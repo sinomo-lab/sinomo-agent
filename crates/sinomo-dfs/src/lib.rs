@@ -6464,9 +6464,7 @@ pub fn materialize_default_sifs_metadata(
     fallback_owner_node_id: NodeId,
     created_at: OffsetDateTime,
 ) -> Result<(), DfsError> {
-    if backend.get_file_system(&file_system.file_system_id)? != Some(file_system.clone()) {
-        backend.put_file_system(file_system)?;
-    }
+    backend.ensure_file_system(file_system)?;
     for object in distributed_sifs_bootstrap_objects_for_nodes(
         bootstrap_owner_node_ids,
         fallback_owner_node_id,
@@ -10498,13 +10496,8 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 store.put_file_system_config(&file_system_config)?;
             }
         }
-        if let Some(backend) = self.metadata_backend.as_mut()
-            && backend
-                .get_file_system(&file_system.file_system_id)?
-                .as_ref()
-                != Some(&file_system)
-        {
-            backend.put_file_system(&file_system)?;
+        if let Some(backend) = self.metadata_backend.as_mut() {
+            backend.ensure_file_system(&file_system)?;
         }
         self.metadata.add_file_system(file_system);
         Ok(())
@@ -10544,17 +10537,19 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         }
         if let Some(backend) = self.metadata_backend.as_mut() {
             for (file_system_id, records) in &grouped {
-                if backend.get_file_system(file_system_id)?.is_none() {
-                    let Some((object, _)) = records.first() else {
-                        continue;
-                    };
-                    backend.put_file_system(&DfsFileSystem {
-                        file_system_id: file_system_id.clone(),
-                        display_name: file_system_id.to_string(),
-                        owner_node_id: object.owner_node_id.clone(),
-                        subtree_policies: Vec::new(),
-                    })?;
-                }
+                let Some((object, _)) = records.first() else {
+                    continue;
+                };
+                let file_system =
+                    backend
+                        .get_file_system(file_system_id)?
+                        .unwrap_or_else(|| DfsFileSystem {
+                            file_system_id: file_system_id.clone(),
+                            display_name: file_system_id.to_string(),
+                            owner_node_id: object.owner_node_id.clone(),
+                            subtree_policies: Vec::new(),
+                        });
+                backend.ensure_file_system(&file_system)?;
 
                 let mut transaction_objects = Vec::new();
                 let mut transaction_versions = Vec::new();
@@ -10658,17 +10653,15 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         transaction: DfsNamespaceTransaction,
     ) -> Result<(), DfsError> {
         if let Some(backend) = self.metadata_backend.as_mut() {
-            if backend
+            let file_system = backend
                 .get_file_system(&transaction.file_system_id)?
-                .is_none()
-            {
-                backend.put_file_system(&DfsFileSystem {
+                .unwrap_or_else(|| DfsFileSystem {
                     file_system_id: transaction.file_system_id.clone(),
                     display_name: transaction.file_system_id.to_string(),
                     owner_node_id: self.node_id.clone(),
                     subtree_policies: Vec::new(),
-                })?;
-            }
+                });
+            backend.ensure_file_system(&file_system)?;
             backend.apply_namespace_transaction(&transaction)?;
         }
         for object in transaction
@@ -15644,7 +15637,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             };
         if let Some(file_system) = file_system_to_persist.as_ref() {
             if let Some(backend) = self.metadata_backend.as_mut() {
-                backend.put_file_system(file_system)?;
+                backend.ensure_file_system(file_system)?;
             }
             if let Some(kv) = self.control_plane.as_mut() {
                 DfsControlPlaneStore::new(kv.as_mut())
@@ -21631,14 +21624,15 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         let Some(backend) = self.metadata_backend.as_mut() else {
             return Ok(());
         };
-        if backend.get_file_system(&object.file_system_id)?.is_none() {
-            backend.put_file_system(&DfsFileSystem {
+        let file_system = backend
+            .get_file_system(&object.file_system_id)?
+            .unwrap_or_else(|| DfsFileSystem {
                 file_system_id: object.file_system_id.clone(),
                 display_name: object.file_system_id.to_string(),
                 owner_node_id: object.owner_node_id.clone(),
                 subtree_policies: Vec::new(),
-            })?;
-        }
+            });
+        backend.ensure_file_system(&file_system)?;
         if backend.get_object(&object.object_id)?.as_ref() != Some(&object) {
             backend.put_object(&object)?;
         }
@@ -21663,14 +21657,15 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         let Some(backend) = self.metadata_backend.as_mut() else {
             return Ok(());
         };
-        if backend.get_file_system(&object.file_system_id)?.is_none() {
-            backend.put_file_system(&DfsFileSystem {
+        let file_system = backend
+            .get_file_system(&object.file_system_id)?
+            .unwrap_or_else(|| DfsFileSystem {
                 file_system_id: object.file_system_id.clone(),
                 display_name: object.file_system_id.to_string(),
                 owner_node_id: object.owner_node_id.clone(),
                 subtree_policies: Vec::new(),
-            })?;
-        }
+            });
+        backend.ensure_file_system(&file_system)?;
 
         let object_changed = backend.get_object(&object.object_id)?.as_ref() != Some(&object);
 

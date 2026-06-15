@@ -1033,6 +1033,15 @@ struct DfsVisibleVersionCommitRecord {
 pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry>;
     fn get_file_system(&self, file_system_id: &DfsFileSystemId) -> Result<Option<DfsFileSystem>>;
+    fn ensure_file_system(
+        &mut self,
+        file_system: &DfsFileSystem,
+    ) -> Result<Option<DfsMetadataJournalEntry>> {
+        if self.get_file_system(&file_system.file_system_id)?.as_ref() == Some(file_system) {
+            return Ok(None);
+        }
+        self.put_file_system(file_system).map(Some)
+    }
     fn list_file_systems(&self) -> Result<Vec<DfsFileSystem>>;
     fn put_object(&mut self, object: &DfsObjectMetadata) -> Result<DfsMetadataJournalEntry>;
     fn put_objects(
@@ -3405,6 +3414,35 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         last_entry.ok_or_else(|| MetadataBackendError::UnknownFileSystem {
             file_system_id: file_system.file_system_id.clone(),
         })
+    }
+
+    fn ensure_file_system(
+        &mut self,
+        file_system: &DfsFileSystem,
+    ) -> Result<Option<DfsMetadataJournalEntry>> {
+        let shard_ids = self
+            .shard_configs_for_file_system(&file_system.file_system_id)
+            .into_iter()
+            .map(|shard| DfsMetadataShardId::new(shard.shard_id))
+            .collect::<Vec<_>>();
+        if shard_ids.is_empty() {
+            return Err(MetadataBackendError::UnknownFileSystem {
+                file_system_id: file_system.file_system_id.clone(),
+            });
+        }
+        let mut last_entry = None;
+        for shard_id in shard_ids {
+            let backend = self.shard_backend_mut(&shard_id)?;
+            if backend
+                .get_file_system(&file_system.file_system_id)?
+                .as_ref()
+                == Some(file_system)
+            {
+                continue;
+            }
+            last_entry = Some(backend.put_file_system(file_system)?);
+        }
+        Ok(last_entry)
     }
 
     fn get_file_system(&self, file_system_id: &DfsFileSystemId) -> Result<Option<DfsFileSystem>> {

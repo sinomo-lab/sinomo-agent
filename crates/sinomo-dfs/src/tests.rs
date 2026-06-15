@@ -4870,6 +4870,68 @@ fn default_sifs_metadata_materialization_writes_node_directories_and_visible_ver
 }
 
 #[test]
+fn sifs_bootstrap_repairs_partial_sharded_filesystem_records() {
+    let root = temp_root("sifs-bootstrap-partial-sharded-filesystem");
+    let metadata_root = root.join("metadata");
+    let node = NodeId::from_legacy_named("node_sifs_partial_sharded_fs").expect("node");
+    let file_system = distributed_sifs(node.clone());
+    let root_shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: node.clone(),
+        replica_node_ids: Vec::new(),
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let services_shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "services".to_string(),
+        primary_node_id: node.clone(),
+        replica_node_ids: Vec::new(),
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::PathPrefix {
+            prefix: SIFS_SERVICES_PATH.to_string(),
+        },
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+
+    {
+        let mut partial =
+            open_local_sharded_metadata_backend(&metadata_root, vec![services_shard.clone()])
+                .expect("partial sharded backend");
+        partial.put_file_system(&file_system).expect("filesystem");
+    }
+
+    let metadata = open_local_sharded_metadata_backend(
+        &metadata_root,
+        vec![root_shard.clone(), services_shard.clone()],
+    )
+    .expect("full sharded backend");
+    let network = InProcessNetwork::new();
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let mut dfs = NetworkedDfsService::new(network.add_node(node.clone()), content)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+
+    dfs.bootstrap_distributed_sifs()
+        .expect("bootstrap should repair the missing root-shard filesystem record");
+    assert!(dfs.posix_stat("/").is_ok());
+    assert!(dfs.posix_stat(SIFS_SERVICES_PATH).is_ok());
+
+    let repaired = open_local_sharded_metadata_backend(&metadata_root, vec![root_shard])
+        .expect("root shard backend");
+    assert_eq!(
+        repaired
+            .get_file_system(&file_system.file_system_id)
+            .expect("root shard filesystem"),
+        Some(file_system)
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn metadata_journal_batch_processor_rejects_non_primary_source() {
     let root = temp_root("metadata-journal-processor-rejects-source");
     let primary = NodeId::from_legacy_named("node_meta_processor_primary").expect("primary");
