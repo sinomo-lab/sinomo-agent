@@ -3896,6 +3896,100 @@ fn cluster_connectivity_probe_batch_and_outcome_transition_are_network_owned() {
 }
 
 #[test]
+fn cluster_connectivity_probe_batch_prioritizes_soon_expiring_records() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-probe-expiry-order");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_connectivity_probe_expiry_order").expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_connectivity_probe_expiry_order_local").expect("local");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "connectivity probe expiry order",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let soon_node =
+        NodeId::from_legacy_named("node_connectivity_probe_expiry_order_soon").expect("soon");
+    let soon_endpoint = daemon_lan_endpoint(&soon_node, "10.91.0.1:21353".to_string(), 10);
+    let mut endpoints = Vec::from([soon_endpoint.clone()]);
+    for index in 0..CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK {
+        let remote =
+            NodeId::from_legacy_named(format!("node_connectivity_probe_expiry_order_far_{index}"))
+                .expect("remote");
+        endpoints.push(daemon_lan_endpoint(
+            &remote,
+            format!("10.91.1.{index}:21353"),
+            10,
+        ));
+    }
+    for endpoint in &endpoints {
+        let mut member = ClusterMemberRecord::local_non_voting(
+            cluster_id.clone(),
+            endpoint.node_id.clone(),
+            endpoint.node_id.to_string(),
+            format!("pk-{}", endpoint.node_id),
+            now,
+        );
+        member.capabilities = sinomo_node::main_daemon_capabilities(&member.role);
+        member.allowed_capabilities = member.capabilities.clone();
+        member.endpoints = vec![endpoint.clone()];
+        state.members.push(member);
+    }
+
+    let mut connectivity = std::collections::BTreeMap::new();
+    for endpoint in &endpoints {
+        let expires_in = if endpoint.endpoint_id == soon_endpoint.endpoint_id {
+            1
+        } else {
+            CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS - 1
+        };
+        let record = cluster_connectivity_record(
+            &state,
+            endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            expires_in,
+        );
+        connectivity.insert(
+            cluster_connectivity_probe_key(&local, endpoint),
+            ClusterConnectivityProbeState { record },
+        );
+    }
+
+    let batch = select_cluster_connectivity_probe_batch(
+        &paths,
+        &state,
+        &mut connectivity,
+        1,
+        &ClusterNodeRole::Workstation,
+        false,
+        now,
+    );
+
+    assert_eq!(
+        batch.entries.len(),
+        CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK
+    );
+    assert!(
+        batch
+            .entries
+            .iter()
+            .any(|entry| entry.endpoint.endpoint_id == soon_endpoint.endpoint_id),
+        "bounded probe batches must refresh the nearest-expiring link before lower-risk endpoints"
+    );
+}
+
+#[test]
 fn cluster_connectivity_identity_mismatch_bypasses_transient_failure_grace() {
     let now = OffsetDateTime::now_utc();
     let cluster_id =

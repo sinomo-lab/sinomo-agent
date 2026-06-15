@@ -5753,13 +5753,14 @@ pub fn select_cluster_connectivity_probe_batch(
     }
 
     let graph = ClusterConnectivityGraph::read_for_local(paths, state);
-    let probe_targets = targets
+    let mut probe_entries = targets
         .iter()
-        .filter(|endpoint| {
+        .filter_map(|endpoint| {
             let key = cluster_connectivity_probe_key(&state.local_node_id, endpoint);
-            connectivity.get(&key).is_none_or(|probe| {
+            let previous = connectivity.get(&key).map(|probe| probe.record.clone());
+            let due = previous.as_ref().is_none_or(|record| {
                 cluster_connectivity_probe_due_with_graph(
-                    &probe.record,
+                    record,
                     endpoint,
                     now,
                     refresh_deadline,
@@ -5768,46 +5769,54 @@ pub fn select_cluster_connectivity_probe_batch(
                     &state.local_node_id,
                     startup_settle_active,
                 )
+            });
+            due.then(|| ClusterConnectivityProbeBatchEntry {
+                key,
+                endpoint: endpoint.clone(),
+                previous,
             })
         })
-        .cloned()
         .collect::<Vec<_>>();
+    probe_entries.sort_by_key(|entry| {
+        (
+            cluster_connectivity_probe_expiry_rank(entry.previous.as_ref()),
+            cluster_connectivity_probe_state_rank(entry.previous.as_ref()),
+            entry.endpoint.node_id.clone(),
+            entry.endpoint.priority,
+            entry.endpoint.address.clone(),
+        )
+    });
     let probe_count =
-        probe_targets
+        probe_entries
             .len()
             .min(cluster_connectivity_probe_max_endpoints_per_tick_for_role(
                 local_node_role,
             ));
-    let probe_start = if probe_targets.is_empty() {
-        0
-    } else {
-        connectivity_cursor % probe_targets.len()
-    };
-    let next_cursor = if probe_targets.is_empty() {
-        0
-    } else {
-        (probe_start + probe_count) % probe_targets.len()
-    };
-    let entries = probe_targets
-        .iter()
-        .cycle()
-        .skip(probe_start)
-        .take(probe_count)
-        .map(|endpoint| {
-            let key = cluster_connectivity_probe_key(&state.local_node_id, endpoint);
-            let previous = connectivity.get(&key).map(|probe| probe.record.clone());
-            ClusterConnectivityProbeBatchEntry {
-                key,
-                endpoint: endpoint.clone(),
-                previous,
-            }
-        })
-        .collect();
+    let _ = connectivity_cursor;
+    let next_cursor = 0;
+    let entries = probe_entries.into_iter().take(probe_count).collect();
 
     ClusterConnectivityProbeBatch {
         active_keys,
         entries,
         next_cursor,
+    }
+}
+
+fn cluster_connectivity_probe_expiry_rank(
+    record: Option<&ClusterConnectivityRecord>,
+) -> OffsetDateTime {
+    record
+        .map(|record| record.expires_at)
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+}
+
+fn cluster_connectivity_probe_state_rank(record: Option<&ClusterConnectivityRecord>) -> u8 {
+    match record.map(|record| &record.state) {
+        None => 0,
+        Some(ClusterConnectivityState::Healthy) => 1,
+        Some(ClusterConnectivityState::Degraded) => 2,
+        Some(ClusterConnectivityState::Unreachable) => 3,
     }
 }
 

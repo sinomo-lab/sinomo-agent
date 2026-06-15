@@ -2215,16 +2215,18 @@ impl ClusterNetworkMaintenance {
         pending: ClusterNetworkMaintenancePendingWork,
         runtime: tokio::runtime::Handle,
     ) {
+        // Connectivity refreshes must run before cluster writes that may need those
+        // freshly-probed relay routes to reach a voter from a segmented learner.
+        if let Some(probe) = pending.connectivity_probe {
+            self.run_pending_connectivity_probe_async(probe, runtime.clone())
+                .await;
+        }
         for publish in pending.member_publishes {
             self.run_pending_member_publish_async(publish, runtime.clone())
                 .await;
         }
         for refresh in pending.node_status_refreshes {
             self.run_pending_node_status_refresh_async(refresh, runtime.clone())
-                .await;
-        }
-        if let Some(probe) = pending.connectivity_probe {
-            self.run_pending_connectivity_probe_async(probe, runtime)
                 .await;
         }
     }
