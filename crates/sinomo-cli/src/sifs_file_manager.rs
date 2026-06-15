@@ -31,6 +31,18 @@ pub(crate) struct SifsFileManagerBackend {
 impl SifsFileManagerBackend {
     pub(crate) fn open(data_dir: &SinomoDataDir) -> Result<Self, String> {
         let service = open_sifs_service(data_dir)?;
+        Self::from_service(data_dir, service)
+    }
+
+    pub(crate) fn open_read_only(data_dir: &SinomoDataDir) -> Result<Self, String> {
+        let service = open_sifs_service_read_only(data_dir)?;
+        Self::from_service(data_dir, service)
+    }
+
+    fn from_service(
+        data_dir: &SinomoDataDir,
+        service: NetworkedDfsService<DfsEndpointTransport>,
+    ) -> Result<Self, String> {
         let replica_candidates = sifs_replica_candidates(data_dir, service.node_id());
         Ok(Self {
             data_dir: data_dir.clone(),
@@ -115,9 +127,14 @@ impl SifsFileManagerBackend {
                     .map_err(|error| format!("cannot create SIFS directory {parent}: {error}"))?;
             }
             service
-                .posix_write_file(&path, bytes, options.clone())
+                .posix_write_file_with_known_parent(&path, bytes, options.clone())
                 .map(|_| ())
                 .map_err(|error| format!("cannot write SIFS file {path}: {error}"))?;
+        }
+        for parent in created_dirs {
+            service
+                .posix_touch_directory_modified(&parent)
+                .map_err(|error| format!("cannot touch SIFS directory {parent}: {error}"))?;
         }
         Ok(())
     }
@@ -332,6 +349,19 @@ impl FileManagerBackend for SifsFileManagerBackend {
 fn open_sifs_service(
     data_dir: &SinomoDataDir,
 ) -> Result<NetworkedDfsService<DfsEndpointTransport>, String> {
+    open_sifs_service_with_hydration(data_dir, true)
+}
+
+fn open_sifs_service_read_only(
+    data_dir: &SinomoDataDir,
+) -> Result<NetworkedDfsService<DfsEndpointTransport>, String> {
+    open_sifs_service_with_hydration(data_dir, false)
+}
+
+fn open_sifs_service_with_hydration(
+    data_dir: &SinomoDataDir,
+    hydrate_metadata: bool,
+) -> Result<NetworkedDfsService<DfsEndpointTransport>, String> {
     data_dir
         .ensure_root_layout()
         .map_err(|error| format!("cannot prepare Sinomo data directory: {error}"))?;
@@ -355,15 +385,27 @@ fn open_sifs_service(
     }
     let service =
         if let Some(metadata) = open_sifs_sharded_metadata_backend(data_dir, &cluster_paths)? {
-            service
-                .with_metadata_backend(metadata)
-                .map_err(|error| format!("cannot open sharded SIFS metadata: {error}"))?
+            if hydrate_metadata {
+                service
+                    .with_metadata_backend(metadata)
+                    .map_err(|error| format!("cannot open sharded SIFS metadata: {error}"))?
+            } else {
+                service
+                    .with_metadata_backend_lazy(metadata)
+                    .map_err(|error| format!("cannot open sharded SIFS metadata: {error}"))?
+            }
         } else {
             let metadata = open_root_local_metadata_backend(default_dfs_metadata_root(data_dir))
                 .map_err(|error| format!("cannot open local SIFS metadata: {error}"))?;
-            service
-                .with_metadata_backend(metadata)
-                .map_err(|error| format!("cannot open local SIFS metadata: {error}"))?
+            if hydrate_metadata {
+                service
+                    .with_metadata_backend(metadata)
+                    .map_err(|error| format!("cannot open local SIFS metadata: {error}"))?
+            } else {
+                service
+                    .with_metadata_backend_lazy(metadata)
+                    .map_err(|error| format!("cannot open local SIFS metadata: {error}"))?
+            }
         };
     let mut service = service;
     service

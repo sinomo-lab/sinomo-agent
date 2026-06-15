@@ -321,6 +321,11 @@ pub type ClusterSignedEndpointRpcFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, NetworkError>> + Send + 'a>>;
 
 pub trait ClusterSignedEndpointRpcAsyncHost {
+    fn sign_endpoint_rpc_request_async<'a>(
+        &'a mut self,
+        request: &'a ObjectRpcRequest,
+    ) -> ClusterSignedEndpointRpcFuture<'a, Vec<u8>>;
+
     fn try_gateway_signed_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
@@ -365,7 +370,31 @@ fn cluster_endpoint_transport_timeouts(
         (None, Some(remaining)) => Some(remaining),
         (None, None) => None,
     };
-    timeouts.with_connect_timeout(connect_timeout)
+    let idle_timeout = match (timeouts.idle_timeout, remaining_route_budget) {
+        (Some(idle_timeout), Some(remaining)) => Some(idle_timeout.min(remaining)),
+        (Some(idle_timeout), None) => Some(idle_timeout),
+        (None, _) => None,
+    };
+    timeouts
+        .with_connect_timeout(connect_timeout)
+        .with_idle_timeout(idle_timeout)
+}
+
+const CLUSTER_ENDPOINT_DIRECT_ATTEMPT_MAX_BEFORE_RELAY: Duration = Duration::from_secs(3);
+
+fn cluster_endpoint_direct_attempt_timeouts(
+    timeouts: DaemonRpcTimeouts,
+    remaining_route_budget: Option<Duration>,
+) -> DaemonRpcTimeouts {
+    let Some(remaining) = remaining_route_budget else {
+        return timeouts;
+    };
+    if remaining <= CLUSTER_RELAY_MIN_BUDGET + CLUSTER_ENDPOINT_DIRECT_ATTEMPT_MAX_BEFORE_RELAY {
+        return cluster_endpoint_transport_timeouts(timeouts, Some(remaining));
+    }
+    let direct_budget = CLUSTER_ENDPOINT_DIRECT_ATTEMPT_MAX_BEFORE_RELAY
+        .min(remaining.saturating_sub(CLUSTER_RELAY_MIN_BUDGET));
+    cluster_endpoint_transport_timeouts(timeouts, Some(direct_budget))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -477,7 +506,7 @@ pub async fn send_signed_rpc_to_endpoint_async_with_host(
                 request,
                 request_auth,
                 request_command,
-                cluster_endpoint_transport_timeouts(options.timeouts, remaining),
+                cluster_endpoint_direct_attempt_timeouts(options.timeouts, remaining),
             )
             .await?
     {
@@ -488,13 +517,14 @@ pub async fn send_signed_rpc_to_endpoint_async_with_host(
         let Some(remaining) = deadline.checked_remaining() else {
             return Err(deadline.timeout_error(endpoint));
         };
+        let direct_auth = host.sign_endpoint_rpc_request_async(request).await?;
         match host
             .send_signed_endpoint_rpc_async(
                 endpoint,
                 request_command,
-                request_auth,
+                &direct_auth,
                 request,
-                cluster_endpoint_transport_timeouts(options.timeouts, remaining),
+                cluster_endpoint_direct_attempt_timeouts(options.timeouts, remaining),
             )
             .await
         {
@@ -503,11 +533,12 @@ pub async fn send_signed_rpc_to_endpoint_async_with_host(
                 let Some(remaining) = deadline.checked_remaining() else {
                     return Err(direct_error);
                 };
+                let relay_auth = host.sign_endpoint_rpc_request_async(request).await?;
                 return match host
                     .relay_signed_endpoint_rpc_async(
                         endpoint,
                         request,
-                        request_auth,
+                        &relay_auth,
                         request_command,
                         relay_command,
                         cluster_endpoint_transport_timeouts(options.timeouts, remaining),
@@ -524,11 +555,12 @@ pub async fn send_signed_rpc_to_endpoint_async_with_host(
     let Some(remaining) = deadline.checked_remaining() else {
         return Err(deadline.timeout_error(endpoint));
     };
+    let relay_auth = host.sign_endpoint_rpc_request_async(request).await?;
     match host
         .relay_signed_endpoint_rpc_async(
             endpoint,
             request,
-            request_auth,
+            &relay_auth,
             request_command,
             relay_command,
             cluster_endpoint_transport_timeouts(options.timeouts, remaining),
@@ -574,7 +606,7 @@ pub async fn relay_rpc_to_endpoint_async_with_host(
         .connect_timeout
         .map(|timeout| timeout.max(CLUSTER_RELAY_MIN_BUDGET));
     let deadline = ClusterEndpointRpcDeadline::new(relay_budget);
-    let request_auth = request_auth.into();
+    let mut next_request_auth = Some(request_auth.into());
     let request_command = request_command.into();
     let mut failures = Vec::new();
     'relay_hops: for (next_hop_id, endpoints) in route_plan {
@@ -584,21 +616,25 @@ pub async fn relay_rpc_to_endpoint_async_with_host(
             ));
             continue;
         }
-        let outer = relay_request_for_signed_rpc(
-            &state.cluster_id,
-            &endpoint.node_id,
-            request,
-            request_auth.clone(),
-            request_command.clone(),
-            std::iter::once(state.local_node_id.clone()),
-        )?;
-        let outer_auth = host.sign_relay_rpc_request_async(&outer).await?;
         for next_hop in endpoints {
             let Some(remaining) = deadline.checked_remaining() else {
                 let timeout = options.timeouts.connect_timeout.unwrap_or_default();
                 failures.push(format!("relay budget expired after {:?}", timeout));
                 break 'relay_hops;
             };
+            let request_auth = match next_request_auth.take() {
+                Some(auth) => auth,
+                None => host.sign_relay_rpc_request_async(request).await?,
+            };
+            let outer = relay_request_for_signed_rpc(
+                &state.cluster_id,
+                &endpoint.node_id,
+                request,
+                request_auth,
+                request_command.clone(),
+                std::iter::once(state.local_node_id.clone()),
+            )?;
+            let outer_auth = host.sign_relay_rpc_request_async(&outer).await?;
             match host
                 .send_signed_relay_rpc_async(
                     &next_hop,
@@ -652,12 +688,13 @@ async fn relay_route_plan(
     runtime
         .spawn_blocking(move || {
             let graph = ClusterConnectivityGraph::read_for_local(&paths, &state);
+            let excluded = vec![endpoint.node_id.clone()];
             let next_hops = cluster_relay_next_hops(
                 &graph,
                 &state,
                 &state.local_node_id,
                 &endpoint.node_id,
-                &[],
+                &excluded,
             );
             Ok(next_hops
                 .into_iter()
@@ -895,9 +932,13 @@ pub fn cluster_relay_next_hop_endpoints_with_graph(
 ) -> Vec<ClusterEndpointRecord> {
     let mut endpoints = Vec::new();
     let mut seen = BTreeSet::new();
-    if let Some(endpoint) = graph.best_healthy_endpoint(source_node_id, node_id) {
-        push_unique_cluster_endpoint(&mut endpoints, &mut seen, endpoint);
-    }
+    let has_healthy_next_hop_endpoint =
+        if let Some(endpoint) = graph.best_healthy_endpoint(source_node_id, node_id) {
+            push_unique_cluster_endpoint(&mut endpoints, &mut seen, endpoint);
+            true
+        } else {
+            false
+        };
     if let Some(member) = state
         .members
         .iter()
@@ -907,6 +948,13 @@ pub fn cluster_relay_next_hop_endpoints_with_graph(
             .endpoints
             .iter()
             .filter(|endpoint| crate::locally_learned_bridge_route_endpoint(endpoint))
+            .filter(|endpoint| {
+                cluster_relay_next_hop_endpoint_is_usable(
+                    graph,
+                    *endpoint,
+                    has_healthy_next_hop_endpoint,
+                )
+            })
         {
             push_unique_cluster_endpoint(&mut endpoints, &mut seen, endpoint.clone());
         }
@@ -914,10 +962,29 @@ pub fn cluster_relay_next_hop_endpoints_with_graph(
     for endpoint in crate::cluster_main_daemon_command_targets(paths, state)
         .into_iter()
         .filter(|endpoint| endpoint.node_id == *node_id)
+        .filter(|endpoint| {
+            cluster_relay_next_hop_endpoint_is_usable(
+                graph,
+                endpoint,
+                has_healthy_next_hop_endpoint,
+            )
+        })
     {
         push_unique_cluster_endpoint(&mut endpoints, &mut seen, endpoint);
     }
     endpoints
+}
+
+fn cluster_relay_next_hop_endpoint_is_usable(
+    graph: &ClusterConnectivityGraph,
+    endpoint: &ClusterEndpointRecord,
+    has_healthy_next_hop_endpoint: bool,
+) -> bool {
+    match graph.state_for_endpoint(endpoint) {
+        Some(crate::ClusterConnectivityState::Healthy) => true,
+        Some(crate::ClusterConnectivityState::Unreachable) => false,
+        Some(crate::ClusterConnectivityState::Degraded) | None => !has_healthy_next_hop_endpoint,
+    }
 }
 
 fn push_unique_cluster_endpoint(
@@ -1338,6 +1405,155 @@ mod tests {
         assert_eq!(decoded, envelope);
     }
 
+    #[test]
+    fn relay_next_hop_endpoints_suppress_unverified_fallback_after_healthy_graph_edge() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-relay-endpoint-healthy-filter");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_relay_endpoint_healthy_filter").expect("cluster");
+        let local = nid("node_relay_endpoint_filter_local");
+        let next_hop = nid("node_relay_endpoint_filter_next");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "relay endpoint filter",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let stale_member_endpoint =
+            crate::daemon_lan_endpoint(&next_hop, "172.24.0.4:21353".to_string(), 5);
+        let mut next_hop_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            next_hop.clone(),
+            "next-hop",
+            "pk-next-hop",
+            now,
+        );
+        next_hop_member.capabilities = main_daemon_capabilities(&next_hop_member.role);
+        next_hop_member.allowed_capabilities = next_hop_member.capabilities.clone();
+        next_hop_member.endpoints = vec![stale_member_endpoint];
+        state.members.push(next_hop_member);
+        let healthy_graph_endpoint =
+            crate::daemon_lan_endpoint(&next_hop, "172.24.0.3:21353".to_string(), 1);
+        let graph = ClusterConnectivityGraph::from_records(
+            local.clone(),
+            [crate::cluster_connectivity_record(
+                &state,
+                &healthy_graph_endpoint,
+                ClusterConnectivityState::Healthy,
+                Some(2),
+                0,
+                Some("ok".to_string()),
+                None,
+                now,
+                60,
+            )],
+        );
+
+        let endpoints =
+            cluster_relay_next_hop_endpoints_with_graph(&paths, &graph, &state, &local, &next_hop);
+
+        assert_eq!(
+            endpoints
+                .iter()
+                .map(|endpoint| endpoint.address.as_str())
+                .collect::<Vec<_>>(),
+            vec!["172.24.0.3:21353"]
+        );
+    }
+
+    #[test]
+    fn relay_next_hop_endpoints_keep_unverified_fallback_without_healthy_graph_edge() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-relay-endpoint-startup-fallback");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_relay_endpoint_startup_fallback")
+            .expect("cluster");
+        let local = nid("node_relay_endpoint_fallback_local");
+        let next_hop = nid("node_relay_endpoint_fallback_next");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "relay endpoint fallback",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let fallback_endpoint =
+            crate::daemon_lan_endpoint(&next_hop, "172.24.0.4:21353".to_string(), 5);
+        let mut next_hop_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            next_hop.clone(),
+            "next-hop",
+            "pk-next-hop",
+            now,
+        );
+        next_hop_member.capabilities = main_daemon_capabilities(&next_hop_member.role);
+        next_hop_member.allowed_capabilities = next_hop_member.capabilities.clone();
+        next_hop_member.endpoints = vec![fallback_endpoint.clone()];
+        state.members.push(next_hop_member);
+        let graph = ClusterConnectivityGraph::from_records(local.clone(), []);
+
+        let endpoints =
+            cluster_relay_next_hop_endpoints_with_graph(&paths, &graph, &state, &local, &next_hop);
+
+        assert_eq!(
+            endpoints
+                .iter()
+                .map(|endpoint| endpoint.address.as_str())
+                .collect::<Vec<_>>(),
+            vec![fallback_endpoint.address.as_str()]
+        );
+    }
+
+    #[test]
+    fn relay_fallback_excluding_target_uses_intermediary_after_stale_direct_edge() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_relay_stale_direct").expect("cluster");
+        let local = nid("node_relay_stale_direct_local");
+        let target = nid("node_relay_stale_direct_target");
+        let bridge = nid("node_relay_stale_direct_bridge");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "relay stale direct",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        for node in [&target, &bridge] {
+            let mut member = ClusterMemberRecord::local_non_voting(
+                state.cluster_id.clone(),
+                node.clone(),
+                node.as_str(),
+                format!("pk-{node}"),
+                now,
+            );
+            member.capabilities = main_daemon_capabilities(&member.role);
+            member.allowed_capabilities = member.capabilities.clone();
+            state.members.push(member);
+        }
+        let graph = ClusterConnectivityGraph::from_records(
+            local.clone(),
+            [
+                edge(&local, &target, ClusterConnectivityState::Healthy),
+                edge(&local, &bridge, ClusterConnectivityState::Healthy),
+                edge(&bridge, &target, ClusterConnectivityState::Healthy),
+            ],
+        );
+
+        let next_hops = cluster_relay_next_hops(&graph, &state, &local, &target, &[target.clone()]);
+
+        assert_eq!(next_hops, vec![bridge]);
+    }
+
     #[derive(Default)]
     struct RecordingSignedRelayRpcHost {
         signed_routes: Vec<String>,
@@ -1618,6 +1834,7 @@ mod tests {
         relay_result: Result<Option<ObjectRpcResponse>, NetworkError>,
         direct_timeout_policies: Vec<DaemonRpcTimeouts>,
         relay_timeout_policies: Vec<DaemonRpcTimeouts>,
+        signed_routes: Vec<String>,
         direct_auth: Vec<Vec<u8>>,
         relay_auth: Vec<Vec<u8>>,
     }
@@ -1636,6 +1853,7 @@ mod tests {
                 relay_result,
                 direct_timeout_policies: Vec::new(),
                 relay_timeout_policies: Vec::new(),
+                signed_routes: Vec::new(),
                 direct_auth: Vec::new(),
                 relay_auth: Vec::new(),
             }
@@ -1643,6 +1861,16 @@ mod tests {
     }
 
     impl ClusterSignedEndpointRpcAsyncHost for RecordingSignedEndpointRpcHost {
+        fn sign_endpoint_rpc_request_async<'a>(
+            &'a mut self,
+            request: &'a ObjectRpcRequest,
+        ) -> ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
+            Box::pin(async move {
+                self.signed_routes.push(request.route.clone());
+                Ok(format!("fresh-auth-{}", self.signed_routes.len()).into_bytes())
+            })
+        }
+
         fn try_gateway_signed_rpc_async<'a>(
             &'a mut self,
             _endpoint: &'a ClusterEndpointRecord,
@@ -1753,8 +1981,15 @@ mod tests {
             host.calls,
             vec!["gateway", "prefer_relay", "direct", "relay"]
         );
-        assert_eq!(host.direct_auth, vec![b"inner-auth".to_vec()]);
-        assert_eq!(host.relay_auth, vec![b"inner-auth".to_vec()]);
+        assert_eq!(
+            host.signed_routes,
+            vec![
+                "/cluster/kv/range".to_string(),
+                "/cluster/kv/range".to_string()
+            ]
+        );
+        assert_eq!(host.direct_auth, vec![b"fresh-auth-1".to_vec()]);
+        assert_eq!(host.relay_auth, vec![b"fresh-auth-2".to_vec()]);
         assert_eq!(host.direct_timeout_policies.len(), 1);
         assert_eq!(host.direct_timeout_policies[0].idle_timeout, None);
         assert!(host.direct_timeout_policies[0].connect_timeout <= Some(Duration::from_secs(5)));
@@ -1791,6 +2026,8 @@ mod tests {
             host.direct_timeout_policies,
             vec![DaemonRpcTimeouts::none()]
         );
+        assert_eq!(host.signed_routes, vec!["/cluster/kv/range".to_string()]);
+        assert_eq!(host.direct_auth, vec![b"fresh-auth-1".to_vec()]);
         assert!(host.relay_timeout_policies.is_empty());
     }
 
@@ -1826,7 +2063,8 @@ mod tests {
         );
         assert_eq!(host.calls, vec!["gateway", "prefer_relay", "relay"]);
         assert!(host.direct_auth.is_empty());
-        assert_eq!(host.relay_auth, vec![b"inner-auth".to_vec()]);
+        assert_eq!(host.signed_routes, vec!["/cluster/kv/range".to_string()]);
+        assert_eq!(host.relay_auth, vec![b"fresh-auth-1".to_vec()]);
     }
 
     #[derive(Default)]

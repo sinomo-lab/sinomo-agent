@@ -273,7 +273,7 @@ fn run_expect_file(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let timeout = expect_timeout(ctx)?;
     let started = Instant::now();
     let deadline = started + timeout;
-    let backend = open_backend_until(ctx, deadline)?;
+    let backend = open_read_only_backend_until(ctx, deadline)?;
     let node = backend.node_label();
     ctx.record("node", &node);
     ctx.record("path", &path);
@@ -313,7 +313,7 @@ fn run_expect_absent(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let timeout = expect_timeout(ctx)?;
     let started = Instant::now();
     let deadline = started + timeout;
-    let backend = open_backend_until(ctx, deadline)?;
+    let backend = open_read_only_backend_until(ctx, deadline)?;
     let node = backend.node_label();
     ctx.record("node", &node);
     ctx.record("path", &path);
@@ -471,7 +471,7 @@ fn run_bulk_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 
     let started = Instant::now();
     let deadline = started + timeout;
-    let backend = open_backend_until(ctx, deadline)?;
+    let backend = open_read_only_backend_until(ctx, deadline)?;
     let node = backend.node_label();
     let mut matched = vec![false; files];
     let mut matched_count = 0usize;
@@ -479,6 +479,9 @@ fn run_bulk_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 
     loop {
         for index in 0..files {
+            if Instant::now() >= deadline {
+                break;
+            }
             if matched[index] {
                 continue;
             }
@@ -549,6 +552,15 @@ fn open_backend(ctx: &SinomoTestContext) -> Result<SifsFileManagerBackend, Sinom
         .map_err(|error| SinomoTestError::failed(format!("cannot open SIFS backend: {error}")))
 }
 
+fn open_read_only_backend(
+    ctx: &SinomoTestContext,
+) -> Result<SifsFileManagerBackend, SinomoTestError> {
+    let data_dir = SinomoDataDir::new(ctx.data_dir());
+    SifsFileManagerBackend::open_read_only(&data_dir).map_err(|error| {
+        SinomoTestError::failed(format!("cannot open read-only SIFS backend: {error}"))
+    })
+}
+
 // The expect-* probes are run on nodes that may still be converging (right
 // after formation or a restart), where opening the backend itself can fail
 // transiently — keep retrying within the probe's own deadline.
@@ -558,6 +570,19 @@ fn open_backend_until(
 ) -> Result<SifsFileManagerBackend, SinomoTestError> {
     loop {
         match open_backend(ctx) {
+            Ok(backend) => return Ok(backend),
+            Err(error) if Instant::now() >= deadline => return Err(error),
+            Err(_) => std::thread::sleep(EXPECT_POLL_INTERVAL),
+        }
+    }
+}
+
+fn open_read_only_backend_until(
+    ctx: &SinomoTestContext,
+    deadline: Instant,
+) -> Result<SifsFileManagerBackend, SinomoTestError> {
+    loop {
+        match open_read_only_backend(ctx) {
             Ok(backend) => return Ok(backend),
             Err(error) if Instant::now() >= deadline => return Err(error),
             Err(_) => std::thread::sleep(EXPECT_POLL_INTERVAL),

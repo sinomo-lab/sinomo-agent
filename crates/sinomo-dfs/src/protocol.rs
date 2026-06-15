@@ -13,6 +13,10 @@ fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsReadData {
     pub object_id: DfsObjectId,
@@ -127,6 +131,8 @@ pub struct DfsDistributedWriteCommand {
     pub policy: DfsReplicationPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
+    #[serde(default = "default_true")]
+    pub touch_parent_on_create: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -144,8 +150,17 @@ pub struct DfsDistributedWriteResponse {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsDistributedWriteResult {
-    Outcome { outcome: NetworkedDfsWriteOutcome },
-    Rejected { reason: String },
+    Outcome {
+        outcome: NetworkedDfsWriteOutcome,
+    },
+    Rejected {
+        reason: String,
+        /// Set when the addressed node is not the current metadata-shard
+        /// primary. Requesters can retry the same routed write against this
+        /// node instead of failing on a stale shard view.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_primary_node_id: Option<NodeId>,
+    },
 }
 
 /// POSIX namespace mutation routed to the metadata shard primary. The primary
@@ -210,6 +225,9 @@ pub enum DfsNamespaceOperation {
         modified_at_unix_nanos: Option<u64>,
         follow_symlink: bool,
     },
+    TouchDirectoryModified {
+        path: String,
+    },
     ClearDirRecursive {
         path: String,
     },
@@ -264,6 +282,7 @@ impl DfsNamespaceOperation {
             | DfsNamespaceOperation::SetMode { path, .. }
             | DfsNamespaceOperation::SetOwner { path, .. }
             | DfsNamespaceOperation::SetTimes { path, .. }
+            | DfsNamespaceOperation::TouchDirectoryModified { path }
             | DfsNamespaceOperation::ClearDirRecursive { path }
             | DfsNamespaceOperation::SyncPath { path } => vec![path],
             DfsNamespaceOperation::Rename { from, to } => vec![from, to],
