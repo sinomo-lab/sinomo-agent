@@ -2237,11 +2237,7 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsFrameTransport>(
     let lifecycle_reports =
         run_dfs_lifecycle_maintenance_with_host(service, maintenance_host, options.lifecycle)?;
     let scheduled_repairs = service.retry_pending_repairs()?;
-    let followup_events = if scheduled_repairs.is_empty() {
-        Vec::new()
-    } else {
-        service.process_incoming()?
-    };
+    let followup_events = service.process_incoming()?;
     let metadata_replication = publish_dfs_metadata_journal_with_host(
         file_system_id,
         local_node_id,
@@ -2285,11 +2281,7 @@ where
     let lifecycle_reports =
         run_dfs_lifecycle_maintenance_with_host(service, maintenance_host, options.lifecycle)?;
     let scheduled_repairs = service.retry_pending_repairs_async().await?;
-    let followup_events = if scheduled_repairs.is_empty() {
-        Vec::new()
-    } else {
-        service.process_incoming_async().await?
-    };
+    let followup_events = service.process_incoming_async().await?;
     let metadata_replication = publish_dfs_metadata_journal_with_async_host(
         file_system_id,
         local_node_id,
@@ -8082,6 +8074,7 @@ where
 {
     async fn retry_pending_repairs_async(&mut self) -> Result<Vec<DistributedRepairJob>, DfsError> {
         self.prune_idle_chunk_transfers();
+        self.restore_pending_writes_for_repair_jobs()?;
         if self.pending_writes.is_empty() {
             return Ok(Vec::new());
         }
@@ -8092,9 +8085,6 @@ where
         let mut scheduled = Vec::new();
 
         for job in repair_jobs {
-            if job.missing_replica_node_id == self.node_id {
-                continue;
-            }
             let Some(pending) = self.pending_writes.get(&job.intent_id).cloned() else {
                 continue;
             };
@@ -8102,7 +8092,36 @@ where
                 continue;
             }
             if !self.pending_repair_is_locally_authoritative(&pending)? {
-                self.suppress_repair_retries_for_lost_authority(&job.intent_id, None);
+                self.suppress_repair_retries_for_lost_authority(&job.intent_id, None, true);
+                continue;
+            }
+
+            if job.missing_replica_node_id == self.node_id {
+                if self
+                    .local_object_version_manifest_size_if_matches(
+                        &pending.object_id,
+                        &pending.version,
+                        &pending.content_hash,
+                    )
+                    .is_some()
+                {
+                    self.record_local_pending_write_receipt_if_desired(
+                        &job.intent_id,
+                        &pending.object_id,
+                        &pending.version,
+                        &pending.content_hash,
+                    )?;
+                    continue;
+                }
+                let fetch_requested = self
+                    .request_repair_blob_from_alternate_async(&job, &pending)
+                    .await?;
+                if !fetch_requested {
+                    self.record_repair_retry_scheduled(
+                        &job.intent_id,
+                        &job.missing_replica_node_id,
+                    );
+                }
                 continue;
             }
 
@@ -11925,49 +11944,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         };
 
         self.try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
-        if !matches!(
-            self.coordinator
-                .intent(&updated_intent.intent_id)
-                .map(|intent| &intent.state),
-            Some(DfsWriteIntentState::Committed)
-        ) {
-            let stage_targets = desired_replica_nodes
-                .iter()
-                .filter(|node_id| *node_id != &self.node_id)
-                .cloned()
-                .collect::<Vec<_>>();
-            for replica_node_id in stage_targets {
-                let request_id = self.next_request_id();
-                let max_chunks =
-                    self.adaptive_stage_chunk_window(&replica_node_id, patch_size_bytes);
-                let outcome = self.send_stage_patch_window_if_routable(
-                    &replica_node_id,
-                    request_id.clone(),
-                    &updated_intent.intent_id,
-                    &request.file_system_id,
-                    &request.object_id,
-                    &expected_base_version,
-                    &request.target_version,
-                    &manifest.content_hash,
-                    offset,
-                    &patch_hash,
-                    patch_size_bytes,
-                    0,
-                    max_chunks,
-                    Some(object.clone()),
-                )?;
-                if outcome.sent {
-                    self.record_stage_window_progress(
-                        &updated_intent.intent_id,
-                        &replica_node_id,
-                        request_id,
-                        outcome,
-                    );
-                } else {
-                    self.record_stage_retry_scheduled(&updated_intent.intent_id, &replica_node_id);
-                }
-            }
-        }
+        self.stage_missing_desired_replicas_for_intent(&updated_intent.intent_id, object.clone())?;
 
         let outcome = self.write_outcome(&updated_intent.intent_id)?;
         self.cleanup_committed_pending_write_if_repaired(&updated_intent.intent_id);
@@ -12142,49 +12119,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         };
 
         self.try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
-        if !matches!(
-            self.coordinator
-                .intent(&updated_intent.intent_id)
-                .map(|intent| &intent.state),
-            Some(DfsWriteIntentState::Committed)
-        ) {
-            let stage_targets = desired_replica_nodes
-                .iter()
-                .filter(|node_id| *node_id != &self.node_id)
-                .cloned()
-                .collect::<Vec<_>>();
-            for replica_node_id in stage_targets {
-                let request_id = self.next_request_id();
-                let max_chunks =
-                    self.adaptive_stage_chunk_window(&replica_node_id, patch_size_bytes);
-                let outcome = self.send_stage_patch_window_if_routable(
-                    &replica_node_id,
-                    request_id.clone(),
-                    &updated_intent.intent_id,
-                    &request.file_system_id,
-                    &request.object_id,
-                    &expected_base_version,
-                    &request.target_version,
-                    &manifest.content_hash,
-                    offset,
-                    &patch_hash,
-                    patch_size_bytes,
-                    0,
-                    max_chunks,
-                    Some(object.clone()),
-                )?;
-                if outcome.sent {
-                    self.record_stage_window_progress(
-                        &updated_intent.intent_id,
-                        &replica_node_id,
-                        request_id,
-                        outcome,
-                    );
-                } else {
-                    self.record_stage_retry_scheduled(&updated_intent.intent_id, &replica_node_id);
-                }
-            }
-        }
+        self.stage_missing_desired_replicas_for_intent(&updated_intent.intent_id, object.clone())?;
 
         let outcome = self.write_outcome(&updated_intent.intent_id)?;
         self.cleanup_committed_pending_write_if_repaired(&updated_intent.intent_id);
@@ -12638,47 +12573,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
 
         self.try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
 
-        if !matches!(
-            self.coordinator
-                .intent(&updated_intent.intent_id)
-                .map(|intent| &intent.state),
-            Some(DfsWriteIntentState::Committed)
-        ) {
-            let stage_targets: Vec<NodeId> = desired_replica_nodes
-                .iter()
-                .filter(|node_id| *node_id != &self.node_id)
-                .cloned()
-                .collect();
-            for replica_node_id in stage_targets {
-                let request_id = self.next_request_id();
-                let max_chunks =
-                    self.adaptive_stage_chunk_window(&replica_node_id, manifest.size_bytes);
-                let outcome = self.send_stage_blob_window_if_routable(
-                    &replica_node_id,
-                    request_id.clone(),
-                    &updated_intent.intent_id,
-                    &request.file_system_id,
-                    &request.object_id,
-                    updated_intent.base_version.clone(),
-                    &request.target_version,
-                    &manifest.content_hash,
-                    manifest.size_bytes,
-                    0,
-                    max_chunks,
-                    Some(object.clone()),
-                )?;
-                if outcome.sent {
-                    self.record_stage_window_progress(
-                        &updated_intent.intent_id,
-                        &replica_node_id,
-                        request_id,
-                        outcome,
-                    );
-                } else {
-                    self.record_stage_retry_scheduled(&updated_intent.intent_id, &replica_node_id);
-                }
-            }
-        }
+        self.stage_missing_desired_replicas_for_intent(&updated_intent.intent_id, object.clone())?;
 
         let outcome = self.write_outcome(&updated_intent.intent_id)?;
         self.cleanup_committed_pending_write_if_repaired(&updated_intent.intent_id);
@@ -13130,47 +13025,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
 
         self.try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
 
-        if !matches!(
-            self.coordinator
-                .intent(&updated_intent.intent_id)
-                .map(|intent| &intent.state),
-            Some(DfsWriteIntentState::Committed)
-        ) {
-            let stage_targets: Vec<NodeId> = desired_replica_nodes
-                .iter()
-                .filter(|node_id| *node_id != &self.node_id)
-                .cloned()
-                .collect();
-            for replica_node_id in stage_targets {
-                let request_id = self.next_request_id();
-                let max_chunks =
-                    self.adaptive_stage_chunk_window(&replica_node_id, manifest.size_bytes);
-                let outcome = self.send_stage_blob_window_if_routable(
-                    &replica_node_id,
-                    request_id.clone(),
-                    &updated_intent.intent_id,
-                    &request.file_system_id,
-                    &request.object_id,
-                    updated_intent.base_version.clone(),
-                    &request.target_version,
-                    &manifest.content_hash,
-                    manifest.size_bytes,
-                    0,
-                    max_chunks,
-                    Some(object.clone()),
-                )?;
-                if outcome.sent {
-                    self.record_stage_window_progress(
-                        &updated_intent.intent_id,
-                        &replica_node_id,
-                        request_id,
-                        outcome,
-                    );
-                } else {
-                    self.record_stage_retry_scheduled(&updated_intent.intent_id, &replica_node_id);
-                }
-            }
-        }
+        self.stage_missing_desired_replicas_for_intent(&updated_intent.intent_id, object.clone())?;
 
         let outcome = self.write_outcome(&updated_intent.intent_id)?;
         self.cleanup_committed_pending_write_if_repaired(&updated_intent.intent_id);
@@ -15365,6 +15220,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
 
     pub fn retry_pending_repairs(&mut self) -> Result<Vec<DistributedRepairJob>, DfsError> {
         self.prune_idle_chunk_transfers();
+        self.restore_pending_writes_for_repair_jobs()?;
         if self.pending_writes.is_empty() {
             return Ok(Vec::new());
         }
@@ -15375,9 +15231,6 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         let mut scheduled = Vec::new();
 
         for job in repair_jobs {
-            if job.missing_replica_node_id == self.node_id {
-                continue;
-            }
             let Some(pending) = self.pending_writes.get(&job.intent_id).cloned() else {
                 continue;
             };
@@ -15385,7 +15238,34 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 continue;
             }
             if !self.pending_repair_is_locally_authoritative(&pending)? {
-                self.suppress_repair_retries_for_lost_authority(&job.intent_id, None);
+                self.suppress_repair_retries_for_lost_authority(&job.intent_id, None, true);
+                continue;
+            }
+
+            if job.missing_replica_node_id == self.node_id {
+                if self
+                    .local_object_version_manifest_size_if_matches(
+                        &pending.object_id,
+                        &pending.version,
+                        &pending.content_hash,
+                    )
+                    .is_some()
+                {
+                    self.record_local_pending_write_receipt_if_desired(
+                        &job.intent_id,
+                        &pending.object_id,
+                        &pending.version,
+                        &pending.content_hash,
+                    )?;
+                    continue;
+                }
+                let fetch_requested = self.request_repair_blob_from_alternate(&job, &pending)?;
+                if !fetch_requested {
+                    self.record_repair_retry_scheduled(
+                        &job.intent_id,
+                        &job.missing_replica_node_id,
+                    );
+                }
                 continue;
             }
 
@@ -17799,6 +17679,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                             self.suppress_repair_retries_for_lost_authority(
                                 &response.intent_id,
                                 Some(&response.replica_node_id),
+                                false,
                             );
                         } else {
                             self.record_repair_retry_scheduled(
@@ -18282,7 +18163,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             }
             DfsFetchBlobResult::Rejected { reason } => {
                 if repair_rejection_indicates_lost_authority(&reason) {
-                    self.suppress_repair_retries_for_lost_authority(&response.intent_id, None);
+                    self.suppress_repair_retries_for_lost_authority(
+                        &response.intent_id,
+                        None,
+                        false,
+                    );
                 } else {
                     self.record_fetch_failed_source_and_wake_retries(
                         &response.intent_id,
@@ -20499,6 +20384,88 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    fn stage_missing_desired_replicas_for_intent(
+        &mut self,
+        intent_id: &str,
+        object_metadata: DfsObjectMetadata,
+    ) -> Result<(), DfsError> {
+        let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
+            return Ok(());
+        };
+        let Some(pending) = self.pending_writes.get(intent_id).cloned() else {
+            return Ok(());
+        };
+        let durable_nodes = self
+            .coordinator
+            .receipts_for_intent(intent_id)
+            .into_iter()
+            .map(|receipt| receipt.replica_node_id.clone())
+            .collect::<BTreeSet<_>>();
+        let stage_targets = intent
+            .desired_replica_nodes
+            .iter()
+            .filter(|node_id| *node_id != &self.node_id && !durable_nodes.contains(*node_id))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for replica_node_id in stage_targets {
+            let request_id = pending
+                .stage_inflight_request_ids
+                .get(&replica_node_id)
+                .cloned()
+                .unwrap_or_else(|| self.next_request_id());
+            match self.send_pending_stage_patch_if_routable(
+                &replica_node_id,
+                request_id.clone(),
+                &intent,
+                &pending,
+                Some(object_metadata.clone()),
+            )? {
+                Some(outcome) if outcome.sent => {
+                    self.record_stage_window_progress(
+                        intent_id,
+                        &replica_node_id,
+                        request_id,
+                        outcome,
+                    );
+                    continue;
+                }
+                Some(_) => {
+                    self.record_stage_retry_scheduled(intent_id, &replica_node_id);
+                    continue;
+                }
+                None => {}
+            }
+
+            let start_chunk_index = pending
+                .stage_next_chunk_indexes
+                .get(&replica_node_id)
+                .copied()
+                .unwrap_or(0);
+            let max_chunks = self.adaptive_stage_chunk_window(&replica_node_id, pending.size_bytes);
+            let outcome = self.send_stage_blob_window_if_routable(
+                &replica_node_id,
+                request_id.clone(),
+                intent_id,
+                &intent.file_system_id,
+                &intent.object_id,
+                intent.base_version.clone(),
+                &intent.target_version,
+                &pending.content_hash,
+                pending.size_bytes,
+                start_chunk_index,
+                max_chunks,
+                Some(object_metadata.clone()),
+            )?;
+            if outcome.sent {
+                self.record_stage_window_progress(intent_id, &replica_node_id, request_id, outcome);
+            } else {
+                self.record_stage_retry_scheduled(intent_id, &replica_node_id);
+            }
+        }
+        Ok(())
+    }
+
     fn send_pending_stage_patch_if_routable(
         &mut self,
         replica_node_id: &NodeId,
@@ -20981,7 +20948,13 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         &mut self,
         intent_id: &str,
         response_replica_node_id: Option<&NodeId>,
+        drop_committed_pending_write: bool,
     ) {
+        let remove_committed_pending_write = drop_committed_pending_write
+            && self
+                .coordinator
+                .intent(intent_id)
+                .is_some_and(|intent| matches!(intent.state, DfsWriteIntentState::Committed));
         let mut replica_node_ids = self
             .coordinator
             .repair_jobs()
@@ -21022,6 +20995,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             pending.fetch_next_chunk_indexes.clear();
             pending.fetch_window_end_chunk_indexes.clear();
             pending.fetch_failed_from.clear();
+        }
+        if remove_committed_pending_write {
+            self.pending_writes.remove(intent_id);
         }
     }
 
@@ -21215,25 +21191,50 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             )?;
         }
 
-        let repair_targets: Vec<NodeId> = self
+        let repair_jobs: Vec<DistributedRepairJob> = self
             .coordinator
             .repair_jobs()
             .iter()
             .filter(|job| job.intent_id == intent_id)
-            .map(|job| job.missing_replica_node_id.clone())
+            .cloned()
             .collect();
-        if !repair_targets.is_empty() && !self.pending_repair_is_locally_authoritative(&pending)? {
-            self.suppress_repair_retries_for_lost_authority(intent_id, None);
+        if !repair_jobs.is_empty() && !self.pending_repair_is_locally_authoritative(&pending)? {
+            self.suppress_repair_retries_for_lost_authority(intent_id, None, true);
             return Ok(());
         }
-        for replica_node_id in repair_targets {
-            if replica_node_id == self.node_id
-                || !self.repair_retry_is_due(intent_id, &replica_node_id)
-            {
+        for job in repair_jobs {
+            let replica_node_id = job.missing_replica_node_id.clone();
+            if !self.repair_retry_is_due(intent_id, &replica_node_id) {
+                continue;
+            }
+            if replica_node_id == self.node_id {
+                if self
+                    .local_object_version_manifest_size_if_matches(
+                        &pending.object_id,
+                        &pending.version,
+                        &pending.content_hash,
+                    )
+                    .is_some()
+                {
+                    self.record_local_pending_write_receipt_if_desired(
+                        intent_id,
+                        &pending.object_id,
+                        &pending.version,
+                        &pending.content_hash,
+                    )?;
+                    continue;
+                }
+                let fetch_requested = self.request_repair_blob_from_alternate(&job, &pending)?;
+                if !fetch_requested {
+                    self.record_repair_retry_scheduled(intent_id, &replica_node_id);
+                }
                 continue;
             }
             if self.open_pending_write_blob_stream(&pending).is_err() {
-                self.record_repair_retry_scheduled(intent_id, &replica_node_id);
+                let fetch_requested = self.request_repair_blob_from_alternate(&job, &pending)?;
+                if !fetch_requested {
+                    self.record_repair_retry_scheduled(intent_id, &replica_node_id);
+                }
                 continue;
             }
             let start_chunk_index = pending
@@ -21455,14 +21456,40 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         {
             self.add_transient_object_metadata(object)?;
         }
-        if record.coordinator_node_id != self.node_id {
-            return Ok(());
-        }
         let Some(content_hash) = record.content_hash.clone() else {
             return Ok(());
         };
+        let is_local_coordinator = record.coordinator_node_id == self.node_id;
+        let local_manifest_size = self.local_object_version_manifest_size_if_matches(
+            &record.object_id,
+            &record.target_version,
+            &content_hash,
+        );
+        let is_local_desired_replica_with_content = record
+            .desired_replica_node_ids
+            .iter()
+            .any(|node_id| node_id == &self.node_id)
+            && local_manifest_size.is_some();
+        let has_repair_job = self
+            .coordinator
+            .repair_jobs()
+            .iter()
+            .any(|job| job.intent_id == intent_id);
+        let is_local_authoritative_repair = if has_repair_job {
+            let repair_object = self.current_read_object_metadata(&record.object_id)?;
+            self.is_local_metadata_primary_for_object(&repair_object)?
+        } else {
+            false
+        };
+        if !is_local_coordinator
+            && !is_local_desired_replica_with_content
+            && !is_local_authoritative_repair
+        {
+            return Ok(());
+        }
         let size_bytes = self
             .pending_write_size_hint(&record.object_id, &record.target_version, &content_hash)?
+            .or(local_manifest_size)
             .unwrap_or(0);
         self.pending_writes.insert(
             intent_id.to_string(),
@@ -21473,6 +21500,17 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 size_bytes,
             ),
         );
+        Ok(())
+    }
+
+    fn restore_pending_writes_for_repair_jobs(&mut self) -> Result<(), DfsError> {
+        let repair_jobs = self.coordinator.repair_jobs().to_vec();
+        for job in repair_jobs {
+            let object = self.current_read_object_metadata(&job.object_id)?;
+            if self.is_local_metadata_primary_for_object(&object)? {
+                self.restore_pending_write_for_intent_if_missing(&job.intent_id, &job.object_id)?;
+            }
+        }
         Ok(())
     }
 

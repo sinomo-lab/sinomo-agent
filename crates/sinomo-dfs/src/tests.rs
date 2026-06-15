@@ -2413,6 +2413,126 @@ fn maintenance_tick_runs_lifecycle_and_metadata_journal_publish() {
 }
 
 #[test]
+fn maintenance_tick_drains_inflight_repair_response_without_new_schedule() {
+    let root = temp_root("maintenance-tick-drains-inflight-repair-response");
+    let owner = NodeId::from_legacy_named("node_maintenance_drain_owner").expect("owner");
+    let replica = NodeId::from_legacy_named("node_maintenance_drain_replica").expect("replica");
+    let object_id = DfsObjectId::from_legacy_named("obj_maintenance_drain").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_maintenance_drain_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_maintenance_drain_2").expect("version");
+    let bytes = b"maintenance drains already queued repair responses";
+    let content_hash = content_hash(bytes);
+    let network = InProcessNetwork::new();
+    let mut replica_transport = network.add_node(replica.clone());
+    let content = LocalContentStore::new(root.join("owner-content")).expect("content");
+    let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+    let mut dfs = NetworkedDfsService::new(network.add_node(owner.clone()), content)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    let mut object = file_metadata(owner.clone());
+    object.object_id = object_id.clone();
+    object.path = "/services/maintenance/drain.txt".to_string();
+    object.version = version_1.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    dfs.add_object_metadata(object).expect("object metadata");
+
+    let outcome = dfs
+        .write_distributed_eventual(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: owner.clone(),
+            },
+            bytes.to_vec(),
+            vec![owner.clone(), replica.clone()],
+            DfsReplicationPolicy::new(1, 2).expect("policy"),
+        )
+        .expect("threshold write");
+    let intent_id = match outcome {
+        NetworkedDfsWriteOutcome::Committed { intent_id, .. } => intent_id,
+        other => panic!("expected committed write with repair, got {other:?}"),
+    };
+    let request_id = dfs
+        .pending_writes
+        .get(&intent_id)
+        .and_then(|pending| pending.repair_inflight_request_ids.get(&replica))
+        .cloned()
+        .expect("inflight repair request");
+    assert!(
+        !dfs.repair_retry_is_due(&intent_id, &replica),
+        "repair response should be queued while retry is still inflight"
+    );
+    dfs.pending_writes
+        .get_mut(&intent_id)
+        .and_then(|pending| pending.repair_retries.get_mut(&replica))
+        .expect("repair retry state")
+        .next_retry_tick = 100;
+
+    let response_frame = build_dfs_network_frame(
+        &replica,
+        &owner,
+        900,
+        901,
+        DfsNetworkMessage::RepairReplicaResponse(DfsRepairReplicaResponse {
+            request_id,
+            intent_id: intent_id.clone(),
+            file_system_id: sifs_file_system_id(),
+            object_id: object_id.clone(),
+            version: version_2.clone(),
+            replica_node_id: replica.clone(),
+            result: DfsBlobTransferResult::Committed {
+                content_hash: content_hash.clone(),
+            },
+        }),
+    )
+    .expect("repair response frame");
+    replica_transport
+        .send(&owner, response_frame)
+        .expect("queue repair response to owner");
+
+    let mut maintenance_host = RecordingMaintenanceHost::default();
+    let mut publisher_host = RecordingMetadataJournalPublisherHost::new(root.join("journal"));
+    let mut metadata_transport = ApplyingMetadataJournalTransport::new(replica.clone());
+    let report = run_dfs_maintenance_tick_with_host(
+        &mut dfs,
+        &mut maintenance_host,
+        sifs_file_system_id(),
+        &owner,
+        Vec::new(),
+        &mut publisher_host,
+        &mut metadata_transport,
+        DfsMaintenanceTickOptions::default(),
+    )
+    .expect("maintenance tick");
+
+    assert!(
+        report.scheduled_repairs.is_empty(),
+        "inflight repair should not be rescheduled in this tick"
+    );
+    assert!(
+        report.followup_events.iter().any(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::ReplicaRepaired {
+                    intent_id: event_intent_id,
+                    replica_node_id,
+                    ..
+                } if event_intent_id == &intent_id && replica_node_id == &replica
+            )
+        }),
+        "maintenance must drain the queued repair response"
+    );
+    assert!(
+        !dfs.pending_writes.contains_key(&intent_id),
+        "repaired committed write should be cleaned up"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_maintenance_tick_opens_service_and_publishes_metadata() {
     let root = temp_root("cluster-maintenance-tick");
     let data_dir = SinomoDataDir::new(&root);
@@ -6082,6 +6202,238 @@ fn stateless_endpoint_reader_write_commits_after_primary_fetch_receipt() {
 }
 
 #[test]
+fn committed_remote_manifest_repair_fetches_from_durable_requester() {
+    let root = temp_root("remote-manifest-commit-fetches-repair-source");
+    let writer = NodeId::from_legacy_named("node_remote_manifest_writer").expect("writer node");
+    let primary = NodeId::from_legacy_named("node_remote_manifest_primary").expect("primary node");
+    let replica = NodeId::from_legacy_named("node_remote_manifest_replica").expect("replica node");
+    let object_id = DfsObjectId::from_legacy_named("obj_remote_manifest_fetch").expect("object");
+    let version_1 =
+        DfsVersion::from_legacy_named("version_remote_manifest_fetch_1").expect("version");
+    let version_2 =
+        DfsVersion::from_legacy_named("version_remote_manifest_fetch_2").expect("version");
+    let bytes = b"reader backed bytes stay on the writer until the primary fetches them";
+    let content_hash = content_hash(bytes);
+    let network = InProcessNetwork::new();
+    let mut writer_mailbox = network.add_node(writer.clone());
+    let content = LocalContentStore::new(root.join("primary-content")).expect("content");
+    let metadata =
+        open_root_local_metadata_backend(root.join("primary-metadata")).expect("primary metadata");
+    let mut dfs = NetworkedDfsService::new(network.add_node(primary.clone()), content)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    let mut object = file_metadata(primary.clone());
+    object.object_id = object_id.clone();
+    object.path = "/services/remote-manifest-fetch.txt".to_string();
+    object.version = version_1.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![writer.clone()];
+    dfs.add_object_metadata(object).expect("object metadata");
+
+    let outcome = dfs
+        .write_distributed_eventual_from_remote_manifest_with_base(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: writer.clone(),
+            },
+            Some(version_1),
+            content_hash.clone(),
+            bytes.len() as u64,
+            vec![writer.clone(), replica.clone()],
+            DfsReplicationPolicy::new(1, 2).expect("policy"),
+        )
+        .expect("remote manifest write");
+    let intent_id = match outcome {
+        NetworkedDfsWriteOutcome::Committed {
+            intent_id,
+            repair_jobs,
+            ..
+        } => {
+            assert!(
+                repair_jobs
+                    .iter()
+                    .any(|job| job.missing_replica_node_id == replica)
+            );
+            intent_id
+        }
+        other => panic!("expected threshold commit with repair job, got {other:?}"),
+    };
+
+    let pending = dfs.pending_writes.get(&intent_id).expect("pending repair");
+    assert!(
+        pending.fetch_inflight_from.contains(&writer),
+        "primary must fetch committed repair content from the durable writer"
+    );
+    let messages = drain_dfs_messages(&mut writer_mailbox);
+    assert!(
+        messages.iter().any(|message| {
+            matches!(
+                message,
+                DfsNetworkMessage::FetchBlob(command)
+                    if command.intent_id == intent_id
+                        && command.object_id == object_id
+                        && command.version == version_2
+                        && command.content_hash == content_hash
+            )
+        }),
+        "expected FetchBlob to writer after threshold commit, got {messages:?}"
+    );
+
+    dfs.pending_writes.clear();
+    let scheduled = dfs
+        .retry_pending_repairs()
+        .expect("restore persisted repair and request fetch");
+    assert!(
+        scheduled.is_empty(),
+        "primary should fetch missing repair content before scheduling repair"
+    );
+    let restored_pending = dfs
+        .pending_writes
+        .get(&intent_id)
+        .expect("metadata primary restores pending repair write");
+    assert!(
+        restored_pending.fetch_inflight_from.contains(&writer),
+        "restored pending repair should fetch from durable writer"
+    );
+    let retry_messages = drain_dfs_messages(&mut writer_mailbox);
+    assert!(
+        retry_messages.iter().any(|message| {
+            matches!(
+                message,
+                DfsNetworkMessage::FetchBlob(command)
+                    if command.intent_id == intent_id
+                        && command.object_id == object_id
+                        && command.version == version_2
+                        && command.content_hash == content_hash
+            )
+        }),
+        "expected retry FetchBlob after restoring pending repair, got {retry_messages:?}"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn committed_remote_manifest_self_repair_fetches_from_durable_requester() {
+    let root = temp_root("remote-manifest-self-repair-fetches-source");
+    let writer =
+        NodeId::from_legacy_named("node_remote_manifest_self_writer").expect("writer node");
+    let primary =
+        NodeId::from_legacy_named("node_remote_manifest_self_primary").expect("primary node");
+    let object_id =
+        DfsObjectId::from_legacy_named("obj_remote_manifest_self_fetch").expect("object");
+    let version_1 =
+        DfsVersion::from_legacy_named("version_remote_manifest_self_fetch_1").expect("version");
+    let version_2 =
+        DfsVersion::from_legacy_named("version_remote_manifest_self_fetch_2").expect("version");
+    let bytes = b"reader backed bytes must be fetched when the primary itself is missing";
+    let content_hash = content_hash(bytes);
+    let network = InProcessNetwork::new();
+    let mut writer_mailbox = network.add_node(writer.clone());
+    let content = LocalContentStore::new(root.join("primary-content")).expect("content");
+    let metadata =
+        open_root_local_metadata_backend(root.join("primary-metadata")).expect("primary metadata");
+    let mut dfs = NetworkedDfsService::new(network.add_node(primary.clone()), content)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    let mut object = file_metadata(primary.clone());
+    object.object_id = object_id.clone();
+    object.path = "/services/remote-manifest-self-fetch.txt".to_string();
+    object.version = version_1.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![writer.clone()];
+    dfs.add_object_metadata(object).expect("object metadata");
+
+    let outcome = dfs
+        .write_distributed_eventual_from_remote_manifest_with_base(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: writer.clone(),
+            },
+            Some(version_1),
+            content_hash.clone(),
+            bytes.len() as u64,
+            vec![writer.clone(), primary.clone()],
+            DfsReplicationPolicy::new(1, 2).expect("policy"),
+        )
+        .expect("remote manifest write");
+    let intent_id = match outcome {
+        NetworkedDfsWriteOutcome::Committed {
+            intent_id,
+            repair_jobs,
+            ..
+        } => {
+            assert!(
+                repair_jobs
+                    .iter()
+                    .any(|job| job.missing_replica_node_id == primary)
+            );
+            intent_id
+        }
+        other => panic!("expected threshold commit with self repair job, got {other:?}"),
+    };
+
+    let pending = dfs.pending_writes.get(&intent_id).expect("pending repair");
+    assert!(
+        pending.fetch_inflight_from.contains(&writer),
+        "primary must fetch committed self-repair content from durable writer"
+    );
+    let messages = drain_dfs_messages(&mut writer_mailbox);
+    assert!(
+        messages.iter().any(|message| {
+            matches!(
+                message,
+                DfsNetworkMessage::FetchBlob(command)
+                    if command.intent_id == intent_id
+                        && command.object_id == object_id
+                        && command.version == version_2
+                        && command.content_hash == content_hash
+            )
+        }),
+        "expected self-repair FetchBlob to writer after threshold commit, got {messages:?}"
+    );
+
+    dfs.pending_writes.clear();
+    let scheduled = dfs
+        .retry_pending_repairs()
+        .expect("restore persisted self repair and request fetch");
+    assert!(
+        scheduled.is_empty(),
+        "self repair should fetch missing local content before any remote repair send"
+    );
+    let restored_pending = dfs
+        .pending_writes
+        .get(&intent_id)
+        .expect("metadata primary restores self repair write");
+    assert!(
+        restored_pending.fetch_inflight_from.contains(&writer),
+        "restored self repair should fetch from durable writer"
+    );
+    let retry_messages = drain_dfs_messages(&mut writer_mailbox);
+    assert!(
+        retry_messages.iter().any(|message| {
+            matches!(
+                message,
+                DfsNetworkMessage::FetchBlob(command)
+                    if command.intent_id == intent_id
+                        && command.object_id == object_id
+                        && command.version == version_2
+                        && command.content_hash == content_hash
+            )
+        }),
+        "expected retry self-repair FetchBlob after restoring pending repair, got {retry_messages:?}"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn stage_response_restores_transient_intent_record_without_visible_object() {
     let root = temp_root("stage-response-restores-transient-intent-record");
     let primary =
@@ -6459,12 +6811,8 @@ fn retry_pending_repairs_skips_sender_that_lost_metadata_primary_authority() {
         "stale metadata primary must not send repair frames after authority moves"
     );
     assert!(
-        dfs.pending_writes
-            .get(&intent_id)
-            .expect("pending write")
-            .repair_retries
-            .contains_key(&replica),
-        "pending repair should stay for a future primary-authoritative retry"
+        !dfs.pending_writes.contains_key(&intent_id),
+        "stale committed repair state should be dropped after authority moves"
     );
     std::fs::remove_dir_all(root).ok();
 }
@@ -7350,7 +7698,7 @@ fn operational_metrics_report_repair_backlog_and_content_footprint() {
     assert_eq!(metrics.repair_job_count, 1);
     assert_eq!(metrics.pending_write_count, 1);
     assert_eq!(metrics.pending_read_count, 0);
-    assert_eq!(metrics.stage_retry_count, 0);
+    assert_eq!(metrics.stage_retry_count, 1);
     assert_eq!(metrics.repair_retry_count, 1);
     assert_eq!(metrics.stage_inflight_count, 0);
     assert_eq!(metrics.repair_inflight_count, 0);
@@ -7423,7 +7771,7 @@ fn operational_metrics_report_transfer_window_progress() {
         .add_object_metadata(metadata)
         .expect("replica object");
 
-    let total_chunks = DFS_STAGE_CHUNK_WINDOW_SIZE + 2;
+    let total_chunks = DFS_LOCAL_CHUNK_WINDOW_SIZE + 2;
     let bytes = vec![0x5a; total_chunks as usize * DFS_BLOB_CHUNK_BYTES];
     let write = owner_dfs
         .write_distributed_eventual(
@@ -7447,7 +7795,7 @@ fn operational_metrics_report_transfer_window_progress() {
         }
     ));
 
-    let first_window_bytes = u64::from(DFS_STAGE_CHUNK_WINDOW_SIZE) * DFS_BLOB_CHUNK_BYTES as u64;
+    let first_window_bytes = u64::from(DFS_LOCAL_CHUNK_WINDOW_SIZE) * DFS_BLOB_CHUNK_BYTES as u64;
     let owner_metrics = owner_dfs.operational_metrics().expect("owner metrics");
     assert_eq!(owner_metrics.stage_window_resume_count, 1);
     assert_eq!(owner_metrics.stage_window_resume_bytes, first_window_bytes);
@@ -8985,7 +9333,7 @@ fn chunked_remote_read_retry_resumes_from_received_prefix() {
     object.policy = DfsObjectPolicy::ReplicatedEventual;
     object.current_locations = vec![owner.clone()];
     let object_id = object.object_id.clone();
-    let total_chunks = DFS_READ_CHUNK_WINDOW_SIZE + 1;
+    let total_chunks = DFS_LOCAL_CHUNK_WINDOW_SIZE + 1;
     let bytes_len = DFS_BLOB_CHUNK_BYTES * (total_chunks as usize - 1) + 17;
     let bytes = (0..bytes_len)
         .map(|index| (index % 251) as u8)
@@ -9019,7 +9367,7 @@ fn chunked_remote_read_retry_resumes_from_received_prefix() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(first_window.len(), DFS_READ_CHUNK_WINDOW_SIZE as usize);
+    assert_eq!(first_window.len(), DFS_LOCAL_CHUNK_WINDOW_SIZE as usize);
     let first_chunk = first_window.remove(0);
     assert_eq!(first_chunk.chunk_index, 0);
     let request_id = first_chunk.request_id.clone();
@@ -9058,7 +9406,7 @@ fn chunked_remote_read_retry_resumes_from_received_prefix() {
         .expect("retry read request");
     assert_eq!(retry_request.request_id, request_id);
     assert_eq!(retry_request.start_chunk_index, 1);
-    assert_eq!(retry_request.max_chunks, DFS_READ_CHUNK_WINDOW_SIZE);
+    assert_eq!(retry_request.max_chunks, DFS_LOCAL_CHUNK_WINDOW_SIZE);
 
     owner_dfs
         .handle_networked_read_request(reader.clone(), retry_request)
@@ -12664,7 +13012,7 @@ fn chunked_fetch_retry_resumes_from_received_prefix() {
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
     let base_version = DfsVersion::from_legacy_named("version_1").expect("version");
     let version = DfsVersion::from_legacy_named("version_2").expect("version");
-    let total_chunks = DFS_FETCH_CHUNK_WINDOW_SIZE + 1;
+    let total_chunks = DFS_LOCAL_CHUNK_WINDOW_SIZE + 1;
     let bytes_len = DFS_BLOB_CHUNK_BYTES * (total_chunks as usize - 1) + 17;
     let bytes = (0..bytes_len)
         .map(|index| (index % 251) as u8)
@@ -12753,7 +13101,7 @@ fn chunked_fetch_retry_resumes_from_received_prefix() {
         })
         .expect("fetch command");
     assert_eq!(first_request.start_chunk_index, 0);
-    assert_eq!(first_request.max_chunks, DFS_FETCH_CHUNK_WINDOW_SIZE);
+    assert_eq!(first_request.max_chunks, DFS_LOCAL_CHUNK_WINDOW_SIZE);
 
     source_dfs
         .handle_fetch_blob(owner.clone(), first_request.clone())
@@ -12843,7 +13191,7 @@ fn chunked_fetch_retry_resumes_from_received_prefix() {
         "fetch retry should preserve the request id so the partial assembler can continue"
     );
     assert_eq!(retry_request.start_chunk_index, 1);
-    assert_eq!(retry_request.max_chunks, DFS_FETCH_CHUNK_WINDOW_SIZE);
+    assert_eq!(retry_request.max_chunks, DFS_LOCAL_CHUNK_WINDOW_SIZE);
 
     source_dfs
         .handle_fetch_blob(owner.clone(), retry_request)
@@ -12912,7 +13260,7 @@ fn chunked_fetch_response_windows_and_continues() {
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
     let base_version = DfsVersion::from_legacy_named("version_1").expect("version");
     let version = DfsVersion::from_legacy_named("version_2").expect("version");
-    let total_chunks = DFS_FETCH_CHUNK_WINDOW_SIZE + 2;
+    let total_chunks = DFS_LOCAL_CHUNK_WINDOW_SIZE + 2;
     let bytes_len = DFS_BLOB_CHUNK_BYTES * (total_chunks as usize - 1) + 17;
     let bytes = (0..bytes_len)
         .map(|index| (index % 251) as u8)
@@ -12992,7 +13340,7 @@ fn chunked_fetch_response_windows_and_continues() {
         })
         .expect("first fetch request");
     assert_eq!(first_request.start_chunk_index, 0);
-    assert_eq!(first_request.max_chunks, DFS_FETCH_CHUNK_WINDOW_SIZE);
+    assert_eq!(first_request.max_chunks, DFS_LOCAL_CHUNK_WINDOW_SIZE);
 
     source_dfs
         .handle_fetch_blob(owner.clone(), first_request)
@@ -13004,14 +13352,14 @@ fn chunked_fetch_response_windows_and_continues() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(first_window.len(), DFS_FETCH_CHUNK_WINDOW_SIZE as usize);
+    assert_eq!(first_window.len(), DFS_LOCAL_CHUNK_WINDOW_SIZE as usize);
     assert_eq!(first_window.first().expect("first chunk").chunk_index, 0);
     assert_eq!(
         first_window
             .last()
             .expect("last first-window chunk")
             .chunk_index,
-        DFS_FETCH_CHUNK_WINDOW_SIZE - 1
+        DFS_LOCAL_CHUNK_WINDOW_SIZE - 1
     );
     for chunk in first_window {
         owner_dfs
@@ -13033,8 +13381,8 @@ fn chunked_fetch_response_windows_and_continues() {
             _ => None,
         })
         .expect("continuation fetch request");
-    assert_eq!(next_request.start_chunk_index, DFS_FETCH_CHUNK_WINDOW_SIZE);
-    assert_eq!(next_request.max_chunks, DFS_FETCH_CHUNK_WINDOW_SIZE);
+    assert_eq!(next_request.start_chunk_index, DFS_LOCAL_CHUNK_WINDOW_SIZE);
+    assert_eq!(next_request.max_chunks, DFS_LOCAL_CHUNK_WINDOW_SIZE);
     source_dfs
         .handle_fetch_blob(owner.clone(), next_request)
         .expect("source sends second fetch window");
@@ -13051,7 +13399,7 @@ fn chunked_fetch_response_windows_and_continues() {
             .first()
             .expect("first resumed chunk")
             .chunk_index,
-        DFS_FETCH_CHUNK_WINDOW_SIZE
+        DFS_LOCAL_CHUNK_WINDOW_SIZE
     );
     assert_eq!(
         second_window
@@ -13224,11 +13572,11 @@ fn missing_current_manifest_blob_returns_pending_replication() {
     let replica = NodeId::from_legacy_named("node_missing_blob_replica").expect("node");
     let object_id = DfsObjectId::from_legacy_named("obj_missing_blob").expect("object");
     let version = DfsVersion::from_legacy_named("version_2").expect("version");
-    let bytes = b"missing local blob bytes";
+    let bytes = vec![b'm'; 17 * 1024];
     let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
     let manifest = dfs
         .content
-        .put_object_version(object_id.as_str(), version.as_str(), bytes)
+        .put_object_version(object_id.as_str(), version.as_str(), &bytes)
         .expect("seed manifest");
     let hex = manifest
         .content_hash
@@ -13271,11 +13619,11 @@ fn reconcile_local_manifests_requires_current_blob_bytes() {
     let remote = NodeId::from_legacy_named("node_reconcile_remote").expect("node");
     let object_id = DfsObjectId::from_legacy_named("obj_reconcile_missing_blob").expect("object");
     let version = DfsVersion::from_legacy_named("version_2").expect("version");
-    let bytes = b"reconcile missing local bytes";
+    let bytes = vec![b'r'; 17 * 1024];
     let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
     let manifest = dfs
         .content
-        .put_object_version(object_id.as_str(), version.as_str(), bytes)
+        .put_object_version(object_id.as_str(), version.as_str(), &bytes)
         .expect("seed manifest");
     let hex = manifest
         .content_hash
@@ -13324,7 +13672,7 @@ fn commit_version_rejects_manifest_without_content_bytes() {
     let object_id = DfsObjectId::from_legacy_named("obj_commit_missing_blob").expect("object");
     let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
     let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
-    let bytes = b"missing commit blob bytes";
+    let bytes = vec![b'c'; 17 * 1024];
     let network = InProcessNetwork::new();
     let _owner_transport = network.add_node(owner.clone());
     let mut replica_dfs = NetworkedDfsService::new(
@@ -13344,7 +13692,7 @@ fn commit_version_rejects_manifest_without_content_bytes() {
         .expect("metadata");
     let manifest = replica_dfs
         .content
-        .put_object_version(object_id.as_str(), version_2.as_str(), bytes)
+        .put_object_version(object_id.as_str(), version_2.as_str(), &bytes)
         .expect("stage manifest");
     let hex = manifest
         .content_hash
@@ -13538,13 +13886,19 @@ fn stale_read_skips_missing_stale_blobs() {
     let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let version_3 = DfsVersion::from_legacy_named("version_3").expect("version");
     let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let readable_stale_bytes = vec![b's'; 17 * 1024];
+    let missing_stale_bytes = vec![b'm'; 17 * 1024];
     let readable_stale = dfs
         .content
-        .put_object_version(object_id.as_str(), version_1.as_str(), b"readable stale")
+        .put_object_version(
+            object_id.as_str(),
+            version_1.as_str(),
+            &readable_stale_bytes,
+        )
         .expect("readable stale");
     let missing_stale = dfs
         .content
-        .put_object_version(object_id.as_str(), version_2.as_str(), b"missing stale")
+        .put_object_version(object_id.as_str(), version_2.as_str(), &missing_stale_bytes)
         .expect("missing stale");
     let hex = missing_stale
         .content_hash
@@ -13571,7 +13925,7 @@ fn stale_read_skips_missing_stale_blobs() {
             freshness: NetworkedDfsReadFreshness::Stale { .. },
         } if data.version == version_1
             && data.content_hash.as_deref() == Some(readable_stale.content_hash.as_str())
-            && data.bytes == b"readable stale"
+            && data.bytes == readable_stale_bytes
     ));
     std::fs::remove_dir_all(root).ok();
 }
