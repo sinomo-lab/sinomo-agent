@@ -1,7 +1,7 @@
 use crate::TaskId;
 use crate::agent::{
-    AgentAbortRecord, AgentCompactionSummary, AgentFollowUpMessage, AgentItem, AgentRole,
-    AgentRunContext, AgentSession, AgentSessionControlSnapshot, AgentSessionProjection,
+    AgentAbortRecord, AgentCompactionSummary, AgentEvent, AgentFollowUpMessage, AgentItem,
+    AgentRole, AgentRunContext, AgentSession, AgentSessionControlSnapshot, AgentSessionProjection,
     AgentSteeringMessage, AgentStopReason, AgentStoragePaths, AgentTaskSnapshot, agent_item_id,
 };
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,13 @@ pub trait AgentSessionStore: Send + Sync {
         _session_id: &SessionId,
     ) -> Result<Option<AgentSessionControlSnapshot>, AgentSessionStoreError> {
         Ok(None)
+    }
+
+    fn load_control_events(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<Vec<AgentEvent>, AgentSessionStoreError> {
+        Ok(Vec::new())
     }
 }
 
@@ -255,7 +262,8 @@ pub enum AgentSessionStoreRecordKind {
         provider: String,
         model: String,
         role: AgentRole,
-        policy_id: String,
+        #[serde(alias = "policy_id")]
+        surface_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_steps: Option<usize>,
         #[serde(default, skip_serializing_if = "AgentRunContext::is_empty")]
@@ -643,6 +651,41 @@ impl AgentSessionStore for FileAgentSessionStore {
             }
         }
         Ok(latest)
+    }
+
+    fn load_control_events(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<AgentEvent>, AgentSessionStoreError> {
+        let path = self.paths.session_events_path_for_session(session_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let file = File::open(&path).map_err(|source| AgentSessionStoreError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let mut events = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|source| AgentSessionStoreError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: AgentSessionStoreRecord =
+                serde_json::from_str(&line).map_err(|source| {
+                    AgentSessionStoreError::Deserialization {
+                        path: path.display().to_string(),
+                        detail: source.to_string(),
+                    }
+                })?;
+            if let AgentSessionStoreRecordKind::ControlEventPublished { event } = record.record {
+                events.push(event);
+            }
+        }
+        Ok(events)
     }
 }
 

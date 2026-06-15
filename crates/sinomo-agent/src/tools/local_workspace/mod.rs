@@ -44,6 +44,7 @@ pub struct LocalWorkspaceAgentConfig {
     pub max_patch_bytes: usize,
     pub max_search_matches: usize,
     pub max_list_entries: usize,
+    pub git_program: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,6 +88,7 @@ impl LocalWorkspaceAgentConfig {
             max_patch_bytes: DEFAULT_LOCAL_MAX_PATCH_BYTES,
             max_search_matches: DEFAULT_LOCAL_MAX_SEARCH_MATCHES,
             max_list_entries: DEFAULT_LOCAL_MAX_LIST_ENTRIES,
+            git_program: "git".to_string(),
         }
     }
 
@@ -111,6 +113,11 @@ impl LocalWorkspaceAgentConfig {
         sifs_root: impl Into<String>,
     ) -> Self {
         self.sifs_evidence = Some(LocalWorkspaceSifsEvidenceConfig::new(mount_dir, sifs_root));
+        self
+    }
+
+    pub fn with_git_program(mut self, git_program: impl Into<String>) -> Self {
+        self.git_program = git_program.into();
         self
     }
 
@@ -195,7 +202,7 @@ fn local_run_command_from_call(
         call,
         "run_command",
         None,
-        "command execution allowed by local workspace policy",
+        "shell command execution enabled for this local workspace",
         cancellation_token,
         progress_sink,
     )
@@ -569,7 +576,7 @@ fn local_command_result_from_output(
     } else {
         None
     };
-    let mut evidence = AgentToolEvidence::policy_only(true, evidence_reason)
+    let mut evidence = AgentToolEvidence::availability_only(true, evidence_reason)
         .with_command(cwd.display().to_string(), status)
         .with_output_value(&payload, stdout.truncated || stderr.truncated)
         .with_metadata(serde_json::json!({
@@ -775,6 +782,30 @@ fn display_workspace_path(config: &LocalWorkspaceAgentConfig, path: &Path) -> St
     path.display().to_string()
 }
 
+fn ensure_local_tool_not_cancelled(
+    cancellation_token: &AgentCancellationToken,
+    tool_name: &str,
+) -> Result<(), String> {
+    if cancellation_token.is_cancelled() {
+        Err(format!("{tool_name} cancelled"))
+    } else {
+        Ok(())
+    }
+}
+
+fn local_tool_cancelled_result(tool_name: &str, detail: impl Into<String>) -> AgentToolResult {
+    let detail = detail.into();
+    let payload = serde_json::json!({
+        "error": "tool_cancelled",
+        "tool": tool_name,
+        "detail": detail,
+    });
+    AgentToolResult::cancelled(format!("{tool_name} cancelled"), payload.clone()).with_evidence(
+        AgentToolEvidence::availability_only(false, "turn cancellation requested")
+            .with_output_value(&payload, false),
+    )
+}
+
 fn collect_workspace_search_matches(
     config: &LocalWorkspaceAgentConfig,
     path: &Path,
@@ -782,7 +813,9 @@ fn collect_workspace_search_matches(
     case_sensitive: bool,
     max_matches: usize,
     matches: &mut Vec<serde_json::Value>,
+    cancellation_token: &AgentCancellationToken,
 ) -> Result<bool, String> {
+    ensure_local_tool_not_cancelled(cancellation_token, "search")?;
     if matches.len() >= max_matches {
         return Ok(true);
     }
@@ -795,6 +828,7 @@ fn collect_workspace_search_matches(
             .map_err(|source| format!("failed to read entry in {}: {source}", path.display()))?;
         dir_entries.sort_by_key(|entry| entry.file_name());
         for entry in dir_entries {
+            ensure_local_tool_not_cancelled(cancellation_token, "search")?;
             let truncated = collect_workspace_search_matches(
                 config,
                 &entry.path(),
@@ -802,6 +836,7 @@ fn collect_workspace_search_matches(
                 case_sensitive,
                 max_matches,
                 matches,
+                cancellation_token,
             )?;
             if truncated {
                 return Ok(true);
@@ -822,6 +857,7 @@ fn collect_workspace_search_matches(
         query.to_ascii_lowercase()
     };
     for (line_index, line) in content.lines().enumerate() {
+        ensure_local_tool_not_cancelled(cancellation_token, "search")?;
         let haystack = if case_sensitive {
             line.to_string()
         } else {

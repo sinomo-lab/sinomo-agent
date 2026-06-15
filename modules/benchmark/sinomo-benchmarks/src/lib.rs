@@ -14,19 +14,35 @@ use sinomo_pytorch::{MINICPM_DEFAULT_MODEL, PytorchDevice, PytorchRuntimeConfig}
 use sinomo_runtime::module_api::{
     NativeModuleBackend, NativeModuleCapabilitiesResponse, NativeModuleDescriptor,
     NativeModuleErrorResponse, NativeModuleInvocationRequest, NativeModuleInvocationResponse,
-    NativeModuleRequest, NativeModuleResponse, SINOMO_MODULE_STATUS_INVALID_ARGUMENT,
-    SINOMO_MODULE_STATUS_OK, SINOMO_MODULE_STATUS_RUNTIME_ERROR,
-    SINOMO_MODULE_STATUS_UNSUPPORTED_ABI, SINOMO_NATIVE_MODULE_ABI_VERSION, SinomoModuleByteBuffer,
-    SinomoModuleByteSlice, SinomoModuleHostApiV1, SinomoModuleStatusCode, decode_sobj, encode_sobj,
+    NativeModuleObjectRpcRoute, NativeModuleRequest, NativeModuleResponse, NativeModuleSurfaces,
+    SINOMO_MODULE_STATUS_INVALID_ARGUMENT, SINOMO_MODULE_STATUS_OK,
+    SINOMO_MODULE_STATUS_RUNTIME_ERROR, SINOMO_MODULE_STATUS_UNSUPPORTED_ABI,
+    SINOMO_NATIVE_MODULE_ABI_VERSION, SinomoModuleByteBuffer, SinomoModuleByteSlice,
+    SinomoModuleHostApiV1, SinomoModuleHostIsCancelledFn, SinomoModuleStatusCode, decode_sobj,
+    encode_sobj,
 };
+use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 pub const SINOMO_BENCHMARKS_MODULE_ID: &str = "module.benchmarks";
 pub const SINOMO_BENCHMARKS_INTERFACE_VERSION: &str = "sinomo.benchmarks.v1";
 pub const SINOMO_BENCHMARKS_OPERATION: &str = "benchmarks.catalog";
+pub const SINOMO_BENCHMARKS_CANCEL_PROBE_OPERATION: &str = "benchmarks.cancel-probe";
+pub const SINOMO_BENCHMARKS_CANCEL_PROBE_ROUTE: &str = "/benchmarks/cancel-probe";
+pub const SINOMO_BENCHMARKS_RPC_CATEGORY: &str = "benchmarks";
 pub const SINOMO_BENCHMARKS_MODULE_ROOT: &str = "modules/benchmark/sinomo-benchmarks";
+
+#[derive(Clone, Copy)]
+struct StoredHostApi {
+    user_data: usize,
+    is_cancelled: Option<SinomoModuleHostIsCancelledFn>,
+}
+
+static MODULE_HOST_API: Mutex<Option<StoredHostApi>> = Mutex::new(None);
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct BenchmarkHarnessPlan {
@@ -80,10 +96,33 @@ pub enum BenchmarkModuleRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct BenchmarkCancelProbeRequest {
+    pub max_runtime_ms: u64,
+    pub poll_interval_ms: u64,
+}
+
+impl Default for BenchmarkCancelProbeRequest {
+    fn default() -> Self {
+        Self {
+            max_runtime_ms: 0,
+            poll_interval_ms: 25,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum BenchmarkModuleResponse {
     Catalog(BenchmarkModuleCatalog),
+    CancelProbe(BenchmarkCancelProbeResponse),
     Error(BenchmarkModuleError),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct BenchmarkCancelProbeResponse {
+    pub cancelled: bool,
+    pub elapsed_ms: u64,
+    pub polls: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -117,6 +156,7 @@ pub fn benchmark_module_catalog() -> BenchmarkModuleCatalog {
         suites: vec![swebench_verified_10_descriptor()],
         plans: vec![
             swebench_verified_10_plan(),
+            agent_compaction_quality_plan(),
             terminalbench_harbor_plan(),
             mcu_minestudio_plan(),
             minestudio_plan(),
@@ -135,14 +175,27 @@ pub fn benchmarks_module_descriptor() -> NativeModuleDescriptor {
         backend: NativeModuleBackend::NativeDylib,
         interface_version: SINOMO_BENCHMARKS_INTERFACE_VERSION.to_string(),
         platform_triple: platform_triple(),
-        supported_operations: vec![SINOMO_BENCHMARKS_OPERATION.to_string()],
+        supported_operations: vec![
+            SINOMO_BENCHMARKS_OPERATION.to_string(),
+            SINOMO_BENCHMARKS_CANCEL_PROBE_OPERATION.to_string(),
+        ],
         capabilities: vec![
             "benchmark.catalog.read".to_string(),
+            "benchmark.agent.cancel-probe".to_string(),
+            "benchmark.agent.compaction.plan".to_string(),
             "benchmark.swebench.plan".to_string(),
             "benchmark.minestudio.plan".to_string(),
             "benchmark.terminalbench.plan".to_string(),
         ],
-        surfaces: Default::default(),
+        surfaces: NativeModuleSurfaces {
+            object_rpc_routes: vec![NativeModuleObjectRpcRoute {
+                route: SINOMO_BENCHMARKS_CANCEL_PROBE_ROUTE.to_string(),
+                category: SINOMO_BENCHMARKS_RPC_CATEGORY.to_string(),
+                operation: SINOMO_BENCHMARKS_CANCEL_PROBE_OPERATION.to_string(),
+                auth: "local-or-cluster-member".to_string(),
+            }],
+            ..Default::default()
+        },
     }
 }
 
@@ -161,6 +214,45 @@ pub fn swebench_verified_10_descriptor() -> BenchmarkSuiteDescriptor {
         split: Some(suite.split),
         runner: benchmark_module_path("swebench/run_swebench_verified.py"),
         baseline: Some("mini-extra swebench".to_string()),
+    }
+}
+
+pub fn agent_compaction_quality_plan() -> BenchmarkHarnessPlan {
+    BenchmarkHarnessPlan {
+        name: "agent-compaction-quality".to_string(),
+        setup_commands: vec![
+            "cargo build -p sinomo".to_string(),
+            format!(
+                "python3 {} --mode plan",
+                benchmark_module_path("agent/run_compaction_eval.py")
+            ),
+            format!(
+                "python3 {} --mode fixture --summary-out benchmark-results/agent-compaction/fixture-summary.json",
+                benchmark_module_path("agent/run_compaction_eval.py")
+            ),
+        ],
+        run_command: format!(
+            "python3 {} --mode run --provider codex --model gpt-5.2-codex --summary-out benchmark-results/agent-compaction/summary.json --progress-out benchmark-results/agent-compaction/progress.jsonl",
+            benchmark_module_path("agent/run_compaction_eval.py")
+        ),
+        required_tools: default_coding_agent_tools()
+            .into_iter()
+            .filter(|tool| {
+                matches!(
+                    tool.kind,
+                    AgentToolKind::ReadFile
+                        | AgentToolKind::SearchFiles
+                        | AgentToolKind::ApplyPatch
+                        | AgentToolKind::RunShellCommand
+                )
+            })
+            .map(|tool| tool.kind)
+            .collect(),
+        notes: vec![
+            "This is a live/model eval harness for compaction quality, not a normal Rust unit test.".to_string(),
+            "The checked-in plan covers long-session resume, constraint retention, coding after compaction, and cluster-ops after compaction.".to_string(),
+            "Default plan/fixture modes are deterministic; --mode run calls the configured Sinomo agent and scores marker retention in generated summaries and post-compaction probes.".to_string(),
+        ],
     }
 }
 
@@ -583,11 +675,16 @@ pub extern "C" fn sinomo_module_descriptor(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sinomo_module_init(host: SinomoModuleHostApiV1) -> SinomoModuleStatusCode {
-    if host.abi_version == SINOMO_NATIVE_MODULE_ABI_VERSION {
-        SINOMO_MODULE_STATUS_OK
-    } else {
-        SINOMO_MODULE_STATUS_UNSUPPORTED_ABI
+    if host.abi_version != SINOMO_NATIVE_MODULE_ABI_VERSION {
+        return SINOMO_MODULE_STATUS_UNSUPPORTED_ABI;
     }
+    if let Ok(mut stored) = MODULE_HOST_API.lock() {
+        *stored = Some(StoredHostApi {
+            user_data: host.user_data as usize,
+            is_cancelled: host.is_cancelled,
+        });
+    }
+    SINOMO_MODULE_STATUS_OK
 }
 
 #[unsafe(no_mangle)]
@@ -632,6 +729,9 @@ fn invoke_unchecked(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sinomo_module_shutdown() -> SinomoModuleStatusCode {
+    if let Ok(mut stored) = MODULE_HOST_API.lock() {
+        *stored = None;
+    }
     SINOMO_MODULE_STATUS_OK
 }
 
@@ -643,6 +743,9 @@ pub extern "C" fn sinomo_module_free_buffer(buffer: SinomoModuleByteBuffer) {
 }
 
 fn invoke_benchmark_operation(request: NativeModuleInvocationRequest) -> NativeModuleResponse {
+    if request.operation == SINOMO_BENCHMARKS_CANCEL_PROBE_OPERATION {
+        return invoke_cancel_probe_operation(request);
+    }
     if request.operation != SINOMO_BENCHMARKS_OPERATION {
         return NativeModuleResponse::Error(native_error_response(
             "unsupported-operation",
@@ -676,6 +779,61 @@ fn invoke_benchmark_operation(request: NativeModuleInvocationRequest) -> NativeM
             &format!("encode benchmark catalog response: {error}"),
         )),
     }
+}
+
+fn invoke_cancel_probe_operation(request: NativeModuleInvocationRequest) -> NativeModuleResponse {
+    let probe_request = decode_sobj::<BenchmarkCancelProbeRequest>(&request.payload_sobj)
+        .unwrap_or_else(|_| BenchmarkCancelProbeRequest::default());
+    let poll_interval_ms = probe_request.poll_interval_ms.clamp(1, 250);
+    let deadline = Duration::from_millis(probe_request.max_runtime_ms.min(300_000));
+    let poll_interval = Duration::from_millis(poll_interval_ms);
+    let started = Instant::now();
+    let mut polls = 0_u64;
+
+    loop {
+        polls = polls.saturating_add(1);
+        if benchmark_host_is_cancelled() {
+            return encode_cancel_probe_response(BenchmarkCancelProbeResponse {
+                cancelled: true,
+                elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                polls,
+            });
+        }
+        if started.elapsed() >= deadline {
+            return encode_cancel_probe_response(BenchmarkCancelProbeResponse {
+                cancelled: false,
+                elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                polls,
+            });
+        }
+        std::thread::sleep(poll_interval);
+    }
+}
+
+fn encode_cancel_probe_response(response: BenchmarkCancelProbeResponse) -> NativeModuleResponse {
+    match encode_sobj(&response) {
+        Ok(payload_sobj) => NativeModuleResponse::Invocation(NativeModuleInvocationResponse {
+            operation: SINOMO_BENCHMARKS_CANCEL_PROBE_OPERATION.to_string(),
+            payload_sobj,
+        }),
+        Err(error) => NativeModuleResponse::Error(native_error_response(
+            "encode-cancel-probe-response",
+            &format!("encode benchmark cancel-probe response: {error}"),
+        )),
+    }
+}
+
+fn benchmark_host_is_cancelled() -> bool {
+    let Ok(stored) = MODULE_HOST_API.lock() else {
+        return false;
+    };
+    let Some(stored) = *stored else {
+        return false;
+    };
+    let Some(is_cancelled) = stored.is_cancelled else {
+        return false;
+    };
+    unsafe { is_cancelled(stored.user_data as *mut c_void) != 0 }
 }
 
 fn decode_native_module_request(
@@ -748,6 +906,8 @@ fn platform_triple() -> String {
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     #[test]
     fn terminalbench_plan_uses_harbor_custom_agent_shape() {
@@ -836,6 +996,101 @@ mod tests {
         assert!(runner.contains("agent_binary"));
         assert!(runner.contains("sha256"));
         assert!(runner.contains("\"cargo\", \"build\""));
+    }
+
+    #[test]
+    fn swebench_runner_keeps_main_pass_uncapped_by_default() {
+        let runner = include_str!("../swebench/run_swebench_verified.py");
+        assert!(runner.contains("default=None"));
+        assert!(runner.contains("unlimited-default"));
+        assert!(runner.contains("if args.max_steps is not None:"));
+        assert!(runner.contains("command.extend([\"--max-steps\", str(args.max_steps)])"));
+    }
+
+    #[test]
+    fn swebench_runner_marks_agent_failures_as_harness_blocked() {
+        let runner = include_str!("../swebench/run_swebench_verified.py");
+        assert!(runner.contains("write_agent_run_blocked_report"));
+        assert!(runner.contains("\"status\": \"harness-blocked\""));
+        assert!(runner.contains("\"failure_class\": \"harness-or-environment\""));
+        assert!(runner.contains("sinomo-instance-blocked"));
+        assert!(runner.contains("sinomo_prediction_prerequisite_issues"));
+        assert!(runner.contains("harness_blocked_instances"));
+        assert!(runner.contains("missing_report_instances"));
+    }
+
+    #[test]
+    fn swebench_runner_records_host_dependency_probe() {
+        let runner = include_str!("../swebench/run_swebench_verified.py");
+        assert!(runner.contains("def host_dependency_probe"));
+        assert!(runner.contains("def should_stop_for_host_dependency_blockers"));
+        assert!(runner.contains("\"host_dependencies\""));
+        assert!(runner.contains("\"host-dependency-probe\""));
+        assert!(runner.contains("\"host-dependency-blocked\""));
+        assert!(runner.contains("\"harness_status\""));
+        assert!(runner.contains("\"blocking_issues\""));
+        assert!(runner.contains("\"git\""));
+        assert!(runner.contains("\"cargo\""));
+        assert!(runner.contains("\"mini-extra\""));
+        assert!(runner.contains("\"swebench\""));
+        assert!(runner.contains("docker_reachability_probe"));
+        assert!(runner.contains("write_evaluation_blocked_marker"));
+        assert!(runner.contains("explicit Sinomo agent binary does not exist"));
+    }
+
+    #[test]
+    fn swebench_runner_aggregates_agent_model_metrics() {
+        let runner = include_str!("../swebench/run_swebench_verified.py");
+        assert!(runner.contains("agent_model_metrics"));
+        assert!(runner.contains("first_successful_patch_turn"));
+        assert!(runner.contains("instances_with_successful_patch"));
+        assert!(runner.contains("coding_validation_status_counts"));
+        assert!(runner.contains("coding_stop_recommendation_counts"));
+        assert!(runner.contains("coding_validation_failure_kind_counts"));
+        assert!(runner.contains("agent_model_response_parse_failures"));
+        assert!(runner.contains("agent_native_tool_call_turns"));
+        assert!(runner.contains("agent_vendor_fallback_tool_call_turns"));
+        assert!(runner.contains("agent_model_repair_attempts"));
+        assert!(runner.contains("agent_event_count"));
+        assert!(runner.contains("agent_tool_call_items"));
+        assert!(runner.contains("agent_tool_result_items"));
+        assert!(runner.contains("orphan_tool_calls"));
+        assert!(runner.contains("orphan_tool_results"));
+        assert!(runner.contains("agent_final_decision_sources"));
+    }
+
+    #[test]
+    fn agent_compaction_quality_plan_is_live_eval_not_unit_gate() {
+        let plan = agent_compaction_quality_plan();
+        assert_eq!(plan.name, "agent-compaction-quality");
+        assert!(
+            plan.setup_commands
+                .iter()
+                .any(|command| command.contains("agent/run_compaction_eval.py --mode fixture"))
+        );
+        assert!(
+            plan.run_command
+                .contains("agent/run_compaction_eval.py --mode run")
+        );
+        assert!(
+            plan.required_tools
+                .contains(&AgentToolKind::RunShellCommand)
+        );
+        assert!(plan.required_tools.contains(&AgentToolKind::ApplyPatch));
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.contains("live/model eval harness"))
+        );
+        let runner = include_str!("../agent/run_compaction_eval.py");
+        assert!(runner.contains("long-session-resume"));
+        assert!(runner.contains("constraint-retention"));
+        assert!(runner.contains("coding-after-compaction"));
+        assert!(runner.contains("cluster-ops-after-compaction"));
+        assert!(runner.contains("SCENARIOS"));
+        assert!(runner.contains("validate_scenario_definitions"));
+        assert!(runner.contains("generated_continuation_uses_compaction_summary"));
+        assert!(runner.contains("missing_marker_phases"));
     }
 
     #[test]
@@ -941,9 +1196,29 @@ mod tests {
         );
         assert!(
             descriptor
+                .supported_operations
+                .contains(&SINOMO_BENCHMARKS_CANCEL_PROBE_OPERATION.to_string())
+        );
+        assert!(
+            descriptor
                 .capabilities
                 .contains(&"benchmark.catalog.read".to_string())
         );
+        assert!(
+            descriptor
+                .capabilities
+                .contains(&"benchmark.agent.cancel-probe".to_string())
+        );
+        assert!(
+            descriptor
+                .capabilities
+                .contains(&"benchmark.agent.compaction.plan".to_string())
+        );
+        assert!(descriptor.surfaces.object_rpc_routes.iter().any(|route| {
+            route.route == SINOMO_BENCHMARKS_CANCEL_PROBE_ROUTE
+                && route.category == SINOMO_BENCHMARKS_RPC_CATEGORY
+                && route.operation == SINOMO_BENCHMARKS_CANCEL_PROBE_OPERATION
+        }));
     }
 
     #[test]
@@ -958,6 +1233,12 @@ mod tests {
                 .plans
                 .iter()
                 .any(|plan| plan.name == "swebench-verified-10")
+        );
+        assert!(
+            catalog
+                .plans
+                .iter()
+                .any(|plan| plan.name == "agent-compaction-quality")
         );
         assert!(
             catalog
@@ -1007,5 +1288,62 @@ mod tests {
                 .iter()
                 .any(|plan| plan.name == "swebench-verified-10")
         );
+    }
+
+    unsafe extern "C" fn test_host_is_cancelled(user_data: *mut c_void) -> u8 {
+        let cancelled = unsafe { (user_data as *const AtomicBool).as_ref() };
+        cancelled.is_some_and(|cancelled| cancelled.load(Ordering::SeqCst)) as u8
+    }
+
+    #[test]
+    fn benchmark_module_native_abi_cancel_probe_observes_host_cancellation() {
+        let cancelled = AtomicBool::new(false);
+        let status = sinomo_module_init(SinomoModuleHostApiV1 {
+            abi_version: SINOMO_NATIVE_MODULE_ABI_VERSION,
+            user_data: &cancelled as *const AtomicBool as *mut c_void,
+            output_chunk: None,
+            log: None,
+            is_cancelled: Some(test_host_is_cancelled),
+        });
+        assert_eq!(status, SINOMO_MODULE_STATUS_OK);
+
+        let payload_sobj = encode_sobj(&BenchmarkCancelProbeRequest {
+            max_runtime_ms: 2_000,
+            poll_interval_ms: 5,
+        })
+        .expect("payload");
+        let request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
+            operation: SINOMO_BENCHMARKS_CANCEL_PROBE_OPERATION.to_string(),
+            payload_sobj,
+        });
+        let request_sobj = encode_sobj(&request).expect("request");
+
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let mut response_buffer = SinomoModuleByteBuffer::null();
+                let status = sinomo_module_invoke(
+                    SinomoModuleByteSlice::from_slice(&request_sobj),
+                    &mut response_buffer,
+                );
+                let response_bytes = unsafe { SinomoModuleByteBuffer::into_vec(response_buffer) };
+                (status, response_bytes)
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            cancelled.store(true, Ordering::SeqCst);
+            let (status, response_bytes) = worker.join().expect("cancel probe worker");
+            assert_eq!(status, SINOMO_MODULE_STATUS_OK);
+            let native_response: NativeModuleResponse =
+                decode_sobj(&response_bytes).expect("native response");
+            let NativeModuleResponse::Invocation(response) = native_response else {
+                panic!("expected invocation response");
+            };
+            assert_eq!(response.operation, SINOMO_BENCHMARKS_CANCEL_PROBE_OPERATION);
+            let cancel_response: BenchmarkCancelProbeResponse =
+                decode_sobj(&response.payload_sobj).expect("cancel response");
+            assert!(cancel_response.cancelled);
+            assert!(cancel_response.polls > 1);
+        });
+
+        assert_eq!(sinomo_module_shutdown(), SINOMO_MODULE_STATUS_OK);
     }
 }

@@ -80,6 +80,33 @@ fn cluster_network_rpc_route_metadata_matches_owned_routes() {
 }
 
 #[test]
+fn object_rpc_requests_carry_operation_cancellation_metadata() {
+    let request = ObjectRpcRequest::encode_body("/test/run", "test", &())
+        .expect("request")
+        .with_operation_id("op_1");
+    assert_eq!(request.operation_id(), Some("op_1"));
+    assert_eq!(request.cancels_operation_id(), None);
+
+    let cancel = ObjectRpcRequest::encode_body(
+        "/test/cancel",
+        "test",
+        &ObjectRpcCancelRequest::new("op_1", "turn cancelled"),
+    )
+    .expect("cancel request")
+    .with_cancels_operation_id("op_1");
+    assert_eq!(cancel.operation_id(), None);
+    assert_eq!(cancel.cancels_operation_id(), Some("op_1"));
+    let body: ObjectRpcCancelRequest = cancel.decode_body().expect("cancel body");
+    assert_eq!(
+        body,
+        ObjectRpcCancelRequest {
+            operation_id: "op_1".to_string(),
+            reason: "turn cancelled".to_string(),
+        }
+    );
+}
+
+#[test]
 fn network_publishes_agent_cluster_inspection_specs() {
     assert_eq!(NETWORK_OBJECT_RPC_ROUTES, &[CLUSTER_HEALTH_ROUTE]);
     assert_eq!(

@@ -4,7 +4,7 @@
 //! tree: [`view`] returns a responsive host ([`ChatView`]) over pre-built pods
 //! (wide split with the agents/sessions sidebar, narrow transcript-only), each
 //! assembled from stock `ListView` / `ScrollView` / `Select` / `TextArea` /
-//! `Button` / `Spinner` / `Separator` / `Label` widgets, plus a small set of
+//! `Button` / `Separator` / `Label` widgets, plus a small set of
 //! bespoke painters for the parts whose *shape* changes live.
 //!
 //! The data layer — [`ChatState`] + its methods, the [`ChatHandle`] worker
@@ -119,7 +119,11 @@ pub struct ChatState {
 impl ChatState {
     pub fn new(backend: &Backend) -> Self {
         let daemon_connected = backend.connection.is_daemon();
-        let handle = ChatHandle::spawn((*backend.data_dir).clone(), daemon_connected);
+        let handle = ChatHandle::spawn(
+            (*backend.data_dir).clone(),
+            daemon_connected,
+            backend.agent_runtime_control.clone(),
+        );
 
         let agents = agent_summaries(&backend.data_dir);
         let providers = crate::backend::config::cluster_provider_summaries(backend.config.as_ref());
@@ -311,6 +315,23 @@ impl ChatState {
                 }
                 self.persist();
             }
+            ChatEvent::ControlStatus(status) => {
+                self.notice = Some(format!(
+                    "agent control {} at sequence {}",
+                    if status.accepted {
+                        "accepted"
+                    } else {
+                        "rejected"
+                    },
+                    status.sequence
+                ));
+            }
+            ChatEvent::ControlState(state) => {
+                self.notice = Some(format!(
+                    "agent control: {} steering, {} follow-ups",
+                    state.steering_count, state.follow_up_count
+                ));
+            }
             ChatEvent::RuntimeInfo(info) => {
                 self.info = info;
                 self.sync_selection_from_info();
@@ -376,7 +397,20 @@ impl ChatState {
 
     fn submit(&mut self) {
         let text = self.input.trim().to_string();
-        if text.is_empty() || self.streaming {
+        if text.is_empty() {
+            return;
+        }
+        if self.streaming {
+            self.handle.send_command(ChatCommand::FollowUp(text.clone()));
+            self.messages.push(ChatMessage {
+                role: ChatRole::User,
+                text,
+            });
+            self.input.clear();
+            self.cursor = 0;
+            self.notice = Some("queued follow-up".to_string());
+            self.stick_bottom = true;
+            self.scroll = f32::MAX;
             return;
         }
         self.messages.push(ChatMessage {
@@ -396,11 +430,20 @@ impl ChatState {
         self.handle.send_command(ChatCommand::Send(text));
     }
 
+    fn interrupt_turn(&mut self) {
+        if !self.streaming {
+            return;
+        }
+        self.handle
+            .send_command(ChatCommand::Interrupt("user interrupted from app chat".to_string()));
+        self.notice = Some("interrupting…".to_string());
+    }
+
     // -- Composed-view action methods (mutation entry points for the widgets) --
 
-    /// Whether the Send button should be enabled (non-empty draft, not streaming).
+    /// Whether the composer has a non-empty draft that can be submitted.
     fn can_send(&self) -> bool {
-        !self.input.trim().is_empty() && !self.streaming
+        !self.input.trim().is_empty()
     }
 
     /// Update the composer draft (bound to the composer `TextArea` via its `on_change`).
@@ -952,9 +995,9 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     WidgetPod::new(row)
 }
 
-/// The composer's bottom row: a flexible message `TextArea` and a fixed-size send action slot. The
-/// input is bound to the draft via `on_change`; the send action is wired to `ChatState::submit`.
-/// The Send control swaps to a `Spinner` while streaming.
+/// The composer's bottom row: a flexible message `TextArea` and a fixed-size action slot. The input
+/// is bound to the draft via `on_change`; Enter submits normally, or queues a follow-up during an
+/// active stream. The action control swaps from Send to Interrupt while streaming.
 fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let input = {
         let s = shared.clone();
@@ -982,8 +1025,8 @@ fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                 }
             })
             // Enter sends, Shift+Enter inserts a newline (the on_submit only fires while the
-            // TextArea is focused — Enter only reaches a focused input). `submit()` already no-ops
-            // when the draft is empty or a turn is streaming, so this matches `can_send`.
+            // TextArea is focused — Enter only reaches a focused input). While streaming, `submit()`
+            // queues the draft as a follow-up for the active runtime turn.
             .on_submit(move |_text| {
                 s.chat_mut().submit();
             })
@@ -991,10 +1034,15 @@ fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
 
     let streaming = shared.chat().streaming;
     let send: WidgetPod = if streaming {
+        let s = shared.clone();
         WidgetPod::new(
-            sui::Spinner::new("chat-sending")
-                .size(22.0)
-                .theme_when(clone_reader(reader)),
+            IconButton::new(IconGlyph::Close, "Interrupt")
+                .size(SEND_BUTTON_SIZE)
+                .icon_size(17.0)
+                .theme_when(clone_reader(reader))
+                .on_press(move || {
+                    s.chat_mut().interrupt_turn();
+                }),
         )
     } else {
         let s = shared.clone();
@@ -1037,7 +1085,7 @@ fn composer(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         )
     };
 
-    // The input row is rebuilt when the streaming flag flips (Send <-> Spinner). The draft text is
+    // The input row is rebuilt when the streaming flag flips (Send <-> Interrupt). The draft text is
     // owned by the `TextArea`, so we do NOT rebuild on every keystroke.
     let input_host = {
         let s = shared.clone();
@@ -1187,7 +1235,7 @@ impl ChatView {
     /// plain `ctx.request_measure()` here would only invalidate `ChatView`'s own measure path, which
     /// can short-circuit before reaching those hosts. Targeting the *window* makes sui's
     /// `build_measure_scope` upgrade the pass to `force_all`, so every pod (including those hosts)
-    /// re-measures and the newly-built option lists / Send<->Spinner swap take effect.
+    /// re-measures and the newly-built option lists / Send<->Interrupt swap take effect.
     fn force_window_relayout(&self, ctx: &mut EventCtx) {
         use sui::{InvalidationKind, InvalidationRequest, InvalidationTarget};
         let window = InvalidationTarget::Window(ctx.window_id());
@@ -1212,7 +1260,7 @@ impl ChatView {
 
         // Recompute the coarse signature each tick: a worker event (RuntimeInfo / Models / TurnDone,
         // or a token that resolved the selection) may have changed the selector option lists, the
-        // sidebar sessions, or the streaming flag (Send <-> Spinner) — anything the inner
+        // sidebar sessions, or the streaming flag (Send <-> Interrupt) — anything the inner
         // `RebuildOnChange` hosts key on. On a signature change, force a full relayout so those hosts
         // rebuild; on a bare token (same signature) just repaint the live-reading transcript.
         let sig = view_signature(&self.shared);
@@ -1713,22 +1761,37 @@ mod tests {
     }
 
     #[test]
-    fn empty_or_streaming_submit_is_a_noop() {
+    fn empty_submit_is_noop_and_streaming_submit_queues_follow_up() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
         // Empty draft → nothing happens.
         state.submit();
         assert!(!state.streaming);
         assert!(state.messages.is_empty());
-        // While streaming, a submit is ignored.
+        // While streaming, a submit is queued as a follow-up for the active runtime turn.
         state.set_draft("queued".to_string());
         state.streaming = true;
         state.submit();
-        assert!(
-            state.messages.is_empty(),
-            "a submit while streaming is ignored"
-        );
-        assert_eq!(state.input, "queued", "the draft is preserved");
+        assert_eq!(state.messages.len(), 1, "queued follow-up is echoed");
+        assert_eq!(state.messages[0].role, ChatRole::User);
+        assert_eq!(state.messages[0].text, "queued");
+        assert!(state.input.is_empty(), "the queued draft is cleared");
+        assert!(state.streaming, "queueing follow-up keeps active stream state");
+        assert_eq!(state.notice.as_deref(), Some("queued follow-up"));
+    }
+
+    #[test]
+    fn interrupt_turn_only_updates_notice_while_streaming() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+
+        state.interrupt_turn();
+        assert!(state.notice.is_none(), "idle interrupt is a no-op");
+
+        state.streaming = true;
+        state.interrupt_turn();
+        assert_eq!(state.notice.as_deref(), Some("interrupting…"));
+        assert!(state.streaming, "interrupt request waits for runtime event");
     }
 
     #[test]
@@ -1749,14 +1812,53 @@ mod tests {
     }
 
     #[test]
-    fn can_send_requires_nonempty_draft_and_not_streaming() {
+    fn control_events_update_notice_without_touching_streaming_state() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.streaming = true;
+
+        state.apply_event(ChatEvent::ControlStatus(
+            sinomo_cli::app_api::ChatControlStatus {
+                session_id: "sess_ui_control".to_string(),
+                accepted: true,
+                sequence: 3,
+                event_count: 1,
+                active_turn: true,
+                task_count: 0,
+                terminal_result_count: 0,
+            },
+        ));
+        assert!(state.streaming);
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("agent control accepted at sequence 3")
+        );
+
+        state.apply_event(ChatEvent::ControlState(
+            sinomo_cli::app_api::ChatControlState {
+                session_id: "sess_ui_control".to_string(),
+                accepted: true,
+                steering_count: 2,
+                follow_up_count: 1,
+                ..Default::default()
+            },
+        ));
+        assert!(state.streaming);
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("agent control: 2 steering, 1 follow-ups")
+        );
+    }
+
+    #[test]
+    fn can_send_requires_nonempty_draft() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
         assert!(!state.can_send(), "empty draft cannot send");
         state.set_draft("ok".to_string());
         assert!(state.can_send(), "a non-empty draft can send");
         state.streaming = true;
-        assert!(!state.can_send(), "cannot send while streaming");
+        assert!(state.can_send(), "a non-empty draft can queue while streaming");
     }
 
     #[test]

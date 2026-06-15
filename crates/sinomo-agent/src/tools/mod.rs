@@ -1,4 +1,5 @@
 mod registry;
+mod remote;
 mod types;
 
 pub mod config;
@@ -7,6 +8,7 @@ pub mod local_workspace;
 pub use config::{ConfigAgentToolConfig, config_tool_descriptors};
 pub use local_workspace::LocalWorkspaceAgentConfig;
 pub use registry::*;
+pub use remote::*;
 pub use types::*;
 
 pub fn default_agent_tool_descriptors() -> Vec<AgentToolDescriptor> {

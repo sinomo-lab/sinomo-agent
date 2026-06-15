@@ -29,10 +29,14 @@ type ObjectRpcAuthorizer = Arc<
 
 pub const OBJECT_RPC_ERROR_METADATA_KEY: &str = "sinomo-error";
 pub const OBJECT_RPC_ERROR_DETAIL_METADATA_KEY: &str = "sinomo-error-detail";
+pub const OBJECT_RPC_OPERATION_ID_METADATA_KEY: &str = "sinomo-operation-id";
+pub const OBJECT_RPC_CANCELS_OPERATION_ID_METADATA_KEY: &str = "sinomo-cancels-operation-id";
 
 pub const DAEMON_RPC_CATEGORY: &str = "daemon";
 pub const DAEMON_STATUS_ROUTE: &str = "/daemon/status";
 pub const DAEMON_SHUTDOWN_ROUTE: &str = "/daemon/shutdown";
+pub const MODULE_RPC_CATEGORY: &str = "module";
+pub const MODULE_NATIVE_DYLIB_CANCEL_ROUTE: &str = "/module/native-dylib/cancel";
 pub const CLUSTER_HEALTH_RPC_CATEGORY: &str = "cluster.health";
 pub const CLUSTER_HEALTH_ROUTE: &str = "/cluster/health";
 pub const CLUSTER_HEALTH_SCOPE_METADATA_KEY: &str = "sinomo-health-scope";
@@ -80,6 +84,7 @@ pub const SANDBOX_HTTP_FETCH_ROUTE: &str = "/sandbox/http/fetch";
 pub const SANDBOX_HTTP_FETCH_TO_FILE_ROUTE: &str = "/sandbox/http/fetch-to-file";
 pub const SANDBOX_RUN_TOOLCHAIN_ROUTE: &str = "/sandbox/run/toolchain";
 pub const SANDBOX_RUN_PROCESS_PLAN_ROUTE: &str = "/sandbox/run/process-plan";
+pub const SANDBOX_RUN_CANCEL_ROUTE: &str = "/sandbox/run/cancel";
 pub const SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE: &str = "/sandbox/run/toolchain/stream";
 pub const SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE: &str = "/sandbox/run/process-plan/stream";
 pub const ROLLOUT_RPC_CATEGORY: &str = "rollout";
@@ -132,6 +137,53 @@ impl ObjectRpcRequest {
     pub fn decode_body<T: serde::de::DeserializeOwned>(&self) -> Result<T, NetworkError> {
         SinomoObjectCodec::network_frame().decode(&self.body)
     }
+
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn with_operation_id(self, operation_id: impl Into<String>) -> Self {
+        self.with_metadata(OBJECT_RPC_OPERATION_ID_METADATA_KEY, operation_id)
+    }
+
+    pub fn with_cancels_operation_id(self, operation_id: impl Into<String>) -> Self {
+        self.with_metadata(OBJECT_RPC_CANCELS_OPERATION_ID_METADATA_KEY, operation_id)
+    }
+
+    pub fn operation_id(&self) -> Option<&str> {
+        self.metadata
+            .get(OBJECT_RPC_OPERATION_ID_METADATA_KEY)
+            .map(String::as_str)
+    }
+
+    pub fn cancels_operation_id(&self) -> Option<&str> {
+        self.metadata
+            .get(OBJECT_RPC_CANCELS_OPERATION_ID_METADATA_KEY)
+            .map(String::as_str)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ObjectRpcCancelRequest {
+    pub operation_id: String,
+    pub reason: String,
+}
+
+impl ObjectRpcCancelRequest {
+    pub fn new(operation_id: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            operation_id: operation_id.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ObjectRpcCancelResponse {
+    pub operation_id: String,
+    pub cancelled: bool,
+    pub detail: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

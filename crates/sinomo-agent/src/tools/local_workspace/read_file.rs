@@ -49,6 +49,11 @@ impl AgentTool for ReadFileTool {
                 );
             }
         };
+        if let Err(detail) =
+            ensure_local_tool_not_cancelled(&request.cancellation_token, "read_file")
+        {
+            return local_tool_cancelled_result("read_file", detail);
+        }
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(source) => {
@@ -58,6 +63,11 @@ impl AgentTool for ReadFileTool {
                 );
             }
         };
+        if let Err(detail) =
+            ensure_local_tool_not_cancelled(&request.cancellation_token, "read_file")
+        {
+            return local_tool_cancelled_result("read_file", detail);
+        }
         let decoded = String::from_utf8_lossy(&bytes);
         let total_lines = count_text_lines(&decoded);
         let selected = select_line_range(&decoded, start_line, end_line);
@@ -80,7 +90,7 @@ impl AgentTool for ReadFileTool {
             "line_range": selected.line_range_payload(),
         });
         let mut evidence =
-            AgentToolEvidence::policy_only(true, "path resolved inside workspace root")
+            AgentToolEvidence::availability_only(true, "path resolved inside workspace root")
                 .with_output_value(&payload, truncated);
         if let Some(full_output_ref) = full_output_ref {
             evidence = evidence.with_artifact(

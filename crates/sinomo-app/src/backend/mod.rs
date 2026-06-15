@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use sinomo_runtime::config::{ConfigClient, ConfigRegistry, ConfigStore, LocalConfigClient};
 use sinomo_runtime::daemon::{
-    DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus, RemoteConfigClient,
-    probe_daemon_status, run_daemon_control_loop,
+    DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonServiceRegistryHook, DaemonStatus,
+    RemoteConfigClient, probe_daemon_status, run_daemon_control_loop_with_services,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::node::{NodeProfile, NodeRole};
@@ -84,6 +84,8 @@ pub struct Backend {
     /// The configuration service the app reads/writes through — always RPC to a daemon (the
     /// app's own in-process one when no external daemon exists). The app holds no config state.
     pub config: Arc<dyn ConfigClient>,
+    /// Runtime-control host shared by the chat worker and the app-started in-process daemon.
+    pub agent_runtime_control: sinomo_agent::AgentRuntimeControlRegistry,
     /// Keeps an app-started in-process daemon alive; `None` when attached to an external one.
     _daemon: Option<Arc<InProcessDaemon>>,
 }
@@ -103,6 +105,7 @@ impl Backend {
         let mut node = NodeProfile::local("Sinomo App")
             .unwrap_or_else(|_| panic!("local node profile uses a valid trust domain"));
         node.role = NodeRole::Mobile;
+        let agent_runtime_control = sinomo_agent::AgentRuntimeControlRegistry::new();
 
         progress("Looking for a daemon…");
         let paths = DaemonPaths::new(&data_dir);
@@ -119,7 +122,7 @@ impl Backend {
             // a mobile node, falling back to direct local config only if that fails.
             DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
                 progress("Starting a local daemon…");
-                match start_in_process_daemon(&paths, &progress) {
+                match start_in_process_daemon(&paths, &progress, agent_runtime_control.clone()) {
                     Some((status, handle)) => (
                         Connection::InProcessDaemon(Box::new(status)),
                         Some(Arc::new(handle)),
@@ -137,6 +140,7 @@ impl Backend {
             node,
             connection,
             config,
+            agent_runtime_control,
             _daemon: daemon,
         }
     }
@@ -162,6 +166,7 @@ impl Backend {
             node,
             connection,
             config,
+            agent_runtime_control: sinomo_agent::AgentRuntimeControlRegistry::new(),
             _daemon: None,
         }
     }
@@ -250,15 +255,20 @@ fn build_config_client(
 fn start_in_process_daemon(
     paths: &DaemonPaths,
     progress: &impl Fn(&str),
+    agent_runtime_control: sinomo_agent::AgentRuntimeControlRegistry,
 ) -> Option<(DaemonStatus, InProcessDaemon)> {
     let options = DaemonRunOptions::default();
     let loop_paths = paths.clone();
+    let control_host = agent_runtime_control.clone();
     let thread = thread::Builder::new()
         .name("sinomo-app-daemon".to_string())
         .spawn(move || {
             // A fresh mobile node has no cluster to resume; the daemon serves local config and
             // joins a cluster later if one is available.
-            if let Err(error) = run_daemon_control_loop(options, loop_paths, "daemon", None) {
+            let hooks = vec![agent_runtime_control_service_hook(control_host)];
+            if let Err(error) =
+                run_daemon_control_loop_with_services(options, loop_paths, "daemon", None, hooks)
+            {
                 tracing::warn!(%error, "in-process daemon exited");
             }
         })
@@ -277,6 +287,40 @@ fn start_in_process_daemon(
             return None;
         }
         thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn agent_runtime_control_service_hook(
+    control_host: sinomo_agent::AgentRuntimeControlRegistry,
+) -> DaemonServiceRegistryHook {
+    DaemonServiceRegistryHook::new(move |builder| {
+        let host: Arc<dyn sinomo_agent::AgentRuntimeControlHost> =
+            Arc::new(control_host.clone());
+        sinomo_agent::register_services_with_runtime_control(builder, host)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_runtime::service::ServiceRegistry;
+
+    #[test]
+    fn app_agent_runtime_control_hook_registers_read_and_control_routes() {
+        let hook =
+            agent_runtime_control_service_hook(sinomo_agent::AgentRuntimeControlRegistry::new());
+        let registry = hook.register(ServiceRegistry::builder()).build();
+
+        for route in sinomo_agent::AGENT_OBJECT_RPC_ROUTES
+            .iter()
+            .chain(sinomo_agent::AGENT_RUNTIME_CONTROL_OBJECT_RPC_ROUTES.iter())
+        {
+            assert!(registry.owns(route), "missing app agent route {route}");
+            assert_eq!(
+                registry.category_for_route(route),
+                Some(sinomo_agent::AGENT_RPC_CATEGORY)
+            );
+        }
     }
 }
 

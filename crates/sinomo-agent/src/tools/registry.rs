@@ -1,12 +1,16 @@
 use super::{
-    AgentTool, AgentToolDescriptor, AgentToolEvidence, AgentToolOutcome, AgentToolProgressSink,
-    AgentToolRequest, AgentToolResult, AgentToolStatus,
+    AgentTool, AgentToolDescriptor, AgentToolEvidence, AgentToolOutcome, AgentToolProgressEvent,
+    AgentToolProgressSink, AgentToolRequest, AgentToolResult, AgentToolStatus,
 };
 use crate::{AgentCancellationToken, AgentToolCall, InteractionSession, TaskId};
 use std::sync::{
     Arc, RwLock,
     atomic::{AtomicU64, Ordering},
+    mpsc,
 };
+use std::time::Duration;
+
+const AGENT_TOOL_GATEWAY_WAIT_POLL_MS: u64 = 50;
 
 #[derive(Clone, Default)]
 pub struct AgentToolRegistry {
@@ -49,8 +53,20 @@ impl AgentToolRegistry {
         self
     }
 
+    pub fn with_gateway<G: AgentToolGateway + 'static>(self, gateway: G) -> Self {
+        self.register_gateway(gateway);
+        self
+    }
+
     pub fn register<T: AgentTool + 'static>(&self, tool: T) -> Option<AgentToolDescriptor> {
         self.register_arc(Arc::new(tool))
+    }
+
+    pub fn register_gateway<G: AgentToolGateway + 'static>(
+        &self,
+        gateway: G,
+    ) -> Option<AgentToolDescriptor> {
+        self.register(AgentToolGatewayAdapter::new(gateway))
     }
 
     pub fn register_arc(&self, tool: Arc<dyn AgentTool>) -> Option<AgentToolDescriptor> {
@@ -170,6 +186,15 @@ impl AgentToolRegistry {
         progress_sink: AgentToolProgressSink,
     ) -> AgentToolOutcome {
         let call_id = TaskId::generate();
+        if cancellation_token.is_cancelled() {
+            return self.outcome_from_result(
+                call_id,
+                step_index,
+                call_index,
+                call,
+                cancelled_before_tool_execution_result(call),
+            );
+        }
         let tool = self
             .tools
             .read()
@@ -199,8 +224,19 @@ impl AgentToolRegistry {
                 )
             });
 
+        self.outcome_from_result(call_id, step_index, call_index, call, result)
+    }
+
+    fn outcome_from_result(
+        &self,
+        call_id: TaskId,
+        step_index: usize,
+        call_index: usize,
+        call: &AgentToolCall,
+        result: AgentToolResult,
+    ) -> AgentToolOutcome {
         let mut evidence = result.evidence.unwrap_or_else(|| {
-            AgentToolEvidence::policy_only(
+            AgentToolEvidence::availability_only(
                 result.status != AgentToolStatus::Blocked,
                 "executed through registered agent tool registry",
             )
@@ -229,6 +265,174 @@ impl AgentToolRegistry {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentToolGatewayCancellation {
+    pub accepted: bool,
+    pub reason: String,
+}
+
+impl AgentToolGatewayCancellation {
+    pub fn accepted(reason: impl Into<String>) -> Self {
+        Self {
+            accepted: true,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn rejected(reason: impl Into<String>) -> Self {
+        Self {
+            accepted: false,
+            reason: reason.into(),
+        }
+    }
+}
+
+pub struct AgentToolGatewayTask {
+    cancel: Arc<dyn Fn() -> AgentToolGatewayCancellation + Send + Sync>,
+    wait: Box<dyn FnOnce() -> AgentToolResult + Send>,
+}
+
+impl AgentToolGatewayTask {
+    pub fn new(
+        wait: impl FnOnce() -> AgentToolResult + Send + 'static,
+        cancel: impl Fn() -> AgentToolGatewayCancellation + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            cancel: Arc::new(cancel),
+            wait: Box::new(wait),
+        }
+    }
+
+    fn cancellation_handle(&self) -> Arc<dyn Fn() -> AgentToolGatewayCancellation + Send + Sync> {
+        Arc::clone(&self.cancel)
+    }
+
+    fn wait(self) -> AgentToolResult {
+        (self.wait)()
+    }
+}
+
+pub trait AgentToolGateway: Send + Sync {
+    fn descriptor(&self) -> AgentToolDescriptor;
+
+    fn start(
+        &self,
+        request: &AgentToolRequest<'_>,
+    ) -> Result<AgentToolGatewayTask, AgentToolResult>;
+}
+
+pub struct AgentToolGatewayAdapter<G> {
+    gateway: G,
+    poll_interval: Duration,
+}
+
+impl<G> AgentToolGatewayAdapter<G> {
+    pub fn new(gateway: G) -> Self {
+        Self {
+            gateway,
+            poll_interval: Duration::from_millis(AGENT_TOOL_GATEWAY_WAIT_POLL_MS),
+        }
+    }
+
+    pub fn with_poll_interval(mut self, poll_interval: Duration) -> Self {
+        self.poll_interval = poll_interval;
+        self
+    }
+}
+
+impl<G> AgentTool for AgentToolGatewayAdapter<G>
+where
+    G: AgentToolGateway + 'static,
+{
+    fn descriptor(&self) -> AgentToolDescriptor {
+        self.gateway.descriptor()
+    }
+
+    fn execute(&self, request: AgentToolRequest<'_>) -> AgentToolResult {
+        execute_gateway_tool_task(&self.gateway, request, self.poll_interval)
+    }
+}
+
+fn execute_gateway_tool_task(
+    gateway: &dyn AgentToolGateway,
+    request: AgentToolRequest<'_>,
+    poll_interval: Duration,
+) -> AgentToolResult {
+    if request.cancellation_token.is_cancelled() {
+        return cancelled_before_tool_execution_result(request.call);
+    }
+    let task = match gateway.start(&request) {
+        Ok(task) => task,
+        Err(result) => return result,
+    };
+    request.progress_sink.emit(AgentToolProgressEvent::Message {
+        summary: "gateway task started".to_string(),
+        payload: serde_json::json!({
+            "tool": request.call.tool,
+            "call_id": request.call_id,
+        }),
+    });
+
+    let cancel = task.cancellation_handle();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(task.wait());
+    });
+
+    let mut cancellation: Option<AgentToolGatewayCancellation> = None;
+    loop {
+        if request.cancellation_token.is_cancelled() && cancellation.is_none() {
+            let decision = cancel();
+            request.progress_sink.emit(AgentToolProgressEvent::Message {
+                summary: "gateway task cancellation requested".to_string(),
+                payload: serde_json::json!({
+                    "tool": request.call.tool,
+                    "accepted": decision.accepted,
+                    "reason": decision.reason,
+                }),
+            });
+            cancellation = Some(decision);
+        }
+
+        match rx.recv_timeout(poll_interval) {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let payload = serde_json::json!({
+                    "error": "gateway_task_disconnected",
+                    "tool": request.call.tool,
+                    "cancellation": cancellation.map(|decision| {
+                        serde_json::json!({
+                            "accepted": decision.accepted,
+                            "reason": decision.reason,
+                        })
+                    }),
+                });
+                return AgentToolResult::failed(
+                    format!("gateway task for `{}` disconnected", request.call.tool),
+                    payload,
+                );
+            }
+        }
+    }
+}
+
+fn cancelled_before_tool_execution_result(call: &AgentToolCall) -> AgentToolResult {
+    let payload = serde_json::json!({
+        "error": "tool_cancelled",
+        "tool": call.tool,
+        "reason": "turn cancellation requested before tool execution",
+    });
+    AgentToolResult::cancelled(format!("tool `{}` cancelled", call.tool), payload.clone())
+        .with_evidence(
+            AgentToolEvidence::availability_only(
+                false,
+                "turn cancellation requested before tool execution",
+            )
+            .with_output_value(&payload, false),
+        )
+}
+
 struct DescriptorOnlyAgentTool {
     descriptor: AgentToolDescriptor,
 }
@@ -249,5 +453,139 @@ impl AgentTool for DescriptorOnlyAgentTool {
                 "tool": request.call.tool,
             }),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        AgentToolCapability, AgentToolKind, AgentToolSpec, InteractionSurface,
+        InteractionSurfaceKind,
+    };
+    use sinomo_runtime::events::SessionId;
+    use sinomo_runtime::node::NodeId;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    struct FakeGateway {
+        started: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
+        cancel_calls: Arc<AtomicUsize>,
+    }
+
+    impl AgentToolGateway for FakeGateway {
+        fn descriptor(&self) -> AgentToolDescriptor {
+            AgentToolDescriptor::new(AgentToolSpec::new(
+                AgentToolKind::ModuleObjectRpc,
+                "gateway_probe",
+                "fake host-provided gateway probe",
+                false,
+            ))
+            .with_capabilities([AgentToolCapability::CallModule])
+        }
+
+        fn start(
+            &self,
+            _request: &AgentToolRequest<'_>,
+        ) -> Result<AgentToolGatewayTask, AgentToolResult> {
+            self.started.store(true, Ordering::SeqCst);
+            let cancelled_for_wait = Arc::clone(&self.cancelled);
+            let cancelled_for_cancel = Arc::clone(&self.cancelled);
+            let cancel_calls = Arc::clone(&self.cancel_calls);
+            Ok(AgentToolGatewayTask::new(
+                move || {
+                    while !cancelled_for_wait.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    AgentToolResult::cancelled(
+                        "gateway task cancelled",
+                        serde_json::json!({
+                            "cancelled": true,
+                            "source": "fake_gateway",
+                        }),
+                    )
+                },
+                move || {
+                    cancel_calls.fetch_add(1, Ordering::SeqCst);
+                    cancelled_for_cancel.store(true, Ordering::SeqCst);
+                    AgentToolGatewayCancellation::accepted("fake gateway cancellation accepted")
+                },
+            ))
+        }
+    }
+
+    fn test_session() -> InteractionSession {
+        InteractionSession::new(
+            SessionId::from_legacy_named("agent_gateway_cancel_session").expect("session"),
+            NodeId::from_legacy_named("agent_gateway_cancel_node").expect("node"),
+            InteractionSurface::new("agent.gateway.test", InteractionSurfaceKind::CommandLine),
+        )
+    }
+
+    #[test]
+    fn gateway_adapter_cancels_active_host_task() {
+        let started = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
+        let registry = AgentToolRegistry::new().with_gateway(FakeGateway {
+            started: Arc::clone(&started),
+            cancelled: Arc::clone(&cancelled),
+            cancel_calls: Arc::clone(&cancel_calls),
+        });
+        let cancellation_token = AgentCancellationToken::new();
+        let token_for_sink = cancellation_token.clone();
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let progress_for_sink = Arc::clone(&progress);
+        let progress_sink = AgentToolProgressSink::new(move |event| {
+            if let AgentToolProgressEvent::Message { summary, .. } = event {
+                if summary == "gateway task started" {
+                    token_for_sink.cancel();
+                }
+                progress_for_sink
+                    .lock()
+                    .expect("progress lock")
+                    .push(summary);
+            }
+        });
+        let call = AgentToolCall {
+            call_id: None,
+            tool: "gateway_probe".to_string(),
+            input: serde_json::json!({}),
+            r#async: false,
+            summary: "cancel gateway probe".to_string(),
+        };
+
+        let outcome = registry.execute_with_cancellation_and_progress(
+            &test_session(),
+            0,
+            0,
+            &call,
+            cancellation_token,
+            progress_sink,
+        );
+
+        assert_eq!(outcome.status, AgentToolStatus::Cancelled);
+        assert!(started.load(Ordering::SeqCst));
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            outcome
+                .output
+                .get("cancelled")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let progress = progress.lock().expect("progress lock");
+        assert!(
+            progress
+                .iter()
+                .any(|summary| summary == "gateway task started")
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|summary| summary == "gateway task cancellation requested")
+        );
     }
 }

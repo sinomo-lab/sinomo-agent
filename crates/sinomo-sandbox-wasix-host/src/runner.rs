@@ -102,6 +102,7 @@ impl SandboxWasixModuleCommandRunner {
                         true,
                         false,
                         Vec::new(),
+                        SandboxCancellationToken::new(),
                     );
                 }
                 Err(error) => return Err(error.into()),
@@ -130,6 +131,7 @@ impl SandboxWasixModuleCommandRunner {
             true,
             false,
             wasix_command_overrides_for_toolchain(&toolchain),
+            SandboxCancellationToken::new(),
         )
     }
 
@@ -173,7 +175,37 @@ impl SandboxWasixModuleCommandRunner {
         policy: &SandboxPolicy,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
-        self.run_toolchain_command_with_stdin_policy_output_sink_cwd_and_env(
+        self.run_toolchain_command_with_stdin_policy_and_output_sink_and_cancellation(
+            store,
+            toolchain_store,
+            sandbox_id,
+            command_name,
+            argv,
+            stdin,
+            timeout_ms,
+            execution_node_id,
+            policy,
+            output_sink,
+            SandboxCancellationToken::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_toolchain_command_with_stdin_policy_and_output_sink_and_cancellation(
+        &self,
+        store: &LocalSandboxInstanceStore,
+        toolchain_store: &LocalSandboxToolchainStore,
+        sandbox_id: &SandboxId,
+        command_name: &str,
+        argv: Vec<String>,
+        stdin: Option<Vec<u8>>,
+        timeout_ms: u64,
+        execution_node_id: &sinomo_node::NodeId,
+        policy: &SandboxPolicy,
+        output_sink: Option<Arc<dyn SandboxOutputSink>>,
+        cancellation_token: SandboxCancellationToken,
+    ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
+        self.run_toolchain_command_with_stdin_policy_output_sink_cwd_and_env_and_cancellation(
             store,
             toolchain_store,
             sandbox_id,
@@ -186,6 +218,7 @@ impl SandboxWasixModuleCommandRunner {
             output_sink,
             None,
             BTreeMap::new(),
+            cancellation_token,
         )
     }
 
@@ -204,6 +237,40 @@ impl SandboxWasixModuleCommandRunner {
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
         cwd_override: Option<SandboxPath>,
         env_override: BTreeMap<String, String>,
+    ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
+        self.run_toolchain_command_with_stdin_policy_output_sink_cwd_and_env_and_cancellation(
+            store,
+            toolchain_store,
+            sandbox_id,
+            command_name,
+            argv,
+            stdin,
+            timeout_ms,
+            execution_node_id,
+            policy,
+            output_sink,
+            cwd_override,
+            env_override,
+            SandboxCancellationToken::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_toolchain_command_with_stdin_policy_output_sink_cwd_and_env_and_cancellation(
+        &self,
+        store: &LocalSandboxInstanceStore,
+        toolchain_store: &LocalSandboxToolchainStore,
+        sandbox_id: &SandboxId,
+        command_name: &str,
+        argv: Vec<String>,
+        stdin: Option<Vec<u8>>,
+        timeout_ms: u64,
+        execution_node_id: &sinomo_node::NodeId,
+        policy: &SandboxPolicy,
+        output_sink: Option<Arc<dyn SandboxOutputSink>>,
+        cwd_override: Option<SandboxPath>,
+        env_override: BTreeMap<String, String>,
+        cancellation_token: SandboxCancellationToken,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
         validate_sandbox_toolchain_argv(command_name, &argv).map_err(|detail| {
             SandboxCommandExecutionError::Wasi(SandboxWasiError::InvalidRequest { detail })
@@ -232,6 +299,7 @@ impl SandboxWasixModuleCommandRunner {
             output_sink,
             cwd_override,
             env_override,
+            cancellation_token,
         )
     }
 
@@ -255,6 +323,7 @@ impl SandboxWasixModuleCommandRunner {
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
         cwd_override: Option<SandboxPath>,
         env_override: BTreeMap<String, String>,
+        cancellation_token: SandboxCancellationToken,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
         let command = toolchain.command(command_name)?;
         policy
@@ -292,6 +361,7 @@ impl SandboxWasixModuleCommandRunner {
             wasix_auto_asyncify,
             false,
             wasix_command_overrides_for_toolchain(toolchain),
+            cancellation_token,
         )
     }
 
@@ -316,6 +386,7 @@ impl SandboxWasixModuleCommandRunner {
         wasix_auto_asyncify: bool,
         wasix_fpcast_emu: bool,
         wasix_command_overrides: Vec<SandboxWasixCommandOverride>,
+        cancellation_token: SandboxCancellationToken,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
         let (manifest, layout) = store.load(sandbox_id)?;
         let limits = limits.unwrap_or_else(|| manifest.limits.clone());
@@ -345,13 +416,18 @@ impl SandboxWasixModuleCommandRunner {
             env,
             timeout_ms,
         };
-        let mut outcome = match self.invoke_run_module(
-            target_abi,
-            wasm.as_ref().to_vec(),
-            request.clone(),
-            options,
-            output_sink,
-        ) {
+        let mut outcome = match if cancellation_token.is_cancelled() {
+            Err(SandboxWasiError::Cancelled)
+        } else {
+            self.invoke_run_module(
+                target_abi,
+                wasm.as_ref().to_vec(),
+                request.clone(),
+                options,
+                output_sink,
+                cancellation_token.clone(),
+            )
+        } {
             Ok(outcome) => outcome,
             Err(error) => {
                 store.resume_checkpoint(
@@ -503,6 +579,32 @@ impl SandboxWasixModuleCommandRunner {
         policy: &SandboxPolicy,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
     ) -> Result<SandboxProcessPlanOutcome, SandboxCommandExecutionError> {
+        self.run_toolchain_process_plan_with_policy_output_sink_and_cancellation(
+            store,
+            toolchain_store,
+            sandbox_id,
+            plan,
+            timeout_ms,
+            execution_node_id,
+            policy,
+            output_sink,
+            SandboxCancellationToken::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_toolchain_process_plan_with_policy_output_sink_and_cancellation(
+        &self,
+        store: &LocalSandboxInstanceStore,
+        toolchain_store: &LocalSandboxToolchainStore,
+        sandbox_id: &SandboxId,
+        plan: &SandboxProcessPlan,
+        timeout_ms: u64,
+        execution_node_id: &sinomo_node::NodeId,
+        policy: &SandboxPolicy,
+        output_sink: Option<Arc<dyn SandboxOutputSink>>,
+        cancellation_token: SandboxCancellationToken,
+    ) -> Result<SandboxProcessPlanOutcome, SandboxCommandExecutionError> {
         validate_sandbox_process_plan(plan)?;
         let (manifest, layout) = store.load(sandbox_id)?;
         let sandbox_fs = LocalSandboxFileSystem::new(layout);
@@ -520,21 +622,26 @@ impl SandboxWasixModuleCommandRunner {
         let mut step_outcomes = Vec::with_capacity(plan.steps.len());
         let mut piped_stdin: Option<Vec<u8>> = None;
         for step in &plan.steps {
+            if cancellation_token.is_cancelled() {
+                return Err(SandboxWasiError::Cancelled.into());
+            }
             let stdin = step.stdin.clone().or_else(|| piped_stdin.take());
-            let outcome = self.run_toolchain_command_with_stdin_policy_output_sink_cwd_and_env(
-                store,
-                toolchain_store,
-                sandbox_id,
-                &step.command_name,
-                step.argv.clone(),
-                stdin,
-                timeout_ms,
-                execution_node_id,
-                policy,
-                output_sink.clone(),
-                step.cwd.clone(),
-                step.env.clone(),
-            )?;
+            let outcome = self
+                .run_toolchain_command_with_stdin_policy_output_sink_cwd_and_env_and_cancellation(
+                    store,
+                    toolchain_store,
+                    sandbox_id,
+                    &step.command_name,
+                    step.argv.clone(),
+                    stdin,
+                    timeout_ms,
+                    execution_node_id,
+                    policy,
+                    output_sink.clone(),
+                    step.cwd.clone(),
+                    step.env.clone(),
+                    cancellation_token.clone(),
+                )?;
             if outcome.response.exit_status != 0 {
                 let exit_status = outcome.response.exit_status;
                 let stdout = outcome.stdout.clone();
@@ -628,6 +735,7 @@ impl SandboxWasixModuleCommandRunner {
         command: SandboxCommandRequest,
         options: SandboxWasixRunModuleOptions,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
+        cancellation_token: SandboxCancellationToken,
     ) -> Result<SandboxLocalCommandOutcome, SandboxWasiError> {
         let request = SandboxWasixNativeRequest::RunModule(SandboxWasixRunModuleRequest {
             target_abi,
@@ -637,7 +745,11 @@ impl SandboxWasixModuleCommandRunner {
         });
         match self
             .module
-            .invoke_with_output_sink(&request, output_sink)
+            .invoke_with_output_sink_and_cancellation(
+                &request,
+                output_sink,
+                Some(cancellation_token),
+            )
             .map_err(wasix_native_module_error_to_wasi)?
         {
             SandboxWasixNativeResponse::RunModule(response) => Ok(response.outcome),
@@ -733,11 +845,41 @@ impl SandboxWasixSifsCommandRunner {
         policy: &SandboxPolicy,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
     ) -> Result<SandboxWasixSifsCommandOutcome<T>, SandboxCommandExecutionError> {
+        self.run_toolchain_command_with_stdin_policy_output_sink_and_cancellation(
+            dfs,
+            local_store,
+            sandbox_id,
+            command_name,
+            argv,
+            stdin,
+            timeout_ms,
+            policy,
+            output_sink,
+            SandboxCancellationToken::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_toolchain_command_with_stdin_policy_output_sink_and_cancellation<
+        T: DfsFrameTransport + Send + 'static,
+    >(
+        &self,
+        dfs: NetworkedDfsService<T>,
+        local_store: &LocalSandboxInstanceStore,
+        sandbox_id: &SandboxId,
+        command_name: &str,
+        argv: Vec<String>,
+        stdin: Option<Vec<u8>>,
+        timeout_ms: u64,
+        policy: &SandboxPolicy,
+        output_sink: Option<Arc<dyn SandboxOutputSink>>,
+        cancellation_token: SandboxCancellationToken,
+    ) -> Result<SandboxWasixSifsCommandOutcome<T>, SandboxCommandExecutionError> {
         let (dfs, execution_node_id, _manifest, local_toolchain_store) =
             self.materialize_sifs_execution(dfs, local_store, sandbox_id)?;
         let command = self
             .local_runner
-            .run_toolchain_command_with_stdin_policy_and_output_sink(
+            .run_toolchain_command_with_stdin_policy_and_output_sink_and_cancellation(
                 local_store,
                 &local_toolchain_store,
                 sandbox_id,
@@ -748,6 +890,7 @@ impl SandboxWasixSifsCommandRunner {
                 &execution_node_id,
                 policy,
                 output_sink,
+                cancellation_token,
             );
         let dfs = self.reconcile_sifs_execution(dfs, local_store, sandbox_id)?;
         Ok(SandboxWasixSifsCommandOutcome { dfs, command })
@@ -765,11 +908,37 @@ impl SandboxWasixSifsCommandRunner {
         policy: &SandboxPolicy,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
     ) -> Result<SandboxWasixSifsProcessPlanOutcome<T>, SandboxCommandExecutionError> {
+        self.run_toolchain_process_plan_with_policy_output_sink_and_cancellation(
+            dfs,
+            local_store,
+            sandbox_id,
+            plan,
+            timeout_ms,
+            policy,
+            output_sink,
+            SandboxCancellationToken::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_toolchain_process_plan_with_policy_output_sink_and_cancellation<
+        T: DfsFrameTransport + Send + 'static,
+    >(
+        &self,
+        dfs: NetworkedDfsService<T>,
+        local_store: &LocalSandboxInstanceStore,
+        sandbox_id: &SandboxId,
+        plan: &SandboxProcessPlan,
+        timeout_ms: u64,
+        policy: &SandboxPolicy,
+        output_sink: Option<Arc<dyn SandboxOutputSink>>,
+        cancellation_token: SandboxCancellationToken,
+    ) -> Result<SandboxWasixSifsProcessPlanOutcome<T>, SandboxCommandExecutionError> {
         let (dfs, execution_node_id, _manifest, local_toolchain_store) =
             self.materialize_sifs_execution(dfs, local_store, sandbox_id)?;
         let process = self
             .local_runner
-            .run_toolchain_process_plan_with_policy_and_output_sink(
+            .run_toolchain_process_plan_with_policy_output_sink_and_cancellation(
                 local_store,
                 &local_toolchain_store,
                 sandbox_id,
@@ -778,6 +947,7 @@ impl SandboxWasixSifsCommandRunner {
                 &execution_node_id,
                 policy,
                 output_sink,
+                cancellation_token,
             );
         let dfs = self.reconcile_sifs_execution(dfs, local_store, sandbox_id)?;
         Ok(SandboxWasixSifsProcessPlanOutcome { dfs, process })

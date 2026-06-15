@@ -142,6 +142,10 @@ pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
     })
 }
 
+pub(crate) fn prefers_native_tool_protocol(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("deepseek")
+}
+
 impl LanguageModelProvider for DeepSeekProvider {
     fn info(&self) -> LanguageModelProviderInfo {
         LanguageModelProviderInfo {
@@ -778,5 +782,12 @@ mod tests {
             inferred_context_window_tokens(DEEPSEEK_V4_PRO_MODEL),
             Some(1_000_000)
         );
+    }
+
+    #[test]
+    fn native_tool_protocol_preference_uses_deepseek_model_family() {
+        assert!(prefers_native_tool_protocol("deepseek-chat"));
+        assert!(prefers_native_tool_protocol(DEEPSEEK_V4_PRO_MODEL));
+        assert!(!prefers_native_tool_protocol("gpt-5.2-codex"));
     }
 }

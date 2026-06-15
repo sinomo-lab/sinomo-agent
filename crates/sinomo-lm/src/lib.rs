@@ -355,6 +355,46 @@ pub fn language_model_tool_adapter(_provider: &str, _model: &str) -> LanguageMod
     }
 }
 
+pub fn language_model_prefers_native_tool_protocol(provider: &str, model: &str) -> bool {
+    let provider =
+        normalize_model_provider(provider).unwrap_or_else(|| provider.to_ascii_lowercase());
+    match provider.as_str() {
+        OpenAiProvider::PROVIDER_ID => openai::prefers_native_tool_protocol(model),
+        CODEX_PROVIDER_ID => codex::prefers_native_tool_protocol(model),
+        DeepSeekProvider::PROVIDER_ID => deepseek::prefers_native_tool_protocol(model),
+        _ => false,
+    }
+}
+
+pub fn language_model_protocol_system_instructions(
+    provider: &str,
+    model: &str,
+    base: &str,
+) -> String {
+    if !language_model_prefers_native_tool_protocol(provider, model) {
+        return base.to_string();
+    }
+    format!(
+        "{base}\n\nModel protocol hint: native tool calls are available for this provider/model. Prefer the provider-native tool protocol for tool use; use JSON `tool_calls` only as a fallback. After native tool results are returned, continue with the required final response format."
+    )
+}
+
+pub fn language_model_system_instructions(
+    provider: &str,
+    model: &str,
+    base: &str,
+    output_contract: Option<&str>,
+) -> String {
+    let mut instructions = language_model_protocol_system_instructions(provider, model, base);
+    if let Some(output_contract) = output_contract
+        && !output_contract.trim().is_empty()
+    {
+        instructions.push_str("\n\nResponse contract:\n");
+        instructions.push_str(output_contract.trim());
+    }
+    instructions
+}
+
 pub fn collect_language_model_tool_calls(
     provider: &str,
     model: &str,
@@ -2807,6 +2847,14 @@ pub fn render_plain_prompt(request: &LanguageModelRequest) -> String {
         prompt.push_str(&message.content);
         prompt.push_str("\n\n");
     }
+    if !request.tools.is_empty() {
+        prompt.push_str("tools:\n```json\n");
+        prompt.push_str(
+            &serde_json::to_string_pretty(&request.tools)
+                .expect("language model tool specs serialize"),
+        );
+        prompt.push_str("\n```\n\n");
+    }
     prompt
 }
 
@@ -2884,6 +2932,13 @@ pub fn classify_language_model_error_detail(detail: &str) -> Option<LanguageMode
     {
         return Some(LanguageModelErrorCategory::RateLimit);
     }
+    if detail.contains("max output")
+        || detail.contains("output too large")
+        || detail.contains("too many output tokens")
+        || detail.contains("completion token limit")
+    {
+        return Some(LanguageModelErrorCategory::OutputTooLarge);
+    }
     if detail.contains("context_length")
         || detail.contains("context length")
         || detail.contains("maximum context")
@@ -2893,13 +2948,6 @@ pub fn classify_language_model_error_detail(detail: &str) -> Option<LanguageMode
         || detail.contains("token limit")
     {
         return Some(LanguageModelErrorCategory::PromptTooLarge);
-    }
-    if detail.contains("max output")
-        || detail.contains("output too large")
-        || detail.contains("too many output tokens")
-        || detail.contains("completion token limit")
-    {
-        return Some(LanguageModelErrorCategory::OutputTooLarge);
     }
     if detail.contains("api key")
         || detail.contains("unauthorized")
@@ -3022,6 +3070,41 @@ mod tests {
     }
 
     #[test]
+    fn native_tool_protocol_preference_lives_with_provider_model_contract() {
+        assert!(language_model_prefers_native_tool_protocol(
+            "openai-api",
+            "gpt-5.2-codex"
+        ));
+        assert!(language_model_prefers_native_tool_protocol(
+            CODEX_PROVIDER_ID,
+            "codex-mini"
+        ));
+        assert!(language_model_prefers_native_tool_protocol(
+            "deepseek-api",
+            "deepseek-chat"
+        ));
+        assert!(!language_model_prefers_native_tool_protocol(
+            "gemini",
+            "gemini-2.5-pro"
+        ));
+    }
+
+    #[test]
+    fn protocol_system_instructions_live_with_provider_model_contract() {
+        let base = "Base agent instructions.";
+        let native =
+            language_model_protocol_system_instructions("openai-api", "gpt-5.2-codex", base);
+
+        assert!(native.starts_with(base));
+        assert!(native.contains("provider-native tool protocol"));
+        assert!(native.contains("JSON `tool_calls` only as a fallback"));
+        assert_eq!(
+            language_model_protocol_system_instructions("gemini", "gemini-2.5-pro", base),
+            base
+        );
+    }
+
+    #[test]
     fn tool_adapter_recovers_dsml_tool_calls_from_text() {
         let content = format!(
             "I found it.\n{open}tool_calls>\n\
@@ -3085,6 +3168,16 @@ mod tests {
         assert_eq!(
             prompt_too_large.category(),
             LanguageModelErrorCategory::PromptTooLarge
+        );
+
+        let output_too_large = LanguageModelError::ProviderInvocationFailed {
+            provider: "openai".to_string(),
+            model: "gpt".to_string(),
+            detail: "completion token limit exceeded".to_string(),
+        };
+        assert_eq!(
+            output_too_large.category(),
+            LanguageModelErrorCategory::OutputTooLarge
         );
 
         let unsupported_tools = LanguageModelError::ProviderInvocationFailed {
@@ -3491,6 +3584,44 @@ mod tests {
 
         assert!(prompt.contains("system:\nReturn JSON only."));
         assert!(prompt.contains("user:\nSummarize evt_1."));
+    }
+
+    #[test]
+    fn plain_prompt_renders_request_tools_outside_chat_messages() {
+        let mut request = request();
+        request.tools.push(LanguageModelToolSpec {
+            name: "read_file".to_string(),
+            description: "Read a workspace file.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" }
+                }
+            }),
+            output_schema: serde_json::Value::Null,
+            supports_parallel: false,
+            provider_specs: Vec::new(),
+        });
+
+        let prompt = render_plain_prompt(&request);
+
+        assert!(prompt.contains("tools:\n```json"));
+        assert!(prompt.contains("\"name\": \"read_file\""));
+        assert!(prompt.contains("\"description\": \"Read a workspace file.\""));
+    }
+
+    #[test]
+    fn system_instructions_append_provider_rendered_output_contract() {
+        let instructions = language_model_system_instructions(
+            CODEX_PROVIDER_ID,
+            "gpt-5.2-codex",
+            "Base prompt.",
+            Some("Return JSON only."),
+        );
+
+        assert!(instructions.starts_with("Base prompt."));
+        assert!(instructions.contains("Model protocol hint: native tool calls are available"));
+        assert!(instructions.contains("Response contract:\nReturn JSON only."));
     }
 
     #[test]

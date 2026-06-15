@@ -5,8 +5,10 @@ use crate::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_runtime::core::{HotSwapState, ModuleLoaderState};
 use sinomo_runtime::events::EventId;
-use sinomo_runtime::module::ModuleRegistration;
-use std::collections::BTreeSet;
+use sinomo_runtime::module::{
+    ModuleDeclarativeResourceExport, ModuleDeclarativeResourceKind, ModuleRegistration,
+};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -95,9 +97,12 @@ fn default_toolsets_for_kind(kind: &crate::AgentToolKind) -> Vec<&'static str> {
         AgentToolKind::ChangedFiles | AgentToolKind::GitDiff => vec!["version_control"],
         AgentToolKind::ModuleObjectRpc => vec!["module", "object_rpc"],
         AgentToolKind::RequestUserInput => vec!["core", "interactive"],
-        AgentToolKind::ToolSearch | AgentToolKind::ToolDescribe | AgentToolKind::ToolCall => {
-            vec!["core", "discovery"]
-        }
+        AgentToolKind::ToolSearch
+        | AgentToolKind::ToolDescribe
+        | AgentToolKind::ToolCall
+        | AgentToolKind::SkillSearch
+        | AgentToolKind::SkillDescribe
+        | AgentToolKind::SkillActivate => vec!["core", "discovery"],
         AgentToolKind::ConfigSearch | AgentToolKind::ConfigGet | AgentToolKind::ConfigSet => {
             vec!["config", "local"]
         }
@@ -173,6 +178,22 @@ pub struct AgentToolPlanEntry {
     pub descriptor: AgentToolDescriptor,
     pub source: AgentToolPlanSource,
     pub executable: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentToolPlanReadinessIssueKind {
+    VisibleToolMissingExecutor,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentToolPlanReadinessIssue {
+    pub kind: AgentToolPlanReadinessIssueKind,
+    pub tool: String,
+    pub source: AgentToolPlanSource,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub toolsets: Vec<String>,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -269,6 +290,26 @@ impl AgentToolPlan {
             .map(|entry| entry.descriptor.clone())
             .collect()
     }
+
+    pub fn readiness_issues(&self) -> Vec<AgentToolPlanReadinessIssue> {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                !entry.executable
+                    && descriptor_matches_toolsets(&entry.descriptor, &self.visible_toolsets)
+            })
+            .map(|entry| AgentToolPlanReadinessIssue {
+                kind: AgentToolPlanReadinessIssueKind::VisibleToolMissingExecutor,
+                tool: entry.descriptor.spec.name.clone(),
+                source: entry.source.clone(),
+                toolsets: entry.descriptor.toolsets.clone(),
+                reason: format!(
+                    "tool `{}` is visible to the model but has no runtime executor",
+                    entry.descriptor.spec.name
+                ),
+            })
+            .collect()
+    }
 }
 
 pub fn tool_disclosure_descriptors() -> Vec<AgentToolDescriptor> {
@@ -318,7 +359,7 @@ pub fn tool_disclosure_descriptors() -> Vec<AgentToolDescriptor> {
         AgentToolDescriptor::new(AgentToolSpec::new(
             AgentToolKind::ToolCall,
             "tool_call",
-            "Execute a planned tool by name with input discovered through tool_search/tool_describe. The target call is checked by the same agent policy and registry path.",
+            "Execute a planned tool by name with input discovered through tool_search/tool_describe. The target call is checked by the same tool-surface availability and registry path.",
             true,
         ))
         .with_capabilities([AgentToolCapability::ObserveEnvironment])
@@ -344,11 +385,264 @@ pub fn tool_disclosure_descriptors() -> Vec<AgentToolDescriptor> {
                 }
             }
         })),
+        AgentToolDescriptor::new(AgentToolSpec::new(
+            AgentToolKind::SkillSearch,
+            "skill_search",
+            "Search skills declared by the active agent package or installed module resources without loading full skill text into the prompt.",
+            false,
+        ))
+        .with_capabilities([AgentToolCapability::ObserveEnvironment])
+        .with_input_schema(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Optional case-insensitive query over skill ids, descriptions, source modules, paths, target agents, model families, tags, and capabilities."
+                },
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum results to return. Defaults to 20."
+                }
+            }
+        })),
+        AgentToolDescriptor::new(AgentToolSpec::new(
+            AgentToolKind::SkillDescribe,
+            "skill_describe",
+            "Return a full skill descriptor, including embedded skill text when the package/module declared it inline.",
+            false,
+        ))
+        .with_capabilities([AgentToolCapability::ObserveEnvironment])
+        .with_input_schema(serde_json::json!({
+            "type": "object",
+            "required": ["skill"],
+            "properties": {
+                "skill": {
+                    "type": "string",
+                    "description": "Skill id to describe."
+                }
+            }
+        })),
+        AgentToolDescriptor::new(AgentToolSpec::new(
+            AgentToolKind::SkillActivate,
+            "skill_activate",
+            "Request activation of a disclosed skill through a host-provided runtime executor. The generic agent bridge reports blocked until such an executor is attached.",
+            true,
+        ))
+        .with_capabilities([AgentToolCapability::ObserveEnvironment])
+        .with_input_schema(serde_json::json!({
+            "type": "object",
+            "required": ["skill"],
+            "properties": {
+                "skill": {
+                    "type": "string",
+                    "description": "Skill id to activate."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Short reason why this skill should be activated."
+                }
+            }
+        })),
     ]
 }
 
 pub fn is_tool_disclosure_bridge_name(tool_name: &str) -> bool {
-    matches!(tool_name, "tool_search" | "tool_describe" | "tool_call")
+    matches!(
+        tool_name,
+        "tool_search"
+            | "tool_describe"
+            | "tool_call"
+            | "skill_search"
+            | "skill_describe"
+            | "skill_activate"
+    )
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentSkillDescriptor {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    pub source: AgentSkillSource,
+    #[serde(default)]
+    pub package_declared: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_agents: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_families: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activation_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedded_text: Option<String>,
+}
+
+impl AgentSkillDescriptor {
+    pub fn package(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            description: String::new(),
+            source: AgentSkillSource::Package,
+            package_declared: true,
+            module_id: None,
+            module_version: None,
+            path: None,
+            target_agents: Vec::new(),
+            model_families: Vec::new(),
+            activation_tags: Vec::new(),
+            required_capabilities: Vec::new(),
+            embedded_text: None,
+        }
+    }
+
+    fn from_module_resource(
+        registration: &ModuleRegistration,
+        resource: &ModuleDeclarativeResourceExport,
+        package_declared: bool,
+    ) -> Self {
+        Self {
+            id: resource.id.clone(),
+            description: resource.description.clone(),
+            source: AgentSkillSource::Module,
+            package_declared,
+            module_id: Some(registration.module_id().as_str().to_string()),
+            module_version: Some(registration.manifest.version.clone()),
+            path: Some(resource.path.clone()),
+            target_agents: resource.target_agents.clone(),
+            model_families: resource.model_families.clone(),
+            activation_tags: resource.activation_tags.clone(),
+            required_capabilities: resource
+                .required_capabilities
+                .iter()
+                .map(|capability| capability.as_str().to_string())
+                .collect(),
+            embedded_text: resource.embedded_text.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentSkillSource {
+    Package,
+    Module,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentSkillPlan {
+    pub skills: Vec<AgentSkillDescriptor>,
+}
+
+impl AgentSkillPlan {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_package_and_modules(
+        package_skills: impl IntoIterator<Item = impl Into<String>>,
+        module_projection: &AgentModuleToolProjection,
+        agent_keys: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        let mut descriptors = BTreeMap::<String, AgentSkillDescriptor>::new();
+        let package_skill_ids = package_skills
+            .into_iter()
+            .map(Into::into)
+            .filter(|skill: &String| !skill.trim().is_empty())
+            .collect::<BTreeSet<_>>();
+        for skill in &package_skill_ids {
+            descriptors.insert(skill.clone(), AgentSkillDescriptor::package(skill.clone()));
+        }
+        let agent_keys = agent_keys
+            .into_iter()
+            .map(Into::into)
+            .collect::<BTreeSet<_>>();
+        for registration in &module_projection.registrations {
+            for resource in &registration.surfaces.declarative_resources {
+                if resource.kind != ModuleDeclarativeResourceKind::Skill {
+                    continue;
+                }
+                if !resource_matches_agent(resource, &agent_keys)
+                    && !package_skill_ids.contains(&resource.id)
+                {
+                    continue;
+                }
+                descriptors.insert(
+                    resource.id.clone(),
+                    AgentSkillDescriptor::from_module_resource(
+                        registration,
+                        resource,
+                        package_skill_ids.contains(&resource.id),
+                    ),
+                );
+            }
+        }
+        Self {
+            skills: descriptors.into_values().collect(),
+        }
+    }
+
+    pub fn get(&self, skill_id: &str) -> Option<&AgentSkillDescriptor> {
+        self.skills.iter().find(|skill| skill.id == skill_id)
+    }
+
+    pub fn matching(&self, query: Option<&str>) -> Vec<&AgentSkillDescriptor> {
+        let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) else {
+            return self.skills.iter().collect();
+        };
+        let query = query.to_ascii_lowercase();
+        self.skills
+            .iter()
+            .filter(|skill| skill_matches_query(skill, &query))
+            .collect()
+    }
+}
+
+fn resource_matches_agent(
+    resource: &ModuleDeclarativeResourceExport,
+    agent_keys: &BTreeSet<String>,
+) -> bool {
+    resource.target_agents.is_empty()
+        || resource
+            .target_agents
+            .iter()
+            .any(|target_agent| agent_keys.contains(target_agent))
+}
+
+fn skill_matches_query(skill: &AgentSkillDescriptor, query: &str) -> bool {
+    skill.id.to_ascii_lowercase().contains(query)
+        || skill.description.to_ascii_lowercase().contains(query)
+        || skill
+            .module_id
+            .as_deref()
+            .is_some_and(|module_id| module_id.to_ascii_lowercase().contains(query))
+        || skill
+            .path
+            .as_deref()
+            .is_some_and(|path| path.to_ascii_lowercase().contains(query))
+        || skill
+            .target_agents
+            .iter()
+            .any(|value| value.to_ascii_lowercase().contains(query))
+        || skill
+            .model_families
+            .iter()
+            .any(|value| value.to_ascii_lowercase().contains(query))
+        || skill
+            .activation_tags
+            .iter()
+            .any(|value| value.to_ascii_lowercase().contains(query))
+        || skill
+            .required_capabilities
+            .iter()
+            .any(|value| value.to_ascii_lowercase().contains(query))
 }
 
 fn descriptor_matches_query(descriptor: &AgentToolDescriptor, query: &str) -> bool {
@@ -365,7 +659,7 @@ fn descriptor_matches_query(descriptor: &AgentToolDescriptor, query: &str) -> bo
         || descriptor
             .capabilities
             .iter()
-            .any(|capability| capability.policy_label().contains(query))
+            .any(|capability| capability.availability_label().contains(query))
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -579,7 +873,7 @@ pub enum AgentToolCapability {
 }
 
 impl AgentToolCapability {
-    pub(crate) fn policy_label(&self) -> &'static str {
+    pub(crate) fn availability_label(&self) -> &'static str {
         match self {
             AgentToolCapability::ReadWorkspace => "read_workspace",
             AgentToolCapability::WriteWorkspace => "write_workspace",
@@ -615,7 +909,8 @@ pub struct AgentToolOutcome {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentToolEvidence {
-    pub policy: AgentToolPolicyDecision,
+    #[serde(default, alias = "policy")]
+    pub availability: AgentToolAvailabilityDecision,
     #[serde(default)]
     pub output: AgentToolOutputEvidence,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -761,9 +1056,9 @@ impl Default for AgentCodingToolEvidence {
 }
 
 impl AgentToolEvidence {
-    pub fn policy_only(allowed: bool, reason: impl Into<String>) -> Self {
+    pub fn availability_only(allowed: bool, reason: impl Into<String>) -> Self {
         Self {
-            policy: AgentToolPolicyDecision {
+            availability: AgentToolAvailabilityDecision {
                 allowed,
                 reason: reason.into(),
             },
@@ -773,6 +1068,11 @@ impl AgentToolEvidence {
             records: Vec::new(),
             metadata: serde_json::Value::Null,
         }
+    }
+
+    #[deprecated(note = "use availability_only")]
+    pub fn policy_only(allowed: bool, reason: impl Into<String>) -> Self {
+        Self::availability_only(allowed, reason)
     }
 
     pub fn with_output(mut self, visible_bytes: usize, truncated: bool) -> Self {
@@ -845,15 +1145,28 @@ impl AgentToolEvidence {
 
 impl Default for AgentToolEvidence {
     fn default() -> Self {
-        Self::policy_only(true, "allowed by registered agent tool policy")
+        Self::availability_only(true, "available through registered agent tool surface")
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct AgentToolPolicyDecision {
+pub struct AgentToolAvailabilityDecision {
     pub allowed: bool,
     pub reason: String,
 }
+
+impl Default for AgentToolAvailabilityDecision {
+    fn default() -> Self {
+        Self {
+            allowed: true,
+            reason: "available through registered agent tool surface".to_string(),
+        }
+    }
+}
+
+/// Backward-compatible name for a tool availability decision.
+#[deprecated(note = "use AgentToolAvailabilityDecision")]
+pub type AgentToolPolicyDecision = AgentToolAvailabilityDecision;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]

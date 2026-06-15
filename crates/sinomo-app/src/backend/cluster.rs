@@ -5,6 +5,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+pub use sinomo_cli::app_api::{AppClusterInvite, AppClusterStatus};
 use sinomo_runtime::core::{ClusterEndpointPrivacy, ClusterNodeAvailability};
 use sinomo_runtime::network::{
     self, ClusterConnectivityRecord, ClusterConnectivityState, ClusterHealthRow, ClusterPaths,
@@ -75,6 +76,29 @@ pub struct ClusterLinkInfo {
 }
 
 impl Backend {
+    pub fn app_cluster_status(&self) -> AppClusterStatus {
+        sinomo_cli::app_api::cluster_status(self.data_dir.as_ref())
+    }
+
+    pub fn create_cluster_invite(&self) -> Result<AppClusterInvite, String> {
+        sinomo_cli::app_api::create_cluster_invite(self.data_dir.as_ref())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn join_cluster(&self, invite: &str) -> Result<AppClusterStatus, String> {
+        sinomo_cli::app_api::join_cluster(
+            self.data_dir.as_ref(),
+            invite,
+            self.node.display_name.as_str(),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn leave_cluster(&self) -> Result<AppClusterStatus, String> {
+        sinomo_cli::app_api::leave_cluster(self.data_dir.as_ref())
+            .map_err(|error| error.to_string())
+    }
+
     pub fn cluster_snapshot(&self) -> ClusterSnapshot {
         let observed_at = OffsetDateTime::now_utc();
         let paths = ClusterPaths::new(self.data_dir.as_ref());

@@ -8,7 +8,11 @@
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
-use sinomo_cli::app_api::{AgentChat, ChatHistoryMessage, ChatRuntimeInfo, ChatStreamEvent};
+use sinomo_agent::AgentRuntimeControlRegistry;
+use sinomo_cli::app_api::{
+    AgentChat, ChatControlState, ChatControlStatus, ChatHistoryMessage, ChatRuntimeInfo,
+    ChatStreamEvent,
+};
 use sinomo_runtime::local::SinomoDataDir;
 
 /// Who authored a chat message.
@@ -44,6 +48,10 @@ impl From<ChatRuntimeInfo> for RuntimeInfo {
 #[derive(Clone, Debug)]
 pub enum ChatCommand {
     Send(String),
+    Steer(String),
+    FollowUp(String),
+    Interrupt(String),
+    ControlState,
     NewSession,
     Resume {
         session_id: String,
@@ -73,6 +81,8 @@ pub enum ChatEvent {
     Token(String),
     Notice(String),
     TurnDone,
+    ControlStatus(ChatControlStatus),
+    ControlState(ChatControlState),
     RuntimeInfo(RuntimeInfo),
     SessionReset {
         session_id: String,
@@ -93,12 +103,24 @@ pub struct ChatHandle {
 
 impl ChatHandle {
     /// Spawn the worker. The runtime is built inside the thread.
-    pub fn spawn(data_dir: SinomoDataDir, daemon_connected: bool) -> Self {
+    pub fn spawn(
+        data_dir: SinomoDataDir,
+        daemon_connected: bool,
+        runtime_control_registry: AgentRuntimeControlRegistry,
+    ) -> Self {
         let (cmd_tx, cmd_rx) = channel::<ChatCommand>();
         let (evt_tx, evt_rx) = channel::<ChatEvent>();
         thread::Builder::new()
             .name("sinomo-chat".to_string())
-            .spawn(move || worker(data_dir, daemon_connected, cmd_rx, evt_tx))
+            .spawn(move || {
+                worker(
+                    data_dir,
+                    daemon_connected,
+                    runtime_control_registry,
+                    cmd_rx,
+                    evt_tx,
+                )
+            })
             .expect("spawn chat worker");
         Self {
             tx: cmd_tx,
@@ -125,10 +147,15 @@ impl Drop for ChatHandle {
 fn worker(
     data_dir: SinomoDataDir,
     daemon_connected: bool,
+    runtime_control_registry: AgentRuntimeControlRegistry,
     cmd_rx: Receiver<ChatCommand>,
     evt_tx: Sender<ChatEvent>,
 ) {
-    let mut chat = match AgentChat::new(data_dir, daemon_connected) {
+    let mut chat = match AgentChat::with_runtime_control_registry(
+        data_dir,
+        daemon_connected,
+        runtime_control_registry,
+    ) {
         Ok(chat) => chat,
         Err(error) => {
             let _ = evt_tx.send(ChatEvent::Error(format!("chat unavailable: {error}")));
@@ -162,6 +189,38 @@ fn worker(
                 }
                 let _ = evt_tx.send(ChatEvent::TurnDone);
             }
+            ChatCommand::Steer(message) => match chat.steer(message) {
+                Ok(status) => {
+                    let _ = evt_tx.send(ChatEvent::ControlStatus(status));
+                }
+                Err(error) => {
+                    let _ = evt_tx.send(ChatEvent::Error(format!("steer failed: {error}")));
+                }
+            },
+            ChatCommand::FollowUp(message) => match chat.follow_up(message) {
+                Ok(status) => {
+                    let _ = evt_tx.send(ChatEvent::ControlStatus(status));
+                }
+                Err(error) => {
+                    let _ = evt_tx.send(ChatEvent::Error(format!("follow-up failed: {error}")));
+                }
+            },
+            ChatCommand::Interrupt(reason) => match chat.interrupt(reason) {
+                Ok(status) => {
+                    let _ = evt_tx.send(ChatEvent::ControlStatus(status));
+                }
+                Err(error) => {
+                    let _ = evt_tx.send(ChatEvent::Error(format!("interrupt failed: {error}")));
+                }
+            },
+            ChatCommand::ControlState => match chat.control_state() {
+                Ok(state) => {
+                    let _ = evt_tx.send(ChatEvent::ControlState(state));
+                }
+                Err(error) => {
+                    let _ = evt_tx.send(ChatEvent::Error(format!("control state failed: {error}")));
+                }
+            },
             ChatCommand::NewSession => {
                 chat.reset_session();
                 let _ = evt_tx.send(ChatEvent::SessionReset {
@@ -210,5 +269,105 @@ fn worker(
             }
             ChatCommand::Shutdown => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn chat_worker_routes_runtime_control_commands() {
+        let data_dir = temp_data_dir("chat-worker-control");
+        let runtime_control = AgentRuntimeControlRegistry::new();
+        let handle = ChatHandle::spawn(data_dir, false, runtime_control.clone());
+        let ready = wait_for_event(&handle, |event| matches!(event, ChatEvent::Ready { .. }))
+            .expect("ready event");
+        let ChatEvent::Ready { session_id, .. } = ready else {
+            unreachable!("matched ready");
+        };
+        assert_eq!(
+            runtime_control
+                .session_count()
+                .expect("runtime control session count"),
+            1
+        );
+
+        handle.send_command(ChatCommand::ControlState);
+        let initial = wait_for_event(&handle, |event| {
+            matches!(event, ChatEvent::ControlState(state) if state.session_id == session_id)
+        })
+        .expect("initial control state");
+        assert!(matches!(
+            initial,
+            ChatEvent::ControlState(state)
+                if state.steering_count == 0 && state.follow_up_count == 0
+        ));
+
+        handle.send_command(ChatCommand::Steer("keep this constraint".to_string()));
+        let steer = wait_for_event(&handle, |event| {
+            matches!(event, ChatEvent::ControlStatus(status) if status.session_id == session_id)
+        })
+        .expect("steer status");
+        assert!(matches!(
+            steer,
+            ChatEvent::ControlStatus(status) if status.accepted
+        ));
+
+        handle.send_command(ChatCommand::FollowUp("also mention tests".to_string()));
+        let follow_up = wait_for_event(&handle, |event| {
+            matches!(event, ChatEvent::ControlStatus(status) if status.session_id == session_id)
+        })
+        .expect("follow-up status");
+        assert!(matches!(
+            follow_up,
+            ChatEvent::ControlStatus(status) if status.accepted
+        ));
+
+        handle.send_command(ChatCommand::ControlState);
+        let state = wait_for_event(&handle, |event| {
+            matches!(
+                event,
+                ChatEvent::ControlState(state)
+                    if state.session_id == session_id
+                        && state.steering_count == 1
+                        && state.follow_up_count == 1
+            )
+        })
+        .expect("updated control state");
+        assert!(matches!(state, ChatEvent::ControlState(_)));
+    }
+
+    fn wait_for_event(
+        handle: &ChatHandle,
+        matches: impl Fn(&ChatEvent) -> bool,
+    ) -> Option<ChatEvent> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            for event in handle.drain() {
+                if matches(&event) {
+                    return Some(event);
+                }
+                if let ChatEvent::Error(error) = &event {
+                    panic!("chat worker error: {error}");
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        None
+    }
+
+    fn temp_data_dir(slug: &str) -> SinomoDataDir {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "sinomo-app-{slug}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create temp data dir");
+        SinomoDataDir::new(path)
     }
 }

@@ -358,7 +358,11 @@ fn open_chat_provider_select(window: &sui_testing::TestWindow) -> sui::Rect {
         Some(true),
         "provider Select must be expanded before dropdown capture"
     );
-    provider.bounds
+    let provider_bounds = provider.bounds;
+    window
+        .advance_time(sui::DefaultTheme::default().motion.entrance_duration() + 0.01)
+        .expect("settle provider select entrance animation");
+    provider_bounds
 }
 
 /// Deterministic captures for the rebuilt (composed) Files tab: the root listing + empty inspector
@@ -648,20 +652,22 @@ fn capture_connecting_then_ready() {
 #[test]
 fn shell_tabbar_switches_tab_and_relayouts_content() {
     use sinomo_app::state::Tab;
+    use sui::SemanticsRole;
 
     let shared = boot(Tab::Sinomo);
     let runtime = build_runtime(shared.clone()).expect("build runtime");
     let app = TestApp::from_runtime(runtime).expect("headless test app");
     let window = app.main_window().expect("main window");
-    let root = window.root();
     app.run_until_idle().expect("settle initial layout");
     assert_eq!(shared.active_tab(), Tab::Sinomo, "starts on the Sinomo tab");
 
     let before = window.capture_screenshot().expect("capture before");
 
-    // Click the "Settings" tab in the composed TabBar strip. The strip starts at ~x=138 in the
-    // title bar; tabs are ~96px wide (Sinomo, Files, Settings), so Settings sits near x=340, y=22.
-    click_at(&root, 360.0, 22.0);
+    window
+        .get_by_role(SemanticsRole::TabBar)
+        .with_name("shell-tabs")
+        .press("End")
+        .expect("activate Settings tab");
     app.run_until_idle().expect("settle tab switch");
 
     assert_eq!(

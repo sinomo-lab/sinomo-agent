@@ -467,6 +467,13 @@ pub struct SandboxRunProcessPlanRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SandboxRunCancelResponse {
+    pub operation_id: String,
+    pub cancelled: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum SandboxRunToolchainStreamFrame {
     Output { chunk: SandboxOutputChunk },

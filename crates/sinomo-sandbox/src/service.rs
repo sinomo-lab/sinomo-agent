@@ -8,17 +8,22 @@
 //! host-specific networking, so it cannot be constructed inside this crate; the daemon
 //! supplies it through the factory.)
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
-use crate::{LocalSandboxBackend, SandboxBackend, SandboxBackendError};
+use crate::{
+    LocalSandboxBackend, SandboxBackend, SandboxBackendError, SandboxCancellationToken,
+    SandboxRunCancelResponse,
+};
 use sinomo_network::{
-    ObjectRpcRequest, ObjectRpcResponse, SANDBOX_CHECKPOINT_ROUTE, SANDBOX_CREATE_ROUTE,
-    SANDBOX_DESTROY_ROUTE, SANDBOX_HTTP_FETCH_ROUTE, SANDBOX_HTTP_FETCH_TO_FILE_ROUTE,
-    SANDBOX_IMPORT_BUSYBOX_ROUTE, SANDBOX_LIST_ROUTE, SANDBOX_READ_ROUTE, SANDBOX_REBOOT_ROUTE,
-    SANDBOX_RESUME_ROUTE, SANDBOX_RUN_PROCESS_PLAN_ROUTE, SANDBOX_RUN_TOOLCHAIN_ROUTE,
-    SANDBOX_STATUS_ROUTE, SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE,
-    SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE, SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE,
-    SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE, SANDBOX_UPDATE_ROUTE, SANDBOX_WRITE_ROUTE,
+    ObjectRpcCancelRequest, ObjectRpcRequest, ObjectRpcResponse, SANDBOX_CHECKPOINT_ROUTE,
+    SANDBOX_CREATE_ROUTE, SANDBOX_DESTROY_ROUTE, SANDBOX_HTTP_FETCH_ROUTE,
+    SANDBOX_HTTP_FETCH_TO_FILE_ROUTE, SANDBOX_IMPORT_BUSYBOX_ROUTE, SANDBOX_LIST_ROUTE,
+    SANDBOX_READ_ROUTE, SANDBOX_REBOOT_ROUTE, SANDBOX_RESUME_ROUTE, SANDBOX_RUN_CANCEL_ROUTE,
+    SANDBOX_RUN_PROCESS_PLAN_ROUTE, SANDBOX_RUN_TOOLCHAIN_ROUTE, SANDBOX_STATUS_ROUTE,
+    SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE, SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE,
+    SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE, SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE,
+    SANDBOX_UPDATE_ROUTE, SANDBOX_WRITE_ROUTE,
 };
 
 use sinomo_service::{
@@ -57,11 +62,15 @@ impl SandboxBackendFactory for LocalSandboxBackendFactory {
 /// decoded request to it.
 pub struct SandboxService {
     factory: Arc<dyn SandboxBackendFactory>,
+    active_run_cancellations: Arc<Mutex<BTreeMap<String, SandboxCancellationToken>>>,
 }
 
 impl SandboxService {
     pub fn new(factory: Arc<dyn SandboxBackendFactory>) -> Self {
-        Self { factory }
+        Self {
+            factory,
+            active_run_cancellations: Arc::new(Mutex::new(BTreeMap::new())),
+        }
     }
 }
 
@@ -79,6 +88,7 @@ pub fn register_services_with_factory(
 fn dispatch_sandbox_backend_request(
     backend: &mut dyn SandboxBackend,
     request: ObjectRpcRequest,
+    active_run_cancellations: &Arc<Mutex<BTreeMap<String, SandboxCancellationToken>>>,
 ) -> Result<ObjectRpcResponse, ServiceError> {
     let response = match request.route.as_str() {
         SANDBOX_CREATE_ROUTE => {
@@ -168,22 +178,109 @@ fn dispatch_sandbox_backend_request(
             )?
         }
         SANDBOX_RUN_TOOLCHAIN_ROUTE => {
+            let operation_id = request.operation_id().map(str::to_string);
             let payload = request.decode_body()?;
-            ObjectRpcResponse::encode_body(
-                SANDBOX_RUN_TOOLCHAIN_ROUTE,
-                &backend.run_toolchain(payload)?,
-            )?
+            let cancellation_token = register_sandbox_run_cancellation(
+                active_run_cancellations,
+                operation_id.as_deref(),
+            )?;
+            let result =
+                backend.run_toolchain_with_cancellation(payload, cancellation_token.clone());
+            unregister_sandbox_run_cancellation(active_run_cancellations, operation_id.as_deref());
+            ObjectRpcResponse::encode_body(SANDBOX_RUN_TOOLCHAIN_ROUTE, &result?)?
         }
         SANDBOX_RUN_PROCESS_PLAN_ROUTE => {
+            let operation_id = request.operation_id().map(str::to_string);
             let payload = request.decode_body()?;
-            ObjectRpcResponse::encode_body(
-                SANDBOX_RUN_PROCESS_PLAN_ROUTE,
-                &backend.run_process_plan(payload)?,
-            )?
+            let cancellation_token = register_sandbox_run_cancellation(
+                active_run_cancellations,
+                operation_id.as_deref(),
+            )?;
+            let result =
+                backend.run_process_plan_with_cancellation(payload, cancellation_token.clone());
+            unregister_sandbox_run_cancellation(active_run_cancellations, operation_id.as_deref());
+            ObjectRpcResponse::encode_body(SANDBOX_RUN_PROCESS_PLAN_ROUTE, &result?)?
         }
         other => return Err(ServiceError::UnknownRoute(other.to_string())),
     };
     Ok(response)
+}
+
+fn register_sandbox_run_cancellation(
+    active_run_cancellations: &Arc<Mutex<BTreeMap<String, SandboxCancellationToken>>>,
+    operation_id: Option<&str>,
+) -> Result<SandboxCancellationToken, ServiceError> {
+    let token = SandboxCancellationToken::new();
+    let Some(operation_id) = operation_id else {
+        return Ok(token);
+    };
+    let mut active = active_run_cancellations.lock().map_err(|_| {
+        ServiceError::Service("sandbox cancellation registry lock failed".to_string())
+    })?;
+    if active.contains_key(operation_id) {
+        return Err(ServiceError::Service(format!(
+            "sandbox run operation `{operation_id}` is already active"
+        )));
+    }
+    active.insert(operation_id.to_string(), token.clone());
+    Ok(token)
+}
+
+fn unregister_sandbox_run_cancellation(
+    active_run_cancellations: &Arc<Mutex<BTreeMap<String, SandboxCancellationToken>>>,
+    operation_id: Option<&str>,
+) {
+    let Some(operation_id) = operation_id else {
+        return;
+    };
+    if let Ok(mut active) = active_run_cancellations.lock() {
+        active.remove(operation_id);
+    }
+}
+
+fn dispatch_sandbox_run_cancel_request(
+    active_run_cancellations: &Arc<Mutex<BTreeMap<String, SandboxCancellationToken>>>,
+    request: ObjectRpcRequest,
+) -> Result<ObjectRpcResponse, ServiceError> {
+    let payload: ObjectRpcCancelRequest = request.decode_body()?;
+    let operation_id = payload.operation_id;
+    let metadata_operation_id = request.cancels_operation_id().map(str::to_string);
+    if metadata_operation_id
+        .as_deref()
+        .is_some_and(|metadata| metadata != operation_id)
+    {
+        return ObjectRpcResponse::encode_body(
+            SANDBOX_RUN_CANCEL_ROUTE,
+            &SandboxRunCancelResponse {
+                operation_id,
+                cancelled: false,
+                detail: "cancel metadata operation id does not match request body".to_string(),
+            },
+        )
+        .map_err(ServiceError::from);
+    }
+    let token = active_run_cancellations
+        .lock()
+        .map_err(|_| {
+            ServiceError::Service("sandbox cancellation registry lock failed".to_string())
+        })?
+        .get(&operation_id)
+        .cloned();
+    let (cancelled, detail) = if let Some(token) = token {
+        token.cancel();
+        (true, payload.reason)
+    } else {
+        (false, "sandbox run operation is not active".to_string())
+    };
+    ObjectRpcResponse::encode_body(
+        SANDBOX_RUN_CANCEL_ROUTE,
+        &SandboxRunCancelResponse {
+            operation_id,
+            cancelled,
+            detail,
+        },
+    )
+    .map_err(ServiceError::from)
 }
 
 impl Service for SandboxService {
@@ -212,6 +309,7 @@ impl Service for SandboxService {
             SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE,
             SANDBOX_RUN_TOOLCHAIN_ROUTE,
             SANDBOX_RUN_PROCESS_PLAN_ROUTE,
+            SANDBOX_RUN_CANCEL_ROUTE,
         ]
     }
 
@@ -225,10 +323,22 @@ impl Service for SandboxService {
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         let factory = Arc::clone(&self.factory);
+        let active_run_cancellations = Arc::clone(&self.active_run_cancellations);
         Box::pin(async move {
+            if request.route == SANDBOX_RUN_CANCEL_ROUTE {
+                let response =
+                    dispatch_sandbox_run_cancel_request(&active_run_cancellations, request)?;
+                ctx.respond(response)?;
+                return Ok(ServiceDisposition::Continue);
+            }
             let mut backend = factory.open(&ctx)?;
+            let active_run_cancellations_for_task = Arc::clone(&active_run_cancellations);
             let response = tokio::task::spawn_blocking(move || {
-                dispatch_sandbox_backend_request(backend.as_mut(), request)
+                dispatch_sandbox_backend_request(
+                    backend.as_mut(),
+                    request,
+                    &active_run_cancellations_for_task,
+                )
             })
             .await
             .map_err(|source| {
@@ -243,7 +353,13 @@ impl Service for SandboxService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        SANDBOX_UNLIMITED_WALL_TIME_MS, SandboxContainerBackendConfig, SandboxContainerRuntime,
+        SandboxCreateInstanceRequest, SandboxId, SandboxRunToolchainRequest, SandboxTempPolicy,
+        SandboxToolchainId,
+    };
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
 
     use sinomo_local::SinomoDataDir;
 
@@ -278,12 +394,25 @@ mod tests {
         }
     }
 
+    struct FakeContainerFactory {
+        config: SandboxContainerBackendConfig,
+    }
+
+    impl SandboxBackendFactory for FakeContainerFactory {
+        fn open(&self, ctx: &ServiceContext) -> Result<Box<dyn SandboxBackend>, ServiceError> {
+            Ok(Box::new(
+                LocalSandboxBackend::new(ctx.data_dir.root().join("sandbox").join("runtime"))
+                    .with_container_config(self.config.clone()),
+            ))
+        }
+    }
+
     #[test]
     fn reports_its_routes() {
         let service = SandboxService::new(Arc::new(UnavailableFactory));
         assert_eq!(service.name(), "sandbox");
         assert!(service.routes().contains(&SANDBOX_STATUS_ROUTE));
-        assert_eq!(service.routes().len(), 19);
+        assert_eq!(service.routes().len(), 20);
         let routes = service.route_categories();
         assert_eq!(routes.len(), service.routes().len());
         assert!(
@@ -314,5 +443,151 @@ mod tests {
         assert!(
             matches!(error, ServiceError::NotClustered(route) if route == SANDBOX_STATUS_ROUTE)
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_cancel_route_cancels_active_container_execution() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = sinomo_testdir::TestDir::new("sinomo-sandbox-service-cancel");
+        let fake_runtime = dir.join("fake-container-runtime.sh");
+        let started_marker = dir.join("container-started");
+        let cancel_marker = dir.join("container-cancelled");
+        std::fs::write(
+            &fake_runtime,
+            format!(
+                r#"#!/bin/sh
+started='{}'
+cancelled='{}'
+if [ "$1" = "rm" ]; then
+  touch "$cancelled"
+  exit 0
+fi
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    fake-image) shift; break ;;
+    --name|--network|--cap-drop|--security-opt|--memory|--stop-timeout|--volume|--workdir|--env) shift 2 ;;
+    --rm|--pull=never|--read-only|-i) shift ;;
+    *) shift ;;
+  esac
+done
+touch "$started"
+while [ ! -f "$cancelled" ]; do
+  sleep 0.05
+done
+exit 0
+"#,
+                started_marker.display(),
+                cancel_marker.display()
+            ),
+        )
+        .expect("write fake runtime");
+        let mut permissions = std::fs::metadata(&fake_runtime)
+            .expect("metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_runtime, permissions).expect("permissions");
+
+        let config = SandboxContainerBackendConfig::new(
+            SandboxContainerRuntime::Command(fake_runtime),
+            "fake-image",
+        )
+        .expect("container config");
+        let registry = register_services_with_factory(
+            ServiceRegistry::builder(),
+            Arc::new(FakeContainerFactory { config }),
+        )
+        .build();
+        let sandbox_id = SandboxId::from_legacy_named("sandbox_service_cancel").expect("sandbox");
+        let create = SandboxCreateInstanceRequest {
+            sandbox_id: Some(sandbox_id.clone()),
+            toolchain_id: SandboxToolchainId::from_legacy_named("toolchain_cancel")
+                .expect("toolchain"),
+            temp_policy: SandboxTempPolicy::RetainAcrossSessions,
+            memory_mb: None,
+            wall_time_ms: None,
+            max_input_bytes: None,
+            max_output_bytes: None,
+            max_workspace_bytes: None,
+            max_written_bytes_per_command: None,
+            max_file_count: None,
+            mounts: Vec::new(),
+        };
+        let create_request =
+            ObjectRpcRequest::encode_body(SANDBOX_CREATE_ROUTE, "sandbox", &create)
+                .expect("create request");
+        registry
+            .dispatch(
+                local_context(&dir, CollectingSink::default()),
+                create_request,
+            )
+            .await
+            .expect("create sandbox");
+
+        let operation_id = "sandbox_run_cancel_route_op";
+        let run = SandboxRunToolchainRequest {
+            sandbox_id,
+            command_name: "sh".to_string(),
+            argv: vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+            stdin: None,
+            timeout_ms: SANDBOX_UNLIMITED_WALL_TIME_MS,
+        };
+        let run_request =
+            ObjectRpcRequest::encode_body(SANDBOX_RUN_TOOLCHAIN_ROUTE, "sandbox", &run)
+                .expect("run request")
+                .with_operation_id(operation_id);
+        let run_registry = registry.clone();
+        let run_dir = dir.to_path_buf();
+        let run_handle = tokio::spawn(async move {
+            run_registry
+                .dispatch(
+                    local_context(&run_dir, CollectingSink::default()),
+                    run_request,
+                )
+                .await
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !started_marker.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "fake runtime did not start before deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let cancel_sink = CollectingSink::default();
+        let cancel_frames = Arc::clone(&cancel_sink.frames);
+        let cancel_request = ObjectRpcRequest::encode_body(
+            SANDBOX_RUN_CANCEL_ROUTE,
+            "sandbox",
+            &ObjectRpcCancelRequest::new(operation_id, "readiness cancel"),
+        )
+        .expect("cancel request")
+        .with_cancels_operation_id(operation_id);
+        registry
+            .dispatch(local_context(&dir, cancel_sink), cancel_request)
+            .await
+            .expect("cancel route");
+        let cancel_response: SandboxRunCancelResponse = cancel_frames
+            .lock()
+            .expect("cancel frames")
+            .first()
+            .expect("cancel response")
+            .decode_body()
+            .expect("cancel response body");
+        assert_eq!(cancel_response.operation_id, operation_id);
+        assert!(cancel_response.cancelled);
+
+        let run_error = run_handle
+            .await
+            .expect("run task")
+            .expect_err("run should be cancelled");
+        assert!(
+            run_error.to_string().contains("cancelled"),
+            "unexpected run error: {run_error}"
+        );
+        assert!(cancel_marker.exists());
     }
 }

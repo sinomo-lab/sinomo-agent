@@ -118,6 +118,11 @@ pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
     })
 }
 
+pub(crate) fn prefers_native_tool_protocol(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("gpt") || model.starts_with('o')
+}
+
 impl LanguageModelProvider for OpenAiProvider {
     fn info(&self) -> LanguageModelProviderInfo {
         LanguageModelProviderInfo {
@@ -873,5 +878,12 @@ mod tests {
         assert_eq!(info.provider, OpenAiProvider::PROVIDER_ID);
         assert_eq!(info.invocation, LanguageModelInvocation::Http);
         assert!(info.supports_json_object);
+    }
+
+    #[test]
+    fn native_tool_protocol_preference_uses_openai_model_family() {
+        assert!(prefers_native_tool_protocol("gpt-5.2-codex"));
+        assert!(prefers_native_tool_protocol("o3"));
+        assert!(!prefers_native_tool_protocol("gemini-2.5-pro"));
     }
 }

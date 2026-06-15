@@ -5,6 +5,7 @@ mod cli_runtime;
 mod engine;
 pub mod module_evidence;
 pub mod persistence;
+mod test_cases;
 pub mod tools;
 mod types;
 
@@ -13,6 +14,7 @@ pub use cli_runtime::*;
 pub use engine::*;
 pub use module_evidence::*;
 pub use persistence::*;
+pub use test_cases::register_evolution_test_cases;
 pub use tools::*;
 pub use types::*;
 

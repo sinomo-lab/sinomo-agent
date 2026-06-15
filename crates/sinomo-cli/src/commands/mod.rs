@@ -9,6 +9,7 @@ mod models;
 mod rollout;
 mod support;
 mod test;
+mod test_cases_agent;
 mod test_cases_dfs;
 
 pub(crate) use cluster::*;

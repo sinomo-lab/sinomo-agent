@@ -15,7 +15,7 @@ use sinomo_runtime::events::{
     EntityId, EventId, EventStore, ReplayDirection, ReplayQuery, SessionId, StoredEvent,
 };
 use sinomo_runtime::node::NodeId;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,12 +25,16 @@ use thiserror::Error;
 mod agent;
 mod compaction;
 mod process;
+mod readiness;
+mod service;
 mod session_store;
 pub mod tools;
 
 pub use agent::*;
 pub use compaction::*;
 pub use process::*;
+pub use readiness::*;
+pub use service::*;
 pub use session_store::*;
 pub use tools::*;
 
@@ -117,6 +121,9 @@ pub enum AgentToolKind {
     ToolSearch,
     ToolDescribe,
     ToolCall,
+    SkillSearch,
+    SkillDescribe,
+    SkillActivate,
     ModuleObjectRpc,
     ReadSifs,
     WriteSifs,
@@ -158,6 +165,8 @@ impl AgentOutputFormat {
 pub struct AgentDefinition {
     #[serde(default = "default_agent_definition_schema_version")]
     pub schema_version: u32,
+    #[serde(default)]
+    pub package: AgentPackageDefinition,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub id: String,
     pub name: String,
@@ -172,6 +181,8 @@ pub struct AgentDefinition {
         skip_serializing_if = "AgentToolSurfaceDefinition::is_default"
     )]
     pub tool_surface: AgentToolSurfaceDefinition,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
     #[serde(default)]
     pub context: AgentContextDefinition,
     #[serde(default)]
@@ -192,11 +203,112 @@ pub struct AgentDefinition {
 }
 
 pub const AGENT_DEFINITION_SCHEMA_VERSION: u32 = 1;
+pub const AGENT_PACKAGE_VERSION: &str = "1.0.0";
 pub const DEFAULT_AGENT_CONTEXT_PIPELINE_ID: &str = "context.pipeline.default";
 pub const DEFAULT_AGENT_COMPACTION_STRATEGY_ID: &str = "compaction.strategy.default";
 
 fn default_agent_definition_schema_version() -> u32 {
     AGENT_DEFINITION_SCHEMA_VERSION
+}
+
+fn default_agent_package_version() -> String {
+    AGENT_PACKAGE_VERSION.to_string()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentPackageDefinition {
+    #[serde(default = "default_agent_package_version")]
+    pub version: String,
+    #[serde(default)]
+    pub provenance: AgentPackageProvenance,
+}
+
+impl Default for AgentPackageDefinition {
+    fn default() -> Self {
+        Self::local()
+    }
+}
+
+impl AgentPackageDefinition {
+    pub fn built_in() -> Self {
+        Self {
+            version: AGENT_PACKAGE_VERSION.to_string(),
+            provenance: AgentPackageProvenance::built_in(),
+        }
+    }
+
+    pub fn local() -> Self {
+        Self {
+            version: AGENT_PACKAGE_VERSION.to_string(),
+            provenance: AgentPackageProvenance::local(),
+        }
+    }
+
+    pub fn from_module(module_id: impl Into<String>, module_version: impl Into<String>) -> Self {
+        let module_version = module_version.into();
+        Self {
+            version: module_version.clone(),
+            provenance: AgentPackageProvenance::module(module_id, module_version),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentPackageProvenance {
+    #[serde(default)]
+    pub source: AgentPackageSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+}
+
+impl AgentPackageProvenance {
+    pub fn built_in() -> Self {
+        Self {
+            source: AgentPackageSource::BuiltIn,
+            ..Self::default()
+        }
+    }
+
+    pub fn local() -> Self {
+        Self {
+            source: AgentPackageSource::Local,
+            ..Self::default()
+        }
+    }
+
+    pub fn module(module_id: impl Into<String>, module_version: impl Into<String>) -> Self {
+        Self {
+            source: AgentPackageSource::Module,
+            module_id: Some(module_id.into()),
+            module_version: Some(module_version.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn imported(path: impl Into<String>) -> Self {
+        Self {
+            source: AgentPackageSource::Imported,
+            path: Some(path.into()),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentPackageSource {
+    BuiltIn,
+    Local,
+    Module,
+    Imported,
+    #[default]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -391,6 +503,7 @@ impl AgentDefinition {
         let name = name.into();
         Self {
             schema_version: AGENT_DEFINITION_SCHEMA_VERSION,
+            package: AgentPackageDefinition::local(),
             id: name.clone(),
             name,
             description: String::new(),
@@ -398,6 +511,7 @@ impl AgentDefinition {
             system_prompt: system_prompt.into(),
             tools: Vec::new(),
             tool_surface: AgentToolSurfaceDefinition::default(),
+            skills: Vec::new(),
             context: AgentContextDefinition::default(),
             compaction: AgentCompactionDefinition::default(),
             model_policy: AgentModelPolicy::default(),
@@ -413,6 +527,7 @@ impl AgentDefinition {
         let max_output_tokens = Some(900);
         Self {
             schema_version: AGENT_DEFINITION_SCHEMA_VERSION,
+            package: AgentPackageDefinition::built_in(),
             id: "main-agent".to_string(),
             name: "main-agent".to_string(),
             description: "user-facing interactive agent".to_string(),
@@ -420,6 +535,7 @@ impl AgentDefinition {
             system_prompt: main_agent_base_prompt().to_string(),
             tools: default_main_agent_tools(),
             tool_surface: AgentToolSurfaceDefinition::default(),
+            skills: Vec::new(),
             context: AgentContextDefinition::default(),
             compaction: AgentCompactionDefinition::default(),
             model_policy: AgentModelPolicy {
@@ -439,6 +555,7 @@ impl AgentDefinition {
         let max_output_tokens = Some(700);
         Self {
             schema_version: AGENT_DEFINITION_SCHEMA_VERSION,
+            package: AgentPackageDefinition::built_in(),
             id: "background-agent".to_string(),
             name: "background-agent".to_string(),
             description: "silent maintenance and cluster-support agent".to_string(),
@@ -446,6 +563,7 @@ impl AgentDefinition {
             system_prompt: background_agent_base_prompt().to_string(),
             tools: default_background_agent_tools(),
             tool_surface: AgentToolSurfaceDefinition::default(),
+            skills: Vec::new(),
             context: AgentContextDefinition::default(),
             compaction: AgentCompactionDefinition::default(),
             model_policy: AgentModelPolicy {
@@ -464,6 +582,7 @@ impl AgentDefinition {
         let temperature = Some(0.2);
         Self {
             schema_version: AGENT_DEFINITION_SCHEMA_VERSION,
+            package: AgentPackageDefinition::built_in(),
             id: "coding-agent".to_string(),
             name: "coding-agent".to_string(),
             description: "workspace coding and verification agent".to_string(),
@@ -471,6 +590,7 @@ impl AgentDefinition {
             system_prompt: coding_agent_base_prompt().to_string(),
             tools: default_coding_agent_tools(),
             tool_surface: AgentToolSurfaceDefinition::default(),
+            skills: Vec::new(),
             context: AgentContextDefinition::default(),
             compaction: AgentCompactionDefinition::default(),
             model_policy: AgentModelPolicy {
@@ -489,6 +609,7 @@ impl AgentDefinition {
         let temperature = Some(0.2);
         Self {
             schema_version: AGENT_DEFINITION_SCHEMA_VERSION,
+            package: AgentPackageDefinition::built_in(),
             id: "evolution-agent".to_string(),
             name: "evolution-agent".to_string(),
             description: "supervised self-evolution mutation agent".to_string(),
@@ -496,6 +617,7 @@ impl AgentDefinition {
             system_prompt: evolution_agent_base_prompt().to_string(),
             tools: default_coding_agent_tools(),
             tool_surface: AgentToolSurfaceDefinition::default(),
+            skills: Vec::new(),
             context: AgentContextDefinition::default(),
             compaction: AgentCompactionDefinition::default(),
             model_policy: AgentModelPolicy {
@@ -529,6 +651,21 @@ impl AgentDefinition {
 
     pub fn with_tool(mut self, tool: AgentToolSpec) -> Self {
         self.tools.push(tool);
+        self
+    }
+
+    pub fn with_skill(mut self, skill: impl Into<String>) -> Self {
+        self.skills.push(skill.into());
+        self
+    }
+
+    pub fn with_package_version(mut self, version: impl Into<String>) -> Self {
+        self.package.version = version.into();
+        self
+    }
+
+    pub fn with_package_provenance(mut self, provenance: AgentPackageProvenance) -> Self {
+        self.package.provenance = provenance;
         self
     }
 
@@ -571,6 +708,48 @@ pub enum AgentDefinitionValidationError {
     MissingName { id: String },
     #[error("agent definition `{id}` has an empty system prompt")]
     MissingSystemPrompt { id: String },
+    #[error("agent definition `{id}` has an empty package version")]
+    MissingPackageVersion { id: String },
+    #[error("agent definition `{id}` package version `{version}` contains unsupported characters")]
+    InvalidPackageVersion { id: String, version: String },
+    #[error("agent definition `{id}` references invalid tool name `{tool}`")]
+    InvalidToolName { id: String, tool: String },
+    #[error("agent definition `{id}` declares duplicate tool name `{tool}`")]
+    DuplicateToolName { id: String, tool: String },
+    #[error("agent definition `{id}` references invalid tool surface entry `{value}` in `{field}`")]
+    InvalidToolSurfaceEntry {
+        id: String,
+        field: String,
+        value: String,
+    },
+    #[error("agent definition `{id}` references invalid skill `{skill}`")]
+    InvalidSkill { id: String, skill: String },
+    #[error("agent definition `{id}` references invalid context provider `{provider}`")]
+    InvalidContextProvider { id: String, provider: String },
+    #[error("agent definition `{id}` references invalid model preference `{value}` in `{field}`")]
+    InvalidModelPreference {
+        id: String,
+        field: String,
+        value: String,
+    },
+    #[error("agent definition `{id}` has invalid temperature `{value}` in `{field}`")]
+    InvalidTemperature {
+        id: String,
+        field: String,
+        value: String,
+    },
+    #[error(
+        "agent definition `{id}` has conflicting `{field}` values in legacy fields and model_policy"
+    )]
+    ConflictingModelPolicyField { id: String, field: String },
+    #[error("agent definition `{id}` has invalid runtime limit `{field}`")]
+    InvalidRuntimeLimit { id: String, field: String },
+    #[error("agent definition `{id}` module provenance is missing module id")]
+    MissingProvenanceModuleId { id: String },
+    #[error(
+        "agent definition `{id}` module provenance id `{module_id}` contains unsupported characters"
+    )]
+    InvalidProvenanceModuleId { id: String, module_id: String },
     #[error("agent definition `{id}` references unknown context pipeline `{pipeline_id}`")]
     UnknownContextPipeline { id: String, pipeline_id: String },
     #[error("agent definition `{id}` references unknown compaction strategy `{strategy_id}`")]
@@ -612,6 +791,141 @@ impl AgentDefinitionValidator {
         if definition.system_prompt.trim().is_empty() {
             return Err(AgentDefinitionValidationError::MissingSystemPrompt { id: id.to_string() });
         }
+        if definition.package.version.trim().is_empty() {
+            return Err(AgentDefinitionValidationError::MissingPackageVersion {
+                id: id.to_string(),
+            });
+        }
+        if !is_valid_agent_package_version(&definition.package.version) {
+            return Err(AgentDefinitionValidationError::InvalidPackageVersion {
+                id: id.to_string(),
+                version: definition.package.version.clone(),
+            });
+        }
+        if definition.package.provenance.source == AgentPackageSource::Module {
+            let module_id = definition
+                .package
+                .provenance
+                .module_id
+                .as_deref()
+                .ok_or_else(
+                    || AgentDefinitionValidationError::MissingProvenanceModuleId {
+                        id: id.to_string(),
+                    },
+                )?;
+            if !is_valid_agent_definition_id(module_id) {
+                return Err(AgentDefinitionValidationError::InvalidProvenanceModuleId {
+                    id: id.to_string(),
+                    module_id: module_id.to_string(),
+                });
+            }
+        }
+        let mut tool_names = BTreeSet::new();
+        for tool in &definition.tools {
+            if !is_valid_agent_package_identifier(&tool.name) {
+                return Err(AgentDefinitionValidationError::InvalidToolName {
+                    id: id.to_string(),
+                    tool: tool.name.clone(),
+                });
+            }
+            if !tool_names.insert(tool.name.clone()) {
+                return Err(AgentDefinitionValidationError::DuplicateToolName {
+                    id: id.to_string(),
+                    tool: tool.name.clone(),
+                });
+            }
+        }
+        for value in &definition.tool_surface.visible_toolsets {
+            validate_tool_surface_entry(id, "visible_toolsets", value)?;
+        }
+        for value in &definition.tool_surface.allow_tools {
+            validate_tool_surface_entry(id, "allow_tools", value)?;
+        }
+        for value in &definition.tool_surface.deny_tools {
+            validate_tool_surface_entry(id, "deny_tools", value)?;
+        }
+        for skill in &definition.skills {
+            if !is_valid_agent_package_identifier(skill) {
+                return Err(AgentDefinitionValidationError::InvalidSkill {
+                    id: id.to_string(),
+                    skill: skill.clone(),
+                });
+            }
+        }
+        for provider in &definition.context.providers {
+            if !is_valid_agent_package_identifier(provider) {
+                return Err(AgentDefinitionValidationError::InvalidContextProvider {
+                    id: id.to_string(),
+                    provider: provider.clone(),
+                });
+            }
+        }
+        if let Some(provider) = definition.model_policy.provider.as_deref() {
+            validate_model_preference(id, "provider", provider)?;
+        }
+        if let Some(model) = definition.model_policy.model.as_deref() {
+            validate_model_preference(id, "model", model)?;
+        }
+        if let Some(temperature) = definition.temperature {
+            validate_temperature(id, "temperature", temperature)?;
+        }
+        if let Some(temperature) = definition.model_policy.temperature {
+            validate_temperature(id, "model_policy.temperature", temperature)?;
+        }
+        if definition.temperature.is_some()
+            && definition.model_policy.temperature.is_some()
+            && definition.temperature != definition.model_policy.temperature
+        {
+            return Err(
+                AgentDefinitionValidationError::ConflictingModelPolicyField {
+                    id: id.to_string(),
+                    field: "temperature".to_string(),
+                },
+            );
+        }
+        if let Some(max_output_tokens) = definition.max_output_tokens
+            && max_output_tokens == 0
+        {
+            return Err(AgentDefinitionValidationError::InvalidRuntimeLimit {
+                id: id.to_string(),
+                field: "max_output_tokens".to_string(),
+            });
+        }
+        if let Some(max_output_tokens) = definition.model_policy.max_output_tokens
+            && max_output_tokens == 0
+        {
+            return Err(AgentDefinitionValidationError::InvalidRuntimeLimit {
+                id: id.to_string(),
+                field: "model_policy.max_output_tokens".to_string(),
+            });
+        }
+        if definition.max_output_tokens.is_some()
+            && definition.model_policy.max_output_tokens.is_some()
+            && definition.max_output_tokens != definition.model_policy.max_output_tokens
+        {
+            return Err(
+                AgentDefinitionValidationError::ConflictingModelPolicyField {
+                    id: id.to_string(),
+                    field: "max_output_tokens".to_string(),
+                },
+            );
+        }
+        if let Some(max_steps) = definition.runtime_limits.max_steps
+            && max_steps == 0
+        {
+            return Err(AgentDefinitionValidationError::InvalidRuntimeLimit {
+                id: id.to_string(),
+                field: "runtime_limits.max_steps".to_string(),
+            });
+        }
+        if let Some(max_tool_calls_per_step) = definition.runtime_limits.max_tool_calls_per_step
+            && max_tool_calls_per_step == 0
+        {
+            return Err(AgentDefinitionValidationError::InvalidRuntimeLimit {
+                id: id.to_string(),
+                field: "runtime_limits.max_tool_calls_per_step".to_string(),
+            });
+        }
         if !self
             .context_strategies
             .contains(&definition.context.pipeline_id)
@@ -634,11 +948,79 @@ impl AgentDefinitionValidator {
     }
 }
 
+fn validate_tool_surface_entry(
+    id: &str,
+    field: &str,
+    value: &str,
+) -> Result<(), AgentDefinitionValidationError> {
+    if is_valid_agent_package_identifier(value) {
+        return Ok(());
+    }
+    Err(AgentDefinitionValidationError::InvalidToolSurfaceEntry {
+        id: id.to_string(),
+        field: field.to_string(),
+        value: value.to_string(),
+    })
+}
+
+fn validate_model_preference(
+    id: &str,
+    field: &str,
+    value: &str,
+) -> Result<(), AgentDefinitionValidationError> {
+    if is_valid_agent_model_preference(value) {
+        return Ok(());
+    }
+    Err(AgentDefinitionValidationError::InvalidModelPreference {
+        id: id.to_string(),
+        field: field.to_string(),
+        value: value.to_string(),
+    })
+}
+
+fn validate_temperature(
+    id: &str,
+    field: &str,
+    value: f32,
+) -> Result<(), AgentDefinitionValidationError> {
+    if value.is_finite() && value >= 0.0 {
+        return Ok(());
+    }
+    Err(AgentDefinitionValidationError::InvalidTemperature {
+        id: id.to_string(),
+        field: field.to_string(),
+        value: value.to_string(),
+    })
+}
+
 fn is_valid_agent_definition_id(id: &str) -> bool {
-    !id.is_empty()
-        && id
+    !id.is_empty() && id.bytes().all(is_valid_agent_package_identifier_byte)
+}
+
+fn is_valid_agent_package_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value == value.trim()
+        && value.bytes().all(is_valid_agent_package_identifier_byte)
+}
+
+fn is_valid_agent_package_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+}
+
+fn is_valid_agent_model_preference(value: &str) -> bool {
+    !value.is_empty()
+        && value == value.trim()
+        && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+            .all(|byte| !byte.is_ascii_control() && !byte.is_ascii_whitespace())
+}
+
+fn is_valid_agent_package_version(version: &str) -> bool {
+    !version.is_empty()
+        && version == version.trim()
+        && version.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'+' | b':')
+        })
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -698,7 +1080,11 @@ impl AgentCatalog {
     ) -> Result<(), AgentCatalogError> {
         for registration in registry.registrations() {
             for export in &registration.surfaces.agent_definitions {
-                let definition = AgentDefinition::try_from_module_export(export)?;
+                let mut definition = AgentDefinition::try_from_module_export(export)?;
+                definition.package = AgentPackageDefinition::from_module(
+                    registration.module_id().as_str(),
+                    registration.manifest.version.clone(),
+                );
                 self.upsert(definition)?;
             }
         }
@@ -1003,7 +1389,7 @@ pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
         AgentToolSpec::new(
             AgentToolKind::ApplyPatch,
             "apply_patch",
-            "Edit workspace files with a scoped patch. This is the only source-editing tool: begin with `*** Begin Patch`, include one or more `*** Add File: path`, `*** Update File: path`, or `*** Delete File: path` hunks, and end with `*** End Patch`. Update hunks use `@@` or `@@ <exact context>` plus space/`-`/`+` lines; do not use git unified range headers.",
+            "Edit workspace files with a scoped patch. This is the only source-editing tool: use raw `*** Begin Patch` hunks, or JSON `changes` entries such as `replace_exact` and one-based `replace_range` for small edits. Do not use git unified range headers.",
             true,
         ),
         AgentToolSpec::new(
@@ -1033,7 +1419,25 @@ pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
         AgentToolSpec::new(
             AgentToolKind::ToolCall,
             "tool_call",
-            "Call a planned tool discovered through tool_search/tool_describe while preserving agent policy and evidence handling.",
+            "Call a planned tool discovered through tool_search/tool_describe while preserving tool-surface availability and evidence handling.",
+            true,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::SkillSearch,
+            "skill_search",
+            "Search skills declared by the active agent package or installed module resources.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::SkillDescribe,
+            "skill_describe",
+            "Describe one skill, including provenance, path, targeting metadata, and embedded text when available.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::SkillActivate,
+            "skill_activate",
+            "Request activation of a disclosed skill through the host runtime when an activation executor is attached.",
             true,
         ),
     ]
@@ -1048,7 +1452,7 @@ Operate as a real-time, event-driven agent. Keep live interaction responsive:
 - treat async progress and results as session events;
 - hand cluster maintenance, cleanup, rollout, and diagnostics to the background agent by default;
 - use SIFS as the default filesystem root;
-- use the local Rust MiniCPM-V 4.6 runtime as the core live model when available, and use stronger models only for deliberate background work."#
+- use runtime-provided model status and session context to decide when local live inference is enough, and delegate deliberate work to stronger configured models when useful."#
 }
 
 fn background_agent_base_prompt() -> &'static str {
@@ -1058,9 +1462,10 @@ fn background_agent_base_prompt() -> &'static str {
 fn coding_agent_base_prompt() -> &'static str {
     r#"You are Sinomo's deliberation agent model.
 
-You operate inside Sinomo's coding-agent loop. The agent owns tool execution,
-policy, event emission, and session state. Use tools when evidence or workspace
-changes are needed, then continue after tool_result messages arrive.
+You operate inside Sinomo's coding-agent loop. The runtime owns tool execution,
+tool-surface availability, sandbox enforcement, event emission, and session
+state. Use tools when evidence or workspace changes are needed, then continue
+after tool_result messages arrive.
 
 Workspace commands start in the repository root. Do not cd to guessed paths
 such as /workspace or /home/user/project; pass a relative cwd only for a known
@@ -1076,7 +1481,10 @@ environment setup unless the task is dependency setup.
 Use apply_patch as the only source-editing tool. Keep patches small and
 source-focused. Do not revert or overwrite user changes you did not make. The
 tool accepts raw patch text; JSON-only providers may pass an object with a
-patch string. Patch failures mean the patch was not applied.
+patch string or a `changes` array. For small edits, prefer structured
+`replace_exact` or one-based inclusive `replace_range` entries inside
+`apply_patch` over fragile full-file replacements. Patch failures mean the
+patch was not applied.
 
 Patch format:
 *** Begin Patch
@@ -1101,9 +1509,9 @@ fn evolution_agent_base_prompt() -> &'static str {
     r#"You are Sinomo's evolution agent model.
 
 You operate inside Sinomo's supervised self-evolution loop. The runtime owns
-tool execution, policy, event emission, candidate evidence, and session state.
-Use tools when evidence or workspace changes are needed, then continue after
-tool_result messages arrive.
+tool execution, tool-surface availability, sandbox enforcement, event emission,
+candidate evidence, and session state. Use tools when evidence or workspace
+changes are needed, then continue after tool_result messages arrive.
 
 Prefer small, auditable changes that satisfy the mutation packet and produce
 clear verification evidence. When the next step is clear and no more tools are
@@ -1117,6 +1525,10 @@ pub fn main_agent_system_prompt(tools: &[AgentToolSpec]) -> String {
 
 pub fn background_agent_system_prompt() -> String {
     background_agent_base_prompt().to_string()
+}
+
+pub fn render_agent_package_system_prompt(definition: &AgentDefinition) -> String {
+    definition.system_prompt.trim().to_string()
 }
 
 pub fn render_agent_system_prompt(definition: &AgentDefinition, tools: &[AgentToolSpec]) -> String {
@@ -1155,7 +1567,14 @@ fn render_agent_system_prompt_with_tools_json(
     prompt
 }
 
-fn agent_decision_output_contract() -> &'static str {
+pub fn agent_output_contract(output_format: &AgentOutputFormat) -> &'static str {
+    match output_format {
+        AgentOutputFormat::JsonDecision => agent_decision_output_contract(),
+        AgentOutputFormat::Text => "Respond directly in plain text.",
+    }
+}
+
+pub fn agent_decision_output_contract() -> &'static str {
     r#"Return only JSON shaped as:
 {
   "response_mode": "answer|acknowledge|clarify|defer|silent",
@@ -2223,6 +2642,11 @@ mod tests {
             definition
                 .validate()
                 .expect("built-in definition validates");
+            assert_eq!(definition.package.version, AGENT_PACKAGE_VERSION);
+            assert_eq!(
+                definition.package.provenance.source,
+                AgentPackageSource::BuiltIn
+            );
             assert_eq!(
                 definition.context.pipeline_id,
                 DEFAULT_AGENT_CONTEXT_PIPELINE_ID
@@ -2248,12 +2672,149 @@ mod tests {
     }
 
     #[test]
+    fn agent_definition_validation_rejects_invalid_package_metadata() {
+        let definition = AgentDefinition::custom("bad-agent", AgentRole::Main, "Be helpful.")
+            .with_package_version("1.0 bad")
+            .with_skill("bad skill");
+
+        let error = definition.validate().expect_err("invalid package version");
+
+        assert!(matches!(
+            error,
+            AgentDefinitionValidationError::InvalidPackageVersion { .. }
+        ));
+
+        let mut definition = AgentDefinition::custom("bad-agent", AgentRole::Main, "Be helpful.")
+            .with_package_provenance(AgentPackageProvenance {
+                source: AgentPackageSource::Module,
+                ..AgentPackageProvenance::default()
+            });
+
+        let error = definition.validate().expect_err("missing module id");
+        assert!(matches!(
+            error,
+            AgentDefinitionValidationError::MissingProvenanceModuleId { .. }
+        ));
+
+        definition.package.provenance = AgentPackageProvenance::local();
+        definition.skills = vec!["bad skill".to_string()];
+        let error = definition.validate().expect_err("invalid skill");
+        assert!(matches!(
+            error,
+            AgentDefinitionValidationError::InvalidSkill { .. }
+        ));
+    }
+
+    #[test]
+    fn agent_definition_validation_rejects_invalid_package_references() {
+        let definition = AgentDefinition::custom("bad-agent", AgentRole::Main, "Be helpful.")
+            .with_tool(AgentToolSpec::new(
+                AgentToolKind::RunShellCommand,
+                "bad tool",
+                "Run a command.",
+                true,
+            ));
+
+        let error = definition.validate().expect_err("invalid tool name");
+        assert!(matches!(
+            error,
+            AgentDefinitionValidationError::InvalidToolName { .. }
+        ));
+
+        let definition = AgentDefinition::custom("bad-agent", AgentRole::Main, "Be helpful.")
+            .with_tool(AgentToolSpec::new(
+                AgentToolKind::RunShellCommand,
+                "run_command",
+                "Run a command.",
+                true,
+            ))
+            .with_tool(AgentToolSpec::new(
+                AgentToolKind::ReadFile,
+                "run_command",
+                "Read a file.",
+                false,
+            ));
+
+        let error = definition.validate().expect_err("duplicate tool name");
+        assert!(matches!(
+            error,
+            AgentDefinitionValidationError::DuplicateToolName { .. }
+        ));
+
+        let mut definition = AgentDefinition::custom("bad-agent", AgentRole::Main, "Be helpful.");
+        definition.tool_surface.visible_toolsets = vec!["bad toolset".to_string()];
+
+        let error = definition.validate().expect_err("invalid toolset");
+        assert!(matches!(
+            error,
+            AgentDefinitionValidationError::InvalidToolSurfaceEntry { .. }
+        ));
+
+        let mut definition = AgentDefinition::custom("bad-agent", AgentRole::Main, "Be helpful.");
+        definition.context.providers = vec!["bad provider".to_string()];
+
+        let error = definition.validate().expect_err("invalid context provider");
+        assert!(matches!(
+            error,
+            AgentDefinitionValidationError::InvalidContextProvider { .. }
+        ));
+    }
+
+    #[test]
+    fn agent_definition_validation_rejects_invalid_model_and_runtime_limits() {
+        let mut definition = AgentDefinition::custom("bad-agent", AgentRole::Main, "Be helpful.");
+        definition.model_policy.model = Some("bad model".to_string());
+
+        let error = definition.validate().expect_err("invalid model preference");
+        assert!(matches!(
+            error,
+            AgentDefinitionValidationError::InvalidModelPreference { .. }
+        ));
+
+        let mut definition = AgentDefinition::custom("bad-agent", AgentRole::Main, "Be helpful.");
+        definition.temperature = Some(-0.1);
+
+        let error = definition.validate().expect_err("invalid temperature");
+        assert!(matches!(
+            error,
+            AgentDefinitionValidationError::InvalidTemperature { .. }
+        ));
+
+        let mut definition = AgentDefinition::custom("bad-agent", AgentRole::Main, "Be helpful.");
+        definition.temperature = Some(0.1);
+        definition.model_policy.temperature = Some(0.2);
+
+        let error = definition.validate().expect_err("conflicting temperature");
+        assert!(matches!(
+            error,
+            AgentDefinitionValidationError::ConflictingModelPolicyField { .. }
+        ));
+
+        let mut definition = AgentDefinition::custom("bad-agent", AgentRole::Main, "Be helpful.");
+        definition.runtime_limits.max_steps = Some(0);
+
+        let error = definition.validate().expect_err("invalid runtime limit");
+        assert!(matches!(
+            error,
+            AgentDefinitionValidationError::InvalidRuntimeLimit { .. }
+        ));
+    }
+
+    #[test]
     fn file_agent_definition_store_round_trips_custom_definition() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-definition-store");
         let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
         let store = FileAgentDefinitionStore::for_data_dir(&data_dir);
         let definition =
             AgentDefinition::custom("docs-agent", AgentRole::Deliberation, "Write docs.")
+                .with_package_version("2.3.4")
+                .with_package_provenance(AgentPackageProvenance {
+                    source: AgentPackageSource::Imported,
+                    path: Some("agent-packages/docs-agent.json".to_string()),
+                    revision: Some("rev_docs_agent".to_string()),
+                    ..AgentPackageProvenance::default()
+                })
+                .with_skill("docs.write")
                 .with_temperature(Some(0.3))
                 .with_max_output_tokens(Some(456));
 
@@ -2266,6 +2827,16 @@ mod tests {
         );
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].key(), "docs-agent");
+        assert_eq!(loaded[0].package.version, "2.3.4");
+        assert_eq!(
+            loaded[0].package.provenance.source,
+            AgentPackageSource::Imported
+        );
+        assert_eq!(
+            loaded[0].package.provenance.path.as_deref(),
+            Some("agent-packages/docs-agent.json")
+        );
+        assert_eq!(loaded[0].skills, vec!["docs.write"]);
         assert_eq!(loaded[0].temperature, Some(0.3));
         assert_eq!(loaded[0].model_policy.max_output_tokens, Some(456));
     }
@@ -2285,9 +2856,11 @@ mod tests {
             false,
         ))
         .with_visible_toolset("coding");
+        let module_id = sinomo_runtime::module::ModuleId::from_legacy_named("module.example")
+            .expect("module id");
+        let module_id_text = module_id.as_str().to_string();
         let registration = sinomo_runtime::module::ModuleRegistration::native_rust(
-            sinomo_runtime::module::ModuleId::from_legacy_named("module.example")
-                .expect("module id"),
+            module_id,
             "0.1.0",
             "module-example",
             "module-example",
@@ -2315,6 +2888,19 @@ mod tests {
         assert_eq!(definition.role, AgentRole::Deliberation);
         assert_eq!(definition.tools[0].kind, AgentToolKind::ReadFile);
         assert_eq!(definition.tool_surface.visible_toolsets, vec!["coding"]);
+        assert_eq!(definition.package.version, "0.1.0");
+        assert_eq!(
+            definition.package.provenance.source,
+            AgentPackageSource::Module
+        );
+        assert_eq!(
+            definition.package.provenance.module_id.as_deref(),
+            Some(module_id_text.as_str())
+        );
+        assert_eq!(
+            definition.package.provenance.module_version.as_deref(),
+            Some("0.1.0")
+        );
     }
 
     #[test]

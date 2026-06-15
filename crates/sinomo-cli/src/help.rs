@@ -60,10 +60,59 @@ pub(super) fn print_agent_help() {
     println!("Agent:");
     println!("  sinomo agent");
     println!("      Show agent commands.");
+    println!("  sinomo agent export [agent-id] [--output <path>]");
+    println!("      Export an agent package JSON artifact.");
+    println!("  sinomo agent import <path> [--json]");
+    println!("      Validate and store an imported agent package under the local data directory.");
+    println!("  sinomo agent inspect [agent-id] [--json]");
+    println!(
+        "      Inspect an agent package: prompt, tools, skills, context, compaction, and model preferences."
+    );
+    println!("  sinomo agent readiness [--json]");
+    println!(
+        "      Run deterministic local readiness gates for packages, tools, protocol parsing, compaction, resume, and command evidence."
+    );
     println!(
         "  sinomo agent run [--prompt <text>] [--provider <provider>] [--model <model>] [--account <account>]"
     );
     println!("      Run one main-agent turn and print the final response.");
+    println!("  sinomo agent validate [agent-id|--file <path>] [--json]");
+    println!("      Validate an agent package from the catalog or a JSON artifact.");
+    println!("  sinomo agent session");
+    println!("      Show agent session inspect/control commands.");
+    println!("  sinomo agent session inspect <session-id> [--json]");
+    println!(
+        "      Inspect persisted session state and control-plane snapshot through daemon RPC."
+    );
+    println!(
+        "  sinomo agent session progress <session-id> [--cursor <offset>] [--last-event <event-id>] [--json]"
+    );
+    println!("      Read persisted control-plane events after a cursor through daemon RPC.");
+    println!("  sinomo agent session terminal-results <session-id> [--task <task-id>] [--json]");
+    println!("      Read terminal task results through daemon RPC.");
+    println!("  sinomo agent session steer <session-id> <message> [--json]");
+    println!("      Queue steering for a live session exposed by an injected runtime host.");
+    println!("  sinomo agent session follow-up <session-id> <message> [--json]");
+    println!(
+        "      Queue a user follow-up for a live session exposed by an injected runtime host."
+    );
+    println!("  sinomo agent session interrupt <session-id> <reason> [--json]");
+    println!("      Interrupt the active live turn exposed by an injected runtime host.");
+    println!("  sinomo agent session resume <session-id> [--json]");
+    println!("      Reattach to a live session exposed by an injected runtime host.");
+}
+
+pub(super) fn print_agent_session_help() {
+    println!("Agent sessions:");
+    println!("  sinomo agent session inspect <session-id> [--json]");
+    println!(
+        "  sinomo agent session progress <session-id> [--cursor <offset>] [--last-event <event-id>] [--json]"
+    );
+    println!("  sinomo agent session terminal-results <session-id> [--task <task-id>] [--json]");
+    println!("  sinomo agent session steer <session-id> <message> [--json]");
+    println!("  sinomo agent session follow-up <session-id> <message> [--json]");
+    println!("  sinomo agent session interrupt <session-id> <reason> [--json]");
+    println!("  sinomo agent session resume <session-id> [--json]");
 }
 
 pub(super) fn print_voice_help() {
@@ -352,9 +401,9 @@ pub(super) fn print_test_help() {
     println!("  sinomo test list [--tag <tag>] [--json]");
     println!("      List registered runtime tests.");
     println!(
-        "  sinomo test run <test-id> [--provider <provider>] [--account <account>] [--model <model>] [--live] [--require-cluster] [--json] [--param <key=value> ...]"
+        "  sinomo test run <test-id>|--tag <tag> [--provider <provider>] [--account <account>] [--model <model>] [--live] [--require-cluster] [--json] [--param <key=value> ...]"
     );
-    println!("      Run one registered runtime test.");
+    println!("      Run one registered runtime test or all tests with a matching tag.");
     println!(
         "  sinomo test smoke [--provider codex|deepseek|openai] [--account <account>] [--model <model>] [--live] [--require-cluster] [--json]"
     );

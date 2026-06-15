@@ -3,26 +3,29 @@ use crate::session_store::{
     AgentSessionStoreRecordKind, NoopAgentSessionStore,
 };
 use crate::tools::{
-    AGENT_CODING_EVIDENCE_KIND, AgentCodingToolEvidence, AgentModuleToolProjection, AgentTool,
+    AGENT_CODING_EVIDENCE_KIND, AgentCodingToolEvidence, AgentModuleToolProjection,
+    AgentSkillDescriptor, AgentSkillPlan, AgentTool, AgentToolAvailabilityDecision,
     AgentToolCapability, AgentToolCustomFormat, AgentToolCustomSpec, AgentToolDescriptor,
-    AgentToolEvidence, AgentToolOutcome, AgentToolPlan, AgentToolPlanner, AgentToolPolicyDecision,
-    AgentToolProgressEvent, AgentToolProgressSink, AgentToolProviderSpec, AgentToolRegistry,
-    AgentToolStatus, is_tool_disclosure_bridge_name,
+    AgentToolEvidence, AgentToolOutcome, AgentToolPlan, AgentToolPlanner, AgentToolProgressEvent,
+    AgentToolProgressSink, AgentToolProviderSpec, AgentToolRegistry, AgentToolStatus,
+    is_tool_disclosure_bridge_name,
 };
 use crate::{
     AgentCancellationToken, AgentCompactionEngine, AgentCompactionRequest, AgentDefinition,
     AgentError, AgentLoopDecision, AgentLoopInput, AgentOutputFormat, AgentToolCall,
-    AsyncTaskNextAction, CodexStyleAgentCompactionEngine, InteractionModel, InteractionSession,
-    TaskId, parse_agent_loop_response, render_agent_system_prompt_with_descriptors,
+    AsyncTaskNextAction, AsyncTaskUpdate, CodexStyleAgentCompactionEngine, InteractionModel,
+    InteractionSession, TaskId, agent_output_contract, parse_agent_loop_response,
+    render_agent_package_system_prompt, render_agent_system_prompt_with_descriptors,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_lm::{
     LanguageModelCustomToolFormat, LanguageModelCustomToolSpec, LanguageModelErrorCategory,
     LanguageModelMessage, LanguageModelProviderToolSpec, LanguageModelRequest,
-    LanguageModelRequestItem, LanguageModelResponse, LanguageModelRole, LanguageModelStreamEvent,
+    LanguageModelRequestItem, LanguageModelResponse, LanguageModelResponseFormat,
+    LanguageModelRole, LanguageModelStreamEvent, LanguageModelToolAdapterSource,
     LanguageModelToolCall, LanguageModelToolChoice, LanguageModelToolSpec,
     classify_language_model_error_detail, collect_language_model_tool_calls,
-    inferred_model_context_window_tokens,
+    inferred_model_context_window_tokens, language_model_system_instructions,
 };
 use sinomo_runtime::core::{
     Confidence, EventEnvelope, EventKind, LatencyClass, PrivacyClass, RoutingMetadata,
@@ -30,6 +33,7 @@ use sinomo_runtime::core::{
 };
 use sinomo_runtime::events::{EventId, SessionId};
 use sinomo_runtime::local::SinomoDataDir;
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -418,7 +422,8 @@ pub enum AgentTraceRecordKind {
         provider: String,
         model: String,
         role: AgentRole,
-        policy_id: String,
+        #[serde(alias = "policy_id")]
+        surface_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_steps: Option<usize>,
         #[serde(default, skip_serializing_if = "AgentRunContext::is_empty")]
@@ -754,6 +759,20 @@ pub enum CodingBlockedReason {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
+pub enum CodingCommandFailureKind {
+    TimedOut,
+    CommandSetup,
+    MissingCommand,
+    MissingDependency,
+    NetworkUnavailable,
+    PermissionDenied,
+    EnvironmentBlocked,
+    PatchRelevant,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum CodingStopDecision {
     Continue,
     FinishWithPatch,
@@ -779,6 +798,8 @@ pub struct CodingValidationAttempt {
     pub exit_code: Option<i32>,
     #[serde(default)]
     pub timed_out: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<CodingCommandFailureKind>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -827,6 +848,10 @@ pub struct AgentContextAttachment {
     pub summary: String,
     #[serde(default)]
     pub payload_json: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_original_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub payload_model_visible_truncated: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -869,6 +894,8 @@ pub struct TurnContext {
     pub role: AgentRole,
     pub provider: String,
     pub model: String,
+    pub output_format: AgentOutputFormat,
+    pub response_format: LanguageModelResponseFormat,
     pub system_instructions: String,
     #[serde(default, skip_serializing_if = "AgentRunContext::is_empty")]
     pub run_context: AgentRunContext,
@@ -884,6 +911,8 @@ pub struct TurnContext {
     pub prompt_references: Vec<PromptReferenceContext>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_attachments: Vec<AgentContextAttachment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub async_update: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_tool_specs: Vec<AgentToolDescriptor>,
     pub budget_estimate: ContextBudgetEstimate,
@@ -935,6 +964,8 @@ pub struct ContextBudgetEstimate {
     pub prompt_reference_bytes: usize,
     #[serde(default)]
     pub context_attachment_bytes: usize,
+    #[serde(default)]
+    pub async_update_bytes: usize,
     pub total_bytes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_context_bytes: Option<usize>,
@@ -956,6 +987,8 @@ pub struct ContextBudgetLane {
 pub struct InstructionFileContext {
     pub path: String,
     pub bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_bytes: Option<usize>,
     #[serde(default)]
     pub truncated: bool,
     pub content: String,
@@ -1056,7 +1089,7 @@ fn resolve_instruction_files(
     let mut included = Vec::new();
     let mut omitted = Vec::new();
     for instruction_file in &config.workspace_instruction_files {
-        match resolve_instruction_file(root, instruction_file) {
+        match resolve_instruction_file(root, instruction_file, config.instruction_file_max_bytes) {
             Ok(file) => {
                 included.push(ContextSource {
                     kind: "instruction_file".to_string(),
@@ -1078,6 +1111,7 @@ fn resolve_instruction_files(
 fn resolve_instruction_file(
     root: &Path,
     instruction_file: &Path,
+    max_bytes: Option<usize>,
 ) -> Result<InstructionFileContext, String> {
     let root = fs::canonicalize(root).map_err(|source| {
         format!(
@@ -1113,15 +1147,20 @@ fn resolve_instruction_file(
     }
     let bytes = fs::read(&resolved)
         .map_err(|source| format!("failed to read {}: {source}", resolved.display()))?;
+    let visible_bytes = max_bytes
+        .map(|max_bytes| bytes.len().min(max_bytes))
+        .unwrap_or(bytes.len());
+    let truncated = visible_bytes < bytes.len();
     Ok(InstructionFileContext {
         path: resolved
             .strip_prefix(&root)
             .unwrap_or(&resolved)
             .display()
             .to_string(),
-        bytes: bytes.len(),
-        truncated: false,
-        content: String::from_utf8_lossy(&bytes).to_string(),
+        bytes: visible_bytes,
+        original_bytes: truncated.then_some(bytes.len()),
+        truncated,
+        content: String::from_utf8_lossy(&bytes[..visible_bytes]).to_string(),
     })
 }
 
@@ -1308,6 +1347,196 @@ fn resolve_prompt_reference_directory(
     })
 }
 
+fn model_visible_context_attachments(
+    attachments: &[AgentContextAttachment],
+    max_payload_bytes: Option<usize>,
+) -> Vec<AgentContextAttachment> {
+    attachments
+        .iter()
+        .map(|attachment| model_visible_context_attachment(attachment, max_payload_bytes))
+        .collect()
+}
+
+fn model_visible_context_attachment(
+    attachment: &AgentContextAttachment,
+    max_payload_bytes: Option<usize>,
+) -> AgentContextAttachment {
+    let Some(max_payload_bytes) = max_payload_bytes else {
+        return attachment.clone();
+    };
+    let payload_bytes = serde_json::to_vec(&attachment.payload_json).unwrap_or_default();
+    if payload_bytes.len() <= max_payload_bytes {
+        return attachment.clone();
+    }
+    let payload_text = serde_json::to_string_pretty(&attachment.payload_json)
+        .or_else(|_| serde_json::to_string(&attachment.payload_json))
+        .unwrap_or_default();
+    let payload_json = bounded_single_string_json_projection(
+        &payload_text,
+        max_payload_bytes,
+        |payload_json_excerpt| {
+            serde_json::json!({
+                "model_visible_truncated": true,
+                "reason": "context attachment payload exceeded model-visible byte budget",
+                "payload_original_bytes": payload_bytes.len(),
+                "payload_budget_bytes": max_payload_bytes,
+                "payload_json_excerpt": payload_json_excerpt,
+            })
+        },
+    );
+    AgentContextAttachment {
+        kind: attachment.kind.clone(),
+        summary: attachment.summary.clone(),
+        payload_json,
+        payload_original_bytes: Some(payload_bytes.len()),
+        payload_model_visible_truncated: true,
+    }
+}
+
+fn model_visible_async_update(
+    update: Option<&AsyncTaskUpdate>,
+    max_update_bytes: Option<usize>,
+) -> Option<serde_json::Value> {
+    let update = update?;
+    let value = serde_json::to_value(update).unwrap_or_else(|_| {
+        serde_json::json!({
+            "kind": &update.kind,
+            "task_id": &update.task_id,
+            "status": &update.status,
+            "summary": &update.summary,
+            "needs_user_attention": update.needs_user_attention,
+            "result_ref": &update.result_ref,
+            "next_action_hint": &update.next_action_hint,
+        })
+    });
+    let Some(max_update_bytes) = max_update_bytes else {
+        return Some(value);
+    };
+    let update_bytes = serde_json::to_vec(&value).unwrap_or_default();
+    if update_bytes.len() <= max_update_bytes {
+        return Some(value);
+    }
+    Some(bounded_async_update_projection(
+        update,
+        update_bytes.len(),
+        max_update_bytes,
+    ))
+}
+
+fn bounded_single_string_json_projection<F>(
+    source: &str,
+    max_bytes: usize,
+    build: F,
+) -> serde_json::Value
+where
+    F: Fn(String) -> serde_json::Value,
+{
+    let mut low = 0usize;
+    let mut high = source.len().min(max_bytes);
+    let mut best = build(String::new());
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        let candidate = build(model_visible_text_excerpt(source, mid));
+        let candidate_bytes = serde_json::to_vec(&candidate)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX);
+        if candidate_bytes <= max_bytes {
+            best = candidate;
+            low = mid.saturating_add(1);
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    best
+}
+
+fn bounded_async_update_projection(
+    update: &AsyncTaskUpdate,
+    original_bytes: usize,
+    max_bytes: usize,
+) -> serde_json::Value {
+    let build = |excerpt_bytes: usize| {
+        serde_json::json!({
+            "kind": &update.kind,
+            "task_id": &update.task_id,
+            "status": &update.status,
+            "needs_user_attention": update.needs_user_attention,
+            "next_action_hint": &update.next_action_hint,
+            "model_visible_truncated": true,
+            "reason": "async task update exceeded model-visible byte budget",
+            "async_update_original_bytes": original_bytes,
+            "async_update_budget_bytes": max_bytes,
+            "summary_excerpt": model_visible_text_excerpt(&update.summary, excerpt_bytes),
+            "summary_original_bytes": update.summary.len(),
+            "summary_model_visible_truncated": update.summary.len() > excerpt_bytes,
+            "result_ref_excerpt": update
+                .result_ref
+                .as_deref()
+                .map(|result_ref| model_visible_text_excerpt(result_ref, excerpt_bytes)),
+            "result_ref_original_bytes": update
+                .result_ref
+                .as_ref()
+                .map(|result_ref| result_ref.len()),
+            "result_ref_model_visible_truncated": update
+                .result_ref
+                .as_ref()
+                .is_some_and(|result_ref| result_ref.len() > excerpt_bytes),
+        })
+    };
+    let mut low = 0usize;
+    let mut high = update
+        .summary
+        .len()
+        .max(
+            update
+                .result_ref
+                .as_ref()
+                .map(|value| value.len())
+                .unwrap_or(0),
+        )
+        .min(max_bytes);
+    let mut best = build(0);
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        let candidate = build(mid);
+        let candidate_bytes = serde_json::to_vec(&candidate)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX);
+        if candidate_bytes <= max_bytes {
+            best = candidate;
+            low = mid.saturating_add(1);
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    best
+}
+
+fn serialized_nonempty_slice_bytes<T>(values: &[T]) -> usize
+where
+    T: Serialize,
+{
+    if values.is_empty() {
+        0
+    } else {
+        serde_json::to_vec(values)
+            .map(|bytes| bytes.len())
+            .unwrap_or_default()
+    }
+}
+
+fn serialized_option_value_bytes(value: &Option<serde_json::Value>) -> usize {
+    value
+        .as_ref()
+        .and_then(|value| serde_json::to_vec(value).ok())
+        .map(|bytes| bytes.len())
+        .unwrap_or_default()
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ContextAssembler;
 
@@ -1322,8 +1551,14 @@ impl ContextAssembler {
         tool_descriptors: Vec<AgentToolDescriptor>,
         step_index: usize,
     ) -> Result<TurnContext, AgentError> {
-        let system_instructions =
-            render_agent_system_prompt_with_descriptors(&config.definition, &tool_descriptors);
+        let system_instructions = render_agent_package_system_prompt(&config.definition);
+        let rendered_system_instruction_bytes = language_model_system_instructions(
+            &config.provider,
+            &config.model,
+            &system_instructions,
+            Some(agent_output_contract(&config.definition.output_format)),
+        )
+        .len();
         let mut workspace_facts = serde_json::json!({
             "session_id": input.session.session_id,
             "surface": input.session.surface,
@@ -1346,17 +1581,18 @@ impl ContextAssembler {
             .unwrap_or_default();
         let (loaded_instruction_files, instruction_sources, instruction_omissions) =
             resolve_instruction_files(config);
-        let instruction_file_bytes = serde_json::to_vec(&loaded_instruction_files)
-            .map(|bytes| bytes.len())
-            .unwrap_or_default();
+        let instruction_file_bytes = serialized_nonempty_slice_bytes(&loaded_instruction_files);
         let (prompt_references, prompt_reference_sources, prompt_reference_omissions) =
             resolve_prompt_references(input, config);
-        let prompt_reference_bytes = serde_json::to_vec(&prompt_references)
-            .map(|bytes| bytes.len())
-            .unwrap_or_default();
-        let context_attachment_bytes = serde_json::to_vec(&input.context_attachments)
-            .map(|bytes| bytes.len())
-            .unwrap_or_default();
+        let prompt_reference_bytes = serialized_nonempty_slice_bytes(&prompt_references);
+        let context_attachments = model_visible_context_attachments(
+            &input.context_attachments,
+            config.context_attachment_max_bytes,
+        );
+        let context_attachment_bytes = serialized_nonempty_slice_bytes(&context_attachments);
+        let async_update =
+            model_visible_async_update(input.async_update.as_ref(), config.async_update_max_bytes);
+        let async_update_bytes = serialized_option_value_bytes(&async_update);
         let session_projection_bytes = session_projection
             .as_ref()
             .and_then(|projection| serde_json::to_vec(projection).ok())
@@ -1376,9 +1612,10 @@ impl ContextAssembler {
         let mut lanes = vec![
             ContextBudgetLane {
                 kind: "fixed_prompt".to_string(),
-                label: "system prompt, tool schemas, workspace facts, and instruction files"
-                    .to_string(),
-                bytes: system_instructions.len()
+                label:
+                    "system prompt, request tool schemas, workspace facts, and instruction files"
+                        .to_string(),
+                bytes: rendered_system_instruction_bytes
                     + tool_schema_bytes
                     + workspace_facts_bytes
                     + instruction_file_bytes,
@@ -1425,8 +1662,16 @@ impl ContextAssembler {
                 priority: 1,
             });
         }
+        if async_update_bytes > 0 {
+            lanes.push(ContextBudgetLane {
+                kind: "async_update".to_string(),
+                label: "latest async task update".to_string(),
+                bytes: async_update_bytes,
+                priority: 1,
+            });
+        }
         let budget_estimate = ContextBudgetEstimate {
-            system_prompt_bytes: system_instructions.len(),
+            system_prompt_bytes: rendered_system_instruction_bytes,
             current_work_bytes,
             old_summary_bytes,
             retrieved_memory_bytes,
@@ -1436,14 +1681,16 @@ impl ContextAssembler {
             instruction_file_bytes,
             prompt_reference_bytes,
             context_attachment_bytes,
-            total_bytes: system_instructions.len()
+            async_update_bytes,
+            total_bytes: rendered_system_instruction_bytes
                 + session_projection_bytes
                 + transcript_bytes
                 + tool_schema_bytes
                 + workspace_facts_bytes
                 + instruction_file_bytes
                 + prompt_reference_bytes
-                + context_attachment_bytes,
+                + context_attachment_bytes
+                + async_update_bytes,
             max_context_bytes: config.context_budget.max_context_bytes,
             compaction_threshold_bytes: config.context_budget.compaction_threshold_bytes(),
             lanes,
@@ -1479,7 +1726,7 @@ impl ContextAssembler {
         }
         included.extend(instruction_sources);
         included.extend(prompt_reference_sources);
-        if !input.context_attachments.is_empty() {
+        if !context_attachments.is_empty() {
             included.push(ContextSource {
                 kind: "context_attachments".to_string(),
                 label: "typed context attachments".to_string(),
@@ -1490,9 +1737,7 @@ impl ContextAssembler {
             included.push(ContextSource {
                 kind: "async_update".to_string(),
                 label: "latest async task update".to_string(),
-                bytes: serde_json::to_vec(&input.async_update)
-                    .map(|bytes| bytes.len())
-                    .unwrap_or_default(),
+                bytes: budget_estimate.async_update_bytes,
             });
         }
         let mut omitted = instruction_omissions;
@@ -1522,6 +1767,11 @@ impl ContextAssembler {
             role,
             provider: config.provider.clone(),
             model: config.model.clone(),
+            output_format: config.definition.output_format.clone(),
+            response_format: config
+                .definition
+                .output_format
+                .language_model_response_format(),
             system_instructions,
             run_context: config.run_context.clone(),
             session_projection,
@@ -1529,7 +1779,8 @@ impl ContextAssembler {
             workspace_facts,
             loaded_instruction_files,
             prompt_references,
-            context_attachments: input.context_attachments.clone(),
+            context_attachments,
+            async_update,
             available_tool_specs: tool_descriptors,
             budget_estimate,
             report,
@@ -2242,7 +2493,7 @@ impl AgentCompactor {
             open_risks: working_state.open_risks.clone(),
             projection,
             policy_constraints: vec![
-                "runtime policy remains authoritative after compaction".to_string(),
+                "runtime tool surface remains authoritative after compaction".to_string(),
                 "verification evidence is structured state, not summary text".to_string(),
             ],
         }
@@ -2511,6 +2762,7 @@ fn coding_state_from_items(items: &[AgentItem]) -> CodingRunState {
                     summary: summary.clone(),
                     exit_code: None,
                     timed_out: false,
+                    failure_kind: None,
                 });
             }
             AgentItem::CodingRunState { .. }
@@ -2543,17 +2795,23 @@ fn finalize_coding_state(mut state: CodingRunState) -> CodingRunState {
         );
     }
     state.stop_recommendation = match (&state.patch_status, &state.validation_status) {
-        (CodingPatchStatus::Applied, CodingValidationStatus::Passed)
-        | (CodingPatchStatus::Applied, CodingValidationStatus::FailedEnvironment)
-            if is_narrow_coding_patch(&state) =>
-        {
-            CodingStopDecision::FinishWithPatch
-        }
         _ if state.blocked_reason == Some(CodingBlockedReason::NeedsUserInput) => {
             CodingStopDecision::RequestUserInput
         }
         _ if state.blocked_reason.is_some() && state.patch_status != CodingPatchStatus::Applied => {
             CodingStopDecision::FinishBlocked
+        }
+        _ if has_terminal_coding_blocker(&state) => CodingStopDecision::FinishBlocked,
+        (CodingPatchStatus::Applied, CodingValidationStatus::Passed)
+            if is_narrow_coding_patch(&state) =>
+        {
+            CodingStopDecision::FinishWithPatch
+        }
+        (CodingPatchStatus::Applied, CodingValidationStatus::FailedEnvironment)
+            if is_narrow_coding_patch(&state)
+                && environment_validation_can_finish_with_patch(&state) =>
+        {
+            CodingStopDecision::FinishWithPatch
         }
         _ => CodingStopDecision::Continue,
     };
@@ -2564,30 +2822,149 @@ fn is_narrow_coding_patch(state: &CodingRunState) -> bool {
     !state.changed_files.is_empty() && state.changed_files.len() <= 3
 }
 
+fn coding_state_should_stop_loop(state: &CodingRunState) -> bool {
+    match state.stop_recommendation {
+        CodingStopDecision::FinishWithPatch
+        | CodingStopDecision::RequestUserInput
+        | CodingStopDecision::Abort => true,
+        CodingStopDecision::FinishBlocked => {
+            state.patch_status != CodingPatchStatus::NotStarted
+                || !state.changed_files.is_empty()
+                || !state.validation_attempts.is_empty()
+        }
+        CodingStopDecision::Continue => false,
+    }
+}
+
+fn has_terminal_coding_blocker(state: &CodingRunState) -> bool {
+    matches!(
+        state.blocked_reason,
+        Some(
+            CodingBlockedReason::PolicyDenied
+                | CodingBlockedReason::ToolUnavailable
+                | CodingBlockedReason::Unknown
+        )
+    ) || state.validation_attempts.iter().any(|attempt| {
+        matches!(
+            attempt.failure_kind,
+            Some(
+                CodingCommandFailureKind::NetworkUnavailable
+                    | CodingCommandFailureKind::PermissionDenied
+            )
+        )
+    })
+}
+
+fn environment_validation_can_finish_with_patch(state: &CodingRunState) -> bool {
+    state
+        .validation_attempts
+        .iter()
+        .filter(|attempt| attempt.status == CodingValidationStatus::FailedEnvironment)
+        .all(|attempt| {
+            matches!(
+                attempt.failure_kind,
+                Some(
+                    CodingCommandFailureKind::CommandSetup
+                        | CodingCommandFailureKind::MissingCommand
+                        | CodingCommandFailureKind::MissingDependency
+                        | CodingCommandFailureKind::EnvironmentBlocked
+                )
+            )
+        })
+        && state
+            .validation_attempts
+            .iter()
+            .any(|attempt| attempt.status == CodingValidationStatus::FailedEnvironment)
+}
+
 fn coding_final_decision_from_state(state: &CodingRunState) -> AgentLoopDecision {
     let files = if state.changed_files.is_empty() {
         "no files recorded".to_string()
     } else {
         state.changed_files.join(", ")
     };
-    let validation = match state.validation_status {
-        CodingValidationStatus::Passed => "validation passed".to_string(),
-        CodingValidationStatus::FailedEnvironment => {
-            "validation was blocked by the local environment".to_string()
-        }
-        _ => format!("validation status: {:?}", state.validation_status),
-    };
+    let validation = coding_validation_summary_from_state(state);
     let summary = state
         .current_diff_summary
         .as_deref()
         .map(|summary| format!(" Summary: {summary}"))
         .unwrap_or_default();
-    AgentLoopDecision {
-        response_mode: crate::AgentLoopResponseMode::Answer,
-        text: format!("Patch is ready. Changed files: {files}. {validation}.{summary}"),
-        tool_calls: Vec::new(),
-        background_handoff: None,
-        next_state: crate::AgentInteractionState::Listening,
+    match state.stop_recommendation {
+        CodingStopDecision::FinishWithPatch => AgentLoopDecision {
+            response_mode: crate::AgentLoopResponseMode::Answer,
+            text: format!("Patch is ready. Changed files: {files}. {validation}.{summary}"),
+            tool_calls: Vec::new(),
+            background_handoff: None,
+            next_state: crate::AgentInteractionState::Listening,
+        },
+        CodingStopDecision::RequestUserInput => AgentLoopDecision {
+            response_mode: crate::AgentLoopResponseMode::Clarify,
+            text: format!(
+                "I need user input before continuing. Changed files: {files}. {validation}.{summary}"
+            ),
+            tool_calls: Vec::new(),
+            background_handoff: None,
+            next_state: crate::AgentInteractionState::Waiting,
+        },
+        CodingStopDecision::FinishBlocked => AgentLoopDecision {
+            response_mode: crate::AgentLoopResponseMode::Answer,
+            text: format!("Coding run is blocked. Changed files: {files}. {validation}.{summary}"),
+            tool_calls: Vec::new(),
+            background_handoff: None,
+            next_state: crate::AgentInteractionState::Listening,
+        },
+        CodingStopDecision::Abort | CodingStopDecision::Continue => AgentLoopDecision {
+            response_mode: crate::AgentLoopResponseMode::Answer,
+            text: format!(
+                "Coding run state: {:?}. Changed files: {files}. {validation}.{summary}",
+                state.stop_recommendation
+            ),
+            tool_calls: Vec::new(),
+            background_handoff: None,
+            next_state: crate::AgentInteractionState::Listening,
+        },
+    }
+}
+
+fn coding_validation_summary_from_state(state: &CodingRunState) -> String {
+    let failure_kind = state
+        .validation_attempts
+        .iter()
+        .rev()
+        .find_map(|attempt| attempt.failure_kind.as_ref())
+        .map(coding_command_failure_kind_label);
+    match state.validation_status {
+        CodingValidationStatus::NotRun => "validation has not run".to_string(),
+        CodingValidationStatus::Passed => "validation passed".to_string(),
+        CodingValidationStatus::FailedPatchRelevant => {
+            "validation failed against the patch".to_string()
+        }
+        CodingValidationStatus::FailedEnvironment => match failure_kind {
+            Some(label) => {
+                format!("validation was blocked by the local environment ({label})")
+            }
+            None => "validation was blocked by the local environment".to_string(),
+        },
+        CodingValidationStatus::FailedCommandSetup => match failure_kind {
+            Some(label) => format!("validation command setup failed ({label})"),
+            None => "validation command setup failed".to_string(),
+        },
+        CodingValidationStatus::TimedOut => "validation timed out".to_string(),
+        CodingValidationStatus::Inconclusive => "validation was inconclusive".to_string(),
+    }
+}
+
+fn coding_command_failure_kind_label(kind: &CodingCommandFailureKind) -> &'static str {
+    match kind {
+        CodingCommandFailureKind::TimedOut => "timed out",
+        CodingCommandFailureKind::CommandSetup => "command setup",
+        CodingCommandFailureKind::MissingCommand => "missing command",
+        CodingCommandFailureKind::MissingDependency => "missing dependency",
+        CodingCommandFailureKind::NetworkUnavailable => "network unavailable",
+        CodingCommandFailureKind::PermissionDenied => "permission denied",
+        CodingCommandFailureKind::EnvironmentBlocked => "environment blocked",
+        CodingCommandFailureKind::PatchRelevant => "patch relevant",
+        CodingCommandFailureKind::Unknown => "unknown",
     }
 }
 
@@ -2640,15 +3017,16 @@ fn coding_validation_attempt_from_tool_result(
         .get("status")
         .and_then(serde_json::Value::as_i64)
         .and_then(|value| i32::try_from(value).ok());
-    let validation_status = classify_command_validation(status, summary, output);
+    let classification = classify_command_failure(status, summary, output);
     Some(CodingValidationAttempt {
         step_index,
         call_id: call_id.clone(),
         command,
-        status: validation_status,
+        status: classification.status,
         summary: compact_multiline(summary, 1000),
         exit_code,
         timed_out,
+        failure_kind: classification.failure_kind,
     })
 }
 
@@ -2660,36 +3038,93 @@ fn looks_like_command_result(output: &serde_json::Value) -> bool {
         && output.get("stderr").is_some()
 }
 
-fn classify_command_validation(
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CodingCommandFailureClassification {
+    status: CodingValidationStatus,
+    failure_kind: Option<CodingCommandFailureKind>,
+}
+
+fn classify_command_failure(
     status: &AgentToolStatus,
     summary: &str,
     output: &serde_json::Value,
-) -> CodingValidationStatus {
+) -> CodingCommandFailureClassification {
     if output
         .get("success")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
     {
-        return CodingValidationStatus::Passed;
+        return CodingCommandFailureClassification {
+            status: CodingValidationStatus::Passed,
+            failure_kind: None,
+        };
     }
     if output
         .get("timed_out")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
     {
-        return CodingValidationStatus::TimedOut;
+        return CodingCommandFailureClassification {
+            status: CodingValidationStatus::TimedOut,
+            failure_kind: Some(CodingCommandFailureKind::TimedOut),
+        };
     }
     if matches!(status, AgentToolStatus::Blocked) {
-        return CodingValidationStatus::FailedEnvironment;
+        let failure_kind = if output
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|error| error == "missing_command")
+        {
+            CodingCommandFailureKind::CommandSetup
+        } else {
+            CodingCommandFailureKind::EnvironmentBlocked
+        };
+        return CodingCommandFailureClassification {
+            status: CodingValidationStatus::FailedEnvironment,
+            failure_kind: Some(failure_kind),
+        };
     }
     let combined = command_failure_text(summary, output);
     if command_setup_failure(&combined) {
-        return CodingValidationStatus::FailedCommandSetup;
+        return CodingCommandFailureClassification {
+            status: CodingValidationStatus::FailedCommandSetup,
+            failure_kind: Some(CodingCommandFailureKind::CommandSetup),
+        };
+    }
+    if missing_command_failure(&combined) {
+        return CodingCommandFailureClassification {
+            status: CodingValidationStatus::FailedEnvironment,
+            failure_kind: Some(CodingCommandFailureKind::MissingCommand),
+        };
+    }
+    if missing_dependency_failure(&combined) {
+        return CodingCommandFailureClassification {
+            status: CodingValidationStatus::FailedEnvironment,
+            failure_kind: Some(CodingCommandFailureKind::MissingDependency),
+        };
+    }
+    if network_failure(&combined) {
+        return CodingCommandFailureClassification {
+            status: CodingValidationStatus::FailedEnvironment,
+            failure_kind: Some(CodingCommandFailureKind::NetworkUnavailable),
+        };
+    }
+    if permission_failure(&combined) {
+        return CodingCommandFailureClassification {
+            status: CodingValidationStatus::FailedEnvironment,
+            failure_kind: Some(CodingCommandFailureKind::PermissionDenied),
+        };
     }
     if environment_failure(&combined) {
-        return CodingValidationStatus::FailedEnvironment;
+        return CodingCommandFailureClassification {
+            status: CodingValidationStatus::FailedEnvironment,
+            failure_kind: Some(CodingCommandFailureKind::EnvironmentBlocked),
+        };
     }
-    CodingValidationStatus::FailedPatchRelevant
+    CodingCommandFailureClassification {
+        status: CodingValidationStatus::FailedPatchRelevant,
+        failure_kind: Some(CodingCommandFailureKind::PatchRelevant),
+    }
 }
 
 fn command_failure_text(summary: &str, output: &serde_json::Value) -> String {
@@ -2720,21 +3155,68 @@ fn command_setup_failure(text: &str) -> bool {
     .any(|needle| text.contains(needle))
 }
 
-fn environment_failure(text: &str) -> bool {
+fn missing_command_failure(text: &str) -> bool {
     [
         "command not found",
         "no such file or directory",
-        "permission denied",
+        "not recognized as an internal or external command",
+        "the system cannot find the file specified",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn missing_dependency_failure(text: &str) -> bool {
+    [
         "missing dependency",
         "module not found",
+        "modulenotfounderror",
         "no module named",
         "cannot find module",
+        "unable to locate package",
+        "package not found",
+        "could not find package",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn network_failure(text: &str) -> bool {
+    [
         "failed to download",
         "network is unreachable",
         "temporary failure in name resolution",
         "connection refused",
+        "connection timed out",
+        "operation timed out",
         "could not resolve",
-        "unable to locate package",
+        "could not resolve host",
+        "dns error",
+        "tls handshake",
+        "certificate verify failed",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn permission_failure(text: &str) -> bool {
+    [
+        "permission denied",
+        "access is denied",
+        "operation not permitted",
+        "read-only file system",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn environment_failure(text: &str) -> bool {
+    [
+        "no space left on device",
+        "disk quota exceeded",
+        "resource temporarily unavailable",
+        "too many open files",
+        "cannot allocate memory",
     ]
     .iter()
     .any(|needle| text.contains(needle))
@@ -2752,7 +3234,7 @@ fn coding_blocked_reason_from_tool_result(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     match error {
-        "policy_denied" => Some(CodingBlockedReason::PolicyDenied),
+        "policy_denied" | "tool_unavailable" => Some(CodingBlockedReason::PolicyDenied),
         "tool_not_visible" | "missing_executor" | "unknown_tool" => {
             Some(CodingBlockedReason::ToolUnavailable)
         }
@@ -2791,10 +3273,16 @@ pub struct AgentConfig {
     pub definition: AgentDefinition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_steps: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    max_steps_explicit_override: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tool_calls_per_step: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    max_tool_calls_per_step_explicit_override: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_model_repair_attempts: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    max_model_repair_attempts_explicit_override: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "AgentRunContext::is_empty")]
@@ -2805,12 +3293,18 @@ pub struct AgentConfig {
     pub module_tool_projection: AgentModuleToolProjection,
     #[serde(default = "default_workspace_instruction_files")]
     pub workspace_instruction_files: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_file_max_bytes: Option<usize>,
     #[serde(default = "default_expand_prompt_references")]
     pub expand_prompt_references: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_reference_max_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_reference_max_entries: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_attachment_max_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub async_update_max_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2832,16 +3326,22 @@ impl AgentConfig {
             max_output_tokens: definition.max_output_tokens,
             definition,
             max_steps: None,
+            max_steps_explicit_override: false,
             max_tool_calls_per_step: None,
+            max_tool_calls_per_step_explicit_override: false,
             max_model_repair_attempts: None,
+            max_model_repair_attempts_explicit_override: false,
             workspace_root: None,
             run_context: AgentRunContext::default(),
             visible_toolsets,
             module_tool_projection: AgentModuleToolProjection::default(),
             workspace_instruction_files: default_workspace_instruction_files(),
+            instruction_file_max_bytes: Some(DEFAULT_WORKSPACE_INSTRUCTION_FILE_BYTES),
             expand_prompt_references: default_expand_prompt_references(),
-            prompt_reference_max_bytes: None,
-            prompt_reference_max_entries: None,
+            prompt_reference_max_bytes: Some(DEFAULT_PROMPT_REFERENCE_FILE_BYTES),
+            prompt_reference_max_entries: Some(DEFAULT_PROMPT_REFERENCE_DIRECTORY_ENTRIES),
+            context_attachment_max_bytes: Some(DEFAULT_CONTEXT_ATTACHMENT_PAYLOAD_BYTES),
+            async_update_max_bytes: Some(DEFAULT_ASYNC_UPDATE_BYTES),
             context_budget: AgentContextBudget::default(),
         }
     }
@@ -2859,13 +3359,13 @@ impl AgentConfig {
         } else if self.visible_toolsets == previous_default_toolsets {
             self.visible_toolsets = default_visible_toolsets_for_role(&definition.role);
         }
-        if self.max_steps.is_none() {
+        if !self.max_steps_explicit_override {
             self.max_steps = definition.runtime_limits.max_steps;
         }
-        if self.max_tool_calls_per_step.is_none() {
+        if !self.max_tool_calls_per_step_explicit_override {
             self.max_tool_calls_per_step = definition.runtime_limits.max_tool_calls_per_step;
         }
-        if self.max_model_repair_attempts.is_none() {
+        if !self.max_model_repair_attempts_explicit_override {
             self.max_model_repair_attempts = definition.runtime_limits.max_model_repair_attempts;
         }
         self.definition = definition;
@@ -2884,16 +3384,19 @@ impl AgentConfig {
 
     pub fn with_max_steps(mut self, max_steps: usize) -> Self {
         self.max_steps = Some(max_steps.max(1));
+        self.max_steps_explicit_override = true;
         self
     }
 
     pub fn with_max_tool_calls_per_step(mut self, max_tool_calls_per_step: usize) -> Self {
         self.max_tool_calls_per_step = Some(max_tool_calls_per_step.max(1));
+        self.max_tool_calls_per_step_explicit_override = true;
         self
     }
 
     pub fn with_max_model_repair_attempts(mut self, max_model_repair_attempts: usize) -> Self {
         self.max_model_repair_attempts = Some(max_model_repair_attempts);
+        self.max_model_repair_attempts_explicit_override = true;
         self
     }
 
@@ -2926,6 +3429,26 @@ impl AgentConfig {
         self
     }
 
+    pub fn with_prompt_reference_limits(
+        mut self,
+        max_bytes: Option<usize>,
+        max_entries: Option<usize>,
+    ) -> Self {
+        self.prompt_reference_max_bytes = max_bytes;
+        self.prompt_reference_max_entries = max_entries;
+        self
+    }
+
+    pub fn with_context_attachment_max_bytes(mut self, max_bytes: Option<usize>) -> Self {
+        self.context_attachment_max_bytes = max_bytes;
+        self
+    }
+
+    pub fn with_async_update_max_bytes(mut self, max_bytes: Option<usize>) -> Self {
+        self.async_update_max_bytes = max_bytes;
+        self
+    }
+
     pub fn with_visible_toolsets(
         mut self,
         toolsets: impl IntoIterator<Item = impl Into<String>>,
@@ -2949,6 +3472,11 @@ impl AgentConfig {
         files: impl IntoIterator<Item = impl Into<PathBuf>>,
     ) -> Self {
         self.workspace_instruction_files = files.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_instruction_file_max_bytes(mut self, max_bytes: Option<usize>) -> Self {
+        self.instruction_file_max_bytes = max_bytes;
         self
     }
 
@@ -2989,10 +3517,18 @@ fn default_expand_prompt_references() -> bool {
     true
 }
 
+const DEFAULT_WORKSPACE_INSTRUCTION_FILE_BYTES: usize = 64 * 1024;
+const DEFAULT_PROMPT_REFERENCE_FILE_BYTES: usize = 64 * 1024;
+const DEFAULT_PROMPT_REFERENCE_DIRECTORY_ENTRIES: usize = 200;
+const DEFAULT_CONTEXT_ATTACHMENT_PAYLOAD_BYTES: usize = 64 * 1024;
+const DEFAULT_ASYNC_UPDATE_BYTES: usize = 64 * 1024;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentRun {
     pub final_decision: AgentLoopDecision,
     pub stop_reason: AgentStopReason,
+    #[serde(default)]
+    pub model_metrics: AgentRunModelMetrics,
     #[serde(default, skip_serializing_if = "AgentRunContext::is_empty")]
     pub run_context: AgentRunContext,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3015,6 +3551,235 @@ pub struct AgentRun {
     pub coding_state: Option<CodingRunState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_evidence_bundle: Option<AgentCandidateEvidenceBundle>,
+}
+
+impl AgentRun {
+    pub fn tool_pair_integrity(&self) -> AgentToolPairIntegrity {
+        AgentToolPairIntegrity::from_items(&self.items)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentToolPairIntegrity {
+    pub tool_calls: usize,
+    pub tool_results: usize,
+    pub orphan_tool_calls: usize,
+    pub orphan_tool_results: usize,
+}
+
+impl AgentToolPairIntegrity {
+    pub fn from_run(run: &AgentRun) -> Self {
+        run.tool_pair_integrity()
+    }
+
+    pub fn from_runs(runs: &[AgentRun]) -> Self {
+        let mut metrics = Self::default();
+        for run in runs {
+            metrics.add(run.tool_pair_integrity());
+        }
+        metrics
+    }
+
+    pub fn from_items(items: &[AgentItem]) -> Self {
+        let mut call_pairs = BTreeSet::new();
+        let mut result_pairs = BTreeSet::new();
+        let mut tool_calls = 0usize;
+        let mut tool_results = 0usize;
+        for item in items {
+            match item {
+                AgentItem::ToolCall {
+                    step_index,
+                    call_index,
+                    ..
+                } => {
+                    tool_calls = tool_calls.saturating_add(1);
+                    call_pairs.insert((*step_index, *call_index));
+                }
+                AgentItem::ToolResult {
+                    step_index,
+                    call_index,
+                    ..
+                } => {
+                    tool_results = tool_results.saturating_add(1);
+                    result_pairs.insert((*step_index, *call_index));
+                }
+                _ => {}
+            }
+        }
+        Self {
+            tool_calls,
+            tool_results,
+            orphan_tool_calls: call_pairs.difference(&result_pairs).count(),
+            orphan_tool_results: result_pairs.difference(&call_pairs).count(),
+        }
+    }
+
+    pub fn add(&mut self, other: Self) {
+        self.tool_calls = self.tool_calls.saturating_add(other.tool_calls);
+        self.tool_results = self.tool_results.saturating_add(other.tool_results);
+        self.orphan_tool_calls = self
+            .orphan_tool_calls
+            .saturating_add(other.orphan_tool_calls);
+        self.orphan_tool_results = self
+            .orphan_tool_results
+            .saturating_add(other.orphan_tool_results);
+    }
+
+    pub fn is_balanced(&self) -> bool {
+        self.orphan_tool_calls == 0 && self.orphan_tool_results == 0
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct AgentRunModelMetrics {
+    #[serde(default)]
+    pub output_format: AgentOutputFormat,
+    #[serde(default)]
+    pub model_turn_count: usize,
+    #[serde(default)]
+    pub model_response_count: usize,
+    #[serde(default)]
+    pub model_response_parse_failure_count: usize,
+    #[serde(default)]
+    pub strict_json_decision_turn_count: usize,
+    #[serde(default)]
+    pub text_fallback_turn_count: usize,
+    #[serde(default)]
+    pub native_tool_call_turn_count: usize,
+    #[serde(default)]
+    pub native_tool_call_count: usize,
+    #[serde(default)]
+    pub vendor_fallback_tool_call_turn_count: usize,
+    #[serde(default)]
+    pub vendor_fallback_tool_call_count: usize,
+    #[serde(default)]
+    pub repair_attempt_count: usize,
+    #[serde(default)]
+    pub repair_request_model_visible_bytes: usize,
+    #[serde(default)]
+    pub reported_usage: AgentRunModelTokenUsage,
+    #[serde(default)]
+    pub repair_reported_usage: AgentRunModelTokenUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_decision_source: Option<AgentModelDecisionSource>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRunModelTokenUsage {
+    #[serde(default)]
+    pub response_count: usize,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentModelDecisionSource {
+    StrictJsonDecision,
+    TextFallback,
+    NativeToolCalls,
+    VendorFallbackToolCalls,
+}
+
+impl Default for AgentModelDecisionSource {
+    fn default() -> Self {
+        Self::StrictJsonDecision
+    }
+}
+
+impl AgentRunModelMetrics {
+    fn from_turns(
+        output_format: AgentOutputFormat,
+        model_turns: &[AgentModelTurn],
+        model_events: &[AgentModelEvent],
+        repair_request_model_visible_bytes: usize,
+    ) -> Self {
+        let model_response_parse_failure_count = model_events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentModelEvent::Error { detail, .. }
+                        if detail.starts_with("model response parse failed")
+                )
+            })
+            .count();
+        let mut metrics = Self {
+            output_format,
+            model_turn_count: model_turns.len(),
+            model_response_count: model_turns.len() + model_response_parse_failure_count,
+            model_response_parse_failure_count,
+            repair_request_model_visible_bytes,
+            reported_usage: Self::reported_usage_from_events(model_events),
+            repair_reported_usage: Self::repair_reported_usage_from_turns(model_turns),
+            final_decision_source: model_turns.last().map(|turn| turn.decision_source.clone()),
+            ..Self::default()
+        };
+        for turn in model_turns {
+            match &turn.decision_source {
+                AgentModelDecisionSource::StrictJsonDecision => {
+                    metrics.strict_json_decision_turn_count += 1;
+                }
+                AgentModelDecisionSource::TextFallback => {
+                    metrics.text_fallback_turn_count += 1;
+                }
+                AgentModelDecisionSource::NativeToolCalls => {
+                    metrics.native_tool_call_turn_count += 1;
+                    metrics.native_tool_call_count += turn.decision.tool_calls.len();
+                }
+                AgentModelDecisionSource::VendorFallbackToolCalls => {
+                    metrics.vendor_fallback_tool_call_turn_count += 1;
+                    metrics.vendor_fallback_tool_call_count += turn.decision.tool_calls.len();
+                }
+            }
+        }
+        metrics.repair_attempt_count = model_response_parse_failure_count;
+        metrics
+    }
+
+    fn reported_usage_from_events(model_events: &[AgentModelEvent]) -> AgentRunModelTokenUsage {
+        let mut usage = AgentRunModelTokenUsage::default();
+        for event in model_events {
+            if let AgentModelEvent::Usage {
+                usage: Some(model_usage),
+                ..
+            } = event
+            {
+                usage.add(model_usage);
+            }
+        }
+        usage
+    }
+
+    fn repair_reported_usage_from_turns(model_turns: &[AgentModelTurn]) -> AgentRunModelTokenUsage {
+        let mut usage = AgentRunModelTokenUsage::default();
+        for turn in model_turns {
+            if turn
+                .request
+                .metadata
+                .get("model_response_repair_attempt")
+                .is_some()
+                && let Some(model_usage) = &turn.response.usage
+            {
+                usage.add(model_usage);
+            }
+        }
+        usage
+    }
+}
+
+impl AgentRunModelTokenUsage {
+    fn add(&mut self, usage: &sinomo_lm::LanguageModelUsage) {
+        self.response_count += 1;
+        self.input_tokens = self
+            .input_tokens
+            .saturating_add(usage.input_tokens.unwrap_or_default());
+        self.output_tokens = self
+            .output_tokens
+            .saturating_add(usage.output_tokens.unwrap_or_default());
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -3175,7 +3940,8 @@ pub enum AgentEventPayload {
         provider: String,
         model: String,
         role: AgentRole,
-        policy_id: String,
+        #[serde(alias = "policy_id")]
+        surface_id: String,
         continuation: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_steps: Option<usize>,
@@ -3548,31 +4314,7 @@ impl AgentSessionControlPlane {
         &self,
         cursor: AgentSessionControlEventCursor,
     ) -> AgentSessionControlEventBatch {
-        let start = cursor.offset.min(self.events.len());
-        let events: Vec<_> = self.events[start..].to_vec();
-        let task_updates = events
-            .iter()
-            .filter_map(|event| match &event.payload {
-                AgentEventPayload::TaskStatusChanged { snapshot } => Some(snapshot.clone()),
-                _ => None,
-            })
-            .collect();
-        let terminal_results = events
-            .iter()
-            .filter_map(|event| match &event.payload {
-                AgentEventPayload::TaskStatusChanged { snapshot } => {
-                    AgentTaskTerminalResult::from_snapshot(snapshot)
-                }
-                _ => None,
-            })
-            .collect();
-        AgentSessionControlEventBatch {
-            cursor,
-            next_cursor: self.event_cursor(),
-            events,
-            task_updates,
-            terminal_results,
-        }
+        agent_session_control_event_batch_from_events(cursor, &self.events)
     }
 
     pub fn drain_events(&mut self) -> Vec<AgentEvent> {
@@ -3969,12 +4711,81 @@ impl AgentSessionControlPlane {
     }
 }
 
+pub fn agent_session_control_event_batch_from_events(
+    cursor: AgentSessionControlEventCursor,
+    events: &[AgentEvent],
+) -> AgentSessionControlEventBatch {
+    let start = session_event_start_for_cursor(&cursor, events);
+    let batch_events: Vec<_> = events[start..].to_vec();
+    let task_updates = batch_events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            AgentEventPayload::TaskStatusChanged { snapshot } => Some(snapshot.clone()),
+            _ => None,
+        })
+        .collect();
+    let terminal_results = batch_events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            AgentEventPayload::TaskStatusChanged { snapshot } => {
+                AgentTaskTerminalResult::from_snapshot(snapshot)
+            }
+            _ => None,
+        })
+        .collect();
+    AgentSessionControlEventBatch {
+        cursor,
+        next_cursor: AgentSessionControlEventCursor {
+            offset: start + batch_events.len(),
+            last_event_id: last_session_event_id_before(start + batch_events.len(), events),
+        },
+        events: batch_events,
+        task_updates,
+        terminal_results,
+    }
+}
+
+fn session_event_start_for_cursor(
+    cursor: &AgentSessionControlEventCursor,
+    events: &[AgentEvent],
+) -> usize {
+    if let Some(last_event_id) = &cursor.last_event_id
+        && let Some(index) = events
+            .iter()
+            .position(|event| &event.event_id == last_event_id)
+    {
+        return index + 1;
+    }
+    cursor.offset.min(events.len())
+}
+
+fn last_session_event_id_before(offset: usize, events: &[AgentEvent]) -> Option<TaskId> {
+    let offset = offset.min(events.len());
+    if offset == 0 {
+        None
+    } else {
+        events.get(offset - 1).map(|event| event.event_id.clone())
+    }
+}
+
 pub struct AgentSessionRuntime<M>
 where
     M: InteractionModel + Send + Sync + 'static,
 {
     agent: Arc<Agent<M>>,
     state: Arc<Mutex<AgentSessionRuntimeState>>,
+}
+
+impl<M> Clone for AgentSessionRuntime<M>
+where
+    M: InteractionModel + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            agent: Arc::clone(&self.agent),
+            state: Arc::clone(&self.state),
+        }
+    }
 }
 
 struct AgentSessionRuntimeState {
@@ -4475,7 +5286,7 @@ fn join_agent_session_worker(worker: thread::JoinHandle<()>) -> Result<(), Agent
 }
 
 impl AgentTaskTerminalResult {
-    fn from_snapshot(snapshot: &AgentTaskSnapshot) -> Option<Self> {
+    pub fn from_snapshot(snapshot: &AgentTaskSnapshot) -> Option<Self> {
         if !is_terminal_task_status(&snapshot.status) {
             return None;
         }
@@ -4570,6 +5381,8 @@ pub struct AgentModelTurn {
     pub request: LanguageModelRequest,
     pub response: LanguageModelResponse,
     pub decision: AgentLoopDecision,
+    #[serde(default)]
+    pub decision_source: AgentModelDecisionSource,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<AgentModelEvent>,
 }
@@ -4642,24 +5455,33 @@ pub enum AgentTranscriptRole {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct AgentPolicyBundle {
-    pub policy_id: String,
+pub struct AgentToolSurface {
+    #[serde(alias = "policy_id")]
+    pub surface_id: String,
     pub role: AgentRole,
     #[serde(default)]
-    pub tools: AgentToolPolicy,
+    pub tools: ToolAvailability,
 }
 
-impl AgentPolicyBundle {
-    pub fn new(policy_id: impl Into<String>, role: AgentRole) -> Self {
+/// Backward-compatible name for the session tool-surface availability bundle.
+#[deprecated(note = "use AgentToolSurface")]
+pub type AgentPolicyBundle = AgentToolSurface;
+
+impl AgentToolSurface {
+    pub fn new(surface_id: impl Into<String>, role: AgentRole) -> Self {
         Self {
-            policy_id: policy_id.into(),
+            surface_id: surface_id.into(),
             role,
-            tools: AgentToolPolicy::default(),
+            tools: ToolAvailability::default(),
         }
     }
 
     pub fn default_for_role(role: AgentRole) -> Self {
-        Self::new(format!("{}-default", role.policy_label()), role)
+        Self::new(format!("{}-default", role.surface_label()), role)
+    }
+
+    pub fn surface_id(&self) -> &str {
+        &self.surface_id
     }
 
     pub fn with_allowed_tools(
@@ -4691,15 +5513,18 @@ impl AgentPolicyBundle {
         self
     }
 
-    pub fn evaluate_descriptor(&self, descriptor: &AgentToolDescriptor) -> AgentToolPolicyDecision {
-        self.tools.evaluate_descriptor(&self.policy_id, descriptor)
+    pub fn evaluate_descriptor(
+        &self,
+        descriptor: &AgentToolDescriptor,
+    ) -> AgentToolAvailabilityDecision {
+        self.tools.evaluate_descriptor(&self.surface_id, descriptor)
     }
 
     pub fn evaluate_tool_call(
         &self,
         descriptor: Option<&AgentToolDescriptor>,
         call: &AgentToolCall,
-    ) -> AgentToolPolicyDecision {
+    ) -> AgentToolAvailabilityDecision {
         if let Some(descriptor) = descriptor {
             return self.evaluate_descriptor(descriptor);
         }
@@ -4709,11 +5534,11 @@ impl AgentPolicyBundle {
             .iter()
             .any(|tool| tool == &call.tool)
         {
-            return AgentToolPolicyDecision {
+            return AgentToolAvailabilityDecision {
                 allowed: false,
                 reason: format!(
-                    "tool `{}` is denied by agent policy `{}`",
-                    call.tool, self.policy_id
+                    "tool `{}` is hidden by agent tool surface `{}`",
+                    call.tool, self.surface_id
                 ),
             };
         }
@@ -4724,19 +5549,19 @@ impl AgentPolicyBundle {
                 .iter()
                 .any(|tool| tool == &call.tool)
         {
-            return AgentToolPolicyDecision {
+            return AgentToolAvailabilityDecision {
                 allowed: false,
                 reason: format!(
-                    "tool `{}` is not in the allow-list for agent policy `{}`",
-                    call.tool, self.policy_id
+                    "tool `{}` is not in the visible set for agent tool surface `{}`",
+                    call.tool, self.surface_id
                 ),
             };
         }
-        AgentToolPolicyDecision {
+        AgentToolAvailabilityDecision {
             allowed: true,
             reason: format!(
-                "tool `{}` has no descriptor and is available to reach the registry by agent policy `{}`",
-                call.tool, self.policy_id
+                "tool `{}` has no descriptor and is available to reach the registry by agent tool surface `{}`",
+                call.tool, self.surface_id
             ),
         }
     }
@@ -4764,7 +5589,7 @@ impl AgentPolicyBundle {
 }
 
 impl AgentRole {
-    fn policy_label(&self) -> &'static str {
+    fn surface_label(&self) -> &'static str {
         match self {
             AgentRole::Main => "main",
             AgentRole::Background => "background",
@@ -4775,7 +5600,7 @@ impl AgentRole {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct AgentToolPolicy {
+pub struct ToolAvailability {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -4786,26 +5611,32 @@ pub struct AgentToolPolicy {
     pub denied_capabilities: Vec<AgentToolCapability>,
 }
 
-impl AgentToolPolicy {
+/// Backward-compatible name for tool availability filters.
+#[deprecated(note = "use ToolAvailability")]
+pub type AgentToolPolicy = ToolAvailability;
+
+impl ToolAvailability {
     fn evaluate_descriptor(
         &self,
-        policy_id: &str,
+        surface_id: &str,
         descriptor: &AgentToolDescriptor,
-    ) -> AgentToolPolicyDecision {
+    ) -> AgentToolAvailabilityDecision {
         let tool_name = &descriptor.spec.name;
         if self.denied_tools.iter().any(|tool| tool == tool_name) {
-            return AgentToolPolicyDecision {
+            return AgentToolAvailabilityDecision {
                 allowed: false,
-                reason: format!("tool `{tool_name}` is denied by agent policy `{policy_id}`"),
+                reason: format!(
+                    "tool `{tool_name}` is hidden by agent tool surface `{surface_id}`"
+                ),
             };
         }
         if !self.allowed_tools.is_empty()
             && !self.allowed_tools.iter().any(|tool| tool == tool_name)
         {
-            return AgentToolPolicyDecision {
+            return AgentToolAvailabilityDecision {
                 allowed: false,
                 reason: format!(
-                    "tool `{tool_name}` is not in the allow-list for agent policy `{policy_id}`"
+                    "tool `{tool_name}` is not in the visible set for agent tool surface `{surface_id}`"
                 ),
             };
         }
@@ -4814,11 +5645,11 @@ impl AgentToolPolicy {
             .iter()
             .find(|capability| self.denied_capabilities.contains(capability))
         {
-            return AgentToolPolicyDecision {
+            return AgentToolAvailabilityDecision {
                 allowed: false,
                 reason: format!(
-                    "tool `{tool_name}` has unavailable capability `{}` under agent policy `{policy_id}`",
-                    capability.policy_label()
+                    "tool `{tool_name}` has unavailable capability `{}` under agent tool surface `{surface_id}`",
+                    capability.availability_label()
                 ),
             };
         }
@@ -4828,25 +5659,34 @@ impl AgentToolPolicy {
                 .iter()
                 .any(|capability| !self.allowed_capabilities.contains(capability))
         {
-            return AgentToolPolicyDecision {
+            return AgentToolAvailabilityDecision {
                 allowed: false,
                 reason: format!(
-                    "tool `{tool_name}` has capabilities outside the available capability set for agent policy `{policy_id}`"
+                    "tool `{tool_name}` has capabilities outside the visible capability set for agent tool surface `{surface_id}`"
                 ),
             };
         }
-        AgentToolPolicyDecision {
+        AgentToolAvailabilityDecision {
             allowed: true,
-            reason: format!("tool `{tool_name}` is available under agent policy `{policy_id}`"),
+            reason: format!(
+                "tool `{tool_name}` is available under agent tool surface `{surface_id}`"
+            ),
         }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentToolOrchestrationRecord {
-    pub policy_id: String,
-    pub policy_allowed: bool,
-    pub policy_reason: String,
+    #[serde(alias = "policy_id")]
+    pub surface_id: String,
+    #[serde(default)]
+    pub registry_generation: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visible_toolsets: Vec<String>,
+    #[serde(alias = "policy_allowed")]
+    pub surface_allowed: bool,
+    #[serde(alias = "policy_reason")]
+    pub surface_reason: String,
     pub descriptor_visible: bool,
     pub executor_available: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4860,22 +5700,29 @@ pub struct AgentToolOrchestrationRecord {
 }
 
 pub struct AgentToolOrchestrator<'a> {
-    policy: &'a AgentPolicyBundle,
+    tool_surface: &'a AgentToolSurface,
     max_tool_calls_per_step: Option<usize>,
     run_context: &'a AgentRunContext,
+    skill_plan: AgentSkillPlan,
 }
 
 impl<'a> AgentToolOrchestrator<'a> {
     pub fn new(
-        policy: &'a AgentPolicyBundle,
+        tool_surface: &'a AgentToolSurface,
         max_tool_calls_per_step: Option<usize>,
         run_context: &'a AgentRunContext,
     ) -> Self {
         Self {
-            policy,
+            tool_surface,
             max_tool_calls_per_step,
             run_context,
+            skill_plan: AgentSkillPlan::default(),
         }
+    }
+
+    pub fn with_skill_plan(mut self, skill_plan: AgentSkillPlan) -> Self {
+        self.skill_plan = skill_plan;
+        self
     }
 
     pub fn execute(
@@ -4934,15 +5781,17 @@ impl<'a> AgentToolOrchestrator<'a> {
         let descriptor = tool_plan.descriptor(&call.tool);
         let descriptor_visible = tool_plan.is_model_visible(&call.tool);
         let executor_available = tool_plan.is_executable(&call.tool);
-        let policy_descriptor = descriptor.filter(|_| descriptor_visible);
-        let policy_decision = self.policy.evaluate_tool_call(policy_descriptor, call);
+        let availability_descriptor = descriptor.filter(|_| descriptor_visible);
+        let availability_decision = self
+            .tool_surface
+            .evaluate_tool_call(availability_descriptor, call);
         let requested_timeout_ms = call
             .input
             .get("timeout_ms")
             .and_then(serde_json::Value::as_u64);
 
-        let (mut outcome, blocked_reason) = if !policy_decision.allowed {
-            let reason = policy_decision.reason.clone();
+        let (mut outcome, blocked_reason) = if !availability_decision.allowed {
+            let reason = availability_decision.reason.clone();
             (
                 AgentToolOutcome {
                     call_id: TaskId::generate(),
@@ -4952,15 +5801,18 @@ impl<'a> AgentToolOrchestrator<'a> {
                     status: AgentToolStatus::Blocked,
                     summary: reason.clone(),
                     output: serde_json::json!({
-                        "error": "policy_denied",
-                        "policy_id": self.policy.policy_id.clone(),
+                        "error": "tool_unavailable",
+                        "surface_id": self.tool_surface.surface_id.clone(),
                         "tool": call.tool.clone(),
                         "reason": reason,
                     }),
                     event_id: None,
-                    evidence: AgentToolEvidence::policy_only(false, policy_decision.reason.clone()),
+                    evidence: AgentToolEvidence::availability_only(
+                        false,
+                        availability_decision.reason.clone(),
+                    ),
                 },
-                Some("policy_denied".to_string()),
+                Some("tool_unavailable".to_string()),
             )
         } else if self
             .max_tool_calls_per_step
@@ -4983,7 +5835,7 @@ impl<'a> AgentToolOrchestrator<'a> {
                         "max_tool_calls_per_step": max_tool_calls_per_step,
                     }),
                     event_id: None,
-                    evidence: AgentToolEvidence::policy_only(
+                    evidence: AgentToolEvidence::availability_only(
                         false,
                         "blocked by per-step tool call limit",
                     ),
@@ -5008,7 +5860,7 @@ impl<'a> AgentToolOrchestrator<'a> {
                         "visible_toolsets": &tool_plan.visible_toolsets,
                     }),
                     event_id: None,
-                    evidence: AgentToolEvidence::policy_only(
+                    evidence: AgentToolEvidence::availability_only(
                         false,
                         "blocked because tool is outside the current model-visible projection",
                     ),
@@ -5032,7 +5884,7 @@ impl<'a> AgentToolOrchestrator<'a> {
                         "tool": call.tool.clone(),
                     }),
                     event_id: None,
-                    evidence: AgentToolEvidence::policy_only(
+                    evidence: AgentToolEvidence::availability_only(
                         false,
                         "blocked because planned tool has no runtime executor",
                     ),
@@ -5067,13 +5919,15 @@ impl<'a> AgentToolOrchestrator<'a> {
             )
         };
 
-        if policy_decision.allowed && outcome.evidence.policy.allowed {
-            outcome.evidence.policy = policy_decision.clone();
+        if availability_decision.allowed && outcome.evidence.availability.allowed {
+            outcome.evidence.availability = availability_decision.clone();
         }
         let record = AgentToolOrchestrationRecord {
-            policy_id: self.policy.policy_id.clone(),
-            policy_allowed: policy_decision.allowed,
-            policy_reason: policy_decision.reason,
+            surface_id: self.tool_surface.surface_id.clone(),
+            registry_generation: tool_plan.registry_generation,
+            visible_toolsets: tool_plan.visible_toolsets.clone(),
+            surface_allowed: availability_decision.allowed,
+            surface_reason: availability_decision.reason,
             descriptor_visible,
             executor_available,
             blocked_reason,
@@ -5103,6 +5957,9 @@ impl<'a> AgentToolOrchestrator<'a> {
             "tool_describe" => {
                 self.execute_tool_describe(session, tool_plan, step_index, call_index, call)
             }
+            "skill_search" => self.execute_skill_search(step_index, call_index, call),
+            "skill_describe" => self.execute_skill_describe(session, step_index, call_index, call),
+            "skill_activate" => self.execute_skill_activate(session, step_index, call_index, call),
             "tool_call" => self.execute_tool_call_bridge(
                 registry,
                 session,
@@ -5114,6 +5971,185 @@ impl<'a> AgentToolOrchestrator<'a> {
                 progress_sink,
             ),
             _ => unreachable!("tool disclosure bridge names are matched by caller"),
+        }
+    }
+
+    fn execute_skill_activate(
+        &self,
+        session: &InteractionSession,
+        step_index: usize,
+        call_index: usize,
+        call: &AgentToolCall,
+    ) -> AgentToolOutcome {
+        let Some(skill_id) = json_input_string(call, "skill") else {
+            return bridge_failed_outcome(
+                session,
+                step_index,
+                call_index,
+                call,
+                "skill_activate requires a string skill",
+                serde_json::json!({ "error": "missing_skill" }),
+            );
+        };
+        let Some(skill) = self.skill_plan.get(&skill_id) else {
+            return bridge_failed_outcome(
+                session,
+                step_index,
+                call_index,
+                call,
+                format!("skill `{skill_id}` is not available to this agent package"),
+                serde_json::json!({ "error": "unknown_skill", "skill": skill_id }),
+            );
+        };
+        let activation = skill_activation_metadata(skill);
+        let output = serde_json::json!({
+            "error": "skill_activation_unavailable",
+            "skill": skill.id,
+            "activation": activation,
+            "reason": "generic skill activation is host/runtime-owned; attach a host runtime activation executor before activating skills",
+        });
+        let evidence = AgentToolEvidence::availability_only(
+            false,
+            "skill activation requires a host runtime activation executor",
+        )
+        .with_output_value(&output, false)
+        .with_record_value(
+            "skill_disclosure",
+            serde_json::json!({
+                "operation": "activate",
+                "skill": skill.id,
+                "available": false,
+                "mode": "host_runtime",
+            }),
+        );
+        AgentToolOutcome {
+            call_id: TaskId::generate(),
+            step_index,
+            call_index,
+            call: call.clone(),
+            status: AgentToolStatus::Blocked,
+            summary: format!(
+                "skill `{}` activation requires a host runtime activation executor",
+                skill.id
+            ),
+            output,
+            event_id: None,
+            evidence,
+        }
+    }
+
+    fn execute_skill_search(
+        &self,
+        step_index: usize,
+        call_index: usize,
+        call: &AgentToolCall,
+    ) -> AgentToolOutcome {
+        let query = json_input_string(call, "query");
+        let max_results = json_input_usize(call, "max_results").unwrap_or(20).min(50);
+        let matches = self
+            .skill_plan
+            .matching(query.as_deref())
+            .into_iter()
+            .take(max_results)
+            .map(|skill| {
+                serde_json::json!({
+                    "id": &skill.id,
+                    "description": &skill.description,
+                    "source": &skill.source,
+                    "package_declared": skill.package_declared,
+                    "module_id": &skill.module_id,
+                    "module_version": &skill.module_version,
+                    "path": &skill.path,
+                    "target_agents": &skill.target_agents,
+                    "model_families": &skill.model_families,
+                    "activation_tags": &skill.activation_tags,
+                    "required_capabilities": &skill.required_capabilities,
+                    "activation": skill_activation_metadata(skill),
+                    "has_embedded_text": skill.embedded_text.is_some(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let match_count = matches.len();
+        let output = serde_json::json!({
+            "query": query,
+            "max_results": max_results,
+            "count": match_count,
+            "matches": matches,
+        });
+        let evidence = AgentToolEvidence::availability_only(true, "inspected planned agent skills")
+            .with_output_value(&output, false)
+            .with_record_value(
+                "skill_disclosure",
+                serde_json::json!({
+                    "operation": "search",
+                    "query": output.get("query").cloned().unwrap_or(serde_json::Value::Null),
+                    "count": output.get("count").cloned().unwrap_or(serde_json::Value::Null),
+                }),
+            );
+        AgentToolOutcome {
+            call_id: TaskId::generate(),
+            step_index,
+            call_index,
+            call: call.clone(),
+            status: AgentToolStatus::Succeeded,
+            summary: format!("found {match_count} skill(s)"),
+            output,
+            event_id: None,
+            evidence,
+        }
+    }
+
+    fn execute_skill_describe(
+        &self,
+        session: &InteractionSession,
+        step_index: usize,
+        call_index: usize,
+        call: &AgentToolCall,
+    ) -> AgentToolOutcome {
+        let Some(skill_id) = json_input_string(call, "skill") else {
+            return bridge_failed_outcome(
+                session,
+                step_index,
+                call_index,
+                call,
+                "skill_describe requires a string skill",
+                serde_json::json!({ "error": "missing_skill" }),
+            );
+        };
+        let Some(skill) = self.skill_plan.get(&skill_id) else {
+            return bridge_failed_outcome(
+                session,
+                step_index,
+                call_index,
+                call,
+                format!("skill `{skill_id}` is not available to this agent package"),
+                serde_json::json!({ "error": "unknown_skill", "skill": skill_id }),
+            );
+        };
+        let output = serde_json::json!({
+            "skill": skill_id,
+            "descriptor": skill,
+            "activation": skill_activation_metadata(skill),
+        });
+        let evidence = AgentToolEvidence::availability_only(true, "inspected planned agent skill")
+            .with_output_value(&output, false)
+            .with_record_value(
+                "skill_disclosure",
+                serde_json::json!({
+                    "operation": "describe",
+                    "skill": skill.id,
+                }),
+            );
+        AgentToolOutcome {
+            call_id: TaskId::generate(),
+            step_index,
+            call_index,
+            call: call.clone(),
+            status: AgentToolStatus::Succeeded,
+            summary: format!("described skill `{}`", skill.id),
+            output,
+            event_id: None,
+            evidence,
         }
     }
 
@@ -5156,7 +6192,7 @@ impl<'a> AgentToolOrchestrator<'a> {
             "matches": matches,
         });
         let evidence =
-            AgentToolEvidence::policy_only(true, "inspected planned agent tool descriptors")
+            AgentToolEvidence::availability_only(true, "inspected planned agent tool descriptors")
                 .with_output_value(&output, false)
                 .with_record_value(
                     "tool_disclosure",
@@ -5217,7 +6253,7 @@ impl<'a> AgentToolOrchestrator<'a> {
             "visible_toolsets": &tool_plan.visible_toolsets,
         });
         let evidence =
-            AgentToolEvidence::policy_only(true, "inspected planned agent tool descriptor")
+            AgentToolEvidence::availability_only(true, "inspected planned agent tool descriptor")
                 .with_output_value(&output, false)
                 .with_record_value(
                     "tool_disclosure",
@@ -5321,21 +6357,21 @@ impl<'a> AgentToolOrchestrator<'a> {
                 format!("called through progressive tool disclosure for `{target_tool}`")
             }),
         };
-        let target_policy = self
-            .policy
+        let target_availability = self
+            .tool_surface
             .evaluate_tool_call(Some(&entry.descriptor), &target_call);
-        if !target_policy.allowed {
+        if !target_availability.allowed {
             return bridge_blocked_outcome(
                 session,
                 step_index,
                 call_index,
                 call,
-                target_policy.reason.clone(),
+                target_availability.reason.clone(),
                 serde_json::json!({
-                    "error": "policy_denied",
-                    "policy_id": self.policy.policy_id,
+                    "error": "tool_unavailable",
+                    "surface_id": self.tool_surface.surface_id.clone(),
                     "tool": target_tool,
-                    "reason": target_policy.reason,
+                    "reason": target_availability.reason,
                 }),
             );
         }
@@ -5348,9 +6384,11 @@ impl<'a> AgentToolOrchestrator<'a> {
             progress_sink,
         );
         let target_record = AgentToolOrchestrationRecord {
-            policy_id: self.policy.policy_id.clone(),
-            policy_allowed: target_policy.allowed,
-            policy_reason: target_policy.reason,
+            surface_id: self.tool_surface.surface_id.clone(),
+            registry_generation: tool_plan.registry_generation,
+            visible_toolsets: tool_plan.visible_toolsets.clone(),
+            surface_allowed: target_availability.allowed,
+            surface_reason: target_availability.reason,
             descriptor_visible: tool_plan.is_model_visible(&target_tool),
             executor_available: entry.executable,
             blocked_reason: (target_outcome.status == AgentToolStatus::Blocked)
@@ -5389,6 +6427,16 @@ impl<'a> AgentToolOrchestrator<'a> {
             evidence,
         }
     }
+}
+
+fn skill_activation_metadata(skill: &AgentSkillDescriptor) -> serde_json::Value {
+    serde_json::json!({
+        "mode": "host_runtime",
+        "available": false,
+        "reason": "generic skill activation is host/runtime-owned; use skill_describe for descriptor text and a host-provided activation surface when one is attached",
+        "activation_tags": &skill.activation_tags,
+        "required_capabilities": &skill.required_capabilities,
+    })
 }
 
 fn json_input_string(call: &AgentToolCall, key: &str) -> Option<String> {
@@ -5430,7 +6478,7 @@ fn bridge_failed_outcome(
         summary: summary.clone(),
         output: output.clone(),
         event_id: None,
-        evidence: AgentToolEvidence::policy_only(true, "tool disclosure bridge failed")
+        evidence: AgentToolEvidence::availability_only(true, "tool disclosure bridge failed")
             .with_output_value(&output, false),
     }
 }
@@ -5453,7 +6501,8 @@ fn bridge_blocked_outcome(
         summary: summary.clone(),
         output: output.clone(),
         event_id: None,
-        evidence: AgentToolEvidence::policy_only(false, summary).with_output_value(&output, false),
+        evidence: AgentToolEvidence::availability_only(false, summary)
+            .with_output_value(&output, false),
     }
 }
 
@@ -5478,7 +6527,7 @@ fn cancelled_tool_outcome(
         summary: format!("tool `{}` cancelled", call.tool),
         output: output.clone(),
         event_id: None,
-        evidence: AgentToolEvidence::policy_only(false, "turn cancellation requested")
+        evidence: AgentToolEvidence::availability_only(false, "turn cancellation requested")
             .with_output_value(&output, false),
     }
 }
@@ -5534,7 +6583,7 @@ fn with_tool_orchestration_record(
 pub struct Agent<M> {
     model: M,
     config: AgentConfig,
-    policy: AgentPolicyBundle,
+    tool_surface: AgentToolSurface,
     tools: AgentToolRegistry,
     context_assembler: ContextAssembler,
     compactor: AgentCompactor,
@@ -5548,11 +6597,11 @@ impl<M: InteractionModel> Agent<M> {
         let provider = provider.into();
         let model_id = model_id.into();
         let config = AgentConfig::new(provider, model_id);
-        let policy = AgentPolicyBundle::default_for_role(config.definition.role.clone());
+        let tool_surface = AgentToolSurface::default_for_role(config.definition.role.clone());
         Self {
             model,
             config,
-            policy,
+            tool_surface,
             tools: AgentToolRegistry::new(),
             context_assembler: ContextAssembler,
             compactor: AgentCompactor::default(),
@@ -5565,20 +6614,20 @@ impl<M: InteractionModel> Agent<M> {
     }
 
     pub fn with_config(mut self, config: AgentConfig) -> Self {
-        let previous_default_policy =
-            AgentPolicyBundle::default_for_role(self.config.definition.role.clone());
-        if self.policy == previous_default_policy {
-            self.policy = AgentPolicyBundle::default_for_role(config.definition.role.clone());
+        let previous_default_surface =
+            AgentToolSurface::default_for_role(self.config.definition.role.clone());
+        if self.tool_surface == previous_default_surface {
+            self.tool_surface = AgentToolSurface::default_for_role(config.definition.role.clone());
         }
         self.config = config;
         self
     }
 
     pub fn with_agent_definition(mut self, definition: AgentDefinition) -> Self {
-        let previous_default_policy =
-            AgentPolicyBundle::default_for_role(self.config.definition.role.clone());
-        if self.policy == previous_default_policy {
-            self.policy = AgentPolicyBundle::default_for_role(definition.role.clone());
+        let previous_default_surface =
+            AgentToolSurface::default_for_role(self.config.definition.role.clone());
+        if self.tool_surface == previous_default_surface {
+            self.tool_surface = AgentToolSurface::default_for_role(definition.role.clone());
         }
         if self.compactor == AgentCompactor::default() {
             self.compactor.retained_tail_count = definition.compaction.retained_tail_items;
@@ -5604,9 +6653,14 @@ impl<M: InteractionModel> Agent<M> {
         self.tools.remove(tool_name)
     }
 
-    pub fn with_policy(mut self, policy: AgentPolicyBundle) -> Self {
-        self.policy = policy;
+    pub fn with_tool_surface(mut self, tool_surface: AgentToolSurface) -> Self {
+        self.tool_surface = tool_surface;
         self
+    }
+
+    #[deprecated(note = "use with_tool_surface")]
+    pub fn with_policy(self, tool_surface: AgentToolSurface) -> Self {
+        self.with_tool_surface(tool_surface)
     }
 
     pub fn with_context_assembler(mut self, context_assembler: ContextAssembler) -> Self {
@@ -5712,7 +6766,7 @@ impl<M: InteractionModel> Agent<M> {
                         provider: self.config.provider.clone(),
                         model: self.config.model.clone(),
                         role: self.config.definition.role.clone(),
-                        policy_id: self.policy.policy_id.clone(),
+                        surface_id: self.tool_surface.surface_id.clone(),
                         continuation: false,
                         max_steps: self.config.max_steps,
                         run_context: self.config.run_context.clone(),
@@ -5740,7 +6794,7 @@ impl<M: InteractionModel> Agent<M> {
                         provider: self.config.provider.clone(),
                         model: self.config.model.clone(),
                         role: self.config.definition.role.clone(),
-                        policy_id: self.policy.policy_id.clone(),
+                        surface_id: self.tool_surface.surface_id.clone(),
                         continuation: true,
                         max_steps: self.config.max_steps,
                         run_context: self.config.run_context.clone(),
@@ -5911,6 +6965,7 @@ impl<M: InteractionModel> Agent<M> {
             return Ok(AgentRun {
                 final_decision: AgentLoopDecision::silent(),
                 stop_reason: AgentStopReason::Aborted,
+                model_metrics: AgentRunModelMetrics::default(),
                 run_context: self.config.run_context.clone(),
                 transcript: Vec::new(),
                 model_turns: Vec::new(),
@@ -5943,7 +6998,7 @@ impl<M: InteractionModel> Agent<M> {
                 provider: self.config.provider.clone(),
                 model: self.config.model.clone(),
                 role: self.config.definition.role.clone(),
-                policy_id: self.policy.policy_id.clone(),
+                surface_id: self.tool_surface.surface_id.clone(),
                 max_steps: self.config.max_steps,
                 run_context: self.config.run_context.clone(),
             },
@@ -6221,6 +7276,7 @@ impl<M: InteractionModel> Agent<M> {
             return Ok(AgentRun {
                 final_decision: AgentLoopDecision::silent(),
                 stop_reason: AgentStopReason::SilentAsyncUpdate,
+                model_metrics: AgentRunModelMetrics::default(),
                 run_context: self.config.run_context.clone(),
                 transcript: Vec::new(),
                 model_turns: Vec::new(),
@@ -6241,7 +7297,7 @@ impl<M: InteractionModel> Agent<M> {
                 provider: self.config.provider.clone(),
                 model: self.config.model.clone(),
                 role: self.config.definition.role.clone(),
-                policy_id: self.policy.policy_id.clone(),
+                surface_id: self.tool_surface.surface_id.clone(),
                 max_steps: self.config.max_steps,
                 run_context: self.config.run_context.clone(),
             },
@@ -6296,7 +7352,7 @@ impl<M: InteractionModel> Agent<M> {
                     "provider": self.config.provider,
                     "model": self.config.model,
                     "role": self.config.definition.role,
-                    "policy_id": self.policy.policy_id,
+                    "agent_tool_surface_id": self.tool_surface.surface_id.clone(),
                     "max_steps": self.config.max_steps,
                     "max_tool_calls_per_step": self.config.max_tool_calls_per_step,
                     "run_context": &self.config.run_context,
@@ -6315,6 +7371,7 @@ impl<M: InteractionModel> Agent<M> {
         let mut stop_reason = AgentStopReason::MaxStepsReached;
         let mut step_index = 0usize;
         let mut latest_coding_state: Option<CodingRunState> = None;
+        let mut repair_request_model_visible_bytes = 0usize;
 
         'turn_loop: loop {
             if cancellation_token.is_cancelled() {
@@ -6460,7 +7517,7 @@ impl<M: InteractionModel> Agent<M> {
             events.push(context_event);
             let mut request = self.request_from_context(input, &turn_context, step_index)?;
             let mut repair_attempt = 0;
-            let (request, response, decision, step_model_events) = loop {
+            let (request, response, decision, decision_source, step_model_events) = loop {
                 let sampled_request = request.clone();
                 let mut language_model_stream_events = Vec::new();
                 let response = match self.model.complete_streaming_events_with_cancellation(
@@ -6516,14 +7573,20 @@ impl<M: InteractionModel> Agent<M> {
                     &turn_context.available_tool_specs,
                     &self.config.definition.output_format,
                 ) {
-                    Ok(decision) => {
+                    Ok(parsed_decision) => {
                         let step_model_events = AgentModelEvent::from_model_response(
                             step_index,
                             &response,
-                            &decision,
+                            &parsed_decision.decision,
                             language_model_stream_events,
                         );
-                        break (sampled_request, response, decision, step_model_events);
+                        break (
+                            sampled_request,
+                            response,
+                            parsed_decision.decision,
+                            parsed_decision.source,
+                            step_model_events,
+                        );
                     }
                     Err(error) => {
                         let detail = model_repair_parse_error_detail(
@@ -6572,6 +7635,14 @@ impl<M: InteractionModel> Agent<M> {
                             &detail,
                             repair_attempt,
                         )?;
+                        repair_request_model_visible_bytes = repair_request_model_visible_bytes
+                            .saturating_add(
+                                request
+                                    .messages
+                                    .last()
+                                    .map(|message| message.content.len())
+                                    .unwrap_or_default(),
+                            );
                     }
                 }
             };
@@ -6585,8 +7656,11 @@ impl<M: InteractionModel> Agent<M> {
                 break;
             }
             transcript.push(
-                AgentTranscriptItem::assistant(step_index, response.content.clone())
-                    .with_native_items(native_tool_call_items_from_decision(&decision)),
+                AgentTranscriptItem::assistant(
+                    step_index,
+                    model_visible_assistant_content(&response.content),
+                )
+                .with_native_items(native_tool_call_items_from_decision(&decision)),
             );
             for event in &step_model_events {
                 self.trace(
@@ -6621,6 +7695,7 @@ impl<M: InteractionModel> Agent<M> {
                     serde_json::json!({
                         "step_index": step_index,
                         "response_mode": decision.response_mode,
+                        "decision_source": &decision_source,
                         "tool_call_count": decision.tool_calls.len(),
                         "next_state": decision.next_state,
                     }),
@@ -6639,6 +7714,7 @@ impl<M: InteractionModel> Agent<M> {
                 request,
                 response,
                 decision: decision.clone(),
+                decision_source,
                 events: step_model_events,
             });
             final_decision = decision.clone();
@@ -6651,10 +7727,11 @@ impl<M: InteractionModel> Agent<M> {
             let mut step_results = Vec::new();
             let tool_plan = self.tool_plan(input);
             let tool_orchestrator = AgentToolOrchestrator::new(
-                &self.policy,
+                &self.tool_surface,
                 self.config.max_tool_calls_per_step,
                 &self.config.run_context,
-            );
+            )
+            .with_skill_plan(self.skill_plan());
             for (call_index, call) in decision.tool_calls.iter().enumerate() {
                 let tool_call_item = AgentItem::ToolCall {
                     item_id: TaskId::generate(),
@@ -6771,7 +7848,7 @@ impl<M: InteractionModel> Agent<M> {
                     tool_message_id,
                     render_tool_results(step_index, &step_results)?,
                 )
-                .with_native_items(native_tool_output_items_from_outcomes(&step_results)),
+                .with_native_items(native_tool_output_items_from_outcomes(&step_results)?),
             );
             let coding_state = coding_state_from_items(&items);
             if !coding_state.is_empty() {
@@ -6811,7 +7888,7 @@ impl<M: InteractionModel> Agent<M> {
                     },
                 )?;
                 events.push(coding_state_event);
-                if coding_state.stop_recommendation == CodingStopDecision::FinishWithPatch {
+                if coding_state_should_stop_loop(&coding_state) {
                     final_decision = coding_final_decision_from_state(&coding_state);
                     stop_reason = AgentStopReason::CodingStopRecommended;
                     latest_coding_state = Some(coding_state);
@@ -6825,6 +7902,12 @@ impl<M: InteractionModel> Agent<M> {
             step_index = step_index.saturating_add(1);
         }
 
+        let model_metrics = AgentRunModelMetrics::from_turns(
+            self.config.definition.output_format.clone(),
+            &model_turns,
+            &model_events,
+            repair_request_model_visible_bytes,
+        );
         let completed_event = caused_by_latest_event(
             agent_event(
                 &input.session,
@@ -6834,6 +7917,7 @@ impl<M: InteractionModel> Agent<M> {
                     "stop_reason": stop_reason,
                     "model_turn_count": model_turns.len(),
                     "tool_result_count": tool_results.len(),
+                    "model_metrics": &model_metrics,
                     "final_response_mode": final_decision.response_mode,
                     "run_context": &self.config.run_context,
                     "coding_state": &latest_coding_state,
@@ -6862,6 +7946,7 @@ impl<M: InteractionModel> Agent<M> {
         Ok(AgentRun {
             final_decision,
             stop_reason,
+            model_metrics,
             run_context: self.config.run_context.clone(),
             transcript,
             model_turns,
@@ -6903,12 +7988,22 @@ impl<M: InteractionModel> Agent<M> {
         step_index: usize,
     ) -> Result<TurnContext, AgentError> {
         let tool_plan = self.tool_plan(input);
+        let readiness_issues = tool_plan.readiness_issues();
+        let unready_visible_tools = readiness_issues
+            .iter()
+            .map(|issue| issue.tool.as_str())
+            .collect::<BTreeSet<_>>();
         let all_tool_descriptors = match self.config.definition.output_format {
-            AgentOutputFormat::JsonDecision => tool_plan.model_visible_descriptors(),
+            AgentOutputFormat::JsonDecision => tool_plan
+                .model_visible_descriptors()
+                .into_iter()
+                .filter(|descriptor| !unready_visible_tools.contains(descriptor.spec.name.as_str()))
+                .collect(),
             AgentOutputFormat::Text => Vec::new(),
         };
-        let (tool_descriptors, policy_omissions) =
-            self.policy.filter_tool_descriptors(all_tool_descriptors);
+        let (tool_descriptors, policy_omissions) = self
+            .tool_surface
+            .filter_tool_descriptors(all_tool_descriptors);
         let mut context = self.context_assembler.assemble(
             input,
             self.config.definition.role.clone(),
@@ -6918,20 +8013,28 @@ impl<M: InteractionModel> Agent<M> {
             tool_descriptors,
             step_index,
         )?;
-        let policy_bytes = serde_json::to_vec(&self.policy)
+        let policy_bytes = serde_json::to_vec(&self.tool_surface)
             .map(|bytes| bytes.len())
             .unwrap_or_default();
         context.report.included.push(ContextSource {
-            kind: "agent_policy".to_string(),
-            label: self.policy.policy_id.clone(),
+            kind: "agent_tool_surface".to_string(),
+            label: self.tool_surface.surface_id.clone(),
             bytes: policy_bytes,
         });
         context.budget_estimate.lanes.push(ContextBudgetLane {
             kind: "fixed_prompt".to_string(),
-            label: "agent policy".to_string(),
+            label: "agent tool surface".to_string(),
             bytes: policy_bytes,
             priority: 0,
         });
+        context
+            .report
+            .omitted
+            .extend(readiness_issues.into_iter().map(|issue| ContextOmission {
+                kind: "tool_readiness".to_string(),
+                label: issue.tool,
+                reason: issue.reason,
+            }));
         context.report.omitted.extend(policy_omissions);
         context.budget_estimate.total_bytes += policy_bytes;
         context.report.budget_estimate = context.budget_estimate.clone();
@@ -6947,10 +8050,11 @@ impl<M: InteractionModel> Agent<M> {
         let turn_context_message = render_turn_context_message(input, turn_context)?;
         let mut messages = vec![LanguageModelMessage {
             role: LanguageModelRole::System,
-            content: model_protocol_system_instructions(
+            content: language_model_system_instructions(
                 &turn_context.provider,
                 &turn_context.model,
                 &turn_context.system_instructions,
+                Some(agent_output_contract(&self.config.definition.output_format)),
             ),
         }];
         messages.push(LanguageModelMessage {
@@ -6998,22 +8102,19 @@ impl<M: InteractionModel> Agent<M> {
                 .config
                 .max_output_tokens
                 .or(self.config.definition.max_output_tokens),
-            response_format: self
-                .config
-                .definition
-                .output_format
-                .language_model_response_format(),
+            response_format: turn_context.response_format.clone(),
             metadata: serde_json::json!({
                 "loop": "agent",
                 "agent_name": self.config.definition.name,
                 "agent_role": self.config.definition.role,
                 "agent_output_format": self.config.definition.output_format,
+                "agent_output_contract": agent_output_contract(&self.config.definition.output_format),
                 "step_index": step_index,
                 "session_id": input.session.session_id,
                 "event_id": input.latest_event.event_id,
                 "context_report_id": turn_context.report.report_id,
                 "context_budget_estimate": turn_context.budget_estimate,
-                "agent_policy_id": self.policy.policy_id.clone(),
+                "agent_tool_surface_id": self.tool_surface.surface_id.clone(),
                 "run_context": &turn_context.run_context,
             }),
         })
@@ -7030,25 +8131,16 @@ impl<M: InteractionModel> Agent<M> {
             self.tools.generation(),
         )
     }
-}
 
-fn model_protocol_system_instructions(provider: &str, model: &str, base: &str) -> String {
-    if !prefers_native_tool_protocol(provider, model) {
-        return base.to_string();
-    }
-    format!(
-        "{base}\n\nModel protocol hint: native tool calls are available for this provider/model. Prefer the provider-native tool protocol for tool use; use JSON `tool_calls` only as a fallback. After native tool results are returned, continue with the required final response format."
-    )
-}
-
-fn prefers_native_tool_protocol(provider: &str, model: &str) -> bool {
-    let provider = provider.to_ascii_lowercase();
-    let model = model.to_ascii_lowercase();
-    match provider.as_str() {
-        "openai" | "openai-api" => model.contains("gpt") || model.starts_with('o'),
-        "codex" => model.contains("gpt") || model.contains("codex"),
-        "deepseek" | "deepseek-api" => model.contains("deepseek"),
-        _ => false,
+    fn skill_plan(&self) -> AgentSkillPlan {
+        AgentSkillPlan::from_package_and_modules(
+            self.config.definition.skills.clone(),
+            &self.config.module_tool_projection,
+            [
+                self.config.definition.key().to_string(),
+                self.config.definition.name.clone(),
+            ],
+        )
     }
 }
 
@@ -7334,7 +8426,10 @@ fn project_agent_item_to_transcript_item(
             step_index,
             content,
             ..
-        } => Some(Ok(AgentTranscriptItem::assistant(step_index, content))),
+        } => Some(Ok(AgentTranscriptItem::assistant(
+            step_index,
+            model_visible_assistant_content(&content),
+        ))),
         AgentItem::ToolResult {
             item_id: _,
             step_index,
@@ -7383,7 +8478,7 @@ fn project_agent_item_to_transcript_item(
             serde_json::to_string_pretty(&serde_json::json!({
                 "kind": "prior_tool_call",
                 "tool": &call.tool,
-                "input": &call.input,
+                "input": model_visible_tool_input(&call.input),
                 "summary": &call.summary,
                 "call_id": &call.call_id,
             }))
@@ -7462,7 +8557,7 @@ fn project_agent_item_to_transcript_item(
         } => Some(
             serde_json::to_string_pretty(&serde_json::json!({
                 "kind": "coding_run_state",
-                "state": state,
+                "state": model_visible_coding_run_state(&state),
             }))
             .map(|content| AgentTranscriptItem::user(step_index, content))
             .map_err(|source| AgentError::ModelRequest {
@@ -7476,13 +8571,75 @@ fn project_agent_item_to_transcript_item(
     }
 }
 
+const MODEL_VISIBLE_CODING_CHANGED_FILE_LIMIT: usize = 25;
+const MODEL_VISIBLE_CODING_ALLOWED_PATH_LIMIT: usize = 25;
+const MODEL_VISIBLE_CODING_VALIDATION_ATTEMPT_LIMIT: usize = 3;
+const MODEL_VISIBLE_CODING_EVIDENCE_LIMIT: usize = 5;
+const MODEL_VISIBLE_CODING_RISK_LIMIT: usize = 5;
+const MODEL_VISIBLE_COMMAND_STDOUT_BYTES: usize = 4096;
+const MODEL_VISIBLE_COMMAND_STDERR_BYTES: usize = 4096;
+const MODEL_VISIBLE_COMMAND_AGGREGATED_BYTES: usize = 8192;
+const MODEL_VISIBLE_READ_FILE_CONTENT_BYTES: usize = 16 * 1024;
+const MODEL_VISIBLE_TOOL_RESULTS_AGGREGATE_BYTES: usize = 64 * 1024;
+const MODEL_VISIBLE_TOOL_INPUT_STRING_BYTES: usize = 8 * 1024;
+
+fn model_visible_coding_run_state(state: &CodingRunState) -> serde_json::Value {
+    let validation_attempt_start = state
+        .validation_attempts
+        .len()
+        .saturating_sub(MODEL_VISIBLE_CODING_VALIDATION_ATTEMPT_LIMIT);
+    let outstanding_evidence_start = state
+        .outstanding_evidence
+        .len()
+        .saturating_sub(MODEL_VISIBLE_CODING_EVIDENCE_LIMIT);
+    let open_risk_start = state
+        .open_risks
+        .len()
+        .saturating_sub(MODEL_VISIBLE_CODING_RISK_LIMIT);
+    let changed_file_count = state.changed_files.len();
+    let allowed_path_count = state.allowed_paths.len();
+
+    serde_json::json!({
+        "projection": "model_visible_bounded",
+        "objective": &state.objective,
+        "allowed_paths": &state.allowed_paths[..allowed_path_count.min(MODEL_VISIBLE_CODING_ALLOWED_PATH_LIMIT)],
+        "allowed_path_count": allowed_path_count,
+        "omitted_allowed_path_count": allowed_path_count.saturating_sub(MODEL_VISIBLE_CODING_ALLOWED_PATH_LIMIT),
+        "changed_files": &state.changed_files[..changed_file_count.min(MODEL_VISIBLE_CODING_CHANGED_FILE_LIMIT)],
+        "changed_file_count": changed_file_count,
+        "omitted_changed_file_count": changed_file_count.saturating_sub(MODEL_VISIBLE_CODING_CHANGED_FILE_LIMIT),
+        "current_diff_hash": &state.current_diff_hash,
+        "current_diff_summary": &state.current_diff_summary,
+        "patch_status": &state.patch_status,
+        "validation_attempts": &state.validation_attempts[validation_attempt_start..],
+        "validation_attempt_count": state.validation_attempts.len(),
+        "omitted_validation_attempt_count": validation_attempt_start,
+        "validation_status": &state.validation_status,
+        "blocked_reason": &state.blocked_reason,
+        "outstanding_evidence": &state.outstanding_evidence[outstanding_evidence_start..],
+        "outstanding_evidence_count": state.outstanding_evidence.len(),
+        "omitted_outstanding_evidence_count": outstanding_evidence_start,
+        "stop_recommendation": &state.stop_recommendation,
+        "open_risks": &state.open_risks[open_risk_start..],
+        "open_risk_count": state.open_risks.len(),
+        "omitted_open_risk_count": open_risk_start,
+    })
+}
+
 fn render_turn_context_message(
-    input: &AgentLoopInput,
+    _input: &AgentLoopInput,
     turn_context: &TurnContext,
 ) -> Result<String, AgentError> {
     serde_json::to_string_pretty(&serde_json::json!({
         "kind": "turn_context",
         "step_index": turn_context.report.step_index,
+        "runtime": {
+            "provider": turn_context.provider,
+            "model": turn_context.model,
+            "agent_output_format": turn_context.output_format,
+            "response_format": turn_context.response_format,
+            "available_tool_count": turn_context.available_tool_specs.len(),
+        },
         "run_context": &turn_context.run_context,
         "session_projection": turn_context.session_projection,
         "current_work": turn_context
@@ -7493,7 +8650,7 @@ fn render_turn_context_message(
         "loaded_instruction_files": turn_context.loaded_instruction_files,
         "prompt_references": turn_context.prompt_references,
         "context_attachments": turn_context.context_attachments,
-        "async_update": input.async_update,
+        "async_update": turn_context.async_update,
         "context_budget_estimate": turn_context.budget_estimate,
         "context_report_id": turn_context.report.report_id,
     }))
@@ -7506,16 +8663,73 @@ fn render_tool_results(
     step_index: usize,
     results: &[AgentToolOutcome],
 ) -> Result<String, AgentError> {
+    let projection = model_visible_tool_results_projection(results)?;
     serde_json::to_string_pretty(&serde_json::json!({
         "kind": "tool_results",
         "step_index": step_index,
-        "results": results
-            .iter()
-            .map(model_visible_tool_outcome)
-            .collect::<Vec<_>>(),
+        "result_count": results.len(),
+        "results": projection.results,
+        "model_visible_budget": projection.budget,
     }))
     .map_err(|source| AgentError::ModelRequest {
         detail: source.to_string(),
+    })
+}
+
+#[derive(Debug)]
+struct ModelVisibleToolResultsProjection {
+    results: Vec<serde_json::Value>,
+    budget: serde_json::Value,
+}
+
+fn model_visible_tool_results_projection(
+    outcomes: &[AgentToolOutcome],
+) -> Result<ModelVisibleToolResultsProjection, AgentError> {
+    let mut results = Vec::new();
+    let mut used_bytes = 0usize;
+    let mut omitted_full_result_count = 0usize;
+    let mut omitted_summary_count = 0usize;
+    let omitted_result_count = 0usize;
+    for outcome in outcomes {
+        let full = model_visible_tool_outcome(outcome);
+        let full_bytes = serde_json::to_vec(&full)
+            .map_err(|source| AgentError::ModelRequest {
+                detail: source.to_string(),
+            })?
+            .len();
+        if used_bytes.saturating_add(full_bytes) <= MODEL_VISIBLE_TOOL_RESULTS_AGGREGATE_BYTES {
+            used_bytes = used_bytes.saturating_add(full_bytes);
+            results.push(full);
+            continue;
+        }
+
+        omitted_full_result_count = omitted_full_result_count.saturating_add(1);
+        let summary = model_visible_tool_outcome_summary_only(
+            outcome,
+            full_bytes,
+            MODEL_VISIBLE_TOOL_RESULTS_AGGREGATE_BYTES,
+        );
+        let summary_bytes = serde_json::to_vec(&summary)
+            .map_err(|source| AgentError::ModelRequest {
+                detail: source.to_string(),
+            })?
+            .len();
+        used_bytes = used_bytes.saturating_add(summary_bytes);
+        results.push(summary);
+        omitted_summary_count = omitted_summary_count.saturating_add(1);
+    }
+
+    Ok(ModelVisibleToolResultsProjection {
+        results,
+        budget: serde_json::json!({
+            "projection": "model_visible_aggregate_bounded",
+            "max_result_bytes": MODEL_VISIBLE_TOOL_RESULTS_AGGREGATE_BYTES,
+            "used_result_bytes": used_bytes,
+            "full_result_count": outcomes.len().saturating_sub(omitted_full_result_count),
+            "summary_only_result_count": omitted_summary_count,
+            "omitted_full_result_count": omitted_full_result_count,
+            "omitted_result_count": omitted_result_count,
+        }),
     })
 }
 
@@ -7525,7 +8739,7 @@ fn model_visible_tool_outcome(outcome: &AgentToolOutcome) -> serde_json::Value {
         "native_call_id": &outcome.call.call_id,
         "step_index": outcome.step_index,
         "call_index": outcome.call_index,
-        "call": &outcome.call,
+        "call": model_visible_tool_call(&outcome.call),
         "status": &outcome.status,
         "summary": &outcome.summary,
         "output": model_visible_tool_output(Some(outcome.call.tool.as_str()), &outcome.output),
@@ -7537,6 +8751,44 @@ fn model_visible_tool_outcome(outcome: &AgentToolOutcome) -> serde_json::Value {
         object.insert("event_id".to_string(), serde_json::json!(event_id));
     }
     value
+}
+
+fn model_visible_tool_call(call: &AgentToolCall) -> serde_json::Value {
+    serde_json::json!({
+        "call_id": &call.call_id,
+        "tool": &call.tool,
+        "input": model_visible_tool_input(&call.input),
+        "async": call.r#async,
+        "summary": &call.summary,
+    })
+}
+
+fn model_visible_tool_outcome_summary_only(
+    outcome: &AgentToolOutcome,
+    omitted_result_bytes: usize,
+    aggregate_budget_bytes: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "call_id": &outcome.call_id,
+        "native_call_id": &outcome.call.call_id,
+        "step_index": outcome.step_index,
+        "call_index": outcome.call_index,
+        "tool": &outcome.call.tool,
+        "status": &outcome.status,
+        "summary": &outcome.summary,
+        "output_omitted": {
+            "reason": "model-visible tool result aggregate budget exceeded",
+            "projection": "summary_only",
+            "omitted_result_bytes": omitted_result_bytes,
+            "aggregate_budget_bytes": aggregate_budget_bytes,
+        },
+        "evidence": {
+            "availability": &outcome.evidence.availability,
+            "output": &outcome.evidence.output,
+            "artifact_count": outcome.evidence.artifacts.len(),
+            "record_count": outcome.evidence.records.len(),
+        },
+    })
 }
 
 fn native_tool_call_items_from_decision(
@@ -7553,27 +8805,100 @@ fn native_tool_call_item_from_call(call: &AgentToolCall) -> Option<LanguageModel
     Some(LanguageModelRequestItem::tool_call(
         call.call_id.as_ref()?.clone(),
         call.tool.clone(),
-        call.input.clone(),
+        model_visible_tool_input(&call.input),
     ))
+}
+
+fn model_visible_assistant_content(content: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return content.to_string();
+    };
+    let Some(tool_calls) = value
+        .get_mut("tool_calls")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return content.to_string();
+    };
+    let mut changed = false;
+    for tool_call in tool_calls {
+        let Some(input) = tool_call.get_mut("input") else {
+            continue;
+        };
+        let projected = model_visible_tool_input(input);
+        if projected != *input {
+            *input = projected;
+            changed = true;
+        }
+    }
+    if !changed {
+        return content.to_string();
+    }
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| content.to_string())
 }
 
 fn native_tool_output_items_from_outcomes(
     outcomes: &[AgentToolOutcome],
-) -> Vec<LanguageModelRequestItem> {
-    outcomes
+) -> Result<Vec<LanguageModelRequestItem>, AgentError> {
+    let projection = model_visible_tool_results_projection(outcomes)?;
+    Ok(outcomes
         .iter()
-        .filter_map(native_tool_output_item_from_outcome)
-        .collect()
+        .zip(projection.results)
+        .filter_map(|(outcome, output)| native_tool_output_item_from_outcome(outcome, output))
+        .collect())
 }
 
 fn native_tool_output_item_from_outcome(
     outcome: &AgentToolOutcome,
+    output: serde_json::Value,
 ) -> Option<LanguageModelRequestItem> {
     Some(LanguageModelRequestItem::tool_call_output(
         outcome.call.call_id.as_ref()?.clone(),
         outcome.call.tool.clone(),
-        model_visible_tool_outcome(outcome),
+        output,
     ))
+}
+
+fn model_visible_tool_input(input: &serde_json::Value) -> serde_json::Value {
+    model_visible_json_value_with_string_bound(input, MODEL_VISIBLE_TOOL_INPUT_STRING_BYTES)
+}
+
+fn model_visible_json_value_with_string_bound(
+    value: &serde_json::Value,
+    max_string_bytes: usize,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => {
+            serde_json::json!(model_visible_text_excerpt(text, max_string_bytes))
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| model_visible_json_value_with_string_bound(item, max_string_bytes))
+                .collect(),
+        ),
+        serde_json::Value::Object(object) => {
+            let mut projected = serde_json::Map::new();
+            for (key, item) in object {
+                let original_string_len = item.as_str().map(str::len);
+                projected.insert(
+                    key.clone(),
+                    model_visible_json_value_with_string_bound(item, max_string_bytes),
+                );
+                if original_string_len.is_some_and(|len| len > max_string_bytes) {
+                    projected.insert(
+                        format!("{key}_model_visible_truncated"),
+                        serde_json::json!(true),
+                    );
+                    projected.insert(
+                        format!("{key}_original_bytes"),
+                        serde_json::json!(original_string_len.unwrap_or_default()),
+                    );
+                }
+            }
+            serde_json::Value::Object(projected)
+        }
+        _ => value.clone(),
+    }
 }
 
 fn model_visible_tool_output(
@@ -7586,15 +8911,39 @@ fn model_visible_tool_output(
     };
     let looks_like_patch_output = tool_name == Some("apply_patch")
         || object.contains_key("diff") && object.contains_key("changed_files");
+    if looks_like_file_read_output(tool_name, object) {
+        bound_model_visible_string_field(
+            object,
+            "content",
+            MODEL_VISIBLE_READ_FILE_CONTENT_BYTES,
+            "content_model_visible_truncated",
+        );
+    }
     if looks_like_patch_output && let Some(diff) = object.get_mut("diff") {
         *diff = model_visible_patch_diff(diff);
     }
-    if looks_like_command_output(tool_name, object)
+    let looks_like_command_output = looks_like_command_output(tool_name, object);
+    if looks_like_command_output
         && let Some(diagnostics) = model_visible_command_output_diagnostics(object)
     {
         object.insert("command_output_diagnostics".to_string(), diagnostics);
     }
+    if looks_like_command_output {
+        sanitize_model_visible_command_output_refs(object);
+        bound_model_visible_command_output_fields(object);
+    }
     value
+}
+
+fn looks_like_file_read_output(
+    tool_name: Option<&str>,
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    tool_name == Some("read_file")
+        || object.contains_key("path")
+            && object.contains_key("content")
+            && object.contains_key("content_bytes")
+            && object.contains_key("line_range")
 }
 
 fn looks_like_command_output(
@@ -7634,26 +8983,177 @@ fn model_visible_command_output_diagnostics(
     if stderr.is_empty() && stdout.is_empty() && !timed_out {
         return None;
     }
-    Some(serde_json::json!({
+    let aggregated_output = object
+        .get("aggregated_output")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let output = serde_json::Value::Object(object.clone());
+    let classification = classify_command_failure(&AgentToolStatus::Failed, "", &output);
+    let mut diagnostics = serde_json::json!({
         "kind": if timed_out { "command_timed_out" } else { "command_failed" },
         "status": object.get("status").cloned().unwrap_or(serde_json::Value::Null),
         "timed_out": timed_out,
+        "duration_ms": object.get("duration_ms").cloned().unwrap_or(serde_json::Value::Null),
+        "timeout_ms": object.get("timeout_ms").cloned().unwrap_or(serde_json::Value::Null),
+        "stdout_ref_available": command_output_ref_available(object, "stdout_ref"),
+        "stderr_ref_available": command_output_ref_available(object, "stderr_ref"),
+        "aggregated_output_excerpt": model_visible_text_excerpt(aggregated_output, 4096),
         "stderr_excerpt": model_visible_text_excerpt(stderr, 4096),
         "stdout_excerpt": model_visible_text_excerpt(stdout, 2048),
         "stderr_truncated": object.get("stderr_truncated").cloned().unwrap_or(serde_json::Value::Bool(false)),
         "stdout_truncated": object.get("stdout_truncated").cloned().unwrap_or(serde_json::Value::Bool(false)),
-    }))
+    });
+    if let serde_json::Value::Object(ref mut map) = diagnostics {
+        map.insert(
+            "validation_status".to_string(),
+            serde_json::to_value(&classification.status).unwrap_or(serde_json::Value::Null),
+        );
+        if let Some(failure_kind) = classification.failure_kind {
+            map.insert(
+                "failure_kind".to_string(),
+                serde_json::to_value(failure_kind).unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
+    Some(diagnostics)
+}
+
+fn command_output_ref_available(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> bool {
+    object.get(key).is_some_and(|value| !value.is_null())
+        || object
+            .get("command_output")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|command_output| command_output.get(key))
+            .is_some_and(|value| !value.is_null())
+}
+
+fn sanitize_model_visible_command_output_refs(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    for key in ["stdout_ref", "stderr_ref"] {
+        sanitize_model_visible_artifact_ref_field(object, key);
+    }
+    if let Some(command_output) = object
+        .get_mut("command_output")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for key in ["stdout_ref", "stderr_ref"] {
+            sanitize_model_visible_artifact_ref_field(command_output, key);
+        }
+    }
+}
+
+fn bound_model_visible_command_output_fields(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    bound_model_visible_command_string_field(object, "stdout", MODEL_VISIBLE_COMMAND_STDOUT_BYTES);
+    bound_model_visible_command_string_field(object, "stderr", MODEL_VISIBLE_COMMAND_STDERR_BYTES);
+    bound_model_visible_command_string_field(
+        object,
+        "aggregated_output",
+        MODEL_VISIBLE_COMMAND_AGGREGATED_BYTES,
+    );
+    if let Some(command_output) = object
+        .get_mut("command_output")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        bound_model_visible_command_string_field(
+            command_output,
+            "stdout",
+            MODEL_VISIBLE_COMMAND_STDOUT_BYTES,
+        );
+        bound_model_visible_command_string_field(
+            command_output,
+            "stderr",
+            MODEL_VISIBLE_COMMAND_STDERR_BYTES,
+        );
+        bound_model_visible_command_string_field(
+            command_output,
+            "aggregated_output",
+            MODEL_VISIBLE_COMMAND_AGGREGATED_BYTES,
+        );
+    }
+}
+
+fn bound_model_visible_command_string_field(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    max_bytes: usize,
+) {
+    bound_model_visible_string_field(
+        object,
+        key,
+        max_bytes,
+        &format!("{key}_model_visible_truncated"),
+    );
+}
+
+fn bound_model_visible_string_field(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    max_bytes: usize,
+    truncated_key: &str,
+) {
+    let Some(text) = object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    if text.len() <= max_bytes {
+        return;
+    }
+    object.insert(
+        key.to_string(),
+        serde_json::json!(model_visible_text_excerpt(&text, max_bytes)),
+    );
+    object.insert(truncated_key.to_string(), serde_json::json!(true));
+}
+
+fn sanitize_model_visible_artifact_ref_field(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) {
+    let Some(value) = object.get_mut(key) else {
+        return;
+    };
+    if value.is_null() {
+        return;
+    }
+    *value = model_visible_artifact_ref(value);
+}
+
+fn model_visible_artifact_ref(ref_value: &serde_json::Value) -> serde_json::Value {
+    let Some(object) = ref_value.as_object() else {
+        return serde_json::json!({
+            "uri_omitted": true,
+        });
+    };
+    serde_json::json!({
+        "kind": object.get("kind").cloned().unwrap_or(serde_json::Value::Null),
+        "label": object.get("label").cloned().unwrap_or(serde_json::Value::Null),
+        "media_type": object.get("media_type").cloned().unwrap_or(serde_json::Value::Null),
+        "uri_omitted": true,
+    })
 }
 
 fn model_visible_text_excerpt(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_string();
     }
-    let mut end = max_bytes;
+    const TRUNCATED_MARKER: &str = "\n[truncated]";
+    if max_bytes <= TRUNCATED_MARKER.len() {
+        return String::new();
+    }
+    let mut end = max_bytes - TRUNCATED_MARKER.len();
     while !text.is_char_boundary(end) {
         end = end.saturating_sub(1);
     }
-    format!("{}\n[truncated]", &text[..end])
+    format!("{}{}", &text[..end], TRUNCATED_MARKER)
 }
 
 fn model_visible_tool_evidence(evidence: &AgentToolEvidence) -> serde_json::Value {
@@ -7687,7 +9187,7 @@ fn model_visible_tool_evidence(evidence: &AgentToolEvidence) -> serde_json::Valu
         })
     });
     let mut value = serde_json::json!({
-        "policy": evidence.policy,
+        "availability": evidence.availability,
         "output": evidence.output,
         "artifacts": artifacts,
         "execution": execution,
@@ -7766,7 +9266,7 @@ fn parse_agent_model_decision(
     stream_events: &[LanguageModelStreamEvent],
     available_tool_specs: &[AgentToolDescriptor],
     output_format: &AgentOutputFormat,
-) -> Result<AgentLoopDecision, AgentError> {
+) -> Result<ParsedAgentModelDecision, AgentError> {
     let language_model_tools: Vec<_> = available_tool_specs
         .iter()
         .map(language_model_tool_spec_from_agent_tool)
@@ -7785,22 +9285,53 @@ fn parse_agent_model_decision(
             .as_deref()
             .unwrap_or(&response.content)
             .trim();
-        return Ok(AgentLoopDecision {
-            response_mode: crate::AgentLoopResponseMode::Defer,
-            text: if text.is_empty() {
-                "The model requested tool execution.".to_string()
-            } else {
-                text.to_string()
+        let source = match tool_output.source {
+            LanguageModelToolAdapterSource::VendorFallback => {
+                AgentModelDecisionSource::VendorFallbackToolCalls
+            }
+            LanguageModelToolAdapterSource::Native | LanguageModelToolAdapterSource::None => {
+                AgentModelDecisionSource::NativeToolCalls
+            }
+        };
+        return Ok(ParsedAgentModelDecision {
+            decision: AgentLoopDecision {
+                response_mode: crate::AgentLoopResponseMode::Defer,
+                text: if text.is_empty() {
+                    "The model requested tool execution.".to_string()
+                } else {
+                    text.to_string()
+                },
+                tool_calls,
+                background_handoff: None,
+                next_state: crate::AgentInteractionState::Waiting,
             },
-            tool_calls,
-            background_handoff: None,
-            next_state: crate::AgentInteractionState::Waiting,
+            source,
         });
     }
     match output_format {
-        AgentOutputFormat::JsonDecision => parse_agent_loop_decision_strict(&response.content),
-        AgentOutputFormat::Text => parse_agent_loop_response(output_format, &response.content),
+        AgentOutputFormat::JsonDecision => {
+            parse_agent_loop_decision_strict(&response.content).map(|decision| {
+                ParsedAgentModelDecision {
+                    decision,
+                    source: AgentModelDecisionSource::StrictJsonDecision,
+                }
+            })
+        }
+        AgentOutputFormat::Text => {
+            parse_agent_loop_response(output_format, &response.content).map(|decision| {
+                ParsedAgentModelDecision {
+                    decision,
+                    source: AgentModelDecisionSource::TextFallback,
+                }
+            })
+        }
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ParsedAgentModelDecision {
+    decision: AgentLoopDecision,
+    source: AgentModelDecisionSource,
 }
 
 fn agent_tool_calls_from_language_model(calls: &[LanguageModelToolCall]) -> Vec<AgentToolCall> {
@@ -8150,9 +9681,10 @@ fn truncate_utf8_lossy(bytes: &[u8], max_bytes: usize) -> TruncatedText {
 mod tests {
     use super::*;
     use crate::{
-        AgentTool, AgentToolArtifactRef, AgentToolKind, AgentToolRequest, AgentToolResult,
-        AgentToolSpec, InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig,
-        default_agent_tool_descriptors, default_coding_agent_tools, user_interaction_input_event,
+        AgentCommandOutput, AgentTool, AgentToolArtifactRef, AgentToolKind, AgentToolRequest,
+        AgentToolResult, AgentToolSpec, InteractionSurface, InteractionSurfaceKind,
+        LocalWorkspaceAgentConfig, default_agent_tool_descriptors, default_coding_agent_tools,
+        user_interaction_input_event,
     };
     use sinomo_lm::{LanguageModelError, LanguageModelResponseFormat};
     use sinomo_runtime::events::SessionId;
@@ -8200,6 +9732,60 @@ mod tests {
                 items: Vec::new(),
                 tool_calls: Vec::new(),
                 usage: None,
+            })
+        }
+    }
+
+    struct SequencedUsageModel {
+        responses: Mutex<VecDeque<(String, Option<sinomo_lm::LanguageModelUsage>)>>,
+        requests: Mutex<Vec<LanguageModelRequest>>,
+    }
+
+    impl SequencedUsageModel {
+        fn new<S>(
+            responses: impl IntoIterator<Item = (S, Option<sinomo_lm::LanguageModelUsage>)>,
+        ) -> Self
+        where
+            S: Into<String>,
+        {
+            Self {
+                responses: Mutex::new(
+                    responses
+                        .into_iter()
+                        .map(|(response, usage)| (response.into(), usage))
+                        .collect(),
+                ),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl InteractionModel for SequencedUsageModel {
+        fn complete(
+            &self,
+            request: &LanguageModelRequest,
+        ) -> Result<LanguageModelResponse, LanguageModelError> {
+            self.requests
+                .lock()
+                .expect("requests")
+                .push(request.clone());
+            let (response, usage) = self
+                .responses
+                .lock()
+                .expect("responses")
+                .pop_front()
+                .ok_or_else(|| LanguageModelError::ProviderInvocationFailed {
+                    provider: "fake".to_string(),
+                    model: "fake".to_string(),
+                    detail: "no fake response queued".to_string(),
+                })?;
+            Ok(LanguageModelResponse {
+                provider: "fake".to_string(),
+                model: "fake".to_string(),
+                content: response,
+                items: Vec::new(),
+                tool_calls: Vec::new(),
+                usage,
             })
         }
     }
@@ -8418,6 +10004,27 @@ mod tests {
         }
     }
 
+    struct CancellationProbeTool {
+        executed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl AgentTool for CancellationProbeTool {
+        fn descriptor(&self) -> AgentToolDescriptor {
+            AgentToolDescriptor::new(AgentToolSpec::new(
+                AgentToolKind::ReadFile,
+                "cancel_probe",
+                "probe cancellation before custom tool execution",
+                false,
+            ))
+        }
+
+        fn execute(&self, _request: AgentToolRequest<'_>) -> AgentToolResult {
+            self.executed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            AgentToolResult::succeeded("probe executed", serde_json::json!({ "ok": true }))
+        }
+    }
+
     fn agent_input(prompt: &str) -> AgentLoopInput {
         let session = InteractionSession::new(
             SessionId::from_legacy_named("sess_agent").expect("session"),
@@ -8466,11 +10073,124 @@ mod tests {
         assert_eq!(config.max_tool_calls_per_step, None);
         assert_eq!(config.max_model_repair_attempts, None);
         assert_eq!(config.max_output_tokens, None);
+        assert_eq!(
+            config.instruction_file_max_bytes,
+            Some(DEFAULT_WORKSPACE_INSTRUCTION_FILE_BYTES)
+        );
         assert!(config.expand_prompt_references);
-        assert_eq!(config.prompt_reference_max_bytes, None);
-        assert_eq!(config.prompt_reference_max_entries, None);
+        assert_eq!(
+            config.prompt_reference_max_bytes,
+            Some(DEFAULT_PROMPT_REFERENCE_FILE_BYTES)
+        );
+        assert_eq!(
+            config.prompt_reference_max_entries,
+            Some(DEFAULT_PROMPT_REFERENCE_DIRECTORY_ENTRIES)
+        );
+        assert_eq!(
+            config.context_attachment_max_bytes,
+            Some(DEFAULT_CONTEXT_ATTACHMENT_PAYLOAD_BYTES)
+        );
+        assert_eq!(
+            config.async_update_max_bytes,
+            Some(DEFAULT_ASYNC_UPDATE_BYTES)
+        );
         assert_eq!(config.context_budget.max_context_bytes, None);
         assert_eq!(config.context_budget.compaction_threshold_bytes(), None);
+    }
+
+    #[test]
+    fn agent_config_definition_swap_clears_package_runtime_limits_without_losing_overrides() {
+        let mut capped_definition =
+            AgentDefinition::custom("capped-agent", AgentRole::Deliberation, "Use one step.");
+        capped_definition.runtime_limits.max_steps = Some(1);
+        capped_definition.runtime_limits.max_tool_calls_per_step = Some(2);
+        capped_definition.runtime_limits.max_model_repair_attempts = Some(3);
+
+        let capped_config =
+            AgentConfig::new("fake", "fake").with_agent_definition(capped_definition.clone());
+        assert_eq!(capped_config.max_steps, Some(1));
+        assert_eq!(capped_config.max_tool_calls_per_step, Some(2));
+        assert_eq!(capped_config.max_model_repair_attempts, Some(3));
+
+        let uncapped_config = capped_config.with_agent_definition(AgentDefinition::coding());
+        assert_eq!(uncapped_config.max_steps, None);
+        assert_eq!(uncapped_config.max_tool_calls_per_step, None);
+        assert_eq!(uncapped_config.max_model_repair_attempts, None);
+
+        let override_config = AgentConfig::new("fake", "fake")
+            .with_agent_definition(capped_definition)
+            .with_max_steps(1)
+            .with_max_tool_calls_per_step(2)
+            .with_max_model_repair_attempts(3)
+            .with_agent_definition(AgentDefinition::coding());
+        assert_eq!(override_config.max_steps, Some(1));
+        assert_eq!(override_config.max_tool_calls_per_step, Some(2));
+        assert_eq!(override_config.max_model_repair_attempts, Some(3));
+    }
+
+    #[test]
+    fn agent_config_runtime_limit_overrides_survive_json_round_trip() {
+        let mut capped_definition =
+            AgentDefinition::custom("capped-agent", AgentRole::Deliberation, "Use one step.");
+        capped_definition.runtime_limits.max_steps = Some(1);
+        capped_definition.runtime_limits.max_tool_calls_per_step = Some(2);
+        capped_definition.runtime_limits.max_model_repair_attempts = Some(3);
+
+        let package_config =
+            AgentConfig::new("fake", "fake").with_agent_definition(capped_definition.clone());
+        let package_value = serde_json::to_value(&package_config).expect("serialize package caps");
+        assert!(package_value.get("max_steps_explicit_override").is_none());
+        assert!(
+            package_value
+                .get("max_tool_calls_per_step_explicit_override")
+                .is_none()
+        );
+        assert!(
+            package_value
+                .get("max_model_repair_attempts_explicit_override")
+                .is_none()
+        );
+
+        let package_round_trip: AgentConfig =
+            serde_json::from_value(package_value).expect("deserialize package caps");
+        let uncapped_package = package_round_trip.with_agent_definition(AgentDefinition::coding());
+        assert_eq!(uncapped_package.max_steps, None);
+        assert_eq!(uncapped_package.max_tool_calls_per_step, None);
+        assert_eq!(uncapped_package.max_model_repair_attempts, None);
+
+        let override_config = AgentConfig::new("fake", "fake")
+            .with_agent_definition(capped_definition)
+            .with_max_steps(1)
+            .with_max_tool_calls_per_step(2)
+            .with_max_model_repair_attempts(3);
+        let override_value =
+            serde_json::to_value(&override_config).expect("serialize explicit caps");
+        assert_eq!(
+            override_value
+                .get("max_steps_explicit_override")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            override_value
+                .get("max_tool_calls_per_step_explicit_override")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            override_value
+                .get("max_model_repair_attempts_explicit_override")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+
+        let override_round_trip: AgentConfig =
+            serde_json::from_value(override_value).expect("deserialize explicit caps");
+        let uncapped_override =
+            override_round_trip.with_agent_definition(AgentDefinition::coding());
+        assert_eq!(uncapped_override.max_steps, Some(1));
+        assert_eq!(uncapped_override.max_tool_calls_per_step, Some(2));
+        assert_eq!(uncapped_override.max_model_repair_attempts, Some(3));
     }
 
     #[test]
@@ -8526,10 +10246,10 @@ mod tests {
             &outcome.events[0].payload,
             AgentEventPayload::TurnStarted {
                 role: AgentRole::Deliberation,
-                policy_id,
+                surface_id,
                 run_context,
                 ..
-            } if policy_id == "deliberation-default"
+            } if surface_id == "deliberation-default"
                 && run_context.task.as_ref().map(|task| &task.task_id) == Some(&task.task_id)
         ));
         assert!(matches!(
@@ -8596,8 +10316,23 @@ mod tests {
 
         assert_eq!(context.role, AgentRole::Background);
         assert!(context.system_instructions.contains("Draft operator docs"));
-        assert!(visible_tools.contains(&"draft_doc"));
+        assert!(!context.system_instructions.contains("Return only JSON"));
+        assert!(
+            !context
+                .system_instructions
+                .contains("Available agent tools")
+        );
+        assert!(!visible_tools.contains(&"draft_doc"));
         assert!(!visible_tools.contains(&"read_file"));
+        assert!(
+            context
+                .report
+                .omitted
+                .iter()
+                .any(|omission| omission.kind == "tool_readiness"
+                    && omission.label == "draft_doc"
+                    && omission.reason.contains("no runtime executor"))
+        );
         assert_eq!(
             request.response_format,
             LanguageModelResponseFormat::JsonObject
@@ -8607,6 +10342,21 @@ mod tests {
                 .content
                 .contains("Draft operator docs from visible evidence")
         );
+        assert!(request.messages[0].content.contains("Response contract:"));
+        assert!(
+            request.messages[0]
+                .content
+                .contains("Return only JSON shaped as")
+        );
+        let request_text = request
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(request_text.contains("\"runtime\""));
+        assert!(request_text.contains("\"provider\": \"fake\""));
+        assert!(request_text.contains("\"agent_output_format\": \"json_decision\""));
         assert_eq!(
             request
                 .metadata
@@ -8643,9 +10393,19 @@ mod tests {
             crate::AgentLoopResponseMode::Answer
         );
         assert_eq!(run.final_decision.text, "Plain status.");
+        assert_eq!(
+            run.model_metrics.final_decision_source,
+            Some(AgentModelDecisionSource::TextFallback)
+        );
+        assert_eq!(run.model_metrics.text_fallback_turn_count, 1);
         assert!(run.tool_results.is_empty());
         assert_eq!(request.response_format, LanguageModelResponseFormat::Text);
         assert_eq!(request.tool_choice, None);
+        assert!(
+            !request.messages[0]
+                .content
+                .contains("Available agent tools")
+        );
         assert!(
             request.messages[0]
                 .content
@@ -8682,7 +10442,7 @@ mod tests {
 
     #[test]
     fn tool_evidence_records_support_generic_typed_payloads() {
-        let evidence = AgentToolEvidence::policy_only(true, "available")
+        let evidence = AgentToolEvidence::availability_only(true, "available")
             .with_record(
                 AGENT_CODING_EVIDENCE_KIND,
                 &AgentCodingToolEvidence {
@@ -8756,9 +10516,26 @@ mod tests {
             .expect("tool orchestration metadata");
         assert_eq!(
             orchestration
-                .get("policy_id")
+                .get("surface_id")
                 .and_then(serde_json::Value::as_str),
             Some("deliberation-default")
+        );
+        assert_eq!(
+            orchestration
+                .get("registry_generation")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            orchestration
+                .get("visible_toolsets")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|toolsets| {
+                    toolsets
+                        .iter()
+                        .any(|toolset| toolset.as_str() == Some("coding"))
+                }),
+            true
         );
         assert_eq!(
             orchestration
@@ -8831,9 +10608,9 @@ mod tests {
                 .any(|item| matches!(item, AgentItem::ContextInjection { .. }))
         );
         assert!(run.items.iter().any(
-            |item| matches!(item, AgentItem::ToolResult { evidence, .. } if evidence.policy.allowed)
+            |item| matches!(item, AgentItem::ToolResult { evidence, .. } if evidence.availability.allowed)
         ));
-        assert!(run.tool_results[0].evidence.policy.allowed);
+        assert!(run.tool_results[0].evidence.availability.allowed);
         assert!(
             agent.model.requests.lock().expect("requests")[0].metadata["context_report_id"]
                 .as_str()
@@ -8974,6 +10751,21 @@ mod tests {
             )
         }));
         let requests = agent.model.requests.lock().expect("requests");
+        assert_eq!(
+            run.model_metrics.final_decision_source,
+            Some(AgentModelDecisionSource::StrictJsonDecision)
+        );
+        assert_eq!(run.model_metrics.model_turn_count, 2);
+        assert_eq!(run.model_metrics.native_tool_call_turn_count, 1);
+        assert_eq!(run.model_metrics.native_tool_call_count, 1);
+        assert_eq!(
+            run.model_turns[0].decision_source,
+            AgentModelDecisionSource::NativeToolCalls
+        );
+        assert_eq!(
+            run.model_turns[1].decision_source,
+            AgentModelDecisionSource::StrictJsonDecision
+        );
         let second_items = &requests[1].items;
         assert!(second_items.iter().any(|item| {
             matches!(
@@ -9217,7 +11009,7 @@ mod tests {
                     provider: "fake".to_string(),
                     model: "fake".to_string(),
                     role: AgentRole::Deliberation,
-                    policy_id: "test-policy".to_string(),
+                    surface_id: "test-surface".to_string(),
                     max_steps: Some(1),
                     run_context: AgentRunContext::default(),
                 },
@@ -9634,6 +11426,72 @@ mod tests {
     }
 
     #[test]
+    fn agent_tool_pair_integrity_pairs_by_runtime_call_slot() {
+        let paired_call_item = TaskId::generate();
+        let paired_result_call_id = TaskId::generate();
+        let orphan_call_item = TaskId::generate();
+        let orphan_result_call_id = TaskId::generate();
+        let items = vec![
+            AgentItem::ToolCall {
+                item_id: paired_call_item,
+                step_index: 0,
+                call_index: 0,
+                call: AgentToolCall {
+                    call_id: None,
+                    tool: "read_file".to_string(),
+                    input: serde_json::json!({"path": "src/lib.rs"}),
+                    r#async: false,
+                    summary: "read source".to_string(),
+                },
+            },
+            AgentItem::ToolResult {
+                item_id: TaskId::generate(),
+                step_index: 0,
+                call_index: 0,
+                call_id: paired_result_call_id,
+                native_call_id: None,
+                tool_name: Some("read_file".to_string()),
+                status: AgentToolStatus::Succeeded,
+                summary: "read source".to_string(),
+                output: serde_json::json!({"content": "ok"}),
+                evidence: AgentToolEvidence::default(),
+            },
+            AgentItem::ToolCall {
+                item_id: orphan_call_item,
+                step_index: 1,
+                call_index: 0,
+                call: AgentToolCall {
+                    call_id: None,
+                    tool: "search".to_string(),
+                    input: serde_json::json!({"query": "needle"}),
+                    r#async: false,
+                    summary: "search source".to_string(),
+                },
+            },
+            AgentItem::ToolResult {
+                item_id: TaskId::generate(),
+                step_index: 2,
+                call_index: 0,
+                call_id: orphan_result_call_id,
+                native_call_id: None,
+                tool_name: Some("read_file".to_string()),
+                status: AgentToolStatus::Succeeded,
+                summary: "late result".to_string(),
+                output: serde_json::json!({"content": "late"}),
+                evidence: AgentToolEvidence::default(),
+            },
+        ];
+
+        let metrics = AgentToolPairIntegrity::from_items(&items);
+
+        assert_eq!(metrics.tool_calls, 2);
+        assert_eq!(metrics.tool_results, 2);
+        assert_eq!(metrics.orphan_tool_calls, 1);
+        assert_eq!(metrics.orphan_tool_results, 1);
+        assert!(!metrics.is_balanced());
+    }
+
+    #[test]
     fn unknown_tool_is_returned_as_model_visible_failure() {
         let model = SequencedModel::new([
             r#"{
@@ -9699,24 +11557,62 @@ mod tests {
 
     #[test]
     fn agent_repairs_malformed_model_response_once() {
-        let model = SequencedModel::new([
-            "not json",
-            r#"{
-                "response_mode": "answer",
-                "text": "Recovered.",
-                "tool_calls": [],
-                "background_handoff": null,
-                "next_state": "listening"
-            }"#,
+        let model = SequencedUsageModel::new([
+            (
+                "not json",
+                Some(sinomo_lm::LanguageModelUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(1),
+                }),
+            ),
+            (
+                r#"{
+                    "response_mode": "answer",
+                    "text": "Recovered.",
+                    "tool_calls": [],
+                    "background_handoff": null,
+                    "next_state": "listening"
+                }"#,
+                Some(sinomo_lm::LanguageModelUsage {
+                    input_tokens: Some(20),
+                    output_tokens: Some(2),
+                }),
+            ),
         ]);
         let agent = Agent::new(model, "fake", "fake");
 
         let run = agent.run(&agent_input("recover")).expect("run");
 
         assert_eq!(run.final_decision.text, "Recovered.");
-        assert_eq!(agent.model.requests.lock().expect("requests").len(), 2);
+        assert_eq!(
+            run.model_metrics.final_decision_source,
+            Some(AgentModelDecisionSource::StrictJsonDecision)
+        );
+        assert_eq!(run.model_metrics.model_turn_count, 1);
+        assert_eq!(run.model_metrics.model_response_count, 2);
+        assert_eq!(run.model_metrics.model_response_parse_failure_count, 1);
+        assert_eq!(run.model_metrics.strict_json_decision_turn_count, 1);
+        assert_eq!(run.model_metrics.repair_attempt_count, 1);
+        assert_eq!(run.model_metrics.reported_usage.response_count, 2);
+        assert_eq!(run.model_metrics.reported_usage.input_tokens, 30);
+        assert_eq!(run.model_metrics.reported_usage.output_tokens, 3);
+        assert_eq!(run.model_metrics.repair_reported_usage.response_count, 1);
+        assert_eq!(run.model_metrics.repair_reported_usage.input_tokens, 20);
+        assert_eq!(run.model_metrics.repair_reported_usage.output_tokens, 2);
+        let requests = agent.model.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        let repair_message_bytes = requests[1]
+            .messages
+            .last()
+            .expect("repair message")
+            .content
+            .len();
+        assert_eq!(
+            run.model_metrics.repair_request_model_visible_bytes,
+            repair_message_bytes
+        );
         assert!(
-            agent.model.requests.lock().expect("requests")[1]
+            requests[1]
                 .messages
                 .last()
                 .expect("repair message")
@@ -9832,6 +11728,41 @@ mod tests {
     }
 
     #[test]
+    fn tool_registry_cancellation_prevents_custom_tool_execution() {
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let registry = AgentToolRegistry::new().with_tool(CancellationProbeTool {
+            executed: executed.clone(),
+        });
+        let input = agent_input("cancel custom tool");
+        let call = AgentToolCall {
+            call_id: None,
+            tool: "cancel_probe".to_string(),
+            input: serde_json::json!({}),
+            r#async: false,
+            summary: "cancel probe".to_string(),
+        };
+        let cancellation_token = AgentCancellationToken::new();
+        cancellation_token.cancel();
+
+        let outcome =
+            registry.execute_with_cancellation(&input.session, 0, 0, &call, cancellation_token);
+
+        assert_eq!(outcome.status, AgentToolStatus::Cancelled);
+        assert!(!executed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            outcome
+                .output
+                .get("error")
+                .and_then(serde_json::Value::as_str),
+            Some("tool_cancelled")
+        );
+        assert_eq!(
+            outcome.evidence.availability.reason.as_str(),
+            "turn cancellation requested before tool execution"
+        );
+    }
+
+    #[test]
     fn tool_plan_tracks_generation_and_scopes_model_visible_descriptors() {
         let runtime_descriptors = vec![
             AgentToolDescriptor::new(AgentToolSpec::new(
@@ -9884,7 +11815,7 @@ mod tests {
             registry.generation(),
         );
         let input = agent_input("use disclosure");
-        let policy = AgentPolicyBundle::default_for_role(AgentRole::Deliberation);
+        let policy = AgentToolSurface::default_for_role(AgentRole::Deliberation);
         let run_context = AgentRunContext::default();
         let orchestrator = AgentToolOrchestrator::new(&policy, None, &run_context);
 
@@ -9983,6 +11914,202 @@ mod tests {
     }
 
     #[test]
+    fn progressive_skill_disclosure_searches_and_describes_package_and_module_skills() {
+        let module_id = sinomo_runtime::module::ModuleId::from_legacy_named("module.skills.rust")
+            .expect("module id");
+        let registration = sinomo_runtime::module::ModuleRegistration::native_rust(
+            module_id,
+            "0.2.0",
+            "module-skills",
+            "module-skills",
+            "module-skills-v1",
+            sinomo_runtime::core::TrustRing::R2TrustedService,
+            "module-skills",
+        )
+        .with_surfaces(
+            sinomo_runtime::module::ModuleSurfaces::default()
+                .with_declarative_resource(
+                    sinomo_runtime::module::ModuleDeclarativeResourceExport::skill(
+                        "skill.rust.debug",
+                        "skills/rust/SKILL.md",
+                    )
+                    .with_description("Debug Rust test failures.")
+                    .with_target_agent("coding-agent")
+                    .with_activation_tag("debug")
+                    .with_embedded_text("# Rust debugging\nInspect the failing assertion first."),
+                )
+                .with_declarative_resource(
+                    sinomo_runtime::module::ModuleDeclarativeResourceExport::skill(
+                        "skill.other.agent",
+                        "skills/other/SKILL.md",
+                    )
+                    .with_target_agent("background-agent"),
+                ),
+        );
+        let module_projection = AgentModuleToolProjection {
+            registrations: vec![registration],
+            loader_states: Vec::new(),
+        };
+        let skill_plan = AgentSkillPlan::from_package_and_modules(
+            ["skill.package.only", "skill.rust.debug"],
+            &module_projection,
+            ["coding-agent"],
+        );
+        let registry = AgentToolRegistry::new();
+        let plan = AgentToolPlanner::plan(
+            registry.descriptors(),
+            &AgentModuleToolProjection::default(),
+            std::iter::empty::<AgentToolSpec>(),
+            std::iter::empty::<AgentToolSpec>(),
+            false,
+            ["discovery"],
+            registry.generation(),
+        );
+        let input = agent_input("use skill disclosure");
+        let policy = AgentToolSurface::default_for_role(AgentRole::Deliberation);
+        let run_context = AgentRunContext::default();
+        let orchestrator =
+            AgentToolOrchestrator::new(&policy, None, &run_context).with_skill_plan(skill_plan);
+
+        assert!(plan.is_model_visible("skill_search"));
+        assert!(plan.is_model_visible("skill_describe"));
+        assert!(plan.is_model_visible("skill_activate"));
+
+        let search = orchestrator.execute(
+            &registry,
+            &input.session,
+            &plan,
+            0,
+            0,
+            &AgentToolCall {
+                call_id: None,
+                tool: "skill_search".to_string(),
+                input: serde_json::json!({ "query": "rust" }),
+                r#async: false,
+                summary: "find rust skill".to_string(),
+            },
+        );
+        assert_eq!(search.status, AgentToolStatus::Succeeded);
+        let matches = search
+            .output
+            .get("matches")
+            .and_then(serde_json::Value::as_array)
+            .expect("matches");
+        assert!(
+            matches.iter().any(|entry| {
+                entry.get("id").and_then(serde_json::Value::as_str) == Some("skill.rust.debug")
+                    && entry.get("source").and_then(serde_json::Value::as_str) == Some("module")
+                    && entry
+                        .get("package_declared")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    && entry
+                        .get("has_embedded_text")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    && entry
+                        .pointer("/activation/mode")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("host_runtime")
+                    && entry
+                        .pointer("/activation/available")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(false)
+            }),
+            "{matches:?}"
+        );
+        assert!(
+            !matches.iter().any(|entry| {
+                entry.get("id").and_then(serde_json::Value::as_str) == Some("skill.other.agent")
+            }),
+            "{matches:?}"
+        );
+
+        let describe = orchestrator.execute(
+            &registry,
+            &input.session,
+            &plan,
+            0,
+            1,
+            &AgentToolCall {
+                call_id: None,
+                tool: "skill_describe".to_string(),
+                input: serde_json::json!({ "skill": "skill.rust.debug" }),
+                r#async: false,
+                summary: "describe rust skill".to_string(),
+            },
+        );
+        assert_eq!(describe.status, AgentToolStatus::Succeeded);
+        assert_eq!(
+            describe
+                .output
+                .pointer("/descriptor/embedded_text")
+                .and_then(serde_json::Value::as_str),
+            Some("# Rust debugging\nInspect the failing assertion first.")
+        );
+        assert_eq!(
+            describe
+                .output
+                .pointer("/activation/mode")
+                .and_then(serde_json::Value::as_str),
+            Some("host_runtime")
+        );
+        assert_eq!(
+            describe
+                .output
+                .pointer("/activation/available")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(describe.evidence.record_value("skill_disclosure").is_some());
+
+        let activate = orchestrator.execute(
+            &registry,
+            &input.session,
+            &plan,
+            0,
+            2,
+            &AgentToolCall {
+                call_id: None,
+                tool: "skill_activate".to_string(),
+                input: serde_json::json!({
+                    "skill": "skill.rust.debug",
+                    "reason": "load debugging guidance"
+                }),
+                r#async: false,
+                summary: "activate rust skill".to_string(),
+            },
+        );
+        assert_eq!(activate.status, AgentToolStatus::Blocked);
+        assert_eq!(
+            activate
+                .output
+                .get("error")
+                .and_then(serde_json::Value::as_str),
+            Some("skill_activation_unavailable")
+        );
+        assert_eq!(
+            activate
+                .output
+                .pointer("/activation/mode")
+                .and_then(serde_json::Value::as_str),
+            Some("host_runtime")
+        );
+        assert_eq!(
+            activate
+                .output
+                .pointer("/activation/available")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            activate.evidence.availability.reason,
+            "skill activation requires a host runtime activation executor"
+        );
+        assert!(activate.evidence.record_value("skill_disclosure").is_some());
+    }
+
+    #[test]
     fn module_tool_projection_uses_active_loader_state() {
         let module_id = TaskId::generate();
         let registration = sinomo_runtime::module::ModuleRegistration::native_rust(
@@ -10035,7 +12162,7 @@ mod tests {
 
         let registry = AgentToolRegistry::new();
         let input = agent_input("find module route");
-        let policy = AgentPolicyBundle::default_for_role(AgentRole::Deliberation);
+        let policy = AgentToolSurface::default_for_role(AgentRole::Deliberation);
         let run_context = AgentRunContext::default();
         let orchestrator = AgentToolOrchestrator::new(&policy, None, &run_context);
         let search = orchestrator.execute(
@@ -10175,6 +12302,10 @@ mod tests {
                         auth: "admin".to_string(),
                     },
                 ],
+                capability_exports: vec![
+                    "dynamic.native.inspect".to_string(),
+                    "dynamic.native.apply".to_string(),
+                ],
                 ..Default::default()
             },
         };
@@ -10270,7 +12401,7 @@ mod tests {
                 }
             }),
             event_id: None,
-            evidence: AgentToolEvidence::policy_only(true, "allowed")
+            evidence: AgentToolEvidence::availability_only(true, "allowed")
                 .with_artifact(AgentToolArtifactRef::new(
                     "diff",
                     "/tmp/sinomo-agent/evidence/apply-patch.diff",
@@ -10322,6 +12453,272 @@ mod tests {
     }
 
     #[test]
+    fn render_tool_results_bounds_read_file_content_in_model_context() {
+        let tail = "READ_FILE_TAIL_SHOULD_NOT_BE_MODEL_VISIBLE";
+        let content = format!(
+            "{}{tail}{}",
+            "r".repeat(MODEL_VISIBLE_READ_FILE_CONTENT_BYTES + 512),
+            "R".repeat(1024)
+        );
+        let outcome = AgentToolOutcome {
+            call_id: TaskId::generate(),
+            step_index: 4,
+            call_index: 0,
+            call: AgentToolCall {
+                call_id: None,
+                tool: "read_file".to_string(),
+                input: serde_json::json!({ "path": "large.txt" }),
+                r#async: false,
+                summary: "read large file".to_string(),
+            },
+            status: AgentToolStatus::Succeeded,
+            summary: "read large.txt".to_string(),
+            output: serde_json::json!({
+                "path": "large.txt",
+                "bytes": content.len(),
+                "content_bytes": content.len(),
+                "truncated": false,
+                "content": content,
+                "total_lines": 1,
+                "line_range": {
+                    "requested_start_line": null,
+                    "requested_end_line": null,
+                    "returned_start_line": 1,
+                    "returned_end_line": 1,
+                },
+            }),
+            event_id: None,
+            evidence: AgentToolEvidence::availability_only(true, "allowed"),
+        };
+        assert!(
+            outcome
+                .output
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.contains(tail))
+        );
+
+        let rendered = render_tool_results(4, &[outcome]).expect("render");
+
+        assert!(rendered.contains("\"content_model_visible_truncated\": true"));
+        assert!(rendered.contains("[truncated]"));
+        assert!(!rendered.contains(tail), "{rendered}");
+    }
+
+    #[test]
+    fn render_tool_results_bounds_aggregate_model_visible_output() {
+        let late_tail = "LATE_TOOL_RESULT_CONTENT_SHOULD_NOT_BE_MODEL_VISIBLE";
+        let outcomes = (0..10)
+            .map(|index| {
+                let marker = if index == 9 {
+                    late_tail
+                } else {
+                    "visible-result"
+                };
+                let content = format!("{marker}\n{}", "r".repeat(12 * 1024));
+                AgentToolOutcome {
+                    call_id: TaskId::generate(),
+                    step_index: 4,
+                    call_index: index,
+                    call: AgentToolCall {
+                        call_id: None,
+                        tool: "read_file".to_string(),
+                        input: serde_json::json!({ "path": format!("file-{index}.txt") }),
+                        r#async: false,
+                        summary: "read file".to_string(),
+                    },
+                    status: AgentToolStatus::Succeeded,
+                    summary: format!("read file-{index}.txt"),
+                    output: serde_json::json!({
+                        "path": format!("file-{index}.txt"),
+                        "bytes": content.len(),
+                        "content_bytes": content.len(),
+                        "truncated": false,
+                        "content": content,
+                        "total_lines": 2,
+                        "line_range": {
+                            "requested_start_line": null,
+                            "requested_end_line": null,
+                            "returned_start_line": 1,
+                            "returned_end_line": 2,
+                        },
+                    }),
+                    event_id: None,
+                    evidence: AgentToolEvidence::availability_only(true, "allowed"),
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            outcomes[9]
+                .output
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.contains(late_tail))
+        );
+
+        let rendered = render_tool_results(4, &outcomes).expect("render");
+
+        assert!(rendered.contains("\"projection\": \"model_visible_aggregate_bounded\""));
+        assert!(rendered.contains("\"output_omitted\""));
+        assert!(rendered.contains("read file-9.txt"));
+        assert!(!rendered.contains(late_tail), "{rendered}");
+    }
+
+    #[test]
+    fn prior_tool_call_projection_bounds_large_input() {
+        let tail = "PATCH_INPUT_TAIL_SHOULD_NOT_BE_MODEL_VISIBLE";
+        let patch = format!(
+            "{}{tail}{}",
+            "p".repeat(MODEL_VISIBLE_TOOL_INPUT_STRING_BYTES + 512),
+            "P".repeat(1024)
+        );
+        let call = AgentToolCall {
+            call_id: Some("call_large_patch".to_string()),
+            tool: "apply_patch".to_string(),
+            input: serde_json::json!({
+                "patch": patch,
+                "path": "hello.txt"
+            }),
+            r#async: false,
+            summary: "apply large patch".to_string(),
+        };
+        assert!(
+            call.input
+                .get("patch")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.contains(tail))
+        );
+
+        let transcript_item = project_agent_item_to_transcript_item(AgentItem::ToolCall {
+            item_id: TaskId::generate(),
+            step_index: 4,
+            call_index: 0,
+            call: call.clone(),
+        })
+        .expect("projected")
+        .expect("projection succeeds");
+
+        assert!(transcript_item.content.contains("\"path\": \"hello.txt\""));
+        assert!(
+            transcript_item
+                .content
+                .contains("\"patch_model_visible_truncated\": true")
+        );
+        assert!(transcript_item.content.contains("\"patch_original_bytes\""));
+        assert!(
+            !transcript_item.content.contains(tail),
+            "{}",
+            transcript_item.content
+        );
+        assert_eq!(transcript_item.native_items.len(), 1);
+        match &transcript_item.native_items[0] {
+            LanguageModelRequestItem::ToolCall { input, .. } => {
+                assert_eq!(
+                    input.get("path").and_then(serde_json::Value::as_str),
+                    Some("hello.txt")
+                );
+                assert_eq!(
+                    input
+                        .get("patch_model_visible_truncated")
+                        .and_then(serde_json::Value::as_bool),
+                    Some(true)
+                );
+                assert!(
+                    !input
+                        .get("patch")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .contains(tail)
+                );
+            }
+            item => panic!("expected native tool call item, got {item:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_decision_projection_bounds_large_tool_call_input() {
+        let tail = "QUESTION_INPUT_TAIL_SHOULD_NOT_BE_MODEL_VISIBLE";
+        let question = format!(
+            "{}{tail}{}",
+            "q".repeat(MODEL_VISIBLE_TOOL_INPUT_STRING_BYTES + 512),
+            "Q".repeat(1024)
+        );
+        let content = serde_json::json!({
+            "response_mode": "defer",
+            "text": "I will ask for input.",
+            "tool_calls": [{
+                "tool": "request_user_input",
+                "input": {
+                    "question": question,
+                    "choices": ["continue"]
+                },
+                "async": false,
+                "summary": "Ask for user input."
+            }],
+            "background_handoff": null,
+            "next_state": "waiting"
+        })
+        .to_string();
+        assert!(content.contains(tail));
+
+        let projected = model_visible_assistant_content(&content);
+
+        assert!(projected.contains("\"question_model_visible_truncated\": true"));
+        assert!(projected.contains("\"question_original_bytes\""));
+        assert!(projected.contains("\"choices\""));
+        assert!(!projected.contains(tail), "{projected}");
+    }
+
+    #[test]
+    fn render_tool_results_bounds_tool_call_input_in_model_context() {
+        let tail = "TOOL_RESULT_CALL_INPUT_TAIL_SHOULD_NOT_BE_MODEL_VISIBLE";
+        let question = format!(
+            "{}{tail}{}",
+            "q".repeat(MODEL_VISIBLE_TOOL_INPUT_STRING_BYTES + 512),
+            "Q".repeat(1024)
+        );
+        let outcome = AgentToolOutcome {
+            call_id: TaskId::generate(),
+            step_index: 4,
+            call_index: 0,
+            call: AgentToolCall {
+                call_id: Some("call_large_question".to_string()),
+                tool: "request_user_input".to_string(),
+                input: serde_json::json!({
+                    "question": question,
+                    "choices": ["continue"]
+                }),
+                r#async: false,
+                summary: "ask for user input".to_string(),
+            },
+            status: AgentToolStatus::Blocked,
+            summary: "request_user_input unavailable".to_string(),
+            output: serde_json::json!({
+                "error": "missing_user_input_bridge",
+            }),
+            event_id: None,
+            evidence: AgentToolEvidence::availability_only(
+                false,
+                "missing interactive runtime bridge",
+            ),
+        };
+        assert!(
+            outcome
+                .call
+                .input
+                .get("question")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.contains(tail))
+        );
+
+        let rendered = render_tool_results(4, &[outcome]).expect("render");
+
+        assert!(rendered.contains("\"question_model_visible_truncated\": true"));
+        assert!(rendered.contains("\"question_original_bytes\""));
+        assert!(!rendered.contains(tail), "{rendered}");
+    }
+
+    #[test]
     fn render_tool_results_surfaces_failed_command_stderr() {
         let outcome = AgentToolOutcome {
             call_id: TaskId::generate(),
@@ -10351,14 +12748,413 @@ mod tests {
                 "changed_files": [],
             }),
             event_id: None,
-            evidence: AgentToolEvidence::policy_only(true, "allowed"),
+            evidence: AgentToolEvidence::availability_only(true, "allowed"),
         };
 
         let rendered = render_tool_results(4, &[outcome]).expect("render");
 
         assert!(rendered.contains("\"command_output_diagnostics\""));
         assert!(rendered.contains("\"kind\": \"command_failed\""));
+        assert!(rendered.contains("\"validation_status\": \"failed_patch_relevant\""));
+        assert!(rendered.contains("\"failure_kind\": \"patch_relevant\""));
         assert!(rendered.contains("checker reported the actual failure"));
+    }
+
+    #[test]
+    fn render_tool_results_bounds_raw_command_output_in_model_context() {
+        let stdout = format!(
+            "{}STDOUT_TAIL_SHOULD_NOT_BE_MODEL_VISIBLE",
+            "o".repeat(MODEL_VISIBLE_COMMAND_STDOUT_BYTES + 512)
+        );
+        let stderr = format!(
+            "{}STDERR_TAIL_SHOULD_NOT_BE_MODEL_VISIBLE",
+            "e".repeat(MODEL_VISIBLE_COMMAND_STDERR_BYTES + 512)
+        );
+        let aggregated_output = format!(
+            "{}AGGREGATED_TAIL_SHOULD_NOT_BE_MODEL_VISIBLE",
+            "a".repeat(MODEL_VISIBLE_COMMAND_AGGREGATED_BYTES + 512)
+        );
+        let command_output = AgentCommandOutput {
+            exit_code: Some(1),
+            stdout: stdout.clone(),
+            stderr: stderr.clone(),
+            stdout_ref: None,
+            stderr_ref: None,
+            aggregated_output: aggregated_output.clone(),
+            duration_ms: 42,
+            timed_out: false,
+            truncated: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        let outcome = AgentToolOutcome {
+            call_id: TaskId::generate(),
+            step_index: 4,
+            call_index: 0,
+            call: AgentToolCall {
+                call_id: None,
+                tool: "run_command".to_string(),
+                input: serde_json::json!({ "command": "make check" }),
+                r#async: false,
+                summary: "run focused check".to_string(),
+            },
+            status: AgentToolStatus::Failed,
+            summary: "make check failed with exit status Some(1)".to_string(),
+            output: serde_json::json!({
+                "program": "bash",
+                "args": ["-lc", "make check"],
+                "cwd": ".",
+                "status": 1,
+                "success": false,
+                "timed_out": false,
+                "duration_ms": 42,
+                "timeout_ms": null,
+                "stdout": stdout,
+                "stderr": stderr,
+                "aggregated_output": aggregated_output,
+                "command_output": command_output,
+                "stdout_truncated": false,
+                "stderr_truncated": false,
+                "changed_files": [],
+            }),
+            event_id: None,
+            evidence: AgentToolEvidence::availability_only(true, "allowed"),
+        };
+
+        let rendered = render_tool_results(4, &[outcome]).expect("render");
+
+        assert!(rendered.contains("\"command_output_diagnostics\""));
+        assert!(rendered.contains("\"stdout_model_visible_truncated\": true"));
+        assert!(rendered.contains("\"stderr_model_visible_truncated\": true"));
+        assert!(rendered.contains("\"aggregated_output_model_visible_truncated\": true"));
+        assert!(rendered.contains("[truncated]"));
+        assert!(
+            !rendered.contains("STDOUT_TAIL_SHOULD_NOT_BE_MODEL_VISIBLE"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("STDERR_TAIL_SHOULD_NOT_BE_MODEL_VISIBLE"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("AGGREGATED_TAIL_SHOULD_NOT_BE_MODEL_VISIBLE"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_tool_results_omits_command_artifact_uris_from_model_output() {
+        let stdout_ref =
+            AgentToolArtifactRef::new("stdout", "/tmp/sinomo-agent/evidence/stdout.txt")
+                .with_label("complete stdout")
+                .with_media_type("text/plain; charset=utf-8");
+        let stderr_ref =
+            AgentToolArtifactRef::new("stderr", "/tmp/sinomo-agent/evidence/stderr.txt")
+                .with_label("complete stderr")
+                .with_media_type("text/plain; charset=utf-8");
+        let command_output = AgentCommandOutput {
+            exit_code: Some(1),
+            stdout: "truncated stdout".to_string(),
+            stderr: "truncated stderr".to_string(),
+            stdout_ref: Some(stdout_ref.clone()),
+            stderr_ref: Some(stderr_ref.clone()),
+            aggregated_output: "stdout:\ntruncated stdout\nstderr:\ntruncated stderr".to_string(),
+            duration_ms: 42,
+            timed_out: false,
+            truncated: true,
+            stdout_truncated: true,
+            stderr_truncated: true,
+        };
+        let outcome = AgentToolOutcome {
+            call_id: TaskId::generate(),
+            step_index: 5,
+            call_index: 0,
+            call: AgentToolCall {
+                call_id: None,
+                tool: "run_command".to_string(),
+                input: serde_json::json!({ "command": "make check" }),
+                r#async: false,
+                summary: "run focused check".to_string(),
+            },
+            status: AgentToolStatus::Failed,
+            summary: "make check failed".to_string(),
+            output: serde_json::json!({
+                "program": "bash",
+                "args": ["-lc", "make check"],
+                "cwd": ".",
+                "status": 1,
+                "success": false,
+                "timed_out": false,
+                "duration_ms": 42,
+                "timeout_ms": 1000,
+                "stdout": "truncated stdout",
+                "stderr": "truncated stderr",
+                "stdout_ref": stdout_ref,
+                "stderr_ref": stderr_ref,
+                "aggregated_output": "stdout:\ntruncated stdout\nstderr:\ntruncated stderr",
+                "command_output": command_output,
+                "stdout_truncated": true,
+                "stderr_truncated": true,
+                "changed_files": [],
+            }),
+            event_id: None,
+            evidence: AgentToolEvidence::availability_only(true, "allowed")
+                .with_artifact(AgentToolArtifactRef::new(
+                    "stdout",
+                    "/tmp/sinomo-agent/evidence/stdout.txt",
+                ))
+                .with_artifact(AgentToolArtifactRef::new(
+                    "stderr",
+                    "/tmp/sinomo-agent/evidence/stderr.txt",
+                )),
+        };
+
+        let rendered = render_tool_results(5, &[outcome]).expect("render");
+
+        assert!(
+            !rendered.contains("/tmp/sinomo-agent/evidence"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\"stdout_ref_available\": true"));
+        assert!(rendered.contains("\"stderr_ref_available\": true"));
+        assert!(rendered.contains("\"duration_ms\": 42"));
+        assert!(rendered.contains("\"timeout_ms\": 1000"));
+        assert!(rendered.contains("\"uri_omitted\": true"));
+        assert!(rendered.contains("\"aggregated_output_excerpt\""));
+    }
+
+    #[test]
+    fn coding_run_state_projection_bounds_model_visible_history() {
+        let state = CodingRunState {
+            objective: Some("fix the validation failure".to_string()),
+            changed_files: (0..30)
+                .map(|index| format!("src/file_{index}.rs"))
+                .collect(),
+            validation_attempts: (0..5)
+                .map(|index| CodingValidationAttempt {
+                    step_index: index,
+                    call_id: TaskId::generate(),
+                    command: format!("cargo test case-{index}"),
+                    status: CodingValidationStatus::FailedPatchRelevant,
+                    summary: format!("failure summary {index}"),
+                    exit_code: Some(101),
+                    timed_out: false,
+                    failure_kind: Some(CodingCommandFailureKind::PatchRelevant),
+                })
+                .collect(),
+            open_risks: (0..7).map(|index| format!("risk {index}")).collect(),
+            outstanding_evidence: (0..6).map(|index| format!("evidence {index}")).collect(),
+            patch_status: CodingPatchStatus::Applied,
+            validation_status: CodingValidationStatus::FailedPatchRelevant,
+            stop_recommendation: CodingStopDecision::Continue,
+            ..CodingRunState::default()
+        };
+        assert_eq!(state.validation_attempts.len(), 5);
+        let item = AgentItem::CodingRunState {
+            item_id: TaskId::generate(),
+            step_index: 9,
+            state,
+        };
+
+        let transcript_item = project_agent_item_to_transcript_item(item)
+            .expect("coding state projects")
+            .expect("render coding state");
+        let rendered: serde_json::Value =
+            serde_json::from_str(&transcript_item.content).expect("json");
+        let projected = rendered.get("state").expect("state");
+
+        assert_eq!(
+            projected
+                .get("projection")
+                .and_then(serde_json::Value::as_str),
+            Some("model_visible_bounded")
+        );
+        assert_eq!(
+            projected
+                .get("validation_attempt_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(5)
+        );
+        assert_eq!(
+            projected
+                .get("omitted_validation_attempt_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        let attempts = projected
+            .get("validation_attempts")
+            .and_then(serde_json::Value::as_array)
+            .expect("attempts");
+        assert_eq!(attempts.len(), 3);
+        assert!(!transcript_item.content.contains("cargo test case-0"));
+        assert!(transcript_item.content.contains("cargo test case-4"));
+        assert_eq!(
+            projected
+                .get("changed_file_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(30)
+        );
+        assert_eq!(
+            projected
+                .get("omitted_changed_file_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(5)
+        );
+        assert!(!transcript_item.content.contains("risk 0"));
+        assert!(transcript_item.content.contains("risk 6"));
+        assert_eq!(
+            projected
+                .get("omitted_open_risk_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            projected
+                .get("omitted_outstanding_evidence_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn command_failure_classifier_separates_environment_causes() {
+        let missing_dependency = serde_json::json!({
+            "success": false,
+            "timed_out": false,
+            "stderr": "ModuleNotFoundError: No module named 'pytest'\n",
+            "stdout": "",
+        });
+        let dependency_classification = classify_command_failure(
+            &AgentToolStatus::Failed,
+            "pytest failed",
+            &missing_dependency,
+        );
+        assert_eq!(
+            dependency_classification.status,
+            CodingValidationStatus::FailedEnvironment
+        );
+        assert_eq!(
+            dependency_classification.failure_kind,
+            Some(CodingCommandFailureKind::MissingDependency)
+        );
+
+        let network = serde_json::json!({
+            "success": false,
+            "timed_out": false,
+            "stderr": "curl: (6) Could not resolve host: example.invalid\n",
+            "stdout": "",
+        });
+        let network_classification =
+            classify_command_failure(&AgentToolStatus::Failed, "download failed", &network);
+        assert_eq!(
+            network_classification.status,
+            CodingValidationStatus::FailedEnvironment
+        );
+        assert_eq!(
+            network_classification.failure_kind,
+            Some(CodingCommandFailureKind::NetworkUnavailable)
+        );
+    }
+
+    #[test]
+    fn coding_stop_policy_blocks_network_validation_even_with_patch() {
+        let state = finalize_coding_state(CodingRunState {
+            changed_files: vec!["src/lib.rs".to_string()],
+            patch_status: CodingPatchStatus::Applied,
+            validation_status: CodingValidationStatus::FailedEnvironment,
+            validation_attempts: vec![CodingValidationAttempt {
+                step_index: 1,
+                call_id: TaskId::generate(),
+                command: "cargo test".to_string(),
+                status: CodingValidationStatus::FailedEnvironment,
+                summary: "failed to download crate index".to_string(),
+                exit_code: Some(101),
+                timed_out: false,
+                failure_kind: Some(CodingCommandFailureKind::NetworkUnavailable),
+            }],
+            ..CodingRunState::default()
+        });
+
+        assert_eq!(state.stop_recommendation, CodingStopDecision::FinishBlocked);
+        assert!(coding_state_should_stop_loop(&state));
+        let decision = coding_final_decision_from_state(&state);
+        assert!(decision.text.contains("Coding run is blocked"));
+        assert!(decision.text.contains("network unavailable"));
+        assert_eq!(decision.response_mode, crate::AgentLoopResponseMode::Answer);
+    }
+
+    #[test]
+    fn coding_final_decision_reports_missing_dependency_validation() {
+        let state = finalize_coding_state(CodingRunState {
+            changed_files: vec!["src/lib.rs".to_string()],
+            patch_status: CodingPatchStatus::Applied,
+            validation_status: CodingValidationStatus::FailedEnvironment,
+            validation_attempts: vec![CodingValidationAttempt {
+                step_index: 1,
+                call_id: TaskId::generate(),
+                command: "pytest".to_string(),
+                status: CodingValidationStatus::FailedEnvironment,
+                summary: "ModuleNotFoundError: No module named 'pytest'".to_string(),
+                exit_code: Some(1),
+                timed_out: false,
+                failure_kind: Some(CodingCommandFailureKind::MissingDependency),
+            }],
+            ..CodingRunState::default()
+        });
+
+        assert_eq!(
+            state.stop_recommendation,
+            CodingStopDecision::FinishWithPatch
+        );
+        let decision = coding_final_decision_from_state(&state);
+        assert!(decision.text.contains("Patch is ready"));
+        assert!(decision.text.contains("missing dependency"));
+    }
+
+    #[test]
+    fn coding_stop_policy_continues_on_patch_relevant_validation_failure() {
+        let state = finalize_coding_state(CodingRunState {
+            changed_files: vec!["src/lib.rs".to_string()],
+            patch_status: CodingPatchStatus::Applied,
+            validation_status: CodingValidationStatus::FailedPatchRelevant,
+            validation_attempts: vec![CodingValidationAttempt {
+                step_index: 1,
+                call_id: TaskId::generate(),
+                command: "cargo test focused".to_string(),
+                status: CodingValidationStatus::FailedPatchRelevant,
+                summary: "assertion failed in changed behavior".to_string(),
+                exit_code: Some(101),
+                timed_out: false,
+                failure_kind: Some(CodingCommandFailureKind::PatchRelevant),
+            }],
+            ..CodingRunState::default()
+        });
+
+        assert_eq!(state.stop_recommendation, CodingStopDecision::Continue);
+        assert!(!coding_state_should_stop_loop(&state));
+    }
+
+    #[test]
+    fn coding_stop_policy_requires_classified_environment_validation() {
+        let state = finalize_coding_state(CodingRunState {
+            changed_files: vec!["src/lib.rs".to_string()],
+            patch_status: CodingPatchStatus::Applied,
+            validation_status: CodingValidationStatus::FailedEnvironment,
+            validation_attempts: vec![CodingValidationAttempt {
+                step_index: 1,
+                call_id: TaskId::generate(),
+                command: "cargo test focused".to_string(),
+                status: CodingValidationStatus::FailedEnvironment,
+                summary: "validation blocked".to_string(),
+                exit_code: None,
+                timed_out: false,
+                failure_kind: None,
+            }],
+            ..CodingRunState::default()
+        });
+
+        assert_eq!(state.stop_recommendation, CodingStopDecision::Continue);
+        assert!(!coding_state_should_stop_loop(&state));
     }
 
     #[test]
@@ -10385,7 +13181,16 @@ mod tests {
             .collect();
 
         assert!(visible_tools.contains(&"read_file"));
-        assert!(visible_tools.contains(&"search"));
+        assert!(!visible_tools.contains(&"search"));
+        assert!(
+            context
+                .report
+                .omitted
+                .iter()
+                .any(|omission| omission.kind == "tool_readiness"
+                    && omission.label == "search"
+                    && omission.reason.contains("no runtime executor"))
+        );
         assert_eq!(
             visible_tools
                 .iter()
@@ -10425,7 +13230,7 @@ mod tests {
             tool_calls: vec![call],
             usage: None,
         };
-        let decision = parse_agent_model_decision(
+        let parsed = parse_agent_model_decision(
             &response,
             &[],
             &[descriptor],
@@ -10433,6 +13238,8 @@ mod tests {
         )
         .expect("decision");
 
+        let decision = parsed.decision;
+        assert_eq!(parsed.source, AgentModelDecisionSource::NativeToolCalls);
         assert_eq!(decision.tool_calls.len(), 1);
         assert_eq!(decision.tool_calls[0].tool, "apply_patch");
         assert_eq!(decision.tool_calls[0].input["patch"], raw_patch);
@@ -10466,6 +13273,14 @@ mod tests {
         let run = agent.run(&agent_input("list files")).expect("run");
 
         assert_eq!(run.stop_reason, AgentStopReason::FinalDecision);
+        assert!(
+            !run.model_turns[0]
+                .request
+                .tools
+                .iter()
+                .any(|tool| tool.name == "search"),
+            "unexecutable visible defaults should not be advertised to the model"
+        );
         assert_eq!(run.tool_results[0].status, AgentToolStatus::Blocked);
         assert_eq!(
             run.tool_results[0]
@@ -10474,6 +13289,52 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("missing_executor")
         );
+    }
+
+    #[test]
+    fn tool_plan_readiness_reports_visible_tools_without_executors() {
+        let plan = AgentToolPlanner::plan(
+            std::iter::empty::<AgentToolDescriptor>(),
+            &AgentModuleToolProjection::default(),
+            std::iter::empty::<AgentToolSpec>(),
+            default_coding_agent_tools(),
+            true,
+            default_visible_toolsets_for_role(&AgentRole::Deliberation),
+            0,
+        );
+
+        let issues = plan.readiness_issues();
+
+        assert!(issues.iter().any(|issue| {
+            issue.kind == crate::tools::AgentToolPlanReadinessIssueKind::VisibleToolMissingExecutor
+                && issue.tool == "read_file"
+                && issue.source == crate::tools::AgentToolPlanSource::Default
+        }));
+        assert!(issues.iter().any(|issue| issue.tool == "run_command"));
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.tool == "tool_search" || issue.tool == "skill_search"),
+            "disclosure bridge tools are runtime-executable"
+        );
+    }
+
+    #[test]
+    fn tool_plan_readiness_accepts_local_workspace_visible_executors() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-readiness-local-tools");
+        let registry =
+            AgentToolRegistry::local_workspace_with_config(LocalWorkspaceAgentConfig::new(&root));
+        let plan = AgentToolPlanner::plan(
+            registry.descriptors(),
+            &AgentModuleToolProjection::default(),
+            std::iter::empty::<AgentToolSpec>(),
+            default_coding_agent_tools(),
+            true,
+            default_visible_toolsets_for_role(&AgentRole::Deliberation),
+            registry.generation(),
+        );
+
+        assert_eq!(plan.readiness_issues(), Vec::new());
     }
 
     #[test]
@@ -10524,6 +13385,20 @@ mod tests {
                 .get("descriptor_visible")
                 .and_then(serde_json::Value::as_bool),
             Some(false)
+        );
+        assert_eq!(
+            orchestration
+                .get("registry_generation")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            orchestration
+                .get("visible_toolsets")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|toolsets| toolsets.first())
+                .and_then(serde_json::Value::as_str),
+            Some("config")
         );
         assert_eq!(
             orchestration
@@ -10583,7 +13458,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_bundle_filters_model_visible_tool_schemas() {
+    fn tool_surface_filters_model_visible_tool_schemas() {
         let agent = Agent::new(
             SequencedModel::new(std::iter::empty::<String>()),
             "fake",
@@ -10592,8 +13467,8 @@ mod tests {
         .with_tool_registry(AgentToolRegistry::descriptor_only(
             default_agent_tool_descriptors(),
         ))
-        .with_policy(
-            AgentPolicyBundle::default_for_role(AgentRole::Deliberation)
+        .with_tool_surface(
+            AgentToolSurface::default_for_role(AgentRole::Deliberation)
                 .with_denied_capabilities([AgentToolCapability::ExecuteProcess]),
         );
 
@@ -10620,7 +13495,7 @@ mod tests {
                 .report
                 .included
                 .iter()
-                .any(|source| source.kind == "agent_policy")
+                .any(|source| source.kind == "agent_tool_surface")
         );
     }
 
@@ -10679,6 +13554,66 @@ mod tests {
     }
 
     #[test]
+    fn context_assembler_bounds_prompt_reference_defaults() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-prompt-ref-bounded");
+        fs::create_dir_all(root.join("many")).expect("workspace");
+        let tail = "PROMPT_REFERENCE_TAIL_SHOULD_NOT_BE_MODEL_VISIBLE";
+        let note = format!(
+            "{}{tail}{}",
+            "n".repeat(DEFAULT_PROMPT_REFERENCE_FILE_BYTES + 512),
+            "N".repeat(1024)
+        );
+        fs::write(root.join("large.txt"), note).expect("large prompt ref");
+        for index in 0..(DEFAULT_PROMPT_REFERENCE_DIRECTORY_ENTRIES + 5) {
+            fs::write(root.join("many").join(format!("{index:03}.txt")), "x").expect("entry");
+        }
+        let input = agent_input("inspect @large.txt and @many");
+        let config = AgentConfig::new("fake", "fake").with_workspace_root(&root);
+        let agent = Agent::new(
+            SequencedModel::new(std::iter::empty::<String>()),
+            "fake",
+            "fake",
+        )
+        .with_config(config);
+
+        let context = agent.assemble_context(&input, &[], 0).expect("context");
+        let file_reference = context
+            .prompt_references
+            .iter()
+            .find(|reference| reference.path == "large.txt")
+            .expect("large file reference");
+        assert_eq!(file_reference.bytes, DEFAULT_PROMPT_REFERENCE_FILE_BYTES);
+        assert!(file_reference.truncated);
+        assert!(
+            !file_reference
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains(tail)
+        );
+        let directory_reference = context
+            .prompt_references
+            .iter()
+            .find(|reference| reference.path == "many")
+            .expect("many directory reference");
+        assert_eq!(
+            directory_reference.entries.len(),
+            DEFAULT_PROMPT_REFERENCE_DIRECTORY_ENTRIES
+        );
+        assert!(directory_reference.truncated);
+
+        let request = agent.request(&input, &[], 0).expect("request");
+        let request_text = request
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(request_text.contains("\"truncated\": true"));
+        assert!(!request_text.contains(tail), "{request_text}");
+    }
+
+    #[test]
     fn context_assembler_can_disable_prompt_reference_expansion() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-no-prompt-ref");
         fs::write(root.join("note.txt"), "important context\n").expect("note");
@@ -10732,6 +13667,42 @@ mod tests {
     }
 
     #[test]
+    fn context_budget_omits_empty_optional_projection_lanes() {
+        let input = agent_input("plain request without optional context");
+        let config = AgentConfig::new("fake", "fake")
+            .with_workspace_instruction_files(Vec::<PathBuf>::new());
+        let agent = Agent::new(
+            SequencedModel::new(std::iter::empty::<String>()),
+            "fake",
+            "fake",
+        )
+        .with_config(config);
+
+        let context = agent.assemble_context(&input, &[], 0).expect("context");
+
+        assert!(context.loaded_instruction_files.is_empty());
+        assert!(context.prompt_references.is_empty());
+        assert!(context.context_attachments.is_empty());
+        assert!(context.async_update.is_none());
+        assert_eq!(context.budget_estimate.instruction_file_bytes, 0);
+        assert_eq!(context.budget_estimate.prompt_reference_bytes, 0);
+        assert_eq!(context.budget_estimate.context_attachment_bytes, 0);
+        assert_eq!(context.budget_estimate.async_update_bytes, 0);
+        assert!(!context.budget_estimate.lanes.iter().any(|lane| {
+            matches!(
+                lane.kind.as_str(),
+                "prompt_references" | "context_attachments" | "async_update"
+            )
+        }));
+        assert!(!context.report.included.iter().any(|source| {
+            matches!(
+                source.kind.as_str(),
+                "prompt_references" | "context_attachments" | "async_update"
+            )
+        }));
+    }
+
+    #[test]
     fn context_assembler_loads_workspace_instruction_files() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-instructions");
         fs::write(
@@ -10752,6 +13723,7 @@ mod tests {
 
         assert_eq!(context.loaded_instruction_files.len(), 1);
         assert_eq!(context.loaded_instruction_files[0].path, "AGENTS.md");
+        assert_eq!(context.loaded_instruction_files[0].original_bytes, None);
         assert!(!context.loaded_instruction_files[0].truncated);
         assert!(
             context.loaded_instruction_files[0]
@@ -10774,9 +13746,13 @@ mod tests {
     }
 
     #[test]
-    fn context_assembler_loads_large_instruction_files_without_default_truncation() {
+    fn context_assembler_bounds_large_instruction_files_by_default() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-large-instructions");
-        let content = format!("# Repo Instructions\n\n{}\n", "x".repeat(500 * 1024));
+        let tail = "INSTRUCTION_FILE_TAIL_SHOULD_NOT_BE_MODEL_VISIBLE";
+        let content = format!(
+            "# Repo Instructions\n\n{}{tail}\n",
+            "x".repeat(DEFAULT_WORKSPACE_INSTRUCTION_FILE_BYTES + 512)
+        );
         fs::write(root.join("AGENTS.md"), &content).expect("instructions");
         let input = agent_input("inspect");
         let config = AgentConfig::new("local", "custom-1m").with_workspace_root(&root);
@@ -10790,14 +13766,56 @@ mod tests {
         let context = agent.assemble_context(&input, &[], 0).expect("context");
 
         assert_eq!(context.loaded_instruction_files.len(), 1);
+        assert_eq!(
+            context.loaded_instruction_files[0].bytes,
+            DEFAULT_WORKSPACE_INSTRUCTION_FILE_BYTES
+        );
+        assert_eq!(
+            context.loaded_instruction_files[0].original_bytes,
+            Some(content.len())
+        );
+        assert!(context.loaded_instruction_files[0].truncated);
+        assert!(!context.loaded_instruction_files[0].content.contains(tail));
+        let request = agent.request(&input, &[], 0).expect("request");
+        let request_text = request
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(request_text.contains("\"truncated\": true"));
+        assert!(!request_text.contains(tail), "{request_text}");
+        assert_eq!(context.budget_estimate.max_context_bytes, None);
+    }
+
+    #[test]
+    fn context_assembler_can_opt_out_of_instruction_file_truncation() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-unbounded-instructions");
+        let content = format!("# Repo Instructions\n\n{}\n", "x".repeat(128 * 1024));
+        fs::write(root.join("AGENTS.md"), &content).expect("instructions");
+        let input = agent_input("inspect");
+        let config = AgentConfig::new("local", "custom-1m")
+            .with_workspace_root(&root)
+            .with_instruction_file_max_bytes(None);
+        let agent = Agent::new(
+            SequencedModel::new(std::iter::empty::<String>()),
+            "local",
+            "custom-1m",
+        )
+        .with_config(config);
+
+        let context = agent.assemble_context(&input, &[], 0).expect("context");
+
+        assert_eq!(context.loaded_instruction_files.len(), 1);
         assert_eq!(context.loaded_instruction_files[0].bytes, content.len());
+        assert_eq!(context.loaded_instruction_files[0].original_bytes, None);
         assert!(!context.loaded_instruction_files[0].truncated);
         assert_eq!(context.loaded_instruction_files[0].content, content);
         assert_eq!(context.budget_estimate.max_context_bytes, None);
     }
 
     #[test]
-    fn policy_bundle_blocks_denied_tool_before_registry_execution() {
+    fn tool_surface_blocks_denied_tool_before_registry_execution() {
         let model = SequencedModel::new([
             r#"{
                 "response_mode": "defer",
@@ -10813,14 +13831,14 @@ mod tests {
             }"#,
             r#"{
                 "response_mode": "answer",
-                "text": "The command was blocked by policy.",
+                "text": "The command was hidden by the tool surface.",
                 "tool_calls": [],
                 "background_handoff": null,
                 "next_state": "listening"
             }"#,
         ]);
-        let agent = Agent::new(model, "fake", "fake").with_policy(
-            AgentPolicyBundle::default_for_role(AgentRole::Deliberation)
+        let agent = Agent::new(model, "fake", "fake").with_tool_surface(
+            AgentToolSurface::default_for_role(AgentRole::Deliberation)
                 .with_denied_tools(["run_command"]),
         );
 
@@ -10828,19 +13846,57 @@ mod tests {
 
         assert_eq!(run.tool_results.len(), 1);
         assert_eq!(run.tool_results[0].status, AgentToolStatus::Blocked);
-        assert!(!run.tool_results[0].evidence.policy.allowed);
+        assert!(!run.tool_results[0].evidence.availability.allowed);
         assert_eq!(
             run.tool_results[0]
                 .output
                 .get("error")
                 .and_then(serde_json::Value::as_str),
-            Some("policy_denied")
+            Some("tool_unavailable")
         );
         assert!(
             run.items
                 .iter()
-                .any(|item| matches!(item, AgentItem::ToolResult { evidence, .. } if !evidence.policy.allowed))
+                .any(|item| matches!(item, AgentItem::ToolResult { evidence, .. } if !evidence.availability.allowed))
         );
+    }
+
+    #[test]
+    fn tool_surface_and_evidence_use_availability_names_with_legacy_aliases() {
+        let surface = AgentToolSurface::new("main-default", AgentRole::Main)
+            .with_denied_tools(["run_command"]);
+        let rendered_surface = serde_json::to_value(&surface).expect("surface json");
+        assert_eq!(rendered_surface["surface_id"], "main-default");
+        assert!(rendered_surface.get("policy_id").is_none());
+
+        let legacy_surface: AgentToolSurface = serde_json::from_value(serde_json::json!({
+            "policy_id": "legacy-main",
+            "role": "main",
+            "tools": {
+                "denied_tools": ["run_command"]
+            }
+        }))
+        .expect("legacy surface json");
+        assert_eq!(legacy_surface.surface_id, "legacy-main");
+        assert_eq!(
+            legacy_surface.tools.denied_tools,
+            vec!["run_command".to_string()]
+        );
+
+        let evidence = AgentToolEvidence::availability_only(false, "hidden by surface");
+        let rendered_evidence = serde_json::to_value(&evidence).expect("evidence json");
+        assert_eq!(rendered_evidence["availability"]["allowed"], false);
+        assert!(rendered_evidence.get("policy").is_none());
+
+        let legacy_evidence: AgentToolEvidence = serde_json::from_value(serde_json::json!({
+            "policy": {
+                "allowed": false,
+                "reason": "legacy hidden tool"
+            }
+        }))
+        .expect("legacy evidence json");
+        assert!(!legacy_evidence.availability.allowed);
+        assert_eq!(legacy_evidence.availability.reason, "legacy hidden tool");
     }
 
     #[test]
@@ -11191,6 +14247,61 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn version_control_tools_cancel_active_git_subprocesses() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-git-tool-cancel");
+        fs::create_dir_all(&root).expect("workspace");
+        let fake_git = root.join("slow-git");
+        fs::write(&fake_git, "#!/bin/sh\nsleep 5\n").expect("fake git");
+        let mut permissions = fs::metadata(&fake_git).expect("metadata").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        fs::set_permissions(&fake_git, permissions).expect("chmod fake git");
+        let fake_git_program = fake_git.display().to_string();
+        let registry = AgentToolRegistry::local_workspace_with_config(
+            LocalWorkspaceAgentConfig::new(&root).with_git_program(fake_git_program.clone()),
+        );
+        let input = agent_input("cancel git status");
+        let cancellation_token = AgentCancellationToken::new();
+        let token_for_sink = cancellation_token.clone();
+        let progress_sink = crate::AgentToolProgressSink::new(move |event| {
+            if matches!(event, crate::AgentToolProgressEvent::ProcessStarted { .. }) {
+                token_for_sink.cancel();
+            }
+        });
+
+        let outcome = registry.execute_with_cancellation_and_progress(
+            &input.session,
+            0,
+            0,
+            &AgentToolCall {
+                call_id: None,
+                tool: "changed_files".to_string(),
+                input: serde_json::json!({}),
+                r#async: false,
+                summary: "cancel changed files".to_string(),
+            },
+            cancellation_token,
+            progress_sink,
+        );
+
+        assert_eq!(outcome.status, AgentToolStatus::Cancelled);
+        assert_eq!(
+            outcome
+                .output
+                .get("cancelled")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            outcome
+                .output
+                .get("program")
+                .and_then(serde_json::Value::as_str),
+            Some(fake_git_program.as_str())
+        );
+    }
+
     #[test]
     fn local_workspace_registry_blocks_shell_commands_by_default() {
         let registry =
@@ -11427,7 +14538,7 @@ mod tests {
             outcome.output.get("error").and_then(|value| value.as_str()),
             Some("file_writes_disabled")
         );
-        assert!(!outcome.evidence.policy.allowed);
+        assert!(!outcome.evidence.availability.allowed);
     }
 
     #[test]
@@ -11989,6 +15100,113 @@ old
     }
 
     #[test]
+    fn local_workspace_apply_patch_supports_structured_exact_and_range_edits() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-structured-small-edits");
+        fs::write(root.join("exact.txt"), "fn value() {\n    old_call();\n}\n")
+            .expect("seed exact file");
+        fs::write(root.join("range.txt"), "one\ntwo\nthree\nfour\n").expect("seed range file");
+        let config = LocalWorkspaceAgentConfig::new(&root).allowing_file_writes(true);
+        let registry = AgentToolRegistry::local_workspace_with_config(config);
+        let input = agent_input("structured small edits");
+
+        let outcome = registry.execute(
+            &input.session,
+            0,
+            0,
+            &AgentToolCall {
+                call_id: None,
+                tool: "apply_patch".to_string(),
+                input: serde_json::json!({
+                    "changes": [
+                        {
+                            "action": "replace_exact",
+                            "path": "exact.txt",
+                            "old": "old_call();",
+                            "new": "new_call();"
+                        },
+                        {
+                            "action": "replace_range",
+                            "path": "range.txt",
+                            "start_line": 2,
+                            "end_line": 3,
+                            "content": "TWO\nTHREE\n"
+                        }
+                    ]
+                }),
+                r#async: false,
+                summary: "apply structured small edits".to_string(),
+            },
+        );
+
+        assert_eq!(outcome.status, AgentToolStatus::Succeeded);
+        assert_eq!(
+            fs::read_to_string(root.join("exact.txt")).expect("exact file"),
+            "fn value() {\n    new_call();\n}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("range.txt")).expect("range file"),
+            "one\nTWO\nTHREE\nfour\n"
+        );
+        let operations = outcome
+            .output
+            .get("operations")
+            .and_then(serde_json::Value::as_array)
+            .expect("operations");
+        assert!(
+            operations
+                .iter()
+                .any(|operation| operation["action"] == "replace_exact")
+        );
+        assert!(
+            operations
+                .iter()
+                .any(|operation| operation["action"] == "replace_range")
+        );
+    }
+
+    #[test]
+    fn local_workspace_apply_patch_rejects_ambiguous_structured_exact_edit_without_mutating() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-structured-ambiguous-edit");
+        fs::write(root.join("ambiguous.txt"), "same\nsame\n").expect("seed ambiguous file");
+        let config = LocalWorkspaceAgentConfig::new(&root).allowing_file_writes(true);
+        let registry = AgentToolRegistry::local_workspace_with_config(config);
+        let input = agent_input("ambiguous structured edit");
+
+        let outcome = registry.execute(
+            &input.session,
+            0,
+            0,
+            &AgentToolCall {
+                call_id: None,
+                tool: "apply_patch".to_string(),
+                input: serde_json::json!({
+                    "changes": [
+                        {
+                            "action": "replace_exact",
+                            "path": "ambiguous.txt",
+                            "old": "same",
+                            "new": "changed"
+                        }
+                    ]
+                }),
+                r#async: false,
+                summary: "reject ambiguous structured edit".to_string(),
+            },
+        );
+
+        assert_eq!(outcome.status, AgentToolStatus::Failed);
+        assert_eq!(
+            fs::read_to_string(root.join("ambiguous.txt")).expect("ambiguous file"),
+            "same\nsame\n"
+        );
+        assert!(
+            outcome
+                .summary
+                .contains("replace_exact expected one match for `ambiguous.txt`, found 2")
+        );
+    }
+
+    #[test]
     fn agent_records_patch_snapshot_items_for_apply_patch() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-loop-patch");
         let evidence_dir = root.join("evidence");
@@ -12109,6 +15327,7 @@ old
             crate::AgentLoopResponseMode::Answer
         );
         assert!(run.final_decision.text.contains("Patch is ready"));
+        assert!(run.final_decision.text.contains("missing command"));
         assert_eq!(coding_state.patch_status, CodingPatchStatus::Applied);
         assert_eq!(
             coding_state.validation_status,
@@ -12117,6 +15336,14 @@ old
         assert_eq!(
             coding_state.stop_recommendation,
             CodingStopDecision::FinishWithPatch
+        );
+        let validation_attempt = coding_state
+            .validation_attempts
+            .last()
+            .expect("validation attempt");
+        assert_eq!(
+            validation_attempt.failure_kind,
+            Some(CodingCommandFailureKind::MissingCommand)
         );
         assert_eq!(coding_state.changed_files, vec!["hello.txt".to_string()]);
         assert!(
@@ -12141,6 +15368,8 @@ old
                     }
                 ]
             }),
+            payload_original_bytes: None,
+            payload_model_visible_truncated: false,
         });
         let agent = Agent::new(
             SequencedModel::new([r#"{
@@ -12170,6 +15399,160 @@ old
             message.content.contains("context_attachments")
                 && message.content.contains("cargo test -p sinomo-agent")
         }));
+    }
+
+    #[test]
+    fn turn_context_bounds_large_context_attachments_for_model() {
+        let mut input = agent_input("continue the attached job");
+        let tail = "CONTEXT_ATTACHMENT_TAIL_SHOULD_NOT_BE_MODEL_VISIBLE";
+        let payload = format!(
+            "{}{tail}{}",
+            "a".repeat(DEFAULT_CONTEXT_ATTACHMENT_PAYLOAD_BYTES + 512),
+            "A".repeat(1024)
+        );
+        input.context_attachments.push(AgentContextAttachment {
+            kind: "sinomo.evolution.large".to_string(),
+            summary: "large evolution evidence context".to_string(),
+            payload_json: serde_json::json!({
+                "log": payload,
+                "status": "passed"
+            }),
+            payload_original_bytes: None,
+            payload_model_visible_truncated: false,
+        });
+        assert!(
+            input.context_attachments[0]
+                .payload_json
+                .get("log")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.contains(tail))
+        );
+        let agent = Agent::new(
+            SequencedModel::new(std::iter::empty::<String>()),
+            "fake",
+            "fake",
+        );
+
+        let context = agent.assemble_context(&input, &[], 0).expect("context");
+        let request = agent.request(&input, &[], 0).expect("request");
+        let request_text = request
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(context.context_attachments.len(), 1);
+        let attachment = &context.context_attachments[0];
+        assert!(attachment.payload_model_visible_truncated);
+        assert!(attachment.payload_original_bytes.is_some());
+        assert_eq!(
+            attachment
+                .payload_json
+                .get("model_visible_truncated")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            attachment
+                .payload_json
+                .get("payload_json_excerpt")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.contains(tail))
+        );
+        assert!(
+            serde_json::to_vec(&attachment.payload_json)
+                .expect("attachment payload projection serializes")
+                .len()
+                <= DEFAULT_CONTEXT_ATTACHMENT_PAYLOAD_BYTES
+        );
+        assert!(request_text.contains("payload_model_visible_truncated"));
+        assert!(request_text.contains("payload_json_excerpt"));
+        assert!(!request_text.contains(tail), "{request_text}");
+    }
+
+    #[test]
+    fn turn_context_bounds_large_async_update_for_model() {
+        let mut input = agent_input("continue after the async task update");
+        let tail = "ASYNC_UPDATE_TAIL_SHOULD_NOT_BE_MODEL_VISIBLE";
+        let summary = format!(
+            "{}{tail}{}",
+            "s".repeat(DEFAULT_ASYNC_UPDATE_BYTES + 512),
+            "S".repeat(1024)
+        );
+        let result_ref = format!(
+            "{}{tail}{}",
+            "r".repeat(DEFAULT_ASYNC_UPDATE_BYTES + 512),
+            "R".repeat(1024)
+        );
+        input.async_update = Some(AsyncTaskUpdate {
+            kind: "coding.validation".to_string(),
+            task_id: TaskId::generate(),
+            status: crate::AsyncTaskStatus::Progress,
+            summary,
+            needs_user_attention: true,
+            result_ref: Some(result_ref),
+            next_action_hint: AsyncTaskNextAction::TellUser,
+        });
+        assert!(input.async_update.as_ref().is_some_and(|update| {
+            update.summary.contains(tail)
+                && update
+                    .result_ref
+                    .as_deref()
+                    .is_some_and(|result_ref| result_ref.contains(tail))
+        }));
+        let agent = Agent::new(
+            SequencedModel::new(std::iter::empty::<String>()),
+            "fake",
+            "fake",
+        );
+
+        let context = agent.assemble_context(&input, &[], 0).expect("context");
+        let request = agent.request(&input, &[], 0).expect("request");
+        let request_text = request
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let async_update = context.async_update.as_ref().expect("async update");
+        assert_eq!(
+            async_update
+                .get("model_visible_truncated")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            async_update
+                .get("summary_excerpt")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.contains(tail))
+        );
+        assert!(
+            async_update
+                .get("result_ref_excerpt")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.contains(tail))
+        );
+        assert!(
+            serde_json::to_vec(async_update)
+                .expect("async update projection serializes")
+                .len()
+                <= DEFAULT_ASYNC_UPDATE_BYTES
+        );
+        assert!(context.budget_estimate.async_update_bytes > 0);
+        assert!(
+            context
+                .report
+                .included
+                .iter()
+                .any(|source| source.kind == "async_update"
+                    && source.bytes == context.budget_estimate.async_update_bytes)
+        );
+        assert!(request_text.contains("async_update_original_bytes"));
+        assert!(request_text.contains("summary_excerpt"));
+        assert!(!request_text.contains(tail), "{request_text}");
     }
 
     #[test]
@@ -12217,6 +15600,8 @@ old
             payload_json: serde_json::json!({
                 "objective": "build a candidate"
             }),
+            payload_original_bytes: None,
+            payload_model_visible_truncated: false,
         });
 
         let run = agent.run(&input).expect("run");
@@ -12673,6 +16058,54 @@ old
         assert!(session_events.contains("\"control_event_published\""));
         assert!(session_events.contains("\"task_status_changed\""));
         assert!(session_events.contains("\"control_snapshot_saved\""));
+    }
+
+    #[test]
+    fn agent_session_progress_cursor_uses_last_event_id_and_preserves_empty_cursor() {
+        let session_id = SessionId::from_legacy_named("sess_progress_cursor").expect("session");
+        let task = AgentTaskRef::new("coding", "progress cursor task")
+            .with_owner_role(AgentRole::Deliberation);
+        let running = AgentTaskSnapshot::new(task.clone(), AgentTaskLifecycleStatus::Running);
+        let completed = AgentTaskSnapshot::new(task, AgentTaskLifecycleStatus::Completed);
+        let first = AgentEvent::new(
+            TaskId::from_legacy_named("op_progress_cursor_first").expect("first op"),
+            session_id.clone(),
+            AgentEventPayload::TaskStatusChanged { snapshot: running },
+        );
+        let second = AgentEvent::new(
+            TaskId::from_legacy_named("op_progress_cursor_second").expect("second op"),
+            session_id,
+            AgentEventPayload::TaskStatusChanged {
+                snapshot: completed,
+            },
+        );
+        let events = vec![first.clone(), second.clone()];
+
+        let realigned = agent_session_control_event_batch_from_events(
+            AgentSessionControlEventCursor {
+                offset: 99,
+                last_event_id: Some(first.event_id.clone()),
+            },
+            &events,
+        );
+        assert_eq!(realigned.events.len(), 1);
+        assert_eq!(realigned.events[0].event_id, second.event_id);
+        assert_eq!(realigned.next_cursor.offset, 2);
+        assert_eq!(
+            realigned.next_cursor.last_event_id.as_ref(),
+            Some(&second.event_id)
+        );
+
+        let empty =
+            agent_session_control_event_batch_from_events(realigned.next_cursor.clone(), &events);
+        assert!(empty.events.is_empty());
+        assert!(empty.task_updates.is_empty());
+        assert!(empty.terminal_results.is_empty());
+        assert_eq!(empty.next_cursor.offset, 2);
+        assert_eq!(
+            empty.next_cursor.last_event_id.as_ref(),
+            Some(&second.event_id)
+        );
     }
 
     #[test]

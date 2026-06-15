@@ -1,5 +1,8 @@
 use super::{
-    AgentCliCommand, AgentRunOptions, BUILTIN_TOP_LEVEL_USAGE_COMMANDS,
+    AgentCliCommand, AgentExportOptions, AgentImportOptions, AgentInspectOptions,
+    AgentReadinessOptions, AgentRunOptions, AgentSessionCliCommand, AgentSessionInspectOptions,
+    AgentSessionMessageOptions, AgentSessionProgressOptions, AgentSessionResumeOptions,
+    AgentSessionTerminalResultsOptions, AgentValidateOptions, BUILTIN_TOP_LEVEL_USAGE_COMMANDS,
     CliClusterMemberMutationHost, CliCommand, CliError, CliRuntimeOptions, ClusterCliCommand,
     ClusterInitOptions, ClusterInviteOptions, ClusterJoinOptions, ClusterJoinRegistrationRequest,
     ClusterPaths, ClusterRaftRoleOptions, ClusterRemoveOptions, ClusterRoleOptions,
@@ -60,6 +63,7 @@ use super::{
     daemon_handle_daemon_sandbox_toolchain_import_package, daemon_handle_daemon_sandbox_write,
 };
 use base64::Engine;
+use sinomo_agent::{AgentRuntimeControlHost, AgentSessionResumeRequest, AgentSessionSteerRequest};
 use sinomo_lm::{
     LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
     ProviderReasoningEffort, ProviderTextVerbosity,
@@ -588,6 +592,20 @@ fn top_level_cli_parser_routes_subcommands() {
         CliCommand::Test(TestCliCommand::List(_))
     ));
     assert!(matches!(
+        parse_cli_command(&[
+            "test".to_string(),
+            "run".to_string(),
+            "--tag".to_string(),
+            "agent-readiness".to_string(),
+            "--require-cluster".to_string(),
+        ])
+        .expect("test run tag"),
+        CliCommand::Test(TestCliCommand::Run(options))
+            if options.id.is_none()
+                && options.tag.as_deref() == Some("agent-readiness")
+                && options.require_cluster
+    ));
+    assert!(matches!(
         parse_cli_command(&["models".to_string()]).expect("models help"),
         CliCommand::Models(ModelsCliCommand::Help)
     ));
@@ -666,12 +684,96 @@ fn top_level_cli_parser_routes_subcommands() {
     assert!(matches!(
         parse_cli_command(&[
             "agent".to_string(),
+            "export".to_string(),
+            "coding-agent".to_string(),
+            "--output".to_string(),
+            "coding-agent.json".to_string(),
+        ])
+        .expect("agent export"),
+        CliCommand::Agent(AgentCliCommand::Export(options))
+            if options == (AgentExportOptions {
+                agent: "coding-agent".to_string(),
+                output: Some(PathBuf::from("coding-agent.json")),
+            })
+    ));
+    assert!(matches!(
+        parse_cli_command(&[
+            "agent".to_string(),
+            "import".to_string(),
+            "coding-agent.json".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("agent import"),
+        CliCommand::Agent(AgentCliCommand::Import(options))
+            if options == (AgentImportOptions {
+                path: PathBuf::from("coding-agent.json"),
+                json: true,
+            })
+    ));
+    assert!(matches!(
+        parse_cli_command(&[
+            "agent".to_string(),
+            "inspect".to_string(),
+            "coding-agent".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("agent inspect"),
+        CliCommand::Agent(AgentCliCommand::Inspect(options))
+            if options == (AgentInspectOptions {
+                agent: "coding-agent".to_string(),
+                json: true,
+            })
+    ));
+    assert!(matches!(
+        parse_cli_command(&[
+            "agent".to_string(),
+            "validate".to_string(),
+            "--file".to_string(),
+            "coding-agent.json".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("agent validate"),
+        CliCommand::Agent(AgentCliCommand::Validate(options))
+            if options == (AgentValidateOptions {
+                agent: "main-agent".to_string(),
+                file: Some(PathBuf::from("coding-agent.json")),
+                json: true,
+            })
+    ));
+    assert!(matches!(
+        parse_cli_command(&[
+            "agent".to_string(),
             "run".to_string(),
             "--prompt".to_string(),
             "hello".to_string(),
         ])
         .expect("agent"),
         CliCommand::Agent(AgentCliCommand::Run(_))
+    ));
+    assert!(matches!(
+        parse_cli_command(&[
+            "agent".to_string(),
+            "readiness".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("agent readiness"),
+        CliCommand::Agent(AgentCliCommand::Readiness(options))
+            if options == (AgentReadinessOptions { json: true })
+    ));
+    assert!(matches!(
+        parse_cli_command(&[
+            "agent".to_string(),
+            "session".to_string(),
+            "inspect".to_string(),
+            "sess_cli_agent_session".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("agent session inspect"),
+        CliCommand::Agent(AgentCliCommand::Session(AgentSessionCliCommand::Inspect(options)))
+            if options == (AgentSessionInspectOptions {
+                session_id: SessionId::from_legacy_named("sess_cli_agent_session").expect("session id"),
+                json: true,
+            })
     ));
     assert!(parse_cli_command(&["evolve".to_string()]).is_err());
 }
@@ -713,6 +815,22 @@ fn test_parser_accepts_live_cluster_smoke_options() {
     assert!(test_command_requires_cluster_state(&TestCliCommand::Smoke(
         options
     )));
+}
+
+#[test]
+fn test_registry_lists_agent_cluster_readiness_case() {
+    let registry = super::test_registry().expect("registry");
+    let cases = registry.metadata();
+    let case = cases
+        .iter()
+        .find(|case| case.id == "cluster.agent.runtime-routes")
+        .expect("agent cluster runtime routes test case");
+    assert!(case.tags.iter().any(|tag| tag == "agent-readiness"));
+    assert!(
+        case.requirements
+            .iter()
+            .any(|requirement| requirement.label() == "cluster-runtime")
+    );
 }
 
 #[test]
@@ -5241,6 +5359,355 @@ fn agent_run_parser_accepts_provider_model_account_and_prompt() {
 }
 
 #[test]
+fn agent_inspect_parser_accepts_agent_and_json() {
+    assert_eq!(
+        super::parse_agent_inspect_options(&[
+            "--agent".to_string(),
+            "evolution-agent".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("agent inspect"),
+        AgentInspectOptions {
+            agent: "evolution-agent".to_string(),
+            json: true,
+        }
+    );
+    assert_eq!(
+        super::parse_agent_inspect_options(&[]).expect("default agent inspect"),
+        AgentInspectOptions {
+            agent: "main-agent".to_string(),
+            json: false,
+        }
+    );
+}
+
+#[test]
+fn agent_export_import_validate_parsers_accept_package_artifacts() {
+    assert_eq!(
+        super::parse_agent_export_options(&[
+            "coding-agent".to_string(),
+            "--output".to_string(),
+            "coding-agent.json".to_string(),
+        ])
+        .expect("agent export"),
+        AgentExportOptions {
+            agent: "coding-agent".to_string(),
+            output: Some(PathBuf::from("coding-agent.json")),
+        }
+    );
+    assert_eq!(
+        super::parse_agent_export_options(&[]).expect("default export"),
+        AgentExportOptions {
+            agent: "main-agent".to_string(),
+            output: None,
+        }
+    );
+    assert_eq!(
+        super::parse_agent_import_options(&[
+            "--file".to_string(),
+            "coding-agent.json".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("agent import"),
+        AgentImportOptions {
+            path: PathBuf::from("coding-agent.json"),
+            json: true,
+        }
+    );
+    assert_eq!(
+        super::parse_agent_validate_options(&[
+            "--file".to_string(),
+            "coding-agent.json".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("agent validate file"),
+        AgentValidateOptions {
+            agent: "main-agent".to_string(),
+            file: Some(PathBuf::from("coding-agent.json")),
+            json: true,
+        }
+    );
+    assert_eq!(
+        super::parse_agent_validate_options(&["coding-agent".to_string()])
+            .expect("agent validate catalog"),
+        AgentValidateOptions {
+            agent: "coding-agent".to_string(),
+            file: None,
+            json: false,
+        }
+    );
+}
+
+#[test]
+fn agent_package_json_artifact_loads_and_validates() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-package-json");
+    let path = root.join("coding-agent.json");
+    let definition = sinomo_agent::AgentDefinition::coding()
+        .with_skill("rust.coding")
+        .with_package_version("2.0.0");
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&definition).expect("definition json"),
+    )
+    .expect("write definition");
+
+    let loaded = super::read_agent_package_definition(&path).expect("read package");
+
+    loaded.validate().expect("valid package");
+    assert_eq!(loaded.key(), "coding-agent");
+    assert_eq!(loaded.package.version, "2.0.0");
+    assert_eq!(loaded.skills, vec!["rust.coding".to_string()]);
+}
+
+#[test]
+fn agent_readiness_parser_accepts_json() {
+    assert_eq!(
+        super::parse_agent_readiness_options(&["--json".to_string()]).expect("agent readiness"),
+        AgentReadinessOptions { json: true }
+    );
+    assert_eq!(
+        super::parse_agent_readiness_options(&[]).expect("default readiness"),
+        AgentReadinessOptions { json: false }
+    );
+}
+
+#[test]
+fn agent_session_parsers_accept_inspect_progress_results_and_control() {
+    let session_id = SessionId::from_legacy_named("sess_agent_session_parser").expect("session");
+    let task_id = sinomo_agent::TaskId::generate();
+    let event_id = sinomo_agent::TaskId::generate();
+
+    assert_eq!(
+        super::parse_agent_session_command(&[
+            "inspect".to_string(),
+            "sess_agent_session_parser".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("inspect"),
+        AgentSessionCliCommand::Inspect(AgentSessionInspectOptions {
+            session_id: session_id.clone(),
+            json: true,
+        })
+    );
+    assert_eq!(
+        super::parse_agent_session_command(&[
+            "progress".to_string(),
+            "sess_agent_session_parser".to_string(),
+            "--cursor".to_string(),
+            "7".to_string(),
+            "--last-event".to_string(),
+            event_id.to_string(),
+            "--json".to_string(),
+        ])
+        .expect("progress"),
+        AgentSessionCliCommand::Progress(AgentSessionProgressOptions {
+            session_id: session_id.clone(),
+            cursor: Some(sinomo_agent::AgentSessionControlEventCursor {
+                offset: 7,
+                last_event_id: Some(event_id),
+            }),
+            json: true,
+        })
+    );
+    assert_eq!(
+        super::parse_agent_session_command(&[
+            "terminal-results".to_string(),
+            "sess_agent_session_parser".to_string(),
+            "--task".to_string(),
+            task_id.to_string(),
+        ])
+        .expect("terminal results"),
+        AgentSessionCliCommand::TerminalResults(AgentSessionTerminalResultsOptions {
+            session_id: session_id.clone(),
+            task_id: Some(task_id),
+            json: false,
+        })
+    );
+    assert_eq!(
+        super::parse_agent_session_command(&[
+            "steer".to_string(),
+            "sess_agent_session_parser".to_string(),
+            "keep".to_string(),
+            "the".to_string(),
+            "constraint".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("steer"),
+        AgentSessionCliCommand::Steer(AgentSessionMessageOptions {
+            session_id: session_id.clone(),
+            message: "keep the constraint".to_string(),
+            json: true,
+        })
+    );
+    assert_eq!(
+        super::parse_agent_session_command(&[
+            "follow-up".to_string(),
+            "--session".to_string(),
+            "sess_agent_session_parser".to_string(),
+            "--message".to_string(),
+            "one more thing".to_string(),
+        ])
+        .expect("follow-up"),
+        AgentSessionCliCommand::FollowUp(AgentSessionMessageOptions {
+            session_id: session_id.clone(),
+            message: "one more thing".to_string(),
+            json: false,
+        })
+    );
+    assert_eq!(
+        super::parse_agent_session_command(&[
+            "interrupt".to_string(),
+            "sess_agent_session_parser".to_string(),
+            "--reason".to_string(),
+            "stop now".to_string(),
+        ])
+        .expect("interrupt"),
+        AgentSessionCliCommand::Interrupt(AgentSessionMessageOptions {
+            session_id: session_id.clone(),
+            message: "stop now".to_string(),
+            json: false,
+        })
+    );
+    assert_eq!(
+        super::parse_agent_session_command(&[
+            "resume".to_string(),
+            "sess_agent_session_parser".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("resume"),
+        AgentSessionCliCommand::Resume(AgentSessionResumeOptions {
+            session_id,
+            json: true,
+        })
+    );
+}
+
+#[test]
+fn agent_session_text_renderers_summarize_persisted_state() {
+    let session_id = SessionId::from_legacy_named("sess_agent_session_text").expect("session");
+    let event_id =
+        sinomo_agent::TaskId::from_legacy_named("event_agent_session_text").expect("event id");
+    let session =
+        sinomo_agent::AgentSession::new(session_id.clone(), sinomo_agent::AgentRole::Main);
+    let inspect = sinomo_agent::AgentSessionInspectResponse {
+        session_id: session_id.clone(),
+        session: Some(session),
+        control_snapshot: None,
+        event_cursor: sinomo_agent::AgentSessionControlEventCursor {
+            offset: 4,
+            last_event_id: Some(event_id.clone()),
+        },
+        terminal_results: Vec::new(),
+        persisted_event_count: 4,
+    };
+
+    let text = super::agent_session_inspection_text(&inspect);
+
+    assert!(text.contains("Agent session:"));
+    assert!(text.contains("role: Main"));
+    assert!(text.contains("persisted events: 4"));
+    assert!(text.contains(&format!("event cursor: offset 4, last event {event_id}")));
+    assert!(text.contains("control snapshot: not found"));
+
+    let progress = sinomo_agent::AgentSessionProgressResponse {
+        session_id: session_id.clone(),
+        batch: sinomo_agent::AgentSessionControlEventBatch {
+            cursor: sinomo_agent::AgentSessionControlEventCursor {
+                offset: 4,
+                last_event_id: Some(event_id.clone()),
+            },
+            next_cursor: sinomo_agent::AgentSessionControlEventCursor {
+                offset: 4,
+                last_event_id: Some(event_id.clone()),
+            },
+            events: Vec::new(),
+            task_updates: Vec::new(),
+            terminal_results: Vec::new(),
+        },
+    };
+    let progress_text = super::agent_session_progress_text(&progress);
+    assert!(progress_text.contains(&format!(
+        "cursor: offset 4, last event {event_id} -> offset 4, last event {event_id}"
+    )));
+
+    let resume = sinomo_agent::AgentSessionResumeResponse {
+        session_id,
+        accepted: false,
+        runtime_attached: false,
+        session: None,
+        control_snapshot: None,
+        event_cursor: sinomo_agent::AgentSessionControlEventCursor {
+            offset: 4,
+            last_event_id: Some(event_id.clone()),
+        },
+        reattach: sinomo_agent::AgentSessionReattachReport {
+            state: sinomo_agent::AgentSessionReattachState::PersistedMetadataOnly,
+            active_turn_persisted: false,
+            running_task_count: 0,
+            persisted_event_count: 4,
+            reason: "readiness resume fixture".to_string(),
+        },
+        detail: None,
+    };
+    let resume_text = super::agent_session_resume_text(&resume);
+    assert!(resume_text.contains(&format!("event cursor: offset 4, last event {event_id}")));
+}
+
+#[test]
+fn agent_inspection_renders_package_surface_and_prompt() {
+    let mut definition = sinomo_agent::AgentDefinition::coding()
+        .with_skill("rust.coding")
+        .with_package_version("2.0.0");
+    definition.temperature = Some(0.3);
+    definition.max_output_tokens = Some(321);
+
+    let text = super::agent_package_inspection_text(&definition);
+    let json = super::agent_package_inspection_json(&definition);
+
+    assert!(text.contains("Agent package: coding-agent"));
+    assert!(text.contains("version: 2.0.0"));
+    assert!(text.contains("skills: rust.coding"));
+    assert!(text.contains("context:"));
+    assert!(text.contains("compaction:"));
+    assert!(text.contains("provider preferences:"));
+    assert!(text.contains("temperature: 0.3"));
+    assert!(text.contains("max output tokens: 321"));
+    assert!(text.contains("runtime limits:"));
+    assert!(text.contains("max steps: unbounded"));
+    assert!(text.contains("max tool calls per step: unbounded"));
+    assert!(text.contains("max model repair attempts: unbounded"));
+    assert!(text.contains("system prompt:"));
+    assert_eq!(json["id"], "coding-agent");
+    assert_eq!(json["package"]["version"], "2.0.0");
+    assert_eq!(json["skills"][0], "rust.coding");
+    let temperature = json["effective_model_policy"]["temperature"]
+        .as_f64()
+        .expect("temperature");
+    assert!((temperature - 0.3).abs() < 0.000001);
+    assert_eq!(json["effective_model_policy"]["max_output_tokens"], 321);
+
+    definition.runtime_limits.max_steps = Some(12);
+    definition.runtime_limits.max_tool_calls_per_step = Some(3);
+    definition.runtime_limits.max_model_repair_attempts = Some(2);
+    let capped_text = super::agent_package_inspection_text(&definition);
+    assert!(capped_text.contains("max steps: 12"));
+    assert!(capped_text.contains("max tool calls per step: 3"));
+    assert!(capped_text.contains("max model repair attempts: 2"));
+}
+
+#[test]
+fn agent_readiness_text_renders_gate_results() {
+    let report = sinomo_agent::run_local_agent_readiness_gate(env!("CARGO_MANIFEST_DIR"));
+    let text = super::agent_readiness_text(&report);
+
+    assert!(report.is_ready(), "{report:#?}");
+    assert!(text.contains("Agent readiness: Ready"));
+    assert!(text.contains("[pass] built_in_package_validation"));
+    assert!(text.contains("[pass] package_rejects_malformed_definitions"));
+    assert!(text.contains("[pass] local_command_evidence_smoke"));
+}
+
+#[test]
 fn cluster_repair_members_parser_accepts_peer_and_promotion() {
     assert_eq!(
         super::parse_cluster_command(&[
@@ -7311,6 +7778,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
         sinomo_runtime::network::SANDBOX_HTTP_FETCH_TO_FILE_ROUTE,
         sinomo_runtime::network::SANDBOX_RUN_TOOLCHAIN_ROUTE,
         sinomo_runtime::network::SANDBOX_RUN_PROCESS_PLAN_ROUTE,
+        sinomo_runtime::network::SANDBOX_RUN_CANCEL_ROUTE,
         sinomo_runtime::network::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
         sinomo_runtime::network::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
         sinomo_runtime::network::SANDBOX_IMPORT_BUSYBOX_ROUTE,
@@ -11348,7 +11816,7 @@ fn debug_sobj_command_prints_typed_text() {
 #[cfg(unix)]
 #[test]
 fn captured_cli_command_collects_raw_stdio_for_embedded_callers() {
-    let captured = super::run_cli_closure_with_capture(|| {
+    let captured = super::run_cli_closure_with_process_stdio_capture(|| {
         std::io::stdout()
             .write_all(b"raw stdout from dependency\n")
             .expect("write raw stdout");
@@ -11523,6 +11991,76 @@ fn main_agent_handler_routes_plain_input_through_agent_loop() {
         events[3].event.kind.as_str(),
         "interaction.main_agent.queued"
     );
+}
+
+#[test]
+fn main_agent_handler_registers_live_runtime_for_control_host() {
+    let session = InteractionSession::new(
+        SessionId::from_legacy_named("sess_main_agent_control_host_test").expect("session"),
+        NodeId::from_legacy_named("node_main_agent_control_host_test").expect("node"),
+        InteractionSurface::new("surface.test", InteractionSurfaceKind::CommandLine),
+    );
+    let mut runtime = InteractionRuntime::new(
+        InMemoryEventStore::new(),
+        RuntimeMainAgentInteractionHandler::with_thinking(
+            MainAgentFixtureModel,
+            "fixture-provider",
+            "fixture-model",
+            super::ThinkingControl::default(),
+        ),
+        session.clone(),
+    );
+    let control_registry = runtime.handler().runtime_control_registry();
+
+    let outputs = runtime
+        .ingest_user_input("what is the cluster doing?")
+        .expect("input");
+    assert!(outputs.is_empty());
+
+    let steer = control_registry
+        .steer(AgentSessionSteerRequest {
+            session_id: session.session_id.clone(),
+            message: "keep the current constraint".to_string(),
+        })
+        .expect("steer via control host");
+    assert!(steer.accepted);
+    let resumed = control_registry
+        .resume(AgentSessionResumeRequest {
+            session_id: session.session_id.clone(),
+        })
+        .expect("resume via control host");
+    assert!(resumed.runtime_attached);
+    let live_session = resumed.session.expect("live session");
+    assert_eq!(live_session.steering_queue.len(), 1);
+    assert_eq!(
+        live_session.steering_queue[0].message,
+        "keep the current constraint"
+    );
+
+    runtime.handler_mut().join_active_tui_turn().expect("join");
+}
+
+#[test]
+fn app_agent_chat_exposes_first_class_runtime_control_methods() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-app-chat-control");
+    let data_dir = SinomoDataDir::new(&root);
+    let chat = super::app_api::AgentChat::new(data_dir, false).expect("chat");
+
+    let initial = chat.control_state().expect("initial control state");
+    assert!(initial.accepted);
+    assert!(!initial.active_turn);
+    assert_eq!(initial.steering_count, 0);
+    assert_eq!(initial.follow_up_count, 0);
+
+    let steering = chat.steer("preserve this instruction").expect("steer");
+    assert!(steering.accepted);
+    assert_eq!(steering.session_id, chat.session_id());
+    let follow_up = chat.follow_up("also mention tests").expect("follow up");
+    assert!(follow_up.accepted);
+
+    let state = chat.control_state().expect("control state");
+    assert_eq!(state.steering_count, 1);
+    assert_eq!(state.follow_up_count, 1);
 }
 
 #[test]

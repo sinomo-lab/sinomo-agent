@@ -9,8 +9,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use sinomo_agent::{
-    AgentCatalog, AgentDefinition, AgentItem, AgentModelEvent, AgentRuntimeEvent,
-    AgentRuntimeEventPayload, AgentToolProgressEvent, InteractionOutput, InteractionSession,
+    AgentCatalog, AgentDefinition, AgentItem, AgentModelEvent, AgentRuntimeControlHost,
+    AgentRuntimeControlRegistry, AgentRuntimeEvent, AgentRuntimeEventPayload,
+    AgentSessionControlResult, AgentSessionFollowUpRequest, AgentSessionInterruptRequest,
+    AgentSessionReattachState, AgentSessionResumeRequest, AgentSessionResumeResponse,
+    AgentSessionSteerRequest, AgentToolProgressEvent, InteractionOutput, InteractionSession,
     InteractionSurface, InteractionSurfaceKind, TaskId,
 };
 use sinomo_lm::{
@@ -19,8 +22,14 @@ use sinomo_lm::{
 };
 use sinomo_runtime::events::{InMemoryEventStore, SessionId};
 use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::NodeId;
+use time::format_description::well_known::Rfc3339;
 
+use crate::commands::{
+    ClusterInviteOptions, ClusterJoinOptions, cluster_invite_with_paths, cluster_join_with_paths,
+    read_cluster_state as read_cli_cluster_state,
+};
 use crate::error::CliError;
 use crate::tui::{
     self, DefaultMainAgentChatModel, InteractionRuntime, RuntimeMainAgentInteractionHandler,
@@ -70,6 +79,37 @@ pub struct ChatHistoryMessage {
     pub text: String,
 }
 
+/// Outcome of a live chat-runtime control operation.
+#[derive(Clone, Debug, Default)]
+pub struct ChatControlStatus {
+    pub session_id: String,
+    pub accepted: bool,
+    pub sequence: u64,
+    pub event_count: usize,
+    pub active_turn: bool,
+    pub task_count: usize,
+    pub terminal_result_count: usize,
+}
+
+/// Snapshot of the live chat runtime's current control state.
+#[derive(Clone, Debug, Default)]
+pub struct ChatControlState {
+    pub session_id: String,
+    pub accepted: bool,
+    pub runtime_attached: bool,
+    pub reattach_state: AgentSessionReattachState,
+    pub reattach_active_turn_persisted: bool,
+    pub reattach_running_task_count: usize,
+    pub reattach_persisted_event_count: usize,
+    pub active_turn: bool,
+    pub next_sequence: u64,
+    pub task_count: usize,
+    pub event_cursor_offset: usize,
+    pub steering_count: usize,
+    pub follow_up_count: usize,
+    pub detail: Option<String>,
+}
+
 /// A selectable agent.
 #[derive(Clone, Debug)]
 pub struct AgentSummary {
@@ -86,6 +126,25 @@ pub struct ProviderSummary {
     pub models: Vec<String>,
 }
 
+/// The app's current local cluster state, as plain strings.
+#[derive(Clone, Debug, Default)]
+pub struct AppClusterStatus {
+    pub clustered: bool,
+    pub cluster_id: Option<String>,
+    pub local_node_id: Option<String>,
+    pub summary: Option<String>,
+    pub error: Option<String>,
+}
+
+/// An invitation generated for a new node.
+#[derive(Clone, Debug)]
+pub struct AppClusterInvite {
+    pub uri: String,
+    pub join_command: String,
+    pub expires_at: String,
+    pub persisted_key: String,
+}
+
 /// One running chat conversation backed by the main-agent runtime.
 pub struct AgentChat {
     data_dir: SinomoDataDir,
@@ -97,9 +156,26 @@ impl AgentChat {
     /// Build a fresh conversation. `daemon_connected` selects cluster vs. local
     /// config resolution for model switching.
     pub fn new(data_dir: SinomoDataDir, daemon_connected: bool) -> Result<Self, CliError> {
-        let handler = tui::app_build_chat_handler(&data_dir, None)?;
-        let runtime =
-            InteractionRuntime::new(InMemoryEventStore::new(), handler, app_session(None));
+        Self::with_runtime_control_registry(
+            data_dir,
+            daemon_connected,
+            AgentRuntimeControlRegistry::new(),
+        )
+    }
+
+    pub fn with_runtime_control_registry(
+        data_dir: SinomoDataDir,
+        daemon_connected: bool,
+        runtime_control_registry: AgentRuntimeControlRegistry,
+    ) -> Result<Self, CliError> {
+        let handler = tui::app_build_chat_handler(&data_dir, None)?
+            .with_runtime_control_registry(runtime_control_registry);
+        let session = app_session(None);
+        let mut runtime =
+            InteractionRuntime::new(InMemoryEventStore::new(), handler, session.clone());
+        runtime
+            .handler_mut()
+            .replace_agent_session(&session, agent_transcript_from_history(&[]))?;
         Ok(Self {
             data_dir,
             daemon_connected,
@@ -140,6 +216,60 @@ impl AgentChat {
 
     pub fn runtime_info(&self) -> ChatRuntimeInfo {
         tui::app_runtime_info(self.runtime.handler()).into()
+    }
+
+    /// Live control registry for this chat runtime's active agent sessions.
+    pub fn runtime_control_registry(&self) -> AgentRuntimeControlRegistry {
+        self.runtime.handler().runtime_control_registry()
+    }
+
+    /// Queue steering for the active agent session.
+    pub fn steer(&self, message: impl Into<String>) -> Result<ChatControlStatus, CliError> {
+        let session_id = self.runtime.session().session_id.clone();
+        let result = self
+            .runtime_control_registry()
+            .steer(AgentSessionSteerRequest {
+                session_id,
+                message: message.into(),
+            })
+            .map_err(agent_control_cli_error)?;
+        Ok(chat_control_status(result))
+    }
+
+    /// Queue a user follow-up for the active agent session.
+    pub fn follow_up(&self, message: impl Into<String>) -> Result<ChatControlStatus, CliError> {
+        let session_id = self.runtime.session().session_id.clone();
+        let result = self
+            .runtime_control_registry()
+            .follow_up(AgentSessionFollowUpRequest {
+                session_id,
+                message: message.into(),
+            })
+            .map_err(agent_control_cli_error)?;
+        Ok(chat_control_status(result))
+    }
+
+    /// Request interruption of the active agent turn.
+    pub fn interrupt(&self, reason: impl Into<String>) -> Result<ChatControlStatus, CliError> {
+        let session_id = self.runtime.session().session_id.clone();
+        let result = self
+            .runtime_control_registry()
+            .interrupt(AgentSessionInterruptRequest {
+                session_id,
+                reason: reason.into(),
+            })
+            .map_err(agent_control_cli_error)?;
+        Ok(chat_control_status(result))
+    }
+
+    /// Inspect the live runtime state for the active chat session.
+    pub fn control_state(&self) -> Result<ChatControlState, CliError> {
+        let session_id = self.runtime.session().session_id.clone();
+        let response = self
+            .runtime_control_registry()
+            .resume(AgentSessionResumeRequest { session_id })
+            .map_err(agent_control_cli_error)?;
+        Ok(chat_control_state(response))
     }
 
     /// Send a user message and stream the agent's reply through `on_event`.
@@ -188,6 +318,59 @@ impl AgentChat {
             self.daemon_connected,
         )?;
         Ok(info.into())
+    }
+}
+
+fn chat_control_status(result: AgentSessionControlResult) -> ChatControlStatus {
+    ChatControlStatus {
+        session_id: result.snapshot.session_id.to_string(),
+        accepted: result.accepted,
+        sequence: result.sequence,
+        event_count: result.events.len(),
+        active_turn: result.snapshot.active_turn.is_some(),
+        task_count: result.snapshot.tasks.len(),
+        terminal_result_count: result.terminal_results().len(),
+    }
+}
+
+fn chat_control_state(response: AgentSessionResumeResponse) -> ChatControlState {
+    let (active_turn, next_sequence, task_count) = response
+        .control_snapshot
+        .as_ref()
+        .map(|snapshot| {
+            (
+                snapshot.active_turn.is_some(),
+                snapshot.next_sequence,
+                snapshot.tasks.len(),
+            )
+        })
+        .unwrap_or((false, 0, 0));
+    let (steering_count, follow_up_count) = response
+        .session
+        .as_ref()
+        .map(|session| (session.steering_queue.len(), session.follow_up_queue.len()))
+        .unwrap_or((0, 0));
+    ChatControlState {
+        session_id: response.session_id.to_string(),
+        accepted: response.accepted,
+        runtime_attached: response.runtime_attached,
+        reattach_state: response.reattach.state.clone(),
+        reattach_active_turn_persisted: response.reattach.active_turn_persisted,
+        reattach_running_task_count: response.reattach.running_task_count,
+        reattach_persisted_event_count: response.reattach.persisted_event_count,
+        active_turn,
+        next_sequence,
+        task_count,
+        event_cursor_offset: response.event_cursor.offset,
+        steering_count,
+        follow_up_count,
+        detail: response.detail,
+    }
+}
+
+fn agent_control_cli_error(error: sinomo_agent::AgentRuntimeControlError) -> CliError {
+    CliError::Parse {
+        detail: format!("agent runtime control: {error}"),
     }
 }
 
@@ -521,6 +704,93 @@ pub fn fallback_model() -> &'static str {
     PROVIDER_DEFAULT_MODEL
 }
 
+/// Read the local cluster status without requiring the app to depend on CLI internals.
+pub fn cluster_status(data_dir: &SinomoDataDir) -> AppClusterStatus {
+    let paths = ClusterPaths::new(data_dir);
+    match read_cli_cluster_state(&paths) {
+        Ok(state) => {
+            let cluster_id = state.cluster_id.to_string();
+            let local_node_id = state.local_node_id.to_string();
+            let member_state = state
+                .members
+                .iter()
+                .find(|member| member.node_id == state.local_node_id)
+                .map(|member| format!("{:?}", member.state).to_lowercase())
+                .unwrap_or_else(|| "unknown".to_string());
+            AppClusterStatus {
+                clustered: true,
+                cluster_id: Some(cluster_id.clone()),
+                local_node_id: Some(local_node_id),
+                summary: Some(format!(
+                    "cluster {} · {}",
+                    app_short_id(&cluster_id, 14),
+                    member_state
+                )),
+                error: None,
+            }
+        }
+        Err(CliError::ClusterOrphan) => AppClusterStatus::default(),
+        Err(error) => AppClusterStatus {
+            error: Some(error.to_string()),
+            ..AppClusterStatus::default()
+        },
+    }
+}
+
+/// Generate a cluster invitation from the local node.
+pub fn create_cluster_invite(data_dir: &SinomoDataDir) -> Result<AppClusterInvite, CliError> {
+    let paths = ClusterPaths::new(data_dir);
+    let rendered = cluster_invite_with_paths(ClusterInviteOptions::default(), &paths)?;
+    Ok(AppClusterInvite {
+        uri: rendered.uri,
+        join_command: rendered.join_command,
+        expires_at: rendered
+            .invite
+            .expires_at
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| "unknown".to_string()),
+        persisted_key: rendered.persisted_key,
+    })
+}
+
+/// Join a cluster using a raw invite URI, join command, JSON payload, or file reference.
+pub fn join_cluster(
+    data_dir: &SinomoDataDir,
+    invite: &str,
+    name: &str,
+) -> Result<AppClusterStatus, CliError> {
+    let invite = invite.trim();
+    if invite.is_empty() {
+        return Err(CliError::Parse {
+            detail: "enter an invitation link before joining".to_string(),
+        });
+    }
+    let paths = ClusterPaths::new(data_dir);
+    cluster_join_with_paths(
+        ClusterJoinOptions {
+            invite: invite.to_string(),
+            cluster_id: None,
+            node_id: None,
+            name: if name.trim().is_empty() {
+                "Sinomo App".to_string()
+            } else {
+                name.trim().to_string()
+            },
+        },
+        &paths,
+    )?;
+    Ok(cluster_status(data_dir))
+}
+
+/// Leave the local cluster by removing this node's local cluster state.
+pub fn leave_cluster(data_dir: &SinomoDataDir) -> Result<AppClusterStatus, CliError> {
+    let paths = ClusterPaths::new(data_dir);
+    match network::remove_local_cluster_state(&paths) {
+        Ok(()) | Err(network::NetworkError::ClusterOrphan) => Ok(cluster_status(data_dir)),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn dedup(values: Vec<String>) -> Vec<String> {
     let mut seen = Vec::new();
     for value in values {
@@ -529,6 +799,16 @@ fn dedup(values: Vec<String>) -> Vec<String> {
         }
     }
     seen
+}
+
+fn app_short_id(id: &str, max_chars: usize) -> String {
+    if id.chars().count() <= max_chars {
+        id.to_string()
+    } else {
+        let keep = max_chars.saturating_sub(3);
+        let head: String = id.chars().take(keep).collect();
+        format!("{head}...")
+    }
 }
 
 // ----------------------------------------------------------------------------

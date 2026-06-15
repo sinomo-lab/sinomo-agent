@@ -16,7 +16,7 @@ use sinomo_module_api::{
     NativeModuleInvocationRequest, NativeModuleRequest, NativeModuleResponse, decode_sobj,
     encode_sobj,
 };
-use sinomo_sandbox::{SandboxOutputChunk, SandboxOutputSink};
+use sinomo_sandbox::{SandboxCancellationToken, SandboxOutputChunk, SandboxOutputSink};
 use sinomo_sandbox_wasix_api::{
     SINOMO_SANDBOX_WASIX_INTERFACE_VERSION, SINOMO_SANDBOX_WASIX_MODULE_ID,
     SINOMO_SANDBOX_WASIX_OPERATION, SandboxWasixNativeRequest, SandboxWasixNativeResponse,
@@ -121,15 +121,26 @@ impl SandboxWasixNativeModule {
         request: &SandboxWasixNativeRequest,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
     ) -> Result<SandboxWasixNativeResponse, SandboxWasixNativeModuleError> {
+        self.invoke_with_output_sink_and_cancellation(request, output_sink, None)
+    }
+
+    pub fn invoke_with_output_sink_and_cancellation(
+        &self,
+        request: &SandboxWasixNativeRequest,
+        output_sink: Option<Arc<dyn SandboxOutputSink>>,
+        cancellation_token: Option<SandboxCancellationToken>,
+    ) -> Result<SandboxWasixNativeResponse, SandboxWasixNativeModuleError> {
         let payload_sobj = encode_sobj(request)
             .map_err(|source| SandboxWasixNativeModuleError::Object(source.to_string()))?;
         let native_request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
             operation: SINOMO_SANDBOX_WASIX_OPERATION.to_string(),
             payload_sobj,
         });
-        let callbacks = output_sink.map(|output_sink| {
-            Arc::new(SandboxWasixHostCallbacks { output_sink })
-                as Arc<dyn NativeModuleHostCallbacks>
+        let callbacks = (output_sink.is_some() || cancellation_token.is_some()).then(|| {
+            Arc::new(SandboxWasixHostCallbacks {
+                output_sink,
+                cancellation_token,
+            }) as Arc<dyn NativeModuleHostCallbacks>
         });
         match self
             .module
@@ -155,14 +166,24 @@ impl SandboxWasixNativeModule {
 }
 
 struct SandboxWasixHostCallbacks {
-    output_sink: Arc<dyn SandboxOutputSink>,
+    output_sink: Option<Arc<dyn SandboxOutputSink>>,
+    cancellation_token: Option<SandboxCancellationToken>,
 }
 
 impl NativeModuleHostCallbacks for SandboxWasixHostCallbacks {
     fn output_payload(&self, payload_sobj: &[u8]) {
-        if let Ok(chunk) = decode_sobj::<SandboxOutputChunk>(payload_sobj) {
-            self.output_sink.output_chunk(chunk);
+        if let (Some(output_sink), Ok(chunk)) = (
+            self.output_sink.as_ref(),
+            decode_sobj::<SandboxOutputChunk>(payload_sobj),
+        ) {
+            output_sink.output_chunk(chunk);
         }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancellation_token
+            .as_ref()
+            .is_some_and(SandboxCancellationToken::is_cancelled)
     }
 }
 

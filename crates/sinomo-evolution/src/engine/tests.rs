@@ -3421,11 +3421,20 @@ fn orchestrator_writes_agent_run_artifacts() {
 
     assert!(bundle.join("agent-run.json").exists());
     assert!(bundle.join("agent-summary.json").exists());
+    assert!(bundle.join("agent-events.jsonl").exists());
+    assert!(bundle.join("coding-run-state.json").exists());
+    assert!(bundle.join("patch-snapshots.json").exists());
+    assert!(bundle.join("validation-records.json").exists());
     assert!(bundle.join("resource-usage.json").exists());
     assert!(bundle.join("bundle-content-manifest.json").exists());
     assert!(bundle.join("bundle-attestation.json").exists());
     let expected_agent_run_path = bundle.join("agent-run.json").display().to_string();
     let expected_agent_summary_path = bundle.join("agent-summary.json").display().to_string();
+    let expected_agent_events_path = bundle.join("agent-events.jsonl").display().to_string();
+    let expected_coding_run_state_path = bundle.join("coding-run-state.json").display().to_string();
+    let expected_patch_snapshots_path = bundle.join("patch-snapshots.json").display().to_string();
+    let expected_validation_records_path =
+        bundle.join("validation-records.json").display().to_string();
     let expected_resource_usage_path = bundle.join("resource-usage.json").display().to_string();
     let expected_content_manifest_path = bundle
         .join("bundle-content-manifest.json")
@@ -3440,6 +3449,98 @@ fn orchestrator_writes_agent_run_artifacts() {
         report.bundle.agent_summary_path.as_deref(),
         Some(expected_agent_summary_path.as_str())
     );
+    assert!(
+        report
+            .bundle
+            .artifact_refs
+            .iter()
+            .any(|reference| reference == &expected_agent_events_path)
+    );
+    assert!(
+        report
+            .bundle
+            .artifact_refs
+            .iter()
+            .any(|reference| reference == &expected_coding_run_state_path)
+    );
+    assert!(
+        report
+            .bundle
+            .artifact_refs
+            .iter()
+            .any(|reference| reference == &expected_patch_snapshots_path)
+    );
+    assert!(
+        report
+            .bundle
+            .artifact_refs
+            .iter()
+            .any(|reference| reference == &expected_validation_records_path)
+    );
+    let agent_summary: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&expected_agent_summary_path).expect("agent summary JSON"),
+    )
+    .expect("parse agent summary JSON");
+    assert_eq!(
+        agent_summary["model_metrics"]["native_tool_call_turn_count"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        agent_summary["model_metrics"]["final_decision_source"],
+        serde_json::json!("strict_json_decision")
+    );
+    assert_eq!(
+        agent_summary["tool_pair_integrity"]["tool_calls"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        agent_summary["tool_pair_integrity"]["tool_results"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        agent_summary["tool_pair_integrity"]["orphan_tool_calls"],
+        serde_json::json!(0)
+    );
+    assert_eq!(
+        agent_summary["tool_pair_integrity"]["orphan_tool_results"],
+        serde_json::json!(0)
+    );
+    let agent_events =
+        fs::read_to_string(bundle.join("agent-events.jsonl")).expect("agent events JSONL");
+    let agent_event_lines = agent_events.lines().collect::<Vec<_>>();
+    assert_eq!(agent_event_lines.len(), 1);
+    let agent_event: serde_json::Value =
+        serde_json::from_str(agent_event_lines[0]).expect("agent event JSON line");
+    assert_eq!(
+        agent_event["payload"]["final_decision_source"],
+        serde_json::json!("strict_json_decision")
+    );
+    let coding_run_state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(bundle.join("coding-run-state.json")).expect("coding run state JSON"),
+    )
+    .expect("parse coding run state JSON");
+    assert_eq!(
+        coding_run_state["stop_recommendation"],
+        serde_json::json!("finish_with_patch")
+    );
+    let patch_snapshots: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(bundle.join("patch-snapshots.json")).expect("patch snapshots JSON"),
+    )
+    .expect("parse patch snapshots JSON");
+    assert_eq!(
+        patch_snapshots[0]["PatchSnapshot"]["changed_files"],
+        serde_json::json!(["hello.txt"])
+    );
+    let validation_records: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(bundle.join("validation-records.json"))
+            .expect("validation records JSON"),
+    )
+    .expect("parse validation records JSON");
+    assert_eq!(
+        validation_records[0]["command"],
+        serde_json::json!("cargo test -p sinomo-evolution")
+    );
+    assert_eq!(validation_records[0]["status"], serde_json::json!("passed"));
     assert_eq!(
         report.bundle.resource_usage_path.as_deref(),
         Some(expected_resource_usage_path.as_str())
@@ -3482,6 +3583,23 @@ fn orchestrator_writes_agent_run_artifacts() {
             .any(|file| file.path == "agent-run.json" && file.digest.starts_with("blake3:"))
     );
     assert!(
+        content_manifest
+            .files
+            .iter()
+            .any(|file| file.path == "agent-events.jsonl" && file.digest.starts_with("blake3:"))
+    );
+    assert!(content_manifest.files.iter().any(|file| {
+        file.path == "coding-run-state.json" && file.digest.starts_with("blake3:")
+    }));
+    assert!(
+        content_manifest.files.iter().any(|file| {
+            file.path == "patch-snapshots.json" && file.digest.starts_with("blake3:")
+        })
+    );
+    assert!(content_manifest.files.iter().any(|file| {
+        file.path == "validation-records.json" && file.digest.starts_with("blake3:")
+    }));
+    assert!(
         !content_manifest
             .files
             .iter()
@@ -3502,6 +3620,34 @@ fn orchestrator_writes_agent_run_artifacts() {
             .iter()
             .any(|reference| reference.ends_with("agent-run.json"))
     );
+    assert!(
+        attestation
+            .predicate
+            .artifact_refs
+            .iter()
+            .any(|reference| reference.ends_with("agent-events.jsonl"))
+    );
+    assert!(
+        attestation
+            .predicate
+            .artifact_refs
+            .iter()
+            .any(|reference| reference.ends_with("coding-run-state.json"))
+    );
+    assert!(
+        attestation
+            .predicate
+            .artifact_refs
+            .iter()
+            .any(|reference| reference.ends_with("patch-snapshots.json"))
+    );
+    assert!(
+        attestation
+            .predicate
+            .artifact_refs
+            .iter()
+            .any(|reference| reference.ends_with("validation-records.json"))
+    );
 }
 
 #[test]
@@ -3516,9 +3662,12 @@ fn orchestrator_records_benchmark_summary_metrics() {
         "{\"event\":\"suite-selected\"}\n{\"event\":\"benchmark-complete\"}\n",
     )
     .expect("progress");
-    let summary_json = serde_json::json!({
+    let summary_json = r#"{
         "benchmark": "swebench",
         "total_instances": 1,
+        "host_dependencies": {
+            "blocking_issue_count": 0
+        },
         "sinomo": {
             "resolved_instances": 1,
             "error_instances": 0,
@@ -3537,10 +3686,46 @@ fn orchestrator_records_benchmark_summary_metrics() {
             "deterministic_repair_changed_files": 1,
             "agent_model_turns": 3,
             "agent_tool_results": 5,
+            "agent_event_count": 8,
+            "agent_item_count": 19,
+            "agent_tool_call_items": 5,
+            "agent_tool_result_items": 5,
+            "orphan_tool_calls": 0,
+            "orphan_tool_results": 0,
             "agent_input_tokens": 11,
-            "agent_output_tokens": 7
+            "agent_output_tokens": 7,
+            "agent_model_response_count": 4,
+            "agent_model_response_parse_failures": 1,
+            "agent_strict_json_decision_turns": 2,
+            "agent_text_fallback_turns": 1,
+            "agent_native_tool_call_turns": 1,
+            "agent_native_tool_calls": 2,
+            "agent_vendor_fallback_tool_call_turns": 1,
+            "agent_vendor_fallback_tool_calls": 1,
+            "agent_model_repair_attempts": 1,
+            "agent_repair_request_model_visible_bytes": 128,
+            "instances_with_successful_patch": 1,
+            "first_successful_patch_turn_sum": 2,
+            "first_successful_patch_turn_min": 2,
+            "first_successful_patch_turn_max": 2,
+            "command_observation_turns": 2,
+            "command_tool_results": 3,
+            "cancelled_tool_results": 1,
+            "cancelled_runs": 1,
+            "extra_turns_after_patch": 4,
+            "coding_validation_attempts": 2,
+            "coding_validation_status_counts": {
+                "failed_environment": 1
+            },
+            "coding_stop_recommendation_counts": {
+                "finish_with_patch": 1
+            },
+            "coding_validation_failure_kind_counts": {
+                "missing_dependency": 1,
+                "patch_relevant": 1
+            }
         }
-    })
+    }"#
     .to_string();
     let benchmark_command = format!(
         "printf %s {} > {}",
@@ -3623,6 +3808,82 @@ fn orchestrator_records_benchmark_summary_metrics() {
         metric.name == "agent_input_tokens" && metric.value == MetricValue::Integer(11)
     }));
     assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "agent_model_response_parse_failures"
+            && metric.value == MetricValue::Integer(1)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "agent_native_tool_call_turns" && metric.value == MetricValue::Integer(1)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "agent_event_count" && metric.value == MetricValue::Integer(8)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "agent_item_count" && metric.value == MetricValue::Integer(19)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "agent_tool_call_items" && metric.value == MetricValue::Integer(5)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "agent_tool_result_items" && metric.value == MetricValue::Integer(5)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "agent_orphan_tool_calls" && metric.value == MetricValue::Integer(0)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "agent_orphan_tool_results" && metric.value == MetricValue::Integer(0)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "agent_vendor_fallback_tool_call_turns"
+            && metric.value == MetricValue::Integer(1)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "agent_model_repair_attempts" && metric.value == MetricValue::Integer(1)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_instances_with_successful_patch"
+            && metric.value == MetricValue::Integer(1)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_first_successful_patch_turn_min"
+            && metric.value == MetricValue::Integer(2)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_coding_validation_attempts"
+            && metric.value == MetricValue::Integer(2)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_coding_finish_with_patch_instances"
+            && metric.value == MetricValue::Integer(1)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_coding_failed_environment_instances"
+            && metric.value == MetricValue::Integer(1)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_coding_missing_dependency_failures"
+            && metric.value == MetricValue::Integer(1)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_command_observation_turns"
+            && metric.value == MetricValue::Integer(2)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_command_tool_results" && metric.value == MetricValue::Integer(3)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_cancelled_tool_results" && metric.value == MetricValue::Integer(1)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_cancelled_runs" && metric.value == MetricValue::Integer(1)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_extra_turns_after_patch" && metric.value == MetricValue::Integer(4)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_host_dependency_blocking_issues"
+            && metric.value == MetricValue::Integer(0)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
         metric.name == "swebench_official_completed_instances"
             && metric.value == MetricValue::Integer(1)
     }));
@@ -3667,6 +3928,393 @@ fn orchestrator_records_benchmark_summary_metrics() {
             && metric.value == MetricValue::Integer(1)
     }));
     assert!(benchmark_results_path.exists());
+}
+
+#[test]
+fn orchestrator_marks_host_blocked_swebench_summary_inconclusive() {
+    let root = temp_dir("orchestrator-benchmark-host-blocked");
+    let candidate = root.join("candidate");
+    fs::create_dir_all(&candidate).expect("candidate dir");
+    let summary_path = candidate.join("benchmark-summary.json");
+    let summary_json = serde_json::json!({
+        "benchmark": "swebench",
+        "total_instances": 1,
+        "harness_status": "host-dependency-blocked",
+        "host_dependencies": {
+            "blocking_issue_count": 1,
+            "blocking_issues": [
+                "mini-extra CLI is required for mini-SWE-agent baseline mode"
+            ]
+        }
+    })
+    .to_string();
+    let benchmark_command = format!(
+        "printf %s {} > {}; exit 1",
+        shell_quote(&summary_json),
+        shell_quote(&summary_path.display().to_string())
+    );
+    let orchestrator = EvolutionOrchestrator::new(
+        FakeWorkspace {
+            root: root.to_path_buf(),
+            candidate: candidate.clone(),
+        },
+        ExecutingEvalHarness::new(LocalCommandRunner::new()),
+        LocalCandidateBundleStore::new(root.join("jobs")),
+    );
+    let model = FakeAgentArtifactMutationModel;
+
+    let report = orchestrator
+        .propose(
+            EvolutionRequest {
+                objective: "record host-blocked benchmark evidence".to_string(),
+                target_ring: TrustRing::R1TrustedRuntime,
+                intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                verification_commands: vec![VerificationCommand {
+                    name: "success".to_string(),
+                    command: "exit 0".to_string(),
+                    expected_exit_code: 0,
+                    gate: EvaluationGate::StaticChecks,
+                }],
+                benchmark_gates: vec![BenchmarkGateRequest {
+                    name: "swebench-host-blocked".to_string(),
+                    expected_exit_code: 0,
+                    kind: BenchmarkGateKind::Command {
+                        command: benchmark_command,
+                        summary_path: Some(summary_path.display().to_string()),
+                        results_dir: Some(candidate.display().to_string()),
+                        progress_path: None,
+                    },
+                }],
+                module_replay_reports: Vec::new(),
+                model_provider: None,
+                model: None,
+                dry_run: false,
+            },
+            Some(&model),
+        )
+        .expect("propose");
+    let benchmark_results_path = report
+        .bundle
+        .benchmark_results_path
+        .as_ref()
+        .map(PathBuf::from)
+        .expect("benchmark results path");
+    let benchmark_reports: Vec<BenchmarkGateReport> = serde_json::from_str(
+        &fs::read_to_string(&benchmark_results_path).expect("benchmark results"),
+    )
+    .expect("benchmark report json");
+    let scorecard = report.scorecard.as_ref().expect("scorecard");
+
+    assert_eq!(scorecard.outcome, EvaluationOutcome::Inconclusive);
+    assert_eq!(benchmark_reports.len(), 1);
+    assert_eq!(benchmark_reports[0].exit_code, Some(1));
+    assert_eq!(
+        benchmark_reports[0].outcome,
+        EvaluationOutcome::Inconclusive
+    );
+    assert_eq!(
+        benchmark_reports[0].summary_verdict.as_deref(),
+        Some("SWE-bench host dependencies blocked 1 issue(s)")
+    );
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_host_dependency_blocking_issues"
+            && metric.value == MetricValue::Integer(1)
+    }));
+    assert!(scorecard.gates.iter().any(|gate| {
+        gate.gate == EvaluationGate::PrivateRegressionEvals
+            && gate.outcome == EvaluationOutcome::Inconclusive
+            && gate.summary.contains("host dependencies blocked")
+    }));
+}
+
+#[test]
+fn orchestrator_marks_harness_incomplete_swebench_summary_inconclusive() {
+    let root = temp_dir("orchestrator-benchmark-harness-incomplete");
+    let candidate = root.join("candidate");
+    fs::create_dir_all(&candidate).expect("candidate dir");
+    let summary_path = candidate.join("benchmark-summary.json");
+    let summary_json = serde_json::json!({
+        "benchmark": "swebench",
+        "total_instances": 2,
+        "sinomo": {
+            "harness_blocked_instances": 1,
+            "missing_report_instances": 1,
+            "error_instances": 2
+        }
+    })
+    .to_string();
+    let benchmark_command = format!(
+        "printf %s {} > {}",
+        shell_quote(&summary_json),
+        shell_quote(&summary_path.display().to_string())
+    );
+    let orchestrator = EvolutionOrchestrator::new(
+        FakeWorkspace {
+            root: root.to_path_buf(),
+            candidate: candidate.clone(),
+        },
+        ExecutingEvalHarness::new(LocalCommandRunner::new()),
+        LocalCandidateBundleStore::new(root.join("jobs")),
+    );
+    let model = FakeAgentArtifactMutationModel;
+
+    let report = orchestrator
+        .propose(
+            EvolutionRequest {
+                objective: "record incomplete benchmark harness evidence".to_string(),
+                target_ring: TrustRing::R1TrustedRuntime,
+                intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                verification_commands: vec![VerificationCommand {
+                    name: "success".to_string(),
+                    command: "exit 0".to_string(),
+                    expected_exit_code: 0,
+                    gate: EvaluationGate::StaticChecks,
+                }],
+                benchmark_gates: vec![BenchmarkGateRequest {
+                    name: "swebench-harness-incomplete".to_string(),
+                    expected_exit_code: 0,
+                    kind: BenchmarkGateKind::Command {
+                        command: benchmark_command,
+                        summary_path: Some(summary_path.display().to_string()),
+                        results_dir: Some(candidate.display().to_string()),
+                        progress_path: None,
+                    },
+                }],
+                module_replay_reports: Vec::new(),
+                model_provider: None,
+                model: None,
+                dry_run: false,
+            },
+            Some(&model),
+        )
+        .expect("propose");
+    let benchmark_results_path = report
+        .bundle
+        .benchmark_results_path
+        .as_ref()
+        .map(PathBuf::from)
+        .expect("benchmark results path");
+    let benchmark_reports: Vec<BenchmarkGateReport> = serde_json::from_str(
+        &fs::read_to_string(&benchmark_results_path).expect("benchmark results"),
+    )
+    .expect("benchmark report json");
+    let scorecard = report.scorecard.as_ref().expect("scorecard");
+
+    assert_eq!(scorecard.outcome, EvaluationOutcome::Inconclusive);
+    assert_eq!(benchmark_reports.len(), 1);
+    assert_eq!(
+        benchmark_reports[0].outcome,
+        EvaluationOutcome::Inconclusive
+    );
+    assert_eq!(
+        benchmark_reports[0].summary_verdict.as_deref(),
+        Some(
+            "SWE-bench harness evidence incomplete: 1 harness-blocked instance(s), 1 missing report instance(s)"
+        )
+    );
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_harness_blocked_instances"
+            && metric.value == MetricValue::Integer(1)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_missing_report_instances"
+            && metric.value == MetricValue::Integer(1)
+    }));
+    assert!(scorecard.gates.iter().any(|gate| {
+        gate.gate == EvaluationGate::PrivateRegressionEvals
+            && gate.outcome == EvaluationOutcome::Inconclusive
+            && gate.summary.contains("harness evidence incomplete")
+    }));
+}
+
+#[test]
+fn orchestrator_fails_swebench_summary_with_orphan_tool_pairs() {
+    let root = temp_dir("orchestrator-benchmark-orphan-tool-pairs");
+    let candidate = root.join("candidate");
+    fs::create_dir_all(&candidate).expect("candidate dir");
+    let summary_path = candidate.join("benchmark-summary.json");
+    let summary_json = serde_json::json!({
+        "benchmark": "swebench",
+        "total_instances": 1,
+        "sinomo": {
+            "resolved_instances": 1,
+            "error_instances": 0,
+            "orphan_tool_calls": 1,
+            "orphan_tool_results": 2
+        }
+    })
+    .to_string();
+    let benchmark_command = format!(
+        "printf %s {} > {}",
+        shell_quote(&summary_json),
+        shell_quote(&summary_path.display().to_string())
+    );
+    let orchestrator = EvolutionOrchestrator::new(
+        FakeWorkspace {
+            root: root.to_path_buf(),
+            candidate: candidate.clone(),
+        },
+        ExecutingEvalHarness::new(LocalCommandRunner::new()),
+        LocalCandidateBundleStore::new(root.join("jobs")),
+    );
+    let model = FakeAgentArtifactMutationModel;
+
+    let report = orchestrator
+        .propose(
+            EvolutionRequest {
+                objective: "record orphan tool-pair benchmark evidence".to_string(),
+                target_ring: TrustRing::R1TrustedRuntime,
+                intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                verification_commands: vec![VerificationCommand {
+                    name: "success".to_string(),
+                    command: "exit 0".to_string(),
+                    expected_exit_code: 0,
+                    gate: EvaluationGate::StaticChecks,
+                }],
+                benchmark_gates: vec![BenchmarkGateRequest {
+                    name: "swebench-orphan-tool-pairs".to_string(),
+                    expected_exit_code: 0,
+                    kind: BenchmarkGateKind::Command {
+                        command: benchmark_command,
+                        summary_path: Some(summary_path.display().to_string()),
+                        results_dir: Some(candidate.display().to_string()),
+                        progress_path: None,
+                    },
+                }],
+                module_replay_reports: Vec::new(),
+                model_provider: None,
+                model: None,
+                dry_run: false,
+            },
+            Some(&model),
+        )
+        .expect("propose");
+    let benchmark_results_path = report
+        .bundle
+        .benchmark_results_path
+        .as_ref()
+        .map(PathBuf::from)
+        .expect("benchmark results path");
+    let benchmark_reports: Vec<BenchmarkGateReport> = serde_json::from_str(
+        &fs::read_to_string(&benchmark_results_path).expect("benchmark results"),
+    )
+    .expect("benchmark report json");
+    let scorecard = report.scorecard.as_ref().expect("scorecard");
+
+    assert_eq!(scorecard.outcome, EvaluationOutcome::Failed);
+    assert_eq!(benchmark_reports.len(), 1);
+    assert_eq!(benchmark_reports[0].outcome, EvaluationOutcome::Failed);
+    assert_eq!(
+        benchmark_reports[0].summary_verdict.as_deref(),
+        Some("SWE-bench reported 1 orphan tool call(s) and 2 orphan tool result(s)")
+    );
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "agent_orphan_tool_calls" && metric.value == MetricValue::Integer(1)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "agent_orphan_tool_results" && metric.value == MetricValue::Integer(2)
+    }));
+    assert!(scorecard.gates.iter().any(|gate| {
+        gate.gate == EvaluationGate::PrivateRegressionEvals
+            && gate.outcome == EvaluationOutcome::Failed
+            && gate.summary.contains("orphan tool call")
+    }));
+}
+
+#[test]
+fn orchestrator_fails_swebench_summary_with_tool_pair_count_mismatch() {
+    let root = temp_dir("orchestrator-benchmark-tool-pair-mismatch");
+    let candidate = root.join("candidate");
+    fs::create_dir_all(&candidate).expect("candidate dir");
+    let summary_path = candidate.join("benchmark-summary.json");
+    let summary_json = serde_json::json!({
+        "benchmark": "swebench",
+        "total_instances": 1,
+        "sinomo": {
+            "resolved_instances": 1,
+            "error_instances": 0,
+            "agent_tool_call_items": 3,
+            "agent_tool_result_items": 2,
+            "orphan_tool_calls": 0,
+            "orphan_tool_results": 0
+        }
+    })
+    .to_string();
+    let benchmark_command = format!(
+        "printf %s {} > {}",
+        shell_quote(&summary_json),
+        shell_quote(&summary_path.display().to_string())
+    );
+    let orchestrator = EvolutionOrchestrator::new(
+        FakeWorkspace {
+            root: root.to_path_buf(),
+            candidate: candidate.clone(),
+        },
+        ExecutingEvalHarness::new(LocalCommandRunner::new()),
+        LocalCandidateBundleStore::new(root.join("jobs")),
+    );
+    let model = FakeAgentArtifactMutationModel;
+
+    let report = orchestrator
+        .propose(
+            EvolutionRequest {
+                objective: "record tool-pair mismatch benchmark evidence".to_string(),
+                target_ring: TrustRing::R1TrustedRuntime,
+                intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                verification_commands: vec![VerificationCommand {
+                    name: "success".to_string(),
+                    command: "exit 0".to_string(),
+                    expected_exit_code: 0,
+                    gate: EvaluationGate::StaticChecks,
+                }],
+                benchmark_gates: vec![BenchmarkGateRequest {
+                    name: "swebench-tool-pair-mismatch".to_string(),
+                    expected_exit_code: 0,
+                    kind: BenchmarkGateKind::Command {
+                        command: benchmark_command,
+                        summary_path: Some(summary_path.display().to_string()),
+                        results_dir: Some(candidate.display().to_string()),
+                        progress_path: None,
+                    },
+                }],
+                module_replay_reports: Vec::new(),
+                model_provider: None,
+                model: None,
+                dry_run: false,
+            },
+            Some(&model),
+        )
+        .expect("propose");
+    let benchmark_results_path = report
+        .bundle
+        .benchmark_results_path
+        .as_ref()
+        .map(PathBuf::from)
+        .expect("benchmark results path");
+    let benchmark_reports: Vec<BenchmarkGateReport> = serde_json::from_str(
+        &fs::read_to_string(&benchmark_results_path).expect("benchmark results"),
+    )
+    .expect("benchmark report json");
+    let scorecard = report.scorecard.as_ref().expect("scorecard");
+
+    assert_eq!(scorecard.outcome, EvaluationOutcome::Failed);
+    assert_eq!(benchmark_reports.len(), 1);
+    assert_eq!(benchmark_reports[0].outcome, EvaluationOutcome::Failed);
+    assert_eq!(
+        benchmark_reports[0].summary_verdict.as_deref(),
+        Some("SWE-bench reported tool call/result item mismatch: 3 call item(s), 2 result item(s)")
+    );
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "agent_tool_call_items" && metric.value == MetricValue::Integer(3)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "agent_tool_result_items" && metric.value == MetricValue::Integer(2)
+    }));
+    assert!(scorecard.gates.iter().any(|gate| {
+        gate.gate == EvaluationGate::PrivateRegressionEvals
+            && gate.outcome == EvaluationOutcome::Failed
+            && gate.summary.contains("tool call/result item mismatch")
+    }));
 }
 
 #[test]
@@ -4674,15 +5322,15 @@ fn approve_override_records_preflight_and_candidate_summary() {
         .map(PathBuf::from)
         .expect("candidate summary path");
     assert!(summary_path.exists());
+    let candidate_summary = fs::read_to_string(&summary_path).expect("candidate summary");
+    assert!(candidate_summary.contains("candidate-bundle-integrity"));
+    assert!(candidate_summary.contains("artifact-evidence-record.json"));
+    assert!(candidate_summary.contains("## Agent Run"));
+    assert!(candidate_summary.contains("agent-summary.json"));
+    assert!(candidate_summary.contains("final_decision_source: strict_json_decision"));
     assert!(
-        fs::read_to_string(&summary_path)
-            .expect("candidate summary")
-            .contains("candidate-bundle-integrity")
-    );
-    assert!(
-        fs::read_to_string(&summary_path)
-            .expect("candidate summary")
-            .contains("artifact-evidence-record.json")
+        candidate_summary
+            .contains("tool_pair_integrity: calls=1, results=1, orphan_calls=0, orphan_results=0")
     );
     assert!(
         fs::read_to_string(recorded.decision_path)
@@ -5358,6 +6006,10 @@ impl MutationModel for FakeMutationModel {
             agent_summary: None,
             agent_resource_usage: None,
             agent_run: None,
+            agent_events: Vec::new(),
+            coding_run_state: None,
+            patch_snapshots: Vec::new(),
+            validation_records: Vec::new(),
         })
     }
 }
@@ -5387,6 +6039,19 @@ impl MutationModel for FakeAgentArtifactMutationModel {
                 tool_results: 1,
                 input_tokens: 5,
                 output_tokens: 7,
+                model_metrics: Some(serde_json::json!({
+                    "model_turn_count": 2,
+                    "model_response_count": 2,
+                    "strict_json_decision_turn_count": 1,
+                    "native_tool_call_turn_count": 1,
+                    "final_decision_source": "strict_json_decision",
+                })),
+                tool_pair_integrity: Some(AgentToolPairIntegrity {
+                    tool_calls: 1,
+                    tool_results: 1,
+                    orphan_tool_calls: 0,
+                    orphan_tool_results: 0,
+                }),
                 final_text: "agent completed".to_string(),
             }),
             agent_resource_usage: Some(agent_resource_usage_summary(
@@ -5402,6 +6067,46 @@ impl MutationModel for FakeAgentArtifactMutationModel {
                 },
                 "stop_reason": "final-decision"
             })),
+            agent_events: vec![serde_json::json!({
+                "kind": "agent.loop.completed",
+                "payload": {
+                    "final_decision_source": "strict_json_decision"
+                }
+            })],
+            coding_run_state: Some(serde_json::json!({
+                "patch_status": "applied",
+                "validation_attempts": [{
+                    "step_index": 1,
+                    "call_id": "01hxy6qa9k0t9vr4g9n8d3q5d4",
+                    "command": "cargo test -p sinomo-evolution",
+                    "status": "passed",
+                    "summary": "validation passed",
+                    "exit_code": 0,
+                    "timed_out": false
+                }],
+                "validation_status": "passed",
+                "stop_recommendation": "finish_with_patch"
+            })),
+            patch_snapshots: vec![serde_json::json!({
+                "PatchSnapshot": {
+                    "item_id": "01hxy6qa9k0t9vr4g9n8d3q5d5",
+                    "step_index": 0,
+                    "call_id": "01hxy6qa9k0t9vr4g9n8d3q5d6",
+                    "status": "succeeded",
+                    "summary": "patched hello.txt",
+                    "patch_ref": "patches/hello.patch",
+                    "changed_files": ["hello.txt"]
+                }
+            })],
+            validation_records: vec![serde_json::json!({
+                "step_index": 1,
+                "call_id": "01hxy6qa9k0t9vr4g9n8d3q5d4",
+                "command": "cargo test -p sinomo-evolution",
+                "status": "passed",
+                "summary": "validation passed",
+                "exit_code": 0,
+                "timed_out": false
+            })],
         })
     }
 }
@@ -5547,6 +6252,30 @@ fn approval_record_fixture(
         "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@\n approved\n",
     )
     .expect("diff");
+    let agent_summary_path = bundle_dir.join("agent-summary.json");
+    let agent_summary = AgentMutationSummary {
+        stop_reason: "final-decision".to_string(),
+        model_turns: 2,
+        tool_results: 1,
+        input_tokens: 5,
+        output_tokens: 7,
+        model_metrics: Some(serde_json::json!({
+            "final_decision_source": "strict_json_decision",
+            "native_tool_call_turn_count": 1,
+        })),
+        tool_pair_integrity: Some(AgentToolPairIntegrity {
+            tool_calls: 1,
+            tool_results: 1,
+            orphan_tool_calls: 0,
+            orphan_tool_results: 0,
+        }),
+        final_text: "approved candidate".to_string(),
+    };
+    fs::write(
+        &agent_summary_path,
+        serde_json::to_string_pretty(&agent_summary).expect("agent summary JSON"),
+    )
+    .expect("agent summary");
     let mut record = StoredEvolutionJob {
         job: job.clone(),
         candidate_workspace: workspace,
@@ -5558,7 +6287,7 @@ fn approval_record_fixture(
             job_path: None,
             model_output_path: None,
             agent_run_path: None,
-            agent_summary_path: None,
+            agent_summary_path: Some(agent_summary_path.display().to_string()),
             benchmark_results_path: None,
             resource_usage_path: None,
             content_manifest_path: None,
