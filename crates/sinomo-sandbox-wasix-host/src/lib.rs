@@ -181,9 +181,14 @@ impl NativeModuleHostCallbacks for SandboxWasixHostCallbacks {
     }
 
     fn is_cancelled(&self) -> bool {
-        self.cancellation_token
+        let cancelled = self
+            .cancellation_token
             .as_ref()
-            .is_some_and(SandboxCancellationToken::is_cancelled)
+            .is_some_and(SandboxCancellationToken::is_cancelled);
+        if cancelled && std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+            eprintln!("sinomo-debug wasix host callback observed cancellation");
+        }
+        cancelled
     }
 }
 

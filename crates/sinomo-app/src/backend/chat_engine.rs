@@ -5,14 +5,23 @@
 //! thread (constructed *inside* that thread, so nothing non-`Send` ever crosses a
 //! boundary). The UI sends [`ChatCommand`]s and drains [`ChatEvent`]s each frame.
 
+use std::str::FromStr;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
-use sinomo_agent::AgentRuntimeControlRegistry;
-use sinomo_cli::app_api::{
-    AgentChat, ChatControlState, ChatControlStatus, ChatHistoryMessage, ChatRuntimeInfo,
-    ChatStreamEvent,
+use sinomo_agent::{
+    AgentRuntimeControlHost, AgentRuntimeControlRegistry, AgentSessionControlResult,
+    AgentSessionFollowUpRequest, AgentSessionInterruptRequest, AgentSessionResumeRequest,
+    AgentSessionResumeResponse, AgentSessionSteerRequest, AgentTaskLifecycleStatus,
+    AgentTaskSnapshot,
 };
+use sinomo_cli::app_api::{
+    AgentChat, ChatContextSnapshot, ChatControlState, ChatControlStatus, ChatHistoryMessage,
+    ChatProcessSnapshot, ChatRuntimeInfo, ChatStreamEvent, ChatToolCallSnapshot,
+    ChatTaskSnapshot, ChatUsageSnapshot,
+};
+use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
 
 /// Who authored a chat message.
@@ -80,6 +89,17 @@ pub enum ChatEvent {
     },
     Token(String),
     Notice(String),
+    Context(ChatContextSnapshot),
+    ToolCallStarted(ChatToolCallSnapshot),
+    ToolCallDelta {
+        step_index: usize,
+        call_id: Option<String>,
+        tool: Option<String>,
+        arguments_delta: String,
+    },
+    ToolCallCompleted(ChatToolCallSnapshot),
+    Process(ChatProcessSnapshot),
+    Usage(ChatUsageSnapshot),
     TurnDone,
     ControlStatus(ChatControlStatus),
     ControlState(ChatControlState),
@@ -99,6 +119,7 @@ pub enum ChatEvent {
 pub struct ChatHandle {
     tx: Sender<ChatCommand>,
     rx: Receiver<ChatEvent>,
+    direct_control: DirectControl,
 }
 
 impl ChatHandle {
@@ -110,6 +131,12 @@ impl ChatHandle {
     ) -> Self {
         let (cmd_tx, cmd_rx) = channel::<ChatCommand>();
         let (evt_tx, evt_rx) = channel::<ChatEvent>();
+        let active_session_id = Arc::new(Mutex::new(None));
+        let direct_control = DirectControl {
+            runtime_control_registry: runtime_control_registry.clone(),
+            active_session_id: active_session_id.clone(),
+            evt_tx: evt_tx.clone(),
+        };
         thread::Builder::new()
             .name("sinomo-chat".to_string())
             .spawn(move || {
@@ -117,6 +144,7 @@ impl ChatHandle {
                     data_dir,
                     daemon_connected,
                     runtime_control_registry,
+                    active_session_id,
                     cmd_rx,
                     evt_tx,
                 )
@@ -125,11 +153,20 @@ impl ChatHandle {
         Self {
             tx: cmd_tx,
             rx: evt_rx,
+            direct_control,
         }
     }
 
     pub fn send_command(&self, command: ChatCommand) {
-        let _ = self.tx.send(command);
+        match command {
+            ChatCommand::Steer(message) => self.direct_control.steer(message),
+            ChatCommand::FollowUp(message) => self.direct_control.follow_up(message),
+            ChatCommand::Interrupt(reason) => self.direct_control.interrupt(reason),
+            ChatCommand::ControlState => self.direct_control.control_state(),
+            command => {
+                let _ = self.tx.send(command);
+            }
+        }
     }
 
     /// Drain all currently-available events without blocking.
@@ -144,10 +181,202 @@ impl Drop for ChatHandle {
     }
 }
 
+#[derive(Clone)]
+struct DirectControl {
+    runtime_control_registry: AgentRuntimeControlRegistry,
+    active_session_id: Arc<Mutex<Option<SessionId>>>,
+    evt_tx: Sender<ChatEvent>,
+}
+
+impl DirectControl {
+    fn steer(&self, message: String) {
+        self.spawn("steer", move |registry, session_id| {
+            registry
+                .steer(AgentSessionSteerRequest {
+                    session_id,
+                    message,
+                })
+                .map(|result| ChatEvent::ControlStatus(chat_control_status(result)))
+        });
+    }
+
+    fn follow_up(&self, message: String) {
+        self.spawn("follow-up", move |registry, session_id| {
+            registry
+                .follow_up(AgentSessionFollowUpRequest {
+                    session_id,
+                    message,
+                })
+                .map(|result| ChatEvent::ControlStatus(chat_control_status(result)))
+        });
+    }
+
+    fn interrupt(&self, reason: String) {
+        self.spawn("interrupt", move |registry, session_id| {
+            registry
+                .interrupt(AgentSessionInterruptRequest { session_id, reason })
+                .map(|result| ChatEvent::ControlStatus(chat_control_status(result)))
+        });
+    }
+
+    fn control_state(&self) {
+        self.spawn("control state", move |registry, session_id| {
+            registry
+                .resume(AgentSessionResumeRequest { session_id })
+                .map(|response| ChatEvent::ControlState(chat_control_state(response)))
+        });
+    }
+
+    fn spawn(
+        &self,
+        label: &'static str,
+        action: impl FnOnce(
+            AgentRuntimeControlRegistry,
+            SessionId,
+        ) -> Result<ChatEvent, sinomo_agent::AgentRuntimeControlError>
+        + Send
+        + 'static,
+    ) {
+        let registry = self.runtime_control_registry.clone();
+        let active_session_id = self.active_session_id.clone();
+        let tx = self.evt_tx.clone();
+        thread::Builder::new()
+            .name("sinomo-chat-control".to_string())
+            .spawn(move || {
+                let session_id = match active_session_id.lock() {
+                    Ok(guard) => guard.clone(),
+                    Err(_) => {
+                        let _ = tx.send(ChatEvent::Error(format!(
+                            "{label} failed: control lock poisoned"
+                        )));
+                        return;
+                    }
+                };
+                let Some(session_id) = session_id else {
+                    let _ = tx.send(ChatEvent::Error(format!(
+                        "{label} failed: no active chat session"
+                    )));
+                    return;
+                };
+                match action(registry, session_id) {
+                    Ok(event) => {
+                        let _ = tx.send(event);
+                    }
+                    Err(error) => {
+                        let _ = tx.send(ChatEvent::Error(format!(
+                            "{label} failed: agent runtime control: {error}"
+                        )));
+                    }
+                }
+            })
+            .ok();
+    }
+}
+
+fn set_active_session_id(
+    active_session_id: &Arc<Mutex<Option<SessionId>>>,
+    evt_tx: &Sender<ChatEvent>,
+    session_id: impl AsRef<str>,
+) {
+    match SessionId::from_str(session_id.as_ref()) {
+        Ok(session_id) => {
+            if let Ok(mut active) = active_session_id.lock() {
+                *active = Some(session_id);
+            } else {
+                let _ = evt_tx.send(ChatEvent::Error(
+                    "control state failed: control lock poisoned".to_string(),
+                ));
+            }
+        }
+        Err(error) => {
+            let _ = evt_tx.send(ChatEvent::Error(format!(
+                "control state failed: invalid session id: {error}"
+            )));
+        }
+    }
+}
+
+fn chat_control_status(result: AgentSessionControlResult) -> ChatControlStatus {
+    ChatControlStatus {
+        session_id: result.snapshot.session_id.to_string(),
+        accepted: result.accepted,
+        sequence: result.sequence,
+        event_count: result.events.len(),
+        active_turn: result.snapshot.active_turn.is_some(),
+        task_count: result.snapshot.tasks.len(),
+        terminal_result_count: result.terminal_results().len(),
+        tasks: result.snapshot.tasks.iter().map(chat_task_snapshot).collect(),
+    }
+}
+
+fn chat_control_state(response: AgentSessionResumeResponse) -> ChatControlState {
+    let (active_turn, next_sequence, task_count) = response
+        .control_snapshot
+        .as_ref()
+        .map(|snapshot| {
+            (
+                snapshot.active_turn.is_some(),
+                snapshot.next_sequence,
+                snapshot.tasks.len(),
+            )
+        })
+        .unwrap_or((false, 0, 0));
+    let (steering_count, follow_up_count) = response
+        .session
+        .as_ref()
+        .map(|session| (session.steering_queue.len(), session.follow_up_queue.len()))
+        .unwrap_or((0, 0));
+    ChatControlState {
+        session_id: response.session_id.to_string(),
+        accepted: response.accepted,
+        runtime_attached: response.runtime_attached,
+        reattach_state: response.reattach.state.clone(),
+        reattach_active_turn_persisted: response.reattach.active_turn_persisted,
+        reattach_running_task_count: response.reattach.running_task_count,
+        reattach_persisted_event_count: response.reattach.persisted_event_count,
+        active_turn,
+        next_sequence,
+        task_count,
+        tasks: response
+            .control_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.tasks.iter().map(chat_task_snapshot).collect())
+            .unwrap_or_default(),
+        event_cursor_offset: response.event_cursor.offset,
+        steering_count,
+        follow_up_count,
+        detail: response.detail,
+    }
+}
+
+fn chat_task_snapshot(task: &AgentTaskSnapshot) -> ChatTaskSnapshot {
+    ChatTaskSnapshot {
+        task_id: task.task.task_id.to_string(),
+        kind: task.task.kind.clone(),
+        summary: task.task.summary.clone(),
+        status: chat_task_status(&task.status).to_string(),
+        progress_summary: task.progress_summary.clone(),
+        result_ref: task.result_ref.clone(),
+        active_op_id: task.active_op_id.as_ref().map(ToString::to_string),
+    }
+}
+
+fn chat_task_status(status: &AgentTaskLifecycleStatus) -> &'static str {
+    match status {
+        AgentTaskLifecycleStatus::Pending => "pending",
+        AgentTaskLifecycleStatus::Running => "running",
+        AgentTaskLifecycleStatus::Completed => "completed",
+        AgentTaskLifecycleStatus::Failed => "failed",
+        AgentTaskLifecycleStatus::Cancelled => "cancelled",
+        AgentTaskLifecycleStatus::TimedOut => "timed-out",
+    }
+}
+
 fn worker(
     data_dir: SinomoDataDir,
     daemon_connected: bool,
     runtime_control_registry: AgentRuntimeControlRegistry,
+    active_session_id: Arc<Mutex<Option<SessionId>>>,
     cmd_rx: Receiver<ChatCommand>,
     evt_tx: Sender<ChatEvent>,
 ) {
@@ -162,6 +391,7 @@ fn worker(
             return;
         }
     };
+    set_active_session_id(&active_session_id, &evt_tx, chat.session_id());
 
     let _ = evt_tx.send(ChatEvent::Ready {
         session_id: chat.session_id(),
@@ -178,7 +408,27 @@ fn worker(
                         ChatStreamEvent::Notice(notice) if !notice.is_empty() => {
                             Some(ChatEvent::Notice(notice))
                         }
-                        ChatStreamEvent::Notice(_) | ChatStreamEvent::Usage { .. } => None,
+                        ChatStreamEvent::Context(context) => Some(ChatEvent::Context(context)),
+                        ChatStreamEvent::ToolCallStarted(call) => {
+                            Some(ChatEvent::ToolCallStarted(call))
+                        }
+                        ChatStreamEvent::ToolCallDelta {
+                            step_index,
+                            call_id,
+                            tool,
+                            arguments_delta,
+                        } => Some(ChatEvent::ToolCallDelta {
+                            step_index,
+                            call_id,
+                            tool,
+                            arguments_delta,
+                        }),
+                        ChatStreamEvent::ToolCallCompleted(call) => {
+                            Some(ChatEvent::ToolCallCompleted(call))
+                        }
+                        ChatStreamEvent::Process(process) => Some(ChatEvent::Process(process)),
+                        ChatStreamEvent::Usage(usage) => Some(ChatEvent::Usage(usage)),
+                        ChatStreamEvent::Notice(_) => None,
                     };
                     if let Some(event) = mapped {
                         let _ = tx.send(event);
@@ -223,6 +473,7 @@ fn worker(
             },
             ChatCommand::NewSession => {
                 chat.reset_session();
+                set_active_session_id(&active_session_id, &evt_tx, chat.session_id());
                 let _ = evt_tx.send(ChatEvent::SessionReset {
                     session_id: chat.session_id(),
                 });
@@ -233,6 +484,8 @@ fn worker(
             } => {
                 if let Err(error) = chat.resume_session(&session_id, &history) {
                     let _ = evt_tx.send(ChatEvent::Error(format!("resume failed: {error}")));
+                } else {
+                    set_active_session_id(&active_session_id, &evt_tx, session_id);
                 }
             }
             ChatCommand::SetModel {
@@ -275,6 +528,8 @@ fn worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -337,6 +592,148 @@ mod tests {
         })
         .expect("updated control state");
         assert!(matches!(state, ChatEvent::ControlState(_)));
+    }
+
+    #[test]
+    fn chat_handle_routes_live_control_without_worker_queue() {
+        let runtime_control = AgentRuntimeControlRegistry::new();
+        let session_id =
+            SessionId::from_legacy_named("sess_chat_direct_control").expect("session id");
+        let session = Arc::new(TestControlSession::new(session_id.clone()));
+        runtime_control
+            .register_session(session.clone())
+            .expect("register fake control session");
+        let (cmd_tx, _cmd_rx) = channel::<ChatCommand>();
+        let (evt_tx, evt_rx) = channel::<ChatEvent>();
+        let handle = ChatHandle {
+            tx: cmd_tx,
+            rx: evt_rx,
+            direct_control: DirectControl {
+                runtime_control_registry: runtime_control,
+                active_session_id: Arc::new(Mutex::new(Some(session_id.clone()))),
+                evt_tx,
+            },
+        };
+
+        handle.send_command(ChatCommand::FollowUp("also mention live controls".to_string()));
+        let follow_up = wait_for_event(&handle, |event| {
+            matches!(event, ChatEvent::ControlStatus(status) if status.session_id == session_id.to_string())
+        })
+        .expect("direct follow-up status");
+        assert!(matches!(
+            follow_up,
+            ChatEvent::ControlStatus(status) if status.accepted
+        ));
+        assert_eq!(
+            session.follow_ups(),
+            vec!["also mention live controls".to_string()]
+        );
+
+        handle.send_command(ChatCommand::ControlState);
+        let state = wait_for_event(&handle, |event| {
+            matches!(event, ChatEvent::ControlState(state) if state.session_id == session_id.to_string())
+        })
+        .expect("direct control state");
+        assert!(matches!(
+            state,
+            ChatEvent::ControlState(state) if state.runtime_attached
+        ));
+    }
+
+    struct TestControlSession {
+        session_id: SessionId,
+        sequence: AtomicU64,
+        follow_ups: Mutex<Vec<String>>,
+    }
+
+    impl TestControlSession {
+        fn new(session_id: SessionId) -> Self {
+            Self {
+                session_id,
+                sequence: AtomicU64::new(1),
+                follow_ups: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn snapshot(&self) -> sinomo_agent::AgentSessionControlSnapshot {
+            sinomo_agent::AgentSessionControlSnapshot {
+                session_id: self.session_id.clone(),
+                next_sequence: self.sequence.load(Ordering::SeqCst),
+                active_turn: None,
+                tasks: Vec::new(),
+                buffered_event_count: 0,
+            }
+        }
+
+        fn result(&self) -> AgentSessionControlResult {
+            AgentSessionControlResult {
+                sequence: self.sequence.fetch_add(1, Ordering::SeqCst),
+                accepted: true,
+                events: Vec::new(),
+                outcome: None,
+                snapshot: self.snapshot(),
+            }
+        }
+
+        fn follow_ups(&self) -> Vec<String> {
+            self.follow_ups.lock().expect("follow-up lock").clone()
+        }
+    }
+
+    impl sinomo_agent::AgentRuntimeControlSession for TestControlSession {
+        fn session_id(&self) -> Result<SessionId, sinomo_agent::AgentRuntimeControlError> {
+            Ok(self.session_id.clone())
+        }
+
+        fn steer(
+            &self,
+            _message: String,
+        ) -> Result<AgentSessionControlResult, sinomo_agent::AgentRuntimeControlError> {
+            Ok(self.result())
+        }
+
+        fn follow_up(
+            &self,
+            message: String,
+        ) -> Result<AgentSessionControlResult, sinomo_agent::AgentRuntimeControlError> {
+            self.follow_ups
+                .lock()
+                .expect("follow-up lock")
+                .push(message);
+            Ok(self.result())
+        }
+
+        fn interrupt(
+            &self,
+            _reason: String,
+        ) -> Result<AgentSessionControlResult, sinomo_agent::AgentRuntimeControlError> {
+            Ok(self.result())
+        }
+
+        fn resume(
+            &self,
+        ) -> Result<AgentSessionResumeResponse, sinomo_agent::AgentRuntimeControlError> {
+            let snapshot = self.snapshot();
+            Ok(AgentSessionResumeResponse {
+                session_id: self.session_id.clone(),
+                accepted: true,
+                runtime_attached: true,
+                session: None,
+                control_snapshot: Some(snapshot),
+                event_cursor: sinomo_agent::AgentSessionControlEventCursor {
+                    offset: 0,
+                    last_event_id: None,
+                },
+                reattach: sinomo_agent::AgentSessionReattachReport {
+                    state: sinomo_agent::AgentSessionReattachState::LiveRuntimeAttached,
+                    active_turn_persisted: false,
+                    running_task_count: 0,
+                    persisted_event_count: 0,
+                    reason: "test control session".to_string(),
+                },
+                detail: None,
+            })
+        }
     }
 
     fn wait_for_event(

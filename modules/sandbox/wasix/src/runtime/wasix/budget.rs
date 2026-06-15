@@ -7,7 +7,10 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use wasmer_wasix::{os::task::process::WasiProcess, wasmer_wasix_types::wasi::Signal};
+use wasmer_wasix::{
+    os::task::process::WasiProcess,
+    wasmer_wasix_types::wasi::{ExitCode, Signal},
+};
 
 const WASIX_TERMINATION_RUNNING: u8 = 0;
 const WASIX_TERMINATION_TIMEOUT: u8 = 1;
@@ -117,7 +120,7 @@ fn spawn_timeout_guard(
                 )
                 .is_ok()
         {
-            process.signal_process(Signal::Sigkill);
+            terminate_wasix_process(&process);
         }
     });
 }
@@ -142,7 +145,7 @@ fn spawn_cancellation_guard(
                     )
                     .is_ok()
                 {
-                    process.signal_process(Signal::Sigkill);
+                    terminate_wasix_process(&process);
                 }
                 break;
             }
@@ -213,12 +216,23 @@ where
                     )
                     .is_ok()
                 {
-                    process.signal_process(Signal::Sigkill);
+                    terminate_wasix_process(&process);
                 }
             }
             _ => {}
         }
     }
+}
+
+fn terminate_wasix_process(process: &WasiProcess) {
+    if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+        eprintln!(
+            "sinomo-debug wasix terminate process pid={}",
+            process.pid().raw()
+        );
+    }
+    process.signal_process(Signal::Sigkill);
+    process.terminate(ExitCode::from(137u16));
 }
 
 fn host_wall_deadline(timeout_ms: u64) -> Option<Instant> {

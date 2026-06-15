@@ -1796,6 +1796,10 @@ pub enum AgentModelEvent {
         provider: String,
         model: String,
     },
+    ContextAssembled {
+        step_index: usize,
+        report: ContextAssemblyReport,
+    },
     AssistantTextDelta {
         step_index: usize,
         delta: String,
@@ -7484,6 +7488,10 @@ impl<M: InteractionModel> Agent<M> {
                     report: turn_context.report.clone(),
                 },
             )?;
+            model_progress_sink.emit(AgentModelEvent::ContextAssembled {
+                step_index,
+                report: turn_context.report.clone(),
+            });
             let context_item = AgentItem::ContextInjection {
                 item_id: TaskId::generate(),
                 report: turn_context.report.clone(),
@@ -9690,7 +9698,7 @@ mod tests {
     use sinomo_runtime::events::SessionId;
     use sinomo_runtime::node::NodeId;
     use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     struct SequencedModel {
         responses: Mutex<VecDeque<String>>,
@@ -10615,6 +10623,52 @@ mod tests {
             agent.model.requests.lock().expect("requests")[0].metadata["context_report_id"]
                 .as_str()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn agent_emits_context_assembled_to_model_progress_sink() {
+        let model = SequencedModel::new([r#"{
+            "response_mode": "answer",
+            "text": "Done.",
+            "tool_calls": [],
+            "background_handoff": null,
+            "next_state": "listening"
+        }"#]);
+        let agent = Agent::new(model, "fake", "fake");
+        let input = agent_input("show context");
+        let mut session = AgentSession::new(input.session.session_id.clone(), AgentRole::Main);
+        let events = Arc::new(Mutex::new(Vec::<AgentModelEvent>::new()));
+        let sink = {
+            let events = Arc::clone(&events);
+            AgentModelProgressSink::new(move |event| {
+                events.lock().expect("model progress lock").push(event);
+            })
+        };
+
+        let run = agent
+            .start_turn_with_cancellation_and_progress(
+                &mut session,
+                &input,
+                AgentCancellationToken::new(),
+                AgentToolProgressSink::default(),
+                sink,
+            )
+            .expect("run");
+
+        let progress_events = events.lock().expect("model progress lock");
+        let context_events = progress_events
+            .iter()
+            .filter_map(|event| match event {
+                AgentModelEvent::ContextAssembled { step_index, report } => {
+                    Some((*step_index, report.report_id.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            context_events,
+            vec![(0, run.context_reports[0].report_id.clone())]
         );
     }
 

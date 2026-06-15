@@ -911,6 +911,189 @@ fn capture_chat_composed() {
     }
 }
 
+/// Deterministic capture for the runtime telemetry chrome: the context budget bar, model usage,
+/// active background-task counts, and the right-side activity rail.
+#[test]
+fn capture_chat_runtime_activity() {
+    use sinomo_app::backend::chat_engine::{ChatRole, RuntimeInfo};
+    use sinomo_app::theme::AppThemeMode;
+    use sinomo_app::ui::chat::{ActivityTone, ChatActivityEntry, ChatMessage, ChatToolActivity};
+    use sinomo_cli::app_api::{
+        ChatContextLane, ChatContextSnapshot, ChatTaskSnapshot, ChatUsageSnapshot,
+    };
+
+    let dir = target_shots_dir();
+    std::fs::create_dir_all(&dir).expect("create shots dir");
+
+    let capture = |name: &str, window: &sui_testing::TestWindow| {
+        let shot = window.capture_screenshot().expect("capture screenshot");
+        let path = dir.join(format!("sinomo-app-{name}.png"));
+        shot.write_png(&path).expect("write png");
+        println!(
+            "wrote {} ({}x{})",
+            path.display(),
+            shot.width(),
+            shot.height()
+        );
+    };
+
+    let seed_runtime = |shared: &sinomo_app::state::Shared| {
+        let mut chat = shared.chat_mut();
+        chat.info = RuntimeInfo {
+            agent: "main-agent".to_string(),
+            provider: "codex".to_string(),
+            model: "gpt-5.5-codex".to_string(),
+            account: Some("default".to_string()),
+            effort: Some("medium".to_string()),
+        };
+        chat.messages = vec![
+            ChatMessage {
+                role: ChatRole::User,
+                text: "Audit the daemon startup path and keep running cluster checks in the background."
+                    .to_string(),
+            },
+            ChatMessage {
+                role: ChatRole::Agent,
+                text: "I am assembling context, checking the recent daemon events, and starting the \
+                       focused verification commands now."
+                    .to_string(),
+            },
+        ];
+        chat.streaming = true;
+        chat.notice = Some(
+            "session saved locally; SIFS mirror failed: DFS services shard replay delayed"
+                .to_string(),
+        );
+        chat.context = Some(ChatContextSnapshot {
+            step_index: 4,
+            provider: "codex".to_string(),
+            model: "gpt-5.5-codex".to_string(),
+            total_bytes: 62_400,
+            max_context_bytes: Some(196_608),
+            compaction_threshold_bytes: Some(147_456),
+            lanes: vec![
+                ChatContextLane {
+                    kind: "fixed_prompt".to_string(),
+                    label: "agent package".to_string(),
+                    bytes: 18_200,
+                    priority: 100,
+                },
+                ChatContextLane {
+                    kind: "recent_tail".to_string(),
+                    label: "recent turn tail".to_string(),
+                    bytes: 21_700,
+                    priority: 80,
+                },
+                ChatContextLane {
+                    kind: "retrieved_memories".to_string(),
+                    label: "retrieved memory".to_string(),
+                    bytes: 8_400,
+                    priority: 60,
+                },
+                ChatContextLane {
+                    kind: "current_work".to_string(),
+                    label: "repo evidence".to_string(),
+                    bytes: 14_100,
+                    priority: 90,
+                },
+            ],
+            included_count: 17,
+            omitted_count: 3,
+        });
+        chat.usage = Some(ChatUsageSnapshot {
+            provider: "codex".to_string(),
+            model: "gpt-5.5-codex".to_string(),
+            input_tokens: Some(14_204),
+            output_tokens: Some(1_168),
+        });
+        chat.control.active_turn = true;
+        chat.control.task_count = 2;
+        chat.control.terminal_result_count = 1;
+        chat.control.steering_count = 1;
+        chat.control.follow_up_count = 1;
+        chat.control.runtime_attached = true;
+        chat.control.tasks = vec![
+            ChatTaskSnapshot {
+                task_id: "task-daemon-check".to_string(),
+                kind: "verification".to_string(),
+                summary: "daemon route audit".to_string(),
+                status: "running".to_string(),
+                progress_summary: Some("cargo test still streaming".to_string()),
+                result_ref: None,
+                active_op_id: Some("op-daemon-check".to_string()),
+            },
+            ChatTaskSnapshot {
+                task_id: "task-cluster-gates".to_string(),
+                kind: "cluster-check".to_string(),
+                summary: "cluster readiness gates".to_string(),
+                status: "pending".to_string(),
+                progress_summary: Some("queued after daemon audit".to_string()),
+                result_ref: None,
+                active_op_id: None,
+            },
+        ];
+        chat.tool_calls = vec![
+            ChatToolActivity {
+                step_index: 4,
+                call_index: Some(0),
+                call_id: Some("call_exec_daemon".to_string()),
+                tool: "exec_command".to_string(),
+                input_preview: "cargo test -p sinomo-daemon service_adapter".to_string(),
+                status: "completed".to_string(),
+            },
+            ChatToolActivity {
+                step_index: 5,
+                call_index: Some(0),
+                call_id: Some("call_cluster_gate".to_string()),
+                tool: "sinomo test run".to_string(),
+                input_preview: "--tag agent-readiness --require-cluster".to_string(),
+                status: "running".to_string(),
+            },
+        ];
+        chat.activity = vec![
+            ChatActivityEntry {
+                title: "context assembled".to_string(),
+                detail: "61.0 KiB across 17 model-visible sources".to_string(),
+                tone: ActivityTone::Good,
+            },
+            ChatActivityEntry {
+                title: "tool started: exec_command".to_string(),
+                detail: "cargo test -p sinomo-daemon service_adapter".to_string(),
+                tone: ActivityTone::Running,
+            },
+            ChatActivityEntry {
+                title: "process completed".to_string(),
+                detail: "exit 0 in 1842ms, stdout tail preserved".to_string(),
+                tone: ActivityTone::Good,
+            },
+            ChatActivityEntry {
+                title: "session mirror".to_string(),
+                detail: "SIFS mirror failed: DFS services shard replay delayed".to_string(),
+                tone: ActivityTone::Warn,
+            },
+            ChatActivityEntry {
+                title: "model usage".to_string(),
+                detail: "14204 input tokens, 1168 output tokens".to_string(),
+                tone: ActivityTone::Neutral,
+            },
+        ];
+        chat.stick_bottom = true;
+        chat.scroll = f32::MAX;
+    };
+
+    for (mode, suffix) in [(AppThemeMode::Dark, "dark"), (AppThemeMode::Light, "light")] {
+        let shared = boot(Tab::Sinomo);
+        shared.borrow_mut().theme_mode = mode;
+        seed_runtime(&shared);
+        let runtime = build_runtime(shared).expect("build runtime");
+        let app = TestApp::from_runtime(runtime).expect("headless test app");
+        let window = app.main_window().expect("main window");
+        app.run_until_idle()
+            .expect("settle chat-runtime-activity layout");
+        capture(&format!("chat-runtime-activity-{suffix}"), &window);
+    }
+}
+
 /// FINAL polish captures (C3 icons + C4 elevation): a clean, clearly-named set so a reviewer can
 /// see the finished state of every tab in BOTH themes. Names follow `sinomo-app-final-<area>-<dark|
 /// light>.png` and land in `target/shots`.

@@ -13,8 +13,9 @@ use sinomo_agent::{
     AgentRuntimeControlRegistry, AgentRuntimeEvent, AgentRuntimeEventPayload,
     AgentSessionControlResult, AgentSessionFollowUpRequest, AgentSessionInterruptRequest,
     AgentSessionReattachState, AgentSessionResumeRequest, AgentSessionResumeResponse,
-    AgentSessionSteerRequest, AgentToolProgressEvent, InteractionOutput, InteractionSession,
-    InteractionSurface, InteractionSurfaceKind, TaskId,
+    AgentSessionSteerRequest, AgentTaskLifecycleStatus, AgentTaskSnapshot, AgentToolProgressEvent,
+    ContextAssemblyReport, InteractionOutput, InteractionSession, InteractionSurface,
+    InteractionSurfaceKind, TaskId,
 };
 use sinomo_lm::{
     AnthropicConfig, ClaudeCodeConfig, CodexCliConfig, GeminiConfig, GitHubCopilotConfig,
@@ -68,8 +69,89 @@ pub enum ChatStreamEvent {
     Token(String),
     /// A transient progress / status note (e.g. "waiting for model runtime").
     Notice(String),
+    /// A model-visible context budget report for the next sampling step.
+    Context(ChatContextSnapshot),
+    /// A native/model tool call started.
+    ToolCallStarted(ChatToolCallSnapshot),
+    /// Incremental tool-call arguments from providers that stream them.
+    ToolCallDelta {
+        step_index: usize,
+        call_id: Option<String>,
+        tool: Option<String>,
+        arguments_delta: String,
+    },
+    /// A native/model tool call completed.
+    ToolCallCompleted(ChatToolCallSnapshot),
+    /// Local tool/process execution progress.
+    Process(ChatProcessSnapshot),
     /// Token accounting for the just-finished turn.
-    Usage { provider: String, model: String },
+    Usage(ChatUsageSnapshot),
+}
+
+/// One lane in the model-visible context budget bar.
+#[derive(Clone, Debug, Default)]
+pub struct ChatContextLane {
+    pub kind: String,
+    pub label: String,
+    pub bytes: usize,
+    pub priority: u8,
+}
+
+/// Compact context report for the app UI.
+#[derive(Clone, Debug, Default)]
+pub struct ChatContextSnapshot {
+    pub step_index: usize,
+    pub provider: String,
+    pub model: String,
+    pub total_bytes: usize,
+    pub max_context_bytes: Option<usize>,
+    pub compaction_threshold_bytes: Option<usize>,
+    pub lanes: Vec<ChatContextLane>,
+    pub included_count: usize,
+    pub omitted_count: usize,
+}
+
+/// Compact model/native tool-call progress for the app UI.
+#[derive(Clone, Debug, Default)]
+pub struct ChatToolCallSnapshot {
+    pub step_index: usize,
+    pub call_index: Option<usize>,
+    pub call_id: Option<String>,
+    pub tool: String,
+    pub input_preview: Option<String>,
+}
+
+/// Compact process/tool progress for the app UI.
+#[derive(Clone, Debug, Default)]
+pub struct ChatProcessSnapshot {
+    pub process_id: String,
+    pub command: String,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub elapsed_ms: u64,
+    pub stdout_tail: String,
+    pub stderr_tail: String,
+}
+
+/// Token usage for the just-finished model response.
+#[derive(Clone, Debug, Default)]
+pub struct ChatUsageSnapshot {
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
+/// Compact background task state for the app UI.
+#[derive(Clone, Debug, Default)]
+pub struct ChatTaskSnapshot {
+    pub task_id: String,
+    pub kind: String,
+    pub summary: String,
+    pub status: String,
+    pub progress_summary: Option<String>,
+    pub result_ref: Option<String>,
+    pub active_op_id: Option<String>,
 }
 
 /// One visible message restored into a GUI chat runtime.
@@ -89,6 +171,7 @@ pub struct ChatControlStatus {
     pub active_turn: bool,
     pub task_count: usize,
     pub terminal_result_count: usize,
+    pub tasks: Vec<ChatTaskSnapshot>,
 }
 
 /// Snapshot of the live chat runtime's current control state.
@@ -104,6 +187,7 @@ pub struct ChatControlState {
     pub active_turn: bool,
     pub next_sequence: u64,
     pub task_count: usize,
+    pub tasks: Vec<ChatTaskSnapshot>,
     pub event_cursor_offset: usize,
     pub steering_count: usize,
     pub follow_up_count: usize,
@@ -330,6 +414,12 @@ fn chat_control_status(result: AgentSessionControlResult) -> ChatControlStatus {
         active_turn: result.snapshot.active_turn.is_some(),
         task_count: result.snapshot.tasks.len(),
         terminal_result_count: result.terminal_results().len(),
+        tasks: result
+            .snapshot
+            .tasks
+            .iter()
+            .map(chat_task_snapshot)
+            .collect(),
     }
 }
 
@@ -361,10 +451,38 @@ fn chat_control_state(response: AgentSessionResumeResponse) -> ChatControlState 
         active_turn,
         next_sequence,
         task_count,
+        tasks: response
+            .control_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.tasks.iter().map(chat_task_snapshot).collect())
+            .unwrap_or_default(),
         event_cursor_offset: response.event_cursor.offset,
         steering_count,
         follow_up_count,
         detail: response.detail,
+    }
+}
+
+fn chat_task_snapshot(task: &AgentTaskSnapshot) -> ChatTaskSnapshot {
+    ChatTaskSnapshot {
+        task_id: task.task.task_id.to_string(),
+        kind: task.task.kind.clone(),
+        summary: task.task.summary.clone(),
+        status: chat_task_status(&task.status).to_string(),
+        progress_summary: task.progress_summary.clone(),
+        result_ref: task.result_ref.clone(),
+        active_op_id: task.active_op_id.as_ref().map(ToString::to_string),
+    }
+}
+
+fn chat_task_status(status: &AgentTaskLifecycleStatus) -> &'static str {
+    match status {
+        AgentTaskLifecycleStatus::Pending => "pending",
+        AgentTaskLifecycleStatus::Running => "running",
+        AgentTaskLifecycleStatus::Completed => "completed",
+        AgentTaskLifecycleStatus::Failed => "failed",
+        AgentTaskLifecycleStatus::Cancelled => "cancelled",
+        AgentTaskLifecycleStatus::TimedOut => "timed-out",
     }
 }
 
@@ -516,6 +634,9 @@ fn forward_model_event(
         } => on_event(ChatStreamEvent::Notice(format!(
             "model started: {provider}/{model}"
         ))),
+        AgentModelEvent::ContextAssembled { report, .. } => {
+            on_event(ChatStreamEvent::Context(chat_context_snapshot(report)));
+        }
         AgentModelEvent::AssistantTextDelta { delta, .. } => {
             for event in split_chunk(&delta) {
                 if let ChatStreamEvent::Token(token) = &event {
@@ -529,19 +650,54 @@ fn forward_model_event(
                 on_event(ChatStreamEvent::Notice(summary));
             }
         }
-        AgentModelEvent::ToolCallStarted { tool, .. } => {
-            on_event(ChatStreamEvent::Notice(format!("using tool: {tool}")));
+        AgentModelEvent::ToolCallStarted {
+            step_index,
+            call_index,
+            call_id,
+            tool,
+        } => {
+            on_event(ChatStreamEvent::ToolCallStarted(ChatToolCallSnapshot {
+                step_index,
+                call_index,
+                call_id,
+                tool,
+                input_preview: None,
+            }));
         }
-        AgentModelEvent::ToolCallDelta { .. } => {}
-        AgentModelEvent::ToolCallCompleted { call, .. } => {
-            on_event(ChatStreamEvent::Notice(format!(
-                "tool completed: {}",
-                call.tool
+        AgentModelEvent::ToolCallDelta {
+            step_index,
+            call_id,
+            tool,
+            arguments_delta,
+        } => {
+            on_event(ChatStreamEvent::ToolCallDelta {
+                step_index,
+                call_id,
+                tool,
+                arguments_delta,
+            });
+        }
+        AgentModelEvent::ToolCallCompleted {
+            step_index,
+            call_index,
+            call_id,
+            call,
+        } => {
+            on_event(ChatStreamEvent::ToolCallCompleted(chat_tool_call_snapshot(
+                step_index, call_index, call_id, call,
             )));
         }
         AgentModelEvent::Usage {
-            provider, model, ..
-        } => on_event(ChatStreamEvent::Usage { provider, model }),
+            provider,
+            model,
+            usage,
+            ..
+        } => on_event(ChatStreamEvent::Usage(ChatUsageSnapshot {
+            provider,
+            model,
+            input_tokens: usage.as_ref().and_then(|usage| usage.input_tokens),
+            output_tokens: usage.as_ref().and_then(|usage| usage.output_tokens),
+        })),
         AgentModelEvent::Finished { .. } => {}
         AgentModelEvent::Error { detail, .. } => {
             on_event(ChatStreamEvent::Notice(format!("model failed: {detail}")));
@@ -555,17 +711,13 @@ fn forward_model_event(
 fn forward_tool_event(event: AgentToolProgressEvent, on_event: &mut dyn FnMut(ChatStreamEvent)) {
     match event {
         AgentToolProgressEvent::ProcessStarted { process } => {
-            on_event(ChatStreamEvent::Notice(format!(
-                "command started: {}",
-                process.command
-            )));
+            on_event(ChatStreamEvent::Process(chat_process_snapshot(process)));
         }
-        AgentToolProgressEvent::ProcessOutput { .. } => {}
+        AgentToolProgressEvent::ProcessOutput { process } => {
+            on_event(ChatStreamEvent::Process(chat_process_snapshot(process)));
+        }
         AgentToolProgressEvent::ProcessCompleted { process } => {
-            on_event(ChatStreamEvent::Notice(format!(
-                "command finished: {}",
-                process.command
-            )));
+            on_event(ChatStreamEvent::Process(chat_process_snapshot(process)));
         }
         AgentToolProgressEvent::Message { summary, .. } => {
             if !summary.trim().is_empty() {
@@ -589,9 +741,94 @@ fn forward_output(output: InteractionOutput, on_event: &mut dyn FnMut(ChatStream
         }
         InteractionOutput::ModelUsage {
             provider, model, ..
-        } => on_event(ChatStreamEvent::Usage { provider, model }),
+        } => on_event(ChatStreamEvent::Usage(ChatUsageSnapshot {
+            provider,
+            model,
+            input_tokens: None,
+            output_tokens: None,
+        })),
         InteractionOutput::Exit => {}
     }
+}
+
+fn chat_context_snapshot(report: ContextAssemblyReport) -> ChatContextSnapshot {
+    ChatContextSnapshot {
+        step_index: report.step_index,
+        provider: report.provider,
+        model: report.model,
+        total_bytes: report.budget_estimate.total_bytes,
+        max_context_bytes: report.budget_estimate.max_context_bytes,
+        compaction_threshold_bytes: report.budget_estimate.compaction_threshold_bytes,
+        lanes: report
+            .budget_estimate
+            .lanes
+            .into_iter()
+            .map(|lane| ChatContextLane {
+                kind: lane.kind,
+                label: lane.label,
+                bytes: lane.bytes,
+                priority: lane.priority,
+            })
+            .collect(),
+        included_count: report.included.len(),
+        omitted_count: report.omitted.len(),
+    }
+}
+
+fn chat_tool_call_snapshot(
+    step_index: usize,
+    call_index: Option<usize>,
+    call_id: Option<String>,
+    call: sinomo_agent::AgentToolCall,
+) -> ChatToolCallSnapshot {
+    ChatToolCallSnapshot {
+        step_index,
+        call_index,
+        call_id: call_id.or(call.call_id),
+        tool: call.tool,
+        input_preview: json_preview(&call.input, 220),
+    }
+}
+
+fn chat_process_snapshot(process: sinomo_agent::AgentProcessSnapshot) -> ChatProcessSnapshot {
+    ChatProcessSnapshot {
+        process_id: process.process_id,
+        command: process.command,
+        status: process.status.as_str().to_string(),
+        exit_code: process.exit_code,
+        elapsed_ms: process.elapsed_ms,
+        stdout_tail: tail_chars(&process.stdout, 240),
+        stderr_tail: tail_chars(&process.stderr, 240),
+    }
+}
+
+fn json_preview(value: &serde_json::Value, max_chars: usize) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    serde_json::to_string(value)
+        .ok()
+        .map(|raw| truncate_chars(raw, max_chars))
+}
+
+fn tail_chars(value: &str, max_chars: usize) -> String {
+    let chars = value.chars().count();
+    if chars <= max_chars {
+        return value.to_string();
+    }
+    let tail: String = value
+        .chars()
+        .skip(chars.saturating_sub(max_chars))
+        .collect();
+    format!("...{tail}")
+}
+
+fn truncate_chars(value: String, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value;
+    }
+    let head: String = value.chars().take(max_chars.saturating_sub(3)).collect();
+    format!("{head}...")
 }
 
 /// Separate inline `<sinomo_progress>…</sinomo_progress>` status markers from
@@ -904,7 +1141,18 @@ mod tests {
         match event {
             ChatStreamEvent::Token(token) => format!("token:{token}"),
             ChatStreamEvent::Notice(notice) => format!("notice:{notice}"),
-            ChatStreamEvent::Usage { provider, model } => format!("usage:{provider}/{model}"),
+            ChatStreamEvent::Context(context) => {
+                format!("context:{}:{}", context.step_index, context.total_bytes)
+            }
+            ChatStreamEvent::ToolCallStarted(call) => format!("tool-start:{}", call.tool),
+            ChatStreamEvent::ToolCallDelta {
+                arguments_delta, ..
+            } => format!("tool-delta:{arguments_delta}"),
+            ChatStreamEvent::ToolCallCompleted(call) => format!("tool-done:{}", call.tool),
+            ChatStreamEvent::Process(process) => {
+                format!("process:{}:{}", process.status, process.command)
+            }
+            ChatStreamEvent::Usage(usage) => format!("usage:{}/{}", usage.provider, usage.model),
         }
     }
 

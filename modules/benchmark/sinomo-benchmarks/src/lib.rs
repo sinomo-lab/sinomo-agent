@@ -194,6 +194,10 @@ pub fn benchmarks_module_descriptor() -> NativeModuleDescriptor {
                 operation: SINOMO_BENCHMARKS_CANCEL_PROBE_OPERATION.to_string(),
                 auth: "local-or-cluster-member".to_string(),
             }],
+            capability_exports: vec![
+                SINOMO_BENCHMARKS_OPERATION.to_string(),
+                SINOMO_BENCHMARKS_CANCEL_PROBE_OPERATION.to_string(),
+            ],
             ..Default::default()
         },
     }
@@ -1219,6 +1223,12 @@ mod tests {
                 && route.category == SINOMO_BENCHMARKS_RPC_CATEGORY
                 && route.operation == SINOMO_BENCHMARKS_CANCEL_PROBE_OPERATION
         }));
+        assert!(
+            descriptor
+                .surfaces
+                .capability_exports
+                .contains(&SINOMO_BENCHMARKS_CANCEL_PROBE_OPERATION.to_string())
+        );
     }
 
     #[test]

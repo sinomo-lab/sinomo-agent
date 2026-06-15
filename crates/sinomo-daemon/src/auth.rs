@@ -295,6 +295,32 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
+        command if is_agent_session_rpc_command(command) => {
+            matches!(
+                authenticated.signer,
+                DaemonSignerAuthority::Local
+                    | DaemonSignerAuthority::Voter
+                    | DaemonSignerAuthority::Member
+            )
+        }
+        command
+            if command == daemon_rpc_command(sinomo_network::MODULE_NATIVE_DYLIB_CANCEL_ROUTE) =>
+        {
+            matches!(
+                authenticated.signer,
+                DaemonSignerAuthority::Local
+                    | DaemonSignerAuthority::Voter
+                    | DaemonSignerAuthority::Member
+            )
+        }
+        command if command == daemon_rpc_command("/benchmarks/cancel-probe") => {
+            matches!(
+                authenticated.signer,
+                DaemonSignerAuthority::Local
+                    | DaemonSignerAuthority::Voter
+                    | DaemonSignerAuthority::Member
+            )
+        }
         command if is_local_sandbox_rpc_command(command) => {
             authenticated.signer.can_run_local_command()
         }
@@ -392,6 +418,10 @@ pub fn authorize_authenticated_daemon_command(
     } else {
         Err(DaemonError::AuthDenied)
     }
+}
+
+fn is_agent_session_rpc_command(command: &str) -> bool {
+    command.strip_prefix("RPC /agent/session/").is_some()
 }
 
 fn is_local_sandbox_rpc_command(command: &str) -> bool {
@@ -1061,5 +1091,53 @@ mod tests {
             authorize_authenticated_daemon_command(&authenticated)
                 .expect("cluster members must be able to exchange DFS protocol frames");
         }
+    }
+
+    #[test]
+    fn agent_session_routes_authorize_cluster_members() {
+        let command = daemon_rpc_command("/agent/session/inspect");
+        for signer in [
+            DaemonSignerAuthority::Local,
+            DaemonSignerAuthority::Voter,
+            DaemonSignerAuthority::Member,
+        ] {
+            let authenticated = authenticated_command(command.clone(), signer);
+            authorize_authenticated_daemon_command(&authenticated)
+                .expect("cluster members must be able to access agent session routes");
+        }
+        let authenticated = authenticated_command(command, DaemonSignerAuthority::JoinCandidate);
+        assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+    }
+
+    #[test]
+    fn native_dylib_cancel_route_authorizes_cluster_members() {
+        let command = daemon_rpc_command(sinomo_network::MODULE_NATIVE_DYLIB_CANCEL_ROUTE);
+        for signer in [
+            DaemonSignerAuthority::Local,
+            DaemonSignerAuthority::Voter,
+            DaemonSignerAuthority::Member,
+        ] {
+            let authenticated = authenticated_command(command.clone(), signer);
+            authorize_authenticated_daemon_command(&authenticated)
+                .expect("cluster members must be able to cancel native dylib module operations");
+        }
+        let authenticated = authenticated_command(command, DaemonSignerAuthority::JoinCandidate);
+        assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+    }
+
+    #[test]
+    fn benchmark_cancel_probe_route_authorizes_cluster_members() {
+        let command = daemon_rpc_command("/benchmarks/cancel-probe");
+        for signer in [
+            DaemonSignerAuthority::Local,
+            DaemonSignerAuthority::Voter,
+            DaemonSignerAuthority::Member,
+        ] {
+            let authenticated = authenticated_command(command.clone(), signer);
+            authorize_authenticated_daemon_command(&authenticated)
+                .expect("cluster members must be able to invoke benchmark cancel probes");
+        }
+        let authenticated = authenticated_command(command, DaemonSignerAuthority::JoinCandidate);
+        assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
     }
 }

@@ -2,6 +2,12 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(feature = "wasix-runtime")]
 use std::sync::Arc;
 use std::sync::Mutex;
+#[cfg(feature = "wasix-runtime")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "wasix-runtime")]
+use std::thread;
+#[cfg(feature = "wasix-runtime")]
+use std::time::Duration;
 
 use sinomo_sandbox_wasix_api::{
     NativeModuleBackend, NativeModuleCapabilitiesResponse, NativeModuleDescriptor,
@@ -25,8 +31,8 @@ use sinomo_sandbox_wasix_api::{
 
 #[cfg(feature = "wasix-runtime")]
 use crate::{
-    SandboxLocalCommandOutcome, SandboxOutputChunk, SandboxOutputSink, SandboxWasiAbi,
-    SandboxWasiPreopen, SandboxWasiRunOptions, SandboxWasixCommandOverride,
+    SandboxCancellation, SandboxLocalCommandOutcome, SandboxOutputChunk, SandboxOutputSink,
+    SandboxWasiAbi, SandboxWasiPreopen, SandboxWasiRunOptions, SandboxWasixCommandOverride,
 };
 
 #[derive(Clone, Copy)]
@@ -287,14 +293,21 @@ fn run_resolved_module(
 ) -> Result<SandboxLocalCommandOutcome, String> {
     let runner =
         crate::LocalStagedSandboxCommandRunner::new().map_err(|error| error.to_string())?;
+    let cancellation = HostCancellationBridge::start();
     runner
-        .run_module_for_abi(target_abi, &wasm, command, convert_run_options(options))
+        .run_module_for_abi(
+            target_abi,
+            &wasm,
+            command,
+            convert_run_options(options, cancellation.token()),
+        )
         .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "wasix-runtime")]
 fn convert_run_options(
     options: sinomo_sandbox_wasix_api::SandboxWasixRunModuleOptions,
+    cancellation: SandboxCancellation,
 ) -> SandboxWasiRunOptions {
     let default_options = SandboxWasiRunOptions::default();
     SandboxWasiRunOptions {
@@ -333,7 +346,7 @@ fn convert_run_options(
         ),
         workspace_limit_bytes: options.workspace_limit_bytes,
         file_count_limit: options.file_count_limit,
-        cancellation: default_options.cancellation,
+        cancellation,
         output_sink: host_output_sink(),
         wasix_pinned_child_exec_only: options.wasix_pinned_child_exec_only,
         wasix_instruction_metering: options.wasix_instruction_metering,
@@ -349,6 +362,74 @@ fn convert_run_options(
             })
             .collect(),
     }
+}
+
+#[cfg(feature = "wasix-runtime")]
+struct HostCancellationBridge {
+    cancellation: SandboxCancellation,
+    done: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "wasix-runtime")]
+impl HostCancellationBridge {
+    fn start() -> Self {
+        let cancellation = SandboxCancellation::new();
+        let done = Arc::new(AtomicBool::new(false));
+        let callback = host_cancellation_callback();
+        if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+            eprintln!(
+                "sinomo-debug wasix native cancellation bridge callback={}",
+                callback.is_some()
+            );
+        }
+        let handle = callback.map(|(is_cancelled, user_data)| {
+            let done = Arc::clone(&done);
+            let cancellation = cancellation.clone();
+            thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    if unsafe { is_cancelled(user_data as *mut std::ffi::c_void) } != 0 {
+                        if std::env::var_os("SINOMO_WASIX_DEBUG").is_some() {
+                            eprintln!("sinomo-debug wasix native bridge observed cancellation");
+                        }
+                        cancellation.cancel();
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            })
+        });
+        Self {
+            cancellation,
+            done,
+            handle,
+        }
+    }
+
+    fn token(&self) -> SandboxCancellation {
+        self.cancellation.clone()
+    }
+}
+
+#[cfg(feature = "wasix-runtime")]
+impl Drop for HostCancellationBridge {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(feature = "wasix-runtime")]
+fn host_cancellation_callback() -> Option<(
+    sinomo_sandbox_wasix_api::SinomoWasixHostIsCancelledFn,
+    usize,
+)> {
+    let api = HOST_API.lock().ok().and_then(|api| *api)?;
+    api.0
+        .is_cancelled
+        .map(|is_cancelled| (is_cancelled, api.0.user_data as usize))
 }
 
 #[cfg(feature = "wasix-runtime")]
@@ -524,5 +605,58 @@ fn usize_or_default(value: u64, default: usize) -> usize {
         default
     } else {
         usize::try_from(value).unwrap_or(usize::MAX)
+    }
+}
+
+#[cfg(all(test, feature = "wasix-runtime"))]
+mod tests {
+    use super::*;
+
+    unsafe extern "C" fn test_is_cancelled(user_data: *mut std::ffi::c_void) -> u8 {
+        let Some(cancelled) = (unsafe { (user_data as *const AtomicBool).as_ref() }) else {
+            return 0;
+        };
+        cancelled.load(Ordering::SeqCst) as u8
+    }
+
+    struct HostApiRestore(Option<StoredHostApi>);
+
+    impl Drop for HostApiRestore {
+        fn drop(&mut self) {
+            if let Ok(mut api) = HOST_API.lock() {
+                *api = self.0.take();
+            }
+        }
+    }
+
+    fn install_test_host_api(cancelled: &AtomicBool) -> HostApiRestore {
+        let mut api = HOST_API.lock().expect("host api lock");
+        let previous = api.replace(StoredHostApi(SinomoWasixHostApiV1 {
+            abi_version: SINOMO_SANDBOX_WASIX_NATIVE_ABI_VERSION,
+            user_data: cancelled as *const AtomicBool as *mut std::ffi::c_void,
+            output_chunk: None,
+            log: None,
+            is_cancelled: Some(test_is_cancelled),
+        }));
+        HostApiRestore(previous)
+    }
+
+    #[test]
+    fn host_cancellation_bridge_flips_module_token() {
+        let cancelled = AtomicBool::new(false);
+        let _restore = install_test_host_api(&cancelled);
+        let bridge = HostCancellationBridge::start();
+        let token = bridge.token();
+
+        assert!(!token.is_cancelled());
+        cancelled.store(true, Ordering::SeqCst);
+        for _ in 0..100 {
+            if token.is_cancelled() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(token.is_cancelled());
     }
 }

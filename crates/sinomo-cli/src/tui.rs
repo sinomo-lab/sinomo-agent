@@ -2441,6 +2441,13 @@ impl TuiState {
                     format!("model started: {provider}/{model} step {step_index}"),
                 );
             }
+            AgentModelEvent::ContextAssembled { report, .. } => {
+                self.runtime_activity.active = true;
+                self.status = format!(
+                    "context ready: {} bytes",
+                    report.budget_estimate.total_bytes
+                );
+            }
             AgentModelEvent::AssistantTextDelta { delta, .. } => {
                 self.runtime_activity.active = true;
                 self.append_streamed_message(TuiMessageKind::Agent, &delta, "streaming");

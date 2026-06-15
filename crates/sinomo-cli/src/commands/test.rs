@@ -450,10 +450,7 @@ fn test_context(
 
 fn test_report_result(report: &SinomoTestReport) -> Result<(), CliError> {
     match report.status {
-        SinomoTestStatus::Passed => Ok(()),
-        SinomoTestStatus::Skipped => Err(CliError::Parse {
-            detail: format!("test skipped: {}", report.summary),
-        }),
+        SinomoTestStatus::Passed | SinomoTestStatus::Skipped => Ok(()),
         SinomoTestStatus::Failed => Err(CliError::Parse {
             detail: format!("test failed: {}", report.summary),
         }),
@@ -462,13 +459,7 @@ fn test_report_result(report: &SinomoTestReport) -> Result<(), CliError> {
 
 fn test_suite_report_result(report: &SinomoTestSuiteReport) -> Result<(), CliError> {
     match report.status {
-        SinomoTestStatus::Passed => Ok(()),
-        SinomoTestStatus::Skipped => Err(CliError::Parse {
-            detail: format!(
-                "test suite skipped: {} selected, {} skipped",
-                report.total, report.skipped
-            ),
-        }),
+        SinomoTestStatus::Passed | SinomoTestStatus::Skipped => Ok(()),
         SinomoTestStatus::Failed => Err(CliError::Parse {
             detail: format!(
                 "test suite failed: {} selected, {} failed, {} skipped",
@@ -565,6 +556,39 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn test_report(status: SinomoTestStatus) -> SinomoTestReport {
+        SinomoTestReport {
+            case: SinomoTestCaseMetadata {
+                id: "test.example".to_string(),
+                summary: "example test".to_string(),
+                tags: Vec::new(),
+                requirements: Vec::new(),
+            },
+            status,
+            summary: "example result".to_string(),
+            duration_ms: 0,
+            diagnostics: serde_json::Value::Object(Default::default()),
+            errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn skipped_test_outcomes_do_not_fail_cli_result() {
+        assert!(test_report_result(&test_report(SinomoTestStatus::Skipped)).is_ok());
+
+        let suite = SinomoTestSuiteReport {
+            selector: "tag:example".to_string(),
+            status: SinomoTestStatus::Skipped,
+            total: 1,
+            passed: 0,
+            failed: 0,
+            skipped: 1,
+            duration_ms: 0,
+            reports: vec![test_report(SinomoTestStatus::Skipped)],
+        };
+        assert!(test_suite_report_result(&suite).is_ok());
     }
 
     #[test]
