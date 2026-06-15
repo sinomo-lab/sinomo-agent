@@ -364,8 +364,10 @@ sinomo test run cluster.agent.module-native-dylib-active-cancel --require-cluste
 sinomo test run --tag agent-readiness --require-cluster
 ```
 
-Skipped selected cases fail the suite command so missing live prerequisites do
-not look like a passed gate.
+Skipped selected cases are reported as `skipped` in text and JSON output. The
+suite command can still exit successfully when a live prerequisite is absent, so
+readiness consumers must treat `skipped` as incomplete gate evidence rather than
+as a pass.
 
 ## Compaction
 
@@ -376,7 +378,7 @@ readiness:
 
 - compaction produces typed projection state;
 - source item counts and retained item ids are preserved;
-- policy constraints survive the projection;
+- tool-surface availability constraints survive the projection;
 - session snapshots can resume after compaction.
 
 Model quality is eval work, not ordinary Rust unit testing. The optional

@@ -8,8 +8,7 @@ Before non-trivial work, skim these design docs — the architecture is invarian
 
 - `docs/architecture.md` — distributed runtime, planes, event model, crate responsibilities, trust rings, MVP scope.
 - `docs/self-evolution-architecture.md` — R0–R5 trust rings, capsule format, evaluation/rollout/rollback model.
-- `docs/plans/r0-r1-bootstrap-technical-architecture.md` and `docs/plans/r0-r1-self-evolution-bootstrap-plan.md` — current bootstrap plan for the R0/R1 foundation.
-- `docs/plans/human-guided-long-horizon-evolution.md` — campaign layer driving `sinomo evolve propose`.
+- `docs/agent-system-architecture.md` — current agent package, tool surface, session, readiness, and compaction architecture.
 
 ## Workspace layout
 

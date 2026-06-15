@@ -7,11 +7,9 @@ runtime behavior, proposes bounded improvements, implements candidates in
 isolated workspaces, evaluates them against replayable evidence, rolls approved
 artifacts out progressively, and rolls back when evidence degrades.
 
-This document defines the stable architecture and invariants. Implementation
-status, phase tracking, and near-term work belong in
-[plans/self-evolution-implementation-roadmap.md](plans/self-evolution-implementation-roadmap.md).
-The long-horizon campaign layer is described in
-[plans/human-guided-long-horizon-evolution.md](plans/human-guided-long-horizon-evolution.md).
+This document defines the stable architecture and invariants. Current
+implementation status is tracked by the code, readiness gates, rollout
+operations, and test evidence rather than by separate plan documents.
 
 Self-evolution complements the event-centric distributed runtime in
 [architecture.md](architecture.md). It is another control plane: it consumes
