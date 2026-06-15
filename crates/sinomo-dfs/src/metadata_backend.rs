@@ -1369,6 +1369,19 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         object_id: &DfsObjectId,
         version: &DfsVersion,
     ) -> Result<Option<DfsObjectVersionRecord>>;
+    fn get_object_version_pairs(
+        &self,
+        keys: &[(DfsObjectId, DfsVersion)],
+    ) -> Result<Vec<(Option<DfsObjectMetadata>, Option<DfsObjectVersionRecord>)>> {
+        keys.iter()
+            .map(|(object_id, version)| {
+                Ok((
+                    self.get_object(object_id)?,
+                    self.get_version(object_id, version)?,
+                ))
+            })
+            .collect()
+    }
     fn versions_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsObjectVersionRecord>> {
         let mut versions = Vec::new();
         let mut cursor = None;
@@ -1993,6 +2006,7 @@ pub struct LocalSobjMetadataBackend {
     next_sequence: u64,
     tables: DfsMetadataTables,
     table_log_offset: u64,
+    table_snapshot_fingerprint: Option<MetadataTableSnapshotFingerprint>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -2032,6 +2046,13 @@ struct DfsMetadataTableState {
     tables: DfsMetadataTables,
     table_log_offset: u64,
     snapshot_format_version: Option<u16>,
+    snapshot_fingerprint: Option<MetadataTableSnapshotFingerprint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MetadataTableSnapshotFingerprint {
+    len: u64,
+    hash: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -2857,6 +2878,7 @@ impl LocalShardedMetadataBackend {
         path: &str,
     ) -> Result<DfsMetadataShardId> {
         let selected = select_metadata_shard_config_for_path(
+            file_system_id,
             self.shard_configs_for_file_system(file_system_id),
             path,
         )
@@ -4965,20 +4987,25 @@ impl LocalSobjMetadataBackend {
         create_dir_all(root.join("records"))?;
         create_dir_all(root.join("journal"))?;
         create_dir_all(root.join("journal").join("segments"))?;
-        migrate_legacy_journal_entries(&root)?;
-        let next_sequence = recover_next_journal_sequence(&root)?;
         let mut backend = Self {
             shard_id,
             root,
-            next_sequence,
+            next_sequence: 1,
             tables: DfsMetadataTables::default(),
             table_log_offset: 0,
+            table_snapshot_fingerprint: None,
         };
-        let state = load_or_migrate_metadata_tables(&backend.root)?;
-        backend.tables = state.tables;
-        backend.table_log_offset = state.table_log_offset;
-        backend.ensure_local_materialization_cursor()?;
-        backend.recover_unmaterialized_local_journal_entries()?;
+        {
+            let _lock = backend.metadata_write_lock()?;
+            migrate_legacy_journal_entries(&backend.root)?;
+            backend.next_sequence = recover_next_journal_sequence(&backend.root)?;
+            let state = load_or_migrate_metadata_tables(&backend.root)?;
+            backend.tables = state.tables;
+            backend.table_log_offset = state.table_log_offset;
+            backend.table_snapshot_fingerprint = state.snapshot_fingerprint;
+            backend.ensure_local_materialization_cursor()?;
+            backend.recover_unmaterialized_local_journal_entries()?;
+        }
         backend.recover_namespace_transactions()?;
         backend.recover_visible_version_commits()?;
         backend.recover_object_locations_from_visible_versions()?;
@@ -5082,6 +5109,7 @@ impl LocalSobjMetadataBackend {
         self.table_log_offset = 0;
         self.next_sequence = replayed_through_sequence.saturating_add(1).max(1);
         persist_metadata_table_snapshot(&self.root, &self.tables)?;
+        self.table_snapshot_fingerprint = metadata_table_snapshot_fingerprint(&self.root)?;
         write_sobj_atomic(
             &self.replay_cursor_path(&source_shard_id),
             &DfsMetadataReplayCursor {
@@ -5635,6 +5663,7 @@ impl LocalSobjMetadataBackend {
         after_sequence: u64,
         max_entries: usize,
     ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let _lock = self.metadata_write_lock()?;
         journal_entries_since_limited(&self.root, after_sequence, max_entries)
     }
 
@@ -5769,6 +5798,7 @@ impl LocalSobjMetadataBackend {
         Ok(entry)
     }
 
+    #[cfg(test)]
     fn write_journal(&mut self, mutation: DfsMetadataMutation) -> Result<DfsMetadataJournalEntry> {
         let _lock = self.begin_metadata_write()?;
         self.write_journal_unlocked(mutation)
@@ -6083,7 +6113,7 @@ impl LocalSobjMetadataBackend {
         let path = self.journal_write_lock_path();
         if let Some(parent) = path.parent() {
             create_dir_all(parent.to_owned())?;
-        }
+        };
         let file = fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -6172,6 +6202,7 @@ impl LocalSobjMetadataBackend {
             return Ok(());
         }
         persist_metadata_table_snapshot(&self.root, &self.tables)?;
+        self.table_snapshot_fingerprint = metadata_table_snapshot_fingerprint(&self.root)?;
         self.table_log_offset = fs::metadata(&path)
             .map(|metadata| metadata.len())
             .map_err(|source| MetadataBackendError::Io { path, source })?;
@@ -6179,8 +6210,22 @@ impl LocalSobjMetadataBackend {
     }
 
     fn refresh_metadata_tables(&mut self) -> Result<()> {
+        self.reload_metadata_tables_if_snapshot_changed()?;
         let path = metadata_table_path(&self.root);
         if !path.is_file() {
+            return Ok(());
+        }
+        let len = fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .map_err(|source| MetadataBackendError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        if len < self.table_log_offset {
+            let state = read_metadata_table_state(&self.root)?;
+            self.tables = state.tables;
+            self.table_log_offset = state.table_log_offset;
+            self.table_snapshot_fingerprint = state.snapshot_fingerprint;
             return Ok(());
         }
         self.table_log_offset =
@@ -6189,6 +6234,10 @@ impl LocalSobjMetadataBackend {
     }
 
     fn current_tables_snapshot(&self) -> Result<Cow<'_, DfsMetadataTables>> {
+        if metadata_table_snapshot_fingerprint(&self.root)? != self.table_snapshot_fingerprint {
+            let state = read_metadata_table_state_lenient(&self.root)?;
+            return Ok(Cow::Owned(state.tables));
+        }
         let path = metadata_table_path(&self.root);
         let metadata = match fs::metadata(&path) {
             Ok(metadata) => metadata,
@@ -6199,12 +6248,28 @@ impl LocalSobjMetadataBackend {
                 return Err(MetadataBackendError::Io { path, source });
             }
         };
-        if metadata.len() <= self.table_log_offset {
+        if metadata.len() < self.table_log_offset {
+            let state = read_metadata_table_state_lenient(&self.root)?;
+            return Ok(Cow::Owned(state.tables));
+        }
+        if metadata.len() == self.table_log_offset {
             return Ok(Cow::Borrowed(&self.tables));
         }
         let mut tables = self.tables.clone();
         replay_metadata_table_batches_from(&path, self.table_log_offset, &mut tables)?;
         Ok(Cow::Owned(tables))
+    }
+
+    fn reload_metadata_tables_if_snapshot_changed(&mut self) -> Result<()> {
+        let current = metadata_table_snapshot_fingerprint(&self.root)?;
+        if current == self.table_snapshot_fingerprint {
+            return Ok(());
+        }
+        let state = read_metadata_table_state(&self.root)?;
+        self.tables = state.tables;
+        self.table_log_offset = state.table_log_offset;
+        self.table_snapshot_fingerprint = state.snapshot_fingerprint;
+        Ok(())
     }
 
     fn child_objects_for_directory_page_entries(
@@ -6901,6 +6966,25 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             .versions
             .get(&(object_id.clone(), version.clone()))
             .cloned())
+    }
+
+    fn get_object_version_pairs(
+        &self,
+        keys: &[(DfsObjectId, DfsVersion)],
+    ) -> Result<Vec<(Option<DfsObjectMetadata>, Option<DfsObjectVersionRecord>)>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(keys
+            .iter()
+            .map(|(object_id, version)| {
+                (
+                    tables.objects.get(object_id).cloned(),
+                    tables
+                        .versions
+                        .get(&(object_id.clone(), version.clone()))
+                        .cloned(),
+                )
+            })
+            .collect())
     }
 
     fn versions_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsObjectVersionRecord>> {
@@ -7678,7 +7762,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     }
 
     fn journal_since(&self, after_sequence: u64) -> Result<Vec<DfsMetadataJournalEntry>> {
-        journal_entries_since(&self.root, after_sequence)
+        LocalSobjMetadataBackend::journal_since_limited(self, after_sequence, usize::MAX)
     }
 
     fn journal_since_limited(
@@ -7824,6 +7908,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
 
 impl LocalSobjMetadataBackend {
     fn recover_namespace_transactions(&mut self) -> Result<()> {
+        let _lock = self.begin_metadata_write()?;
         for transaction in self
             .tables
             .namespace_transactions
@@ -7832,7 +7917,7 @@ impl LocalSobjMetadataBackend {
             .collect::<Vec<_>>()
         {
             if self.materialize_namespace_transaction_for_recovery(&transaction)? {
-                self.write_journal(DfsMetadataMutation::ApplyNamespaceTransaction {
+                self.write_journal_unlocked(DfsMetadataMutation::ApplyNamespaceTransaction {
                     file_system_id: transaction.file_system_id.clone(),
                     transaction_id: transaction.transaction_id.clone(),
                     object_count: transaction.objects.len(),
@@ -8472,6 +8557,7 @@ impl LocalSobjMetadataBackend {
     }
 
     fn recover_object_locations_from_visible_versions(&mut self) -> Result<()> {
+        let _lock = self.begin_metadata_write()?;
         let sequence = self.next_sequence.saturating_sub(1);
         for mut object in self.object_records()? {
             if object.kind == DfsObjectKind::Tombstone {
@@ -8503,6 +8589,7 @@ impl LocalSobjMetadataBackend {
         &mut self,
         commit: &DfsVisibleVersionCommitRecord,
     ) -> Result<()> {
+        let _lock = self.begin_metadata_write()?;
         if self
             .get_object_by_path(
                 &commit.committed_object.file_system_id,
@@ -8548,7 +8635,7 @@ impl LocalSobjMetadataBackend {
             return Ok(());
         }
 
-        let entry = self.write_journal(DfsMetadataMutation::CommitVisibleVersion {
+        let entry = self.write_journal_unlocked(DfsMetadataMutation::CommitVisibleVersion {
             file_system_id: commit.committed_object.file_system_id.clone(),
             object_id: commit.committed_object.object_id.clone(),
             previous_version: commit.expected_version.clone(),
@@ -9116,6 +9203,7 @@ fn load_or_migrate_metadata_tables(root: &Path) -> Result<DfsMetadataTableState>
         persist_metadata_table_snapshot(root, &state.tables)?;
         state.table_log_offset = 0;
         state.snapshot_format_version = Some(METADATA_TABLE_SNAPSHOT_FORMAT_VERSION);
+        state.snapshot_fingerprint = metadata_table_snapshot_fingerprint(root)?;
         return Ok(state);
     }
     if state.tables.has_materialized_state() {
@@ -9126,17 +9214,31 @@ fn load_or_migrate_metadata_tables(root: &Path) -> Result<DfsMetadataTableState>
         persist_metadata_table_snapshot(root, &state.tables)?;
         state.table_log_offset = 0;
         state.snapshot_format_version = Some(METADATA_TABLE_SNAPSHOT_FORMAT_VERSION);
+        state.snapshot_fingerprint = metadata_table_snapshot_fingerprint(root)?;
     }
     Ok(state)
 }
 
 fn read_metadata_table_state(root: &Path) -> Result<DfsMetadataTableState> {
+    read_metadata_table_state_with_tail_policy(root, true)
+}
+
+fn read_metadata_table_state_lenient(root: &Path) -> Result<DfsMetadataTableState> {
+    read_metadata_table_state_with_tail_policy(root, false)
+}
+
+fn read_metadata_table_state_with_tail_policy(
+    root: &Path,
+    truncate_torn_tail: bool,
+) -> Result<DfsMetadataTableState> {
     let mut state = read_metadata_table_snapshot(root)?;
     let table_path = metadata_table_path(root);
     if table_path.is_file() {
         state.table_log_offset =
             replay_metadata_table_batches_from(&table_path, 0, &mut state.tables)?;
-        truncate_torn_metadata_table_log_tail(&table_path, state.table_log_offset)?;
+        if truncate_torn_tail {
+            truncate_torn_metadata_table_log_tail(&table_path, state.table_log_offset)?;
+        }
     }
     Ok(state)
 }
@@ -9195,7 +9297,27 @@ fn read_metadata_table_snapshot(root: &Path) -> Result<DfsMetadataTableState> {
         tables,
         table_log_offset: 0,
         snapshot_format_version: Some(format_version),
+        snapshot_fingerprint: metadata_table_snapshot_fingerprint(root)?,
     })
+}
+
+fn metadata_table_snapshot_fingerprint(
+    root: &Path,
+) -> Result<Option<MetadataTableSnapshotFingerprint>> {
+    let path = metadata_table_snapshot_path(root);
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(MetadataBackendError::Io { path, source }),
+    };
+    let bytes = fs::read(&path).map_err(|source| MetadataBackendError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    Ok(Some(MetadataTableSnapshotFingerprint {
+        len: metadata.len(),
+        hash: blake3::hash(&bytes).to_hex().to_string(),
+    }))
 }
 
 fn metadata_tables_from_table_snapshot(
@@ -9281,6 +9403,20 @@ fn replay_metadata_table_batches(
             }
         }
         let length = u32::from_le_bytes(length_bytes) as usize;
+        let record_start = offset;
+        let record_end = record_start
+            .saturating_add(4)
+            .saturating_add(u64::from(u32::from_le_bytes(length_bytes)));
+        let file_len = file
+            .metadata()
+            .map_err(|source| MetadataBackendError::Io {
+                path: path.to_owned(),
+                source,
+            })?
+            .len();
+        if record_end > file_len {
+            break;
+        }
         let mut bytes = vec![0_u8; length];
         match file.read_exact(&mut bytes) {
             Ok(()) => {}
@@ -9292,8 +9428,11 @@ fn replay_metadata_table_batches(
                 });
             }
         }
-        let batch: DfsMetadataTableBatch = sinomo_object_serde::from_bytes(&bytes)
-            .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
+        let batch: DfsMetadataTableBatch = match sinomo_object_serde::from_bytes(&bytes) {
+            Ok(batch) => batch,
+            Err(_) if record_end >= file_len => break,
+            Err(source) => return Err(MetadataBackendError::Serde(source.to_string())),
+        };
         for op in batch.ops {
             tables.apply(op);
         }
@@ -9927,10 +10066,6 @@ fn append_segmented_journal_entries(
     Ok(())
 }
 
-fn journal_entries_since(root: &Path, after_sequence: u64) -> Result<Vec<DfsMetadataJournalEntry>> {
-    journal_entries_since_limited(root, after_sequence, usize::MAX)
-}
-
 fn journal_entries_since_limited(
     root: &Path,
     after_sequence: u64,
@@ -10152,6 +10287,12 @@ fn read_next_segmented_journal_entry(
     file: &mut fs::File,
     path: &Path,
 ) -> Result<Option<DfsMetadataJournalEntry>> {
+    let record_start = file
+        .stream_position()
+        .map_err(|source| MetadataBackendError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
     let mut length_bytes = [0_u8; 4];
     match file.read_exact(&mut length_bytes) {
         Ok(()) => {}
@@ -10164,6 +10305,19 @@ fn read_next_segmented_journal_entry(
         }
     }
     let length = u32::from_le_bytes(length_bytes) as usize;
+    let record_end = record_start
+        .saturating_add(4)
+        .saturating_add(u64::from(u32::from_le_bytes(length_bytes)));
+    let file_len = file
+        .metadata()
+        .map_err(|source| MetadataBackendError::Io {
+            path: path.to_owned(),
+            source,
+        })?
+        .len();
+    if record_end > file_len {
+        return Ok(None);
+    }
     let mut bytes = vec![0_u8; length];
     match file.read_exact(&mut bytes) {
         Ok(()) => {}
@@ -10175,8 +10329,11 @@ fn read_next_segmented_journal_entry(
             });
         }
     }
-    let entry = sinomo_object_serde::from_bytes(&bytes)
-        .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
+    let entry = match sinomo_object_serde::from_bytes(&bytes) {
+        Ok(entry) => entry,
+        Err(_) if record_end >= file_len => return Ok(None),
+        Err(source) => return Err(MetadataBackendError::Serde(source.to_string())),
+    };
     Ok(Some(entry))
 }
 
@@ -12388,6 +12545,47 @@ mod tests {
     }
 
     #[test]
+    fn local_backend_reopen_truncates_invalid_table_log_tail() {
+        let root = temp_root("local_backend_truncates_invalid_table_log_tail");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let object_a = object(version("version_1"));
+        {
+            let mut backend =
+                LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+            backend.put_file_system(&file_system()).expect("filesystem");
+            backend.put_object(&object_a).expect("object");
+        }
+        let table_path = metadata_table_path(&root);
+        let good_len = fs::metadata(&table_path).expect("table log").len();
+
+        let invalid_payload = b"not-sobj";
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&table_path)
+            .expect("open table log");
+        file.write_all(&(invalid_payload.len() as u32).to_le_bytes())
+            .and_then(|()| file.write_all(invalid_payload))
+            .expect("invalid tail append");
+        drop(file);
+
+        let reopened =
+            LocalSobjMetadataBackend::new(shard_id, &root).expect("reopen tolerates invalid tail");
+        assert_eq!(
+            reopened
+                .get_object(&object_a.object_id)
+                .expect("object lookup"),
+            Some(object_a),
+            "complete records before the malformed tail must replay"
+        );
+        assert_eq!(
+            fs::metadata(&table_path).expect("table log").len(),
+            good_len,
+            "open must cut a fully length-prefixed but malformed tail before later appends"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
     fn local_backend_migrates_legacy_op_snapshot_to_structured_snapshot() {
         let root = temp_root("local_backend_migrates_legacy_op_snapshot");
         let shard_id = DfsMetadataShardId::new("shard-root");
@@ -12503,6 +12701,118 @@ mod tests {
                 .objects_for_file_system(&file_system.file_system_id)
                 .expect("objects from second handle"),
             vec![object]
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_reloads_snapshot_when_other_handle_compacts_table_log() {
+        let root = temp_root("local_backend_reloads_snapshot_after_external_compaction");
+        let mut writer =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("writer backend");
+        writer.put_file_system(&file_system()).expect("filesystem");
+        persist_metadata_table_snapshot(&root, &writer.tables)
+            .expect("snapshot filesystem before table-log shrink");
+        truncate_metadata_table_log(&root).expect("truncate table log after snapshot");
+        drop(writer);
+        let mut writer =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("writer backend after snapshot");
+        let mut logged_object = object(version("version_1"));
+        logged_object.object_id =
+            DfsObjectId::from_legacy_named("obj_before_table_log_shrink").expect("object");
+        logged_object.path = "/docs/before-table-log-shrink.md".to_string();
+        writer.put_object(&logged_object).expect("logged object");
+
+        let mut stale = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("stale backend");
+        let stale_offset = stale.table_log_offset;
+        assert!(
+            stale_offset > 0,
+            "stale handle needs an old table-log cursor"
+        );
+
+        for index in 0..8 {
+            let mut object = object(version("version_1"));
+            object.object_id =
+                DfsObjectId::from_legacy_named(format!("obj_pre_compact_{index}")).expect("object");
+            object.path = format!("/docs/pre-compact-{index}.md");
+            writer.put_object(&object).expect("pre compact object");
+        }
+        writer
+            .compact_metadata_table_log_if_needed(1)
+            .expect("force compaction");
+
+        let mut index = 0usize;
+        while fs::metadata(metadata_table_path(&root))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+            <= stale_offset
+        {
+            let mut object = object(version("version_1"));
+            object.object_id = DfsObjectId::from_legacy_named(format!("obj_post_compact_{index}"))
+                .expect("object");
+            object.path = format!("/docs/post-compact-{index}.md");
+            writer.put_object(&object).expect("post compact object");
+            index += 1;
+        }
+
+        let mut object = object(version("version_1"));
+        object.object_id =
+            DfsObjectId::from_legacy_named("obj_stale_handle_after_compact").expect("object");
+        object.path = "/docs/stale-handle-after-compact.md".to_string();
+        stale
+            .put_object(&object)
+            .expect("stale handle should refresh from the new snapshot before writing");
+        assert_eq!(
+            stale
+                .get_object(&object.object_id)
+                .expect("object lookup after stale write"),
+            Some(object)
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_reloads_when_table_log_shrinks_below_cached_offset() {
+        let root = temp_root("local_backend_reloads_after_external_table_log_truncation");
+        let mut writer =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("writer backend");
+        let file_system = file_system();
+        writer.put_file_system(&file_system).expect("filesystem");
+
+        let mut stale = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("stale backend");
+        let stale_offset = stale.table_log_offset;
+        assert!(
+            stale_offset > 1,
+            "stale handle needs a cached table-log cursor"
+        );
+
+        let table_path = metadata_table_path(&root);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&table_path)
+            .expect("open table log");
+        file.set_len(stale_offset - 1)
+            .and_then(|()| file.sync_all())
+            .expect("shrink table log below cached cursor");
+
+        stale
+            .current_tables_snapshot()
+            .expect("lock-free read should reload instead of seeking past EOF");
+        stale
+            .put_file_system(&file_system)
+            .expect("stale writer should reload after table log shrink");
+        assert_eq!(
+            stale
+                .get_file_system(&file_system.file_system_id)
+                .expect("filesystem lookup after stale write"),
+            Some(file_system)
         );
 
         cleanup(&root);
@@ -12802,6 +13112,150 @@ mod tests {
                 .is_empty()
         );
 
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_journal_reader_ignores_invalid_tail_record() {
+        let root = temp_root("local_backend_journal_reader_ignores_invalid_tail_record");
+        let mut backend =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend
+            .put_object(&object(version("version_1")))
+            .expect("object");
+        let expected = backend.journal_since(0).expect("journal before tail");
+
+        let segment_path = root
+            .join("journal")
+            .join("segments")
+            .join("00000000000000000001.slog");
+        let invalid_payload = b"not-sobj";
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&segment_path)
+            .expect("open segment");
+        file.write_all(&(invalid_payload.len() as u32).to_le_bytes())
+            .and_then(|()| file.write_all(invalid_payload))
+            .expect("invalid tail append");
+        drop(file);
+
+        assert_eq!(
+            backend
+                .journal_since(0)
+                .expect("journal after invalid tail"),
+            expected,
+            "journal polling must ignore a malformed trailing record and retry it later"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_journal_reader_waits_for_writer_lock() {
+        let root = temp_root("local_backend_journal_reader_waits_for_writer_lock");
+        let mut backend =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend
+            .put_object(&object(version("version_1")))
+            .expect("object");
+        let expected = backend.journal_since(0).expect("journal before tail");
+        let segment_path = root
+            .join("journal")
+            .join("segments")
+            .join("00000000000000000001.slog");
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let root_for_writer = root.to_path_buf();
+        let segment_for_writer = segment_path.clone();
+        let writer = std::thread::spawn(move || {
+            let writer_backend = LocalSobjMetadataBackend::new(
+                DfsMetadataShardId::new("shard-root"),
+                &root_for_writer,
+            )
+            .expect("writer backend");
+            let _lock = writer_backend.metadata_write_lock().expect("writer lock");
+            locked_tx.send(()).expect("signal lock acquired");
+            std::thread::sleep(Duration::from_millis(100));
+            let invalid_payload = b"not-sobj";
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&segment_for_writer)
+                .expect("open segment");
+            file.write_all(&(invalid_payload.len() as u32).to_le_bytes())
+                .and_then(|()| file.write_all(invalid_payload))
+                .expect("invalid tail append");
+        });
+        locked_rx.recv().expect("writer acquired lock");
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            backend
+                .journal_since(0)
+                .expect("journal reader waits for lock"),
+            expected,
+            "journal polling must not read while a writer is appending a record"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "journal reader should wait for the in-flight metadata writer"
+        );
+        writer.join().expect("writer thread");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_open_waits_for_writer_lock_before_table_replay() {
+        let root = temp_root("local_backend_open_waits_for_writer_lock");
+        let mut seed = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("seed backend");
+        seed.put_file_system(&file_system()).expect("filesystem");
+        drop(seed);
+
+        let mut object = object(version("version_1"));
+        object.object_id =
+            DfsObjectId::from_legacy_named("obj_open_waits_for_writer_lock").expect("object");
+        object.path = "/docs/open-waits-for-writer-lock.md".to_string();
+        let object_id = object.object_id.clone();
+        let expected_object = object.clone();
+        let root_for_writer = root.to_path_buf();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut writer_backend = LocalSobjMetadataBackend::new(
+                DfsMetadataShardId::new("shard-root"),
+                root_for_writer,
+            )
+            .expect("writer backend");
+            let _lock = writer_backend.metadata_write_lock().expect("writer lock");
+            locked_tx.send(()).expect("signal lock acquired");
+            std::thread::sleep(Duration::from_millis(100));
+            writer_backend
+                .append_and_apply_table_ops(
+                    writer_backend.next_sequence.max(1),
+                    vec![DfsMetadataTableOp::PutObject { object }],
+                )
+                .expect("append table batch while lock is held");
+        });
+        locked_rx.recv().expect("writer acquired lock");
+
+        let started = std::time::Instant::now();
+        let opened = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("opener backend");
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "backend open must wait for in-flight metadata writers before table replay"
+        );
+        assert_eq!(
+            opened
+                .get_object(&object_id)
+                .expect("object lookup")
+                .as_ref(),
+            Some(&expected_object),
+            "backend open must replay the complete table batch after the writer releases the lock"
+        );
+
+        writer.join().expect("writer thread");
         cleanup(&root);
     }
 

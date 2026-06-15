@@ -10549,6 +10549,149 @@ fn cluster_kv_store_prefers_local_raft_over_stale_materialized_snapshot() {
 }
 
 #[test]
+fn telemetry_kv_read_views_prefer_newer_materialized_snapshot() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-telemetry-newer-cache");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_telemetry_newer_cache").expect("cluster");
+    let local_node = NodeId::from_legacy_named("node_telemetry_newer_cache_local").expect("local");
+    let remote_node =
+        NodeId::from_legacy_named("node_telemetry_newer_cache_remote").expect("remote");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "telemetry newer cache",
+        local_node.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    let current = append_cluster_raft_command(
+        &paths,
+        &local_node,
+        KvCommand::Op(KvOp::Put {
+            key: "/local-only".to_string(),
+            value: b"raft".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("seed stale local raft");
+
+    let endpoint = daemon_lan_endpoint(&remote_node, "10.42.0.2:21353".to_string(), 10);
+    let connectivity = cluster_connectivity_record(
+        &state,
+        &endpoint,
+        ClusterConnectivityState::Healthy,
+        Some(4),
+        0,
+        Some("ok".to_string()),
+        None,
+        now,
+        60,
+    );
+    let mut imported = InProcessKvStore::new();
+    imported
+        .put("/cache-revision-bump", b"cache".to_vec(), None)
+        .expect("bump cache revision");
+    imported
+        .put_serde(
+            cluster_connectivity_key(
+                &connectivity.source_node_id,
+                &connectivity.target_node_id,
+                &connectivity.endpoint_id,
+            ),
+            &connectivity,
+            None,
+        )
+        .expect("cache connectivity");
+    let imported_snapshot = imported.snapshot();
+    assert!(
+        imported_snapshot.revision > current.revision,
+        "test requires a materialized snapshot newer than local raft"
+    );
+    write_cluster_kv_snapshot(&paths, &imported_snapshot).expect("write imported snapshot");
+
+    let graph = read_cluster_connectivity_graph_from_kv(&paths).expect("read connectivity graph");
+    assert!(
+        graph.iter().any(|record| record == &connectivity),
+        "telemetry read views should use a fresher imported snapshot when local raft lags"
+    );
+}
+
+#[test]
+fn telemetry_kv_read_views_keep_current_raft_over_stale_materialized_snapshot() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-telemetry-stale-cache");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_telemetry_stale_cache").expect("cluster");
+    let local_node = NodeId::from_legacy_named("node_telemetry_stale_cache_local").expect("local");
+    let remote_node =
+        NodeId::from_legacy_named("node_telemetry_stale_cache_remote").expect("remote");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "telemetry stale cache",
+        local_node.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+
+    let endpoint = daemon_lan_endpoint(&remote_node, "10.42.0.3:21353".to_string(), 10);
+    let connectivity = cluster_connectivity_record(
+        &state,
+        &endpoint,
+        ClusterConnectivityState::Healthy,
+        Some(5),
+        0,
+        Some("ok".to_string()),
+        None,
+        now,
+        60,
+    );
+    append_cluster_raft_command(
+        &paths,
+        &local_node,
+        KvCommand::Txn(KvTxn {
+            compares: Vec::new(),
+            success: vec![
+                KvOp::Put {
+                    key: "/local-revision-bump".to_string(),
+                    value: b"raft".to_vec(),
+                    lease_id: None,
+                },
+                KvOp::put_serde(
+                    cluster_connectivity_key(
+                        &connectivity.source_node_id,
+                        &connectivity.target_node_id,
+                        &connectivity.endpoint_id,
+                    ),
+                    &connectivity,
+                    None,
+                )
+                .expect("connectivity op"),
+            ],
+            failure: Vec::new(),
+        }),
+    )
+    .expect("seed current raft");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write stale imported snapshot");
+
+    let graph = read_cluster_connectivity_graph_from_kv(&paths).expect("read connectivity graph");
+    assert!(
+        graph.iter().any(|record| record == &connectivity),
+        "a stale imported snapshot must not hide fresher local raft telemetry"
+    );
+}
+
+#[test]
 fn volatile_raft_commits_defer_materialized_snapshot_until_structural_change() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-kv-volatile-deferred-materialized");
     let data_dir = SinomoDataDir::new(&root);

@@ -156,6 +156,7 @@ dfs/metadata/journal
 dfs/metadata/root
 dfs/metadata/shard-index
 dfs/metadata-replication-cursors
+dfs/metadata
 dfs/operator
 dfs/pins
 files

@@ -6982,6 +6982,22 @@ fn read_cluster_kv_current_or_cached_snapshot_arc_if_present(
     }
 }
 
+fn read_cluster_kv_latest_observed_snapshot_arc_if_present(
+    paths: &ClusterPaths,
+) -> Result<Option<Arc<KvSnapshot>>, NetworkError> {
+    let current = match read_cluster_kv_current_snapshot_arc(paths) {
+        Ok(snapshot) => Some(snapshot),
+        Err(NetworkError::ClusterOrphan) => None,
+        Err(error) => return Err(error),
+    };
+    let cached = read_cluster_kv_cached_snapshot_if_present(paths)?;
+    Ok(match (current, cached) {
+        (Some(current), Some(cached)) if cached.revision > current.revision => Some(cached),
+        (Some(current), _) => Some(current),
+        (None, cached) => cached,
+    })
+}
+
 fn read_cluster_kv_current_or_empty_snapshot_arc(
     paths: &ClusterPaths,
 ) -> Result<Arc<KvSnapshot>, NetworkError> {
@@ -8055,7 +8071,7 @@ fn read_cluster_capability_policies_from_snapshot(
 pub fn read_cluster_node_statuses_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterNodeStatusRecord>, NetworkError> {
-    let Some(snapshot) = read_cluster_kv_current_or_cached_snapshot_arc_if_present(paths)? else {
+    let Some(snapshot) = read_cluster_kv_latest_observed_snapshot_arc_if_present(paths)? else {
         return Ok(Vec::new());
     };
     let mut statuses: Vec<ClusterNodeStatusRecord> = Vec::new();
@@ -8071,7 +8087,7 @@ pub fn read_cluster_node_statuses_from_kv(
 pub fn read_cluster_network_info_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterNetworkInfoRecord>, NetworkError> {
-    let Some(snapshot) = read_cluster_kv_current_or_cached_snapshot_arc_if_present(paths)? else {
+    let Some(snapshot) = read_cluster_kv_latest_observed_snapshot_arc_if_present(paths)? else {
         return Ok(Vec::new());
     };
     let now = OffsetDateTime::now_utc();
@@ -8092,7 +8108,7 @@ pub fn read_cluster_network_info_from_kv(
 pub fn read_cluster_connectivity_graph_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
-    let Some(snapshot) = read_cluster_kv_current_or_cached_snapshot_arc_if_present(paths)? else {
+    let Some(snapshot) = read_cluster_kv_latest_observed_snapshot_arc_if_present(paths)? else {
         return Ok(Vec::new());
     };
     let now = OffsetDateTime::now_utc();

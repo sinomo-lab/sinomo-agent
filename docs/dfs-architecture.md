@@ -370,11 +370,14 @@ Current layout:
 ```text
 content/
   blobs/<hash>
+  blob-packs/index.sobj
+  blob-packs/segments/<segment>.pack
   objects/<object_id>/<version>/manifest.sobj
+  stats.sobj
   staging/<intent_id>/
 ```
 
-The content store is append-first: write staged bytes or chunked staging files, fsync as needed, verify hashes, then publish a manifest or receipt. Visible metadata advances only after the relevant policy allows it.
+The content store is append-first: write staged bytes or chunked staging files, fsync as needed, verify hashes, then publish a manifest or receipt. Small blobs may be appended into packed segments and resolved through the packed index to avoid one loose file per tiny object. Visible metadata advances only after the relevant policy allows it.
 
 Content identity uses BLAKE3. The canonical content-hash string is:
 

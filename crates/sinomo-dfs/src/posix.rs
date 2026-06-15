@@ -9,10 +9,11 @@
 use crate::namespace::{initial_version, metadata_path, next_version, object_id_for_path};
 use crate::{
     DfsControlPlaneStore, DfsDirectoryPage, DfsDirectoryPageCursor, DfsError, DfsFileSystem,
-    DfsFrameTransport, DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobRecord,
-    DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNamespacePosixError, DfsNamespaceResult,
-    DfsNamespaceTransaction, DfsObjectKind, DfsObjectMetadata, DfsObjectVersionRecord, DfsReadData,
-    DfsReadRangeData, DfsReplicaReceiptRecord, DfsReplicationPolicy, NetworkedDfsRangeReadOutcome,
+    DfsFrameTransport, DfsMetadataShardConfig, DfsNamespaceJobFrame, DfsNamespaceJobKind,
+    DfsNamespaceJobRecord, DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNamespacePosixError,
+    DfsNamespaceResult, DfsNamespaceTransaction, DfsObjectKind, DfsObjectMetadata,
+    DfsObjectVersionRecord, DfsReadData, DfsReadRangeData, DfsReplicaReceiptRecord,
+    DfsReplicationPolicy, DfsWriteIntentState, DfsWriteIntentStatus, NetworkedDfsRangeReadOutcome,
     NetworkedDfsRangeReadStreamOutcome, NetworkedDfsReadOutcome, NetworkedDfsReadStreamOutcome,
     NetworkedDfsService, NetworkedDfsWriteOutcome, ObjectVersionReader, sifs_file_system_id,
 };
@@ -32,6 +33,7 @@ const POSIX_LINK_COUNT_PAGE_SIZE: usize = 4096;
 const POSIX_RECURSIVE_CLEAR_JOB_BATCH_STEPS: usize = 512;
 const POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE: usize = 128;
 const POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE: usize = 1024;
+const POSIX_REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const POSIX_REMOTE_READ_IDLE_WAIT_INITIAL: Duration = Duration::from_millis(2);
 /// Version-history records shipped with a cross-shard adoption; older
 /// history stays in the source shard until lifecycle GC collects it.
@@ -45,6 +47,7 @@ const POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT: usize = 3;
 /// Budget for the best-effort freshness pull a distributed read performs on
 /// foreign-shard paths; reads fall back to the local mirror when it elapses.
 const POSIX_READ_FRESHNESS_SYNC_TIMEOUT: Duration = Duration::from_secs(3);
+const POSIX_READ_FRESHNESS_SYNC_CACHE_TTL: Duration = Duration::from_secs(5);
 const POSIX_REMOTE_READ_IDLE_WAIT_MAX: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Error)]
@@ -162,6 +165,15 @@ pub struct DfsNamespaceJobFailure {
     pub reason: String,
 }
 
+fn namespace_job_kind_is_cross_shard(kind: &DfsNamespaceJobKind) -> bool {
+    matches!(
+        kind,
+        DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
+            | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
+            | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
+    )
+}
+
 impl DfsWriteOptions {
     pub fn replicated_eventual(replica_candidates: Vec<NodeId>) -> Self {
         let desired = replica_candidates.len().max(1).min(2);
@@ -244,16 +256,49 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     /// when this node is itself the namespace authority for the path (or no
     /// cluster shard configuration exists).
     fn routed_namespace_primary_for_path(&mut self, path: &str) -> Result<Option<NodeId>> {
+        Ok(self
+            .routed_namespace_shard_for_path(path)?
+            .map(|shard| shard.primary_node_id))
+    }
+
+    fn routed_namespace_shard_for_path(
+        &mut self,
+        path: &str,
+    ) -> Result<Option<DfsMetadataShardConfig>> {
         let Some(kv) = self.control_plane.as_mut() else {
             return Ok(None);
         };
         let shard = DfsControlPlaneStore::new(kv.as_mut())
-            .select_metadata_shard_for_path(&sifs_file_system_id(), path)
+            .select_metadata_shard_for_path_strict_default_sifs_split(&sifs_file_system_id(), path)
             .map_err(DfsError::from)?;
         Ok(match shard {
-            Some(shard) if shard.primary_node_id != self.node_id => Some(shard.primary_node_id),
+            Some(shard) if shard.primary_node_id != self.node_id => Some(shard),
             _ => None,
         })
+    }
+
+    fn should_attempt_read_freshness_sync(&mut self, shard: &DfsMetadataShardConfig) -> bool {
+        let now = Instant::now();
+        self.recent_namespace_freshness_syncs
+            .retain(|_, attempted_at| {
+                now.duration_since(*attempted_at) < POSIX_READ_FRESHNESS_SYNC_CACHE_TTL
+            });
+        let key = (
+            shard.file_system_id.clone(),
+            DfsMetadataShardId::new(shard.shard_id.clone()),
+            shard.primary_node_id.clone(),
+        );
+        match self.recent_namespace_freshness_syncs.get(&key) {
+            Some(attempted_at)
+                if now.duration_since(*attempted_at) < POSIX_READ_FRESHNESS_SYNC_CACHE_TTL =>
+            {
+                false
+            }
+            _ => {
+                self.recent_namespace_freshness_syncs.insert(key, now);
+                true
+            }
+        }
     }
 
     /// The local journal cursor of the shard owning `path`, used to detect
@@ -263,7 +308,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             return Ok(0);
         };
         let Some(shard) = DfsControlPlaneStore::new(kv.as_mut())
-            .select_metadata_shard_for_path(&sifs_file_system_id(), path)
+            .select_metadata_shard_for_path_strict_default_sifs_split(&sifs_file_system_id(), path)
             .map_err(DfsError::from)?
         else {
             return Ok(0);
@@ -296,19 +341,22 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         // staleness of found entries (deletions become visible). It is
         // best-effort with a short budget: an unreachable primary must not
         // take down reads the local mirror can serve.
-        if let Some(primary) = self.routed_namespace_primary_for_path(&resolved)?
-            && self
+        if let Some(shard) = self.routed_namespace_shard_for_path(&resolved)?
+            && self.should_attempt_read_freshness_sync(&shard)
+        {
+            if self
                 .route_namespace_operation_to_metadata_primary_with_timeout(
                     sifs_file_system_id(),
-                    primary,
+                    shard.primary_node_id,
                     DfsNamespaceOperation::SyncPath {
                         path: resolved.clone(),
                     },
                     POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
                 )
                 .is_ok()
-        {
-            resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
+            {
+                resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
+            }
         }
         for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
             if let Some(object) = self.lookup_sifs_path(&resolved)?
@@ -381,6 +429,35 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         &mut self,
         operation: &DfsNamespaceOperation,
     ) -> Result<()> {
+        match operation {
+            DfsNamespaceOperation::Rename { from, to } => {
+                if self.resume_running_cross_shard_namespace_job_for_paths(
+                    &sifs_file_system_id(),
+                    from,
+                    to,
+                    &[
+                        DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries,
+                        DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries,
+                    ],
+                )? {
+                    return Ok(());
+                }
+            }
+            DfsNamespaceOperation::Hardlink {
+                existing_path,
+                link_path,
+            } => {
+                if self.resume_running_cross_shard_namespace_job_for_paths(
+                    &sifs_file_system_id(),
+                    existing_path,
+                    link_path,
+                    &[DfsNamespaceJobKind::HardlinkAcrossShardPrimaries],
+                )? {
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
         // Mutations must not interleave with an in-flight cross-shard move of
         // the same path; the coordinator releases the lock when the move
         // completes or aborts.
@@ -430,6 +507,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     )
                     .map(drop)
                 }
+            }
+            DfsNamespaceOperation::TouchDirectoryModified { path } => {
+                self.touch_directory_modified(path)
             }
             DfsNamespaceOperation::ClearDirRecursive { path } => {
                 self.posix_clear_dir_recursive_local(path)
@@ -554,9 +634,6 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         if from == to {
             return Ok(());
         }
-        let file_system_id = sifs_file_system_id();
-        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &from)?;
-        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &to)?;
         let source = self
             .lookup_sifs_path(&from)?
             .ok_or_else(|| DfsPosixError::NotFound { path: from.clone() })?;
@@ -572,19 +649,24 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     path: format!("{from} -> {to}"),
                 });
             }
+            let job_id = namespace_job_id(
+                "rename-dir-cross-shard",
+                &source.file_system_id,
+                &format!("{from}->{to}"),
+                &source.object_id,
+                &source.version,
+            );
+            if let Some(job) = self.namespace_job(&job_id)? {
+                return self.drive_cross_shard_namespace_job(job);
+            }
+            let file_system_id = sifs_file_system_id();
+            self.ensure_path_not_in_cross_shard_flight(&file_system_id, &from)?;
+            self.ensure_path_not_in_cross_shard_flight(&file_system_id, &to)?;
             return self.coordinate_cross_shard_directory_rename(&from, &to, source);
         }
         if to_requires_directory {
             return Err(DfsPosixError::NotDirectory { path: to });
         }
-        // Reject up front while writes are still settling so the caller sees
-        // a clean retriable error with no job created.
-        self.ensure_no_open_write_state_for_object(&source.object_id, &from)?;
-
-        let mut moved = source.clone();
-        moved.path = to.clone();
-        moved.changed_at_unix_nanos = now_unix_nanos();
-        moved.version = next_version(&source.version);
         let job_id = namespace_job_id(
             "rename-cross-shard",
             &source.file_system_id,
@@ -592,6 +674,20 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             &source.object_id,
             &source.version,
         );
+        if let Some(job) = self.namespace_job(&job_id)? {
+            return self.drive_cross_shard_namespace_job(job);
+        }
+        let file_system_id = sifs_file_system_id();
+        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &from)?;
+        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &to)?;
+        // Reject up front while writes are still settling so the caller sees
+        // a clean retriable error with no job created.
+        self.ensure_no_open_write_state_for_object(&source, &from)?;
+
+        let mut moved = source.clone();
+        moved.path = to.clone();
+        moved.changed_at_unix_nanos = now_unix_nanos();
+        moved.version = next_version(&source.version);
         let job = match self.namespace_job(&job_id)? {
             Some(job) => job,
             None => {
@@ -720,7 +816,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 path: format!("{current_path} -> {target_root}"),
             });
         }
-        self.ensure_no_open_write_state_for_object(source_object_id, source_root)?;
+        self.ensure_no_open_write_state_for_object(&current, source_root)?;
         moved.path = target_root.to_string();
         moved.changed_at_unix_nanos = now_unix_nanos();
         moved.version = next_version(&current.version);
@@ -775,7 +871,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             if current_path != object_path {
                 continue;
             }
-            self.ensure_no_open_write_state_for_object(&current.object_id, &object_path)?;
+            self.ensure_no_open_write_state_for_object(&current, &object_path)?;
             let mut moved = current.clone();
             moved.path = target_child_path.clone();
             self.adopt_moved_object_on_destination_primary(&moved, &object_path)?;
@@ -813,7 +909,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     /// sagas wait for the write to drain.
     fn ensure_no_open_write_state_for_object(
         &self,
-        object_id: &DfsObjectId,
+        object: &DfsObjectMetadata,
         path: &str,
     ) -> Result<()> {
         let busy = || {
@@ -821,21 +917,21 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 path: path.to_string(),
             }))
         };
-        if self
-            .pending_writes
-            .values()
-            .any(|pending| &pending.object_id == object_id)
-        {
-            return busy();
-        }
-        if self.coordinator.has_open_intent_for_object(object_id) {
-            return busy();
+        for (intent_id, pending) in &self.pending_writes {
+            if pending.object_id != object.object_id {
+                continue;
+            }
+            let committed_visible = self.coordinator.intent(intent_id).is_some_and(|intent| {
+                matches!(intent.state, DfsWriteIntentState::Committed)
+                    && intent.target_version == object.version
+            });
+            if !committed_visible {
+                return busy();
+            }
         }
         if self
             .coordinator
-            .repair_jobs()
-            .iter()
-            .any(|job| &job.object_id == object_id)
+            .has_open_intent_for_object(&object.object_id)
         {
             return busy();
         }
@@ -843,16 +939,14 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             let mut cursor = None;
             loop {
                 let page = backend.intents_for_object_page(
-                    object_id,
+                    &object.object_id,
                     cursor.as_ref(),
                     POSIX_LIST_DIR_COLLECT_PAGE_SIZE,
                 )?;
                 if page.intents.iter().any(|intent| {
-                    matches!(
-                        intent.status,
-                        crate::DfsWriteIntentStatus::Staging
-                            | crate::DfsWriteIntentStatus::ReceiptsPending
-                    )
+                    matches!(intent.status, DfsWriteIntentStatus::Staging)
+                        || (matches!(intent.status, DfsWriteIntentStatus::ReceiptsPending)
+                            && intent.target_version != object.version)
                 }) {
                     return busy();
                 }
@@ -893,7 +987,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 path: format!("{current_path} -> {target_path}"),
             });
         }
-        self.ensure_no_open_write_state_for_object(&current.object_id, &old_path)?;
+        self.ensure_no_open_write_state_for_object(&current, &old_path)?;
         let mut moved = current;
         moved.path = target_path;
         moved.changed_at_unix_nanos = now_unix_nanos();
@@ -955,9 +1049,6 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         if link_path == "/" {
             return Err(DfsPosixError::InvalidPath { path: link_path });
         }
-        let file_system_id = sifs_file_system_id();
-        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &existing_path)?;
-        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &link_path)?;
         let existing =
             self.lookup_sifs_path(&existing_path)?
                 .ok_or_else(|| DfsPosixError::NotFound {
@@ -1019,6 +1110,12 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             &target.object_id,
             &target.version,
         );
+        if let Some(job) = self.namespace_job(&job_id)? {
+            return self.drive_cross_shard_namespace_job(job);
+        }
+        let file_system_id = sifs_file_system_id();
+        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &existing_path)?;
+        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &link_path)?;
         let job = match self.namespace_job(&job_id)? {
             Some(job) => job,
             None => {
@@ -1604,11 +1701,37 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         self.posix_write_file_from_reader(path, Cursor::new(bytes), options)
     }
 
+    pub fn posix_write_file_with_known_parent(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
+        self.posix_write_file_from_reader_checked_parent(
+            path,
+            Cursor::new(bytes),
+            options,
+            false,
+            false,
+        )
+    }
+
     pub fn posix_write_file_from_reader<R: Read>(
         &mut self,
         path: &str,
         reader: R,
         options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
+        self.posix_write_file_from_reader_checked_parent(path, reader, options, true, true)
+    }
+
+    fn posix_write_file_from_reader_checked_parent<R: Read>(
+        &mut self,
+        path: &str,
+        reader: R,
+        options: DfsWriteOptions,
+        check_parent: bool,
+        touch_parent_on_create: bool,
     ) -> Result<DfsStat> {
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
         let path = self.resolve_posix_path_distributed(&path, true)?;
@@ -1622,7 +1745,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 Err(error) => Err(error),
             };
         }
-        self.ensure_parent_directory(&path)?;
+        if check_parent {
+            self.ensure_parent_directory(&path)?;
+        }
         let mut transient_create = false;
         let object = match self.lookup_sifs_path(&path)? {
             Some(object) if object.kind == DfsObjectKind::Directory => {
@@ -1658,7 +1783,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             candidates.insert(0, self.node_id.clone());
         }
         let committed_locations = candidates.clone();
-        let outcome = self.write_distributed_eventual_from_reader_with_candidates(
+        let outcome = self.write_distributed_eventual_from_reader_with_candidates_and_parent_touch(
             DfsWriteRequest {
                 file_system_id: object.file_system_id.clone(),
                 object_id: object.object_id.clone(),
@@ -1668,6 +1793,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             reader,
             candidates,
             options.policy,
+            touch_parent_on_create,
         );
         let outcome = match outcome {
             Ok(outcome) => outcome,
@@ -1712,7 +1838,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 // metadata shard primary and arrives here through journal
                 // replay; appending it locally as well would fork this
                 // replica's journal sequence space from the primary's stream.
-                if transient_create && self.is_local_metadata_primary_for_object(&object)? {
+                if transient_create
+                    && touch_parent_on_create
+                    && self.is_local_metadata_primary_for_object(&object)?
+                {
                     self.touch_parent_directory_modified(&path)?;
                 }
                 // Bounded response replay may not have covered a deep
@@ -2390,7 +2519,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         if requested.is_empty() {
             return Ok(initial);
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + POSIX_REMOTE_READ_TIMEOUT;
         let mut idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
         loop {
             let events = self.process_incoming()?;
@@ -3202,13 +3331,36 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     },
                     Err(error) => {
                         let reason = error.to_string();
-                        let failed = self.fail_namespace_job(job, reason.clone())?;
-                        report.failed_job_count = report.failed_job_count.saturating_add(1);
-                        report.failures.push(DfsNamespaceJobFailure {
-                            job_id: failed.job_id,
-                            kind: failed.kind,
-                            reason,
-                        });
+                        let latest = self.namespace_job(&job.job_id)?.unwrap_or(job);
+                        match latest.status {
+                            DfsNamespaceJobStatus::Completed => {
+                                report.completed_job_count =
+                                    report.completed_job_count.saturating_add(1);
+                            }
+                            DfsNamespaceJobStatus::Running
+                                if namespace_job_kind_is_cross_shard(&latest.kind) =>
+                            {
+                                report.remaining_running_job_count =
+                                    report.remaining_running_job_count.saturating_add(1);
+                            }
+                            DfsNamespaceJobStatus::Running => {
+                                let failed = self.fail_namespace_job(latest, reason.clone())?;
+                                report.failed_job_count = report.failed_job_count.saturating_add(1);
+                                report.failures.push(DfsNamespaceJobFailure {
+                                    job_id: failed.job_id,
+                                    kind: failed.kind,
+                                    reason,
+                                });
+                            }
+                            DfsNamespaceJobStatus::Failed => {
+                                report.failed_job_count = report.failed_job_count.saturating_add(1);
+                                report.failures.push(DfsNamespaceJobFailure {
+                                    job_id: latest.job_id,
+                                    kind: latest.kind,
+                                    reason: latest.failure_reason.unwrap_or(reason),
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -4111,6 +4263,80 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         Ok(backend.get_namespace_job(job_id)?)
     }
 
+    pub(crate) fn resume_running_cross_shard_namespace_job_for_paths(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        root_path: &str,
+        target_path: &str,
+        kinds: &[DfsNamespaceJobKind],
+    ) -> Result<bool> {
+        let Some(job) = self.running_cross_shard_namespace_job_for_paths(
+            file_system_id,
+            root_path,
+            target_path,
+            kinds,
+        )?
+        else {
+            return Ok(false);
+        };
+        self.drive_cross_shard_namespace_job(job)?;
+        Ok(true)
+    }
+
+    fn running_cross_shard_namespace_job_for_paths(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        root_path: &str,
+        target_path: &str,
+        kinds: &[DfsNamespaceJobKind],
+    ) -> Result<Option<DfsNamespaceJobRecord>> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(None);
+        };
+        let root_path = match normalize_posix_path(root_path) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        let target_path = match normalize_posix_path(target_path) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        let mut cursor = None;
+        loop {
+            let page = backend.list_namespace_jobs_page(
+                cursor.as_ref(),
+                POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE,
+            )?;
+            for job in page.jobs {
+                if job.file_system_id != *file_system_id
+                    || job.status != DfsNamespaceJobStatus::Running
+                    || !kinds.contains(&job.kind)
+                {
+                    continue;
+                }
+                let Ok(job_root_path) = normalize_posix_path(&job.root_path) else {
+                    continue;
+                };
+                if job_root_path != root_path {
+                    continue;
+                }
+                let Some(job_target_path) = job.target_path.as_ref() else {
+                    continue;
+                };
+                let Ok(job_target_path) = normalize_posix_path(job_target_path) else {
+                    continue;
+                };
+                if job_target_path == target_path {
+                    return Ok(Some(job));
+                }
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                return Ok(None);
+            };
+            cursor = Some(next_cursor);
+        }
+    }
+
     fn persist_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {
         if let Some(backend) = self.metadata_backend.as_mut() {
             backend.put_namespace_job(job)?;
@@ -4822,6 +5048,18 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             return Ok(());
         };
         self.touch_directory_modified(&parent)
+    }
+
+    pub fn posix_touch_directory_modified(&mut self, path: &str) -> Result<()> {
+        let path = normalize_posix_path(path)?;
+        let path = self.resolve_posix_path_distributed(&path, true)?;
+        if let Some(primary) = self.routed_namespace_primary_for_path(&path)? {
+            return self.route_namespace_operation(
+                primary,
+                DfsNamespaceOperation::TouchDirectoryModified { path },
+            );
+        }
+        self.touch_directory_modified(&path)
     }
 
     fn touch_directory_modified(&mut self, path: &str) -> Result<()> {

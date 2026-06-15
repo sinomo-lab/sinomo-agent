@@ -24,6 +24,12 @@
 #   SINOMO_TEST_PROJECT         compose project name   (default sinomo-dfs-test)
 #   SINOMO_TEST_FORMATION_WAIT  formation gate seconds (default 420)
 #   SINOMO_TEST_EXPECT_TIMEOUT  cross-node poll seconds (default 90)
+#   SINOMO_TEST_PERF_FILES      files per bulk-performance leg (default 64)
+#   SINOMO_TEST_PERF_WARMUP_FILES files in the no-threshold warmup leg (default 8)
+#   SINOMO_TEST_PERF_BYTES      bytes per bulk-performance file (default 4096)
+#   SINOMO_TEST_PERF_TIMEOUT    bulk write/read timeout seconds (default 120)
+#   SINOMO_TEST_PERF_MIN_WRITE_FILES_PER_SEC  min writer throughput (default 0.75)
+#   SINOMO_TEST_PERF_MIN_READ_FILES_PER_SEC   min cross-node read/convergence throughput (default 1)
 #   SINOMO_TEST_BUILD=1         force `cargo build -p sinomo` first
 #   SINOMO_TEST_ARTIFACTS       artifact dir (default target/cluster-test-artifacts/<run>)
 #
@@ -41,6 +47,12 @@ DFS_READY_WAIT="${SINOMO_TEST_DFS_READY_WAIT:-240}"
 EXPECT_TIMEOUT="${SINOMO_TEST_EXPECT_TIMEOUT:-90}"
 POLL_INTERVAL="${SINOMO_TEST_POLL_INTERVAL:-5}"
 EXPECTED_MAINS=6
+PERF_FILES="${SINOMO_TEST_PERF_FILES:-64}"
+PERF_WARMUP_FILES="${SINOMO_TEST_PERF_WARMUP_FILES:-8}"
+PERF_BYTES="${SINOMO_TEST_PERF_BYTES:-4096}"
+PERF_TIMEOUT="${SINOMO_TEST_PERF_TIMEOUT:-120}"
+PERF_MIN_WRITE_FILES_PER_SEC="${SINOMO_TEST_PERF_MIN_WRITE_FILES_PER_SEC:-0.75}"
+PERF_MIN_READ_FILES_PER_SEC="${SINOMO_TEST_PERF_MIN_READ_FILES_PER_SEC:-1}"
 NODES="node1 node2 node3 node4 node5 node6"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 ARTIFACTS="${SINOMO_TEST_ARTIFACTS:-$SINOMO_ROOT/target/cluster-test-artifacts/$RUN_ID}"
@@ -204,6 +216,46 @@ rename_across_prefixes() {
   && run_probe node3 cluster.dfs.remove --param "path=$dst"
 }
 
+bulk_performance() {
+  local warm="/services/cluster-tests/$RUN_ID/perf-warmup"
+  local a="/services/cluster-tests/$RUN_ID/perf-a"
+  local b="/services/cluster-tests/$RUN_ID/perf-b"
+  run_probe node2 cluster.dfs.bulk-write \
+    --param "base=$warm" \
+    --param "files=$PERF_WARMUP_FILES" \
+    --param "bytes=$PERF_BYTES" \
+    --param "timeout-seconds=$PERF_TIMEOUT" \
+  && run_probe node6 cluster.dfs.bulk-expect \
+    --param "base=$warm" \
+    --param "files=$PERF_WARMUP_FILES" \
+    --param "bytes=$PERF_BYTES" \
+    --param "timeout-seconds=$PERF_TIMEOUT" \
+  && run_probe node2 cluster.dfs.bulk-write \
+    --param "base=$a" \
+    --param "files=$PERF_FILES" \
+    --param "bytes=$PERF_BYTES" \
+    --param "timeout-seconds=$PERF_TIMEOUT" \
+    --param "min-files-per-second=$PERF_MIN_WRITE_FILES_PER_SEC" \
+  && run_probe node6 cluster.dfs.bulk-expect \
+    --param "base=$a" \
+    --param "files=$PERF_FILES" \
+    --param "bytes=$PERF_BYTES" \
+    --param "timeout-seconds=$PERF_TIMEOUT" \
+    --param "min-files-per-second=$PERF_MIN_READ_FILES_PER_SEC" \
+  && run_probe node5 cluster.dfs.bulk-write \
+    --param "base=$b" \
+    --param "files=$PERF_FILES" \
+    --param "bytes=$PERF_BYTES" \
+    --param "timeout-seconds=$PERF_TIMEOUT" \
+    --param "min-files-per-second=$PERF_MIN_WRITE_FILES_PER_SEC" \
+  && run_probe node1 cluster.dfs.bulk-expect \
+    --param "base=$b" \
+    --param "files=$PERF_FILES" \
+    --param "bytes=$PERF_BYTES" \
+    --param "timeout-seconds=$PERF_TIMEOUT" \
+    --param "min-files-per-second=$PERF_MIN_READ_FILES_PER_SEC"
+}
+
 restart_durability() {
   local path="/services/cluster-tests/$RUN_ID/durable.txt"
   local payload="durable $RUN_ID"
@@ -295,6 +347,7 @@ scenario "invariants-baseline"  invariants_sweep
 scenario "read-your-write"      read_your_write
 scenario "cross-node"           cross_node
 scenario "rename-across-prefixes" rename_across_prefixes
+scenario "bulk-performance"     bulk_performance
 scenario "restart-durability"   restart_durability
 scenario "invariants-final"     invariants_sweep
 

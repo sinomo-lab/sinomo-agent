@@ -1,5 +1,6 @@
 //! Durable local content storage for DFS blobs.
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use sinomo_storage::durable_file;
@@ -13,6 +14,16 @@ use thiserror::Error;
 
 const HASH_PREFIX: &str = "blake3:";
 const BLAKE3_HEX_LEN: usize = 64;
+const CONTENT_STORE_STATS_VERSION: u32 = 1;
+const CONTENT_STORE_STATS_FILE: &str = "stats.sobj";
+const CONTENT_STORE_STATS_LOCK_FILE: &str = "stats.lock";
+const PACKED_BLOB_INDEX_VERSION: u32 = 1;
+const PACKED_BLOB_DIR: &str = "blob-packs";
+const PACKED_BLOB_SEGMENT_DIR: &str = "segments";
+const PACKED_BLOB_INDEX_FILE: &str = "index.sobj";
+const PACKED_BLOB_LOCK_FILE: &str = "pack.lock";
+const PACKED_BLOB_SMALL_LIMIT_BYTES: u64 = 16 * 1024;
+const PACKED_BLOB_SEGMENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ContentStoreError {
@@ -107,6 +118,27 @@ pub struct ContentStoreStats {
     pub staging_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ContentStoreStatsSnapshot {
+    version: u32,
+    stats: ContentStoreStats,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct PackedBlobIndex {
+    version: u32,
+    next_segment_id: u64,
+    #[serde(default)]
+    entries: BTreeMap<String, PackedBlobLocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PackedBlobLocation {
+    segment_id: String,
+    offset: u64,
+    size_bytes: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentStoreScrubReport {
     pub stats: ContentStoreStats,
@@ -162,6 +194,13 @@ pub enum ContentStoreScrubIssue {
     },
     OrphanBlob {
         content_hash: String,
+        path: PathBuf,
+        size_bytes: u64,
+    },
+    OrphanPackedBlob {
+        content_hash: String,
+        segment_id: String,
+        offset: u64,
         path: PathBuf,
         size_bytes: u64,
     },
@@ -328,6 +367,33 @@ struct ScrubbedBlob {
 }
 
 #[derive(Debug, Clone)]
+enum OrphanBlobGcCandidate {
+    Loose {
+        path: PathBuf,
+        size_bytes: u64,
+    },
+    Packed {
+        content_hash: String,
+        path: PathBuf,
+        size_bytes: u64,
+    },
+}
+
+impl OrphanBlobGcCandidate {
+    fn path(&self) -> PathBuf {
+        match self {
+            Self::Loose { path, .. } | Self::Packed { path, .. } => path.clone(),
+        }
+    }
+
+    fn size_bytes(&self) -> u64 {
+        match self {
+            Self::Loose { size_bytes, .. } | Self::Packed { size_bytes, .. } => *size_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct VersionManifestEntry {
     version: String,
     path: PathBuf,
@@ -336,6 +402,7 @@ struct VersionManifestEntry {
     modified_nanos: u64,
     manifest_bytes: u64,
     logical_bytes: u64,
+    extent_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -346,10 +413,92 @@ struct ContentStoreQuotaDelta {
     staging_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ContentStoreStatsDelta {
+    blob_count: i128,
+    blob_bytes: i128,
+    manifest_count: i128,
+    manifest_bytes: i128,
+    logical_object_bytes: i128,
+    extent_manifest_count: i128,
+    extent_count: i128,
+    staging_file_count: i128,
+    staging_bytes: i128,
+}
+
+impl ContentStoreStatsDelta {
+    fn blob_file_change(before_len: Option<u64>, after_len: Option<u64>) -> Self {
+        Self {
+            blob_count: file_count_delta(before_len, after_len),
+            blob_bytes: file_bytes_delta(before_len, after_len),
+            ..Self::default()
+        }
+    }
+
+    fn staging_file_change(before_len: Option<u64>, after_len: Option<u64>) -> Self {
+        Self {
+            staging_file_count: file_count_delta(before_len, after_len),
+            staging_bytes: file_bytes_delta(before_len, after_len),
+            ..Self::default()
+        }
+    }
+
+    fn manifest_created(manifest: &ContentManifest, manifest_bytes: u64) -> Self {
+        let extent_manifest_count = if manifest.extents.is_empty() { 0 } else { 1 };
+        Self {
+            manifest_count: 1,
+            manifest_bytes: i128::from(manifest_bytes),
+            logical_object_bytes: i128::from(manifest.size_bytes),
+            extent_manifest_count,
+            extent_count: manifest.extents.len() as i128,
+            ..Self::default()
+        }
+    }
+
+    fn manifest_deleted(entry: &VersionManifestEntry) -> Self {
+        Self {
+            manifest_count: -1,
+            manifest_bytes: -i128::from(entry.manifest_bytes),
+            logical_object_bytes: -i128::from(entry.logical_bytes),
+            extent_manifest_count: if entry.extent_count == 0 { 0 } else { -1 },
+            extent_count: -(entry.extent_count as i128),
+            ..Self::default()
+        }
+    }
+
+    fn apply_to(self, stats: &mut ContentStoreStats) {
+        stats.blob_count = apply_signed_delta(stats.blob_count, self.blob_count);
+        stats.blob_bytes = apply_signed_delta(stats.blob_bytes, self.blob_bytes);
+        stats.manifest_count = apply_signed_delta(stats.manifest_count, self.manifest_count);
+        stats.manifest_bytes = apply_signed_delta(stats.manifest_bytes, self.manifest_bytes);
+        stats.logical_object_bytes =
+            apply_signed_delta(stats.logical_object_bytes, self.logical_object_bytes);
+        stats.extent_manifest_count =
+            apply_signed_delta(stats.extent_manifest_count, self.extent_manifest_count);
+        stats.extent_count = apply_signed_delta(stats.extent_count, self.extent_count);
+        stats.staging_file_count =
+            apply_signed_delta(stats.staging_file_count, self.staging_file_count);
+        stats.staging_bytes = apply_signed_delta(stats.staging_bytes, self.staging_bytes);
+    }
+
+    fn is_zero(self) -> bool {
+        self.blob_count == 0
+            && self.blob_bytes == 0
+            && self.manifest_count == 0
+            && self.manifest_bytes == 0
+            && self.logical_object_bytes == 0
+            && self.extent_manifest_count == 0
+            && self.extent_count == 0
+            && self.staging_file_count == 0
+            && self.staging_bytes == 0
+    }
+}
+
 #[derive(Debug)]
 pub struct BlobReader {
     file: fs::File,
     size_bytes: u64,
+    remaining_bytes: u64,
 }
 
 impl BlobReader {
@@ -360,7 +509,15 @@ impl BlobReader {
 
 impl Read for BlobReader {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.file.read(buffer)
+        if self.remaining_bytes == 0 || buffer.is_empty() {
+            return Ok(0);
+        }
+        let limit = buffer
+            .len()
+            .min(usize::try_from(self.remaining_bytes).unwrap_or(usize::MAX));
+        let read = self.file.read(&mut buffer[..limit])?;
+        self.remaining_bytes = self.remaining_bytes.saturating_sub(read as u64);
+        Ok(read)
     }
 }
 
@@ -505,6 +662,7 @@ pub struct ChunkedBlobAssembler {
     received_count: u32,
     path: PathBuf,
     file: fs::File,
+    store: LocalContentStore,
     cleanup_on_drop: bool,
 }
 
@@ -608,7 +766,7 @@ impl ChunkedBlobAssembler {
 impl Drop for ChunkedBlobAssembler {
     fn drop(&mut self) {
         if self.cleanup_on_drop {
-            let _ = fs::remove_file(&self.path);
+            let _ = self.store.remove_tracked_staging_file_if_exists(&self.path);
         }
     }
 }
@@ -617,6 +775,7 @@ impl LocalContentStore {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         create_dir_all(root.join("blobs"))?;
+        create_dir_all(root.join(PACKED_BLOB_DIR).join(PACKED_BLOB_SEGMENT_DIR))?;
         create_dir_all(root.join("objects"))?;
         create_dir_all(root.join("staging"))?;
         Ok(Self { root, quota: None })
@@ -649,7 +808,7 @@ impl LocalContentStore {
             staging_bytes: projected_file_growth(&staging_path, bytes.len() as u64)?,
             ..ContentStoreQuotaDelta::default()
         })?;
-        write_file_atomic(&staging_path, bytes)?;
+        self.write_tracked_staging_bytes(&staging_path, bytes)?;
         Ok(hash)
     }
 
@@ -665,7 +824,7 @@ impl LocalContentStore {
         }
 
         let manifest = self.write_object_version_from_file(object_id, version, &staging_path)?;
-        remove_file(&staging_path)?;
+        self.remove_tracked_staging_file(&staging_path)?;
         Ok(manifest)
     }
 
@@ -690,12 +849,16 @@ impl LocalContentStore {
             remove_file_if_exists(&tmp_path).ok();
             return Err(error);
         }
-        if let Err(error) = self.ensure_quota_delta(ContentStoreQuotaDelta::default()) {
+        if let Err(error) = self.track_staging_file_created(&tmp_path) {
             remove_file_if_exists(&tmp_path).ok();
             return Err(error);
         }
+        if let Err(error) = self.ensure_quota_delta(ContentStoreQuotaDelta::default()) {
+            self.remove_tracked_staging_file_if_exists(&tmp_path).ok();
+            return Err(error);
+        }
         let result = self.write_object_version_from_file(object_id, version, &tmp_path);
-        remove_file_if_exists(&tmp_path).ok();
+        self.remove_tracked_staging_file_if_exists(&tmp_path).ok();
         result
     }
 
@@ -710,6 +873,11 @@ impl LocalContentStore {
     ) -> Result<ChunkedBlobAssembler> {
         validate_chunked_object_shape(total_size_bytes, total_chunks, chunk_size_bytes)?;
         hash_hex(expected_hash)?;
+        let received_len = usize::try_from(total_chunks).map_err(|_| {
+            ContentStoreError::InvalidChunkedContent {
+                message: format!("chunk count is too large for this platform: {total_chunks}"),
+            }
+        })?;
         let staging_anchor = self.root.join("staging").join("chunked-object-version");
         let path = temporary_path_for(&staging_anchor);
         self.ensure_quota_delta(ContentStoreQuotaDelta {
@@ -733,11 +901,10 @@ impl LocalContentStore {
                 path: path.clone(),
                 source,
             })?;
-        let received_len = usize::try_from(total_chunks).map_err(|_| {
-            ContentStoreError::InvalidChunkedContent {
-                message: format!("chunk count is too large for this platform: {total_chunks}"),
-            }
-        })?;
+        if let Err(error) = self.track_staging_file_created(&path) {
+            remove_file_if_exists(&path).ok();
+            return Err(error);
+        }
         Ok(ChunkedBlobAssembler {
             object_id: object_id.to_owned(),
             version: version.to_owned(),
@@ -749,6 +916,7 @@ impl LocalContentStore {
             received_count: 0,
             path,
             file,
+            store: self.clone(),
             cleanup_on_drop: true,
         })
     }
@@ -787,12 +955,14 @@ impl LocalContentStore {
                 actual_hash,
             });
         }
-        let manifest = self.write_object_version_from_file(
+        let manifest = self.write_object_version_from_verified_file(
             &assembler.object_id,
             &assembler.version,
             &assembler.path,
+            actual_hash,
+            actual_size_bytes,
         )?;
-        remove_file_if_exists(&assembler.path)?;
+        self.remove_tracked_staging_file_if_exists(&assembler.path)?;
         assembler.cleanup_on_drop = false;
         Ok(manifest)
     }
@@ -842,14 +1012,23 @@ impl LocalContentStore {
                 &assembler.path,
             )?
             .manifest;
-        remove_file_if_exists(&assembler.path)?;
+        self.remove_tracked_staging_file_if_exists(&assembler.path)?;
         assembler.cleanup_on_drop = false;
         Ok(manifest)
     }
 
     pub fn read_blob(&self, hash: &str) -> Result<Vec<u8>> {
-        let path = self.blob_path(hash)?;
-        let bytes = read_file(&path)?;
+        let mut reader = self.open_blob_reader(hash)?;
+        let mut bytes =
+            Vec::with_capacity(usize::try_from(reader.size_bytes()).unwrap_or(usize::MAX));
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|source| ContentStoreError::Io {
+                path: self
+                    .blob_path(hash)
+                    .unwrap_or_else(|_| self.root.join("blobs")),
+                source,
+            })?;
         ensure_bytes_match_hash(hash, &bytes)?;
         Ok(bytes)
     }
@@ -871,16 +1050,39 @@ impl LocalContentStore {
 
     pub fn open_blob_reader(&self, hash: &str) -> Result<BlobReader> {
         let path = self.blob_path(hash)?;
-        let (actual_hash, size_bytes) = file_content_hash_and_size(&path)?;
-        if actual_hash != hash {
-            return Err(ContentStoreError::BlobHashMismatch {
-                expected: hash.to_owned(),
-                actual: actual_hash,
+        if path.is_file() {
+            let (actual_hash, size_bytes) = file_content_hash_and_size(&path)?;
+            if actual_hash != hash {
+                return Err(ContentStoreError::BlobHashMismatch {
+                    expected: hash.to_owned(),
+                    actual: actual_hash,
+                });
+            }
+            let file =
+                fs::File::open(&path).map_err(|source| ContentStoreError::Io { path, source })?;
+            return Ok(BlobReader {
+                file,
+                size_bytes,
+                remaining_bytes: size_bytes,
             });
         }
-        let file =
-            fs::File::open(&path).map_err(|source| ContentStoreError::Io { path, source })?;
-        Ok(BlobReader { file, size_bytes })
+        let Some(location) = self.packed_blob_location(hash)? else {
+            return Err(ContentStoreError::Io {
+                path,
+                source: io::Error::new(io::ErrorKind::NotFound, "blob not found"),
+            });
+        };
+        let mut reader = self.open_packed_blob_reader(&location, 0, usize::MAX)?;
+        let mut bytes =
+            Vec::with_capacity(usize::try_from(reader.size_bytes()).unwrap_or(usize::MAX));
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|source| ContentStoreError::Io {
+                path: self.packed_blob_segment_path(&location.segment_id),
+                source,
+            })?;
+        ensure_bytes_match_hash(hash, &bytes)?;
+        self.open_packed_blob_reader(&location, 0, usize::MAX)
     }
 
     /// Opens a blob for streaming using a single read pass.
@@ -893,15 +1095,28 @@ impl LocalContentStore {
     /// pass would simply double the I/O for large blobs.
     pub fn open_blob_stream(&self, hash: &str) -> Result<BlobReader> {
         let path = self.blob_path(hash)?;
-        let file = fs::File::open(&path).map_err(|source| ContentStoreError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        let size_bytes = file
-            .metadata()
-            .map_err(|source| ContentStoreError::Io { path, source })?
-            .len();
-        Ok(BlobReader { file, size_bytes })
+        if path.is_file() {
+            let file = fs::File::open(&path).map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            let size_bytes = file
+                .metadata()
+                .map_err(|source| ContentStoreError::Io { path, source })?
+                .len();
+            return Ok(BlobReader {
+                file,
+                size_bytes,
+                remaining_bytes: size_bytes,
+            });
+        }
+        let Some(location) = self.packed_blob_location(hash)? else {
+            return Err(ContentStoreError::Io {
+                path,
+                source: io::Error::new(io::ErrorKind::NotFound, "blob not found"),
+            });
+        };
+        self.open_packed_blob_reader(&location, 0, usize::MAX)
     }
 
     /// Opens a bounded range of a content-addressed blob for streaming.
@@ -918,6 +1133,15 @@ impl LocalContentStore {
         max_bytes: usize,
     ) -> Result<BlobRangeReader> {
         let path = self.blob_path(hash)?;
+        if !path.is_file() {
+            let Some(location) = self.packed_blob_location(hash)? else {
+                return Err(ContentStoreError::Io {
+                    path,
+                    source: io::Error::new(io::ErrorKind::NotFound, "blob not found"),
+                });
+            };
+            return self.open_packed_blob_range_reader(&location, offset, max_bytes);
+        }
         let mut file = fs::File::open(&path).map_err(|source| ContentStoreError::Io {
             path: path.clone(),
             source,
@@ -1129,7 +1353,17 @@ impl LocalContentStore {
     }
 
     pub fn stats(&self) -> Result<ContentStoreStats> {
-        let (blob_count, blob_bytes) = recursive_file_count_and_bytes(&self.root.join("blobs"))?;
+        let _lock = self.lock_stats_snapshot()?;
+        if let Some(stats) = self.read_stats_snapshot_unlocked()? {
+            return Ok(stats);
+        }
+        let stats = self.scan_stats()?;
+        self.write_stats_snapshot_unlocked(&stats)?;
+        Ok(stats)
+    }
+
+    fn scan_stats(&self) -> Result<ContentStoreStats> {
+        let (blob_count, blob_bytes) = self.scan_blob_stats()?;
         let (staging_file_count, staging_bytes) =
             recursive_file_count_and_bytes(&self.root.join("staging"))?;
         let mut stats = ContentStoreStats {
@@ -1144,7 +1378,7 @@ impl LocalContentStore {
     }
 
     pub fn scrub(&self) -> Result<ContentStoreScrubReport> {
-        let (blob_count, blob_bytes) = recursive_file_count_and_bytes(&self.root.join("blobs"))?;
+        let (blob_count, blob_bytes) = self.scan_blob_stats()?;
         let (staging_file_count, staging_bytes) =
             recursive_file_count_and_bytes(&self.root.join("staging"))?;
         let mut report = ContentStoreScrubReport {
@@ -1166,12 +1400,14 @@ impl LocalContentStore {
             &mut checked_blobs,
         )?;
         self.collect_orphan_blob_issues(&self.root.join("blobs"), &referenced_blobs, &mut report)?;
+        self.collect_orphan_packed_blob_issues(&referenced_blobs, &mut report)?;
         report.referenced_blob_count = referenced_blobs.len() as u64;
         report.referenced_blob_bytes = referenced_blobs
             .iter()
             .filter_map(|hash| checked_blobs.get(hash))
             .map(|blob| blob.size_bytes)
             .fold(0_u64, |total, size| total.saturating_add(size));
+        self.replace_stats_snapshot(&report.stats)?;
         Ok(report)
     }
 
@@ -1180,7 +1416,13 @@ impl LocalContentStore {
         let blocked_by_scrub_issue_count = scrub
             .issues
             .iter()
-            .filter(|issue| !matches!(issue, ContentStoreScrubIssue::OrphanBlob { .. }))
+            .filter(|issue| {
+                !matches!(
+                    issue,
+                    ContentStoreScrubIssue::OrphanBlob { .. }
+                        | ContentStoreScrubIssue::OrphanPackedBlob { .. }
+                )
+            })
             .count() as u64;
         let mut report = ContentStoreGcReport {
             scrub,
@@ -1201,14 +1443,27 @@ impl LocalContentStore {
             .iter()
             .filter_map(|issue| match issue {
                 ContentStoreScrubIssue::OrphanBlob {
+                    path, size_bytes, ..
+                } => Some(OrphanBlobGcCandidate::Loose {
+                    path: path.clone(),
+                    size_bytes: *size_bytes,
+                }),
+                ContentStoreScrubIssue::OrphanPackedBlob {
                     content_hash,
                     path,
                     size_bytes,
-                } => Some((content_hash.clone(), path.clone(), *size_bytes)),
+                    ..
+                } => Some(OrphanBlobGcCandidate::Packed {
+                    content_hash: content_hash.clone(),
+                    path: path.clone(),
+                    size_bytes: *size_bytes,
+                }),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        for (_content_hash, path, size_bytes) in orphan_blobs {
+        for orphan in orphan_blobs {
+            let path = orphan.path();
+            let size_bytes = orphan.size_bytes();
             let age_nanos = file_age_nanos(&path, now)?;
             if age_nanos < options.min_orphan_age_nanos {
                 report.retained_young_orphan_count =
@@ -1236,10 +1491,30 @@ impl LocalContentStore {
             if options.dry_run {
                 continue;
             }
-            if remove_file_if_exists_and_sync_parent(&path)? {
-                report.deleted_orphan_count = report.deleted_orphan_count.saturating_add(1);
-                report.deleted_orphan_bytes =
-                    report.deleted_orphan_bytes.saturating_add(size_bytes);
+            match orphan {
+                OrphanBlobGcCandidate::Loose { path, .. } => {
+                    let before_len = file_len_if_exists(&path)?;
+                    if remove_file_if_exists_and_sync_parent(&path)? {
+                        report.deleted_orphan_count = report.deleted_orphan_count.saturating_add(1);
+                        report.deleted_orphan_bytes =
+                            report.deleted_orphan_bytes.saturating_add(size_bytes);
+                        self.apply_stats_delta(ContentStoreStatsDelta::blob_file_change(
+                            before_len, None,
+                        ))?;
+                    }
+                }
+                OrphanBlobGcCandidate::Packed { content_hash, .. } => {
+                    if self.remove_packed_blob_index_entry(&content_hash)? {
+                        report.deleted_orphan_count = report.deleted_orphan_count.saturating_add(1);
+                        report.deleted_orphan_bytes =
+                            report.deleted_orphan_bytes.saturating_add(size_bytes);
+                        self.apply_stats_delta(ContentStoreStatsDelta {
+                            blob_count: -1,
+                            blob_bytes: -i128::from(size_bytes),
+                            ..ContentStoreStatsDelta::default()
+                        })?;
+                    }
+                }
             }
         }
         Ok(report)
@@ -1253,7 +1528,13 @@ impl LocalContentStore {
         let blocked_by_scrub_issue_count = scrub
             .issues
             .iter()
-            .filter(|issue| !matches!(issue, ContentStoreScrubIssue::OrphanBlob { .. }))
+            .filter(|issue| {
+                !matches!(
+                    issue,
+                    ContentStoreScrubIssue::OrphanBlob { .. }
+                        | ContentStoreScrubIssue::OrphanPackedBlob { .. }
+                )
+            })
             .count() as u64;
         let keep_latest_versions_per_object = options.keep_latest_versions_per_object.max(1);
         let mut report = ContentStoreVersionGcReport {
@@ -1338,6 +1619,7 @@ impl LocalContentStore {
                     report.deleted_manifest_bytes = report
                         .deleted_manifest_bytes
                         .saturating_add(entry.manifest_bytes);
+                    self.apply_stats_delta(ContentStoreStatsDelta::manifest_deleted(entry))?;
                     remove_empty_dir_if_exists_and_sync_parent(&entry.version_dir)?;
                     remove_empty_dir_if_exists_and_sync_parent(&entry.object_dir)?;
                 }
@@ -1348,10 +1630,22 @@ impl LocalContentStore {
 
     pub fn has_blob(&self, hash: &str) -> Result<bool> {
         let path = self.blob_path(hash)?;
-        if !path.is_file() {
-            return Ok(false);
+        if path.is_file() {
+            return Ok(file_content_hash(&path).is_ok_and(|actual| actual == hash));
         }
-        Ok(file_content_hash(&path).is_ok_and(|actual| actual == hash))
+        let Some(location) = self.packed_blob_location(hash)? else {
+            return Ok(false);
+        };
+        let mut reader = self.open_packed_blob_reader(&location, 0, usize::MAX)?;
+        let mut bytes =
+            Vec::with_capacity(usize::try_from(reader.size_bytes()).unwrap_or(usize::MAX));
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|source| ContentStoreError::Io {
+                path: self.packed_blob_segment_path(&location.segment_id),
+                source,
+            })?;
+        Ok(content_hash(&bytes) == hash)
     }
 
     pub fn put_object_version_patch(
@@ -1456,8 +1750,12 @@ impl LocalContentStore {
             remove_file_if_exists(&tmp_path).ok();
             return Err(error);
         }
-        if let Err(error) = self.ensure_quota_delta(ContentStoreQuotaDelta::default()) {
+        if let Err(error) = self.track_staging_file_created(&tmp_path) {
             remove_file_if_exists(&tmp_path).ok();
+            return Err(error);
+        }
+        if let Err(error) = self.ensure_quota_delta(ContentStoreQuotaDelta::default()) {
+            self.remove_tracked_staging_file_if_exists(&tmp_path).ok();
             return Err(error);
         }
         let result = self.put_object_version_patch_from_file(
@@ -1467,7 +1765,7 @@ impl LocalContentStore {
             offset,
             &tmp_path,
         );
-        remove_file_if_exists(&tmp_path).ok();
+        self.remove_tracked_staging_file_if_exists(&tmp_path).ok();
         result
     }
 
@@ -1497,7 +1795,7 @@ impl LocalContentStore {
                 blob_bytes: projected_file_growth(&blob_path, patch_size)?,
                 ..ContentStoreQuotaDelta::default()
             })?;
-            publish_file_as_blob(source_path, &blob_path, &patch_hash)?;
+            self.publish_tracked_file_as_blob(&patch_hash, source_path, &blob_path, &patch_hash)?;
         }
         self.put_object_version_patch_from_blob(
             object_id,
@@ -1655,7 +1953,7 @@ impl LocalContentStore {
                     blob_bytes: projected_file_growth(&blob_path, bytes.len() as u64)?,
                     ..ContentStoreQuotaDelta::default()
                 })?;
-                write_file_atomic(&blob_path, bytes)?;
+                self.write_tracked_blob_bytes(&hash, &blob_path, bytes)?;
             }
             return Ok(existing);
         }
@@ -1681,7 +1979,7 @@ impl LocalContentStore {
             ..ContentStoreQuotaDelta::default()
         })?;
         if blob_needs_write {
-            write_file_atomic(&blob_path, bytes)?;
+            self.write_tracked_blob_bytes(&manifest.content_hash, &blob_path, bytes)?;
         }
 
         if let Err(error) = write_file_create_new_atomic(&manifest_path, &manifest_bytes) {
@@ -1701,6 +1999,10 @@ impl LocalContentStore {
             }
             return Err(error);
         }
+        self.apply_stats_delta(ContentStoreStatsDelta::manifest_created(
+            &manifest,
+            manifest_bytes.len() as u64,
+        ))?;
         Ok(manifest)
     }
 
@@ -1711,6 +2013,23 @@ impl LocalContentStore {
         source_path: &Path,
     ) -> Result<ContentManifest> {
         let (hash, size_bytes) = file_content_hash_and_size(source_path)?;
+        self.write_object_version_from_verified_file(
+            object_id,
+            version,
+            source_path,
+            hash,
+            size_bytes,
+        )
+    }
+
+    fn write_object_version_from_verified_file(
+        &self,
+        object_id: &str,
+        version: &str,
+        source_path: &Path,
+        hash: String,
+        size_bytes: u64,
+    ) -> Result<ContentManifest> {
         let manifest_path = self.manifest_path(object_id, version);
         if manifest_path.is_file() {
             let existing = decode_manifest(&read_file(&manifest_path)?)?;
@@ -1728,7 +2047,7 @@ impl LocalContentStore {
                     blob_bytes: projected_file_growth(&blob_path, size_bytes)?,
                     ..ContentStoreQuotaDelta::default()
                 })?;
-                publish_file_as_blob(source_path, &blob_path, &hash)?;
+                self.publish_tracked_file_as_blob(&hash, source_path, &blob_path, &hash)?;
             }
             return Ok(existing);
         }
@@ -1756,7 +2075,12 @@ impl LocalContentStore {
         // The quota check needs to know whether this publish grows durable blob
         // storage, so we preflight the content-addressed blob before linking it.
         if blob_needs_publish {
-            publish_file_as_blob(source_path, &blob_path, &manifest.content_hash)?;
+            self.publish_tracked_file_as_blob(
+                &manifest.content_hash,
+                source_path,
+                &blob_path,
+                &manifest.content_hash,
+            )?;
         }
         if let Err(error) = write_file_create_new_atomic(&manifest_path, &manifest_bytes) {
             if let ContentStoreError::Io { source, .. } = &error
@@ -1775,6 +2099,10 @@ impl LocalContentStore {
             }
             return Err(error);
         }
+        self.apply_stats_delta(ContentStoreStatsDelta::manifest_created(
+            &manifest,
+            manifest_bytes.len() as u64,
+        ))?;
         Ok(manifest)
     }
 
@@ -1808,6 +2136,460 @@ impl LocalContentStore {
             }
         }
         Ok(())
+    }
+
+    fn scan_blob_stats(&self) -> Result<(u64, u64)> {
+        let (loose_count, loose_bytes) = recursive_file_count_and_bytes(&self.root.join("blobs"))?;
+        let index = self.read_packed_blob_index_unlocked()?;
+        let packed_count = index.entries.len() as u64;
+        let packed_bytes = index
+            .entries
+            .values()
+            .map(|location| location.size_bytes)
+            .fold(0_u64, |total, size| total.saturating_add(size));
+        Ok((
+            loose_count.saturating_add(packed_count),
+            loose_bytes.saturating_add(packed_bytes),
+        ))
+    }
+
+    fn lock_stats_snapshot(&self) -> Result<fs::File> {
+        let path = self.root.join(CONTENT_STORE_STATS_LOCK_FILE);
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.lock_exclusive()
+            .map_err(|source| ContentStoreError::Io { path, source })?;
+        Ok(file)
+    }
+
+    fn read_stats_snapshot_unlocked(&self) -> Result<Option<ContentStoreStats>> {
+        let path = self.stats_snapshot_path();
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(ContentStoreError::Io {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        };
+        let snapshot = match decode_stats_snapshot(&bytes) {
+            Ok(snapshot) if snapshot.version == CONTENT_STORE_STATS_VERSION => snapshot,
+            Ok(_) | Err(_) => return Ok(None),
+        };
+        Ok(Some(snapshot.stats))
+    }
+
+    fn write_stats_snapshot_unlocked(&self, stats: &ContentStoreStats) -> Result<()> {
+        let snapshot = ContentStoreStatsSnapshot {
+            version: CONTENT_STORE_STATS_VERSION,
+            stats: stats.clone(),
+        };
+        let bytes = encode_stats_snapshot(&snapshot)?;
+        write_file_atomic(&self.stats_snapshot_path(), &bytes)
+    }
+
+    fn replace_stats_snapshot(&self, stats: &ContentStoreStats) -> Result<()> {
+        let _lock = self.lock_stats_snapshot()?;
+        self.write_stats_snapshot_unlocked(stats)
+    }
+
+    fn apply_stats_delta(&self, delta: ContentStoreStatsDelta) -> Result<()> {
+        if delta.is_zero() {
+            return Ok(());
+        }
+        let _lock = self.lock_stats_snapshot()?;
+        if let Some(mut stats) = self.read_stats_snapshot_unlocked()? {
+            delta.apply_to(&mut stats);
+            self.write_stats_snapshot_unlocked(&stats)?;
+            return Ok(());
+        }
+        let stats = self.scan_stats()?;
+        self.write_stats_snapshot_unlocked(&stats)
+    }
+
+    fn write_tracked_blob_bytes(&self, hash: &str, blob_path: &Path, bytes: &[u8]) -> Result<()> {
+        if bytes.len() as u64 <= PACKED_BLOB_SMALL_LIMIT_BYTES {
+            if self.write_packed_blob(hash, bytes)? {
+                self.apply_stats_delta(ContentStoreStatsDelta {
+                    blob_count: 1,
+                    blob_bytes: bytes.len() as i128,
+                    ..ContentStoreStatsDelta::default()
+                })?;
+            }
+            if blob_path.is_file()
+                && !file_content_hash(blob_path).is_ok_and(|actual| actual == hash)
+            {
+                remove_file_if_exists(blob_path)?;
+            }
+            return Ok(());
+        }
+        let before_len = file_len_if_exists(blob_path)?;
+        write_file_atomic(blob_path, bytes)?;
+        let after_len = file_len_if_exists(blob_path)?;
+        self.apply_stats_delta(ContentStoreStatsDelta::blob_file_change(
+            before_len, after_len,
+        ))
+    }
+
+    fn publish_tracked_file_as_blob(
+        &self,
+        hash: &str,
+        source_path: &Path,
+        blob_path: &Path,
+        expected_hash: &str,
+    ) -> Result<()> {
+        let source_len = file_len_if_exists(source_path)?.unwrap_or(0);
+        if source_len <= PACKED_BLOB_SMALL_LIMIT_BYTES {
+            let bytes = read_file(source_path)?;
+            ensure_bytes_match_hash(hash, &bytes)?;
+            if hash != expected_hash {
+                return Err(ContentStoreError::BlobHashMismatch {
+                    expected: expected_hash.to_owned(),
+                    actual: hash.to_owned(),
+                });
+            }
+            if self.write_packed_blob(hash, &bytes)? {
+                self.apply_stats_delta(ContentStoreStatsDelta {
+                    blob_count: 1,
+                    blob_bytes: bytes.len() as i128,
+                    ..ContentStoreStatsDelta::default()
+                })?;
+            }
+            if blob_path.is_file()
+                && !file_content_hash(blob_path).is_ok_and(|actual| actual == hash)
+            {
+                remove_file_if_exists(blob_path)?;
+            }
+            return Ok(());
+        }
+        let before_len = file_len_if_exists(blob_path)?;
+        publish_file_as_blob(source_path, blob_path, expected_hash)?;
+        let after_len = file_len_if_exists(blob_path)?;
+        self.apply_stats_delta(ContentStoreStatsDelta::blob_file_change(
+            before_len, after_len,
+        ))
+    }
+
+    fn write_tracked_staging_bytes(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        let before_len = file_len_if_exists(path)?;
+        write_file_atomic(path, bytes)?;
+        let after_len = file_len_if_exists(path)?;
+        self.apply_stats_delta(ContentStoreStatsDelta::staging_file_change(
+            before_len, after_len,
+        ))
+    }
+
+    fn track_staging_file_created(&self, path: &Path) -> Result<()> {
+        self.apply_stats_delta(ContentStoreStatsDelta::staging_file_change(
+            None,
+            file_len_if_exists(path)?,
+        ))
+    }
+
+    fn remove_tracked_staging_file(&self, path: &Path) -> Result<()> {
+        let before_len = file_len_if_exists(path)?;
+        remove_file(path)?;
+        let after_len = file_len_if_exists(path)?;
+        self.apply_stats_delta(ContentStoreStatsDelta::staging_file_change(
+            before_len, after_len,
+        ))
+    }
+
+    fn remove_tracked_staging_file_if_exists(&self, path: &Path) -> Result<()> {
+        let before_len = file_len_if_exists(path)?;
+        remove_file_if_exists(path)?;
+        let after_len = file_len_if_exists(path)?;
+        self.apply_stats_delta(ContentStoreStatsDelta::staging_file_change(
+            before_len, after_len,
+        ))
+    }
+
+    fn stats_snapshot_path(&self) -> PathBuf {
+        self.root.join(CONTENT_STORE_STATS_FILE)
+    }
+
+    fn lock_packed_blobs(&self) -> Result<fs::File> {
+        let path = self.root.join(PACKED_BLOB_DIR).join(PACKED_BLOB_LOCK_FILE);
+        if let Some(parent) = path.parent() {
+            create_dir_all(parent.to_owned())?;
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.lock_exclusive()
+            .map_err(|source| ContentStoreError::Io { path, source })?;
+        Ok(file)
+    }
+
+    fn read_packed_blob_index_unlocked(&self) -> Result<PackedBlobIndex> {
+        let path = self.packed_blob_index_path();
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                return Ok(PackedBlobIndex {
+                    version: PACKED_BLOB_INDEX_VERSION,
+                    next_segment_id: 1,
+                    entries: BTreeMap::new(),
+                });
+            }
+            Err(source) => {
+                return Err(ContentStoreError::Io {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        };
+        let mut index = decode_packed_blob_index(&bytes)?;
+        if index.version != PACKED_BLOB_INDEX_VERSION {
+            return Err(ContentStoreError::Serde(format!(
+                "unsupported packed blob index version: {}",
+                index.version
+            )));
+        }
+        if index.next_segment_id == 0 {
+            index.next_segment_id = 1;
+        }
+        Ok(index)
+    }
+
+    fn write_packed_blob_index_unlocked(&self, index: &PackedBlobIndex) -> Result<()> {
+        let bytes = encode_packed_blob_index(index)?;
+        write_file_atomic(&self.packed_blob_index_path(), &bytes)
+    }
+
+    fn packed_blob_location(&self, hash: &str) -> Result<Option<PackedBlobLocation>> {
+        hash_hex(hash)?;
+        let _lock = self.lock_packed_blobs()?;
+        let index = self.read_packed_blob_index_unlocked()?;
+        Ok(index.entries.get(hash).cloned())
+    }
+
+    fn write_packed_blob(&self, hash: &str, bytes: &[u8]) -> Result<bool> {
+        hash_hex(hash)?;
+        let _lock = self.lock_packed_blobs()?;
+        let mut index = self.read_packed_blob_index_unlocked()?;
+        if let Some(location) = index.entries.get(hash)
+            && self.packed_blob_location_readable(location)?
+        {
+            return Ok(false);
+        }
+
+        let mut segment_id = if index.next_segment_id == 1 {
+            "0000000000000000.pack".to_string()
+        } else {
+            format!("{:016x}.pack", index.next_segment_id.saturating_sub(1))
+        };
+        let mut segment_path = self.packed_blob_segment_path(&segment_id);
+        let mut segment_len = file_len_if_exists(&segment_path)?.unwrap_or(0);
+        if segment_len.saturating_add(bytes.len() as u64) > PACKED_BLOB_SEGMENT_MAX_BYTES {
+            segment_id = format!("{:016x}.pack", index.next_segment_id);
+            index.next_segment_id = index.next_segment_id.saturating_add(1);
+            segment_path = self.packed_blob_segment_path(&segment_id);
+            segment_len = 0;
+        } else if index.next_segment_id == 1 {
+            index.next_segment_id = 1;
+        }
+
+        if let Some(parent) = segment_path.parent() {
+            create_dir_all(parent.to_owned())?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&segment_path)
+            .map_err(|source| ContentStoreError::Io {
+                path: segment_path.clone(),
+                source,
+            })?;
+        let offset = segment_len;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|source| ContentStoreError::Io {
+                path: segment_path.clone(),
+                source,
+            })?;
+        if let Some(parent) = segment_path.parent() {
+            sync_dir(parent)?;
+        }
+        index.entries.insert(
+            hash.to_owned(),
+            PackedBlobLocation {
+                segment_id,
+                offset,
+                size_bytes: bytes.len() as u64,
+            },
+        );
+        self.write_packed_blob_index_unlocked(&index)?;
+        Ok(true)
+    }
+
+    fn remove_packed_blob_index_entry(&self, hash: &str) -> Result<bool> {
+        hash_hex(hash)?;
+        let _lock = self.lock_packed_blobs()?;
+        let mut index = self.read_packed_blob_index_unlocked()?;
+        let removed = index.entries.remove(hash).is_some();
+        if removed {
+            self.write_packed_blob_index_unlocked(&index)?;
+        }
+        Ok(removed)
+    }
+
+    fn open_packed_blob_reader(
+        &self,
+        location: &PackedBlobLocation,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<BlobReader> {
+        let path = self.packed_blob_segment_path(&location.segment_id);
+        let mut file = fs::File::open(&path).map_err(|source| ContentStoreError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let segment_len = file
+            .metadata()
+            .map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?
+            .len();
+        let start = offset.min(location.size_bytes);
+        let physical_start = location.offset.checked_add(start).ok_or_else(|| {
+            ContentStoreError::InvalidChunkedContent {
+                message: format!(
+                    "packed blob offset overflows: segment={}",
+                    location.segment_id
+                ),
+            }
+        })?;
+        let physical_end = location
+            .offset
+            .checked_add(location.size_bytes)
+            .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+                message: format!(
+                    "packed blob range overflows: segment={}",
+                    location.segment_id
+                ),
+            })?;
+        if physical_end > segment_len {
+            return Err(ContentStoreError::InvalidChunkedContent {
+                message: format!(
+                    "packed blob range exceeds segment: segment={}, end={}, len={segment_len}",
+                    location.segment_id, physical_end
+                ),
+            });
+        }
+        file.seek(SeekFrom::Start(physical_start))
+            .map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        let remaining_bytes = location
+            .size_bytes
+            .saturating_sub(start)
+            .min(u64::try_from(max_bytes).unwrap_or(u64::MAX));
+        Ok(BlobReader {
+            file,
+            size_bytes: location.size_bytes,
+            remaining_bytes,
+        })
+    }
+
+    fn open_packed_blob_range_reader(
+        &self,
+        location: &PackedBlobLocation,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<BlobRangeReader> {
+        let path = self.packed_blob_segment_path(&location.segment_id);
+        let mut file = fs::File::open(&path).map_err(|source| ContentStoreError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let segment_len = file
+            .metadata()
+            .map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?
+            .len();
+        let start = offset.min(location.size_bytes);
+        let physical_start = location.offset.checked_add(start).ok_or_else(|| {
+            ContentStoreError::InvalidChunkedContent {
+                message: format!(
+                    "packed blob offset overflows: segment={}",
+                    location.segment_id
+                ),
+            }
+        })?;
+        let physical_end = location
+            .offset
+            .checked_add(location.size_bytes)
+            .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+                message: format!(
+                    "packed blob range overflows: segment={}",
+                    location.segment_id
+                ),
+            })?;
+        if physical_end > segment_len {
+            return Err(ContentStoreError::InvalidChunkedContent {
+                message: format!(
+                    "packed blob range exceeds segment: segment={}, end={}, len={segment_len}",
+                    location.segment_id, physical_end
+                ),
+            });
+        }
+        file.seek(SeekFrom::Start(physical_start))
+            .map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        let remaining_bytes = location
+            .size_bytes
+            .saturating_sub(start)
+            .min(u64::try_from(max_bytes).unwrap_or(u64::MAX));
+        Ok(BlobRangeReader {
+            file,
+            offset: start,
+            size_bytes: location.size_bytes,
+            remaining_bytes,
+        })
+    }
+
+    fn packed_blob_location_readable(&self, location: &PackedBlobLocation) -> Result<bool> {
+        let path = self.packed_blob_segment_path(&location.segment_id);
+        let Some(segment_len) = file_len_if_exists(&path)? else {
+            return Ok(false);
+        };
+        Ok(location
+            .offset
+            .checked_add(location.size_bytes)
+            .is_some_and(|end| end <= segment_len))
+    }
+
+    fn packed_blob_index_path(&self) -> PathBuf {
+        self.root.join(PACKED_BLOB_DIR).join(PACKED_BLOB_INDEX_FILE)
+    }
+
+    fn packed_blob_segment_path(&self, segment_id: &str) -> PathBuf {
+        self.root
+            .join(PACKED_BLOB_DIR)
+            .join(PACKED_BLOB_SEGMENT_DIR)
+            .join(segment_id)
     }
 
     fn collect_version_manifest_entries(
@@ -1855,6 +2637,7 @@ impl LocalContentStore {
                     modified_nanos: system_time_nanos_since_epoch_saturating(modified),
                     manifest_bytes: manifest_bytes.len() as u64,
                     logical_bytes: manifest.size_bytes,
+                    extent_count: manifest.extents.len() as u64,
                 });
         }
         Ok(())
@@ -1993,12 +2776,89 @@ impl LocalContentStore {
         referenced_blobs.insert(content_hash.to_owned());
         let blob_path = self.blob_path(content_hash)?;
         if !blob_path.is_file() {
-            report.issues.push(ContentStoreScrubIssue::MissingBlob {
-                object_id: object_id.to_owned(),
-                version: version.to_owned(),
-                content_hash: content_hash.to_owned(),
-                path: blob_path,
-            });
+            let Some(location) = self.packed_blob_location(content_hash)? else {
+                report.issues.push(ContentStoreScrubIssue::MissingBlob {
+                    object_id: object_id.to_owned(),
+                    version: version.to_owned(),
+                    content_hash: content_hash.to_owned(),
+                    path: blob_path,
+                });
+                return Ok(());
+            };
+            if !checked_blobs.contains_key(content_hash) {
+                let segment_path = self.packed_blob_segment_path(&location.segment_id);
+                let mut reader = match self.open_packed_blob_reader(&location, 0, usize::MAX) {
+                    Ok(reader) => reader,
+                    Err(error) => {
+                        report.issues.push(ContentStoreScrubIssue::MissingBlob {
+                            object_id: object_id.to_owned(),
+                            version: version.to_owned(),
+                            content_hash: content_hash.to_owned(),
+                            path: segment_path,
+                        });
+                        report.issues.push(ContentStoreScrubIssue::InvalidManifest {
+                            path: manifest_path.to_owned(),
+                            message: error.to_string(),
+                        });
+                        return Ok(());
+                    }
+                };
+                let mut bytes =
+                    Vec::with_capacity(usize::try_from(location.size_bytes).unwrap_or(usize::MAX));
+                if let Err(source) = reader.read_to_end(&mut bytes) {
+                    return Err(ContentStoreError::Io {
+                        path: segment_path,
+                        source,
+                    });
+                }
+                checked_blobs.insert(
+                    content_hash.to_owned(),
+                    ScrubbedBlob {
+                        actual_hash: crate::content_store::content_hash(&bytes),
+                        size_bytes: bytes.len() as u64,
+                    },
+                );
+            }
+            let checked = checked_blobs
+                .get(content_hash)
+                .expect("checked packed blob inserted before lookup");
+            if checked.actual_hash != content_hash {
+                report.issues.push(ContentStoreScrubIssue::CorruptBlob {
+                    object_id: object_id.to_owned(),
+                    version: version.to_owned(),
+                    content_hash: content_hash.to_owned(),
+                    path: self.packed_blob_segment_path(&location.segment_id),
+                    actual_hash: checked.actual_hash.clone(),
+                });
+                return Ok(());
+            }
+            if require_exact_size && checked.size_bytes != size_bytes {
+                report
+                    .issues
+                    .push(ContentStoreScrubIssue::BlobSizeMismatch {
+                        object_id: object_id.to_owned(),
+                        version: version.to_owned(),
+                        content_hash: content_hash.to_owned(),
+                        path: self.packed_blob_segment_path(&location.segment_id),
+                        expected_size_bytes: size_bytes,
+                        actual_size_bytes: checked.size_bytes,
+                    });
+                return Ok(());
+            }
+            let extent_end = blob_offset.checked_add(size_bytes);
+            if extent_end.is_none_or(|end| end > checked.size_bytes) {
+                report
+                    .issues
+                    .push(ContentStoreScrubIssue::BlobRangeOutOfBounds {
+                        object_id: object_id.to_owned(),
+                        version: version.to_owned(),
+                        content_hash: content_hash.to_owned(),
+                        path: self.packed_blob_segment_path(&location.segment_id),
+                        blob_offset,
+                        size_bytes,
+                        blob_size_bytes: checked.size_bytes,
+                    });
+            }
             return Ok(());
         }
         if !checked_blobs.contains_key(content_hash) {
@@ -2102,6 +2962,32 @@ impl LocalContentStore {
                 path: entry_path,
                 size_bytes,
             });
+        }
+        Ok(())
+    }
+
+    fn collect_orphan_packed_blob_issues(
+        &self,
+        referenced_blobs: &BTreeSet<String>,
+        report: &mut ContentStoreScrubReport,
+    ) -> Result<()> {
+        let index = self.read_packed_blob_index_unlocked()?;
+        for (content_hash, location) in index.entries {
+            if referenced_blobs.contains(&content_hash) {
+                continue;
+            }
+            let path = self.packed_blob_segment_path(&location.segment_id);
+            report.orphan_blob_count = report.orphan_blob_count.saturating_add(1);
+            report.orphan_blob_bytes = report.orphan_blob_bytes.saturating_add(location.size_bytes);
+            report
+                .issues
+                .push(ContentStoreScrubIssue::OrphanPackedBlob {
+                    content_hash,
+                    segment_id: location.segment_id,
+                    offset: location.offset,
+                    path,
+                    size_bytes: location.size_bytes,
+                });
         }
         Ok(())
     }
@@ -2268,7 +3154,7 @@ impl LocalContentStore {
                 blob_bytes: projected_file_growth(&blob_path, bytes.len() as u64)?,
                 ..ContentStoreQuotaDelta::default()
             })?;
-            write_file_atomic(&blob_path, bytes)?;
+            self.write_tracked_blob_bytes(&hash, &blob_path, bytes)?;
         }
         Ok((hash, bytes.len() as u64))
     }
@@ -2358,6 +3244,10 @@ impl LocalContentStore {
             }
             return Err(error);
         }
+        self.apply_stats_delta(ContentStoreStatsDelta::manifest_created(
+            &manifest,
+            manifest_bytes.len() as u64,
+        ))?;
         Ok(manifest)
     }
 
@@ -2418,6 +3308,46 @@ fn encode_manifest(manifest: &ContentManifest) -> Result<Vec<u8>> {
 fn decode_manifest(bytes: &[u8]) -> Result<ContentManifest> {
     sinomo_object_serde::from_bytes(bytes)
         .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn encode_stats_snapshot(snapshot: &ContentStoreStatsSnapshot) -> Result<Vec<u8>> {
+    sinomo_object_serde::to_bytes(snapshot, 1, LengthMode::U32)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn decode_stats_snapshot(bytes: &[u8]) -> Result<ContentStoreStatsSnapshot> {
+    sinomo_object_serde::from_bytes(bytes)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn encode_packed_blob_index(index: &PackedBlobIndex) -> Result<Vec<u8>> {
+    sinomo_object_serde::to_bytes(index, 1, LengthMode::U32)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn decode_packed_blob_index(bytes: &[u8]) -> Result<PackedBlobIndex> {
+    sinomo_object_serde::from_bytes(bytes)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn file_count_delta(before_len: Option<u64>, after_len: Option<u64>) -> i128 {
+    match (before_len, after_len) {
+        (None, Some(_)) => 1,
+        (Some(_), None) => -1,
+        _ => 0,
+    }
+}
+
+fn file_bytes_delta(before_len: Option<u64>, after_len: Option<u64>) -> i128 {
+    i128::from(after_len.unwrap_or(0)) - i128::from(before_len.unwrap_or(0))
+}
+
+fn apply_signed_delta(value: u64, delta: i128) -> u64 {
+    if delta >= 0 {
+        value.saturating_add(u64::try_from(delta).unwrap_or(u64::MAX))
+    } else {
+        value.saturating_sub(u64::try_from(-delta).unwrap_or(u64::MAX))
+    }
 }
 
 fn clip_extent(
@@ -2715,6 +3645,18 @@ fn projected_file_growth(path: &Path, new_len: u64) -> Result<u64> {
         }
     };
     Ok(new_len.saturating_sub(existing_len))
+}
+
+fn file_len_if_exists(path: &Path) -> Result<Option<u64>> {
+    match path.metadata() {
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata.len())),
+        Ok(_) => Ok(None),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ContentStoreError::Io {
+            path: path.to_owned(),
+            source,
+        }),
+    }
 }
 
 fn check_quota_limit(
@@ -3154,6 +4096,83 @@ mod tests {
     }
 
     #[test]
+    fn small_object_versions_are_stored_in_packed_segments() {
+        let root = temp_root("small_object_versions_are_stored_in_packed_segments");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let first_bytes = b"tiny packed object alpha";
+        let second_bytes = b"tiny packed object bravo";
+
+        let first = store
+            .put_object_version("object-packed-a", "v1", first_bytes)
+            .expect("put first packed object");
+        let second = store
+            .put_object_version("object-packed-b", "v1", second_bytes)
+            .expect("put second packed object");
+
+        assert!(
+            !store
+                .blob_path(&first.content_hash)
+                .expect("first loose blob path")
+                .exists(),
+            "small content should avoid one loose blob file per object"
+        );
+        assert!(
+            !store
+                .blob_path(&second.content_hash)
+                .expect("second loose blob path")
+                .exists(),
+            "small content should avoid one loose blob file per object"
+        );
+        let segment_files = fs::read_dir(root.join(PACKED_BLOB_DIR).join(PACKED_BLOB_SEGMENT_DIR))
+            .expect("pack segment dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_file())
+            .count();
+        assert_eq!(segment_files, 1);
+
+        assert_eq!(
+            store
+                .read_blob(&first.content_hash)
+                .expect("read first blob"),
+            first_bytes
+        );
+        assert_eq!(
+            store
+                .read_object_version("object-packed-b", "v1")
+                .expect("read second object")
+                .1,
+            second_bytes
+        );
+        let mut stream = store
+            .open_blob_stream(&first.content_hash)
+            .expect("open packed stream");
+        let mut streamed = Vec::new();
+        stream.read_to_end(&mut streamed).expect("read stream");
+        assert_eq!(streamed, first_bytes);
+        assert_eq!(
+            store
+                .read_blob_range(&second.content_hash, 5, 6)
+                .expect("read packed range"),
+            &second_bytes[5..11]
+        );
+
+        let stats = store.stats().expect("packed stats");
+        assert_eq!(stats.blob_count, 2);
+        assert_eq!(
+            stats.blob_bytes,
+            first_bytes.len() as u64 + second_bytes.len() as u64
+        );
+        assert_eq!(stats.manifest_count, 2);
+        let scrub = store.scrub().expect("packed scrub");
+        assert!(scrub.is_healthy(), "packed scrub issues: {scrub:?}");
+        assert_eq!(scrub.referenced_blob_count, 2);
+        assert_eq!(scrub.orphan_blob_count, 0);
+        assert_eq!(store.stats().expect("stats after scrub"), scrub.stats);
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn put_object_version_patch_reuses_base_extents_and_reads_logical_bytes() {
         let root = temp_root("put_object_version_patch_reuses_base_extents");
         let store = LocalContentStore::new(&root).expect("create store");
@@ -3256,11 +4275,13 @@ mod tests {
     fn scrub_reports_missing_corrupt_and_orphan_blobs() {
         let root = temp_root("scrub_reports_content_anomalies");
         let store = LocalContentStore::new(&root).expect("create store");
+        let missing_bytes = vec![b'm'; PACKED_BLOB_SMALL_LIMIT_BYTES as usize + 1];
+        let corrupt_bytes = vec![b'c'; PACKED_BLOB_SMALL_LIMIT_BYTES as usize + 2];
         let missing = store
-            .put_object_version("object-missing", "v1", b"missing referenced blob")
+            .put_object_version("object-missing", "v1", &missing_bytes)
             .expect("put missing object");
         let corrupt = store
-            .put_object_version("object-corrupt", "v1", b"corrupt referenced blob")
+            .put_object_version("object-corrupt", "v1", &corrupt_bytes)
             .expect("put corrupt object");
         fs::remove_file(
             store
@@ -3314,6 +4335,36 @@ mod tests {
                 ..
             } if content_hash == &orphan_hash && *size_bytes == orphan_bytes.len() as u64
         )));
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn stats_snapshot_is_cached_and_scrub_rebuilds_drift() {
+        let root = temp_root("stats_snapshot_is_cached_and_scrub_rebuilds_drift");
+        let store = LocalContentStore::new(&root).expect("create store");
+        store
+            .put_object_version("object-live", "v1", b"live referenced blob")
+            .expect("put live object");
+        let cached = store.stats().expect("initial stats");
+        assert_eq!(cached.blob_count, 1);
+        assert_eq!(cached.manifest_count, 1);
+
+        let orphan_bytes = b"out-of-band orphan blob";
+        let orphan_hash = content_hash(orphan_bytes);
+        write_file_atomic(
+            &store.blob_path(&orphan_hash).expect("orphan blob path"),
+            orphan_bytes,
+        )
+        .expect("write orphan outside store counters");
+
+        let still_cached = store.stats().expect("cached stats");
+        assert_eq!(still_cached, cached);
+
+        let scrub = store.scrub().expect("scrub rebuilds stats");
+        assert_eq!(scrub.orphan_blob_count, 1);
+        assert_eq!(scrub.stats.blob_count, 2);
+        assert_eq!(store.stats().expect("rebuilt stats"), scrub.stats);
 
         cleanup(&root);
     }
@@ -4077,6 +5128,9 @@ mod tests {
             .expect("stage bytes");
         let staging_path = root.join("staging").join("intent-1");
         assert!(staging_path.is_file());
+        let staged_stats = store.stats().expect("staged stats");
+        assert_eq!(staged_stats.staging_file_count, 1);
+        assert_eq!(staged_stats.staging_bytes, b"pending content".len() as u64);
 
         let manifest = store
             .commit_staged("intent-1", "object-b", "v2")
@@ -4088,6 +5142,11 @@ mod tests {
             store.read_blob(&manifest.content_hash).expect("read blob"),
             b"pending content"
         );
+        let committed_stats = store.stats().expect("committed stats");
+        assert_eq!(committed_stats.staging_file_count, 0);
+        assert_eq!(committed_stats.staging_bytes, 0);
+        assert_eq!(committed_stats.blob_count, 1);
+        assert_eq!(committed_stats.manifest_count, 1);
 
         cleanup(&root);
     }

@@ -39,6 +39,9 @@ use sinomo_service::{
     ServiceRegistryBuilder, ServiceRoute,
 };
 
+const DFS_DEFAULT_ROUTE_CONCURRENCY_LIMIT: usize = 8;
+const DFS_PROTOCOL_FRAME_ROUTE_CONCURRENCY_LIMIT: usize = 64;
+
 /// DFS control-plane service. Host-agnostic: it derives everything from the request's
 /// [`ServiceContext::data_dir`], so it runs with or without a daemon/cluster.
 #[derive(Default)]
@@ -75,7 +78,15 @@ fn dfs_service_route(route: &'static str) -> ServiceRoute {
             .into_iter()
             .map(|capability| capability.to_string()),
     )
-    .with_concurrency_limit(8)
+    .with_concurrency_limit(dfs_service_route_concurrency_limit(route))
+}
+
+fn dfs_service_route_concurrency_limit(route: &str) -> usize {
+    if route == DFS_PROTOCOL_FRAME_ROUTE {
+        DFS_PROTOCOL_FRAME_ROUTE_CONCURRENCY_LIMIT
+    } else {
+        DFS_DEFAULT_ROUTE_CONCURRENCY_LIMIT
+    }
 }
 
 fn dfs_service_routes(routes: &[&'static str]) -> Vec<ServiceRoute> {
@@ -530,7 +541,10 @@ mod tests {
                     .map(|capability| capability.as_str().to_string())
                     .collect::<Vec<_>>()
             );
-            assert_eq!(service_route.concurrency_limit, Some(8));
+            assert_eq!(
+                service_route.concurrency_limit,
+                Some(dfs_service_route_concurrency_limit(route))
+            );
         }
     }
 

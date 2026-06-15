@@ -86,6 +86,32 @@ impl DfsFrameTransport for FailingSendTransport {
     }
 }
 
+fn test_routed_write_command(
+    request_id: &str,
+    requester: &NodeId,
+    object_id: &DfsObjectId,
+) -> DfsDistributedWriteCommand {
+    DfsDistributedWriteCommand {
+        request_id: request_id.to_string(),
+        request: DfsWriteRequest {
+            file_system_id: sifs_file_system_id(),
+            object_id: object_id.clone(),
+            target_version: DfsVersion::from_legacy_named(format!("version_{request_id}"))
+                .expect("version"),
+            requesting_node_id: requester.clone(),
+        },
+        expected_base_version: None,
+        metadata_journal_after_sequence: None,
+        bytes: Vec::new(),
+        content_hash: Some(format!("blake3:{request_id}")),
+        content_size_bytes: Some(0),
+        desired_replica_nodes: vec![requester.clone()],
+        policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+        object_metadata: None,
+        touch_parent_on_create: true,
+    }
+}
+
 #[test]
 fn async_dfs_frame_transport_in_process_sends_waits_and_drains() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -260,6 +286,71 @@ fn test_endpoint(node_id: &NodeId, address: &str) -> ClusterEndpointRecord {
         priority: 10,
         last_observed_latency_ms: None,
     }
+}
+
+#[test]
+fn adaptive_chunk_window_scales_by_profile_and_object_size() {
+    let large_object = 64 * 1024 * 1024;
+    assert_eq!(
+        dfs_adaptive_chunk_window_size(
+            DfsTransferProfile::Conservative,
+            large_object,
+            DFS_STAGE_CHUNK_WINDOW_SIZE,
+        ),
+        DFS_STAGE_CHUNK_WINDOW_SIZE
+    );
+    assert_eq!(
+        dfs_adaptive_chunk_window_size(
+            DfsTransferProfile::Lan,
+            large_object,
+            DFS_STAGE_CHUNK_WINDOW_SIZE,
+        ),
+        DFS_LAN_CHUNK_WINDOW_SIZE
+    );
+    assert_eq!(
+        dfs_adaptive_chunk_window_size(
+            DfsTransferProfile::Local,
+            large_object,
+            DFS_STAGE_CHUNK_WINDOW_SIZE,
+        ),
+        DFS_LOCAL_CHUNK_WINDOW_SIZE
+    );
+    assert_eq!(
+        dfs_adaptive_chunk_window_size(
+            DfsTransferProfile::Local,
+            DFS_BLOB_CHUNK_BYTES as u64 * 3,
+            DFS_STAGE_CHUNK_WINDOW_SIZE,
+        ),
+        3,
+        "small transfers should finish in one bounded window instead of advertising unused chunks"
+    );
+}
+
+#[test]
+fn endpoint_transport_transfer_profile_tracks_best_endpoint_kind() {
+    let local = NodeId::from_legacy_named("node_dfs_transfer_profile_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_dfs_transfer_profile_remote").expect("remote");
+    let unknown = NodeId::from_legacy_named("node_dfs_transfer_profile_unknown").expect("unknown");
+    let sender: DfsProtocolFrameSender =
+        Arc::new(|_endpoint, _command, _timeout| Err(DfsPeerTransportError::new("test sender")));
+
+    let lan = test_endpoint(&remote, "192.0.2.80:21353");
+    let mut loopback = test_endpoint(&remote, "127.0.0.1:21353");
+    loopback.transport = ClusterTransportKind::Loopback;
+    let transport = DfsEndpointTransport::new(local.clone(), vec![lan, loopback], sender);
+
+    assert_eq!(
+        transport.transfer_profile(&local),
+        DfsTransferProfile::Local
+    );
+    assert_eq!(
+        transport.transfer_profile(&remote),
+        DfsTransferProfile::Local
+    );
+    assert_eq!(
+        transport.transfer_profile(&unknown),
+        DfsTransferProfile::Conservative
+    );
 }
 
 #[derive(Default)]
@@ -3049,6 +3140,50 @@ fn add_object_metadata_batch_persists_visible_versions_in_one_transaction() {
 }
 
 #[test]
+fn add_object_metadata_batch_trusts_supplied_content_size() {
+    let root = temp_root("add-object-metadata-batch-trusts-size");
+    let owner = NodeId::from_legacy_named("node_batch_size_owner").expect("node");
+    let network = InProcessNetwork::new();
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let manifest = content
+        .put_object_version(
+            "obj_batch_trusted_size",
+            "version_batch_trusted_size",
+            b"local",
+        )
+        .expect("local content manifest");
+    let metadata =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+            .expect("metadata");
+    let mut dfs = NetworkedDfsService::new(network.add_node(owner.clone()), content)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+
+    let mut object = file_metadata(owner);
+    object.object_id = DfsObjectId::from_legacy_named("obj_batch_trusted_size").expect("object");
+    object.path = "/services/batch-visible/trusted-size.txt".to_string();
+    object.content_hash = Some(manifest.content_hash);
+    object.content_size_bytes = Some(128);
+    object.version = DfsVersion::from_legacy_named("version_batch_trusted_size").expect("version");
+
+    dfs.add_object_metadata_batch([object.clone()])
+        .expect("metadata batch");
+
+    let version = dfs
+        .metadata_backend()
+        .expect("metadata backend")
+        .get_version(&object.object_id, &object.version)
+        .expect("version lookup")
+        .expect("version");
+    assert_eq!(
+        version.size_bytes, object.content_size_bytes,
+        "metadata-only batch imports should not stat local content first"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn metadata_replication_cursor_advances_only_after_replica_ack() {
     let root = temp_root("metadata-replication-cursor-after-ack");
     let primary = NodeId::from_legacy_named("node_meta_primary").expect("primary");
@@ -3364,6 +3499,7 @@ fn dfs_metadata_publish_gate_tracks_mutating_events() {
             requester_node_id: node.clone(),
             result: DfsDistributedWriteResult::Rejected {
                 reason: "rejected".to_string(),
+                current_primary_node_id: None,
             },
         },
     ]));
@@ -5197,7 +5333,7 @@ fn routed_write_response_tracks_remote_intent_alias() {
     let root = temp_root("routed-write-alias");
     let mut dfs = NetworkedDfsService::new(
         FailingSendTransport {
-            local_node_id: requester,
+            local_node_id: requester.clone(),
         },
         LocalContentStore::new(root.join("content")).expect("content"),
     );
@@ -5206,6 +5342,8 @@ fn routed_write_response_tracks_remote_intent_alias() {
         PendingRoutedWrite {
             object_id: object_id.clone(),
             primary_node_id: primary.clone(),
+            command: test_routed_write_command("dfs_net_req_1", &requester, &object_id),
+            authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
             remote_intent_id: None,
             durable_receipts: 0,
             required_receipts: 1,
@@ -5329,6 +5467,8 @@ fn routed_write_response_replays_primary_metadata_journal() {
         PendingRoutedWrite {
             object_id: object_id.clone(),
             primary_node_id: primary.clone(),
+            command: test_routed_write_command("dfs_net_req_journal", &requester, &object_id),
+            authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
             remote_intent_id: None,
             durable_receipts: 0,
             required_receipts: 1,
@@ -18853,6 +18993,20 @@ fn sifs_cluster_posix_cross_shard_rename_recovers_after_destination_outage() {
             .contains("moving between metadata shards"),
         "unexpected namespace lock error: {chmod_error}"
     );
+    let parked_report = cluster
+        .users_primary
+        .posix_resume_namespace_jobs_bounded(8, 512)
+        .expect("maintenance scan while destination is still unreachable");
+    assert_eq!(
+        (
+            parked_report.resumed_job_count,
+            parked_report.completed_job_count,
+            parked_report.failed_job_count,
+            parked_report.remaining_running_job_count,
+        ),
+        (1, 0, 0, 1),
+        "a transient resume failure must leave the cross-shard saga running: {parked_report:?}"
+    );
 
     // Heal the topology: transfer the services shard to its real primary and
     // resume the parked saga through the maintenance path.
@@ -18934,6 +19088,116 @@ fn sifs_cluster_posix_cross_shard_rename_recovers_after_destination_outage() {
         )
         .expect("the freed source path accepts new files after recovery");
 
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_cross_shard_rename_retry_resumes_existing_job() {
+    let mut cluster = sifs_two_primary_cluster("sifs-xshard-retry");
+    let ghost = NodeId::from_legacy_named("node_sifs_xshard_retry_ghost").expect("ghost node");
+    let bytes = b"rename retry resumes the same durable saga".to_vec();
+    cluster
+        .users_primary
+        .posix_write_file(
+            "/users/retry.txt",
+            &bytes,
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+                replica_candidates: vec![cluster.users_primary_node.clone()],
+                wait_for_commit: true,
+            },
+        )
+        .expect("primary local create");
+
+    let to_ghost = sifs_two_primary_shard_configs(
+        &cluster.users_primary_node,
+        &ghost,
+        3,
+        vec![
+            cluster.services_primary_node.clone(),
+            cluster.replica_node.clone(),
+        ],
+        vec![
+            cluster.users_primary_node.clone(),
+            cluster.replica_node.clone(),
+        ],
+    );
+    cluster.shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        for shard in &to_ghost {
+            control.put_metadata_shard(shard).expect("ghost shard");
+        }
+    });
+    let error = cluster
+        .users_primary
+        .posix_rename("/users/retry.txt", "/services/retry-moved.txt")
+        .expect_err("first rename parks while destination primary is unreachable");
+    assert!(
+        matches!(error, DfsPosixError::Dfs(DfsError::Network { .. })),
+        "expected a transport error, got {error:?}"
+    );
+
+    let healed = sifs_two_primary_shard_configs(
+        &cluster.users_primary_node,
+        &cluster.services_primary_node,
+        4,
+        vec![
+            cluster.services_primary_node.clone(),
+            cluster.replica_node.clone(),
+        ],
+        vec![
+            cluster.users_primary_node.clone(),
+            cluster.replica_node.clone(),
+        ],
+    );
+    cluster.shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        for shard in &healed {
+            control.put_metadata_shard(shard).expect("healed shard");
+        }
+    });
+    let services_primary = std::mem::replace(
+        &mut cluster.services_primary,
+        NetworkedDfsService::new(
+            sinomo_network::InProcessNetwork::new()
+                .add_node(NodeId::from_legacy_named("node_unused_pump_retry").expect("node")),
+            LocalContentStore::new(cluster.root.join("unused-content")).expect("content"),
+        ),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let services_stop = Arc::clone(&stop);
+    let services_thread = std::thread::spawn(move || {
+        let mut services_primary = services_primary;
+        while !services_stop.load(Ordering::SeqCst) {
+            services_primary
+                .process_incoming()
+                .expect("services primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        services_primary
+    });
+
+    cluster
+        .users_primary
+        .execute_namespace_operation_local(&DfsNamespaceOperation::Rename {
+            from: "/users/retry.txt".to_string(),
+            to: "/services/retry-moved.txt".to_string(),
+        })
+        .expect("routed retry resumes existing cross-shard rename job");
+    assert!(matches!(
+        cluster.users_primary.posix_stat("/users/retry.txt"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert_eq!(
+        cluster
+            .users_primary
+            .posix_read_file("/services/retry-moved.txt")
+            .expect("read moved"),
+        bytes
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    cluster.services_primary = services_thread.join().expect("services thread");
     std::fs::remove_dir_all(&cluster.root).ok();
 }
 
@@ -19484,6 +19748,91 @@ fn sifs_cluster_posix_cross_shard_move_fences_open_write_intents() {
 }
 
 #[test]
+fn sifs_cluster_posix_cross_shard_move_allows_committed_pending_repair() {
+    let mut cluster = sifs_two_primary_cluster("sifs-xshard-repair-pending");
+    let bytes = b"committed while desired replica repair is pending".to_vec();
+
+    // Commit with min=1, desired=2 while the destination primary is not
+    // pumping. The write is visible and safe to move, but the second replica
+    // remains a background repair target.
+    let source_stat = cluster
+        .users_primary
+        .posix_write_file(
+            "/users/repair-pending.txt",
+            &bytes,
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+                replica_candidates: vec![
+                    cluster.users_primary_node.clone(),
+                    cluster.services_primary_node.clone(),
+                ],
+                wait_for_commit: true,
+            },
+        )
+        .expect("min-replica write commits");
+    assert!(
+        cluster
+            .users_primary
+            .coordinator
+            .repair_jobs()
+            .iter()
+            .any(|job| job.object_id == source_stat.object_id),
+        "test setup must leave committed repair work pending"
+    );
+
+    let services_primary = std::mem::replace(
+        &mut cluster.services_primary,
+        NetworkedDfsService::new(
+            sinomo_network::InProcessNetwork::new()
+                .add_node(NodeId::from_legacy_named("node_unused_repair_pending").expect("node")),
+            LocalContentStore::new(cluster.root.join("unused-content")).expect("content"),
+        ),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let services_stop = Arc::clone(&stop);
+    let services_thread = std::thread::spawn(move || {
+        let mut services_primary = services_primary;
+        while !services_stop.load(Ordering::SeqCst) {
+            services_primary
+                .process_incoming()
+                .expect("services primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        services_primary
+    });
+
+    let moved = cluster
+        .users_primary
+        .posix_rename(
+            "/users/repair-pending.txt",
+            "/services/repair-pending-moved.txt",
+        )
+        .expect("committed repair-pending object moves across shards");
+    assert_eq!(moved.path, "/services/repair-pending-moved.txt");
+    assert_eq!(
+        moved.content_hash.as_deref(),
+        Some(content_hash(&bytes).as_str())
+    );
+    assert!(matches!(
+        cluster
+            .users_primary
+            .posix_stat("/users/repair-pending.txt"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert_eq!(
+        cluster
+            .users_primary
+            .posix_read_file("/services/repair-pending-moved.txt")
+            .expect("read moved object"),
+        bytes
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    cluster.services_primary = services_thread.join().expect("services thread");
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
 fn late_routed_responses_are_discarded_without_failing_the_event_loop() {
     let root = temp_root("late-routed-responses-discarded");
     let local = NodeId::from_legacy_named("node_late_response_local").expect("local");
@@ -19491,7 +19840,7 @@ fn late_routed_responses_are_discarded_without_failing_the_event_loop() {
     let object_id = DfsObjectId::from_legacy_named("obj_late_response").expect("object");
     let mut dfs = NetworkedDfsService::new(
         FailingSendTransport {
-            local_node_id: local,
+            local_node_id: local.clone(),
         },
         LocalContentStore::new(root.join("content")).expect("content"),
     );
@@ -19505,6 +19854,7 @@ fn late_routed_responses_are_discarded_without_failing_the_event_loop() {
                 object_id: object_id.clone(),
                 result: DfsDistributedWriteResult::Rejected {
                     reason: "too late".to_string(),
+                    current_primary_node_id: None,
                 },
                 metadata_journal_batches: Vec::new(),
             },
@@ -19538,6 +19888,8 @@ fn late_routed_responses_are_discarded_without_failing_the_event_loop() {
             object_id: object_id.clone(),
             primary_node_id: NodeId::from_legacy_named("node_late_response_primary")
                 .expect("primary"),
+            command: test_routed_write_command("dfs_net_req_tracked", &local, &object_id),
+            authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
             remote_intent_id: None,
             durable_receipts: 0,
             required_receipts: 1,
@@ -19552,6 +19904,7 @@ fn late_routed_responses_are_discarded_without_failing_the_event_loop() {
                 object_id,
                 result: DfsDistributedWriteResult::Rejected {
                     reason: "spoofed".to_string(),
+                    current_primary_node_id: None,
                 },
                 metadata_journal_batches: Vec::new(),
             },
@@ -19579,6 +19932,7 @@ fn late_routed_responses_are_discarded_without_failing_the_event_loop() {
                 reason:
                     "path /users/moving.txt is moving between metadata shards; retry the operation"
                         .to_string(),
+                current_primary_node_id: None,
             },
             metadata_journal_batches: Vec::new(),
         },
@@ -20262,6 +20616,120 @@ fn sifs_routed_namespace_op_follows_authority_redirect() {
             .expect("requester reads its own redirected write")
             .kind,
         DfsObjectKind::Directory
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    old_thread.join().expect("old primary thread");
+    new_thread.join().expect("new primary thread");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sifs_routed_write_follows_authority_redirect() {
+    let root = temp_root("sifs-write-authority-redirect");
+    let primary_node =
+        NodeId::from_legacy_named("node_sifs_write_redirect_old_primary").expect("old primary");
+    let writer_node =
+        NodeId::from_legacy_named("node_sifs_write_redirect_new_primary").expect("new primary");
+    let requester_node =
+        NodeId::from_legacy_named("node_sifs_write_redirect_requester").expect("requester");
+
+    let network = InProcessNetwork::new();
+    let shard_config = |primary: &NodeId, epoch: u64| DfsMetadataShardConfig {
+        file_system_id: sifs_file_system_id(),
+        shard_id: "root".to_string(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![primary_node.clone(), writer_node.clone()],
+        epoch,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+
+    let kv_current = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![primary_node.clone()]).expect("current kv"),
+    );
+    kv_current.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                writer_node.clone(),
+            )))
+            .expect("current filesystem config");
+        control
+            .put_metadata_shard(&shard_config(&writer_node, 2))
+            .expect("current shard config");
+    });
+    let kv_stale = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![requester_node.clone()]).expect("stale kv"),
+    );
+    kv_stale.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                writer_node.clone(),
+            )))
+            .expect("stale filesystem config");
+        control
+            .put_metadata_shard(&shard_config(&primary_node, 1))
+            .expect("stale shard config");
+    });
+
+    let old_primary =
+        sifs_posix_cluster_node(&network, &kv_current, &root, "old-primary", primary_node);
+    let mut new_primary = sifs_posix_cluster_node(
+        &network,
+        &kv_current,
+        &root,
+        "new-primary",
+        writer_node.clone(),
+    );
+    let mut requester = sifs_posix_cluster_node(
+        &network,
+        &kv_stale,
+        &root,
+        "requester",
+        requester_node.clone(),
+    );
+    new_primary
+        .bootstrap_distributed_sifs()
+        .expect("new primary SIFS bootstrap");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let old_stop = Arc::clone(&stop);
+    let old_thread = std::thread::spawn(move || {
+        let mut node = old_primary;
+        while !old_stop.load(Ordering::SeqCst) {
+            node.process_incoming().expect("old primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let new_stop = Arc::clone(&stop);
+    let new_thread = std::thread::spawn(move || {
+        let mut node = new_primary;
+        while !new_stop.load(Ordering::SeqCst) {
+            node.process_incoming().expect("new primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    requester
+        .posix_mkdir_all("/users")
+        .expect("parent mkdir follows authority redirect");
+    let path = "/users/write-redirected.txt";
+    let bytes = b"routed write follows current primary".to_vec();
+    let stat = requester
+        .posix_write_file(
+            path,
+            &bytes,
+            DfsWriteOptions::replicated_eventual(vec![requester_node, writer_node]),
+        )
+        .expect("routed write follows authority redirect");
+    assert_eq!(stat.size_bytes, Some(bytes.len() as u64));
+    assert_eq!(
+        requester
+            .posix_read_file_distributed(path)
+            .expect("requester reads redirected write"),
+        bytes
     );
 
     stop.store(true, Ordering::SeqCst);

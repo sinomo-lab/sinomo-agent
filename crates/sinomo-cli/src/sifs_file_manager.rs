@@ -18,6 +18,7 @@ use sinomo_runtime::kv::{self, KvError, KvOp, KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::NodeId;
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
@@ -30,6 +31,18 @@ pub(crate) struct SifsFileManagerBackend {
 impl SifsFileManagerBackend {
     pub(crate) fn open(data_dir: &SinomoDataDir) -> Result<Self, String> {
         let service = open_sifs_service(data_dir)?;
+        Self::from_service(data_dir, service)
+    }
+
+    pub(crate) fn open_read_only(data_dir: &SinomoDataDir) -> Result<Self, String> {
+        let service = open_sifs_service_read_only(data_dir)?;
+        Self::from_service(data_dir, service)
+    }
+
+    fn from_service(
+        data_dir: &SinomoDataDir,
+        service: NetworkedDfsService<DfsEndpointTransport>,
+    ) -> Result<Self, String> {
         let replica_candidates = sifs_replica_candidates(data_dir, service.node_id());
         Ok(Self {
             data_dir: data_dir.clone(),
@@ -46,7 +59,7 @@ impl SifsFileManagerBackend {
             .map_err(|_| "SIFS service lock is poisoned".to_string())
     }
 
-    fn publish_metadata_after_mutation(&self) {
+    pub(crate) fn publish_metadata_after_mutation(&self) {
         let _ = publish_sifs_metadata_journal_from_data_dir(&self.data_dir);
     }
 
@@ -66,6 +79,15 @@ impl SifsFileManagerBackend {
     }
 
     pub(crate) fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
+        self.write_file_with_publish(path, bytes, true)
+    }
+
+    fn write_file_with_publish(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        publish_metadata: bool,
+    ) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
         if let Some(parent) = parent_sifs_path(&path) {
@@ -79,7 +101,41 @@ impl SifsFileManagerBackend {
             .map(|_| ())
             .map_err(|error| format!("cannot write SIFS file {path}: {error}"))?;
         drop(service);
-        self.publish_metadata_after_mutation();
+        if publish_metadata {
+            self.publish_metadata_after_mutation();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write_files_deferred_publish(
+        &self,
+        files: &[(String, Vec<u8>)],
+    ) -> Result<(), String> {
+        let normalized = files
+            .iter()
+            .map(|(path, bytes)| normalize_sifs_path(path).map(|path| (path, bytes.as_slice())))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut service = self.lock_service()?;
+        let options = sifs_write_options(&service, &self.replica_candidates);
+        let mut created_dirs = BTreeSet::new();
+        for (path, bytes) in normalized {
+            if let Some(parent) = parent_sifs_path(&path)
+                && created_dirs.insert(parent.clone())
+            {
+                service
+                    .posix_mkdir_all(&parent)
+                    .map_err(|error| format!("cannot create SIFS directory {parent}: {error}"))?;
+            }
+            service
+                .posix_write_file_with_known_parent(&path, bytes, options.clone())
+                .map(|_| ())
+                .map_err(|error| format!("cannot write SIFS file {path}: {error}"))?;
+        }
+        for parent in created_dirs {
+            service
+                .posix_touch_directory_modified(&parent)
+                .map_err(|error| format!("cannot touch SIFS directory {parent}: {error}"))?;
+        }
         Ok(())
     }
 
@@ -293,6 +349,19 @@ impl FileManagerBackend for SifsFileManagerBackend {
 fn open_sifs_service(
     data_dir: &SinomoDataDir,
 ) -> Result<NetworkedDfsService<DfsEndpointTransport>, String> {
+    open_sifs_service_with_hydration(data_dir, true)
+}
+
+fn open_sifs_service_read_only(
+    data_dir: &SinomoDataDir,
+) -> Result<NetworkedDfsService<DfsEndpointTransport>, String> {
+    open_sifs_service_with_hydration(data_dir, false)
+}
+
+fn open_sifs_service_with_hydration(
+    data_dir: &SinomoDataDir,
+    hydrate_metadata: bool,
+) -> Result<NetworkedDfsService<DfsEndpointTransport>, String> {
     data_dir
         .ensure_root_layout()
         .map_err(|error| format!("cannot prepare Sinomo data directory: {error}"))?;
@@ -316,15 +385,27 @@ fn open_sifs_service(
     }
     let service =
         if let Some(metadata) = open_sifs_sharded_metadata_backend(data_dir, &cluster_paths)? {
-            service
-                .with_metadata_backend(metadata)
-                .map_err(|error| format!("cannot open sharded SIFS metadata: {error}"))?
+            if hydrate_metadata {
+                service
+                    .with_metadata_backend(metadata)
+                    .map_err(|error| format!("cannot open sharded SIFS metadata: {error}"))?
+            } else {
+                service
+                    .with_metadata_backend_lazy(metadata)
+                    .map_err(|error| format!("cannot open sharded SIFS metadata: {error}"))?
+            }
         } else {
             let metadata = open_root_local_metadata_backend(default_dfs_metadata_root(data_dir))
                 .map_err(|error| format!("cannot open local SIFS metadata: {error}"))?;
-            service
-                .with_metadata_backend(metadata)
-                .map_err(|error| format!("cannot open local SIFS metadata: {error}"))?
+            if hydrate_metadata {
+                service
+                    .with_metadata_backend(metadata)
+                    .map_err(|error| format!("cannot open local SIFS metadata: {error}"))?
+            } else {
+                service
+                    .with_metadata_backend_lazy(metadata)
+                    .map_err(|error| format!("cannot open local SIFS metadata: {error}"))?
+            }
         };
     let mut service = service;
     service
@@ -432,12 +513,11 @@ fn sifs_replica_candidates(data_dir: &SinomoDataDir, local_node_id: &NodeId) -> 
     let Ok(state) = network::read_cluster_state_without_kv(&cluster_paths) else {
         return candidates;
     };
-    let mut routable_node_ids = network::cluster_dfs_protocol_targets(&cluster_paths, &state)
+    let routable_node_ids = network::cluster_dfs_protocol_targets(&cluster_paths, &state)
         .into_iter()
         .map(|endpoint| endpoint.node_id)
-        .collect::<Vec<_>>();
-    routable_node_ids.sort();
-    routable_node_ids.dedup();
+        .collect::<BTreeSet<_>>();
+    let graph = network::ClusterConnectivityGraph::read_for_local(&cluster_paths, &state);
     let Ok(entries) =
         kv::read_cluster_kv_prefix_entries(&cluster_paths.kv_paths(), content_services_prefix())
     else {
@@ -450,13 +530,56 @@ fn sifs_replica_candidates(data_dir: &SinomoDataDir, local_node_id: &NodeId) -> 
         .collect::<Vec<_>>();
     content_node_ids.sort();
     content_node_ids.dedup();
-    if let Some(remote_node_id) = content_node_ids
-        .into_iter()
-        .find(|node_id| node_id != local_node_id && routable_node_ids.contains(node_id))
-    {
+    if let Some(remote_node_id) = choose_sifs_remote_replica_candidate(
+        &graph,
+        local_node_id,
+        content_node_ids,
+        &routable_node_ids,
+    ) {
         candidates.push(remote_node_id);
     }
     candidates
+}
+
+fn choose_sifs_remote_replica_candidate(
+    graph: &network::ClusterConnectivityGraph,
+    local_node_id: &NodeId,
+    mut content_node_ids: Vec<NodeId>,
+    routable_node_ids: &BTreeSet<NodeId>,
+) -> Option<NodeId> {
+    content_node_ids
+        .sort_by_key(|node_id| sifs_replica_candidate_rank(&graph, local_node_id, node_id));
+    content_node_ids.into_iter().find(|node_id| {
+        node_id != local_node_id
+            && routable_node_ids.contains(node_id)
+            && graph
+                .best_healthy_endpoint(local_node_id, node_id)
+                .is_some()
+    })
+}
+
+fn sifs_replica_candidate_rank(
+    graph: &network::ClusterConnectivityGraph,
+    local_node_id: &NodeId,
+    node_id: &NodeId,
+) -> (u8, u64, String) {
+    if node_id == local_node_id {
+        return (0, 0, node_id.to_string());
+    }
+    if let Some(endpoint) = graph.best_healthy_endpoint(local_node_id, node_id) {
+        return (
+            1,
+            endpoint
+                .last_observed_latency_ms
+                .map(u64::from)
+                .unwrap_or(u64::MAX),
+            node_id.to_string(),
+        );
+    }
+    if graph.reachable_targets(local_node_id).contains(node_id) {
+        return (2, u64::MAX, node_id.to_string());
+    }
+    (3, u64::MAX, node_id.to_string())
 }
 
 fn sifs_protocol_frame_sender() -> DfsProtocolFrameSender {
@@ -608,6 +731,128 @@ mod tests {
         manager.delete_selected("DELETE").expect("delete file");
         manager.go_parent().expect("parent");
         manager.delete_selected("DELETE").expect("delete dir");
+    }
+
+    #[test]
+    fn replica_candidate_rank_prefers_near_healthy_peer_over_lexicographic_peer() {
+        let local = NodeId::from_legacy_named("node_z_local").expect("node");
+        let far = NodeId::from_legacy_named("node_a_far").expect("node");
+        let near = NodeId::from_legacy_named("node_y_near").expect("node");
+        let graph = network::ClusterConnectivityGraph::from_records(
+            local.clone(),
+            vec![
+                healthy_connectivity_record(&local, &far, 50),
+                healthy_connectivity_record(&local, &near, 1),
+            ],
+        );
+        let mut candidates = vec![far.clone(), near.clone()];
+
+        candidates.sort_by_key(|node_id| sifs_replica_candidate_rank(&graph, &local, node_id));
+
+        assert_eq!(
+            candidates,
+            vec![near, far],
+            "replica selection should prefer the lower-latency healthy peer, not lexical order"
+        );
+    }
+
+    #[test]
+    fn remote_replica_candidate_requires_healthy_peer() {
+        let local = NodeId::from_legacy_named("node_replica_select_local").expect("node");
+        let degraded = NodeId::from_legacy_named("node_replica_select_degraded").expect("node");
+        let healthy = NodeId::from_legacy_named("node_replica_select_healthy").expect("node");
+        let mut routable = BTreeSet::new();
+        routable.insert(degraded.clone());
+        routable.insert(healthy.clone());
+        let degraded_graph = network::ClusterConnectivityGraph::from_records(
+            local.clone(),
+            vec![connectivity_record(
+                &local,
+                &degraded,
+                network::ClusterConnectivityState::Degraded,
+                Some(1),
+            )],
+        );
+
+        assert_eq!(
+            choose_sifs_remote_replica_candidate(
+                &degraded_graph,
+                &local,
+                vec![degraded.clone()],
+                &routable,
+            ),
+            None,
+            "reachable but degraded peers must not be selected as synchronous replicas"
+        );
+
+        let healthy_graph = network::ClusterConnectivityGraph::from_records(
+            local.clone(),
+            vec![
+                connectivity_record(
+                    &local,
+                    &degraded,
+                    network::ClusterConnectivityState::Degraded,
+                    Some(1),
+                ),
+                connectivity_record(
+                    &local,
+                    &healthy,
+                    network::ClusterConnectivityState::Healthy,
+                    Some(25),
+                ),
+            ],
+        );
+
+        assert_eq!(
+            choose_sifs_remote_replica_candidate(
+                &healthy_graph,
+                &local,
+                vec![degraded, healthy.clone()],
+                &routable,
+            ),
+            Some(healthy)
+        );
+    }
+
+    fn healthy_connectivity_record(
+        source: &NodeId,
+        target: &NodeId,
+        latency_ms: u64,
+    ) -> network::ClusterConnectivityRecord {
+        connectivity_record(
+            source,
+            target,
+            network::ClusterConnectivityState::Healthy,
+            Some(latency_ms),
+        )
+    }
+
+    fn connectivity_record(
+        source: &NodeId,
+        target: &NodeId,
+        state: network::ClusterConnectivityState,
+        latency_ms: Option<u64>,
+    ) -> network::ClusterConnectivityRecord {
+        let now = time::OffsetDateTime::now_utc();
+        network::ClusterConnectivityRecord {
+            cluster_id: network::ClusterId::from_legacy_named("cluster_sifs_replica_rank")
+                .expect("cluster"),
+            source_node_id: source.clone(),
+            target_node_id: target.clone(),
+            endpoint_id: network::ClusterEndpointId::from_legacy_named(format!(
+                "endpoint_sifs_replica_rank_{target}"
+            ))
+            .expect("endpoint"),
+            transport: sinomo_runtime::core::ClusterTransportKind::LanTcp,
+            address: format!("{target}:21353"),
+            state,
+            latency_ms,
+            consecutive_failures: 0,
+            last_success_at: None,
+            last_failure_at: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(600),
+        }
     }
 
     fn temp_sifs_data_dir(name: &str) -> sinomo_testdir::TestDir {

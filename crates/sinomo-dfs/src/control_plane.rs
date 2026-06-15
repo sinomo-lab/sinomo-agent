@@ -6,7 +6,8 @@
 //! in the DFS metadata service and its sharded local stores.
 
 use crate::DfsFileSystemId;
-use crate::{DfsFileSystem, DfsSubtreePolicy};
+use crate::namespace::{SIFS_SERVICES_PATH, SIFS_USERS_PATH};
+use crate::{DfsFileSystem, DfsSubtreePolicy, sifs_file_system_id};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_core::DfsObjectPolicy;
 use sinomo_kv::{
@@ -284,7 +285,23 @@ impl<'a> DfsControlPlaneStore<'a> {
         file_system_id: &DfsFileSystemId,
         path: &str,
     ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
-        select_metadata_shard_config_for_path(self.list_metadata_shards(file_system_id)?, path)
+        select_metadata_shard_config_for_path(
+            file_system_id,
+            self.list_metadata_shards(file_system_id)?,
+            path,
+        )
+    }
+
+    pub fn select_metadata_shard_for_path_strict_default_sifs_split(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
+        select_metadata_shard_config_for_path_strict_default_sifs_split(
+            file_system_id,
+            self.list_metadata_shards(file_system_id)?,
+            path,
+        )
     }
 
     pub fn transfer_metadata_shard_primary(
@@ -403,6 +420,19 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         path: &str,
     ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
         select_metadata_shard_config_for_path(
+            file_system_id,
+            self.list_metadata_shards(file_system_id).await?,
+            path,
+        )
+    }
+
+    pub async fn select_metadata_shard_for_path_strict_default_sifs_split(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
+        select_metadata_shard_config_for_path_strict_default_sifs_split(
+            file_system_id,
             self.list_metadata_shards(file_system_id).await?,
             path,
         )
@@ -467,14 +497,33 @@ fn normalize_segment(segment: &str) -> String {
 }
 
 pub(crate) fn select_metadata_shard_config_for_path(
+    file_system_id: &DfsFileSystemId,
     shards: Vec<DfsMetadataShardConfig>,
     path: &str,
+) -> Result<Option<DfsMetadataShardConfig>, KvError> {
+    select_metadata_shard_config_for_path_with_options(file_system_id, shards, path, false)
+}
+
+pub(crate) fn select_metadata_shard_config_for_path_strict_default_sifs_split(
+    file_system_id: &DfsFileSystemId,
+    shards: Vec<DfsMetadataShardConfig>,
+    path: &str,
+) -> Result<Option<DfsMetadataShardConfig>, KvError> {
+    select_metadata_shard_config_for_path_with_options(file_system_id, shards, path, true)
+}
+
+fn select_metadata_shard_config_for_path_with_options(
+    file_system_id: &DfsFileSystemId,
+    shards: Vec<DfsMetadataShardConfig>,
+    path: &str,
+    reject_incomplete_default_sifs_split: bool,
 ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
     let path = normalize_metadata_selection_path(path)?;
     let path_hash = metadata_name_hash(&path);
     let mut root = None;
     let mut prefix_match = None::<(usize, String, DfsMetadataShardConfig)>;
     let mut hash_match = None::<(u128, String, DfsMetadataShardConfig)>;
+    let mut saw_default_sifs_split_shard = false;
 
     for shard in shards {
         match &shard.assignment {
@@ -490,6 +539,9 @@ pub(crate) fn select_metadata_shard_config_for_path(
             }
             DfsMetadataShardAssignment::PathPrefix { prefix } => {
                 let prefix = normalize_metadata_selection_path(prefix)?;
+                if matches!(prefix.as_str(), SIFS_SERVICES_PATH | SIFS_USERS_PATH) {
+                    saw_default_sifs_split_shard = true;
+                }
                 if metadata_path_matches_prefix(&path, &prefix) {
                     let candidate = (prefix.len(), shard.shard_id.clone(), shard);
                     if prefix_match.as_ref().is_none_or(|current| {
@@ -521,10 +573,35 @@ pub(crate) fn select_metadata_shard_config_for_path(
         }
     }
 
+    if reject_incomplete_default_sifs_split
+        && prefix_match.is_none()
+        && hash_match.is_none()
+        && root.is_some()
+        && file_system_id == &sifs_file_system_id()
+        && saw_default_sifs_split_shard
+        && let Some((shard_id, prefix)) = default_sifs_split_shard_for_path(&path)
+    {
+        return Err(KvError::Busy {
+            path: format!(
+                "metadata shard config incomplete for {path}: missing default {shard_id} shard for {prefix}"
+            ),
+        });
+    }
+
     Ok(prefix_match
         .map(|(_, _, shard)| shard)
         .or_else(|| hash_match.map(|(_, _, shard)| shard))
         .or(root))
+}
+
+fn default_sifs_split_shard_for_path(path: &str) -> Option<(&'static str, &'static str)> {
+    if metadata_path_matches_prefix(path, SIFS_SERVICES_PATH) {
+        Some(("services", SIFS_SERVICES_PATH))
+    } else if metadata_path_matches_prefix(path, SIFS_USERS_PATH) {
+        Some(("users", SIFS_USERS_PATH))
+    } else {
+        None
+    }
 }
 
 fn normalize_metadata_selection_path(path: &str) -> Result<String, KvError> {
@@ -765,6 +842,101 @@ mod tests {
                 .expect("select root")
                 .map(|shard| shard.shard_id),
             Some("root".to_string())
+        );
+    }
+
+    #[test]
+    fn metadata_shard_selection_rejects_partial_default_sifs_split_view() {
+        let node_root = node("node_shard_partial_root");
+        let node_services = node("node_shard_partial_services");
+        let node_users = node("node_shard_partial_users");
+        let mut kv = InProcessRaftKvCluster::new(vec![
+            node_root.clone(),
+            node_services.clone(),
+            node_users.clone(),
+        ])
+        .expect("kv cluster");
+        let file_system_id = sifs_file_system_id();
+        let mut control = DfsControlPlaneStore::new(&mut kv);
+        let root_shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: node_root.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        control
+            .put_metadata_shard(&root_shard)
+            .expect("put root shard");
+        assert_eq!(
+            control
+                .select_metadata_shard_for_path(&file_system_id, "/services/api")
+                .expect("root-only SIFS view remains usable")
+                .map(|shard| shard.shard_id),
+            Some("root".to_string())
+        );
+
+        let users_shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "users".to_string(),
+            primary_node_id: node_users,
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: SIFS_USERS_PATH.to_string(),
+            },
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        control
+            .put_metadata_shard(&users_shard)
+            .expect("put users shard");
+        assert_eq!(
+            control
+                .select_metadata_shard_for_path(&file_system_id, "/services/api")
+                .expect("generic selector keeps custom partial SIFS views usable")
+                .map(|shard| shard.shard_id),
+            Some("root".to_string())
+        );
+        let error = control
+            .select_metadata_shard_for_path_strict_default_sifs_split(
+                &file_system_id,
+                "/services/api",
+            )
+            .expect_err("partial split view must not route /services to root");
+        assert!(
+            matches!(&error, KvError::Busy { path } if path.contains("missing default services shard")),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            control
+                .select_metadata_shard_for_path(&file_system_id, "/users/alice")
+                .expect("visible users shard remains selected")
+                .map(|shard| shard.shard_id),
+            Some("users".to_string())
+        );
+
+        let services_shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "services".to_string(),
+            primary_node_id: node_services,
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: SIFS_SERVICES_PATH.to_string(),
+            },
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        control
+            .put_metadata_shard(&services_shard)
+            .expect("put services shard");
+        assert_eq!(
+            control
+                .select_metadata_shard_for_path(&file_system_id, "/services/api")
+                .expect("complete split view selects services")
+                .map(|shard| shard.shard_id),
+            Some("services".to_string())
         );
     }
 

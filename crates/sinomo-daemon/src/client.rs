@@ -568,6 +568,24 @@ where
 }
 
 impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointRpcAsyncHost {
+    fn sign_endpoint_rpc_request_async<'a>(
+        &'a mut self,
+        request: &'a ObjectRpcRequest,
+    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
+        let request = request.clone();
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime
+                .spawn_blocking(move || sign_daemon_rpc_request_for_local_node(&request))
+                .await
+                .map_err(|source| sinomo_network::NetworkError::Io {
+                    operation: "cluster endpoint signing".to_string(),
+                    detail: format!("endpoint signing task failed: {source}"),
+                })?
+                .map_err(|error| daemon_client_network_error("cluster endpoint signing", error))
+        })
+    }
+
     fn try_gateway_signed_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,

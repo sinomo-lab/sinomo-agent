@@ -631,6 +631,8 @@ mod tests {
             "cluster.dfs.expect-absent",
             "cluster.dfs.rename",
             "cluster.dfs.remove",
+            "cluster.dfs.bulk-write",
+            "cluster.dfs.bulk-expect",
         ] {
             assert!(ids.iter().any(|candidate| candidate == id), "missing {id}");
         }
