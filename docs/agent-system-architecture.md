@@ -2,417 +2,470 @@
 
 ## Purpose
 
-This document defines the first agent-system shape for Sinomo: the user-facing main agent, the maintenance-oriented background agent, the local core model that drives real-time interaction, and the async deliberation, tool, cluster, and self-evolution paths around them.
+This document is the single source of truth for the current Sinomo agent system.
+It describes the architecture that is implemented now: agent packages,
+provider-neutral model requests, runtime-owned tool execution, durable session
+state, readiness gates, live session control, command evidence, cancellation,
+and compaction evaluation boundaries.
 
-It complements the distributed runtime in [architecture.md](architecture.md), the cluster control plane in [clustering-architecture.md](clustering-architecture.md), the cluster root filesystem in [sifs.md](sifs.md), and controlled mutation in [self-evolution-architecture.md](self-evolution-architecture.md). Current implementation entry points are tracked in [agent-system-implementation.md](agent-system-implementation.md).
+It complements the distributed runtime in [architecture.md](architecture.md),
+the cluster control plane in [clustering-architecture.md](clustering-architecture.md),
+the cluster root filesystem in [sifs.md](sifs.md), and controlled mutation in
+[self-evolution-architecture.md](self-evolution-architecture.md). The agent loop
+is generic R2 infrastructure; self-evolution is one caller of it, not a separate
+agent runtime layer.
 
 ## Design Position
 
-Sinomo should feel like one continuous entity to users, but internally it is a real-time multimodal agent running on top of a cluster-aware action substrate. The main agent must never block live interaction just because slow work is in progress. Tool calls, research, coding, background cleanup, and delegated agent work run asynchronously and report results back into the session timeline.
+Sinomo should feel like one continuous agent to users, but the implementation is
+a cluster-aware runtime around model turns, durable session state, tool
+orchestration, and async task control. The main agent must not block live
+interaction just because slow work is in progress. Tool calls, command
+execution, research, coding, maintenance, and background work are represented as
+typed session activity with evidence.
 
-The implementation should follow the coding-harness pattern used by mature agent runtimes: a small core loop around a streaming model, a typed transcript/evidence store, runtime-owned tool policy, explicit context assembly, and first-class compaction. Provider-specific behavior belongs at the provider adapter boundary. Prompt text can guide behavior, but it must not be the security, storage, rollout, or tool-execution authority.
+The runtime owns security and execution. Prompts describe behavior, but they are
+not the authority for tools, filesystem access, sandboxing, cancellation,
+storage, rollout, or cluster placement. If a tool is visible to the model, it is
+available in that session surface; hidden tools can be searched and described
+through progressive disclosure, but guessed direct calls are rejected.
 
-The first implementation should use [OpenBMB MiniCPM-o](https://github.com/OpenBMB/MiniCPM-o) as the local core model family. As of 2026-05-10, the repository describes MiniCPM-o 4.5 as a 9B end-to-end multimodal model for image, video, text, and audio input with text and speech output, including full-duplex multimodal live streaming where input streams and output streams do not block each other. The repository also documents local deployment paths including PyTorch inference, llama.cpp-omni, Ollama, vLLM, SGLang, LLaMA-Factory, and SWIFT.
+Provider-specific behavior belongs in `sinomo-lm`. `sinomo-agent` builds a
+provider-neutral `LanguageModelRequest`; `sinomo-lm` renders provider protocol
+hints, output contracts, tool schemas, plain-prompt fallbacks, native tool-call
+normalization, malformed-output repair classification, context-window
+inference, and provider error categories.
 
-Local inference is preferred over API inference for the main user-facing loop. API and CLI models remain important, but they are helpers for slower or more specialized work rather than the identity of Sinomo.
+## Crate Boundaries
 
-## Agent Roles
+The main implementation lives in `crates/sinomo-agent`.
 
-### Main Agent: Sinomo
+Important exported surfaces:
 
-The main agent is the user-facing agent named Sinomo.
+- `Agent`, `AgentSession`, `AgentRun`, `AgentItem`, and `AgentTranscript`;
+- `AgentDefinition`, `AgentPackageDefinition`, `AgentPackageProvenance`, and
+  `AgentCatalog`;
+- `AgentConfig`, `AgentLoopInput`, `AgentOutputFormat`, and `TurnContext`;
+- `ContextAssembler`, `ContextAssemblyReport`, and `ContextBudgetEstimate`;
+- `AgentCompactor` and `AgentCompactionSummary`;
+- `AgentToolRegistry`, `AgentToolOrchestrator`, `AgentToolSurface`,
+  `ToolAvailability`, `AgentToolEvidence`, and `AgentToolPairIntegrity`;
+- `AgentSessionStore`, `FileAgentSessionStore`, `AgentTraceStore`, and
+  `FileAgentTraceStore`;
+- `AgentSessionControlPlane`, `AgentSessionRuntime`,
+  `AgentRuntimeService`, `AgentRuntimeControlService`,
+  `AgentRuntimeControlHost`, and `AgentRuntimeControlRegistry`;
+- `run_local_agent_readiness_gate` and the CLI-facing readiness report types.
 
-Responsibilities:
+Supporting crates:
 
-- Maintain continuous full-duplex multimodal interaction with one or more users.
-- Track session context, active user surfaces, active action targets, current task state, and pending async work.
-- Decide when to speak, listen, interrupt, stay silent, ask for clarification, or continue a background task.
-- Use local model inference for the real-time loop whenever hardware and policy allow.
-- Use advanced API or CLI models for slow deliberation, planning, research, coding, maintenance planning, and debugging.
-- Start, monitor, summarize, and cancel async work without blocking live conversation.
-- Handoff cluster-operation and system-maintenance work to the background agent by default.
-- Start or request self-evolution when explicitly asked by the user, or when an architectural limitation prevents a bounded fix.
+- `sinomo-lm` owns provider adapters, protocol rendering, provider-neutral
+  stream events, tool-call collection, context-window inference, and provider
+  error classification.
+- `sinomo-cli` exposes `sinomo agent ...` commands, `sinomo test run ...`,
+  daemon registration hooks, and local/readiness test cases.
+- `sinomo-daemon` hosts service routes without depending on R2 agent code
+  directly; application registration supplies the agent service hooks.
+- `sinomo-network`, `sinomo-sandbox`, and `sinomo-sandbox-wasix-host` provide
+  object-RPC routing and cancellable sandbox execution used by agent tools.
+- `modules/benchmark/sinomo-benchmarks` owns optional benchmark and eval
+  harnesses, including compaction quality scenarios.
 
-The main agent should not need to reason about low-level cluster mechanics for ordinary user tasks. It sees SIFS as its filesystem, receives useful cluster status summaries, and invokes tools with session-aware defaults. When placement matters, it can target a specific node, device, or SIFS subtree explicitly.
+## Agent Packages
 
-### Background Agent
+`AgentDefinition` is the agent package artifact. There is no extra runtime profile layer.
+A package carries:
 
-The background agent is the maintenance and background-operations agent.
+- schema version and package version;
+- provenance (`built-in`, `local`, `module`, or `imported`);
+- role, description, and base prompt;
+- declared tools and tool-surface projection hints;
+- skill references;
+- context strategy and compaction strategy;
+- provider preferences and raw model policy;
+- optional runtime caps;
+- output format.
 
-Responsibilities:
+Built-in packages use built-in provenance. File-backed custom packages are stored
+under `$SINOMO_DATA_DIR/agents/*.json`. Imported package JSON receives imported
+provenance with the source path. Module-projected packages receive module
+provenance from the module registration id and version.
 
-- Keep the cluster healthy.
-- Handle background tasks that are not directly part of the immediate user conversation.
-- Aggregate operational events and decide whether action is needed.
-- Clean up old files and artifacts according to storage rules and policy.
-- Investigate logged errors, degraded nodes, failed tasks, stale workspaces, rollout issues, and unexpected daemon behavior.
-- Support main-agent operations by preparing environments, checking node health, running diagnostics, or scheduling safe maintenance.
-- Apply minimal bug fixes through the normal self-evolution or rollout path when the scope is clearly operational and bounded.
-- Escalate large functionality changes to self-evolution instead of making broad ad hoc changes.
+Package validation rejects malformed ids, package versions, duplicate tools,
+invalid tool names, invalid tool-surface entries, invalid skills, invalid
+context providers, blank model preferences, invalid temperatures, conflicting
+legacy/model-policy fields, zero runtime limits, and unknown context or
+compaction strategies before the package enters the catalog.
 
-The background agent should stay silent most of the time. Its default report target is the main agent, not the user. It may address the user directly only when there is a critical, time-sensitive, dangerous, or destructive issue, or when the main agent is malfunctioning and cannot mediate.
+Runtime limits are unbounded by default. Explicit caps remain opt-in and can be
+set by callers that own a concrete session or model constraint. Package-derived
+caps do not become sticky: switching from a capped package back to an unbounded
+package clears package-derived caps, while caller-provided explicit caps survive
+package swaps and JSON persistence.
 
-The background agent defaults to a powerful API-hosted or CLI-accessible coding LLM. It is event-woken rather than continuously active. A cluster-wide concurrency limit controls sessions for this agent; the default limit is one active background-agent session across the whole cluster. Multiple events should coalesce into one wake cycle so routine maintenance does not consume tokens continuously.
+CLI package commands:
 
-## Core Model
-
-The core model is the model that drives Sinomo's real-time identity and user interaction loop.
-
-Requirements:
-
-- Full-duplex multimodal operation.
-- Streaming audio input and speech output.
-- Streaming visual input from cameras, screens, or encoded video events.
-- Text input and text output.
-- Barge-in and overlap handling, where listening and speaking can happen at the same time.
-- Low-latency local deployment path.
-- Trainable or adaptable local model path for Sinomo-specific behavior.
-- Stable event-level integration with the runtime so the model can observe async task progress without waiting on tool calls.
-
-Initial model choice:
-
-- First version: MiniCPM-o 4.5 or the best compatible MiniCPM-o release available at implementation time.
-- First local serving path: PyTorch. This should be the initial reference runtime for model loading, streaming behavior, interrupt behavior, and training or fine-tuning experiments.
-- Later serving paths: llama.cpp-omni, Ollama, vLLM, SGLang, or other deployment backends can be added after the PyTorch path defines the runtime contract.
-- API fallback: allowed when local inference is unavailable, overloaded, or below the required quality threshold, but this should be visible in runtime status and policy.
-
-The main agent should treat the core model as the live interaction controller, not as the only reasoning engine. It can ask stronger or specialized models for deliberation while continuing to talk with users.
-
-## Runtime Topology
-
-```text
-Users / Devices / Sessions
-  <-> Sinomo main agent
-      <-> Core full-duplex multimodal model
-      <-> Session timeline and world-state
-      <-> Async task registry
-      <-> Typed transcript and evidence store
-      <-> Deliberation model gateway
-      <-> Deliberation harness
-          <-> Context assembler and compactor
-          <-> Tool registry and executor
-          <-> Provider adapters through sinomo-lm
-      <-> Cluster-aware tool/action gateway
-      <-> SIFS filesystem view
-      <-> Background handoff queue
-
-Cluster events / health / storage / logs
-  -> Background wake aggregator
-  -> Background agent session
-  -> Maintenance actions, reports, or self-evolution jobs
+```sh
+sinomo agent inspect [agent-id] [--json]
+sinomo agent validate [agent-id|--file <path>] [--json]
+sinomo agent export [agent-id] [--output <path>]
+sinomo agent import <path> [--json]
 ```
 
-The main agent and background agent are logical roles. They may run on the same node in a single-machine deployment, but their responsibilities, wake policies, permissions, and reporting paths should remain separate.
+## Prompts and Provider Rendering
 
-## Real-Time Interaction Model
+Package prompts are role-oriented. They do not hardcode runtime model facts,
+provider protocol rules, tool schemas, or output contracts.
 
-Traditional LLM tool loops block on a request-response cycle. Sinomo should instead use an event-driven, real-time loop:
+The current rendering pipeline is:
 
-1. Perception, user input, tool progress, cluster health, and async worker updates enter the session timeline as events.
-2. The main agent continuously updates an interaction state: speaking, listening, waiting, delegating, recovering, or idle.
-3. Slow work creates async task records and returns a handle immediately.
-4. Partial progress, completion, failure, and cancellation arrive as new events.
-5. The main agent decides whether each event should change the live conversation, update memory silently, wake the background agent, or trigger self-evolution.
+1. `sinomo-agent` selects the package prompt and assembles typed turn context.
+2. `sinomo-agent` attaches request tools as `LanguageModelRequest.tools`.
+3. `sinomo-agent` passes the package output format to `sinomo-lm`.
+4. `sinomo-lm` renders provider-native protocol hints and output contracts.
+5. Providers return text, native tool calls, vendor fallback tool calls, usage,
+   finish events, or provider errors as provider-neutral values.
 
-Async task status can be injected into the live model stream as steering. The default immediate response after starting a background task is a short hint that the task is running asynchronously and will report back later. The runtime injects this hint right after the ongoing tool call or output stream boundary instead of waiting for the original turn to complete. If MiniCPM-o's native interrupt mechanism works reliably for tool-call progress, the runtime may use that path for lower-latency background-task updates.
+`Agent` treats malformed model output as recoverable. The failed response is
+preserved as typed evidence, model metrics record a repair attempt, and the
+runtime sends a focused repair request. `max_model_repair_attempts` is optional;
+when absent, repair attempts are left to session cancellation, steering, or
+runtime policy.
 
-The main agent must be trainable because most language models are optimized for turn-based tool calls, not concurrent full-duplex interaction with long-running background work. Runtime traces should explicitly capture interruption, overlap, task progress, delayed results, and user corrections so future local training can teach the model this interaction style.
+## Session and Turn Model
 
-## Async Work and Deliberation
+The generic agent loop has a session/turn split:
 
-Advanced models from APIs and CLIs are used for deliberate work that does not belong in the core real-time loop.
+- `Agent::run` remains the compatibility helper for one-shot calls.
+- `Agent::start_turn`, `continue_turn`, `steer`, `follow_up`, `compact`, and
+  `abort` operate on `AgentSession`.
+- `AgentSession` keeps both a model-facing projection transcript and an
+  append-only raw transcript so compaction never destroys source history.
+- Queued steering and follow-up messages are consumed into the next turn as
+  explicit queued context.
 
-Examples:
+Every model step assembles a `TurnContext` containing runtime facts, workspace
+facts, current session projection, working state, async updates, workspace
+instruction files such as `AGENTS.md`, prompt-reference expansions, generic
+context attachments, available tools, and budget estimates.
 
-- Planning complex multi-step tasks.
-- Internet research and synthesis.
-- Coding tasks.
-- Maintenance and cleanup planning.
-- Debugging Sinomo itself after crashes, unexpected behavior, regressions, or confusing user-visible failures.
-- Reviewing proposed self-evolution candidates.
-- Generating tests, diagnostics, and reproduction steps.
+The context assembler writes a `ContextAssemblyReport` for each turn. The report
+records included sources, omitted sources, byte estimates, and budget lanes for
+fixed prompt, current work, recent tail, retrieved memories, old summaries,
+prompt references, context attachments, async updates, and tool-surface
+availability.
 
-### Deliberation Harness
+Default model-visible bounds:
 
-Async model work should run through a reusable deliberation harness rather than bespoke prompt calls. The first implementation can live in `sinomo-agent` for velocity, but the stable contracts should stay compatible with `sinomo-lm`, `sinomo-events`, `sinomo-deliberation`, and the self-evolution crates.
+- workspace instruction files: 64 KiB;
+- prompt-reference files: 64 KiB;
+- prompt-reference directories: 200 entries;
+- context attachment payloads: bounded to configured model-visible byte budget;
+- async updates: bounded to configured model-visible byte budget;
+- replayed large tool-call inputs and tool results: bounded before the next
+  model request.
 
-The harness loop is intentionally small:
+Durable inputs and tool outcomes remain complete even when model-visible
+projections are bounded.
 
-```text
-assemble turn context
-  -> render provider request
-  -> stream model events
-  -> persist assistant items
-  -> execute requested tools through runtime policy
-  -> persist tool results as evidence
-  -> compact, retry, or continue if needed
-  -> finish with a final answer and evidence summary
+## Storage and Evidence
+
+`AgentSessionStore` is the reloadable session-state boundary.
+`FileAgentSessionStore` writes:
+
+- `events/agent/sessions/<session>/snapshot.json`;
+- `events/agent/sessions/<session>/events.jsonl`;
+- `events/agent/sessions/<session>/items.jsonl`;
+- `events/agent/sessions/<session>/projections.jsonl`.
+
+The snapshot is the canonical resume projection. Item and projection streams are
+append-only audit trails.
+
+`AgentTraceStore` is the append-only observability boundary.
+`FileAgentTraceStore` writes run boundaries, context reports, model events,
+typed transcript items, tool outcomes, compactions, and emitted runtime events
+under `events/agent/traces/<session>.jsonl`.
+
+Full command and tool evidence can be written under
+`events/agent/evidence/<session>/...`. `LocalWorkspaceAgentConfig` wires local
+evidence roots and optional SIFS-backed evidence mounts into workspace tools.
+
+`sinomo-agent::register_storage_paths` registers `events/agent` as the R2-owned
+agent storage subtree.
+
+## Tool Surface and Progressive Disclosure
+
+The primary availability surface is `AgentToolSurface`. Compatibility aliases
+for older `AgentPolicyBundle` and policy naming remain loadable for persisted
+data, but new code should use tool-surface and availability terminology.
+
+The tool planner combines:
+
+- registry descriptors;
+- module-projected tools;
+- package-declared tools;
+- visible toolsets;
+- explicit allow and deny lists;
+- declared tool capabilities;
+- registry generation.
+
+Visible local tools must have executors. Planned visible tools without executors
+produce typed model-visible failures. Stale or hallucinated tool calls that are
+not planned for the current generation also produce typed model-visible
+failures with registry-generation and visible-toolset evidence.
+
+The coding package's visible bridge tools are:
+
+- `tool_search`;
+- `tool_describe`;
+- `tool_call`;
+- `skill_search`;
+- `skill_describe`;
+- `skill_activate`.
+
+Hidden tools such as `git_diff` can be discovered and invoked through these
+bridges. Direct guessed calls to hidden tools are blocked.
+
+`skill_search` and `skill_describe` disclose package-declared skills and module
+embedded skills. `skill_activate` currently returns an explicit host-runtime
+activation contract unless an embedding runtime attaches an activation executor.
+
+## Workspace Tools
+
+The local workspace registry includes file, search, patch, version-control,
+command, and user-input tools.
+
+Important behavior:
+
+- `read_file`, `list_files`, and `search` bound model-visible output.
+- `apply_patch` is the source-editing tool and supports raw patch text plus
+  structured small-edit forms such as exact replacement and one-based range
+  replacement.
+- `changed_files` and `git_diff` are version-control helpers. `git_diff` is
+  normally hidden behind progressive disclosure and preserves durable full-diff
+  artifacts while returning a bounded preview.
+- `run_command` preserves stdout, stderr, exit status, duration, timeout state,
+  availability, execution evidence, and artifact refs across success, failure,
+  and timeout paths.
+- Large command output can be mirrored to SIFS-backed artifact refs while the
+  model-visible turn sees only bounded output and redacted artifact availability.
+- Model-visible tool results omit local and SIFS artifact URI values while
+  durable evidence keeps the exact refs.
+
+The coding-state reducer classifies validation outcomes, including missing
+commands, missing dependencies, environment blockers, terminal validation
+blockers, and patch-relevant failures. A narrow patch can finish as
+environment-blocked when remaining validation is blocked by missing setup rather
+than by patch evidence.
+
+## Runtime Services and Live Control
+
+`AgentSessionControlPlane` serializes active-turn state, task snapshots, task
+progress summaries, result refs, terminal statuses, and buffered events through
+`AgentSessionControlSnapshot`.
+
+Read-only object-RPC routes:
+
+- `/agent/session/inspect`;
+- `/agent/session/progress`;
+- `/agent/session/terminal-results`.
+
+Runtime-control object-RPC routes:
+
+- `/agent/session/steer`;
+- `/agent/session/follow-up`;
+- `/agent/session/interrupt`;
+- `/agent/session/resume`.
+
+The default daemon registration exposes the read-only routes. A process that
+owns live runtimes can register `AgentRuntimeControlService` with an
+`AgentRuntimeControlHost`. `AgentRuntimeControlRegistry` is the reusable host for
+live `AgentSessionRuntime` handles.
+
+Resume responses include `runtime_attached` and a typed reattach report:
+
+- `live_runtime_attached` when the host still owns the live runtime;
+- `persisted_metadata_only` when session/control metadata exists but live
+  handles cannot be restored;
+- `missing` when neither live runtime nor persisted metadata exists.
+
+True in-flight task reattachment across process restart remains a host-owned
+mechanism. The implemented route reports that limitation explicitly instead of
+pretending persisted metadata can restore process handles.
+
+The app chat worker and app-started in-process daemon share an
+`AgentRuntimeControlRegistry`, so GUI calls can steer, queue follow-ups,
+interrupt, and inspect active chat sessions owned by the app process.
+
+## Cancellation
+
+Cancellation is explicit across local and remote work.
+
+Implemented cancellation paths:
+
+- registry-level cancellation before non-command tool execution;
+- active version-control helper subprocess cancellation;
+- active sandbox/container cancellation;
+- host-provided gateway task cancellation;
+- remote object-RPC cancellation by operation id;
+- daemon sandbox cancellation routes;
+- native-dylib module cancellation routes for cancel-aware modules.
+
+Remote object-RPC tools stamp a `sinomo-operation-id` on run requests and send
+`ObjectRpcCancelRequest` to a configured cancel route with
+`sinomo-cancels-operation-id`. If a remote run returns an error after accepted
+cancellation, the agent classifies the outcome as cancelled rather than as an
+ordinary failure.
+
+Live-cluster test cases cover sandbox cancel route availability, active sandbox
+cancellation, native-dylib cancel route availability, and active cancel-aware
+module cancellation when the required fixtures are installed.
+
+## Readiness Gates
+
+`sinomo agent readiness [--json]` runs the deterministic local readiness gate.
+It validates:
+
+- built-in package metadata and package JSON round trips;
+- file-backed package save/load/import/catalog merge behavior;
+- malformed package rejection;
+- unbounded continuous-agent runtime defaults and explicit cap persistence;
+- prompt decomposition and provider-boundary delegation to `sinomo-lm`;
+- tool-surface compatibility aliases;
+- visible local tools having executors;
+- tool and skill progressive disclosure;
+- hidden-tool guarding and stale tool-call rejection;
+- task/workspace/placement run-context provenance;
+- prompt-reference, instruction-file, context-attachment, async-update, read-file,
+  tool-call input, and aggregate tool-result bounding;
+- `git_diff` hidden disclosure and durable full-diff evidence;
+- local, sandbox, gateway, and remote cancellation;
+- JSON decision parsing, text fallback, malformed-output repair, native tool
+  normalization, provider error classification, model metrics, and
+  `AgentToolPairIntegrity`;
+- deterministic compaction projection invariants;
+- session snapshot resume;
+- read-only runtime routes and runtime-control routes;
+- live steer/follow-up queueing, live interrupt, live resume, persisted-only
+  resume fallback, and missing-metadata resume fallback;
+- coding-state validation classification;
+- command evidence preservation, SIFS-backed command evidence, and
+  model-visible evidence redaction.
+
+Live-cluster agent tests are registered through the normal `sinomo test` harness:
+
+```sh
+sinomo test run cluster.agent.runtime-routes --require-cluster
+sinomo test run cluster.agent.runtime-persisted-session-routes --require-cluster
+sinomo test run cluster.agent.sandbox-cancel-route --require-cluster
+sinomo test run cluster.agent.sandbox-active-cancel --require-cluster
+sinomo test run cluster.agent.module-native-dylib-cancel-route --require-cluster
+sinomo test run cluster.agent.module-native-dylib-active-cancel --require-cluster
+sinomo test run --tag agent-readiness --require-cluster
 ```
 
-Core harness responsibilities:
+Skipped selected cases fail the suite command so missing live prerequisites do
+not look like a passed gate.
 
-- Maintain a typed transcript and evidence view, not only a model-visible text transcript.
-- Normalize provider output into provider-neutral stream events for assistant text, reasoning summaries, tool-call deltas, usage, finish reasons, errors, and aborts.
-- Keep model-visible tool schemas separate from runtime tool handlers.
-- Run every tool through policy, sandbox, scope, and output-size checks before execution.
-- Return tool results to the model as continuation context when another step is needed.
-- Preserve enough evidence for replay, compaction, user explanation, training, and self-evolution review.
-- Stop on final answer, budget exhaustion, explicit cancellation, or a harness-level policy decision.
+## Compaction
 
-OpenAI Responses should be the first direct API renderer for the deliberation harness because it maps well to typed text, reasoning, tool-call, and tool-result items. The durable Sinomo transcript must remain provider-neutral so Chat Completions-compatible local servers, Anthropic, Google, process-backed coding agents, and smaller interactive models can be added later without changing the core session contract.
+Compaction has two separate concerns.
 
-Async work should use the standard task-call schema, with durable task records behind each call:
+Deterministic runtime invariants live in `sinomo-agent` and are covered by local
+readiness:
 
-- `task_id`
-- owner agent role
-- originating session
-- user-visible summary
-- current state
-- priority
-- node placement
-- permissions and resource limits
-- cancellation policy
-- input evidence handles
-- output artifact handles
-- progress events
+- compaction produces typed projection state;
+- source item counts and retained item ids are preserved;
+- policy constraints survive the projection;
+- session snapshots can resume after compaction.
 
-The immediate return value follows normal task-call shape but marks the task as backgrounded and includes the stream-injection hint to present to the main agent. Completion and progress messages are delivered later through task events. No new external call shape is required for the language model: from the model's perspective these remain normal tool calls. The runtime guarantee is that a later injected response will arrive when progress, completion, failure, or cancellation needs attention.
+Model quality is eval work, not ordinary Rust unit testing. The optional
+benchmark module owns the live/model harness:
 
-Recommended injected response shape:
-
-```json
-{
-  "kind": "async_task_update",
-  "task_id": "task_...",
-  "status": "running|progress|completed|failed|cancelled",
-  "summary": "Short natural-language update for the live agent.",
-  "needs_user_attention": false,
-  "result_ref": "sifs:/services/tasks/task_.../result.json",
-  "next_action_hint": "continue_silently|tell_user|ask_user|handoff_to_background|inspect_result"
-}
+```sh
+python3 modules/benchmark/sinomo-benchmarks/agent/run_compaction_eval.py --mode plan
+python3 modules/benchmark/sinomo-benchmarks/agent/run_compaction_eval.py --mode fixture --summary-out benchmark-results/agent-compaction/fixture-summary.json
+python3 modules/benchmark/sinomo-benchmarks/agent/run_compaction_eval.py --mode run --provider codex --model gpt-5.2-codex
 ```
 
-The `summary` should be safe to inject into a live stream. Larger outputs, logs, files, or artifacts should be referenced through `result_ref` instead of being inlined. `next_action_hint` is advisory steering, not authority; the main agent still decides how to respond in context.
+The checked-in scenarios cover long-session resume, explicit constraint
+retention, coding continuation after compaction, and live-cluster operations
+after compaction. Fixture mode validates harness structure without invoking a
+model. Live/model results are research and eval evidence; local readiness remains responsible only for deterministic projection and persistence invariants.
 
-The main agent should be able to continue speaking with the user while these tasks run. When a result arrives, it is just another event in the session timeline and can be summarized, ignored, acted on, or handed to the background agent.
+## Model and Local Runtime
 
-## Transcript, Context, and Compaction
+The local PyTorch bridge lives in `crates/sinomo-pytorch`. It owns the stable
+request/response schema, process invocation, status reporting, and a
+`LanguageModel` provider adapter. Python and Transformers integration stays
+isolated in `crates/sinomo-pytorch/python/pytorch_bridge.py`.
 
-The agent system should define the transcript before it defines provider payloads. Provider requests are rendered from Sinomo transcript state, not the other way around.
+The bridge supports text requests, vision requests with image path or base64
+payload, audio and duplex request modes in the stable schema, dependency probes,
+and local mock mode for smoke tests. MiniCPM-o remains the first configured
+backend, but the Rust boundary is model-family neutral: any local
+PyTorch/Transformers model that satisfies the schema can be hosted behind the
+bridge or managed server.
 
-Initial transcript item families:
+Product runtime configuration is stored through model runtime settings rather
+than prompt text. Cluster-scoped settings live in cluster KV at
+`/config/lm/runtime`; local-only test overrides use `sinomo --local`.
 
-- user messages;
-- assistant text and optional reasoning summaries;
-- tool calls and tool results;
-- async task creation, progress, completion, failure, and cancellation;
-- context-injection records;
-- model usage and provider diagnostics;
-- patch, diff, snapshot, and verification records;
-- errors, retries, aborts, and policy denials;
-- compaction summaries and retained-tail markers.
+## Background Agent and Cluster Operations
 
-Every deliberation turn should be assembled from durable state into a `TurnContext`:
+The main and background agents are logical roles. The current generic runtime
+supports both through packages and tool surfaces.
 
-```text
-TurnContext
-  session_id
-  active agent role
-  provider and model
-  stable system/base instructions
-  transcript view
-  workspace and SIFS facts
-  loaded instruction files
-  evolution job facts when relevant
-  available tool specs
-  budget estimates
-  omitted-context report
-```
+Main-agent defaults:
 
-The context assembler should emit a context assembly report for every turn. The report should list included files, summaries, memory fragments, tool schemas, token or size estimates, omitted items, and omission reasons. This report is evidence; it is also the first place to debug context-packing failures.
+- user-facing interaction;
+- session/task state tracking;
+- local live inference when available;
+- handoff of cluster maintenance by default;
+- bounded direct workspace work when visible tools allow it.
 
-Compaction must be explicit typed state. A compaction event should include:
+Background-agent defaults:
 
-- reason and trigger threshold;
-- summary text;
-- first retained item or event;
-- token or size estimate before compaction;
-- retained-tail size;
-- files read and modified;
-- current objective and latest user request;
-- active plan, completed work, blockers, and next actions;
-- verification state and open risks;
-- policy constraints that must survive the summary.
+- maintenance and background operations;
+- event-woken execution rather than continuous model polling;
+- cluster and SIFS diagnostics through operational tools;
+- concise reports back to the main agent unless escalation requires user
+  notification.
 
-Compaction summaries are reference material for future model turns, not authority. Runtime policy, tool state, verification state, and rollout decisions remain structured state outside the summary.
+Cluster operation tools should carry session, workspace, task, placement, node,
+and evidence metadata. The ordinary model-visible context should get summaries
+and handles, not unbounded cluster logs.
 
-## Cluster-Aware Tooling
+## Self-Evolution Boundary
 
-All environment interaction runs on top of the Sinomo cluster infrastructure. This does not require distributed model inference. It means tool execution, filesystem access, device control, process execution, diagnostics, rollout, and storage work are cluster-aware by default.
+Self-evolution is outside the agent runtime core. It is an R2 caller that uses
+the generic `Agent` loop with context attachments for evolution jobs, mutation
+packets, candidate bundles, and prior evidence.
 
-Main-agent view:
+The agent runtime provides generic evidence: model events, tool calls, tool
+results, patch snapshots, validation records, model metrics, and tool-pair
+integrity. `sinomo-evolution` decides how to package that evidence into
+candidate bundles and approval summaries. The agent runtime should not grow
+self-evolution-specific control flow.
 
-- The default filesystem root is SIFS.
-- Session context supplies default node, user, workspace, and device targets.
-- The main agent can start, inspect, and cancel background work without blocking live interaction.
-- The main agent can hand off cluster-health, SIFS file inspection, cleanup, rollout, and maintenance work to the background agent.
-- Direct `cluster_status`, `read_sifs`, `write_sifs`, and `list_sifs` tools are not part of the main-agent default tool set.
-- The background-agent default tool set includes direct cluster status and SIFS read/write/list tools.
-- The ordinary model context includes only basic cluster overview information such as available services and endpoint information.
+## Training and Data Collection
 
-Tool gateway responsibilities:
+Local training and adaptation depend on durable traces.
 
-- Resolve session defaults into concrete node/device/workspace targets.
-- Check cluster membership and orphan guards before distributed work.
-- Select model-visible tool schemas from the runtime registry according to agent role, trust ring, provider capability, workspace scope, and policy.
-- Validate model tool arguments before execution.
-- Enforce node-local policy and sandbox limits.
-- Route actions to the node closest to the relevant device or data.
-- Return async handles for slow calls.
-- Attach provenance, node identity, policy decision, and evidence handles to every result.
-- Truncate large model-visible output while preserving full-output handles for audit and later inspection.
-- Prefer structured machine-readable output over terminal-only text.
+Useful data classes:
 
-Cluster-operation tasks should be handed to the background agent unless they are a direct, immediate part of the user's task and safe for the main agent to drive. This keeps cluster details mostly transparent to Sinomo's real-time persona while still preserving explicit control when placement matters.
+- user interaction streams and explicit corrections;
+- agent decisions to speak, stay silent, interrupt, delegate, ask, or use tools;
+- async task lifecycle and delayed results;
+- tool inputs, outputs, errors, placement, duration, and availability decisions;
+- context assembly reports, model events, compactions, repair turns, and final
+  evidence;
+- cluster health and recovery traces.
 
-The initial deliberation tool set should stay small and auditable:
+Training data must carry provenance, privacy labels, retention policy, and
+deletion hooks. Raw sensitive media should stay local by default; derived
+summaries, embeddings, or clips can be used only according to policy.
 
-- `read_file`
-- `list_files`
-- `search`
-- `apply_patch`
-- `run_command`
-- `request_user_input`
-- `tool_search`
-- `tool_describe`
-- `tool_call`
-
-Version-control helpers such as `changed_files` and `git_diff` should remain registered but hidden behind progressive tool disclosure. Formatting, testing, and project-specific workflows should usually run through `run_command` until a session-specific extension can provide a better structured contract.
-
-## Background Wake and Event Aggregation
-
-The background agent is woken by events, not by polling an expensive model loop.
-
-Wake sources:
-
-- Cluster error logs.
-- Repeated task failures.
-- Storage rule violations.
-- Low disk space or runaway artifact growth.
-- Daemon crash or restart events.
-- Rollout failures.
-- DFS repair or replication failures.
-- Security, policy, or sandbox incidents.
-- Main-agent handoff requests.
-- Scheduled maintenance windows.
-
-Wake aggregation rules:
-
-- Events are queued durably and grouped by family, affected node, affected service, workspace, and time window.
-- Normal events wake the background agent only once per configurable interval. The default interval is once per day.
-- Emergency events, such as logged errors or dangerous policy incidents, wake the background agent immediately.
-- A wake cycle receives a queued incident bundle, not one isolated event.
-- Cluster-wide background concurrency defaults to one active session.
-- New non-emergency events remain queued while the current background-agent session is running and are considered in the next wake cycle.
-- Emergency events that arrive during an active background-agent session are queued after the current emergency bundle and do not start parallel sessions unless policy explicitly permits it.
-- The event bundle is written to a temporary file instead of being injected directly into the model context. The background agent receives the file path and uses file tools to inspect, filter, summarize, and act on the queued events.
-- The temporary file format is LM-friendly JSON: a top-level list of event objects. Sinomo Object remains appropriate for internal storage and transport, but JSON is the handoff format for model-facing event review.
-- Token budgets and wall-clock budgets are explicit per wake cycle.
-- The background agent writes a concise report to the main agent unless escalation rules require direct user notification.
-
-Example wake condition:
-
-```text
-storage.rule_violation:
-  path: /services/evolution/workspaces/old-candidates
-  rule: delete_or_archive_after_days
-  count: 42
-  oldest_age_days: 31
-  suggested_action: archive_or_delete
-```
-
-## Data Collection and Local Training
-
-When local models are used, Sinomo should be able to train or adapt them from operation data. Data collection is therefore part of the architecture, not an afterthought.
-
-Collected data classes:
-
-- User interaction streams: text, audio transcripts, speech timing, barge-in points, selected visual summaries, and explicit user corrections.
-- Agent decisions: when Sinomo spoke, stayed silent, interrupted, delegated, asked a question, used a tool, or handed off to the background.
-- Async task traces: task creation, progress, delayed results, cancellations, and user satisfaction signals.
-- Tool traces: structured inputs, outputs, errors, node placement, duration, and policy decisions.
-- Deliberation harness traces: context assembly reports, provider request metadata, normalized stream events, tool-call continuations, compaction events, retries, and final answer evidence.
-- Cluster traces: node health, rollout state, DFS issues, daemon errors, and recovery actions.
-- Self-evolution traces: issue detection, proposal, implementation, evaluation, rollout, rollback, and postmortem outcomes.
-
-Training data requirements:
-
-- Collection defaults to on for every data class, including audio and video, because local traces are critical for training the real-time multimodal agent. Users, devices, sessions, and data classes must still support explicit opt-out.
-- Consent, privacy, retention policy, and opt-out state must be explicit per user, session, device, and data class.
-- Raw sensitive media should stay local by default. Redacted summaries, embeddings, or clips can be derived for training according to policy.
-- Training examples should preserve concurrency and timing information, not only final text turns.
-- Bad outcomes and corrected behavior should be kept as high-value training and evaluation material.
-- Data used for training should have provenance, policy labels, and deletion hooks.
-- Local fine-tuning, adapter training, preference tuning, and replay-based evaluation should be separate pipeline stages.
-
-The first trainable path can start with adapter-style tuning or supervised fine-tuning on curated traces. Later versions can add preference optimization, replay-driven evaluation, and targeted training for real-time task-state management.
-
-## Self-Evolution
-
-Both agents can start and monitor self-evolution tasks, but they should do so for different reasons.
-
-Main-agent triggers:
-
-- The user explicitly asks Sinomo to evolve.
-- A user-facing task repeatedly fails for architectural reasons.
-- The main agent lacks a required tool, skill, or runtime behavior.
-- The interaction model cannot represent the user's workflow cleanly.
-
-Background-agent triggers:
-
-- A system issue cannot be fixed by bounded maintenance.
-- A recurring cluster, DFS, rollout, daemon, or policy failure points to a design flaw.
-- A minimal operational bug fix is insufficient or would be brittle.
-- A maintenance task reveals missing observability, missing tooling, or unsafe manual steps.
-
-Self-evolution handoff rules:
-
-- Small operational repairs from the background agent go directly to approval. If approved, they go directly to rollout. This path is intended for quick, narrow system fixes and must remain bounded.
-- Until Sinomo has an autonomous approval system, approval for quick background-driven operational fixes is delegated to a human. This should use the same approval and rollout surfaces as self-evolution.
-- Large functionality changes use the self-evolution architecture.
-- Evolution jobs must have bounded scope, write-set ownership, evaluation gates, rollback policy, and provenance.
-- Mutation packets and implementation runs should be ordinary deliberation-harness sessions with extra job, scope, verification, and rollback context.
-- Verification commands, patch snapshots, changed-file summaries, tool results, and final model claims should be stored as typed candidate evidence.
-- A candidate cannot be treated as successful only because the model says it is done. Verification evidence and policy decisions remain authoritative.
-- The main agent can explain and negotiate user-facing evolution goals.
-- The background agent can provide diagnostics, incident bundles, reproduction steps, and operational constraints.
-
-## Permissions and Reporting
-
-The main agent and background agent need different defaults.
-
-| Capability | Main agent | Background agent |
-|---|---|---|
-| Direct user interaction | Default yes | Default no |
-| Real-time speech/video loop | Default yes | No |
-| Cluster health inspection | Summary by default | Full operational view |
-| Cluster operation execution | Handoff by default | Default owner |
-| User task execution | Default owner | Support role |
-| Background cleanup | Handoff by default | Default owner |
-| Minimal operational bug fix | Request or monitor | May drive through gates |
-| Large functionality change | Self-evolution | Self-evolution |
-| Direct user alert | Normal conversation | Critical escalation only |
-
-Every action should carry the responsible agent role, initiating event, session or maintenance bundle, target node, and policy decision. This is needed for debugging, training, user explanation, and self-evolution evidence.
-
-Tool and rollout permissions are runtime decisions. System prompts should tell models what to expect, but actual permission checks happen before tool schema exposure, file reads, file writes, command execution, network access, memory writes, candidate approval, and rollout activation.
-
-## Remaining Refinements
-
-- Define the exact JSON schemas for async task updates and background event-bundle files once the event and task crates stabilize.
-- Define the stable typed transcript and evidence item schema shared by `sinomo-agent`, `sinomo-deliberation`, `sinomo-lm`, and self-evolution jobs.
-- Define the normalized provider stream event enum and the first OpenAI Responses renderer/parser.
-- Define the context assembly report schema and compaction event schema.
-- Define the policy metadata required by tool descriptors before broadening the tool registry.
-- Define the user-facing controls for per-user, per-device, per-session, and per-data-class collection opt-out.
-- Define the human approval UI or CLI flow shared by quick background fixes and self-evolution rollout approval.
+The first training path can be adapter-style tuning or supervised fine-tuning on
+curated traces. Later paths can add preference optimization and replay-driven
+evaluation.

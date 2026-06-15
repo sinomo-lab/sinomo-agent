@@ -50,7 +50,7 @@ The artifact-integrity path is now generic below R2. Candidate bundles carry a s
 5. Human approval remains required for now. Automatic live rollout, distributed canaries, and R1 self-promotion come after local candidate quality is reliable.
 6. Every candidate must be inspectable after the fact: mutation packet, full agent run, tool evidence, diff, command logs, benchmark logs, scorecards, and approval decision.
 
-Coding-agent quality work is tracked in [coding-agent-improvement-plan.md](coding-agent-improvement-plan.md). Self-evolution should consume that controller and its evidence instead of growing another mutation harness.
+Coding-agent quality work is described in [agent-system-architecture.md](../agent-system-architecture.md). Self-evolution should consume that controller and its evidence instead of growing another mutation harness.
 
 ## Phase 1: Use The Agent Loop As The Mutation Worker
 

@@ -105,7 +105,7 @@ SCENARIOS: list[CompactionEvalScenario] = [
             "Completed work: AgentToolSurface renamed the policy surface, visible tools are pre-approved, and hidden stale tool calls return tool_unavailable.",
             "Completed verification: cargo test -p sinomo-agent --quiet passed before this eval slice; cargo fmt --all and git diff --check were clean.",
             "Current task: add compaction quality eval coverage outside normal Rust unit tests, probably under modules/benchmark/sinomo-benchmarks.",
-            "Next concrete files to inspect or edit are modules/benchmark/sinomo-benchmarks/src/lib.rs and docs/agent-system-implementation.md.",
+            "Next concrete files to inspect or edit are modules/benchmark/sinomo-benchmarks/src/lib.rs and docs/agent-system-architecture.md.",
         ],
         post_compaction_probe="Name the next three concrete engineering actions and the first verification command.",
         expected_markers=[

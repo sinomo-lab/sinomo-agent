@@ -105,7 +105,7 @@ pub fn run_local_agent_readiness_gate(workspace_root: impl Into<PathBuf>) -> Age
     checks.push(check_package_rejects_malformed_definitions());
     checks.push(check_continuous_runtime_limits_smoke());
     checks.push(check_prompt_decomposition_smoke());
-    checks.push(check_agent_plan_terminology_smoke(&workspace_root));
+    checks.push(check_agent_architecture_doc_smoke(&workspace_root));
     checks.push(check_provider_boundary_smoke(&workspace_root));
     checks.push(check_tool_surface_compatibility_smoke());
     checks.push(check_local_tool_readiness(
@@ -294,16 +294,16 @@ fn check_prompt_decomposition_smoke() -> AgentReadinessCheck {
     }
 }
 
-fn check_agent_plan_terminology_smoke(workspace_root: &Path) -> AgentReadinessCheck {
-    let plan_path = coding_agent_improvement_plan_path(workspace_root);
-    let plan = match fs::read_to_string(&plan_path) {
-        Ok(plan) => plan,
+fn check_agent_architecture_doc_smoke(workspace_root: &Path) -> AgentReadinessCheck {
+    let docs_path = agent_system_architecture_path(workspace_root);
+    let docs = match fs::read_to_string(&docs_path) {
+        Ok(docs) => docs,
         Err(error) => {
             return failed(
-                "agent_plan_terminology_smoke",
-                "coding-agent improvement plan could not be read for terminology checks",
+                "agent_architecture_doc_smoke",
+                "agent-system architecture doc could not be read for terminology checks",
                 serde_json::json!({
-                    "path": plan_path,
+                    "path": docs_path,
                     "error": error.to_string(),
                 }),
             );
@@ -314,42 +314,80 @@ fn check_agent_plan_terminology_smoke(workspace_root: &Path) -> AgentReadinessCh
         "ToolApprovalDecision",
         "AgentPolicyDecision",
     ];
-    let failures = forbidden_terms
+    let mut failures = forbidden_terms
         .iter()
-        .filter(|term| plan.contains(**term))
+        .filter(|term| docs.contains(**term))
         .map(|term| {
             serde_json::json!({
                 "term": term,
-                "error": "plan uses obsolete tool approval or agent policy terminology",
+                "error": "architecture doc uses obsolete tool approval or agent policy terminology",
             })
         })
         .collect::<Vec<_>>();
+    let required_markers = [
+        "single source of truth",
+        "AgentDefinition` is the agent package artifact",
+        "There is no extra runtime profile layer",
+        "Provider-specific behavior belongs in `sinomo-lm`",
+        "The primary availability surface is `AgentToolSurface`",
+        "`sinomo agent readiness [--json]` runs the deterministic local readiness gate",
+        "Model quality is eval work, not ordinary Rust unit testing",
+        "Self-evolution is outside the agent runtime core",
+    ];
+    failures.extend(
+        required_markers
+            .iter()
+            .filter(|marker| !docs.contains(**marker))
+            .map(|marker| {
+                serde_json::json!({
+                    "marker": marker,
+                    "error": "single-source agent architecture doc is missing required current-implementation coverage",
+                })
+            }),
+    );
+    let removed_docs = [
+        workspace_file_path(workspace_root, &["docs", "agent-system-implementation.md"]),
+        workspace_file_path(
+            workspace_root,
+            &["docs", "plans", "coding-agent-improvement-plan.md"],
+        ),
+    ];
+    failures.extend(
+        removed_docs
+            .iter()
+            .filter(|path| path.exists())
+            .map(|path| {
+                serde_json::json!({
+                    "path": path,
+                    "error": "agent-system doc cleanup expects architecture doc to be the only agent-system source",
+                })
+            }),
+    );
     if failures.is_empty() {
         passed(
-            "agent_plan_terminology_smoke",
-            "coding-agent plan keeps session-control terminology aligned with tool-surface availability",
+            "agent_architecture_doc_smoke",
+            "agent-system architecture doc is the single current source for package, tool-surface, provider, readiness, compaction, and self-evolution boundaries",
             serde_json::json!({
-                "path": plan_path,
+                "path": docs_path,
                 "forbidden_terms": forbidden_terms,
+                "required_markers": required_markers,
+                "removed_docs": removed_docs,
             }),
         )
     } else {
         failed(
-            "agent_plan_terminology_smoke",
-            "coding-agent plan contains obsolete tool approval or agent policy terminology",
+            "agent_architecture_doc_smoke",
+            "agent-system architecture doc cleanup checks failed",
             serde_json::json!({
-                "path": plan_path,
+                "path": docs_path,
                 "failures": failures,
             }),
         )
     }
 }
 
-fn coding_agent_improvement_plan_path(workspace_root: &Path) -> PathBuf {
-    workspace_file_path(
-        workspace_root,
-        &["docs", "plans", "coding-agent-improvement-plan.md"],
-    )
+fn agent_system_architecture_path(workspace_root: &Path) -> PathBuf {
+    workspace_file_path(workspace_root, &["docs", "agent-system-architecture.md"])
 }
 
 fn check_provider_boundary_smoke(workspace_root: &Path) -> AgentReadinessCheck {
@@ -4382,16 +4420,11 @@ fn check_compaction_eval_harness_smoke(workspace_root: &Path) -> AgentReadinessC
         workspace_root,
         &["modules", "benchmark", "sinomo-benchmarks", "src", "lib.rs"],
     );
-    let docs_path =
-        workspace_file_path(workspace_root, &["docs", "agent-system-implementation.md"]);
+    let docs_path = agent_system_architecture_path(workspace_root);
     let mut failures = Vec::new();
     let script = read_readiness_text(&script_path, "compaction eval script", &mut failures);
     let catalog = read_readiness_text(&catalog_path, "benchmark catalog", &mut failures);
-    let docs = read_readiness_text(
-        &docs_path,
-        "agent system implementation docs",
-        &mut failures,
-    );
+    let docs = read_readiness_text(&docs_path, "agent system architecture docs", &mut failures);
 
     let required_scenarios = [
         "long-session-resume",
@@ -4449,11 +4482,11 @@ fn check_compaction_eval_harness_smoke(workspace_root: &Path) -> AgentReadinessC
     }
 
     let required_doc_markers = [
-        "Compaction quality evals live under the optional benchmark module",
+        "Model quality is eval work, not ordinary Rust unit testing",
         "run_compaction_eval.py --mode plan",
         "run_compaction_eval.py --mode fixture",
         "run_compaction_eval.py --mode run",
-        "Live/model results are research/eval evidence",
+        "Live/model results are research and eval evidence",
         "local readiness remains responsible only for deterministic projection and persistence invariants",
     ];
     for marker in required_doc_markers {
@@ -4461,7 +4494,7 @@ fn check_compaction_eval_harness_smoke(workspace_root: &Path) -> AgentReadinessC
             failures.push(serde_json::json!({
                 "path": docs_path,
                 "marker": marker,
-                "error": "agent implementation docs no longer describe the compaction eval/readiness boundary",
+                "error": "agent architecture docs no longer describe the compaction eval/readiness boundary",
             }));
         }
     }
@@ -7143,7 +7176,7 @@ mod tests {
             report
                 .checks
                 .iter()
-                .any(|check| check.id == "agent_plan_terminology_smoke")
+                .any(|check| check.id == "agent_architecture_doc_smoke")
         );
         assert!(
             report
