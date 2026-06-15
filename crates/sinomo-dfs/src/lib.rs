@@ -125,7 +125,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use time::OffsetDateTime;
-#[cfg(test)]
 use transfer::RepairRetryState;
 use transfer::{
     InProgressBlobTransfer, InProgressFetchBlobTransfer, InProgressPatchTransfer,
@@ -435,6 +434,7 @@ const DFS_LOCAL_CHUNK_WINDOW_SIZE: u32 = 256;
 const DFS_ADAPTIVE_TRANSFER_WINDOW_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const DFS_REMOTE_READ_RETRY_DELAY: Duration = Duration::from_secs(1);
 const DFS_CHUNK_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const DFS_REPAIR_RETRY_SUPPRESSED_TICK: u64 = u64::MAX;
 const DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE: usize = 4096;
 const DFS_METADATA_OBJECT_VERSION_PAGE_SIZE: usize = 1024;
 const DFS_METADATA_OBJECT_INTENT_PAGE_SIZE: usize = 1024;
@@ -8081,6 +8081,10 @@ where
             if !self.repair_retry_is_due(&job.intent_id, &job.missing_replica_node_id) {
                 continue;
             }
+            if !self.pending_repair_is_locally_authoritative(&pending)? {
+                self.suppress_repair_retries_for_lost_authority(&job.intent_id, None);
+                continue;
+            }
 
             if self.open_pending_write_blob_stream(&pending).is_err() {
                 let fetch_requested = self
@@ -9642,12 +9646,13 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             if !distributed_intent_matches_record(restored_intent, &intent_record) {
                 continue;
             }
-            let needs_pending_write =
-                matches!(
+            let locally_coordinated_intent = intent_record.coordinator_node_id == self.node_id;
+            let needs_pending_write = locally_coordinated_intent
+                && (matches!(
                     intent_record.status,
                     DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
                 ) || (matches!(intent_record.status, DfsWriteIntentStatus::Committed)
-                    && repair_intent_ids.contains(&intent_record.intent_id));
+                    && repair_intent_ids.contains(&intent_record.intent_id)));
             if needs_pending_write && let Some(content_hash) = intent_record.content_hash.clone() {
                 let size_bytes = self
                     .pending_write_size_hint(
@@ -15193,7 +15198,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     state.inflight = false;
                 }
                 for state in pending.repair_retries.values_mut() {
-                    state.next_retry_tick = 0;
+                    wake_repair_retry_state(state);
                     state.inflight = false;
                 }
             }
@@ -15226,6 +15231,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 continue;
             };
             if !self.repair_retry_is_due(&job.intent_id, &job.missing_replica_node_id) {
+                continue;
+            }
+            if !self.pending_repair_is_locally_authoritative(&pending)? {
+                self.suppress_repair_retries_for_lost_authority(&job.intent_id, None);
                 continue;
             }
 
@@ -17635,10 +17644,17 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             DfsBlobTransferResult::Rejected { ref reason } => {
                 match self.ensure_repair_response_request_matches_pending(&response) {
                     Ok(()) => {
-                        self.record_repair_retry_scheduled(
-                            &response.intent_id,
-                            &response.replica_node_id,
-                        );
+                        if repair_rejection_indicates_lost_authority(reason) {
+                            self.suppress_repair_retries_for_lost_authority(
+                                &response.intent_id,
+                                Some(&response.replica_node_id),
+                            );
+                        } else {
+                            self.record_repair_retry_scheduled(
+                                &response.intent_id,
+                                &response.replica_node_id,
+                            );
+                        }
                         Ok(NetworkedDfsServiceEvent::RepairRejected {
                             intent_id: response.intent_id,
                             object_id: response.object_id,
@@ -18114,10 +18130,14 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 })
             }
             DfsFetchBlobResult::Rejected { reason } => {
-                self.record_fetch_failed_source_and_wake_retries(
-                    &response.intent_id,
-                    &response.source_node_id,
-                );
+                if repair_rejection_indicates_lost_authority(&reason) {
+                    self.suppress_repair_retries_for_lost_authority(&response.intent_id, None);
+                } else {
+                    self.record_fetch_failed_source_and_wake_retries(
+                        &response.intent_id,
+                        &response.source_node_id,
+                    );
+                }
                 Ok(NetworkedDfsServiceEvent::BlobFetchRejected {
                     intent_id: response.intent_id,
                     object_id: response.object_id,
@@ -18560,7 +18580,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         }
         if let Some(pending) = self.pending_writes.get_mut(intent_id) {
             for state in pending.repair_retries.values_mut() {
-                state.next_retry_tick = 0;
+                wake_repair_retry_state(state);
                 state.inflight = false;
             }
             for state in pending.stage_retries.values_mut() {
@@ -18619,7 +18639,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 state.inflight = false;
             }
             for state in pending.repair_retries.values_mut() {
-                state.next_retry_tick = 0;
+                wake_repair_retry_state(state);
                 state.inflight = false;
             }
         }
@@ -20577,7 +20597,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 state.inflight = false;
             }
             for state in pending.repair_retries.values_mut() {
-                state.next_retry_tick = 0;
+                wake_repair_retry_state(state);
                 state.inflight = false;
             }
         }
@@ -20607,7 +20627,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 state.inflight = false;
             }
             for state in pending.repair_retries.values_mut() {
-                state.next_retry_tick = 0;
+                wake_repair_retry_state(state);
                 state.inflight = false;
             }
         }
@@ -20706,7 +20726,18 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         self.pending_writes
             .get(intent_id)
             .and_then(|pending| pending.repair_retries.get(replica_node_id))
-            .is_none_or(|state| state.next_retry_tick <= self.repair_retry_tick)
+            .is_none_or(|state| {
+                !repair_retry_state_is_suppressed(state)
+                    && state.next_retry_tick <= self.repair_retry_tick
+            })
+    }
+
+    fn pending_repair_is_locally_authoritative(
+        &mut self,
+        pending: &PendingNetworkedWrite,
+    ) -> Result<bool, DfsError> {
+        let object = self.current_read_object_metadata(&pending.object_id)?;
+        self.is_local_metadata_primary_for_object(&object)
     }
 
     fn record_repair_inflight(
@@ -20721,6 +20752,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 .repair_retries
                 .entry(replica_node_id.clone())
                 .or_default();
+            if repair_retry_state_is_suppressed(state) {
+                state.inflight = false;
+                return;
+            }
             state.attempts = state.attempts.saturating_add(1);
             state.inflight = true;
             state.next_retry_tick = tick.saturating_add(repair_retry_delay_ticks(state.attempts));
@@ -20752,6 +20787,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 .repair_retries
                 .entry(replica_node_id.clone())
                 .or_default();
+            if repair_retry_state_is_suppressed(state) {
+                state.inflight = false;
+                return;
+            }
             state.attempts = state.attempts.saturating_add(1);
             state.inflight = false;
             state.next_retry_tick = tick;
@@ -20771,6 +20810,12 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 .repair_retries
                 .entry(replica_node_id.clone())
                 .or_default();
+            if repair_retry_state_is_suppressed(state) {
+                state.inflight = false;
+                pending.repair_inflight_request_ids.remove(replica_node_id);
+                pending.repair_next_chunk_indexes.remove(replica_node_id);
+                return;
+            }
             if !state.inflight {
                 state.attempts = state.attempts.saturating_add(1);
             }
@@ -20778,6 +20823,54 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             state.next_retry_tick = tick.saturating_add(repair_retry_delay_ticks(state.attempts));
             pending.repair_inflight_request_ids.remove(replica_node_id);
             pending.repair_next_chunk_indexes.remove(replica_node_id);
+        }
+    }
+
+    fn suppress_repair_retries_for_lost_authority(
+        &mut self,
+        intent_id: &str,
+        response_replica_node_id: Option<&NodeId>,
+    ) {
+        let mut replica_node_ids = self
+            .coordinator
+            .repair_jobs()
+            .iter()
+            .filter(|job| job.intent_id == intent_id)
+            .map(|job| job.missing_replica_node_id.clone())
+            .collect::<BTreeSet<_>>();
+        if let Some(replica_node_id) = response_replica_node_id {
+            replica_node_ids.insert(replica_node_id.clone());
+        }
+        let stale_fetch_request_ids = if let Some(pending) = self.pending_writes.get(intent_id) {
+            replica_node_ids.extend(pending.repair_retries.keys().cloned());
+            pending
+                .fetch_inflight_request_ids
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        for request_id in stale_fetch_request_ids {
+            self.incoming_fetch_transfers.remove(&request_id);
+        }
+        if let Some(pending) = self.pending_writes.get_mut(intent_id) {
+            for replica_node_id in replica_node_ids {
+                let state = pending
+                    .repair_retries
+                    .entry(replica_node_id.clone())
+                    .or_default();
+                state.inflight = false;
+                state.next_retry_tick = DFS_REPAIR_RETRY_SUPPRESSED_TICK;
+                pending.repair_inflight_request_ids.remove(&replica_node_id);
+                pending.repair_next_chunk_indexes.remove(&replica_node_id);
+            }
+            pending.fetch_inflight_from.clear();
+            pending.fetch_inflight_request_ids.clear();
+            pending.fetch_inflight_started_ticks.clear();
+            pending.fetch_next_chunk_indexes.clear();
+            pending.fetch_window_end_chunk_indexes.clear();
+            pending.fetch_failed_from.clear();
         }
     }
 
@@ -20978,6 +21071,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             .filter(|job| job.intent_id == intent_id)
             .map(|job| job.missing_replica_node_id.clone())
             .collect();
+        if !repair_targets.is_empty() && !self.pending_repair_is_locally_authoritative(&pending)? {
+            self.suppress_repair_retries_for_lost_authority(intent_id, None);
+            return Ok(());
+        }
         for replica_node_id in repair_targets {
             if replica_node_id == self.node_id
                 || !self.repair_retry_is_due(intent_id, &replica_node_id)
@@ -21206,6 +21303,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             && let Some(object) = record.object_metadata.clone()
         {
             self.add_transient_object_metadata(object)?;
+        }
+        if record.coordinator_node_id != self.node_id {
+            return Ok(());
         }
         let Some(content_hash) = record.content_hash.clone() else {
             return Ok(());
@@ -23031,6 +23131,21 @@ fn write_intent_status_requires_hydrate_restore(status: &DfsWriteIntentStatus) -
 
 fn repair_retry_delay_ticks(attempts: u32) -> u64 {
     1_u64 << attempts.saturating_sub(1).min(6)
+}
+
+fn repair_retry_state_is_suppressed(state: &RepairRetryState) -> bool {
+    state.next_retry_tick == DFS_REPAIR_RETRY_SUPPRESSED_TICK
+}
+
+fn wake_repair_retry_state(state: &mut RepairRetryState) {
+    if !repair_retry_state_is_suppressed(state) {
+        state.next_retry_tick = 0;
+    }
+}
+
+fn repair_rejection_indicates_lost_authority(reason: &str) -> bool {
+    reason.contains("source is not current metadata shard primary")
+        || reason.contains("source is not authorized to fetch DFS blob")
 }
 
 fn stage_inflight_retry_delay_ticks(attempts: u32) -> u64 {

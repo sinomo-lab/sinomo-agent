@@ -1,3 +1,4 @@
+use crate::control::DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL;
 use crate::{
     DaemonError, DaemonPaths, DaemonRunOptions, send_dfs_metadata_journal_batch_to_endpoint_async,
     send_dfs_metadata_journal_batch_to_endpoint_on_runtime,
@@ -23,9 +24,10 @@ use sinomo_dfs::{
     DfsEndpointServedProtocolFrameTransport, DfsEndpointTransport, DfsMaintenanceTickOptions,
     DfsMetadataBackend, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
     DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
-    DfsMetadataPeerTransportError, DfsMetadataSnapshotInstallCommand,
-    DfsMetadataSnapshotInstallResponse, DfsPeerTransport, DfsPeerTransportError,
-    DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsProtocolFrameSender, NetworkedDfsService,
+    DfsMetadataPeerTransportError, DfsMetadataPublishScheduleOptions,
+    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse, DfsPeerTransport,
+    DfsPeerTransportError, DfsProtocolFrameCommand, DfsProtocolFrameResponse,
+    DfsProtocolFrameSender, NetworkedDfsService,
 };
 use sinomo_kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_local::SinomoDataDir;
@@ -38,6 +40,10 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 const DAEMON_DFS_PROTOCOL_FRAME_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 1;
+const DAEMON_DFS_METADATA_REPLICATION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
+const DAEMON_DFS_METADATA_REPLICATION_TARGET_TIMEOUT: Duration = Duration::from_secs(1);
+const DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS: usize = 0;
 
 type DaemonDfsProtocolFrameService = NetworkedDfsService<DfsEndpointServedProtocolFrameTransport>;
 
@@ -615,8 +621,8 @@ async fn handle_daemon_dfs_protocol_frame_async(
             cluster_paths,
             daemon_dfs_async_peer_transport(runtime),
             &events,
-            sinomo_dfs::DfsMetadataPublishScheduleOptions::default(),
-            DfsMetadataJournalReplicationOptions::default(),
+            daemon_dfs_metadata_publish_schedule_options(),
+            daemon_dfs_metadata_replication_options(),
             log_dfs_metadata_replication_report,
             |error| {
                 eprintln!(
@@ -652,7 +658,7 @@ fn handle_daemon_dfs_protocol_frame_on_runtime(
         &cluster_paths,
         daemon_dfs_blocking_peer_transport_on_runtime(runtime),
         &events,
-        DfsMetadataJournalReplicationOptions::default(),
+        daemon_dfs_metadata_replication_options(),
         log_dfs_metadata_replication_report,
         |error| {
             eprintln!("sinomo daemon DFS metadata publish after protocol mutation failed: {error}");
@@ -707,7 +713,7 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
             &cluster_paths,
             daemon_dfs_blocking_peer_transport_on_runtime(&runtime),
             daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(&runtime)),
-            DfsMaintenanceTickOptions::default(),
+            daemon_dfs_maintenance_tick_options(),
         )
     })
     .await
@@ -728,6 +734,28 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
         eprintln!("sinomo daemon {line}");
     }
     Ok(())
+}
+
+fn daemon_dfs_maintenance_tick_options() -> DfsMaintenanceTickOptions {
+    let mut options = DfsMaintenanceTickOptions::default();
+    options.metadata_replication = daemon_dfs_metadata_replication_options();
+    options
+}
+
+fn daemon_dfs_metadata_replication_options() -> DfsMetadataJournalReplicationOptions {
+    DfsMetadataJournalReplicationOptions {
+        max_batches_per_target: DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET,
+        attempt_timeout: DAEMON_DFS_METADATA_REPLICATION_ATTEMPT_TIMEOUT,
+        target_timeout: DAEMON_DFS_METADATA_REPLICATION_TARGET_TIMEOUT,
+        ..DfsMetadataJournalReplicationOptions::default()
+    }
+}
+
+fn daemon_dfs_metadata_publish_schedule_options() -> DfsMetadataPublishScheduleOptions {
+    DfsMetadataPublishScheduleOptions {
+        max_retry_rounds: DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS,
+        retry_delay: DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL,
+    }
 }
 
 fn log_dfs_metadata_replication_report(report: DfsMetadataJournalReplicationReport) {
@@ -851,6 +879,34 @@ mod tests {
 
     fn daemon_test_runtime(name: &str) -> tokio::runtime::Runtime {
         crate::build_daemon_async_runtime(name).expect("test daemon runtime")
+    }
+
+    #[test]
+    fn daemon_dfs_metadata_publish_uses_daemon_bounds() {
+        assert_eq!(
+            daemon_dfs_maintenance_tick_options().metadata_replication,
+            daemon_dfs_metadata_replication_options()
+        );
+        assert_eq!(
+            daemon_dfs_metadata_replication_options().max_batches_per_target,
+            DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET
+        );
+        assert_eq!(
+            daemon_dfs_metadata_replication_options().attempt_timeout,
+            DAEMON_DFS_METADATA_REPLICATION_ATTEMPT_TIMEOUT
+        );
+        assert_eq!(
+            daemon_dfs_metadata_replication_options().target_timeout,
+            DAEMON_DFS_METADATA_REPLICATION_TARGET_TIMEOUT
+        );
+        assert_eq!(
+            daemon_dfs_metadata_publish_schedule_options().max_retry_rounds,
+            DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS
+        );
+        assert_eq!(
+            daemon_dfs_metadata_publish_schedule_options().retry_delay,
+            DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL
+        );
     }
 
     fn test_default_cluster_bootstrap_host(
