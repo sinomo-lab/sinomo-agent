@@ -1105,6 +1105,27 @@ fn outcome_label(outcome: &EvaluationOutcome) -> &'static str {
     }
 }
 
+struct PersistentEvolutionLifecycleObserver {
+    paths: EvolutionPaths,
+}
+
+impl EvolutionLifecycleObserver for PersistentEvolutionLifecycleObserver {
+    fn on_update(&self, update: &EvolutionLifecycleUpdate) -> Result<(), String> {
+        write_stored_job(
+            &self.paths,
+            &StoredEvolutionJob {
+                job: update.job.clone(),
+                candidate_workspace: update.candidate_workspace.clone(),
+                bundle: update.bundle.clone(),
+                verification_outcome: update.verification_outcome.clone(),
+                changed_files: update.changed_files.clone(),
+                decision: None,
+            },
+        )
+        .map_err(|error| format!("{} ({})", update.summary, error))
+    }
+}
+
 pub(crate) fn evolve_propose(args: &[String]) -> Result<(), CliError> {
     let options = parse_propose_options(args)?;
     let data_dir = SinomoDataDir::from_env_or_home()?;
@@ -1175,10 +1196,13 @@ pub(crate) fn evolve_propose(args: &[String]) -> Result<(), CliError> {
         data_dir: data_dir.clone(),
         max_steps: None,
     };
+    let lifecycle = PersistentEvolutionLifecycleObserver {
+        paths: paths.clone(),
+    };
     let mut report = if request.dry_run {
-        orchestrator.propose(request, None)?
+        orchestrator.propose_with_lifecycle(request, None, Some(&lifecycle))?
     } else {
-        orchestrator.propose(request, Some(&model_runner))?
+        orchestrator.propose_with_lifecycle(request, Some(&model_runner), Some(&lifecycle))?
     };
     if let Some(sifs_root) = configured_sifs_artifact_root(config.as_ref()) {
         mirror_evolution_report_bundle_to_sifs(&data_dir, &mut report, &sifs_root)?;

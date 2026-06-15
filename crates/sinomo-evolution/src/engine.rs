@@ -5055,6 +5055,20 @@ pub struct EvolutionOrchestrator<W, R, B> {
     pub bundles: B,
 }
 
+#[derive(Clone, Debug)]
+pub struct EvolutionLifecycleUpdate {
+    pub job: EvolutionJob,
+    pub candidate_workspace: CandidateWorkspace,
+    pub bundle: CandidateBundleManifest,
+    pub verification_outcome: Option<EvaluationOutcome>,
+    pub changed_files: Vec<String>,
+    pub summary: String,
+}
+
+pub trait EvolutionLifecycleObserver {
+    fn on_update(&self, update: &EvolutionLifecycleUpdate) -> Result<(), String>;
+}
+
 impl<W, R, B> EvolutionOrchestrator<W, R, B> {
     pub fn new(workspace: W, evaluator: ExecutingEvalHarness<R>, bundles: B) -> Self {
         Self {
@@ -5076,232 +5090,370 @@ where
         request: EvolutionRequest,
         model: Option<&dyn MutationModel>,
     ) -> Result<EvolutionReport, EvolutionError> {
-        let job = create_bootstrap_job(&request, self.workspace.root());
+        self.propose_with_lifecycle(request, model, None)
+    }
+
+    pub fn propose_with_lifecycle(
+        &self,
+        request: EvolutionRequest,
+        model: Option<&dyn MutationModel>,
+        observer: Option<&dyn EvolutionLifecycleObserver>,
+    ) -> Result<EvolutionReport, EvolutionError> {
+        let mut job = create_bootstrap_job(&request, self.workspace.root());
         let mut bundle = self.bundles.create(&job)?;
         let candidate_workspace = self.workspace.prepare_candidate(&job)?;
+        notify_lifecycle(
+            observer,
+            &job,
+            &candidate_workspace,
+            &bundle,
+            None,
+            &[],
+            "candidate job created",
+        )?;
         let packet = mutation_packet_for_job(&job);
 
         self.bundles.write_json(&bundle, "job.json", &job)?;
         self.bundles
             .write_json(&bundle, "mutation-packet.json", &packet)?;
-
-        let mut mutation_result = None;
-        if request.dry_run {
-            // Dry-run proposals only prepare candidate artifacts and verification evidence.
-        } else if let Some(model) = model {
-            let result = model.mutate(&packet, &candidate_workspace, Some(&bundle))?;
-            self.bundles
-                .write_text(&bundle, "model-output.txt", &result.raw_output)?;
-            self.bundles
-                .write_json(&bundle, "model-result.json", &result)?;
-            if let Some(agent_run) = &result.agent_run {
-                self.bundles
-                    .write_json(&bundle, "agent-run.json", agent_run)?;
-                bundle.agent_run_path = Some(
-                    PathBuf::from(&bundle.bundle_path)
-                        .join("agent-run.json")
-                        .display()
-                        .to_string(),
-                );
-            }
-            if let Some(agent_summary) = &result.agent_summary {
-                self.bundles
-                    .write_json(&bundle, "agent-summary.json", agent_summary)?;
-                bundle.agent_summary_path = Some(
-                    PathBuf::from(&bundle.bundle_path)
-                        .join("agent-summary.json")
-                        .display()
-                        .to_string(),
-                );
-            }
-            if !result.agent_events.is_empty() {
-                self.bundles.write_text(
-                    &bundle,
-                    AGENT_EVENTS_RELATIVE_PATH,
-                    &render_jsonl(&result.agent_events)?,
-                )?;
-                bundle.artifact_refs.push(
-                    PathBuf::from(&bundle.bundle_path)
-                        .join(AGENT_EVENTS_RELATIVE_PATH)
-                        .display()
-                        .to_string(),
-                );
-            }
-            if let Some(coding_run_state) = &result.coding_run_state {
-                self.bundles.write_json(
-                    &bundle,
-                    CODING_RUN_STATE_RELATIVE_PATH,
-                    coding_run_state,
-                )?;
-                bundle.artifact_refs.push(
-                    PathBuf::from(&bundle.bundle_path)
-                        .join(CODING_RUN_STATE_RELATIVE_PATH)
-                        .display()
-                        .to_string(),
-                );
-            }
-            if !result.patch_snapshots.is_empty() {
-                self.bundles.write_json(
-                    &bundle,
-                    PATCH_SNAPSHOTS_RELATIVE_PATH,
-                    &result.patch_snapshots,
-                )?;
-                bundle.artifact_refs.push(
-                    PathBuf::from(&bundle.bundle_path)
-                        .join(PATCH_SNAPSHOTS_RELATIVE_PATH)
-                        .display()
-                        .to_string(),
-                );
-            }
-            if !result.validation_records.is_empty() {
-                self.bundles.write_json(
-                    &bundle,
-                    VALIDATION_RECORDS_RELATIVE_PATH,
-                    &result.validation_records,
-                )?;
-                bundle.artifact_refs.push(
-                    PathBuf::from(&bundle.bundle_path)
-                        .join(VALIDATION_RECORDS_RELATIVE_PATH)
-                        .display()
-                        .to_string(),
-                );
-            }
-            if let Some(patch) = &result.parsed_patch {
-                self.bundles.write_text(&bundle, "model.patch", patch)?;
-            }
-            if !result.tool_results.is_empty() {
-                self.bundles.write_json(
-                    &bundle,
-                    "model-tool-results.json",
-                    &result.tool_results,
-                )?;
-            }
-            if !result.model_turns.is_empty() {
-                self.bundles
-                    .write_json(&bundle, "model-turns.json", &result.model_turns)?;
-            }
-            bundle.model_output_path = Some(
-                PathBuf::from(&bundle.bundle_path)
-                    .join("model-output.txt")
-                    .display()
-                    .to_string(),
-            );
-            mutation_result = Some(result);
-        }
-
-        let changed_files = self.workspace.changed_files(&candidate_workspace)?;
-        let diff = self.workspace.diff(&candidate_workspace)?;
-        self.bundles
-            .write_json(&bundle, "changed-files.json", &changed_files)?;
-        self.bundles.write_text(&bundle, "diff.patch", &diff)?;
-        bundle.changed_files_path = Some(
-            PathBuf::from(&bundle.bundle_path)
-                .join("changed-files.json")
-                .display()
-                .to_string(),
-        );
-        bundle.diff_path = Some(
-            PathBuf::from(&bundle.bundle_path)
-                .join("diff.patch")
-                .display()
-                .to_string(),
-        );
-
-        let benchmark_executions = prepare_benchmark_gate_executions(&request, &bundle);
-        let mut verification_plan = job.verification.clone();
-        verification_plan.commands.extend(
-            benchmark_executions
-                .iter()
-                .map(|execution| execution.command.clone()),
-        );
-        let (mut scorecard, command_results) = self
-            .evaluator
-            .run_verification_plan(verification_plan.into(), &candidate_workspace.path)?;
-        for result in &command_results {
-            let log_ref = write_command_log_via_store(&self.bundles, &bundle, result)?;
-            bundle.command_logs.push(log_ref);
-        }
-        let benchmark_reports =
-            finalize_benchmark_gate_reports(benchmark_executions, &command_results, &bundle);
-        apply_benchmark_reports_to_scorecard(&mut scorecard, &benchmark_reports);
-        if !benchmark_reports.is_empty() {
-            self.bundles
-                .write_json(&bundle, "benchmark-results.json", &benchmark_reports)?;
-            bundle.benchmark_results_path = Some(
-                PathBuf::from(&bundle.bundle_path)
-                    .join("benchmark-results.json")
-                    .display()
-                    .to_string(),
-            );
-        }
-        let resource_usage_summary = candidate_resource_usage_summary(
-            &job,
-            mutation_result.as_ref(),
-            &command_results,
-            &benchmark_reports,
-        );
-        self.bundles
-            .write_json(&bundle, "resource-usage.json", &resource_usage_summary)?;
-        bundle.resource_usage_path = Some(
-            PathBuf::from(&bundle.bundle_path)
-                .join("resource-usage.json")
-                .display()
-                .to_string(),
-        );
-        self.bundles
-            .write_json(&bundle, "scorecard.json", &scorecard)?;
-        bundle.scorecard_path = Some(
-            PathBuf::from(&bundle.bundle_path)
-                .join("scorecard.json")
-                .display()
-                .to_string(),
-        );
-        let regression_evidence = candidate_regression_evidence_summary(
-            &job,
-            &bundle,
-            &request,
-            &scorecard,
-            &changed_files,
-            &command_results,
-            &benchmark_reports,
-        );
-        self.bundles.write_json(
-            &bundle,
-            CANDIDATE_REGRESSION_EVIDENCE_RELATIVE_PATH,
-            &regression_evidence,
-        )?;
-        self.bundles.write_text(
-            &bundle,
-            CANDIDATE_EVIDENCE_SUMMARY_RELATIVE_PATH,
-            &render_candidate_evidence_summary(&regression_evidence),
-        )?;
-        if scorecard.outcome != EvaluationOutcome::Passed {
-            let lesson = candidate_evolution_lesson_record(&job, &regression_evidence);
-            self.bundles
-                .write_json(&bundle, CANDIDATE_EVOLUTION_LESSON_RELATIVE_PATH, &lesson)?;
-        }
-
-        finalize_candidate_bundle_integrity(
-            &mut bundle,
+        job.status = EvolutionJobStatus::PacketWritten;
+        notify_lifecycle(
+            observer,
             &job,
             &candidate_workspace,
-            mutation_result.as_ref(),
-            scorecard.outcome.clone(),
-            &changed_files,
+            &bundle,
+            None,
+            &[],
+            "mutation packet written",
         )?;
-        self.bundles.write_json(&bundle, "manifest.json", &bundle)?;
 
-        Ok(EvolutionReport {
-            job: EvolutionJob {
-                status: EvolutionJobStatus::AwaitingApproval,
-                ..job
-            },
-            candidate_workspace,
-            bundle,
-            scorecard: Some(scorecard),
-            changed_files,
-        })
+        let mut mutation_result = None;
+        let run_result = (|| -> Result<EvolutionReport, EvolutionError> {
+            if request.dry_run {
+                // Dry-run proposals only prepare candidate artifacts and verification evidence.
+                job.status = EvolutionJobStatus::MutationFinished;
+                notify_lifecycle(
+                    observer,
+                    &job,
+                    &candidate_workspace,
+                    &bundle,
+                    None,
+                    &[],
+                    "dry-run mutation skipped",
+                )?;
+            } else if let Some(model) = model {
+                job.status = EvolutionJobStatus::MutationStarted;
+                notify_lifecycle(
+                    observer,
+                    &job,
+                    &candidate_workspace,
+                    &bundle,
+                    None,
+                    &[],
+                    "mutation agent started",
+                )?;
+                let result = model.mutate(&packet, &candidate_workspace, Some(&bundle))?;
+                self.bundles
+                    .write_text(&bundle, "model-output.txt", &result.raw_output)?;
+                self.bundles
+                    .write_json(&bundle, "model-result.json", &result)?;
+                if let Some(agent_run) = &result.agent_run {
+                    self.bundles
+                        .write_json(&bundle, "agent-run.json", agent_run)?;
+                    bundle.agent_run_path = Some(
+                        PathBuf::from(&bundle.bundle_path)
+                            .join("agent-run.json")
+                            .display()
+                            .to_string(),
+                    );
+                }
+                if let Some(agent_summary) = &result.agent_summary {
+                    self.bundles
+                        .write_json(&bundle, "agent-summary.json", agent_summary)?;
+                    bundle.agent_summary_path = Some(
+                        PathBuf::from(&bundle.bundle_path)
+                            .join("agent-summary.json")
+                            .display()
+                            .to_string(),
+                    );
+                }
+                if !result.agent_events.is_empty() {
+                    self.bundles.write_text(
+                        &bundle,
+                        AGENT_EVENTS_RELATIVE_PATH,
+                        &render_jsonl(&result.agent_events)?,
+                    )?;
+                    bundle.artifact_refs.push(
+                        PathBuf::from(&bundle.bundle_path)
+                            .join(AGENT_EVENTS_RELATIVE_PATH)
+                            .display()
+                            .to_string(),
+                    );
+                }
+                if let Some(coding_run_state) = &result.coding_run_state {
+                    self.bundles.write_json(
+                        &bundle,
+                        CODING_RUN_STATE_RELATIVE_PATH,
+                        coding_run_state,
+                    )?;
+                    bundle.artifact_refs.push(
+                        PathBuf::from(&bundle.bundle_path)
+                            .join(CODING_RUN_STATE_RELATIVE_PATH)
+                            .display()
+                            .to_string(),
+                    );
+                }
+                if !result.patch_snapshots.is_empty() {
+                    self.bundles.write_json(
+                        &bundle,
+                        PATCH_SNAPSHOTS_RELATIVE_PATH,
+                        &result.patch_snapshots,
+                    )?;
+                    bundle.artifact_refs.push(
+                        PathBuf::from(&bundle.bundle_path)
+                            .join(PATCH_SNAPSHOTS_RELATIVE_PATH)
+                            .display()
+                            .to_string(),
+                    );
+                }
+                if !result.validation_records.is_empty() {
+                    self.bundles.write_json(
+                        &bundle,
+                        VALIDATION_RECORDS_RELATIVE_PATH,
+                        &result.validation_records,
+                    )?;
+                    bundle.artifact_refs.push(
+                        PathBuf::from(&bundle.bundle_path)
+                            .join(VALIDATION_RECORDS_RELATIVE_PATH)
+                            .display()
+                            .to_string(),
+                    );
+                }
+                if let Some(patch) = &result.parsed_patch {
+                    self.bundles.write_text(&bundle, "model.patch", patch)?;
+                }
+                if !result.tool_results.is_empty() {
+                    self.bundles.write_json(
+                        &bundle,
+                        "model-tool-results.json",
+                        &result.tool_results,
+                    )?;
+                }
+                if !result.model_turns.is_empty() {
+                    self.bundles
+                        .write_json(&bundle, "model-turns.json", &result.model_turns)?;
+                }
+                bundle.model_output_path = Some(
+                    PathBuf::from(&bundle.bundle_path)
+                        .join("model-output.txt")
+                        .display()
+                        .to_string(),
+                );
+                mutation_result = Some(result);
+                job.status = EvolutionJobStatus::MutationFinished;
+                notify_lifecycle(
+                    observer,
+                    &job,
+                    &candidate_workspace,
+                    &bundle,
+                    None,
+                    &[],
+                    "mutation agent finished",
+                )?;
+            }
+
+            let changed_files = self.workspace.changed_files(&candidate_workspace)?;
+            let diff = self.workspace.diff(&candidate_workspace)?;
+            self.bundles
+                .write_json(&bundle, "changed-files.json", &changed_files)?;
+            self.bundles.write_text(&bundle, "diff.patch", &diff)?;
+            bundle.changed_files_path = Some(
+                PathBuf::from(&bundle.bundle_path)
+                    .join("changed-files.json")
+                    .display()
+                    .to_string(),
+            );
+            bundle.diff_path = Some(
+                PathBuf::from(&bundle.bundle_path)
+                    .join("diff.patch")
+                    .display()
+                    .to_string(),
+            );
+            job.status = EvolutionJobStatus::Implemented;
+            notify_lifecycle(
+                observer,
+                &job,
+                &candidate_workspace,
+                &bundle,
+                None,
+                &changed_files,
+                "candidate diff captured",
+            )?;
+
+            let benchmark_executions = prepare_benchmark_gate_executions(&request, &bundle);
+            let mut verification_plan = job.verification.clone();
+            verification_plan.commands.extend(
+                benchmark_executions
+                    .iter()
+                    .map(|execution| execution.command.clone()),
+            );
+            job.status = EvolutionJobStatus::Built;
+            notify_lifecycle(
+                observer,
+                &job,
+                &candidate_workspace,
+                &bundle,
+                None,
+                &changed_files,
+                "verification plan prepared",
+            )?;
+            let (mut scorecard, command_results) = self
+                .evaluator
+                .run_verification_plan(verification_plan.into(), &candidate_workspace.path)?;
+            for result in &command_results {
+                let log_ref = write_command_log_via_store(&self.bundles, &bundle, result)?;
+                bundle.command_logs.push(log_ref);
+            }
+            let benchmark_reports =
+                finalize_benchmark_gate_reports(benchmark_executions, &command_results, &bundle);
+            apply_benchmark_reports_to_scorecard(&mut scorecard, &benchmark_reports);
+            if !benchmark_reports.is_empty() {
+                self.bundles
+                    .write_json(&bundle, "benchmark-results.json", &benchmark_reports)?;
+                bundle.benchmark_results_path = Some(
+                    PathBuf::from(&bundle.bundle_path)
+                        .join("benchmark-results.json")
+                        .display()
+                        .to_string(),
+                );
+            }
+            let resource_usage_summary = candidate_resource_usage_summary(
+                &job,
+                mutation_result.as_ref(),
+                &command_results,
+                &benchmark_reports,
+            );
+            self.bundles
+                .write_json(&bundle, "resource-usage.json", &resource_usage_summary)?;
+            bundle.resource_usage_path = Some(
+                PathBuf::from(&bundle.bundle_path)
+                    .join("resource-usage.json")
+                    .display()
+                    .to_string(),
+            );
+            self.bundles
+                .write_json(&bundle, "scorecard.json", &scorecard)?;
+            bundle.scorecard_path = Some(
+                PathBuf::from(&bundle.bundle_path)
+                    .join("scorecard.json")
+                    .display()
+                    .to_string(),
+            );
+            let regression_evidence = candidate_regression_evidence_summary(
+                &job,
+                &bundle,
+                &request,
+                &scorecard,
+                &changed_files,
+                &command_results,
+                &benchmark_reports,
+            );
+            self.bundles.write_json(
+                &bundle,
+                CANDIDATE_REGRESSION_EVIDENCE_RELATIVE_PATH,
+                &regression_evidence,
+            )?;
+            self.bundles.write_text(
+                &bundle,
+                CANDIDATE_EVIDENCE_SUMMARY_RELATIVE_PATH,
+                &render_candidate_evidence_summary(&regression_evidence),
+            )?;
+            if scorecard.outcome != EvaluationOutcome::Passed {
+                let lesson = candidate_evolution_lesson_record(&job, &regression_evidence);
+                self.bundles.write_json(
+                    &bundle,
+                    CANDIDATE_EVOLUTION_LESSON_RELATIVE_PATH,
+                    &lesson,
+                )?;
+            }
+            job.status = EvolutionJobStatus::Evaluated;
+            notify_lifecycle(
+                observer,
+                &job,
+                &candidate_workspace,
+                &bundle,
+                Some(&scorecard.outcome),
+                &changed_files,
+                "evaluation scorecard written",
+            )?;
+
+            finalize_candidate_bundle_integrity(
+                &mut bundle,
+                &job,
+                &candidate_workspace,
+                mutation_result.as_ref(),
+                scorecard.outcome.clone(),
+                &changed_files,
+            )?;
+            self.bundles.write_json(&bundle, "manifest.json", &bundle)?;
+
+            job.status = EvolutionJobStatus::AwaitingApproval;
+            notify_lifecycle(
+                observer,
+                &job,
+                &candidate_workspace,
+                &bundle,
+                Some(&scorecard.outcome),
+                &changed_files,
+                "candidate awaiting approval",
+            )?;
+
+            Ok(EvolutionReport {
+                job: job.clone(),
+                candidate_workspace: candidate_workspace.clone(),
+                bundle: bundle.clone(),
+                scorecard: Some(scorecard),
+                changed_files,
+            })
+        })();
+        if let Err(error) = &run_result {
+            job.status = EvolutionJobStatus::Failed;
+            let _ = notify_lifecycle(
+                observer,
+                &job,
+                &candidate_workspace,
+                &bundle,
+                None,
+                &[],
+                &format!("candidate failed: {error}"),
+            );
+        }
+        run_result
     }
+}
+
+fn notify_lifecycle(
+    observer: Option<&dyn EvolutionLifecycleObserver>,
+    job: &EvolutionJob,
+    candidate_workspace: &CandidateWorkspace,
+    bundle: &CandidateBundleManifest,
+    verification_outcome: Option<&EvaluationOutcome>,
+    changed_files: &[String],
+    summary: &str,
+) -> Result<(), EvolutionError> {
+    if let Some(observer) = observer {
+        observer
+            .on_update(&EvolutionLifecycleUpdate {
+                job: job.clone(),
+                candidate_workspace: candidate_workspace.clone(),
+                bundle: bundle.clone(),
+                verification_outcome: verification_outcome.cloned(),
+                changed_files: changed_files.to_vec(),
+                summary: summary.to_string(),
+            })
+            .map_err(|detail| EvolutionError::LifecycleObserver { detail })?;
+    }
+    Ok(())
 }
 
 fn finalize_candidate_bundle_integrity(
@@ -8060,6 +8212,8 @@ pub enum EvolutionError {
     Eval(#[from] sinomo_runtime::eval::EvalError),
     #[error(transparent)]
     MutationModel(#[from] MutationModelError),
+    #[error("lifecycle observer failed: {detail}")]
+    LifecycleObserver { detail: String },
     #[error("approval preflight failed: {detail}")]
     ApprovalPreflight { detail: String },
     #[error(transparent)]

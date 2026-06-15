@@ -16,6 +16,7 @@ use crate::backend::Backend;
 use crate::theme::{AppThemeMode, resolve_theme};
 use crate::ui::chat::ChatState;
 use crate::ui::cluster::ClusterState;
+use crate::ui::evolution::EvolutionState;
 use crate::ui::files::FilesState;
 use crate::ui::settings::SettingsState;
 
@@ -24,6 +25,8 @@ use crate::ui::settings::SettingsState;
 pub enum Tab {
     /// AI chat with the Sinomo agent.
     Sinomo,
+    /// Self-evolution jobs, candidate bundles, and rollout evidence.
+    Evolution,
     /// Cluster topology graph.
     Cluster,
     /// SIFS distributed file browser.
@@ -33,20 +36,28 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Sinomo, Tab::Cluster, Tab::Files, Tab::Settings];
+    pub const ALL: [Tab; 5] = [
+        Tab::Sinomo,
+        Tab::Evolution,
+        Tab::Cluster,
+        Tab::Files,
+        Tab::Settings,
+    ];
 
     pub fn index(self) -> usize {
         match self {
             Tab::Sinomo => 0,
-            Tab::Cluster => 1,
-            Tab::Files => 2,
-            Tab::Settings => 3,
+            Tab::Evolution => 1,
+            Tab::Cluster => 2,
+            Tab::Files => 3,
+            Tab::Settings => 4,
         }
     }
 
     pub fn title(self) -> &'static str {
         match self {
             Tab::Sinomo => "Sinomo",
+            Tab::Evolution => "Evolution",
             Tab::Cluster => "Cluster",
             Tab::Files => "Files",
             Tab::Settings => "Settings",
@@ -66,6 +77,7 @@ pub enum ConnectEvent {
 pub struct ReadyState {
     pub backend: Backend,
     pub chat: ChatState,
+    pub evolution: EvolutionState,
     pub cluster: ClusterState,
     pub files: FilesState,
     pub settings: SettingsState,
@@ -76,12 +88,14 @@ impl ReadyState {
     /// browser, loads config). Runs on the UI thread when the connection completes.
     pub fn build(backend: Backend) -> Self {
         let chat = ChatState::new(&backend);
+        let evolution = EvolutionState::new(&backend);
         let cluster = ClusterState::new(&backend);
         let files = FilesState::new(&backend);
         let settings = SettingsState::new(&backend);
         Self {
             backend,
             chat,
+            evolution,
             cluster,
             files,
             settings,
@@ -201,6 +215,18 @@ impl Shared {
     pub fn chat_mut(&self) -> RefMut<'_, ChatState> {
         RefMut::map(self.0.borrow_mut(), |s| {
             &mut s.ready.as_mut().expect("app is ready").chat
+        })
+    }
+
+    pub fn evolution(&self) -> Ref<'_, EvolutionState> {
+        Ref::map(self.0.borrow(), |s| {
+            &s.ready.as_ref().expect("app is ready").evolution
+        })
+    }
+
+    pub fn evolution_mut(&self) -> RefMut<'_, EvolutionState> {
+        RefMut::map(self.0.borrow_mut(), |s| {
+            &mut s.ready.as_mut().expect("app is ready").evolution
         })
     }
 

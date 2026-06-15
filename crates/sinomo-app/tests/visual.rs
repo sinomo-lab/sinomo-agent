@@ -36,6 +36,7 @@ fn capture_tabs() {
 
     for (tab, name) in [
         (Tab::Sinomo, "sinomo"),
+        (Tab::Evolution, "evolution"),
         (Tab::Cluster, "cluster"),
         (Tab::Files, "files"),
         (Tab::Settings, "settings"),
@@ -46,6 +47,7 @@ fn capture_tabs() {
     // Light-theme variants to validate the light palette.
     for (tab, name) in [
         (Tab::Sinomo, "sinomo-light"),
+        (Tab::Evolution, "evolution-light"),
         (Tab::Cluster, "cluster-light"),
         (Tab::Settings, "settings-light"),
     ] {
@@ -53,6 +55,133 @@ fn capture_tabs() {
         shared.borrow_mut().theme_mode = AppThemeMode::Light;
         capture(shared, name);
     }
+}
+
+#[test]
+fn capture_evolution_seeded() {
+    use sinomo_app::backend::evolution::{
+        EvolutionDashboard, EvolutionDecisionSummary, EvolutionJobSummary, EvolutionPhase,
+    };
+
+    let dir = shots_dir();
+    std::fs::create_dir_all(&dir).expect("create shots dir");
+
+    let shared = boot(Tab::Evolution);
+    {
+        let mut evolution = shared.evolution_mut();
+        evolution.objective_draft = "Improve DFS performance".to_string();
+        evolution.scope_draft = "crates/sinomo-dfs/**".to_string();
+        evolution.target_ring_index = 1;
+        evolution.dashboard = EvolutionDashboard {
+            source: "/home/ix/.sinomo/evolution".to_string(),
+            jobs: vec![
+                EvolutionJobSummary {
+                    id: "01j9candidate-ready-for-review".to_string(),
+                    short_id: "01j9candidate".to_string(),
+                    objective: "Tighten compaction resume evidence for long-running coding turns"
+                        .to_string(),
+                    status_key: "awaiting-approval".to_string(),
+                    status_label: "awaiting approval".to_string(),
+                    phase: EvolutionPhase::AwaitingDecision,
+                    target_ring: "R2".to_string(),
+                    created_at: "2026-06-15T11:34:20Z".to_string(),
+                    workspace_root: "/home/ix/.sinomo/source/sinomo".to_string(),
+                    candidate_workspace:
+                        "/home/ix/.sinomo/evolution/worktrees/01j9candidate-ready-for-review"
+                            .to_string(),
+                    candidate_branch: "evolution/compaction-resume-evidence".to_string(),
+                    source_revision: Some("7f4d2c05".to_string()),
+                    verification_outcome: Some("passed".to_string()),
+                    required_gate_count: 4,
+                    verification_command_count: 3,
+                    module_replay_count: 1,
+                    changed_files: vec![
+                        "crates/sinomo-agent/src/compaction.rs".to_string(),
+                        "crates/sinomo-agent/tests/compaction_resume.rs".to_string(),
+                        "docs/agent-system-architecture.md".to_string(),
+                    ],
+                    allowed_paths: vec![
+                        "crates/sinomo-agent".to_string(),
+                        "docs/agent-system-architecture.md".to_string(),
+                    ],
+                    forbidden_paths: vec!["crates/sinomo-dfs".to_string()],
+                    recovery_strategy: "git branch reset".to_string(),
+                    recovery_note: "Reset the candidate worktree and preserve scorecard evidence"
+                        .to_string(),
+                    rollback_policy: "Manual".to_string(),
+                    bundle_path:
+                        "/home/ix/.sinomo/evolution/candidates/01j9candidate-ready-for-review"
+                            .to_string(),
+                    mutation_packet_path:
+                        "/home/ix/.sinomo/evolution/candidates/01j9candidate-ready-for-review/mutation-packet.json"
+                            .to_string(),
+                    diff_path: Some(
+                        "/home/ix/.sinomo/evolution/candidates/01j9candidate-ready-for-review/diff.patch"
+                            .to_string(),
+                    ),
+                    scorecard_path: Some(
+                        "/home/ix/.sinomo/evolution/candidates/01j9candidate-ready-for-review/scorecard.json"
+                            .to_string(),
+                    ),
+                    candidate_summary_path: Some(
+                        "/home/ix/.sinomo/evolution/candidates/01j9candidate-ready-for-review/candidate-summary.md"
+                            .to_string(),
+                    ),
+                    artifact_ref_count: 7,
+                    command_log_count: 3,
+                    ..EvolutionJobSummary::default()
+                },
+                EvolutionJobSummary {
+                    id: "01j9candidate-failed".to_string(),
+                    short_id: "01j9failed".to_string(),
+                    objective: "Move rollout prompt overflow classification into sinomo-lm"
+                        .to_string(),
+                    status_key: "eval-failed".to_string(),
+                    status_label: "eval failed".to_string(),
+                    phase: EvolutionPhase::Failed,
+                    target_ring: "R2".to_string(),
+                    created_at: "2026-06-14T22:18:04Z".to_string(),
+                    required_gate_count: 5,
+                    verification_command_count: 4,
+                    changed_files: vec!["crates/sinomo-lm/src/providers.rs".to_string()],
+                    bundle_path: "/home/ix/.sinomo/evolution/candidates/01j9candidate-failed"
+                        .to_string(),
+                    mutation_packet_path:
+                        "/home/ix/.sinomo/evolution/candidates/01j9candidate-failed/mutation-packet.json"
+                            .to_string(),
+                    ..EvolutionJobSummary::default()
+                },
+                EvolutionJobSummary {
+                    id: "01j9candidate-promoted".to_string(),
+                    short_id: "01j9promoted".to_string(),
+                    objective: "Expose Hermes-style skill disclosure in agent package inspection"
+                        .to_string(),
+                    status_key: "promoted".to_string(),
+                    status_label: "promoted".to_string(),
+                    phase: EvolutionPhase::Passed,
+                    target_ring: "R2".to_string(),
+                    created_at: "2026-06-13T16:05:48Z".to_string(),
+                    decision: Some(EvolutionDecisionSummary {
+                        outcome: "approved".to_string(),
+                        decided_at: "2026-06-13T18:12:02Z".to_string(),
+                        decided_by: "operator".to_string(),
+                        note: "Promoted after shadow evidence stayed clean".to_string(),
+                        preflight_passed: Some(true),
+                    }),
+                    bundle_path:
+                        "/home/ix/.sinomo/evolution/candidates/01j9candidate-promoted"
+                            .to_string(),
+                    mutation_packet_path:
+                        "/home/ix/.sinomo/evolution/candidates/01j9candidate-promoted/mutation-packet.json"
+                            .to_string(),
+                    ..EvolutionJobSummary::default()
+                },
+            ],
+            error: None,
+        };
+        evolution.selected = Some(0);
+    }
+    capture(shared, "evolution-seeded");
 }
 
 #[test]

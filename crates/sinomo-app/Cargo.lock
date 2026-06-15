@@ -5051,6 +5051,7 @@ dependencies = [
  "serde_json",
  "sinomo-agent",
  "sinomo-cli",
+ "sinomo-evolution",
  "sinomo-lm",
  "sinomo-runtime",
  "sui",
@@ -5224,6 +5225,20 @@ dependencies = [
  "sinomo-core",
  "sinomo-node",
  "sinomo-storage",
+ "thiserror 2.0.18",
+ "time",
+]
+
+[[package]]
+name = "sinomo-evolution"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "sinomo-agent",
+ "sinomo-lm",
+ "sinomo-runtime",
  "thiserror 2.0.18",
  "time",
 ]

@@ -3343,6 +3343,67 @@ fn orchestrator_dry_run_writes_bundle_and_runs_verification() {
 }
 
 #[test]
+fn orchestrator_lifecycle_observer_records_durable_statuses() {
+    let root = temp_dir("orchestrator-lifecycle");
+    let candidate = root.join("candidate");
+    fs::create_dir_all(&candidate).expect("candidate dir");
+    let orchestrator = EvolutionOrchestrator::new(
+        FakeWorkspace {
+            root: root.to_path_buf(),
+            candidate: candidate.clone(),
+        },
+        ExecutingEvalHarness::new(LocalCommandRunner::new()),
+        LocalCandidateBundleStore::new(root.join("candidates")),
+    );
+    let observer = RecordingLifecycleObserver::default();
+
+    let report = orchestrator
+        .propose_with_lifecycle(
+            EvolutionRequest {
+                objective: "observe lifecycle".to_string(),
+                target_ring: TrustRing::R1TrustedRuntime,
+                intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                verification_commands: vec![VerificationCommand {
+                    name: "success".to_string(),
+                    command: "exit 0".to_string(),
+                    expected_exit_code: 0,
+                    gate: EvaluationGate::StaticChecks,
+                }],
+                benchmark_gates: Vec::new(),
+                module_replay_reports: Vec::new(),
+                model_provider: None,
+                model: None,
+                dry_run: true,
+            },
+            None,
+            Some(&observer),
+        )
+        .expect("dry run propose");
+
+    assert_eq!(report.job.status, EvolutionJobStatus::AwaitingApproval);
+    let updates = observer.updates.borrow();
+    let statuses = updates
+        .iter()
+        .map(|update| update.job.status.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(statuses.first(), Some(&EvolutionJobStatus::Created));
+    assert_eq!(statuses.last(), Some(&EvolutionJobStatus::AwaitingApproval));
+    for expected in [
+        EvolutionJobStatus::PacketWritten,
+        EvolutionJobStatus::MutationFinished,
+        EvolutionJobStatus::Implemented,
+        EvolutionJobStatus::Built,
+        EvolutionJobStatus::Evaluated,
+    ] {
+        assert!(statuses.contains(&expected), "missing {expected:?}");
+    }
+    assert!(updates.iter().any(|update| {
+        update.job.status == EvolutionJobStatus::Evaluated
+            && update.verification_outcome == Some(EvaluationOutcome::Passed)
+    }));
+}
+
+#[test]
 fn orchestrator_writes_model_turn_and_tool_evidence_artifacts() {
     let root = temp_dir("orchestrator-model-evidence");
     let candidate = root.join("candidate");
@@ -6011,6 +6072,18 @@ impl MutationModel for FakeMutationModel {
             patch_snapshots: Vec::new(),
             validation_records: Vec::new(),
         })
+    }
+}
+
+#[derive(Clone, Default)]
+struct RecordingLifecycleObserver {
+    updates: Rc<RefCell<Vec<EvolutionLifecycleUpdate>>>,
+}
+
+impl EvolutionLifecycleObserver for RecordingLifecycleObserver {
+    fn on_update(&self, update: &EvolutionLifecycleUpdate) -> Result<(), String> {
+        self.updates.borrow_mut().push(update.clone());
+        Ok(())
     }
 }
 

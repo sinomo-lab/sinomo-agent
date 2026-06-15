@@ -9,6 +9,7 @@
 pub mod chat_engine;
 pub mod cluster;
 pub mod config;
+pub mod evolution;
 pub mod sessions;
 pub mod sifs;
 
