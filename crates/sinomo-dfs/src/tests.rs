@@ -86,6 +86,26 @@ impl DfsFrameTransport for FailingSendTransport {
     }
 }
 
+struct DroppingSendTransport {
+    local_node_id: NodeId,
+}
+
+impl DfsTransportIdentity for DroppingSendTransport {
+    fn local_node_id(&self) -> &NodeId {
+        &self.local_node_id
+    }
+}
+
+impl DfsFrameTransport for DroppingSendTransport {
+    fn send(&mut self, _target_node_id: &NodeId, _frame: NetworkFrame) -> Result<(), NetworkError> {
+        Ok(())
+    }
+
+    fn drain_incoming(&mut self) -> Result<Vec<sinomo_network::InboundFrame>, NetworkError> {
+        Ok(Vec::new())
+    }
+}
+
 fn test_routed_write_command(
     request_id: &str,
     requester: &NodeId,
@@ -5469,6 +5489,101 @@ fn routed_write_response_tracks_remote_intent_alias() {
             version: committed_version,
             ..
         } if intent_id == "intent_remote_alias" && committed_version == version
+    ));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn routed_write_replay_uses_existing_committed_intent_after_service_restart() {
+    let requester =
+        NodeId::from_legacy_named("node_routed_write_replay_requester").expect("requester");
+    let primary = NodeId::from_legacy_named("node_routed_write_replay_primary").expect("primary");
+    let object_id = DfsObjectId::from_legacy_named("obj_routed_write_replay").expect("object");
+    let base_version =
+        DfsVersion::from_legacy_named("version_routed_replay_base").expect("base version");
+    let target_version =
+        DfsVersion::from_legacy_named("version_routed_replay_target").expect("target version");
+    let root = temp_root("routed-write-replay-existing-intent");
+    let metadata_root = root.join("metadata");
+    let content_hash = content_hash(b"remote routed duplicate payload");
+    let file_system = file_system(primary.clone());
+
+    let mut object = file_metadata(primary.clone());
+    object.file_system_id = file_system.file_system_id.clone();
+    object.object_id = object_id.clone();
+    object.path = "/services/replayed-routed-write.txt".to_string();
+    object.version = base_version.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+
+    let command = DfsDistributedWriteCommand {
+        request_id: "dfs_req_replayed_routed_write".to_string(),
+        request: DfsWriteRequest {
+            file_system_id: file_system.file_system_id.clone(),
+            object_id: object_id.clone(),
+            target_version: target_version.clone(),
+            requesting_node_id: requester.clone(),
+        },
+        expected_base_version: Some(base_version),
+        metadata_journal_after_sequence: None,
+        bytes: Vec::new(),
+        content_hash: Some(content_hash.clone()),
+        content_size_bytes: Some(31),
+        desired_replica_nodes: vec![requester.clone()],
+        policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+        object_metadata: Some(object.clone()),
+        touch_parent_on_create: false,
+    };
+
+    let mut primary_service = NetworkedDfsService::new(
+        DroppingSendTransport {
+            local_node_id: primary.clone(),
+        },
+        LocalContentStore::new(root.join("content-primary")).expect("primary content"),
+    )
+    .with_metadata_backend(open_root_local_metadata_backend(&metadata_root).expect("metadata"))
+    .expect("metadata backend");
+    primary_service
+        .add_file_system(file_system.clone())
+        .expect("filesystem");
+    primary_service.add_object_metadata(object).expect("object");
+    let first_outcome = primary_service
+        .write_distributed_eventual_from_remote_manifest_with_base(
+            command.request.clone(),
+            command.expected_base_version.clone(),
+            content_hash.clone(),
+            31,
+            command.desired_replica_nodes.clone(),
+            command.policy.clone(),
+        )
+        .expect("first routed write");
+    let NetworkedDfsWriteOutcome::Committed { intent_id, .. } = first_outcome else {
+        panic!("expected committed routed write, got {first_outcome:?}");
+    };
+
+    let mut restarted_primary = NetworkedDfsService::new(
+        DroppingSendTransport {
+            local_node_id: primary,
+        },
+        LocalContentStore::new(root.join("content-restarted")).expect("restarted content"),
+    )
+    .with_metadata_backend(open_root_local_metadata_backend(&metadata_root).expect("metadata"))
+    .expect("metadata backend");
+    let replayed = restarted_primary
+        .replayed_routed_write_outcome_if_known(&requester, &command)
+        .expect("replay lookup")
+        .expect("existing committed intent");
+
+    assert!(matches!(
+        replayed,
+        NetworkedDfsWriteOutcome::Committed {
+            intent_id: replayed_intent_id,
+            version,
+            content_hash: replayed_content_hash,
+            ..
+        } if replayed_intent_id == intent_id
+            && version == target_version
+            && replayed_content_hash == content_hash
     ));
 
     std::fs::remove_dir_all(root).ok();

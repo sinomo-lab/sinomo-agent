@@ -353,6 +353,19 @@ impl DistributedEventualCoordinator {
         })
     }
 
+    pub fn intent_for_target(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        target_version: &DfsVersion,
+    ) -> Option<&DistributedWriteIntent> {
+        self.intents.values().find(|intent| {
+            intent.file_system_id == *file_system_id
+                && intent.object_id == *object_id
+                && intent.target_version == *target_version
+        })
+    }
+
     /// Whether any write intent for the object is still awaiting receipts.
     /// Cross-shard moves fence on this: a half-finished write must settle
     /// before its object may change shard authority.

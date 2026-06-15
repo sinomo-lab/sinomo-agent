@@ -39,7 +39,11 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 use time::OffsetDateTime;
 
-const DAEMON_DFS_PROTOCOL_FRAME_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+// Protocol frames keep the cached service hot by applying inbound frames and
+// routed journal batches. A full backend hydrate is a defensive catch-up for
+// out-of-band metadata writes, and doing it every few seconds makes multi-node
+// DFS writes pay repeated disk scans while a request is still in flight.
+const DAEMON_DFS_PROTOCOL_FRAME_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 1;
 const DAEMON_DFS_METADATA_REPLICATION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
 const DAEMON_DFS_METADATA_REPLICATION_TARGET_TIMEOUT: Duration = Duration::from_secs(1);
@@ -50,7 +54,6 @@ type DaemonDfsProtocolFrameService = NetworkedDfsService<DfsEndpointServedProtoc
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DaemonDfsProtocolFrameServiceSignature {
     local_node_id: sinomo_node::NodeId,
-    endpoints: Vec<ClusterEndpointRecord>,
     kv_snapshot_available: bool,
 }
 
@@ -533,7 +536,6 @@ fn process_daemon_dfs_protocol_frame_command_on_runtime(
     let endpoints = sinomo_network::cluster_dfs_protocol_targets(cluster_paths, &state);
     let signature = DaemonDfsProtocolFrameServiceSignature {
         local_node_id: state.local_node_id.clone(),
-        endpoints: endpoints.clone(),
         kv_snapshot_available: cluster_paths.kv_snapshot.exists(),
     };
     let cache_key = data_dir.root();
@@ -549,7 +551,7 @@ fn process_daemon_dfs_protocol_frame_command_on_runtime(
             sinomo_dfs::open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
         let transport = DfsEndpointServedProtocolFrameTransport::new(
             signature.local_node_id.clone(),
-            endpoints,
+            endpoints.clone(),
             daemon_dfs_protocol_frame_sender_on_runtime(runtime),
             sinomo_dfs::DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT,
         );
@@ -570,6 +572,7 @@ fn process_daemon_dfs_protocol_frame_command_on_runtime(
     let entry = cache
         .get_mut(&cache_key)
         .expect("daemon DFS protocol frame cache entry inserted");
+    entry.service.refresh_protocol_frame_endpoints(endpoints);
     if entry.last_metadata_refresh.elapsed() >= DAEMON_DFS_PROTOCOL_FRAME_CACHE_REFRESH_INTERVAL {
         entry.service.hydrate_from_metadata_backend()?;
         entry.last_metadata_refresh = Instant::now();
@@ -2734,6 +2737,12 @@ mod tests {
             .get(&cache_key)
             .expect("cache entry")
             .last_metadata_refresh;
+        write_test_cluster_state_with_remote_endpoint(
+            &data_root,
+            &local,
+            &remote,
+            "10.77.0.2:21353",
+        );
         let response = handle_daemon_dfs_protocol_frame_on_runtime(
             &paths,
             DfsProtocolFrameCommand {
@@ -2765,7 +2774,7 @@ mod tests {
             .last_metadata_refresh;
         assert_eq!(
             first_refresh, second_refresh,
-            "back-to-back protocol frames should reuse the hydrated service cache"
+            "endpoint-list refreshes should not rebuild the hydrated service cache"
         );
     }
 
@@ -3372,13 +3381,48 @@ mod tests {
     }
 
     fn write_test_cluster_state(data_root: &std::path::Path, node_id: &NodeId) {
+        write_test_cluster_state_with_members(data_root, node_id, Vec::new());
+    }
+
+    fn write_test_cluster_state_with_remote_endpoint(
+        data_root: &std::path::Path,
+        local_node_id: &NodeId,
+        remote_node_id: &NodeId,
+        address: &str,
+    ) {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            sinomo_network::ClusterId::from_legacy_named("cluster_daemon_dfs_protocol")
+                .expect("cluster");
+        let mut remote = sinomo_core::ClusterMemberRecord::local_non_voting(
+            cluster_id.clone(),
+            remote_node_id.clone(),
+            "daemon dfs protocol remote",
+            format!("pk-{remote_node_id}"),
+            now,
+        );
+        remote.capabilities = sinomo_node::main_daemon_capabilities(&remote.role);
+        remote.allowed_capabilities = remote.capabilities.clone();
+        remote.endpoints.push(sinomo_network::daemon_lan_endpoint(
+            remote_node_id,
+            address.to_string(),
+            5,
+        ));
+        write_test_cluster_state_with_members(data_root, local_node_id, vec![remote]);
+    }
+
+    fn write_test_cluster_state_with_members(
+        data_root: &std::path::Path,
+        node_id: &NodeId,
+        members: Vec<sinomo_core::ClusterMemberRecord>,
+    ) {
         let data_dir = SinomoDataDir::new(data_root);
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
             sinomo_network::ClusterId::from_legacy_named("cluster_daemon_dfs_protocol")
                 .expect("cluster");
-        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
             cluster_id,
             "daemon dfs protocol",
             node_id.clone(),
@@ -3386,6 +3430,7 @@ mod tests {
             format!("pk-{node_id}"),
             now,
         );
+        state.members.extend(members);
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
     }
 
