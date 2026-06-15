@@ -39,6 +39,7 @@ use time::OffsetDateTime;
 
 pub const DAEMON_COMMAND_MAX_BYTES: usize = sinomo_network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES;
 pub const DAEMON_DFS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
+pub const DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 pub const DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(5);
 pub const DAEMON_ROLLOUT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(60);
 pub const DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL: Duration =
@@ -301,6 +302,9 @@ async fn run_daemon_background_maintenance_loop(
             Duration::ZERO
         })
         .unwrap_or(maintenance_started);
+    let mut last_dfs_maintenance_probe = maintenance_started
+        .checked_sub(DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL)
+        .unwrap_or(maintenance_started);
     let mut last_rollout_telemetry = maintenance_started
         .checked_sub(DAEMON_ROLLOUT_TELEMETRY_INTERVAL)
         .unwrap_or(maintenance_started);
@@ -344,7 +348,12 @@ async fn run_daemon_background_maintenance_loop(
             }
         }
 
-        if dfs_maintenance_enabled && label == "daemon" && !dfs_triggered_maintenance_requested {
+        if dfs_maintenance_enabled
+            && label == "daemon"
+            && !dfs_triggered_maintenance_requested
+            && last_dfs_maintenance_probe.elapsed() >= DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL
+        {
+            last_dfs_maintenance_probe = std::time::Instant::now();
             let probe_paths = paths.clone();
             match tokio::task::spawn_blocking(move || {
                 daemon_dfs_pending_maintenance_work(&probe_paths)
@@ -461,12 +470,24 @@ async fn run_daemon_background_maintenance_loop(
         } else {
             None
         };
+        let dfs_maintenance_probe_due =
+            if dfs_maintenance_enabled && label == "daemon" && !dfs_triggered_maintenance_requested
+            {
+                Some(daemon_maintenance_interval_remaining(
+                    sleep_started,
+                    last_dfs_maintenance_probe,
+                    DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL,
+                ))
+            } else {
+                None
+            };
         let sleep_duration = daemon_maintenance_sleep_duration(
             sleep_started,
             cluster_network.next_due_duration(sleep_started),
             last_dfs_maintenance,
             last_rollout_telemetry,
             dfs_triggered_maintenance_due,
+            dfs_maintenance_probe_due,
             shadow_finalization_due,
         );
         if dfs_maintenance_enabled && label == "daemon" {
@@ -1050,6 +1071,7 @@ fn daemon_maintenance_sleep_duration(
     last_dfs_maintenance: Instant,
     last_rollout_telemetry: Instant,
     dfs_triggered_maintenance_due: Option<Duration>,
+    dfs_maintenance_probe_due: Option<Duration>,
     shadow_finalization_due: Option<Duration>,
 ) -> Duration {
     let mut next_due = cluster_next_due;
@@ -1066,6 +1088,9 @@ fn daemon_maintenance_sleep_duration(
         ));
     if let Some(dfs_triggered_maintenance_due) = dfs_triggered_maintenance_due {
         next_due = next_due.min(dfs_triggered_maintenance_due);
+    }
+    if let Some(dfs_maintenance_probe_due) = dfs_maintenance_probe_due {
+        next_due = next_due.min(dfs_maintenance_probe_due);
     }
     if let Some(shadow_finalization_due) = shadow_finalization_due {
         next_due = next_due.min(shadow_finalization_due);
@@ -4457,10 +4482,11 @@ mod tests {
                 last_dfs,
                 last_rollout,
                 None,
+                Some(DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL),
                 Some(DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL),
             ),
-            Duration::from_secs(30),
-            "quiet main daemons should sleep until cluster discovery/publish/probe work is due"
+            DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL,
+            "quiet main daemons should wake periodically to discover durable DFS maintenance work"
         );
         assert_eq!(
             daemon_maintenance_sleep_duration(
@@ -4469,6 +4495,7 @@ mod tests {
                 last_dfs,
                 last_rollout,
                 None,
+                Some(DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL),
                 Some(Duration::from_secs(5)),
             ),
             Duration::from_secs(5),
@@ -4481,6 +4508,7 @@ mod tests {
                 last_dfs,
                 last_rollout,
                 Some(Duration::from_secs(3)),
+                Some(DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL),
                 None,
             ),
             Duration::from_secs(3),
@@ -4496,6 +4524,7 @@ mod tests {
                 almost_due_dfs,
                 now,
                 None,
+                Some(DAEMON_DFS_MAINTENANCE_PROBE_INTERVAL),
                 None,
             ),
             Duration::from_secs(1),
@@ -4507,6 +4536,7 @@ mod tests {
                 Duration::ZERO,
                 last_dfs,
                 last_rollout,
+                None,
                 None,
                 None,
             ),

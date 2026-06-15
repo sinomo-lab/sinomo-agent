@@ -1454,7 +1454,7 @@ fn networked_dfs_reader_write_resumes_stage_windows() {
         .add_object_metadata(metadata)
         .expect("replica object");
 
-    let byte_count = 65 * 64 * 1024 + 17;
+    let byte_count = 257 * 64 * 1024 + 17;
     let write = owner_dfs
         .write_distributed_eventual_from_reader(
             DfsWriteRequest {
@@ -4558,14 +4558,14 @@ fn networked_dfs_persists_committed_metadata_through_backend() {
 }
 
 #[test]
-fn networked_dfs_threshold_commit_repairs_missing_desired_replica() {
+fn networked_dfs_threshold_commit_stages_missing_desired_replica() {
     let owner = NodeId::from_legacy_named("node_owner").expect("node");
     let replica = NodeId::from_legacy_named("node_replica").expect("node");
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
     let object_id = DfsObjectId::from_legacy_named("obj_artifact").expect("object");
     let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
     let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
-    let root = temp_root("networked_threshold_repair");
+    let root = temp_root("networked_threshold_stage");
     let network = InProcessNetwork::new();
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -4638,13 +4638,17 @@ fn networked_dfs_threshold_commit_repairs_missing_desired_replica() {
         NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } if repair_jobs.len() == 1
     ));
 
-    let repair_events = replica_dfs.process_incoming().expect("repair");
-    assert!(repair_events.iter().any(|event| {
+    let stage_events = replica_dfs.process_incoming().expect("stage");
+    assert!(stage_events.iter().any(|event| {
         matches!(
             event,
-            sinomo_dfs::NetworkedDfsServiceEvent::ReplicaRepaired { .. }
+            sinomo_dfs::NetworkedDfsServiceEvent::BlobStaged { .. }
         )
     }));
+    owner_dfs.process_incoming().expect("stage response");
+    let owner_metrics = owner_dfs.operational_metrics().expect("owner metrics");
+    assert_eq!(owner_metrics.repair_job_count, 0);
+    assert_eq!(owner_metrics.pending_write_count, 0);
     let read = replica_dfs
         .read_local_object(&object_id)
         .expect("read")
@@ -7778,14 +7782,14 @@ fn networked_dfs_remote_range_read_returns_slice_without_full_cache() {
         last_modified_by_event_id: None,
     };
     let chunk_size = 64 * 1024;
-    let bytes = (0..(chunk_size * 66 + 17))
+    let bytes = (0..(chunk_size * 258 + 17))
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
     let offset = 70_003_u64;
     let max_bytes = 4096_usize;
     let expected = bytes[offset as usize..offset as usize + max_bytes].to_vec();
     let chunked_offset = 17_u64;
-    let chunked_max_bytes = chunk_size * 64 + 4096;
+    let chunked_max_bytes = chunk_size * 256 + 4096;
     let chunked_expected =
         bytes[chunked_offset as usize..chunked_offset as usize + chunked_max_bytes].to_vec();
 
@@ -7925,7 +7929,7 @@ fn networked_dfs_remote_range_read_returns_slice_without_full_cache() {
             saw_range_complete |= *complete;
         }
     }
-    assert_eq!(chunked_actual.len(), chunk_size * 64);
+    assert_eq!(chunked_actual.len(), chunk_size * 256);
     assert!(!saw_range_complete);
 
     let second_served = owner_dfs
@@ -8018,7 +8022,7 @@ fn networked_dfs_large_remote_read_windows_and_continues() {
         last_modified_by_event_id: None,
     };
     let chunk_size = 64 * 1024;
-    let total_chunks = 66;
+    let total_chunks = 258;
     let bytes = (0..(chunk_size * (total_chunks - 1) + 17))
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
