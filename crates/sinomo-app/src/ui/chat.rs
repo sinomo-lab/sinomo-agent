@@ -71,6 +71,8 @@ const COMPOSER_PAD_Y: f32 = 12.0;
 const COMPOSER_SECTION_GAP: f32 = 10.0;
 const INPUT_ACTION_GAP: f32 = 10.0;
 const SEND_BUTTON_SIZE: f32 = 40.0;
+const COMPOSER_TEXT_SIZE: f32 = 13.5;
+const COMPOSER_LINE_HEIGHT: f32 = 19.0;
 
 /// A shared closure that resolves the current widget theme — threaded into every control so the
 /// Appearance toggle restyles the whole tab live, with no rebuild. (Same pattern as the other tabs.)
@@ -931,6 +933,16 @@ impl ChatState {
 fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     let reader = Rc::clone(reader);
     move || reader()
+}
+
+fn composer_control_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || {
+        let mut theme = reader();
+        theme.typography.body_font_size = COMPOSER_TEXT_SIZE;
+        theme.typography.body_line_height = COMPOSER_LINE_HEIGHT;
+        theme
+    }
 }
 
 /// Resolve the app chrome palette for the current theme (used by the `Label` color readers and the
@@ -1826,7 +1838,7 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         sui::Select::new("chat-provider")
             .options(names)
             .placeholder("Provider")
-            .theme_when(clone_reader(reader))
+            .theme_when(composer_control_reader(reader))
             .selected_when({
                 let s = s.clone();
                 move || Some(s.chat().provider_idx)
@@ -1850,7 +1862,7 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         sui::Select::new("chat-model")
             .options(models)
             .placeholder(placeholder)
-            .theme_when(clone_reader(reader))
+            .theme_when(composer_control_reader(reader))
             .selected_when({
                 let s = s.clone();
                 move || Some(s.chat().model_idx)
@@ -1872,7 +1884,7 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         let effort = sui::Select::new("chat-effort")
             .options(efforts)
             .placeholder("Effort")
-            .theme_when(clone_reader(reader))
+            .theme_when(composer_control_reader(reader))
             .selected_when({
                 let s = s.clone();
                 move || Some(s.chat().effort_idx)
@@ -1893,22 +1905,16 @@ fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let input = {
         let s = shared.clone();
         let draft = shared.chat().input.clone();
-        let theme = shared.theme();
         TextArea::new("chat-input")
             .value(draft)
             .placeholder("Message Sinomo…  (⏎ to send, ⇧⏎ for newline)")
-            .text_style(sui::TextStyle {
-                font_size: 13.5,
-                line_height: 19.0,
-                ..theme.body_text_style()
-            })
             .padding(Insets {
                 left: 12.0,
                 top: 8.0,
                 right: 12.0,
                 bottom: 8.0,
             })
-            .theme_when(clone_reader(reader))
+            .theme_when(composer_control_reader(reader))
             .on_change({
                 let s = s.clone();
                 move |value| {
@@ -2654,6 +2660,19 @@ mod tests {
     use super::*;
     use crate::backend::Backend;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn composer_control_reader_keeps_footer_text_compact() {
+        let reader: ThemeReader = Rc::new(DefaultTheme::default);
+        let theme = composer_control_reader(&reader)();
+        let body = theme.body_text_style();
+        let placeholder = theme.placeholder_text_style();
+
+        assert_eq!(body.font_size, COMPOSER_TEXT_SIZE);
+        assert_eq!(body.line_height, COMPOSER_LINE_HEIGHT);
+        assert_eq!(placeholder.font_size, COMPOSER_TEXT_SIZE);
+        assert_eq!(placeholder.line_height, COMPOSER_LINE_HEIGHT);
+    }
 
     #[test]
     fn submit_pushes_user_and_agent_placeholder_and_sets_streaming() {

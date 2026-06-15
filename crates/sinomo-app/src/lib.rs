@@ -11,25 +11,18 @@ pub mod state;
 pub mod theme;
 pub mod ui;
 
-use sui::{
-    App, Window, WindowRenderOptions, WindowStemDarkening, WindowTextHinting,
-    default_sui_logo_image,
-};
+use sui::{App, Window, WindowRenderOptions, default_sui_logo_image};
 
 use crate::backend::Backend;
 use crate::state::{AppState, ConnectEvent, Shared, Tab};
 use crate::ui::Shell;
 use crate::ui::shell::logo_image_handle;
 
-/// Crisp text: hint at small sizes and darken stems so light backgrounds stay
-/// legible.
+/// Use the same text rendering policy as the SUI widget book. Forced hinting
+/// and stem darkening make adjacent app labels look uneven on some Windows
+/// displays.
 fn render_options() -> WindowRenderOptions {
     WindowRenderOptions::new(true, 1.0)
-        .with_text_hinting(WindowTextHinting::Slight { max_ppem: 96.0 })
-        .with_stem_darkening(WindowStemDarkening::Enabled {
-            max_ppem: 72.0,
-            amount: 0.4,
-        })
 }
 
 /// Construct the application around a given shared state. Exposed so headless
@@ -90,4 +83,17 @@ pub fn run() -> sui::Result<()> {
             })
             .expect("spawn connect thread");
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use sui::{WindowStemDarkening, WindowTextHinting};
+
+    #[test]
+    fn render_options_match_widget_book_text_policy() {
+        let options = super::render_options();
+
+        assert_eq!(options.text_hinting, WindowTextHinting::None);
+        assert_eq!(options.stem_darkening, WindowStemDarkening::None);
+    }
 }
