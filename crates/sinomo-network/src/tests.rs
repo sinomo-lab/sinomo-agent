@@ -3923,6 +3923,100 @@ fn cluster_connectivity_probe_batch_and_outcome_transition_are_network_owned() {
 }
 
 #[test]
+fn cluster_connectivity_probe_batch_prioritizes_soon_expiring_records() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-probe-expiry-order");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_connectivity_probe_expiry_order").expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_connectivity_probe_expiry_order_local").expect("local");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "connectivity probe expiry order",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let soon_node =
+        NodeId::from_legacy_named("node_connectivity_probe_expiry_order_soon").expect("soon");
+    let soon_endpoint = daemon_lan_endpoint(&soon_node, "10.91.0.1:21353".to_string(), 10);
+    let mut endpoints = Vec::from([soon_endpoint.clone()]);
+    for index in 0..CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK {
+        let remote =
+            NodeId::from_legacy_named(format!("node_connectivity_probe_expiry_order_far_{index}"))
+                .expect("remote");
+        endpoints.push(daemon_lan_endpoint(
+            &remote,
+            format!("10.91.1.{index}:21353"),
+            10,
+        ));
+    }
+    for endpoint in &endpoints {
+        let mut member = ClusterMemberRecord::local_non_voting(
+            cluster_id.clone(),
+            endpoint.node_id.clone(),
+            endpoint.node_id.to_string(),
+            format!("pk-{}", endpoint.node_id),
+            now,
+        );
+        member.capabilities = sinomo_node::main_daemon_capabilities(&member.role);
+        member.allowed_capabilities = member.capabilities.clone();
+        member.endpoints = vec![endpoint.clone()];
+        state.members.push(member);
+    }
+
+    let mut connectivity = std::collections::BTreeMap::new();
+    for endpoint in &endpoints {
+        let expires_in = if endpoint.endpoint_id == soon_endpoint.endpoint_id {
+            1
+        } else {
+            CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS - 1
+        };
+        let record = cluster_connectivity_record(
+            &state,
+            endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            expires_in,
+        );
+        connectivity.insert(
+            cluster_connectivity_probe_key(&local, endpoint),
+            ClusterConnectivityProbeState { record },
+        );
+    }
+
+    let batch = select_cluster_connectivity_probe_batch(
+        &paths,
+        &state,
+        &mut connectivity,
+        1,
+        &ClusterNodeRole::Workstation,
+        false,
+        now,
+    );
+
+    assert_eq!(
+        batch.entries.len(),
+        CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK
+    );
+    assert!(
+        batch
+            .entries
+            .iter()
+            .any(|entry| entry.endpoint.endpoint_id == soon_endpoint.endpoint_id),
+        "bounded probe batches must refresh the nearest-expiring link before lower-risk endpoints"
+    );
+}
+
+#[test]
 fn cluster_connectivity_identity_mismatch_bypasses_transient_failure_grace() {
     let now = OffsetDateTime::now_utc();
     let cluster_id =
@@ -13460,6 +13554,86 @@ fn cluster_sync_targets_keep_lan_public_iroh_order_before_connectivity() {
             public.endpoint_id.clone(),
             iroh.endpoint_id.clone(),
         ]
+    );
+}
+
+#[test]
+fn advertised_hostname_outranks_opportunistic_private_ip_for_docker_routes() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-docker-hostname-route-order");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_docker_hostname_route_order").expect("cluster");
+    let local = NodeId::from_legacy_named("node_docker_hostname_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_docker_hostname_remote").expect("remote");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "docker hostname route order",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let stale_private_ip = daemon_lan_endpoint(&remote, "172.24.0.3:21353".to_string(), 20);
+    let stable_hostname = daemon_lan_endpoint(&remote, "node5:21353".to_string(), 5);
+    let mut member =
+        ClusterMemberRecord::local_voter(cluster_id, remote, "remote", "pk-remote", now);
+    member.capabilities = main_daemon_capabilities(&member.role);
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![stale_private_ip.clone(), stable_hostname.clone()];
+    state.members.push(member.clone());
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let probe_targets = cluster_network_probe_targets(&state);
+    assert_eq!(
+        probe_targets
+            .iter()
+            .find(|endpoint| endpoint.node_id == member.node_id)
+            .map(|endpoint| &endpoint.endpoint_id),
+        Some(&stable_hostname.endpoint_id),
+        "active probes must verify the stable Docker hostname before a reusable container IP"
+    );
+
+    let sync_targets = cluster_sync_targets_with_connectivity(&paths, &state);
+    assert_eq!(
+        sync_targets.first().map(|endpoint| &endpoint.endpoint_id),
+        Some(&stable_hostname.endpoint_id),
+        "cluster sync should honor the lower priority stable hostname when routes are otherwise unknown"
+    );
+
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &local,
+        vec![cluster_connectivity_record(
+            &state,
+            &stable_hostname,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            60,
+        )],
+    )
+    .expect("connectivity records");
+
+    let raft_targets = cluster_raft_command_targets(&paths, &state);
+    assert_eq!(
+        raft_targets.first().map(|endpoint| &endpoint.endpoint_id),
+        Some(&stable_hostname.endpoint_id),
+        "KV/Raft command routing should not fall back to the stale private IP when the hostname is healthy"
+    );
+
+    let status_targets =
+        cluster_member_daemon_status_targets_with_connectivity(&paths, &state, &member);
+    assert_eq!(
+        status_targets.first().map(|endpoint| &endpoint.endpoint_id),
+        Some(&stable_hostname.endpoint_id),
+        "status probes should use the same stable direct route ordering"
     );
 }
 

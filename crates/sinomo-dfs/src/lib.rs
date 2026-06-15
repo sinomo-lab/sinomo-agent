@@ -6464,9 +6464,7 @@ pub fn materialize_default_sifs_metadata(
     fallback_owner_node_id: NodeId,
     created_at: OffsetDateTime,
 ) -> Result<(), DfsError> {
-    if backend.get_file_system(&file_system.file_system_id)? != Some(file_system.clone()) {
-        backend.put_file_system(file_system)?;
-    }
+    backend.ensure_file_system(file_system)?;
     for object in distributed_sifs_bootstrap_objects_for_nodes(
         bootstrap_owner_node_ids,
         fallback_owner_node_id,
@@ -7341,6 +7339,20 @@ impl DfsEndpointTransport {
         }
     }
 
+    fn replace_endpoints(&mut self, endpoints: impl IntoIterator<Item = ClusterEndpointRecord>) {
+        let mut endpoints_by_node_id: BTreeMap<NodeId, Vec<ClusterEndpointRecord>> =
+            BTreeMap::new();
+        for endpoint in endpoints {
+            if endpoint.node_id != self.local_node_id {
+                endpoints_by_node_id
+                    .entry(endpoint.node_id.clone())
+                    .or_default()
+                    .push(endpoint);
+            }
+        }
+        self.endpoints_by_node_id = endpoints_by_node_id;
+    }
+
     fn transfer_profile_for_target(&self, target_node_id: &NodeId) -> DfsTransferProfile {
         if target_node_id == &self.local_node_id {
             return DfsTransferProfile::Local;
@@ -7661,6 +7673,10 @@ impl DfsEndpointServedProtocolFrameTransport {
         self.endpoint_transport.incoming_frames.clear();
         std::mem::take(&mut self.outbound_frames)
     }
+
+    pub fn replace_endpoints(&mut self, endpoints: Vec<ClusterEndpointRecord>) {
+        self.endpoint_transport.replace_endpoints(endpoints);
+    }
 }
 
 impl DfsTransportIdentity for DfsEndpointServedProtocolFrameTransport {
@@ -7720,6 +7736,10 @@ impl DfsFrameTransport for DfsEndpointServedProtocolFrameTransport {
 }
 
 impl NetworkedDfsService<DfsEndpointServedProtocolFrameTransport> {
+    pub fn refresh_protocol_frame_endpoints(&mut self, endpoints: Vec<ClusterEndpointRecord>) {
+        self.transport.replace_endpoints(endpoints);
+    }
+
     pub fn process_protocol_frame(
         &mut self,
         inbound_frame: NetworkFrame,
@@ -10498,13 +10518,8 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 store.put_file_system_config(&file_system_config)?;
             }
         }
-        if let Some(backend) = self.metadata_backend.as_mut()
-            && backend
-                .get_file_system(&file_system.file_system_id)?
-                .as_ref()
-                != Some(&file_system)
-        {
-            backend.put_file_system(&file_system)?;
+        if let Some(backend) = self.metadata_backend.as_mut() {
+            backend.ensure_file_system(&file_system)?;
         }
         self.metadata.add_file_system(file_system);
         Ok(())
@@ -10544,17 +10559,19 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         }
         if let Some(backend) = self.metadata_backend.as_mut() {
             for (file_system_id, records) in &grouped {
-                if backend.get_file_system(file_system_id)?.is_none() {
-                    let Some((object, _)) = records.first() else {
-                        continue;
-                    };
-                    backend.put_file_system(&DfsFileSystem {
-                        file_system_id: file_system_id.clone(),
-                        display_name: file_system_id.to_string(),
-                        owner_node_id: object.owner_node_id.clone(),
-                        subtree_policies: Vec::new(),
-                    })?;
-                }
+                let Some((object, _)) = records.first() else {
+                    continue;
+                };
+                let file_system =
+                    backend
+                        .get_file_system(file_system_id)?
+                        .unwrap_or_else(|| DfsFileSystem {
+                            file_system_id: file_system_id.clone(),
+                            display_name: file_system_id.to_string(),
+                            owner_node_id: object.owner_node_id.clone(),
+                            subtree_policies: Vec::new(),
+                        });
+                backend.ensure_file_system(&file_system)?;
 
                 let mut transaction_objects = Vec::new();
                 let mut transaction_versions = Vec::new();
@@ -10658,17 +10675,15 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         transaction: DfsNamespaceTransaction,
     ) -> Result<(), DfsError> {
         if let Some(backend) = self.metadata_backend.as_mut() {
-            if backend
+            let file_system = backend
                 .get_file_system(&transaction.file_system_id)?
-                .is_none()
-            {
-                backend.put_file_system(&DfsFileSystem {
+                .unwrap_or_else(|| DfsFileSystem {
                     file_system_id: transaction.file_system_id.clone(),
                     display_name: transaction.file_system_id.to_string(),
                     owner_node_id: self.node_id.clone(),
                     subtree_policies: Vec::new(),
-                })?;
-            }
+                });
+            backend.ensure_file_system(&file_system)?;
             backend.apply_namespace_transaction(&transaction)?;
         }
         for object in transaction
@@ -13485,6 +13500,94 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         }
     }
 
+    fn replayed_routed_write_outcome_if_known(
+        &mut self,
+        requester_node_id: &NodeId,
+        command: &DfsDistributedWriteCommand,
+    ) -> Result<Option<NetworkedDfsWriteOutcome>, DfsError> {
+        if requester_node_id != &command.request.requesting_node_id {
+            return Ok(None);
+        }
+        if let Some(intent) = self
+            .coordinator
+            .intent_for_target(
+                &command.request.file_system_id,
+                &command.request.object_id,
+                &command.request.target_version,
+            )
+            .cloned()
+            && distributed_intent_matches_routed_write_command(&intent, requester_node_id, command)
+        {
+            return self.replayed_routed_write_outcome_for_intent(&intent);
+        }
+
+        let expected_content_hash = routed_write_command_content_hash(command);
+        let matching_record = {
+            let Some(backend) = self.metadata_backend.as_ref() else {
+                return Ok(None);
+            };
+            let mut cursor = None;
+            let mut matching_record = None;
+            loop {
+                let page = backend.intents_for_object_version_page(
+                    &command.request.object_id,
+                    &command.request.target_version,
+                    cursor.as_ref(),
+                    DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
+                )?;
+                for record in page.intents {
+                    if write_intent_record_matches_routed_write_command(
+                        &record,
+                        requester_node_id,
+                        command,
+                        &expected_content_hash,
+                    ) {
+                        matching_record = Some(record);
+                        break;
+                    }
+                }
+                if matching_record.is_some() {
+                    break;
+                }
+                let Some(next_cursor) = page.next_cursor else {
+                    break;
+                };
+                cursor = Some(next_cursor);
+            }
+            matching_record
+        };
+        let Some(record) = matching_record else {
+            return Ok(None);
+        };
+        self.restore_pending_write_for_intent_if_missing(&record.intent_id, &record.object_id)?;
+        self.restore_backend_receipt_pages_for_intent(&record)?;
+        if matches!(record.status, DfsWriteIntentStatus::Committed) {
+            self.restore_visible_committed_object_location_receipts(&record)?;
+        }
+        let Some(intent) = self.coordinator.intent(&record.intent_id).cloned() else {
+            return Ok(None);
+        };
+        self.replayed_routed_write_outcome_for_intent(&intent)
+    }
+
+    fn replayed_routed_write_outcome_for_intent(
+        &mut self,
+        intent: &DistributedWriteIntent,
+    ) -> Result<Option<NetworkedDfsWriteOutcome>, DfsError> {
+        match self.write_outcome(&intent.intent_id) {
+            Ok(outcome) => Ok(Some(outcome)),
+            Err(error) if matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) => {
+                let _ = error;
+                Ok(Some(NetworkedDfsWriteOutcome::Pending {
+                    intent_id: intent.intent_id.clone(),
+                    durable_receipts: self.coordinator.durable_receipt_count(&intent.intent_id),
+                    required_receipts: intent.policy.min_commit_replicas,
+                }))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn handle_distributed_write_request(
         &mut self,
         requester_node_id: NodeId,
@@ -13507,6 +13610,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 ),
                 current_primary_node_id: None,
             }
+        } else if let Some(outcome) =
+            self.replayed_routed_write_outcome_if_known(&requester_node_id, &command)?
+        {
+            DfsDistributedWriteResult::Outcome { outcome }
         } else {
             match self
                 .ensure_routed_write_object_metadata(
@@ -13664,14 +13771,49 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         primary_node_id: &NodeId,
         batch: &DfsMetadataJournalBatch,
     ) -> Result<(), DfsError> {
-        let _ = primary_node_id;
         if let Some(reason) = self.validate_routed_response_journal_batch(batch)? {
             return Err(DfsError::Distributed { message: reason });
         }
         if let Some(backend) = self.metadata_backend.as_mut() {
-            backend.apply_journal_batch(batch)?;
+            if let Err(error) = backend.apply_journal_batch(batch) {
+                let reason = error.to_string();
+                if metadata_journal_rejection_is_sequence_conflict(&reason) {
+                    self.request_metadata_snapshot_repair_from_primary(
+                        primary_node_id,
+                        &batch.shard_id,
+                        batch.next_after_sequence,
+                        reason,
+                    )?;
+                    return Ok(());
+                }
+                return Err(error.into());
+            }
         }
         self.apply_metadata_journal_batch_to_service_state(batch)?;
+        Ok(())
+    }
+
+    fn request_metadata_snapshot_repair_from_primary(
+        &mut self,
+        primary_node_id: &NodeId,
+        shard_id: &DfsMetadataShardId,
+        next_after_sequence: u64,
+        reason: String,
+    ) -> Result<(), DfsError> {
+        let request_id = format!(
+            "dfs_meta_snapshot_request_{}_{}_{}",
+            self.node_id, shard_id.0, next_after_sequence
+        );
+        self.send_dfs_message_if_routable(
+            primary_node_id,
+            DfsNetworkMessage::MetadataJournalBatchResponse(DfsMetadataJournalBatchResponse {
+                request_id,
+                shard_id: shard_id.clone(),
+                next_after_sequence,
+                applied_entries: 0,
+                result: DfsMetadataJournalBatchResult::Rejected { reason },
+            }),
+        )?;
         Ok(())
     }
 
@@ -14659,6 +14801,15 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             .pending_metadata_replications
             .remove(&response.request_id);
         let Some(pending) = pending else {
+            if let DfsMetadataJournalBatchResult::Rejected { reason } = &response.result
+                && metadata_journal_rejection_is_sequence_conflict(reason)
+            {
+                self.send_metadata_snapshot_repair(
+                    &source_node_id,
+                    &response.shard_id,
+                    reason.clone(),
+                )?;
+            }
             return Ok(None);
         };
         if pending.target_node_id != source_node_id || pending.shard_id != response.shard_id {
@@ -15644,7 +15795,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             };
         if let Some(file_system) = file_system_to_persist.as_ref() {
             if let Some(backend) = self.metadata_backend.as_mut() {
-                backend.put_file_system(file_system)?;
+                backend.ensure_file_system(file_system)?;
             }
             if let Some(kv) = self.control_plane.as_mut() {
                 DfsControlPlaneStore::new(kv.as_mut())
@@ -21631,14 +21782,15 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         let Some(backend) = self.metadata_backend.as_mut() else {
             return Ok(());
         };
-        if backend.get_file_system(&object.file_system_id)?.is_none() {
-            backend.put_file_system(&DfsFileSystem {
+        let file_system = backend
+            .get_file_system(&object.file_system_id)?
+            .unwrap_or_else(|| DfsFileSystem {
                 file_system_id: object.file_system_id.clone(),
                 display_name: object.file_system_id.to_string(),
                 owner_node_id: object.owner_node_id.clone(),
                 subtree_policies: Vec::new(),
-            })?;
-        }
+            });
+        backend.ensure_file_system(&file_system)?;
         if backend.get_object(&object.object_id)?.as_ref() != Some(&object) {
             backend.put_object(&object)?;
         }
@@ -21663,14 +21815,15 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         let Some(backend) = self.metadata_backend.as_mut() else {
             return Ok(());
         };
-        if backend.get_file_system(&object.file_system_id)?.is_none() {
-            backend.put_file_system(&DfsFileSystem {
+        let file_system = backend
+            .get_file_system(&object.file_system_id)?
+            .unwrap_or_else(|| DfsFileSystem {
                 file_system_id: object.file_system_id.clone(),
                 display_name: object.file_system_id.to_string(),
                 owner_node_id: object.owner_node_id.clone(),
                 subtree_policies: Vec::new(),
-            })?;
-        }
+            });
+        backend.ensure_file_system(&file_system)?;
 
         let object_changed = backend.get_object(&object.object_id)?.as_ref() != Some(&object);
 
@@ -22922,6 +23075,51 @@ fn read_small_blob_from_reader(
 
 fn content_hash(bytes: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(bytes).to_hex())
+}
+
+fn routed_write_command_content_hash(command: &DfsDistributedWriteCommand) -> String {
+    command
+        .content_hash
+        .clone()
+        .unwrap_or_else(|| content_hash(&command.bytes))
+}
+
+fn distributed_intent_matches_routed_write_command(
+    intent: &DistributedWriteIntent,
+    requester_node_id: &NodeId,
+    command: &DfsDistributedWriteCommand,
+) -> bool {
+    intent.file_system_id == command.request.file_system_id
+        && intent.object_id == command.request.object_id
+        && intent.base_version == command.expected_base_version
+        && intent.target_version == command.request.target_version
+        && intent.requesting_node_id == *requester_node_id
+        && command.request.requesting_node_id == *requester_node_id
+        && matches!(
+            intent.state,
+            DfsWriteIntentState::AwaitingReceipts | DfsWriteIntentState::Committed
+        )
+}
+
+fn write_intent_record_matches_routed_write_command(
+    record: &DfsWriteIntentRecord,
+    requester_node_id: &NodeId,
+    command: &DfsDistributedWriteCommand,
+    expected_content_hash: &str,
+) -> bool {
+    record.file_system_id == command.request.file_system_id
+        && record.object_id == command.request.object_id
+        && record.base_version == command.expected_base_version
+        && record.target_version == command.request.target_version
+        && record.coordinator_node_id == *requester_node_id
+        && command.request.requesting_node_id == *requester_node_id
+        && record.content_hash.as_deref() == Some(expected_content_hash)
+        && matches!(
+            record.status,
+            DfsWriteIntentStatus::Staging
+                | DfsWriteIntentStatus::ReceiptsPending
+                | DfsWriteIntentStatus::Committed
+        )
 }
 
 fn metadata_journal_batch_file_system_id(
