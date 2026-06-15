@@ -97,13 +97,16 @@ pub const DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL: Duration =
 // Active health and connectivity probes handle reachability, so unchanged records
 // can refresh sparsely to avoid idle WAL/snapshot churn on low-write storage.
 pub const CLUSTER_NETWORK_INFO_TTL_SECONDS: i64 = sinomo_network::CLUSTER_NETWORK_INFO_TTL_SECONDS;
+#[cfg(test)]
 pub const CLUSTER_CONNECTIVITY_TTL_SECONDS: i64 = sinomo_network::CLUSTER_CONNECTIVITY_TTL_SECONDS;
+#[cfg(test)]
 pub const CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS: i64 =
     sinomo_network::CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS;
 #[cfg(test)]
 pub const CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS: i64 =
     sinomo_network::CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS;
 const CLUSTER_HEALTH_PEER_ROWS_TIMEOUT: Duration = Duration::from_secs(8);
+#[cfg(test)]
 pub const CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD: u16 =
     sinomo_network::CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD;
 const PUBLISHED_NODE_CACHE_MAX_ENTRIES: usize = sinomo_kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
@@ -672,7 +675,7 @@ fn publish_command_connectivity_if_needed(
     });
 }
 
-fn remember_cluster_endpoint_command_connectivity(
+pub(crate) fn remember_cluster_endpoint_command_connectivity(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
@@ -696,58 +699,20 @@ fn remember_cluster_endpoint_command_connectivity(
         connectivity_state,
         sinomo_network::ClusterConnectivityState::Healthy
     );
-    let observed_failures = if is_healthy {
-        0
-    } else {
+    let observed_latency_ms = latency_ms.unwrap_or_else(|| {
         previous
             .as_ref()
-            .map(|record| record.consecutive_failures.saturating_add(1))
-            .unwrap_or(1)
-    };
-    let consecutive_failures = observed_failures.min(CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD);
-    let observed_connectivity_state = if is_healthy {
-        sinomo_network::ClusterConnectivityState::Healthy
-    } else if matches!(
-        connectivity_state,
-        sinomo_network::ClusterConnectivityState::Unreachable
-    ) || consecutive_failures >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD
-    {
-        sinomo_network::ClusterConnectivityState::Unreachable
-    } else {
-        connectivity_state.clone()
-    };
-    let last_success_at = if is_healthy {
-        Some(timestamp.clone())
-    } else if observed_failures < CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD {
-        previous
-            .as_ref()
-            .and_then(|record| record.last_success_at.clone())
-    } else {
-        None
-    };
-    let last_failure_at = if is_healthy {
-        None
-    } else {
-        Some(timestamp.clone())
-    };
-    let ttl_seconds = if matches!(
-        observed_connectivity_state,
-        sinomo_network::ClusterConnectivityState::Unreachable
-    ) {
-        CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS
-    } else {
-        CLUSTER_CONNECTIVITY_TTL_SECONDS
-    };
-    let record = sinomo_network::cluster_connectivity_record(
+            .and_then(|record| record.latency_ms)
+            .unwrap_or(0)
+    });
+    let record = sinomo_network::cluster_connectivity_record_for_probe_outcome(
         state,
         endpoint,
-        observed_connectivity_state,
-        latency_ms,
-        consecutive_failures,
-        last_success_at,
-        last_failure_at,
+        previous.as_ref(),
+        is_healthy,
+        observed_latency_ms,
+        &timestamp,
         now,
-        ttl_seconds,
     );
     if sinomo_network::write_local_cluster_connectivity_records(
         paths,
@@ -1443,12 +1408,19 @@ impl sinomo_network::ClusterJoinRegistrationHost for DaemonClusterJoinRegistrati
         state: &ClusterBootstrapState,
         endpoint: &ClusterEndpointRecord,
     ) -> Result<(), sinomo_network::NetworkError> {
-        sinomo_network::ClusterJoinRegistrationHost::remember_successful_join_endpoint(
-            &mut self.driver,
+        // Joining through a bridge has a narrow ordering window: the voter has
+        // accepted the member before the joiner has imported the accepted state.
+        // Keep this response-path observation local and let the periodic
+        // connectivity publisher advertise it after the joiner settles.
+        remember_cluster_endpoint_command_connectivity(
             paths,
             state,
             endpoint,
-        )
+            sinomo_network::ClusterConnectivityState::Healthy,
+            None,
+            None,
+        );
+        Ok(())
     }
 }
 
@@ -1488,9 +1460,15 @@ impl sinomo_network::ClusterJoinRegistrationAsyncHost for DaemonClusterJoinRegis
         endpoint: &'a ClusterEndpointRecord,
     ) -> sinomo_network::ClusterMembershipRpcFuture<'a, ()> {
         Box::pin(async move {
-            sinomo_network::ClusterJoinRegistrationHost::remember_successful_join_endpoint(
-                self, paths, state, endpoint,
-            )
+            remember_cluster_endpoint_command_connectivity(
+                paths,
+                state,
+                endpoint,
+                sinomo_network::ClusterConnectivityState::Healthy,
+                None,
+                None,
+            );
+            Ok(())
         })
     }
 }
@@ -2472,31 +2450,55 @@ fn connectivity_record_for_daemon_status_probe(
     timestamp: &str,
     now: time::OffsetDateTime,
 ) -> (String, ClusterConnectivityRecord) {
-    let healthy = match &result {
-        Ok(status) => {
-            let matches = daemon_cluster_status_matches(state, &entry.endpoint, status);
-            if !matches {
-                eprintln!(
-                    "sinomo daemon connectivity probe identity mismatch: endpoint {} expected node {}, responder reported cluster={:?} node={:?}",
-                    entry.endpoint.address,
-                    entry.endpoint.node_id,
-                    status.cluster.as_ref().map(|c| c.cluster_id.to_string()),
-                    status.cluster.as_ref().map(|c| c.node_id.to_string()),
-                );
-            }
-            matches
+    let record = match &result {
+        Ok(status) if daemon_cluster_status_matches(state, &entry.endpoint, status) => {
+            sinomo_network::cluster_connectivity_record_for_probe_outcome(
+                state,
+                &entry.endpoint,
+                entry.previous.as_ref(),
+                true,
+                latency_ms,
+                timestamp,
+                now,
+            )
         }
-        Err(_) => false,
+        Ok(status) => {
+            eprintln!(
+                "sinomo daemon connectivity probe identity mismatch: endpoint {} expected node {}, responder reported cluster={:?} node={:?}",
+                entry.endpoint.address,
+                entry.endpoint.node_id,
+                status.cluster.as_ref().map(|c| c.cluster_id.to_string()),
+                status.cluster.as_ref().map(|c| c.node_id.to_string()),
+            );
+            if status.cluster.is_some() {
+                sinomo_network::cluster_connectivity_record_for_identity_mismatch(
+                    state,
+                    &entry.endpoint,
+                    timestamp,
+                    now,
+                )
+            } else {
+                sinomo_network::cluster_connectivity_record_for_probe_outcome(
+                    state,
+                    &entry.endpoint,
+                    entry.previous.as_ref(),
+                    false,
+                    latency_ms,
+                    timestamp,
+                    now,
+                )
+            }
+        }
+        Err(_) => sinomo_network::cluster_connectivity_record_for_probe_outcome(
+            state,
+            &entry.endpoint,
+            entry.previous.as_ref(),
+            false,
+            latency_ms,
+            timestamp,
+            now,
+        ),
     };
-    let record = sinomo_network::cluster_connectivity_record_for_probe_outcome(
-        state,
-        &entry.endpoint,
-        entry.previous.as_ref(),
-        healthy,
-        latency_ms,
-        timestamp,
-        now,
-    );
     (entry.key, record)
 }
 
@@ -4555,9 +4557,9 @@ fn commit_cluster_kv_txn_with_quorum_response_with_forwarding_on_runtime(
     Ok((result.snapshot, result.txn_response))
 }
 
-/// Per-hop timeout for a relayed cluster RPC. The first hop waits for the whole downstream
-/// chain, so this is generous; the relay TTL bounds the number of hops.
-const DAEMON_CLUSTER_RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Per-hop timeout for a relayed cluster RPC. Healthy LAN/container hops answer quickly;
+/// long no-progress waits let background relays occupy foreground route capacity.
+const DAEMON_CLUSTER_RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Handle a `CLUSTER_RELAY_ROUTE` request. Runs the pure routing decision, then either
 /// delivers the wrapped request locally (when this node is the target) by re-injecting it
 /// through the daemon's own control port, or forwards it one hop closer to the target over
@@ -4582,7 +4584,10 @@ pub(crate) async fn handle_daemon_cluster_relay_request_on_runtime(
             detail: format!("cluster relay state read task failed: {source}"),
         })??;
     let local_node_id = relay_local_node_id(paths, &state);
-    let mut host = DaemonClusterRelayAsyncHost { paths };
+    let mut host = DaemonClusterRelayAsyncHost {
+        paths,
+        runtime: runtime.clone(),
+    };
     sinomo_network::handle_cluster_relay_async_with_host(
         runtime,
         &cluster_paths,
@@ -4602,6 +4607,7 @@ pub(crate) async fn handle_daemon_cluster_relay_request_on_runtime(
 
 struct DaemonClusterRelayAsyncHost<'a> {
     paths: &'a DaemonPaths,
+    runtime: tokio::runtime::Handle,
 }
 
 impl sinomo_network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost<'_> {
@@ -4612,39 +4618,57 @@ impl sinomo_network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost<'_> {
         timeouts: sinomo_network::DaemonRpcTimeouts,
     ) -> sinomo_network::ClusterRelayFuture<'a, Option<sinomo_network::ObjectRpcResponse>> {
         let paths = self.paths.clone();
+        let runtime = self.runtime.clone();
         let state = state.clone();
         let target_node_id = envelope.target_node_id.clone();
         let envelope = envelope.clone();
         Box::pin(async move {
-            let local_address = tokio::task::spawn_blocking(move || {
-                relay_local_delivery_address(&paths, &state, &target_node_id)
+            let delivery = tokio::task::spawn_blocking(move || {
+                relay_local_delivery_target(&paths, &state, &target_node_id)
             })
             .await
             .map_err(|source| sinomo_network::NetworkError::Io {
                 operation: "cluster relay local delivery".to_string(),
-                detail: format!("local delivery address task failed: {source}"),
+                detail: format!("local delivery target task failed: {source}"),
             })?
             .map_err(|error| daemon_host_network_error("cluster relay local delivery", error))?;
-            let Some(local_address) = local_address else {
+            let Some(delivery) = delivery else {
                 return Ok(None);
             };
-            let inner = &envelope.inner;
-            let inner_rpc = inner
-                .rpc
-                .as_ref()
-                .ok_or_else(|| sinomo_network::NetworkError::Io {
-                    operation: "cluster relay local delivery".to_string(),
-                    detail: "relayed request carried no rpc payload".to_string(),
-                })?;
-            sinomo_network::send_daemon_rpc_to_address_async(
-                &local_address,
-                &inner.command,
-                inner.auth.as_deref(),
-                inner_rpc,
-                timeouts,
-            )
-            .await
-            .map(Some)
+            match delivery {
+                RelayLocalDeliveryTarget::CurrentProcess(paths) => {
+                    crate::control::dispatch_daemon_control_request_in_process_async(
+                        paths,
+                        runtime,
+                        envelope.inner,
+                    )
+                    .await
+                    .map(Some)
+                    .map_err(|error| {
+                        daemon_host_network_error("cluster relay local delivery", error)
+                    })
+                }
+                RelayLocalDeliveryTarget::LoopbackAddress(local_address) => {
+                    let inner = &envelope.inner;
+                    let inner_rpc =
+                        inner
+                            .rpc
+                            .as_ref()
+                            .ok_or_else(|| sinomo_network::NetworkError::Io {
+                                operation: "cluster relay local delivery".to_string(),
+                                detail: "relayed request carried no rpc payload".to_string(),
+                            })?;
+                    sinomo_network::send_daemon_rpc_to_address_async(
+                        &local_address,
+                        &inner.command,
+                        inner.auth.as_deref(),
+                        inner_rpc,
+                        timeouts,
+                    )
+                    .await
+                    .map(Some)
+                }
+            }
         })
     }
 
@@ -4654,14 +4678,67 @@ impl sinomo_network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost<'_> {
         request: &'a sinomo_network::ObjectRpcRequest,
         timeouts: sinomo_network::DaemonRpcTimeouts,
     ) -> sinomo_network::ClusterRelayFuture<'a, sinomo_network::ObjectRpcResponse> {
+        let paths = self.paths.clone();
+        let runtime = self.runtime.clone();
         let endpoint = endpoint.clone();
         let request = request.clone();
         Box::pin(async move {
-            send_cluster_relay_request_to_next_hop_async(&endpoint, &request, timeouts)
-                .await
-                .map_err(|error| daemon_host_network_error("cluster relay", error))
+            let started = Instant::now();
+            let result =
+                send_cluster_relay_request_to_next_hop_async(&endpoint, &request, timeouts)
+                    .await
+                    .map_err(|error| daemon_host_network_error("cluster relay", error));
+            let connectivity_state = if result.is_ok() {
+                sinomo_network::ClusterConnectivityState::Healthy
+            } else {
+                sinomo_network::ClusterConnectivityState::Unreachable
+            };
+            let latency_ms = result
+                .as_ref()
+                .ok()
+                .map(|_| daemon_cluster_elapsed_latency_ms(started));
+            remember_relay_endpoint_command_connectivity_async(
+                paths,
+                runtime,
+                endpoint,
+                connectivity_state,
+                latency_ms,
+            )
+            .await;
+            result
         })
     }
+}
+
+fn daemon_cluster_elapsed_latency_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+async fn remember_relay_endpoint_command_connectivity_async(
+    paths: DaemonPaths,
+    runtime: tokio::runtime::Handle,
+    endpoint: ClusterEndpointRecord,
+    connectivity_state: sinomo_network::ClusterConnectivityState,
+    latency_ms: Option<u64>,
+) {
+    let _ = runtime
+        .spawn_blocking(move || {
+            let Ok(cluster_paths) = cluster_paths_from_daemon_paths(&paths) else {
+                return;
+            };
+            let Ok(state) = sinomo_network::read_cluster_state_without_kv(&cluster_paths) else {
+                return;
+            };
+            remember_cluster_endpoint_command_connectivity(
+                &cluster_paths,
+                &state,
+                &endpoint,
+                connectivity_state,
+                latency_ms,
+                None,
+            );
+        })
+        .await;
 }
 
 async fn send_cluster_relay_request_to_next_hop_async(
@@ -4698,11 +4775,22 @@ fn relay_local_node_id(paths: &DaemonPaths, state: &ClusterBootstrapState) -> No
     }
 }
 
-fn relay_local_delivery_address(
+enum RelayLocalDeliveryTarget {
+    CurrentProcess(DaemonPaths),
+    LoopbackAddress(String),
+}
+
+fn relay_local_delivery_target(
     paths: &DaemonPaths,
     state: &ClusterBootstrapState,
     target_node_id: &NodeId,
-) -> Result<Option<String>, DaemonError> {
+) -> Result<Option<RelayLocalDeliveryTarget>, DaemonError> {
+    if *target_node_id == relay_local_node_id(paths, state) {
+        return Ok(Some(RelayLocalDeliveryTarget::CurrentProcess(
+            paths.clone(),
+        )));
+    }
+
     let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon paths have no data directory parent".to_string(),
@@ -4719,7 +4807,9 @@ fn relay_local_delivery_address(
     };
     let status = read_daemon_status(&target_paths)?;
     let port = daemon_options_from_status(&status).port;
-    Ok(Some(daemon_connect_address("127.0.0.1", port)))
+    Ok(Some(RelayLocalDeliveryTarget::LoopbackAddress(
+        daemon_connect_address("127.0.0.1", port),
+    )))
 }
 
 fn daemon_host_network_error(operation: &str, error: DaemonError) -> sinomo_network::NetworkError {
@@ -4914,24 +5004,45 @@ mod tests {
         )
         .expect("shadow status");
 
-        assert_eq!(
-            relay_local_delivery_address(&main_paths, &state, &shadow_node_id)
-                .expect("main to shadow"),
-            Some("127.0.0.1:32154".to_string())
-        );
-        assert_eq!(
-            relay_local_delivery_address(&shadow_paths, &state, &main_node_id)
-                .expect("shadow to main"),
-            Some("127.0.0.1:32153".to_string())
-        );
-        assert_eq!(
-            relay_local_delivery_address(
+        match relay_local_delivery_target(&main_paths, &state, &main_node_id).expect("main to main")
+        {
+            Some(RelayLocalDeliveryTarget::CurrentProcess(paths)) => {
+                assert_eq!(paths.root, main_paths.root)
+            }
+            _ => panic!("main target should dispatch in-process"),
+        }
+        match relay_local_delivery_target(&main_paths, &state, &shadow_node_id)
+            .expect("main to shadow")
+        {
+            Some(RelayLocalDeliveryTarget::LoopbackAddress(address)) => {
+                assert_eq!(address, "127.0.0.1:32154")
+            }
+            _ => panic!("shadow target from main should use sibling loopback"),
+        }
+        match relay_local_delivery_target(&shadow_paths, &state, &shadow_node_id)
+            .expect("shadow to shadow")
+        {
+            Some(RelayLocalDeliveryTarget::CurrentProcess(paths)) => {
+                assert_eq!(paths.root, shadow_paths.root)
+            }
+            _ => panic!("shadow target should dispatch in-process"),
+        }
+        match relay_local_delivery_target(&shadow_paths, &state, &main_node_id)
+            .expect("shadow to main")
+        {
+            Some(RelayLocalDeliveryTarget::LoopbackAddress(address)) => {
+                assert_eq!(address, "127.0.0.1:32153")
+            }
+            _ => panic!("main target from shadow should use sibling loopback"),
+        }
+        assert!(
+            relay_local_delivery_target(
                 &main_paths,
                 &state,
                 &NodeId::from_legacy_named("node_relay_local_remote").expect("remote")
             )
-            .expect("remote target"),
-            None
+            .expect("remote target")
+            .is_none()
         );
     }
 
@@ -8621,7 +8732,27 @@ mod tests {
             "command-path observations must not enter the published cache before a KV sync"
         );
 
-        for expected_failures in 1..CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD {
+        remember_cluster_endpoint_command_connectivity(
+            &paths,
+            &state,
+            &tcp,
+            sinomo_network::ClusterConnectivityState::Degraded,
+            None,
+            None,
+        );
+        let record = read_tcp_record();
+        assert_eq!(
+            record.state,
+            sinomo_network::ClusterConnectivityState::Healthy,
+            "first command-path failure after a healthy send should keep the direct edge usable"
+        );
+        assert_eq!(record.consecutive_failures, 1);
+        assert!(
+            record.last_success_at.is_some(),
+            "transient command-path failures should retain the last success timestamp"
+        );
+
+        for expected_failures in 2..CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD {
             remember_cluster_endpoint_command_connectivity(
                 &paths,
                 &state,
@@ -8686,7 +8817,10 @@ mod tests {
         );
         assert_eq!(record.consecutive_failures, 0);
         assert_eq!(record.latency_ms, Some(12));
-        assert!(record.last_failure_at.is_none());
+        assert!(
+            record.last_failure_at.is_some(),
+            "healthy recovery keeps the last failure timestamp as diagnostic history"
+        );
 
         let targets = sinomo_network::cluster_raft_command_targets(&paths, &state);
         assert_eq!(

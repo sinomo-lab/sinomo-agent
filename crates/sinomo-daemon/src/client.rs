@@ -643,6 +643,29 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
         })
     }
 
+    fn endpoint_rpc_cluster_id_async<'a>(
+        &'a mut self,
+        _endpoint: &'a ClusterEndpointRecord,
+    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_network::ClusterId>> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            let Some(paths) = cluster_paths_from_env() else {
+                return Ok(None);
+            };
+            runtime
+                .spawn_blocking(move || {
+                    Ok(sinomo_network::read_cluster_state(&paths)
+                        .ok()
+                        .map(|state| state.cluster_id))
+                })
+                .await
+                .map_err(|source| sinomo_network::NetworkError::Io {
+                    operation: "cluster endpoint relay context".to_string(),
+                    detail: format!("endpoint relay context task failed: {source}"),
+                })?
+        })
+    }
+
     fn send_signed_endpoint_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
@@ -651,15 +674,34 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
         request: &'a ObjectRpcRequest,
         timeouts: sinomo_network::DaemonRpcTimeouts,
     ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, sinomo_network::ObjectRpcResponse> {
+        let runtime = self.runtime.clone();
         Box::pin(async move {
-            sinomo_network::send_daemon_rpc_to_cluster_endpoint_async(
+            let started = Instant::now();
+            let result = sinomo_network::send_daemon_rpc_to_cluster_endpoint_async(
                 endpoint,
                 command,
                 Some(auth),
                 request,
                 timeouts,
             )
-            .await
+            .await;
+            let connectivity_state = if result.is_ok() {
+                sinomo_network::ClusterConnectivityState::Healthy
+            } else {
+                sinomo_network::ClusterConnectivityState::Unreachable
+            };
+            let latency_ms = result
+                .as_ref()
+                .ok()
+                .map(|_| daemon_rpc_elapsed_latency_ms(started));
+            remember_endpoint_command_connectivity_from_env_async(
+                runtime,
+                endpoint.clone(),
+                connectivity_state,
+                latency_ms,
+            )
+            .await;
+            result
         })
     }
 
@@ -721,21 +763,70 @@ impl sinomo_network::ClusterSignedRelayRpcAsyncHost for DaemonSignedEndpointRpcA
         request: &'a sinomo_network::ObjectRpcRequest,
         timeouts: sinomo_network::DaemonRpcTimeouts,
     ) -> sinomo_network::ClusterSignedRelayRpcFuture<'a, sinomo_network::ObjectRpcResponse> {
+        let runtime = self.runtime.clone();
         Box::pin(async move {
-            sinomo_network::send_daemon_rpc_to_cluster_endpoint_async(
+            let started = Instant::now();
+            let result = sinomo_network::send_daemon_rpc_to_cluster_endpoint_async(
                 endpoint,
                 command,
                 Some(auth),
                 request,
                 timeouts,
             )
-            .await
+            .await;
+            let connectivity_state = if result.is_ok() {
+                sinomo_network::ClusterConnectivityState::Healthy
+            } else {
+                sinomo_network::ClusterConnectivityState::Unreachable
+            };
+            let latency_ms = result
+                .as_ref()
+                .ok()
+                .map(|_| daemon_rpc_elapsed_latency_ms(started));
+            remember_endpoint_command_connectivity_from_env_async(
+                runtime,
+                endpoint.clone(),
+                connectivity_state,
+                latency_ms,
+            )
+            .await;
+            result
         })
     }
 }
 
 fn daemon_rpc_timeout_from_policy(timeouts: sinomo_network::DaemonRpcTimeouts) -> Option<Duration> {
     timeouts.connect_timeout.or(timeouts.idle_timeout)
+}
+
+fn daemon_rpc_elapsed_latency_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+async fn remember_endpoint_command_connectivity_from_env_async(
+    runtime: tokio::runtime::Handle,
+    endpoint: ClusterEndpointRecord,
+    connectivity_state: sinomo_network::ClusterConnectivityState,
+    latency_ms: Option<u64>,
+) {
+    let Some(paths) = cluster_paths_from_env() else {
+        return;
+    };
+    let _ = runtime
+        .spawn_blocking(move || {
+            let Ok(state) = sinomo_network::read_cluster_state_without_kv(&paths) else {
+                return;
+            };
+            crate::cluster::remember_cluster_endpoint_command_connectivity(
+                &paths,
+                &state,
+                &endpoint,
+                connectivity_state,
+                latency_ms,
+                None,
+            );
+        })
+        .await;
 }
 
 fn cluster_paths_from_env() -> Option<sinomo_network::ClusterPaths> {

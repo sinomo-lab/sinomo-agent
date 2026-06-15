@@ -5875,6 +5875,25 @@ pub fn cluster_connectivity_record_for_probe_outcome(
     )
 }
 
+pub fn cluster_connectivity_record_for_identity_mismatch(
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    timestamp: &str,
+    now: OffsetDateTime,
+) -> ClusterConnectivityRecord {
+    cluster_connectivity_record(
+        state,
+        endpoint,
+        ClusterConnectivityState::Unreachable,
+        None,
+        CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD,
+        None,
+        Some(timestamp.to_string()),
+        now,
+        CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
+    )
+}
+
 pub fn apply_cluster_connectivity_probe_results(
     connectivity: &mut BTreeMap<String, ClusterConnectivityProbeState>,
     active_keys: &BTreeSet<String>,
@@ -9955,6 +9974,7 @@ pub fn cluster_reachable_voter_count_with_host(
     }
     let deadline = Instant::now() + options.timeout;
     let targets = cluster_raft_live_voter_targets(paths, state);
+    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
     for (index, endpoint) in targets.iter().enumerate() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -9962,7 +9982,10 @@ pub fn cluster_reachable_voter_count_with_host(
         if remaining.is_zero() {
             break;
         }
-        if host.probe_voter(endpoint, options.fair_command_timeout(endpoint, remaining)) {
+        if host.probe_voter(
+            endpoint,
+            cluster_voter_probe_timeout(&graph, state, endpoint, options, remaining),
+        ) {
             voters.insert(endpoint.node_id.clone());
             if voters.len() >= quorum_size {
                 break;
@@ -9991,6 +10014,7 @@ pub async fn cluster_reachable_voter_count_async_with_host(
     }
     let deadline = Instant::now() + options.timeout;
     let targets = cluster_raft_live_voter_targets(paths, state);
+    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
     for (index, endpoint) in targets.iter().enumerate() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -9999,7 +10023,10 @@ pub async fn cluster_reachable_voter_count_async_with_host(
             break;
         }
         if host
-            .probe_voter_async(endpoint, options.fair_command_timeout(endpoint, remaining))
+            .probe_voter_async(
+                endpoint,
+                cluster_voter_probe_timeout(&graph, state, endpoint, options, remaining),
+            )
             .await?
         {
             voters.insert(endpoint.node_id.clone());
@@ -10012,6 +10039,20 @@ pub async fn cluster_reachable_voter_count_async_with_host(
         }
     }
     Ok(voters.len())
+}
+
+fn cluster_voter_probe_timeout(
+    graph: &ClusterConnectivityGraph,
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    options: ClusterVoterReachabilityOptions,
+    remaining: Duration,
+) -> Duration {
+    if crate::cluster_endpoint_prefers_relay_with_graph(graph, state, endpoint) {
+        options.command_timeout(endpoint, remaining)
+    } else {
+        options.fair_command_timeout(endpoint, remaining)
+    }
 }
 
 pub fn cluster_has_local_quorum_with_host(
@@ -11160,14 +11201,37 @@ pub fn cluster_daemon_command_targets(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
-    prefer_bounded_daemon_command_targets(cluster_sync_targets_with_connectivity(paths, state))
+    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
+    prefer_bounded_daemon_command_targets(
+        cluster_sync_targets_with_connectivity(paths, state)
+            .into_iter()
+            .filter(|endpoint| cluster_daemon_command_endpoint_is_usable(&graph, endpoint)),
+    )
+}
+
+fn cluster_daemon_command_endpoint_is_usable(
+    graph: &ClusterConnectivityGraph,
+    endpoint: &ClusterEndpointRecord,
+) -> bool {
+    match graph.state_for_endpoint(endpoint) {
+        Some(ClusterConnectivityState::Healthy) | None => true,
+        Some(ClusterConnectivityState::Degraded) | Some(ClusterConnectivityState::Unreachable) => {
+            false
+        }
+    }
 }
 
 pub fn cluster_dfs_protocol_targets(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
-    cluster_daemon_command_targets(paths, state)
+    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
+    let node_statuses = cluster_node_status_map_from_kv(paths);
+    prefer_bounded_daemon_command_targets(cluster_sync_targets_with_connectivity_context(
+        state,
+        &graph,
+        &node_statuses,
+    ))
 }
 
 pub fn cluster_main_daemon_command_targets(

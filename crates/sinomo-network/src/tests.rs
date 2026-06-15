@@ -3923,6 +3923,60 @@ fn cluster_connectivity_probe_batch_and_outcome_transition_are_network_owned() {
 }
 
 #[test]
+fn cluster_connectivity_identity_mismatch_bypasses_transient_failure_grace() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_connectivity_identity_mismatch").expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_connectivity_identity_mismatch_local").expect("local");
+    let target =
+        NodeId::from_legacy_named("node_connectivity_identity_mismatch_target").expect("target");
+    let endpoint = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named(
+            "endpoint_connectivity_identity_mismatch",
+        )
+        .expect("endpoint"),
+        node_id: target.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "10.0.0.92:21353".to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 0,
+        last_observed_latency_ms: None,
+    };
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "connectivity identity mismatch",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+
+    let healthy =
+        cluster_connectivity_record_for_probe_outcome(&state, &endpoint, None, true, 7, "ok", now);
+    let mismatch =
+        cluster_connectivity_record_for_identity_mismatch(&state, &endpoint, "wrong-node", now);
+
+    assert_eq!(
+        healthy.state,
+        ClusterConnectivityState::Healthy,
+        "test setup needs a previously healthy endpoint"
+    );
+    assert_eq!(mismatch.state, ClusterConnectivityState::Unreachable);
+    assert_eq!(
+        mismatch.consecutive_failures,
+        CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD
+    );
+    assert!(mismatch.last_success_at.is_none());
+    assert_eq!(mismatch.latency_ms, None);
+    assert_eq!(
+        (mismatch.expires_at - mismatch.observed_at).whole_seconds(),
+        CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS
+    );
+}
+
+#[test]
 fn cluster_connectivity_sync_is_noop_detects_stable_changed_and_removed() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-noop");
     let data_dir = SinomoDataDir::new(&root);
@@ -5293,6 +5347,70 @@ fn main_daemon_command_targets_select_one_route_per_remote_main() {
 
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].endpoint_id, remote_tcp.endpoint_id);
+}
+
+#[test]
+fn main_daemon_command_targets_filter_known_unreachable_endpoints() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-main-daemon-targets-unreachable");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_main_daemon_unreachable").expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_network_main_daemon_unreachable_local").expect("local");
+    let remote =
+        NodeId::from_legacy_named("node_network_main_daemon_unreachable_remote").expect("remote");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network main daemon unreachable",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+    let stale_tcp = daemon_lan_endpoint(&remote, "10.0.0.41:21353".to_string(), 10);
+    let mut member =
+        ClusterMemberRecord::local_voter(cluster_id, remote, "remote", "pk-remote", now);
+    member.capabilities = main_daemon_capabilities(&member.role);
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![stale_tcp.clone()];
+    state.members.push(member);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &state.local_node_id,
+        vec![cluster_connectivity_record(
+            &state,
+            &stale_tcp,
+            ClusterConnectivityState::Unreachable,
+            None,
+            CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD,
+            None,
+            Some("identity mismatch".to_string()),
+            now,
+            60,
+        )],
+    )
+    .expect("connectivity records");
+
+    let targets = cluster_main_daemon_command_targets(&paths, &state);
+
+    assert!(
+        targets.is_empty(),
+        "known-unreachable direct endpoints should not remain daemon command targets"
+    );
+    let dfs_targets = cluster_dfs_protocol_targets(&paths, &state);
+    assert_eq!(
+        dfs_targets
+            .iter()
+            .map(|endpoint| &endpoint.endpoint_id)
+            .collect::<Vec<_>>(),
+        vec![&stale_tcp.endpoint_id],
+        "DFS frame routing should keep the target record so relay can handle known-bad direct paths"
+    );
 }
 
 #[test]
@@ -9649,6 +9767,118 @@ fn cluster_voter_reachability_probes_remote_live_voters_until_quorum() {
         2
     );
     assert_eq!(host.probes, vec![(remote, Duration::from_secs(2))]);
+}
+
+#[test]
+fn cluster_voter_reachability_uses_command_timeout_for_relay_routed_voter() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-voter-reachability-relay");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_voter_reachability_relay").expect("cluster");
+    let local = NodeId::from_legacy_named("node_voter_reachability_relay_local").expect("local");
+    let bridge = NodeId::from_legacy_named("node_voter_reachability_relay_bridge").expect("bridge");
+    let remote = NodeId::from_legacy_named("node_voter_reachability_relay_remote").expect("remote");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "relay voter reachability",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    state.members[0].capabilities = main_daemon_capabilities(&state.members[0].role);
+    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+
+    let remote_endpoint = daemon_lan_endpoint(&remote, "10.49.0.2:21353".to_string(), 10);
+    let mut remote_member = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        remote.clone(),
+        "remote",
+        "pk-remote",
+        now,
+    );
+    remote_member.capabilities = main_daemon_capabilities(&remote_member.role);
+    remote_member.allowed_capabilities = remote_member.capabilities.clone();
+    remote_member.endpoints = vec![remote_endpoint.clone()];
+
+    let bridge_endpoint = daemon_lan_endpoint(&bridge, "10.49.0.3:21353".to_string(), 10);
+    let mut bridge_member = ClusterMemberRecord::local_non_voting(
+        cluster_id,
+        bridge.clone(),
+        "bridge",
+        "pk-bridge",
+        now,
+    );
+    bridge_member.capabilities = main_daemon_capabilities(&bridge_member.role);
+    bridge_member.allowed_capabilities = bridge_member.capabilities.clone();
+    bridge_member.endpoints = vec![bridge_endpoint.clone()];
+    state.members.push(remote_member);
+    state.members.push(bridge_member);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let mut bridge_to_remote = cluster_connectivity_record(
+        &state,
+        &remote_endpoint,
+        ClusterConnectivityState::Healthy,
+        Some(30),
+        0,
+        Some("ok".to_string()),
+        None,
+        now,
+        60,
+    );
+    bridge_to_remote.source_node_id = bridge.clone();
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &local,
+        vec![
+            cluster_connectivity_record(
+                &state,
+                &remote_endpoint,
+                ClusterConnectivityState::Unreachable,
+                None,
+                4,
+                None,
+                Some("timed out".to_string()),
+                now,
+                60,
+            ),
+            cluster_connectivity_record(
+                &state,
+                &bridge_endpoint,
+                ClusterConnectivityState::Healthy,
+                Some(20),
+                0,
+                Some("ok".to_string()),
+                None,
+                now,
+                60,
+            ),
+        ],
+    )
+    .expect("local connectivity records");
+    sync_cluster_connectivity_records_to_kv(&paths, &bridge, vec![bridge_to_remote])
+        .expect("bridge connectivity records");
+
+    let mut host = RecordingVoterReachabilityHost {
+        reachable: BTreeSet::from([remote.clone()]),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        cluster_reachable_voter_count_with_host(
+            &paths,
+            &state,
+            voter_reachability_test_options(),
+            &mut host,
+        ),
+        2
+    );
+    assert_eq!(host.probes, vec![(remote, Duration::from_secs(8))]);
 }
 
 #[test]

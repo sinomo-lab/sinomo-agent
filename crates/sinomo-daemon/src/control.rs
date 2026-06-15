@@ -31,9 +31,7 @@ use sinomo_sandbox::SandboxFileSystem;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
-#[cfg(feature = "sandbox")]
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(test)]
 use std::thread;
 use std::time::{Duration, Instant};
@@ -47,6 +45,25 @@ pub const DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL: Duration =
     DAEMON_CLUSTER_PUBLISH_INTERVAL;
 pub(crate) const ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE: Duration = Duration::from_millis(200);
 const DAEMON_SANDBOX_STREAM_CHANNEL_CAPACITY: usize = 64;
+const DAEMON_DFS_FRAME_REPLAY_RETENTION: Duration = Duration::from_secs(120);
+const DAEMON_DFS_FRAME_REPLAY_WAIT: Duration = Duration::from_secs(30);
+
+static DAEMON_DFS_FRAME_REPLAY_CACHE: OnceLock<
+    Mutex<BTreeMap<PathBuf, BTreeMap<Vec<u8>, DaemonDfsFrameReplayEntry>>>,
+> = OnceLock::new();
+
+#[derive(Clone)]
+enum DaemonDfsFrameReplayState {
+    InFlight,
+    Complete(sinomo_network::ObjectRpcResponse),
+}
+
+#[derive(Clone)]
+struct DaemonDfsFrameReplayEntry {
+    state: DaemonDfsFrameReplayState,
+    notify: Arc<tokio::sync::Notify>,
+    updated_at: Instant,
+}
 
 // The sandbox concurrency tracker is only exercised by the sandbox-exec RPC
 // handlers below, which are gated on the `sandbox` feature. Gate it to match so
@@ -563,12 +580,30 @@ pub(crate) async fn handle_daemon_connection_async(
         };
     }
 
+    let replay_key = daemon_dfs_frame_replay_key(&request);
+    if let Some(key) = replay_key.as_ref()
+        && let Some(response) = wait_for_daemon_dfs_frame_replay(&paths, key).await
+    {
+        let _ = write_daemon_rpc_response_frame_async(&mut stream, &stream_address, response).await;
+        let _ = stream.shutdown_write(&stream_address).await;
+        return Ok(false);
+    }
+
     let command = request.command.trim().to_string();
     let authenticated = match authenticate_daemon_control_request(&paths, &request) {
         Ok(authenticated) => authenticated,
         Err(error) => {
             if crate::auth::is_cluster_join_register_control_request(&request) {
                 eprintln!("sinomo daemon client auth failed for {command}: {error}");
+            }
+            if let Some(key) = replay_key.as_ref()
+                && let Some(response) = wait_for_daemon_dfs_frame_replay(&paths, key).await
+            {
+                let _ =
+                    write_daemon_rpc_response_frame_async(&mut stream, &stream_address, response)
+                        .await;
+                let _ = stream.shutdown_write(&stream_address).await;
+                return Ok(false);
             }
             if let Some(rpc_request) = request.rpc.as_ref()
                 && let Ok(response) = sinomo_network::ObjectRpcResponse::encode_error(
@@ -585,10 +620,14 @@ pub(crate) async fn handle_daemon_connection_async(
         }
     };
 
+    if let Some(key) = replay_key.as_ref() {
+        begin_daemon_dfs_frame_replay(&paths, key);
+    }
     let rpc_request = request.rpc;
     handle_authenticated_daemon_command_async(
         authenticated,
         rpc_request,
+        replay_key,
         stream,
         paths,
         service_host,
@@ -598,9 +637,237 @@ pub(crate) async fn handle_daemon_connection_async(
     .await
 }
 
+pub(crate) async fn dispatch_daemon_control_request_in_process_async(
+    paths: DaemonPaths,
+    service_runtime: tokio::runtime::Handle,
+    request: sinomo_network::DaemonControlRequest,
+) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
+    let replay_key = daemon_dfs_frame_replay_key(&request);
+    if let Some(key) = replay_key.as_ref()
+        && let Some(response) = wait_for_daemon_dfs_frame_replay(&paths, key).await
+    {
+        return Ok(response);
+    }
+
+    let command = request.command.trim().to_string();
+    if command == daemon_rpc_command(sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE)
+        && request.rpc.as_ref().is_some_and(|rpc| {
+            rpc.route == sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE
+                && rpc.category == sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
+        })
+    {
+        let service_host = crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime(
+            paths.clone(),
+            service_runtime.clone(),
+        )
+        .await?;
+        if let Some(response) =
+            crate::service_adapter::dispatch_pre_auth_via_registry_to_response_async(
+                &request,
+                &service_host,
+            )
+            .await?
+        {
+            return Ok(response);
+        }
+    }
+
+    let authenticated = match authenticate_daemon_control_request(&paths, &request) {
+        Ok(authenticated) => authenticated,
+        Err(error) => {
+            if let Some(key) = replay_key.as_ref()
+                && let Some(response) = wait_for_daemon_dfs_frame_replay(&paths, key).await
+            {
+                return Ok(response);
+            }
+            let Some(route) = request.rpc.as_ref().map(|rpc| rpc.route.clone()) else {
+                return Err(error);
+            };
+            let detail = error.to_string();
+            return sinomo_network::ObjectRpcResponse::encode_error(route, detail)
+                .map_err(DaemonError::from);
+        }
+    };
+    if let Some(key) = replay_key.as_ref() {
+        begin_daemon_dfs_frame_replay(&paths, key);
+    }
+
+    let Some(rpc_request) = request.rpc else {
+        if let Some(key) = replay_key.as_ref() {
+            abandon_daemon_dfs_frame_replay(&paths, key);
+        }
+        return Err(DaemonError::Network {
+            address: command,
+            detail: "in-process daemon dispatch requires an object RPC payload".to_string(),
+        });
+    };
+    if crate::service_adapter::is_sandbox_stream_route(&rpc_request) {
+        if let Some(key) = replay_key.as_ref() {
+            abandon_daemon_dfs_frame_replay(&paths, key);
+        }
+        return Err(DaemonError::Network {
+            address: rpc_request.route,
+            detail: "sandbox stream routes cannot be delivered through cluster relay".to_string(),
+        });
+    }
+    let service_host = crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime(
+        paths.clone(),
+        service_runtime,
+    )
+    .await?;
+    if service_host
+        .object_rpc_route_descriptor(&rpc_request.route)
+        .is_none()
+    {
+        if let Some(key) = replay_key.as_ref() {
+            abandon_daemon_dfs_frame_replay(&paths, key);
+        }
+        return Err(DaemonError::Network {
+            address: rpc_request.route,
+            detail: "in-process daemon dispatch has no registered object RPC route".to_string(),
+        });
+    }
+    match crate::service_adapter::dispatch_rpc_via_registry_to_response_async(
+        &service_host,
+        &authenticated,
+        rpc_request.clone(),
+        Some(&paths),
+        replay_key.clone(),
+    )
+    .await
+    {
+        Ok((response, _stop)) => Ok(response),
+        Err(error) => {
+            if let Some(key) = replay_key.as_ref() {
+                abandon_daemon_dfs_frame_replay(&paths, key);
+            }
+            sinomo_network::ObjectRpcResponse::encode_error(rpc_request.route, error.to_string())
+                .map_err(DaemonError::from)
+        }
+    }
+}
+
+pub(crate) fn daemon_dfs_frame_replay_key(
+    request: &sinomo_network::DaemonControlRequest,
+) -> Option<Vec<u8>> {
+    let rpc = request.rpc.as_ref()?;
+    if rpc.route != sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE {
+        return None;
+    }
+    let auth = request.auth.as_ref()?;
+    let mut key = Vec::with_capacity(rpc.route.len() + 1 + auth.len());
+    key.extend_from_slice(rpc.route.as_bytes());
+    key.push(0);
+    key.extend_from_slice(auth);
+    Some(key)
+}
+
+fn daemon_dfs_frame_replay_cache()
+-> &'static Mutex<BTreeMap<PathBuf, BTreeMap<Vec<u8>, DaemonDfsFrameReplayEntry>>> {
+    DAEMON_DFS_FRAME_REPLAY_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn prune_daemon_dfs_frame_replay_cache(
+    cache: &mut BTreeMap<PathBuf, BTreeMap<Vec<u8>, DaemonDfsFrameReplayEntry>>,
+) {
+    let now = Instant::now();
+    cache.retain(|_, entries| {
+        entries.retain(|_, entry| {
+            now.saturating_duration_since(entry.updated_at) <= DAEMON_DFS_FRAME_REPLAY_RETENTION
+        });
+        !entries.is_empty()
+    });
+}
+
+async fn wait_for_daemon_dfs_frame_replay(
+    paths: &DaemonPaths,
+    key: &[u8],
+) -> Option<sinomo_network::ObjectRpcResponse> {
+    let started = Instant::now();
+    loop {
+        let notify = {
+            let mut cache = daemon_dfs_frame_replay_cache().lock().ok()?;
+            prune_daemon_dfs_frame_replay_cache(&mut cache);
+            let entry = cache.get(&paths.root)?.get(key)?;
+            match &entry.state {
+                DaemonDfsFrameReplayState::Complete(response) => return Some(response.clone()),
+                DaemonDfsFrameReplayState::InFlight => Arc::clone(&entry.notify),
+            }
+        };
+        let remaining = DAEMON_DFS_FRAME_REPLAY_WAIT.checked_sub(started.elapsed())?;
+        if tokio::time::timeout(remaining, notify.notified())
+            .await
+            .is_err()
+        {
+            return None;
+        }
+    }
+}
+
+fn begin_daemon_dfs_frame_replay(paths: &DaemonPaths, key: &[u8]) {
+    let Ok(mut cache) = daemon_dfs_frame_replay_cache().lock() else {
+        return;
+    };
+    prune_daemon_dfs_frame_replay_cache(&mut cache);
+    cache
+        .entry(paths.root.clone())
+        .or_default()
+        .entry(key.to_vec())
+        .or_insert_with(|| DaemonDfsFrameReplayEntry {
+            state: DaemonDfsFrameReplayState::InFlight,
+            notify: Arc::new(tokio::sync::Notify::new()),
+            updated_at: Instant::now(),
+        });
+}
+
+pub(crate) fn complete_daemon_dfs_frame_replay(
+    paths: &DaemonPaths,
+    key: &[u8],
+    response: &sinomo_network::ObjectRpcResponse,
+) {
+    let notify = {
+        let Ok(mut cache) = daemon_dfs_frame_replay_cache().lock() else {
+            return;
+        };
+        prune_daemon_dfs_frame_replay_cache(&mut cache);
+        let entries = cache.entry(paths.root.clone()).or_default();
+        let entry = entries
+            .entry(key.to_vec())
+            .or_insert_with(|| DaemonDfsFrameReplayEntry {
+                state: DaemonDfsFrameReplayState::InFlight,
+                notify: Arc::new(tokio::sync::Notify::new()),
+                updated_at: Instant::now(),
+            });
+        entry.state = DaemonDfsFrameReplayState::Complete(response.clone());
+        entry.updated_at = Instant::now();
+        Arc::clone(&entry.notify)
+    };
+    notify.notify_waiters();
+}
+
+pub(crate) fn abandon_daemon_dfs_frame_replay(paths: &DaemonPaths, key: &[u8]) {
+    let notify = {
+        let Ok(mut cache) = daemon_dfs_frame_replay_cache().lock() else {
+            return;
+        };
+        let Some(entries) = cache.get_mut(&paths.root) else {
+            return;
+        };
+        let Some(entry) = entries.remove(key) else {
+            return;
+        };
+        if entries.is_empty() {
+            cache.remove(&paths.root);
+        }
+        entry.notify
+    };
+    notify.notify_waiters();
+}
+
 async fn handle_authenticated_daemon_command_async(
     authenticated: AuthenticatedDaemonCommand,
     rpc_request: Option<sinomo_network::ObjectRpcRequest>,
+    replay_key: Option<Vec<u8>>,
     mut stream: sinomo_network::AsyncDaemonControlStream,
     paths: DaemonPaths,
     service_host: crate::service_adapter::DaemonServiceRegistryHost,
@@ -625,6 +892,8 @@ async fn handle_authenticated_daemon_command_async(
         &mut stream,
         &stream_address,
         &service_host,
+        &paths,
+        replay_key.clone(),
     )
     .await
     {
@@ -633,6 +902,11 @@ async fn handle_authenticated_daemon_command_async(
         {
             let _ =
                 write_daemon_rpc_response_frame_async(&mut stream, &stream_address, response).await;
+        }
+        if result.is_err()
+            && let Some(key) = replay_key.as_ref()
+        {
+            abandon_daemon_dfs_frame_replay(&paths, key);
         }
         return result;
     }
@@ -694,6 +968,11 @@ async fn handle_authenticated_daemon_command_async(
         && let Some(response) = rpc_error_response_for_request(&error_response_request, error)
     {
         let _ = write_daemon_rpc_response_frame_async(&mut stream, &stream_address, response).await;
+    }
+    if result.is_err()
+        && let Some(key) = replay_key.as_ref()
+    {
+        abandon_daemon_dfs_frame_replay(&paths, key);
     }
     result
 }

@@ -1412,7 +1412,7 @@ impl DaemonServiceRegistryHost {
         self.router.route_registry_snapshot()
     }
 
-    fn object_rpc_route_descriptor(&self, route: &str) -> Option<ObjectRouteDescriptor> {
+    pub(crate) fn object_rpc_route_descriptor(&self, route: &str) -> Option<ObjectRouteDescriptor> {
         self.router.object_rpc_route_descriptor(route)
     }
 
@@ -2344,14 +2344,32 @@ pub(crate) async fn try_dispatch_pre_auth_via_registry_async(
     stream_address: &str,
     service_host: &DaemonServiceRegistryHost,
 ) -> Result<bool, DaemonError> {
+    match dispatch_pre_auth_via_registry_to_response_async(request, service_host).await {
+        Ok(Some(response)) => {
+            write_async_daemon_rpc_response_frame(stream, stream_address, response).await?;
+            Ok(true)
+        }
+        Ok(None) => Ok(false),
+        Err(error) => {
+            eprintln!("sinomo daemon pre-auth join challenge ignored: {error}");
+            let _ = stream.shutdown_write(stream_address).await;
+            Ok(true)
+        }
+    }
+}
+
+pub(crate) async fn dispatch_pre_auth_via_registry_to_response_async(
+    request: &DaemonControlRequest,
+    service_host: &DaemonServiceRegistryHost,
+) -> Result<Option<ObjectRpcResponse>, DaemonError> {
     let Some(rpc_request) = request.rpc.as_ref() else {
-        return Ok(false);
+        return Ok(None);
     };
     if request.command.trim() != daemon_rpc_command(CLUSTER_JOIN_CHALLENGE_ROUTE)
         || rpc_request.route != CLUSTER_JOIN_CHALLENGE_ROUTE
         || rpc_request.category != CLUSTER_MEMBERSHIP_RPC_CATEGORY
     {
-        return Ok(false);
+        return Ok(None);
     }
 
     let authenticated = AuthenticatedDaemonCommand {
@@ -2364,22 +2382,17 @@ pub(crate) async fn try_dispatch_pre_auth_via_registry_async(
         .object_rpc_route_descriptor(CLUSTER_JOIN_CHALLENGE_ROUTE)
         .is_none()
     {
-        return Ok(false);
+        return Ok(None);
     }
-    let dispatch = dispatch_via_registry_async(
+    let (response, _stop) = dispatch_rpc_via_registry_to_response_async(
         service_host,
         &authenticated,
         rpc_request.clone(),
-        stream,
-        stream_address,
+        None,
+        None,
     )
-    .await;
-    if let Err(error) = dispatch {
-        eprintln!("sinomo daemon pre-auth join challenge ignored: {error}");
-        let _ = stream.shutdown_write(stream_address).await;
-        return Ok(true);
-    }
-    Ok(true)
+    .await?;
+    Ok(Some(response))
 }
 
 pub(crate) async fn try_dispatch_via_registry_async(
@@ -2388,6 +2401,8 @@ pub(crate) async fn try_dispatch_via_registry_async(
     stream: &mut AsyncDaemonControlStream,
     stream_address: &str,
     service_host: &DaemonServiceRegistryHost,
+    paths: &DaemonPaths,
+    replay_key: Option<Vec<u8>>,
 ) -> Option<Result<bool, DaemonError>> {
     let request = rpc_request.as_ref()?;
     if is_sandbox_stream_route(request) {
@@ -2406,6 +2421,8 @@ pub(crate) async fn try_dispatch_via_registry_async(
             request.clone(),
             stream,
             stream_address,
+            Some(paths),
+            replay_key,
         )
         .await,
     )
@@ -2414,21 +2431,20 @@ pub(crate) async fn try_dispatch_via_registry_async(
 async fn dispatch_via_registry_async(
     service_host: &DaemonServiceRegistryHost,
     authenticated: &AuthenticatedDaemonCommand,
-    mut request: ObjectRpcRequest,
+    request: ObjectRpcRequest,
     stream: &mut AsyncDaemonControlStream,
     stream_address: &str,
+    paths: Option<&DaemonPaths>,
+    replay_key: Option<Vec<u8>>,
 ) -> Result<bool, DaemonError> {
-    annotate_daemon_service_request(&mut request, authenticated);
-    let router = service_host
-        .route_policy_layer()
-        .layer(service_host.active_router());
-    let mut router =
-        daemon_service_object_rpc_authorization_layer(authenticated.signer.clone()).layer(router);
-    let mut response = sinomo_network::call_object_rpc_service_async(&mut router, request).await?;
-    let stop = response
-        .metadata
-        .remove(DAEMON_SERVICE_DISPOSITION_METADATA_KEY)
-        .is_some_and(|value| value == "stop");
+    let (response, stop) = dispatch_rpc_via_registry_to_response_async(
+        service_host,
+        authenticated,
+        request,
+        paths,
+        replay_key,
+    )
+    .await?;
     write_async_daemon_rpc_response_frame(stream, stream_address, response).await?;
     if stop {
         stream
@@ -2438,6 +2454,39 @@ async fn dispatch_via_registry_async(
         tokio::time::sleep(ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE).await;
     }
     Ok(stop)
+}
+
+pub(crate) async fn dispatch_rpc_via_registry_to_response_async(
+    service_host: &DaemonServiceRegistryHost,
+    authenticated: &AuthenticatedDaemonCommand,
+    mut request: ObjectRpcRequest,
+    paths: Option<&DaemonPaths>,
+    replay_key: Option<Vec<u8>>,
+) -> Result<(ObjectRpcResponse, bool), DaemonError> {
+    annotate_daemon_service_request(&mut request, authenticated);
+    let router = service_host
+        .route_policy_layer()
+        .layer(service_host.active_router());
+    let mut router =
+        daemon_service_object_rpc_authorization_layer(authenticated.signer.clone()).layer(router);
+    let mut response =
+        match sinomo_network::call_object_rpc_service_async(&mut router, request).await {
+            Ok(response) => response,
+            Err(error) => {
+                if let (Some(paths), Some(key)) = (paths, replay_key.as_ref()) {
+                    crate::control::abandon_daemon_dfs_frame_replay(paths, key);
+                }
+                return Err(error.into());
+            }
+        };
+    let stop = response
+        .metadata
+        .remove(DAEMON_SERVICE_DISPOSITION_METADATA_KEY)
+        .is_some_and(|value| value == "stop");
+    if let (Some(paths), Some(key)) = (paths, replay_key.as_ref()) {
+        crate::control::complete_daemon_dfs_frame_replay(paths, key, &response);
+    }
+    Ok((response, stop))
 }
 
 async fn write_async_daemon_rpc_response_frame(
@@ -2518,6 +2567,46 @@ mod tests {
                 ctx.respond(ObjectRpcResponse::encode_body(
                     request.route,
                     &"limited".to_string(),
+                )?)?;
+                Ok(ServiceDisposition::Continue)
+            })
+        }
+    }
+
+    struct TestJoinChallengeService;
+
+    impl Service for TestJoinChallengeService {
+        fn name(&self) -> &'static str {
+            "test-join-challenge"
+        }
+
+        fn routes(&self) -> &'static [&'static str] {
+            &[CLUSTER_JOIN_CHALLENGE_ROUTE]
+        }
+
+        fn route_categories(&self) -> Vec<ServiceRoute> {
+            vec![ServiceRoute::new(
+                CLUSTER_JOIN_CHALLENGE_ROUTE,
+                CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+            )]
+        }
+
+        fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+            Box::pin(async move {
+                let _: () = request.decode_body()?;
+                let signer_authority = request
+                    .metadata
+                    .get(DAEMON_SERVICE_SIGNER_AUTHORITY_METADATA_KEY)
+                    .cloned()
+                    .unwrap_or_default();
+                let signer_node_id = request
+                    .metadata
+                    .get(DAEMON_SERVICE_SIGNER_NODE_ID_METADATA_KEY)
+                    .cloned()
+                    .unwrap_or_default();
+                ctx.respond(ObjectRpcResponse::encode_body(
+                    request.route,
+                    &(signer_authority, signer_node_id),
                 )?)?;
                 Ok(ServiceDisposition::Continue)
             })
@@ -2715,6 +2804,40 @@ mod tests {
                 .detail
                 .contains("native dylib module operation is not active")
         );
+    }
+
+    #[test]
+    fn pre_auth_join_challenge_dispatches_as_join_candidate() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-pre-auth-join-challenge");
+        let registry = ServiceRegistry::builder()
+            .register(TestJoinChallengeService)
+            .build();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let host = test_service_host(&root, registry);
+        let request = sinomo_network::DaemonControlRequest::rpc(
+            daemon_rpc_command(CLUSTER_JOIN_CHALLENGE_ROUTE),
+            ObjectRpcRequest::encode_body(
+                CLUSTER_JOIN_CHALLENGE_ROUTE,
+                CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+                &(),
+            )
+            .expect("join challenge rpc"),
+        );
+
+        let response = runtime
+            .block_on(dispatch_pre_auth_via_registry_to_response_async(
+                &request, &host,
+            ))
+            .expect("pre-auth dispatch")
+            .expect("pre-auth response");
+        let (signer_authority, signer_node_id): (String, String) =
+            response.decode_body().expect("decode response");
+
+        assert_eq!(signer_authority, "join-candidate");
+        assert_eq!(signer_node_id, "");
     }
 
     #[test]
