@@ -11655,7 +11655,7 @@ fn cluster_direct_endpoint_static_fallback_rank(endpoint: &ClusterEndpointRecord
     let Ok(address) = endpoint.address.parse::<SocketAddr>() else {
         return if !is_loopback_connect_address(&endpoint.address) && endpoint.address.contains(':')
         {
-            1
+            0
         } else {
             3
         };

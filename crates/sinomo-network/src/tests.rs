@@ -13437,6 +13437,86 @@ fn cluster_sync_targets_keep_lan_public_iroh_order_before_connectivity() {
 }
 
 #[test]
+fn advertised_hostname_outranks_opportunistic_private_ip_for_docker_routes() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-docker-hostname-route-order");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_docker_hostname_route_order").expect("cluster");
+    let local = NodeId::from_legacy_named("node_docker_hostname_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_docker_hostname_remote").expect("remote");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "docker hostname route order",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let stale_private_ip = daemon_lan_endpoint(&remote, "172.24.0.3:21353".to_string(), 20);
+    let stable_hostname = daemon_lan_endpoint(&remote, "node5:21353".to_string(), 5);
+    let mut member =
+        ClusterMemberRecord::local_voter(cluster_id, remote, "remote", "pk-remote", now);
+    member.capabilities = main_daemon_capabilities(&member.role);
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![stale_private_ip.clone(), stable_hostname.clone()];
+    state.members.push(member.clone());
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let probe_targets = cluster_network_probe_targets(&state);
+    assert_eq!(
+        probe_targets
+            .iter()
+            .find(|endpoint| endpoint.node_id == member.node_id)
+            .map(|endpoint| &endpoint.endpoint_id),
+        Some(&stable_hostname.endpoint_id),
+        "active probes must verify the stable Docker hostname before a reusable container IP"
+    );
+
+    let sync_targets = cluster_sync_targets_with_connectivity(&paths, &state);
+    assert_eq!(
+        sync_targets.first().map(|endpoint| &endpoint.endpoint_id),
+        Some(&stable_hostname.endpoint_id),
+        "cluster sync should honor the lower priority stable hostname when routes are otherwise unknown"
+    );
+
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &local,
+        vec![cluster_connectivity_record(
+            &state,
+            &stable_hostname,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            60,
+        )],
+    )
+    .expect("connectivity records");
+
+    let raft_targets = cluster_raft_command_targets(&paths, &state);
+    assert_eq!(
+        raft_targets.first().map(|endpoint| &endpoint.endpoint_id),
+        Some(&stable_hostname.endpoint_id),
+        "KV/Raft command routing should not fall back to the stale private IP when the hostname is healthy"
+    );
+
+    let status_targets =
+        cluster_member_daemon_status_targets_with_connectivity(&paths, &state, &member);
+    assert_eq!(
+        status_targets.first().map(|endpoint| &endpoint.endpoint_id),
+        Some(&stable_hostname.endpoint_id),
+        "status probes should use the same stable direct route ordering"
+    );
+}
+
+#[test]
 fn connectivity_sort_uses_lan_public_iroh_fallback_order() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-lan-public-iroh-sort");
     let data_dir = SinomoDataDir::new(&root);
