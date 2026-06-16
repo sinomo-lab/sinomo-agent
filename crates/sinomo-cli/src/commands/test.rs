@@ -659,6 +659,8 @@ mod tests {
             "cluster.dfs.remove",
             "cluster.dfs.bulk-write",
             "cluster.dfs.bulk-expect",
+            "cluster.dfs.large-write",
+            "cluster.dfs.large-expect",
         ] {
             assert!(ids.iter().any(|candidate| candidate == id), "missing {id}");
         }

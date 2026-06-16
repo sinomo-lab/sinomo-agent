@@ -244,6 +244,21 @@ impl SifsFileManagerBackend {
         Ok(())
     }
 
+    pub(crate) fn write_file_with_known_parent_deferred_publish(
+        &self,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let path = normalize_sifs_path(path)?;
+        let mut service = self.lock_service()?;
+        let options = sifs_write_options(&service, &self.replica_candidates);
+        service
+            .posix_write_file(&path, bytes, options)
+            .map(|_| ())
+            .map_err(|error| format!("cannot write SIFS file {path}: {error}"))?;
+        Ok(())
+    }
+
     pub(crate) fn operational_metrics(
         &self,
     ) -> Result<sinomo_runtime::dfs::DfsOperationalMetrics, String> {

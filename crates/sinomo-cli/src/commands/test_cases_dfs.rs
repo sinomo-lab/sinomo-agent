@@ -19,6 +19,9 @@
 //! - `cluster.dfs.bulk-write` / `cluster.dfs.bulk-expect` — deterministic bulk
 //!   write/read probes for cluster-level throughput, convergence evidence, and
 //!   steady-state process I/O accounting.
+//! - `cluster.dfs.large-write` / `cluster.dfs.large-expect` — deterministic
+//!   large-object throughput probes that exercise chunked transfer and read-side
+//!   no-write accounting.
 
 use crate::file_manager::FileManagerBackend;
 use crate::sifs_file_manager::SifsFileManagerBackend;
@@ -33,6 +36,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_EXPECT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_BULK_FILE_COUNT: usize = 128;
 const DEFAULT_BULK_FILE_BYTES: usize = 4 * 1024;
+const DEFAULT_LARGE_FILE_BYTES: usize = 16 * 1024 * 1024;
 const EXPECT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_ROUNDTRIP_BASE: &str = "/services/cluster-tests";
 
@@ -51,6 +55,8 @@ pub fn register_dfs_cluster_test_cases(
         .register(dfs_remove())
         .register(dfs_bulk_write())
         .register(dfs_bulk_expect())
+        .register(dfs_large_write())
+        .register(dfs_large_expect())
 }
 
 sinomo_runtime::test::sinomo_test_case! {
@@ -181,6 +187,30 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_bulk_expect(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_large_write(ctx) {
+        id: "cluster.dfs.large-write",
+        summary: "Write one deterministic large SIFS file and report throughput, publish timing, and process I/O (--param path=... [--param bytes=N])",
+        tags: ["cluster-dfs", "probe", "performance"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_large_write(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_large_expect(ctx) {
+        id: "cluster.dfs.large-expect",
+        summary: "Poll one deterministic large SIFS file from this node and report convergence/read throughput and read-side process I/O (--param path=... [--param bytes=N])",
+        tags: ["cluster-dfs", "probe", "performance"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_large_expect(ctx)
         }
     }
 }
@@ -801,6 +831,226 @@ fn run_bulk_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     }
 }
 
+fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let path = ctx.required_parameter("path")?.to_string();
+    let bytes = optional_usize_parameter(ctx, "bytes", DEFAULT_LARGE_FILE_BYTES)?;
+    let timeout = expect_timeout(ctx)?;
+    let min_bytes_per_second = optional_f64_parameter(ctx, "min-bytes-per-second", 0.0)?;
+    let max_proc_wchar_amplification =
+        optional_f64_parameter(ctx, "max-proc-wchar-amplification", 0.0)?;
+    let max_proc_write_bytes_amplification =
+        optional_f64_parameter(ctx, "max-proc-write-bytes-amplification", 0.0)?;
+    require_positive("bytes", bytes)?;
+
+    let payload_started = Instant::now();
+    let payload = large_payload(&path, bytes);
+    let payload_build_elapsed = payload_started.elapsed();
+    let backend = open_backend(ctx)?;
+    let node = backend.node_label();
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let parent = parent_probe_path(&path);
+    let mkdir_started = Instant::now();
+    if let Some(parent) = parent.as_deref() {
+        retry_bulk_mutation(
+            deadline,
+            || backend.create_dir_all_deferred_local_replay(parent),
+            || format!("cannot create SIFS parent directory {parent}"),
+        )?;
+    }
+    let mkdir_elapsed = mkdir_started.elapsed();
+    let proc_io_before = current_proc_io();
+    let write_started = Instant::now();
+    retry_bulk_mutation(
+        deadline,
+        || backend.write_file_with_known_parent_deferred_publish(&path, &payload),
+        || format!("cannot write large SIFS file {path}"),
+    )?;
+    let write_elapsed = write_started.elapsed();
+    let proc_io_after_write = current_proc_io();
+    let publish_started = Instant::now();
+    backend.publish_metadata_after_mutation();
+    let publish_elapsed = publish_started.elapsed();
+    let proc_io_after_publish = current_proc_io();
+    let elapsed = started.elapsed();
+    let total_bytes = bytes as u64;
+    let bytes_per_second = rate_per_second(total_bytes as f64, elapsed);
+    let data_write_bytes_per_second = rate_per_second(total_bytes as f64, write_elapsed);
+    let proc_io_delta = proc_io_before
+        .zip(current_proc_io())
+        .map(|(before, after)| after.saturating_delta(before));
+    let proc_io_write_delta = proc_io_before
+        .zip(proc_io_after_write)
+        .map(|(before, after)| after.saturating_delta(before));
+    let proc_io_publish_delta = proc_io_after_write
+        .zip(proc_io_after_publish)
+        .map(|(before, after)| after.saturating_delta(before));
+
+    ctx.record("node", &node);
+    ctx.record("path", &path);
+    if let Some(parent) = parent {
+        ctx.record("parent", &parent);
+    }
+    ctx.record("bytes", total_bytes);
+    ctx.record(
+        "payload_build_elapsed_ms",
+        payload_build_elapsed.as_millis() as u64,
+    );
+    ctx.record("elapsed_ms", elapsed.as_millis() as u64);
+    ctx.record("mkdir_elapsed_ms", mkdir_elapsed.as_millis() as u64);
+    ctx.record("write_elapsed_ms", write_elapsed.as_millis() as u64);
+    ctx.record("publish_elapsed_ms", publish_elapsed.as_millis() as u64);
+    ctx.record("bytes_per_second", bytes_per_second);
+    ctx.record("data_write_bytes_per_second", data_write_bytes_per_second);
+    ctx.record("min_bytes_per_second", min_bytes_per_second);
+    ctx.record("max_proc_wchar_amplification", max_proc_wchar_amplification);
+    ctx.record(
+        "max_proc_write_bytes_amplification",
+        max_proc_write_bytes_amplification,
+    );
+    if let Some(proc_io_delta) = proc_io_delta {
+        let proc_wchar_amplification =
+            amplification_ratio(proc_io_delta.wchar, total_bytes).unwrap_or(0.0);
+        let proc_write_bytes_amplification =
+            amplification_ratio(proc_io_delta.write_bytes, total_bytes).unwrap_or(0.0);
+        ctx.record("proc_rchar_delta", proc_io_delta.rchar);
+        ctx.record("proc_wchar_delta", proc_io_delta.wchar);
+        ctx.record("proc_read_bytes_delta", proc_io_delta.read_bytes);
+        ctx.record("proc_write_bytes_delta", proc_io_delta.write_bytes);
+        ctx.record("proc_wchar_amplification", proc_wchar_amplification);
+        ctx.record(
+            "proc_write_bytes_amplification",
+            proc_write_bytes_amplification,
+        );
+        if let Some(delta) = proc_io_write_delta {
+            ctx.record("proc_write_bytes_data_write_delta", delta.write_bytes);
+            ctx.record("proc_wchar_data_write_delta", delta.wchar);
+        }
+        if let Some(delta) = proc_io_publish_delta {
+            ctx.record("proc_write_bytes_publish_delta", delta.write_bytes);
+            ctx.record("proc_wchar_publish_delta", delta.wchar);
+        }
+        if max_proc_wchar_amplification > 0.0
+            && proc_wchar_amplification > max_proc_wchar_amplification
+        {
+            return Ok(SinomoTestOutcome::failed(format!(
+                "large write on node {node} wrote {total_bytes} bytes with proc wchar amplification {proc_wchar_amplification:.2}x, above allowed {max_proc_wchar_amplification:.2}x"
+            )));
+        }
+        if max_proc_write_bytes_amplification > 0.0
+            && proc_write_bytes_amplification > max_proc_write_bytes_amplification
+        {
+            return Ok(SinomoTestOutcome::failed(format!(
+                "large write on node {node} wrote {total_bytes} bytes with proc write_bytes amplification {proc_write_bytes_amplification:.2}x, above allowed {max_proc_write_bytes_amplification:.2}x"
+            )));
+        }
+    }
+
+    if min_bytes_per_second > 0.0 && data_write_bytes_per_second < min_bytes_per_second {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "large write on node {node} wrote {total_bytes} bytes in {}ms ({data_write_bytes_per_second:.2} bytes/s), below required {min_bytes_per_second:.2} bytes/s",
+            write_elapsed.as_millis()
+        )));
+    }
+
+    Ok(SinomoTestOutcome::passed(format!(
+        "large write on node {node} wrote {total_bytes} bytes in {}ms ({data_write_bytes_per_second:.2} bytes/s)",
+        write_elapsed.as_millis()
+    )))
+}
+
+fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let path = ctx.required_parameter("path")?.to_string();
+    let bytes = optional_usize_parameter(ctx, "bytes", DEFAULT_LARGE_FILE_BYTES)?;
+    let timeout = expect_timeout(ctx)?;
+    let min_bytes_per_second = optional_f64_parameter(ctx, "min-bytes-per-second", 0.0)?;
+    let max_proc_write_bytes = optional_u64_parameter(ctx, "max-proc-write-bytes")?;
+    require_positive("bytes", bytes)?;
+
+    let payload_started = Instant::now();
+    let expected = large_payload(&path, bytes);
+    let payload_build_elapsed = payload_started.elapsed();
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let backend = open_read_only_backend_until(ctx, deadline)?;
+    let node = backend.node_label();
+    let measurement_started = Instant::now();
+    let proc_io_before = current_proc_io();
+    let mut last_state: String;
+
+    loop {
+        match backend.read_file(&path) {
+            Ok(actual) if actual.as_slice() == expected.as_slice() => {
+                let elapsed = measurement_started.elapsed();
+                let elapsed_ms = elapsed.as_millis() as u64;
+                let total_bytes = bytes as u64;
+                let bytes_per_second = rate_per_second(total_bytes as f64, elapsed);
+                let proc_io_delta = proc_io_before
+                    .zip(current_proc_io())
+                    .map(|(before, after)| after.saturating_delta(before));
+                ctx.record("node", &node);
+                ctx.record("path", &path);
+                ctx.record("bytes", total_bytes);
+                ctx.record(
+                    "expected_payload_build_elapsed_ms",
+                    payload_build_elapsed.as_millis() as u64,
+                );
+                ctx.record("elapsed_ms", elapsed_ms);
+                ctx.record("bytes_per_second", bytes_per_second);
+                ctx.record("min_bytes_per_second", min_bytes_per_second);
+                if let Some(max_proc_write_bytes) = max_proc_write_bytes {
+                    ctx.record("max_proc_write_bytes", max_proc_write_bytes);
+                }
+                if let Some(proc_io_delta) = proc_io_delta {
+                    ctx.record("proc_rchar_delta", proc_io_delta.rchar);
+                    ctx.record("proc_wchar_delta", proc_io_delta.wchar);
+                    ctx.record("proc_read_bytes_delta", proc_io_delta.read_bytes);
+                    ctx.record("proc_write_bytes_delta", proc_io_delta.write_bytes);
+                    if let Some(max_proc_write_bytes) = max_proc_write_bytes
+                        && proc_io_delta.write_bytes > max_proc_write_bytes
+                    {
+                        return Ok(SinomoTestOutcome::failed(format!(
+                            "large expect on node {node} read {total_bytes} bytes with proc write_bytes delta {}, above allowed {max_proc_write_bytes}",
+                            proc_io_delta.write_bytes
+                        )));
+                    }
+                }
+
+                if min_bytes_per_second > 0.0 && bytes_per_second < min_bytes_per_second {
+                    return Ok(SinomoTestOutcome::failed(format!(
+                        "large expect on node {node} read {total_bytes} bytes in {elapsed_ms}ms ({bytes_per_second:.2} bytes/s), below required {min_bytes_per_second:.2} bytes/s"
+                    )));
+                }
+                return Ok(SinomoTestOutcome::passed(format!(
+                    "large expect on node {node} read {total_bytes} bytes in {elapsed_ms}ms ({bytes_per_second:.2} bytes/s)"
+                )));
+            }
+            Ok(actual) => {
+                last_state = format!(
+                    "{path} content mismatch ({} bytes, expected {})",
+                    actual.len(),
+                    expected.len()
+                );
+            }
+            Err(error) => {
+                last_state = format!("{path}: {error}");
+            }
+        }
+
+        if Instant::now() >= deadline {
+            ctx.record("node", &node);
+            ctx.record("path", &path);
+            ctx.record("bytes", bytes as u64);
+            ctx.record("last_state", &last_state);
+            return Ok(SinomoTestOutcome::failed(format!(
+                "large expect on node {node} did not read matching {bytes} byte file at {path} within {}s: {last_state}",
+                timeout.as_secs()
+            )));
+        }
+        std::thread::sleep(EXPECT_POLL_INTERVAL);
+    }
+}
+
 fn open_backend(ctx: &SinomoTestContext) -> Result<SifsFileManagerBackend, SinomoTestError> {
     let data_dir = SinomoDataDir::new(ctx.data_dir());
     SifsFileManagerBackend::open(&data_dir)
@@ -984,6 +1234,20 @@ fn bulk_payload(base: &str, index: usize, bytes: usize) -> Vec<u8> {
     }
     payload.truncate(bytes);
     payload
+}
+
+fn large_payload(path: &str, bytes: usize) -> Vec<u8> {
+    pattern_payload(&format!("{path}|sinomo-dfs-large"), bytes)
+}
+
+fn parent_probe_path(path: &str) -> Option<String> {
+    let path = path.trim_end_matches('/');
+    let slash = path.rfind('/')?;
+    if slash == 0 {
+        Some("/".to_string())
+    } else {
+        Some(path[..slash].to_string())
+    }
 }
 
 fn rate_per_second(count: f64, elapsed: Duration) -> f64 {
