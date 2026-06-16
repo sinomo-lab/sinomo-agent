@@ -262,8 +262,8 @@ pub(crate) fn run_test_command(command: TestCliCommand) -> Result<(), CliError> 
 
 pub(crate) fn test_registry() -> Result<SinomoTestRegistry, CliError> {
     let builder = sinomo_lm::register_lm_test_cases(SinomoTestRegistry::builder());
-    let builder = crate::commands::test_cases_agent::register_agent_cluster_test_cases(builder);
     let builder = crate::commands::test_cases_network::register_network_cluster_test_cases(builder);
+    let builder = crate::commands::test_cases_agent::register_agent_cluster_test_cases(builder);
     let builder = crate::commands::test_cases_dfs::register_dfs_cluster_test_cases(builder);
     let builder = cli_runtime_config()
         .test_registry_hooks
