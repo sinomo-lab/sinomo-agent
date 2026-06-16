@@ -578,21 +578,37 @@ pub type AsyncNetworkTransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + S
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AsyncNetworkSendOptions {
     timeout: Option<Duration>,
+    nonblocking: bool,
 }
 
 impl AsyncNetworkSendOptions {
     pub const fn timeout(timeout: Duration) -> Self {
         Self {
             timeout: Some(timeout),
+            nonblocking: false,
         }
     }
 
     pub fn from_timeout(timeout: Option<Duration>) -> Self {
-        Self { timeout }
+        Self {
+            timeout,
+            nonblocking: false,
+        }
+    }
+
+    pub const fn nonblocking() -> Self {
+        Self {
+            timeout: None,
+            nonblocking: true,
+        }
     }
 
     pub const fn timeout_duration(self) -> Option<Duration> {
         self.timeout
+    }
+
+    pub const fn is_nonblocking(self) -> bool {
+        self.nonblocking
     }
 }
 
@@ -1018,6 +1034,7 @@ impl AsyncInProcessNetwork {
         let (sender, incoming) = tokio::sync::mpsc::channel(self.inner.mailbox_capacity);
         let target = AsyncInProcessTarget {
             sender,
+            mailbox_capacity: self.inner.mailbox_capacity,
             send_limiter: Arc::new(tokio::sync::Semaphore::new(
                 self.inner.per_target_send_limit,
             )),
@@ -1050,6 +1067,7 @@ struct AsyncInProcessNetworkInner {
 #[derive(Clone)]
 struct AsyncInProcessTarget {
     sender: tokio::sync::mpsc::Sender<InboundFrame>,
+    mailbox_capacity: usize,
     send_limiter: Arc<tokio::sync::Semaphore>,
 }
 
@@ -1184,6 +1202,28 @@ async fn send_async_in_process_frame(
         received_by: target_node_id.clone(),
         frame,
     };
+    if options.is_nonblocking() {
+        let _permit =
+            target
+                .send_limiter
+                .try_acquire_owned()
+                .map_err(|_| NetworkError::MailboxFull {
+                    node_id: target_node_id.clone(),
+                    max_frames: target.mailbox_capacity,
+                })?;
+        return target
+            .sender
+            .try_send(inbound)
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => NetworkError::MailboxFull {
+                    node_id: target_node_id.clone(),
+                    max_frames: target.mailbox_capacity,
+                },
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => NetworkError::UnknownNode {
+                    node_id: target_node_id.clone(),
+                },
+            });
+    }
     match options.timeout_duration() {
         Some(timeout) => {
             let deadline = tokio::time::Instant::now() + timeout;
@@ -1334,15 +1374,16 @@ impl<T: AsyncNetworkTransport> NetworkService<T> {
                 .send_async(
                     &target_node_id,
                     frame,
-                    AsyncNetworkSendOptions::from_timeout(remaining_async_command_timeout(
-                        send_deadline,
-                    )),
+                    actor_send_options_for_deadline(send_deadline),
                 )
                 .await
             {
                 Ok(()) => {
                     self.ledger.mark_sent(delivery_id)?;
                     sent += 1;
+                }
+                Err(NetworkError::MailboxFull { .. }) => {
+                    self.ledger.mark_backpressured(delivery_id)?;
                 }
                 Err(error) => {
                     self.ledger.mark_attempt_failed(delivery_id)?;
@@ -1433,9 +1474,7 @@ impl<T: AsyncNetworkTransport> NetworkService<T> {
                         .send_async(
                             &ack_target_node_id,
                             ack_frame,
-                            AsyncNetworkSendOptions::from_timeout(remaining_async_command_timeout(
-                                send_deadline,
-                            )),
+                            actor_send_options_for_deadline(send_deadline),
                         )
                         .await
                     {
@@ -1544,9 +1583,7 @@ impl<T: AsyncNetworkTransport> NetworkService<T> {
             .send_async(
                 target_node_id,
                 frame,
-                AsyncNetworkSendOptions::from_timeout(remaining_async_command_timeout(
-                    send_deadline,
-                )),
+                actor_send_options_for_deadline(send_deadline),
             )
             .await
     }
@@ -1781,6 +1818,15 @@ fn remaining_async_command_timeout(deadline: Option<tokio::time::Instant>) -> Op
             .checked_duration_since(tokio::time::Instant::now())
             .unwrap_or_default()
     })
+}
+
+fn actor_send_options_for_deadline(
+    deadline: Option<tokio::time::Instant>,
+) -> AsyncNetworkSendOptions {
+    match remaining_async_command_timeout(deadline) {
+        Some(timeout) => AsyncNetworkSendOptions::timeout(timeout),
+        None => AsyncNetworkSendOptions::nonblocking(),
+    }
 }
 
 impl<T: AsyncNetworkTransport + Send + 'static> NetworkService<T> {
@@ -2698,6 +2744,35 @@ impl DeliveryLedger {
         delivery_id: RouteDeliveryId,
     ) -> Result<(), NetworkError> {
         self.mark_attempt_failed_at(delivery_id, Instant::now())
+    }
+
+    pub fn mark_backpressured(&mut self, delivery_id: RouteDeliveryId) -> Result<(), NetworkError> {
+        self.mark_backpressured_at(delivery_id, Instant::now())
+    }
+
+    pub(crate) fn mark_backpressured_at(
+        &mut self,
+        delivery_id: RouteDeliveryId,
+        now: Instant,
+    ) -> Result<(), NetworkError> {
+        let (retry_deadline, target_node_id) = {
+            let record = self
+                .records
+                .get_mut(&delivery_id)
+                .ok_or(NetworkError::UnknownDelivery { delivery_id })?;
+            if record.delivery.status == DeliveryStatus::Delivered {
+                return Ok(());
+            }
+            record.delivery.status = DeliveryStatus::Retrying;
+            (
+                now + retry_delay_for_record(record),
+                record.delivery.target_node_id.clone(),
+            )
+        };
+        self.clear_delivery_index_state(delivery_id);
+        self.insert_retry_deadline(delivery_id, retry_deadline);
+        self.set_target_status(delivery_id, &target_node_id, &DeliveryStatus::Retrying);
+        Ok(())
     }
 
     pub(crate) fn mark_attempt_failed_at(

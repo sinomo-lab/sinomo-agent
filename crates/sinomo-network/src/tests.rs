@@ -23987,7 +23987,12 @@ async fn network_service_dropped_pump_outbound_keeps_delivery_retryable() {
 
     let mut pump_task = tokio::spawn({
         let service = Arc::clone(&service);
-        async move { service.pump_outbound().await }
+        async move {
+            service
+                .with_command_timeout(Duration::from_secs(1))
+                .pump_outbound()
+                .await
+        }
     });
     tokio::select! {
         _ = tokio::time::sleep(Duration::from_millis(20)) => {}
@@ -24050,6 +24055,119 @@ async fn network_service_dropped_pump_outbound_keeps_delivery_retryable() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn network_service_pump_outbound_does_not_block_healthy_targets_behind_full_mailbox() {
+    let node_a = NodeId::from_legacy_named("node_async_nonblocking_pump_sender").expect("node");
+    let node_b = NodeId::from_legacy_named("node_async_nonblocking_pump_full").expect("node");
+    let node_c = NodeId::from_legacy_named("node_async_nonblocking_pump_ready").expect("node");
+    let node_filler =
+        NodeId::from_legacy_named("node_async_nonblocking_pump_filler").expect("node");
+    let session_id = SessionId::from_legacy_named("sess_async_nonblocking_pump").expect("session");
+    let network = AsyncInProcessNetwork::with_mailbox_capacity(1);
+    let transport_a = network.add_node(node_a.clone());
+    let mut transport_b = network.add_node(node_b.clone());
+    let mut transport_c = network.add_node(node_c.clone());
+    let mut filler = network.add_node(node_filler.clone());
+
+    send_async_test_frame(
+        &mut filler,
+        &node_b,
+        NetworkFrame {
+            frame_id: NetworkFrameId(1),
+            source_node_id: node_filler.clone(),
+            target_node_id: node_b.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(1),
+                origin_node_id: node_filler.clone(),
+                target_node_id: node_b.clone(),
+                body: MeshMessageBody::Heartbeat(Heartbeat {
+                    node_id: node_filler,
+                    tick: 1,
+                }),
+            },
+        },
+    )
+    .await
+    .expect("prefill first target mailbox");
+
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_async_nonblocking_pump_sender"));
+    registry.register_node(node("node_async_nonblocking_pump_full"));
+    registry.register_node(node("node_async_nonblocking_pump_ready"));
+    registry
+        .join_session(session_id.clone(), node_b.clone())
+        .expect("join full target");
+    registry
+        .join_session(session_id.clone(), node_c.clone())
+        .expect("join ready target");
+
+    let mut store = InMemoryEventStore::new();
+    let event =
+        fixture_event("evt_async_nonblocking_pump", node_a.clone()).with_session(session_id);
+    let receipt = store.append(event).expect("append event");
+    let stored = store
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored event");
+    let service = NetworkService::new(registry, transport_a)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), store);
+    let deliveries = service.enqueue_event(stored).await.expect("enqueue event");
+    assert_eq!(deliveries.len(), 2);
+    let full_target_delivery = deliveries
+        .iter()
+        .find(|delivery| delivery.target_node_id == node_b)
+        .expect("full target delivery")
+        .delivery_id;
+    let ready_target_delivery = deliveries
+        .iter()
+        .find(|delivery| delivery.target_node_id == node_c)
+        .expect("ready target delivery")
+        .delivery_id;
+
+    let sent = tokio::time::timeout(Duration::from_millis(100), service.pump_outbound())
+        .await
+        .expect("default pump must not wait behind a full target mailbox")
+        .expect("pump outbound");
+    assert_eq!(sent, 1);
+
+    assert_eq!(
+        drain_async_test_frames(&mut transport_b)
+            .await
+            .expect("drain full target")
+            .len(),
+        1,
+        "the full target should contain only its prefilled frame"
+    );
+    assert_eq!(
+        drain_async_test_frames(&mut transport_c)
+            .await
+            .expect("drain ready target")
+            .len(),
+        1,
+        "the healthy target should receive its frame in the same pump"
+    );
+    let records = service.ledger_records().await.expect("ledger records");
+    let full_record = records
+        .iter()
+        .find(|record| record.delivery.delivery_id == full_target_delivery)
+        .expect("full target record");
+    assert_eq!(full_record.delivery.status, DeliveryStatus::Retrying);
+    assert_eq!(
+        full_record.attempts, 0,
+        "mailbox backpressure should not consume a delivery failure attempt"
+    );
+    let ready_record = records
+        .iter()
+        .find(|record| record.delivery.delivery_id == ready_target_delivery)
+        .expect("ready target record");
+    assert_eq!(ready_record.delivery.status, DeliveryStatus::Sent);
+    assert_eq!(ready_record.attempts, 1);
+
+    let store = service.shutdown().await;
+    assert_eq!(store.len(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn network_service_dropped_heartbeat_send_releases_actor() {
     let node_a = NodeId::from_legacy_named("node_async_cancel_heartbeat_sender").expect("node");
     let node_b = NodeId::from_legacy_named("node_async_cancel_heartbeat_receiver").expect("node");
@@ -24088,7 +24206,12 @@ async fn network_service_dropped_heartbeat_send_releases_actor() {
     let mut heartbeat_task = tokio::spawn({
         let service = Arc::clone(&service);
         let target_node_id = node_b.clone();
-        async move { service.send_heartbeat(target_node_id, 2).await }
+        async move {
+            service
+                .with_command_timeout(Duration::from_secs(1))
+                .send_heartbeat(target_node_id, 2)
+                .await
+        }
     });
     tokio::select! {
         _ = tokio::time::sleep(Duration::from_millis(20)) => {}

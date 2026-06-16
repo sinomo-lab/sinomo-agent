@@ -53,6 +53,7 @@
 #   SINOMO_TEST_NETWORK_ONLY=1              stop after network baseline
 #   SINOMO_TEST_BUILD=1         force `cargo build -p sinomo` first
 #   SINOMO_TEST_ARTIFACTS       artifact dir (default target/cluster-test-artifacts/<run>)
+#   SINOMO_TEST_ALLOW_OTHER_COMPOSE=1       allow running while unrelated compose projects are up
 #
 # Exits non-zero if any scenario fails; failure evidence (probe JSON, compose ps,
 # cluster health/doctor, per-node logs) lands in the artifact directory.
@@ -101,6 +102,29 @@ log() { echo "[test-cluster] $*"; }
 
 compose() {
   docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"
+}
+
+running_other_compose_projects() {
+  docker ps \
+    --filter label=com.docker.compose.project \
+    --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null \
+    | grep -v "^$PROJECT$" \
+    | sort -u
+}
+
+require_no_other_compose_projects() {
+  if [ "${SINOMO_TEST_ALLOW_OTHER_COMPOSE:-0}" = 1 ]; then
+    return 0
+  fi
+  local others
+  others="$(running_other_compose_projects || true)"
+  if [ -z "$others" ]; then
+    return 0
+  fi
+  log "refusing to start/reuse compose project $PROJECT while other compose projects are running:"
+  echo "$others" | sed 's/^/[test-cluster]   /'
+  log "stop those projects first, or set SINOMO_TEST_ALLOW_OTHER_COMPOSE=1 for an explicit override"
+  return 1
 }
 
 main_online_count() {
@@ -440,6 +464,8 @@ teardown() {
 trap teardown EXIT
 
 # --- bring-up -----------------------------------------------------------------
+
+require_no_other_compose_projects || exit 1
 
 if [ "${SINOMO_TEST_BUILD:-0}" = 1 ] || [ ! -x "$BINARY" ]; then
   log "building host binary (cargo build -p sinomo)"
