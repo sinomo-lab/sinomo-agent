@@ -3305,7 +3305,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         if object.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory { path });
         }
-        match self.read_current_object_or_fetch_remote(&object.object_id)? {
+        match self.read_object_metadata_or_fetch_remote_without_cache(&object)? {
             NetworkedDfsReadOutcome::Found {
                 data: DfsReadData { bytes, .. },
                 ..
@@ -4007,7 +4007,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         if object.kind != DfsObjectKind::Symlink {
             return Err(DfsPosixError::NotSymlink { path });
         }
-        match self.read_current_object_or_fetch_remote(&object.object_id)? {
+        match self.read_object_metadata_or_fetch_remote_without_cache(&object)? {
             NetworkedDfsReadOutcome::Found {
                 data: DfsReadData { bytes, .. },
                 ..
@@ -4884,7 +4884,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 path: path.to_string(),
             });
         }
-        match self.read_current_object_or_fetch_remote(&object.object_id)? {
+        match self.read_object_metadata_or_fetch_remote_without_cache(object)? {
             NetworkedDfsReadOutcome::Found {
                 data: DfsReadData { bytes, .. },
                 ..

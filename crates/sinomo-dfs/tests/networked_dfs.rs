@@ -10566,6 +10566,10 @@ fn networked_sifs_remote_read_fetches_current_content_for_posix_path() {
         .object(&stat.object_id)
         .expect("owner metadata")
         .clone();
+    let file_content_hash = file_metadata
+        .content_hash
+        .clone()
+        .expect("file content hash");
     let link_stat = owner_dfs
         .posix_symlink(
             "file.txt",
@@ -10578,6 +10582,10 @@ fn networked_sifs_remote_read_fetches_current_content_for_posix_path() {
         .object(&link_stat.object_id)
         .expect("owner symlink metadata")
         .clone();
+    let link_content_hash = link_metadata
+        .content_hash
+        .clone()
+        .expect("link content hash");
     let dir_link_stat = owner_dfs
         .posix_symlink(
             "readthrough",
@@ -10590,6 +10598,10 @@ fn networked_sifs_remote_read_fetches_current_content_for_posix_path() {
         .object(&dir_link_stat.object_id)
         .expect("owner directory symlink metadata")
         .clone();
+    let dir_link_content_hash = dir_link_metadata
+        .content_hash
+        .clone()
+        .expect("directory symlink content hash");
     let overwrite_stat = owner_dfs
         .posix_write_file(
             "/services/readthrough/overwrite.txt",
@@ -10698,11 +10710,18 @@ fn networked_sifs_remote_read_fetches_current_content_for_posix_path() {
             } if object_id == &stat.object_id
         )
     }));
-    assert_eq!(
+    assert!(
+        !reader_dfs
+            .content()
+            .has_blob(&file_content_hash)
+            .expect("reader file blob check"),
+        "read-through must not persist remote file content in the reader store"
+    );
+    assert!(
         reader_dfs
             .posix_read_file("/services/readthrough/file.txt")
-            .expect("posix read after cached read-through"),
-        b"remote bytes"
+            .is_err(),
+        "local-only POSIX read must still miss after no-cache read-through"
     );
     assert_eq!(
         reader_dfs
@@ -10716,15 +10735,18 @@ fn networked_sifs_remote_read_fetches_current_content_for_posix_path() {
     let owner_worker = {
         let owner_dfs = Arc::clone(&owner_dfs);
         let dir_link_stat = dir_link_stat.clone();
+        let stat = stat.clone();
         std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut served_dir_link = false;
+            let mut served_file = false;
             loop {
                 let events = owner_dfs
                     .lock()
                     .expect("owner dfs lock")
                     .process_incoming()
                     .expect("owner serves intermediate symlink read");
-                if events.iter().any(|event| {
+                served_dir_link |= events.iter().any(|event| {
                     matches!(
                         event,
                         NetworkedDfsServiceEvent::RemoteReadServed {
@@ -10733,12 +10755,23 @@ fn networked_sifs_remote_read_fetches_current_content_for_posix_path() {
                             ..
                         } if object_id == &dir_link_stat.object_id
                     )
-                }) {
-                    return events;
+                });
+                served_file |= events.iter().any(|event| {
+                    matches!(
+                        event,
+                        NetworkedDfsServiceEvent::RemoteReadServed {
+                            object_id,
+                            result: sinomo_dfs::DfsReadResult::Found(_),
+                            ..
+                        } if object_id == &stat.object_id
+                    )
+                });
+                if served_dir_link && served_file {
+                    return (served_dir_link, served_file);
                 }
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "owner did not receive remote intermediate symlink read request"
+                    "owner did not receive remote intermediate symlink and file read requests"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
@@ -10750,24 +10783,24 @@ fn networked_sifs_remote_read_fetches_current_content_for_posix_path() {
             .expect("distributed POSIX path resolution fetches intermediate symlink content"),
         b"remote bytes"
     );
-    let owner_events = owner_worker
+    let (served_dir_link, served_file) = owner_worker
         .join()
         .expect("owner intermediate symlink worker");
-    assert!(owner_events.iter().any(|event| {
-        matches!(
-            event,
-            NetworkedDfsServiceEvent::RemoteReadServed {
-                object_id,
-                result: sinomo_dfs::DfsReadResult::Found(_),
-                ..
-            } if object_id == &dir_link_stat.object_id
-        )
-    }));
-    assert_eq!(
-        reader_dfs
-            .posix_read_file("/services/readthrough-link/file.txt")
-            .expect("posix read through cached intermediate symlink"),
-        b"remote bytes"
+    assert!(served_dir_link);
+    assert!(served_file);
+    assert!(
+        !reader_dfs
+            .content()
+            .has_blob(&dir_link_content_hash)
+            .expect("reader directory symlink blob check"),
+        "symlink resolution must not persist remote link content in the reader store"
+    );
+    assert!(
+        !reader_dfs
+            .content()
+            .has_blob(&file_content_hash)
+            .expect("reader file blob check after symlink read-through"),
+        "symlink read-through must not persist remote file content in the reader store"
     );
 
     let owner_worker = {
@@ -10818,11 +10851,18 @@ fn networked_sifs_remote_read_fetches_current_content_for_posix_path() {
             } if object_id == &link_stat.object_id
         )
     }));
-    assert_eq!(
+    assert!(
+        !reader_dfs
+            .content()
+            .has_blob(&link_content_hash)
+            .expect("reader symlink blob check"),
+        "readlink read-through must not persist remote symlink content in the reader store"
+    );
+    assert!(
         reader_dfs
             .posix_readlink("/services/readthrough/link.txt")
-            .expect("posix readlink after cached read-through"),
-        "file.txt"
+            .is_err(),
+        "local-only POSIX readlink must still miss after no-cache read-through"
     );
     assert_eq!(
         reader_dfs
