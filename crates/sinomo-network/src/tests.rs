@@ -683,6 +683,89 @@ async fn object_rpc_route_policy_layer_enforces_shared_route_concurrency() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn object_rpc_route_policy_layer_does_not_head_of_line_block_other_routes() {
+    use tower_layer::Layer;
+
+    let slow_entered = Arc::new(tokio::sync::Notify::new());
+    let slow_release = Arc::new(tokio::sync::Notify::new());
+    let slow_descriptor =
+        ObjectRouteDescriptor::for_types::<(), String>("/test/slow", "test", "slow route")
+            .with_concurrency_limit(1);
+    let fast_descriptor =
+        ObjectRouteDescriptor::for_types::<(), String>("/test/fast", "test", "fast route")
+            .with_concurrency_limit(8);
+    let mut catalog = ServiceCatalog::default();
+    catalog.register_route(slow_descriptor.clone());
+    catalog.register_route(fast_descriptor.clone());
+    let layer = ObjectRpcRoutePolicyLayer::new(catalog).expect("policy layer");
+    let router = object_rpc_router_from_registry(
+        ObjectRpcRouteRegistry::builder()
+            .register_route(slow_descriptor, {
+                let slow_entered = Arc::clone(&slow_entered);
+                let slow_release = Arc::clone(&slow_release);
+                move |request| {
+                    let slow_entered = Arc::clone(&slow_entered);
+                    let slow_release = Arc::clone(&slow_release);
+                    async move {
+                        let _: () = request.decode_body()?;
+                        slow_entered.notify_one();
+                        slow_release.notified().await;
+                        ObjectRpcResponse::encode_body(request.route, &"slow-done".to_string())
+                    }
+                }
+            })
+            .register_route(fast_descriptor, |request| async move {
+                let _: () = request.decode_body()?;
+                ObjectRpcResponse::encode_body(request.route, &"fast-done".to_string())
+            })
+            .build(),
+    );
+    let mut policy_service = layer.layer(router);
+
+    let mut slow_service = policy_service.clone();
+    let slow = tokio::spawn(async move {
+        call_object_rpc_service_async(
+            &mut slow_service,
+            ObjectRpcRequest::encode_body("/test/slow", "test", &()).expect("slow request"),
+        )
+        .await
+    });
+    slow_entered.notified().await;
+    assert_eq!(
+        policy_service
+            .object_rpc_route_readiness("/test/slow")
+            .expect("slow readiness")
+            .available_concurrency,
+        Some(0)
+    );
+
+    let fast = tokio::time::timeout(
+        Duration::from_millis(50),
+        call_object_rpc_service_async(
+            &mut policy_service,
+            ObjectRpcRequest::encode_body("/test/fast", "test", &()).expect("fast request"),
+        ),
+    )
+    .await
+    .expect("fast route should not wait for slow route permit")
+    .expect("fast route response");
+    assert_eq!(
+        fast.decode_body::<String>().expect("decode fast"),
+        "fast-done"
+    );
+
+    slow_release.notify_one();
+    let slow = slow
+        .await
+        .expect("join slow request")
+        .expect("slow route response");
+    assert_eq!(
+        slow.decode_body::<String>().expect("decode slow"),
+        "slow-done"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn object_rpc_route_policy_layer_enforces_route_timeout() {
     use tower_layer::Layer;
 
