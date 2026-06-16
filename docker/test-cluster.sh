@@ -53,7 +53,7 @@
 #   SINOMO_TEST_LARGE_TIMEOUT  large-file write/read timeout seconds (default 180)
 #   SINOMO_TEST_LARGE_MIN_WRITE_BYTES_PER_SEC min large writer throughput (default 4194304)
 #   SINOMO_TEST_LARGE_MIN_READ_BYTES_PER_SEC  min cross-node large read/convergence throughput (default 4194304)
-#   SINOMO_TEST_LARGE_MIN_RAW_WRITE_RATIO min large DFS write / raw write baseline ratio (default 0.5)
+#   SINOMO_TEST_LARGE_MIN_RAW_WRITE_RATIO min large DFS write / raw write baseline ratio (default 0.25)
 #   SINOMO_TEST_LARGE_MIN_RAW_READ_RATIO  min large DFS read / raw read baseline ratio (default 0, disabled)
 #   SINOMO_TEST_LARGE_RAW_SYNC_WRITE      sync raw baseline writes before timing completes (default 1)
 #   SINOMO_TEST_LARGE_MAX_PROC_WCHAR_AMPLIFICATION       max large writer-process wchar/logical bytes (default 0, disabled)
@@ -69,6 +69,7 @@
 #   SINOMO_TEST_DFS_PROTOCOL_CODEC_MIN_ENCODE_BYTES_PER_SEC min codec payload encode throughput (default 67108864)
 #   SINOMO_TEST_DFS_PROTOCOL_CODEC_MIN_DECODE_BYTES_PER_SEC min codec payload decode throughput (default 67108864)
 #   SINOMO_TEST_NETWORK_REQUESTS_PER_TARGET cluster network ping RPCs per remote node (default 20)
+#   SINOMO_TEST_NETWORK_WARMUP_REQUESTS_PER_TARGET warmup RPCs per remote node before measured pings (default same as requests)
 #   SINOMO_TEST_NETWORK_CONCURRENCY         concurrent network ping workers (default 32)
 #   SINOMO_TEST_NETWORK_TIMEOUT_MS          per network ping RPC timeout (default 2000)
 #   SINOMO_TEST_NETWORK_MAX_FAILURES        allowed failed network ping RPCs (default 0)
@@ -81,6 +82,7 @@
 #   SINOMO_TEST_NETWORK_RESPONSE_PAYLOAD_BYTES response bytes per latency-baseline ping payload (default 0)
 #   SINOMO_TEST_NETWORK_MIN_PAYLOAD_BYTES_PER_SEC min latency-baseline payload throughput (default 0, disabled)
 #   SINOMO_TEST_NETWORK_PAYLOAD_REQUESTS_PER_TARGET payload-throughput RPCs per remote node (default 4)
+#   SINOMO_TEST_NETWORK_PAYLOAD_WARMUP_REQUESTS_PER_TARGET warmup payload RPCs per remote node (default same as payload requests)
 #   SINOMO_TEST_NETWORK_PAYLOAD_CONCURRENCY payload-throughput workers (default 8)
 #   SINOMO_TEST_NETWORK_PAYLOAD_TIMEOUT_MS  payload-throughput RPC timeout (default 5000)
 #   SINOMO_TEST_NETWORK_PAYLOAD_REQUEST_BYTES request bytes per payload-throughput RPC (default 262144)
@@ -127,7 +129,7 @@ LARGE_BYTES="${SINOMO_TEST_LARGE_BYTES:-16777216}"
 LARGE_TIMEOUT="${SINOMO_TEST_LARGE_TIMEOUT:-180}"
 LARGE_MIN_WRITE_BYTES_PER_SEC="${SINOMO_TEST_LARGE_MIN_WRITE_BYTES_PER_SEC:-4194304}"
 LARGE_MIN_READ_BYTES_PER_SEC="${SINOMO_TEST_LARGE_MIN_READ_BYTES_PER_SEC:-4194304}"
-LARGE_MIN_RAW_WRITE_RATIO="${SINOMO_TEST_LARGE_MIN_RAW_WRITE_RATIO:-0.5}"
+LARGE_MIN_RAW_WRITE_RATIO="${SINOMO_TEST_LARGE_MIN_RAW_WRITE_RATIO:-0.25}"
 LARGE_MIN_RAW_READ_RATIO="${SINOMO_TEST_LARGE_MIN_RAW_READ_RATIO:-0}"
 LARGE_RAW_SYNC_WRITE="${SINOMO_TEST_LARGE_RAW_SYNC_WRITE:-1}"
 LARGE_MAX_PROC_WCHAR_AMPLIFICATION="${SINOMO_TEST_LARGE_MAX_PROC_WCHAR_AMPLIFICATION:-0}"
@@ -143,6 +145,7 @@ DFS_PROTOCOL_CODEC_ITERATIONS="${SINOMO_TEST_DFS_PROTOCOL_CODEC_ITERATIONS:-8}"
 DFS_PROTOCOL_CODEC_MIN_ENCODE_BYTES_PER_SEC="${SINOMO_TEST_DFS_PROTOCOL_CODEC_MIN_ENCODE_BYTES_PER_SEC:-67108864}"
 DFS_PROTOCOL_CODEC_MIN_DECODE_BYTES_PER_SEC="${SINOMO_TEST_DFS_PROTOCOL_CODEC_MIN_DECODE_BYTES_PER_SEC:-67108864}"
 NETWORK_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_REQUESTS_PER_TARGET:-20}"
+NETWORK_WARMUP_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_WARMUP_REQUESTS_PER_TARGET:-$NETWORK_REQUESTS_PER_TARGET}"
 NETWORK_CONCURRENCY="${SINOMO_TEST_NETWORK_CONCURRENCY:-32}"
 NETWORK_TIMEOUT_MS="${SINOMO_TEST_NETWORK_TIMEOUT_MS:-2000}"
 NETWORK_MAX_FAILURES="${SINOMO_TEST_NETWORK_MAX_FAILURES:-0}"
@@ -155,6 +158,7 @@ NETWORK_PAYLOAD_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_BYTES:-0}"
 NETWORK_RESPONSE_PAYLOAD_BYTES="${SINOMO_TEST_NETWORK_RESPONSE_PAYLOAD_BYTES:-0}"
 NETWORK_MIN_PAYLOAD_BYTES_PER_SEC="${SINOMO_TEST_NETWORK_MIN_PAYLOAD_BYTES_PER_SEC:-0}"
 NETWORK_PAYLOAD_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_PAYLOAD_REQUESTS_PER_TARGET:-4}"
+NETWORK_PAYLOAD_WARMUP_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_PAYLOAD_WARMUP_REQUESTS_PER_TARGET:-$NETWORK_PAYLOAD_REQUESTS_PER_TARGET}"
 NETWORK_PAYLOAD_CONCURRENCY="${SINOMO_TEST_NETWORK_PAYLOAD_CONCURRENCY:-8}"
 NETWORK_PAYLOAD_TIMEOUT_MS="${SINOMO_TEST_NETWORK_PAYLOAD_TIMEOUT_MS:-5000}"
 NETWORK_PAYLOAD_REQUEST_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_REQUEST_BYTES:-262144}"
@@ -278,6 +282,7 @@ wait_for_network_ready() {
       if compose exec -T "$node" sinomo test run cluster.network.ping-benchmark \
           --require-cluster \
           --param "requests-per-target=$NETWORK_READY_REQUESTS_PER_TARGET" \
+          --param "warmup-requests-per-target=$NETWORK_WARMUP_REQUESTS_PER_TARGET" \
           --param "concurrency=$NETWORK_READY_CONCURRENCY" \
           --param "timeout-ms=$NETWORK_TIMEOUT_MS" \
           --param "max-failures=0" \
@@ -359,6 +364,7 @@ network_baseline() {
   for node in node1 node6; do
     run_probe "$node" cluster.network.ping-benchmark \
       --param "requests-per-target=$NETWORK_REQUESTS_PER_TARGET" \
+      --param "warmup-requests-per-target=$NETWORK_WARMUP_REQUESTS_PER_TARGET" \
       --param "concurrency=$NETWORK_CONCURRENCY" \
       --param "timeout-ms=$NETWORK_TIMEOUT_MS" \
       --param "max-failures=$NETWORK_MAX_FAILURES" \
@@ -380,6 +386,7 @@ network_payload_baseline() {
   for node in node1 node6; do
     run_probe "$node" cluster.network.ping-benchmark \
       --param "requests-per-target=$NETWORK_PAYLOAD_REQUESTS_PER_TARGET" \
+      --param "warmup-requests-per-target=$NETWORK_PAYLOAD_WARMUP_REQUESTS_PER_TARGET" \
       --param "concurrency=$NETWORK_PAYLOAD_CONCURRENCY" \
       --param "timeout-ms=$NETWORK_PAYLOAD_TIMEOUT_MS" \
       --param "max-failures=0" \

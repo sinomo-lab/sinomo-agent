@@ -508,6 +508,9 @@ async fn run_daemon_background_maintenance_loop(
                 _ = tokio::time::sleep(sleep_duration) => {}
                 _ = notify.notified() => {
                     dfs_triggered_maintenance_requested = true;
+                    last_dfs_maintenance = Instant::now()
+                        .checked_sub(DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL)
+                        .unwrap_or(last_dfs_maintenance);
                 }
             }
         } else {
@@ -581,82 +584,161 @@ pub(crate) async fn handle_daemon_connection_async(
     service_runtime: tokio::runtime::Handle,
     stream_address: String,
 ) -> Result<bool, DaemonError> {
-    let mut request = match read_daemon_control_frame_async(&mut stream, &stream_address).await {
-        Ok(request) => request,
-        Err(_) => {
-            let _ = stream.shutdown_write(&stream_address).await;
-            return Ok(false);
-        }
-    };
-    if crate::service_adapter::try_dispatch_pre_auth_via_registry_async(
-        &request,
-        &mut stream,
-        &stream_address,
-        &service_host,
-    )
-    .await?
-    {
-        request = match read_daemon_control_frame_async(&mut stream, &stream_address).await {
+    loop {
+        let mut request = match read_daemon_control_frame_async(&mut stream, &stream_address).await
+        {
             Ok(request) => request,
-            Err(_) => return Ok(false),
-        };
-    }
-
-    let replay_key = daemon_dfs_frame_replay_key(&request);
-    if let Some(key) = replay_key.as_ref()
-        && let Some(response) = wait_for_daemon_dfs_frame_replay(&paths, key).await
-    {
-        let _ = write_daemon_rpc_response_frame_async(&mut stream, &stream_address, response).await;
-        let _ = stream.shutdown_write(&stream_address).await;
-        return Ok(false);
-    }
-
-    let command = request.command.trim().to_string();
-    let authenticated = match authenticate_daemon_control_request(&paths, &request) {
-        Ok(authenticated) => authenticated,
-        Err(error) => {
-            if crate::auth::is_cluster_join_register_control_request(&request) {
-                eprintln!("sinomo daemon client auth failed for {command}: {error}");
-            }
-            if let Some(key) = replay_key.as_ref()
-                && let Some(response) = wait_for_daemon_dfs_frame_replay(&paths, key).await
-            {
-                let _ =
-                    write_daemon_rpc_response_frame_async(&mut stream, &stream_address, response)
-                        .await;
+            Err(_) => {
                 let _ = stream.shutdown_write(&stream_address).await;
                 return Ok(false);
             }
-            if let Some(rpc_request) = request.rpc.as_ref()
-                && let Ok(response) = sinomo_network::ObjectRpcResponse::encode_error(
-                    rpc_request.route.clone(),
-                    DaemonError::AuthDenied.to_string(),
-                )
-            {
-                let _ =
-                    write_daemon_rpc_response_frame_async(&mut stream, &stream_address, response)
-                        .await;
-            }
+        };
+        if crate::service_adapter::try_dispatch_pre_auth_via_registry_async(
+            &request,
+            &mut stream,
+            &stream_address,
+            &service_host,
+        )
+        .await?
+        {
+            request = match read_daemon_control_frame_async(&mut stream, &stream_address).await {
+                Ok(request) => request,
+                Err(_) => return Ok(false),
+            };
+        }
+
+        let replay_key = daemon_dfs_frame_replay_key(&request);
+        if let Some(key) = replay_key.as_ref()
+            && let Some(response) = wait_for_daemon_dfs_frame_replay(&paths, key).await
+        {
+            let _ =
+                write_daemon_rpc_response_frame_async(&mut stream, &stream_address, response).await;
             let _ = stream.shutdown_write(&stream_address).await;
             return Ok(false);
         }
-    };
 
-    if let Some(key) = replay_key.as_ref() {
-        begin_daemon_dfs_frame_replay(&paths, key);
+        let command = request.command.trim().to_string();
+        let authenticated = match authenticate_daemon_control_request(&paths, &request) {
+            Ok(authenticated) => authenticated,
+            Err(error) => {
+                if crate::auth::is_cluster_join_register_control_request(&request) {
+                    eprintln!("sinomo daemon client auth failed for {command}: {error}");
+                }
+                if let Some(key) = replay_key.as_ref()
+                    && let Some(response) = wait_for_daemon_dfs_frame_replay(&paths, key).await
+                {
+                    let _ = write_daemon_rpc_response_frame_async(
+                        &mut stream,
+                        &stream_address,
+                        response,
+                    )
+                    .await;
+                    let _ = stream.shutdown_write(&stream_address).await;
+                    return Ok(false);
+                }
+                if let Some(rpc_request) = request.rpc.as_ref()
+                    && let Ok(response) = sinomo_network::ObjectRpcResponse::encode_error(
+                        rpc_request.route.clone(),
+                        DaemonError::AuthDenied.to_string(),
+                    )
+                {
+                    let _ = write_daemon_rpc_response_frame_async(
+                        &mut stream,
+                        &stream_address,
+                        response,
+                    )
+                    .await;
+                }
+                let _ = stream.shutdown_write(&stream_address).await;
+                return Ok(false);
+            }
+        };
+
+        if let Some(key) = replay_key.as_ref() {
+            begin_daemon_dfs_frame_replay(&paths, key);
+        }
+        let rpc_request = request.rpc;
+        if let Some(request) = rpc_request.as_ref()
+            && request.route == sinomo_network::CLUSTER_NETWORK_PING_ROUTE
+        {
+            let response = daemon_cluster_network_ping_response(&paths, request.clone())?;
+            write_daemon_rpc_response_frame_async(&mut stream, &stream_address, response).await?;
+            continue;
+        }
+        if let Some(request) = rpc_request.as_ref()
+            && request.route == sinomo_network::CLUSTER_RELAY_ROUTE
+        {
+            let response = match sinomo_network::RelayEnvelope::from_request(request) {
+                Ok(envelope) => {
+                    match handle_daemon_cluster_relay_request_on_runtime(
+                        &paths,
+                        envelope,
+                        Some(&service_runtime),
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => sinomo_network::ObjectRpcResponse::encode_error(
+                            sinomo_network::CLUSTER_RELAY_ROUTE,
+                            error.to_string(),
+                        )
+                        .map_err(DaemonError::from)?,
+                    }
+                }
+                Err(error) => sinomo_network::ObjectRpcResponse::encode_error(
+                    sinomo_network::CLUSTER_RELAY_ROUTE,
+                    error.to_string(),
+                )
+                .map_err(DaemonError::from)?,
+            };
+            write_daemon_rpc_response_frame_async(&mut stream, &stream_address, response).await?;
+            continue;
+        }
+        if let Some(request) = rpc_request.as_ref()
+            && daemon_rpc_request_allows_reusable_stream(request)
+            && let Some(result) = crate::service_adapter::try_dispatch_via_registry_async(
+                &authenticated,
+                &rpc_request,
+                &mut stream,
+                &stream_address,
+                &service_host,
+                &paths,
+                replay_key.clone(),
+            )
+            .await
+        {
+            match result {
+                Ok(stop) if stop => return Ok(true),
+                Ok(_) => continue,
+                Err(error) => {
+                    if let Some(response) = rpc_error_response_for_request(&rpc_request, &error) {
+                        let _ = write_daemon_rpc_response_frame_async(
+                            &mut stream,
+                            &stream_address,
+                            response,
+                        )
+                        .await;
+                    }
+                    if let Some(key) = replay_key.as_ref() {
+                        abandon_daemon_dfs_frame_replay(&paths, key);
+                    }
+                    let _ = stream.shutdown_write(&stream_address).await;
+                    return Ok(false);
+                }
+            }
+        }
+        return handle_authenticated_daemon_command_async(
+            authenticated,
+            rpc_request,
+            replay_key,
+            stream,
+            paths,
+            service_host,
+            service_runtime,
+            stream_address.clone(),
+        )
+        .await;
     }
-    let rpc_request = request.rpc;
-    handle_authenticated_daemon_command_async(
-        authenticated,
-        rpc_request,
-        replay_key,
-        stream,
-        paths,
-        service_host,
-        service_runtime,
-        stream_address.clone(),
-    )
-    .await
 }
 
 pub(crate) async fn dispatch_daemon_control_request_in_process_async(
@@ -784,6 +866,16 @@ fn daemon_cluster_network_ping_response(
         time::OffsetDateTime::now_utc(),
     )
     .map_err(DaemonError::from)
+}
+
+fn daemon_rpc_request_allows_reusable_stream(request: &sinomo_network::ObjectRpcRequest) -> bool {
+    request
+        .metadata
+        .get(sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY)
+        .is_some_and(|value| {
+            value == sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE
+                || value.eq_ignore_ascii_case("true")
+        })
 }
 
 pub(crate) fn daemon_dfs_frame_replay_key(

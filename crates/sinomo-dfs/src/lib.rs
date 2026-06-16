@@ -121,8 +121,8 @@ use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -160,7 +160,20 @@ pub enum DfsTransferProfile {
 
 pub trait DfsFrameTransport: DfsTransportIdentity {
     fn send(&mut self, target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError>;
+    fn send_detached(
+        &mut self,
+        target_node_id: &NodeId,
+        frame: NetworkFrame,
+    ) -> Result<(), NetworkError> {
+        self.send(target_node_id, frame)
+    }
     fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError>;
+    fn flush_detached_sends(&mut self) -> Result<(), NetworkError> {
+        Ok(())
+    }
+    fn can_send_synchronously(&self) -> bool {
+        true
+    }
     fn transfer_profile(&self, _target_node_id: &NodeId) -> DfsTransferProfile {
         DfsTransferProfile::Conservative
     }
@@ -388,6 +401,24 @@ pub fn dfs_protocol_frame_requires_fresh_metadata(frame: &NetworkFrame) -> bool 
     false
 }
 
+fn dfs_protocol_frame_foreground_repair_request_id(frame: &NetworkFrame) -> Option<String> {
+    let MeshMessageBody::Protocol(protocol_message) = &frame.message.body else {
+        return None;
+    };
+    if protocol_message.protocol != DFS_PROTOCOL {
+        return None;
+    }
+    let message = protocol_message.decode::<DfsNetworkMessage>().ok()?;
+    match message {
+        DfsNetworkMessage::DistributedWriteRequest(command)
+            if command.foreground_replica_repair =>
+        {
+            Some(command.request_id)
+        }
+        _ => None,
+    }
+}
+
 pub fn dfs_status_rpc_request() -> Result<ObjectRpcRequest, NetworkError> {
     ObjectRpcRequest::encode_body(DFS_STATUS_ROUTE, DFS_RPC_CATEGORY, &())
 }
@@ -451,7 +482,17 @@ pub fn decode_dfs_metadata_snapshot_install_rpc_response(
 pub fn dfs_protocol_frame_rpc_request(
     command: &DfsProtocolFrameCommand,
 ) -> Result<ObjectRpcRequest, NetworkError> {
-    ObjectRpcRequest::encode_body(DFS_PROTOCOL_FRAME_ROUTE, DFS_RPC_CATEGORY, command)
+    let mut request =
+        ObjectRpcRequest::encode_body(DFS_PROTOCOL_FRAME_ROUTE, DFS_RPC_CATEGORY, command)?;
+    request.metadata.insert(
+        sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY.to_string(),
+        sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE.to_string(),
+    );
+    request.metadata.insert(
+        sinomo_network::ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY.to_string(),
+        sinomo_network::ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE.to_string(),
+    );
+    Ok(request)
 }
 
 pub fn decode_dfs_protocol_frame_rpc_response(
@@ -461,7 +502,7 @@ pub fn decode_dfs_protocol_frame_rpc_response(
 }
 
 pub(crate) const DFS_BLOB_INLINE_LIMIT_BYTES: usize = 1024 * 1024;
-const DFS_BLOB_CHUNK_BYTES: usize = 1024 * 1024;
+const DFS_BLOB_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const DFS_STAGE_CHUNK_WINDOW_SIZE: u32 = 4;
 const DFS_READ_CHUNK_WINDOW_SIZE: u32 = 4;
 const DFS_FETCH_CHUNK_WINDOW_SIZE: u32 = 4;
@@ -4551,6 +4592,7 @@ struct PendingRemoteWriteResponse {
     object_id: DfsObjectId,
     metadata_journal_after_sequence: Option<u64>,
     created_object_path: Option<String>,
+    foreground_replica_repair: bool,
     created_at: Instant,
 }
 
@@ -4755,6 +4797,8 @@ pub struct NetworkedDfsService<T> {
     pending_metadata_replications: BTreeMap<String, PendingMetadataReplication>,
     pending_routed_writes: BTreeMap<String, PendingRoutedWrite>,
     pending_remote_write_responses: BTreeMap<String, PendingRemoteWriteResponse>,
+    deferred_routed_create_parent_touches: BTreeSet<String>,
+    deferred_untracked_routed_write_responses: BTreeMap<String, DfsObjectId>,
     pending_routed_namespace_ops: BTreeMap<String, PendingRoutedNamespaceOp>,
     routed_namespace_settle_depth: usize,
     cross_shard_namespace_locks: BTreeSet<(DfsFileSystemId, String)>,
@@ -4775,6 +4819,7 @@ pub struct DfsProtocolFrameProcessResult {
 pub const DEFAULT_DFS_METADATA_REPLICATION_TIMEOUT: Duration = Duration::from_secs(3);
 pub const DEFAULT_DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
+const DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT: usize = 8;
 // Cross-shard coordination (rename/hardlink sagas) does several primary-to-
 // primary roundtrips plus journal publication before the requester's answer;
 // over bridge-relayed segments that legitimately exceeds a small budget.
@@ -4786,11 +4831,47 @@ const DFS_MAX_NESTED_NAMESPACE_COORDINATION_DEPTH: usize = 8;
 /// Journal batches a primary ships in one routed-operation response.
 pub const DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT: usize = 16;
 const DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT: usize = 3;
-const DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT: u64 = 16 * 1024;
+const DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT: u64 = DFS_BLOB_INLINE_LIMIT_BYTES as u64;
 /// How long a primary keeps an unanswered routed-write response obligation
 /// before assuming the requester gave up.
 const DFS_REMOTE_WRITE_RESPONSE_TTL: Duration = Duration::from_secs(60);
 const DFS_ROUTED_NAMESPACE_IDLE_WAIT: Duration = Duration::from_millis(10);
+
+fn dfs_perf_trace_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("SINOMO_DFS_PERF_TRACE")
+            .ok()
+            .is_some_and(|value| {
+                value == "1"
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("yes")
+            })
+    });
+    *ENABLED
+}
+
+fn dfs_perf_trace(args: std::fmt::Arguments<'_>) {
+    if dfs_perf_trace_enabled() {
+        eprintln!("[sinomo-dfs-perf] {args}");
+    }
+}
+
+fn dfs_distributed_write_result_trace_label(result: &DfsDistributedWriteResult) -> &'static str {
+    match result {
+        DfsDistributedWriteResult::Rejected { .. } => "rejected",
+        DfsDistributedWriteResult::Outcome { outcome } => match outcome {
+            NetworkedDfsWriteOutcome::Pending { .. } => "pending",
+            NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } => {
+                if repair_jobs.is_empty() {
+                    "committed"
+                } else {
+                    "committed-with-repair"
+                }
+            }
+            NetworkedDfsWriteOutcome::Conflict { .. } => "conflict",
+        },
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsMetadataReplicaShardContext {
@@ -7274,10 +7355,20 @@ pub fn dfs_metadata_snapshot_install_sender_from_peer_transport(
 }
 
 #[derive(Clone)]
+struct DeferredDfsEndpointSend {
+    endpoints: Vec<ClusterEndpointRecord>,
+    sender: DfsProtocolFrameSender,
+    connect_timeout: Duration,
+    target_node_id: NodeId,
+    frame: NetworkFrame,
+}
+
+#[derive(Clone)]
 pub struct DfsEndpointTransport {
     local_node_id: NodeId,
     endpoints_by_node_id: BTreeMap<NodeId, Vec<ClusterEndpointRecord>>,
     incoming_frames: VecDeque<InboundFrame>,
+    detached_sends: Arc<std::sync::Mutex<Vec<DeferredDfsEndpointSend>>>,
     connect_timeout: Duration,
     sender: Option<DfsProtocolFrameSender>,
     async_sender: Option<AsyncDfsProtocolFrameSender>,
@@ -7431,6 +7522,7 @@ impl DfsEndpointTransport {
             local_node_id,
             endpoints_by_node_id,
             incoming_frames: VecDeque::new(),
+            detached_sends: Arc::new(std::sync::Mutex::new(Vec::new())),
             connect_timeout,
             sender,
             async_sender,
@@ -7494,6 +7586,66 @@ impl DfsEndpointTransport {
             )?;
             for returned_frame in returned_frames {
                 pending.push_back((returned_frame.target_node_id.clone(), returned_frame, false));
+            }
+        }
+        Ok(())
+    }
+
+    fn send_frame_to_endpoint_detached(
+        &mut self,
+        target_node_id: &NodeId,
+        frame: NetworkFrame,
+        require_local_source: bool,
+    ) -> Result<(), NetworkError> {
+        if target_node_id == &self.local_node_id {
+            self.incoming_frames.push_back(InboundFrame {
+                received_by: self.local_node_id.clone(),
+                frame,
+            });
+            return Ok(());
+        }
+        let endpoints = self.endpoint_send_plan(target_node_id, &frame, require_local_source)?;
+        let Some(sender) = self.sender.as_ref().cloned() else {
+            return Err(NetworkError::Io {
+                operation: format!("send DFS protocol frame to {target_node_id}"),
+                detail: "DFS endpoint transport was constructed without a sync sender".to_string(),
+            });
+        };
+        self.detached_sends
+            .lock()
+            .map_err(|_| NetworkError::Io {
+                operation: "track detached DFS protocol frame send".to_string(),
+                detail: "detached send lock is poisoned".to_string(),
+            })?
+            .push(DeferredDfsEndpointSend {
+                endpoints,
+                sender,
+                connect_timeout: self.connect_timeout,
+                target_node_id: target_node_id.clone(),
+                frame,
+            });
+        Ok(())
+    }
+
+    fn flush_detached_endpoint_sends(&mut self) -> Result<(), NetworkError> {
+        let sends = {
+            let mut sends = self.detached_sends.lock().map_err(|_| NetworkError::Io {
+                operation: "flush detached DFS protocol frame sends".to_string(),
+                detail: "detached send lock is poisoned".to_string(),
+            })?;
+            std::mem::take(&mut *sends)
+        };
+        for send in sends {
+            let returned_frames = send_dfs_frame_to_endpoint(
+                send.endpoints,
+                send.sender,
+                send.connect_timeout,
+                send.target_node_id,
+                send.frame,
+            )?;
+            for returned_frame in returned_frames {
+                let target_node_id = returned_frame.target_node_id.clone();
+                self.send_frame_to_endpoint(&target_node_id, returned_frame, false)?;
             }
         }
         Ok(())
@@ -7587,11 +7739,37 @@ fn send_dfs_frame_to_endpoint(
         request_id: format!("dfs_protocol_frame_{}", frame.frame_id.0),
         frame,
     };
+    let payload_bytes = dfs_network_frame_protocol_payload_bytes(&command.frame);
     let mut failures = Vec::new();
     for endpoint in &endpoints {
+        let send_started = Instant::now();
         match sender(endpoint, &command, connect_timeout) {
-            Ok(response) => return Ok(response.outbound_frames),
-            Err(error) => failures.push(format!("{} failed: {error}", endpoint.address)),
+            Ok(response) => {
+                dfs_perf_trace(format_args!(
+                    "protocol-frame-send local={} target={} endpoint={} request={} payload_bytes={} outbound_frames={} elapsed_ms={}",
+                    command.frame.source_node_id,
+                    target_node_id,
+                    endpoint.address,
+                    command.request_id,
+                    payload_bytes,
+                    response.outbound_frames.len(),
+                    send_started.elapsed().as_millis()
+                ));
+                return Ok(response.outbound_frames);
+            }
+            Err(error) => {
+                dfs_perf_trace(format_args!(
+                    "protocol-frame-send-error local={} target={} endpoint={} request={} payload_bytes={} elapsed_ms={} error={}",
+                    command.frame.source_node_id,
+                    target_node_id,
+                    endpoint.address,
+                    command.request_id,
+                    payload_bytes,
+                    send_started.elapsed().as_millis(),
+                    error
+                ));
+                failures.push(format!("{} failed: {error}", endpoint.address));
+            }
         }
     }
     Err(NetworkError::Io {
@@ -7611,17 +7789,50 @@ async fn send_dfs_frame_to_endpoint_async(
         request_id: format!("dfs_protocol_frame_{}", frame.frame_id.0),
         frame,
     };
+    let payload_bytes = dfs_network_frame_protocol_payload_bytes(&command.frame);
     let mut failures = Vec::new();
     for endpoint in &endpoints {
+        let send_started = Instant::now();
         match sender(endpoint, &command, connect_timeout).await {
-            Ok(response) => return Ok(response.outbound_frames),
-            Err(error) => failures.push(format!("{} failed: {error}", endpoint.address)),
+            Ok(response) => {
+                dfs_perf_trace(format_args!(
+                    "protocol-frame-send-async local={} target={} endpoint={} request={} payload_bytes={} outbound_frames={} elapsed_ms={}",
+                    command.frame.source_node_id,
+                    target_node_id,
+                    endpoint.address,
+                    command.request_id,
+                    payload_bytes,
+                    response.outbound_frames.len(),
+                    send_started.elapsed().as_millis()
+                ));
+                return Ok(response.outbound_frames);
+            }
+            Err(error) => {
+                dfs_perf_trace(format_args!(
+                    "protocol-frame-send-async-error local={} target={} endpoint={} request={} payload_bytes={} elapsed_ms={} error={}",
+                    command.frame.source_node_id,
+                    target_node_id,
+                    endpoint.address,
+                    command.request_id,
+                    payload_bytes,
+                    send_started.elapsed().as_millis(),
+                    error
+                ));
+                failures.push(format!("{} failed: {error}", endpoint.address));
+            }
         }
     }
     Err(NetworkError::Io {
         operation: format!("send DFS protocol frame to {target_node_id}"),
         detail: failures.join("; "),
     })
+}
+
+fn dfs_network_frame_protocol_payload_bytes(frame: &NetworkFrame) -> usize {
+    match &frame.message.body {
+        MeshMessageBody::Protocol(protocol) => protocol.payload.len(),
+        _ => 0,
+    }
 }
 
 impl DfsTransportIdentity for DfsEndpointTransport {
@@ -7664,8 +7875,24 @@ impl DfsFrameTransport for DfsEndpointTransport {
         self.send_frame_to_endpoint(target_node_id, frame, true)
     }
 
+    fn send_detached(
+        &mut self,
+        target_node_id: &NodeId,
+        frame: NetworkFrame,
+    ) -> Result<(), NetworkError> {
+        self.send_frame_to_endpoint_detached(target_node_id, frame, true)
+    }
+
     fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
         Ok(self.incoming_frames.drain(..).collect())
+    }
+
+    fn flush_detached_sends(&mut self) -> Result<(), NetworkError> {
+        self.flush_detached_endpoint_sends()
+    }
+
+    fn can_send_synchronously(&self) -> bool {
+        self.sender.is_some()
     }
 
     fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
@@ -7838,6 +8065,10 @@ impl NetworkedDfsService<DfsEndpointServedProtocolFrameTransport> {
         self.transport.replace_endpoints(endpoints);
     }
 
+    pub fn drain_protocol_frame_deferred_work(&mut self) {
+        self.drain_deferred_routed_create_parent_touches();
+    }
+
     pub fn process_protocol_frame(
         &mut self,
         inbound_frame: NetworkFrame,
@@ -7850,22 +8081,29 @@ impl NetworkedDfsService<DfsEndpointServedProtocolFrameTransport> {
                 ),
             });
         }
-        let allow_write_repair_progress = !dfs_protocol_frame_is_read_only_request(&inbound_frame);
+        let foreground_repair_request_id =
+            dfs_protocol_frame_foreground_repair_request_id(&inbound_frame);
         self.transport
             .enqueue_protocol_frame(inbound_frame)
             .map_err(DfsError::from_network)?;
         let mut events = Vec::new();
         for _ in 0..DFS_PROTOCOL_FRAME_DRAIN_MAX_PASSES {
-            let batch = match self.process_incoming() {
+            let batch = match self.process_incoming_with_options(false) {
                 Ok(batch) => batch,
                 Err(error) => {
                     self.transport.finish_protocol_frame();
                     return Err(error);
                 }
             };
-            let batch_is_empty = batch.is_empty();
             events.extend(batch);
-            let scheduled = if allow_write_repair_progress {
+            let should_drive_foreground_repairs = foreground_repair_request_id
+                .as_ref()
+                .is_some_and(|request_id| {
+                    self.pending_remote_write_responses.values().any(|pending| {
+                        pending.foreground_replica_repair && pending.request_id == *request_id
+                    })
+                });
+            let scheduled = if should_drive_foreground_repairs {
                 match self.retry_pending_repairs_bounded(usize::MAX) {
                     Ok(scheduled) => scheduled,
                     Err(error) => {
@@ -7887,7 +8125,7 @@ impl NetworkedDfsService<DfsEndpointServedProtocolFrameTransport> {
                     return Err(error);
                 }
             };
-            if pending == Some(0) && batch_is_empty && scheduled.is_empty() {
+            if pending == Some(0) && scheduled.is_empty() {
                 let outbound_frames = self.transport.finish_protocol_frame();
                 return Ok(DfsProtocolFrameProcessResult {
                     outbound_frames,
@@ -8189,6 +8427,8 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             pending_metadata_replications: BTreeMap::new(),
             pending_routed_writes: BTreeMap::new(),
             pending_remote_write_responses: BTreeMap::new(),
+            deferred_routed_create_parent_touches: BTreeSet::new(),
+            deferred_untracked_routed_write_responses: BTreeMap::new(),
             pending_routed_namespace_ops: BTreeMap::new(),
             routed_namespace_settle_depth: 0,
             cross_shard_namespace_locks: BTreeSet::new(),
@@ -8358,6 +8598,8 @@ where
             .map_err(DfsError::from_network)?
             == Some(0)
         {
+            self.flush_deferred_untracked_routed_write_responses_async()
+                .await?;
             return Ok(Vec::new());
         }
         let inbound_frames = self
@@ -8365,7 +8607,63 @@ where
             .drain_incoming_async()
             .await
             .map_err(DfsError::from_network)?;
-        self.process_inbound_frames(inbound_frames)
+        let events = self.process_inbound_frames(inbound_frames)?;
+        self.flush_deferred_untracked_routed_write_responses_async()
+            .await?;
+        Ok(events)
+    }
+
+    async fn flush_deferred_untracked_routed_write_responses_async(
+        &mut self,
+    ) -> Result<(), DfsError> {
+        if self.deferred_untracked_routed_write_responses.is_empty() {
+            return Ok(());
+        }
+        let pending = self
+            .deferred_untracked_routed_write_responses
+            .iter()
+            .map(|(intent_id, object_id)| (intent_id.clone(), object_id.clone()))
+            .collect::<Vec<_>>();
+        for (intent_id, object_id) in pending {
+            let Some(intent) = self.coordinator.intent(&intent_id).cloned() else {
+                self.deferred_untracked_routed_write_responses
+                    .remove(&intent_id);
+                continue;
+            };
+            if !matches!(intent.state, DfsWriteIntentState::Committed)
+                || intent.requesting_node_id == self.node_id
+                || self.pending_remote_write_responses.contains_key(&intent_id)
+            {
+                self.deferred_untracked_routed_write_responses
+                    .remove(&intent_id);
+                continue;
+            }
+            let outcome = self.write_outcome(&intent_id)?;
+            if !matches!(outcome, NetworkedDfsWriteOutcome::Committed { .. }) {
+                self.deferred_untracked_routed_write_responses
+                    .remove(&intent_id);
+                continue;
+            }
+            let result = DfsDistributedWriteResult::Outcome { outcome };
+            let metadata_journal_batches =
+                self.routed_write_response_metadata_journal_batches(&object_id, &result, None)?;
+            let sent = self
+                .send_dfs_message_if_routable_async(
+                    &intent.requesting_node_id,
+                    DfsNetworkMessage::DistributedWriteResponse(DfsDistributedWriteResponse {
+                        request_id: intent.intent_id.clone(),
+                        object_id: object_id.clone(),
+                        result,
+                        metadata_journal_batches,
+                    }),
+                )
+                .await?;
+            if sent {
+                self.deferred_untracked_routed_write_responses
+                    .remove(&intent_id);
+            }
+        }
+        Ok(())
     }
 
     async fn retry_pending_stages_async(&mut self) -> Result<(), DfsError> {
@@ -8758,9 +9056,11 @@ where
         object_metadata: Option<DfsObjectMetadata>,
     ) -> Result<StageBlobSendOutcome, DfsError> {
         if total_size_bytes <= DFS_BLOB_INLINE_LIMIT_BYTES as u64 {
-            let (_, mut reader) = self.content.open_object_version_range_stream(
-                object_id.as_str(),
-                version.as_str(),
+            let mut reader = self.open_content_hash_range_stream(
+                object_id,
+                version,
+                content_hash,
+                Some(total_size_bytes),
                 0,
                 usize::try_from(total_size_bytes).unwrap_or(usize::MAX),
             )?;
@@ -8835,9 +9135,11 @@ where
         object_metadata: Option<DfsObjectMetadata>,
     ) -> Result<StageBlobSendOutcome, DfsError> {
         if total_size_bytes <= DFS_BLOB_INLINE_LIMIT_BYTES as u64 {
-            let (_, mut reader) = self.content.open_object_version_range_stream(
-                object_id.as_str(),
-                version.as_str(),
+            let mut reader = self.open_content_hash_range_stream(
+                object_id,
+                version,
+                content_hash,
+                Some(total_size_bytes),
                 0,
                 usize::try_from(total_size_bytes).unwrap_or(usize::MAX),
             )?;
@@ -8933,18 +9235,14 @@ where
                 ),
             }
         })?;
-        let (manifest, mut reader) = self.content.open_object_version_range_stream(
-            object_id.as_str(),
-            version.as_str(),
+        let mut reader = self.open_content_hash_range_stream(
+            object_id,
+            version,
+            content_hash,
+            Some(total_size_bytes),
             start_offset,
             range_len,
         )?;
-        if manifest.content_hash != content_hash {
-            return Err(DfsError::ContentHashMismatch {
-                expected: content_hash.to_string(),
-                actual: manifest.content_hash,
-            });
-        }
         let mut buffer = vec![0_u8; DFS_BLOB_CHUNK_BYTES];
         for chunk_index in start_chunk_index..end_chunk_index {
             let chunk_len = blob_chunk_len(total_size_bytes, chunk_index)?;
@@ -11272,7 +11570,45 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             memory_object.as_ref(),
             backend_object.as_ref(),
         )?;
+        object = self.object_metadata_with_receipt_locations(object)?;
         self.apply_transient_remote_read_location_prunes(&mut object);
+        Ok(object)
+    }
+
+    pub(crate) fn object_metadata_with_receipt_locations(
+        &self,
+        mut object: DfsObjectMetadata,
+    ) -> Result<DfsObjectMetadata, DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(object);
+        };
+        let Some(content_hash) = object.content_hash.as_deref() else {
+            return Ok(object);
+        };
+        let mut locations = object
+            .current_locations
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut cursor = None;
+        loop {
+            let page = backend.receipts_for_version_page(
+                &object.object_id,
+                &object.version,
+                cursor.as_ref(),
+                DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
+            )?;
+            for receipt in page.receipts {
+                if receipt.content_hash.as_deref() == Some(content_hash) {
+                    locations.insert(receipt.replica_node_id);
+                }
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        object.current_locations = locations.into_iter().collect();
         Ok(object)
     }
 
@@ -11365,7 +11701,6 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             {
                 self.has_pending_write_targeting(object_id, &memory_object.version)
                     || self.has_awaiting_intent_targeting(object_id, &memory_object.version)
-                    || memory_object.kind != DfsObjectKind::Tombstone
             }
             _ => false,
         }
@@ -11961,6 +12296,69 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             plan.desired_replica_nodes,
             policy,
             touch_parent_on_create,
+            foreground_replica_repair,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_distributed_eventual_from_local_manifest_with_candidates_and_parent_touch(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: Option<DfsVersion>,
+        content_hash: String,
+        content_size_bytes: u64,
+        candidate_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        touch_parent_on_create: bool,
+        foreground_replica_repair: bool,
+        detach_request: bool,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        let plan =
+            self.plan_distributed_eventual_replicas(&request, candidate_nodes, policy.clone())?;
+        let object = self.current_object_for_write(&request.object_id)?;
+        if let Some(shard) = self.select_metadata_shard_for_object(&object)? {
+            if shard.primary_node_id != self.node_id {
+                if !detach_request {
+                    self.content.flush_deferred_durable_dirs()?;
+                }
+                return self.route_distributed_manifest_write_to_metadata_primary(
+                    request,
+                    expected_base_version,
+                    content_hash,
+                    content_size_bytes,
+                    plan.desired_replica_nodes,
+                    policy,
+                    object,
+                    shard,
+                    touch_parent_on_create,
+                    foreground_replica_repair,
+                    detach_request,
+                );
+            }
+            if detach_request {
+                return self.route_distributed_manifest_write_to_metadata_primary(
+                    request,
+                    expected_base_version,
+                    content_hash,
+                    content_size_bytes,
+                    plan.desired_replica_nodes,
+                    policy,
+                    object,
+                    shard,
+                    touch_parent_on_create,
+                    foreground_replica_repair,
+                    true,
+                );
+            }
+        }
+        self.content.flush_deferred_durable_dirs()?;
+        self.write_distributed_eventual_from_remote_manifest_with_base(
+            request,
+            expected_base_version,
+            content_hash,
+            content_size_bytes,
+            plan.desired_replica_nodes,
+            policy,
             foreground_replica_repair,
         )
     }
@@ -12847,7 +13245,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             intent
         };
 
-        self.try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
+        self.try_apply_committed_intent_if_ready_with_repair_mode(
+            &updated_intent.intent_id,
+            foreground_replica_repair,
+        )?;
 
         if self.should_stage_missing_replicas_after_write(
             &updated_intent.intent_id,
@@ -12874,6 +13275,14 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         policy: DfsReplicationPolicy,
         foreground_replica_repair: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        let trace_started = Instant::now();
+        let trace_object_id = request.object_id.clone();
+        let trace_version = request.target_version.clone();
+        let trace_requester = request.requesting_node_id.clone();
+        let trace_desired_count = desired_replica_nodes.len();
+        let trace_policy_min = policy.min_commit_replicas;
+        let trace_policy_desired = policy.desired_replicas;
+        let trace_content_size_bytes = content_size_bytes;
         let object = self.current_object_for_write(&request.object_id)?;
         if !matches!(
             object.policy,
@@ -12996,6 +13405,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             return Err(error.into());
         }
 
+        let create_intent_started = Instant::now();
         let intent = match self.coordinator.create_intent_at_epoch(
             request.file_system_id.clone(),
             request.object_id.clone(),
@@ -13024,7 +13434,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             }
             Err(error) => return Err(error.into()),
         };
-        self.put_metadata_intent(&intent, Some(&content_hash))?;
+        let create_intent_elapsed = create_intent_started.elapsed();
+        let put_intent_started = Instant::now();
+        let put_intent_elapsed = put_intent_started.elapsed();
         self.pending_writes.insert(
             intent.intent_id.clone(),
             pending_networked_write(
@@ -13035,18 +13447,30 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             ),
         );
 
-        self.put_metadata_receipt(
-            &request.file_system_id,
-            &request.object_id,
-            &request.target_version,
-            &request.requesting_node_id,
-            &content_hash,
-        )?;
+        let record_receipt_started = Instant::now();
         let updated_intent = self
             .coordinator
             .record_durable_receipt(&intent.intent_id, request.requesting_node_id.clone())?;
-        self.try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
+        let record_receipt_elapsed = record_receipt_started.elapsed();
+        let commit_started = Instant::now();
+        if !foreground_replica_repair && updated_intent.policy.min_commit_replicas <= 1 {
+            self.commit_remote_manifest_ready_intent_batched(
+                &updated_intent,
+                &object,
+                &content_hash,
+                content_size_bytes,
+            )?;
+        } else {
+            let receipt_node_ids = vec![request.requesting_node_id.clone()];
+            self.put_metadata_intent_and_receipts(&intent, &content_hash, &receipt_node_ids)?;
+            self.try_apply_committed_intent_if_ready_with_repair_mode(
+                &updated_intent.intent_id,
+                foreground_replica_repair,
+            )?;
+        }
+        let commit_elapsed = commit_started.elapsed();
 
+        let stage_started = Instant::now();
         let is_committed = matches!(
             self.coordinator
                 .intent(&updated_intent.intent_id)
@@ -13066,8 +13490,38 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         {
             let _ = self.request_stage_blob_from_alternate(&updated_intent, &pending)?;
         }
+        let stage_elapsed = stage_started.elapsed();
 
         let outcome = self.write_outcome(&updated_intent.intent_id)?;
+        dfs_perf_trace(format_args!(
+            "distributed-write-remote-manifest-apply node={} requester={} object={} version={} bytes={} desired={} policy_min={} policy_desired={} foreground_repair={} outcome={} create_intent_ms={} put_intent_receipts_ms={} record_receipt_ms={} commit_ms={} stage_ms={} total_ms={}",
+            self.node_id,
+            trace_requester,
+            trace_object_id,
+            trace_version,
+            trace_content_size_bytes,
+            trace_desired_count,
+            trace_policy_min,
+            trace_policy_desired,
+            foreground_replica_repair,
+            match &outcome {
+                NetworkedDfsWriteOutcome::Pending { .. } => "pending",
+                NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } => {
+                    if repair_jobs.is_empty() {
+                        "committed"
+                    } else {
+                        "committed-with-repair"
+                    }
+                }
+                NetworkedDfsWriteOutcome::Conflict { .. } => "conflict",
+            },
+            create_intent_elapsed.as_millis(),
+            put_intent_elapsed.as_millis(),
+            record_receipt_elapsed.as_millis(),
+            commit_elapsed.as_millis(),
+            stage_elapsed.as_millis(),
+            trace_started.elapsed().as_millis()
+        ));
         self.cleanup_committed_pending_write_if_repaired(&updated_intent.intent_id);
         Ok(outcome)
     }
@@ -13268,11 +13722,21 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             });
         }
 
+        let trace_started = Instant::now();
+        let trace_object_id = request.object_id.clone();
+        let trace_version = request.target_version.clone();
+        let trace_requester = request.requesting_node_id.clone();
+        let trace_desired_count = desired_replica_nodes.len();
+        let trace_policy_min = policy.min_commit_replicas;
+        let trace_policy_desired = policy.desired_replicas;
+        let content_started = Instant::now();
         let manifest = self.content.put_object_version(
             request.object_id.as_str(),
             request.target_version.as_str(),
             &bytes,
         )?;
+        let content_elapsed = content_started.elapsed();
+        let create_intent_started = Instant::now();
         let intent = match self.coordinator.create_intent_at_epoch(
             request.file_system_id.clone(),
             request.object_id.clone(),
@@ -13301,7 +13765,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             }
             Err(error) => return Err(error.into()),
         };
-        self.put_metadata_intent(&intent, Some(&manifest.content_hash))?;
+        let create_intent_elapsed = create_intent_started.elapsed();
         self.pending_writes.insert(
             intent.intent_id.clone(),
             pending_networked_write(
@@ -13312,23 +13776,34 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             ),
         );
 
-        let updated_intent = if desired_replica_nodes.contains(&self.node_id) {
-            let local_node_id = self.node_id.clone();
-            self.put_metadata_receipt(
-                &request.file_system_id,
-                &request.object_id,
-                &request.target_version,
-                &local_node_id,
-                &manifest.content_hash,
-            )?;
-            self.coordinator
-                .record_durable_receipt(&intent.intent_id, self.node_id.clone())?
-        } else {
-            intent
-        };
+        let mut receipt_node_ids = Vec::new();
+        if desired_replica_nodes.contains(&self.node_id) {
+            receipt_node_ids.push(self.node_id.clone());
+        }
+        if request.requesting_node_id != self.node_id
+            && desired_replica_nodes.contains(&request.requesting_node_id)
+        {
+            receipt_node_ids.push(request.requesting_node_id.clone());
+        }
+        let put_intent_started = Instant::now();
+        self.put_metadata_intent_and_receipts(&intent, &manifest.content_hash, &receipt_node_ids)?;
+        let put_intent_elapsed = put_intent_started.elapsed();
 
-        self.try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
+        let mut updated_intent = intent;
+        for replica_node_id in receipt_node_ids {
+            updated_intent = self
+                .coordinator
+                .record_durable_receipt(&updated_intent.intent_id, replica_node_id)?;
+        }
 
+        let commit_started = Instant::now();
+        self.try_apply_committed_intent_if_ready_with_repair_mode(
+            &updated_intent.intent_id,
+            foreground_replica_repair,
+        )?;
+        let commit_elapsed = commit_started.elapsed();
+
+        let stage_started = Instant::now();
         if self.should_stage_missing_replicas_after_write(
             &updated_intent.intent_id,
             foreground_replica_repair,
@@ -13338,8 +13813,37 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 object.clone(),
             )?;
         }
+        let stage_elapsed = stage_started.elapsed();
 
         let outcome = self.write_outcome(&updated_intent.intent_id)?;
+        dfs_perf_trace(format_args!(
+            "distributed-write-apply node={} requester={} object={} version={} bytes={} desired={} policy_min={} policy_desired={} outcome={} content_ms={} create_intent_ms={} put_intent_receipts_ms={} commit_ms={} stage_ms={} total_ms={}",
+            self.node_id,
+            trace_requester,
+            trace_object_id,
+            trace_version,
+            manifest.size_bytes,
+            trace_desired_count,
+            trace_policy_min,
+            trace_policy_desired,
+            match &outcome {
+                NetworkedDfsWriteOutcome::Pending { .. } => "pending",
+                NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } => {
+                    if repair_jobs.is_empty() {
+                        "committed"
+                    } else {
+                        "committed-with-repair"
+                    }
+                }
+                NetworkedDfsWriteOutcome::Conflict { .. } => "conflict",
+            },
+            content_elapsed.as_millis(),
+            create_intent_elapsed.as_millis(),
+            put_intent_elapsed.as_millis(),
+            commit_elapsed.as_millis(),
+            stage_elapsed.as_millis(),
+            trace_started.elapsed().as_millis()
+        ));
         self.cleanup_committed_pending_write_if_repaired(&updated_intent.intent_id);
         Ok(outcome)
     }
@@ -13405,6 +13909,77 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn route_distributed_manifest_write_to_metadata_primary(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: Option<DfsVersion>,
+        content_hash: String,
+        content_size_bytes: u64,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        object: DfsObjectMetadata,
+        shard: DfsMetadataShardConfig,
+        touch_parent_on_create: bool,
+        foreground_replica_repair: bool,
+        detach_request: bool,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        let request_id = self.next_request_id();
+        let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+        let metadata_journal_after_sequence = if foreground_replica_repair {
+            self.metadata_journal_last_sequence_for_shard(&shard_id)?
+        } else {
+            None
+        };
+        let primary_node_id = shard.primary_node_id.clone();
+        let command = DfsDistributedWriteCommand {
+            request_id: request_id.clone(),
+            request,
+            expected_base_version,
+            metadata_journal_after_sequence,
+            bytes: Vec::new(),
+            content_hash: Some(content_hash),
+            content_size_bytes: Some(content_size_bytes),
+            desired_replica_nodes,
+            policy,
+            object_metadata: Some(object.clone()),
+            touch_parent_on_create,
+            foreground_replica_repair,
+        };
+        let message = DfsNetworkMessage::DistributedWriteRequest(command.clone());
+        let sent = if detach_request {
+            self.send_dfs_message_if_routable_detached(&primary_node_id, message)?
+        } else {
+            self.send_dfs_message_if_routable(&primary_node_id, message)?
+        };
+        if !sent {
+            return Err(DfsError::Network {
+                message: format!(
+                    "metadata shard {} primary {} is not routable",
+                    shard.shard_id, primary_node_id
+                ),
+            });
+        }
+        self.pending_routed_writes.insert(
+            request_id.clone(),
+            PendingRoutedWrite {
+                object_id: object.object_id,
+                primary_node_id,
+                command,
+                authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
+                remote_intent_id: None,
+                durable_receipts: 0,
+                required_receipts: 1,
+                result: None,
+            },
+        );
+        Ok(NetworkedDfsWriteOutcome::Pending {
+            intent_id: request_id,
+            durable_receipts: 0,
+            required_receipts: 1,
+        })
+    }
+
     fn route_distributed_write_from_reader_to_metadata_primary<R: Read>(
         &mut self,
         request: DfsWriteRequest,
@@ -13425,30 +14000,46 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 ),
             });
         }
-        let manifest = self.content.put_object_version_from_reader(
+        let trace_started = Instant::now();
+        let trace_object_id = request.object_id.clone();
+        let trace_version = request.target_version.clone();
+        let trace_requester = request.requesting_node_id.clone();
+        let trace_desired_count = desired_replica_nodes.len();
+        let trace_policy_min = policy.min_commit_replicas;
+        let trace_policy_desired = policy.desired_replicas;
+        let capture_started = Instant::now();
+        let (manifest, captured_bytes) = self.content.put_object_version_from_reader_capture(
             request.object_id.as_str(),
             request.target_version.as_str(),
             reader,
+            usize::try_from(DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT).unwrap_or(usize::MAX),
         )?;
+        let capture_elapsed = capture_started.elapsed();
         let request_id = self.next_request_id();
         let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+        let metadata_sequence_started = Instant::now();
         let metadata_journal_after_sequence =
             self.metadata_journal_last_sequence_for_shard(&shard_id)?;
+        let metadata_sequence_elapsed = metadata_sequence_started.elapsed();
         let primary_node_id = shard.primary_node_id.clone();
         let (bytes, content_hash, content_size_bytes) = if manifest.size_bytes
             <= DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT
             && desired_replica_nodes.contains(&primary_node_id)
         {
-            match self
-                .content
-                .read_object_version(request.object_id.as_str(), request.target_version.as_str())
-            {
-                Ok((_, bytes)) => (bytes, None, None),
-                Err(_) => (
-                    Vec::new(),
-                    Some(manifest.content_hash.clone()),
-                    Some(manifest.size_bytes),
-                ),
+            if let Some(bytes) = captured_bytes {
+                (bytes, None, None)
+            } else {
+                match self.content.read_object_version(
+                    request.object_id.as_str(),
+                    request.target_version.as_str(),
+                ) {
+                    Ok((_, bytes)) => (bytes, None, None),
+                    Err(_) => (
+                        Vec::new(),
+                        Some(manifest.content_hash.clone()),
+                        Some(manifest.size_bytes),
+                    ),
+                }
             }
         } else {
             (
@@ -13457,6 +14048,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 Some(manifest.size_bytes),
             )
         };
+        let inline_bytes = bytes.len();
+        let captured_inline =
+            inline_bytes > 0 && content_hash.is_none() && content_size_bytes.is_none();
         let command = DfsDistributedWriteCommand {
             request_id: request_id.clone(),
             request,
@@ -13471,10 +14065,32 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             touch_parent_on_create,
             foreground_replica_repair,
         };
+        let send_started = Instant::now();
         let sent = self.send_dfs_message_if_routable(
             &primary_node_id,
             DfsNetworkMessage::DistributedWriteRequest(command.clone()),
         )?;
+        let send_elapsed = send_started.elapsed();
+        dfs_perf_trace(format_args!(
+            "routed-write-send node={} requester={} primary={} request={} object={} version={} bytes={} inline_bytes={} captured_inline={} desired={} policy_min={} policy_desired={} capture_ms={} metadata_seq_ms={} send_ms={} total_ms={} sent={}",
+            self.node_id,
+            trace_requester,
+            primary_node_id,
+            request_id,
+            trace_object_id,
+            trace_version,
+            manifest.size_bytes,
+            inline_bytes,
+            captured_inline,
+            trace_desired_count,
+            trace_policy_min,
+            trace_policy_desired,
+            capture_elapsed.as_millis(),
+            metadata_sequence_elapsed.as_millis(),
+            send_elapsed.as_millis(),
+            trace_started.elapsed().as_millis(),
+            sent
+        ));
         if !sent {
             return Err(DfsError::Network {
                 message: format!(
@@ -13504,6 +14120,13 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     pub fn process_incoming(&mut self) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
+        self.process_incoming_with_options(true)
+    }
+
+    fn process_incoming_with_options(
+        &mut self,
+        drain_deferred_parent_touches: bool,
+    ) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
         self.prune_idle_chunk_transfers();
         if self
             .transport
@@ -13513,6 +14136,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         {
             let mut events = Vec::new();
             self.flush_completed_pending_remote_write_responses(&mut events)?;
+            if drain_deferred_parent_touches {
+                self.drain_deferred_routed_create_parent_touches();
+            }
             self.prune_expired_pending_remote_reads();
             self.last_events = events.clone();
             return Ok(events);
@@ -13521,12 +14147,20 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             .transport
             .drain_incoming()
             .map_err(DfsError::from_network)?;
-        self.process_inbound_frames(inbound_frames)
+        self.process_inbound_frames_with_options(inbound_frames, drain_deferred_parent_touches)
     }
 
     fn process_inbound_frames(
         &mut self,
         inbound_frames: Vec<InboundFrame>,
+    ) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
+        self.process_inbound_frames_with_options(inbound_frames, true)
+    }
+
+    fn process_inbound_frames_with_options(
+        &mut self,
+        inbound_frames: Vec<InboundFrame>,
+        drain_deferred_parent_touches: bool,
     ) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
         let mut events = Vec::new();
 
@@ -13652,6 +14286,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 | DfsNetworkMessage::WriteResponse(_) => {}
             }
             self.flush_completed_pending_remote_write_responses(&mut events)?;
+            if drain_deferred_parent_touches {
+                self.drain_deferred_routed_create_parent_touches();
+            }
         }
 
         self.prune_expired_pending_remote_reads();
@@ -13708,6 +14345,12 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             let Some(backend) = self.metadata_backend.as_ref() else {
                 return Ok(None);
             };
+            if backend
+                .get_version(&command.request.object_id, &command.request.target_version)?
+                .is_none()
+            {
+                return Ok(None);
+            }
             let mut cursor = None;
             let mut matching_record = None;
             loop {
@@ -13783,7 +14426,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             .as_ref()
             .map(|object| object.path.clone());
         let touch_parent_on_create = command.touch_parent_on_create;
+        let trace_started = Instant::now();
+        let trace_payload_bytes = command.bytes.len();
+        let trace_manifest_only = command.content_hash.is_some();
         let mut created_object_path = None;
+        let apply_started = Instant::now();
         let result = if requester_node_id != command.request.requesting_node_id {
             DfsDistributedWriteResult::Rejected {
                 reason: format!(
@@ -13843,7 +14490,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     }
                 }) {
                 Ok(outcome) => {
-                    match &outcome {
+                    let response_outcome = match &outcome {
                         NetworkedDfsWriteOutcome::Pending { intent_id, .. } => {
                             self.pending_remote_write_responses.insert(
                                 intent_id.clone(),
@@ -13853,18 +14500,56 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                                     object_id: object_id.clone(),
                                     metadata_journal_after_sequence,
                                     created_object_path: created_object_path.clone(),
+                                    foreground_replica_repair: command.foreground_replica_repair,
                                     created_at: Instant::now(),
                                 },
                             );
+                            outcome.clone()
+                        }
+                        NetworkedDfsWriteOutcome::Committed {
+                            intent_id,
+                            repair_jobs,
+                            ..
+                        } if command.foreground_replica_repair && !repair_jobs.is_empty() => {
+                            self.pending_remote_write_responses.insert(
+                                intent_id.clone(),
+                                PendingRemoteWriteResponse {
+                                    requester_node_id: requester_node_id.clone(),
+                                    request_id: request_id.clone(),
+                                    object_id: object_id.clone(),
+                                    metadata_journal_after_sequence,
+                                    created_object_path: created_object_path.clone(),
+                                    foreground_replica_repair: command.foreground_replica_repair,
+                                    created_at: Instant::now(),
+                                },
+                            );
+                            NetworkedDfsWriteOutcome::Pending {
+                                intent_id: intent_id.clone(),
+                                durable_receipts: self.coordinator.durable_receipt_count(intent_id),
+                                required_receipts: self
+                                    .coordinator
+                                    .intent(intent_id)
+                                    .map(|intent| intent.policy.min_commit_replicas)
+                                    .unwrap_or_else(|| {
+                                        self.coordinator.durable_receipt_count(intent_id)
+                                    }),
+                            }
                         }
                         NetworkedDfsWriteOutcome::Committed { .. } => {
                             if let Some(path) = created_object_path.as_deref() {
-                                self.touch_routed_create_parent_directory(path);
+                                if command.foreground_replica_repair {
+                                    self.touch_routed_create_parent_directory(path);
+                                } else {
+                                    self.defer_routed_create_parent_directory_touch(path);
+                                }
                             }
+                            outcome.clone()
                         }
-                        NetworkedDfsWriteOutcome::Conflict { .. } => {}
+                        NetworkedDfsWriteOutcome::Conflict { .. } => outcome.clone(),
+                    };
+                    DfsDistributedWriteResult::Outcome {
+                        outcome: response_outcome,
                     }
-                    DfsDistributedWriteResult::Outcome { outcome }
                 }
                 Err(error) => {
                     let current_primary_node_id =
@@ -13876,12 +14561,17 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 }
             }
         };
+        let apply_elapsed = apply_started.elapsed();
+        let journal_started = Instant::now();
         let metadata_journal_batches = self.routed_write_response_metadata_journal_batches(
             &object_id,
             &result,
             metadata_journal_after_sequence,
         )?;
-        self.send_dfs_message_if_routable(
+        let journal_elapsed = journal_started.elapsed();
+        let metadata_journal_batch_count = metadata_journal_batches.len();
+        let send_started = Instant::now();
+        let send_result = self.send_dfs_message_if_routable(
             &requester_node_id,
             DfsNetworkMessage::DistributedWriteResponse(DfsDistributedWriteResponse {
                 request_id: request_id.clone(),
@@ -13889,7 +14579,25 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 result: result.clone(),
                 metadata_journal_batches,
             }),
-        )?;
+        );
+        let send_elapsed = send_started.elapsed();
+        dfs_perf_trace(format_args!(
+            "distributed-write-serve node={} requester={} request={} object={} payload_bytes={} manifest_only={} result={} journal_batches={} apply_ms={} journal_ms={} response_send_ms={} total_ms={} response_sent={}",
+            self.node_id,
+            requester_node_id,
+            request_id,
+            object_id,
+            trace_payload_bytes,
+            trace_manifest_only,
+            dfs_distributed_write_result_trace_label(&result),
+            metadata_journal_batch_count,
+            apply_elapsed.as_millis(),
+            journal_elapsed.as_millis(),
+            send_elapsed.as_millis(),
+            trace_started.elapsed().as_millis(),
+            send_result.is_ok()
+        ));
+        send_result?;
         Ok(NetworkedDfsServiceEvent::RemoteWriteServed {
             request_id,
             object_id,
@@ -13904,6 +14612,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         result: &DfsDistributedWriteResult,
         after_sequence: Option<u64>,
     ) -> Result<Vec<DfsMetadataJournalBatch>, DfsError> {
+        let Some(after_sequence) = after_sequence else {
+            return Ok(Vec::new());
+        };
         if !matches!(
             result,
             DfsDistributedWriteResult::Outcome {
@@ -13921,7 +14632,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         }
         self.metadata_journal_batches_for_shard_since(
             &DfsMetadataShardId::new(shard.shard_id),
-            after_sequence.unwrap_or(0),
+            after_sequence,
         )
     }
 
@@ -13978,15 +14689,21 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             return Ok(memory_object);
         };
         let backend_object = backend.get_object_by_path(file_system_id, &metadata_path(path))?;
-        Ok(match (memory_object, backend_object) {
-            (Some(memory_object), Some(backend_object))
-                if memory_object.version > backend_object.version =>
-            {
-                Some(memory_object)
+        let object = match (memory_object.as_ref(), backend_object.as_ref()) {
+            (Some(memory_object), Some(backend_object)) => {
+                Some(self.resolve_authoritative_object_metadata(
+                    &backend_object.object_id,
+                    Some(memory_object),
+                    Some(backend_object),
+                )?)
             }
-            (Some(memory_object), None) => Some(memory_object),
-            (_, backend_object) => backend_object,
-        })
+            (Some(memory_object), None) => Some(memory_object.clone()),
+            (_, Some(backend_object)) => Some(backend_object.clone()),
+            (None, None) => None,
+        };
+        object
+            .map(|object| self.object_metadata_with_receipt_locations(object))
+            .transpose()
     }
 
     fn apply_routed_write_metadata_journal_batch(
@@ -14293,6 +15010,17 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     }
                 }
             };
+            if self
+                .pending_remote_write_responses
+                .get(&intent_id)
+                .is_some_and(|pending| pending.foreground_replica_repair)
+                && let DfsDistributedWriteResult::Outcome {
+                    outcome: NetworkedDfsWriteOutcome::Committed { repair_jobs, .. },
+                } = &result
+                && !repair_jobs.is_empty()
+            {
+                continue;
+            }
             let Some(pending) = self.pending_remote_write_responses.remove(&intent_id) else {
                 continue;
             };
@@ -14303,7 +15031,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 }
             ) && let Some(path) = pending.created_object_path.as_deref()
             {
-                self.touch_routed_create_parent_directory(path);
+                if pending.foreground_replica_repair {
+                    self.touch_routed_create_parent_directory(path);
+                } else {
+                    self.defer_routed_create_parent_directory_touch(path);
+                }
             }
             let metadata_journal_batches = self.routed_write_response_metadata_journal_batches(
                 &pending.object_id,
@@ -14334,6 +15066,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         intent_id: &str,
         object_id: &DfsObjectId,
     ) -> Result<(), DfsError> {
+        if !self.transport.can_send_synchronously() {
+            self.deferred_untracked_routed_write_responses
+                .insert(intent_id.to_string(), object_id.clone());
+            return Ok(());
+        }
         let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
             return Ok(());
         };
@@ -14998,13 +15735,18 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
         let request_id = self.next_request_id();
+        let metadata_journal_after_sequences = if replay_journal_batches {
+            self.local_metadata_shard_cursors()?
+        } else {
+            Vec::new()
+        };
         let sent = match self.send_dfs_message_if_routable(
             &primary_node_id,
             DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
                 request_id: request_id.clone(),
                 file_system_id,
                 requesting_node_id: self.node_id.clone(),
-                metadata_journal_after_sequences: self.local_metadata_shard_cursors()?,
+                metadata_journal_after_sequences,
                 operation,
             }),
         ) {
@@ -15154,6 +15896,27 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     /// write.
     fn touch_routed_create_parent_directory(&mut self, path: &str) {
         let _ = self.touch_parent_directory_modified(path);
+    }
+
+    fn defer_routed_create_parent_directory_touch(&mut self, path: &str) {
+        self.deferred_routed_create_parent_touches
+            .insert(path.to_string());
+    }
+
+    fn drain_deferred_routed_create_parent_touches(&mut self) {
+        if self.deferred_routed_create_parent_touches.is_empty() {
+            return;
+        }
+        let paths = self
+            .deferred_routed_create_parent_touches
+            .iter()
+            .take(DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT)
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in paths {
+            self.deferred_routed_create_parent_touches.remove(&path);
+            self.touch_routed_create_parent_directory(&path);
+        }
     }
 
     /// Whether this node is the metadata write authority for the object's
@@ -18255,7 +19018,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         requester_node_id: NodeId,
         command: DfsFetchBlobCommand,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
-        let manifest_result = self
+        let open_result = self
             .ensure_blob_fetch_authorized(
                 &requester_node_id,
                 &command.intent_id,
@@ -18269,93 +19032,70 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 )
             })
             .and_then(|()| {
-                self.content
-                    .read_manifest(command.object_id.as_str(), command.version.as_str())
-                    .map_err(DfsError::from)
-            })
-            .and_then(|manifest| {
-                if manifest.content_hash != command.content_hash {
-                    return Err(DfsError::ContentHashMismatch {
-                        expected: command.content_hash.clone(),
-                        actual: manifest.content_hash,
-                    });
-                }
-                Ok(manifest)
+                self.open_content_hash_stream(
+                    &command.object_id,
+                    &command.version,
+                    &command.content_hash,
+                    None,
+                )
             });
 
         let mut sent_chunked_response = false;
-        let result = match manifest_result {
-            Ok(manifest) => match self
-                .content
-                .open_object_version_stream(&manifest.object_id, &manifest.version)
-            {
-                Ok((stream_manifest, reader))
-                    if stream_manifest.content_hash == command.content_hash
-                        && stream_manifest.size_bytes > DFS_BLOB_INLINE_LIMIT_BYTES as u64 =>
-                {
+        let result = match open_result {
+            Ok((total_size_bytes, reader)) => {
+                if total_size_bytes > DFS_BLOB_INLINE_LIMIT_BYTES as u64 {
                     let reader = if command.start_chunk_index == 0 {
                         reader
                     } else {
-                        self.open_fetch_response_chunk_reader(&stream_manifest, &command)?
+                        self.open_fetch_response_chunk_reader(total_size_bytes, &command)?
                     };
                     self.send_fetch_blob_response_chunks_from_reader(
                         &requester_node_id,
                         &command,
                         reader,
-                        stream_manifest.size_bytes,
+                        total_size_bytes,
                     )?;
                     sent_chunked_response = true;
                     DfsFetchBlobResult::Found {
                         content_hash: command.content_hash.clone(),
                         bytes: Vec::new(),
                     }
-                }
-                Ok((stream_manifest, mut reader))
-                    if stream_manifest.content_hash == command.content_hash =>
-                {
-                    if command.start_chunk_index > 0 {
-                        match self.open_fetch_response_chunk_reader(&stream_manifest, &command) {
-                            Ok(reader) => {
-                                self.send_fetch_blob_response_chunks_from_reader(
-                                    &requester_node_id,
-                                    &command,
-                                    reader,
-                                    stream_manifest.size_bytes,
-                                )?;
-                                sent_chunked_response = true;
-                                DfsFetchBlobResult::Found {
-                                    content_hash: command.content_hash.clone(),
-                                    bytes: Vec::new(),
-                                }
-                            }
-                            Err(error) => DfsFetchBlobResult::Rejected {
-                                reason: error.to_string(),
-                            },
-                        }
-                    } else {
-                        match read_small_blob_from_reader(
-                            &command.content_hash,
-                            stream_manifest.size_bytes,
-                            &mut reader,
-                        ) {
-                            Ok(bytes) => DfsFetchBlobResult::Found {
+                } else if command.start_chunk_index > 0 {
+                    match self.open_fetch_response_chunk_reader(total_size_bytes, &command) {
+                        Ok(reader) => {
+                            self.send_fetch_blob_response_chunks_from_reader(
+                                &requester_node_id,
+                                &command,
+                                reader,
+                                total_size_bytes,
+                            )?;
+                            sent_chunked_response = true;
+                            DfsFetchBlobResult::Found {
                                 content_hash: command.content_hash.clone(),
-                                bytes,
-                            },
-                            Err(error) => DfsFetchBlobResult::Rejected {
-                                reason: error.to_string(),
-                            },
+                                bytes: Vec::new(),
+                            }
                         }
+                        Err(error) => DfsFetchBlobResult::Rejected {
+                            reason: error.to_string(),
+                        },
+                    }
+                } else {
+                    let mut reader = reader;
+                    match read_small_blob_from_reader(
+                        &command.content_hash,
+                        total_size_bytes,
+                        &mut reader,
+                    ) {
+                        Ok(bytes) => DfsFetchBlobResult::Found {
+                            content_hash: command.content_hash.clone(),
+                            bytes,
+                        },
+                        Err(error) => DfsFetchBlobResult::Rejected {
+                            reason: error.to_string(),
+                        },
                     }
                 }
-                Ok((stream_manifest, _)) => DfsFetchBlobResult::Rejected {
-                    reason: format!(
-                        "object manifest hash changed while serving fetch: expected {}, actual {}",
-                        command.content_hash, stream_manifest.content_hash
-                    ),
-                },
-                Err(_) => DfsFetchBlobResult::NotFound,
-            },
+            }
             Err(DfsError::ContentStore { .. }) => DfsFetchBlobResult::NotFound,
             Err(error) => DfsFetchBlobResult::Rejected {
                 reason: error.to_string(),
@@ -18478,10 +19218,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
 
     fn open_fetch_response_chunk_reader(
         &self,
-        manifest: &ContentManifest,
+        total_size_bytes: u64,
         command: &DfsFetchBlobCommand,
     ) -> Result<ObjectVersionReader, DfsError> {
-        let total_chunks = blob_chunk_count_for_size(manifest.size_bytes)?;
+        let total_chunks = blob_chunk_count_for_size(total_size_bytes)?;
         if command.start_chunk_index >= total_chunks {
             return Err(DfsError::Distributed {
                 message: format!(
@@ -18491,7 +19231,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             });
         }
         let start_offset = u64::from(command.start_chunk_index) * DFS_BLOB_CHUNK_BYTES as u64;
-        let remaining_bytes = manifest.size_bytes.saturating_sub(start_offset);
+        let remaining_bytes = total_size_bytes.saturating_sub(start_offset);
         let remaining_bytes = usize::try_from(remaining_bytes).map_err(|_| {
             DfsError::Distributed {
                 message: format!(
@@ -18499,26 +19239,14 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 ),
             }
         })?;
-        let (range_manifest, reader) = self
-            .content
-            .open_object_version_range_stream(
-                command.object_id.as_str(),
-                command.version.as_str(),
-                start_offset,
-                remaining_bytes,
-            )
-            .map_err(DfsError::from)?;
-        if range_manifest.content_hash != command.content_hash
-            || range_manifest.size_bytes != manifest.size_bytes
-        {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "object manifest changed while opening fetch resume range for {} {}",
-                    command.object_id, command.version
-                ),
-            });
-        }
-        Ok(reader)
+        self.open_content_hash_range_stream(
+            &command.object_id,
+            &command.version,
+            &command.content_hash,
+            Some(total_size_bytes),
+            start_offset,
+            remaining_bytes,
+        )
     }
 
     fn fetch_window_end_chunk_index(start_chunk_index: u32, max_chunks: u32) -> Option<u32> {
@@ -21729,6 +22457,101 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         Ok(ObjectVersionReader::from_blob(reader))
     }
 
+    fn open_content_hash_stream(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        content_hash: &str,
+        expected_size_bytes: Option<u64>,
+    ) -> Result<(u64, ObjectVersionReader), DfsError> {
+        if let Ok((manifest, reader)) = self
+            .content
+            .open_object_version_stream(object_id.as_str(), version.as_str())
+        {
+            if manifest.content_hash != content_hash {
+                return Err(DfsError::ContentHashMismatch {
+                    expected: content_hash.to_string(),
+                    actual: manifest.content_hash,
+                });
+            }
+            if let Some(expected_size_bytes) = expected_size_bytes
+                && manifest.size_bytes != expected_size_bytes
+            {
+                return Err(DfsError::Distributed {
+                    message: format!(
+                        "object version size mismatch for {object_id} {version}: expected {expected_size_bytes}, actual {}",
+                        manifest.size_bytes
+                    ),
+                });
+            }
+            return Ok((manifest.size_bytes, reader));
+        }
+
+        let reader = self.content.open_blob_stream(content_hash)?;
+        if let Some(expected_size_bytes) = expected_size_bytes
+            && reader.size_bytes() != expected_size_bytes
+        {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "content blob size mismatch for {object_id} {version}: expected {expected_size_bytes}, actual {}",
+                    reader.size_bytes()
+                ),
+            });
+        }
+        let size_bytes = reader.size_bytes();
+        Ok((size_bytes, ObjectVersionReader::from_blob(reader)))
+    }
+
+    fn open_content_hash_range_stream(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        content_hash: &str,
+        expected_size_bytes: Option<u64>,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<ObjectVersionReader, DfsError> {
+        if let Ok((manifest, reader)) = self.content.open_object_version_range_stream(
+            object_id.as_str(),
+            version.as_str(),
+            offset,
+            max_bytes,
+        ) {
+            if manifest.content_hash != content_hash {
+                return Err(DfsError::ContentHashMismatch {
+                    expected: content_hash.to_string(),
+                    actual: manifest.content_hash,
+                });
+            }
+            if let Some(expected_size_bytes) = expected_size_bytes
+                && manifest.size_bytes != expected_size_bytes
+            {
+                return Err(DfsError::Distributed {
+                    message: format!(
+                        "object version range size mismatch for {object_id} {version}: expected {expected_size_bytes}, actual {}",
+                        manifest.size_bytes
+                    ),
+                });
+            }
+            return Ok(reader);
+        }
+
+        let reader = self
+            .content
+            .open_blob_range_stream(content_hash, offset, max_bytes)?;
+        if let Some(expected_size_bytes) = expected_size_bytes {
+            let end = offset.saturating_add(reader.size_bytes());
+            if offset > expected_size_bytes || end > expected_size_bytes {
+                return Err(DfsError::Distributed {
+                    message: format!(
+                        "content blob range for {object_id} {version} exceeds expected size {expected_size_bytes}: {offset}..{end}"
+                    ),
+                });
+            }
+        }
+        Ok(ObjectVersionReader::from_blob_range(reader))
+    }
+
     fn request_stage_blob_from_alternate(
         &mut self,
         intent: &DistributedWriteIntent,
@@ -21900,11 +22723,23 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
 
     fn expire_stale_fetch_requests(&mut self) {
         let tick = self.repair_retry_tick;
+        let active_fetch_request_ids = self
+            .incoming_fetch_transfers
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
         for pending in self.pending_writes.values_mut() {
             let expired_sources = pending
                 .fetch_inflight_started_ticks
                 .iter()
                 .filter_map(|(source_node_id, started_tick)| {
+                    if pending
+                        .fetch_inflight_request_ids
+                        .get(source_node_id)
+                        .is_some_and(|request_id| active_fetch_request_ids.contains(request_id))
+                    {
+                        return None;
+                    }
                     let expires_at = started_tick.saturating_add(fetch_inflight_timeout_ticks());
                     (expires_at <= tick).then_some(source_node_id.clone())
                 })
@@ -21914,7 +22749,12 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             }
             for source_node_id in expired_sources {
                 pending.fetch_inflight_from.remove(&source_node_id);
+                pending.fetch_inflight_request_ids.remove(&source_node_id);
                 pending.fetch_inflight_started_ticks.remove(&source_node_id);
+                pending.fetch_next_chunk_indexes.remove(&source_node_id);
+                pending
+                    .fetch_window_end_chunk_indexes
+                    .remove(&source_node_id);
                 pending.fetch_failed_from.insert(source_node_id);
             }
             for state in pending.stage_retries.values_mut() {
@@ -22295,6 +23135,14 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     fn apply_committed_intent(&mut self, intent_id: &str) -> Result<(), DfsError> {
+        self.apply_committed_intent_with_repair_mode(intent_id, true)
+    }
+
+    fn apply_committed_intent_with_repair_mode(
+        &mut self,
+        intent_id: &str,
+        foreground_replica_repair: bool,
+    ) -> Result<(), DfsError> {
         let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
             return Err(DfsError::Distributed {
                 message: format!("unknown committed intent: {intent_id}"),
@@ -22373,7 +23221,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
 
         let commit_targets: Vec<NodeId> = durable_nodes
             .iter()
-            .filter(|node_id| *node_id != &self.node_id)
+            .filter(|node_id| *node_id != &self.node_id && *node_id != &intent.requesting_node_id)
             .cloned()
             .collect();
         let committed_metadata = Some(self.current_read_object_metadata(&pending.object_id)?);
@@ -22392,6 +23240,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     object_metadata: committed_metadata.clone(),
                 }),
             )?;
+        }
+
+        if !foreground_replica_repair {
+            return Ok(());
         }
 
         let repair_jobs: Vec<DistributedRepairJob> = self
@@ -22480,8 +23332,16 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     fn try_apply_committed_intent_if_ready(&mut self, intent_id: &str) -> Result<(), DfsError> {
+        self.try_apply_committed_intent_if_ready_with_repair_mode(intent_id, true)
+    }
+
+    fn try_apply_committed_intent_if_ready_with_repair_mode(
+        &mut self,
+        intent_id: &str,
+        foreground_replica_repair: bool,
+    ) -> Result<(), DfsError> {
         if self.coordinator.is_commit_ready(intent_id)? {
-            self.apply_committed_intent(intent_id)?;
+            self.apply_committed_intent_with_repair_mode(intent_id, foreground_replica_repair)?;
         }
         Ok(())
     }
@@ -22877,6 +23737,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             }
         }
         if object.current_locations.contains(replica_node_id) {
+            self.put_visible_object_in_metadata_backend(&object)?;
             return Ok(());
         }
         object.current_locations.push(replica_node_id.clone());
@@ -23010,6 +23871,65 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             }
         }
         backend.put_intent_for_object(object.as_ref(), &record)?;
+        Ok(())
+    }
+
+    fn put_metadata_intent_and_receipts(
+        &mut self,
+        intent: &DistributedWriteIntent,
+        content_hash: &str,
+        replica_node_ids: &[NodeId],
+    ) -> Result<(), DfsError> {
+        let object = self.current_object_for_write(&intent.object_id).ok();
+        for replica_node_id in replica_node_ids {
+            self.ensure_metadata_receipt_accepts(
+                &intent.object_id,
+                &intent.target_version,
+                replica_node_id,
+                content_hash,
+            )?;
+        }
+
+        let Some(backend) = self.metadata_backend.as_mut() else {
+            return Ok(());
+        };
+        let owner_node_id = self.node_id.clone();
+        let mut intent_record = write_intent_record(intent, Some(content_hash), object.clone());
+        if let Some(existing) = backend.get_intent(&intent.object_id, &intent.intent_id)? {
+            intent_record.created_at = existing.created_at;
+            let mut comparable_record = intent_record.clone();
+            comparable_record.updated_at = existing.updated_at;
+            if comparable_record == existing && replica_node_ids.is_empty() {
+                return Ok(());
+            }
+        }
+        let receipts = replica_node_ids
+            .iter()
+            .map(|replica_node_id| DfsReplicaReceiptRecord {
+                receipt: DfsWriteReceipt {
+                    file_system_id: intent.file_system_id.clone(),
+                    object_id: intent.object_id.clone(),
+                    committed_version: intent.target_version.clone(),
+                    owner_node_id: owner_node_id.clone(),
+                    event_id: EventId::generate(),
+                },
+                replica_node_id: replica_node_id.clone(),
+                content_hash: Some(content_hash.to_string()),
+                received_at: OffsetDateTime::now_utc(),
+            })
+            .collect::<Vec<_>>();
+        backend.put_intent_and_receipts_for_object(object.as_ref(), &intent_record, &receipts)?;
+        for replica_node_id in replica_node_ids {
+            match self.mark_repaired_location(
+                &intent.object_id,
+                &intent.target_version,
+                replica_node_id,
+                content_hash,
+            ) {
+                Ok(()) | Err(DfsError::UnknownObject { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
         Ok(())
     }
 
@@ -23233,6 +24153,99 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             &visible_version,
             &required_replica_node_ids,
         )?;
+        Ok(())
+    }
+
+    fn commit_remote_manifest_ready_intent_batched(
+        &mut self,
+        intent: &DistributedWriteIntent,
+        base_object: &DfsObjectMetadata,
+        content_hash: &str,
+        content_size_bytes: u64,
+    ) -> Result<(), DfsError> {
+        let trace_started = Instant::now();
+        let trace_intent_id = intent.intent_id.clone();
+        let trace_object_id = intent.object_id.clone();
+        let trace_version = intent.target_version.clone();
+        if !self.coordinator.is_commit_ready(&intent.intent_id)? {
+            return Err(DfsError::Distributed {
+                message: format!("intent {} is not ready to commit", intent.intent_id),
+            });
+        }
+        let prepare_started = Instant::now();
+        self.ensure_intent_epoch_current(intent)?;
+        let durable_nodes: BTreeSet<NodeId> = self
+            .coordinator
+            .receipts_for_intent(&intent.intent_id)
+            .into_iter()
+            .map(|receipt| receipt.replica_node_id.clone())
+            .collect();
+        let write_time = dfs_now_unix_nanos();
+        let mut committed_object = base_object.clone();
+        committed_object.version = intent.target_version.clone();
+        committed_object.content_hash = Some(content_hash.to_string());
+        committed_object.content_size_bytes = Some(content_size_bytes);
+        committed_object.modified_at_unix_nanos = write_time;
+        committed_object.changed_at_unix_nanos = write_time;
+        committed_object.last_modified_by_event_id = Some(EventId::generate());
+        committed_object.current_locations = durable_nodes.iter().cloned().collect();
+        let visible_version = object_version_record(&committed_object, Some(content_size_bytes));
+
+        let mut committed_intent = intent.clone();
+        committed_intent.state = DfsWriteIntentState::Committed;
+        let intent_record = write_intent_record(
+            &committed_intent,
+            Some(content_hash),
+            Some(committed_object.clone()),
+        );
+        let receipts = durable_nodes
+            .iter()
+            .map(|replica_node_id| DfsReplicaReceiptRecord {
+                receipt: DfsWriteReceipt {
+                    file_system_id: intent.file_system_id.clone(),
+                    object_id: intent.object_id.clone(),
+                    committed_version: intent.target_version.clone(),
+                    owner_node_id: self.node_id.clone(),
+                    event_id: EventId::generate(),
+                },
+                replica_node_id: replica_node_id.clone(),
+                content_hash: Some(content_hash.to_string()),
+                received_at: OffsetDateTime::now_utc(),
+            })
+            .collect::<Vec<_>>();
+        let prepare_ms = prepare_started.elapsed().as_millis();
+        let backend_started = Instant::now();
+        if let Some(backend) = self.metadata_backend.as_mut() {
+            backend.put_object_version_intent_and_receipts(
+                &committed_object,
+                &visible_version,
+                &intent_record,
+                &receipts,
+            )?;
+        }
+        let backend_ms = backend_started.elapsed().as_millis();
+        let coordinator_started = Instant::now();
+        self.coordinator
+            .commit_intent(&intent.intent_id)
+            .map_err(DfsError::from)?;
+        let coordinator_ms = coordinator_started.elapsed().as_millis();
+        let memory_started = Instant::now();
+        self.track_metadata_tombstone(&committed_object);
+        self.metadata.add_object(committed_object)?;
+        self.clear_active_replica_stage(&intent.object_id, &intent.target_version);
+        let memory_ms = memory_started.elapsed().as_millis();
+        dfs_perf_trace(format_args!(
+            "remote-manifest-commit-batched intent={} object={} version={} receipts={} prepare_ms={} backend_ms={} coordinator_ms={} memory_ms={} total_ms={}",
+            trace_intent_id,
+            trace_object_id,
+            trace_version,
+            receipts.len(),
+            prepare_ms,
+            backend_ms,
+            coordinator_ms,
+            memory_ms,
+            trace_started.elapsed().as_millis()
+        ));
         Ok(())
     }
 
@@ -23660,9 +24673,6 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     fn write_outcome(&self, intent_id: &str) -> Result<NetworkedDfsWriteOutcome, DfsError> {
-        if let Some(intent) = self.coordinator.intent(intent_id) {
-            return self.local_write_outcome(intent_id, intent);
-        }
         if let Some(pending) = self.pending_routed_writes.get(intent_id) {
             match &pending.result {
                 Some(Ok(outcome)) => return Ok(outcome.clone()),
@@ -23698,6 +24708,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     required_receipts: pending.required_receipts,
                 }),
             };
+        }
+        if let Some(intent) = self.coordinator.intent(intent_id) {
+            return self.local_write_outcome(intent_id, intent);
         }
         Err(DfsError::Distributed {
             message: format!("unknown intent: {intent_id}"),
@@ -23769,6 +24782,30 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     ) -> Result<bool, DfsError> {
         let frame = self.next_dfs_network_frame(target_node_id, message)?;
         match self.transport.send(target_node_id, frame) {
+            Ok(()) => Ok(true),
+            Err(NetworkError::UnknownNode { .. }) => Ok(false),
+            Err(error) => Err(DfsError::from_network(error)),
+        }
+    }
+
+    pub fn flush_detached_transport_sends(&mut self) -> Result<(), DfsError> {
+        self.transport
+            .flush_detached_sends()
+            .map_err(DfsError::from_network)
+    }
+
+    pub fn flush_deferred_content_durability(&mut self) -> Result<(), DfsError> {
+        self.content.flush_deferred_durable_dirs()?;
+        Ok(())
+    }
+
+    pub(crate) fn send_dfs_message_if_routable_detached(
+        &mut self,
+        target_node_id: &NodeId,
+        message: DfsNetworkMessage,
+    ) -> Result<bool, DfsError> {
+        let frame = self.next_dfs_network_frame(target_node_id, message)?;
+        match self.transport.send_detached(target_node_id, frame) {
             Ok(()) => Ok(true),
             Err(NetworkError::UnknownNode { .. }) => Ok(false),
             Err(error) => Err(DfsError::from_network(error)),
@@ -23964,9 +25001,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         object_metadata: Option<DfsObjectMetadata>,
     ) -> Result<StageBlobSendOutcome, DfsError> {
         if total_size_bytes <= DFS_BLOB_INLINE_LIMIT_BYTES as u64 {
-            let (_, mut reader) = self.content.open_object_version_range_stream(
-                object_id.as_str(),
-                version.as_str(),
+            let mut reader = self.open_content_hash_range_stream(
+                object_id,
+                version,
+                content_hash,
+                Some(total_size_bytes),
                 0,
                 usize::try_from(total_size_bytes).unwrap_or(usize::MAX),
             )?;
@@ -24038,9 +25077,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         object_metadata: Option<DfsObjectMetadata>,
     ) -> Result<StageBlobSendOutcome, DfsError> {
         if total_size_bytes <= DFS_BLOB_INLINE_LIMIT_BYTES as u64 {
-            let (_, mut reader) = self.content.open_object_version_range_stream(
-                object_id.as_str(),
-                version.as_str(),
+            let mut reader = self.open_content_hash_range_stream(
+                object_id,
+                version,
+                content_hash,
+                Some(total_size_bytes),
                 0,
                 usize::try_from(total_size_bytes).unwrap_or(usize::MAX),
             )?;
@@ -24133,18 +25174,14 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 ),
             }
         })?;
-        let (manifest, mut reader) = self.content.open_object_version_range_stream(
-            object_id.as_str(),
-            version.as_str(),
+        let mut reader = self.open_content_hash_range_stream(
+            object_id,
+            version,
+            content_hash,
+            Some(total_size_bytes),
             start_offset,
             range_len,
         )?;
-        if manifest.content_hash != content_hash {
-            return Err(DfsError::ContentHashMismatch {
-                expected: content_hash.to_string(),
-                actual: manifest.content_hash,
-            });
-        }
         let mut buffer = vec![0_u8; DFS_BLOB_CHUNK_BYTES];
         for chunk_index in start_chunk_index..end_chunk_index {
             let chunk_len = blob_chunk_len(total_size_bytes, chunk_index)?;

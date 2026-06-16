@@ -1,9 +1,11 @@
 use crate::error::NetworkError;
 use sinomo_object::{LengthMode, serde_ext};
+use std::collections::HashMap;
 #[cfg(test)]
 use std::io::{Read, Write};
 #[cfg(test)]
 use std::net::TcpStream;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -15,6 +17,10 @@ pub const OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL: u32 = u32::MAX;
 pub const DAEMON_CONTROL_RPC_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024 * 1024;
 #[cfg(not(target_pointer_width = "64"))]
 pub const DAEMON_CONTROL_RPC_MAX_FRAME_BYTES: usize = usize::MAX;
+pub const DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY: &str = "sinomo.daemon-control.reuse-stream";
+pub const DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE: &str = "1";
+pub const ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY: &str = "sinomo.endpoint-rpc.raw-direct";
+pub const ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE: &str = "1";
 const OBJECT_STREAM_CHUNK_FRAME_OVERHEAD_BYTES: usize = 4096;
 
 /// Timeout policy for daemon object-RPC transport.
@@ -295,6 +301,12 @@ pub struct AsyncDaemonControlStream {
     stream: tokio::net::TcpStream,
 }
 
+const ASYNC_DAEMON_CONTROL_STREAM_POOL_MAX_IDLE_PER_ADDRESS: usize = 64;
+
+static ASYNC_DAEMON_CONTROL_STREAM_POOL: LazyLock<
+    Mutex<HashMap<String, Vec<AsyncDaemonControlStream>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
 impl AsyncDaemonControlStream {
     pub fn new(stream: tokio::net::TcpStream) -> Self {
         Self { stream }
@@ -419,7 +431,77 @@ pub async fn send_daemon_control_request_async(
     timeouts: DaemonRpcTimeouts,
     max_response_bytes: usize,
 ) -> Result<DaemonControlResponse, NetworkError> {
+    if daemon_control_request_allows_stream_reuse(request) {
+        return send_reusable_daemon_control_request_async(
+            address,
+            request,
+            timeouts,
+            max_response_bytes,
+        )
+        .await;
+    }
     let mut stream = AsyncDaemonControlStream::connect_with_options(address, timeouts).await?;
+    send_daemon_control_request_on_stream_async(
+        address,
+        request,
+        timeouts,
+        max_response_bytes,
+        &mut stream,
+    )
+    .await
+}
+
+async fn send_reusable_daemon_control_request_async(
+    address: &str,
+    request: &DaemonControlRequest,
+    timeouts: DaemonRpcTimeouts,
+    max_response_bytes: usize,
+) -> Result<DaemonControlResponse, NetworkError> {
+    let (mut stream, reused) = match take_pooled_daemon_control_stream(address) {
+        Some(stream) => (stream, true),
+        None => (
+            AsyncDaemonControlStream::connect_with_options(address, timeouts).await?,
+            false,
+        ),
+    };
+    match send_daemon_control_request_on_stream_async(
+        address,
+        request,
+        timeouts,
+        max_response_bytes,
+        &mut stream,
+    )
+    .await
+    {
+        Ok(response) => {
+            return_pooled_daemon_control_stream(address, stream);
+            Ok(response)
+        }
+        Err(_) if reused => {
+            let mut stream =
+                AsyncDaemonControlStream::connect_with_options(address, timeouts).await?;
+            let response = send_daemon_control_request_on_stream_async(
+                address,
+                request,
+                timeouts,
+                max_response_bytes,
+                &mut stream,
+            )
+            .await?;
+            return_pooled_daemon_control_stream(address, stream);
+            Ok(response)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn send_daemon_control_request_on_stream_async(
+    address: &str,
+    request: &DaemonControlRequest,
+    timeouts: DaemonRpcTimeouts,
+    max_response_bytes: usize,
+    stream: &mut AsyncDaemonControlStream,
+) -> Result<DaemonControlResponse, NetworkError> {
     let frame_options = ObjectFrameIoOptions::none().with_idle_timeout(timeouts.idle_timeout);
     stream
         .write_request(address, request, frame_options)
@@ -427,6 +509,40 @@ pub async fn send_daemon_control_request_async(
     stream
         .read_response(address, max_response_bytes, frame_options)
         .await
+}
+
+fn daemon_control_request_allows_stream_reuse(request: &DaemonControlRequest) -> bool {
+    request.rpc.as_ref().is_some_and(|rpc| {
+        rpc.route == crate::CLUSTER_NETWORK_PING_ROUTE
+            || rpc.route == crate::CLUSTER_RELAY_ROUTE
+            || rpc
+                .metadata
+                .get(DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY)
+                .is_some_and(|value| {
+                    value == DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE
+                        || value.eq_ignore_ascii_case("true")
+                })
+    })
+}
+
+fn take_pooled_daemon_control_stream(address: &str) -> Option<AsyncDaemonControlStream> {
+    let mut pool = ASYNC_DAEMON_CONTROL_STREAM_POOL.lock().ok()?;
+    let streams = pool.get_mut(address)?;
+    let stream = streams.pop();
+    if streams.is_empty() {
+        pool.remove(address);
+    }
+    stream
+}
+
+fn return_pooled_daemon_control_stream(address: &str, stream: AsyncDaemonControlStream) {
+    let Ok(mut pool) = ASYNC_DAEMON_CONTROL_STREAM_POOL.lock() else {
+        return;
+    };
+    let streams = pool.entry(address.to_string()).or_default();
+    if streams.len() < ASYNC_DAEMON_CONTROL_STREAM_POOL_MAX_IDLE_PER_ADDRESS {
+        streams.push(stream);
+    }
 }
 
 fn daemon_control_timeout_detail(timeout: Duration) -> String {
@@ -1643,6 +1759,139 @@ mod serde_bytes_tests {
         .expect("control response");
 
         assert_eq!(response.body, "pong");
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn reusable_daemon_control_request_reuses_ping_route_stream() {
+        let listener = AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("listener address");
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept");
+            for expected in ["one", "two"] {
+                let request = stream
+                    .read_request(
+                        "listener",
+                        1024,
+                        ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
+                    )
+                    .await
+                    .expect("request");
+                assert_eq!(request.command, "RPC /cluster/network/ping");
+                assert_eq!(
+                    request.rpc.as_ref().map(|rpc| rpc.route.as_str()),
+                    Some(crate::CLUSTER_NETWORK_PING_ROUTE)
+                );
+                stream
+                    .write_response(
+                        "listener",
+                        &DaemonControlResponse::new(expected),
+                        ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
+                    )
+                    .await
+                    .expect("response");
+            }
+        });
+        let request = DaemonControlRequest::rpc(
+            "RPC /cluster/network/ping",
+            crate::ObjectRpcRequest {
+                route: crate::CLUSTER_NETWORK_PING_ROUTE.to_string(),
+                category: crate::CLUSTER_NETWORK_RPC_CATEGORY.to_string(),
+                metadata: std::collections::BTreeMap::new(),
+                body: Vec::new(),
+            },
+        );
+
+        let first = send_daemon_control_request_async(
+            &address,
+            &request,
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
+            1024,
+        )
+        .await
+        .expect("first response");
+        let second = send_daemon_control_request_async(
+            &address,
+            &request,
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
+            1024,
+        )
+        .await
+        .expect("second response");
+
+        assert_eq!(first.body, "one");
+        assert_eq!(second.body, "two");
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn reusable_daemon_control_request_reuses_metadata_opt_in_stream() {
+        let listener = AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("listener address");
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept");
+            for expected in ["one", "two"] {
+                let request = stream
+                    .read_request(
+                        "listener",
+                        1024,
+                        ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
+                    )
+                    .await
+                    .expect("request");
+                assert_eq!(request.command, "RPC /test/reusable");
+                assert_eq!(
+                    request.rpc.as_ref().map(|rpc| rpc.route.as_str()),
+                    Some("/test/reusable")
+                );
+                stream
+                    .write_response(
+                        "listener",
+                        &DaemonControlResponse::new(expected),
+                        ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
+                    )
+                    .await
+                    .expect("response");
+            }
+        });
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert(
+            super::DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY.to_string(),
+            super::DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE.to_string(),
+        );
+        let request = DaemonControlRequest::rpc(
+            "RPC /test/reusable",
+            crate::ObjectRpcRequest {
+                route: "/test/reusable".to_string(),
+                category: "test".to_string(),
+                metadata,
+                body: Vec::new(),
+            },
+        );
+
+        let first = send_daemon_control_request_async(
+            &address,
+            &request,
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
+            1024,
+        )
+        .await
+        .expect("first response");
+        let second = send_daemon_control_request_async(
+            &address,
+            &request,
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
+            1024,
+        )
+        .await
+        .expect("second response");
+
+        assert_eq!(first.body, "one");
+        assert_eq!(second.body, "two");
         server.await.expect("server task");
     }
 }

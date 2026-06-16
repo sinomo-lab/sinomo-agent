@@ -49,6 +49,8 @@ sinomo_runtime::test::sinomo_test_case! {
 fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let requests_per_target =
         optional_usize_parameter(ctx, "requests-per-target", DEFAULT_REQUESTS_PER_TARGET)?;
+    let warmup_requests_per_target =
+        optional_usize_parameter(ctx, "warmup-requests-per-target", requests_per_target)?;
     let concurrency = optional_usize_parameter(ctx, "concurrency", DEFAULT_CONCURRENCY)?;
     let timeout_ms = optional_u64_parameter(ctx, "timeout-ms", DEFAULT_TIMEOUT_MS)?;
     let expected_targets =
@@ -116,7 +118,10 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let prepare_started = Instant::now();
     let nonce_prefix = format!("{}-{}", current_millis(), std::process::id());
     let total_requests = target_count.saturating_mul(requests_per_target);
-    let concurrency_limit = concurrency.min(total_requests).max(1);
+    let warmup_total_requests = target_count.saturating_mul(warmup_requests_per_target);
+    let concurrency_limit = concurrency
+        .min(total_requests.max(warmup_total_requests))
+        .max(1);
     let runtime_worker_threads = network_ping_runtime_worker_threads(concurrency_limit);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(runtime_worker_threads)
@@ -126,52 +131,61 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             SinomoTestError::failed(format!("cannot create network ping runtime: {source}"))
         })?;
     let runtime_handle = runtime.handle().clone();
-    let mut jobs = Vec::with_capacity(total_requests);
-    for endpoint in targets {
-        let route_mode = route_by_target
-            .get(&endpoint.node_id)
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
-        for attempt in 0..requests_per_target {
-            let nonce = format!("ping-{nonce_prefix}-{}-{attempt}", endpoint.node_id);
-            let request = network::cluster_network_ping_rpc_request_with_response_payload(
-                &nonce,
-                payload_bytes,
-                response_payload_bytes,
-            )
-            .map_err(|source| {
-                SinomoTestError::failed(format!(
-                    "cannot prepare network ping request for {}: {source}",
-                    endpoint.node_id
-                ))
-            })?;
-            let request_auth =
-                sign_daemon_rpc_request_for_local_node(&request).map_err(|source| {
+    let build_jobs = |phase: &str,
+                      requests_per_target: usize|
+     -> Result<Vec<NetworkPingJob>, SinomoTestError> {
+        let mut jobs = Vec::with_capacity(target_count.saturating_mul(requests_per_target));
+        for endpoint in &targets {
+            let route_mode = route_by_target
+                .get(&endpoint.node_id)
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            for attempt in 0..requests_per_target {
+                let nonce = format!("ping-{phase}-{nonce_prefix}-{}-{attempt}", endpoint.node_id);
+                let request = network::cluster_network_ping_rpc_request_with_response_payload(
+                    &nonce,
+                    payload_bytes,
+                    response_payload_bytes,
+                )
+                .map_err(|source| {
                     SinomoTestError::failed(format!(
-                        "cannot sign network ping request for {}: {source}",
+                        "cannot prepare network ping request for {}: {source}",
                         endpoint.node_id
                     ))
                 })?;
-            let request_command = daemon_rpc_command(&request.route);
-            jobs.push(NetworkPingJob {
-                target_node_id: endpoint.node_id.clone(),
-                endpoint: endpoint.clone(),
-                timeout: Duration::from_millis(timeout_ms),
-                request_payload_bytes: payload_bytes,
-                response_payload_bytes,
-                nonce,
-                request,
-                request_auth,
-                request_command,
-                route_mode: route_mode.clone(),
-                runtime: runtime_handle.clone(),
-                paths: cluster_paths.clone(),
-            });
+                let request_auth =
+                    sign_daemon_rpc_request_for_local_node(&request).map_err(|source| {
+                        SinomoTestError::failed(format!(
+                            "cannot sign network ping request for {}: {source}",
+                            endpoint.node_id
+                        ))
+                    })?;
+                let request_command = daemon_rpc_command(&request.route);
+                jobs.push(NetworkPingJob {
+                    target_node_id: endpoint.node_id.clone(),
+                    endpoint: endpoint.clone(),
+                    timeout: Duration::from_millis(timeout_ms),
+                    request_payload_bytes: payload_bytes,
+                    response_payload_bytes,
+                    nonce,
+                    request,
+                    request_auth,
+                    request_command,
+                    route_mode: route_mode.clone(),
+                    runtime: runtime_handle.clone(),
+                    paths: cluster_paths.clone(),
+                });
+            }
         }
-    }
+        Ok(jobs)
+    };
+    let warmup_jobs = build_jobs("warmup", warmup_requests_per_target)?;
+    let jobs = build_jobs("measure", requests_per_target)?;
     let prepare_elapsed = prepare_started.elapsed();
     let total_requests = jobs.len();
     ctx.record("requests_per_target", requests_per_target);
+    ctx.record("warmup_requests_per_target", warmup_requests_per_target);
+    ctx.record("warmup_total_requests", warmup_jobs.len());
     ctx.record("total_requests", total_requests);
     ctx.record("concurrency", concurrency_limit);
     ctx.record("runtime_worker_threads", runtime_worker_threads);
@@ -194,6 +208,44 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         "request_prepare_requests_per_second",
         rate_per_second(total_requests as f64, prepare_elapsed),
     );
+
+    let warmup_started = Instant::now();
+    let warmup_results = if warmup_jobs.is_empty() {
+        Vec::new()
+    } else {
+        runtime.block_on(run_network_ping_jobs_async(warmup_jobs, concurrency_limit))?
+    };
+    let warmup_elapsed = warmup_started.elapsed();
+    let warmup_success_count = warmup_results
+        .iter()
+        .filter(|result| matches!(result.outcome, NetworkPingOutcome::Success))
+        .count();
+    let warmup_failures = warmup_results
+        .iter()
+        .filter_map(|result| match &result.outcome {
+            NetworkPingOutcome::Success => None,
+            NetworkPingOutcome::Failure(detail) => Some(format!(
+                "{} via {}: {}",
+                result.target_node_id, result.endpoint_address, detail
+            )),
+        })
+        .collect::<Vec<_>>();
+    ctx.record("warmup_success_count", warmup_success_count);
+    ctx.record("warmup_failure_count", warmup_failures.len());
+    ctx.record("warmup_elapsed_ms", warmup_elapsed.as_millis() as u64);
+    if !warmup_failures.is_empty() {
+        ctx.record(
+            "warmup_failure_samples",
+            warmup_failures.iter().take(12).cloned().collect::<Vec<_>>(),
+        );
+    }
+    if warmup_failures.len() > max_failures {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "network ping warmup had {}/{} failed RPCs, above allowed {max_failures}",
+            warmup_failures.len(),
+            warmup_results.len()
+        )));
+    }
 
     let started = Instant::now();
     let mut results = runtime.block_on(run_network_ping_jobs_async(jobs, concurrency_limit))?;

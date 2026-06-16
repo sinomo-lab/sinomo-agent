@@ -8,8 +8,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::{
+    Arc, LazyLock, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 
 const HASH_PREFIX: &str = "blake3:";
@@ -25,6 +28,26 @@ const PACKED_BLOB_INDEX_LOG_FILE: &str = "index.slog";
 const PACKED_BLOB_LOCK_FILE: &str = "pack.lock";
 const PACKED_BLOB_SMALL_LIMIT_BYTES: u64 = 16 * 1024;
 const PACKED_BLOB_SEGMENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const STREAMED_OBJECT_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
+
+fn content_store_perf_trace_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("SINOMO_DFS_PERF_TRACE")
+            .ok()
+            .is_some_and(|value| {
+                value == "1"
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("yes")
+            })
+    });
+    *ENABLED
+}
+
+fn content_store_perf_trace(args: std::fmt::Arguments<'_>) {
+    if content_store_perf_trace_enabled() {
+        eprintln!("[sinomo-dfs-perf] {args}");
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ContentStoreError {
@@ -372,6 +395,8 @@ pub struct ContentStoreQuotaUsage {
 pub struct LocalContentStore {
     root: PathBuf,
     quota: Option<ContentStoreQuota>,
+    stats_snapshot_active: Arc<AtomicBool>,
+    deferred_durable_blobs: Arc<Mutex<BTreeMap<PathBuf, PathBuf>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -526,6 +551,13 @@ struct PreparedSmallObjectVersion<'a> {
     manifest: ContentManifest,
     manifest_bytes: Vec<u8>,
     manifest_path: PathBuf,
+}
+
+struct StreamedObjectVersionFile {
+    path: PathBuf,
+    hash: String,
+    size_bytes: u64,
+    captured_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -808,11 +840,23 @@ impl Drop for ChunkedBlobAssembler {
 impl LocalContentStore {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        create_dir_all(root.join("blobs"))?;
+        let blobs_dir = root.join("blobs");
+        create_dir_all(blobs_dir.clone())?;
+        for shard in 0_u8..=u8::MAX {
+            create_dir_all(blobs_dir.join(format!("{shard:02x}")))?;
+        }
         create_dir_all(root.join(PACKED_BLOB_DIR).join(PACKED_BLOB_SEGMENT_DIR))?;
         create_dir_all(root.join("objects"))?;
         create_dir_all(root.join("staging"))?;
-        Ok(Self { root, quota: None })
+        let stats_snapshot_active = Arc::new(AtomicBool::new(
+            root.join(CONTENT_STORE_STATS_FILE).is_file(),
+        ));
+        Ok(Self {
+            root,
+            quota: None,
+            stats_snapshot_active,
+            deferred_durable_blobs: Arc::new(Mutex::new(BTreeMap::new())),
+        })
     }
 
     pub fn with_quota(mut self, quota: ContentStoreQuota) -> Self {
@@ -908,7 +952,7 @@ impl LocalContentStore {
             return versions
                 .into_iter()
                 .map(|(object_id, version, bytes)| {
-                    self.write_object_version(object_id, version, bytes)
+                    self.write_object_version_blob_only(object_id, version, bytes)
                 })
                 .collect();
         }
@@ -967,29 +1011,95 @@ impl LocalContentStore {
         Ok(manifests)
     }
 
+    pub fn put_object_version_blob_only(
+        &self,
+        object_id: &str,
+        version: &str,
+        bytes: &[u8],
+    ) -> Result<ContentManifest> {
+        self.write_object_version_blob_only(object_id, version, bytes)
+    }
+
+    pub fn flush_deferred_durable_dirs(&self) -> Result<()> {
+        let blobs = {
+            let mut blobs =
+                self.deferred_durable_blobs
+                    .lock()
+                    .map_err(|_| ContentStoreError::Io {
+                        path: self.root.clone(),
+                        source: io::Error::other("deferred durable blob lock is poisoned"),
+                    })?;
+            std::mem::take(&mut *blobs)
+        };
+        let mut dirs = BTreeSet::new();
+        for (blob_path, dir) in blobs {
+            let file = fs::File::open(&blob_path).map_err(|source| ContentStoreError::Io {
+                path: blob_path.clone(),
+                source,
+            })?;
+            file.sync_data().map_err(|source| ContentStoreError::Io {
+                path: blob_path,
+                source,
+            })?;
+            dirs.insert(dir);
+        }
+        for dir in dirs {
+            sync_dir(&dir)?;
+        }
+        Ok(())
+    }
+
     pub fn put_object_version_from_reader<R: Read>(
         &self,
         object_id: &str,
         version: &str,
-        mut reader: R,
+        reader: R,
     ) -> Result<ContentManifest> {
-        let staging_anchor = self.root.join("staging").join("streamed-object-version");
-        let tmp_path = temporary_path_for(&staging_anchor);
-        if let Err(error) = write_reader_to_file(&tmp_path, &mut reader) {
-            remove_file_if_exists(&tmp_path).ok();
-            return Err(error);
+        self.put_object_version_from_reader_capture(object_id, version, reader, 0)
+            .map(|(manifest, _)| manifest)
+    }
+
+    pub fn put_object_version_from_reader_capture<R: Read>(
+        &self,
+        object_id: &str,
+        version: &str,
+        reader: R,
+        capture_limit_bytes: usize,
+    ) -> Result<(ContentManifest, Option<Vec<u8>>)> {
+        let internal_capture_limit =
+            capture_limit_bytes.max(PACKED_BLOB_SMALL_LIMIT_BYTES as usize);
+        let mut streamed =
+            self.write_streamed_object_version_file(reader, internal_capture_limit)?;
+        if streamed.size_bytes <= PACKED_BLOB_SMALL_LIMIT_BYTES {
+            let bytes = streamed
+                .captured_bytes
+                .take()
+                .expect("small streamed object bytes are always captured");
+            let captured = if capture_limit_includes_size(capture_limit_bytes, streamed.size_bytes)
+            {
+                Some(bytes.clone())
+            } else {
+                None
+            };
+            let result = self.write_object_version(object_id, version, &bytes);
+            remove_file_if_exists(&streamed.path).ok();
+            return result.map(|manifest| (manifest, captured));
         }
-        if let Err(error) = self.track_staging_file_created(&tmp_path) {
-            remove_file_if_exists(&tmp_path).ok();
-            return Err(error);
-        }
-        if let Err(error) = self.ensure_quota_delta(ContentStoreQuotaDelta::default()) {
-            self.remove_tracked_staging_file_if_exists(&tmp_path).ok();
-            return Err(error);
-        }
-        let result = self.write_object_version_from_file(object_id, version, &tmp_path);
-        self.remove_tracked_staging_file_if_exists(&tmp_path).ok();
-        result
+
+        let captured = if capture_limit_includes_size(capture_limit_bytes, streamed.size_bytes) {
+            streamed.captured_bytes.take()
+        } else {
+            None
+        };
+        let result = self.write_object_version_from_verified_file(
+            object_id,
+            version,
+            &streamed.path,
+            streamed.hash,
+            streamed.size_bytes,
+        );
+        remove_file_if_exists(&streamed.path).ok();
+        result.map(|manifest| (manifest, captured))
     }
 
     pub fn begin_chunked_object_version(
@@ -2161,6 +2271,95 @@ impl LocalContentStore {
         Ok(manifest)
     }
 
+    fn write_object_version_blob_only(
+        &self,
+        object_id: &str,
+        version: &str,
+        bytes: &[u8],
+    ) -> Result<ContentManifest> {
+        let trace_started = Instant::now();
+        let hash_started = Instant::now();
+        let hash = content_hash(bytes);
+        let hash_ms = hash_started.elapsed().as_millis();
+        let manifest_check_started = Instant::now();
+        let manifest_path = self.manifest_path(object_id, version);
+        if manifest_path.is_file() {
+            let existing = decode_manifest(&read_file(&manifest_path)?)?;
+            if existing.content_hash != hash {
+                return Err(ContentStoreError::VersionHashConflict {
+                    object_id: object_id.to_owned(),
+                    version: version.to_owned(),
+                    existing_hash: existing.content_hash,
+                    new_hash: hash,
+                });
+            }
+            content_store_perf_trace(format_args!(
+                "blob-only-write object={} version={} bytes={} existing_manifest=true hash_ms={} manifest_check_ms={} total_ms={}",
+                object_id,
+                version,
+                bytes.len(),
+                hash_ms,
+                manifest_check_started.elapsed().as_millis(),
+                trace_started.elapsed().as_millis()
+            ));
+            return Ok(existing);
+        }
+        let manifest_check_ms = manifest_check_started.elapsed().as_millis();
+
+        let blob_path = self.blob_path(&hash)?;
+        let manifest = ContentManifest {
+            object_id: object_id.to_owned(),
+            version: version.to_owned(),
+            content_hash: hash,
+            size_bytes: bytes.len() as u64,
+            extents: Vec::new(),
+        };
+
+        let defer_blob_dir_sync = !self.tracks_stats_deltas();
+        let has_blob_started = Instant::now();
+        let blob_exists = if defer_blob_dir_sync {
+            false
+        } else {
+            self.has_blob(&manifest.content_hash)?
+        };
+        let has_blob_ms = has_blob_started.elapsed().as_millis();
+        let mut quota_ms = 0;
+        let mut blob_write_ms = 0;
+        if defer_blob_dir_sync {
+            let blob_write_started = Instant::now();
+            self.write_tracked_blob_bytes_prehashed_deferred_dir_sync(
+                &manifest.content_hash,
+                &blob_path,
+                bytes,
+            )?;
+            blob_write_ms = blob_write_started.elapsed().as_millis();
+        } else if !blob_exists {
+            let quota_started = Instant::now();
+            self.ensure_quota_delta(ContentStoreQuotaDelta {
+                blob_bytes: projected_file_growth(&blob_path, manifest.size_bytes)?,
+                ..ContentStoreQuotaDelta::default()
+            })?;
+            quota_ms = quota_started.elapsed().as_millis();
+            let blob_write_started = Instant::now();
+            self.write_tracked_blob_bytes_prehashed(&manifest.content_hash, &blob_path, bytes)?;
+            blob_write_ms = blob_write_started.elapsed().as_millis();
+        }
+        content_store_perf_trace(format_args!(
+            "blob-only-write object={} version={} bytes={} existing_manifest=false blob_exists={} hash_ms={} manifest_check_ms={} has_blob_ms={} quota_ms={} blob_write_ms={} total_ms={}",
+            object_id,
+            version,
+            bytes.len(),
+            blob_exists,
+            hash_ms,
+            manifest_check_ms,
+            has_blob_ms,
+            quota_ms,
+            blob_write_ms,
+            trace_started.elapsed().as_millis()
+        ));
+        Ok(manifest)
+    }
+
     fn write_small_object_versions_batch<'a>(
         &self,
         versions: &[(&'a str, &'a str, &'a [u8])],
@@ -2270,6 +2469,80 @@ impl LocalContentStore {
             hash,
             size_bytes,
         )
+    }
+
+    fn write_streamed_object_version_file<R: Read>(
+        &self,
+        mut reader: R,
+        capture_limit_bytes: usize,
+    ) -> Result<StreamedObjectVersionFile> {
+        let tmp_anchor = self.root.join("blob-tmp").join("streamed-object-version");
+        let tmp_path = temporary_path_for(&tmp_anchor);
+        let result = (|| {
+            if let Some(parent) = tmp_path.parent() {
+                create_dir_all(parent.to_owned())?;
+            }
+            let mut file = fs::File::create(&tmp_path).map_err(|source| ContentStoreError::Io {
+                path: tmp_path.clone(),
+                source,
+            })?;
+            let mut hasher = blake3::Hasher::new();
+            let mut buffer = vec![0_u8; STREAMED_OBJECT_WRITE_BUFFER_BYTES];
+            let mut size_bytes = 0_u64;
+            let mut captured_bytes = if capture_limit_bytes > 0 {
+                Some(Vec::new())
+            } else {
+                None
+            };
+            loop {
+                let read = reader
+                    .read(&mut buffer)
+                    .map_err(|source| ContentStoreError::Io {
+                        path: tmp_path.clone(),
+                        source,
+                    })?;
+                if read == 0 {
+                    break;
+                }
+                size_bytes =
+                    size_bytes
+                        .checked_add(read as u64)
+                        .ok_or_else(|| ContentStoreError::Io {
+                            path: tmp_path.clone(),
+                            source: io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "content size overflow",
+                            ),
+                        })?;
+                hasher.update(&buffer[..read]);
+                file.write_all(&buffer[..read])
+                    .map_err(|source| ContentStoreError::Io {
+                        path: tmp_path.clone(),
+                        source,
+                    })?;
+                if let Some(bytes) = captured_bytes.as_mut() {
+                    if bytes.len().saturating_add(read) <= capture_limit_bytes {
+                        bytes.extend_from_slice(&buffer[..read]);
+                    } else {
+                        captured_bytes = None;
+                    }
+                }
+            }
+            file.sync_data().map_err(|source| ContentStoreError::Io {
+                path: tmp_path.clone(),
+                source,
+            })?;
+            Ok(StreamedObjectVersionFile {
+                path: tmp_path.clone(),
+                hash: format!("{HASH_PREFIX}{}", hasher.finalize().to_hex()),
+                size_bytes,
+                captured_bytes,
+            })
+        })();
+        if result.is_err() {
+            remove_file_if_exists(&tmp_path).ok();
+        }
+        result
     }
 
     fn write_object_version_from_verified_file(
@@ -2444,7 +2717,9 @@ impl LocalContentStore {
             stats: stats.clone(),
         };
         let bytes = encode_stats_snapshot(&snapshot)?;
-        write_file_atomic(&self.stats_snapshot_path(), &bytes)
+        write_file_atomic(&self.stats_snapshot_path(), &bytes)?;
+        self.stats_snapshot_active.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     fn replace_stats_snapshot(&self, stats: &ContentStoreStats) -> Result<()> {
@@ -2454,6 +2729,9 @@ impl LocalContentStore {
 
     fn apply_stats_delta(&self, delta: ContentStoreStatsDelta) -> Result<()> {
         if delta.is_zero() {
+            return Ok(());
+        }
+        if !self.tracks_stats_deltas() {
             return Ok(());
         }
         let _lock = self.lock_stats_snapshot()?;
@@ -2467,6 +2745,10 @@ impl LocalContentStore {
         }
         let stats = self.scan_stats()?;
         self.write_stats_snapshot_unlocked(&stats)
+    }
+
+    fn tracks_stats_deltas(&self) -> bool {
+        self.quota.is_some() || self.stats_snapshot_active.load(Ordering::Relaxed)
     }
 
     fn write_tracked_blob_bytes(&self, hash: &str, blob_path: &Path, bytes: &[u8]) -> Result<()> {
@@ -2485,12 +2767,67 @@ impl LocalContentStore {
             }
             return Ok(());
         }
+        if !self.tracks_stats_deltas() {
+            return write_content_addressed_blob_bytes(hash, blob_path, bytes);
+        }
         let before_len = file_len_if_exists(blob_path)?;
-        write_file_atomic(blob_path, bytes)?;
+        write_content_addressed_blob_bytes(hash, blob_path, bytes)?;
         let after_len = file_len_if_exists(blob_path)?;
         self.apply_stats_delta(ContentStoreStatsDelta::blob_file_change(
             before_len, after_len,
         ))
+    }
+
+    fn write_tracked_blob_bytes_prehashed(
+        &self,
+        hash: &str,
+        blob_path: &Path,
+        bytes: &[u8],
+    ) -> Result<()> {
+        if bytes.len() as u64 <= PACKED_BLOB_SMALL_LIMIT_BYTES {
+            return self.write_tracked_blob_bytes(hash, blob_path, bytes);
+        }
+        if !self.tracks_stats_deltas() {
+            return write_content_addressed_blob_bytes_prehashed_existing_parent(
+                hash, blob_path, bytes,
+            );
+        }
+        let before_len = file_len_if_exists(blob_path)?;
+        write_content_addressed_blob_bytes_prehashed_existing_parent(hash, blob_path, bytes)?;
+        let after_len = file_len_if_exists(blob_path)?;
+        self.apply_stats_delta(ContentStoreStatsDelta::blob_file_change(
+            before_len, after_len,
+        ))
+    }
+
+    fn write_tracked_blob_bytes_prehashed_deferred_dir_sync(
+        &self,
+        hash: &str,
+        blob_path: &Path,
+        bytes: &[u8],
+    ) -> Result<()> {
+        if bytes.len() as u64 <= PACKED_BLOB_SMALL_LIMIT_BYTES {
+            return self.write_tracked_blob_bytes_prehashed(hash, blob_path, bytes);
+        }
+        let deferred =
+            write_content_addressed_blob_bytes_prehashed_defer_durability_existing_parent(
+                hash, blob_path, bytes,
+            )?;
+        if let Some((blob_path, sync_dir)) = deferred {
+            self.defer_durable_blob_sync(blob_path, sync_dir)?;
+        }
+        Ok(())
+    }
+
+    fn defer_durable_blob_sync(&self, blob_path: PathBuf, dir: PathBuf) -> Result<()> {
+        self.deferred_durable_blobs
+            .lock()
+            .map_err(|_| ContentStoreError::Io {
+                path: dir.clone(),
+                source: io::Error::other("deferred durable blob lock is poisoned"),
+            })?
+            .insert(blob_path, dir);
+        Ok(())
     }
 
     fn publish_tracked_file_as_blob(
@@ -2523,6 +2860,9 @@ impl LocalContentStore {
                 remove_file_if_exists(blob_path)?;
             }
             return Ok(());
+        }
+        if !self.tracks_stats_deltas() {
+            return publish_file_as_blob(source_path, blob_path, expected_hash);
         }
         let before_len = file_len_if_exists(blob_path)?;
         publish_file_as_blob(source_path, blob_path, expected_hash)?;
@@ -4314,6 +4654,10 @@ fn check_quota_limit(
     })
 }
 
+fn capture_limit_includes_size(limit_bytes: usize, size_bytes: u64) -> bool {
+    limit_bytes > 0 && size_bytes <= u64::try_from(limit_bytes).unwrap_or(u64::MAX)
+}
+
 fn remove_file(path: &Path) -> Result<()> {
     fs::remove_file(path).map_err(|source| ContentStoreError::Io {
         path: path.to_owned(),
@@ -4505,6 +4849,214 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         durable_file::DurableAtomicFileOptions::new("tmp", "tmp").sync_all(),
     )
     .map_err(content_durable_file_error)
+}
+
+fn write_content_addressed_blob_bytes(hash: &str, blob_path: &Path, bytes: &[u8]) -> Result<()> {
+    ensure_bytes_match_hash(hash, bytes)?;
+    write_content_addressed_blob_bytes_prehashed(hash, blob_path, bytes)
+}
+
+fn write_content_addressed_blob_bytes_prehashed(
+    hash: &str,
+    blob_path: &Path,
+    bytes: &[u8],
+) -> Result<()> {
+    if let Some(parent) =
+        write_content_addressed_blob_bytes_prehashed_defer_dir_sync(hash, blob_path, bytes)?
+    {
+        sync_dir(&parent)?;
+    }
+    Ok(())
+}
+
+fn write_content_addressed_blob_bytes_prehashed_existing_parent(
+    hash: &str,
+    blob_path: &Path,
+    bytes: &[u8],
+) -> Result<()> {
+    if let Some(parent) = write_content_addressed_blob_bytes_prehashed_defer_dir_sync_inner(
+        hash, blob_path, bytes, false,
+    )? {
+        sync_dir(&parent)?;
+    }
+    Ok(())
+}
+
+fn write_content_addressed_blob_bytes_prehashed_defer_dir_sync(
+    hash: &str,
+    blob_path: &Path,
+    bytes: &[u8],
+) -> Result<Option<PathBuf>> {
+    write_content_addressed_blob_bytes_prehashed_defer_dir_sync_inner(hash, blob_path, bytes, true)
+}
+
+fn write_content_addressed_blob_bytes_prehashed_defer_durability_existing_parent(
+    hash: &str,
+    blob_path: &Path,
+    bytes: &[u8],
+) -> Result<Option<(PathBuf, PathBuf)>> {
+    let trace_started = Instant::now();
+    let existing_check_started = Instant::now();
+    if blob_path.is_file() {
+        if file_content_hash(blob_path).is_ok_and(|actual| actual == hash) {
+            content_store_perf_trace(format_args!(
+                "content-addressed-blob-write hash={} bytes={} existing=true create_dir_ms=0 existing_check_ms={} total_ms={}",
+                hash,
+                bytes.len(),
+                existing_check_started.elapsed().as_millis(),
+                trace_started.elapsed().as_millis()
+            ));
+            return Ok(None);
+        }
+        remove_file_if_exists(blob_path)?;
+    }
+    let existing_check_ms = existing_check_started.elapsed().as_millis();
+
+    let write_started = Instant::now();
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(blob_path)
+    {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            if file_content_hash(blob_path).is_ok_and(|actual| actual == hash) {
+                content_store_perf_trace(format_args!(
+                    "content-addressed-blob-write hash={} bytes={} existing_race=true create_dir_ms=0 existing_check_ms={} total_ms={}",
+                    hash,
+                    bytes.len(),
+                    existing_check_ms,
+                    trace_started.elapsed().as_millis()
+                ));
+                return Ok(None);
+            }
+            remove_file_if_exists(blob_path)?;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(blob_path)
+                .map_err(|source| ContentStoreError::Io {
+                    path: blob_path.to_owned(),
+                    source,
+                })?
+        }
+        Err(source) => {
+            return Err(ContentStoreError::Io {
+                path: blob_path.to_owned(),
+                source,
+            });
+        }
+    };
+    if let Err(source) = file.write_all(bytes) {
+        drop(file);
+        remove_file_if_exists(blob_path).ok();
+        return Err(ContentStoreError::Io {
+            path: blob_path.to_owned(),
+            source,
+        });
+    }
+    drop(file);
+    let write_ms = write_started.elapsed().as_millis();
+    let Some(sync_dir) = blob_path.parent().map(Path::to_path_buf) else {
+        return Ok(None);
+    };
+    content_store_perf_trace(format_args!(
+        "content-addressed-blob-write hash={} bytes={} existing=false create_dir_ms=0 existing_check_ms={} write_ms={} sync_file_ms=deferred sync_dir_ms=deferred total_ms={}",
+        hash,
+        bytes.len(),
+        existing_check_ms,
+        write_ms,
+        trace_started.elapsed().as_millis()
+    ));
+    Ok(Some((blob_path.to_owned(), sync_dir)))
+}
+
+fn write_content_addressed_blob_bytes_prehashed_defer_dir_sync_inner(
+    hash: &str,
+    blob_path: &Path,
+    bytes: &[u8],
+    ensure_parent: bool,
+) -> Result<Option<PathBuf>> {
+    let trace_started = Instant::now();
+    let create_dir_started = Instant::now();
+    if ensure_parent && let Some(parent) = blob_path.parent() {
+        create_dir_all(parent.to_owned())?;
+    }
+    let create_dir_ms = create_dir_started.elapsed().as_millis();
+    let existing_check_started = Instant::now();
+    if blob_path.is_file() {
+        if file_content_hash(blob_path).is_ok_and(|actual| actual == hash) {
+            content_store_perf_trace(format_args!(
+                "content-addressed-blob-write hash={} bytes={} existing=true create_dir_ms={} existing_check_ms={} total_ms={}",
+                hash,
+                bytes.len(),
+                create_dir_ms,
+                existing_check_started.elapsed().as_millis(),
+                trace_started.elapsed().as_millis()
+            ));
+            return Ok(None);
+        }
+        remove_file_if_exists(blob_path)?;
+    }
+    let existing_check_ms = existing_check_started.elapsed().as_millis();
+
+    let write_sync_started = Instant::now();
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(blob_path)
+    {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            if file_content_hash(blob_path).is_ok_and(|actual| actual == hash) {
+                content_store_perf_trace(format_args!(
+                    "content-addressed-blob-write hash={} bytes={} existing_race=true create_dir_ms={} existing_check_ms={} total_ms={}",
+                    hash,
+                    bytes.len(),
+                    create_dir_ms,
+                    existing_check_ms,
+                    trace_started.elapsed().as_millis()
+                ));
+                return Ok(None);
+            }
+            remove_file_if_exists(blob_path)?;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(blob_path)
+                .map_err(|source| ContentStoreError::Io {
+                    path: blob_path.to_owned(),
+                    source,
+                })?
+        }
+        Err(source) => {
+            return Err(ContentStoreError::Io {
+                path: blob_path.to_owned(),
+                source,
+            });
+        }
+    };
+    if let Err(source) = file.write_all(bytes).and_then(|()| file.sync_data()) {
+        drop(file);
+        remove_file_if_exists(blob_path).ok();
+        return Err(ContentStoreError::Io {
+            path: blob_path.to_owned(),
+            source,
+        });
+    }
+    drop(file);
+    let write_sync_ms = write_sync_started.elapsed().as_millis();
+    let deferred_sync_dir = blob_path.parent().map(Path::to_path_buf);
+    content_store_perf_trace(format_args!(
+        "content-addressed-blob-write hash={} bytes={} existing=false create_dir_ms={} existing_check_ms={} write_sync_ms={} sync_dir_ms=deferred total_ms={}",
+        hash,
+        bytes.len(),
+        create_dir_ms,
+        existing_check_ms,
+        write_sync_ms,
+        trace_started.elapsed().as_millis()
+    ));
+    Ok(deferred_sync_dir)
 }
 
 fn write_file_create_new_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -4737,6 +5289,30 @@ mod tests {
     }
 
     #[test]
+    fn put_object_version_blob_only_large_blob_skips_manifest() {
+        let root = temp_root("put_object_version_blob_only_large_blob_skips_manifest");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let bytes = vec![0x71; PACKED_BLOB_SMALL_LIMIT_BYTES as usize + 4096];
+
+        let manifest = store
+            .put_object_version_blob_only("object-blob-only-large", "v1", &bytes)
+            .expect("put blob-only large object");
+
+        assert_eq!(
+            store
+                .read_blob(&manifest.content_hash)
+                .expect("read large blob"),
+            bytes
+        );
+        assert!(
+            store.read_manifest("object-blob-only-large", "v1").is_err(),
+            "blob-only large writes should not create per-object manifests"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn put_object_version_from_reader_streams_blob_and_manifest() {
         let root = temp_root("put_object_version_from_reader_streams_blob_and_manifest");
         let store = LocalContentStore::new(&root).expect("create store");
@@ -4766,6 +5342,55 @@ mod tests {
                 .next()
                 .is_none(),
             "streaming writes must not leave temporary staging files"
+        );
+        assert_eq!(store.stats().expect("stats").staging_bytes, 0);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn put_object_version_from_reader_capture_reuses_streamed_bytes() {
+        let root = temp_root("put_object_version_from_reader_capture_reuses_streamed_bytes");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let bytes = (0..192 * 1024 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+
+        let (manifest, captured) = store
+            .put_object_version_from_reader_capture(
+                "object-large-capture",
+                "v1",
+                bytes.as_slice(),
+                bytes.len(),
+            )
+            .expect("put object version from reader with capture");
+
+        assert_eq!(captured.as_deref(), Some(bytes.as_slice()));
+        assert_eq!(manifest.content_hash, content_hash(&bytes));
+        assert_eq!(
+            store
+                .read_manifest("object-large-capture", "v1")
+                .expect("read manifest"),
+            manifest
+        );
+        assert_eq!(
+            store.read_blob(&manifest.content_hash).expect("read blob"),
+            bytes
+        );
+        assert!(
+            std::fs::read_dir(root.join("staging"))
+                .expect("staging dir")
+                .next()
+                .is_none(),
+            "capture writes must not use the staged-write directory"
+        );
+        assert!(
+            !root.join("blob-tmp").exists()
+                || std::fs::read_dir(root.join("blob-tmp"))
+                    .expect("blob tmp dir")
+                    .next()
+                    .is_none(),
+            "capture writes must remove temporary blob files"
         );
 
         cleanup(&root);
@@ -4992,6 +5617,10 @@ mod tests {
         assert!(
             !store.stats_snapshot_path().exists(),
             "ordinary writes without quotas should not force a stats snapshot write"
+        );
+        assert!(
+            !root.join(CONTENT_STORE_STATS_LOCK_FILE).exists(),
+            "ordinary writes without quotas should not force a stats lock"
         );
 
         let initial = store.stats().expect("stats scan materializes snapshot");
