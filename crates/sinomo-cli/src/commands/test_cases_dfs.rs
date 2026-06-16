@@ -9,6 +9,9 @@
 //!   roundtrip; read-your-write must hold immediately on the writing node.
 //! - `cluster.dfs.invariants` — operational-metric sweep: no open conflicts,
 //!   no stuck routed namespace ops, no leaked cross-shard locks.
+//! - `cluster.dfs.protocol-codec-baseline` — in-memory DFS data-plane
+//!   protocol-frame/object-RPC codec throughput for representative chunk
+//!   messages, independent of disk and live network conditions.
 //! - `cluster.dfs.write` / `cluster.dfs.expect-file` / `cluster.dfs.expect-absent`
 //!   / `cluster.dfs.rename` / `cluster.dfs.remove` — parameterized probes
 //!   (`--param path=... --param payload=...`); the expect-* probes poll with a
@@ -16,23 +19,45 @@
 //! - `cluster.dfs.expect-replicated` / `cluster.dfs.damage-local-loose-blob`
 //!   — fault-injection probes used by the Docker gate to verify reads survive
 //!   one damaged durable replica.
+//! - `cluster.dfs.small-file-baseline` — node-local raw tiny-file write baseline
+//!   used to compare DFS bulk-write syscall amplification against ordinary file
+//!   creation on the same container storage path.
 //! - `cluster.dfs.bulk-write` / `cluster.dfs.bulk-expect` — deterministic bulk
 //!   write/read probes for cluster-level throughput, convergence evidence, and
 //!   steady-state process I/O accounting.
+//! - `cluster.dfs.disk-baseline` — node-local raw file write/read baseline used
+//!   to compare DFS large-object throughput against the container's current
+//!   storage path.
+//! - `cluster.dfs.large-write` / `cluster.dfs.large-expect` — deterministic
+//!   large-object throughput probes that exercise chunked transfer and read-side
+//!   no-write accounting.
 
 use crate::file_manager::FileManagerBackend;
 use crate::sifs_file_manager::SifsFileManagerBackend;
+use sinomo_runtime::dfs::{
+    self, DfsFetchBlobResponseChunk, DfsFileSystemId, DfsNetworkMessage, DfsObjectId,
+    DfsProtocolFrameCommand, DfsReadResponseChunk, DfsStageBlobChunkCommand, DfsVersion,
+    SIFS_FILE_SYSTEM_ID,
+};
 use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::network::{
+    MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrame, NetworkFrameId, ProtocolMessage,
+};
+use sinomo_runtime::node::NodeId;
 use sinomo_runtime::test::{
     SinomoTestContext, SinomoTestError, SinomoTestOutcome, SinomoTestRegistryBuilder,
     SinomoTestRequirement, SinomoTestResult,
 };
 use std::fs;
+use std::io::{Read, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_EXPECT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_BULK_FILE_COUNT: usize = 128;
 const DEFAULT_BULK_FILE_BYTES: usize = 4 * 1024;
+const DEFAULT_LARGE_FILE_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_PROTOCOL_CODEC_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_PROTOCOL_CODEC_ITERATIONS: usize = 8;
 const EXPECT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_ROUNDTRIP_BASE: &str = "/services/cluster-tests";
 
@@ -42,6 +67,7 @@ pub fn register_dfs_cluster_test_cases(
     builder
         .register(dfs_read_your_write())
         .register(dfs_invariants())
+        .register(dfs_protocol_codec_baseline())
         .register(dfs_write())
         .register(dfs_expect_file())
         .register(dfs_expect_absent())
@@ -49,8 +75,12 @@ pub fn register_dfs_cluster_test_cases(
         .register(dfs_damage_local_loose_blob())
         .register(dfs_rename())
         .register(dfs_remove())
+        .register(dfs_small_file_baseline())
         .register(dfs_bulk_write())
         .register(dfs_bulk_expect())
+        .register(dfs_disk_baseline())
+        .register(dfs_large_write())
+        .register(dfs_large_expect())
 }
 
 sinomo_runtime::test::sinomo_test_case! {
@@ -73,6 +103,18 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_invariants(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_protocol_codec_baseline(ctx) {
+        id: "cluster.dfs.protocol-codec-baseline",
+        summary: "Measure in-memory DFS protocol-frame object-RPC encode/decode throughput for chunk payloads",
+        tags: ["cluster-dfs", "probe", "performance"],
+        requirements: [],
+        run: {
+            run_protocol_codec_baseline(ctx)
         }
     }
 }
@@ -162,6 +204,18 @@ sinomo_runtime::test::sinomo_test_case! {
 }
 
 sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_small_file_baseline(ctx) {
+        id: "cluster.dfs.small-file-baseline",
+        summary: "Measure node-local raw tiny-file create/write throughput and syscall count under SINOMO_DATA_DIR",
+        tags: ["cluster-dfs", "probe", "performance"],
+        requirements: [],
+        run: {
+            run_small_file_baseline(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
     pub fn dfs_bulk_write(ctx) {
         id: "cluster.dfs.bulk-write",
         summary: "Write deterministic SIFS files and report throughput (--param base=... [--param files=N] [--param bytes=N])",
@@ -181,6 +235,42 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_bulk_expect(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_disk_baseline(ctx) {
+        id: "cluster.dfs.disk-baseline",
+        summary: "Measure node-local raw file write/read throughput under SINOMO_DATA_DIR (--param bytes=N)",
+        tags: ["cluster-dfs", "probe", "performance"],
+        requirements: [],
+        run: {
+            run_disk_baseline(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_large_write(ctx) {
+        id: "cluster.dfs.large-write",
+        summary: "Write one deterministic large SIFS file and report throughput, publish timing, and process I/O (--param path=... [--param bytes=N])",
+        tags: ["cluster-dfs", "probe", "performance"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_large_write(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_large_expect(ctx) {
+        id: "cluster.dfs.large-expect",
+        summary: "Poll one deterministic large SIFS file from this node and report convergence/read throughput and read-side process I/O (--param path=... [--param bytes=N])",
+        tags: ["cluster-dfs", "probe", "performance"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_large_expect(ctx)
         }
     }
 }
@@ -219,6 +309,152 @@ fn run_read_your_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 
     Ok(SinomoTestOutcome::passed(format!(
         "write/read/rename/delete roundtrip held read-your-write on node {node}"
+    )))
+}
+
+fn run_protocol_codec_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let bytes = optional_usize_parameter(ctx, "bytes", DEFAULT_PROTOCOL_CODEC_BYTES)?;
+    let iterations =
+        optional_usize_parameter(ctx, "iterations", DEFAULT_PROTOCOL_CODEC_ITERATIONS)?;
+    let min_encode_bytes_per_second =
+        optional_f64_parameter(ctx, "min-encode-bytes-per-second", 0.0)?;
+    let min_decode_bytes_per_second =
+        optional_f64_parameter(ctx, "min-decode-bytes-per-second", 0.0)?;
+    require_positive("bytes", bytes)?;
+    require_positive("iterations", iterations)?;
+
+    let payload = bulk_payload("dfs-protocol-codec", 0, bytes);
+    let samples = dfs_protocol_codec_samples(&payload)?;
+    let encoded_samples = samples
+        .iter()
+        .map(|sample| {
+            let request =
+                dfs::dfs_protocol_frame_rpc_request(&sample.command).map_err(|error| {
+                    SinomoTestError::failed(format!(
+                        "cannot encode {} DFS protocol frame request: {error}",
+                        sample.label
+                    ))
+                })?;
+            Ok(EncodedDfsProtocolCodecSample {
+                label: sample.label,
+                request_body_bytes: request.body.len(),
+                protocol_payload_bytes: sample.protocol_payload_bytes,
+                request,
+            })
+        })
+        .collect::<Result<Vec<_>, SinomoTestError>>()?;
+    let messages_per_iteration = encoded_samples.len();
+    let total_messages = messages_per_iteration.saturating_mul(iterations);
+    let total_payload_bytes = bytes.saturating_mul(total_messages);
+    let request_body_bytes_per_iteration = encoded_samples
+        .iter()
+        .map(|sample| sample.request_body_bytes)
+        .sum::<usize>();
+    let protocol_payload_bytes_per_iteration = encoded_samples
+        .iter()
+        .map(|sample| sample.protocol_payload_bytes)
+        .sum::<usize>();
+
+    let encode_started = Instant::now();
+    let mut encoded_request_body_bytes = 0_usize;
+    for _ in 0..iterations {
+        for sample in &samples {
+            let request =
+                dfs::dfs_protocol_frame_rpc_request(&sample.command).map_err(|error| {
+                    SinomoTestError::failed(format!(
+                        "cannot encode {} DFS protocol frame request: {error}",
+                        sample.label
+                    ))
+                })?;
+            encoded_request_body_bytes =
+                encoded_request_body_bytes.saturating_add(request.body.len());
+            std::hint::black_box(&request);
+        }
+    }
+    let encode_elapsed = encode_started.elapsed();
+
+    let decode_started = Instant::now();
+    let mut decoded_request_body_bytes = 0_usize;
+    for _ in 0..iterations {
+        for sample in &encoded_samples {
+            let decoded = sample
+                .request
+                .decode_body::<DfsProtocolFrameCommand>()
+                .map_err(|error| {
+                    SinomoTestError::failed(format!(
+                        "cannot decode {} DFS protocol frame request body: {error}",
+                        sample.label
+                    ))
+                })?;
+            let decoded_payload_bytes = decoded_dfs_protocol_payload_bytes(&decoded)?;
+            if decoded_payload_bytes != bytes {
+                return Ok(SinomoTestOutcome::failed(format!(
+                    "decoded {} DFS protocol payload had {decoded_payload_bytes} bytes, expected {bytes}",
+                    sample.label
+                )));
+            }
+            decoded_request_body_bytes =
+                decoded_request_body_bytes.saturating_add(sample.request_body_bytes);
+            std::hint::black_box(decoded);
+        }
+    }
+    let decode_elapsed = decode_started.elapsed();
+
+    let encode_bytes_per_second = rate_per_second(total_payload_bytes as f64, encode_elapsed);
+    let decode_bytes_per_second = rate_per_second(total_payload_bytes as f64, decode_elapsed);
+    let request_body_encode_bytes_per_second =
+        rate_per_second(encoded_request_body_bytes as f64, encode_elapsed);
+    let request_body_decode_bytes_per_second =
+        rate_per_second(decoded_request_body_bytes as f64, decode_elapsed);
+
+    ctx.record("payload_bytes_per_message", bytes as u64);
+    ctx.record("iterations", iterations);
+    ctx.record("messages_per_iteration", messages_per_iteration);
+    ctx.record("total_messages", total_messages);
+    ctx.record("total_payload_bytes", total_payload_bytes as u64);
+    ctx.record(
+        "request_body_bytes_per_iteration",
+        request_body_bytes_per_iteration as u64,
+    );
+    ctx.record(
+        "protocol_payload_bytes_per_iteration",
+        protocol_payload_bytes_per_iteration as u64,
+    );
+    ctx.record("encode_elapsed_ms", encode_elapsed.as_millis() as u64);
+    ctx.record("decode_elapsed_ms", decode_elapsed.as_millis() as u64);
+    ctx.record("encode_bytes_per_second", encode_bytes_per_second);
+    ctx.record("decode_bytes_per_second", decode_bytes_per_second);
+    ctx.record(
+        "request_body_encode_bytes_per_second",
+        request_body_encode_bytes_per_second,
+    );
+    ctx.record(
+        "request_body_decode_bytes_per_second",
+        request_body_decode_bytes_per_second,
+    );
+    ctx.record("min_encode_bytes_per_second", min_encode_bytes_per_second);
+    ctx.record("min_decode_bytes_per_second", min_decode_bytes_per_second);
+    ctx.record(
+        "sample_labels",
+        samples
+            .iter()
+            .map(|sample| sample.label)
+            .collect::<Vec<_>>(),
+    );
+
+    if min_encode_bytes_per_second > 0.0 && encode_bytes_per_second < min_encode_bytes_per_second {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "DFS protocol frame encode throughput {encode_bytes_per_second:.2} bytes/s is below required {min_encode_bytes_per_second:.2} bytes/s"
+        )));
+    }
+    if min_decode_bytes_per_second > 0.0 && decode_bytes_per_second < min_decode_bytes_per_second {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "DFS protocol frame decode throughput {decode_bytes_per_second:.2} bytes/s is below required {min_decode_bytes_per_second:.2} bytes/s"
+        )));
+    }
+
+    Ok(SinomoTestOutcome::passed(format!(
+        "DFS protocol codec processed {total_messages} messages of {bytes} bytes (encode {encode_bytes_per_second:.2} bytes/s, decode {decode_bytes_per_second:.2} bytes/s)"
     )))
 }
 
@@ -323,10 +559,7 @@ fn run_expect_file(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     .zip(current_proc_io())
                     .map(|(before, after)| after.saturating_delta(before))
                 {
-                    ctx.record("proc_rchar_delta", proc_io_delta.rchar);
-                    ctx.record("proc_wchar_delta", proc_io_delta.wchar);
-                    ctx.record("proc_read_bytes_delta", proc_io_delta.read_bytes);
-                    ctx.record("proc_write_bytes_delta", proc_io_delta.write_bytes);
+                    record_proc_io_delta_flat(ctx, proc_io_delta);
                     if let Some(max_proc_write_bytes) = max_proc_write_bytes
                         && proc_io_delta.write_bytes > max_proc_write_bytes
                     {
@@ -528,6 +761,49 @@ fn run_remove(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     )))
 }
 
+fn run_small_file_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let files = optional_usize_parameter(ctx, "files", DEFAULT_BULK_FILE_COUNT)?;
+    let bytes = optional_usize_parameter(ctx, "bytes", DEFAULT_BULK_FILE_BYTES)?;
+    let sync_writes = optional_bool_parameter(ctx, "sync-writes", false)?;
+    let min_files_per_second = optional_f64_parameter(ctx, "min-files-per-second", 0.0)?;
+    let max_proc_syscw_per_file = optional_f64_parameter(ctx, "max-proc-syscw-per-file", 0.0)?;
+    require_positive("files", files)?;
+    require_positive("bytes", bytes)?;
+
+    let benchmark = raw_small_file_baseline(ctx, files, bytes, sync_writes)?;
+    record_raw_small_file_baseline(ctx, &benchmark, "raw_small");
+    ctx.record("min_files_per_second", min_files_per_second);
+    ctx.record("max_proc_syscw_per_file", max_proc_syscw_per_file);
+
+    if min_files_per_second > 0.0 && benchmark.files_per_second < min_files_per_second {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "raw small-file baseline wrote {} files in {}ms ({:.2} files/s), below required {:.2} files/s",
+            benchmark.files,
+            benchmark.elapsed.as_millis(),
+            benchmark.files_per_second,
+            min_files_per_second
+        )));
+    }
+    if max_proc_syscw_per_file > 0.0
+        && benchmark.proc_syscw_per_file.unwrap_or(0.0) > max_proc_syscw_per_file
+    {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "raw small-file baseline wrote {} files with proc syscw/file {:.2}, above allowed {:.2}",
+            benchmark.files,
+            benchmark.proc_syscw_per_file.unwrap_or(0.0),
+            max_proc_syscw_per_file
+        )));
+    }
+
+    Ok(SinomoTestOutcome::passed(format!(
+        "raw small-file baseline wrote {} files in {}ms ({:.2} files/s, {:.2} syscw/file)",
+        benchmark.files,
+        benchmark.elapsed.as_millis(),
+        benchmark.files_per_second,
+        benchmark.proc_syscw_per_file.unwrap_or(0.0)
+    )))
+}
+
 fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let base = ctx
         .required_parameter("base")?
@@ -541,6 +817,7 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         optional_f64_parameter(ctx, "max-proc-wchar-amplification", 0.0)?;
     let max_proc_write_bytes_amplification =
         optional_f64_parameter(ctx, "max-proc-write-bytes-amplification", 0.0)?;
+    let max_proc_syscw_per_file = optional_f64_parameter(ctx, "max-proc-syscw-per-file", 0.0)?;
     require_positive("files", files)?;
     require_positive("bytes", bytes)?;
 
@@ -555,17 +832,24 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         || backend.create_dir_all_deferred_local_replay(&base),
         || format!("cannot create SIFS directory {base}"),
     )?;
+    let mkdir_elapsed = started.elapsed();
     let proc_io_after_mkdir = current_proc_io();
+    let batch_started = Instant::now();
     let batch = (0..files)
         .map(|index| (bulk_path(&base, index), bulk_payload(&base, index, bytes)))
         .collect::<Vec<_>>();
+    let batch_build_elapsed = batch_started.elapsed();
+    let write_started = Instant::now();
     retry_bulk_mutation(
         deadline,
-        || backend.write_files_deferred_publish(&batch),
+        || backend.write_files_with_known_parents_deferred_publish(&batch),
         || format!("cannot write SIFS bulk batch under {base}"),
     )?;
+    let write_elapsed = write_started.elapsed();
     let proc_io_after_write = current_proc_io();
+    let publish_started = Instant::now();
     backend.publish_metadata_after_mutation();
+    let publish_elapsed = publish_started.elapsed();
     let proc_io_after_publish = current_proc_io();
     let elapsed = started.elapsed();
     let proc_io_delta = proc_io_before
@@ -591,39 +875,57 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("bytes_per_file", bytes);
     ctx.record("total_bytes", total_bytes);
     ctx.record("elapsed_ms", elapsed_ms);
+    ctx.record("mkdir_elapsed_ms", mkdir_elapsed.as_millis() as u64);
+    ctx.record(
+        "batch_build_elapsed_ms",
+        batch_build_elapsed.as_millis() as u64,
+    );
+    ctx.record("write_elapsed_ms", write_elapsed.as_millis() as u64);
+    ctx.record("publish_elapsed_ms", publish_elapsed.as_millis() as u64);
     ctx.record("files_per_second", files_per_second);
     ctx.record("bytes_per_second", bytes_per_second);
+    ctx.record(
+        "data_write_bytes_per_second",
+        rate_per_second(total_bytes as f64, write_elapsed),
+    );
     ctx.record("min_files_per_second", min_files_per_second);
     ctx.record("max_proc_wchar_amplification", max_proc_wchar_amplification);
     ctx.record(
         "max_proc_write_bytes_amplification",
         max_proc_write_bytes_amplification,
     );
+    ctx.record("max_proc_syscw_per_file", max_proc_syscw_per_file);
     if let Some(proc_io_delta) = proc_io_delta {
         let proc_wchar_amplification =
             amplification_ratio(proc_io_delta.wchar, total_bytes).unwrap_or(0.0);
         let proc_write_bytes_amplification =
             amplification_ratio(proc_io_delta.write_bytes, total_bytes).unwrap_or(0.0);
-        ctx.record("proc_rchar_delta", proc_io_delta.rchar);
-        ctx.record("proc_wchar_delta", proc_io_delta.wchar);
-        ctx.record("proc_read_bytes_delta", proc_io_delta.read_bytes);
-        ctx.record("proc_write_bytes_delta", proc_io_delta.write_bytes);
+        let proc_syscw_per_file = per_file(proc_io_delta.syscw, files).unwrap_or(0.0);
+        record_proc_io_delta_flat(ctx, proc_io_delta);
         ctx.record("proc_wchar_amplification", proc_wchar_amplification);
         ctx.record(
             "proc_write_bytes_amplification",
             proc_write_bytes_amplification,
         );
+        ctx.record("proc_syscw_per_file", proc_syscw_per_file);
         if let Some(delta) = proc_io_mkdir_delta {
             ctx.record("proc_write_bytes_after_mkdir_delta", delta.write_bytes);
             ctx.record("proc_wchar_after_mkdir_delta", delta.wchar);
+            ctx.record("proc_syscw_after_mkdir_delta", delta.syscw);
         }
         if let Some(delta) = proc_io_write_delta {
             ctx.record("proc_write_bytes_bulk_write_delta", delta.write_bytes);
             ctx.record("proc_wchar_bulk_write_delta", delta.wchar);
+            ctx.record("proc_syscw_bulk_write_delta", delta.syscw);
+            ctx.record(
+                "proc_syscw_bulk_write_per_file",
+                per_file(delta.syscw, files).unwrap_or(0.0),
+            );
         }
         if let Some(delta) = proc_io_publish_delta {
             ctx.record("proc_write_bytes_publish_delta", delta.write_bytes);
             ctx.record("proc_wchar_publish_delta", delta.wchar);
+            ctx.record("proc_syscw_publish_delta", delta.syscw);
         }
         if max_proc_wchar_amplification > 0.0
             && proc_wchar_amplification > max_proc_wchar_amplification
@@ -637,6 +939,11 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         {
             return Ok(SinomoTestOutcome::failed(format!(
                 "bulk write on node {node} wrote {files} files with proc write_bytes amplification {proc_write_bytes_amplification:.2}x, above allowed {max_proc_write_bytes_amplification:.2}x"
+            )));
+        }
+        if max_proc_syscw_per_file > 0.0 && proc_syscw_per_file > max_proc_syscw_per_file {
+            return Ok(SinomoTestOutcome::failed(format!(
+                "bulk write on node {node} wrote {files} files with proc syscw/file {proc_syscw_per_file:.2}, above allowed {max_proc_syscw_per_file:.2}"
             )));
         }
     }
@@ -672,6 +979,11 @@ fn run_bulk_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let read_pool = backend
         .open_parallel_read_pool(files)
         .map_err(SinomoTestError::failed)?;
+    let expected_started = Instant::now();
+    let expected_payloads = (0..files)
+        .map(|index| bulk_payload(&base, index, bytes))
+        .collect::<Vec<_>>();
+    let expected_payload_build_elapsed = expected_started.elapsed();
     let measurement_started = Instant::now();
     let proc_io_before = current_proc_io();
     let mut matched = vec![false; files];
@@ -692,9 +1004,9 @@ fn run_bulk_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             if Instant::now() >= deadline {
                 break;
             }
-            let expected = bulk_payload(&base, index, bytes);
+            let expected = &expected_payloads[index];
             match result {
-                Ok(actual) if actual == expected => {
+                Ok(actual) if actual.as_slice() == expected.as_slice() => {
                     matched[index] = true;
                     matched_count += 1;
                 }
@@ -726,6 +1038,10 @@ fn run_bulk_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             ctx.record("read_workers", read_pool.worker_count());
             ctx.record("bytes_per_file", bytes);
             ctx.record("total_bytes", total_bytes);
+            ctx.record(
+                "expected_payload_build_elapsed_ms",
+                expected_payload_build_elapsed.as_millis() as u64,
+            );
             ctx.record("elapsed_ms", elapsed_ms);
             ctx.record("files_per_second", files_per_second);
             ctx.record("bytes_per_second", bytes_per_second);
@@ -734,10 +1050,7 @@ fn run_bulk_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 ctx.record("max_proc_write_bytes", max_proc_write_bytes);
             }
             if let Some(proc_io_delta) = proc_io_delta {
-                ctx.record("proc_rchar_delta", proc_io_delta.rchar);
-                ctx.record("proc_wchar_delta", proc_io_delta.wchar);
-                ctx.record("proc_read_bytes_delta", proc_io_delta.read_bytes);
-                ctx.record("proc_write_bytes_delta", proc_io_delta.write_bytes);
+                record_proc_io_delta_flat(ctx, proc_io_delta);
                 if let Some(max_proc_write_bytes) = max_proc_write_bytes
                     && proc_io_delta.write_bytes > max_proc_write_bytes
                 {
@@ -767,6 +1080,333 @@ fn run_bulk_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             ctx.record("last_state", &last_state);
             return Ok(SinomoTestOutcome::failed(format!(
                 "bulk expect on node {node} matched {matched_count}/{files} files under {base} within {}s: {last_state}",
+                timeout.as_secs()
+            )));
+        }
+        std::thread::sleep(EXPECT_POLL_INTERVAL);
+    }
+}
+
+fn run_disk_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let bytes = optional_usize_parameter(ctx, "bytes", DEFAULT_LARGE_FILE_BYTES)?;
+    let sync_write = optional_bool_parameter(ctx, "sync-write", true)?;
+    let min_write_bytes_per_second =
+        optional_f64_parameter(ctx, "min-write-bytes-per-second", 0.0)?;
+    let min_read_bytes_per_second = optional_f64_parameter(ctx, "min-read-bytes-per-second", 0.0)?;
+    require_positive("bytes", bytes)?;
+
+    let benchmark = raw_disk_baseline(ctx, bytes, "disk-baseline", sync_write)?;
+    record_raw_disk_baseline(ctx, &benchmark, "raw_disk");
+    ctx.record("min_write_bytes_per_second", min_write_bytes_per_second);
+    ctx.record("min_read_bytes_per_second", min_read_bytes_per_second);
+
+    if min_write_bytes_per_second > 0.0
+        && benchmark.write_bytes_per_second < min_write_bytes_per_second
+    {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "raw disk baseline wrote {} bytes in {}ms ({:.2} bytes/s), below required {:.2} bytes/s",
+            benchmark.bytes,
+            benchmark.write_elapsed.as_millis(),
+            benchmark.write_bytes_per_second,
+            min_write_bytes_per_second
+        )));
+    }
+    if min_read_bytes_per_second > 0.0
+        && benchmark.read_bytes_per_second < min_read_bytes_per_second
+    {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "raw disk baseline read {} bytes in {}ms ({:.2} bytes/s), below required {:.2} bytes/s",
+            benchmark.bytes,
+            benchmark.read_elapsed.as_millis(),
+            benchmark.read_bytes_per_second,
+            min_read_bytes_per_second
+        )));
+    }
+
+    Ok(SinomoTestOutcome::passed(format!(
+        "raw disk baseline wrote {:.2} bytes/s and read {:.2} bytes/s for {} bytes",
+        benchmark.write_bytes_per_second, benchmark.read_bytes_per_second, benchmark.bytes
+    )))
+}
+
+fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let path = ctx.required_parameter("path")?.to_string();
+    let bytes = optional_usize_parameter(ctx, "bytes", DEFAULT_LARGE_FILE_BYTES)?;
+    let timeout = expect_timeout(ctx)?;
+    let min_bytes_per_second = optional_f64_parameter(ctx, "min-bytes-per-second", 0.0)?;
+    let min_raw_write_ratio = optional_f64_parameter(ctx, "min-raw-write-ratio", 0.0)?;
+    let raw_sync_write = optional_bool_parameter(ctx, "raw-sync-write", true)?;
+    let max_proc_wchar_amplification =
+        optional_f64_parameter(ctx, "max-proc-wchar-amplification", 0.0)?;
+    let max_proc_write_bytes_amplification =
+        optional_f64_parameter(ctx, "max-proc-write-bytes-amplification", 0.0)?;
+    require_positive("bytes", bytes)?;
+
+    let payload_started = Instant::now();
+    let payload = large_payload(&path, bytes);
+    let payload_build_elapsed = payload_started.elapsed();
+    let raw_baseline = if min_raw_write_ratio > 0.0 {
+        Some(raw_disk_baseline(
+            ctx,
+            bytes,
+            &format!("large-write-{path}"),
+            raw_sync_write,
+        )?)
+    } else {
+        None
+    };
+    let backend = open_backend(ctx)?;
+    let node = backend.node_label();
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let parent = parent_probe_path(&path);
+    let mkdir_started = Instant::now();
+    if let Some(parent) = parent.as_deref() {
+        retry_bulk_mutation(
+            deadline,
+            || backend.create_dir_all_deferred_local_replay(parent),
+            || format!("cannot create SIFS parent directory {parent}"),
+        )?;
+    }
+    let mkdir_elapsed = mkdir_started.elapsed();
+    let proc_io_before = current_proc_io();
+    let write_started = Instant::now();
+    retry_bulk_mutation(
+        deadline,
+        || backend.write_file_with_known_parent_deferred_publish(&path, &payload),
+        || format!("cannot write large SIFS file {path}"),
+    )?;
+    let write_elapsed = write_started.elapsed();
+    let proc_io_after_write = current_proc_io();
+    let publish_started = Instant::now();
+    backend.publish_metadata_after_mutation();
+    let publish_elapsed = publish_started.elapsed();
+    let proc_io_after_publish = current_proc_io();
+    let elapsed = started.elapsed();
+    let total_bytes = bytes as u64;
+    let bytes_per_second = rate_per_second(total_bytes as f64, elapsed);
+    let data_write_bytes_per_second = rate_per_second(total_bytes as f64, write_elapsed);
+    let proc_io_delta = proc_io_before
+        .zip(current_proc_io())
+        .map(|(before, after)| after.saturating_delta(before));
+    let proc_io_write_delta = proc_io_before
+        .zip(proc_io_after_write)
+        .map(|(before, after)| after.saturating_delta(before));
+    let proc_io_publish_delta = proc_io_after_write
+        .zip(proc_io_after_publish)
+        .map(|(before, after)| after.saturating_delta(before));
+
+    ctx.record("node", &node);
+    ctx.record("path", &path);
+    if let Some(parent) = parent {
+        ctx.record("parent", &parent);
+    }
+    ctx.record("bytes", total_bytes);
+    ctx.record(
+        "payload_build_elapsed_ms",
+        payload_build_elapsed.as_millis() as u64,
+    );
+    ctx.record("elapsed_ms", elapsed.as_millis() as u64);
+    ctx.record("mkdir_elapsed_ms", mkdir_elapsed.as_millis() as u64);
+    ctx.record("write_elapsed_ms", write_elapsed.as_millis() as u64);
+    ctx.record("publish_elapsed_ms", publish_elapsed.as_millis() as u64);
+    ctx.record("bytes_per_second", bytes_per_second);
+    ctx.record("data_write_bytes_per_second", data_write_bytes_per_second);
+    ctx.record("min_bytes_per_second", min_bytes_per_second);
+    ctx.record("min_raw_write_ratio", min_raw_write_ratio);
+    if let Some(raw_baseline) = raw_baseline.as_ref() {
+        record_raw_disk_baseline(ctx, raw_baseline, "raw_disk");
+        ctx.record(
+            "raw_write_ratio",
+            ratio(
+                data_write_bytes_per_second,
+                raw_baseline.write_bytes_per_second,
+            )
+            .unwrap_or(0.0),
+        );
+    }
+    ctx.record("max_proc_wchar_amplification", max_proc_wchar_amplification);
+    ctx.record(
+        "max_proc_write_bytes_amplification",
+        max_proc_write_bytes_amplification,
+    );
+    if let Some(proc_io_delta) = proc_io_delta {
+        let proc_wchar_amplification =
+            amplification_ratio(proc_io_delta.wchar, total_bytes).unwrap_or(0.0);
+        let proc_write_bytes_amplification =
+            amplification_ratio(proc_io_delta.write_bytes, total_bytes).unwrap_or(0.0);
+        record_proc_io_delta_flat(ctx, proc_io_delta);
+        ctx.record("proc_wchar_amplification", proc_wchar_amplification);
+        ctx.record(
+            "proc_write_bytes_amplification",
+            proc_write_bytes_amplification,
+        );
+        if let Some(delta) = proc_io_write_delta {
+            ctx.record("proc_write_bytes_data_write_delta", delta.write_bytes);
+            ctx.record("proc_wchar_data_write_delta", delta.wchar);
+            ctx.record("proc_syscw_data_write_delta", delta.syscw);
+        }
+        if let Some(delta) = proc_io_publish_delta {
+            ctx.record("proc_write_bytes_publish_delta", delta.write_bytes);
+            ctx.record("proc_wchar_publish_delta", delta.wchar);
+            ctx.record("proc_syscw_publish_delta", delta.syscw);
+        }
+        if max_proc_wchar_amplification > 0.0
+            && proc_wchar_amplification > max_proc_wchar_amplification
+        {
+            return Ok(SinomoTestOutcome::failed(format!(
+                "large write on node {node} wrote {total_bytes} bytes with proc wchar amplification {proc_wchar_amplification:.2}x, above allowed {max_proc_wchar_amplification:.2}x"
+            )));
+        }
+        if max_proc_write_bytes_amplification > 0.0
+            && proc_write_bytes_amplification > max_proc_write_bytes_amplification
+        {
+            return Ok(SinomoTestOutcome::failed(format!(
+                "large write on node {node} wrote {total_bytes} bytes with proc write_bytes amplification {proc_write_bytes_amplification:.2}x, above allowed {max_proc_write_bytes_amplification:.2}x"
+            )));
+        }
+    }
+
+    if min_bytes_per_second > 0.0 && data_write_bytes_per_second < min_bytes_per_second {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "large write on node {node} wrote {total_bytes} bytes in {}ms ({data_write_bytes_per_second:.2} bytes/s), below required {min_bytes_per_second:.2} bytes/s",
+            write_elapsed.as_millis()
+        )));
+    }
+    if let Some(raw_baseline) = raw_baseline.as_ref()
+        && min_raw_write_ratio > 0.0
+    {
+        let raw_ratio = ratio(
+            data_write_bytes_per_second,
+            raw_baseline.write_bytes_per_second,
+        )
+        .unwrap_or(0.0);
+        if raw_ratio < min_raw_write_ratio {
+            return Ok(SinomoTestOutcome::failed(format!(
+                "large write on node {node} wrote {total_bytes} bytes at {data_write_bytes_per_second:.2} bytes/s, {raw_ratio:.2}x raw disk write baseline, below required {min_raw_write_ratio:.2}x"
+            )));
+        }
+    }
+
+    Ok(SinomoTestOutcome::passed(format!(
+        "large write on node {node} wrote {total_bytes} bytes in {}ms ({data_write_bytes_per_second:.2} bytes/s)",
+        write_elapsed.as_millis()
+    )))
+}
+
+fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let path = ctx.required_parameter("path")?.to_string();
+    let bytes = optional_usize_parameter(ctx, "bytes", DEFAULT_LARGE_FILE_BYTES)?;
+    let timeout = expect_timeout(ctx)?;
+    let min_bytes_per_second = optional_f64_parameter(ctx, "min-bytes-per-second", 0.0)?;
+    let min_raw_read_ratio = optional_f64_parameter(ctx, "min-raw-read-ratio", 0.0)?;
+    let raw_sync_write = optional_bool_parameter(ctx, "raw-sync-write", true)?;
+    let max_proc_write_bytes = optional_u64_parameter(ctx, "max-proc-write-bytes")?;
+    require_positive("bytes", bytes)?;
+
+    let payload_started = Instant::now();
+    let expected = large_payload(&path, bytes);
+    let payload_build_elapsed = payload_started.elapsed();
+    let raw_baseline = if min_raw_read_ratio > 0.0 {
+        Some(raw_disk_baseline(
+            ctx,
+            bytes,
+            &format!("large-expect-{path}"),
+            raw_sync_write,
+        )?)
+    } else {
+        None
+    };
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let backend = open_read_only_backend_until(ctx, deadline)?;
+    let node = backend.node_label();
+    let measurement_started = Instant::now();
+    let proc_io_before = current_proc_io();
+    let mut last_state: String;
+
+    loop {
+        match backend.read_file(&path) {
+            Ok(actual) if actual.as_slice() == expected.as_slice() => {
+                let elapsed = measurement_started.elapsed();
+                let elapsed_ms = elapsed.as_millis() as u64;
+                let total_bytes = bytes as u64;
+                let bytes_per_second = rate_per_second(total_bytes as f64, elapsed);
+                let proc_io_delta = proc_io_before
+                    .zip(current_proc_io())
+                    .map(|(before, after)| after.saturating_delta(before));
+                ctx.record("node", &node);
+                ctx.record("path", &path);
+                ctx.record("bytes", total_bytes);
+                ctx.record(
+                    "expected_payload_build_elapsed_ms",
+                    payload_build_elapsed.as_millis() as u64,
+                );
+                ctx.record("elapsed_ms", elapsed_ms);
+                ctx.record("bytes_per_second", bytes_per_second);
+                ctx.record("min_bytes_per_second", min_bytes_per_second);
+                ctx.record("min_raw_read_ratio", min_raw_read_ratio);
+                if let Some(raw_baseline) = raw_baseline.as_ref() {
+                    record_raw_disk_baseline(ctx, raw_baseline, "raw_disk");
+                    ctx.record(
+                        "raw_read_ratio",
+                        ratio(bytes_per_second, raw_baseline.read_bytes_per_second).unwrap_or(0.0),
+                    );
+                }
+                if let Some(max_proc_write_bytes) = max_proc_write_bytes {
+                    ctx.record("max_proc_write_bytes", max_proc_write_bytes);
+                }
+                if let Some(proc_io_delta) = proc_io_delta {
+                    record_proc_io_delta_flat(ctx, proc_io_delta);
+                    if let Some(max_proc_write_bytes) = max_proc_write_bytes
+                        && proc_io_delta.write_bytes > max_proc_write_bytes
+                    {
+                        return Ok(SinomoTestOutcome::failed(format!(
+                            "large expect on node {node} read {total_bytes} bytes with proc write_bytes delta {}, above allowed {max_proc_write_bytes}",
+                            proc_io_delta.write_bytes
+                        )));
+                    }
+                }
+
+                if min_bytes_per_second > 0.0 && bytes_per_second < min_bytes_per_second {
+                    return Ok(SinomoTestOutcome::failed(format!(
+                        "large expect on node {node} read {total_bytes} bytes in {elapsed_ms}ms ({bytes_per_second:.2} bytes/s), below required {min_bytes_per_second:.2} bytes/s"
+                    )));
+                }
+                if let Some(raw_baseline) = raw_baseline.as_ref()
+                    && min_raw_read_ratio > 0.0
+                {
+                    let raw_ratio =
+                        ratio(bytes_per_second, raw_baseline.read_bytes_per_second).unwrap_or(0.0);
+                    if raw_ratio < min_raw_read_ratio {
+                        return Ok(SinomoTestOutcome::failed(format!(
+                            "large expect on node {node} read {total_bytes} bytes at {bytes_per_second:.2} bytes/s, {raw_ratio:.2}x raw disk read baseline, below required {min_raw_read_ratio:.2}x"
+                        )));
+                    }
+                }
+                return Ok(SinomoTestOutcome::passed(format!(
+                    "large expect on node {node} read {total_bytes} bytes in {elapsed_ms}ms ({bytes_per_second:.2} bytes/s)"
+                )));
+            }
+            Ok(actual) => {
+                last_state = format!(
+                    "{path} content mismatch ({} bytes, expected {})",
+                    actual.len(),
+                    expected.len()
+                );
+            }
+            Err(error) => {
+                last_state = format!("{path}: {error}");
+            }
+        }
+
+        if Instant::now() >= deadline {
+            ctx.record("node", &node);
+            ctx.record("path", &path);
+            ctx.record("bytes", bytes as u64);
+            ctx.record("last_state", &last_state);
+            return Ok(SinomoTestOutcome::failed(format!(
+                "large expect on node {node} did not read matching {bytes} byte file at {path} within {}s: {last_state}",
                 timeout.as_secs()
             )));
         }
@@ -842,6 +1482,157 @@ where
     }
 }
 
+struct DfsProtocolCodecSample {
+    label: &'static str,
+    command: DfsProtocolFrameCommand,
+    protocol_payload_bytes: usize,
+}
+
+struct EncodedDfsProtocolCodecSample {
+    label: &'static str,
+    request: sinomo_runtime::network::ObjectRpcRequest,
+    request_body_bytes: usize,
+    protocol_payload_bytes: usize,
+}
+
+fn dfs_protocol_codec_samples(
+    payload: &[u8],
+) -> Result<Vec<DfsProtocolCodecSample>, SinomoTestError> {
+    let source_node_id = NodeId::from_legacy_named("dfs_codec_source").expect("source node id");
+    let target_node_id = NodeId::from_legacy_named("dfs_codec_target").expect("target node id");
+    let file_system_id =
+        DfsFileSystemId::from_legacy_named(SIFS_FILE_SYSTEM_ID).expect("filesystem id");
+    let object_id = DfsObjectId::from_legacy_named("dfs_codec_object").expect("object id");
+    let version = DfsVersion::from_legacy_named("dfs_codec_version").expect("version id");
+    let total_size_bytes = payload.len() as u64;
+
+    Ok(vec![
+        dfs_protocol_codec_sample(
+            "stage-blob-chunk",
+            1,
+            1,
+            &source_node_id,
+            &target_node_id,
+            DfsNetworkMessage::StageBlobChunk(DfsStageBlobChunkCommand {
+                request_id: "dfs-codec-stage".to_string(),
+                intent_id: "dfs-codec-intent".to_string(),
+                file_system_id: file_system_id.clone(),
+                object_id: object_id.clone(),
+                expected_base_version: None,
+                version: version.clone(),
+                content_hash: "dfs-codec-hash".to_string(),
+                total_size_bytes,
+                chunk_index: 0,
+                total_chunks: 1,
+                chunk_hash: None,
+                bytes: payload.to_vec(),
+                object_metadata: None,
+            }),
+        )?,
+        dfs_protocol_codec_sample(
+            "read-response-chunk",
+            2,
+            2,
+            &target_node_id,
+            &source_node_id,
+            DfsNetworkMessage::ReadResponseChunk(DfsReadResponseChunk {
+                request_id: "dfs-codec-read".to_string(),
+                object_id: object_id.clone(),
+                version: version.clone(),
+                content_hash: Some("dfs-codec-hash".to_string()),
+                range_offset: None,
+                object_total_size_bytes: None,
+                total_size_bytes,
+                chunk_index: 0,
+                total_chunks: 1,
+                chunk_hash: None,
+                bytes: payload.to_vec(),
+            }),
+        )?,
+        dfs_protocol_codec_sample(
+            "fetch-blob-response-chunk",
+            3,
+            3,
+            &target_node_id,
+            &source_node_id,
+            DfsNetworkMessage::FetchBlobResponseChunk(DfsFetchBlobResponseChunk {
+                request_id: "dfs-codec-fetch".to_string(),
+                intent_id: "dfs-codec-intent".to_string(),
+                object_id,
+                version,
+                source_node_id: target_node_id.clone(),
+                content_hash: "dfs-codec-hash".to_string(),
+                total_size_bytes,
+                chunk_index: 0,
+                total_chunks: 1,
+                chunk_hash: None,
+                bytes: payload.to_vec(),
+            }),
+        )?,
+    ])
+}
+
+fn dfs_protocol_codec_sample(
+    label: &'static str,
+    frame_id: u64,
+    message_id: u64,
+    source_node_id: &NodeId,
+    target_node_id: &NodeId,
+    message: DfsNetworkMessage,
+) -> Result<DfsProtocolCodecSample, SinomoTestError> {
+    let protocol_message =
+        ProtocolMessage::encode(dfs::DFS_PROTOCOL, &message).map_err(|error| {
+            SinomoTestError::failed(format!(
+                "cannot encode {label} DFS protocol message: {error}"
+            ))
+        })?;
+    let protocol_payload_bytes = protocol_message.payload.len();
+    let frame = NetworkFrame {
+        frame_id: NetworkFrameId(frame_id),
+        source_node_id: source_node_id.clone(),
+        target_node_id: target_node_id.clone(),
+        message: MeshMessage {
+            message_id: MeshMessageId(message_id),
+            origin_node_id: source_node_id.clone(),
+            target_node_id: target_node_id.clone(),
+            body: MeshMessageBody::Protocol(protocol_message),
+        },
+    };
+    Ok(DfsProtocolCodecSample {
+        label,
+        command: DfsProtocolFrameCommand {
+            request_id: format!("dfs-codec-{label}-{frame_id}"),
+            frame,
+        },
+        protocol_payload_bytes,
+    })
+}
+
+fn decoded_dfs_protocol_payload_bytes(
+    command: &DfsProtocolFrameCommand,
+) -> Result<usize, SinomoTestError> {
+    let MeshMessageBody::Protocol(protocol_message) = &command.frame.message.body else {
+        return Err(SinomoTestError::failed(
+            "decoded DFS protocol frame was not a protocol message",
+        ));
+    };
+    let message = protocol_message
+        .decode::<DfsNetworkMessage>()
+        .map_err(|error| {
+            SinomoTestError::failed(format!(
+                "cannot decode nested DFS protocol message: {error}"
+            ))
+        })?;
+    match message {
+        DfsNetworkMessage::StageBlobChunk(command) => Ok(command.bytes.len()),
+        DfsNetworkMessage::ReadResponseChunk(command) => Ok(command.bytes.len()),
+        DfsNetworkMessage::FetchBlobResponseChunk(command) => Ok(command.bytes.len()),
+        other => Err(SinomoTestError::failed(format!(
+            "decoded unexpected DFS protocol message variant: {other:?}"
+        ))),
+    }
+}
+
 fn expect_timeout(ctx: &SinomoTestContext) -> Result<Duration, SinomoTestError> {
     let seconds = match ctx.parameter("timeout-seconds") {
         Some(raw) => raw.trim().parse::<u64>().map_err(|_| {
@@ -886,6 +1677,24 @@ fn optional_f64_parameter(
                     detail: source.to_string(),
                 })
         }
+        None => Ok(default),
+    }
+}
+
+fn optional_bool_parameter(
+    ctx: &SinomoTestContext,
+    key: &str,
+    default: bool,
+) -> Result<bool, SinomoTestError> {
+    match ctx.parameter(key) {
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            other => Err(SinomoTestError::InvalidParameter {
+                name: key.to_string(),
+                detail: format!("expected boolean, got {other}"),
+            }),
+        },
         None => Ok(default),
     }
 }
@@ -959,6 +1768,336 @@ fn bulk_payload(base: &str, index: usize, bytes: usize) -> Vec<u8> {
     payload
 }
 
+fn large_payload(path: &str, bytes: usize) -> Vec<u8> {
+    pattern_payload(&format!("{path}|sinomo-dfs-large"), bytes)
+}
+
+#[derive(Clone, Debug)]
+struct RawSmallFileBaseline {
+    root: String,
+    files: usize,
+    bytes_per_file: usize,
+    total_bytes: u64,
+    sync_writes: bool,
+    batch_build_elapsed: Duration,
+    elapsed: Duration,
+    files_per_second: f64,
+    bytes_per_second: f64,
+    proc_io_delta: Option<ProcIoSample>,
+    proc_syscw_per_file: Option<f64>,
+}
+
+fn raw_small_file_baseline(
+    ctx: &SinomoTestContext,
+    files: usize,
+    bytes: usize,
+    sync_writes: bool,
+) -> Result<RawSmallFileBaseline, SinomoTestError> {
+    require_positive("files", files)?;
+    require_positive("bytes", bytes)?;
+    let root = ctx
+        .data_dir()
+        .join("test-artifacts")
+        .join("dfs-small-file-baseline")
+        .join(probe_nonce());
+    fs::create_dir_all(&root).map_err(|source| {
+        SinomoTestError::failed(format!(
+            "cannot create raw small-file baseline directory {}: {source}",
+            root.display()
+        ))
+    })?;
+    let batch_started = Instant::now();
+    let batch = (0..files)
+        .map(|index| {
+            (
+                root.join(format!("raw-{index:06}.bin")),
+                bulk_payload("raw-small-file-baseline", index, bytes),
+            )
+        })
+        .collect::<Vec<_>>();
+    let batch_build_elapsed = batch_started.elapsed();
+    let proc_io_before = current_proc_io();
+    let started = Instant::now();
+    for (path, payload) in &batch {
+        let mut file = fs::File::create(path).map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot create raw small-file baseline file {}: {source}",
+                path.display()
+            ))
+        })?;
+        file.write_all(payload).map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot write raw small-file baseline file {}: {source}",
+                path.display()
+            ))
+        })?;
+        if sync_writes {
+            file.sync_all().map_err(|source| {
+                SinomoTestError::failed(format!(
+                    "cannot sync raw small-file baseline file {}: {source}",
+                    path.display()
+                ))
+            })?;
+        }
+    }
+    let elapsed = started.elapsed();
+    let proc_io_delta = proc_io_before
+        .zip(current_proc_io())
+        .map(|(before, after)| after.saturating_delta(before));
+    fs::remove_dir_all(&root).map_err(|source| {
+        SinomoTestError::failed(format!(
+            "cannot remove raw small-file baseline directory {}: {source}",
+            root.display()
+        ))
+    })?;
+
+    let total_bytes = (files as u64).saturating_mul(bytes as u64);
+    Ok(RawSmallFileBaseline {
+        root: root.display().to_string(),
+        files,
+        bytes_per_file: bytes,
+        total_bytes,
+        sync_writes,
+        batch_build_elapsed,
+        elapsed,
+        files_per_second: rate_per_second(files as f64, elapsed),
+        bytes_per_second: rate_per_second(total_bytes as f64, elapsed),
+        proc_io_delta,
+        proc_syscw_per_file: proc_io_delta.and_then(|delta| per_file(delta.syscw, files)),
+    })
+}
+
+fn record_raw_small_file_baseline(
+    ctx: &mut SinomoTestContext,
+    baseline: &RawSmallFileBaseline,
+    prefix: &str,
+) {
+    ctx.record(format!("{prefix}_root"), &baseline.root);
+    ctx.record(format!("{prefix}_files"), baseline.files);
+    ctx.record(format!("{prefix}_bytes_per_file"), baseline.bytes_per_file);
+    ctx.record(format!("{prefix}_total_bytes"), baseline.total_bytes);
+    ctx.record(format!("{prefix}_sync_writes"), baseline.sync_writes);
+    ctx.record(
+        format!("{prefix}_batch_build_elapsed_ms"),
+        baseline.batch_build_elapsed.as_millis() as u64,
+    );
+    ctx.record(
+        format!("{prefix}_elapsed_ms"),
+        baseline.elapsed.as_millis() as u64,
+    );
+    ctx.record(
+        format!("{prefix}_files_per_second"),
+        baseline.files_per_second,
+    );
+    ctx.record(
+        format!("{prefix}_bytes_per_second"),
+        baseline.bytes_per_second,
+    );
+    if let Some(delta) = baseline.proc_io_delta {
+        record_proc_io_delta(ctx, prefix, "write", delta);
+    }
+    if let Some(syscw_per_file) = baseline.proc_syscw_per_file {
+        ctx.record(format!("{prefix}_proc_syscw_per_file"), syscw_per_file);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RawDiskBaseline {
+    path: String,
+    bytes: u64,
+    sync_write: bool,
+    payload_build_elapsed: Duration,
+    write_elapsed: Duration,
+    read_elapsed: Duration,
+    write_bytes_per_second: f64,
+    read_bytes_per_second: f64,
+    write_proc_io_delta: Option<ProcIoSample>,
+    read_proc_io_delta: Option<ProcIoSample>,
+}
+
+fn raw_disk_baseline(
+    ctx: &SinomoTestContext,
+    bytes: usize,
+    seed: &str,
+    sync_write: bool,
+) -> Result<RawDiskBaseline, SinomoTestError> {
+    require_positive("bytes", bytes)?;
+    let root = ctx
+        .data_dir()
+        .join("test-artifacts")
+        .join("dfs-disk-baseline");
+    fs::create_dir_all(&root).map_err(|source| {
+        SinomoTestError::failed(format!(
+            "cannot create raw disk baseline directory {}: {source}",
+            root.display()
+        ))
+    })?;
+    let path = root.join(format!("baseline-{}.bin", probe_nonce()));
+    let payload_started = Instant::now();
+    let payload = pattern_payload(seed, bytes);
+    let payload_build_elapsed = payload_started.elapsed();
+
+    let write_proc_before = current_proc_io();
+    let write_started = Instant::now();
+    {
+        let mut file = fs::File::create(&path).map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot create raw disk baseline file {}: {source}",
+                path.display()
+            ))
+        })?;
+        file.write_all(&payload).map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot write raw disk baseline file {}: {source}",
+                path.display()
+            ))
+        })?;
+        if sync_write {
+            file.sync_all().map_err(|source| {
+                SinomoTestError::failed(format!(
+                    "cannot sync raw disk baseline file {}: {source}",
+                    path.display()
+                ))
+            })?;
+        }
+    }
+    let write_elapsed = write_started.elapsed();
+    let write_proc_after = current_proc_io();
+
+    let read_proc_before = current_proc_io();
+    let read_started = Instant::now();
+    let mut actual = Vec::with_capacity(bytes);
+    {
+        let mut file = fs::File::open(&path).map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot open raw disk baseline file {}: {source}",
+                path.display()
+            ))
+        })?;
+        file.read_to_end(&mut actual).map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot read raw disk baseline file {}: {source}",
+                path.display()
+            ))
+        })?;
+    }
+    let read_elapsed = read_started.elapsed();
+    let read_proc_after = current_proc_io();
+    if actual != payload {
+        let _ = fs::remove_file(&path);
+        return Err(SinomoTestError::failed(format!(
+            "raw disk baseline file {} read back {} bytes, expected {} bytes",
+            path.display(),
+            actual.len(),
+            payload.len()
+        )));
+    }
+    let cleanup_result = fs::remove_file(&path);
+    if let Err(source) = cleanup_result {
+        return Err(SinomoTestError::failed(format!(
+            "cannot remove raw disk baseline file {}: {source}",
+            path.display()
+        )));
+    }
+
+    let total_bytes = bytes as u64;
+    Ok(RawDiskBaseline {
+        path: path.display().to_string(),
+        bytes: total_bytes,
+        sync_write,
+        payload_build_elapsed,
+        write_elapsed,
+        read_elapsed,
+        write_bytes_per_second: rate_per_second(total_bytes as f64, write_elapsed),
+        read_bytes_per_second: rate_per_second(total_bytes as f64, read_elapsed),
+        write_proc_io_delta: write_proc_before
+            .zip(write_proc_after)
+            .map(|(before, after)| after.saturating_delta(before)),
+        read_proc_io_delta: read_proc_before
+            .zip(read_proc_after)
+            .map(|(before, after)| after.saturating_delta(before)),
+    })
+}
+
+fn record_raw_disk_baseline(ctx: &mut SinomoTestContext, baseline: &RawDiskBaseline, prefix: &str) {
+    ctx.record(format!("{prefix}_path"), &baseline.path);
+    ctx.record(format!("{prefix}_bytes"), baseline.bytes);
+    ctx.record(format!("{prefix}_sync_write"), baseline.sync_write);
+    ctx.record(
+        format!("{prefix}_payload_build_elapsed_ms"),
+        baseline.payload_build_elapsed.as_millis() as u64,
+    );
+    ctx.record(
+        format!("{prefix}_write_elapsed_ms"),
+        baseline.write_elapsed.as_millis() as u64,
+    );
+    ctx.record(
+        format!("{prefix}_read_elapsed_ms"),
+        baseline.read_elapsed.as_millis() as u64,
+    );
+    ctx.record(
+        format!("{prefix}_write_bytes_per_second"),
+        baseline.write_bytes_per_second,
+    );
+    ctx.record(
+        format!("{prefix}_read_bytes_per_second"),
+        baseline.read_bytes_per_second,
+    );
+    if let Some(delta) = baseline.write_proc_io_delta {
+        record_proc_io_delta(ctx, prefix, "write", delta);
+    }
+    if let Some(delta) = baseline.read_proc_io_delta {
+        record_proc_io_delta(ctx, prefix, "read", delta);
+    }
+}
+
+fn record_proc_io_delta(
+    ctx: &mut SinomoTestContext,
+    prefix: &str,
+    phase: &str,
+    delta: ProcIoSample,
+) {
+    ctx.record(format!("{prefix}_{phase}_proc_rchar_delta"), delta.rchar);
+    ctx.record(format!("{prefix}_{phase}_proc_wchar_delta"), delta.wchar);
+    ctx.record(format!("{prefix}_{phase}_proc_syscr_delta"), delta.syscr);
+    ctx.record(format!("{prefix}_{phase}_proc_syscw_delta"), delta.syscw);
+    ctx.record(
+        format!("{prefix}_{phase}_proc_read_bytes_delta"),
+        delta.read_bytes,
+    );
+    ctx.record(
+        format!("{prefix}_{phase}_proc_write_bytes_delta"),
+        delta.write_bytes,
+    );
+    ctx.record(
+        format!("{prefix}_{phase}_proc_cancelled_write_bytes_delta"),
+        delta.cancelled_write_bytes,
+    );
+}
+
+fn record_proc_io_delta_flat(ctx: &mut SinomoTestContext, delta: ProcIoSample) {
+    ctx.record("proc_rchar_delta", delta.rchar);
+    ctx.record("proc_wchar_delta", delta.wchar);
+    ctx.record("proc_syscr_delta", delta.syscr);
+    ctx.record("proc_syscw_delta", delta.syscw);
+    ctx.record("proc_read_bytes_delta", delta.read_bytes);
+    ctx.record("proc_write_bytes_delta", delta.write_bytes);
+    ctx.record(
+        "proc_cancelled_write_bytes_delta",
+        delta.cancelled_write_bytes,
+    );
+}
+
+fn parent_probe_path(path: &str) -> Option<String> {
+    let path = path.trim_end_matches('/');
+    let slash = path.rfind('/')?;
+    if slash == 0 {
+        Some("/".to_string())
+    } else {
+        Some(path[..slash].to_string())
+    }
+}
+
 fn rate_per_second(count: f64, elapsed: Duration) -> f64 {
     let seconds = elapsed.as_secs_f64();
     if seconds <= f64::EPSILON {
@@ -971,8 +2110,11 @@ fn rate_per_second(count: f64, elapsed: Duration) -> f64 {
 struct ProcIoSample {
     rchar: u64,
     wchar: u64,
+    syscr: u64,
+    syscw: u64,
     read_bytes: u64,
     write_bytes: u64,
+    cancelled_write_bytes: u64,
 }
 
 impl ProcIoSample {
@@ -980,8 +2122,13 @@ impl ProcIoSample {
         Self {
             rchar: self.rchar.saturating_sub(before.rchar),
             wchar: self.wchar.saturating_sub(before.wchar),
+            syscr: self.syscr.saturating_sub(before.syscr),
+            syscw: self.syscw.saturating_sub(before.syscw),
             read_bytes: self.read_bytes.saturating_sub(before.read_bytes),
             write_bytes: self.write_bytes.saturating_sub(before.write_bytes),
+            cancelled_write_bytes: self
+                .cancelled_write_bytes
+                .saturating_sub(before.cancelled_write_bytes),
         }
     }
 }
@@ -995,8 +2142,11 @@ fn current_proc_io() -> Option<ProcIoSample> {
         match key {
             "rchar" => sample.rchar = value,
             "wchar" => sample.wchar = value,
+            "syscr" => sample.syscr = value,
+            "syscw" => sample.syscw = value,
             "read_bytes" => sample.read_bytes = value,
             "write_bytes" => sample.write_bytes = value,
+            "cancelled_write_bytes" => sample.cancelled_write_bytes = value,
             _ => {}
         }
     }
@@ -1008,6 +2158,20 @@ fn amplification_ratio(written_bytes: u64, logical_bytes: u64) -> Option<f64> {
         return None;
     }
     Some(written_bytes as f64 / logical_bytes as f64)
+}
+
+fn ratio(numerator: f64, denominator: f64) -> Option<f64> {
+    if denominator <= f64::EPSILON {
+        return None;
+    }
+    Some(numerator / denominator)
+}
+
+fn per_file(count: u64, files: usize) -> Option<f64> {
+    if files == 0 {
+        return None;
+    }
+    Some(count as f64 / files as f64)
 }
 
 fn expect_payload_now(

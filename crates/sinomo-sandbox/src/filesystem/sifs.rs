@@ -295,13 +295,9 @@ impl<T: DfsFrameTransport> SifsSandboxFileSystem<T> {
     fn read_sifs_path(
         &mut self,
         sifs_path: &str,
-        update_access: bool,
+        _update_access: bool,
     ) -> Result<Vec<u8>, DfsPosixError> {
-        if update_access {
-            self.dfs.posix_read_file_update_access(sifs_path)
-        } else {
-            self.dfs.posix_read_file_distributed(sifs_path)
-        }
+        self.dfs.posix_read_file_distributed(sifs_path)
     }
 
     fn read_sifs_file_mut(
@@ -322,16 +318,12 @@ impl<T: DfsFrameTransport> SifsSandboxFileSystem<T> {
     fn readlink_sifs_path_mut(
         &mut self,
         path: &SandboxPath,
-        update_access: bool,
+        _update_access: bool,
     ) -> Result<PathBuf, SandboxFsError> {
         self.process_incoming_dfs_messages(path)?;
         let sifs_path = self.sifs_path(path);
-        let target = if update_access {
-            self.dfs.posix_readlink_update_access(&sifs_path)
-        } else {
-            self.dfs.posix_readlink_distributed(&sifs_path)
-        };
-        target
+        self.dfs
+            .posix_readlink_distributed(&sifs_path)
             .map(PathBuf::from)
             .map_err(|error| sandbox_fs_error_from_dfs(path, error))
     }
@@ -1034,9 +1026,7 @@ impl<T: DfsFrameTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
             return Err(SandboxFsError::NotFound { path: path.clone() });
         }
         self.ensure_file_allows_read(&resolved)?;
-        let update_access =
-            self.ensure_writable_path(path).is_ok() && self.ensure_writable_path(&resolved).is_ok();
-        self.read_sifs_file_mut(path, &resolved, range, update_access)
+        self.read_sifs_file_mut(path, &resolved, range, false)
     }
 
     fn read_unchecked_update_access(
@@ -1057,9 +1047,7 @@ impl<T: DfsFrameTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
         if sandbox_path_is_dev_tree(&resolved) {
             return Err(SandboxFsError::NotFound { path: path.clone() });
         }
-        let update_access =
-            self.ensure_writable_path(path).is_ok() && self.ensure_writable_path(&resolved).is_ok();
-        self.read_sifs_file_mut(path, &resolved, range, update_access)
+        self.read_sifs_file_mut(path, &resolved, range, false)
     }
 
     fn create_dir(&mut self, path: &SandboxPath) -> Result<(), SandboxFsError> {
@@ -1381,9 +1369,6 @@ impl<T: DfsFrameTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
     ) -> Result<Vec<SandboxDirEntry>, SandboxFsError> {
         let entries = self.list_with_access_checks_mut(path)?;
         if path.as_str() == "/" {
-            self.dfs
-                .posix_list_dir_update_access(&self.sifs_path(path))
-                .map_err(|error| sandbox_fs_error_from_dfs(path, error))?;
             return Ok(entries);
         }
         if sandbox_virtual_device_path(path).is_some() || sandbox_path_is_dev_tree(path) {
@@ -1395,11 +1380,6 @@ impl<T: DfsFrameTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
         }
         if self.synthetic_mount_directory_metadata(&resolved).is_some() {
             return Ok(entries);
-        }
-        if self.ensure_writable_path(path).is_ok() && self.ensure_writable_path(&resolved).is_ok() {
-            self.dfs
-                .posix_list_dir_update_access(&self.sifs_path(&resolved))
-                .map_err(|error| sandbox_fs_error_from_dfs(path, error))?;
         }
         Ok(entries)
     }
@@ -1679,17 +1659,7 @@ impl<T: DfsFrameTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
             return Err(SandboxFsError::NotFound { path: path.clone() });
         }
         let resolved = self.resolve_path_mut(path, false)?;
-        if self.ensure_writable_path(path).is_ok() && self.ensure_writable_path(&resolved).is_ok() {
-            return self
-                .dfs
-                .posix_readlink_update_access(&self.sifs_path(&resolved))
-                .map(PathBuf::from)
-                .map_err(|error| sandbox_fs_error_from_dfs(path, error));
-        }
-        self.dfs
-            .posix_readlink(&self.sifs_path(&resolved))
-            .map(PathBuf::from)
-            .map_err(|error| sandbox_fs_error_from_dfs(path, error))
+        self.readlink_sifs_path_mut(&resolved, false)
     }
 
     fn symlink(&mut self, target: &Path, link_path: &SandboxPath) -> Result<(), SandboxFsError> {

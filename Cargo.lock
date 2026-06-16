@@ -5896,6 +5896,7 @@ dependencies = [
  "blake3",
  "fs2",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sinomo-config",
  "sinomo-core",

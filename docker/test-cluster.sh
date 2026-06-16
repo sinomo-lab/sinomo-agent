@@ -3,21 +3,28 @@
 #
 # Brings up a DEDICATED compose project (so it never collides with a manually
 # started dev cluster), waits for clean 6-node formation, then drives the
-# in-binary `cluster-dfs` runtime test cases (sinomo test run --require-cluster)
-# from different nodes to verify cluster-wide POSIX behavior:
+# in-binary cluster runtime test cases (sinomo test run --require-cluster)
+# from different nodes to verify network health and cluster-wide POSIX behavior:
 #
-#   1. invariants     — per-node DFS operational invariants (baseline)
-#   2. read-your-write — write/read/rename/delete roundtrip on node1 and node5
-#   3. cross-node     — write on one segment, poll-read on the other (both
+#   1. DFS protocol codec — in-memory DFS data-plane frame encode/decode baseline
+#   2. network latency — signed object-RPC latency/RPS with no failed requests
+#   3. network payload — signed object-RPC payload throughput with no failed requests
+#   4. invariants     — per-node DFS operational invariants (baseline)
+#   5. read-your-write — write/read/rename/delete roundtrip on node1 and node5
+#   6. cross-node     — write on one segment, poll-read on the other (both
 #                       directions), then a routed delete observed cluster-wide
-#   4. rename         — /users -> /services rename issued by a NON-writer node,
+#   7. rename         — /users -> /services rename issued by a NON-writer node,
 #                       observed (and the old path absent) on far nodes
-#   5. bulk perf      — small-file bulk write/read throughput with process I/O
+#   8. small baseline — node-local raw tiny-file write baseline for DFS comparison
+#   9. bulk perf      — small-file bulk write/read throughput with process I/O
 #                       amplification checks and read-side write_bytes == 0
-#   6. disk damage    — delete one durable loose blob and read through the
+#   10. disk baseline — node-local raw file write/read baseline for DFS comparison
+#   11. large-file perf — large object write/read throughput with process I/O
+#                       amplification checks and read-side write_bytes == 0
+#   12. disk damage   — delete one durable loose blob and read through the
 #                       remaining replica without read-side disk writes
-#   7. restart        — restart a member, re-gate formation, re-read its data
-#   8. final sweep    — invariants again on every node
+#   13. restart       — restart a member, re-gate formation, re-read its data
+#   14. final sweep   — invariants again on every node
 #
 # Usage:
 #   docker/test-cluster.sh                  # build-if-missing, up, test, down -v
@@ -36,8 +43,31 @@
 #   SINOMO_TEST_PERF_MIN_READ_FILES_PER_SEC   min cross-node read/convergence throughput (default 1)
 #   SINOMO_TEST_PERF_MAX_PROC_WCHAR_AMPLIFICATION       max writer-process wchar/logical bytes (default 0, disabled)
 #   SINOMO_TEST_PERF_MAX_PROC_WRITE_BYTES_AMPLIFICATION max writer-process write_bytes/logical bytes (default 0, disabled)
+#   SINOMO_TEST_PERF_MAX_PROC_SYSCW_PER_FILE max writer-process write syscalls/logical file (default 4)
 #   SINOMO_TEST_PERF_MAX_READ_PROC_WRITE_BYTES max reader-process write_bytes during bulk-expect (default 0)
+#   SINOMO_TEST_SMALL_BASELINE_FILES files in raw tiny-file baseline leg (default same as SINOMO_TEST_PERF_FILES)
+#   SINOMO_TEST_SMALL_BASELINE_BYTES bytes per raw tiny-file baseline file (default same as SINOMO_TEST_PERF_BYTES)
+#   SINOMO_TEST_SMALL_BASELINE_SYNC_WRITES sync each raw tiny-file write before timing completes (default 0)
+#   SINOMO_TEST_SMALL_BASELINE_MIN_FILES_PER_SEC min raw tiny-file throughput (default 0, disabled)
+#   SINOMO_TEST_LARGE_BYTES    bytes in large-file performance leg (default 16777216)
+#   SINOMO_TEST_LARGE_TIMEOUT  large-file write/read timeout seconds (default 180)
+#   SINOMO_TEST_LARGE_MIN_WRITE_BYTES_PER_SEC min large writer throughput (default 4194304)
+#   SINOMO_TEST_LARGE_MIN_READ_BYTES_PER_SEC  min cross-node large read/convergence throughput (default 4194304)
+#   SINOMO_TEST_LARGE_MIN_RAW_WRITE_RATIO min large DFS write / raw write baseline ratio (default 0.5)
+#   SINOMO_TEST_LARGE_MIN_RAW_READ_RATIO  min large DFS read / raw read baseline ratio (default 0, disabled)
+#   SINOMO_TEST_LARGE_RAW_SYNC_WRITE      sync raw baseline writes before timing completes (default 1)
+#   SINOMO_TEST_LARGE_MAX_PROC_WCHAR_AMPLIFICATION       max large writer-process wchar/logical bytes (default 0, disabled)
+#   SINOMO_TEST_LARGE_MAX_PROC_WRITE_BYTES_AMPLIFICATION max large writer-process write_bytes/logical bytes (default 4)
+#   SINOMO_TEST_LARGE_MAX_READ_PROC_WRITE_BYTES max reader-process write_bytes during large-expect (default 0)
+#   SINOMO_TEST_DISK_BASELINE_BYTES bytes in raw disk baseline leg (default same as SINOMO_TEST_LARGE_BYTES)
+#   SINOMO_TEST_DISK_BASELINE_SYNC_WRITE sync raw disk baseline writes before timing completes (default 1)
+#   SINOMO_TEST_DISK_BASELINE_MIN_WRITE_BYTES_PER_SEC min raw write throughput (default 0, disabled)
+#   SINOMO_TEST_DISK_BASELINE_MIN_READ_BYTES_PER_SEC  min raw read throughput (default 0, disabled)
 #   SINOMO_TEST_DAMAGE_BYTES    bytes in loose-blob disk damage scenario (default 65536)
+#   SINOMO_TEST_DFS_PROTOCOL_CODEC_BYTES bytes per DFS protocol codec message (default 4194304)
+#   SINOMO_TEST_DFS_PROTOCOL_CODEC_ITERATIONS codec encode/decode iterations per sample (default 8)
+#   SINOMO_TEST_DFS_PROTOCOL_CODEC_MIN_ENCODE_BYTES_PER_SEC min codec payload encode throughput (default 67108864)
+#   SINOMO_TEST_DFS_PROTOCOL_CODEC_MIN_DECODE_BYTES_PER_SEC min codec payload decode throughput (default 67108864)
 #   SINOMO_TEST_NETWORK_REQUESTS_PER_TARGET cluster network ping RPCs per remote node (default 20)
 #   SINOMO_TEST_NETWORK_CONCURRENCY         concurrent network ping workers (default 32)
 #   SINOMO_TEST_NETWORK_TIMEOUT_MS          per network ping RPC timeout (default 2000)
@@ -45,12 +75,23 @@
 #   SINOMO_TEST_NETWORK_MAX_P50_MS          max network ping p50 latency (default 50)
 #   SINOMO_TEST_NETWORK_MAX_P95_MS          max network ping p95 latency (default 250)
 #   SINOMO_TEST_NETWORK_MIN_RPS             min network ping throughput (default 50)
+#   SINOMO_TEST_NETWORK_PAYLOAD_BYTES       request bytes per latency-baseline ping payload (default 0)
+#   SINOMO_TEST_NETWORK_RESPONSE_PAYLOAD_BYTES response bytes per latency-baseline ping payload (default 0)
+#   SINOMO_TEST_NETWORK_MIN_PAYLOAD_BYTES_PER_SEC min latency-baseline payload throughput (default 0, disabled)
+#   SINOMO_TEST_NETWORK_PAYLOAD_REQUESTS_PER_TARGET payload-throughput RPCs per remote node (default 4)
+#   SINOMO_TEST_NETWORK_PAYLOAD_CONCURRENCY payload-throughput workers (default 8)
+#   SINOMO_TEST_NETWORK_PAYLOAD_TIMEOUT_MS  payload-throughput RPC timeout (default 5000)
+#   SINOMO_TEST_NETWORK_PAYLOAD_REQUEST_BYTES request bytes per payload-throughput RPC (default 262144)
+#   SINOMO_TEST_NETWORK_PAYLOAD_RESPONSE_BYTES response bytes per payload-throughput RPC (default 262144)
+#   SINOMO_TEST_NETWORK_PAYLOAD_MIN_BYTES_PER_SEC min payload-throughput rate (default 4194304)
+#   SINOMO_TEST_NETWORK_REQUIRE_DIRECT      require direct, non-relayed network routes (default 0; this compose is segmented)
 #   SINOMO_TEST_NETWORK_READY_WAIT          network/auth convergence gate seconds (default 120)
 #   SINOMO_TEST_NETWORK_READY_REQUESTS_PER_TARGET requests per target during readiness warmup (default 20)
 #   SINOMO_TEST_NETWORK_READY_CONCURRENCY   readiness warmup concurrency (default 32)
 #   SINOMO_TEST_NETWORK_ONLY=1              stop after network baseline
 #   SINOMO_TEST_BUILD=1         force `cargo build -p sinomo` first
 #   SINOMO_TEST_ARTIFACTS       artifact dir (default target/cluster-test-artifacts/<run>)
+#   SINOMO_TEST_ALLOW_OTHER_COMPOSE=1       allow running while unrelated compose projects are up
 #
 # Exits non-zero if any scenario fails; failure evidence (probe JSON, compose ps,
 # cluster health/doctor, per-node logs) lands in the artifact directory.
@@ -74,8 +115,31 @@ PERF_MIN_WRITE_FILES_PER_SEC="${SINOMO_TEST_PERF_MIN_WRITE_FILES_PER_SEC:-0.75}"
 PERF_MIN_READ_FILES_PER_SEC="${SINOMO_TEST_PERF_MIN_READ_FILES_PER_SEC:-1}"
 PERF_MAX_PROC_WCHAR_AMPLIFICATION="${SINOMO_TEST_PERF_MAX_PROC_WCHAR_AMPLIFICATION:-0}"
 PERF_MAX_PROC_WRITE_BYTES_AMPLIFICATION="${SINOMO_TEST_PERF_MAX_PROC_WRITE_BYTES_AMPLIFICATION:-0}"
+PERF_MAX_PROC_SYSCW_PER_FILE="${SINOMO_TEST_PERF_MAX_PROC_SYSCW_PER_FILE:-4}"
 PERF_MAX_READ_PROC_WRITE_BYTES="${SINOMO_TEST_PERF_MAX_READ_PROC_WRITE_BYTES:-0}"
+SMALL_BASELINE_FILES="${SINOMO_TEST_SMALL_BASELINE_FILES:-$PERF_FILES}"
+SMALL_BASELINE_BYTES="${SINOMO_TEST_SMALL_BASELINE_BYTES:-$PERF_BYTES}"
+SMALL_BASELINE_SYNC_WRITES="${SINOMO_TEST_SMALL_BASELINE_SYNC_WRITES:-0}"
+SMALL_BASELINE_MIN_FILES_PER_SEC="${SINOMO_TEST_SMALL_BASELINE_MIN_FILES_PER_SEC:-0}"
+LARGE_BYTES="${SINOMO_TEST_LARGE_BYTES:-16777216}"
+LARGE_TIMEOUT="${SINOMO_TEST_LARGE_TIMEOUT:-180}"
+LARGE_MIN_WRITE_BYTES_PER_SEC="${SINOMO_TEST_LARGE_MIN_WRITE_BYTES_PER_SEC:-4194304}"
+LARGE_MIN_READ_BYTES_PER_SEC="${SINOMO_TEST_LARGE_MIN_READ_BYTES_PER_SEC:-4194304}"
+LARGE_MIN_RAW_WRITE_RATIO="${SINOMO_TEST_LARGE_MIN_RAW_WRITE_RATIO:-0.5}"
+LARGE_MIN_RAW_READ_RATIO="${SINOMO_TEST_LARGE_MIN_RAW_READ_RATIO:-0}"
+LARGE_RAW_SYNC_WRITE="${SINOMO_TEST_LARGE_RAW_SYNC_WRITE:-1}"
+LARGE_MAX_PROC_WCHAR_AMPLIFICATION="${SINOMO_TEST_LARGE_MAX_PROC_WCHAR_AMPLIFICATION:-0}"
+LARGE_MAX_PROC_WRITE_BYTES_AMPLIFICATION="${SINOMO_TEST_LARGE_MAX_PROC_WRITE_BYTES_AMPLIFICATION:-4}"
+LARGE_MAX_READ_PROC_WRITE_BYTES="${SINOMO_TEST_LARGE_MAX_READ_PROC_WRITE_BYTES:-0}"
+DISK_BASELINE_BYTES="${SINOMO_TEST_DISK_BASELINE_BYTES:-$LARGE_BYTES}"
+DISK_BASELINE_SYNC_WRITE="${SINOMO_TEST_DISK_BASELINE_SYNC_WRITE:-1}"
+DISK_BASELINE_MIN_WRITE_BYTES_PER_SEC="${SINOMO_TEST_DISK_BASELINE_MIN_WRITE_BYTES_PER_SEC:-0}"
+DISK_BASELINE_MIN_READ_BYTES_PER_SEC="${SINOMO_TEST_DISK_BASELINE_MIN_READ_BYTES_PER_SEC:-0}"
 DAMAGE_BYTES="${SINOMO_TEST_DAMAGE_BYTES:-65536}"
+DFS_PROTOCOL_CODEC_BYTES="${SINOMO_TEST_DFS_PROTOCOL_CODEC_BYTES:-4194304}"
+DFS_PROTOCOL_CODEC_ITERATIONS="${SINOMO_TEST_DFS_PROTOCOL_CODEC_ITERATIONS:-8}"
+DFS_PROTOCOL_CODEC_MIN_ENCODE_BYTES_PER_SEC="${SINOMO_TEST_DFS_PROTOCOL_CODEC_MIN_ENCODE_BYTES_PER_SEC:-67108864}"
+DFS_PROTOCOL_CODEC_MIN_DECODE_BYTES_PER_SEC="${SINOMO_TEST_DFS_PROTOCOL_CODEC_MIN_DECODE_BYTES_PER_SEC:-67108864}"
 NETWORK_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_REQUESTS_PER_TARGET:-20}"
 NETWORK_CONCURRENCY="${SINOMO_TEST_NETWORK_CONCURRENCY:-32}"
 NETWORK_TIMEOUT_MS="${SINOMO_TEST_NETWORK_TIMEOUT_MS:-2000}"
@@ -83,6 +147,16 @@ NETWORK_MAX_FAILURES="${SINOMO_TEST_NETWORK_MAX_FAILURES:-0}"
 NETWORK_MAX_P50_MS="${SINOMO_TEST_NETWORK_MAX_P50_MS:-50}"
 NETWORK_MAX_P95_MS="${SINOMO_TEST_NETWORK_MAX_P95_MS:-250}"
 NETWORK_MIN_RPS="${SINOMO_TEST_NETWORK_MIN_RPS:-50}"
+NETWORK_PAYLOAD_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_BYTES:-0}"
+NETWORK_RESPONSE_PAYLOAD_BYTES="${SINOMO_TEST_NETWORK_RESPONSE_PAYLOAD_BYTES:-0}"
+NETWORK_MIN_PAYLOAD_BYTES_PER_SEC="${SINOMO_TEST_NETWORK_MIN_PAYLOAD_BYTES_PER_SEC:-0}"
+NETWORK_PAYLOAD_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_PAYLOAD_REQUESTS_PER_TARGET:-4}"
+NETWORK_PAYLOAD_CONCURRENCY="${SINOMO_TEST_NETWORK_PAYLOAD_CONCURRENCY:-8}"
+NETWORK_PAYLOAD_TIMEOUT_MS="${SINOMO_TEST_NETWORK_PAYLOAD_TIMEOUT_MS:-5000}"
+NETWORK_PAYLOAD_REQUEST_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_REQUEST_BYTES:-262144}"
+NETWORK_PAYLOAD_RESPONSE_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_RESPONSE_BYTES:-262144}"
+NETWORK_PAYLOAD_MIN_BYTES_PER_SEC="${SINOMO_TEST_NETWORK_PAYLOAD_MIN_BYTES_PER_SEC:-4194304}"
+NETWORK_REQUIRE_DIRECT="${SINOMO_TEST_NETWORK_REQUIRE_DIRECT:-0}"
 NETWORK_READY_WAIT="${SINOMO_TEST_NETWORK_READY_WAIT:-120}"
 NETWORK_READY_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_READY_REQUESTS_PER_TARGET:-20}"
 NETWORK_READY_CONCURRENCY="${SINOMO_TEST_NETWORK_READY_CONCURRENCY:-32}"
@@ -97,6 +171,29 @@ log() { echo "[test-cluster] $*"; }
 
 compose() {
   docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"
+}
+
+running_other_compose_projects() {
+  docker ps \
+    --filter label=com.docker.compose.project \
+    --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null \
+    | grep -v "^$PROJECT$" \
+    | sort -u
+}
+
+require_no_other_compose_projects() {
+  if [ "${SINOMO_TEST_ALLOW_OTHER_COMPOSE:-0}" = 1 ]; then
+    return 0
+  fi
+  local others
+  others="$(running_other_compose_projects || true)"
+  if [ -z "$others" ]; then
+    return 0
+  fi
+  log "refusing to start/reuse compose project $PROJECT while other compose projects are running:"
+  echo "$others" | sed 's/^/[test-cluster]   /'
+  log "stop those projects first, or set SINOMO_TEST_ALLOW_OTHER_COMPOSE=1 for an explicit override"
+  return 1
 }
 
 main_online_count() {
@@ -182,6 +279,7 @@ wait_for_network_ready() {
           --param "max-failures=0" \
           --param "max-p50-ms=$NETWORK_MAX_P50_MS" \
           --param "max-p95-ms=$NETWORK_MAX_P95_MS" \
+          --param "require-direct=$NETWORK_REQUIRE_DIRECT" \
           --param "min-requests-per-second=$NETWORK_MIN_RPS" \
           >"$ARTIFACTS/network-ready-$node.last.json" 2>&1; then
         log "  network-ready: $node"
@@ -242,6 +340,14 @@ invariants_sweep() {
   return $rc
 }
 
+dfs_protocol_codec_baseline() {
+  run_probe node1 cluster.dfs.protocol-codec-baseline \
+    --param "bytes=$DFS_PROTOCOL_CODEC_BYTES" \
+    --param "iterations=$DFS_PROTOCOL_CODEC_ITERATIONS" \
+    --param "min-encode-bytes-per-second=$DFS_PROTOCOL_CODEC_MIN_ENCODE_BYTES_PER_SEC" \
+    --param "min-decode-bytes-per-second=$DFS_PROTOCOL_CODEC_MIN_DECODE_BYTES_PER_SEC"
+}
+
 network_baseline() {
   local rc=0 node
   for node in node1 node6; do
@@ -252,7 +358,30 @@ network_baseline() {
       --param "max-failures=$NETWORK_MAX_FAILURES" \
       --param "max-p50-ms=$NETWORK_MAX_P50_MS" \
       --param "max-p95-ms=$NETWORK_MAX_P95_MS" \
+      --param "payload-bytes=$NETWORK_PAYLOAD_BYTES" \
+      --param "response-payload-bytes=$NETWORK_RESPONSE_PAYLOAD_BYTES" \
+      --param "min-payload-bytes-per-second=$NETWORK_MIN_PAYLOAD_BYTES_PER_SEC" \
+      --param "require-direct=$NETWORK_REQUIRE_DIRECT" \
       --param "min-requests-per-second=$NETWORK_MIN_RPS" || rc=1
+  done
+  return $rc
+}
+
+network_payload_baseline() {
+  local rc=0 node
+  for node in node1 node6; do
+    run_probe "$node" cluster.network.ping-benchmark \
+      --param "requests-per-target=$NETWORK_PAYLOAD_REQUESTS_PER_TARGET" \
+      --param "concurrency=$NETWORK_PAYLOAD_CONCURRENCY" \
+      --param "timeout-ms=$NETWORK_PAYLOAD_TIMEOUT_MS" \
+      --param "max-failures=0" \
+      --param "max-p50-ms=0" \
+      --param "max-p95-ms=0" \
+      --param "payload-bytes=$NETWORK_PAYLOAD_REQUEST_BYTES" \
+      --param "response-payload-bytes=$NETWORK_PAYLOAD_RESPONSE_BYTES" \
+      --param "require-direct=$NETWORK_REQUIRE_DIRECT" \
+      --param "min-requests-per-second=0" \
+      --param "min-payload-bytes-per-second=$NETWORK_PAYLOAD_MIN_BYTES_PER_SEC" || rc=1
   done
   return $rc
 }
@@ -299,6 +428,18 @@ rename_across_prefixes() {
   && run_probe node3 cluster.dfs.remove --param "path=$dst"
 }
 
+small_file_baseline() {
+  local rc=0 node
+  for node in node2 node5; do
+    run_probe "$node" cluster.dfs.small-file-baseline \
+      --param "files=$SMALL_BASELINE_FILES" \
+      --param "bytes=$SMALL_BASELINE_BYTES" \
+      --param "sync-writes=$SMALL_BASELINE_SYNC_WRITES" \
+      --param "min-files-per-second=$SMALL_BASELINE_MIN_FILES_PER_SEC" || rc=1
+  done
+  return $rc
+}
+
 bulk_performance() {
   local warm="/services/cluster-tests/$RUN_ID/perf-warmup"
   local a="/services/cluster-tests/$RUN_ID/perf-a"
@@ -322,6 +463,7 @@ bulk_performance() {
     --param "min-files-per-second=$PERF_MIN_WRITE_FILES_PER_SEC" \
     --param "max-proc-wchar-amplification=$PERF_MAX_PROC_WCHAR_AMPLIFICATION" \
     --param "max-proc-write-bytes-amplification=$PERF_MAX_PROC_WRITE_BYTES_AMPLIFICATION" \
+    --param "max-proc-syscw-per-file=$PERF_MAX_PROC_SYSCW_PER_FILE" \
   && run_probe node6 cluster.dfs.bulk-expect \
     --param "base=$a" \
     --param "files=$PERF_FILES" \
@@ -337,6 +479,7 @@ bulk_performance() {
     --param "min-files-per-second=$PERF_MIN_WRITE_FILES_PER_SEC" \
     --param "max-proc-wchar-amplification=$PERF_MAX_PROC_WCHAR_AMPLIFICATION" \
     --param "max-proc-write-bytes-amplification=$PERF_MAX_PROC_WRITE_BYTES_AMPLIFICATION" \
+    --param "max-proc-syscw-per-file=$PERF_MAX_PROC_SYSCW_PER_FILE" \
   && run_probe node1 cluster.dfs.bulk-expect \
     --param "base=$b" \
     --param "files=$PERF_FILES" \
@@ -344,6 +487,57 @@ bulk_performance() {
     --param "timeout-seconds=$PERF_TIMEOUT" \
     --param "min-files-per-second=$PERF_MIN_READ_FILES_PER_SEC" \
     --param "max-proc-write-bytes=$PERF_MAX_READ_PROC_WRITE_BYTES"
+}
+
+disk_baseline() {
+  local rc=0 node
+  for node in node2 node6 node5 node1; do
+    run_probe "$node" cluster.dfs.disk-baseline \
+      --param "bytes=$DISK_BASELINE_BYTES" \
+      --param "sync-write=$DISK_BASELINE_SYNC_WRITE" \
+      --param "min-write-bytes-per-second=$DISK_BASELINE_MIN_WRITE_BYTES_PER_SEC" \
+      --param "min-read-bytes-per-second=$DISK_BASELINE_MIN_READ_BYTES_PER_SEC" || rc=1
+  done
+  return $rc
+}
+
+large_file_performance() {
+  local a="/services/cluster-tests/$RUN_ID/large-a.bin"
+  local b="/services/cluster-tests/$RUN_ID/large-b.bin"
+  run_probe node2 cluster.dfs.large-write \
+    --param "path=$a" \
+    --param "bytes=$LARGE_BYTES" \
+    --param "timeout-seconds=$LARGE_TIMEOUT" \
+    --param "min-bytes-per-second=$LARGE_MIN_WRITE_BYTES_PER_SEC" \
+    --param "min-raw-write-ratio=$LARGE_MIN_RAW_WRITE_RATIO" \
+    --param "raw-sync-write=$LARGE_RAW_SYNC_WRITE" \
+    --param "max-proc-wchar-amplification=$LARGE_MAX_PROC_WCHAR_AMPLIFICATION" \
+    --param "max-proc-write-bytes-amplification=$LARGE_MAX_PROC_WRITE_BYTES_AMPLIFICATION" \
+  && run_probe node6 cluster.dfs.large-expect \
+    --param "path=$a" \
+    --param "bytes=$LARGE_BYTES" \
+    --param "timeout-seconds=$LARGE_TIMEOUT" \
+    --param "min-bytes-per-second=$LARGE_MIN_READ_BYTES_PER_SEC" \
+    --param "min-raw-read-ratio=$LARGE_MIN_RAW_READ_RATIO" \
+    --param "raw-sync-write=$LARGE_RAW_SYNC_WRITE" \
+    --param "max-proc-write-bytes=$LARGE_MAX_READ_PROC_WRITE_BYTES" \
+  && run_probe node5 cluster.dfs.large-write \
+    --param "path=$b" \
+    --param "bytes=$LARGE_BYTES" \
+    --param "timeout-seconds=$LARGE_TIMEOUT" \
+    --param "min-bytes-per-second=$LARGE_MIN_WRITE_BYTES_PER_SEC" \
+    --param "min-raw-write-ratio=$LARGE_MIN_RAW_WRITE_RATIO" \
+    --param "raw-sync-write=$LARGE_RAW_SYNC_WRITE" \
+    --param "max-proc-wchar-amplification=$LARGE_MAX_PROC_WCHAR_AMPLIFICATION" \
+    --param "max-proc-write-bytes-amplification=$LARGE_MAX_PROC_WRITE_BYTES_AMPLIFICATION" \
+  && run_probe node1 cluster.dfs.large-expect \
+    --param "path=$b" \
+    --param "bytes=$LARGE_BYTES" \
+    --param "timeout-seconds=$LARGE_TIMEOUT" \
+    --param "min-bytes-per-second=$LARGE_MIN_READ_BYTES_PER_SEC" \
+    --param "min-raw-read-ratio=$LARGE_MIN_RAW_READ_RATIO" \
+    --param "raw-sync-write=$LARGE_RAW_SYNC_WRITE" \
+    --param "max-proc-write-bytes=$LARGE_MAX_READ_PROC_WRITE_BYTES"
 }
 
 disk_damage_recovery() {
@@ -434,6 +628,8 @@ trap teardown EXIT
 
 # --- bring-up -----------------------------------------------------------------
 
+require_no_other_compose_projects || exit 1
+
 if [ "${SINOMO_TEST_BUILD:-0}" = 1 ] || [ ! -x "$BINARY" ]; then
   log "building host binary (cargo build -p sinomo)"
   (cd "$SINOMO_ROOT" && cargo build -p sinomo) || { log "host build failed"; exit 1; }
@@ -460,12 +656,14 @@ if ! wait_for_network_ready; then
   exit 1
 fi
 
-scenario "network-baseline" network_baseline
+scenario "dfs-protocol-codec-baseline" dfs_protocol_codec_baseline
+scenario "network-latency-baseline" network_baseline
+scenario "network-payload-baseline" network_payload_baseline
 if [ -n "$FAILED_SCENARIOS" ]; then
   exit 1
 fi
 if [ "${SINOMO_TEST_NETWORK_ONLY:-0}" = 1 ]; then
-  log "RESULT: PASS — network baseline green (probe reports in $ARTIFACTS)"
+  log "RESULT: PASS — network baselines green (probe reports in $ARTIFACTS)"
   exit 0
 fi
 
@@ -480,7 +678,10 @@ scenario "invariants-baseline"  invariants_sweep
 scenario "read-your-write"      read_your_write
 scenario "cross-node"           cross_node
 scenario "rename-across-prefixes" rename_across_prefixes
+scenario "small-file-baseline"  small_file_baseline
 scenario "bulk-performance"     bulk_performance
+scenario "disk-baseline"        disk_baseline
+scenario "large-file-performance" large_file_performance
 scenario "disk-damage-recovery" disk_damage_recovery
 scenario "restart-durability"   restart_durability
 scenario "invariants-final"     invariants_sweep

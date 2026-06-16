@@ -171,6 +171,25 @@ fn network_publishes_agent_cluster_inspection_specs() {
 }
 
 #[test]
+fn cluster_network_ping_can_measure_request_and_response_payload_bytes() {
+    let request = cluster_network_ping_rpc_request_with_response_payload("payload-probe", 7, 11)
+        .expect("ping request");
+    let responder = NodeId::from_legacy_named("node.payload").expect("legacy node id");
+    let response = handle_cluster_network_ping_rpc_request_for_node(
+        &responder,
+        request,
+        time::OffsetDateTime::UNIX_EPOCH,
+    )
+    .expect("ping response");
+    let response = decode_cluster_network_ping_rpc_response(&response).expect("decode response");
+
+    assert_eq!(response.nonce, "payload-probe");
+    assert_eq!(response.responder_node_id, responder);
+    assert_eq!(response.payload_bytes, 7);
+    assert_eq!(response.response_payload.len(), 11);
+}
+
+#[test]
 fn direct_cluster_rpc_handlers_return_unknown_route_errors() {
     struct NoopClusterStatusProbe;
 
@@ -661,6 +680,89 @@ async fn object_rpc_route_policy_layer_enforces_shared_route_concurrency() {
         .object_rpc_route_readiness("/test/policy")
         .expect("recovered readiness");
     assert_eq!(recovered.available_concurrency, Some(1));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn object_rpc_route_policy_layer_does_not_head_of_line_block_other_routes() {
+    use tower_layer::Layer;
+
+    let slow_entered = Arc::new(tokio::sync::Notify::new());
+    let slow_release = Arc::new(tokio::sync::Notify::new());
+    let slow_descriptor =
+        ObjectRouteDescriptor::for_types::<(), String>("/test/slow", "test", "slow route")
+            .with_concurrency_limit(1);
+    let fast_descriptor =
+        ObjectRouteDescriptor::for_types::<(), String>("/test/fast", "test", "fast route")
+            .with_concurrency_limit(8);
+    let mut catalog = ServiceCatalog::default();
+    catalog.register_route(slow_descriptor.clone());
+    catalog.register_route(fast_descriptor.clone());
+    let layer = ObjectRpcRoutePolicyLayer::new(catalog).expect("policy layer");
+    let router = object_rpc_router_from_registry(
+        ObjectRpcRouteRegistry::builder()
+            .register_route(slow_descriptor, {
+                let slow_entered = Arc::clone(&slow_entered);
+                let slow_release = Arc::clone(&slow_release);
+                move |request| {
+                    let slow_entered = Arc::clone(&slow_entered);
+                    let slow_release = Arc::clone(&slow_release);
+                    async move {
+                        let _: () = request.decode_body()?;
+                        slow_entered.notify_one();
+                        slow_release.notified().await;
+                        ObjectRpcResponse::encode_body(request.route, &"slow-done".to_string())
+                    }
+                }
+            })
+            .register_route(fast_descriptor, |request| async move {
+                let _: () = request.decode_body()?;
+                ObjectRpcResponse::encode_body(request.route, &"fast-done".to_string())
+            })
+            .build(),
+    );
+    let mut policy_service = layer.layer(router);
+
+    let mut slow_service = policy_service.clone();
+    let slow = tokio::spawn(async move {
+        call_object_rpc_service_async(
+            &mut slow_service,
+            ObjectRpcRequest::encode_body("/test/slow", "test", &()).expect("slow request"),
+        )
+        .await
+    });
+    slow_entered.notified().await;
+    assert_eq!(
+        policy_service
+            .object_rpc_route_readiness("/test/slow")
+            .expect("slow readiness")
+            .available_concurrency,
+        Some(0)
+    );
+
+    let fast = tokio::time::timeout(
+        Duration::from_millis(50),
+        call_object_rpc_service_async(
+            &mut policy_service,
+            ObjectRpcRequest::encode_body("/test/fast", "test", &()).expect("fast request"),
+        ),
+    )
+    .await
+    .expect("fast route should not wait for slow route permit")
+    .expect("fast route response");
+    assert_eq!(
+        fast.decode_body::<String>().expect("decode fast"),
+        "fast-done"
+    );
+
+    slow_release.notify_one();
+    let slow = slow
+        .await
+        .expect("join slow request")
+        .expect("slow route response");
+    assert_eq!(
+        slow.decode_body::<String>().expect("decode slow"),
+        "slow-done"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -23987,7 +24089,12 @@ async fn network_service_dropped_pump_outbound_keeps_delivery_retryable() {
 
     let mut pump_task = tokio::spawn({
         let service = Arc::clone(&service);
-        async move { service.pump_outbound().await }
+        async move {
+            service
+                .with_command_timeout(Duration::from_secs(1))
+                .pump_outbound()
+                .await
+        }
     });
     tokio::select! {
         _ = tokio::time::sleep(Duration::from_millis(20)) => {}
@@ -24050,6 +24157,119 @@ async fn network_service_dropped_pump_outbound_keeps_delivery_retryable() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn network_service_pump_outbound_does_not_block_healthy_targets_behind_full_mailbox() {
+    let node_a = NodeId::from_legacy_named("node_async_nonblocking_pump_sender").expect("node");
+    let node_b = NodeId::from_legacy_named("node_async_nonblocking_pump_full").expect("node");
+    let node_c = NodeId::from_legacy_named("node_async_nonblocking_pump_ready").expect("node");
+    let node_filler =
+        NodeId::from_legacy_named("node_async_nonblocking_pump_filler").expect("node");
+    let session_id = SessionId::from_legacy_named("sess_async_nonblocking_pump").expect("session");
+    let network = AsyncInProcessNetwork::with_mailbox_capacity(1);
+    let transport_a = network.add_node(node_a.clone());
+    let mut transport_b = network.add_node(node_b.clone());
+    let mut transport_c = network.add_node(node_c.clone());
+    let mut filler = network.add_node(node_filler.clone());
+
+    send_async_test_frame(
+        &mut filler,
+        &node_b,
+        NetworkFrame {
+            frame_id: NetworkFrameId(1),
+            source_node_id: node_filler.clone(),
+            target_node_id: node_b.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(1),
+                origin_node_id: node_filler.clone(),
+                target_node_id: node_b.clone(),
+                body: MeshMessageBody::Heartbeat(Heartbeat {
+                    node_id: node_filler,
+                    tick: 1,
+                }),
+            },
+        },
+    )
+    .await
+    .expect("prefill first target mailbox");
+
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_async_nonblocking_pump_sender"));
+    registry.register_node(node("node_async_nonblocking_pump_full"));
+    registry.register_node(node("node_async_nonblocking_pump_ready"));
+    registry
+        .join_session(session_id.clone(), node_b.clone())
+        .expect("join full target");
+    registry
+        .join_session(session_id.clone(), node_c.clone())
+        .expect("join ready target");
+
+    let mut store = InMemoryEventStore::new();
+    let event =
+        fixture_event("evt_async_nonblocking_pump", node_a.clone()).with_session(session_id);
+    let receipt = store.append(event).expect("append event");
+    let stored = store
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored event");
+    let service = NetworkService::new(registry, transport_a)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), store);
+    let deliveries = service.enqueue_event(stored).await.expect("enqueue event");
+    assert_eq!(deliveries.len(), 2);
+    let full_target_delivery = deliveries
+        .iter()
+        .find(|delivery| delivery.target_node_id == node_b)
+        .expect("full target delivery")
+        .delivery_id;
+    let ready_target_delivery = deliveries
+        .iter()
+        .find(|delivery| delivery.target_node_id == node_c)
+        .expect("ready target delivery")
+        .delivery_id;
+
+    let sent = tokio::time::timeout(Duration::from_millis(100), service.pump_outbound())
+        .await
+        .expect("default pump must not wait behind a full target mailbox")
+        .expect("pump outbound");
+    assert_eq!(sent, 1);
+
+    assert_eq!(
+        drain_async_test_frames(&mut transport_b)
+            .await
+            .expect("drain full target")
+            .len(),
+        1,
+        "the full target should contain only its prefilled frame"
+    );
+    assert_eq!(
+        drain_async_test_frames(&mut transport_c)
+            .await
+            .expect("drain ready target")
+            .len(),
+        1,
+        "the healthy target should receive its frame in the same pump"
+    );
+    let records = service.ledger_records().await.expect("ledger records");
+    let full_record = records
+        .iter()
+        .find(|record| record.delivery.delivery_id == full_target_delivery)
+        .expect("full target record");
+    assert_eq!(full_record.delivery.status, DeliveryStatus::Retrying);
+    assert_eq!(
+        full_record.attempts, 0,
+        "mailbox backpressure should not consume a delivery failure attempt"
+    );
+    let ready_record = records
+        .iter()
+        .find(|record| record.delivery.delivery_id == ready_target_delivery)
+        .expect("ready target record");
+    assert_eq!(ready_record.delivery.status, DeliveryStatus::Sent);
+    assert_eq!(ready_record.attempts, 1);
+
+    let store = service.shutdown().await;
+    assert_eq!(store.len(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn network_service_dropped_heartbeat_send_releases_actor() {
     let node_a = NodeId::from_legacy_named("node_async_cancel_heartbeat_sender").expect("node");
     let node_b = NodeId::from_legacy_named("node_async_cancel_heartbeat_receiver").expect("node");
@@ -24088,7 +24308,12 @@ async fn network_service_dropped_heartbeat_send_releases_actor() {
     let mut heartbeat_task = tokio::spawn({
         let service = Arc::clone(&service);
         let target_node_id = node_b.clone();
-        async move { service.send_heartbeat(target_node_id, 2).await }
+        async move {
+            service
+                .with_command_timeout(Duration::from_secs(1))
+                .send_heartbeat(target_node_id, 2)
+                .await
+        }
     });
     tokio::select! {
         _ = tokio::time::sleep(Duration::from_millis(20)) => {}

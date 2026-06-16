@@ -28,6 +28,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
+const TEST_DFS_CHUNK_BYTES: usize = 1024 * 1024;
+
+fn chunked_test_bytes(extra_bytes: usize) -> Vec<u8> {
+    (0..(TEST_DFS_CHUNK_BYTES + extra_bytes))
+        .map(|index| (index % 251) as u8)
+        .collect()
+}
+
 #[test]
 fn networked_dfs_commits_after_stage_ack_and_replica_reads_content() {
     let owner = NodeId::from_legacy_named("node_owner").expect("node");
@@ -835,9 +843,7 @@ fn networked_dfs_retries_lost_inflight_stage_after_retry_delay() {
         .add_object_metadata(metadata)
         .expect("replica object");
 
-    let bytes = (0..90_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let write = owner_dfs
         .write_distributed_eventual(
             DfsWriteRequest {
@@ -966,9 +972,7 @@ fn networked_dfs_fetches_lost_stage_blob_from_durable_replica_before_commit() {
         dfs.add_object_metadata(metadata.clone()).expect("object");
     }
 
-    let bytes = (0..90_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let hash = content_hash(&bytes);
     let write = owner_dfs
         .write_distributed_eventual(
@@ -1118,9 +1122,7 @@ fn networked_dfs_stage_fetch_rotates_after_durable_source_misses_blob() {
         dfs.add_object_metadata(metadata.clone()).expect("object");
     }
 
-    let bytes = (0..90_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let hash = content_hash(&bytes);
     let write = owner_dfs
         .write_distributed_eventual(
@@ -1270,7 +1272,7 @@ fn networked_dfs_transfers_large_writes_in_chunks() {
         .add_object_metadata(metadata)
         .expect("replica object");
 
-    let bytes: Vec<u8> = (0..150_000).map(|index| (index % 251) as u8).collect();
+    let bytes = chunked_test_bytes(4_464);
     let write = owner_dfs
         .write_distributed_eventual(
             DfsWriteRequest {
@@ -1362,7 +1364,7 @@ fn networked_dfs_streams_large_writes_from_reader() {
         .add_object_metadata(metadata)
         .expect("replica object");
 
-    let byte_count = 150_000;
+    let byte_count = TEST_DFS_CHUNK_BYTES + 4_464;
     let write = owner_dfs
         .write_distributed_eventual_from_reader(
             DfsWriteRequest {
@@ -1547,7 +1549,7 @@ fn networked_dfs_large_stage_chunks_are_self_describing() {
         })
         .expect("owner object");
 
-    let bytes: Vec<u8> = (0..150_000).map(|index| (index % 251) as u8).collect();
+    let bytes = chunked_test_bytes(4_464);
     owner_dfs
         .write_distributed_eventual(
             DfsWriteRequest {
@@ -2183,9 +2185,7 @@ fn networked_dfs_repair_fetch_rotates_after_durable_source_misses_blob() {
         dfs.add_object_metadata(metadata.clone()).expect("object");
     }
 
-    let bytes = (0..90_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let hash = content_hash(&bytes);
     let write = owner_dfs
         .write_distributed_eventual(
@@ -5080,7 +5080,7 @@ fn networked_dfs_large_repair_chunks_are_self_describing() {
         })
         .expect("owner object");
 
-    let bytes: Vec<u8> = (0..150_000).map(|index| (index % 251) as u8).collect();
+    let bytes = chunked_test_bytes(4_464);
     let write = owner_dfs
         .write_distributed_eventual(
             DfsWriteRequest {
@@ -9216,11 +9216,9 @@ fn networked_dfs_chunked_stage_accepts_out_of_order_chunks() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     );
     let mut owner_transport = network.add_node(owner.clone());
-    let bytes = (0..70_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let hash = content_hash(&bytes);
-    let chunk_size = 64 * 1024;
+    let chunk_size = TEST_DFS_CHUNK_BYTES;
     let metadata = DfsObjectMetadata {
         object_id: object_id.clone(),
         file_system_id: file_system_id.clone(),
@@ -9313,11 +9311,9 @@ fn networked_dfs_chunked_repair_accepts_out_of_order_chunks() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     );
     let mut owner_transport = network.add_node(owner.clone());
-    let bytes = (0..70_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let hash = content_hash(&bytes);
-    let chunk_size = 64 * 1024;
+    let chunk_size = TEST_DFS_CHUNK_BYTES;
     let metadata = DfsObjectMetadata {
         object_id: object_id.clone(),
         file_system_id: file_system_id.clone(),
@@ -9419,11 +9415,9 @@ fn networked_dfs_chunked_stage_retry_uses_latest_request_id() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     );
     let mut owner_transport = network.add_node(owner.clone());
-    let bytes = (0..70_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let hash = content_hash(&bytes);
-    let chunk_size = 64 * 1024;
+    let chunk_size = TEST_DFS_CHUNK_BYTES;
     let metadata = DfsObjectMetadata {
         object_id: object_id.clone(),
         file_system_id: file_system_id.clone(),
@@ -9543,11 +9537,9 @@ fn networked_dfs_chunked_repair_retry_uses_latest_request_id() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     );
     let mut owner_transport = network.add_node(owner.clone());
-    let bytes = (0..70_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let hash = content_hash(&bytes);
-    let chunk_size = 64 * 1024;
+    let chunk_size = TEST_DFS_CHUNK_BYTES;
     let metadata = DfsObjectMetadata {
         object_id: object_id.clone(),
         file_system_id: file_system_id.clone(),
@@ -9667,11 +9659,9 @@ fn networked_dfs_stage_chunk_duplicate_is_idempotent() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     );
     let mut owner_transport = network.add_node(owner.clone());
-    let bytes = (0..70_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let hash = content_hash(&bytes);
-    let chunk_size = 64 * 1024;
+    let chunk_size = TEST_DFS_CHUNK_BYTES;
     let first_chunk = bytes[..chunk_size].to_vec();
     let second_chunk = bytes[chunk_size..].to_vec();
     let metadata = DfsObjectMetadata {
@@ -10052,7 +10042,7 @@ fn networked_sifs_remote_read_retries_lost_request_within_readthrough_budget() {
     reader_dfs
         .posix_mkdir_all("/services/readthrough-retry")
         .expect("reader mkdir");
-    let bytes = vec![0x5a; 70_000];
+    let bytes = vec![0x5a; TEST_DFS_CHUNK_BYTES + 4_464];
     let stat = owner_dfs
         .posix_write_file(
             "/services/readthrough-retry/file.txt",
@@ -10198,6 +10188,13 @@ fn networked_sifs_remote_read_falls_back_after_stale_location_rejection() {
                     .expect("stale rejects read");
                 if events.iter().any(|event| {
                     matches!(
+                        event,
+                        NetworkedDfsServiceEvent::RemoteReadServed {
+                            object_id: served_object_id,
+                            result: DfsReadResult::NotFound,
+                            ..
+                        } if served_object_id == &object_id
+                    ) || matches!(
                         event,
                         NetworkedDfsServiceEvent::RemoteReadServed {
                             object_id: served_object_id,
@@ -10379,24 +10376,23 @@ fn networked_dfs_remote_read_prunes_stale_version_source_before_retry() {
                 event,
                 NetworkedDfsServiceEvent::RemoteReadServed {
                     object_id: served_object_id,
-                    result: DfsReadResult::Found(data),
+                    result: DfsReadResult::NotFound,
                     ..
-                } if served_object_id == &object_id && data.version == version_1
+                } if served_object_id == &object_id
             ))
     );
     assert!(
         reader_dfs
             .process_incoming()
-            .expect("reader rejects stale version")
+            .expect("reader prunes stale version source")
             .iter()
             .any(|event| matches!(
                 event,
                 NetworkedDfsServiceEvent::RemoteReadCompleted {
                     object_id: completed_object_id,
-                    result: DfsReadResult::Rejected { reason },
+                    result: DfsReadResult::NotFound,
                     ..
                 } if completed_object_id == &object_id
-                    && reason.contains("expected version")
             ))
     );
     assert_eq!(
@@ -10570,6 +10566,10 @@ fn networked_sifs_remote_read_fetches_current_content_for_posix_path() {
         .object(&stat.object_id)
         .expect("owner metadata")
         .clone();
+    let file_content_hash = file_metadata
+        .content_hash
+        .clone()
+        .expect("file content hash");
     let link_stat = owner_dfs
         .posix_symlink(
             "file.txt",
@@ -10582,6 +10582,10 @@ fn networked_sifs_remote_read_fetches_current_content_for_posix_path() {
         .object(&link_stat.object_id)
         .expect("owner symlink metadata")
         .clone();
+    let link_content_hash = link_metadata
+        .content_hash
+        .clone()
+        .expect("link content hash");
     let dir_link_stat = owner_dfs
         .posix_symlink(
             "readthrough",
@@ -10594,6 +10598,10 @@ fn networked_sifs_remote_read_fetches_current_content_for_posix_path() {
         .object(&dir_link_stat.object_id)
         .expect("owner directory symlink metadata")
         .clone();
+    let dir_link_content_hash = dir_link_metadata
+        .content_hash
+        .clone()
+        .expect("directory symlink content hash");
     let overwrite_stat = owner_dfs
         .posix_write_file(
             "/services/readthrough/overwrite.txt",
@@ -10702,11 +10710,18 @@ fn networked_sifs_remote_read_fetches_current_content_for_posix_path() {
             } if object_id == &stat.object_id
         )
     }));
-    assert_eq!(
+    assert!(
+        !reader_dfs
+            .content()
+            .has_blob(&file_content_hash)
+            .expect("reader file blob check"),
+        "read-through must not persist remote file content in the reader store"
+    );
+    assert!(
         reader_dfs
             .posix_read_file("/services/readthrough/file.txt")
-            .expect("posix read after cached read-through"),
-        b"remote bytes"
+            .is_err(),
+        "local-only POSIX read must still miss after no-cache read-through"
     );
     assert_eq!(
         reader_dfs
@@ -10720,15 +10735,18 @@ fn networked_sifs_remote_read_fetches_current_content_for_posix_path() {
     let owner_worker = {
         let owner_dfs = Arc::clone(&owner_dfs);
         let dir_link_stat = dir_link_stat.clone();
+        let stat = stat.clone();
         std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut served_dir_link = false;
+            let mut served_file = false;
             loop {
                 let events = owner_dfs
                     .lock()
                     .expect("owner dfs lock")
                     .process_incoming()
                     .expect("owner serves intermediate symlink read");
-                if events.iter().any(|event| {
+                served_dir_link |= events.iter().any(|event| {
                     matches!(
                         event,
                         NetworkedDfsServiceEvent::RemoteReadServed {
@@ -10737,12 +10755,23 @@ fn networked_sifs_remote_read_fetches_current_content_for_posix_path() {
                             ..
                         } if object_id == &dir_link_stat.object_id
                     )
-                }) {
-                    return events;
+                });
+                served_file |= events.iter().any(|event| {
+                    matches!(
+                        event,
+                        NetworkedDfsServiceEvent::RemoteReadServed {
+                            object_id,
+                            result: sinomo_dfs::DfsReadResult::Found(_),
+                            ..
+                        } if object_id == &stat.object_id
+                    )
+                });
+                if served_dir_link && served_file {
+                    return (served_dir_link, served_file);
                 }
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "owner did not receive remote intermediate symlink read request"
+                    "owner did not receive remote intermediate symlink and file read requests"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
@@ -10754,24 +10783,24 @@ fn networked_sifs_remote_read_fetches_current_content_for_posix_path() {
             .expect("distributed POSIX path resolution fetches intermediate symlink content"),
         b"remote bytes"
     );
-    let owner_events = owner_worker
+    let (served_dir_link, served_file) = owner_worker
         .join()
         .expect("owner intermediate symlink worker");
-    assert!(owner_events.iter().any(|event| {
-        matches!(
-            event,
-            NetworkedDfsServiceEvent::RemoteReadServed {
-                object_id,
-                result: sinomo_dfs::DfsReadResult::Found(_),
-                ..
-            } if object_id == &dir_link_stat.object_id
-        )
-    }));
-    assert_eq!(
-        reader_dfs
-            .posix_read_file("/services/readthrough-link/file.txt")
-            .expect("posix read through cached intermediate symlink"),
-        b"remote bytes"
+    assert!(served_dir_link);
+    assert!(served_file);
+    assert!(
+        !reader_dfs
+            .content()
+            .has_blob(&dir_link_content_hash)
+            .expect("reader directory symlink blob check"),
+        "symlink resolution must not persist remote link content in the reader store"
+    );
+    assert!(
+        !reader_dfs
+            .content()
+            .has_blob(&file_content_hash)
+            .expect("reader file blob check after symlink read-through"),
+        "symlink read-through must not persist remote file content in the reader store"
     );
 
     let owner_worker = {
@@ -10822,11 +10851,18 @@ fn networked_sifs_remote_read_fetches_current_content_for_posix_path() {
             } if object_id == &link_stat.object_id
         )
     }));
-    assert_eq!(
+    assert!(
+        !reader_dfs
+            .content()
+            .has_blob(&link_content_hash)
+            .expect("reader symlink blob check"),
+        "readlink read-through must not persist remote symlink content in the reader store"
+    );
+    assert!(
         reader_dfs
             .posix_readlink("/services/readthrough/link.txt")
-            .expect("posix readlink after cached read-through"),
-        "file.txt"
+            .is_err(),
+        "local-only POSIX readlink must still miss after no-cache read-through"
     );
     assert_eq!(
         reader_dfs
@@ -11007,9 +11043,7 @@ fn networked_dfs_retries_offline_repair_when_replica_appears() {
         .add_object_metadata(metadata.clone())
         .expect("owner object");
 
-    let bytes = (0..90_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let write = owner_dfs
         .write_distributed_eventual(
             DfsWriteRequest {

@@ -24,6 +24,7 @@ const DEFAULT_MAX_FAILURES: usize = 0;
 const DEFAULT_MAX_P50_MS: u64 = 50;
 const DEFAULT_MAX_P95_MS: u64 = 250;
 const DEFAULT_MIN_REQUESTS_PER_SECOND: f64 = 50.0;
+const DEFAULT_MIN_PAYLOAD_BYTES_PER_SECOND: f64 = 0.0;
 
 pub fn register_network_cluster_test_cases(
     builder: SinomoTestRegistryBuilder,
@@ -59,6 +60,13 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         DEFAULT_MIN_REQUESTS_PER_SECOND,
     )?;
     let payload_bytes = optional_usize_parameter(ctx, "payload-bytes", 0)?;
+    let response_payload_bytes = optional_usize_parameter(ctx, "response-payload-bytes", 0)?;
+    let min_payload_bytes_per_second = optional_f64_parameter(
+        ctx,
+        "min-payload-bytes-per-second",
+        DEFAULT_MIN_PAYLOAD_BYTES_PER_SECOND,
+    )?;
+    let require_direct = optional_bool_parameter(ctx, "require-direct", false)?;
     require_positive("requests-per-target", requests_per_target)?;
     require_positive("concurrency", concurrency)?;
     require_positive("timeout-ms", timeout_ms as usize)?;
@@ -80,9 +88,19 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             })
             .collect::<Vec<_>>(),
     );
+    let (target_routes, route_by_target) =
+        network_ping_target_route_descriptions(&cluster_paths, &targets);
+    ctx.record("target_routes", target_routes.clone());
     ctx.record(
-        "target_routes",
-        network_ping_target_route_descriptions(&cluster_paths, &targets),
+        "target_route_modes",
+        route_by_target
+            .iter()
+            .map(|(node_id, route)| (node_id.to_string(), route.clone()))
+            .collect::<BTreeMap<_, _>>(),
+    );
+    ctx.record(
+        "target_route_counts",
+        route_counts(route_by_target.values().map(String::as_str)),
     );
     if target_count < expected_targets {
         return Ok(SinomoTestOutcome::failed(format!(
@@ -90,6 +108,8 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         )));
     }
 
+    let benchmark_started = Instant::now();
+    let prepare_started = Instant::now();
     let nonce_prefix = format!("{}-{}", current_millis(), std::process::id());
     let total_requests = target_count.saturating_mul(requests_per_target);
     let concurrency_limit = concurrency.min(total_requests).max(1);
@@ -102,38 +122,77 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             SinomoTestError::failed(format!("cannot create network ping runtime: {source}"))
         })?;
     let runtime_handle = runtime.handle().clone();
-    let jobs = targets
-        .into_iter()
-        .flat_map(|endpoint| {
-            let nonce_prefix = nonce_prefix.clone();
-            let runtime = runtime_handle.clone();
-            let paths = cluster_paths.clone();
-            (0..requests_per_target).map(move |attempt| NetworkPingJob {
+    let mut jobs = Vec::with_capacity(total_requests);
+    for endpoint in targets {
+        let route_mode = route_by_target
+            .get(&endpoint.node_id)
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        for attempt in 0..requests_per_target {
+            let nonce = format!("ping-{nonce_prefix}-{}-{attempt}", endpoint.node_id);
+            let request = network::cluster_network_ping_rpc_request_with_response_payload(
+                &nonce,
+                payload_bytes,
+                response_payload_bytes,
+            )
+            .map_err(|source| {
+                SinomoTestError::failed(format!(
+                    "cannot prepare network ping request for {}: {source}",
+                    endpoint.node_id
+                ))
+            })?;
+            let request_auth =
+                sign_daemon_rpc_request_for_local_node(&request).map_err(|source| {
+                    SinomoTestError::failed(format!(
+                        "cannot sign network ping request for {}: {source}",
+                        endpoint.node_id
+                    ))
+                })?;
+            let request_command = daemon_rpc_command(&request.route);
+            jobs.push(NetworkPingJob {
                 target_node_id: endpoint.node_id.clone(),
                 endpoint: endpoint.clone(),
-                nonce: format!("ping-{nonce_prefix}-{}-{attempt}", endpoint.node_id),
                 timeout: Duration::from_millis(timeout_ms),
-                payload_bytes,
-                runtime: runtime.clone(),
-                paths: paths.clone(),
-            })
-        })
-        .collect::<Vec<_>>();
+                request_payload_bytes: payload_bytes,
+                response_payload_bytes,
+                nonce,
+                request,
+                request_auth,
+                request_command,
+                route_mode: route_mode.clone(),
+                runtime: runtime_handle.clone(),
+                paths: cluster_paths.clone(),
+            });
+        }
+    }
+    let prepare_elapsed = prepare_started.elapsed();
     let total_requests = jobs.len();
     ctx.record("requests_per_target", requests_per_target);
     ctx.record("total_requests", total_requests);
     ctx.record("concurrency", concurrency_limit);
     ctx.record("runtime_worker_threads", runtime_worker_threads);
     ctx.record("timeout_ms", timeout_ms);
-    ctx.record("payload_bytes", payload_bytes);
+    ctx.record("request_payload_bytes", payload_bytes);
+    ctx.record("response_payload_bytes", response_payload_bytes);
     ctx.record("max_failures", max_failures);
     ctx.record("max_p50_ms", max_p50_ms);
     ctx.record("max_p95_ms", max_p95_ms);
     ctx.record("min_requests_per_second", min_requests_per_second);
+    ctx.record("min_payload_bytes_per_second", min_payload_bytes_per_second);
+    ctx.record("require_direct", require_direct);
+    ctx.record(
+        "request_prepare_elapsed_ms",
+        prepare_elapsed.as_millis() as u64,
+    );
+    ctx.record(
+        "request_prepare_requests_per_second",
+        rate_per_second(total_requests as f64, prepare_elapsed),
+    );
 
     let started = Instant::now();
     let mut results = runtime.block_on(run_network_ping_jobs_async(jobs, concurrency_limit))?;
     let elapsed = started.elapsed();
+    let total_elapsed = benchmark_started.elapsed();
     results.sort_by_key(|result| (result.target_node_id.clone(), result.latency_ms));
 
     let mut latencies = Vec::new();
@@ -141,10 +200,15 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let mut successes_by_target = BTreeMap::<String, usize>::new();
     let mut failures_by_target = BTreeMap::<String, usize>::new();
     let mut latencies_by_target = BTreeMap::<String, Vec<u64>>::new();
+    let mut latencies_by_route = BTreeMap::<String, Vec<u64>>::new();
     for result in &results {
         match &result.outcome {
             NetworkPingOutcome::Success => {
                 latencies.push(result.latency_ms);
+                latencies_by_route
+                    .entry(result.route_mode.clone())
+                    .or_default()
+                    .push(result.latency_ms);
                 latencies_by_target
                     .entry(result.target_node_id.to_string())
                     .or_default()
@@ -172,6 +236,9 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let max_ms = latencies.iter().copied().max().unwrap_or(0);
     let min_ms = latencies.iter().copied().min().unwrap_or(0);
     let requests_per_second = rate_per_second(success_count as f64, elapsed);
+    let payload_bytes_per_success = payload_bytes.saturating_add(response_payload_bytes);
+    let total_success_payload_bytes = payload_bytes_per_success.saturating_mul(success_count);
+    let payload_bytes_per_second = rate_per_second(total_success_payload_bytes as f64, elapsed);
     let latency_by_target_ms = latencies_by_target
         .into_iter()
         .map(|(target, mut target_latencies)| {
@@ -189,10 +256,33 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             )
         })
         .collect::<BTreeMap<_, _>>();
+    let latency_by_route_ms = latencies_by_route
+        .into_iter()
+        .map(|(route, mut route_latencies)| {
+            route_latencies.sort_unstable();
+            let min = route_latencies.iter().copied().min().unwrap_or(0);
+            let p50 = percentile_ms(&route_latencies, 50);
+            let p95 = percentile_ms(&route_latencies, 95);
+            let max = route_latencies.iter().copied().max().unwrap_or(0);
+            (
+                route,
+                format!(
+                    "count={} min={min} p50={p50} p95={p95} max={max}",
+                    route_latencies.len()
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     ctx.record("success_count", success_count);
     ctx.record("failure_count", failure_count);
     ctx.record("elapsed_ms", elapsed.as_millis() as u64);
+    ctx.record(
+        "total_elapsed_including_prepare_ms",
+        total_elapsed.as_millis() as u64,
+    );
     ctx.record("requests_per_second", requests_per_second);
+    ctx.record("success_payload_bytes", total_success_payload_bytes as u64);
+    ctx.record("payload_bytes_per_second", payload_bytes_per_second);
     ctx.record("latency_min_ms", min_ms);
     ctx.record("latency_p50_ms", p50_ms);
     ctx.record("latency_p95_ms", p95_ms);
@@ -200,6 +290,7 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("successes_by_target", successes_by_target);
     ctx.record("failures_by_target", failures_by_target);
     ctx.record("latency_by_target_ms", latency_by_target_ms);
+    ctx.record("latency_by_route_ms", latency_by_route_ms);
     if !failures.is_empty() {
         ctx.record(
             "failure_samples",
@@ -217,6 +308,18 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             "network ping had no successful RPCs".to_string(),
         ));
     }
+    if require_direct {
+        let relayed_targets = route_by_target
+            .iter()
+            .filter_map(|(target, route)| (route == "relay").then(|| target.to_string()))
+            .collect::<Vec<_>>();
+        if !relayed_targets.is_empty() {
+            return Ok(SinomoTestOutcome::failed(format!(
+                "network ping used relay routes for direct-required targets: {}",
+                relayed_targets.join(", ")
+            )));
+        }
+    }
     if max_p50_ms > 0 && p50_ms > max_p50_ms {
         return Ok(SinomoTestOutcome::failed(format!(
             "network ping p50 latency {p50_ms}ms is above allowed {max_p50_ms}ms"
@@ -232,9 +335,15 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             "network ping throughput {requests_per_second:.2} req/s is below required {min_requests_per_second:.2} req/s"
         )));
     }
+    if min_payload_bytes_per_second > 0.0 && payload_bytes_per_second < min_payload_bytes_per_second
+    {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "network ping payload throughput {payload_bytes_per_second:.2} bytes/s is below required {min_payload_bytes_per_second:.2} bytes/s"
+        )));
+    }
 
     Ok(SinomoTestOutcome::passed(format!(
-        "network ping completed {success_count}/{total_requests} RPCs in {}ms ({requests_per_second:.2} req/s, p50={p50_ms}ms p95={p95_ms}ms)",
+        "network ping completed {success_count}/{total_requests} RPCs in {}ms ({requests_per_second:.2} req/s, {payload_bytes_per_second:.2} payload bytes/s, p50={p50_ms}ms p95={p95_ms}ms)",
         elapsed.as_millis()
     )))
 }
@@ -269,9 +378,9 @@ fn network_ping_targets(
 fn network_ping_target_route_descriptions(
     paths: &ClusterPaths,
     targets: &[ClusterEndpointRecord],
-) -> Vec<String> {
+) -> (Vec<String>, BTreeMap<NodeId, String>) {
     let Ok(state) = network::read_cluster_state(paths) else {
-        return targets
+        let routes = targets
             .iter()
             .map(|target| {
                 format!(
@@ -280,9 +389,15 @@ fn network_ping_target_route_descriptions(
                 )
             })
             .collect();
+        let route_by_target = targets
+            .iter()
+            .map(|target| (target.node_id.clone(), "unknown".to_string()))
+            .collect();
+        return (routes, route_by_target);
     };
     let graph = network::ClusterConnectivityGraph::read_for_local(paths, &state);
-    targets
+    let mut route_by_target = BTreeMap::new();
+    let routes = targets
         .iter()
         .map(|target| {
             let route =
@@ -291,12 +406,22 @@ fn network_ping_target_route_descriptions(
                 } else {
                     "direct"
                 };
+            route_by_target.insert(target.node_id.clone(), route.to_string());
             format!(
                 "{} {} {:?} route={route}",
                 target.node_id, target.address, target.transport
             )
         })
-        .collect()
+        .collect();
+    (routes, route_by_target)
+}
+
+fn route_counts<'a>(routes: impl IntoIterator<Item = &'a str>) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for route in routes {
+        *counts.entry(route.to_string()).or_default() += 1;
+    }
+    counts
 }
 
 fn member_has_main_daemon(member: &ClusterMemberRecord) -> bool {
@@ -312,7 +437,12 @@ struct NetworkPingJob {
     endpoint: ClusterEndpointRecord,
     nonce: String,
     timeout: Duration,
-    payload_bytes: usize,
+    request_payload_bytes: usize,
+    response_payload_bytes: usize,
+    request: network::ObjectRpcRequest,
+    request_auth: Vec<u8>,
+    request_command: String,
+    route_mode: String,
     runtime: tokio::runtime::Handle,
     paths: ClusterPaths,
 }
@@ -321,6 +451,7 @@ struct NetworkPingJob {
 struct NetworkPingResult {
     target_node_id: NodeId,
     endpoint_address: String,
+    route_mode: String,
     latency_ms: u64,
     outcome: NetworkPingOutcome,
 }
@@ -337,30 +468,22 @@ async fn run_network_ping_job(job: NetworkPingJob) -> NetworkPingResult {
     NetworkPingResult {
         target_node_id: job.target_node_id,
         endpoint_address: job.endpoint.address,
+        route_mode: job.route_mode,
         latency_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         outcome,
     }
 }
 
 async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome {
-    let request = match network::cluster_network_ping_rpc_request(&job.nonce, job.payload_bytes) {
-        Ok(request) => request,
-        Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
-    };
-    let auth = match sign_daemon_rpc_request_for_local_node(&request) {
-        Ok(auth) => auth,
-        Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
-    };
-    let command = daemon_rpc_command(&request.route);
     let mut host = NetworkPingEndpointRpcHost {
         runtime: job.runtime.clone(),
         paths: job.paths.clone(),
     };
     let response = match network::send_signed_rpc_to_endpoint_async_with_host(
         &job.endpoint,
-        &request,
-        &auth,
-        &command,
+        &job.request,
+        &job.request_auth,
+        &job.request_command,
         &daemon_rpc_command(network::CLUSTER_RELAY_ROUTE),
         network::ClusterSignedEndpointRpcOptions {
             timeouts: network::DaemonRpcTimeouts::connect_and_idle(job.timeout),
@@ -388,10 +511,17 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
             response.responder_node_id, job.target_node_id
         ));
     }
-    if response.payload_bytes != job.payload_bytes {
+    if response.payload_bytes != job.request_payload_bytes {
         return NetworkPingOutcome::Failure(format!(
             "payload length mismatch: got {}, expected {}",
-            response.payload_bytes, job.payload_bytes
+            response.payload_bytes, job.request_payload_bytes
+        ));
+    }
+    if response.response_payload.len() != job.response_payload_bytes {
+        return NetworkPingOutcome::Failure(format!(
+            "response payload length mismatch: got {}, expected {}",
+            response.response_payload.len(),
+            job.response_payload_bytes
         ));
     }
     NetworkPingOutcome::Success
@@ -584,6 +714,24 @@ fn optional_f64_parameter(
                     detail: source.to_string(),
                 })
         }
+        None => Ok(default),
+    }
+}
+
+fn optional_bool_parameter(
+    ctx: &SinomoTestContext,
+    key: &str,
+    default: bool,
+) -> Result<bool, SinomoTestError> {
+    match ctx.parameter(key) {
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            other => Err(SinomoTestError::InvalidParameter {
+                name: key.to_string(),
+                detail: format!("expected boolean, got {other}"),
+            }),
+        },
         None => Ok(default),
     }
 }

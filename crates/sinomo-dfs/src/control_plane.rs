@@ -287,7 +287,7 @@ impl<'a> DfsControlPlaneStore<'a> {
     ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
         select_metadata_shard_config_for_path(
             file_system_id,
-            self.list_metadata_shards(file_system_id)?,
+            &self.list_metadata_shards(file_system_id)?,
             path,
         )
     }
@@ -299,7 +299,7 @@ impl<'a> DfsControlPlaneStore<'a> {
     ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
         select_metadata_shard_config_for_path_strict_default_sifs_split(
             file_system_id,
-            self.list_metadata_shards(file_system_id)?,
+            &self.list_metadata_shards(file_system_id)?,
             path,
         )
     }
@@ -421,7 +421,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
     ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
         select_metadata_shard_config_for_path(
             file_system_id,
-            self.list_metadata_shards(file_system_id).await?,
+            &self.list_metadata_shards(file_system_id).await?,
             path,
         )
     }
@@ -433,7 +433,7 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
     ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
         select_metadata_shard_config_for_path_strict_default_sifs_split(
             file_system_id,
-            self.list_metadata_shards(file_system_id).await?,
+            &self.list_metadata_shards(file_system_id).await?,
             path,
         )
     }
@@ -498,7 +498,7 @@ fn normalize_segment(segment: &str) -> String {
 
 pub(crate) fn select_metadata_shard_config_for_path(
     file_system_id: &DfsFileSystemId,
-    shards: Vec<DfsMetadataShardConfig>,
+    shards: &[DfsMetadataShardConfig],
     path: &str,
 ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
     select_metadata_shard_config_for_path_with_options(file_system_id, shards, path, false)
@@ -506,7 +506,7 @@ pub(crate) fn select_metadata_shard_config_for_path(
 
 pub(crate) fn select_metadata_shard_config_for_path_strict_default_sifs_split(
     file_system_id: &DfsFileSystemId,
-    shards: Vec<DfsMetadataShardConfig>,
+    shards: &[DfsMetadataShardConfig],
     path: &str,
 ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
     select_metadata_shard_config_for_path_with_options(file_system_id, shards, path, true)
@@ -514,15 +514,15 @@ pub(crate) fn select_metadata_shard_config_for_path_strict_default_sifs_split(
 
 fn select_metadata_shard_config_for_path_with_options(
     file_system_id: &DfsFileSystemId,
-    shards: Vec<DfsMetadataShardConfig>,
+    shards: &[DfsMetadataShardConfig],
     path: &str,
     reject_incomplete_default_sifs_split: bool,
 ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
     let path = normalize_metadata_selection_path(path)?;
     let path_hash = metadata_name_hash(&path);
-    let mut root = None;
-    let mut prefix_match = None::<(usize, String, DfsMetadataShardConfig)>;
-    let mut hash_match = None::<(u128, String, DfsMetadataShardConfig)>;
+    let mut root = None::<&DfsMetadataShardConfig>;
+    let mut prefix_match = None::<(usize, String, &DfsMetadataShardConfig)>;
+    let mut hash_match = None::<(u128, String, &DfsMetadataShardConfig)>;
     let mut saw_default_sifs_split_shard = false;
 
     for shard in shards {
@@ -530,9 +530,7 @@ fn select_metadata_shard_config_for_path_with_options(
             DfsMetadataShardAssignment::Root => {
                 if root
                     .as_ref()
-                    .is_none_or(|current: &DfsMetadataShardConfig| {
-                        shard.shard_id < current.shard_id
-                    })
+                    .is_none_or(|current| shard.shard_id < current.shard_id)
                 {
                     root = Some(shard);
                 }
@@ -591,7 +589,8 @@ fn select_metadata_shard_config_for_path_with_options(
     Ok(prefix_match
         .map(|(_, _, shard)| shard)
         .or_else(|| hash_match.map(|(_, _, shard)| shard))
-        .or(root))
+        .or(root)
+        .cloned())
 }
 
 fn default_sifs_split_shard_for_path(path: &str) -> Option<(&'static str, &'static str)> {

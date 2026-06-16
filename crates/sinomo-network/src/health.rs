@@ -28,8 +28,10 @@ pub struct ClusterHealthRow {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterNetworkPingRequest {
     pub nonce: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty", with = "serde_bytes")]
     pub payload: Vec<u8>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub response_payload_bytes: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -37,6 +39,8 @@ pub struct ClusterNetworkPingResponse {
     pub nonce: String,
     pub responder_node_id: NodeId,
     pub payload_bytes: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty", with = "serde_bytes")]
+    pub response_payload: Vec<u8>,
     #[serde(with = "time::serde::rfc3339")]
     pub observed_at: OffsetDateTime,
 }
@@ -49,12 +53,21 @@ pub fn cluster_network_ping_rpc_request(
     nonce: impl Into<String>,
     payload_bytes: usize,
 ) -> Result<ObjectRpcRequest, NetworkError> {
+    cluster_network_ping_rpc_request_with_response_payload(nonce, payload_bytes, 0)
+}
+
+pub fn cluster_network_ping_rpc_request_with_response_payload(
+    nonce: impl Into<String>,
+    payload_bytes: usize,
+    response_payload_bytes: usize,
+) -> Result<ObjectRpcRequest, NetworkError> {
     ObjectRpcRequest::encode_body(
         CLUSTER_NETWORK_PING_ROUTE,
         CLUSTER_NETWORK_RPC_CATEGORY,
         &ClusterNetworkPingRequest {
             nonce: nonce.into(),
             payload: vec![0_u8; payload_bytes],
+            response_payload_bytes,
         },
     )
 }
@@ -187,6 +200,7 @@ pub fn handle_cluster_network_ping_rpc_request_for_node(
                 nonce: request.nonce,
                 responder_node_id: responder_node_id.clone(),
                 payload_bytes: request.payload.len(),
+                response_payload: vec![0_u8; request.response_payload_bytes],
                 observed_at,
             };
             ObjectRpcResponse::encode_body(CLUSTER_NETWORK_PING_ROUTE, &response)
@@ -195,6 +209,10 @@ pub fn handle_cluster_network_ping_rpc_request_for_node(
             route: other.to_string(),
         }),
     }
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -590,5 +608,55 @@ fn merge_online_peer_health_rows(rows: &mut [ClusterHealthRow], peer_rows: Vec<C
         row.status = peer_row.status;
         row.status.availability = ClusterNodeAvailability::Online;
         row.availability = ClusterNodeAvailability::Online;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_object::Value;
+
+    fn object_field<'a>(value: &'a Value, key: &str) -> &'a Value {
+        let Value::Object(object) = value else {
+            panic!("expected object value for field {key}, got {value:?}");
+        };
+        object
+            .fields
+            .iter()
+            .find(|field| field.key == key)
+            .map(|field| &field.value)
+            .unwrap_or_else(|| panic!("missing object field {key} in {object:?}"))
+    }
+
+    fn assert_native_bytes_field(value: &impl serde::Serialize, key: &str) {
+        let value = sinomo_object::serde_ext::to_value(value).expect("serialize value");
+        let field = object_field(&value, key);
+        assert!(
+            matches!(field, Value::Bytes(_)),
+            "expected {key} to serialize as native bytes, got {field:?}"
+        );
+    }
+
+    #[test]
+    fn cluster_network_ping_payloads_use_native_bytes_codec() {
+        let payload = vec![0, 1, 2, 3, 253, 254, 255];
+        assert_native_bytes_field(
+            &ClusterNetworkPingRequest {
+                nonce: "nonce".to_string(),
+                payload: payload.clone(),
+                response_payload_bytes: payload.len(),
+            },
+            "payload",
+        );
+        assert_native_bytes_field(
+            &ClusterNetworkPingResponse {
+                nonce: "nonce".to_string(),
+                responder_node_id: NodeId::from_legacy_named("node").expect("node id"),
+                payload_bytes: payload.len(),
+                response_payload: payload,
+                observed_at: OffsetDateTime::UNIX_EPOCH,
+            },
+            "response_payload",
+        );
     }
 }

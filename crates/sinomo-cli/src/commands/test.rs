@@ -650,6 +650,7 @@ mod tests {
             .collect();
         for id in [
             "cluster.network.ping-benchmark",
+            "cluster.dfs.protocol-codec-baseline",
             "cluster.dfs.read-your-write",
             "cluster.dfs.invariants",
             "cluster.dfs.write",
@@ -657,8 +658,12 @@ mod tests {
             "cluster.dfs.expect-absent",
             "cluster.dfs.rename",
             "cluster.dfs.remove",
+            "cluster.dfs.small-file-baseline",
             "cluster.dfs.bulk-write",
             "cluster.dfs.bulk-expect",
+            "cluster.dfs.disk-baseline",
+            "cluster.dfs.large-write",
+            "cluster.dfs.large-expect",
         ] {
             assert!(ids.iter().any(|candidate| candidate == id), "missing {id}");
         }

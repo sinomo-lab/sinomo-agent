@@ -150,7 +150,6 @@ pub fn sign_daemon_rpc_request_for_local_node(
     request: &sinomo_network::ObjectRpcRequest,
 ) -> Result<Vec<u8>, DaemonError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
-    data_dir.ensure_root_layout()?;
     sign_daemon_rpc_request_from_data_dir(&data_dir, request)
 }
 
@@ -222,6 +221,7 @@ fn cached_daemon_signing_identity(
         return Ok(cached);
     }
 
+    data_dir.ensure_root_layout()?;
     let identity = load_or_create_main_node_identity(&root)?;
     let node_id = sinomo_network::read_cluster_state(&ClusterPaths::new(data_dir))
         .map(|state| state.local_node_id.to_string())

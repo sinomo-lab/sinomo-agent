@@ -460,13 +460,13 @@ pub fn decode_dfs_protocol_frame_rpc_response(
     response.decode_body()
 }
 
-pub(crate) const DFS_BLOB_INLINE_LIMIT_BYTES: usize = 64 * 1024;
-const DFS_BLOB_CHUNK_BYTES: usize = 64 * 1024;
-const DFS_STAGE_CHUNK_WINDOW_SIZE: u32 = 64;
-const DFS_READ_CHUNK_WINDOW_SIZE: u32 = 64;
-const DFS_FETCH_CHUNK_WINDOW_SIZE: u32 = 64;
-const DFS_LAN_CHUNK_WINDOW_SIZE: u32 = 128;
-const DFS_LOCAL_CHUNK_WINDOW_SIZE: u32 = 256;
+pub(crate) const DFS_BLOB_INLINE_LIMIT_BYTES: usize = 1024 * 1024;
+const DFS_BLOB_CHUNK_BYTES: usize = 1024 * 1024;
+const DFS_STAGE_CHUNK_WINDOW_SIZE: u32 = 4;
+const DFS_READ_CHUNK_WINDOW_SIZE: u32 = 4;
+const DFS_FETCH_CHUNK_WINDOW_SIZE: u32 = 4;
+const DFS_LAN_CHUNK_WINDOW_SIZE: u32 = 16;
+const DFS_LOCAL_CHUNK_WINDOW_SIZE: u32 = 16;
 const DFS_ADAPTIVE_TRANSFER_WINDOW_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const DFS_REMOTE_READ_RETRY_DELAY: Duration = Duration::from_secs(1);
 const DFS_CHUNK_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -11035,7 +11035,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         range: Option<(u64, usize)>,
         cache_response: bool,
     ) -> Result<Vec<NodeId>, DfsError> {
-        self.prune_stale_pending_remote_reads_for_object(object);
+        self.prune_pending_remote_reads_to_removed_locations(object);
         if object.content_hash.is_none() {
             return Ok(Vec::new());
         }
@@ -11151,6 +11151,23 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         Ok(sent)
     }
 
+    fn prune_pending_remote_reads_to_removed_locations(&mut self, object: &DfsObjectMetadata) {
+        let request_ids = self
+            .pending_reads
+            .iter()
+            .filter(|(_, pending)| {
+                pending.object_id == object.object_id
+                    && !object.current_locations.contains(&pending.target_node_id)
+            })
+            .map(|(request_id, _)| request_id.clone())
+            .collect::<Vec<_>>();
+        for request_id in request_ids {
+            self.pending_reads.remove(&request_id);
+            self.incoming_read_transfers.remove(&request_id);
+            self.incoming_read_memory_transfers.remove(&request_id);
+        }
+    }
+
     fn pending_remote_read_has_resume_state(
         &self,
         request_id: &str,
@@ -11196,26 +11213,6 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 Self::read_window_end_chunk_index(start_chunk_index, max_chunks);
         }
         Ok(sent)
-    }
-
-    fn prune_stale_pending_remote_reads_for_object(&mut self, object: &DfsObjectMetadata) {
-        let request_ids = self
-            .pending_reads
-            .iter()
-            .filter(|(_, pending)| {
-                pending.object_id == object.object_id
-                    && (pending.version != object.version
-                        || pending.content_hash != object.content_hash
-                        || pending.content_size_bytes != object.content_size_bytes
-                        || !object.current_locations.contains(&pending.target_node_id))
-            })
-            .map(|(request_id, _)| request_id.clone())
-            .collect::<Vec<_>>();
-        for request_id in request_ids {
-            self.pending_reads.remove(&request_id);
-            self.incoming_read_transfers.remove(&request_id);
-            self.incoming_read_memory_transfers.remove(&request_id);
-        }
     }
 
     pub(crate) fn has_pending_remote_read_for_current_object(
@@ -15024,7 +15021,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
         let request_id = self.next_request_id();
-        let sent = self.send_dfs_message_if_routable(
+        let sent = match self.send_dfs_message_if_routable(
             &primary_node_id,
             DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
                 request_id: request_id.clone(),
@@ -15033,8 +15030,16 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 metadata_journal_after_sequences: self.local_metadata_shard_cursors()?,
                 operation,
             }),
-        )?;
+        ) {
+            Ok(sent) => sent,
+            Err(error @ DfsError::Network { .. }) => {
+                self.cached_sifs_metadata_shards = None;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         if !sent {
+            self.cached_sifs_metadata_shards = None;
             return Err(DfsError::Network {
                 message: format!(
                     "metadata primary {primary_node_id} is not routable for namespace operation"
@@ -15101,6 +15106,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             let elapsed = started_at.elapsed();
             if elapsed >= timeout {
                 self.pending_routed_namespace_ops.remove(request_id);
+                self.cached_sifs_metadata_shards = None;
                 return Err(DfsError::Network {
                     message: format!(
                         "routed namespace operation {request_id} timed out waiting for the metadata primary"
@@ -20087,7 +20093,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                         },
                     });
                 }
-                if self.pending_read_metadata_advanced(&pending)? {
+                if pending.cache_response && self.pending_read_metadata_advanced(&pending)? {
                     return Ok(NetworkedDfsServiceEvent::RemoteReadCompleted {
                         request_id: response.request_id,
                         object_id: response.object_id,
@@ -20097,7 +20103,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                         },
                     });
                 }
-                if !self.pending_read_source_still_current(&pending, &source_node_id)? {
+                if pending.cache_response
+                    && !self.pending_read_source_still_current(&pending, &source_node_id)?
+                {
                     return Ok(NetworkedDfsServiceEvent::RemoteReadCompleted {
                         request_id: response.request_id,
                         object_id: response.object_id,
@@ -20220,7 +20228,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 }
             }
             DfsReadResult::NotFound => {
-                if self.pending_read_metadata_advanced(&pending)? {
+                if pending.cache_response && self.pending_read_metadata_advanced(&pending)? {
                     return Ok(NetworkedDfsServiceEvent::RemoteReadCompleted {
                         request_id: response.request_id,
                         object_id: response.object_id,
@@ -20382,7 +20390,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 },
             }));
         }
-        if self.pending_read_metadata_advanced(&pending)? {
+        if pending.cache_response && self.pending_read_metadata_advanced(&pending)? {
             self.pending_reads.remove(&chunk.request_id);
             return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
                 request_id,
@@ -20393,7 +20401,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 },
             }));
         }
-        if !self.pending_read_source_still_current(&pending, &source_node_id)? {
+        if pending.cache_response
+            && !self.pending_read_source_still_current(&pending, &source_node_id)?
+        {
             self.pending_reads.remove(&chunk.request_id);
             return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
                 request_id,
@@ -20626,7 +20636,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 },
             }));
         }
-        if self.pending_read_metadata_advanced(&pending)? {
+        if pending.cache_response && self.pending_read_metadata_advanced(&pending)? {
             self.pending_reads.remove(&chunk.request_id);
             self.incoming_read_transfers.remove(&chunk.request_id);
             self.incoming_read_memory_transfers
@@ -20640,7 +20650,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 },
             }));
         }
-        if !self.pending_read_source_still_current(&pending, &source_node_id)? {
+        if pending.cache_response
+            && !self.pending_read_source_still_current(&pending, &source_node_id)?
+        {
             self.pending_reads.remove(&chunk.request_id);
             self.incoming_read_transfers.remove(&chunk.request_id);
             self.incoming_read_memory_transfers
@@ -21137,7 +21149,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             content_hash: Some(content_hash),
             bytes,
         };
-        if let Err(error) = self.validate_remote_read_data(&data) {
+        if let Err(error) = self.validate_remote_read_data_for_pending(&pending, &data) {
             if matches!(error, DfsError::ContentHashMismatch { .. }) {
                 self.mark_remote_read_location_missing(
                     &pending.object_id,
