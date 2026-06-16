@@ -2194,6 +2194,7 @@ pub fn dfs_repair_maintenance_notice_lines(
                 event,
                 NetworkedDfsServiceEvent::ReplicaRepaired { .. }
                     | NetworkedDfsServiceEvent::RepairRejected { .. }
+                    | NetworkedDfsServiceEvent::RepairRetryFailed { .. }
                     | NetworkedDfsServiceEvent::BlobFetched { .. }
                     | NetworkedDfsServiceEvent::BlobFetchRejected { .. }
             )
@@ -2232,6 +2233,9 @@ pub fn dfs_repair_maintenance_notice_lines(
         } => Some(format!(
             "DFS repair rejected {intent_id} {object_id} by {replica_node_id}: {reason}"
         )),
+        NetworkedDfsServiceEvent::RepairRetryFailed { reason } => {
+            Some(format!("DFS repair retry failed: {reason}"))
+        }
         NetworkedDfsServiceEvent::BlobFetched {
             intent_id,
             object_id,
@@ -2797,6 +2801,9 @@ fn dfs_event_summary(events: &[NetworkedDfsServiceEvent]) -> Vec<String> {
                 reason,
                 ..
             } => Some(format!("repair rejected by {replica_node_id}: {reason}")),
+            NetworkedDfsServiceEvent::RepairRetryFailed { reason } => {
+                Some(format!("repair retry failed: {reason}"))
+            }
             _ => None,
         })
         .collect()
@@ -4683,6 +4690,9 @@ pub enum NetworkedDfsServiceEvent {
         replica_node_id: NodeId,
         reason: String,
     },
+    RepairRetryFailed {
+        reason: String,
+    },
     WriteConflictCreated {
         conflict: DfsConflictRecord,
     },
@@ -4969,6 +4979,7 @@ pub fn dfs_events_should_publish_metadata(events: &[NetworkedDfsServiceEvent]) -
         | NetworkedDfsServiceEvent::RemoteReadCompleted { .. }
         | NetworkedDfsServiceEvent::RemoteBulkReadCompleted { .. }
         | NetworkedDfsServiceEvent::RepairRejected { .. }
+        | NetworkedDfsServiceEvent::RepairRetryFailed { .. }
         | NetworkedDfsServiceEvent::MetadataJournalBatchApplied { .. }
         | NetworkedDfsServiceEvent::MetadataJournalBatchRejected { .. }
         | NetworkedDfsServiceEvent::MetadataSnapshotInstalled { .. } => false,
@@ -7866,13 +7877,9 @@ impl NetworkedDfsService<DfsEndpointServedProtocolFrameTransport> {
             let batch_is_empty = batch.is_empty();
             events.extend(batch);
             let scheduled = if allow_write_repair_progress {
-                match self.retry_pending_repairs_bounded(usize::MAX) {
-                    Ok(scheduled) => scheduled,
-                    Err(error) => {
-                        self.transport.finish_protocol_frame();
-                        return Err(error);
-                    }
-                }
+                let (scheduled, repair_events) = self.retry_pending_repairs_best_effort();
+                events.extend(repair_events);
+                scheduled
             } else {
                 Vec::new()
             };
@@ -7902,6 +7909,22 @@ impl NetworkedDfsService<DfsEndpointServedProtocolFrameTransport> {
                 outbound_frames.len()
             ),
         })
+    }
+}
+
+impl<T: DfsFrameTransport> NetworkedDfsService<T> {
+    fn retry_pending_repairs_best_effort(
+        &mut self,
+    ) -> (Vec<DistributedRepairJob>, Vec<NetworkedDfsServiceEvent>) {
+        match self.retry_pending_repairs_bounded(usize::MAX) {
+            Ok(scheduled) => (scheduled, Vec::new()),
+            Err(error) => (
+                Vec::new(),
+                vec![NetworkedDfsServiceEvent::RepairRetryFailed {
+                    reason: error.to_string(),
+                }],
+            ),
+        }
     }
 }
 
