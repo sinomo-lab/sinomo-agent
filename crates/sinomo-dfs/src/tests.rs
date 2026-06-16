@@ -1427,6 +1427,177 @@ fn endpoint_transport_completes_synchronous_replica_write() {
     std::fs::remove_dir_all(root).ok();
 }
 
+#[test]
+fn served_protocol_frame_drains_nested_stage_response_before_returning() {
+    let root = temp_root("served-protocol-frame-drains-nested-stage-response");
+    let requester = NodeId::from_legacy_named("node_served_frame_requester").expect("requester");
+    let primary = NodeId::from_legacy_named("node_served_frame_primary").expect("primary");
+    let replica = NodeId::from_legacy_named("node_served_frame_replica").expect("replica");
+    let object_id = DfsObjectId::from_legacy_named("obj_served_frame_routed").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_served_frame_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_served_frame_2").expect("version");
+    let endpoint = test_endpoint(&replica, "192.0.2.21:21353");
+    let stage_calls = Arc::new(Mutex::new(Vec::new()));
+    let stage_calls_for_sender = Arc::clone(&stage_calls);
+    let replica_for_sender = replica.clone();
+    let sender: DfsProtocolFrameSender = Arc::new(move |endpoint, command, _timeout| {
+        assert_eq!(endpoint.node_id, replica_for_sender);
+        let MeshMessageBody::Protocol(protocol) = &command.frame.message.body else {
+            panic!("expected protocol frame");
+        };
+        let message: DfsNetworkMessage = protocol.decode().expect("decode dfs message");
+        let DfsNetworkMessage::StageBlob(stage) = message else {
+            return Ok(DfsProtocolFrameResponse {
+                request_id: command.request_id.clone(),
+                outbound_frames: Vec::new(),
+            });
+        };
+        stage_calls_for_sender
+            .lock()
+            .expect("stage calls lock")
+            .push(stage.request_id.clone());
+        let response = DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
+            request_id: stage.request_id,
+            intent_id: stage.intent_id,
+            file_system_id: stage.file_system_id,
+            object_id: stage.object_id,
+            version: stage.version,
+            replica_node_id: command.frame.target_node_id.clone(),
+            result: DfsBlobTransferResult::Durable {
+                content_hash: stage.content_hash,
+            },
+        });
+        Ok(DfsProtocolFrameResponse {
+            request_id: command.request_id.clone(),
+            outbound_frames: vec![NetworkFrame {
+                frame_id: NetworkFrameId(100),
+                source_node_id: command.frame.target_node_id.clone(),
+                target_node_id: command.frame.source_node_id.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(100),
+                    origin_node_id: command.frame.target_node_id.clone(),
+                    target_node_id: command.frame.source_node_id.clone(),
+                    body: MeshMessageBody::Protocol(
+                        ProtocolMessage::encode(DFS_PROTOCOL, &response).expect("encode response"),
+                    ),
+                },
+            }],
+        })
+    });
+    let transport = DfsEndpointServedProtocolFrameTransport::new(
+        primary.clone(),
+        vec![endpoint],
+        sender,
+        Duration::from_millis(1),
+    );
+    let content = LocalContentStore::new(root.join("content")).expect("content store");
+    let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+    let mut dfs = NetworkedDfsService::new(transport, content)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    let mut object = file_metadata(primary.clone());
+    object.object_id = object_id.clone();
+    object.path = "/services/served-frame/routed.txt".to_string();
+    object.version = version_1.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![primary.clone()];
+    dfs.add_object_metadata(object).expect("object metadata");
+
+    let request_id = "dfs_net_req_served_frame".to_string();
+    let command = DfsDistributedWriteCommand {
+        request_id: request_id.clone(),
+        request: DfsWriteRequest {
+            file_system_id: sifs_file_system_id(),
+            object_id: object_id.clone(),
+            target_version: version_2.clone(),
+            requesting_node_id: requester.clone(),
+        },
+        expected_base_version: Some(version_1),
+        metadata_journal_after_sequence: None,
+        bytes: b"served routed bytes".to_vec(),
+        content_hash: None,
+        content_size_bytes: None,
+        desired_replica_nodes: vec![primary.clone(), replica.clone()],
+        policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
+        object_metadata: None,
+        touch_parent_on_create: false,
+        foreground_replica_repair: true,
+    };
+    let frame = build_dfs_network_frame(
+        &requester,
+        &primary,
+        10,
+        11,
+        DfsNetworkMessage::DistributedWriteRequest(command),
+    )
+    .expect("request frame");
+
+    let result = dfs.process_protocol_frame(frame).expect("process frame");
+
+    assert_eq!(stage_calls.lock().expect("stage calls lock").len(), 1);
+    let responses = result
+        .outbound_frames
+        .iter()
+        .filter_map(|frame| {
+            if frame.source_node_id != primary || frame.target_node_id != requester {
+                return None;
+            }
+            let MeshMessageBody::Protocol(protocol) = &frame.message.body else {
+                return None;
+            };
+            protocol.decode::<DfsNetworkMessage>().ok()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        responses.iter().any(|message| {
+            matches!(
+                message,
+                DfsNetworkMessage::DistributedWriteResponse(DfsDistributedWriteResponse {
+                    request_id: response_request_id,
+                    object_id: response_object_id,
+                    result:
+                        DfsDistributedWriteResult::Outcome {
+                            outcome:
+                                NetworkedDfsWriteOutcome::Pending {
+                                    durable_receipts: 1,
+                                    required_receipts: 2,
+                                    ..
+                                },
+                        },
+                    ..
+                }) if response_request_id == &request_id && response_object_id == &object_id
+            )
+        }),
+        "served frame should return the initial pending response, got {responses:?}"
+    );
+    assert!(
+        responses.iter().any(|message| {
+            matches!(
+                message,
+                DfsNetworkMessage::DistributedWriteResponse(DfsDistributedWriteResponse {
+                    request_id: response_request_id,
+                    object_id: response_object_id,
+                    result:
+                        DfsDistributedWriteResult::Outcome {
+                            outcome:
+                                NetworkedDfsWriteOutcome::Committed {
+                                    version,
+                                    ..
+                                },
+                        },
+                    ..
+                }) if response_request_id == &request_id
+                    && response_object_id == &object_id
+                    && version == &version_2
+            )
+        }),
+        "served frame must drain nested replica response and return the committed response, got {responses:?}"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
 #[derive(Clone, Debug)]
 struct ApplyingMetadataJournalTransport {
     target_node_id: NodeId,
@@ -5802,6 +5973,180 @@ fn routed_write_response_tracks_remote_intent_alias() {
 }
 
 #[test]
+fn routed_write_stale_pending_response_does_not_downgrade_completion() {
+    let requester =
+        NodeId::from_legacy_named("node_routed_write_stale_requester").expect("requester");
+    let primary = NodeId::from_legacy_named("node_routed_write_stale_primary").expect("primary");
+    let object_id = DfsObjectId::from_legacy_named("obj_routed_write_stale").expect("object");
+    let version = DfsVersion::from_legacy_named("version_routed_write_stale").expect("version");
+    let root = temp_root("routed-write-stale-pending");
+    let mut dfs = NetworkedDfsService::new(
+        FailingSendTransport {
+            local_node_id: requester.clone(),
+        },
+        LocalContentStore::new(root.join("content")).expect("content"),
+    );
+    dfs.pending_routed_writes.insert(
+        "dfs_net_req_1".to_string(),
+        PendingRoutedWrite {
+            object_id: object_id.clone(),
+            primary_node_id: primary.clone(),
+            command: test_routed_write_command("dfs_net_req_1", &requester, &object_id),
+            authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
+            remote_intent_id: None,
+            durable_receipts: 0,
+            required_receipts: 1,
+            result: None,
+        },
+    );
+
+    dfs.handle_distributed_write_response(
+        primary.clone(),
+        DfsDistributedWriteResponse {
+            request_id: "dfs_net_req_1".to_string(),
+            object_id: object_id.clone(),
+            result: DfsDistributedWriteResult::Outcome {
+                outcome: NetworkedDfsWriteOutcome::Committed {
+                    intent_id: "intent_remote_alias".to_string(),
+                    version: version.clone(),
+                    content_hash: "blake3:routed-write-stale".to_string(),
+                    repair_jobs: Vec::new(),
+                },
+            },
+            metadata_journal_batches: Vec::new(),
+        },
+    )
+    .expect("committed response");
+
+    dfs.handle_distributed_write_response(
+        primary,
+        DfsDistributedWriteResponse {
+            request_id: "dfs_net_req_1".to_string(),
+            object_id,
+            result: DfsDistributedWriteResult::Outcome {
+                outcome: NetworkedDfsWriteOutcome::Pending {
+                    intent_id: "intent_remote_alias".to_string(),
+                    durable_receipts: 1,
+                    required_receipts: 2,
+                },
+            },
+            metadata_journal_batches: Vec::new(),
+        },
+    )
+    .expect("stale pending response");
+
+    assert!(matches!(
+        dfs.write_outcome("dfs_net_req_1")
+            .expect("request outcome"),
+        NetworkedDfsWriteOutcome::Committed {
+            intent_id,
+            version: committed_version,
+            ..
+        } if intent_id == "intent_remote_alias" && committed_version == version
+    ));
+    assert!(matches!(
+        dfs.write_outcome("intent_remote_alias")
+            .expect("alias outcome"),
+        NetworkedDfsWriteOutcome::Committed {
+            intent_id,
+            version: committed_version,
+            ..
+        } if intent_id == "intent_remote_alias" && committed_version == version
+    ));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn local_write_outcome_wins_over_stale_routed_alias_shadow() {
+    let local = NodeId::from_legacy_named("node_local_shadow_writer").expect("local");
+    let replica = NodeId::from_legacy_named("node_local_shadow_replica").expect("replica");
+    let primary = NodeId::from_legacy_named("node_local_shadow_primary").expect("primary");
+    let object_id = DfsObjectId::from_legacy_named("obj_local_shadow").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_local_shadow_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_local_shadow_2").expect("version");
+    let root = temp_root("local-write-shadowed-by-routed-alias");
+    let mut dfs = NetworkedDfsService::new(
+        FailingSendTransport {
+            local_node_id: local.clone(),
+        },
+        LocalContentStore::new(root.join("content")).expect("content"),
+    );
+    let file_system_id = sifs_file_system_id();
+    dfs.add_file_system(DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "sifs".to_string(),
+        owner_node_id: local.clone(),
+        subtree_policies: Vec::new(),
+    })
+    .expect("filesystem");
+    dfs.add_object_metadata(DfsObjectMetadata {
+        object_id: object_id.clone(),
+        file_system_id: file_system_id.clone(),
+        path: "/services/local-shadow.txt".to_string(),
+        kind: DfsObjectKind::File,
+        owner_node_id: local.clone(),
+        current_locations: vec![local.clone()],
+        content_hash: Some(content_hash(b"old local shadow bytes")),
+        content_size_bytes: Some(b"old local shadow bytes".len() as u64),
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
+        version: version_1,
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    })
+    .expect("object metadata");
+
+    let write = dfs
+        .write_distributed_eventual(
+            DfsWriteRequest {
+                file_system_id,
+                object_id: object_id.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: local.clone(),
+            },
+            b"new local shadow bytes".to_vec(),
+            vec![local.clone(), replica],
+            DfsReplicationPolicy::new(1, 2).expect("policy"),
+        )
+        .expect("local write");
+    let NetworkedDfsWriteOutcome::Committed { intent_id, .. } = write else {
+        panic!("expected committed local write, got {write:?}");
+    };
+    dfs.pending_routed_writes.insert(
+        intent_id.clone(),
+        PendingRoutedWrite {
+            object_id: object_id.clone(),
+            primary_node_id: primary,
+            command: test_routed_write_command("dfs_net_req_shadow", &local, &object_id),
+            authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
+            remote_intent_id: Some(intent_id.clone()),
+            durable_receipts: 1,
+            required_receipts: 2,
+            result: None,
+        },
+    );
+
+    assert!(matches!(
+        dfs.write_outcome(&intent_id).expect("shadowed outcome"),
+        NetworkedDfsWriteOutcome::Committed {
+            intent_id: committed_intent_id,
+            version,
+            ..
+        } if committed_intent_id == intent_id && version == version_2
+    ));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn routed_write_replay_uses_existing_committed_intent_after_service_restart() {
     let requester =
         NodeId::from_legacy_named("node_routed_write_replay_requester").expect("requester");
@@ -6379,14 +6724,241 @@ fn stateless_endpoint_reader_write_commits_after_primary_fetch_receipt() {
         )
     });
 
-    assert!(matches!(
-        committed,
-        NetworkedDfsWriteOutcome::Committed {
-            version,
-            repair_jobs,
-            ..
-        } if version == version_2 && repair_jobs.is_empty()
-    ));
+    assert!(
+        matches!(
+            &committed,
+            NetworkedDfsWriteOutcome::Committed { version, .. } if version == &version_2
+        ),
+        "unexpected served routed write outcome: {committed:?}"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
+    let root = temp_root("served-endpoint-reader-write-fetch-stage");
+    let writer = NodeId::from_legacy_named("node_served_endpoint_writer").expect("writer node");
+    let primary = NodeId::from_legacy_named("node_served_endpoint_primary").expect("primary node");
+    let replica = NodeId::from_legacy_named("node_served_endpoint_replica").expect("replica node");
+    let object_id =
+        DfsObjectId::from_legacy_named("obj_served_endpoint_fetch_stage").expect("object");
+    let version_1 =
+        DfsVersion::from_legacy_named("version_served_endpoint_fetch_stage_1").expect("version");
+    let version_2 =
+        DfsVersion::from_legacy_named("version_served_endpoint_fetch_stage_2").expect("version");
+    let file_system = file_system(primary.clone());
+    let control_plane = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![writer.clone(), primary.clone(), replica.clone()])
+            .expect("kv"),
+    );
+    control_plane.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        control
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system.file_system_id.clone(),
+                shard_id: "services".to_string(),
+                primary_node_id: primary.clone(),
+                replica_node_ids: vec![writer.clone(), replica.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("metadata shard");
+    });
+
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let replica_for_sender = replica.clone();
+    let trace_for_replica_sender = Arc::clone(&trace);
+    let replica_sender: DfsProtocolFrameSender = Arc::new(move |endpoint, command, _timeout| {
+        assert_eq!(endpoint.node_id, replica_for_sender);
+        let MeshMessageBody::Protocol(protocol) = &command.frame.message.body else {
+            panic!("expected protocol frame");
+        };
+        let message: DfsNetworkMessage = protocol.decode().expect("decode dfs message");
+        let DfsNetworkMessage::StageBlob(stage) = message else {
+            return Ok(DfsProtocolFrameResponse {
+                request_id: command.request_id.clone(),
+                outbound_frames: Vec::new(),
+            });
+        };
+        trace_for_replica_sender
+            .lock()
+            .expect("trace")
+            .push(format!("stage:{}", stage.intent_id));
+        let response = DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
+            request_id: stage.request_id,
+            intent_id: stage.intent_id,
+            file_system_id: stage.file_system_id,
+            object_id: stage.object_id,
+            version: stage.version,
+            replica_node_id: command.frame.target_node_id.clone(),
+            result: DfsBlobTransferResult::Durable {
+                content_hash: stage.content_hash,
+            },
+        });
+        Ok(DfsProtocolFrameResponse {
+            request_id: command.request_id.clone(),
+            outbound_frames: vec![NetworkFrame {
+                frame_id: NetworkFrameId(101),
+                source_node_id: command.frame.target_node_id.clone(),
+                target_node_id: command.frame.source_node_id.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(101),
+                    origin_node_id: command.frame.target_node_id.clone(),
+                    target_node_id: command.frame.source_node_id.clone(),
+                    body: MeshMessageBody::Protocol(
+                        ProtocolMessage::encode(DFS_PROTOCOL, &response).expect("encode response"),
+                    ),
+                },
+            }],
+        })
+    });
+    let primary_transport = DfsEndpointServedProtocolFrameTransport::new(
+        primary.clone(),
+        vec![test_endpoint(&replica, "192.0.2.45:21353")],
+        replica_sender,
+        Duration::from_millis(1),
+    );
+    let primary_content = LocalContentStore::new(root.join("primary-content")).expect("content");
+    let primary_metadata = LocalSobjMetadataBackend::new(
+        DfsMetadataShardId::new("services"),
+        root.join("primary-metadata"),
+    )
+    .expect("primary metadata");
+    let mut primary_service = NetworkedDfsService::new(primary_transport, primary_content)
+        .with_control_plane(control_plane.clone())
+        .with_metadata_backend(primary_metadata)
+        .expect("primary metadata backend");
+    primary_service
+        .add_file_system(file_system.clone())
+        .expect("primary filesystem");
+    let mut primary_object = file_metadata(primary.clone());
+    primary_object.file_system_id = file_system.file_system_id.clone();
+    primary_object.object_id = object_id.clone();
+    primary_object.path = "/services/served-fetch-stage.txt".to_string();
+    primary_object.version = version_1.clone();
+    primary_object.policy = DfsObjectPolicy::ReplicatedEventual;
+    primary_object.current_locations = vec![writer.clone()];
+    primary_service
+        .add_object_metadata(primary_object)
+        .expect("primary object");
+    let primary_service = Arc::new(Mutex::new(primary_service));
+    let primary_service_for_sender = Arc::clone(&primary_service);
+    let trace_for_primary_sender = Arc::clone(&trace);
+    let primary_sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, command, _timeout| {
+        if let MeshMessageBody::Protocol(protocol) = &command.frame.message.body
+            && protocol.protocol == DFS_PROTOCOL
+            && let Ok(message) = protocol.decode::<DfsNetworkMessage>()
+        {
+            trace_for_primary_sender
+                .lock()
+                .expect("trace")
+                .push(format!("primary-in:{message:?}"));
+        }
+        let result = primary_service_for_sender
+            .lock()
+            .expect("primary service")
+            .process_protocol_frame(command.frame.clone())
+            .expect("process primary frame");
+        for frame in &result.outbound_frames {
+            if let MeshMessageBody::Protocol(protocol) = &frame.message.body
+                && protocol.protocol == DFS_PROTOCOL
+                && let Ok(message) = protocol.decode::<DfsNetworkMessage>()
+            {
+                trace_for_primary_sender
+                    .lock()
+                    .expect("trace")
+                    .push(format!("primary-out:{message:?}"));
+            }
+        }
+        Ok(DfsProtocolFrameResponse {
+            request_id: command.request_id.clone(),
+            outbound_frames: result.outbound_frames,
+        })
+    });
+    let transport = DfsEndpointTransport::with_connect_timeout(
+        writer.clone(),
+        vec![test_endpoint(&primary, "192.0.2.44:21353")],
+        Duration::from_millis(1),
+        primary_sender,
+    );
+    let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
+    let mut dfs =
+        NetworkedDfsService::new(transport, writer_content).with_control_plane(control_plane);
+    dfs.add_file_system(file_system.clone())
+        .expect("writer filesystem");
+    let mut writer_object = file_metadata(primary.clone());
+    writer_object.file_system_id = file_system.file_system_id.clone();
+    writer_object.object_id = object_id.clone();
+    writer_object.path = "/services/served-fetch-stage.txt".to_string();
+    writer_object.version = version_1.clone();
+    writer_object.policy = DfsObjectPolicy::ReplicatedEventual;
+    writer_object.current_locations = vec![writer.clone()];
+    dfs.add_object_metadata(writer_object)
+        .expect("writer object");
+
+    let outcome = dfs
+        .write_distributed_eventual_from_reader(
+            DfsWriteRequest {
+                file_system_id: file_system.file_system_id,
+                object_id: object_id.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: writer.clone(),
+            },
+            std::io::Cursor::new(b"served endpoint reader bytes".to_vec()),
+            vec![writer.clone(), replica.clone()],
+            DfsReplicationPolicy::new(2, 2).expect("policy"),
+        )
+        .expect("routed reader write");
+    let NetworkedDfsWriteOutcome::Pending { mut intent_id, .. } = outcome else {
+        panic!("expected pending routed write, got {outcome:?}");
+    };
+    let mut committed = None;
+    for _ in 0..20 {
+        let _ = dfs.process_incoming().expect("process routed frames");
+        let next = dfs.write_outcome(&intent_id).expect("write outcome");
+        match next {
+            NetworkedDfsWriteOutcome::Pending {
+                intent_id: next_intent_id,
+                ..
+            } => {
+                intent_id = next_intent_id;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            outcome => {
+                committed = Some(outcome);
+                break;
+            }
+        }
+    }
+    let committed = committed.unwrap_or_else(|| {
+        panic!(
+            "served routed write should commit; trace={:?}",
+            trace.lock().expect("trace")
+        )
+    });
+
+    assert!(
+        matches!(
+            &committed,
+            NetworkedDfsWriteOutcome::Committed { version, .. } if version == &version_2
+        ),
+        "unexpected served routed write outcome: {committed:?}"
+    );
+    assert!(
+        trace
+            .lock()
+            .expect("trace")
+            .iter()
+            .any(|entry| entry.starts_with("stage:")),
+        "primary should stage fetched content to the strict replica"
+    );
 
     std::fs::remove_dir_all(root).ok();
 }

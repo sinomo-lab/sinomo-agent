@@ -233,6 +233,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         let mut ready_drains = 0;
         loop {
             let events = self.process_incoming()?;
+            let scheduled = self.retry_pending_repairs_bounded(usize::MAX)?;
             let outcome = self.write_outcome(&intent_id)?;
             if let NetworkedDfsWriteOutcome::Pending {
                 intent_id: next_intent_id,
@@ -244,7 +245,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             if !matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }) {
                 return Ok(outcome);
             }
-            if events.is_empty() || ready_drains >= POSIX_WAIT_FOR_COMMIT_READY_DRAIN_LIMIT {
+            if (events.is_empty() && scheduled.is_empty())
+                || ready_drains >= POSIX_WAIT_FOR_COMMIT_READY_DRAIN_LIMIT
+            {
                 let elapsed = started_at.elapsed();
                 if elapsed >= POSIX_WAIT_FOR_COMMIT_TIMEOUT {
                     return Ok(outcome);
@@ -2904,17 +2907,41 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 message: format!("bulk read source {source_node_id} is not routable"),
             }));
         }
-        let events = self.process_incoming()?;
-        for event in events {
-            if let NetworkedDfsServiceEvent::RemoteBulkReadCompleted {
-                request_id: event_request_id,
-                source_node_id: event_source_node_id,
-                results,
-            } = event
-                && event_request_id == request_id
-                && event_source_node_id == *source_node_id
+
+        let deadline = Instant::now() + POSIX_REMOTE_READ_TIMEOUT;
+        let mut idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
+        loop {
+            let events = self.process_incoming()?;
+            if !events.is_empty() {
+                idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
+            }
+            for event in events {
+                if let NetworkedDfsServiceEvent::RemoteBulkReadCompleted {
+                    request_id: event_request_id,
+                    source_node_id: event_source_node_id,
+                    results,
+                } = event
+                    && event_request_id == request_id
+                    && event_source_node_id == *source_node_id
+                {
+                    return Ok(results);
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let wait = idle_wait.min(deadline.saturating_duration_since(now));
+            if self
+                .transport
+                .wait_for_incoming(wait)
+                .map_err(DfsError::from_network)?
             {
-                return Ok(results);
+                idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
+            } else {
+                idle_wait = idle_wait
+                    .saturating_mul(2)
+                    .min(POSIX_REMOTE_READ_IDLE_WAIT_MAX);
             }
         }
         Err(DfsPosixError::Dfs(DfsError::Network {

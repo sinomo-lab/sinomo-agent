@@ -3081,6 +3081,211 @@ fn networked_dfs_routes_non_primary_write_to_metadata_shard_primary() {
 }
 
 #[test]
+fn networked_dfs_strict_routed_write_completion_resolves_remote_intent_alias() {
+    let writer = NodeId::from_legacy_named("node_strict_route_writer").expect("node");
+    let primary = NodeId::from_legacy_named("node_strict_route_primary").expect("node");
+    let witness = NodeId::from_legacy_named("node_strict_route_witness").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_strict_route_primary").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_strict_route_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_strict_route_2").expect("version");
+    let root = temp_root("networked_strict_route_alias");
+    let network = InProcessNetwork::new();
+    let control_plane = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![writer.clone(), primary.clone(), witness])
+            .expect("control-plane kv cluster"),
+    );
+    control_plane.with_client(|kv| {
+        DfsControlPlaneStore::new(kv)
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "services".to_string(),
+                primary_node_id: primary.clone(),
+                replica_node_ids: vec![writer.clone()],
+                epoch: 3,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("metadata shard");
+    });
+    let primary_backend = LocalSobjMetadataBackend::new(
+        DfsMetadataShardId::new("services"),
+        root.join("primary-meta"),
+    )
+    .expect("primary metadata backend");
+    let mut writer_dfs = NetworkedDfsService::new(
+        network.add_node(writer.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("writer-content")).expect("writer content"),
+    )
+    .with_control_plane(control_plane.clone());
+    let mut primary_dfs = NetworkedDfsService::new(
+        network.add_node(primary.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("primary-content")).expect("primary content"),
+    )
+    .with_control_plane(control_plane)
+    .with_metadata_backend(primary_backend)
+    .expect("primary metadata backend");
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "sifs".to_string(),
+        owner_node_id: primary.clone(),
+        subtree_policies: Vec::new(),
+    };
+    let object = DfsObjectMetadata {
+        object_id: object_id.clone(),
+        file_system_id: file_system_id.clone(),
+        path: "/services/strict-routed.txt".to_string(),
+        kind: DfsObjectKind::File,
+        owner_node_id: primary.clone(),
+        current_locations: vec![writer.clone()],
+        content_hash: Some(content_hash(b"old strict routed bytes")),
+        content_size_bytes: Some(b"old strict routed bytes".len() as u64),
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
+        version: version_1.clone(),
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    };
+    writer_dfs
+        .add_file_system(file_system.clone())
+        .expect("writer filesystem");
+    primary_dfs
+        .add_file_system(file_system)
+        .expect("primary filesystem");
+    writer_dfs
+        .add_object_metadata(object)
+        .expect("writer object metadata");
+
+    let routed = writer_dfs
+        .write_distributed_eventual(
+            DfsWriteRequest {
+                file_system_id: file_system_id.clone(),
+                object_id: object_id.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: writer.clone(),
+            },
+            b"strict routed primary bytes".to_vec(),
+            vec![primary.clone(), writer.clone()],
+            DfsReplicationPolicy::new(2, 2).expect("strict policy"),
+        )
+        .expect("routed write request");
+    assert!(matches!(
+        routed,
+        NetworkedDfsWriteOutcome::Pending {
+            durable_receipts: 0,
+            required_receipts: 1,
+            ..
+        }
+    ));
+
+    let primary_events = primary_dfs.process_incoming().expect("primary incoming");
+    assert!(primary_events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteWriteServed {
+                requester_node_id,
+                result:
+                    DfsDistributedWriteResult::Outcome {
+                        outcome:
+                            NetworkedDfsWriteOutcome::Pending {
+                                durable_receipts: 1,
+                                required_receipts: 2,
+                                ..
+                            },
+                    },
+                ..
+            } if requester_node_id == &writer
+        )
+    }));
+
+    let writer_events = writer_dfs.process_incoming().expect("writer stages");
+    let remote_intent_id = writer_events
+        .iter()
+        .find_map(|event| match event {
+            NetworkedDfsServiceEvent::RemoteWriteCompleted {
+                result:
+                    DfsDistributedWriteResult::Outcome {
+                        outcome:
+                            NetworkedDfsWriteOutcome::Pending {
+                                intent_id,
+                                durable_receipts: 1,
+                                required_receipts: 2,
+                            },
+                    },
+                ..
+            } => Some(intent_id.clone()),
+            _ => None,
+        })
+        .expect("writer receives remote pending intent");
+    assert!(matches!(
+        writer_dfs
+            .handle_confirmed_write_timeout(
+                &remote_intent_id,
+                DfsConfirmedTimeoutAction::KeepPending,
+            )
+            .expect("remote intent pending"),
+        DfsConfirmedTimeoutOutcome::StillPending {
+            durable_receipts: 1,
+            required_receipts: 2,
+            ..
+        }
+    ));
+
+    let primary_events = primary_dfs
+        .process_incoming()
+        .expect("primary receives strict receipt");
+    assert!(primary_events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteWriteServed {
+                requester_node_id,
+                result:
+                    DfsDistributedWriteResult::Outcome {
+                        outcome: NetworkedDfsWriteOutcome::Committed { .. },
+                    },
+                ..
+            } if requester_node_id == &writer
+        )
+    }));
+    let writer_events = writer_dfs
+        .process_incoming()
+        .expect("writer receives strict completion");
+    assert!(writer_events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteWriteCompleted {
+                primary_node_id,
+                result:
+                    DfsDistributedWriteResult::Outcome {
+                        outcome: NetworkedDfsWriteOutcome::Committed { .. },
+                    },
+                ..
+            } if primary_node_id == &primary
+        )
+    }));
+    assert!(matches!(
+        writer_dfs
+            .handle_confirmed_write_timeout(
+                &remote_intent_id,
+                DfsConfirmedTimeoutAction::KeepPending,
+            )
+            .expect("remote intent committed"),
+        DfsConfirmedTimeoutOutcome::Committed(NetworkedDfsWriteOutcome::Committed { .. })
+    ));
+
+    cleanup(&root);
+}
+
+#[test]
 fn routed_write_response_does_not_fail_when_requester_becomes_metadata_primary() {
     let writer = NodeId::from_legacy_named("node_route_flip_writer").expect("node");
     let primary = NodeId::from_legacy_named("node_route_flip_primary").expect("node");

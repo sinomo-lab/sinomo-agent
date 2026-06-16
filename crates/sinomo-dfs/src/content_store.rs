@@ -38,6 +38,10 @@ pub enum ContentStoreError {
     MissingStaged(String),
     #[error("content-addressed blob hash mismatch: expected={expected}, actual={actual}")]
     BlobHashMismatch { expected: String, actual: String },
+    #[error("loose content-addressed blob not found: {hash}")]
+    MissingLooseBlob { hash: String },
+    #[error("content-addressed blob is packed, not loose: {hash}")]
+    PackedBlob { hash: String },
     #[error(
         "chunked content hash mismatch: object={object_id}, version={version}, expected={expected_hash}, actual={actual_hash}"
     )]
@@ -1772,6 +1776,31 @@ impl LocalContentStore {
                 source,
             })?;
         Ok(content_hash(&bytes) == hash)
+    }
+
+    /// Test-only fault injection: remove a loose content-addressed blob.
+    ///
+    /// Packed blobs share segment files, so this deliberately refuses packed
+    /// content. Cluster tests use payloads above the packed threshold when they
+    /// need to simulate one replica losing local disk content.
+    pub fn debug_remove_loose_blob(&self, hash: &str) -> Result<()> {
+        hash_hex(hash)?;
+        let blob_path = self.blob_path(hash)?;
+        let before_len = file_len_if_exists(&blob_path)?;
+        if before_len.is_some() {
+            if remove_file_if_exists_and_sync_parent(&blob_path)? {
+                self.apply_stats_delta(ContentStoreStatsDelta::blob_file_change(before_len, None))?;
+            }
+            return Ok(());
+        }
+        if self.packed_blob_location(hash)?.is_some() {
+            return Err(ContentStoreError::PackedBlob {
+                hash: hash.to_owned(),
+            });
+        }
+        Err(ContentStoreError::MissingLooseBlob {
+            hash: hash.to_owned(),
+        })
     }
 
     pub fn put_object_version_patch(

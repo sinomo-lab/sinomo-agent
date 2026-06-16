@@ -7087,6 +7087,7 @@ fn metadata_journal_rejection_is_sequence_conflict(reason: &str) -> bool {
 }
 
 pub const DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const DFS_PROTOCOL_FRAME_DRAIN_MAX_PASSES: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsPeerTransportError {
@@ -7849,14 +7850,57 @@ impl NetworkedDfsService<DfsEndpointServedProtocolFrameTransport> {
                 ),
             });
         }
+        let allow_write_repair_progress = !dfs_protocol_frame_is_read_only_request(&inbound_frame);
         self.transport
             .enqueue_protocol_frame(inbound_frame)
             .map_err(DfsError::from_network)?;
-        let events = self.process_incoming();
+        let mut events = Vec::new();
+        for _ in 0..DFS_PROTOCOL_FRAME_DRAIN_MAX_PASSES {
+            let batch = match self.process_incoming() {
+                Ok(batch) => batch,
+                Err(error) => {
+                    self.transport.finish_protocol_frame();
+                    return Err(error);
+                }
+            };
+            let batch_is_empty = batch.is_empty();
+            events.extend(batch);
+            let scheduled = if allow_write_repair_progress {
+                match self.retry_pending_repairs_bounded(usize::MAX) {
+                    Ok(scheduled) => scheduled,
+                    Err(error) => {
+                        self.transport.finish_protocol_frame();
+                        return Err(error);
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            let pending = match self
+                .transport
+                .pending_incoming_count()
+                .map_err(DfsError::from_network)
+            {
+                Ok(pending) => pending,
+                Err(error) => {
+                    self.transport.finish_protocol_frame();
+                    return Err(error);
+                }
+            };
+            if pending == Some(0) && batch_is_empty && scheduled.is_empty() {
+                let outbound_frames = self.transport.finish_protocol_frame();
+                return Ok(DfsProtocolFrameProcessResult {
+                    outbound_frames,
+                    events,
+                });
+            }
+        }
         let outbound_frames = self.transport.finish_protocol_frame();
-        Ok(DfsProtocolFrameProcessResult {
-            outbound_frames,
-            events: events?,
+        Err(DfsError::Network {
+            message: format!(
+                "DFS protocol frame did not quiesce after {DFS_PROTOCOL_FRAME_DRAIN_MAX_PASSES} passes; returned {} frame(s) before aborting",
+                outbound_frames.len()
+            ),
         })
     }
 }
@@ -13470,7 +13514,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             .map_err(DfsError::from_network)?
             == Some(0)
         {
-            return Ok(Vec::new());
+            let mut events = Vec::new();
+            self.flush_completed_pending_remote_write_responses(&mut events)?;
+            self.prune_expired_pending_remote_reads();
+            self.last_events = events.clone();
+            return Ok(events);
         }
         let inbound_frames = self
             .transport
@@ -14176,10 +14224,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                         ..
                     },
             } => {
-                pending.remote_intent_id = Some(intent_id.clone());
-                pending.durable_receipts = *durable_receipts;
-                pending.required_receipts = *required_receipts;
-                pending.result = None;
+                if pending.result.is_none() {
+                    pending.remote_intent_id = Some(intent_id.clone());
+                    pending.durable_receipts = *durable_receipts;
+                    pending.required_receipts = *required_receipts;
+                }
                 if intent_id != &response.request_id {
                     remote_intent_alias = Some((intent_id.clone(), pending.clone()));
                 }
@@ -23599,10 +23648,35 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     fn write_outcome(&self, intent_id: &str) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        if let Some(intent) = self.coordinator.intent(intent_id) {
+            return self.local_write_outcome(intent_id, intent);
+        }
         if let Some(pending) = self.pending_routed_writes.get(intent_id) {
+            match &pending.result {
+                Some(Ok(outcome)) => return Ok(outcome.clone()),
+                Some(Err(error)) => return Err(error.clone()),
+                None => {}
+            }
+            if pending.command.request_id != intent_id
+                && let Some(canonical) = self.pending_routed_writes.get(&pending.command.request_id)
+            {
+                match &canonical.result {
+                    Some(Ok(outcome)) => return Ok(outcome.clone()),
+                    Some(Err(error)) => return Err(error.clone()),
+                    None => {
+                        return Ok(NetworkedDfsWriteOutcome::Pending {
+                            intent_id: canonical
+                                .remote_intent_id
+                                .clone()
+                                .unwrap_or_else(|| intent_id.to_string()),
+                            durable_receipts: canonical.durable_receipts,
+                            required_receipts: canonical.required_receipts,
+                        });
+                    }
+                }
+            }
             return match &pending.result {
-                Some(Ok(outcome)) => Ok(outcome.clone()),
-                Some(Err(error)) => Err(error.clone()),
+                Some(Ok(_)) | Some(Err(_)) => unreachable!("pending result handled above"),
                 None => Ok(NetworkedDfsWriteOutcome::Pending {
                     intent_id: pending
                         .remote_intent_id
@@ -23613,12 +23687,16 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 }),
             };
         }
-        let intent = self
-            .coordinator
-            .intent(intent_id)
-            .ok_or_else(|| DfsError::Distributed {
-                message: format!("unknown intent: {intent_id}"),
-            })?;
+        Err(DfsError::Distributed {
+            message: format!("unknown intent: {intent_id}"),
+        })
+    }
+
+    fn local_write_outcome(
+        &self,
+        intent_id: &str,
+        intent: &DistributedWriteIntent,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         if matches!(intent.state, DfsWriteIntentState::Committed) {
             let pending = self.pending_writes.get(intent_id);
             let content_hash = pending
