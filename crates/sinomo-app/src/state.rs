@@ -8,11 +8,14 @@
 
 use std::cell::{Ref, RefCell, RefMut};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
 use sui::DefaultTheme;
 
-use crate::backend::Backend;
+use sinomo_runtime::local::SinomoDataDir;
+
+use crate::backend::{Backend, app_config};
 use crate::theme::{AppThemeMode, resolve_theme};
 use crate::ui::chat::ChatState;
 use crate::ui::cluster::ClusterState;
@@ -107,6 +110,7 @@ impl ReadyState {
 pub struct AppState {
     pub active_tab: Tab,
     pub theme_mode: AppThemeMode,
+    pub data_dir: Arc<SinomoDataDir>,
     /// Live status line for the title-bar indicator while connecting.
     pub status: String,
     /// `Some` once the backend connection has resolved.
@@ -121,9 +125,12 @@ pub struct AppState {
 impl AppState {
     /// The pre-connection state shown immediately at launch. The backend resolves asynchronously.
     pub fn connecting() -> Self {
+        let data_dir = Arc::new(app_config::default_data_dir());
+        let theme_mode = app_config::load_theme(&data_dir);
         Self {
             active_tab: Tab::Sinomo,
-            theme_mode: AppThemeMode::System,
+            theme_mode,
+            data_dir,
             status: "Starting…".to_string(),
             ready: None,
             connect_rx: None,
@@ -134,9 +141,12 @@ impl AppState {
     /// A fully-resolved state built synchronously from a backend — used by headless tooling and
     /// visual tests, which render the tabs directly without the async connection dance.
     pub fn ready(backend: Backend) -> Self {
+        let data_dir = backend.data_dir.clone();
+        let theme_mode = app_config::load_theme(&data_dir);
         Self {
             active_tab: Tab::Sinomo,
-            theme_mode: AppThemeMode::System,
+            theme_mode,
+            data_dir,
             status: backend.mode_label(),
             ready: Some(ReadyState::build(backend)),
             connect_rx: None,
@@ -294,7 +304,11 @@ impl Shared {
                 ConnectEvent::Connected(backend) => {
                     // Build the tab sub-states off the borrow (a one-time hitch), then commit.
                     let ready = ReadyState::build(*backend);
+                    let data_dir = ready.backend.data_dir.clone();
+                    let theme_mode = app_config::load_theme(&data_dir);
                     let mut state = self.0.borrow_mut();
+                    state.theme_mode = theme_mode;
+                    state.data_dir = data_dir;
                     state.status = ready.backend.mode_label();
                     state.ready = Some(ready);
                     state.connect_rx = None;
@@ -304,5 +318,19 @@ impl Shared {
             }
         }
         (changed, became_ready)
+    }
+
+    pub fn set_theme_mode(&self, mode: AppThemeMode) {
+        let data_dir = {
+            let mut state = self.0.borrow_mut();
+            if state.theme_mode == mode {
+                return;
+            }
+            state.theme_mode = mode;
+            state.data_dir.clone()
+        };
+        if let Err(error) = app_config::save_theme(&data_dir, mode) {
+            tracing::warn!(%error, "failed to persist app UI theme preference");
+        }
     }
 }

@@ -3,10 +3,12 @@
 
 use sui::{Color, DefaultTheme, FontWeight, TextStyle};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AppThemeMode {
     Light,
     Dark,
+    #[default]
     System,
 }
 

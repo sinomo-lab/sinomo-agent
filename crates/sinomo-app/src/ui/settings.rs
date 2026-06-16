@@ -676,7 +676,7 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
             .selected(mode_index)
             .theme_when(clone_reader(reader))
             .on_change(move |i, _| {
-                s.borrow_mut().theme_mode = index_to_mode(i);
+                s.set_theme_mode(index_to_mode(i));
             })
     };
     let body = FieldGroup::new().with_child(
