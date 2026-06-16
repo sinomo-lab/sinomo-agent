@@ -657,6 +657,7 @@ mod tests {
             "cluster.dfs.expect-absent",
             "cluster.dfs.rename",
             "cluster.dfs.remove",
+            "cluster.dfs.small-file-baseline",
             "cluster.dfs.bulk-write",
             "cluster.dfs.bulk-expect",
             "cluster.dfs.disk-baseline",

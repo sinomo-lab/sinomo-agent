@@ -14,15 +14,16 @@
 #                       directions), then a routed delete observed cluster-wide
 #   6. rename         — /users -> /services rename issued by a NON-writer node,
 #                       observed (and the old path absent) on far nodes
-#   7. bulk perf      — small-file bulk write/read throughput with process I/O
+#   7. small baseline — node-local raw tiny-file write baseline for DFS comparison
+#   8. bulk perf      — small-file bulk write/read throughput with process I/O
 #                       amplification checks and read-side write_bytes == 0
-#   8. disk baseline — node-local raw file write/read baseline for DFS comparison
-#   9. large-file perf — large object write/read throughput with process I/O
+#   9. disk baseline — node-local raw file write/read baseline for DFS comparison
+#   10. large-file perf — large object write/read throughput with process I/O
 #                       amplification checks and read-side write_bytes == 0
-#   10. disk damage   — delete one durable loose blob and read through the
+#   11. disk damage   — delete one durable loose blob and read through the
 #                       remaining replica without read-side disk writes
-#   11. restart       — restart a member, re-gate formation, re-read its data
-#   12. final sweep   — invariants again on every node
+#   12. restart       — restart a member, re-gate formation, re-read its data
+#   13. final sweep   — invariants again on every node
 #
 # Usage:
 #   docker/test-cluster.sh                  # build-if-missing, up, test, down -v
@@ -41,7 +42,12 @@
 #   SINOMO_TEST_PERF_MIN_READ_FILES_PER_SEC   min cross-node read/convergence throughput (default 1)
 #   SINOMO_TEST_PERF_MAX_PROC_WCHAR_AMPLIFICATION       max writer-process wchar/logical bytes (default 0, disabled)
 #   SINOMO_TEST_PERF_MAX_PROC_WRITE_BYTES_AMPLIFICATION max writer-process write_bytes/logical bytes (default 0, disabled)
+#   SINOMO_TEST_PERF_MAX_PROC_SYSCW_PER_FILE max writer-process write syscalls/logical file (default 4)
 #   SINOMO_TEST_PERF_MAX_READ_PROC_WRITE_BYTES max reader-process write_bytes during bulk-expect (default 0)
+#   SINOMO_TEST_SMALL_BASELINE_FILES files in raw tiny-file baseline leg (default same as SINOMO_TEST_PERF_FILES)
+#   SINOMO_TEST_SMALL_BASELINE_BYTES bytes per raw tiny-file baseline file (default same as SINOMO_TEST_PERF_BYTES)
+#   SINOMO_TEST_SMALL_BASELINE_SYNC_WRITES sync each raw tiny-file write before timing completes (default 0)
+#   SINOMO_TEST_SMALL_BASELINE_MIN_FILES_PER_SEC min raw tiny-file throughput (default 0, disabled)
 #   SINOMO_TEST_LARGE_BYTES    bytes in large-file performance leg (default 16777216)
 #   SINOMO_TEST_LARGE_TIMEOUT  large-file write/read timeout seconds (default 180)
 #   SINOMO_TEST_LARGE_MIN_WRITE_BYTES_PER_SEC min large writer throughput (default 4194304)
@@ -104,7 +110,12 @@ PERF_MIN_WRITE_FILES_PER_SEC="${SINOMO_TEST_PERF_MIN_WRITE_FILES_PER_SEC:-0.75}"
 PERF_MIN_READ_FILES_PER_SEC="${SINOMO_TEST_PERF_MIN_READ_FILES_PER_SEC:-1}"
 PERF_MAX_PROC_WCHAR_AMPLIFICATION="${SINOMO_TEST_PERF_MAX_PROC_WCHAR_AMPLIFICATION:-0}"
 PERF_MAX_PROC_WRITE_BYTES_AMPLIFICATION="${SINOMO_TEST_PERF_MAX_PROC_WRITE_BYTES_AMPLIFICATION:-0}"
+PERF_MAX_PROC_SYSCW_PER_FILE="${SINOMO_TEST_PERF_MAX_PROC_SYSCW_PER_FILE:-4}"
 PERF_MAX_READ_PROC_WRITE_BYTES="${SINOMO_TEST_PERF_MAX_READ_PROC_WRITE_BYTES:-0}"
+SMALL_BASELINE_FILES="${SINOMO_TEST_SMALL_BASELINE_FILES:-$PERF_FILES}"
+SMALL_BASELINE_BYTES="${SINOMO_TEST_SMALL_BASELINE_BYTES:-$PERF_BYTES}"
+SMALL_BASELINE_SYNC_WRITES="${SINOMO_TEST_SMALL_BASELINE_SYNC_WRITES:-0}"
+SMALL_BASELINE_MIN_FILES_PER_SEC="${SINOMO_TEST_SMALL_BASELINE_MIN_FILES_PER_SEC:-0}"
 LARGE_BYTES="${SINOMO_TEST_LARGE_BYTES:-16777216}"
 LARGE_TIMEOUT="${SINOMO_TEST_LARGE_TIMEOUT:-180}"
 LARGE_MIN_WRITE_BYTES_PER_SEC="${SINOMO_TEST_LARGE_MIN_WRITE_BYTES_PER_SEC:-4194304}"
@@ -400,6 +411,18 @@ rename_across_prefixes() {
   && run_probe node3 cluster.dfs.remove --param "path=$dst"
 }
 
+small_file_baseline() {
+  local rc=0 node
+  for node in node2 node5; do
+    run_probe "$node" cluster.dfs.small-file-baseline \
+      --param "files=$SMALL_BASELINE_FILES" \
+      --param "bytes=$SMALL_BASELINE_BYTES" \
+      --param "sync-writes=$SMALL_BASELINE_SYNC_WRITES" \
+      --param "min-files-per-second=$SMALL_BASELINE_MIN_FILES_PER_SEC" || rc=1
+  done
+  return $rc
+}
+
 bulk_performance() {
   local warm="/services/cluster-tests/$RUN_ID/perf-warmup"
   local a="/services/cluster-tests/$RUN_ID/perf-a"
@@ -423,6 +446,7 @@ bulk_performance() {
     --param "min-files-per-second=$PERF_MIN_WRITE_FILES_PER_SEC" \
     --param "max-proc-wchar-amplification=$PERF_MAX_PROC_WCHAR_AMPLIFICATION" \
     --param "max-proc-write-bytes-amplification=$PERF_MAX_PROC_WRITE_BYTES_AMPLIFICATION" \
+    --param "max-proc-syscw-per-file=$PERF_MAX_PROC_SYSCW_PER_FILE" \
   && run_probe node6 cluster.dfs.bulk-expect \
     --param "base=$a" \
     --param "files=$PERF_FILES" \
@@ -438,6 +462,7 @@ bulk_performance() {
     --param "min-files-per-second=$PERF_MIN_WRITE_FILES_PER_SEC" \
     --param "max-proc-wchar-amplification=$PERF_MAX_PROC_WCHAR_AMPLIFICATION" \
     --param "max-proc-write-bytes-amplification=$PERF_MAX_PROC_WRITE_BYTES_AMPLIFICATION" \
+    --param "max-proc-syscw-per-file=$PERF_MAX_PROC_SYSCW_PER_FILE" \
   && run_probe node1 cluster.dfs.bulk-expect \
     --param "base=$b" \
     --param "files=$PERF_FILES" \
@@ -635,6 +660,7 @@ scenario "invariants-baseline"  invariants_sweep
 scenario "read-your-write"      read_your_write
 scenario "cross-node"           cross_node
 scenario "rename-across-prefixes" rename_across_prefixes
+scenario "small-file-baseline"  small_file_baseline
 scenario "bulk-performance"     bulk_performance
 scenario "disk-baseline"        disk_baseline
 scenario "large-file-performance" large_file_performance

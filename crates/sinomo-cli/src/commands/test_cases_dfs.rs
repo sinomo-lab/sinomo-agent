@@ -16,6 +16,9 @@
 //! - `cluster.dfs.expect-replicated` / `cluster.dfs.damage-local-loose-blob`
 //!   — fault-injection probes used by the Docker gate to verify reads survive
 //!   one damaged durable replica.
+//! - `cluster.dfs.small-file-baseline` — node-local raw tiny-file write baseline
+//!   used to compare DFS bulk-write syscall amplification against ordinary file
+//!   creation on the same container storage path.
 //! - `cluster.dfs.bulk-write` / `cluster.dfs.bulk-expect` — deterministic bulk
 //!   write/read probes for cluster-level throughput, convergence evidence, and
 //!   steady-state process I/O accounting.
@@ -57,6 +60,7 @@ pub fn register_dfs_cluster_test_cases(
         .register(dfs_damage_local_loose_blob())
         .register(dfs_rename())
         .register(dfs_remove())
+        .register(dfs_small_file_baseline())
         .register(dfs_bulk_write())
         .register(dfs_bulk_expect())
         .register(dfs_disk_baseline())
@@ -168,6 +172,18 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_remove(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_small_file_baseline(ctx) {
+        id: "cluster.dfs.small-file-baseline",
+        summary: "Measure node-local raw tiny-file create/write throughput and syscall count under SINOMO_DATA_DIR",
+        tags: ["cluster-dfs", "probe", "performance"],
+        requirements: [],
+        run: {
+            run_small_file_baseline(ctx)
         }
     }
 }
@@ -370,10 +386,7 @@ fn run_expect_file(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     .zip(current_proc_io())
                     .map(|(before, after)| after.saturating_delta(before))
                 {
-                    ctx.record("proc_rchar_delta", proc_io_delta.rchar);
-                    ctx.record("proc_wchar_delta", proc_io_delta.wchar);
-                    ctx.record("proc_read_bytes_delta", proc_io_delta.read_bytes);
-                    ctx.record("proc_write_bytes_delta", proc_io_delta.write_bytes);
+                    record_proc_io_delta_flat(ctx, proc_io_delta);
                     if let Some(max_proc_write_bytes) = max_proc_write_bytes
                         && proc_io_delta.write_bytes > max_proc_write_bytes
                     {
@@ -575,6 +588,49 @@ fn run_remove(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     )))
 }
 
+fn run_small_file_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let files = optional_usize_parameter(ctx, "files", DEFAULT_BULK_FILE_COUNT)?;
+    let bytes = optional_usize_parameter(ctx, "bytes", DEFAULT_BULK_FILE_BYTES)?;
+    let sync_writes = optional_bool_parameter(ctx, "sync-writes", false)?;
+    let min_files_per_second = optional_f64_parameter(ctx, "min-files-per-second", 0.0)?;
+    let max_proc_syscw_per_file = optional_f64_parameter(ctx, "max-proc-syscw-per-file", 0.0)?;
+    require_positive("files", files)?;
+    require_positive("bytes", bytes)?;
+
+    let benchmark = raw_small_file_baseline(ctx, files, bytes, sync_writes)?;
+    record_raw_small_file_baseline(ctx, &benchmark, "raw_small");
+    ctx.record("min_files_per_second", min_files_per_second);
+    ctx.record("max_proc_syscw_per_file", max_proc_syscw_per_file);
+
+    if min_files_per_second > 0.0 && benchmark.files_per_second < min_files_per_second {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "raw small-file baseline wrote {} files in {}ms ({:.2} files/s), below required {:.2} files/s",
+            benchmark.files,
+            benchmark.elapsed.as_millis(),
+            benchmark.files_per_second,
+            min_files_per_second
+        )));
+    }
+    if max_proc_syscw_per_file > 0.0
+        && benchmark.proc_syscw_per_file.unwrap_or(0.0) > max_proc_syscw_per_file
+    {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "raw small-file baseline wrote {} files with proc syscw/file {:.2}, above allowed {:.2}",
+            benchmark.files,
+            benchmark.proc_syscw_per_file.unwrap_or(0.0),
+            max_proc_syscw_per_file
+        )));
+    }
+
+    Ok(SinomoTestOutcome::passed(format!(
+        "raw small-file baseline wrote {} files in {}ms ({:.2} files/s, {:.2} syscw/file)",
+        benchmark.files,
+        benchmark.elapsed.as_millis(),
+        benchmark.files_per_second,
+        benchmark.proc_syscw_per_file.unwrap_or(0.0)
+    )))
+}
+
 fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let base = ctx
         .required_parameter("base")?
@@ -588,6 +644,7 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         optional_f64_parameter(ctx, "max-proc-wchar-amplification", 0.0)?;
     let max_proc_write_bytes_amplification =
         optional_f64_parameter(ctx, "max-proc-write-bytes-amplification", 0.0)?;
+    let max_proc_syscw_per_file = optional_f64_parameter(ctx, "max-proc-syscw-per-file", 0.0)?;
     require_positive("files", files)?;
     require_positive("bytes", bytes)?;
 
@@ -664,31 +721,38 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         "max_proc_write_bytes_amplification",
         max_proc_write_bytes_amplification,
     );
+    ctx.record("max_proc_syscw_per_file", max_proc_syscw_per_file);
     if let Some(proc_io_delta) = proc_io_delta {
         let proc_wchar_amplification =
             amplification_ratio(proc_io_delta.wchar, total_bytes).unwrap_or(0.0);
         let proc_write_bytes_amplification =
             amplification_ratio(proc_io_delta.write_bytes, total_bytes).unwrap_or(0.0);
-        ctx.record("proc_rchar_delta", proc_io_delta.rchar);
-        ctx.record("proc_wchar_delta", proc_io_delta.wchar);
-        ctx.record("proc_read_bytes_delta", proc_io_delta.read_bytes);
-        ctx.record("proc_write_bytes_delta", proc_io_delta.write_bytes);
+        let proc_syscw_per_file = per_file(proc_io_delta.syscw, files).unwrap_or(0.0);
+        record_proc_io_delta_flat(ctx, proc_io_delta);
         ctx.record("proc_wchar_amplification", proc_wchar_amplification);
         ctx.record(
             "proc_write_bytes_amplification",
             proc_write_bytes_amplification,
         );
+        ctx.record("proc_syscw_per_file", proc_syscw_per_file);
         if let Some(delta) = proc_io_mkdir_delta {
             ctx.record("proc_write_bytes_after_mkdir_delta", delta.write_bytes);
             ctx.record("proc_wchar_after_mkdir_delta", delta.wchar);
+            ctx.record("proc_syscw_after_mkdir_delta", delta.syscw);
         }
         if let Some(delta) = proc_io_write_delta {
             ctx.record("proc_write_bytes_bulk_write_delta", delta.write_bytes);
             ctx.record("proc_wchar_bulk_write_delta", delta.wchar);
+            ctx.record("proc_syscw_bulk_write_delta", delta.syscw);
+            ctx.record(
+                "proc_syscw_bulk_write_per_file",
+                per_file(delta.syscw, files).unwrap_or(0.0),
+            );
         }
         if let Some(delta) = proc_io_publish_delta {
             ctx.record("proc_write_bytes_publish_delta", delta.write_bytes);
             ctx.record("proc_wchar_publish_delta", delta.wchar);
+            ctx.record("proc_syscw_publish_delta", delta.syscw);
         }
         if max_proc_wchar_amplification > 0.0
             && proc_wchar_amplification > max_proc_wchar_amplification
@@ -702,6 +766,11 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         {
             return Ok(SinomoTestOutcome::failed(format!(
                 "bulk write on node {node} wrote {files} files with proc write_bytes amplification {proc_write_bytes_amplification:.2}x, above allowed {max_proc_write_bytes_amplification:.2}x"
+            )));
+        }
+        if max_proc_syscw_per_file > 0.0 && proc_syscw_per_file > max_proc_syscw_per_file {
+            return Ok(SinomoTestOutcome::failed(format!(
+                "bulk write on node {node} wrote {files} files with proc syscw/file {proc_syscw_per_file:.2}, above allowed {max_proc_syscw_per_file:.2}"
             )));
         }
     }
@@ -808,10 +877,7 @@ fn run_bulk_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 ctx.record("max_proc_write_bytes", max_proc_write_bytes);
             }
             if let Some(proc_io_delta) = proc_io_delta {
-                ctx.record("proc_rchar_delta", proc_io_delta.rchar);
-                ctx.record("proc_wchar_delta", proc_io_delta.wchar);
-                ctx.record("proc_read_bytes_delta", proc_io_delta.read_bytes);
-                ctx.record("proc_write_bytes_delta", proc_io_delta.write_bytes);
+                record_proc_io_delta_flat(ctx, proc_io_delta);
                 if let Some(max_proc_write_bytes) = max_proc_write_bytes
                     && proc_io_delta.write_bytes > max_proc_write_bytes
                 {
@@ -996,10 +1062,7 @@ fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             amplification_ratio(proc_io_delta.wchar, total_bytes).unwrap_or(0.0);
         let proc_write_bytes_amplification =
             amplification_ratio(proc_io_delta.write_bytes, total_bytes).unwrap_or(0.0);
-        ctx.record("proc_rchar_delta", proc_io_delta.rchar);
-        ctx.record("proc_wchar_delta", proc_io_delta.wchar);
-        ctx.record("proc_read_bytes_delta", proc_io_delta.read_bytes);
-        ctx.record("proc_write_bytes_delta", proc_io_delta.write_bytes);
+        record_proc_io_delta_flat(ctx, proc_io_delta);
         ctx.record("proc_wchar_amplification", proc_wchar_amplification);
         ctx.record(
             "proc_write_bytes_amplification",
@@ -1008,10 +1071,12 @@ fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         if let Some(delta) = proc_io_write_delta {
             ctx.record("proc_write_bytes_data_write_delta", delta.write_bytes);
             ctx.record("proc_wchar_data_write_delta", delta.wchar);
+            ctx.record("proc_syscw_data_write_delta", delta.syscw);
         }
         if let Some(delta) = proc_io_publish_delta {
             ctx.record("proc_write_bytes_publish_delta", delta.write_bytes);
             ctx.record("proc_wchar_publish_delta", delta.wchar);
+            ctx.record("proc_syscw_publish_delta", delta.syscw);
         }
         if max_proc_wchar_amplification > 0.0
             && proc_wchar_amplification > max_proc_wchar_amplification
@@ -1119,10 +1184,7 @@ fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     ctx.record("max_proc_write_bytes", max_proc_write_bytes);
                 }
                 if let Some(proc_io_delta) = proc_io_delta {
-                    ctx.record("proc_rchar_delta", proc_io_delta.rchar);
-                    ctx.record("proc_wchar_delta", proc_io_delta.wchar);
-                    ctx.record("proc_read_bytes_delta", proc_io_delta.read_bytes);
-                    ctx.record("proc_write_bytes_delta", proc_io_delta.write_bytes);
+                    record_proc_io_delta_flat(ctx, proc_io_delta);
                     if let Some(max_proc_write_bytes) = max_proc_write_bytes
                         && proc_io_delta.write_bytes > max_proc_write_bytes
                     {
@@ -1387,6 +1449,135 @@ fn large_payload(path: &str, bytes: usize) -> Vec<u8> {
 }
 
 #[derive(Clone, Debug)]
+struct RawSmallFileBaseline {
+    root: String,
+    files: usize,
+    bytes_per_file: usize,
+    total_bytes: u64,
+    sync_writes: bool,
+    batch_build_elapsed: Duration,
+    elapsed: Duration,
+    files_per_second: f64,
+    bytes_per_second: f64,
+    proc_io_delta: Option<ProcIoSample>,
+    proc_syscw_per_file: Option<f64>,
+}
+
+fn raw_small_file_baseline(
+    ctx: &SinomoTestContext,
+    files: usize,
+    bytes: usize,
+    sync_writes: bool,
+) -> Result<RawSmallFileBaseline, SinomoTestError> {
+    require_positive("files", files)?;
+    require_positive("bytes", bytes)?;
+    let root = ctx
+        .data_dir()
+        .join("test-artifacts")
+        .join("dfs-small-file-baseline")
+        .join(probe_nonce());
+    fs::create_dir_all(&root).map_err(|source| {
+        SinomoTestError::failed(format!(
+            "cannot create raw small-file baseline directory {}: {source}",
+            root.display()
+        ))
+    })?;
+    let batch_started = Instant::now();
+    let batch = (0..files)
+        .map(|index| {
+            (
+                root.join(format!("raw-{index:06}.bin")),
+                bulk_payload("raw-small-file-baseline", index, bytes),
+            )
+        })
+        .collect::<Vec<_>>();
+    let batch_build_elapsed = batch_started.elapsed();
+    let proc_io_before = current_proc_io();
+    let started = Instant::now();
+    for (path, payload) in &batch {
+        let mut file = fs::File::create(path).map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot create raw small-file baseline file {}: {source}",
+                path.display()
+            ))
+        })?;
+        file.write_all(payload).map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot write raw small-file baseline file {}: {source}",
+                path.display()
+            ))
+        })?;
+        if sync_writes {
+            file.sync_all().map_err(|source| {
+                SinomoTestError::failed(format!(
+                    "cannot sync raw small-file baseline file {}: {source}",
+                    path.display()
+                ))
+            })?;
+        }
+    }
+    let elapsed = started.elapsed();
+    let proc_io_delta = proc_io_before
+        .zip(current_proc_io())
+        .map(|(before, after)| after.saturating_delta(before));
+    fs::remove_dir_all(&root).map_err(|source| {
+        SinomoTestError::failed(format!(
+            "cannot remove raw small-file baseline directory {}: {source}",
+            root.display()
+        ))
+    })?;
+
+    let total_bytes = (files as u64).saturating_mul(bytes as u64);
+    Ok(RawSmallFileBaseline {
+        root: root.display().to_string(),
+        files,
+        bytes_per_file: bytes,
+        total_bytes,
+        sync_writes,
+        batch_build_elapsed,
+        elapsed,
+        files_per_second: rate_per_second(files as f64, elapsed),
+        bytes_per_second: rate_per_second(total_bytes as f64, elapsed),
+        proc_io_delta,
+        proc_syscw_per_file: proc_io_delta.and_then(|delta| per_file(delta.syscw, files)),
+    })
+}
+
+fn record_raw_small_file_baseline(
+    ctx: &mut SinomoTestContext,
+    baseline: &RawSmallFileBaseline,
+    prefix: &str,
+) {
+    ctx.record(format!("{prefix}_root"), &baseline.root);
+    ctx.record(format!("{prefix}_files"), baseline.files);
+    ctx.record(format!("{prefix}_bytes_per_file"), baseline.bytes_per_file);
+    ctx.record(format!("{prefix}_total_bytes"), baseline.total_bytes);
+    ctx.record(format!("{prefix}_sync_writes"), baseline.sync_writes);
+    ctx.record(
+        format!("{prefix}_batch_build_elapsed_ms"),
+        baseline.batch_build_elapsed.as_millis() as u64,
+    );
+    ctx.record(
+        format!("{prefix}_elapsed_ms"),
+        baseline.elapsed.as_millis() as u64,
+    );
+    ctx.record(
+        format!("{prefix}_files_per_second"),
+        baseline.files_per_second,
+    );
+    ctx.record(
+        format!("{prefix}_bytes_per_second"),
+        baseline.bytes_per_second,
+    );
+    if let Some(delta) = baseline.proc_io_delta {
+        record_proc_io_delta(ctx, prefix, "write", delta);
+    }
+    if let Some(syscw_per_file) = baseline.proc_syscw_per_file {
+        ctx.record(format!("{prefix}_proc_syscw_per_file"), syscw_per_file);
+    }
+}
+
+#[derive(Clone, Debug)]
 struct RawDiskBaseline {
     path: String,
     bytes: u64,
@@ -1544,6 +1735,8 @@ fn record_proc_io_delta(
 ) {
     ctx.record(format!("{prefix}_{phase}_proc_rchar_delta"), delta.rchar);
     ctx.record(format!("{prefix}_{phase}_proc_wchar_delta"), delta.wchar);
+    ctx.record(format!("{prefix}_{phase}_proc_syscr_delta"), delta.syscr);
+    ctx.record(format!("{prefix}_{phase}_proc_syscw_delta"), delta.syscw);
     ctx.record(
         format!("{prefix}_{phase}_proc_read_bytes_delta"),
         delta.read_bytes,
@@ -1551,6 +1744,23 @@ fn record_proc_io_delta(
     ctx.record(
         format!("{prefix}_{phase}_proc_write_bytes_delta"),
         delta.write_bytes,
+    );
+    ctx.record(
+        format!("{prefix}_{phase}_proc_cancelled_write_bytes_delta"),
+        delta.cancelled_write_bytes,
+    );
+}
+
+fn record_proc_io_delta_flat(ctx: &mut SinomoTestContext, delta: ProcIoSample) {
+    ctx.record("proc_rchar_delta", delta.rchar);
+    ctx.record("proc_wchar_delta", delta.wchar);
+    ctx.record("proc_syscr_delta", delta.syscr);
+    ctx.record("proc_syscw_delta", delta.syscw);
+    ctx.record("proc_read_bytes_delta", delta.read_bytes);
+    ctx.record("proc_write_bytes_delta", delta.write_bytes);
+    ctx.record(
+        "proc_cancelled_write_bytes_delta",
+        delta.cancelled_write_bytes,
     );
 }
 
@@ -1576,8 +1786,11 @@ fn rate_per_second(count: f64, elapsed: Duration) -> f64 {
 struct ProcIoSample {
     rchar: u64,
     wchar: u64,
+    syscr: u64,
+    syscw: u64,
     read_bytes: u64,
     write_bytes: u64,
+    cancelled_write_bytes: u64,
 }
 
 impl ProcIoSample {
@@ -1585,8 +1798,13 @@ impl ProcIoSample {
         Self {
             rchar: self.rchar.saturating_sub(before.rchar),
             wchar: self.wchar.saturating_sub(before.wchar),
+            syscr: self.syscr.saturating_sub(before.syscr),
+            syscw: self.syscw.saturating_sub(before.syscw),
             read_bytes: self.read_bytes.saturating_sub(before.read_bytes),
             write_bytes: self.write_bytes.saturating_sub(before.write_bytes),
+            cancelled_write_bytes: self
+                .cancelled_write_bytes
+                .saturating_sub(before.cancelled_write_bytes),
         }
     }
 }
@@ -1600,8 +1818,11 @@ fn current_proc_io() -> Option<ProcIoSample> {
         match key {
             "rchar" => sample.rchar = value,
             "wchar" => sample.wchar = value,
+            "syscr" => sample.syscr = value,
+            "syscw" => sample.syscw = value,
             "read_bytes" => sample.read_bytes = value,
             "write_bytes" => sample.write_bytes = value,
+            "cancelled_write_bytes" => sample.cancelled_write_bytes = value,
             _ => {}
         }
     }
@@ -1620,6 +1841,13 @@ fn ratio(numerator: f64, denominator: f64) -> Option<f64> {
         return None;
     }
     Some(numerator / denominator)
+}
+
+fn per_file(count: u64, files: usize) -> Option<f64> {
+    if files == 0 {
+        return None;
+    }
+    Some(count as f64 / files as f64)
 }
 
 fn expect_payload_now(
