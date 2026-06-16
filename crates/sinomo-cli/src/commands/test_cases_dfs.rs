@@ -13,6 +13,9 @@
 //!   / `cluster.dfs.rename` / `cluster.dfs.remove` — parameterized probes
 //!   (`--param path=... --param payload=...`); the expect-* probes poll with a
 //!   bounded deadline to absorb cross-node replication lag.
+//! - `cluster.dfs.expect-replicated` / `cluster.dfs.damage-local-loose-blob`
+//!   — fault-injection probes used by the Docker gate to verify reads survive
+//!   one damaged durable replica.
 //! - `cluster.dfs.bulk-write` / `cluster.dfs.bulk-expect` — deterministic bulk
 //!   write/read probes for cluster-level throughput, convergence evidence, and
 //!   steady-state process I/O accounting.
@@ -42,6 +45,8 @@ pub fn register_dfs_cluster_test_cases(
         .register(dfs_write())
         .register(dfs_expect_file())
         .register(dfs_expect_absent())
+        .register(dfs_expect_replicated())
+        .register(dfs_damage_local_loose_blob())
         .register(dfs_rename())
         .register(dfs_remove())
         .register(dfs_bulk_write())
@@ -104,6 +109,30 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_expect_absent(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_expect_replicated(ctx) {
+        id: "cluster.dfs.expect-replicated",
+        summary: "Poll until a SIFS file has the requested number of current locations",
+        tags: ["cluster-dfs", "probe", "fault-injection"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_expect_replicated(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_damage_local_loose_blob(ctx) {
+        id: "cluster.dfs.damage-local-loose-blob",
+        summary: "Delete this node's local loose blob for a replicated SIFS file",
+        tags: ["cluster-dfs", "probe", "fault-injection"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_damage_local_loose_blob(ctx)
         }
     }
 }
@@ -254,11 +283,11 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 
 fn run_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let path = ctx.required_parameter("path")?.to_string();
-    let payload = ctx.required_parameter("payload")?.to_string();
+    let payload = required_payload_bytes(ctx)?;
     let backend = open_backend(ctx)?;
     let node = backend.node_label();
     backend
-        .write_file(&path, payload.as_bytes())
+        .write_file(&path, &payload)
         .map_err(SinomoTestError::failed)?;
     ctx.record("node", &node);
     ctx.record("path", &path);
@@ -271,19 +300,42 @@ fn run_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 
 fn run_expect_file(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let path = ctx.required_parameter("path")?.to_string();
-    let payload = ctx.required_parameter("payload")?.to_string();
+    let payload = required_payload_bytes(ctx)?;
     let timeout = expect_timeout(ctx)?;
+    let max_proc_write_bytes = optional_u64_parameter(ctx, "max-proc-write-bytes")?;
     let started = Instant::now();
     let deadline = started + timeout;
     let backend = open_read_only_backend_until(ctx, deadline)?;
     let node = backend.node_label();
     ctx.record("node", &node);
     ctx.record("path", &path);
+    ctx.record("bytes", payload.len());
+    if let Some(max_proc_write_bytes) = max_proc_write_bytes {
+        ctx.record("max_proc_write_bytes", max_proc_write_bytes);
+    }
+    let proc_io_before = current_proc_io();
     let mut last_state;
     loop {
         match backend.read_file(&path) {
-            Ok(bytes) if bytes == payload.as_bytes() => {
+            Ok(bytes) if bytes == payload => {
                 ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
+                if let Some(proc_io_delta) = proc_io_before
+                    .zip(current_proc_io())
+                    .map(|(before, after)| after.saturating_delta(before))
+                {
+                    ctx.record("proc_rchar_delta", proc_io_delta.rchar);
+                    ctx.record("proc_wchar_delta", proc_io_delta.wchar);
+                    ctx.record("proc_read_bytes_delta", proc_io_delta.read_bytes);
+                    ctx.record("proc_write_bytes_delta", proc_io_delta.write_bytes);
+                    if let Some(max_proc_write_bytes) = max_proc_write_bytes
+                        && proc_io_delta.write_bytes > max_proc_write_bytes
+                    {
+                        return Ok(SinomoTestOutcome::failed(format!(
+                            "{path} matched on node {node}, but read proc write_bytes delta {} was above allowed {max_proc_write_bytes}",
+                            proc_io_delta.write_bytes
+                        )));
+                    }
+                }
                 return Ok(SinomoTestOutcome::passed(format!(
                     "{path} matched the expected payload on node {node} after {}ms",
                     started.elapsed().as_millis()
@@ -308,6 +360,81 @@ fn run_expect_file(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         }
         std::thread::sleep(EXPECT_POLL_INTERVAL);
     }
+}
+
+fn run_expect_replicated(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let path = ctx.required_parameter("path")?.to_string();
+    let min_locations = optional_usize_parameter(ctx, "min-locations", 2)?;
+    let timeout = expect_timeout(ctx)?;
+    require_positive("min-locations", min_locations)?;
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let backend = open_read_only_backend_until(ctx, deadline)?;
+    let node = backend.node_label();
+    ctx.record("node", &node);
+    ctx.record("path", &path);
+    ctx.record("min_locations", min_locations);
+    loop {
+        let last_state = match backend.dfs_stat(&path) {
+            Ok(stat)
+                if stat.content_hash.is_some() && stat.current_locations.len() >= min_locations =>
+            {
+                ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
+                ctx.record("object_id", stat.object_id.to_string());
+                ctx.record("version", stat.version.to_string());
+                ctx.record("content_hash", stat.content_hash.unwrap_or_default());
+                ctx.record("size_bytes", stat.size_bytes.unwrap_or_default());
+                ctx.record(
+                    "current_locations",
+                    stat_location_labels(&stat.current_locations),
+                );
+                return Ok(SinomoTestOutcome::passed(format!(
+                    "{path} has {} current locations on node {node} after {}ms",
+                    stat.current_locations.len(),
+                    started.elapsed().as_millis()
+                )));
+            }
+            Ok(stat) => {
+                format!(
+                    "locations={} content_hash={:?} size={:?}",
+                    stat.current_locations.len(),
+                    stat.content_hash,
+                    stat.size_bytes
+                )
+            }
+            Err(error) => error,
+        };
+        if Instant::now() >= deadline {
+            ctx.record("last_state", &last_state);
+            return Ok(SinomoTestOutcome::failed(format!(
+                "{path} did not reach {min_locations} current locations on node {node} within {}s: {last_state}",
+                timeout.as_secs()
+            )));
+        }
+        std::thread::sleep(EXPECT_POLL_INTERVAL);
+    }
+}
+
+fn run_damage_local_loose_blob(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let path = ctx.required_parameter("path")?.to_string();
+    let backend = open_read_only_backend(ctx)?;
+    let node = backend.node_label();
+    let stat = backend
+        .debug_remove_local_loose_blob_for_path(&path)
+        .map_err(SinomoTestError::failed)?;
+    ctx.record("node", &node);
+    ctx.record("path", &path);
+    ctx.record("object_id", stat.object_id.to_string());
+    ctx.record("version", stat.version.to_string());
+    ctx.record("content_hash", stat.content_hash.unwrap_or_default());
+    ctx.record("size_bytes", stat.size_bytes.unwrap_or_default());
+    ctx.record(
+        "current_locations",
+        stat_location_labels(&stat.current_locations),
+    );
+    Ok(SinomoTestOutcome::passed(format!(
+        "removed local loose blob for {path} on node {node}"
+    )))
 }
 
 fn run_expect_absent(ctx: &mut SinomoTestContext) -> SinomoTestResult {
@@ -786,6 +913,36 @@ fn require_positive(name: &str, value: usize) -> Result<(), SinomoTestError> {
         });
     }
     Ok(())
+}
+
+fn required_payload_bytes(ctx: &SinomoTestContext) -> Result<Vec<u8>, SinomoTestError> {
+    if let Some(payload) = ctx.parameter("payload") {
+        return Ok(payload.as_bytes().to_vec());
+    }
+    let bytes = optional_usize_parameter(ctx, "payload-bytes", 0)?;
+    if bytes == 0 {
+        return Err(SinomoTestError::failed(
+            "missing payload: pass --param payload=... or --param payload-bytes=N".to_string(),
+        ));
+    }
+    let seed = ctx
+        .parameter("payload-seed")
+        .unwrap_or("sinomo-dfs-payload");
+    Ok(pattern_payload(seed, bytes))
+}
+
+fn pattern_payload(seed: &str, bytes: usize) -> Vec<u8> {
+    let seed = format!("{seed}|sinomo-dfs-payload|");
+    let mut payload = Vec::with_capacity(bytes);
+    while payload.len() < bytes {
+        payload.extend_from_slice(seed.as_bytes());
+    }
+    payload.truncate(bytes);
+    payload
+}
+
+fn stat_location_labels(locations: &[sinomo_runtime::node::NodeId]) -> Vec<String> {
+    locations.iter().map(ToString::to_string).collect()
 }
 
 fn bulk_path(base: &str, index: usize) -> String {

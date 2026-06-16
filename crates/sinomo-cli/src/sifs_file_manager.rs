@@ -9,10 +9,10 @@ use sinomo_runtime::dfs::{
     DfsMetadataJournalBatchSender, DfsMetadataJournalReplicationOptions,
     DfsMetadataPeerTransportError, DfsMetadataShardConfig, DfsMetadataSnapshotInstallSender,
     DfsNodeAdvertisement, DfsObjectKind, DfsPeerTransportError, DfsProtocolFrameCommand,
-    DfsProtocolFrameResponse, DfsProtocolFrameSender, DfsWriteOptions, LocalContentStore,
-    NetworkedDfsService, content_services_prefix, default_dfs_metadata_root,
-    default_dfs_metadata_shards_root, fallback_dfs_node_id, metadata_shards_prefix,
-    open_local_sharded_metadata_backend, open_root_local_metadata_backend,
+    DfsProtocolFrameResponse, DfsProtocolFrameSender, DfsReplicationPolicy, DfsStat,
+    DfsWriteOptions, LocalContentStore, NetworkedDfsService, content_services_prefix,
+    default_dfs_metadata_root, default_dfs_metadata_shards_root, fallback_dfs_node_id,
+    metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
     publish_cluster_dfs_metadata_journal, sifs_file_system_id,
 };
 use sinomo_runtime::kv::{self, KvError, KvOp, KvTxn, KvTxnResponse};
@@ -94,6 +94,41 @@ impl SifsFileManagerBackend {
         service
             .posix_read_file_distributed(&path)
             .map_err(|error| format!("cannot read SIFS file {path}: {error}"))
+    }
+
+    pub(crate) fn dfs_stat(&self, path: &str) -> Result<DfsStat, String> {
+        let path = normalize_sifs_path(path)?;
+        let mut service = self.lock_service()?;
+        service
+            .posix_stat_distributed(&path)
+            .map_err(|error| format!("cannot inspect {path}: {error}"))
+    }
+
+    pub(crate) fn debug_remove_local_loose_blob_for_path(
+        &self,
+        path: &str,
+    ) -> Result<DfsStat, String> {
+        let stat = self.dfs_stat(path)?;
+        let local_node_id = self.node_label();
+        if !stat
+            .current_locations
+            .iter()
+            .any(|node_id| node_id.as_str() == local_node_id)
+        {
+            return Err(format!(
+                "local node {local_node_id} is not a current location for {path}: {:?}",
+                stat.current_locations
+            ));
+        }
+        let Some(content_hash) = stat.content_hash.as_deref() else {
+            return Err(format!("{path} has no content hash to damage"));
+        };
+        let store = LocalContentStore::new(self.data_dir.dfs_dir().join("content"))
+            .map_err(|error| format!("cannot open DFS content store: {error}"))?;
+        store
+            .debug_remove_loose_blob(content_hash)
+            .map_err(|error| format!("cannot remove local loose blob for {path}: {error}"))?;
+        Ok(stat)
     }
 
     pub(crate) fn read_files(&self, paths: &[String]) -> Vec<Result<Vec<u8>, String>> {
@@ -268,7 +303,7 @@ impl SifsParallelReadPool {
                 .map(|path| Err(format!("cannot read SIFS file {path}: no read workers")))
                 .collect();
         }
-        if paths.len() > 1 {
+        if paths.len() == 1 {
             return self.workers[0].read_files(paths);
         }
         let results = Arc::new(Mutex::new(
@@ -279,8 +314,18 @@ impl SifsParallelReadPool {
             for (worker_index, worker) in self.workers.iter().enumerate() {
                 let results = Arc::clone(&results);
                 scope.spawn(move || {
-                    for index in (worker_index..paths.len()).step_by(worker_count) {
-                        let result = worker.read_file(&paths[index]);
+                    let indexes = (worker_index..paths.len())
+                        .step_by(worker_count)
+                        .collect::<Vec<_>>();
+                    if indexes.is_empty() {
+                        return;
+                    }
+                    let worker_paths = indexes
+                        .iter()
+                        .map(|index| paths[*index].clone())
+                        .collect::<Vec<_>>();
+                    for (index, result) in indexes.into_iter().zip(worker.read_files(&worker_paths))
+                    {
                         if let Ok(mut results) = results.lock() {
                             results[index] = Some(result);
                         }
@@ -886,7 +931,11 @@ fn sifs_write_options(
     if !candidates.contains(service.node_id()) {
         candidates.insert(0, service.node_id().clone());
     }
-    DfsWriteOptions::replicated_eventual(candidates)
+    let desired_replicas = candidates.len().max(1).min(2);
+    let mut options = DfsWriteOptions::replicated_eventual(candidates);
+    options.policy = DfsReplicationPolicy::new(desired_replicas, desired_replicas)
+        .expect("valid SIFS replication policy");
+    options
 }
 
 fn sifs_entry_kind(kind: &DfsObjectKind) -> FileManagerEntryKind {
