@@ -246,8 +246,12 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         let started_at = Instant::now();
         let mut ready_drains = 0;
         loop {
-            let events = self.process_incoming()?;
-            let scheduled = self.retry_pending_repairs_bounded(usize::MAX)?;
+            let mut events = self.process_incoming()?;
+            let (scheduled, repair_events) = self.retry_pending_repairs_best_effort();
+            if !repair_events.is_empty() {
+                events.extend(repair_events);
+                self.last_events = events.clone();
+            }
             let outcome = self.write_outcome(&intent_id)?;
             if let NetworkedDfsWriteOutcome::Pending {
                 intent_id: next_intent_id,

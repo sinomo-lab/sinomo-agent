@@ -401,21 +401,19 @@ pub fn dfs_protocol_frame_requires_fresh_metadata(frame: &NetworkFrame) -> bool 
     false
 }
 
-fn dfs_protocol_frame_foreground_repair_request_id(frame: &NetworkFrame) -> Option<String> {
+fn dfs_protocol_frame_allows_write_repair_progress(frame: &NetworkFrame) -> bool {
     let MeshMessageBody::Protocol(protocol_message) = &frame.message.body else {
-        return None;
+        return true;
     };
     if protocol_message.protocol != DFS_PROTOCOL {
-        return None;
+        return true;
     }
-    let message = protocol_message.decode::<DfsNetworkMessage>().ok()?;
+    let Ok(message) = protocol_message.decode::<DfsNetworkMessage>() else {
+        return true;
+    };
     match message {
-        DfsNetworkMessage::DistributedWriteRequest(command)
-            if command.foreground_replica_repair =>
-        {
-            Some(command.request_id)
-        }
-        _ => None,
+        DfsNetworkMessage::DistributedWriteRequest(command) => command.foreground_replica_repair,
+        _ => true,
     }
 }
 
@@ -2235,6 +2233,7 @@ pub fn dfs_repair_maintenance_notice_lines(
                 event,
                 NetworkedDfsServiceEvent::ReplicaRepaired { .. }
                     | NetworkedDfsServiceEvent::RepairRejected { .. }
+                    | NetworkedDfsServiceEvent::RepairRetryFailed { .. }
                     | NetworkedDfsServiceEvent::BlobFetched { .. }
                     | NetworkedDfsServiceEvent::BlobFetchRejected { .. }
             )
@@ -2273,6 +2272,9 @@ pub fn dfs_repair_maintenance_notice_lines(
         } => Some(format!(
             "DFS repair rejected {intent_id} {object_id} by {replica_node_id}: {reason}"
         )),
+        NetworkedDfsServiceEvent::RepairRetryFailed { reason } => {
+            Some(format!("DFS repair retry failed: {reason}"))
+        }
         NetworkedDfsServiceEvent::BlobFetched {
             intent_id,
             object_id,
@@ -2838,6 +2840,9 @@ fn dfs_event_summary(events: &[NetworkedDfsServiceEvent]) -> Vec<String> {
                 reason,
                 ..
             } => Some(format!("repair rejected by {replica_node_id}: {reason}")),
+            NetworkedDfsServiceEvent::RepairRetryFailed { reason } => {
+                Some(format!("repair retry failed: {reason}"))
+            }
             _ => None,
         })
         .collect()
@@ -4725,6 +4730,9 @@ pub enum NetworkedDfsServiceEvent {
         replica_node_id: NodeId,
         reason: String,
     },
+    RepairRetryFailed {
+        reason: String,
+    },
     WriteConflictCreated {
         conflict: DfsConflictRecord,
     },
@@ -5050,6 +5058,7 @@ pub fn dfs_events_should_publish_metadata(events: &[NetworkedDfsServiceEvent]) -
         | NetworkedDfsServiceEvent::RemoteReadCompleted { .. }
         | NetworkedDfsServiceEvent::RemoteBulkReadCompleted { .. }
         | NetworkedDfsServiceEvent::RepairRejected { .. }
+        | NetworkedDfsServiceEvent::RepairRetryFailed { .. }
         | NetworkedDfsServiceEvent::MetadataJournalBatchApplied { .. }
         | NetworkedDfsServiceEvent::MetadataJournalBatchRejected { .. }
         | NetworkedDfsServiceEvent::MetadataSnapshotInstalled { .. } => false,
@@ -8081,8 +8090,8 @@ impl NetworkedDfsService<DfsEndpointServedProtocolFrameTransport> {
                 ),
             });
         }
-        let foreground_repair_request_id =
-            dfs_protocol_frame_foreground_repair_request_id(&inbound_frame);
+        let allow_write_repair_progress =
+            dfs_protocol_frame_allows_write_repair_progress(&inbound_frame);
         self.transport
             .enqueue_protocol_frame(inbound_frame)
             .map_err(DfsError::from_network)?;
@@ -8096,21 +8105,10 @@ impl NetworkedDfsService<DfsEndpointServedProtocolFrameTransport> {
                 }
             };
             events.extend(batch);
-            let should_drive_foreground_repairs = foreground_repair_request_id
-                .as_ref()
-                .is_some_and(|request_id| {
-                    self.pending_remote_write_responses.values().any(|pending| {
-                        pending.foreground_replica_repair && pending.request_id == *request_id
-                    })
-                });
-            let scheduled = if should_drive_foreground_repairs {
-                match self.retry_pending_repairs_bounded(usize::MAX) {
-                    Ok(scheduled) => scheduled,
-                    Err(error) => {
-                        self.transport.finish_protocol_frame();
-                        return Err(error);
-                    }
-                }
+            let scheduled = if allow_write_repair_progress {
+                let (scheduled, repair_events) = self.retry_pending_repairs_best_effort();
+                events.extend(repair_events);
+                scheduled
             } else {
                 Vec::new()
             };
@@ -8140,6 +8138,22 @@ impl NetworkedDfsService<DfsEndpointServedProtocolFrameTransport> {
                 outbound_frames.len()
             ),
         })
+    }
+}
+
+impl<T: DfsFrameTransport> NetworkedDfsService<T> {
+    fn retry_pending_repairs_best_effort(
+        &mut self,
+    ) -> (Vec<DistributedRepairJob>, Vec<NetworkedDfsServiceEvent>) {
+        match self.retry_pending_repairs_bounded(usize::MAX) {
+            Ok(scheduled) => (scheduled, Vec::new()),
+            Err(error) => (
+                Vec::new(),
+                vec![NetworkedDfsServiceEvent::RepairRetryFailed {
+                    reason: error.to_string(),
+                }],
+            ),
+        }
     }
 }
 

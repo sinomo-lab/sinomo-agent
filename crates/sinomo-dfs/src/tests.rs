@@ -1823,6 +1823,146 @@ fn endpoint_transport_completes_synchronous_replica_write() {
 }
 
 #[test]
+fn posix_wait_for_commit_reports_repair_retry_failure_without_failing_write() {
+    let root = temp_root("posix-wait-repair-retry-best-effort");
+    let local = NodeId::from_legacy_named("node_posix_wait_repair_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_posix_wait_repair_remote").expect("remote");
+    let endpoint = test_endpoint(&remote, "192.0.2.12:21353");
+    let stage_calls = Arc::new(Mutex::new(Vec::new()));
+    let stage_calls_for_sender = Arc::clone(&stage_calls);
+    let sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, command, _timeout| {
+        let MeshMessageBody::Protocol(protocol) = &command.frame.message.body else {
+            panic!("expected protocol frame");
+        };
+        let message: DfsNetworkMessage = protocol.decode().expect("decode dfs message");
+        let DfsNetworkMessage::StageBlob(stage) = message else {
+            return Ok(DfsProtocolFrameResponse {
+                request_id: command.request_id.clone(),
+                outbound_frames: Vec::new(),
+            });
+        };
+        stage_calls_for_sender
+            .lock()
+            .expect("stage calls lock")
+            .push(stage.request_id.clone());
+        let response = DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
+            request_id: stage.request_id,
+            intent_id: stage.intent_id,
+            file_system_id: stage.file_system_id,
+            object_id: stage.object_id,
+            version: stage.version,
+            replica_node_id: command.frame.target_node_id.clone(),
+            result: DfsBlobTransferResult::Durable {
+                content_hash: stage.content_hash,
+            },
+        });
+        Ok(DfsProtocolFrameResponse {
+            request_id: command.request_id.clone(),
+            outbound_frames: vec![NetworkFrame {
+                frame_id: NetworkFrameId(100),
+                source_node_id: command.frame.target_node_id.clone(),
+                target_node_id: command.frame.source_node_id.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(100),
+                    origin_node_id: command.frame.target_node_id.clone(),
+                    target_node_id: command.frame.source_node_id.clone(),
+                    body: MeshMessageBody::Protocol(
+                        ProtocolMessage::encode(DFS_PROTOCOL, &response).expect("encode response"),
+                    ),
+                },
+            }],
+        })
+    });
+    let transport = DfsEndpointTransport::with_connect_timeout(
+        local.clone(),
+        vec![endpoint],
+        Duration::from_millis(1),
+        sender,
+    );
+    let content = LocalContentStore::new(root.join("content")).expect("content store");
+    let mut dfs = NetworkedDfsService::new(transport, content);
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    dfs.posix_mkdir_all("/services/repair").expect("repair dir");
+
+    let mut initial = vec![0_u8; 256 * 1024 + 31];
+    for (index, byte) in initial.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    let broken_path = "/services/repair/broken-patch.bin";
+    dfs.posix_write_file(
+        broken_path,
+        &initial,
+        DfsWriteOptions::replicated_eventual(vec![local.clone()]),
+    )
+    .expect("initial self write");
+
+    let mut patch = vec![0_u8; 80 * 1024 + 7];
+    for (index, byte) in patch.iter_mut().enumerate() {
+        *byte = (index % 239) as u8;
+    }
+    dfs.posix_write_file_at(
+        broken_path,
+        96 * 1024 + 5,
+        &patch,
+        DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(2, 2).expect("strict policy"),
+            replica_candidates: vec![local.clone(), remote.clone()],
+            wait_for_commit: false,
+            foreground_replica_repair: true,
+        },
+    )
+    .expect("pending patch write");
+    let pending_patch_hash = dfs
+        .pending_writes
+        .values()
+        .find_map(|pending| pending.patch.as_ref().map(|patch| patch.patch_hash.clone()))
+        .expect("pending patch hash");
+    dfs.content()
+        .debug_remove_loose_blob(&pending_patch_hash)
+        .expect("remove patch blob");
+    *stage_calls.lock().expect("stage calls lock") = Vec::new();
+    dfs.repair_retry_tick = 0;
+    for pending in dfs.pending_writes.values_mut() {
+        for state in pending.stage_retries.values_mut() {
+            state.next_retry_tick = 0;
+            state.inflight = false;
+        }
+        for state in pending.repair_retries.values_mut() {
+            state.next_retry_tick = 0;
+            state.inflight = false;
+        }
+    }
+
+    let stat = dfs
+        .posix_write_file(
+            "/services/repair/foreground.txt",
+            b"foreground bytes",
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(2, 2).expect("foreground policy"),
+                replica_candidates: vec![local.clone(), remote.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: true,
+            },
+        )
+        .expect("foreground write should not fail on repair retry error");
+
+    assert_eq!(stat.current_locations, vec![local, remote]);
+    assert_eq!(stat.size_bytes, Some(b"foreground bytes".len() as u64));
+    assert_eq!(stage_calls.lock().expect("stage calls lock").len(), 1);
+    assert!(
+        dfs.last_events().iter().any(|event| matches!(
+            event,
+            NetworkedDfsServiceEvent::RepairRetryFailed { reason }
+                if reason.contains("failed to open DFS patch blob")
+        )),
+        "repair retry failure should be reported as an event: {:?}",
+        dfs.last_events()
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn served_protocol_frame_drains_nested_stage_response_before_returning() {
     let root = temp_root("served-protocol-frame-drains-nested-stage-response");
     let requester = NodeId::from_legacy_named("node_served_frame_requester").expect("requester");
@@ -2154,6 +2294,134 @@ fn served_non_foreground_write_does_not_retry_unrelated_repairs() {
             )
         }),
         "served frame should return committed deferred write response, got {responses:?}"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn served_protocol_frame_reports_repair_retry_failure_without_failing_request() {
+    let root = temp_root("served-protocol-frame-repair-retry-best-effort");
+    let requester =
+        NodeId::from_legacy_named("node_served_frame_repair_requester").expect("requester");
+    let primary = NodeId::from_legacy_named("node_served_frame_repair_primary").expect("primary");
+    let replica = NodeId::from_legacy_named("node_served_frame_repair_replica").expect("replica");
+    let path = "/services/served-frame/repair-retry-patch.bin";
+    let send_attempts = Arc::new(Mutex::new(0usize));
+    let send_attempts_for_sender = Arc::clone(&send_attempts);
+    let sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, _command, _timeout| {
+        *send_attempts_for_sender.lock().expect("send attempts") += 1;
+        Ok(DfsProtocolFrameResponse {
+            request_id: "dropped-stage".to_string(),
+            outbound_frames: Vec::new(),
+        })
+    });
+    let transport = DfsEndpointServedProtocolFrameTransport::new(
+        primary.clone(),
+        vec![test_endpoint(&replica, "192.0.2.31:21353")],
+        sender,
+        Duration::from_millis(1),
+    );
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let mut dfs = NetworkedDfsService::new(transport, content)
+        .with_metadata_backend(
+            LocalSobjMetadataBackend::new(
+                DfsMetadataShardId::new("served-repair"),
+                root.join("metadata"),
+            )
+            .expect("metadata backend"),
+        )
+        .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+
+    let mut initial = vec![0_u8; 256 * 1024 + 31];
+    for (index, byte) in initial.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    dfs.posix_mkdir_all("/services/served-frame")
+        .expect("served-frame directory");
+    dfs.posix_write_file(
+        path,
+        &initial,
+        DfsWriteOptions::replicated_eventual(vec![primary.clone()]),
+    )
+    .expect("initial self write");
+    let base_object = dfs.posix_stat(path).expect("stat base object");
+    dfs.content()
+        .put_object_version(
+            base_object.object_id.as_str(),
+            base_object.version.as_str(),
+            &initial,
+        )
+        .expect("seed base object version manifest");
+
+    let mut patch = vec![0_u8; 80 * 1024 + 7];
+    for (index, byte) in patch.iter_mut().enumerate() {
+        *byte = (index % 239) as u8;
+    }
+    dfs.posix_write_file_at(
+        path,
+        96 * 1024 + 5,
+        &patch,
+        DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(2, 2).expect("strict policy"),
+            replica_candidates: vec![primary.clone(), replica.clone()],
+            wait_for_commit: false,
+            foreground_replica_repair: true,
+        },
+    )
+    .expect("patch write");
+    let pending_patch_hash = dfs
+        .pending_writes
+        .values()
+        .find_map(|pending| pending.patch.as_ref().map(|patch| patch.patch_hash.clone()))
+        .expect("pending patch hash");
+    dfs.content()
+        .debug_remove_loose_blob(&pending_patch_hash)
+        .expect("remove patch blob");
+    *send_attempts.lock().expect("send attempts") = 0;
+    dfs.repair_retry_tick = 0;
+    for pending in dfs.pending_writes.values_mut() {
+        for state in pending.stage_retries.values_mut() {
+            state.next_retry_tick = 0;
+            state.inflight = false;
+        }
+        for state in pending.repair_retries.values_mut() {
+            state.next_retry_tick = 0;
+            state.inflight = false;
+        }
+    }
+
+    let frame = build_dfs_network_frame(
+        &requester,
+        &primary,
+        77,
+        77,
+        DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+            request_id: "served_frame_sync_after_repair_failure".to_string(),
+            file_system_id: sifs_file_system_id(),
+            requesting_node_id: requester.clone(),
+            metadata_journal_after_sequences: Vec::new(),
+            operation: DfsNamespaceOperation::SyncPath {
+                path: "/services".to_string(),
+            },
+        }),
+    )
+    .expect("foreground frame");
+
+    let result = dfs
+        .process_protocol_frame(frame)
+        .expect("foreground frame should not fail on repair retry error");
+
+    assert_eq!(*send_attempts.lock().expect("send attempts"), 0);
+    assert!(
+        result.events.iter().any(|event| matches!(
+            event,
+            NetworkedDfsServiceEvent::RepairRetryFailed { reason }
+                if reason.contains("failed to open DFS patch blob")
+        )),
+        "repair retry failure should be reported as an event: {:?}",
+        result.events
     );
 
     std::fs::remove_dir_all(root).ok();
