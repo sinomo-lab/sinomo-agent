@@ -23234,6 +23234,93 @@ fn sifs_replica_read_miss_queries_primary_without_pulling_metadata() {
 }
 
 #[test]
+fn sifs_replica_primary_lookup_read_retries_after_stale_location_without_local_metadata() {
+    let cluster = sifs_posix_cluster("sifs-replica-read-stale-source-no-local-metadata");
+    let SifsPosixCluster {
+        root,
+        primary_node,
+        writer_node,
+        mut primary,
+        mut writer,
+        mut observer,
+        ..
+    } = cluster;
+    let path = "/users/replica-read-stale-source.txt";
+    let bytes = b"replica primary lookup should retry a stale advertised location".to_vec();
+    let stat = primary
+        .posix_write_file(
+            path,
+            &bytes,
+            DfsWriteOptions::replicated_eventual(vec![primary_node.clone()]),
+        )
+        .expect("primary local write");
+
+    let mut object = primary
+        .metadata()
+        .object(&stat.object_id)
+        .expect("primary object")
+        .clone();
+    object.current_locations = vec![writer_node.clone(), primary_node.clone()];
+    primary
+        .add_object_metadata(object.clone())
+        .expect("primary in-memory stale location");
+    primary
+        .put_visible_object_in_metadata_backend(&object)
+        .expect("primary backend stale location");
+
+    assert!(
+        matches!(
+            observer.posix_stat(path),
+            Err(DfsPosixError::NotFound { .. })
+        ),
+        "observer should not have local metadata before the distributed read"
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let primary_stop = Arc::clone(&stop);
+    let primary_thread = std::thread::spawn(move || {
+        while !primary_stop.load(Ordering::SeqCst) {
+            primary.process_incoming().expect("primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        primary
+    });
+    let writer_stop = Arc::clone(&stop);
+    let writer_thread = std::thread::spawn(move || {
+        while !writer_stop.load(Ordering::SeqCst) {
+            writer.process_incoming().expect("writer stale-source pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        writer
+    });
+
+    let started = Instant::now();
+    assert_eq!(
+        observer
+            .posix_read_file_distributed(path)
+            .expect("observer retries from stale source to primary"),
+        bytes
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "stale-source retry should not spend the full remote-read budget"
+    );
+    assert!(
+        matches!(
+            observer.posix_stat(path),
+            Err(DfsPosixError::NotFound { .. })
+        ),
+        "read-only primary lookup must not install metadata on the replica"
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    primary_thread.join().expect("primary thread");
+    writer_thread.join().expect("writer thread");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn sifs_routed_namespace_op_follows_authority_redirect() {
     let root = temp_root("sifs-authority-redirect");
     let primary_node =

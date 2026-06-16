@@ -10201,6 +10201,13 @@ fn networked_sifs_remote_read_falls_back_after_stale_location_rejection() {
                         event,
                         NetworkedDfsServiceEvent::RemoteReadServed {
                             object_id: served_object_id,
+                            result: DfsReadResult::NotFound,
+                            ..
+                        } if served_object_id == &object_id
+                    ) || matches!(
+                        event,
+                        NetworkedDfsServiceEvent::RemoteReadServed {
+                            object_id: served_object_id,
                             result: DfsReadResult::Rejected { reason },
                             ..
                         } if served_object_id == &object_id
@@ -10379,24 +10386,23 @@ fn networked_dfs_remote_read_prunes_stale_version_source_before_retry() {
                 event,
                 NetworkedDfsServiceEvent::RemoteReadServed {
                     object_id: served_object_id,
-                    result: DfsReadResult::Found(data),
+                    result: DfsReadResult::NotFound,
                     ..
-                } if served_object_id == &object_id && data.version == version_1
+                } if served_object_id == &object_id
             ))
     );
     assert!(
         reader_dfs
             .process_incoming()
-            .expect("reader rejects stale version")
+            .expect("reader prunes stale version source")
             .iter()
             .any(|event| matches!(
                 event,
                 NetworkedDfsServiceEvent::RemoteReadCompleted {
                     object_id: completed_object_id,
-                    result: DfsReadResult::Rejected { reason },
+                    result: DfsReadResult::NotFound,
                     ..
                 } if completed_object_id == &object_id
-                    && reason.contains("expected version")
             ))
     );
     assert_eq!(

@@ -555,17 +555,24 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         || backend.create_dir_all_deferred_local_replay(&base),
         || format!("cannot create SIFS directory {base}"),
     )?;
+    let mkdir_elapsed = started.elapsed();
     let proc_io_after_mkdir = current_proc_io();
+    let batch_started = Instant::now();
     let batch = (0..files)
         .map(|index| (bulk_path(&base, index), bulk_payload(&base, index, bytes)))
         .collect::<Vec<_>>();
+    let batch_build_elapsed = batch_started.elapsed();
+    let write_started = Instant::now();
     retry_bulk_mutation(
         deadline,
         || backend.write_files_deferred_publish(&batch),
         || format!("cannot write SIFS bulk batch under {base}"),
     )?;
+    let write_elapsed = write_started.elapsed();
     let proc_io_after_write = current_proc_io();
+    let publish_started = Instant::now();
     backend.publish_metadata_after_mutation();
+    let publish_elapsed = publish_started.elapsed();
     let proc_io_after_publish = current_proc_io();
     let elapsed = started.elapsed();
     let proc_io_delta = proc_io_before
@@ -591,6 +598,13 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("bytes_per_file", bytes);
     ctx.record("total_bytes", total_bytes);
     ctx.record("elapsed_ms", elapsed_ms);
+    ctx.record("mkdir_elapsed_ms", mkdir_elapsed.as_millis() as u64);
+    ctx.record(
+        "batch_build_elapsed_ms",
+        batch_build_elapsed.as_millis() as u64,
+    );
+    ctx.record("write_elapsed_ms", write_elapsed.as_millis() as u64);
+    ctx.record("publish_elapsed_ms", publish_elapsed.as_millis() as u64);
     ctx.record("files_per_second", files_per_second);
     ctx.record("bytes_per_second", bytes_per_second);
     ctx.record("min_files_per_second", min_files_per_second);

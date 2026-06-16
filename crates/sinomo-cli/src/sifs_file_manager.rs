@@ -244,7 +244,7 @@ impl SifsFileManagerBackend {
             }
         }
         service
-            .posix_write_files_local_eventual_with_known_parents(
+            .posix_create_files_local_eventual_with_known_parents(
                 normalized
                     .iter()
                     .map(|(path, bytes)| (path.as_str(), *bytes)),

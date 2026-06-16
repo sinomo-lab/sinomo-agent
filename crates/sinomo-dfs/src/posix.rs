@@ -1863,9 +1863,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
 
         let mut prepared = Vec::with_capacity(files.len());
         let mut seen_objects = BTreeSet::new();
+        let mut resolved_parents = BTreeMap::<String, String>::new();
         for (path, bytes) in &files {
             let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
-            let path = self.resolve_posix_path_distributed(&path, true)?;
             if requires_directory {
                 return match self.ensure_resolved_path_is_directory(&path) {
                     Ok(()) => Err(DfsPosixError::IsDirectory { path }),
@@ -1878,9 +1878,27 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     Err(error) => Err(error),
                 };
             }
+            let Some(parent) = parent_posix_path(&path) else {
+                return Err(DfsPosixError::IsDirectory { path });
+            };
+            let resolved_parent = match resolved_parents.get(&parent) {
+                Some(resolved) => resolved.clone(),
+                None => {
+                    let resolved = self.resolve_posix_path_distributed(&parent, true)?;
+                    resolved_parents.insert(parent.clone(), resolved.clone());
+                    resolved
+                }
+            };
+            let Some((_, child_name)) = path.rsplit_once('/') else {
+                return Err(DfsPosixError::InvalidPath { path });
+            };
+            let path = join_posix_path(&resolved_parent, child_name);
             let object = match self.lookup_sifs_path(&path)? {
                 Some(object) if object.kind == DfsObjectKind::Directory => {
                     return Err(DfsPosixError::IsDirectory { path });
+                }
+                Some(object) if object.kind == DfsObjectKind::Symlink => {
+                    return self.posix_write_files_local_eventual_fallback(&files);
                 }
                 Some(object) if object.kind == DfsObjectKind::Hardlink => {
                     self.resolve_hardlink_target(&object)?
@@ -1906,14 +1924,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             {
                 return self.posix_write_files_local_eventual_fallback(&files);
             }
-            let metadata_primary = if self.is_local_metadata_primary_for_object(&object)? {
-                None
-            } else {
-                let Some(primary) = self.routed_namespace_primary_for_path(&path)? else {
-                    return self.posix_write_files_local_eventual_fallback(&files);
-                };
-                Some(primary)
-            };
+            let metadata_primary = self.routed_namespace_primary_for_path(&path)?;
             let target_version = next_version(&object.version);
             prepared.push(PosixBulkLocalWrite {
                 path,
@@ -1924,6 +1935,64 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             });
         }
 
+        self.commit_posix_bulk_local_writes(prepared)
+    }
+
+    pub fn posix_create_files_local_eventual_with_known_parents<'a, I>(
+        &mut self,
+        files: I,
+    ) -> Result<Vec<DfsStat>>
+    where
+        I: IntoIterator<Item = (&'a str, &'a [u8])>,
+    {
+        let files = files.into_iter().collect::<Vec<_>>();
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut prepared = Vec::with_capacity(files.len());
+        let mut seen_objects = BTreeSet::new();
+        let mut resolved_parents = BTreeMap::<String, String>::new();
+        for (path, bytes) in files {
+            let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
+            if requires_directory {
+                return Err(DfsPosixError::IsDirectory { path });
+            }
+            let Some(parent) = parent_posix_path(&path) else {
+                return Err(DfsPosixError::IsDirectory { path });
+            };
+            let resolved_parent = match resolved_parents.get(&parent) {
+                Some(resolved) => resolved.clone(),
+                None => {
+                    let resolved = self.resolve_posix_path_distributed(&parent, true)?;
+                    resolved_parents.insert(parent.clone(), resolved.clone());
+                    resolved
+                }
+            };
+            let Some((_, child_name)) = path.rsplit_once('/') else {
+                return Err(DfsPosixError::InvalidPath { path });
+            };
+            let path = join_posix_path(&resolved_parent, child_name);
+            let object = self.metadata_object_for_new_path(&path, DfsObjectKind::File);
+            if !seen_objects.insert(object.object_id.clone()) {
+                return Err(DfsPosixError::AlreadyExists { path });
+            }
+            let metadata_primary = self.routed_namespace_primary_for_path(&path)?;
+            let target_version = next_version(&object.version);
+            prepared.push(PosixBulkLocalWrite {
+                path,
+                object,
+                target_version,
+                bytes,
+                metadata_primary,
+            });
+        }
+        self.commit_posix_bulk_local_writes(prepared)
+    }
+
+    fn commit_posix_bulk_local_writes<'a>(
+        &mut self,
+        prepared: Vec<PosixBulkLocalWrite<'a>>,
+    ) -> Result<Vec<DfsStat>> {
         let content_versions = prepared.iter().map(|write| {
             (
                 write.object.object_id.as_str(),
@@ -1982,7 +2051,6 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 self.add_object_metadata_batch(objects)?;
             }
         }
-
         committed_objects
             .iter()
             .zip(prepared.iter())
@@ -3198,8 +3266,15 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         &self,
         object: &DfsObjectMetadata,
     ) -> Result<NetworkedDfsReadOutcome> {
+        let local = self.read_object_metadata_local_content_with_state(object, false)?;
+        if matches!(
+            local,
+            NetworkedDfsReadOutcome::Found { .. } | NetworkedDfsReadOutcome::Conflicted { .. }
+        ) {
+            return Ok(local);
+        }
         if object.current_locations.contains(&self.node_id) {
-            return Ok(self.read_object_metadata_local_content_with_state(object, false)?);
+            return Ok(local);
         }
         if object.content_hash.is_some() {
             return Ok(NetworkedDfsReadOutcome::PendingReplication {
