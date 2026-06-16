@@ -5,6 +5,8 @@ use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+const SANDBOX_CONTAINER_WAIT_POLL_MS: u64 = 50;
+
 pub const SINOMO_SANDBOX_BACKEND_ENV: &str = "SINOMO_SANDBOX_BACKEND";
 pub const SINOMO_SANDBOX_CONTAINER_RUNTIME_ENV: &str = "SINOMO_SANDBOX_CONTAINER_RUNTIME";
 pub const SINOMO_SANDBOX_CONTAINER_IMAGE_ENV: &str = "SINOMO_SANDBOX_CONTAINER_IMAGE";
@@ -174,6 +176,30 @@ impl SandboxContainerCommandRunner {
         timeout_ms: u64,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
+        self.run_toolchain_command_with_stdin_and_output_sink_and_cancellation(
+            store,
+            sandbox_id,
+            command_name,
+            argv,
+            stdin,
+            timeout_ms,
+            output_sink,
+            SandboxCancellationToken::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_toolchain_command_with_stdin_and_output_sink_and_cancellation(
+        &self,
+        store: &LocalSandboxInstanceStore,
+        sandbox_id: &SandboxId,
+        command_name: &str,
+        argv: Vec<String>,
+        stdin: Option<Vec<u8>>,
+        timeout_ms: u64,
+        output_sink: Option<Arc<dyn SandboxOutputSink>>,
+        cancellation_token: SandboxCancellationToken,
+    ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
         validate_toolchain_command_name(command_name)?;
         validate_sandbox_toolchain_argv(command_name, &argv).map_err(|error| {
             SandboxCommandExecutionError::Wasi(SandboxWasiError::InvalidRequest { detail: error })
@@ -189,7 +215,14 @@ impl SandboxContainerCommandRunner {
             env: manifest.env.clone(),
             timeout_ms,
         };
-        self.run_container_command(store, &manifest, &layout, request, output_sink)
+        self.run_container_command(
+            store,
+            &manifest,
+            &layout,
+            request,
+            output_sink,
+            &cancellation_token,
+        )
     }
 
     pub fn run_process_plan_with_output_sink(
@@ -199,6 +232,25 @@ impl SandboxContainerCommandRunner {
         plan: &SandboxProcessPlan,
         timeout_ms: u64,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
+    ) -> Result<SandboxProcessPlanOutcome, SandboxCommandExecutionError> {
+        self.run_process_plan_with_output_sink_and_cancellation(
+            store,
+            sandbox_id,
+            plan,
+            timeout_ms,
+            output_sink,
+            SandboxCancellationToken::new(),
+        )
+    }
+
+    pub fn run_process_plan_with_output_sink_and_cancellation(
+        &self,
+        store: &LocalSandboxInstanceStore,
+        sandbox_id: &SandboxId,
+        plan: &SandboxProcessPlan,
+        timeout_ms: u64,
+        output_sink: Option<Arc<dyn SandboxOutputSink>>,
+        cancellation_token: SandboxCancellationToken,
     ) -> Result<SandboxProcessPlanOutcome, SandboxCommandExecutionError> {
         validate_sandbox_process_plan(plan)?;
         let (manifest, layout) = store.load(sandbox_id)?;
@@ -230,6 +282,7 @@ impl SandboxContainerCommandRunner {
                 &layout,
                 request,
                 output_sink.clone(),
+                &cancellation_token,
             )?;
             if step.pipe_stdout_to_next {
                 piped_stdin = Some(outcome.stdout.clone());
@@ -266,6 +319,7 @@ impl SandboxContainerCommandRunner {
         layout: &LocalSandboxInstanceLayout,
         request: SandboxCommandRequest,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
+        cancellation_token: &SandboxCancellationToken,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
         validate_sandbox_toolchain_argv(&request.argv[0], &request.argv).map_err(|error| {
             SandboxCommandExecutionError::Wasi(SandboxWasiError::InvalidRequest { detail: error })
@@ -274,6 +328,23 @@ impl SandboxContainerCommandRunner {
         let started_at = OffsetDateTime::now_utc();
         let timeout_ms =
             effective_sandbox_timeout_ms(request.timeout_ms, manifest.limits.wall_time_ms);
+        if cancellation_token.is_cancelled() {
+            let error = SandboxWasiError::Cancelled;
+            self.persist_failed_command(
+                store,
+                manifest,
+                layout,
+                &command_id,
+                &request,
+                started_at,
+                None,
+                Vec::new(),
+                Vec::new(),
+                sandbox_command_record_status_for_wasi_error(&error),
+                error.to_string(),
+            )?;
+            return Err(error.into());
+        }
         if let Some(stdin) = &request.stdin {
             if stdin.len() as u64 > manifest.limits.max_input_bytes {
                 let error = SandboxWasiError::InputLimitExceeded {
@@ -306,6 +377,7 @@ impl SandboxContainerCommandRunner {
             &request,
             &manifest.limits,
             timeout_ms,
+            cancellation_token,
         ) {
             Ok(output) => output,
             Err(error) => {
@@ -461,6 +533,7 @@ impl SandboxContainerCommandRunner {
         request: &SandboxCommandRequest,
         limits: &SandboxResourceLimits,
         timeout_ms: u64,
+        cancellation_token: &SandboxCancellationToken,
     ) -> Result<Output, SandboxWasiError> {
         ensure_container_layout_dirs(layout)?;
         let container_name = container_name(command_id);
@@ -499,32 +572,13 @@ impl SandboxContainerCommandRunner {
         std::thread::spawn(move || {
             let _ = tx.send(child.wait_with_output());
         });
-        if timeout_ms == SANDBOX_UNLIMITED_WALL_TIME_MS {
-            return rx
-                .recv()
-                .map_err(|source| SandboxWasiError::Runtime {
-                    detail: format!("container wait channel failed: {source}"),
-                })?
-                .map_err(|source| SandboxWasiError::Runtime {
-                    detail: format!("container runtime wait failed: {source}"),
-                });
-        }
-        match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
-            Ok(output) => output.map_err(|source| SandboxWasiError::Runtime {
-                detail: format!("container runtime wait failed: {source}"),
-            }),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let _ = Command::new(self.config.runtime.command())
-                    .args(["rm", "-f", &container_name])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                Err(SandboxWasiError::TimedOut { timeout_ms })
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(SandboxWasiError::Runtime {
-                detail: "container wait channel disconnected".to_string(),
-            }),
-        }
+        wait_for_container_runtime_output(
+            &self.config.runtime,
+            &container_name,
+            rx,
+            timeout_ms,
+            cancellation_token,
+        )
     }
 
     fn container_run_args(
@@ -581,6 +635,69 @@ impl SandboxContainerCommandRunner {
         args.extend(request.argv.clone());
         Ok(args)
     }
+}
+
+fn wait_for_container_runtime_output(
+    runtime: &SandboxContainerRuntime,
+    container_name: &str,
+    rx: mpsc::Receiver<std::io::Result<Output>>,
+    timeout_ms: u64,
+    cancellation_token: &SandboxCancellationToken,
+) -> Result<Output, SandboxWasiError> {
+    let started = Instant::now();
+    loop {
+        if cancellation_token.is_cancelled() {
+            request_container_removal(runtime, container_name);
+            return Err(SandboxWasiError::Cancelled);
+        }
+        let wait = match container_wait_poll_duration(started, timeout_ms) {
+            Ok(wait) => wait,
+            Err(SandboxWasiError::TimedOut { timeout_ms }) => {
+                request_container_removal(runtime, container_name);
+                return Err(SandboxWasiError::TimedOut { timeout_ms });
+            }
+            Err(error) => return Err(error),
+        };
+        match rx.recv_timeout(wait) {
+            Ok(output) => {
+                return output.map_err(|source| SandboxWasiError::Runtime {
+                    detail: format!("container runtime wait failed: {source}"),
+                });
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(SandboxWasiError::Runtime {
+                    detail: "container wait channel disconnected".to_string(),
+                });
+            }
+        }
+    }
+}
+
+fn container_wait_poll_duration(
+    started: Instant,
+    timeout_ms: u64,
+) -> Result<Duration, SandboxWasiError> {
+    if timeout_ms == SANDBOX_UNLIMITED_WALL_TIME_MS {
+        return Ok(Duration::from_millis(SANDBOX_CONTAINER_WAIT_POLL_MS));
+    }
+    let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    if elapsed_ms >= timeout_ms {
+        return Err(SandboxWasiError::TimedOut { timeout_ms });
+    }
+    Ok(Duration::from_millis(
+        timeout_ms
+            .saturating_sub(elapsed_ms)
+            .min(SANDBOX_CONTAINER_WAIT_POLL_MS),
+    ))
+}
+
+fn request_container_removal(runtime: &SandboxContainerRuntime, container_name: &str) {
+    let _ = Command::new(runtime.command())
+        .args(["rm", "-f", container_name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn ensure_container_layout_dirs(
@@ -814,6 +931,105 @@ exec "$@"
                 )
                 .expect("stdout"),
             b"hello"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_runner_cancels_active_fake_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = sinomo_testdir::TestDir::new("sinomo-container-runner-cancel");
+        let fake_runtime = root.join("fake-container-runtime.sh");
+        let cancel_marker = root.join("container-cancelled");
+        fs::write(
+            &fake_runtime,
+            format!(
+                r#"#!/bin/sh
+marker='{}'
+if [ "$1" = "rm" ]; then
+  touch "$marker"
+  exit 0
+fi
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    fake-image) shift; break ;;
+    --name|--network|--cap-drop|--security-opt|--memory|--stop-timeout|--volume|--workdir|--env) shift 2 ;;
+    --rm|--pull=never|--read-only|-i) shift ;;
+    *) shift ;;
+  esac
+done
+while [ ! -f "$marker" ]; do
+  sleep 0.05
+done
+exit 0
+"#,
+                cancel_marker.display()
+            ),
+        )
+        .expect("write fake runtime");
+        let mut permissions = fs::metadata(&fake_runtime).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_runtime, permissions).expect("permissions");
+
+        let store = LocalSandboxInstanceStore::new(&root);
+        let sandbox_id = SandboxId::from_legacy_named("container_cancel").expect("sandbox");
+        let toolchain_id =
+            SandboxToolchainId::from_legacy_named("container_tools").expect("toolchain");
+        store
+            .create(sandbox_id.clone(), toolchain_id, OffsetDateTime::now_utc())
+            .expect("create sandbox");
+        let config = SandboxContainerBackendConfig::new(
+            SandboxContainerRuntime::Command(fake_runtime),
+            "fake-image",
+        )
+        .expect("config");
+        let runner = SandboxContainerCommandRunner::new(config);
+        let cancellation_token = SandboxCancellationToken::new();
+        let token_for_run = cancellation_token.clone();
+        let runner_for_run = runner.clone();
+        let store_for_run = store.clone();
+        let sandbox_id_for_run = sandbox_id.clone();
+        let started = Instant::now();
+        let handle = std::thread::spawn(move || {
+            runner_for_run.run_toolchain_command_with_stdin_and_output_sink_and_cancellation(
+                &store_for_run,
+                &sandbox_id_for_run,
+                "sh",
+                vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+                None,
+                SANDBOX_UNLIMITED_WALL_TIME_MS,
+                None,
+                token_for_run,
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(150));
+        cancellation_token.cancel();
+        let result = handle.join().expect("runner thread");
+        assert!(matches!(
+            result,
+            Err(SandboxCommandExecutionError::Wasi(
+                SandboxWasiError::Cancelled
+            ))
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancelled run should finish promptly"
+        );
+        assert!(cancel_marker.exists());
+
+        let (manifest, layout) = store.load(&sandbox_id).expect("load manifest");
+        assert_eq!(manifest.command_history.len(), 1);
+        let mut sandbox_fs = LocalSandboxFileSystem::new(layout);
+        let record =
+            load_command_record(&mut sandbox_fs, &manifest.command_history[0]).expect("record");
+        assert_eq!(record.status, SandboxCommandRecordStatus::Cancelled);
+        assert!(
+            record
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("cancelled"))
         );
     }
 }

@@ -54,10 +54,15 @@ impl AgentTool for ApplyPatchTool {
                     "tool": "apply_patch",
                 }),
             )
-            .with_evidence(AgentToolEvidence::policy_only(
+            .with_evidence(AgentToolEvidence::availability_only(
                 false,
-                "file writes disabled by local workspace policy",
+                "file writes are not enabled for this local workspace",
             ));
+        }
+        if let Err(detail) =
+            ensure_local_tool_not_cancelled(&request.cancellation_token, "apply_patch")
+        {
+            return local_tool_cancelled_result("apply_patch", detail);
         }
 
         if let Some(changes) = request
@@ -83,7 +88,12 @@ impl AgentTool for ApplyPatchTool {
                 return patch_too_large(patch_bytes.len(), self.config.max_patch_bytes);
             }
             let patch_ref = write_local_evidence(&self.config, "apply_patch", "json", &patch_bytes);
-            return apply_structured_json_changes(&self.config, changes, patch_ref);
+            return apply_structured_json_changes(
+                &self.config,
+                changes,
+                patch_ref,
+                &request.cancellation_token,
+            );
         }
 
         let Some(patch) = input_patch_string(request.call) else {
@@ -97,7 +107,7 @@ impl AgentTool for ApplyPatchTool {
         }
         let patch_bytes = patch.as_bytes();
         let patch_ref = write_local_evidence(&self.config, "apply_patch", "patch", patch_bytes);
-        apply_freeform_patch(&self.config, &patch, patch_ref)
+        apply_freeform_patch(&self.config, &patch, patch_ref, &request.cancellation_token)
     }
 }
 
@@ -106,11 +116,25 @@ pub(super) fn descriptor() -> AgentToolDescriptor {
         .with_capabilities([AgentToolCapability::WriteWorkspace])
         .with_input_schema(serde_json::json!({
             "type": "object",
-            "required": ["patch"],
+            "anyOf": [
+                { "required": ["patch"] },
+                { "required": ["changes"] },
+                { "required": ["edits"] }
+            ],
             "properties": {
                 "patch": {
                     "type": "string",
                     "description": "Patch text beginning with *** Begin Patch and ending with *** End Patch. Use Add File, Update File, Delete File, and Move to hunks; update hunks use @@ context plus space/-/+ lines, not git unified range headers."
+                },
+                "changes": {
+                    "type": "array",
+                    "description": "Structured edit operations. Supported actions: add_file, delete_file, update_file/replace_file for full-file replacement, move_file, replace_exact for one exact text occurrence, and replace_range for one-based inclusive line ranges.",
+                    "items": { "type": "object" }
+                },
+                "edits": {
+                    "type": "array",
+                    "description": "Alias for changes.",
+                    "items": { "type": "object" }
                 }
             }
         }))
@@ -163,6 +187,17 @@ enum StructuredPatchChange {
         path: String,
         move_to: String,
     },
+    ReplaceExact {
+        path: String,
+        old: String,
+        new: String,
+    },
+    ReplaceRange {
+        path: String,
+        start_line: usize,
+        end_line: usize,
+        content: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -177,7 +212,11 @@ fn apply_freeform_patch(
     config: &LocalWorkspaceAgentConfig,
     patch: &str,
     patch_ref: Option<String>,
+    cancellation_token: &AgentCancellationToken,
 ) -> AgentToolResult {
+    if let Err(detail) = ensure_local_tool_not_cancelled(cancellation_token, "apply_patch") {
+        return local_tool_cancelled_result("apply_patch", detail);
+    }
     let changes = match parse_freeform_patch(patch) {
         Ok(changes) => changes,
         Err(detail) => {
@@ -197,16 +236,20 @@ fn apply_freeform_patch(
             );
         }
     };
-    apply_structured_changes(config, changes, patch_ref, "freeform")
+    apply_structured_changes(config, changes, patch_ref, "freeform", cancellation_token)
 }
 
 fn apply_structured_json_changes(
     config: &LocalWorkspaceAgentConfig,
     values: &[serde_json::Value],
     patch_ref: Option<String>,
+    cancellation_token: &AgentCancellationToken,
 ) -> AgentToolResult {
     let mut changes = Vec::new();
     for value in values {
+        if let Err(detail) = ensure_local_tool_not_cancelled(cancellation_token, "apply_patch") {
+            return local_tool_cancelled_result("apply_patch", detail);
+        }
         let action = value
             .get("action")
             .or_else(|| value.get("kind"))
@@ -245,6 +288,58 @@ fn apply_structured_json_changes(
                     .unwrap_or_default()
                     .to_string(),
             },
+            "replace_exact" | "replace_text" => {
+                let old = match required_structured_string(
+                    value,
+                    &["old", "old_text", "expected"],
+                    action,
+                ) {
+                    Ok(value) => value,
+                    Err(detail) => {
+                        return structured_patch_change_error(detail, patch_ref);
+                    }
+                };
+                let new = match required_structured_string(
+                    value,
+                    &["new", "new_text", "replacement", "content"],
+                    action,
+                ) {
+                    Ok(value) => value,
+                    Err(detail) => {
+                        return structured_patch_change_error(detail, patch_ref);
+                    }
+                };
+                StructuredPatchChange::ReplaceExact { path, old, new }
+            }
+            "replace_range" | "replace_lines" => {
+                let start_line =
+                    match required_structured_usize(value, &["start_line", "start"], action) {
+                        Ok(value) => value,
+                        Err(detail) => {
+                            return structured_patch_change_error(detail, patch_ref);
+                        }
+                    };
+                let end_line = match required_structured_usize(value, &["end_line", "end"], action)
+                {
+                    Ok(value) => value,
+                    Err(detail) => {
+                        return structured_patch_change_error(detail, patch_ref);
+                    }
+                };
+                StructuredPatchChange::ReplaceRange {
+                    path,
+                    start_line,
+                    end_line,
+                    content: value
+                        .get("content")
+                        .or_else(|| value.get("replacement"))
+                        .or_else(|| value.get("new"))
+                        .or_else(|| value.get("new_text"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                }
+            }
             other => {
                 let detail = format!("unsupported structured patch action `{other}`");
                 let summary = format_patch_failure_summary(&detail);
@@ -265,7 +360,70 @@ fn apply_structured_json_changes(
         };
         changes.push(change);
     }
-    apply_structured_changes(config, changes, patch_ref, "structured")
+    apply_structured_changes(config, changes, patch_ref, "structured", cancellation_token)
+}
+
+fn structured_patch_change_error(detail: String, patch_ref: Option<String>) -> AgentToolResult {
+    let summary = format_patch_failure_summary(&detail);
+    with_patch_evidence(
+        AgentToolResult::failed(
+            summary.clone(),
+            serde_json::json!({
+                "error": "invalid_structured_patch_change",
+                "detail": detail,
+                "message": summary,
+            }),
+        ),
+        patch_ref,
+        None,
+        summary,
+    )
+}
+
+fn required_structured_string(
+    value: &serde_json::Value,
+    fields: &[&str],
+    action: &str,
+) -> Result<String, String> {
+    fields
+        .iter()
+        .find_map(|field| {
+            value
+                .get(*field)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .ok_or_else(|| {
+            format!(
+                "structured patch action `{action}` requires one of: {}",
+                fields.join(", ")
+            )
+        })
+}
+
+fn required_structured_usize(
+    value: &serde_json::Value,
+    fields: &[&str],
+    action: &str,
+) -> Result<usize, String> {
+    let Some(raw) = fields.iter().find_map(|field| value.get(*field)) else {
+        return Err(format!(
+            "structured patch action `{action}` requires one of: {}",
+            fields.join(", ")
+        ));
+    };
+    match raw {
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| format!("structured patch action `{action}` line value is invalid")),
+        serde_json::Value::String(text) => text.parse::<usize>().map_err(|source| {
+            format!("structured patch action `{action}` line value `{text}` is invalid: {source}")
+        }),
+        _ => Err(format!(
+            "structured patch action `{action}` line value must be a positive integer"
+        )),
+    }
 }
 
 fn apply_structured_changes(
@@ -273,7 +431,11 @@ fn apply_structured_changes(
     changes: Vec<StructuredPatchChange>,
     patch_ref: Option<String>,
     patch_format: &str,
+    cancellation_token: &AgentCancellationToken,
 ) -> AgentToolResult {
+    if let Err(detail) = ensure_local_tool_not_cancelled(cancellation_token, "apply_patch") {
+        return local_tool_cancelled_result("apply_patch", detail);
+    }
     let root = match canonical_workspace_root(config) {
         Ok(root) => root,
         Err(detail) => {
@@ -293,25 +455,35 @@ fn apply_structured_changes(
             );
         }
     };
-    let plan = match plan_structured_changes(&root, config, changes, patch_format) {
-        Ok(plan) => plan,
-        Err(detail) => {
-            return with_patch_evidence(
-                patch_failure_result(
-                    patch_format,
-                    &root,
-                    "structured apply_patch preflight failed",
-                    &detail,
-                ),
-                patch_ref,
-                None,
-                format_patch_failure_summary(&detail),
-            );
-        }
-    };
+    let plan =
+        match plan_structured_changes(&root, config, changes, patch_format, cancellation_token) {
+            Ok(plan) => plan,
+            Err(detail) => {
+                if cancellation_token.is_cancelled() {
+                    return local_tool_cancelled_result("apply_patch", detail);
+                }
+                return with_patch_evidence(
+                    patch_failure_result(
+                        patch_format,
+                        &root,
+                        "structured apply_patch preflight failed",
+                        &detail,
+                    ),
+                    patch_ref,
+                    None,
+                    format_patch_failure_summary(&detail),
+                );
+            }
+        };
+    if let Err(detail) = ensure_local_tool_not_cancelled(cancellation_token, "apply_patch") {
+        return local_tool_cancelled_result("apply_patch", detail);
+    }
     let diff_ref =
         write_local_evidence(config, "apply_patch", "diff", plan.unified_diff.as_bytes());
-    if let Err(detail) = apply_planned_patch(config, &plan) {
+    if let Err(detail) = apply_planned_patch(config, &plan, cancellation_token) {
+        if cancellation_token.is_cancelled() {
+            return local_tool_cancelled_result("apply_patch", detail);
+        }
         return with_patch_evidence(
             patch_result(
                 AgentToolStatus::Failed,
@@ -423,6 +595,15 @@ impl<'a> PatchPreflight<'a> {
             StructuredPatchChange::Delete { path } => self.delete_file(path),
             StructuredPatchChange::Replace { path, content } => self.replace_file(path, content),
             StructuredPatchChange::Move { path, move_to } => self.move_file(path, move_to),
+            StructuredPatchChange::ReplaceExact { path, old, new } => {
+                self.replace_exact(path, old, new)
+            }
+            StructuredPatchChange::ReplaceRange {
+                path,
+                start_line,
+                end_line,
+                content,
+            } => self.replace_range(path, start_line, end_line, content),
             StructuredPatchChange::Update {
                 path,
                 move_to,
@@ -602,6 +783,54 @@ impl<'a> PatchPreflight<'a> {
         Ok(())
     }
 
+    fn replace_exact(&mut self, path: String, old: String, new: String) -> Result<(), String> {
+        let (target, old_state) = self.virtual_existing_file(&path)?;
+        let content = replace_exact_content(&old_state.content, &old, &new, &path)?;
+        self.files.insert(
+            target,
+            Some(VirtualFileState {
+                content,
+                display_path: path.clone(),
+                mode_source: old_state.mode_source,
+            }),
+        );
+        self.operations.push(serde_json::json!({
+            "action": "replace_exact",
+            "path": path,
+            "old_bytes": old.len(),
+            "new_bytes": new.len(),
+        }));
+        Ok(())
+    }
+
+    fn replace_range(
+        &mut self,
+        path: String,
+        start_line: usize,
+        end_line: usize,
+        content: String,
+    ) -> Result<(), String> {
+        let (target, old_state) = self.virtual_existing_file(&path)?;
+        let new_content =
+            replace_line_range_content(&old_state.content, start_line, end_line, &content, &path)?;
+        self.files.insert(
+            target,
+            Some(VirtualFileState {
+                content: new_content,
+                display_path: path.clone(),
+                mode_source: old_state.mode_source,
+            }),
+        );
+        self.operations.push(serde_json::json!({
+            "action": "replace_range",
+            "path": path,
+            "start_line": start_line,
+            "end_line": end_line,
+            "replacement_bytes": content.len(),
+        }));
+        Ok(())
+    }
+
     fn virtual_exists(&mut self, path: &Path) -> Result<bool, String> {
         if let Some(state) = self.files.get(path) {
             return Ok(state.is_some());
@@ -678,9 +907,11 @@ fn plan_structured_changes(
     config: &LocalWorkspaceAgentConfig,
     changes: Vec<StructuredPatchChange>,
     patch_format: &str,
+    cancellation_token: &AgentCancellationToken,
 ) -> Result<PlannedPatch, String> {
     let mut preflight = PatchPreflight::new(root, config);
     for change in changes {
+        ensure_local_tool_not_cancelled(cancellation_token, "apply_patch")?;
         preflight.apply_change(change)?;
     }
     Ok(preflight.finish(patch_format))
@@ -689,7 +920,9 @@ fn plan_structured_changes(
 fn apply_planned_patch(
     config: &LocalWorkspaceAgentConfig,
     plan: &PlannedPatch,
+    cancellation_token: &AgentCancellationToken,
 ) -> Result<(), String> {
+    ensure_local_tool_not_cancelled(cancellation_token, "apply_patch")?;
     let root = canonical_workspace_root(config)?;
     if root != plan.root {
         return Err(format!(
@@ -703,6 +936,7 @@ fn apply_planned_patch(
         .iter()
         .filter(|change| change.new_content.is_some())
     {
+        ensure_local_tool_not_cancelled(cancellation_token, "apply_patch")?;
         prepare_write_target(&root, change)?;
     }
     for change in plan
@@ -710,6 +944,7 @@ fn apply_planned_patch(
         .iter()
         .filter(|change| change.new_content.is_none())
     {
+        ensure_local_tool_not_cancelled(cancellation_token, "apply_patch")?;
         prepare_delete_target(&root, change)?;
     }
     for change in plan
@@ -717,6 +952,7 @@ fn apply_planned_patch(
         .iter()
         .filter(|change| change.new_content.is_some())
     {
+        ensure_local_tool_not_cancelled(cancellation_token, "apply_patch")?;
         let content = change.new_content.as_ref().expect("filtered");
         atomic_write_text_file(&change.path, content, change.mode_source.as_deref())
             .map_err(|source| format!("write `{}`: {source}", change.display_path))?;
@@ -726,6 +962,7 @@ fn apply_planned_patch(
         .iter()
         .filter(|change| change.new_content.is_none())
     {
+        ensure_local_tool_not_cancelled(cancellation_token, "apply_patch")?;
         fs::remove_file(&change.path)
             .map_err(|source| format!("delete `{}`: {source}", change.display_path))?;
     }
@@ -987,6 +1224,78 @@ fn preserve_replacement_file_style(old_content: &str, content: &str) -> String {
     content
 }
 
+fn replace_exact_content(
+    old_content: &str,
+    old: &str,
+    new: &str,
+    path: &str,
+) -> Result<String, String> {
+    let normalized_original = normalize_line_endings(old_content);
+    let (had_bom, normalized_content) = strip_utf8_bom(&normalized_original);
+    let old = normalize_line_endings(old);
+    if old.is_empty() {
+        return Err(format!(
+            "replace_exact old text for `{path}` must not be empty"
+        ));
+    }
+    let new = normalize_line_endings(new);
+    let matches = normalized_content.match_indices(&old).count();
+    if matches != 1 {
+        return Err(format!(
+            "replace_exact expected one match for `{path}`, found {matches}"
+        ));
+    }
+    let mut content = normalized_content.replacen(&old, &new, 1);
+    if preferred_line_ending(old_content) == "\r\n" {
+        content = content.replace('\n', "\r\n");
+    }
+    if had_bom {
+        content.insert(0, '\u{feff}');
+    }
+    Ok(content)
+}
+
+fn replace_line_range_content(
+    old_content: &str,
+    start_line: usize,
+    end_line: usize,
+    replacement: &str,
+    path: &str,
+) -> Result<String, String> {
+    if start_line == 0 {
+        return Err(format!(
+            "replace_range start_line for `{path}` must be >= 1"
+        ));
+    }
+    if end_line < start_line {
+        return Err(format!(
+            "replace_range end_line for `{path}` must be >= start_line"
+        ));
+    }
+    let normalized_original = normalize_line_endings(old_content);
+    let had_trailing_newline = normalized_original.ends_with('\n');
+    let (had_bom, normalized_content) = strip_utf8_bom(&normalized_original);
+    let preferred_line_ending = preferred_line_ending(old_content);
+    let mut lines = split_patch_lines(&normalized_content);
+    if start_line > lines.len() || end_line > lines.len() {
+        return Err(format!(
+            "replace_range {start_line}..{end_line} for `{path}` is outside the file's {} lines",
+            lines.len()
+        ));
+    }
+    let replacement = normalize_line_endings(replacement);
+    let replacement_lines = split_patch_lines(&replacement);
+    lines.splice(start_line - 1..end_line, replacement_lines);
+    let mut new_content = join_patch_lines(lines, had_trailing_newline);
+    if preferred_line_ending == "\r\n" {
+        new_content = new_content.replace('\n', "\r\n");
+    }
+    if had_bom {
+        new_content.insert(0, '\u{feff}');
+    }
+    Ok(new_content)
+}
+
 impl PatchFileDiff {
     fn from_change(change: &PlannedFileChange) -> Self {
         let old_content = change.old_content.as_deref().unwrap_or_default();
@@ -1092,7 +1401,7 @@ fn patch_failure_result(
         "changed_files": [],
         "operations": [],
     });
-    let evidence = AgentToolEvidence::policy_only(true, evidence_reason)
+    let evidence = AgentToolEvidence::availability_only(true, evidence_reason)
         .with_command(root.display().to_string(), Some(1))
         .with_output_value(&payload, false)
         .with_record(
@@ -1121,7 +1430,7 @@ fn patch_result(
         },
     });
     let mut evidence =
-        AgentToolEvidence::policy_only(status != AgentToolStatus::Blocked, evidence_reason)
+        AgentToolEvidence::availability_only(status != AgentToolStatus::Blocked, evidence_reason)
             .with_command(
                 root.display().to_string(),
                 Some(if status == AgentToolStatus::Succeeded {
@@ -1681,7 +1990,7 @@ fn with_patch_evidence(
 ) -> AgentToolResult {
     let summary = diff_summary.into();
     let base_evidence = result.evidence.take().unwrap_or_else(|| {
-        AgentToolEvidence::policy_only(
+        AgentToolEvidence::availability_only(
             result.status != AgentToolStatus::Blocked,
             "apply_patch produced patch evidence",
         )

@@ -34,6 +34,7 @@ sui = { path = "../../../sui/crates/sui", optional = true }
 # Application/R2 service crates used directly (allowed by trust-ring rules).
 sinomo-cli = { path = "../sinomo-cli" }
 sinomo-agent = { path = "../sinomo-agent" }
+sinomo-evolution = { path = "../sinomo-evolution" }
 sinomo-lm = { path = "../sinomo-lm" }
 
 # R0/R1 surface is reached only through the runtime facade (ring boundary).

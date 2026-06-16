@@ -9,7 +9,6 @@ The target environment is a real POSIX command workspace for coding tasks: `sh`/
 - [Architecture](docs/architecture.md): storage layout, runtime boundaries, virtual filesystem model, policy, events, and source layout.
 - [Implementation notes](docs/implementation-notes.md): current runtime, filesystem, toolchain, operational status, remaining gaps, and historical detailed implementation notes extracted from the project plan.
 - [Arch-style package build guide](docs/sandbox-package-build-guide.md): package-manager bootstrap, WASIX package repository, and automated Arch PKGBUILD source rebuild goals.
-- [Project plan](../../docs/plans/sifs-wasm-sandbox-plan.md): roadmap and plan-level progress for the SIFS-backed WASM sandbox.
 
 ## What This Crate Owns
 
@@ -114,7 +113,7 @@ When adding sandbox functionality:
 4. Add verifier coverage that runs the real command path.
 5. Update [docs/implementation-notes.md](docs/implementation-notes.md) with implementation status and remaining gaps.
 
-The project-level plan stays in [`docs/plans/sifs-wasm-sandbox-plan.md`](../../docs/plans/sifs-wasm-sandbox-plan.md). Keep this README as an entry point; do not use it as a detailed changelog or gap tracker.
+Keep this README as an entry point; do not use it as a detailed changelog or gap tracker.
 
 ## Source Notes
 

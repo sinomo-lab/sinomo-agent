@@ -76,7 +76,7 @@ impl AgentTool for ConfigSearchTool {
             format!("found {} config definition(s)", definitions.len()),
             output,
         )
-        .with_evidence(AgentToolEvidence::policy_only(
+        .with_evidence(AgentToolEvidence::availability_only(
             true,
             "searched registered config definitions",
         ))
@@ -119,7 +119,10 @@ impl AgentTool for ConfigGetTool {
                     "value": redact_config_value(resolution.value),
                 });
                 AgentToolResult::succeeded(format!("read config `{key}`"), output).with_evidence(
-                    AgentToolEvidence::policy_only(true, "resolved config through sinomo-config"),
+                    AgentToolEvidence::availability_only(
+                        true,
+                        "resolved config through sinomo-config",
+                    ),
                 )
             }
             Err(error) => config_error_result("config_get", &key, error),
@@ -189,7 +192,10 @@ impl AgentTool for ConfigSetTool {
                     "value": redact_config_value(result.value),
                 });
                 AgentToolResult::succeeded(format!("updated config `{key}`"), output).with_evidence(
-                    AgentToolEvidence::policy_only(true, "updated config through sinomo-config"),
+                    AgentToolEvidence::availability_only(
+                        true,
+                        "updated config through sinomo-config",
+                    ),
                 )
             }
             Err(error) => config_error_result("config_set", &key, error),

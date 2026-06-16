@@ -51,9 +51,13 @@ impl AgentTool for SearchFilesTool {
             case_sensitive,
             max_matches,
             &mut matches,
+            &request.cancellation_token,
         ) {
             Ok(truncated) => truncated,
             Err(detail) => {
+                if request.cancellation_token.is_cancelled() {
+                    return local_tool_cancelled_result("search", detail);
+                }
                 return AgentToolResult::failed(
                     detail.clone(),
                     serde_json::json!({ "error": "search_failed", "detail": detail }),
@@ -67,8 +71,9 @@ impl AgentTool for SearchFilesTool {
             "truncated": truncated,
             "matches": matches,
         });
-        let evidence = AgentToolEvidence::policy_only(true, "path resolved inside workspace root")
-            .with_output_value(&payload, truncated);
+        let evidence =
+            AgentToolEvidence::availability_only(true, "path resolved inside workspace root")
+                .with_output_value(&payload, truncated);
         AgentToolResult::succeeded(format!("found {} match(es)", matches.len()), payload)
             .with_evidence(evidence)
     }

@@ -1,6 +1,5 @@
 use super::*;
 use serde::Serialize;
-use std::process::Command;
 
 #[derive(Clone)]
 pub(super) struct ChangedFilesTool {
@@ -20,43 +19,43 @@ impl AgentTool for ChangedFilesTool {
 
     fn execute(&self, request: super::super::AgentToolRequest<'_>) -> AgentToolResult {
         let include_untracked = input_bool(request.call, "include_untracked").unwrap_or(true);
-        let (root, _) = match resolve_workspace_cwd(&self.config, None) {
-            Ok(paths) => paths,
-            Err(detail) => {
-                return AgentToolResult::blocked(
-                    detail.clone(),
-                    serde_json::json!({ "error": "workspace_root_not_allowed", "detail": detail }),
-                );
-            }
+        let args = vec![
+            "status".to_string(),
+            "--porcelain=v1".to_string(),
+            "-z".to_string(),
+        ];
+        let execution = match execute_local_command(
+            &self.config,
+            &self.config.git_program,
+            &args,
+            None,
+            input_timeout_ms(request.call),
+            None,
+            &request.cancellation_token,
+            request.progress_sink.clone(),
+        ) {
+            Ok(execution) => execution,
+            Err(result) => return result,
         };
-        let output = match Command::new("git")
-            .args(["status", "--porcelain=v1", "-z"])
-            .current_dir(&root)
-            .output()
-        {
-            Ok(output) => output,
-            Err(source) => {
-                return AgentToolResult::failed(
-                    format!("failed to run git status: {source}"),
-                    serde_json::json!({
-                        "error": "git_status_spawn_failed",
-                        "detail": source.to_string(),
-                    }),
-                );
-            }
-        };
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return AgentToolResult::failed(
-                format!("git status failed with {:?}", output.status.code()),
-                serde_json::json!({
-                    "error": "git_status_failed",
-                    "status": output.status.code(),
-                    "stderr": stderr,
-                }),
+        if !execution.output.success || execution.cancelled || execution.timed_out {
+            return local_command_result_from_output(
+                &self.config,
+                execution.root,
+                execution.cwd,
+                &self.config.git_program,
+                &args,
+                &execution.output,
+                execution.timed_out,
+                execution.cancelled,
+                execution.duration_ms,
+                input_timeout_ms(request.call),
+                "changed_files",
+                "inspected git status for workspace changes",
+                Vec::new(),
+                Some("git status".to_string()),
             );
         }
-        let changed = parse_git_status_porcelain_z(&output.stdout, include_untracked);
+        let changed = parse_git_status_porcelain_z(&execution.output.stdout, include_untracked);
         let paths = changed
             .iter()
             .map(|file| file.path.clone())
@@ -72,15 +71,18 @@ impl AgentTool for ChangedFilesTool {
             result.clone(),
         )
         .with_evidence(
-            AgentToolEvidence::policy_only(true, "inspected git status for workspace changes")
-                .with_output_value(&result, false)
-                .with_record(
-                    AGENT_CODING_EVIDENCE_KIND,
-                    &AgentCodingToolEvidence {
-                        changed_files: paths,
-                        ..AgentCodingToolEvidence::default()
-                    },
-                ),
+            AgentToolEvidence::availability_only(
+                true,
+                "inspected git status for workspace changes",
+            )
+            .with_output_value(&result, false)
+            .with_record(
+                AGENT_CODING_EVIDENCE_KIND,
+                &AgentCodingToolEvidence {
+                    changed_files: paths,
+                    ..AgentCodingToolEvidence::default()
+                },
+            ),
         )
     }
 }
@@ -98,6 +100,11 @@ pub(super) fn descriptor() -> AgentToolDescriptor {
                 "include_untracked": {
                     "type": "boolean",
                     "description": "Whether to include untracked files. Defaults to true."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional timeout for the git status subprocess."
                 }
             }
         }))

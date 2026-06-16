@@ -1,10 +1,11 @@
 use crate::TaskId;
 use crate::agent::{
-    AgentAbortRecord, AgentCompactionSummary, AgentFollowUpMessage, AgentItem, AgentRole,
-    AgentRunContext, AgentSession, AgentSessionControlSnapshot, AgentSessionProjection,
+    AgentAbortRecord, AgentCompactionSummary, AgentEvent, AgentFollowUpMessage, AgentItem,
+    AgentRole, AgentRunContext, AgentSession, AgentSessionControlSnapshot, AgentSessionProjection,
     AgentSteeringMessage, AgentStopReason, AgentStoragePaths, AgentTaskSnapshot, agent_item_id,
 };
 use serde::{Deserialize, Serialize};
+use sinomo_lm::RealtimeAudioSampleFormat;
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
 use std::fs::{self, File, OpenOptions};
@@ -13,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 
 pub const AGENT_SESSION_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub const AGENT_SESSION_AUDIO_SEGMENT_SCHEMA_VERSION: u32 = 1;
 
 pub trait AgentSessionStore: Send + Sync {
     fn load_session(
@@ -42,6 +44,13 @@ pub trait AgentSessionStore: Send + Sync {
         _session_id: &SessionId,
     ) -> Result<Option<AgentSessionControlSnapshot>, AgentSessionStoreError> {
         Ok(None)
+    }
+
+    fn load_control_events(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<Vec<AgentEvent>, AgentSessionStoreError> {
+        Ok(Vec::new())
     }
 }
 
@@ -123,6 +132,123 @@ impl AgentSessionProjectionRecord {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentAudioDirection {
+    Input,
+    Output,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentAudioSegmentInput {
+    pub direction: AgentAudioDirection,
+    pub sequence: u64,
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
+    pub sample_rate_hz: u32,
+    pub channels: u8,
+    pub sample_format: RealtimeAudioSampleFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub end_of_turn: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
+}
+
+impl AgentAudioSegmentInput {
+    pub fn new(
+        direction: AgentAudioDirection,
+        sequence: u64,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        sample_rate_hz: u32,
+        sample_format: RealtimeAudioSampleFormat,
+    ) -> Self {
+        Self {
+            direction,
+            sequence,
+            provider: provider.into(),
+            model: model.into(),
+            provider_session_id: None,
+            sample_rate_hz,
+            channels: 1,
+            sample_format,
+            text: None,
+            end_of_turn: false,
+            duration_ms: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentAudioDataRef {
+    pub relative_path: String,
+    pub byte_len: u64,
+    pub blake3: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentAudioSegmentRecord {
+    pub schema_version: u32,
+    pub segment_id: TaskId,
+    pub session_id: SessionId,
+    #[serde(with = "time::serde::rfc3339")]
+    pub recorded_at: time::OffsetDateTime,
+    pub direction: AgentAudioDirection,
+    pub sequence: u64,
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
+    pub sample_rate_hz: u32,
+    pub channels: u8,
+    pub sample_format: RealtimeAudioSampleFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub end_of_turn: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    pub audio: AgentAudioDataRef,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
+}
+
+impl AgentAudioSegmentRecord {
+    fn new(
+        segment_id: TaskId,
+        session_id: SessionId,
+        input: AgentAudioSegmentInput,
+        audio: AgentAudioDataRef,
+    ) -> Self {
+        Self {
+            schema_version: AGENT_SESSION_AUDIO_SEGMENT_SCHEMA_VERSION,
+            segment_id,
+            session_id,
+            recorded_at: time::OffsetDateTime::now_utc(),
+            direction: input.direction,
+            sequence: input.sequence,
+            provider: input.provider,
+            model: input.model,
+            provider_session_id: input.provider_session_id,
+            sample_rate_hz: input.sample_rate_hz,
+            channels: input.channels,
+            sample_format: input.sample_format,
+            text: input.text,
+            end_of_turn: input.end_of_turn,
+            duration_ms: input.duration_ms,
+            audio,
+            metadata: input.metadata,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentSessionStoreRecordKind {
@@ -136,7 +262,8 @@ pub enum AgentSessionStoreRecordKind {
         provider: String,
         model: String,
         role: AgentRole,
-        policy_id: String,
+        #[serde(alias = "policy_id")]
+        surface_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_steps: Option<usize>,
         #[serde(default, skip_serializing_if = "AgentRunContext::is_empty")]
@@ -163,6 +290,19 @@ pub enum AgentSessionStoreRecordKind {
     },
     ControlSnapshotSaved {
         snapshot: AgentSessionControlSnapshot,
+    },
+    AudioSegmentAppended {
+        segment_id: TaskId,
+        direction: AgentAudioDirection,
+        sequence: u64,
+        provider: String,
+        model: String,
+        byte_len: u64,
+        sample_rate_hz: u32,
+        sample_format: RealtimeAudioSampleFormat,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        end_of_turn: bool,
     },
     TaskStatusChanged {
         snapshot: AgentTaskSnapshot,
@@ -262,6 +402,100 @@ impl FileAgentSessionStore {
                 sender,
             });
         receiver
+    }
+
+    pub fn append_audio_segment(
+        &self,
+        session_id: &SessionId,
+        input: AgentAudioSegmentInput,
+        bytes: &[u8],
+    ) -> Result<AgentAudioSegmentRecord, AgentSessionStoreError> {
+        let segment_id = TaskId::generate();
+        let file_name = format!(
+            "{:08}-{}-{}.raw",
+            input.sequence,
+            match input.direction {
+                AgentAudioDirection::Input => "input",
+                AgentAudioDirection::Output => "output",
+            },
+            segment_id.as_str()
+        );
+        let relative_path = format!("audio/{file_name}");
+        let path = self
+            .paths
+            .session_audio_dir_for_session(session_id)
+            .join(&file_name);
+        replace_file(&path, bytes)?;
+        let audio = AgentAudioDataRef {
+            relative_path,
+            byte_len: bytes.len() as u64,
+            blake3: blake3::hash(bytes).to_hex().to_string(),
+        };
+        let record =
+            AgentAudioSegmentRecord::new(segment_id, session_id.clone(), input.clone(), audio);
+        append_jsonl_record(
+            &self
+                .paths
+                .session_audio_segments_path_for_session(session_id),
+            &record,
+        )?;
+        self.append_record(&AgentSessionStoreRecord::new(
+            session_id.clone(),
+            AgentSessionStoreRecordKind::AudioSegmentAppended {
+                segment_id: record.segment_id.clone(),
+                direction: record.direction,
+                sequence: record.sequence,
+                provider: record.provider.clone(),
+                model: record.model.clone(),
+                byte_len: record.audio.byte_len,
+                sample_rate_hz: record.sample_rate_hz,
+                sample_format: record.sample_format,
+                text: record.text.clone(),
+                end_of_turn: record.end_of_turn,
+            },
+        ))?;
+        Ok(record)
+    }
+
+    pub fn load_audio_segments(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<AgentAudioSegmentRecord>, AgentSessionStoreError> {
+        let path = self
+            .paths
+            .session_audio_segments_path_for_session(session_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let file = File::open(&path).map_err(|source| AgentSessionStoreError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let mut segments = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|source| AgentSessionStoreError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: AgentAudioSegmentRecord =
+                serde_json::from_str(&line).map_err(|source| {
+                    AgentSessionStoreError::Deserialization {
+                        path: path.display().to_string(),
+                        detail: source.to_string(),
+                    }
+                })?;
+            if record.schema_version != AGENT_SESSION_AUDIO_SEGMENT_SCHEMA_VERSION {
+                return Err(AgentSessionStoreError::UnsupportedSnapshotSchema {
+                    path: path.display().to_string(),
+                    schema_version: record.schema_version,
+                });
+            }
+            segments.push(record);
+        }
+        Ok(segments)
     }
 
     fn publish_record(&self, record: &AgentSessionStoreRecord) {
@@ -418,6 +652,41 @@ impl AgentSessionStore for FileAgentSessionStore {
         }
         Ok(latest)
     }
+
+    fn load_control_events(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<AgentEvent>, AgentSessionStoreError> {
+        let path = self.paths.session_events_path_for_session(session_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let file = File::open(&path).map_err(|source| AgentSessionStoreError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let mut events = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|source| AgentSessionStoreError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: AgentSessionStoreRecord =
+                serde_json::from_str(&line).map_err(|source| {
+                    AgentSessionStoreError::Deserialization {
+                        path: path.display().to_string(),
+                        detail: source.to_string(),
+                    }
+                })?;
+            if let AgentSessionStoreRecordKind::ControlEventPublished { event } = record.record {
+                events.push(event);
+            }
+        }
+        Ok(events)
+    }
 }
 
 #[cfg(test)]
@@ -460,6 +729,48 @@ mod tests {
         )
         .expect("events");
         assert!(events.contains("\"snapshot_saved\""));
+    }
+
+    #[test]
+    fn file_session_store_persists_audio_sidecars_and_metadata() {
+        let data_dir = SinomoDataDir::new(std::env::temp_dir().join(format!(
+            "sinomo-agent-audio-session-store-{}",
+            TaskId::generate()
+        )));
+        let store = FileAgentSessionStore::for_data_dir(&data_dir);
+        let session_id = SessionId::from_legacy_named("sess_audio_store").expect("session");
+        let input = AgentAudioSegmentInput::new(
+            AgentAudioDirection::Input,
+            7,
+            "openai",
+            "gpt-realtime-2",
+            24_000,
+            RealtimeAudioSampleFormat::Pcm16Le,
+        );
+
+        let record = store
+            .append_audio_segment(&session_id, input, &[0, 1, 2, 3])
+            .expect("append segment");
+
+        assert_eq!(record.sequence, 7);
+        assert_eq!(record.audio.byte_len, 4);
+        let audio_path = AgentStoragePaths::from_data_dir(&data_dir)
+            .session_dir_for_session(&session_id)
+            .join(&record.audio.relative_path);
+        assert_eq!(
+            fs::read(audio_path).expect("audio sidecar"),
+            vec![0, 1, 2, 3]
+        );
+        let loaded = store
+            .load_audio_segments(&session_id)
+            .expect("load segments");
+        assert_eq!(loaded, vec![record]);
+        let events = fs::read_to_string(
+            AgentStoragePaths::from_data_dir(&data_dir)
+                .session_events_path_for_session(&session_id),
+        )
+        .expect("events");
+        assert!(events.contains("\"audio_segment_appended\""));
     }
 }
 

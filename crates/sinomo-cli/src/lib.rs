@@ -29,12 +29,22 @@ macro_rules! eprintln {
 #[cfg(test)]
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sinomo_agent::{
-    Agent, AgentDefinition, AgentEventPayload, AgentLoopDecision, AgentLoopInput, AgentModelEvent,
-    AgentOp, AgentRole, AgentRuntimeEvent, AgentRuntimeEventCursor, AgentRuntimeEventPayload,
-    AgentSession, AgentSessionRuntime, AgentToolProgressEvent, BoundedContextBuilder,
-    ConfigAgentToolConfig, EventEnvelopeExt, InteractionModel, InteractionOutput,
-    InteractionSession, InteractionSurface, InteractionSurfaceKind, interaction_event,
-    interaction_model_request, user_interaction_input_event,
+    AGENT_RPC_CATEGORY, AGENT_SESSION_FOLLOW_UP_ROUTE, AGENT_SESSION_INSPECT_ROUTE,
+    AGENT_SESSION_INTERRUPT_ROUTE, AGENT_SESSION_PROGRESS_ROUTE, AGENT_SESSION_RESUME_ROUTE,
+    AGENT_SESSION_STEER_ROUTE, AGENT_SESSION_TERMINAL_RESULTS_ROUTE, Agent, AgentCatalog,
+    AgentDefinition, AgentDefinitionStore, AgentEventPayload, AgentLoopDecision, AgentLoopInput,
+    AgentModelEvent, AgentOp, AgentPackageProvenance, AgentPackageSource,
+    AgentReadinessCheckStatus, AgentReadinessReport, AgentRole, AgentRuntimeEvent,
+    AgentRuntimeEventCursor, AgentRuntimeEventPayload, AgentSession,
+    AgentSessionControlEventCursor, AgentSessionControlResponse, AgentSessionFollowUpRequest,
+    AgentSessionInspectRequest, AgentSessionInspectResponse, AgentSessionInterruptRequest,
+    AgentSessionProgressRequest, AgentSessionProgressResponse, AgentSessionResumeRequest,
+    AgentSessionResumeResponse, AgentSessionRuntime, AgentSessionSteerRequest,
+    AgentSessionTerminalResultsRequest, AgentSessionTerminalResultsResponse,
+    AgentTaskTerminalResult, AgentToolProgressEvent, BoundedContextBuilder, ConfigAgentToolConfig,
+    EventEnvelopeExt, FileAgentDefinitionStore, InteractionModel, InteractionOutput,
+    InteractionSession, InteractionSurface, InteractionSurfaceKind, TaskId, interaction_event,
+    interaction_model_request, run_local_agent_readiness_gate, user_interaction_input_event,
 };
 use sinomo_lm::{
     AnthropicProvider, CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, CurrentDefaultModel,
@@ -103,7 +113,7 @@ use sinomo_runtime::daemon::{
     prepare_installed_daemon_install_plan as daemon_prepare_installed_daemon_install_plan,
     prepare_local_rollout_main_activation as daemon_prepare_local_rollout_main_activation,
     probe_daemon_status, remove_boot_entry as daemon_remove_boot_entry,
-    run_daemon_control_loop as daemon_run_daemon_control_loop,
+    run_daemon_control_loop_with_services as daemon_run_daemon_control_loop_with_services,
     run_shadow_daemon_supervision_loop as daemon_run_shadow_daemon_supervision_loop,
     send_daemon_rollout_binary as daemon_send_daemon_rollout_binary,
     send_daemon_rollout_binary_to_endpoint as daemon_send_daemon_rollout_binary_to_endpoint,
@@ -147,22 +157,12 @@ use sinomo_runtime::daemon::{
 };
 #[cfg(all(test, feature = "sandbox"))]
 use sinomo_runtime::daemon::{
-    handle_daemon_sandbox_checkpoint as daemon_handle_daemon_sandbox_checkpoint,
-    handle_daemon_sandbox_create as daemon_handle_daemon_sandbox_create,
-    handle_daemon_sandbox_destroy as daemon_handle_daemon_sandbox_destroy,
     handle_daemon_sandbox_http_fetch_to_file as daemon_handle_daemon_sandbox_http_fetch_to_file,
     handle_daemon_sandbox_import_busybox as daemon_handle_daemon_sandbox_import_busybox,
-    handle_daemon_sandbox_list as daemon_handle_daemon_sandbox_list,
     handle_daemon_sandbox_read as daemon_handle_daemon_sandbox_read,
-    handle_daemon_sandbox_reboot as daemon_handle_daemon_sandbox_reboot,
-    handle_daemon_sandbox_resume as daemon_handle_daemon_sandbox_resume,
-    handle_daemon_sandbox_run_process_plan as daemon_handle_daemon_sandbox_run_process_plan,
-    handle_daemon_sandbox_run_toolchain as daemon_handle_daemon_sandbox_run_toolchain,
-    handle_daemon_sandbox_status as daemon_handle_daemon_sandbox_status,
     handle_daemon_sandbox_toolchain_add_artifact as daemon_handle_daemon_sandbox_toolchain_add_artifact,
     handle_daemon_sandbox_toolchain_add_command as daemon_handle_daemon_sandbox_toolchain_add_command,
     handle_daemon_sandbox_toolchain_import_package as daemon_handle_daemon_sandbox_toolchain_import_package,
-    handle_daemon_sandbox_update as daemon_handle_daemon_sandbox_update,
     handle_daemon_sandbox_write as daemon_handle_daemon_sandbox_write,
     open_daemon_sandbox_dfs_service as daemon_open_daemon_sandbox_dfs_service,
 };
@@ -235,6 +235,7 @@ use std::io::{self, BufRead, Read, Write};
 #[cfg(unix)]
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -250,6 +251,7 @@ mod sandbox_host;
 #[cfg(test)]
 mod tests;
 mod tui;
+mod voice;
 
 /// GUI-facing surface over the main-agent chat runtime (used by `sinomo-app`).
 pub mod app_api;
@@ -260,6 +262,7 @@ pub use providers::*;
 use sandbox_host::SinomoCliSandboxHost;
 use time::format_description::well_known::Rfc3339;
 pub use tui::*;
+pub(crate) use voice::*;
 
 struct CliClusterVoterReachabilityHost;
 
@@ -455,10 +458,19 @@ pub type CliStorageLayoutHook = Box<
         + Sync,
 >;
 
+pub type CliTestRegistryHook = Box<
+    dyn Fn(
+            sinomo_runtime::test::SinomoTestRegistryBuilder,
+        ) -> sinomo_runtime::test::SinomoTestRegistryBuilder
+        + Send
+        + Sync,
+>;
+
 pub struct CliRuntimeConfig {
     command_registry: CliCommandRegistry,
     config_registry_hooks: Vec<CliConfigRegistryHook>,
     storage_layout_hooks: Vec<CliStorageLayoutHook>,
+    test_registry_hooks: Vec<CliTestRegistryHook>,
 }
 
 impl CliRuntimeConfig {
@@ -523,6 +535,19 @@ impl CliRuntimeConfig {
         self.storage_layout_hooks.push(Box::new(hook));
         self
     }
+
+    pub fn with_test_cases(
+        mut self,
+        hook: impl Fn(
+            sinomo_runtime::test::SinomoTestRegistryBuilder,
+        ) -> sinomo_runtime::test::SinomoTestRegistryBuilder
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.test_registry_hooks.push(Box::new(hook));
+        self
+    }
 }
 
 pub fn default_cli_runtime_config() -> CliRuntimeConfig {
@@ -530,6 +555,7 @@ pub fn default_cli_runtime_config() -> CliRuntimeConfig {
         command_registry: default_cli_command_registry(),
         config_registry_hooks: Vec::new(),
         storage_layout_hooks: Vec::new(),
+        test_registry_hooks: Vec::new(),
     }
 }
 
@@ -674,13 +700,31 @@ fn run_cli_command_with_capture(args: &[String]) -> CliCommandCaptureExecution {
 fn run_cli_closure_with_capture(
     f: impl FnOnce() -> Result<(), CliError>,
 ) -> CliCommandCaptureExecution {
+    run_cli_closure_with_cli_output_capture(f, false)
+}
+
+#[cfg(test)]
+fn run_cli_closure_with_process_stdio_capture(
+    f: impl FnOnce() -> Result<(), CliError>,
+) -> CliCommandCaptureExecution {
+    run_cli_closure_with_cli_output_capture(f, true)
+}
+
+fn run_cli_closure_with_cli_output_capture(
+    f: impl FnOnce() -> Result<(), CliError>,
+    capture_process_stdio: bool,
+) -> CliCommandCaptureExecution {
     let previous = CLI_OUTPUT_CAPTURE.with(|capture| {
         capture.replace(Some(CliOutputBuffer {
             stdout: Vec::new(),
             stderr: Vec::new(),
         }))
     });
-    let (result, raw_output) = run_with_process_stdio_capture(f);
+    let (result, raw_output) = if capture_process_stdio {
+        run_with_process_stdio_capture(f)
+    } else {
+        (f(), CliOutputBuffer::default())
+    };
     let buffer = CLI_OUTPUT_CAPTURE
         .with(|capture| capture.replace(previous))
         .expect("CLI output capture installed");
@@ -965,6 +1009,25 @@ pub(crate) fn cli_command_supports_degraded_local_mode(command: &CliCommand) -> 
     }
 }
 
+pub(crate) fn cli_command_is_help(command: &CliCommand) -> bool {
+    match command {
+        CliCommand::Help | CliCommand::InstallHelp => true,
+        CliCommand::Cluster(ClusterCliCommand::Help)
+        | CliCommand::Daemon(DaemonCliCommand::Help)
+        | CliCommand::Debug(DebugCliCommand::Help)
+        | CliCommand::Rollout(RolloutCliCommand::Help)
+        | CliCommand::Dfs(DfsCliCommand::Help)
+        | CliCommand::Models(ModelsCliCommand::Help)
+        | CliCommand::Providers(ProviderCliCommand::Help)
+        | CliCommand::Voice(VoiceCliCommand::Help)
+        | CliCommand::Test(TestCliCommand::Help)
+        | CliCommand::Agent(AgentCliCommand::Help)
+        | CliCommand::Agent(AgentCliCommand::Session(AgentSessionCliCommand::Help)) => true,
+        CliCommand::Registered(command) => command.is_help(),
+        _ => false,
+    }
+}
+
 fn cli_command_needs_daemon_probe(command: &CliCommand) -> bool {
     cli_command_requires_cluster_state(command) || cli_command_supports_degraded_local_mode(command)
 }
@@ -1065,6 +1128,7 @@ pub(crate) enum CliCommand {
     Dfs(DfsCliCommand),
     Models(ModelsCliCommand),
     Providers(ProviderCliCommand),
+    Voice(VoiceCliCommand),
     Test(TestCliCommand),
     Agent(AgentCliCommand),
     Registered(RegisteredCliCommand),
@@ -1156,6 +1220,9 @@ pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError>
         Some((command, rest)) if command == "providers" => {
             Ok(CliCommand::Providers(parse_provider_command(rest)?))
         }
+        Some((command, rest)) if command == "voice" => {
+            Ok(CliCommand::Voice(parse_voice_command(rest)?))
+        }
         Some((command, rest)) if command == "test" => {
             Ok(CliCommand::Test(parse_test_command(rest)?))
         }
@@ -1174,7 +1241,56 @@ pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError>
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum AgentCliCommand {
+    Help,
+    Export(AgentExportOptions),
+    Import(AgentImportOptions),
+    Inspect(AgentInspectOptions),
+    Readiness(AgentReadinessOptions),
     Run(AgentRunOptions),
+    Session(AgentSessionCliCommand),
+    Validate(AgentValidateOptions),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum AgentSessionCliCommand {
+    Help,
+    Inspect(AgentSessionInspectOptions),
+    Progress(AgentSessionProgressOptions),
+    TerminalResults(AgentSessionTerminalResultsOptions),
+    Steer(AgentSessionMessageOptions),
+    FollowUp(AgentSessionMessageOptions),
+    Interrupt(AgentSessionMessageOptions),
+    Resume(AgentSessionResumeOptions),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct AgentInspectOptions {
+    pub agent: String,
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct AgentExportOptions {
+    pub agent: String,
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct AgentImportOptions {
+    pub path: PathBuf,
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct AgentValidateOptions {
+    pub agent: String,
+    pub file: Option<PathBuf>,
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct AgentReadinessOptions {
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1185,13 +1301,495 @@ pub(crate) struct AgentRunOptions {
     pub account: Option<String>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct AgentSessionInspectOptions {
+    pub session_id: SessionId,
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct AgentSessionProgressOptions {
+    pub session_id: SessionId,
+    pub cursor: Option<AgentSessionControlEventCursor>,
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct AgentSessionTerminalResultsOptions {
+    pub session_id: SessionId,
+    pub task_id: Option<TaskId>,
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct AgentSessionMessageOptions {
+    pub session_id: SessionId,
+    pub message: String,
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct AgentSessionResumeOptions {
+    pub session_id: SessionId,
+    pub json: bool,
+}
+
 pub(crate) fn parse_agent_command(args: &[String]) -> Result<AgentCliCommand, CliError> {
     match args.split_first() {
+        None => Ok(AgentCliCommand::Help),
+        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
+            Ok(AgentCliCommand::Help)
+        }
+        Some((command, rest)) if command == "export" => {
+            Ok(AgentCliCommand::Export(parse_agent_export_options(rest)?))
+        }
+        Some((command, rest)) if command == "import" => {
+            Ok(AgentCliCommand::Import(parse_agent_import_options(rest)?))
+        }
+        Some((command, rest)) if command == "inspect" => {
+            Ok(AgentCliCommand::Inspect(parse_agent_inspect_options(rest)?))
+        }
+        Some((command, rest)) if matches!(command.as_str(), "readiness" | "ready") => Ok(
+            AgentCliCommand::Readiness(parse_agent_readiness_options(rest)?),
+        ),
         Some((command, rest)) if command == "run" => {
             Ok(AgentCliCommand::Run(parse_agent_run_options(rest)?))
         }
+        Some((command, rest)) if matches!(command.as_str(), "session" | "sessions") => {
+            Ok(AgentCliCommand::Session(parse_agent_session_command(rest)?))
+        }
+        Some((command, rest)) if command == "validate" => Ok(AgentCliCommand::Validate(
+            parse_agent_validate_options(rest)?,
+        )),
         _ => Err(CliError::Usage),
     }
+}
+
+pub(crate) fn parse_agent_session_command(
+    args: &[String],
+) -> Result<AgentSessionCliCommand, CliError> {
+    match args.split_first() {
+        None => Ok(AgentSessionCliCommand::Help),
+        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
+            Ok(AgentSessionCliCommand::Help)
+        }
+        Some((command, rest)) if command == "inspect" => Ok(AgentSessionCliCommand::Inspect(
+            parse_agent_session_inspect_options(rest)?,
+        )),
+        Some((command, rest)) if command == "progress" => Ok(AgentSessionCliCommand::Progress(
+            parse_agent_session_progress_options(rest)?,
+        )),
+        Some((command, rest)) if matches!(command.as_str(), "terminal-results" | "results") => {
+            Ok(AgentSessionCliCommand::TerminalResults(
+                parse_agent_session_terminal_results_options(rest)?,
+            ))
+        }
+        Some((command, rest)) if command == "steer" => Ok(AgentSessionCliCommand::Steer(
+            parse_agent_session_message_options(rest, "steer")?,
+        )),
+        Some((command, rest)) if matches!(command.as_str(), "follow-up" | "followup") => {
+            Ok(AgentSessionCliCommand::FollowUp(
+                parse_agent_session_message_options(rest, "follow-up")?,
+            ))
+        }
+        Some((command, rest)) if command == "interrupt" => Ok(AgentSessionCliCommand::Interrupt(
+            parse_agent_session_message_options(rest, "interrupt")?,
+        )),
+        Some((command, rest)) if command == "resume" => Ok(AgentSessionCliCommand::Resume(
+            parse_agent_session_resume_options(rest)?,
+        )),
+        _ => Err(CliError::Usage),
+    }
+}
+
+pub(crate) fn parse_agent_inspect_options(
+    args: &[String],
+) -> Result<AgentInspectOptions, CliError> {
+    let mut agent = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                json = true;
+            }
+            "--agent" => {
+                index += 1;
+                agent = Some(args.get(index).cloned().ok_or_else(|| CliError::Parse {
+                    detail: "--agent requires a value".to_string(),
+                })?);
+            }
+            value if agent.is_none() => {
+                agent = Some(value.to_string());
+            }
+            value => {
+                return Err(CliError::Parse {
+                    detail: format!("unexpected agent inspect argument `{value}`"),
+                });
+            }
+        }
+        index += 1;
+    }
+    Ok(AgentInspectOptions {
+        agent: agent.unwrap_or_else(|| "main-agent".to_string()),
+        json,
+    })
+}
+
+pub(crate) fn parse_agent_session_inspect_options(
+    args: &[String],
+) -> Result<AgentSessionInspectOptions, CliError> {
+    let mut session_id = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--session" | "--session-id" => {
+                index += 1;
+                session_id = Some(parse_agent_session_id_arg(args.get(index), "--session")?);
+            }
+            value if session_id.is_none() => {
+                session_id = Some(parse_agent_session_id(value)?);
+            }
+            value => {
+                return Err(CliError::Parse {
+                    detail: format!("unexpected agent session inspect argument `{value}`"),
+                });
+            }
+        }
+        index += 1;
+    }
+    Ok(AgentSessionInspectOptions {
+        session_id: session_id.ok_or_else(|| CliError::Parse {
+            detail: "agent session inspect requires a session id".to_string(),
+        })?,
+        json,
+    })
+}
+
+pub(crate) fn parse_agent_session_progress_options(
+    args: &[String],
+) -> Result<AgentSessionProgressOptions, CliError> {
+    let mut session_id = None;
+    let mut offset = None;
+    let mut last_event_id = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--session" | "--session-id" => {
+                index += 1;
+                session_id = Some(parse_agent_session_id_arg(args.get(index), "--session")?);
+            }
+            "--cursor" | "--offset" => {
+                index += 1;
+                offset = Some(parse_usize_arg(args.get(index), "--cursor")?);
+            }
+            "--last-event" | "--last-event-id" => {
+                index += 1;
+                last_event_id = Some(parse_agent_task_id_arg(args.get(index), "--last-event")?);
+            }
+            value if session_id.is_none() => {
+                session_id = Some(parse_agent_session_id(value)?);
+            }
+            value => {
+                return Err(CliError::Parse {
+                    detail: format!("unexpected agent session progress argument `{value}`"),
+                });
+            }
+        }
+        index += 1;
+    }
+    Ok(AgentSessionProgressOptions {
+        session_id: session_id.ok_or_else(|| CliError::Parse {
+            detail: "agent session progress requires a session id".to_string(),
+        })?,
+        cursor: if offset.is_some() || last_event_id.is_some() {
+            Some(AgentSessionControlEventCursor {
+                offset: offset.unwrap_or_default(),
+                last_event_id,
+            })
+        } else {
+            None
+        },
+        json,
+    })
+}
+
+pub(crate) fn parse_agent_session_terminal_results_options(
+    args: &[String],
+) -> Result<AgentSessionTerminalResultsOptions, CliError> {
+    let mut session_id = None;
+    let mut task_id = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--session" | "--session-id" => {
+                index += 1;
+                session_id = Some(parse_agent_session_id_arg(args.get(index), "--session")?);
+            }
+            "--task" | "--task-id" => {
+                index += 1;
+                task_id = Some(parse_agent_task_id_arg(args.get(index), "--task")?);
+            }
+            value if session_id.is_none() => {
+                session_id = Some(parse_agent_session_id(value)?);
+            }
+            value => {
+                return Err(CliError::Parse {
+                    detail: format!("unexpected agent session terminal-results argument `{value}`"),
+                });
+            }
+        }
+        index += 1;
+    }
+    Ok(AgentSessionTerminalResultsOptions {
+        session_id: session_id.ok_or_else(|| CliError::Parse {
+            detail: "agent session terminal-results requires a session id".to_string(),
+        })?,
+        task_id,
+        json,
+    })
+}
+
+pub(crate) fn parse_agent_session_message_options(
+    args: &[String],
+    command: &str,
+) -> Result<AgentSessionMessageOptions, CliError> {
+    let mut session_id = None;
+    let mut message_parts = Vec::new();
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--session" | "--session-id" => {
+                index += 1;
+                session_id = Some(parse_agent_session_id_arg(args.get(index), "--session")?);
+            }
+            "--message" | "--reason" => {
+                index += 1;
+                message_parts.push(args.get(index).cloned().ok_or_else(|| CliError::Parse {
+                    detail: format!("{} requires a value", args[index - 1]),
+                })?);
+            }
+            value if session_id.is_none() => {
+                session_id = Some(parse_agent_session_id(value)?);
+            }
+            value => {
+                message_parts.push(value.to_string());
+            }
+        }
+        index += 1;
+    }
+    let message = message_parts.join(" ");
+    if message.trim().is_empty() {
+        return Err(CliError::Parse {
+            detail: format!("agent session {command} requires a message"),
+        });
+    }
+    Ok(AgentSessionMessageOptions {
+        session_id: session_id.ok_or_else(|| CliError::Parse {
+            detail: format!("agent session {command} requires a session id"),
+        })?,
+        message,
+        json,
+    })
+}
+
+pub(crate) fn parse_agent_session_resume_options(
+    args: &[String],
+) -> Result<AgentSessionResumeOptions, CliError> {
+    let mut session_id = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--session" | "--session-id" => {
+                index += 1;
+                session_id = Some(parse_agent_session_id_arg(args.get(index), "--session")?);
+            }
+            value if session_id.is_none() => {
+                session_id = Some(parse_agent_session_id(value)?);
+            }
+            value => {
+                return Err(CliError::Parse {
+                    detail: format!("unexpected agent session resume argument `{value}`"),
+                });
+            }
+        }
+        index += 1;
+    }
+    Ok(AgentSessionResumeOptions {
+        session_id: session_id.ok_or_else(|| CliError::Parse {
+            detail: "agent session resume requires a session id".to_string(),
+        })?,
+        json,
+    })
+}
+
+fn parse_agent_session_id_arg(value: Option<&String>, option: &str) -> Result<SessionId, CliError> {
+    parse_agent_session_id(value.ok_or_else(|| CliError::Parse {
+        detail: format!("{option} requires a value"),
+    })?)
+}
+
+fn parse_agent_session_id(value: &str) -> Result<SessionId, CliError> {
+    SessionId::from_str(value)
+        .or_else(|_| SessionId::from_legacy_named(value))
+        .map_err(|source| CliError::Parse {
+            detail: format!("invalid agent session id `{value}`: {source}"),
+        })
+}
+
+fn parse_agent_task_id_arg(value: Option<&String>, option: &str) -> Result<TaskId, CliError> {
+    let value = value.ok_or_else(|| CliError::Parse {
+        detail: format!("{option} requires a value"),
+    })?;
+    TaskId::from_str(value).map_err(|source| CliError::Parse {
+        detail: format!("invalid agent task id `{value}`: {source}"),
+    })
+}
+
+fn parse_usize_arg(value: Option<&String>, option: &str) -> Result<usize, CliError> {
+    let value = value.ok_or_else(|| CliError::Parse {
+        detail: format!("{option} requires a value"),
+    })?;
+    value.parse::<usize>().map_err(|source| CliError::Parse {
+        detail: format!("invalid {option} value `{value}`: {source}"),
+    })
+}
+
+pub(crate) fn parse_agent_export_options(args: &[String]) -> Result<AgentExportOptions, CliError> {
+    let mut agent = None;
+    let mut output = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--output" | "-o" => {
+                index += 1;
+                output =
+                    Some(
+                        args.get(index)
+                            .map(PathBuf::from)
+                            .ok_or_else(|| CliError::Parse {
+                                detail: "--output requires a value".to_string(),
+                            })?,
+                    );
+            }
+            value if agent.is_none() => {
+                agent = Some(value.to_string());
+            }
+            value => {
+                return Err(CliError::Parse {
+                    detail: format!("unexpected agent export argument `{value}`"),
+                });
+            }
+        }
+        index += 1;
+    }
+    Ok(AgentExportOptions {
+        agent: agent.unwrap_or_else(|| "main-agent".to_string()),
+        output,
+    })
+}
+
+pub(crate) fn parse_agent_import_options(args: &[String]) -> Result<AgentImportOptions, CliError> {
+    let mut path = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                json = true;
+            }
+            "--file" => {
+                index += 1;
+                path = Some(
+                    args.get(index)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| CliError::Parse {
+                            detail: "--file requires a value".to_string(),
+                        })?,
+                );
+            }
+            value if path.is_none() => {
+                path = Some(PathBuf::from(value));
+            }
+            value => {
+                return Err(CliError::Parse {
+                    detail: format!("unexpected agent import argument `{value}`"),
+                });
+            }
+        }
+        index += 1;
+    }
+    let path = path.ok_or_else(|| CliError::Parse {
+        detail: "agent import requires a package JSON path".to_string(),
+    })?;
+    Ok(AgentImportOptions { path, json })
+}
+
+pub(crate) fn parse_agent_readiness_options(
+    args: &[String],
+) -> Result<AgentReadinessOptions, CliError> {
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            value => {
+                return Err(CliError::Parse {
+                    detail: format!("unexpected agent readiness argument `{value}`"),
+                });
+            }
+        }
+    }
+    Ok(AgentReadinessOptions { json })
+}
+
+pub(crate) fn parse_agent_validate_options(
+    args: &[String],
+) -> Result<AgentValidateOptions, CliError> {
+    let mut agent = None;
+    let mut file = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                json = true;
+            }
+            "--file" => {
+                index += 1;
+                file = Some(
+                    args.get(index)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| CliError::Parse {
+                            detail: "--file requires a value".to_string(),
+                        })?,
+                );
+            }
+            value if agent.is_none() && file.is_none() => {
+                agent = Some(value.to_string());
+            }
+            value => {
+                return Err(CliError::Parse {
+                    detail: format!("unexpected agent validate argument `{value}`"),
+                });
+            }
+        }
+        index += 1;
+    }
+    Ok(AgentValidateOptions {
+        agent: agent.unwrap_or_else(|| "main-agent".to_string()),
+        file,
+        json,
+    })
 }
 
 pub(crate) fn parse_agent_run_options(args: &[String]) -> Result<AgentRunOptions, CliError> {
@@ -1497,8 +2095,810 @@ fn ensure_local_pytorch_endpoint(endpoint: &str, model: &str) -> Result<(), Lang
 
 pub(crate) fn run_agent_command(command: AgentCliCommand) -> Result<(), CliError> {
     match command {
+        AgentCliCommand::Help => {
+            print_agent_help();
+            Ok(())
+        }
+        AgentCliCommand::Export(options) => export_agent_package(options),
+        AgentCliCommand::Import(options) => import_agent_package(options),
+        AgentCliCommand::Inspect(options) => inspect_agent_package(options),
+        AgentCliCommand::Readiness(options) => run_agent_readiness(options),
         AgentCliCommand::Run(options) => run_agent_once(options),
+        AgentCliCommand::Session(command) => run_agent_session_command(command),
+        AgentCliCommand::Validate(options) => validate_agent_package(options),
     }
+}
+
+pub(crate) fn run_agent_session_command(command: AgentSessionCliCommand) -> Result<(), CliError> {
+    match command {
+        AgentSessionCliCommand::Help => {
+            print_agent_session_help();
+            Ok(())
+        }
+        AgentSessionCliCommand::Inspect(options) => {
+            let response: AgentSessionInspectResponse = send_agent_session_rpc(
+                AGENT_SESSION_INSPECT_ROUTE,
+                &AgentSessionInspectRequest {
+                    session_id: options.session_id,
+                },
+            )?;
+            if options.json {
+                print_agent_session_json("<agent session inspect>", &response)?;
+            } else {
+                print!("{}", agent_session_inspection_text(&response));
+            }
+            Ok(())
+        }
+        AgentSessionCliCommand::Progress(options) => {
+            let response: AgentSessionProgressResponse = send_agent_session_rpc(
+                AGENT_SESSION_PROGRESS_ROUTE,
+                &AgentSessionProgressRequest {
+                    session_id: options.session_id,
+                    cursor: options.cursor,
+                },
+            )?;
+            if options.json {
+                print_agent_session_json("<agent session progress>", &response)?;
+            } else {
+                print!("{}", agent_session_progress_text(&response));
+            }
+            Ok(())
+        }
+        AgentSessionCliCommand::TerminalResults(options) => {
+            let response: AgentSessionTerminalResultsResponse = send_agent_session_rpc(
+                AGENT_SESSION_TERMINAL_RESULTS_ROUTE,
+                &AgentSessionTerminalResultsRequest {
+                    session_id: options.session_id,
+                    task_id: options.task_id,
+                },
+            )?;
+            if options.json {
+                print_agent_session_json("<agent session terminal-results>", &response)?;
+            } else {
+                print!("{}", agent_session_terminal_results_text(&response));
+            }
+            Ok(())
+        }
+        AgentSessionCliCommand::Steer(options) => {
+            let response: AgentSessionControlResponse = send_agent_session_rpc(
+                AGENT_SESSION_STEER_ROUTE,
+                &AgentSessionSteerRequest {
+                    session_id: options.session_id,
+                    message: options.message,
+                },
+            )?;
+            if options.json {
+                print_agent_session_json("<agent session steer>", &response)?;
+            } else {
+                print!("{}", agent_session_control_text("steer", &response));
+            }
+            Ok(())
+        }
+        AgentSessionCliCommand::FollowUp(options) => {
+            let response: AgentSessionControlResponse = send_agent_session_rpc(
+                AGENT_SESSION_FOLLOW_UP_ROUTE,
+                &AgentSessionFollowUpRequest {
+                    session_id: options.session_id,
+                    message: options.message,
+                },
+            )?;
+            if options.json {
+                print_agent_session_json("<agent session follow-up>", &response)?;
+            } else {
+                print!("{}", agent_session_control_text("follow-up", &response));
+            }
+            Ok(())
+        }
+        AgentSessionCliCommand::Interrupt(options) => {
+            let response: AgentSessionControlResponse = send_agent_session_rpc(
+                AGENT_SESSION_INTERRUPT_ROUTE,
+                &AgentSessionInterruptRequest {
+                    session_id: options.session_id,
+                    reason: options.message,
+                },
+            )?;
+            if options.json {
+                print_agent_session_json("<agent session interrupt>", &response)?;
+            } else {
+                print!("{}", agent_session_control_text("interrupt", &response));
+            }
+            Ok(())
+        }
+        AgentSessionCliCommand::Resume(options) => {
+            let response: AgentSessionResumeResponse = send_agent_session_rpc(
+                AGENT_SESSION_RESUME_ROUTE,
+                &AgentSessionResumeRequest {
+                    session_id: options.session_id,
+                },
+            )?;
+            if options.json {
+                print_agent_session_json("<agent session resume>", &response)?;
+            } else {
+                print!("{}", agent_session_resume_text(&response));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn send_agent_session_rpc<Req, Resp>(route: &str, body: &Req) -> Result<Resp, CliError>
+where
+    Req: serde::Serialize + ?Sized,
+    Resp: serde::de::DeserializeOwned,
+{
+    let Some(status) = default_main_daemon_status()? else {
+        return Err(CliError::DaemonNotRunning {
+            detail: "agent session commands require the local daemon RPC service".to_string(),
+        });
+    };
+    let request = network::ObjectRpcRequest::encode_body(route, AGENT_RPC_CATEGORY, body)
+        .map_err(CliError::from)?;
+    let response = daemon_send_daemon_rpc(&status.address, &request, DAEMON_AGENT_SESSION_TIMEOUT)?;
+    response.decode_body().map_err(CliError::from)
+}
+
+fn print_agent_session_json<T: serde::Serialize>(path: &str, value: &T) -> Result<(), CliError> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).map_err(|source| CliError::Json {
+            path: path.to_string(),
+            detail: source.to_string(),
+        })?
+    );
+    Ok(())
+}
+
+pub(crate) fn agent_session_inspection_text(response: &AgentSessionInspectResponse) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("Agent session: {}\n", response.session_id));
+    match &response.session {
+        Some(session) => {
+            output.push_str(&format!("  role: {:?}\n", session.role));
+            output.push_str(&format!(
+                "  transcript items: {}\n",
+                session.transcript.items.len()
+            ));
+            output.push_str(&format!(
+                "  raw transcript items: {}\n",
+                session.raw_transcript.items.len()
+            ));
+            output.push_str(&format!(
+                "  queued steering: {}\n",
+                session.steering_queue.len()
+            ));
+            output.push_str(&format!(
+                "  queued follow-ups: {}\n",
+                session.follow_up_queue.len()
+            ));
+        }
+        None => output.push_str("  session: not found\n"),
+    }
+    if let Some(snapshot) = &response.control_snapshot {
+        output.push_str(&format!(
+            "  active turn: {}\n",
+            snapshot.active_turn.is_some()
+        ));
+        output.push_str(&format!("  tasks: {}\n", snapshot.tasks.len()));
+        output.push_str(&format!(
+            "  buffered events: {}\n",
+            snapshot.buffered_event_count
+        ));
+    } else {
+        output.push_str("  control snapshot: not found\n");
+    }
+    output.push_str(&format!(
+        "  persisted events: {}\n",
+        response.persisted_event_count
+    ));
+    output.push_str(&format!(
+        "  event cursor: {}\n",
+        agent_session_cursor_label(&response.event_cursor)
+    ));
+    output.push_str(&format!(
+        "  terminal results: {}\n",
+        response.terminal_results.len()
+    ));
+    output
+}
+
+pub(crate) fn agent_session_progress_text(response: &AgentSessionProgressResponse) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "Agent session progress: {}\n",
+        response.session_id
+    ));
+    output.push_str(&format!(
+        "  cursor: {} -> {}\n",
+        agent_session_cursor_label(&response.batch.cursor),
+        agent_session_cursor_label(&response.batch.next_cursor)
+    ));
+    output.push_str(&format!("  events: {}\n", response.batch.events.len()));
+    output.push_str(&format!(
+        "  task updates: {}\n",
+        response.batch.task_updates.len()
+    ));
+    output.push_str(&format!(
+        "  terminal results: {}\n",
+        response.batch.terminal_results.len()
+    ));
+    for task in &response.batch.task_updates {
+        output.push_str(&format!(
+            "  - {} {} {}\n",
+            task.task.task_id,
+            agent_task_status_label(&task.status),
+            task.task.summary
+        ));
+    }
+    output
+}
+
+pub(crate) fn agent_session_terminal_results_text(
+    response: &AgentSessionTerminalResultsResponse,
+) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "Agent session terminal results: {}\n",
+        response.session_id
+    ));
+    output.push_str(&format!("  results: {}\n", response.terminal_results.len()));
+    for result in &response.terminal_results {
+        output.push_str(&agent_terminal_result_line(result));
+    }
+    output
+}
+
+fn agent_session_control_text(action: &str, response: &AgentSessionControlResponse) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "Agent session {action}: {}\n",
+        response.session_id
+    ));
+    output.push_str(&format!("  accepted: {}\n", response.result.accepted));
+    output.push_str(&format!("  sequence: {}\n", response.result.sequence));
+    output.push_str(&format!(
+        "  active turn: {}\n",
+        response.result.snapshot.active_turn.is_some()
+    ));
+    output.push_str(&format!(
+        "  tasks: {}\n",
+        response.result.snapshot.tasks.len()
+    ));
+    output.push_str(&format!("  events: {}\n", response.result.events.len()));
+    output.push_str(&format!(
+        "  terminal results: {}\n",
+        response.result.terminal_results().len()
+    ));
+    output
+}
+
+pub(crate) fn agent_session_resume_text(response: &AgentSessionResumeResponse) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("Agent session resume: {}\n", response.session_id));
+    output.push_str(&format!("  accepted: {}\n", response.accepted));
+    output.push_str(&format!(
+        "  runtime attached: {}\n",
+        response.runtime_attached
+    ));
+    output.push_str(&format!(
+        "  reattach state: {}\n",
+        agent_reattach_state_label(&response.reattach.state)
+    ));
+    output.push_str(&format!(
+        "  persisted active turn: {}\n",
+        response.reattach.active_turn_persisted
+    ));
+    output.push_str(&format!(
+        "  running tasks: {}\n",
+        response.reattach.running_task_count
+    ));
+    output.push_str(&format!(
+        "  persisted events: {}\n",
+        response.reattach.persisted_event_count
+    ));
+    if let Some(session) = &response.session {
+        output.push_str(&format!("  role: {:?}\n", session.role));
+        output.push_str(&format!(
+            "  queued steering: {}\n",
+            session.steering_queue.len()
+        ));
+        output.push_str(&format!(
+            "  queued follow-ups: {}\n",
+            session.follow_up_queue.len()
+        ));
+    }
+    if let Some(snapshot) = &response.control_snapshot {
+        output.push_str(&format!(
+            "  active turn: {}\n",
+            snapshot.active_turn.is_some()
+        ));
+        output.push_str(&format!("  tasks: {}\n", snapshot.tasks.len()));
+    }
+    output.push_str(&format!(
+        "  event cursor: {}\n",
+        agent_session_cursor_label(&response.event_cursor)
+    ));
+    if let Some(detail) = response.detail.as_deref() {
+        output.push_str(&format!("  detail: {detail}\n"));
+    }
+    output.push_str(&format!(
+        "  reattach reason: {}\n",
+        response.reattach.reason
+    ));
+    output
+}
+
+fn agent_reattach_state_label(state: &sinomo_agent::AgentSessionReattachState) -> &'static str {
+    match state {
+        sinomo_agent::AgentSessionReattachState::LiveRuntimeAttached => "live_runtime_attached",
+        sinomo_agent::AgentSessionReattachState::PersistedMetadataOnly => "persisted_metadata_only",
+        sinomo_agent::AgentSessionReattachState::Missing => "missing",
+    }
+}
+
+fn agent_session_cursor_label(cursor: &AgentSessionControlEventCursor) -> String {
+    match &cursor.last_event_id {
+        Some(event_id) => format!("offset {}, last event {}", cursor.offset, event_id),
+        None => format!("offset {}, last event none", cursor.offset),
+    }
+}
+
+fn agent_terminal_result_line(result: &AgentTaskTerminalResult) -> String {
+    let mut line = format!(
+        "  - {} {} {}",
+        result.task.task_id,
+        agent_task_status_label(&result.status),
+        result.task.summary
+    );
+    if let Some(summary) = result.progress_summary.as_deref() {
+        line.push_str(&format!(": {summary}"));
+    }
+    if let Some(result_ref) = result.result_ref.as_deref() {
+        line.push_str(&format!(" [{result_ref}]"));
+    }
+    line.push('\n');
+    line
+}
+
+fn agent_task_status_label(status: &sinomo_agent::AgentTaskLifecycleStatus) -> &'static str {
+    match status {
+        sinomo_agent::AgentTaskLifecycleStatus::Pending => "pending",
+        sinomo_agent::AgentTaskLifecycleStatus::Running => "running",
+        sinomo_agent::AgentTaskLifecycleStatus::Completed => "completed",
+        sinomo_agent::AgentTaskLifecycleStatus::Failed => "failed",
+        sinomo_agent::AgentTaskLifecycleStatus::Cancelled => "cancelled",
+        sinomo_agent::AgentTaskLifecycleStatus::TimedOut => "timed-out",
+    }
+}
+
+pub(crate) fn inspect_agent_package(options: AgentInspectOptions) -> Result<(), CliError> {
+    let catalog = load_agent_catalog_for_cli()?;
+    let definition = agent_definition_from_catalog(&catalog, &options.agent)?;
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&agent_package_inspection_json(definition)).map_err(
+                |source| CliError::Json {
+                    path: "<agent inspect>".to_string(),
+                    detail: source.to_string(),
+                },
+            )?
+        );
+    } else {
+        print!("{}", agent_package_inspection_text(definition));
+    }
+    Ok(())
+}
+
+pub(crate) fn export_agent_package(options: AgentExportOptions) -> Result<(), CliError> {
+    let catalog = load_agent_catalog_for_cli()?;
+    let definition = agent_definition_from_catalog(&catalog, &options.agent)?;
+    let bytes = serde_json::to_vec_pretty(definition).map_err(|source| CliError::Json {
+        path: "<agent export>".to_string(),
+        detail: source.to_string(),
+    })?;
+    if let Some(path) = options.output {
+        fs::write(&path, bytes).map_err(|source| CliError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        println!("exported agent package: {}", path.display());
+    } else {
+        println!(
+            "{}",
+            String::from_utf8(bytes).map_err(|source| CliError::Json {
+                path: "<agent export>".to_string(),
+                detail: source.to_string(),
+            })?
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn import_agent_package(options: AgentImportOptions) -> Result<(), CliError> {
+    let source_path = agent_package_source_path(&options.path);
+    let mut definition = read_agent_package_definition(&options.path)?;
+    definition.package.provenance = AgentPackageProvenance::imported(source_path.clone());
+    definition.validate().map_err(|source| CliError::Parse {
+        detail: source.to_string(),
+    })?;
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let store = FileAgentDefinitionStore::for_data_dir(&data_dir);
+    let saved_path = store
+        .save_definition(&definition)
+        .map_err(agent_definition_store_cli_error)?;
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "imported",
+                "id": definition.key(),
+                "source_path": source_path,
+                "stored_path": saved_path,
+                "package": definition.package,
+            }))
+            .map_err(|source| CliError::Json {
+                path: "<agent import>".to_string(),
+                detail: source.to_string(),
+            })?
+        );
+    } else {
+        println!(
+            "imported agent package `{}` to {}",
+            definition.key(),
+            saved_path.display()
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_agent_package(options: AgentValidateOptions) -> Result<(), CliError> {
+    let (definition, source, path) = if let Some(path) = options.file {
+        let definition = read_agent_package_definition(&path)?;
+        definition.validate().map_err(|source| CliError::Parse {
+            detail: source.to_string(),
+        })?;
+        (
+            definition,
+            "file".to_string(),
+            Some(agent_package_source_path(&path)),
+        )
+    } else {
+        let catalog = load_agent_catalog_for_cli()?;
+        let definition = agent_definition_from_catalog(&catalog, &options.agent)?.clone();
+        definition.validate().map_err(|source| CliError::Parse {
+            detail: source.to_string(),
+        })?;
+        (definition, "catalog".to_string(), None)
+    };
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "valid",
+                "id": definition.key(),
+                "source": source,
+                "path": path,
+                "package": definition.package,
+            }))
+            .map_err(|source| CliError::Json {
+                path: "<agent validate>".to_string(),
+                detail: source.to_string(),
+            })?
+        );
+    } else {
+        println!(
+            "valid agent package `{}` from {}",
+            definition.key(),
+            path.unwrap_or(source)
+        );
+    }
+    Ok(())
+}
+
+fn load_agent_catalog_for_cli() -> Result<AgentCatalog, CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    AgentCatalog::load_from_data_dir(&data_dir).map_err(|source| CliError::Parse {
+        detail: source.to_string(),
+    })
+}
+
+fn agent_definition_from_catalog<'a>(
+    catalog: &'a AgentCatalog,
+    agent: &str,
+) -> Result<&'a AgentDefinition, CliError> {
+    catalog.get(agent).ok_or_else(|| CliError::Parse {
+        detail: format!("unknown agent `{agent}`"),
+    })
+}
+
+fn read_agent_package_definition(path: &Path) -> Result<AgentDefinition, CliError> {
+    let content = fs::read_to_string(path).map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let mut definition: AgentDefinition =
+        serde_json::from_str(&content).map_err(|source| CliError::Json {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    if definition.id.is_empty() {
+        definition.id = definition.name.clone();
+    }
+    Ok(definition)
+}
+
+fn agent_definition_store_cli_error(error: sinomo_agent::AgentDefinitionStoreError) -> CliError {
+    match error {
+        sinomo_agent::AgentDefinitionStoreError::Io { path, detail } => {
+            CliError::Io { path, detail }
+        }
+        sinomo_agent::AgentDefinitionStoreError::Json { path, detail } => {
+            CliError::Json { path, detail }
+        }
+        sinomo_agent::AgentDefinitionStoreError::Validation(error) => CliError::Parse {
+            detail: error.to_string(),
+        },
+    }
+}
+
+fn agent_package_source_path(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
+pub(crate) fn run_agent_readiness(options: AgentReadinessOptions) -> Result<(), CliError> {
+    let workspace_root = env::current_dir().map_err(|source| CliError::Io {
+        path: ".".to_string(),
+        detail: source.to_string(),
+    })?;
+    let report = run_local_agent_readiness_gate(workspace_root);
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|source| CliError::Json {
+                path: "<agent readiness>".to_string(),
+                detail: source.to_string(),
+            })?
+        );
+    } else {
+        print!("{}", agent_readiness_text(&report));
+    }
+    if !report.is_ready() {
+        return Err(CliError::Parse {
+            detail: agent_readiness_failure_detail(&report),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn agent_readiness_text(report: &AgentReadinessReport) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("Agent readiness: {:?}\n", report.status));
+    output.push_str(&format!("  workspace root: {}\n", report.workspace_root));
+    for check in &report.checks {
+        output.push_str(&format!(
+            "  [{}] {}: {}\n",
+            agent_readiness_check_label(&check.status),
+            check.id,
+            check.summary
+        ));
+    }
+    output
+}
+
+fn agent_readiness_check_label(status: &AgentReadinessCheckStatus) -> &'static str {
+    match status {
+        AgentReadinessCheckStatus::Passed => "pass",
+        AgentReadinessCheckStatus::Failed => "fail",
+    }
+}
+
+fn agent_readiness_failure_detail(report: &AgentReadinessReport) -> String {
+    let failed = report
+        .failed_checks()
+        .map(|check| check.id.as_str())
+        .collect::<Vec<_>>();
+    if failed.is_empty() {
+        "agent readiness failed".to_string()
+    } else {
+        format!("agent readiness failed: {}", failed.join(", "))
+    }
+}
+
+pub(crate) fn agent_package_inspection_json(definition: &AgentDefinition) -> serde_json::Value {
+    serde_json::json!({
+        "id": definition.key(),
+        "name": definition.name,
+        "description": definition.description,
+        "role": definition.role,
+        "package": definition.package,
+        "system_prompt": definition.system_prompt,
+        "tools": definition.tools.iter().map(|tool| serde_json::json!({
+            "name": tool.name,
+            "kind": tool.kind,
+            "async_default": tool.async_default,
+        })).collect::<Vec<_>>(),
+        "tool_surface": definition.tool_surface,
+        "skills": definition.skills,
+        "context": definition.context,
+        "compaction": definition.compaction,
+        "model_policy": definition.model_policy,
+        "effective_model_policy": {
+            "provider": definition.model_policy.provider.clone(),
+            "model": definition.model_policy.model.clone(),
+            "temperature": effective_agent_temperature(definition),
+            "max_output_tokens": effective_agent_max_output_tokens(definition),
+            "vendor_options": definition.model_policy.vendor_options.clone(),
+        },
+        "runtime_limits": definition.runtime_limits,
+        "output_format": definition.output_format,
+    })
+}
+
+pub(crate) fn agent_package_inspection_text(definition: &AgentDefinition) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("Agent package: {}\n", definition.key()));
+    output.push_str(&format!("  name: {}\n", definition.name));
+    if !definition.description.is_empty() {
+        output.push_str(&format!("  description: {}\n", definition.description));
+    }
+    output.push_str(&format!("  role: {:?}\n", definition.role));
+    output.push_str(&format!(
+        "  output format: {:?}\n",
+        definition.output_format
+    ));
+    output.push_str("  package:\n");
+    output.push_str(&format!("    version: {}\n", definition.package.version));
+    output.push_str(&format!(
+        "    provenance: {}\n",
+        agent_package_source_label(&definition.package.provenance.source)
+    ));
+    if let Some(module_id) = definition.package.provenance.module_id.as_deref() {
+        output.push_str(&format!("    module id: {module_id}\n"));
+    }
+    if let Some(module_version) = definition.package.provenance.module_version.as_deref() {
+        output.push_str(&format!("    module version: {module_version}\n"));
+    }
+    if let Some(path) = definition.package.provenance.path.as_deref() {
+        output.push_str(&format!("    path: {path}\n"));
+    }
+    if let Some(revision) = definition.package.provenance.revision.as_deref() {
+        output.push_str(&format!("    revision: {revision}\n"));
+    }
+    output.push_str("  provider preferences:\n");
+    output.push_str(&format!(
+        "    provider: {}\n",
+        definition
+            .model_policy
+            .provider
+            .as_deref()
+            .unwrap_or("runtime-default")
+    ));
+    output.push_str(&format!(
+        "    model: {}\n",
+        definition
+            .model_policy
+            .model
+            .as_deref()
+            .unwrap_or("runtime-default")
+    ));
+    output.push_str(&format!(
+        "    temperature: {}\n",
+        format_optional_value(effective_agent_temperature(definition))
+    ));
+    output.push_str(&format!(
+        "    max output tokens: {}\n",
+        format_optional_value(effective_agent_max_output_tokens(definition))
+    ));
+    output.push_str("  runtime limits:\n");
+    output.push_str(&format!(
+        "    max steps: {}\n",
+        format_unbounded_runtime_limit(definition.runtime_limits.max_steps)
+    ));
+    output.push_str(&format!(
+        "    max tool calls per step: {}\n",
+        format_unbounded_runtime_limit(definition.runtime_limits.max_tool_calls_per_step)
+    ));
+    output.push_str(&format!(
+        "    max model repair attempts: {}\n",
+        format_unbounded_runtime_limit(definition.runtime_limits.max_model_repair_attempts)
+    ));
+    output.push_str("  tool surface:\n");
+    output.push_str(&format!(
+        "    visible toolsets: {}\n",
+        format_string_list(&definition.tool_surface.visible_toolsets)
+    ));
+    output.push_str(&format!(
+        "    allow tools: {}\n",
+        format_string_list(&definition.tool_surface.allow_tools)
+    ));
+    output.push_str(&format!(
+        "    deny tools: {}\n",
+        format_string_list(&definition.tool_surface.deny_tools)
+    ));
+    output.push_str(&format!(
+        "  skills: {}\n",
+        format_string_list(&definition.skills)
+    ));
+    output.push_str("  context:\n");
+    output.push_str(&format!(
+        "    strategy: {}\n",
+        definition.context.pipeline_id
+    ));
+    output.push_str(&format!(
+        "    providers: {}\n",
+        format_string_list(&definition.context.providers)
+    ));
+    output.push_str("  compaction:\n");
+    output.push_str(&format!(
+        "    strategy: {}\n",
+        definition.compaction.strategy_id
+    ));
+    output.push_str(&format!(
+        "    retained tail items: {}\n",
+        format_optional_value(definition.compaction.retained_tail_items)
+    ));
+    output.push_str(&format!(
+        "  tools: {}\n",
+        format_string_list(
+            &definition
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>()
+        )
+    ));
+    output.push_str("  system prompt:\n");
+    for line in definition.system_prompt.lines() {
+        output.push_str("    ");
+        output.push_str(line);
+        output.push('\n');
+    }
+    output
+}
+
+fn effective_agent_temperature(definition: &AgentDefinition) -> Option<f32> {
+    definition
+        .temperature
+        .or(definition.model_policy.temperature)
+}
+
+fn effective_agent_max_output_tokens(definition: &AgentDefinition) -> Option<u32> {
+    definition
+        .max_output_tokens
+        .or(definition.model_policy.max_output_tokens)
+}
+
+fn agent_package_source_label(source: &AgentPackageSource) -> &'static str {
+    match source {
+        AgentPackageSource::BuiltIn => "built-in",
+        AgentPackageSource::Local => "local",
+        AgentPackageSource::Module => "module",
+        AgentPackageSource::Imported => "imported",
+        AgentPackageSource::Unknown => "unknown",
+    }
+}
+
+fn format_string_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(", ")
+    }
+}
+
+fn format_optional_value<T: std::fmt::Display>(value: Option<T>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "runtime-default".to_string())
+}
+
+fn format_unbounded_runtime_limit<T: std::fmt::Display>(value: Option<T>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unbounded".to_string())
 }
 
 pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
@@ -1541,7 +2941,7 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
     let agent = Agent::new(loop_model, provider, model)
         .with_agent_definition(AgentDefinition::main())
         .with_tool_registry(tool_registry)
-        .with_policy(sinomo_agent::AgentPolicyBundle::default_for_role(
+        .with_tool_surface(sinomo_agent::AgentToolSurface::default_for_role(
             AgentRole::Main,
         ));
     let runtime = AgentSessionRuntime::new(
@@ -1625,12 +3025,16 @@ fn run_cli_command(args: &[String]) -> Result<(), CliError> {
 
 fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> {
     let command = invocation.command;
-    let daemon = if invocation.options.force_local || !cli_command_needs_daemon_probe(&command) {
+    let command_is_help = cli_command_is_help(&command);
+    let daemon = if invocation.options.force_local
+        || command_is_help
+        || !cli_command_needs_daemon_probe(&command)
+    {
         None
     } else {
         default_main_daemon_status()?
     };
-    let local_cluster_quorum = if invocation.options.force_local {
+    let local_cluster_quorum = if invocation.options.force_local || command_is_help {
         None
     } else {
         cli_local_cluster_quorum_if_relevant(&command, daemon.as_ref())?
@@ -1643,7 +3047,7 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
     );
     let _guard = enter_cli_force_local_mode(force_local);
 
-    if !cli_force_local_mode() && cli_command_requires_cluster_state(&command) {
+    if !cli_force_local_mode() && !command_is_help && cli_command_requires_cluster_state(&command) {
         let paths = cluster_paths_from_defaults()?;
         require_cluster_runtime_quorum_with_paths_and_daemon(&paths, daemon.as_ref())?;
     }
@@ -1667,6 +3071,7 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
         CliCommand::Dfs(command) => run_dfs_cli_command(command),
         CliCommand::Models(command) => run_models_command(command),
         CliCommand::Providers(command) => run_provider_command(command),
+        CliCommand::Voice(command) => run_voice_command(command),
         CliCommand::Test(command) => run_test_command(command),
         CliCommand::Agent(command) => run_agent_command(command),
         CliCommand::Registered(command) => {
@@ -1694,6 +3099,7 @@ const IROH_DAEMON_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const CLUSTER_HEALTH_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const CLUSTER_HEALTH_PEER_ROWS_TIMEOUT: Duration = Duration::from_secs(8);
+const DAEMON_AGENT_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const SINOMO_JOIN_URI_PREFIX: &str = network::SINOMO_JOIN_URI_PREFIX;
 const CLUSTER_INVITE_DEFAULT_TTL_SECONDS: i64 = 24 * 60 * 60;

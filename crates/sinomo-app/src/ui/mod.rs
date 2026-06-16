@@ -2,6 +2,7 @@
 
 pub mod chat;
 pub mod cluster;
+pub mod evolution;
 pub mod files;
 pub mod settings;
 pub mod shell;

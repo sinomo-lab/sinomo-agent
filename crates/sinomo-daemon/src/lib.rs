@@ -13,6 +13,37 @@ mod rollout;
 mod service_adapter;
 mod status;
 
+#[derive(Clone)]
+pub struct DaemonServiceRegistryHook {
+    register: std::sync::Arc<
+        dyn Fn(sinomo_service::ServiceRegistryBuilder) -> sinomo_service::ServiceRegistryBuilder
+            + Send
+            + Sync,
+    >,
+}
+
+impl DaemonServiceRegistryHook {
+    pub fn new(
+        register: impl Fn(
+            sinomo_service::ServiceRegistryBuilder,
+        ) -> sinomo_service::ServiceRegistryBuilder
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            register: std::sync::Arc::new(register),
+        }
+    }
+
+    pub fn register(
+        &self,
+        builder: sinomo_service::ServiceRegistryBuilder,
+    ) -> sinomo_service::ServiceRegistryBuilder {
+        (self.register)(builder)
+    }
+}
+
 pub use auth::{
     AuthenticatedDaemonCommand, DaemonSignerAuthority, SignedDaemonCommand,
     authenticate_daemon_control_request, authorize_authenticated_daemon_command,
@@ -59,7 +90,7 @@ pub use control::{
     handle_daemon_sandbox_status, handle_daemon_sandbox_toolchain_add_artifact,
     handle_daemon_sandbox_toolchain_add_command, handle_daemon_sandbox_toolchain_import_package,
     handle_daemon_sandbox_update, handle_daemon_sandbox_write, open_daemon_sandbox_dfs_service,
-    run_daemon_control_loop,
+    run_daemon_control_loop, run_daemon_control_loop_with_services,
 };
 pub use error::DaemonError;
 pub use idle_stats::IdleStatsSnapshot;

@@ -141,6 +141,17 @@ def run_command(
                 **progress_fields,
             )
         raise
+    except OSError as source:
+        if progress:
+            progress.emit(
+                "command-failed",
+                phase=phase,
+                command=command_text,
+                exit_code=None,
+                os_error=str(source),
+                **progress_fields,
+            )
+        raise
     if progress:
         progress.emit(
             "command-complete",
@@ -165,6 +176,177 @@ def command_output(command: list[str], *, cwd: Path) -> str | None:
         return None
     value = output.stdout.strip()
     return value if value else None
+
+
+def command_probe(command: list[str], *, cwd: Path = REPO_ROOT) -> dict[str, object]:
+    executable = shutil.which(command[0])
+    probe: dict[str, object] = {
+        "command": command,
+        "available": executable is not None,
+        "executable": executable,
+        "version": None,
+        "error": None,
+    }
+    if executable is None:
+        return probe
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as source:
+        probe["error"] = str(source)
+        return probe
+    probe["exit_code"] = completed.returncode
+    version = (completed.stdout or completed.stderr).strip().splitlines()
+    probe["version"] = version[0] if version else None
+    if completed.returncode != 0:
+        probe["error"] = completed.stderr.strip() or completed.stdout.strip() or "non-zero exit"
+    return probe
+
+
+def python_import_probe(module: str) -> dict[str, object]:
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", f"import {module}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as source:
+        return {
+            "module": module,
+            "importable": False,
+            "error": str(source),
+        }
+    return {
+        "module": module,
+        "importable": completed.returncode == 0,
+        "error": None if completed.returncode == 0 else completed.stderr.strip(),
+    }
+
+
+def docker_reachability_probe() -> dict[str, object]:
+    docker = shutil.which("docker")
+    has_socket = Path("/var/run/docker.sock").exists()
+    probe: dict[str, object] = {
+        "cli_available": docker is not None,
+        "executable": docker,
+        "docker_host": os.environ.get("DOCKER_HOST"),
+        "default_socket_exists": has_socket,
+        "reachable": False,
+        "error": None,
+    }
+    if docker is None:
+        probe["error"] = "Docker CLI is not available"
+        return probe
+    try:
+        completed = subprocess.run(
+            ["docker", "info", "--format", "{{json .ServerVersion}}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as source:
+        probe["error"] = str(source)
+        return probe
+    probe["reachable"] = completed.returncode == 0
+    probe["server_version"] = completed.stdout.strip().strip('"') if completed.stdout.strip() else None
+    if completed.returncode != 0:
+        probe["error"] = completed.stderr.strip() or completed.stdout.strip() or "docker info failed"
+    return probe
+
+
+def host_dependency_probe(args: argparse.Namespace, suite: dict) -> dict[str, object]:
+    instance_count = len(suite.get("instances", []))
+    commands = {
+        "git": command_probe(["git", "--version"]),
+        "cargo": command_probe(["cargo", "--version"]),
+        "python": command_probe([sys.executable, "--version"]),
+        "mini-extra": command_probe(["mini-extra", "--version"]),
+    }
+    python_imports = {
+        "swebench": python_import_probe("swebench"),
+    }
+    docker = docker_reachability_probe()
+    agent_binary = {
+        "path": str(args.sinomo_agent_bin),
+        "explicit": args.sinomo_agent_bin_explicit,
+        "exists": args.sinomo_agent_bin.exists(),
+        "default_binary_will_be_rebuilt": not args.sinomo_agent_bin_explicit
+        and args.mode in {"sinomo", "both"},
+    }
+    required = {
+        "git": args.mode in {"sinomo", "both"},
+        "cargo": args.mode in {"sinomo", "both"} and not args.sinomo_agent_bin_explicit,
+        "mini-extra": args.mode in {"mini", "both"},
+        "swebench_python_package": bool(args.evaluate),
+        "docker": bool(args.evaluate or args.environment_class == "docker"),
+        "explicit_agent_binary": args.mode in {"sinomo", "both"} and args.sinomo_agent_bin_explicit,
+    }
+    issues: list[str] = []
+    if required["git"] and not commands["git"]["available"]:
+        issues.append("git CLI is required for Sinomo SWE-bench workspace preparation")
+    if required["cargo"] and not commands["cargo"]["available"]:
+        issues.append("cargo is required to rebuild the default Sinomo SWE-bench agent binary")
+    if required["mini-extra"] and not commands["mini-extra"]["available"]:
+        issues.append("mini-extra CLI is required for mini-SWE-agent baseline mode")
+    if required["swebench_python_package"] and not python_imports["swebench"]["importable"]:
+        issues.append("Python package `swebench` is required for official evaluation")
+    if required["docker"] and not docker["cli_available"]:
+        issues.append("Docker CLI is required for official SWE-bench evaluation")
+    if required["docker"] and not docker["reachable"]:
+        issues.append("Docker daemon is not reachable for official SWE-bench evaluation")
+    if required["explicit_agent_binary"] and not agent_binary["exists"]:
+        issues.append(f"explicit Sinomo agent binary does not exist: {args.sinomo_agent_bin}")
+    return {
+        "generated_at": utc_now(),
+        "suite_instance_count": instance_count,
+        "mode": args.mode,
+        "evaluate": bool(args.evaluate),
+        "environment_class": args.environment_class,
+        "commands": commands,
+        "python_imports": python_imports,
+        "docker": docker,
+        "agent_binary": agent_binary,
+        "required": required,
+        "blocking_issues": issues,
+        "blocking_issue_count": len(issues),
+    }
+
+
+def host_dependency_blocking_issues(host_dependencies: dict[str, object]) -> list[str]:
+    issues = host_dependencies.get("blocking_issues")
+    if not isinstance(issues, list):
+        return []
+    return [str(issue) for issue in issues if str(issue).strip()]
+
+
+def should_stop_for_host_dependency_blockers(
+    args: argparse.Namespace,
+    host_dependencies: dict[str, object],
+) -> bool:
+    return bool(host_dependency_blocking_issues(host_dependencies)) and not args.dry_run and args.mode != "plan"
+
+
+def host_dependency_harness_status(
+    args: argparse.Namespace,
+    host_dependencies: dict[str, object],
+) -> str:
+    if should_stop_for_host_dependency_blockers(args, host_dependencies):
+        return "host-dependency-blocked"
+    if host_dependency_blocking_issues(host_dependencies):
+        return "host-dependency-issues-recorded"
+    return "ready"
 
 
 def repo_source_provenance() -> dict[str, object]:
@@ -350,6 +532,48 @@ def ensure_sinomo_agent_binary(
     return provenance
 
 
+def write_agent_run_blocked_report(
+    *,
+    task: dict,
+    report_path: Path,
+    prediction_path: Path,
+    agent_trace_path: Path,
+    workspace: Path,
+    provider: str,
+    model: str,
+    command: list[str],
+    source: BaseException,
+) -> dict[str, object]:
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    exit_code = source.returncode if isinstance(source, subprocess.CalledProcessError) else None
+    report = {
+        "status": "harness-blocked",
+        "blocked": True,
+        "blocked_reason": "sinomo-agent-run-failed",
+        "failure_class": "harness-or-environment",
+        "phase": "agent-run",
+        "exit_code": exit_code,
+        "error": str(source),
+        "command": shlex.join(command),
+        "task": {
+            "instance_id": task.get("instance_id"),
+            "repo": task.get("repo"),
+            "base_commit": task.get("base_commit"),
+            "difficulty": task.get("difficulty"),
+        },
+        "provider": provider,
+        "model": model,
+        "workspace": str(workspace),
+        "prediction_path": str(prediction_path),
+        "prediction_written": prediction_path.exists(),
+        "agent_trace_path": str(agent_trace_path),
+    }
+    with report_path.open("w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2)
+        handle.write("\n")
+    return report
+
+
 def run_sinomo(
     args: argparse.Namespace,
     suite: dict,
@@ -419,23 +643,49 @@ def run_sinomo(
             args.provider,
             "--model",
             args.model,
-            "--max-steps",
-            str(args.max_steps),
             "--repair-steps",
             str(args.repair_steps),
         ]
+        if args.max_steps is not None:
+            command.extend(["--max-steps", str(args.max_steps)])
         if args.account:
             command.extend(["--account", args.account])
-        run_command(
-            command,
-            cwd=REPO_ROOT,
-            dry_run=args.dry_run,
-            progress=progress,
-            phase="agent-run",
-            instance_id=instance_id,
-            current=index,
-            total=len(instance_ids),
-        )
+        try:
+            run_command(
+                command,
+                cwd=REPO_ROOT,
+                dry_run=args.dry_run,
+                progress=progress,
+                phase="agent-run",
+                instance_id=instance_id,
+                current=index,
+                total=len(instance_ids),
+            )
+        except (subprocess.CalledProcessError, OSError) as source:
+            if args.dry_run:
+                raise
+            blocked_report = write_agent_run_blocked_report(
+                task=task,
+                report_path=report_path,
+                prediction_path=prediction_path,
+                agent_trace_path=agent_trace_path,
+                workspace=workspace,
+                provider=args.provider,
+                model=args.model,
+                command=command,
+                source=source,
+            )
+            progress.emit(
+                "sinomo-instance-blocked",
+                instance_id=instance_id,
+                current=index,
+                total=len(instance_ids),
+                report_path=str(report_path),
+                blocked_reason=blocked_report["blocked_reason"],
+                failure_class=blocked_report["failure_class"],
+                exit_code=blocked_report["exit_code"],
+            )
+            continue
         if not args.dry_run:
             prediction = json.loads(prediction_path.read_text(encoding="utf-8"))
             with predictions_path.open("a", encoding="utf-8") as handle:
@@ -493,28 +743,15 @@ def evaluate_predictions(
     suite: dict,
     progress: ProgressWriter,
 ) -> None:
+    instance_ids = [item["instance_id"] for item in suite["instances"]]
+    missing = sinomo_prediction_prerequisite_issues(args, predictions_path, suite)
+    missing.extend(official_evaluation_prerequisite_issues())
+    if missing:
+        write_evaluation_blocked_marker(args, predictions_path, instance_ids, missing, progress)
+        return
     evaluation_dir = args.results_dir / "evaluation"
     if not args.dry_run:
         evaluation_dir.mkdir(parents=True, exist_ok=True)
-    instance_ids = [item["instance_id"] for item in suite["instances"]]
-    missing = official_evaluation_prerequisite_issues()
-    if missing:
-        blocked = {
-            "requested": True,
-            "blocked": True,
-            "issues": missing,
-            "predictions_path": str(predictions_path),
-            "total_instances": len(instance_ids),
-        }
-        if not args.dry_run:
-            with (evaluation_dir / "blocked.json").open("w", encoding="utf-8") as handle:
-                json.dump(blocked, handle, indent=2)
-                handle.write("\n")
-        progress.emit("evaluation-blocked", issues=missing, results_dir=str(evaluation_dir))
-        print("official evaluation blocked:")
-        for issue in missing:
-            print(f"- {issue}")
-        return
     progress.emit(
         "evaluation-start",
         predictions_path=str(predictions_path),
@@ -547,6 +784,94 @@ def evaluate_predictions(
         phase="official-evaluation",
     )
     progress.emit("evaluation-complete", results_dir=str(evaluation_dir))
+
+
+def write_evaluation_blocked_marker(
+    args: argparse.Namespace,
+    predictions_path: Path,
+    instance_ids: list[str],
+    issues: list[str],
+    progress: ProgressWriter,
+) -> None:
+    evaluation_dir = args.results_dir / "evaluation"
+    if not args.dry_run:
+        evaluation_dir.mkdir(parents=True, exist_ok=True)
+    blocked = {
+        "requested": True,
+        "blocked": True,
+        "issues": issues,
+        "predictions_path": str(predictions_path),
+        "total_instances": len(instance_ids),
+    }
+    if not args.dry_run:
+        with (evaluation_dir / "blocked.json").open("w", encoding="utf-8") as handle:
+            json.dump(blocked, handle, indent=2)
+            handle.write("\n")
+    progress.emit("evaluation-blocked", issues=issues, results_dir=str(evaluation_dir))
+    print("official evaluation blocked:")
+    for issue in issues:
+        print(f"- {issue}")
+
+
+def sinomo_prediction_prerequisite_issues(
+    args: argparse.Namespace,
+    predictions_path: Path,
+    suite: dict,
+) -> list[str]:
+    if args.mode not in {"sinomo", "both"} or args.dry_run:
+        return []
+    instance_ids = [item["instance_id"] for item in suite["instances"]]
+    reports_dir = args.results_dir / "sinomo" / "reports"
+    blocked_ids = []
+    for instance_id in instance_ids:
+        report_path = reports_dir / f"{instance_id}.json"
+        if not report_path.exists():
+            continue
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if report.get("status") == "harness-blocked":
+            blocked_ids.append(instance_id)
+
+    issues = []
+    if blocked_ids:
+        issues.append(
+            "Sinomo agent run blocked for "
+            f"{len(blocked_ids)} instance(s): {', '.join(blocked_ids)}"
+        )
+
+    if not predictions_path.exists():
+        issues.append(f"Sinomo predictions file is missing: {predictions_path}")
+        return issues
+
+    predicted_ids = set()
+    try:
+        with predictions_path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    prediction = json.loads(line)
+                except json.JSONDecodeError as source:
+                    issues.append(
+                        f"Sinomo predictions file has invalid JSON on line {line_number}: {source}"
+                    )
+                    continue
+                instance_id = prediction.get("instance_id")
+                if isinstance(instance_id, str):
+                    predicted_ids.add(instance_id)
+    except OSError as source:
+        issues.append(f"failed to read Sinomo predictions file {predictions_path}: {source}")
+        return issues
+
+    missing_predictions = [instance_id for instance_id in instance_ids if instance_id not in predicted_ids]
+    if missing_predictions:
+        issues.append(
+            "Sinomo predictions are incomplete; missing "
+            f"{len(missing_predictions)} instance(s): {', '.join(missing_predictions)}"
+        )
+    return issues
 
 
 def official_evaluation_prerequisite_issues() -> list[str]:
@@ -740,6 +1065,7 @@ def write_summary(
     predictions_path: Path | None,
     sinomo_agent_binary: dict[str, object] | None,
     mini_predictions_path: Path | None,
+    host_dependencies: dict[str, object],
     progress: ProgressWriter,
 ) -> None:
     if not args.summary_out:
@@ -751,6 +1077,18 @@ def write_summary(
         report_path = reports_dir / f"{instance_id}.json"
         if report_path.exists():
             reports.append(json.loads(report_path.read_text(encoding="utf-8")))
+    harness_blocked_reports = [
+        report for report in reports if report.get("status") == "harness-blocked"
+    ]
+    completed_reports = [
+        report for report in reports if report.get("status") != "harness-blocked"
+    ]
+    harness_blocked_instance_ids = [
+        report.get("task", {}).get("instance_id")
+        for report in harness_blocked_reports
+        if isinstance(report.get("task"), dict)
+        and isinstance(report.get("task", {}).get("instance_id"), str)
+    ]
     agent_trace_paths = [
         report["agent_trace_path"]
         for report in reports
@@ -769,13 +1107,57 @@ def write_summary(
         and report["initial_post_patch_check"].get("passed") is False
     )
     official_evaluation = collect_official_evaluation_summary(args, suite)
+    agent_final_decision_sources: dict[str, int] = {}
+    for report in reports:
+        source = report_agent_model_metric(report, "final_decision_source")
+        if isinstance(source, str) and source:
+            agent_final_decision_sources[source] = agent_final_decision_sources.get(source, 0) + 1
+    first_successful_patch_turns = [
+        int(report["first_successful_patch_turn"])
+        for report in reports
+        if isinstance(report.get("first_successful_patch_turn"), int)
+        and not isinstance(report.get("first_successful_patch_turn"), bool)
+    ]
+    coding_validation_status_counts: dict[str, int] = {}
+    coding_stop_recommendation_counts: dict[str, int] = {}
+    coding_blocked_reason_counts: dict[str, int] = {}
+    coding_validation_failure_kind_counts: dict[str, int] = {}
+    for report in reports:
+        increment_string_count(
+            coding_validation_status_counts,
+            report.get("coding_validation_status"),
+        )
+        increment_string_count(
+            coding_stop_recommendation_counts,
+            report.get("coding_stop_recommendation"),
+        )
+        increment_string_count(coding_blocked_reason_counts, report.get("coding_blocked_reason"))
+        failure_kinds = report.get("coding_validation_failure_kinds")
+        if isinstance(failure_kinds, list):
+            for failure_kind in failure_kinds:
+                increment_string_count(coding_validation_failure_kind_counts, failure_kind)
     sinomo_summary = {
         "prediction_path": str(predictions_path) if predictions_path else None,
         "agent_binary": sinomo_agent_binary,
         "report_dir": str(reports_dir),
         "report_count": len(reports),
+        "completed_report_count": len(completed_reports),
+        "harness_blocked_instances": len(harness_blocked_reports),
+        "harness_blocked_instance_ids": harness_blocked_instance_ids,
         "agent_trace_paths": agent_trace_paths,
         "agent_trace_records": sum(int(report.get("agent_trace_records", 0)) for report in reports),
+        "agent_event_count": sum(int(report.get("agent_event_count", 0)) for report in reports),
+        "agent_item_count": sum(int(report.get("agent_item_count", 0)) for report in reports),
+        "agent_tool_call_items": sum(
+            int(report.get("agent_tool_call_items", 0)) for report in reports
+        ),
+        "agent_tool_result_items": sum(
+            int(report.get("agent_tool_result_items", 0)) for report in reports
+        ),
+        "orphan_tool_calls": sum(int(report.get("orphan_tool_calls", 0)) for report in reports),
+        "orphan_tool_results": sum(
+            int(report.get("orphan_tool_results", 0)) for report in reports
+        ),
         "patch_bytes": sum(int(report.get("patch_bytes", 0)) for report in reports),
         "changed_files": sum(len(report.get("changed_files", [])) for report in reports),
         "initial_post_patch_check_failures": initial_post_patch_check_failures,
@@ -795,7 +1177,8 @@ def write_summary(
         "deterministic_repair_changed_files": sum(
             len(report.get("deterministic_repair_changed_files", [])) for report in reports
         ),
-        "error_instances": len(instance_ids) - len(reports),
+        "missing_report_instances": len(instance_ids) - len(reports),
+        "error_instances": len(instance_ids) - len(completed_reports),
         "resolved_instances": official_evaluation.get("resolved_instances"),
         "unresolved_instances": official_evaluation.get("unresolved_instances"),
         "official_completed_instances": official_evaluation.get("completed_instances"),
@@ -812,11 +1195,75 @@ def write_summary(
             int(report.get("cancelled_tool_results", 0)) for report in reports
         ),
         "cancelled_runs": sum(int(report.get("cancelled_runs", 0)) for report in reports),
+        "coding_validation_attempts": sum(
+            int(report.get("coding_validation_attempts", 0)) for report in reports
+        ),
+        "coding_validation_status_counts": coding_validation_status_counts,
+        "coding_stop_recommendation_counts": coding_stop_recommendation_counts,
+        "coding_blocked_reason_counts": coding_blocked_reason_counts,
+        "coding_validation_failure_kind_counts": coding_validation_failure_kind_counts,
+        "instances_with_successful_patch": len(first_successful_patch_turns),
+        "first_successful_patch_turn_sum": sum(first_successful_patch_turns),
+        "first_successful_patch_turn_min": (
+            min(first_successful_patch_turns) if first_successful_patch_turns else None
+        ),
+        "first_successful_patch_turn_max": (
+            max(first_successful_patch_turns) if first_successful_patch_turns else None
+        ),
         "extra_turns_after_patch": sum(
             int(report.get("extra_turns_after_patch", 0)) for report in reports
         ),
         "agent_input_tokens": sum(int(report.get("agent_input_tokens", 0)) for report in reports),
         "agent_output_tokens": sum(int(report.get("agent_output_tokens", 0)) for report in reports),
+        "agent_model_response_count": sum(
+            report_agent_model_metric_int(report, "model_response_count") for report in reports
+        ),
+        "agent_model_response_parse_failures": sum(
+            report_agent_model_metric_int(report, "model_response_parse_failure_count")
+            for report in reports
+        ),
+        "agent_strict_json_decision_turns": sum(
+            report_agent_model_metric_int(report, "strict_json_decision_turn_count")
+            for report in reports
+        ),
+        "agent_text_fallback_turns": sum(
+            report_agent_model_metric_int(report, "text_fallback_turn_count") for report in reports
+        ),
+        "agent_native_tool_call_turns": sum(
+            report_agent_model_metric_int(report, "native_tool_call_turn_count")
+            for report in reports
+        ),
+        "agent_native_tool_calls": sum(
+            report_agent_model_metric_int(report, "native_tool_call_count") for report in reports
+        ),
+        "agent_vendor_fallback_tool_call_turns": sum(
+            report_agent_model_metric_int(report, "vendor_fallback_tool_call_turn_count")
+            for report in reports
+        ),
+        "agent_vendor_fallback_tool_calls": sum(
+            report_agent_model_metric_int(report, "vendor_fallback_tool_call_count")
+            for report in reports
+        ),
+        "agent_model_repair_attempts": sum(
+            report_agent_model_metric_int(report, "repair_attempt_count") for report in reports
+        ),
+        "agent_repair_request_model_visible_bytes": sum(
+            report_agent_model_metric_int(report, "repair_request_model_visible_bytes")
+            for report in reports
+        ),
+        "agent_model_repair_reported_usage_responses": sum(
+            report_agent_model_metric_int(report, "repair_reported_usage", "response_count")
+            for report in reports
+        ),
+        "agent_model_repair_input_tokens": sum(
+            report_agent_model_metric_int(report, "repair_reported_usage", "input_tokens")
+            for report in reports
+        ),
+        "agent_model_repair_output_tokens": sum(
+            report_agent_model_metric_int(report, "repair_reported_usage", "output_tokens")
+            for report in reports
+        ),
+        "agent_final_decision_sources": agent_final_decision_sources,
     }
     summary = {
         "benchmark": "swebench",
@@ -826,8 +1273,10 @@ def write_summary(
         "instances": instance_ids,
         "total_instances": len(instance_ids),
         "mode": args.mode,
+        "harness_status": host_dependency_harness_status(args, host_dependencies),
         "results_dir": str(args.results_dir),
         "progress_path": str(args.progress_out) if args.progress_out else None,
+        "host_dependencies": host_dependencies,
         "sinomo": sinomo_summary,
         "mini_swe_agent": {
             "prediction_path": str(mini_predictions_path) if mini_predictions_path else None,
@@ -840,7 +1289,29 @@ def write_summary(
     progress.emit("summary-written", summary_path=str(args.summary_out), dry_run=args.dry_run)
 
 
-def print_plan(args: argparse.Namespace, suite: dict) -> None:
+def report_agent_model_metric(report: dict[str, object], *path: str) -> object | None:
+    value: object = report.get("agent_model_metrics")
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def report_agent_model_metric_int(report: dict[str, object], *path: str) -> int:
+    value = report_agent_model_metric(report, *path)
+    try:
+        return int(value) if value is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def increment_string_count(counts: dict[str, int], value: object) -> None:
+    if isinstance(value, str) and value:
+        counts[value] = counts.get(value, 0) + 1
+
+
+def print_plan(args: argparse.Namespace, suite: dict, host_dependencies: dict[str, object]) -> None:
     instance_ids = [item["instance_id"] for item in suite["instances"]]
     print(json.dumps({
         "suite": suite["name"],
@@ -851,6 +1322,7 @@ def print_plan(args: argparse.Namespace, suite: dict) -> None:
             "provider": args.provider,
             "model": args.model,
             "max_steps": args.max_steps,
+            "max_steps_policy": "explicit-cap" if args.max_steps is not None else "unlimited-default",
             "repair_steps": args.repair_steps,
         },
         "sinomo_agent_binary": {
@@ -868,6 +1340,7 @@ def print_plan(args: argparse.Namespace, suite: dict) -> None:
             "workers": args.workers,
         },
         "results_dir": str(args.results_dir),
+        "host_dependencies": host_dependencies,
     }, indent=2))
 
 
@@ -883,7 +1356,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--account")
     parser.add_argument("--baseline-model", default="deepseek/deepseek-v4-flash")
     parser.add_argument("--sinomo-agent-bin", type=Path)
-    parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="optional model-turn cap; omit for the continuous-agent default",
+    )
     parser.add_argument("--repair-steps", type=int, default=6)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--environment-class", choices=["docker", "singularity", "bubblewrap", "local"], default=None)
@@ -918,10 +1396,47 @@ def main() -> int:
             total_instances=len(suite["instances"]),
             dry_run=args.dry_run,
         )
-        print_plan(args, suite)
+        host_dependencies = host_dependency_probe(args, suite)
+        progress.emit(
+            "host-dependency-probe",
+            blocking_issue_count=host_dependencies["blocking_issue_count"],
+            blocking_issues=host_dependencies["blocking_issues"],
+            mode=args.mode,
+            evaluate=args.evaluate,
+        )
+        print_plan(args, suite, host_dependencies)
         predictions_path: Path | None = None
         sinomo_agent_binary: dict[str, object] | None = None
         mini_predictions_path: Path | None = None
+        if should_stop_for_host_dependency_blockers(args, host_dependencies):
+            blocking_issues = host_dependency_blocking_issues(host_dependencies)
+            progress.emit(
+                "host-dependency-blocked",
+                blocking_issue_count=len(blocking_issues),
+                blocking_issues=blocking_issues,
+                mode=args.mode,
+                evaluate=args.evaluate,
+            )
+            if args.evaluate:
+                write_evaluation_blocked_marker(
+                    args,
+                    args.results_dir / "sinomo" / "predictions.jsonl",
+                    [item["instance_id"] for item in suite["instances"]],
+                    blocking_issues,
+                    progress,
+                )
+            write_summary(
+                args,
+                suite,
+                predictions_path=predictions_path,
+                sinomo_agent_binary=sinomo_agent_binary,
+                mini_predictions_path=mini_predictions_path,
+                host_dependencies=host_dependencies,
+                progress=progress,
+            )
+            raise SystemExit(
+                "benchmark host dependencies are not ready: " + "; ".join(blocking_issues)
+            )
         if args.mode in {"sinomo", "both"}:
             predictions_path, sinomo_agent_binary = run_sinomo(args, suite, progress)
         if args.mode in {"mini", "both"}:
@@ -936,6 +1451,7 @@ def main() -> int:
             predictions_path=predictions_path,
             sinomo_agent_binary=sinomo_agent_binary,
             mini_predictions_path=mini_predictions_path,
+            host_dependencies=host_dependencies,
             progress=progress,
         )
         progress.emit("benchmark-complete", summary_path=str(args.summary_out) if args.summary_out else None)

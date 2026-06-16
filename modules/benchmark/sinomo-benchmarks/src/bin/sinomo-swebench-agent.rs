@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 use sinomo_agent::{
-    Agent, AgentConfig, AgentContextBudget, AgentLoopInput, AgentModelEvent, AgentOp,
-    AgentPolicyBundle, AgentRole, AgentRun, AgentSession, AgentSessionRuntime, AgentStopReason,
-    AgentStoragePaths, AgentToolRegistry, AgentToolStatus, BoundedContext, FileAgentTraceStore,
-    InteractionModel, InteractionSession, InteractionSurface, InteractionSurfaceKind,
-    LocalWorkspaceAgentConfig, default_coding_agent_tools, user_interaction_input_event,
+    Agent, AgentConfig, AgentContextBudget, AgentItem, AgentLoopInput, AgentModelEvent, AgentOp,
+    AgentRole, AgentRun, AgentRunModelMetrics, AgentSession, AgentSessionRuntime, AgentStopReason,
+    AgentStoragePaths, AgentToolPairIntegrity, AgentToolRegistry, AgentToolStatus,
+    AgentToolSurface, BoundedContext, FileAgentTraceStore, InteractionModel, InteractionSession,
+    InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig,
+    default_coding_agent_tools, user_interaction_input_event,
 };
 use sinomo_lm::{
     LanguageModelError, LanguageModelRequest, LanguageModelResponse, ModelPaths,
@@ -32,7 +33,7 @@ struct Options {
     provider: String,
     model: String,
     account: Option<String>,
-    max_steps: usize,
+    max_steps: Option<usize>,
     repair_steps: usize,
 }
 
@@ -91,6 +92,12 @@ struct SweBenchAgentReport {
     repair_run_trace_path: Option<String>,
     agent_trace_path: String,
     agent_trace_records: usize,
+    agent_event_count: usize,
+    agent_item_count: usize,
+    agent_tool_call_items: usize,
+    agent_tool_result_items: usize,
+    orphan_tool_calls: usize,
+    orphan_tool_results: usize,
     patch_bytes: usize,
     changed_files: Vec<String>,
     initial_post_patch_check: Option<SweBenchPostPatchCheck>,
@@ -103,15 +110,22 @@ struct SweBenchAgentReport {
     deterministic_repair_attempted: bool,
     deterministic_repair_changed_files: Vec<String>,
     stop_reason: String,
+    coding_validation_status: Option<String>,
+    coding_stop_recommendation: Option<String>,
+    coding_blocked_reason: Option<String>,
+    coding_validation_attempts: usize,
+    coding_validation_failure_kinds: Vec<String>,
     model_turns: usize,
     tool_results: usize,
     command_observation_turns: usize,
     command_tool_results: usize,
     cancelled_tool_results: usize,
     cancelled_runs: usize,
+    first_successful_patch_turn: Option<usize>,
     extra_turns_after_patch: usize,
     agent_input_tokens: u64,
     agent_output_tokens: u64,
+    agent_model_metrics: AgentRunModelMetrics,
     final_text: String,
 }
 
@@ -243,7 +257,7 @@ fn run() -> Result<(), String> {
             &options.model,
             &options.workspace,
             workspace_config,
-            options.repair_steps,
+            Some(options.repair_steps),
             &agent_trace_path,
         );
         let repair_runtime = AgentSessionRuntime::new(
@@ -287,10 +301,13 @@ fn run() -> Result<(), String> {
         }
     }
     let (agent_input_tokens, agent_output_tokens) = agent_usage_totals(&runs);
+    let agent_model_metrics = combined_agent_model_metrics(&runs);
     let command_observation_turns = command_observation_turns(&runs);
     let command_tool_results = command_tool_results(&runs);
     let cancelled_tool_results = cancelled_tool_results(&runs);
     let cancelled_runs = cancelled_runs(&runs);
+    let tool_pair_integrity = AgentToolPairIntegrity::from_runs(&runs);
+    let first_successful_patch_turn = first_successful_patch_turn(&runs);
     let extra_turns_after_patch = extra_turns_after_patch(&runs);
     let prediction = SweBenchPrediction {
         instance_id: task.instance_id.clone(),
@@ -302,6 +319,7 @@ fn run() -> Result<(), String> {
     write_json(&run_trace_path, &runs[0])?;
     let agent_trace_records = count_lines(&agent_trace_path)?;
     let last_run = runs.last().expect("at least one agent run");
+    let coding_state = last_run.coding_state.as_ref();
     let report = SweBenchAgentReport {
         task: SweBenchTaskReport {
             repo: task.repo,
@@ -317,6 +335,12 @@ fn run() -> Result<(), String> {
         repair_run_trace_path: repair_run_trace_path.map(|path| path.display().to_string()),
         agent_trace_path: agent_trace_path.display().to_string(),
         agent_trace_records,
+        agent_event_count: runs.iter().map(|run| run.events.len()).sum(),
+        agent_item_count: runs.iter().map(|run| run.items.len()).sum(),
+        agent_tool_call_items: tool_pair_integrity.tool_calls,
+        agent_tool_result_items: tool_pair_integrity.tool_results,
+        orphan_tool_calls: tool_pair_integrity.orphan_tool_calls,
+        orphan_tool_results: tool_pair_integrity.orphan_tool_results,
         patch_bytes: patch.len(),
         changed_files,
         initial_post_patch_check,
@@ -329,15 +353,26 @@ fn run() -> Result<(), String> {
         deterministic_repair_attempted,
         deterministic_repair_changed_files,
         stop_reason: format!("{:?}", last_run.stop_reason),
+        coding_validation_status: coding_state
+            .map(|state| serde_string_label(&state.validation_status)),
+        coding_stop_recommendation: coding_state
+            .map(|state| serde_string_label(&state.stop_recommendation)),
+        coding_blocked_reason: coding_state
+            .and_then(|state| state.blocked_reason.as_ref())
+            .map(serde_string_label),
+        coding_validation_attempts: coding_validation_attempt_count(&runs),
+        coding_validation_failure_kinds: coding_validation_failure_kinds(&runs),
         model_turns: runs.iter().map(|run| run.model_turns.len()).sum(),
         tool_results: runs.iter().map(|run| run.tool_results.len()).sum(),
         command_observation_turns,
         command_tool_results,
         cancelled_tool_results,
         cancelled_runs,
+        first_successful_patch_turn,
         extra_turns_after_patch,
         agent_input_tokens,
         agent_output_tokens,
+        agent_model_metrics,
         final_text: last_run.final_decision.text.clone(),
     };
     write_json(&options.report_out, &report)?;
@@ -379,20 +414,22 @@ fn benchmark_agent(
     model_id: &str,
     workspace: &Path,
     workspace_config: LocalWorkspaceAgentConfig,
-    max_steps: usize,
+    max_steps: Option<usize>,
     agent_trace_path: &Path,
 ) -> Agent<ConfiguredBenchmarkModel> {
-    let config = AgentConfig::new(provider.to_string(), model_id.to_string())
+    let mut config = AgentConfig::new(provider.to_string(), model_id.to_string())
         .with_workspace_root(workspace)
         .with_prompt_reference_expansion(false)
         .with_context_budget(AgentContextBudget::for_loaded_model(
             provider, model_id, None,
         ))
-        .with_max_steps(max_steps)
         .with_max_model_repair_attempts(2);
+    if let Some(max_steps) = max_steps {
+        config = config.with_max_steps(max_steps);
+    }
     Agent::new(model, provider.to_string(), model_id.to_string())
         .with_config(config)
-        .with_policy(AgentPolicyBundle::default_for_role(AgentRole::Deliberation))
+        .with_tool_surface(AgentToolSurface::default_for_role(AgentRole::Deliberation))
         .with_tool_registry(AgentToolRegistry::local_workspace_with_config(
             workspace_config,
         ))
@@ -436,6 +473,75 @@ fn agent_usage_totals(runs: &[AgentRun]) -> (u64, u64) {
         })
 }
 
+fn combined_agent_model_metrics(runs: &[AgentRun]) -> AgentRunModelMetrics {
+    let mut metrics = AgentRunModelMetrics::default();
+    if let Some(last_run) = runs.last() {
+        metrics.output_format = last_run.model_metrics.output_format.clone();
+        metrics.final_decision_source = last_run.model_metrics.final_decision_source.clone();
+    }
+    for run in runs {
+        let run_metrics = &run.model_metrics;
+        metrics.model_turn_count = metrics
+            .model_turn_count
+            .saturating_add(run_metrics.model_turn_count);
+        metrics.model_response_count = metrics
+            .model_response_count
+            .saturating_add(run_metrics.model_response_count);
+        metrics.model_response_parse_failure_count = metrics
+            .model_response_parse_failure_count
+            .saturating_add(run_metrics.model_response_parse_failure_count);
+        metrics.strict_json_decision_turn_count = metrics
+            .strict_json_decision_turn_count
+            .saturating_add(run_metrics.strict_json_decision_turn_count);
+        metrics.text_fallback_turn_count = metrics
+            .text_fallback_turn_count
+            .saturating_add(run_metrics.text_fallback_turn_count);
+        metrics.native_tool_call_turn_count = metrics
+            .native_tool_call_turn_count
+            .saturating_add(run_metrics.native_tool_call_turn_count);
+        metrics.native_tool_call_count = metrics
+            .native_tool_call_count
+            .saturating_add(run_metrics.native_tool_call_count);
+        metrics.vendor_fallback_tool_call_turn_count = metrics
+            .vendor_fallback_tool_call_turn_count
+            .saturating_add(run_metrics.vendor_fallback_tool_call_turn_count);
+        metrics.vendor_fallback_tool_call_count = metrics
+            .vendor_fallback_tool_call_count
+            .saturating_add(run_metrics.vendor_fallback_tool_call_count);
+        metrics.repair_attempt_count = metrics
+            .repair_attempt_count
+            .saturating_add(run_metrics.repair_attempt_count);
+        metrics.repair_request_model_visible_bytes = metrics
+            .repair_request_model_visible_bytes
+            .saturating_add(run_metrics.repair_request_model_visible_bytes);
+        metrics.reported_usage.response_count = metrics
+            .reported_usage
+            .response_count
+            .saturating_add(run_metrics.reported_usage.response_count);
+        metrics.reported_usage.input_tokens = metrics
+            .reported_usage
+            .input_tokens
+            .saturating_add(run_metrics.reported_usage.input_tokens);
+        metrics.reported_usage.output_tokens = metrics
+            .reported_usage
+            .output_tokens
+            .saturating_add(run_metrics.reported_usage.output_tokens);
+        metrics.repair_reported_usage.response_count = metrics
+            .repair_reported_usage
+            .response_count
+            .saturating_add(run_metrics.repair_reported_usage.response_count);
+        metrics.repair_reported_usage.input_tokens = metrics
+            .repair_reported_usage
+            .input_tokens
+            .saturating_add(run_metrics.repair_reported_usage.input_tokens);
+        metrics.repair_reported_usage.output_tokens = metrics
+            .repair_reported_usage
+            .output_tokens
+            .saturating_add(run_metrics.repair_reported_usage.output_tokens);
+    }
+    metrics
+}
+
 fn command_observation_turns(runs: &[AgentRun]) -> usize {
     let mut turns = BTreeSet::new();
     for (run_index, run) in runs.iter().enumerate() {
@@ -470,6 +576,51 @@ fn cancelled_runs(runs: &[AgentRun]) -> usize {
     runs.iter()
         .filter(|run| run.stop_reason == AgentStopReason::Cancelled)
         .count()
+}
+
+fn coding_validation_attempt_count(runs: &[AgentRun]) -> usize {
+    runs.iter()
+        .filter_map(|run| run.coding_state.as_ref())
+        .map(|state| state.validation_attempts.len())
+        .sum()
+}
+
+fn coding_validation_failure_kinds(runs: &[AgentRun]) -> Vec<String> {
+    runs.iter()
+        .filter_map(|run| run.coding_state.as_ref())
+        .flat_map(|state| state.validation_attempts.iter())
+        .filter_map(|attempt| attempt.failure_kind.as_ref())
+        .map(serde_string_label)
+        .collect()
+}
+
+fn serde_string_label<T: Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(value)) => value,
+        Ok(value) => value.to_string(),
+        Err(_) => "unserializable".to_string(),
+    }
+}
+
+fn first_successful_patch_turn(runs: &[AgentRun]) -> Option<usize> {
+    let mut turn_offset = 0usize;
+    let mut first_patch_turn = None;
+    for run in runs {
+        if let Some(step_index) = run
+            .tool_results
+            .iter()
+            .filter(|outcome| {
+                outcome.call.tool == "apply_patch" && outcome.status == AgentToolStatus::Succeeded
+            })
+            .map(|outcome| outcome.step_index)
+            .min()
+        {
+            first_patch_turn = Some(turn_offset.saturating_add(step_index));
+            break;
+        }
+        turn_offset = turn_offset.saturating_add(run.model_turns.len());
+    }
+    first_patch_turn
 }
 
 fn extra_turns_after_patch(runs: &[AgentRun]) -> usize {
@@ -511,7 +662,7 @@ fn parse_options(args: Vec<String>) -> Result<Options, String> {
     let mut provider = "deepseek".to_string();
     let mut model = "deepseek-v4-flash".to_string();
     let mut account = None;
-    let mut max_steps = 20usize;
+    let mut max_steps = None;
     let mut repair_steps = 6usize;
     let mut index = 0usize;
     while index < args.len() {
@@ -530,10 +681,12 @@ fn parse_options(args: Vec<String>) -> Result<Options, String> {
             "--account" => account = Some(next_value(&args, &mut index, "--account")?),
             "--max-steps" => {
                 let value = next_value(&args, &mut index, "--max-steps")?;
-                max_steps = value
-                    .parse::<usize>()
-                    .map_err(|source| format!("invalid --max-steps `{value}`: {source}"))?
-                    .max(1);
+                max_steps = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|source| format!("invalid --max-steps `{value}`: {source}"))?
+                        .max(1),
+                );
             }
             "--repair-steps" => {
                 let value = next_value(&args, &mut index, "--repair-steps")?;
@@ -561,7 +714,7 @@ fn parse_options(args: Vec<String>) -> Result<Options, String> {
 }
 
 fn usage() -> String {
-    "usage: sinomo-swebench-agent --workspace <path> --task-json <path> --prediction-out <path> --report-out <path> [--agent-trace-out <path>] [--provider deepseek] [--model deepseek-v4-flash] [--account name] [--max-steps n] [--repair-steps n]".to_string()
+    "usage: sinomo-swebench-agent --workspace <path> --task-json <path> --prediction-out <path> --report-out <path> [--agent-trace-out <path>] [--provider deepseek] [--model deepseek-v4-flash] [--account name] [--max-steps n] [--repair-steps n]\n\n--max-steps is optional; omit it for the continuous-agent default with no model-turn cap.".to_string()
 }
 
 fn next_path(args: &[String], index: &mut usize, flag: &str) -> Result<PathBuf, String> {
@@ -596,12 +749,22 @@ fn configured_account(
     Ok(provider_account_config(&config, provider, Some(account_name)).cloned())
 }
 
-fn task_prompt(task: &SweBenchTask, max_steps: usize) -> String {
+fn task_prompt(task: &SweBenchTask, max_steps: Option<usize>) -> String {
     let hints = if task.hints_text.trim().is_empty() {
         "No hints were provided.".to_string()
     } else {
         task.hints_text.clone()
     };
+    let turn_budget_guidance = max_steps.map_or_else(
+        || {
+            "No fixed model-turn cap is imposed by this benchmark adapter. Keep the run focused: inspect enough to make the minimal source patch, avoid redundant validation turns, and end with no tool calls once a patch is present or once no useful action remains.".to_string()
+        },
+        |max_steps| {
+            format!(
+                "You have at most {max_steps} model turns. Spend the first turns locating the bug, but reserve enough budget to apply a minimal source patch. If the remaining budget is small, prefer making the highest-confidence patch over continuing to inspect. End with no tool calls once a patch is present or once no useful action remains."
+            )
+        },
+    );
     format!(
         r#"Solve this SWE-bench Verified task in the current repository checkout.
 
@@ -631,7 +794,7 @@ Example update hunk:
  unchanged
 *** End Patch
 If a check fails because stderr/stdout show missing local dependencies, package installation policy, or incompatible local tooling, do not spend repeated turns installing dependencies. Use a narrower available check, inspect git diff, and finish if the source patch is minimal and directly addresses the issue.
-You have at most {max_steps} model turns. Spend the first turns locating the bug, but reserve enough budget to apply a minimal source patch. If the remaining budget is small, prefer making the highest-confidence patch over continuing to inspect. End with no tool calls once a patch is present or once no useful action remains.
+{turn_budget_guidance}
 When you are done, return a concise summary and leave the final patch in the working tree."#,
         instance_id = &task.instance_id,
         repo = &task.repo,
@@ -639,7 +802,7 @@ When you are done, return a concise summary and leave the final patch in the wor
         difficulty = &task.difficulty,
         problem_statement = &task.problem_statement,
         hints = hints,
-        max_steps = max_steps,
+        turn_budget_guidance = turn_budget_guidance,
     )
 }
 
@@ -993,4 +1156,61 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let content = serde_json::to_string_pretty(value).map_err(|source| source.to_string())?;
     fs::write(path, content)
         .map_err(|source| format!("failed to write {}: {source}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_agent::{AgentToolCall, AgentToolEvidence, TaskId};
+
+    fn tool_call_item(item_id: TaskId, step_index: usize, call_index: usize) -> AgentItem {
+        AgentItem::ToolCall {
+            item_id,
+            step_index,
+            call_index,
+            call: AgentToolCall {
+                call_id: None,
+                tool: "read_file".to_string(),
+                input: serde_json::json!({"path": "src/lib.rs"}),
+                r#async: false,
+                summary: "read source".to_string(),
+            },
+        }
+    }
+
+    fn tool_result_item(call_id: TaskId, step_index: usize, call_index: usize) -> AgentItem {
+        AgentItem::ToolResult {
+            item_id: TaskId::generate(),
+            step_index,
+            call_index,
+            call_id,
+            native_call_id: None,
+            tool_name: Some("read_file".to_string()),
+            status: AgentToolStatus::Succeeded,
+            summary: "read source".to_string(),
+            output: serde_json::json!({"content": "ok"}),
+            evidence: AgentToolEvidence::default(),
+        }
+    }
+
+    #[test]
+    fn tool_pair_integrity_pairs_by_step_and_call_index() {
+        let paired_call = TaskId::generate();
+        let paired_result = TaskId::generate();
+        let orphan_call = TaskId::generate();
+        let orphan_result = TaskId::generate();
+        let items = vec![
+            tool_call_item(paired_call, 0, 0),
+            tool_result_item(paired_result, 0, 0),
+            tool_call_item(orphan_call, 1, 0),
+            tool_result_item(orphan_result, 2, 0),
+        ];
+
+        let metrics = AgentToolPairIntegrity::from_items(&items);
+
+        assert_eq!(metrics.tool_calls, 2);
+        assert_eq!(metrics.tool_results, 2);
+        assert_eq!(metrics.orphan_tool_calls, 1);
+        assert_eq!(metrics.orphan_tool_results, 1);
+    }
 }

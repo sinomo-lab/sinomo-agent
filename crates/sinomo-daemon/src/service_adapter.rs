@@ -16,6 +16,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use sinomo_config::{
@@ -36,11 +37,12 @@ use sinomo_network::{
     CLUSTER_JOIN_REGISTER_ROUTE, CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY,
     CLUSTER_MEMBERSHIP_RPC_ROUTE_METADATA, CLUSTER_NETWORK_PING_ROUTE, CLUSTER_RELAY_ROUTE,
     CLUSTER_ROUTING_RPC_ROUTE_METADATA, ClusterPaths, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
-    DAEMON_STATUS_ROUTE, DaemonControlRequest, DaemonControlResponse, NETWORK_OBJECT_RPC_ROUTES,
-    NetworkError, ObjectRouteDescriptor, ObjectRpcAuthorizationLayer, ObjectRpcRequest,
-    ObjectRpcResponse, ObjectRpcRouteCatalog, ObjectRpcRoutePolicyLayer, ObjectRpcRouteRegistry,
-    ObjectRpcRouter, RelayEnvelope, SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
-    SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE, ServiceCatalog,
+    DAEMON_STATUS_ROUTE, DaemonControlRequest, DaemonControlResponse,
+    MODULE_NATIVE_DYLIB_CANCEL_ROUTE, MODULE_RPC_CATEGORY, NETWORK_OBJECT_RPC_ROUTES, NetworkError,
+    ObjectRouteDescriptor, ObjectRpcAuthorizationLayer, ObjectRpcCancelRequest,
+    ObjectRpcCancelResponse, ObjectRpcRequest, ObjectRpcResponse, ObjectRpcRouteCatalog,
+    ObjectRpcRoutePolicyLayer, ObjectRpcRouteRegistry, ObjectRpcRouter, RelayEnvelope,
+    SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE, SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE, ServiceCatalog,
 };
 use sinomo_network_module::network_module_surfaces;
 use sinomo_rollout::{
@@ -51,7 +53,7 @@ use sinomo_rollout::{
 use sinomo_sandbox::{
     LocalSandboxBackend, SandboxAddToolchainArtifactRequest, SandboxAddToolchainArtifactResponse,
     SandboxAddToolchainCommandRequest, SandboxAddToolchainCommandResponse, SandboxBackend,
-    SandboxBackendError, SandboxBackendFactory, SandboxCheckpointRequest,
+    SandboxBackendError, SandboxBackendFactory, SandboxCancellationToken, SandboxCheckpointRequest,
     SandboxCheckpointResponse, SandboxCreateInstanceRequest, SandboxCreateInstanceResponse,
     SandboxDestroyRequest, SandboxDestroyResponse, SandboxHttpFetchFileResult,
     SandboxHttpFetchToFileRequest, SandboxHttpRequest, SandboxHttpResponse,
@@ -89,8 +91,10 @@ use crate::control::{
     handle_daemon_sandbox_read_on_runtime, handle_daemon_sandbox_reboot_on_runtime,
     handle_daemon_sandbox_resume_on_runtime, handle_daemon_sandbox_run_process_plan_on_runtime,
     handle_daemon_sandbox_run_process_plan_stream_async_on_runtime,
+    handle_daemon_sandbox_run_process_plan_with_cancellation_on_runtime,
     handle_daemon_sandbox_run_toolchain_on_runtime,
     handle_daemon_sandbox_run_toolchain_stream_async_on_runtime,
+    handle_daemon_sandbox_run_toolchain_with_cancellation_on_runtime,
     handle_daemon_sandbox_status_on_runtime,
     handle_daemon_sandbox_toolchain_add_artifact_on_runtime,
     handle_daemon_sandbox_toolchain_add_command_on_runtime,
@@ -1212,6 +1216,20 @@ impl SandboxBackend for DaemonSandboxBackend {
             .map_err(daemon_sandbox_error)
     }
 
+    fn run_toolchain_with_cancellation(
+        &mut self,
+        request: SandboxRunToolchainRequest,
+        cancellation_token: SandboxCancellationToken,
+    ) -> Result<SandboxLocalCommandOutcome, SandboxBackendError> {
+        handle_daemon_sandbox_run_toolchain_with_cancellation_on_runtime(
+            &self.paths,
+            request,
+            self.runtime.as_ref(),
+            cancellation_token,
+        )
+        .map_err(daemon_sandbox_error)
+    }
+
     fn run_process_plan(
         &mut self,
         request: SandboxRunProcessPlanRequest,
@@ -1220,6 +1238,20 @@ impl SandboxBackend for DaemonSandboxBackend {
             &self.paths,
             request,
             self.runtime.as_ref(),
+        )
+        .map_err(daemon_sandbox_error)
+    }
+
+    fn run_process_plan_with_cancellation(
+        &mut self,
+        request: SandboxRunProcessPlanRequest,
+        cancellation_token: SandboxCancellationToken,
+    ) -> Result<SandboxProcessPlanOutcome, SandboxBackendError> {
+        handle_daemon_sandbox_run_process_plan_with_cancellation_on_runtime(
+            &self.paths,
+            request,
+            self.runtime.as_ref(),
+            cancellation_token,
         )
         .map_err(daemon_sandbox_error)
     }
@@ -1256,6 +1288,7 @@ impl SandboxBackendFactory for DaemonSandboxBackendFactory {
 fn daemon_service_registry(
     paths: &DaemonPaths,
     service_runtime: Option<&tokio::runtime::Handle>,
+    service_hooks: &[crate::DaemonServiceRegistryHook],
 ) -> ServiceRegistry {
     let mut builder: ServiceRegistryBuilder = register_dfs_services(ServiceRegistry::builder());
     if observe_module_should_register(paths) {
@@ -1302,14 +1335,17 @@ fn daemon_service_registry(
     } else {
         builder
     };
-    sinomo_sandbox::register_services_with_factory(
+    let mut builder = sinomo_sandbox::register_services_with_factory(
         builder,
         Arc::new(DaemonSandboxBackendFactory {
             paths: paths.clone(),
             runtime: service_runtime.cloned(),
         }),
-    )
-    .build()
+    );
+    for hook in service_hooks {
+        builder = hook.register(builder);
+    }
+    builder.build()
 }
 
 fn service_registry_snapshot(registry: ServiceRegistry) -> Arc<ServiceRegistrySnapshot> {
@@ -1416,9 +1452,12 @@ impl DaemonServiceRegistryHost {
             return Ok(host);
         }
         let registry_paths = paths.clone();
-        let registry =
-            daemon_service_registry_on_blocking_pool(registry_paths, service_runtime.clone())
-                .await?;
+        let registry = daemon_service_registry_on_blocking_pool(
+            registry_paths,
+            service_runtime.clone(),
+            Vec::new(),
+        )
+        .await?;
         let host = Self::from_registry_for_paths_on_runtime(registry, &paths, service_runtime)?;
         let mut cache = DAEMON_SERVICE_REGISTRY_HOSTS
             .get_or_init(|| Mutex::new(HashMap::new()))
@@ -1428,6 +1467,24 @@ impl DaemonServiceRegistryHost {
                 detail: source.to_string(),
             })?;
         Ok(cache.entry(cache_key).or_insert_with(|| host).clone())
+    }
+
+    pub(crate) async fn new_on_runtime_with_services(
+        paths: DaemonPaths,
+        service_runtime: tokio::runtime::Handle,
+        service_hooks: Vec<crate::DaemonServiceRegistryHook>,
+    ) -> Result<Self, DaemonError> {
+        if service_hooks.is_empty() {
+            return Self::new_on_runtime(paths, service_runtime).await;
+        }
+        let registry_paths = paths.clone();
+        let registry = daemon_service_registry_on_blocking_pool(
+            registry_paths,
+            service_runtime.clone(),
+            service_hooks,
+        )
+        .await?;
+        Self::from_registry_for_paths_on_runtime(registry, &paths, service_runtime)
     }
 
     fn active_router(&self) -> ObjectRpcRouter {
@@ -1451,13 +1508,16 @@ impl DaemonServiceRegistryHost {
 async fn daemon_service_registry_on_blocking_pool(
     paths: DaemonPaths,
     service_runtime: tokio::runtime::Handle,
+    service_hooks: Vec<crate::DaemonServiceRegistryHook>,
 ) -> Result<ServiceRegistry, DaemonError> {
-    tokio::task::spawn_blocking(move || daemon_service_registry(&paths, Some(&service_runtime)))
-        .await
-        .map_err(|source| DaemonError::Network {
-            address: "daemon service registry".to_string(),
-            detail: format!("daemon service registry task failed: {source}"),
-        })
+    tokio::task::spawn_blocking(move || {
+        daemon_service_registry(&paths, Some(&service_runtime), &service_hooks)
+    })
+    .await
+    .map_err(|source| DaemonError::Network {
+        address: "daemon service registry".to_string(),
+        detail: format!("daemon service registry task failed: {source}"),
+    })
 }
 
 fn observe_module_should_register(paths: &DaemonPaths) -> bool {
@@ -1599,6 +1659,35 @@ struct DaemonInternalModuleSnapshot {
 struct DaemonNativeDylibRouteTarget {
     module_id: sinomo_module::ModuleId,
     operation: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DaemonOperationCancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl DaemonOperationCancellationToken {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+struct NativeDylibModuleInvocationCallbacks {
+    cancellation_token: DaemonOperationCancellationToken,
+}
+
+impl sinomo_module::NativeModuleHostCallbacks for NativeDylibModuleInvocationCallbacks {
+    fn is_cancelled(&self) -> bool {
+        self.cancellation_token.is_cancelled()
+    }
 }
 
 fn daemon_internal_module_registry(
@@ -1844,12 +1933,94 @@ async fn dispatch_service_registry_request(
     }
 }
 
+fn register_native_dylib_operation_cancellation(
+    active_operations: &Arc<Mutex<BTreeMap<String, DaemonOperationCancellationToken>>>,
+    operation_id: Option<&str>,
+) -> Result<DaemonOperationCancellationToken, NetworkError> {
+    let token = DaemonOperationCancellationToken::new();
+    let Some(operation_id) = operation_id else {
+        return Ok(token);
+    };
+    let mut active = active_operations.lock().map_err(|_| NetworkError::Io {
+        operation: "register native dylib module cancellation".to_string(),
+        detail: "native dylib operation cancellation registry lock poisoned".to_string(),
+    })?;
+    if active.contains_key(operation_id) {
+        return Err(NetworkError::Serialization {
+            detail: format!("native dylib module operation `{operation_id}` is already active"),
+        });
+    }
+    active.insert(operation_id.to_string(), token.clone());
+    Ok(token)
+}
+
+fn unregister_native_dylib_operation_cancellation(
+    active_operations: &Arc<Mutex<BTreeMap<String, DaemonOperationCancellationToken>>>,
+    operation_id: Option<&str>,
+) {
+    let Some(operation_id) = operation_id else {
+        return;
+    };
+    if let Ok(mut active) = active_operations.lock() {
+        active.remove(operation_id);
+    }
+}
+
+fn dispatch_native_dylib_module_cancel_request(
+    active_operations: &Arc<Mutex<BTreeMap<String, DaemonOperationCancellationToken>>>,
+    request: ObjectRpcRequest,
+) -> Result<ObjectRpcResponse, NetworkError> {
+    let payload: ObjectRpcCancelRequest = request.decode_body()?;
+    let operation_id = payload.operation_id;
+    let metadata_operation_id = request.cancels_operation_id().map(str::to_string);
+    if metadata_operation_id
+        .as_deref()
+        .is_some_and(|metadata| metadata != operation_id)
+    {
+        return ObjectRpcResponse::encode_body(
+            MODULE_NATIVE_DYLIB_CANCEL_ROUTE,
+            &ObjectRpcCancelResponse {
+                operation_id,
+                cancelled: false,
+                detail: "cancel metadata operation id does not match request body".to_string(),
+            },
+        );
+    }
+    let token = active_operations
+        .lock()
+        .map_err(|_| NetworkError::Io {
+            operation: "cancel native dylib module operation".to_string(),
+            detail: "native dylib operation cancellation registry lock poisoned".to_string(),
+        })?
+        .get(&operation_id)
+        .cloned();
+    let (cancelled, detail) = if let Some(token) = token {
+        token.cancel();
+        (true, payload.reason)
+    } else {
+        (
+            false,
+            "native dylib module operation is not active".to_string(),
+        )
+    };
+    ObjectRpcResponse::encode_body(
+        MODULE_NATIVE_DYLIB_CANCEL_ROUTE,
+        &ObjectRpcCancelResponse {
+            operation_id,
+            cancelled,
+            detail,
+        },
+    )
+}
+
 async fn dispatch_native_dylib_module_request(
     paths: DaemonPaths,
     target: DaemonNativeDylibRouteTarget,
+    active_operations: Arc<Mutex<BTreeMap<String, DaemonOperationCancellationToken>>>,
     request: ObjectRpcRequest,
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let route_for_error = request.route.clone();
+    let operation_id = request.operation_id().map(str::to_string);
     tokio::task::spawn_blocking(move || {
         let data_dir_root = daemon_data_dir_path(&paths).map_err(daemon_error_to_network_error)?;
         let state =
@@ -1898,14 +2069,27 @@ async fn dispatch_native_dylib_module_request(
                 ),
             });
         }
+        let cancellation_token = register_native_dylib_operation_cancellation(
+            &active_operations,
+            operation_id.as_deref(),
+        )?;
+        let callbacks: Arc<dyn sinomo_module::NativeModuleHostCallbacks> =
+            Arc::new(NativeDylibModuleInvocationCallbacks {
+                cancellation_token: cancellation_token.clone(),
+            });
         let native_response = module
-            .invoke(&sinomo_module_api::NativeModuleRequest::Invoke(
-                sinomo_module_api::NativeModuleInvocationRequest {
-                    operation: target.operation.clone(),
-                    payload_sobj: request.body,
-                },
-            ))
-            .map_err(module_error_to_network_error)?;
+            .invoke_with_callbacks(
+                &sinomo_module_api::NativeModuleRequest::Invoke(
+                    sinomo_module_api::NativeModuleInvocationRequest {
+                        operation: target.operation.clone(),
+                        payload_sobj: request.body,
+                    },
+                ),
+                Some(callbacks),
+            )
+            .map_err(module_error_to_network_error);
+        unregister_native_dylib_operation_cancellation(&active_operations, operation_id.as_deref());
+        let native_response = native_response?;
         match native_response {
             sinomo_module_api::NativeModuleResponse::Invocation(response) => {
                 if response.operation != target.operation {
@@ -2009,6 +2193,19 @@ fn apply_native_dylib_route_execution_policy(
     descriptor.observable("daemon.native_dylib_module_route", "true")
 }
 
+fn native_dylib_cancel_route_descriptor() -> ObjectRouteDescriptor {
+    ObjectRouteDescriptor::new(
+        MODULE_NATIVE_DYLIB_CANCEL_ROUTE,
+        MODULE_RPC_CATEGORY,
+        "cancel an active native-dylib module object-RPC operation by id",
+        "sinomo_network::ObjectRpcCancelRequest",
+        "sinomo_network::ObjectRpcCancelResponse",
+    )
+    .with_auth_scope("local-or-cluster-member")
+    .require_capability("module.native-dylib.cancel")
+    .observable("daemon.native_dylib_module_cancel_route", "true")
+}
+
 const DAEMON_SERVICE_SIGNER_AUTHORITY_METADATA_KEY: &str = "daemon.service.signer.authority";
 const DAEMON_SERVICE_SIGNER_NODE_ID_METADATA_KEY: &str = "daemon.service.signer.node_id";
 const DAEMON_SERVICE_SIGNER_PUBLIC_KEY_METADATA_KEY: &str = "daemon.service.signer.public_key";
@@ -2056,6 +2253,9 @@ fn daemon_service_object_rpc_route_descriptors_from_module_snapshot(
             mark_service_snapshot_route(service_route_descriptor(&route), &service_snapshot);
         insert_daemon_route_descriptor(&mut catalog, descriptor)?;
     }
+    let cancel_descriptor =
+        mark_service_snapshot_route(native_dylib_cancel_route_descriptor(), &service_snapshot);
+    insert_daemon_route_descriptor(&mut catalog, cancel_descriptor)?;
     Ok(catalog.routes.into_values().collect())
 }
 
@@ -2067,6 +2267,10 @@ fn daemon_service_object_rpc_route_registry_from_module_snapshot(
 ) -> Result<Arc<ObjectRpcRouteRegistry>, NetworkError> {
     let service_registry = service_snapshot.registry_arc();
     let native_dylib_routes = Arc::new(module_snapshot.native_dylib_routes.clone());
+    let active_native_dylib_operations = Arc::new(Mutex::new(BTreeMap::<
+        String,
+        DaemonOperationCancellationToken,
+    >::new()));
     let descriptors = daemon_service_object_rpc_route_descriptors_from_module_snapshot(
         service_snapshot,
         module_snapshot,
@@ -2075,17 +2279,31 @@ fn daemon_service_object_rpc_route_registry_from_module_snapshot(
     for descriptor in descriptors {
         let registry = Arc::clone(&service_registry);
         let native_target = native_dylib_routes.get(&descriptor.route).cloned();
+        let is_native_cancel_route = descriptor.route == MODULE_NATIVE_DYLIB_CANCEL_ROUTE;
         let handler_paths = paths.clone();
         let handler_runtime = service_runtime.clone();
+        let active_native_dylib_operations = Arc::clone(&active_native_dylib_operations);
         builder = builder.try_register_route(descriptor, move |request| {
             let registry = Arc::clone(&registry);
             let paths = handler_paths.clone();
             let runtime = handler_runtime.clone();
             let native_target = native_target.clone();
+            let active_native_dylib_operations = Arc::clone(&active_native_dylib_operations);
             async move {
+                if is_native_cancel_route {
+                    return dispatch_native_dylib_module_cancel_request(
+                        &active_native_dylib_operations,
+                        request,
+                    );
+                }
                 if let Some(native_target) = native_target {
-                    return dispatch_native_dylib_module_request(paths, native_target, request)
-                        .await;
+                    return dispatch_native_dylib_module_request(
+                        paths,
+                        native_target,
+                        active_native_dylib_operations,
+                        request,
+                    )
+                    .await;
                 }
                 let signer = daemon_service_signer_from_request_metadata(&request)?;
                 let (data_dir, cluster) = tokio::task::spawn_blocking(move || {
@@ -2616,6 +2834,63 @@ mod tests {
     }
 
     #[test]
+    fn daemon_service_registry_host_installs_native_dylib_cancel_route() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-native-dylib-cancel-route");
+        let registry = ServiceRegistry::builder().build();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let host = test_service_host(&root, registry);
+        let catalog = host.active_route_snapshot().catalog().clone();
+        let descriptor = catalog
+            .routes
+            .get(MODULE_NATIVE_DYLIB_CANCEL_ROUTE)
+            .expect("native dylib cancel route descriptor");
+        assert_eq!(descriptor.category, MODULE_RPC_CATEGORY);
+        assert_eq!(
+            descriptor.auth_scope.as_deref(),
+            Some("local-or-cluster-member")
+        );
+        assert_eq!(
+            descriptor.required_capabilities,
+            vec!["module.native-dylib.cancel".to_string()]
+        );
+        assert_eq!(
+            descriptor
+                .observability
+                .get("daemon.native_dylib_module_cancel_route")
+                .map(String::as_str),
+            Some("true")
+        );
+
+        let mut router = host.route_policy_layer().layer(host.active_router());
+        let response = runtime
+            .block_on(sinomo_network::call_object_rpc_service_async(
+                &mut router,
+                ObjectRpcRequest::encode_body(
+                    MODULE_NATIVE_DYLIB_CANCEL_ROUTE,
+                    MODULE_RPC_CATEGORY,
+                    &ObjectRpcCancelRequest::new("agent_module_cancel_route_probe", "route probe"),
+                )
+                .expect("request")
+                .with_cancels_operation_id("agent_module_cancel_route_probe"),
+            ))
+            .expect("native dylib cancel route response");
+        let cancel_response: ObjectRpcCancelResponse = response.decode_body().expect("decode");
+        assert_eq!(
+            cancel_response.operation_id,
+            "agent_module_cancel_route_probe"
+        );
+        assert!(!cancel_response.cancelled);
+        assert!(
+            cancel_response
+                .detail
+                .contains("native dylib module operation is not active")
+        );
+    }
+
+    #[test]
     fn pre_auth_join_challenge_dispatches_as_join_candidate() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-pre-auth-join-challenge");
         let registry = ServiceRegistry::builder()
@@ -2850,18 +3125,52 @@ mod tests {
         let data_dir = SinomoDataDir::new(&root);
         let paths = DaemonPaths::new(&data_dir);
 
-        let registry = daemon_service_registry(&paths, None);
+        let registry = daemon_service_registry(&paths, None, &[]);
         assert!(registry.owns(sinomo_observe::OBSERVE_EVENTS_ROUTE));
 
         sinomo_observe::set_observe_module_enabled(&root, false, "test", "disable observe")
             .expect("disable observe");
-        let registry = daemon_service_registry(&paths, None);
+        let registry = daemon_service_registry(&paths, None, &[]);
         assert!(!registry.owns(sinomo_observe::OBSERVE_EVENTS_ROUTE));
 
         sinomo_observe::set_observe_module_enabled(&root, true, "test", "enable observe")
             .expect("enable observe");
-        let registry = daemon_service_registry(&paths, None);
+        let registry = daemon_service_registry(&paths, None, &[]);
         assert!(registry.owns(sinomo_observe::OBSERVE_EVENTS_ROUTE));
+    }
+
+    #[test]
+    fn daemon_service_registry_accepts_application_service_hooks() {
+        fn register_test_stop_service(builder: ServiceRegistryBuilder) -> ServiceRegistryBuilder {
+            builder.register(TestStopService)
+        }
+
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-service-hooks");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+
+        let hook = crate::DaemonServiceRegistryHook::new(register_test_stop_service);
+        let registry = daemon_service_registry(&paths, None, &[hook]);
+        assert!(registry.owns("/test/stop"));
+        assert_eq!(registry.category_for_route("/test/stop"), Some("test-stop"));
+
+        let host = DaemonServiceRegistryHost::from_registry_for_paths(registry, &paths)
+            .expect("service host");
+        let descriptor = host
+            .active_route_snapshot()
+            .catalog()
+            .routes
+            .get("/test/stop")
+            .expect("hooked service route")
+            .clone();
+        assert_eq!(descriptor.category, "test-stop");
+        assert_eq!(
+            descriptor
+                .observability
+                .get("daemon.service_registry")
+                .map(String::as_str),
+            Some("true")
+        );
     }
 
     #[test]
@@ -2870,7 +3179,7 @@ mod tests {
         let data_dir = SinomoDataDir::new(&root);
         let paths = DaemonPaths::new(&data_dir);
 
-        let enabled_registry = daemon_service_registry(&paths, None);
+        let enabled_registry = daemon_service_registry(&paths, None, &[]);
         let enabled_host =
             DaemonServiceRegistryHost::from_registry_for_paths(enabled_registry, &paths)
                 .expect("enabled service host");
@@ -2888,7 +3197,7 @@ mod tests {
 
         sinomo_observe::set_observe_module_enabled(&root, false, "test", "disable observe")
             .expect("disable observe");
-        let disabled_registry = daemon_service_registry(&paths, None);
+        let disabled_registry = daemon_service_registry(&paths, None, &[]);
         let disabled_host =
             DaemonServiceRegistryHost::from_registry_for_paths(disabled_registry, &paths)
                 .expect("disabled service host");
@@ -2907,7 +3216,7 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-module-snapshot-routes");
         let data_dir = Arc::new(SinomoDataDir::new(&root));
         let paths = DaemonPaths::new(data_dir.as_ref());
-        let registry = daemon_service_registry(&paths, None);
+        let registry = daemon_service_registry(&paths, None, &[]);
 
         let host = DaemonServiceRegistryHost::from_registry_for_paths(registry, &paths)
             .expect("service host");
@@ -3100,7 +3409,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
-        let registry = daemon_service_registry(&paths, Some(runtime.handle()));
+        let registry = daemon_service_registry(&paths, Some(runtime.handle()), &[]);
 
         for route in CLUSTER_KV_RPC_ROUTES.iter().copied().chain([
             sinomo_network::CLUSTER_HEALTH_ROUTE,

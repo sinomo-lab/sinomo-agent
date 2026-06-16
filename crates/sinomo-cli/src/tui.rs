@@ -2441,6 +2441,13 @@ impl TuiState {
                     format!("model started: {provider}/{model} step {step_index}"),
                 );
             }
+            AgentModelEvent::ContextAssembled { report, .. } => {
+                self.runtime_activity.active = true;
+                self.status = format!(
+                    "context ready: {} bytes",
+                    report.budget_estimate.total_bytes
+                );
+            }
             AgentModelEvent::AssistantTextDelta { delta, .. } => {
                 self.runtime_activity.active = true;
                 self.append_streamed_message(TuiMessageKind::Agent, &delta, "streaming");
@@ -5159,7 +5166,6 @@ mod tui_tests {
         assert!(keys.iter().any(|key| *key == "dfs.expose"));
         assert!(keys.iter().any(|key| *key == "rollout.telemetry.gates"));
         assert!(keys.iter().any(|key| *key == "lm.credentials.openai"));
-        assert!(keys.iter().any(|key| *key == "evolution.config"));
     }
 
     #[test]
@@ -6105,6 +6111,7 @@ where
     M: InteractionModel + Send + Sync + 'static,
 {
     runtime: Option<RuntimeMainAgentSlot<M>>,
+    runtime_control_registry: sinomo_agent::AgentRuntimeControlRegistry,
     runtime_cursor: AgentRuntimeEventCursor,
     agent_definition: AgentDefinition,
     tool_registry: sinomo_agent::AgentToolRegistry,
@@ -6191,6 +6198,7 @@ where
     ) -> Self {
         Self {
             runtime: Some(RuntimeMainAgentSlot::Pending(model)),
+            runtime_control_registry: sinomo_agent::AgentRuntimeControlRegistry::new(),
             runtime_cursor: AgentRuntimeEventCursor {
                 offset: 0,
                 last_event_id: None,
@@ -6209,6 +6217,18 @@ where
 
     pub fn with_tool_registry(mut self, registry: sinomo_agent::AgentToolRegistry) -> Self {
         self.tool_registry = registry;
+        self
+    }
+
+    pub(crate) fn runtime_control_registry(&self) -> sinomo_agent::AgentRuntimeControlRegistry {
+        self.runtime_control_registry.clone()
+    }
+
+    pub(crate) fn with_runtime_control_registry(
+        mut self,
+        registry: sinomo_agent::AgentRuntimeControlRegistry,
+    ) -> Self {
+        self.runtime_control_registry = registry;
         self
     }
 
@@ -6247,6 +6267,7 @@ where
                 self.agent_definition.role.clone(),
             );
             let runtime = self.build_runtime(model, agent_session);
+            self.register_runtime_control(&runtime)?;
             self.runtime = Some(RuntimeMainAgentSlot::Ready(runtime));
             self.runtime_cursor = AgentRuntimeEventCursor {
                 offset: 0,
@@ -6295,6 +6316,7 @@ where
         options: LanguageModelProviderOptions,
     ) -> Result<TuiAgentRuntimeInfo, CliError> {
         let previous = self.runtime.take();
+        let mut previous_session_id = None;
         let preserved_session = match previous {
             Some(RuntimeMainAgentSlot::Ready(runtime)) => {
                 if runtime.active_turn()?.is_some() {
@@ -6302,10 +6324,15 @@ where
                         runtime.interrupt_active_turn("model switched while turn was active")?;
                     runtime.join_active_turn()?;
                 }
-                Some(runtime.session_snapshot()?)
+                let session = runtime.session_snapshot()?;
+                previous_session_id = Some(session.session_id.clone());
+                Some(session)
             }
             Some(RuntimeMainAgentSlot::Pending(_)) | None => None,
         };
+        if let Some(session_id) = previous_session_id {
+            self.unregister_runtime_control_session(&session_id)?;
+        }
 
         self.provider = provider;
         self.model_name = model_name;
@@ -6313,7 +6340,11 @@ where
         self.reasoning_effort = options.reasoning_effort;
         self.reasoning_budget_tokens = options.reasoning_budget_tokens;
         self.runtime = Some(match preserved_session {
-            Some(session) => RuntimeMainAgentSlot::Ready(self.build_runtime(model, session)),
+            Some(session) => {
+                let runtime = self.build_runtime(model, session);
+                self.register_runtime_control(&runtime)?;
+                RuntimeMainAgentSlot::Ready(runtime)
+            }
             None => RuntimeMainAgentSlot::Pending(model),
         });
         self.runtime_cursor = AgentRuntimeEventCursor {
@@ -6346,13 +6377,40 @@ where
         );
         agent_session.transcript = transcript.clone();
         agent_session.raw_transcript = transcript;
-        let cursor = {
+        let (previous_session_id, cursor, runtime_handle) = {
             let runtime = self.ensure_runtime(interaction_session)?;
+            let previous_session_id = runtime.session_snapshot()?.session_id;
             runtime.replace_session(agent_session)?;
-            runtime.runtime_event_cursor()?
+            (
+                previous_session_id,
+                runtime.runtime_event_cursor()?,
+                runtime.clone(),
+            )
         };
+        self.unregister_runtime_control_session(&previous_session_id)?;
+        self.register_runtime_control(&runtime_handle)?;
         self.runtime_cursor = cursor;
         Ok(())
+    }
+
+    fn register_runtime_control(&self, runtime: &AgentSessionRuntime<M>) -> Result<(), CliError> {
+        self.runtime_control_registry
+            .register_runtime(runtime.clone())
+            .map(|_| ())
+            .map_err(runtime_control_cli_error)
+    }
+
+    fn unregister_runtime_control_session(&self, session_id: &SessionId) -> Result<(), CliError> {
+        self.runtime_control_registry
+            .unregister_session(session_id)
+            .map(|_| ())
+            .map_err(runtime_control_cli_error)
+    }
+}
+
+fn runtime_control_cli_error(error: sinomo_agent::AgentRuntimeControlError) -> CliError {
+    CliError::Parse {
+        detail: format!("agent runtime control registry: {error}"),
     }
 }
 

@@ -1,40 +1,43 @@
 use super::{
-    AgentCliCommand, AgentRunOptions, CliClusterMemberMutationHost, CliCommand, CliError,
-    CliRuntimeOptions, ClusterCliCommand, ClusterInitOptions, ClusterInviteOptions,
-    ClusterJoinOptions, ClusterJoinRegistrationRequest, ClusterPaths, ClusterRaftRoleOptions,
-    ClusterRemoveOptions, ClusterRoleOptions, ClusterRolloutBuildRequest, DaemonCliCommand,
-    DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
-    DebugCliCommand, DfsCliCommand, DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions,
-    DfsMountOptions, DfsPinCliCommand, InstallLayout, InstallOptions, InteractionModel,
-    InteractionRuntime, InteractionSession, InteractionSurface, InteractionSurfaceKind,
-    ModelBackedInteractionHandler, ModelOptionValueUpdate, ModelOptionsCliCommand,
-    ModelOptionsSetOptions, ModelOptionsTarget, ModelRuntimeCliCommand, ModelRuntimeSetOptions,
-    ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions, ProviderName,
-    RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation,
-    RolloutModuleNativeDylibOptions, RolloutOptions, RolloutProgressExpectation,
-    RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler, SelfRolloutPaths,
-    TestCliCommand, UninstallOptions, advertised_peer_route_targets, apply_cluster_node_role,
-    apply_cluster_raft_role, authenticate_daemon_control_request,
-    build_cluster_raft_append_request_from_next_index, cli_command_requires_cluster_state,
-    cli_command_supports_degraded_local_mode, cli_invocation_force_local_mode,
-    cluster_connectivity_sync_ops, cluster_doctor_findings, cluster_has_local_quorum,
-    cluster_init_with_paths, cluster_invite_with_paths, cluster_join_with_paths,
-    cluster_node_status_from_daemon_status, cluster_peer_members, cluster_raft_known_leader_id,
-    cluster_state_sync_txn, cluster_sync_targets, compact_default_invite_introducers,
-    daemon_advertised_endpoints_for_state, daemon_handle_daemon_sandbox_http_fetch,
-    daemon_package_version, data_dir_storage_contract_findings, decode_cluster_join_invite,
-    encode_cluster_join_invite, ensure_rollout_layout, expire_cluster_network_records_in_kv,
-    extend_rollout_endpoints_from_kv, format_rollout_progress_line,
-    handle_daemon_cluster_join_request, handle_daemon_cluster_kv_txn_request,
-    handle_daemon_rollout_build_request, install_should_update_binary, install_with_layout,
-    invite_channels_for_join_registration, invite_communication_channels,
-    invite_introducer_endpoint, invite_introducer_endpoint_from_state,
-    load_tui_model_runtime_config, main_agent_config_tool_registry,
-    main_agent_handler_for_tui_with_data_dir, managed_source_status, model_config_uses_cluster,
-    models_default_with_data_dir, normalize_model_provider,
-    open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
-    parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
-    parse_dfs_command, parse_install_options, parse_model_default_options,
+    AgentCliCommand, AgentExportOptions, AgentImportOptions, AgentInspectOptions,
+    AgentReadinessOptions, AgentRunOptions, AgentSessionCliCommand, AgentSessionInspectOptions,
+    AgentSessionMessageOptions, AgentSessionProgressOptions, AgentSessionResumeOptions,
+    AgentSessionTerminalResultsOptions, AgentValidateOptions, BUILTIN_TOP_LEVEL_USAGE_COMMANDS,
+    CliClusterMemberMutationHost, CliCommand, CliError, CliRuntimeOptions, ClusterCliCommand,
+    ClusterInitOptions, ClusterInviteOptions, ClusterJoinOptions, ClusterJoinRegistrationRequest,
+    ClusterPaths, ClusterRaftRoleOptions, ClusterRemoveOptions, ClusterRoleOptions,
+    ClusterRolloutBuildRequest, DaemonCliCommand, DaemonClusterStatus, DaemonPaths,
+    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DebugCliCommand, DfsCliCommand,
+    DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions, DfsMountOptions, DfsPinCliCommand,
+    InstallLayout, InstallOptions, InteractionModel, InteractionRuntime, InteractionSession,
+    InteractionSurface, InteractionSurfaceKind, ModelBackedInteractionHandler,
+    ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions, ModelOptionsTarget,
+    ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand,
+    ProviderCommandOptions, ProviderName, RolloutAdvanceOptions, RolloutCliCommand,
+    RolloutMainActivation, RolloutModuleNativeDylibOptions, RolloutOptions,
+    RolloutProgressExpectation, RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler,
+    SelfRolloutPaths, TestCliCommand, UninstallOptions, advertised_peer_route_targets,
+    apply_cluster_node_role, apply_cluster_raft_role, authenticate_daemon_control_request,
+    build_cluster_raft_append_request_from_next_index, cli_command_is_help,
+    cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
+    cli_invocation_force_local_mode, cluster_connectivity_sync_ops, cluster_doctor_findings,
+    cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_with_paths,
+    cluster_join_with_paths, cluster_node_status_from_daemon_status, cluster_peer_members,
+    cluster_raft_known_leader_id, cluster_state_sync_txn, cluster_sync_targets,
+    compact_default_invite_introducers, daemon_advertised_endpoints_for_state,
+    daemon_handle_daemon_sandbox_http_fetch, daemon_package_version,
+    data_dir_storage_contract_findings, decode_cluster_join_invite, encode_cluster_join_invite,
+    ensure_rollout_layout, expire_cluster_network_records_in_kv, extend_rollout_endpoints_from_kv,
+    format_rollout_progress_line, handle_daemon_cluster_join_request,
+    handle_daemon_cluster_kv_txn_request, handle_daemon_rollout_build_request,
+    install_should_update_binary, install_with_layout, invite_channels_for_join_registration,
+    invite_communication_channels, invite_introducer_endpoint,
+    invite_introducer_endpoint_from_state, load_tui_model_runtime_config,
+    main_agent_config_tool_registry, main_agent_handler_for_tui_with_data_dir,
+    managed_source_status, model_config_uses_cluster, models_default_with_data_dir,
+    normalize_model_provider, open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command,
+    parse_cli_invocation, parse_cluster_command, parse_cluster_join_invite_argument,
+    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
     parse_model_options_command, parse_models_list_options, parse_models_runtime_command,
     parse_provider_command, parse_rollout_command, parse_slash_command, parse_test_command,
     parse_uninstall_options, parse_usage_options, push_unique_introducer, read_cluster_kv_snapshot,
@@ -54,17 +57,13 @@ use super::{
 };
 #[cfg(feature = "sandbox")]
 use super::{
-    daemon_handle_daemon_sandbox_checkpoint, daemon_handle_daemon_sandbox_create,
-    daemon_handle_daemon_sandbox_destroy, daemon_handle_daemon_sandbox_http_fetch_to_file,
-    daemon_handle_daemon_sandbox_import_busybox, daemon_handle_daemon_sandbox_list,
-    daemon_handle_daemon_sandbox_read, daemon_handle_daemon_sandbox_reboot,
-    daemon_handle_daemon_sandbox_resume, daemon_handle_daemon_sandbox_run_process_plan,
-    daemon_handle_daemon_sandbox_status, daemon_handle_daemon_sandbox_toolchain_add_artifact,
+    daemon_handle_daemon_sandbox_http_fetch_to_file, daemon_handle_daemon_sandbox_import_busybox,
+    daemon_handle_daemon_sandbox_read, daemon_handle_daemon_sandbox_toolchain_add_artifact,
     daemon_handle_daemon_sandbox_toolchain_add_command,
-    daemon_handle_daemon_sandbox_toolchain_import_package, daemon_handle_daemon_sandbox_update,
-    daemon_handle_daemon_sandbox_write,
+    daemon_handle_daemon_sandbox_toolchain_import_package, daemon_handle_daemon_sandbox_write,
 };
 use base64::Engine;
+use sinomo_agent::{AgentRuntimeControlHost, AgentSessionResumeRequest, AgentSessionSteerRequest};
 use sinomo_lm::{
     LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
     ProviderReasoningEffort, ProviderTextVerbosity,
@@ -312,6 +311,7 @@ fn write_sandbox_policy_config_for_node(
 struct TestRegisteredCommandHandler {
     name: &'static str,
     policy: CliCommandPolicy,
+    is_help: bool,
 }
 
 impl CliCommandHandler for TestRegisteredCommandHandler {
@@ -330,6 +330,7 @@ impl CliCommandHandler for TestRegisteredCommandHandler {
         Ok(Box::new(TestRegisteredCommand {
             name: self.name,
             policy: self.policy,
+            is_help: self.is_help,
         }))
     }
 }
@@ -338,6 +339,7 @@ impl CliCommandHandler for TestRegisteredCommandHandler {
 struct TestRegisteredCommand {
     name: &'static str,
     policy: CliCommandPolicy,
+    is_help: bool,
 }
 
 impl sinomo_runtime::cli_registry::CliCommand for TestRegisteredCommand {
@@ -349,13 +351,33 @@ impl sinomo_runtime::cli_registry::CliCommand for TestRegisteredCommand {
         self.policy
     }
 
+    fn is_help(&self) -> bool {
+        self.is_help
+    }
+
     fn run(self: Box<Self>, _context: &mut CliCommandContext<'_>) -> Result<(), CliCommandError> {
         Ok(())
     }
 }
 
 fn registered_test_command(name: &'static str, policy: CliCommandPolicy) -> CliCommand {
-    let handler = TestRegisteredCommandHandler { name, policy };
+    registered_test_command_with_help(name, policy, false)
+}
+
+fn registered_test_help_command(name: &'static str, policy: CliCommandPolicy) -> CliCommand {
+    registered_test_command_with_help(name, policy, true)
+}
+
+fn registered_test_command_with_help(
+    name: &'static str,
+    policy: CliCommandPolicy,
+    is_help: bool,
+) -> CliCommand {
+    let handler = TestRegisteredCommandHandler {
+        name,
+        policy,
+        is_help,
+    };
     CliCommand::Registered(RegisteredCliCommand::new(
         handler.parse(&[]).expect("parse registered test command"),
     ))
@@ -570,7 +592,25 @@ fn top_level_cli_parser_routes_subcommands() {
         CliCommand::Test(TestCliCommand::List(_))
     ));
     assert!(matches!(
+        parse_cli_command(&[
+            "test".to_string(),
+            "run".to_string(),
+            "--tag".to_string(),
+            "agent-readiness".to_string(),
+            "--require-cluster".to_string(),
+        ])
+        .expect("test run tag"),
+        CliCommand::Test(TestCliCommand::Run(options))
+            if options.id.is_none()
+                && options.tag.as_deref() == Some("agent-readiness")
+                && options.require_cluster
+    ));
+    assert!(matches!(
         parse_cli_command(&["models".to_string()]).expect("models help"),
+        CliCommand::Models(ModelsCliCommand::Help)
+    ));
+    assert!(matches!(
+        parse_cli_command(&["model".to_string()]).expect("model alias help"),
         CliCommand::Models(ModelsCliCommand::Help)
     ));
     assert!(matches!(
@@ -634,6 +674,73 @@ fn top_level_cli_parser_routes_subcommands() {
         CliCommand::Registered(command) if command.name() == "sandbox"
     ));
     assert!(matches!(
+        parse_cli_command(&["agent".to_string()]).expect("agent help"),
+        CliCommand::Agent(AgentCliCommand::Help)
+    ));
+    assert!(matches!(
+        parse_cli_command(&["agent".to_string(), "help".to_string()]).expect("agent help"),
+        CliCommand::Agent(AgentCliCommand::Help)
+    ));
+    assert!(matches!(
+        parse_cli_command(&[
+            "agent".to_string(),
+            "export".to_string(),
+            "coding-agent".to_string(),
+            "--output".to_string(),
+            "coding-agent.json".to_string(),
+        ])
+        .expect("agent export"),
+        CliCommand::Agent(AgentCliCommand::Export(options))
+            if options == (AgentExportOptions {
+                agent: "coding-agent".to_string(),
+                output: Some(PathBuf::from("coding-agent.json")),
+            })
+    ));
+    assert!(matches!(
+        parse_cli_command(&[
+            "agent".to_string(),
+            "import".to_string(),
+            "coding-agent.json".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("agent import"),
+        CliCommand::Agent(AgentCliCommand::Import(options))
+            if options == (AgentImportOptions {
+                path: PathBuf::from("coding-agent.json"),
+                json: true,
+            })
+    ));
+    assert!(matches!(
+        parse_cli_command(&[
+            "agent".to_string(),
+            "inspect".to_string(),
+            "coding-agent".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("agent inspect"),
+        CliCommand::Agent(AgentCliCommand::Inspect(options))
+            if options == (AgentInspectOptions {
+                agent: "coding-agent".to_string(),
+                json: true,
+            })
+    ));
+    assert!(matches!(
+        parse_cli_command(&[
+            "agent".to_string(),
+            "validate".to_string(),
+            "--file".to_string(),
+            "coding-agent.json".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("agent validate"),
+        CliCommand::Agent(AgentCliCommand::Validate(options))
+            if options == (AgentValidateOptions {
+                agent: "main-agent".to_string(),
+                file: Some(PathBuf::from("coding-agent.json")),
+                json: true,
+            })
+    ));
+    assert!(matches!(
         parse_cli_command(&[
             "agent".to_string(),
             "run".to_string(),
@@ -643,7 +750,41 @@ fn top_level_cli_parser_routes_subcommands() {
         .expect("agent"),
         CliCommand::Agent(AgentCliCommand::Run(_))
     ));
+    assert!(matches!(
+        parse_cli_command(&[
+            "agent".to_string(),
+            "readiness".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("agent readiness"),
+        CliCommand::Agent(AgentCliCommand::Readiness(options))
+            if options == (AgentReadinessOptions { json: true })
+    ));
+    assert!(matches!(
+        parse_cli_command(&[
+            "agent".to_string(),
+            "session".to_string(),
+            "inspect".to_string(),
+            "sess_cli_agent_session".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("agent session inspect"),
+        CliCommand::Agent(AgentCliCommand::Session(AgentSessionCliCommand::Inspect(options)))
+            if options == (AgentSessionInspectOptions {
+                session_id: SessionId::from_legacy_named("sess_cli_agent_session").expect("session id"),
+                json: true,
+            })
+    ));
     assert!(parse_cli_command(&["evolve".to_string()]).is_err());
+}
+
+#[test]
+fn documented_builtin_top_level_commands_are_parseable() {
+    for command in BUILTIN_TOP_LEVEL_USAGE_COMMANDS {
+        parse_cli_command(&[command.to_string()]).unwrap_or_else(|error| {
+            panic!("documented command `{command}` did not parse: {error}")
+        });
+    }
 }
 
 #[test]
@@ -674,6 +815,22 @@ fn test_parser_accepts_live_cluster_smoke_options() {
     assert!(test_command_requires_cluster_state(&TestCliCommand::Smoke(
         options
     )));
+}
+
+#[test]
+fn test_registry_lists_agent_cluster_readiness_case() {
+    let registry = super::test_registry().expect("registry");
+    let cases = registry.metadata();
+    let case = cases
+        .iter()
+        .find(|case| case.id == "cluster.agent.runtime-routes")
+        .expect("agent cluster runtime routes test case");
+    assert!(case.tags.iter().any(|tag| tag == "agent-readiness"));
+    assert!(
+        case.requirements
+            .iter()
+            .any(|requirement| requirement.label() == "cluster-runtime")
+    );
 }
 
 #[test]
@@ -2569,303 +2726,6 @@ fn sandbox_doctor_reports_recent_resource_exhaustion_for_target_sandbox() {
             .all(|finding| !finding.detail.contains("sandbox unknown"))
     );
 }
-
-#[test]
-#[cfg(feature = "sandbox")]
-fn sandbox_doctor_reports_coding_toolchain_readiness() {
-    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-doctor-coding");
-    let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(root.join("runtime"));
-    let toolchain_store =
-        sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
-    let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
-    let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
-    let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
-        toolchain_id.clone(),
-        "coding-base-test",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
-        "unit test",
-        OffsetDateTime::now_utc(),
-    )
-    .expect("toolchain");
-    toolchain_store
-        .put_command_module(
-            &mut toolchain,
-            "grep",
-            wasi_stdin_to_stdout_module().as_bytes(),
-            sinomo_runtime::sandbox::SandboxResourceLimits::default(),
-        )
-        .expect("grep");
-    sandbox_create_with_store(
-        SandboxCreateOptions {
-            sandbox_id: Some(sandbox_id.clone()),
-            toolchain_id,
-            temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
-            memory_mb: None,
-            wall_time_ms: None,
-            max_input_bytes: None,
-            max_output_bytes: None,
-            max_workspace_bytes: None,
-            max_written_bytes_per_command: None,
-            max_file_count: None,
-            mounts: Vec::new(),
-            execution: SandboxMetadataExecution::Local,
-        },
-        &store,
-    )
-    .expect("create");
-
-    let findings = sandbox_doctor_findings_with_stores(
-        SandboxDoctorOptions {
-            sandbox_id: Some(sandbox_id),
-        },
-        &store,
-        &toolchain_store,
-        &sinomo_runtime::sandbox::SandboxPolicy::default(),
-    )
-    .expect("doctor");
-    let coding_findings: Vec<_> = findings
-        .iter()
-        .filter(|finding| finding.code == "coding-command-missing")
-        .collect();
-    assert_eq!(
-        coding_findings.len(),
-        sinomo_runtime::sandbox::BUSYBOX_TOOLCHAIN_COMMANDS.len() - 1
-    );
-    for required in ["bash", "python", "pip"] {
-        assert!(
-            findings.iter().any(
-                |finding| finding.code == "required-toolchain-command-missing"
-                    && finding.detail.contains(&format!("`{required}`"))
-            ),
-            "doctor should report missing required richer toolchain command {required}"
-        );
-    }
-    let planned_rich_targets: Vec<_> = findings
-        .iter()
-        .filter(|finding| finding.code == "rich-toolchain-target-planned")
-        .collect();
-    assert!(planned_rich_targets.is_empty());
-    assert!(
-        findings
-            .iter()
-            .any(|finding| finding.code == "rich-toolchain-command-missing"
-                && finding.detail.contains("`make`")
-                && finding.detail.contains("build-make-wasix.sh"))
-    );
-    let required_toolchain_findings: Vec<_> = findings
-        .iter()
-        .filter(|finding| finding.code == "required-toolchain-command-missing")
-        .collect();
-    assert_eq!(required_toolchain_findings.len(), 3);
-    for required in ["bash", "python", "pip"] {
-        assert!(
-            required_toolchain_findings
-                .iter()
-                .any(|finding| finding.detail.contains(&format!("`{required}`"))
-                    && finding.severity == SandboxDoctorSeverity::Error),
-            "doctor should treat missing {required} as an error"
-        );
-    }
-    assert!(
-        !coding_findings
-            .iter()
-            .any(|finding| finding.detail.contains("`grep`"))
-    );
-    assert!(
-        findings
-            .iter()
-            .any(|finding| finding.code == "ambient-wasi-network-disabled")
-    );
-    assert!(
-        findings
-            .iter()
-            .any(|finding| finding.code == "process-substrate-missing"
-                && finding.severity == SandboxDoctorSeverity::Warning
-                && finding
-                    .detail
-                    .contains(sinomo_runtime::sandbox::SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY)
-                && finding.detail.contains("asyncify")),
-        "doctor should report the WASIX asyncified fork boundary separately"
-    );
-    assert!(
-        findings
-            .iter()
-            .any(|finding| finding.code == "process-substrate-missing"
-                && finding.severity == SandboxDoctorSeverity::Warning
-                && finding.detail.contains("child-process-exec")
-                && finding.detail.contains("fork/exec"))
-    );
-    assert!(
-        findings
-            .iter()
-            .any(|finding| finding.code == "process-substrate-available"
-                && finding.severity == SandboxDoctorSeverity::Info
-                && finding.detail.contains(
-                    sinomo_runtime::sandbox::SANDBOX_PINNED_CHILD_EXEC_CONTAINMENT_CAPABILITY
-                )
-                && finding.detail.contains("pinned /bin")),
-        "doctor should report strict WASIX pinned child-exec containment as available"
-    );
-    assert!(
-        findings
-            .iter()
-            .any(|finding| finding.code == "runtime-budget-supported"
-                && finding.severity == SandboxDoctorSeverity::Info
-                && finding.detail.contains("WASIX")
-                && finding.detail.contains("wall-timeout"))
-    );
-    assert!(
-        findings
-            .iter()
-            .any(|finding| finding.code == "runtime-budget-missing"
-                && finding.severity == SandboxDoctorSeverity::Warning
-                && finding.detail.contains("Wasix")
-                && finding.detail.contains("wall-timeout"))
-    );
-    assert!(
-        findings.iter().any(|finding| {
-            (finding.code == "runtime-budget-supported" || finding.code == "runtime-budget-missing")
-                && finding.detail.contains("Wasix")
-                && finding.detail.contains("task-limit")
-        }),
-        "doctor should report whether the WASIX process/thread fanout guard is available"
-    );
-    assert!(
-        findings.iter().any(|finding| {
-            (finding.code == "runtime-budget-supported" || finding.code == "runtime-budget-missing")
-                && finding.detail.contains("Wasix")
-                && finding.detail.contains("output-limit")
-        }),
-        "doctor should report whether WASIX streaming output limit enforcement is available"
-    );
-    assert!(
-        findings.iter().any(|finding| {
-            (finding.code == "runtime-budget-supported" || finding.code == "runtime-budget-missing")
-                && finding.detail.contains("Wasix")
-                && finding.detail.contains("input-limit")
-        }),
-        "doctor should report whether WASIX stdin input limit enforcement is available"
-    );
-    assert!(
-        findings.iter().any(|finding| {
-            (finding.code == "runtime-budget-supported" || finding.code == "runtime-budget-missing")
-                && finding.detail.contains("Wasix")
-                && finding.detail.contains("memory-limit")
-        }),
-        "doctor should report whether the WASIX static linear-memory budget guard is available"
-    );
-    let device_findings: Vec<_> = findings
-        .iter()
-        .filter(|finding| finding.code == "mvp-wasi-device-missing")
-        .collect();
-    assert!(device_findings.is_empty());
-    let mvp_findings: Vec<_> = findings
-        .iter()
-        .filter(|finding| finding.code == "mvp-command-missing")
-        .collect();
-    assert_eq!(
-        mvp_findings.len(),
-        sinomo_runtime::sandbox::SANDBOX_MVP_COMMANDS.len() - 1
-    );
-    assert!(
-        mvp_findings
-            .iter()
-            .any(|finding| finding.detail.contains("`sh`"))
-    );
-    assert!(
-        !mvp_findings
-            .iter()
-            .any(|finding| finding.detail.contains("popen/pclose"))
-    );
-    assert!(
-        !mvp_findings
-            .iter()
-            .any(|finding| finding.detail.contains("`grep`"))
-    );
-    assert!(
-        findings
-            .iter()
-            .any(|finding| finding.code == "mvp-command-surface-incomplete"
-                && finding.severity == SandboxDoctorSeverity::Error
-                && finding.detail.contains("`sh`"))
-    );
-    assert!(
-        findings
-            .iter()
-            .any(|finding| finding.code == "shell-command-missing"
-                && finding.severity == SandboxDoctorSeverity::Error
-                && finding.detail.contains("genuine shell/process substrate"))
-    );
-}
-
-#[test]
-fn sandbox_doctor_rejects_shell_when_process_substrate_is_missing() {
-    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-doctor-shell-substrate");
-    let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(root.join("runtime"));
-    let toolchain_store =
-        sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
-    let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
-    let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
-    let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
-        toolchain_id.clone(),
-        "shell-substrate-test",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
-        "unit test",
-        OffsetDateTime::now_utc(),
-    )
-    .expect("toolchain");
-    toolchain_store
-        .put_command_module_with_capabilities(
-            &mut toolchain,
-            "sh",
-            wasi_stdin_to_stdout_module().as_bytes(),
-            sinomo_runtime::sandbox::SandboxResourceLimits::default(),
-            vec![sinomo_runtime::sandbox::SANDBOX_CHILD_PROCESS_EXEC_CAPABILITY.to_string()],
-        )
-        .expect("sh");
-    sandbox_create_with_store(
-        SandboxCreateOptions {
-            sandbox_id: Some(sandbox_id.clone()),
-            toolchain_id,
-            temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
-            memory_mb: None,
-            wall_time_ms: None,
-            max_input_bytes: None,
-            max_output_bytes: None,
-            max_workspace_bytes: None,
-            max_written_bytes_per_command: None,
-            max_file_count: None,
-            mounts: Vec::new(),
-            execution: SandboxMetadataExecution::Local,
-        },
-        &store,
-    )
-    .expect("create");
-
-    let findings = sandbox_doctor_findings_with_stores(
-        SandboxDoctorOptions {
-            sandbox_id: Some(sandbox_id),
-        },
-        &store,
-        &toolchain_store,
-        &sinomo_runtime::sandbox::SandboxPolicy::default(),
-    )
-    .expect("doctor");
-
-    assert!(
-        findings
-            .iter()
-            .any(|finding| finding.code == "shell-process-substrate-missing"
-                && finding.severity == SandboxDoctorSeverity::Error
-                && finding.detail.contains("child-process-exec"))
-    );
-    assert!(
-        !findings
-            .iter()
-            .any(|finding| finding.code == "shell-command-missing")
-    );
-}
-
 #[test]
 fn sandbox_doctor_warns_when_wasix_shell_uses_unpinned_child_exec_acknowledgement() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-doctor-wasix-unpinned");
@@ -3709,7 +3569,7 @@ fn sandbox_run_persists_stdout_and_stderr_logs() {
         (module
           (import "wasi_snapshot_preview1" "fd_write"
             (func $fd_write (param i32 i32 i32 i32) (result i32)))
-          (memory (export "memory") 1)
+          (memory (export "memory") 1 128)
           (data (i32.const 0) "\08\00\00\00\06\00\00\00hello\0a")
           (func (export "_start")
             i32.const 1
@@ -3820,7 +3680,7 @@ fn sandbox_run_returns_error_when_guest_exits_nonzero() {
         (module
           (import "wasi_snapshot_preview1" "proc_exit"
             (func $proc_exit (param i32)))
-          (memory (export "memory") 1)
+          (memory (export "memory") 1 128)
           (func (export "_start")
             i32.const 7
             call $proc_exit))
@@ -3943,7 +3803,7 @@ fn sandbox_run_uses_pinned_toolchain_command() {
             (module
               (import "wasi_snapshot_preview1" "fd_write"
                 (func $fd_write (param i32 i32 i32 i32) (result i32)))
-              (memory (export "memory") 1)
+              (memory (export "memory") 1 128)
               (data (i32.const 0) "\08\00\00\00\06\00\00\00hello\0a")
               (func (export "_start")
                 i32.const 1
@@ -4083,7 +3943,7 @@ fn sandbox_process_plan_runs_pinned_commands_from_json_plan() {
             (module
               (import "wasi_snapshot_preview1" "fd_write"
                 (func $fd_write (param i32 i32 i32 i32) (result i32)))
-              (memory (export "memory") 1)
+              (memory (export "memory") 1 128)
               (data (i32.const 0) "\08\00\00\00\06\00\00\00hello\0a")
               (func (export "_start")
                 i32.const 1
@@ -4185,80 +4045,6 @@ fn sandbox_process_plan_runs_pinned_commands_from_json_plan() {
 
 #[test]
 #[cfg(feature = "sandbox")]
-fn sandbox_shell_invokes_pinned_sh_command() {
-    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-shell");
-    let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(root.join("runtime"));
-    let toolchain_store =
-        sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
-    let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
-    let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
-    let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
-        toolchain_id.clone(),
-        "test-1",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
-        "test shell module",
-        OffsetDateTime::now_utc(),
-    )
-    .expect("toolchain");
-    toolchain_store
-        .put_command_module(
-            &mut toolchain,
-            "cat",
-            wasi_stdin_to_stdout_module().as_bytes(),
-            sinomo_runtime::sandbox::SandboxResourceLimits::default(),
-        )
-        .expect("put command");
-
-    sandbox_create_with_store(
-        SandboxCreateOptions {
-            sandbox_id: Some(sandbox_id.clone()),
-            toolchain_id,
-            temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
-            memory_mb: None,
-            wall_time_ms: None,
-            max_input_bytes: None,
-            max_output_bytes: None,
-            max_workspace_bytes: None,
-            max_written_bytes_per_command: None,
-            max_file_count: None,
-            mounts: Vec::new(),
-            execution: SandboxMetadataExecution::Local,
-        },
-        &store,
-    )
-    .expect("create");
-
-    sandbox_shell_with_stores(
-        SandboxShellOptions {
-            sandbox_id: sandbox_id.clone(),
-            script: None,
-            timeout_ms: 1_000,
-            execution: SandboxRunExecution::Local,
-        },
-        b"echo shell\n".to_vec(),
-        &store,
-        &toolchain_store,
-    )
-    .expect("shell command");
-
-    let (_manifest, layout) = store.load(&sandbox_id).expect("load");
-    let fs = sinomo_runtime::sandbox::LocalSandboxFileSystem::new(layout);
-    let entries = fs
-        .list(&sinomo_runtime::sandbox::SandboxPath::new("/logs").expect("logs"))
-        .expect("logs");
-    let stdout_logs: Vec<_> = entries
-        .iter()
-        .filter(|entry| entry.path.as_str().ends_with(".stdout"))
-        .collect();
-    assert_eq!(stdout_logs.len(), 1);
-    assert_eq!(
-        fs.read(&stdout_logs[0].path, None).expect("stdout"),
-        b"echo shell\n"
-    );
-}
-
-#[test]
-#[cfg(feature = "sandbox")]
 fn sandbox_shell_rejects_toolchain_without_real_sh() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-shell-missing");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(root.join("runtime"));
@@ -4334,7 +4120,7 @@ fn sandbox_toolchain_add_command_installs_local_command_module() {
         (module
           (import "wasi_snapshot_preview1" "fd_write"
             (func $fd_write (param i32 i32 i32 i32) (result i32)))
-          (memory (export "memory") 1)
+          (memory (export "memory") 1 128)
           (data (i32.const 0) "\08\00\00\00\06\00\00\00hello\0a")
           (func (export "_start")
             i32.const 1
@@ -5383,7 +5169,7 @@ fn sandbox_toolchain_import_busybox_installs_core_applets() {
         (module
           (import "wasi_snapshot_preview1" "fd_write"
             (func $fd_write (param i32 i32 i32 i32) (result i32)))
-          (memory (export "memory") 1)
+          (memory (export "memory") 1 128)
           (data (i32.const 0) "\08\00\00\00\06\00\00\00hello\0a")
           (func (export "_start")
             i32.const 1
@@ -5456,7 +5242,7 @@ fn sandbox_run_applies_toolchain_command_default_limits() {
             (module
               (import "wasi_snapshot_preview1" "fd_write"
                 (func $fd_write (param i32 i32 i32 i32) (result i32)))
-              (memory (export "memory") 1)
+              (memory (export "memory") 1 128)
               (data (i32.const 0) "\08\00\00\00\06\00\00\00hello\0a")
               (func (export "_start")
                 i32.const 1
@@ -5520,7 +5306,7 @@ fn wasi_stdin_to_stdout_module() -> &'static str {
         (func $fd_write (param i32 i32 i32 i32) (result i32)))
       (import "wasi_snapshot_preview1" "proc_exit"
         (func $proc_exit (param i32)))
-      (memory (export "memory") 1)
+      (memory (export "memory") 1 128)
       (data (i32.const 0) "\80\00\00\00\40\00\00\00")
       (func $exit_if_errno (param $errno i32)
         local.get $errno
@@ -5549,144 +5335,6 @@ fn wasi_stdin_to_stdout_module() -> &'static str {
         call $exit_if_errno))
     "#
 }
-
-#[test]
-#[cfg(feature = "sandbox")]
-fn sandbox_run_rejects_written_bytes_over_limit() {
-    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-quota-run");
-    let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(&root);
-    let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
-    let module_path = root.join("write.wat");
-    std::fs::create_dir_all(&root).expect("root");
-    std::fs::write(
-        &module_path,
-        r#"
-        (module
-          (import "wasi_snapshot_preview1" "path_open"
-            (func $path_open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
-          (import "wasi_snapshot_preview1" "fd_write"
-            (func $fd_write (param i32 i32 i32 i32) (result i32)))
-          (import "wasi_snapshot_preview1" "fd_close"
-            (func $fd_close (param i32) (result i32)))
-          (import "wasi_snapshot_preview1" "proc_exit"
-            (func $proc_exit (param i32)))
-          (memory (export "memory") 1)
-          (data (i32.const 0) "\80\00\00\00\07\00\00\00")
-          (data (i32.const 96) "out.txt")
-          (data (i32.const 128) "created")
-          (func $exit_if_errno (param $errno i32)
-            local.get $errno
-            i32.eqz
-            if
-            else
-              local.get $errno
-              call $proc_exit
-            end)
-          (func (export "_start")
-            i32.const 3
-            i32.const 0
-            i32.const 96
-            i32.const 7
-            i32.const 9
-            i64.const 64
-            i64.const 0
-            i32.const 0
-            i32.const 64
-            call $path_open
-            call $exit_if_errno
-            i32.const 64
-            i32.load
-            i32.const 0
-            i32.const 1
-            i32.const 72
-            call $fd_write
-            call $exit_if_errno
-            i32.const 64
-            i32.load
-            call $fd_close
-            call $exit_if_errno))
-        "#,
-    )
-    .expect("module");
-
-    sandbox_create_with_store(
-        SandboxCreateOptions {
-            sandbox_id: Some(sandbox_id.clone()),
-            toolchain_id: sinomo_runtime::sandbox::SandboxToolchainId::generate(),
-            temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
-            memory_mb: None,
-            wall_time_ms: None,
-            max_input_bytes: None,
-            max_output_bytes: None,
-            max_workspace_bytes: None,
-            max_written_bytes_per_command: None,
-            max_file_count: None,
-            mounts: Vec::new(),
-            execution: SandboxMetadataExecution::Local,
-        },
-        &store,
-    )
-    .expect("create");
-    let (mut manifest, _layout) = store.load(&sandbox_id).expect("load");
-    manifest.limits.max_written_bytes_per_command = 3;
-    store.save_manifest(&manifest).expect("save");
-
-    let error = sandbox_run_with_store(
-        SandboxRunOptions {
-            sandbox_id: sandbox_id.clone(),
-            target: SandboxRunTarget::WasmModule(module_path),
-            argv: vec!["write.wasm".to_string()],
-            timeout_ms: 1_000,
-            stdin: false,
-            allow_unsigned: true,
-            allowed_capabilities: Vec::new(),
-            execution: SandboxRunExecution::Local,
-        },
-        &store,
-    )
-    .expect_err("quota");
-    assert!(format!("{error:?}").contains("written-bytes-per-command"));
-    let (_manifest, layout) = store.load(&sandbox_id).expect("load after rollback");
-    let fs = sinomo_runtime::sandbox::LocalSandboxFileSystem::new(layout.clone());
-    assert!(matches!(
-        fs.read(
-            &sinomo_runtime::sandbox::SandboxPath::new("/work/out.txt").expect("out"),
-            None,
-        )
-        .expect_err("rolled back"),
-        sinomo_runtime::sandbox::SandboxFsError::NotFound { .. }
-    ));
-    assert_eq!(
-        std::fs::read_dir(&layout.checkpoints)
-            .expect("checkpoints")
-            .count(),
-        0
-    );
-    let entries = fs
-        .list(&sinomo_runtime::sandbox::SandboxPath::new("/logs").expect("logs"))
-        .expect("logs");
-    let record_path = entries
-        .iter()
-        .find(|entry| entry.path.as_str().ends_with(".record.sobj"))
-        .expect("record")
-        .path
-        .clone();
-    let record = sinomo_runtime::sandbox::decode_command_record(
-        &fs.read(&record_path, None).expect("record bytes"),
-    )
-    .expect("record");
-    assert_eq!(
-        record.status,
-        sinomo_runtime::sandbox::SandboxCommandRecordStatus::ResourceExhausted
-    );
-    assert!(
-        record
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("written-bytes-per-command"))
-    );
-}
-
 #[test]
 fn agent_run_parser_accepts_provider_model_account_and_prompt() {
     assert_eq!(
@@ -5708,6 +5356,355 @@ fn agent_run_parser_accepts_provider_model_account_and_prompt() {
             account: Some("work".to_string()),
         }
     );
+}
+
+#[test]
+fn agent_inspect_parser_accepts_agent_and_json() {
+    assert_eq!(
+        super::parse_agent_inspect_options(&[
+            "--agent".to_string(),
+            "evolution-agent".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("agent inspect"),
+        AgentInspectOptions {
+            agent: "evolution-agent".to_string(),
+            json: true,
+        }
+    );
+    assert_eq!(
+        super::parse_agent_inspect_options(&[]).expect("default agent inspect"),
+        AgentInspectOptions {
+            agent: "main-agent".to_string(),
+            json: false,
+        }
+    );
+}
+
+#[test]
+fn agent_export_import_validate_parsers_accept_package_artifacts() {
+    assert_eq!(
+        super::parse_agent_export_options(&[
+            "coding-agent".to_string(),
+            "--output".to_string(),
+            "coding-agent.json".to_string(),
+        ])
+        .expect("agent export"),
+        AgentExportOptions {
+            agent: "coding-agent".to_string(),
+            output: Some(PathBuf::from("coding-agent.json")),
+        }
+    );
+    assert_eq!(
+        super::parse_agent_export_options(&[]).expect("default export"),
+        AgentExportOptions {
+            agent: "main-agent".to_string(),
+            output: None,
+        }
+    );
+    assert_eq!(
+        super::parse_agent_import_options(&[
+            "--file".to_string(),
+            "coding-agent.json".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("agent import"),
+        AgentImportOptions {
+            path: PathBuf::from("coding-agent.json"),
+            json: true,
+        }
+    );
+    assert_eq!(
+        super::parse_agent_validate_options(&[
+            "--file".to_string(),
+            "coding-agent.json".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("agent validate file"),
+        AgentValidateOptions {
+            agent: "main-agent".to_string(),
+            file: Some(PathBuf::from("coding-agent.json")),
+            json: true,
+        }
+    );
+    assert_eq!(
+        super::parse_agent_validate_options(&["coding-agent".to_string()])
+            .expect("agent validate catalog"),
+        AgentValidateOptions {
+            agent: "coding-agent".to_string(),
+            file: None,
+            json: false,
+        }
+    );
+}
+
+#[test]
+fn agent_package_json_artifact_loads_and_validates() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-package-json");
+    let path = root.join("coding-agent.json");
+    let definition = sinomo_agent::AgentDefinition::coding()
+        .with_skill("rust.coding")
+        .with_package_version("2.0.0");
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&definition).expect("definition json"),
+    )
+    .expect("write definition");
+
+    let loaded = super::read_agent_package_definition(&path).expect("read package");
+
+    loaded.validate().expect("valid package");
+    assert_eq!(loaded.key(), "coding-agent");
+    assert_eq!(loaded.package.version, "2.0.0");
+    assert_eq!(loaded.skills, vec!["rust.coding".to_string()]);
+}
+
+#[test]
+fn agent_readiness_parser_accepts_json() {
+    assert_eq!(
+        super::parse_agent_readiness_options(&["--json".to_string()]).expect("agent readiness"),
+        AgentReadinessOptions { json: true }
+    );
+    assert_eq!(
+        super::parse_agent_readiness_options(&[]).expect("default readiness"),
+        AgentReadinessOptions { json: false }
+    );
+}
+
+#[test]
+fn agent_session_parsers_accept_inspect_progress_results_and_control() {
+    let session_id = SessionId::from_legacy_named("sess_agent_session_parser").expect("session");
+    let task_id = sinomo_agent::TaskId::generate();
+    let event_id = sinomo_agent::TaskId::generate();
+
+    assert_eq!(
+        super::parse_agent_session_command(&[
+            "inspect".to_string(),
+            "sess_agent_session_parser".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("inspect"),
+        AgentSessionCliCommand::Inspect(AgentSessionInspectOptions {
+            session_id: session_id.clone(),
+            json: true,
+        })
+    );
+    assert_eq!(
+        super::parse_agent_session_command(&[
+            "progress".to_string(),
+            "sess_agent_session_parser".to_string(),
+            "--cursor".to_string(),
+            "7".to_string(),
+            "--last-event".to_string(),
+            event_id.to_string(),
+            "--json".to_string(),
+        ])
+        .expect("progress"),
+        AgentSessionCliCommand::Progress(AgentSessionProgressOptions {
+            session_id: session_id.clone(),
+            cursor: Some(sinomo_agent::AgentSessionControlEventCursor {
+                offset: 7,
+                last_event_id: Some(event_id),
+            }),
+            json: true,
+        })
+    );
+    assert_eq!(
+        super::parse_agent_session_command(&[
+            "terminal-results".to_string(),
+            "sess_agent_session_parser".to_string(),
+            "--task".to_string(),
+            task_id.to_string(),
+        ])
+        .expect("terminal results"),
+        AgentSessionCliCommand::TerminalResults(AgentSessionTerminalResultsOptions {
+            session_id: session_id.clone(),
+            task_id: Some(task_id),
+            json: false,
+        })
+    );
+    assert_eq!(
+        super::parse_agent_session_command(&[
+            "steer".to_string(),
+            "sess_agent_session_parser".to_string(),
+            "keep".to_string(),
+            "the".to_string(),
+            "constraint".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("steer"),
+        AgentSessionCliCommand::Steer(AgentSessionMessageOptions {
+            session_id: session_id.clone(),
+            message: "keep the constraint".to_string(),
+            json: true,
+        })
+    );
+    assert_eq!(
+        super::parse_agent_session_command(&[
+            "follow-up".to_string(),
+            "--session".to_string(),
+            "sess_agent_session_parser".to_string(),
+            "--message".to_string(),
+            "one more thing".to_string(),
+        ])
+        .expect("follow-up"),
+        AgentSessionCliCommand::FollowUp(AgentSessionMessageOptions {
+            session_id: session_id.clone(),
+            message: "one more thing".to_string(),
+            json: false,
+        })
+    );
+    assert_eq!(
+        super::parse_agent_session_command(&[
+            "interrupt".to_string(),
+            "sess_agent_session_parser".to_string(),
+            "--reason".to_string(),
+            "stop now".to_string(),
+        ])
+        .expect("interrupt"),
+        AgentSessionCliCommand::Interrupt(AgentSessionMessageOptions {
+            session_id: session_id.clone(),
+            message: "stop now".to_string(),
+            json: false,
+        })
+    );
+    assert_eq!(
+        super::parse_agent_session_command(&[
+            "resume".to_string(),
+            "sess_agent_session_parser".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("resume"),
+        AgentSessionCliCommand::Resume(AgentSessionResumeOptions {
+            session_id,
+            json: true,
+        })
+    );
+}
+
+#[test]
+fn agent_session_text_renderers_summarize_persisted_state() {
+    let session_id = SessionId::from_legacy_named("sess_agent_session_text").expect("session");
+    let event_id =
+        sinomo_agent::TaskId::from_legacy_named("event_agent_session_text").expect("event id");
+    let session =
+        sinomo_agent::AgentSession::new(session_id.clone(), sinomo_agent::AgentRole::Main);
+    let inspect = sinomo_agent::AgentSessionInspectResponse {
+        session_id: session_id.clone(),
+        session: Some(session),
+        control_snapshot: None,
+        event_cursor: sinomo_agent::AgentSessionControlEventCursor {
+            offset: 4,
+            last_event_id: Some(event_id.clone()),
+        },
+        terminal_results: Vec::new(),
+        persisted_event_count: 4,
+    };
+
+    let text = super::agent_session_inspection_text(&inspect);
+
+    assert!(text.contains("Agent session:"));
+    assert!(text.contains("role: Main"));
+    assert!(text.contains("persisted events: 4"));
+    assert!(text.contains(&format!("event cursor: offset 4, last event {event_id}")));
+    assert!(text.contains("control snapshot: not found"));
+
+    let progress = sinomo_agent::AgentSessionProgressResponse {
+        session_id: session_id.clone(),
+        batch: sinomo_agent::AgentSessionControlEventBatch {
+            cursor: sinomo_agent::AgentSessionControlEventCursor {
+                offset: 4,
+                last_event_id: Some(event_id.clone()),
+            },
+            next_cursor: sinomo_agent::AgentSessionControlEventCursor {
+                offset: 4,
+                last_event_id: Some(event_id.clone()),
+            },
+            events: Vec::new(),
+            task_updates: Vec::new(),
+            terminal_results: Vec::new(),
+        },
+    };
+    let progress_text = super::agent_session_progress_text(&progress);
+    assert!(progress_text.contains(&format!(
+        "cursor: offset 4, last event {event_id} -> offset 4, last event {event_id}"
+    )));
+
+    let resume = sinomo_agent::AgentSessionResumeResponse {
+        session_id,
+        accepted: false,
+        runtime_attached: false,
+        session: None,
+        control_snapshot: None,
+        event_cursor: sinomo_agent::AgentSessionControlEventCursor {
+            offset: 4,
+            last_event_id: Some(event_id.clone()),
+        },
+        reattach: sinomo_agent::AgentSessionReattachReport {
+            state: sinomo_agent::AgentSessionReattachState::PersistedMetadataOnly,
+            active_turn_persisted: false,
+            running_task_count: 0,
+            persisted_event_count: 4,
+            reason: "readiness resume fixture".to_string(),
+        },
+        detail: None,
+    };
+    let resume_text = super::agent_session_resume_text(&resume);
+    assert!(resume_text.contains(&format!("event cursor: offset 4, last event {event_id}")));
+}
+
+#[test]
+fn agent_inspection_renders_package_surface_and_prompt() {
+    let mut definition = sinomo_agent::AgentDefinition::coding()
+        .with_skill("rust.coding")
+        .with_package_version("2.0.0");
+    definition.temperature = Some(0.3);
+    definition.max_output_tokens = Some(321);
+
+    let text = super::agent_package_inspection_text(&definition);
+    let json = super::agent_package_inspection_json(&definition);
+
+    assert!(text.contains("Agent package: coding-agent"));
+    assert!(text.contains("version: 2.0.0"));
+    assert!(text.contains("skills: rust.coding"));
+    assert!(text.contains("context:"));
+    assert!(text.contains("compaction:"));
+    assert!(text.contains("provider preferences:"));
+    assert!(text.contains("temperature: 0.3"));
+    assert!(text.contains("max output tokens: 321"));
+    assert!(text.contains("runtime limits:"));
+    assert!(text.contains("max steps: unbounded"));
+    assert!(text.contains("max tool calls per step: unbounded"));
+    assert!(text.contains("max model repair attempts: unbounded"));
+    assert!(text.contains("system prompt:"));
+    assert_eq!(json["id"], "coding-agent");
+    assert_eq!(json["package"]["version"], "2.0.0");
+    assert_eq!(json["skills"][0], "rust.coding");
+    let temperature = json["effective_model_policy"]["temperature"]
+        .as_f64()
+        .expect("temperature");
+    assert!((temperature - 0.3).abs() < 0.000001);
+    assert_eq!(json["effective_model_policy"]["max_output_tokens"], 321);
+
+    definition.runtime_limits.max_steps = Some(12);
+    definition.runtime_limits.max_tool_calls_per_step = Some(3);
+    definition.runtime_limits.max_model_repair_attempts = Some(2);
+    let capped_text = super::agent_package_inspection_text(&definition);
+    assert!(capped_text.contains("max steps: 12"));
+    assert!(capped_text.contains("max tool calls per step: 3"));
+    assert!(capped_text.contains("max model repair attempts: 2"));
+}
+
+#[test]
+fn agent_readiness_text_renders_gate_results() {
+    let report = sinomo_agent::run_local_agent_readiness_gate(env!("CARGO_MANIFEST_DIR"));
+    let text = super::agent_readiness_text(&report);
+
+    assert!(report.is_ready(), "{report:#?}");
+    assert!(text.contains("Agent readiness: Ready"));
+    assert!(text.contains("[pass] built_in_package_validation"));
+    assert!(text.contains("[pass] package_rejects_malformed_definitions"));
+    assert!(text.contains("[pass] local_command_evidence_smoke"));
 }
 
 #[test]
@@ -6694,6 +6691,15 @@ fn orphan_guard_applies_to_distributed_runtime_commands() {
     assert!(cli_command_requires_cluster_state(
         &registered_cluster_command
     ));
+    assert!(!cli_command_is_help(&registered_cluster_command));
+    let registered_cluster_help_command = registered_test_help_command(
+        "registered-cluster-help",
+        CliCommandPolicy::cluster_required(),
+    );
+    assert!(cli_command_requires_cluster_state(
+        &registered_cluster_help_command
+    ));
+    assert!(cli_command_is_help(&registered_cluster_help_command));
     assert!(!cli_command_requires_cluster_state(&CliCommand::Cluster(
         ClusterCliCommand::Status
     )));
@@ -6713,6 +6719,9 @@ fn orphan_guard_applies_to_distributed_runtime_commands() {
         DfsCliCommand::MetadataPublish { json: false }
     )));
     assert!(!cli_command_requires_cluster_state(&CliCommand::Models(
+        ModelsCliCommand::Help
+    )));
+    assert!(cli_command_is_help(&CliCommand::Models(
         ModelsCliCommand::Help
     )));
     assert!(!cli_command_requires_cluster_state(&CliCommand::Providers(
@@ -7277,12 +7286,19 @@ fn cluster_state_sync_rejects_unsafe_voter_reconfiguration() {
     )
     .expect("cluster init");
     let state = read_cluster_state(&paths).expect("cluster state");
+    sync_cluster_state_to_kv(&paths, &state).expect("publish baseline cluster config");
 
     let mut removed_voter_state = state.clone();
     removed_voter_state.members.clear();
     let removed_error =
         sync_cluster_state_to_kv(&paths, &removed_voter_state).expect_err("reject voter removal");
-    assert!(matches!(removed_error, CliError::ClusterReadOnly { .. }));
+    match removed_error {
+        CliError::Kv(sinomo_runtime::kv::KvError::InvalidRaftConfigTransition { detail }) => {
+            assert!(detail.contains("overlapping old/new quorum"));
+            assert!(detail.contains("refusing to remove"));
+        }
+        other => panic!("unexpected voter removal error: {other:?}"),
+    }
 
     let mut direct_voter_state = state.clone();
     let peer_id = NodeId::from_legacy_named("node_direct_voter").expect("peer");
@@ -7303,7 +7319,13 @@ fn cluster_state_sync_rejects_unsafe_voter_reconfiguration() {
     direct_voter_state.members.push(direct_voter);
     let added_error =
         sync_cluster_state_to_kv(&paths, &direct_voter_state).expect_err("reject direct voter add");
-    assert!(matches!(added_error, CliError::ClusterReadOnly { .. }));
+    match added_error {
+        CliError::Kv(sinomo_runtime::kv::KvError::InvalidRaftConfigTransition { detail }) => {
+            assert!(detail.contains("must already be a committed learner or non-voting member"));
+            assert!(detail.contains(peer_id.as_str()));
+        }
+        other => panic!("unexpected direct voter add error: {other:?}"),
+    }
 }
 
 #[test]
@@ -7756,6 +7778,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
         sinomo_runtime::network::SANDBOX_HTTP_FETCH_TO_FILE_ROUTE,
         sinomo_runtime::network::SANDBOX_RUN_TOOLCHAIN_ROUTE,
         sinomo_runtime::network::SANDBOX_RUN_PROCESS_PLAN_ROUTE,
+        sinomo_runtime::network::SANDBOX_RUN_CANCEL_ROUTE,
         sinomo_runtime::network::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
         sinomo_runtime::network::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
         sinomo_runtime::network::SANDBOX_IMPORT_BUSYBOX_ROUTE,
@@ -8939,559 +8962,6 @@ fn daemon_sandbox_import_busybox_preflights_policy_before_sifs_writes() {
             .any(|event| event.event.payload["phase"] == "sandbox-toolchain-import-busybox")
     );
 }
-
-#[test]
-#[cfg(feature = "sandbox")]
-fn daemon_sandbox_create_status_and_busybox_import_use_sifs() {
-    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-create");
-    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-    cluster_init_with_paths(
-        ClusterInitOptions {
-            cluster_id: Some(
-                ClusterId::from_legacy_named("cluster_sandbox_create").expect("cluster"),
-            ),
-            node_id: Some(NodeId::from_legacy_named("node_sandbox_create").expect("node")),
-            name: "sandbox create cluster".to_string(),
-        },
-        &paths,
-    )
-    .expect("cluster init");
-    let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
-
-    let import_response = daemon_handle_daemon_sandbox_import_busybox(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxImportBusyBoxToolchainRequest {
-            version: "busybox-wasi-test".to_string(),
-            provenance: "unit test".to_string(),
-            module_bytes: b"busybox module".to_vec(),
-        },
-    )
-    .expect("import busybox");
-    assert_eq!(
-        import_response.manifest.commands.len(),
-        sinomo_runtime::sandbox::BUSYBOX_TOOLCHAIN_COMMANDS.len()
-    );
-    assert_eq!(
-        import_response.module_hash,
-        sinomo_runtime::sandbox::sandbox_module_hash(b"busybox module")
-    );
-
-    let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
-    let create_response = daemon_handle_daemon_sandbox_create(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxCreateInstanceRequest {
-            sandbox_id: Some(sandbox_id.clone()),
-            toolchain_id: import_response.manifest.toolchain_id.clone(),
-            temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
-            memory_mb: None,
-            wall_time_ms: None,
-            max_input_bytes: None,
-            max_output_bytes: None,
-            max_workspace_bytes: None,
-            max_written_bytes_per_command: None,
-            max_file_count: None,
-            mounts: vec![sinomo_runtime::sandbox::SandboxMount {
-                source_sifs_path: "/services/sandbox/shared".to_string(),
-                mount_path: sinomo_runtime::sandbox::SandboxPath::new("/work/shared")
-                    .expect("mount path"),
-                mode: sinomo_runtime::sandbox::SandboxMountMode::ReadWrite,
-            }],
-        },
-    )
-    .expect("create sandbox");
-    assert_eq!(create_response.manifest.sandbox_id, sandbox_id);
-    assert_eq!(
-        create_response.manifest.temp_policy,
-        sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart
-    );
-    assert_eq!(create_response.manifest.mounts.len(), 1);
-
-    let status_response = daemon_handle_daemon_sandbox_status(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxStatusRequest {
-            sandbox_id: sandbox_id.clone(),
-        },
-    )
-    .expect("status sandbox");
-    assert_eq!(status_response.manifest, create_response.manifest);
-    let update_response = daemon_handle_daemon_sandbox_update(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxUpdateInstanceRequest {
-            sandbox_id: sandbox_id.clone(),
-            cwd: Some(sinomo_runtime::sandbox::SandboxPath::new("/work").expect("cwd")),
-            env_set: BTreeMap::from([("PATH".to_string(), "/bin".to_string())]),
-            env_unset: Vec::new(),
-        },
-    )
-    .expect("update sandbox config");
-    assert_eq!(update_response.manifest.cwd.as_str(), "/work");
-    assert_eq!(
-        update_response.manifest.env.get("PATH").map(String::as_str),
-        Some("/bin")
-    );
-    let invalid_env = daemon_handle_daemon_sandbox_update(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxUpdateInstanceRequest {
-            sandbox_id: sandbox_id.clone(),
-            cwd: None,
-            env_set: BTreeMap::from([("BAD-NAME".to_string(), "value".to_string())]),
-            env_unset: Vec::new(),
-        },
-    )
-    .expect_err("invalid env name rejected");
-    assert!(format!("{invalid_env:?}").contains("invalid sandbox env name"));
-    let invalid_env_value = daemon_handle_daemon_sandbox_update(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxUpdateInstanceRequest {
-            sandbox_id: sandbox_id.clone(),
-            cwd: None,
-            env_set: BTreeMap::from([("PATH".to_string(), "/bin\0bad".to_string())]),
-            env_unset: Vec::new(),
-        },
-    )
-    .expect_err("invalid env value rejected");
-    assert!(format!("{invalid_env_value:?}").contains("embedded NUL byte"));
-    let mut restrictive_policy = sinomo_runtime::sandbox::SandboxClusterPolicyConfig::default();
-    restrictive_policy.policy.allowed_mount_prefixes = vec!["/users".to_string()];
-    let txn = sinomo_runtime::sandbox::sandbox_policy_config_cluster_kv_txn(&restrictive_policy)
-        .expect("restrictive policy txn");
-    handle_daemon_cluster_kv_txn_request(&daemon_paths, txn).expect("write restrictive policy");
-    let denied_update = daemon_handle_daemon_sandbox_update(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxUpdateInstanceRequest {
-            sandbox_id: sandbox_id.clone(),
-            cwd: None,
-            env_set: BTreeMap::from([("EDITOR".to_string(), "vi".to_string())]),
-            env_unset: Vec::new(),
-        },
-    )
-    .expect_err("policy-denied update rejected");
-    assert!(format!("{denied_update:?}").contains("mount source"));
-    let denied_write = daemon_handle_daemon_sandbox_write(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxWriteRequest {
-            sandbox_id: sandbox_id.clone(),
-            path: sinomo_runtime::sandbox::SandboxPath::new("/work/policy-denied.txt")
-                .expect("path"),
-            bytes: b"denied\n".to_vec(),
-        },
-    )
-    .expect_err("policy-denied write rejected");
-    assert!(format!("{denied_write:?}").contains("mount source"));
-    let denied_checkpoint = daemon_handle_daemon_sandbox_checkpoint(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxCheckpointRequest {
-            sandbox_id: sandbox_id.clone(),
-        },
-    )
-    .expect_err("policy-denied checkpoint rejected");
-    assert!(format!("{denied_checkpoint:?}").contains("mount source"));
-    let denied_reboot = daemon_handle_daemon_sandbox_reboot(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxRebootRequest {
-            sandbox_id: sandbox_id.clone(),
-        },
-    )
-    .expect_err("policy-denied reboot rejected");
-    assert!(format!("{denied_reboot:?}").contains("mount source"));
-    let txn = sinomo_runtime::sandbox::sandbox_policy_config_cluster_kv_txn(
-        &sinomo_runtime::sandbox::SandboxClusterPolicyConfig::default(),
-    )
-    .expect("default policy txn");
-    handle_daemon_cluster_kv_txn_request(&daemon_paths, txn).expect("restore default policy");
-
-    let write_response = daemon_handle_daemon_sandbox_write(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxWriteRequest {
-            sandbox_id: sandbox_id.clone(),
-            path: sinomo_runtime::sandbox::SandboxPath::new("/work/main.rs").expect("path"),
-            bytes: b"fn main() {}\n".to_vec(),
-        },
-    )
-    .expect("write sandbox file");
-    assert_eq!(write_response.bytes_written, 13);
-    assert_eq!(write_response.path.as_str(), "/work/main.rs");
-
-    let list_response = daemon_handle_daemon_sandbox_list(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxListRequest {
-            sandbox_id: sandbox_id.clone(),
-            path: sinomo_runtime::sandbox::SandboxPath::new("/work").expect("work"),
-        },
-    )
-    .expect("list sandbox");
-    assert!(
-        list_response
-            .entries
-            .iter()
-            .any(|entry| entry.path.as_str() == "/work/main.rs")
-    );
-    let read_response = daemon_handle_daemon_sandbox_read(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxReadRequest {
-            sandbox_id: sandbox_id.clone(),
-            path: sinomo_runtime::sandbox::SandboxPath::new("/work/main.rs").expect("file"),
-            range: None,
-        },
-    )
-    .expect("read sandbox");
-    assert_eq!(read_response.bytes, b"fn main() {}\n");
-    let denied_file = daemon_handle_daemon_sandbox_read(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxReadRequest {
-            sandbox_id: sandbox_id.clone(),
-            path: sinomo_runtime::sandbox::SandboxPath::new("/work/policy-denied.txt")
-                .expect("file"),
-            range: None,
-        },
-    )
-    .expect_err("policy denied write did not mutate filesystem");
-    assert!(format!("{denied_file:?}").contains("not found"));
-    let event_store =
-        sinomo_runtime::events::JsonlEventStore::new(root.join("events").join("event-log.jsonl"));
-    let file_events = event_store
-        .replay(ReplayQuery::by_kind_prefix("sandbox.file"))
-        .expect("replay sandbox file events");
-    assert_eq!(file_events.len(), 1);
-    assert_eq!(file_events[0].event.kind.as_str(), "sandbox.file.written");
-    assert_eq!(
-        file_events[0].event.payload["sandbox_id"],
-        sandbox_id.to_string()
-    );
-    assert_eq!(
-        file_events[0].event.payload["workspace_root"],
-        sinomo_runtime::sandbox::sandbox_instance_root(&sandbox_id)
-    );
-    assert_eq!(file_events[0].event.payload["path"], "/work/main.rs");
-    assert_eq!(file_events[0].event.payload["bytes_written"], 13);
-    let dfs = super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("open dfs");
-    let mut store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
-    let mut limited_manifest = store.load(&sandbox_id).expect("load limited sandbox");
-    limited_manifest.limits.max_written_bytes_per_command = 8;
-    limited_manifest.limits.max_workspace_bytes = 16;
-    store
-        .save_manifest(&limited_manifest)
-        .expect("save limited sandbox");
-    let dev_list = daemon_handle_daemon_sandbox_list(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxListRequest {
-            sandbox_id: sandbox_id.clone(),
-            path: sinomo_runtime::sandbox::SandboxPath::new("/dev").expect("dev"),
-        },
-    )
-    .expect("list virtual devices");
-    assert_eq!(
-        dev_list
-            .entries
-            .iter()
-            .map(|entry| entry.path.as_str())
-            .collect::<Vec<_>>(),
-        vec!["/dev/null", "/dev/zero"]
-    );
-    let null_read = daemon_handle_daemon_sandbox_read(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxReadRequest {
-            sandbox_id: sandbox_id.clone(),
-            path: sinomo_runtime::sandbox::SandboxPath::new("/dev/null").expect("null"),
-            range: None,
-        },
-    )
-    .expect("read null");
-    assert!(null_read.bytes.is_empty());
-    let zero_read = daemon_handle_daemon_sandbox_read(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxReadRequest {
-            sandbox_id: sandbox_id.clone(),
-            path: sinomo_runtime::sandbox::SandboxPath::new("/dev/zero").expect("zero"),
-            range: Some(sinomo_runtime::sandbox::ByteRange {
-                start: 0,
-                end: Some(4),
-            }),
-        },
-    )
-    .expect("read zero");
-    assert_eq!(zero_read.bytes, vec![0; 4]);
-    let null_write = daemon_handle_daemon_sandbox_write(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxWriteRequest {
-            sandbox_id: sandbox_id.clone(),
-            path: sinomo_runtime::sandbox::SandboxPath::new("/dev/null").expect("null"),
-            bytes: b"discarded by device".to_vec(),
-        },
-    )
-    .expect("write null bypasses workspace quota");
-    assert_eq!(null_write.bytes_written, 19);
-    let file_events = event_store
-        .replay(ReplayQuery::by_kind_prefix("sandbox.file"))
-        .expect("replay sandbox file events after virtual device write");
-    assert_eq!(file_events.len(), 1);
-    let error = daemon_handle_daemon_sandbox_write(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxWriteRequest {
-            sandbox_id: sandbox_id.clone(),
-            path: sinomo_runtime::sandbox::SandboxPath::new("/work/main.rs").expect("path"),
-            bytes: b"too much content\n".to_vec(),
-        },
-    )
-    .expect_err("quota should reject daemon write");
-    assert!(format!("{error:?}").contains("written-bytes-per-command"));
-    let read_response = daemon_handle_daemon_sandbox_read(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxReadRequest {
-            sandbox_id: sandbox_id.clone(),
-            path: sinomo_runtime::sandbox::SandboxPath::new("/work/main.rs").expect("file"),
-            range: None,
-        },
-    )
-    .expect("read after rejected daemon write");
-    assert_eq!(read_response.bytes, b"fn main() {}\n");
-    let file_events = event_store
-        .replay(ReplayQuery::by_kind_prefix("sandbox.file"))
-        .expect("replay sandbox file events after rejection");
-    assert_eq!(file_events.len(), 1);
-    let resource_events = event_store
-        .replay(ReplayQuery::by_kind_prefix("sandbox.resource"))
-        .expect("replay sandbox resource events");
-    assert_eq!(resource_events.len(), 1);
-    assert_eq!(
-        resource_events[0].event.kind.as_str(),
-        "sandbox.resource.exhausted"
-    );
-    assert_eq!(
-        resource_events[0].event.payload["sandbox_id"],
-        sandbox_id.to_string()
-    );
-    assert_eq!(
-        resource_events[0].event.payload["workspace_root"],
-        sinomo_runtime::sandbox::sandbox_instance_root(&sandbox_id)
-    );
-    assert_eq!(resource_events[0].event.payload["phase"], "sandbox-write");
-    assert_eq!(
-        resource_events[0].event.payload["kind"],
-        "written-bytes-per-command"
-    );
-    assert_eq!(resource_events[0].event.payload["limit"], 8);
-    limited_manifest.limits.max_written_bytes_per_command =
-        sinomo_runtime::sandbox::SandboxResourceLimits::default().max_written_bytes_per_command;
-    store
-        .save_manifest(&limited_manifest)
-        .expect("restore sandbox limits");
-
-    let checkpoint_response = daemon_handle_daemon_sandbox_checkpoint(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxCheckpointRequest {
-            sandbox_id: sandbox_id.clone(),
-        },
-    )
-    .expect("checkpoint sandbox");
-    assert_eq!(checkpoint_response.checkpoint.sandbox_id, sandbox_id);
-
-    let dfs = super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("open dfs");
-    let mut store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
-    let manifest = store.load(&sandbox_id).expect("load sandbox");
-    let mut fs = sinomo_runtime::sandbox::SifsSandboxFileSystem::new(store.into_inner(), &manifest);
-    fs.write(
-        &sinomo_runtime::sandbox::SandboxPath::new("/work/main.rs").expect("path"),
-        b"changed\n",
-    )
-    .expect("change file");
-    drop(fs);
-
-    let resume_response = daemon_handle_daemon_sandbox_resume(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxResumeRequest {
-            sandbox_id: sandbox_id.clone(),
-            checkpoint_id: checkpoint_response.checkpoint.checkpoint_id.clone(),
-        },
-    )
-    .expect("resume sandbox");
-    assert_eq!(resume_response.manifest.sandbox_id, sandbox_id);
-    let read_response = daemon_handle_daemon_sandbox_read(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxReadRequest {
-            sandbox_id: sandbox_id.clone(),
-            path: sinomo_runtime::sandbox::SandboxPath::new("/work/main.rs").expect("file"),
-            range: None,
-        },
-    )
-    .expect("read resumed sandbox");
-    assert_eq!(read_response.bytes, b"fn main() {}\n");
-
-    let dfs = super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("open dfs");
-    let mut toolchain_store = sinomo_runtime::sandbox::SifsSandboxToolchainStore::new(dfs);
-    assert_eq!(
-        toolchain_store
-            .load_command_module(&import_response.manifest, "cat")
-            .expect("busybox cat"),
-        b"busybox module"
-    );
-
-    let dfs = super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("open dfs");
-    let mut store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
-    let manifest = store.load(&sandbox_id).expect("load sandbox");
-    let mut fs = sinomo_runtime::sandbox::SifsSandboxFileSystem::new(store.into_inner(), &manifest);
-    fs.write(
-        &sinomo_runtime::sandbox::SandboxPath::new("/tmp/session-cache.txt").expect("tmp path"),
-        b"tmp",
-    )
-    .expect("write tmp");
-    drop(fs);
-    let tmp_list = daemon_handle_daemon_sandbox_list(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxListRequest {
-            sandbox_id: sandbox_id.clone(),
-            path: sinomo_runtime::sandbox::SandboxPath::new("/tmp").expect("tmp path"),
-        },
-    )
-    .expect("list tmp");
-    assert!(
-        tmp_list
-            .entries
-            .iter()
-            .any(|entry| entry.path.as_str() == "/tmp/session-cache.txt")
-    );
-    let reboot_response = daemon_handle_daemon_sandbox_reboot(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxRebootRequest {
-            sandbox_id: sandbox_id.clone(),
-        },
-    )
-    .expect("reboot sandbox");
-    assert_eq!(reboot_response.manifest.sandbox_id, sandbox_id);
-    assert!(reboot_response.cleared_tmp);
-    let missing_tmp = daemon_handle_daemon_sandbox_read(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxReadRequest {
-            sandbox_id: sandbox_id.clone(),
-            path: sinomo_runtime::sandbox::SandboxPath::new("/tmp/session-cache.txt")
-                .expect("tmp path"),
-            range: None,
-        },
-    )
-    .expect_err("tmp cleared");
-    assert!(format!("{missing_tmp:?}").contains("not found"));
-
-    let destroy_response = daemon_handle_daemon_sandbox_destroy(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxDestroyRequest {
-            sandbox_id: sandbox_id.clone(),
-        },
-    )
-    .expect("destroy sandbox");
-    assert_eq!(destroy_response.sandbox_id, sandbox_id);
-    let missing = daemon_handle_daemon_sandbox_status(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxStatusRequest {
-            sandbox_id: sandbox_id.clone(),
-        },
-    )
-    .expect_err("destroyed sandbox");
-    assert!(format!("{missing:?}").contains("not found"));
-    let event_store =
-        sinomo_runtime::events::JsonlEventStore::new(root.join("events").join("event-log.jsonl"));
-    let events = event_store
-        .replay(ReplayQuery::by_kind_prefix("sandbox.instance"))
-        .expect("replay sandbox lifecycle events");
-    let event_kinds: Vec<_> = events
-        .iter()
-        .map(|event| event.event.kind.as_str().to_string())
-        .collect();
-    assert_eq!(
-        event_kinds,
-        vec![
-            "sandbox.instance.created",
-            "sandbox.instance.updated",
-            "sandbox.instance.checkpointed",
-            "sandbox.instance.resumed",
-            "sandbox.instance.rebooted",
-            "sandbox.instance.destroyed",
-        ]
-    );
-    assert_eq!(
-        events[0].event.payload["sandbox_id"],
-        sandbox_id.to_string()
-    );
-    assert_eq!(events[1].event.payload["cwd_changed"], true);
-    assert_eq!(events[1].event.payload["env_set_keys"][0], "PATH");
-    assert!(
-        events[1].event.payload["env_unset_keys"]
-            .as_array()
-            .expect("env unset keys")
-            .is_empty()
-    );
-    assert_eq!(
-        events[5].event.payload["workspace_root"],
-        manifest.workspace_root
-    );
-    let mount_events = event_store
-        .replay(ReplayQuery::by_kind_prefix("sandbox.mount"))
-        .expect("replay sandbox mount events");
-    assert_eq!(mount_events.len(), 5);
-    assert_eq!(mount_events[0].event.kind.as_str(), "sandbox.mount.added");
-    assert_eq!(
-        mount_events[0].event.payload["sandbox_id"],
-        sandbox_id.to_string()
-    );
-    assert_eq!(
-        mount_events[0].event.payload["source_sifs_path"],
-        "/services/sandbox/shared"
-    );
-    assert_eq!(mount_events[0].event.payload["mount_path"], "/work/shared");
-    assert_eq!(mount_events[0].event.payload["mode"], "read-write");
-    assert_eq!(mount_events[1].event.kind.as_str(), "sandbox.mount.denied");
-    assert_eq!(mount_events[1].event.payload["phase"], "sandbox-update");
-    assert_eq!(mount_events[2].event.kind.as_str(), "sandbox.mount.denied");
-    assert_eq!(mount_events[2].event.payload["phase"], "sandbox-write");
-    assert_eq!(mount_events[3].event.kind.as_str(), "sandbox.mount.denied");
-    assert_eq!(mount_events[3].event.payload["phase"], "sandbox-checkpoint");
-    assert_eq!(mount_events[4].event.kind.as_str(), "sandbox.mount.denied");
-    assert_eq!(mount_events[4].event.payload["phase"], "sandbox-reboot");
-    let policy_events = event_store
-        .replay(ReplayQuery::by_kind_prefix("sandbox.policy"))
-        .expect("replay sandbox policy events");
-    for phase in [
-        "sandbox-update",
-        "sandbox-write",
-        "sandbox-checkpoint",
-        "sandbox-reboot",
-    ] {
-        assert!(
-            policy_events
-                .iter()
-                .any(|event| event.event.payload["phase"] == phase),
-            "missing policy denial phase {phase}",
-        );
-    }
-    let toolchain_events = event_store
-        .replay(ReplayQuery::by_kind_prefix("sandbox.toolchain"))
-        .expect("replay sandbox toolchain events");
-    assert_eq!(toolchain_events.len(), 2);
-    assert_eq!(
-        toolchain_events[0].event.kind.as_str(),
-        "sandbox.toolchain.updated"
-    );
-    assert_eq!(
-        toolchain_events[0].event.payload["toolchain_id"],
-        import_response.manifest.toolchain_id.to_string()
-    );
-    assert_eq!(
-        toolchain_events[0].event.payload["module_hash"],
-        import_response.module_hash
-    );
-    assert_eq!(
-        toolchain_events[1].event.kind.as_str(),
-        "sandbox.toolchain.pinned"
-    );
-    assert_eq!(
-        toolchain_events[1].event.payload["sandbox_id"],
-        sandbox_id.to_string()
-    );
-    assert_eq!(
-        toolchain_events[1].event.payload["toolchain_id"],
-        import_response.manifest.toolchain_id.to_string()
-    );
-}
-
 #[test]
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_toolchain_add_command_persists_sifs_command() {
@@ -9959,640 +9429,6 @@ fn daemon_sandbox_toolchain_import_package_persists_sifs_package() {
             .any(|event| event.event.payload["phase"] == "sandbox-toolchain-import-package")
     );
 }
-
-#[test]
-#[cfg(feature = "sandbox")]
-fn daemon_sandbox_run_toolchain_executes_sifs_pinned_command() {
-    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-run");
-    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-    cluster_init_with_paths(
-        ClusterInitOptions {
-            cluster_id: Some(ClusterId::from_legacy_named("cluster_sandbox_run").expect("cluster")),
-            node_id: Some(NodeId::from_legacy_named("node_sandbox_run").expect("node")),
-            name: "sandbox run cluster".to_string(),
-        },
-        &paths,
-    )
-    .expect("cluster init");
-    let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
-    let mut policy_config = sinomo_runtime::sandbox::SandboxClusterPolicyConfig::default();
-    policy_config.policy.allow_unsigned_toolchains = true;
-    let txn = sinomo_runtime::sandbox::sandbox_policy_config_cluster_kv_txn(&policy_config)
-        .expect("policy txn");
-    handle_daemon_cluster_kv_txn_request(&daemon_paths, txn).expect("write policy");
-
-    let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
-    let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
-    let mut dfs =
-        super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("open dfs service");
-    let mut toolchain_store = sinomo_runtime::sandbox::SifsSandboxToolchainStore::new(dfs);
-    let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
-        toolchain_id.clone(),
-        "test-1",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
-        "unit test",
-        OffsetDateTime::now_utc(),
-    )
-    .expect("toolchain");
-    toolchain_store
-        .put_command_module(
-            &mut toolchain,
-            "hello",
-            br#"
-            (module
-              (import "wasi_snapshot_preview1" "fd_write"
-                (func $fd_write (param i32 i32 i32 i32) (result i32)))
-              (memory (export "memory") 1)
-              (data (i32.const 0) "\08\00\00\00\06\00\00\00hello\0a")
-              (func (export "_start")
-                i32.const 1
-                i32.const 0
-                i32.const 1
-                i32.const 20
-                call $fd_write
-                drop))
-            "#,
-            sinomo_runtime::sandbox::SandboxResourceLimits::default(),
-        )
-        .expect("put command");
-    dfs = toolchain_store.into_inner();
-    let mut instance_store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
-    instance_store
-        .create(sandbox_id.clone(), toolchain_id, OffsetDateTime::now_utc())
-        .expect("create sandbox");
-    drop(instance_store);
-
-    let outcome = super::daemon_handle_daemon_sandbox_run_toolchain(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxRunToolchainRequest {
-            sandbox_id: sandbox_id.clone(),
-            command_name: "hello".to_string(),
-            argv: vec!["hello".to_string()],
-            stdin: None,
-            timeout_ms: 5_000,
-        },
-    )
-    .expect("run command");
-
-    assert_eq!(outcome.response.exit_status, 0);
-    assert_eq!(outcome.stdout, b"hello\n");
-    let dfs = super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("reopen dfs");
-    let mut instance_store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
-    let manifest = instance_store.load(&sandbox_id).expect("load sandbox");
-    assert!(manifest.last_placement.is_some());
-    let event_store =
-        sinomo_runtime::events::JsonlEventStore::new(root.join("events").join("event-log.jsonl"));
-    let events = event_store
-        .replay(ReplayQuery::by_kind_prefix("sandbox.command"))
-        .expect("replay sandbox command events");
-    assert_eq!(events.len(), 3);
-    assert_eq!(events[0].event.kind.as_str(), "sandbox.command.started");
-    assert_eq!(
-        events[0].event.payload["sandbox_id"],
-        sandbox_id.to_string()
-    );
-    assert_eq!(
-        events[0].event.payload["command_id"],
-        outcome.response.command_id.to_string()
-    );
-    assert_eq!(events[0].event.payload["argv"][0], "hello");
-    assert_eq!(events[1].event.kind.as_str(), "sandbox.command.output");
-    assert_eq!(
-        events[1].event.payload["sandbox_id"],
-        sandbox_id.to_string()
-    );
-    assert_eq!(
-        events[1].event.payload["command_id"],
-        outcome.response.command_id.to_string()
-    );
-    assert_eq!(events[1].event.payload["stream"], "stdout");
-    assert_eq!(events[1].event.payload["offset"], 0);
-    assert_eq!(events[1].event.payload["byte_len"], 6);
-    assert_eq!(events[1].event.payload["bytes"][0], b'h');
-    assert_eq!(events[2].event.kind.as_str(), "sandbox.command.completed");
-    assert_eq!(
-        events[2].event.payload["sandbox_id"],
-        sandbox_id.to_string()
-    );
-    assert_eq!(
-        events[2].event.payload["command_id"],
-        outcome.response.command_id.to_string()
-    );
-    assert_eq!(
-        events[2].event.payload["stdout_ref"],
-        outcome.response.stdout_ref
-    );
-}
-
-#[test]
-#[cfg(feature = "sandbox")]
-fn daemon_sandbox_run_process_plan_executes_sifs_pinned_commands() {
-    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-process-plan");
-    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-    cluster_init_with_paths(
-        ClusterInitOptions {
-            cluster_id: Some(
-                ClusterId::from_legacy_named("cluster_sandbox_process_plan").expect("cluster"),
-            ),
-            node_id: Some(NodeId::from_legacy_named("node_sandbox_process_plan").expect("node")),
-            name: "sandbox process plan cluster".to_string(),
-        },
-        &paths,
-    )
-    .expect("cluster init");
-    let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
-    let mut policy_config = sinomo_runtime::sandbox::SandboxClusterPolicyConfig::default();
-    policy_config.policy.allow_unsigned_toolchains = true;
-    let txn = sinomo_runtime::sandbox::sandbox_policy_config_cluster_kv_txn(&policy_config)
-        .expect("policy txn");
-    handle_daemon_cluster_kv_txn_request(&daemon_paths, txn).expect("write policy");
-
-    let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
-    let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
-    let mut dfs =
-        super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("open dfs service");
-    let mut toolchain_store = sinomo_runtime::sandbox::SifsSandboxToolchainStore::new(dfs);
-    let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
-        toolchain_id.clone(),
-        "test-1",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
-        "unit test process plan",
-        OffsetDateTime::now_utc(),
-    )
-    .expect("toolchain");
-    toolchain_store
-        .put_command_module(
-            &mut toolchain,
-            "echo",
-            br#"
-            (module
-              (import "wasi_snapshot_preview1" "fd_write"
-                (func $fd_write (param i32 i32 i32 i32) (result i32)))
-              (memory (export "memory") 1)
-              (data (i32.const 0) "\08\00\00\00\06\00\00\00hello\0a")
-              (func (export "_start")
-                i32.const 1
-                i32.const 0
-                i32.const 1
-                i32.const 20
-                call $fd_write
-                drop))
-            "#,
-            sinomo_runtime::sandbox::SandboxResourceLimits::default(),
-        )
-        .expect("put echo command");
-    toolchain_store
-        .put_command_module(
-            &mut toolchain,
-            "cat",
-            wasi_stdin_to_stdout_module().as_bytes(),
-            sinomo_runtime::sandbox::SandboxResourceLimits::default(),
-        )
-        .expect("put cat command");
-    dfs = toolchain_store.into_inner();
-    let mut instance_store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
-    instance_store
-        .create(sandbox_id.clone(), toolchain_id, OffsetDateTime::now_utc())
-        .expect("create sandbox");
-    drop(instance_store);
-
-    let outcome = daemon_handle_daemon_sandbox_run_process_plan(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxRunProcessPlanRequest {
-            sandbox_id: sandbox_id.clone(),
-            plan: sinomo_runtime::sandbox::SandboxProcessPlan {
-                steps: vec![
-                    sinomo_runtime::sandbox::SandboxProcessPlanStep {
-                        command_name: "echo".to_string(),
-                        argv: vec!["echo".to_string()],
-                        stdin: None,
-                        cwd: None,
-                        env: Default::default(),
-                        pipe_stdout_to_next: true,
-                    },
-                    sinomo_runtime::sandbox::SandboxProcessPlanStep {
-                        command_name: "cat".to_string(),
-                        argv: vec!["cat".to_string()],
-                        stdin: None,
-                        cwd: None,
-                        env: Default::default(),
-                        pipe_stdout_to_next: false,
-                    },
-                ],
-            },
-            timeout_ms: 5_000,
-        },
-    )
-    .expect("run process plan");
-
-    assert_eq!(outcome.exit_status, 0);
-    assert_eq!(outcome.stdout, b"hello\n");
-    assert_eq!(outcome.step_outcomes.len(), 2);
-    let dfs = super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("reopen dfs");
-    let mut instance_store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
-    let manifest = instance_store.load(&sandbox_id).expect("load sandbox");
-    assert_eq!(manifest.command_history.len(), 2);
-    let event_store =
-        sinomo_runtime::events::JsonlEventStore::new(root.join("events").join("event-log.jsonl"));
-    let events = event_store
-        .replay(ReplayQuery::by_kind_prefix("sandbox.command"))
-        .expect("replay sandbox command events");
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.event.kind.as_str() == "sandbox.command.started")
-            .count(),
-        2
-    );
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.event.kind.as_str() == "sandbox.command.completed")
-            .count(),
-        2
-    );
-    assert!(events.iter().any(|event| {
-        event.event.kind.as_str() == "sandbox.command.output"
-            && event.event.payload["stream"] == "stdout"
-            && event.event.payload["byte_len"] == 6
-    }));
-}
-
-#[test]
-#[cfg(feature = "sandbox")]
-fn daemon_sandbox_run_process_plan_records_events_for_resource_exhausted_step() {
-    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-process-plan-exhausted");
-    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-    cluster_init_with_paths(
-        ClusterInitOptions {
-            cluster_id: Some(
-                ClusterId::from_legacy_named("cluster_sandbox_process_plan_exhausted")
-                    .expect("cluster"),
-            ),
-            node_id: Some(
-                NodeId::from_legacy_named("node_sandbox_process_plan_exhausted").expect("node"),
-            ),
-            name: "sandbox process plan exhausted cluster".to_string(),
-        },
-        &paths,
-    )
-    .expect("cluster init");
-    let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
-    let mut policy_config = sinomo_runtime::sandbox::SandboxClusterPolicyConfig::default();
-    policy_config.policy.allow_unsigned_toolchains = true;
-    let txn = sinomo_runtime::sandbox::sandbox_policy_config_cluster_kv_txn(&policy_config)
-        .expect("policy txn");
-    handle_daemon_cluster_kv_txn_request(&daemon_paths, txn).expect("write policy");
-
-    let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
-    let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
-    let mut dfs =
-        super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("open dfs service");
-    let mut toolchain_store = sinomo_runtime::sandbox::SifsSandboxToolchainStore::new(dfs);
-    let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
-        toolchain_id.clone(),
-        "test-1",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
-        "unit test process plan resource exhaustion",
-        OffsetDateTime::now_utc(),
-    )
-    .expect("toolchain");
-    toolchain_store
-        .put_command_module(
-            &mut toolchain,
-            "echo",
-            br#"
-            (module
-              (import "wasi_snapshot_preview1" "fd_write"
-                (func $fd_write (param i32 i32 i32 i32) (result i32)))
-              (memory (export "memory") 1)
-              (data (i32.const 0) "\08\00\00\00\06\00\00\00hello\0a")
-              (func (export "_start")
-                i32.const 1
-                i32.const 0
-                i32.const 1
-                i32.const 20
-                call $fd_write
-                drop))
-            "#,
-            sinomo_runtime::sandbox::SandboxResourceLimits::default(),
-        )
-        .expect("put echo command");
-    let mut cat_limits = sinomo_runtime::sandbox::SandboxResourceLimits::default();
-    cat_limits.max_input_bytes = 4;
-    toolchain_store
-        .put_command_module(
-            &mut toolchain,
-            "cat",
-            wasi_stdin_to_stdout_module().as_bytes(),
-            cat_limits,
-        )
-        .expect("put cat command");
-    dfs = toolchain_store.into_inner();
-    let mut instance_store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
-    instance_store
-        .create(sandbox_id.clone(), toolchain_id, OffsetDateTime::now_utc())
-        .expect("create sandbox");
-    drop(instance_store);
-
-    let error = daemon_handle_daemon_sandbox_run_process_plan(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxRunProcessPlanRequest {
-            sandbox_id: sandbox_id.clone(),
-            plan: sinomo_runtime::sandbox::SandboxProcessPlan {
-                steps: vec![
-                    sinomo_runtime::sandbox::SandboxProcessPlanStep {
-                        command_name: "echo".to_string(),
-                        argv: vec!["echo".to_string()],
-                        stdin: None,
-                        cwd: None,
-                        env: Default::default(),
-                        pipe_stdout_to_next: true,
-                    },
-                    sinomo_runtime::sandbox::SandboxProcessPlanStep {
-                        command_name: "cat".to_string(),
-                        argv: vec!["cat".to_string()],
-                        stdin: None,
-                        cwd: None,
-                        env: Default::default(),
-                        pipe_stdout_to_next: false,
-                    },
-                ],
-            },
-            timeout_ms: 5_000,
-        },
-    )
-    .expect_err("run process plan should fail on receiver input limit");
-    assert!(error.to_string().contains("input limit"));
-
-    let dfs = super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("reopen dfs");
-    let mut instance_store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
-    let manifest = instance_store.load(&sandbox_id).expect("load sandbox");
-    assert_eq!(manifest.command_history.len(), 2);
-    let mut fs =
-        sinomo_runtime::sandbox::SifsSandboxFileSystem::new(instance_store.into_inner(), &manifest);
-    let receiver_record =
-        sinomo_runtime::sandbox::load_command_record(&mut fs, &manifest.command_history[1])
-            .expect("receiver record");
-    assert_eq!(
-        receiver_record.status,
-        sinomo_runtime::sandbox::SandboxCommandRecordStatus::ResourceExhausted
-    );
-
-    let event_store =
-        sinomo_runtime::events::JsonlEventStore::new(root.join("events").join("event-log.jsonl"));
-    let command_events = event_store
-        .replay(ReplayQuery::by_kind_prefix("sandbox.command"))
-        .expect("replay sandbox command events");
-    assert_eq!(
-        command_events
-            .iter()
-            .filter(|event| event.event.kind.as_str() == "sandbox.command.started")
-            .count(),
-        2
-    );
-    assert!(command_events.iter().any(|event| {
-        event.event.kind.as_str() == "sandbox.command.started"
-            && event.event.payload["command_id"] == manifest.command_history[1].to_string()
-            && !event.event.payload["last_placement"].is_null()
-    }));
-    assert!(command_events.iter().any(|event| {
-        event.event.kind.as_str() == "sandbox.command.output"
-            && event.event.payload["command_id"] == manifest.command_history[0].to_string()
-            && event.event.payload["stream"] == "stdout"
-    }));
-    let resource_events = event_store
-        .replay(ReplayQuery::by_kind_prefix("sandbox.resource"))
-        .expect("replay sandbox resource events");
-    assert!(resource_events.iter().any(|event| {
-        event.event.kind.as_str() == "sandbox.resource.exhausted"
-            && event.event.payload["command_id"] == manifest.command_history[1].to_string()
-            && event.event.payload["status"] == "resource-exhausted"
-            && event.event.payload["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("input limit")
-    }));
-}
-
-#[test]
-#[cfg(feature = "sandbox")]
-fn daemon_sandbox_run_toolchain_audits_policy_denial() {
-    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-run-denied");
-    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-    cluster_init_with_paths(
-        ClusterInitOptions {
-            cluster_id: Some(
-                ClusterId::from_legacy_named("cluster_sandbox_run_denied").expect("cluster"),
-            ),
-            node_id: Some(NodeId::from_legacy_named("node_sandbox_run_denied").expect("node")),
-            name: "sandbox run denied cluster".to_string(),
-        },
-        &paths,
-    )
-    .expect("cluster init");
-    let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
-
-    let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
-    let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
-    let dfs =
-        super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("open dfs service");
-    let mut toolchain_store = sinomo_runtime::sandbox::SifsSandboxToolchainStore::new(dfs);
-    let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
-        toolchain_id.clone(),
-        "test-1",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
-        "unit test",
-        OffsetDateTime::now_utc(),
-    )
-    .expect("toolchain");
-    toolchain_store
-        .put_command_module(
-            &mut toolchain,
-            "hello",
-            br#"
-            (module
-              (memory (export "memory") 1)
-              (func (export "_start")))
-            "#,
-            sinomo_runtime::sandbox::SandboxResourceLimits::default(),
-        )
-        .expect("put command");
-    let dfs = toolchain_store.into_inner();
-    let mut instance_store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
-    instance_store
-        .create(sandbox_id.clone(), toolchain_id, OffsetDateTime::now_utc())
-        .expect("create sandbox");
-    drop(instance_store);
-
-    let error = super::daemon_handle_daemon_sandbox_run_toolchain(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxRunToolchainRequest {
-            sandbox_id: sandbox_id.clone(),
-            command_name: "hello".to_string(),
-            argv: vec!["hello".to_string()],
-            stdin: None,
-            timeout_ms: 5_000,
-        },
-    )
-    .expect_err("unsigned toolchain should be denied by default policy");
-    assert!(format!("{error:?}").contains("toolchain-unsigned-denied"));
-
-    let event_store =
-        sinomo_runtime::events::JsonlEventStore::new(root.join("events").join("event-log.jsonl"));
-    let events = event_store
-        .replay(ReplayQuery::by_kind_prefix("sandbox.policy"))
-        .expect("replay sandbox policy events");
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].event.kind.as_str(), "sandbox.policy.denied");
-    assert_eq!(
-        events[0].event.payload["sandbox_id"],
-        sandbox_id.to_string()
-    );
-    assert_eq!(events[0].event.payload["phase"], "sandbox-run");
-    assert_eq!(events[0].event.payload["code"], "toolchain-unsigned-denied");
-}
-
-#[test]
-#[cfg(feature = "sandbox")]
-fn daemon_sandbox_run_toolchain_audits_mount_policy_denial() {
-    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-run-mount-denied");
-    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-    let execution_node = NodeId::from_legacy_named("node_sandbox_run_mount_exec").expect("node");
-    let owner_node = NodeId::from_legacy_named("node_sandbox_run_mount_owner").expect("owner");
-    cluster_init_with_paths(
-        ClusterInitOptions {
-            cluster_id: Some(
-                ClusterId::from_legacy_named("cluster_sandbox_run_mount").expect("cluster"),
-            ),
-            node_id: Some(execution_node.clone()),
-            name: "sandbox run mount cluster".to_string(),
-        },
-        &paths,
-    )
-    .expect("cluster init");
-    let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
-
-    let mut permissive_policy = sinomo_runtime::sandbox::SandboxClusterPolicyConfig::default();
-    permissive_policy.policy.allow_unsigned_toolchains = true;
-    permissive_policy.policy.allow_remote_local_owned_mounts = true;
-    permissive_policy
-        .policy
-        .allowed_mount_prefixes
-        .push("/sinomo/nodes".to_string());
-    let txn = sinomo_runtime::sandbox::sandbox_policy_config_cluster_kv_txn(&permissive_policy)
-        .expect("permissive policy txn");
-    handle_daemon_cluster_kv_txn_request(&daemon_paths, txn).expect("write permissive policy");
-
-    let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
-    let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
-    let dfs =
-        super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("open dfs service");
-    let mut toolchain_store = sinomo_runtime::sandbox::SifsSandboxToolchainStore::new(dfs);
-    let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
-        toolchain_id.clone(),
-        "test-1",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
-        "unit test",
-        OffsetDateTime::now_utc(),
-    )
-    .expect("toolchain");
-    toolchain_store
-        .put_command_module(
-            &mut toolchain,
-            "hello",
-            br#"
-            (module
-              (memory (export "memory") 1)
-              (func (export "_start")))
-            "#,
-            sinomo_runtime::sandbox::SandboxResourceLimits::default(),
-        )
-        .expect("put command");
-    let dfs = toolchain_store.into_inner();
-    let mut instance_store = sinomo_runtime::sandbox::SifsSandboxInstanceStore::new(dfs);
-    let mut manifest = instance_store
-        .create(
-            sandbox_id.clone(),
-            toolchain_id.clone(),
-            OffsetDateTime::now_utc(),
-        )
-        .expect("create sandbox");
-    manifest.mounts.push(sinomo_runtime::sandbox::SandboxMount {
-        source_sifs_path: format!("/sinomo/nodes/{owner_node}/files"),
-        mount_path: sinomo_runtime::sandbox::SandboxPath::new("/host").expect("mount path"),
-        mode: sinomo_runtime::sandbox::SandboxMountMode::ReadOnly,
-    });
-    instance_store
-        .save_manifest(&manifest)
-        .expect("save mounted sandbox");
-    drop(instance_store);
-
-    let mut restrictive_policy = permissive_policy;
-    restrictive_policy.policy.allow_remote_local_owned_mounts = false;
-    let txn = sinomo_runtime::sandbox::sandbox_policy_config_cluster_kv_txn(&restrictive_policy)
-        .expect("restrictive policy txn");
-    handle_daemon_cluster_kv_txn_request(&daemon_paths, txn).expect("write restrictive policy");
-
-    let error = super::daemon_handle_daemon_sandbox_run_toolchain(
-        &daemon_paths,
-        sinomo_runtime::sandbox::SandboxRunToolchainRequest {
-            sandbox_id: sandbox_id.clone(),
-            command_name: "hello".to_string(),
-            argv: vec!["hello".to_string()],
-            stdin: None,
-            timeout_ms: 5_000,
-        },
-    )
-    .expect_err("remote local-owned mount should be denied");
-    assert!(format!("{error:?}").contains("mount-local-owned-remote-denied"));
-
-    let event_store =
-        sinomo_runtime::events::JsonlEventStore::new(root.join("events").join("event-log.jsonl"));
-    let policy_events = event_store
-        .replay(ReplayQuery::by_kind_prefix("sandbox.policy"))
-        .expect("replay sandbox policy events");
-    assert_eq!(policy_events.len(), 1);
-    assert_eq!(policy_events[0].event.payload["phase"], "sandbox-run");
-    assert_eq!(
-        policy_events[0].event.payload["code"],
-        "mount-local-owned-remote-denied"
-    );
-    assert_eq!(
-        policy_events[0].event.payload["sandbox_id"],
-        sandbox_id.to_string()
-    );
-    assert_eq!(
-        policy_events[0].event.payload["workspace_root"],
-        sinomo_runtime::sandbox::sandbox_instance_root(&sandbox_id)
-    );
-    let mount_events = event_store
-        .replay(ReplayQuery::by_kind_prefix("sandbox.mount"))
-        .expect("replay sandbox mount events");
-    assert_eq!(mount_events.len(), 1);
-    assert_eq!(mount_events[0].event.kind.as_str(), "sandbox.mount.denied");
-    assert_eq!(mount_events[0].event.payload["phase"], "sandbox-run");
-    assert_eq!(
-        mount_events[0].event.payload["code"],
-        "mount-local-owned-remote-denied"
-    );
-    assert_eq!(
-        mount_events[0].event.payload["sandbox_id"],
-        sandbox_id.to_string()
-    );
-    assert_eq!(
-        mount_events[0].event.payload["workspace_root"],
-        sinomo_runtime::sandbox::sandbox_instance_root(&sandbox_id)
-    );
-    assert!(
-        !root
-            .join("sandbox/tmp/daemon-staging")
-            .join(sandbox_id.as_str())
-            .exists(),
-        "denied run should not create a daemon staging workspace"
-    );
-}
-
 #[test]
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_write_to_read_only_mount_emits_denial_events() {
@@ -12980,7 +11816,7 @@ fn debug_sobj_command_prints_typed_text() {
 #[cfg(unix)]
 #[test]
 fn captured_cli_command_collects_raw_stdio_for_embedded_callers() {
-    let captured = super::run_cli_closure_with_capture(|| {
+    let captured = super::run_cli_closure_with_process_stdio_capture(|| {
         std::io::stdout()
             .write_all(b"raw stdout from dependency\n")
             .expect("write raw stdout");
@@ -13155,6 +11991,76 @@ fn main_agent_handler_routes_plain_input_through_agent_loop() {
         events[3].event.kind.as_str(),
         "interaction.main_agent.queued"
     );
+}
+
+#[test]
+fn main_agent_handler_registers_live_runtime_for_control_host() {
+    let session = InteractionSession::new(
+        SessionId::from_legacy_named("sess_main_agent_control_host_test").expect("session"),
+        NodeId::from_legacy_named("node_main_agent_control_host_test").expect("node"),
+        InteractionSurface::new("surface.test", InteractionSurfaceKind::CommandLine),
+    );
+    let mut runtime = InteractionRuntime::new(
+        InMemoryEventStore::new(),
+        RuntimeMainAgentInteractionHandler::with_thinking(
+            MainAgentFixtureModel,
+            "fixture-provider",
+            "fixture-model",
+            super::ThinkingControl::default(),
+        ),
+        session.clone(),
+    );
+    let control_registry = runtime.handler().runtime_control_registry();
+
+    let outputs = runtime
+        .ingest_user_input("what is the cluster doing?")
+        .expect("input");
+    assert!(outputs.is_empty());
+
+    let steer = control_registry
+        .steer(AgentSessionSteerRequest {
+            session_id: session.session_id.clone(),
+            message: "keep the current constraint".to_string(),
+        })
+        .expect("steer via control host");
+    assert!(steer.accepted);
+    let resumed = control_registry
+        .resume(AgentSessionResumeRequest {
+            session_id: session.session_id.clone(),
+        })
+        .expect("resume via control host");
+    assert!(resumed.runtime_attached);
+    let live_session = resumed.session.expect("live session");
+    assert_eq!(live_session.steering_queue.len(), 1);
+    assert_eq!(
+        live_session.steering_queue[0].message,
+        "keep the current constraint"
+    );
+
+    runtime.handler_mut().join_active_tui_turn().expect("join");
+}
+
+#[test]
+fn app_agent_chat_exposes_first_class_runtime_control_methods() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-app-chat-control");
+    let data_dir = SinomoDataDir::new(&root);
+    let chat = super::app_api::AgentChat::new(data_dir, false).expect("chat");
+
+    let initial = chat.control_state().expect("initial control state");
+    assert!(initial.accepted);
+    assert!(!initial.active_turn);
+    assert_eq!(initial.steering_count, 0);
+    assert_eq!(initial.follow_up_count, 0);
+
+    let steering = chat.steer("preserve this instruction").expect("steer");
+    assert!(steering.accepted);
+    assert_eq!(steering.session_id, chat.session_id());
+    let follow_up = chat.follow_up("also mention tests").expect("follow up");
+    assert!(follow_up.accepted);
+
+    let state = chat.control_state().expect("control state");
+    assert_eq!(state.steering_count, 1);
+    assert_eq!(state.follow_up_count, 1);
 }
 
 #[test]
@@ -13784,7 +12690,6 @@ fn main_agent_config_tool_registry_exposes_host_config_catalog() {
         "lm.runtime",
         "lm.credentials.openai",
         "lm.credentials.codex",
-        "evolution.config",
     ] {
         assert!(keys.iter().any(|key| key == &expected), "{expected}");
     }

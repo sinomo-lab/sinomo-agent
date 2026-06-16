@@ -29,6 +29,7 @@ use sui::{
 use sinomo_runtime::config::ConfigClient;
 
 use crate::backend::Backend;
+use crate::backend::cluster::{AppClusterInvite, AppClusterStatus};
 use crate::backend::config::{
     CONFIGURABLE_PROVIDERS, ConfigEditKind, ConfigItem, ProviderForm, REASONING_EFFORT_OPTIONS,
     cycle_provider_reasoning_effort, provider_forms, reasoning_effort_index, resolve_items,
@@ -103,6 +104,11 @@ pub struct SettingsState {
     pub role: String,
     pub clustered: bool,
     pub cluster_summary: Option<String>,
+    pub join_invite: String,
+    pub invite_result: Option<AppClusterInvite>,
+    pub cluster_action_error: Option<String>,
+    pub cluster_action_status: Option<String>,
+    pub leave_confirming: bool,
     pub version: String,
     /// The open section. `None` means "at the menu level" (only meaningful when
     /// the layout is narrow; when wide we always show a section).
@@ -165,18 +171,24 @@ impl SettingsState {
         };
         let provider_forms = provider_forms(config.as_ref());
 
-        let cluster_summary = match &backend.connection {
-            crate::backend::Connection::Daemon(status)
-            | crate::backend::Connection::InProcessDaemon(status) => {
-                status.cluster.as_ref().map(|cluster| {
-                    format!(
-                        "cluster {} · {:?}",
-                        short(&format!("{:?}", cluster.cluster_id), 14),
-                        cluster.member_state
-                    )
-                })
+        let cluster_status = backend.app_cluster_status();
+        let (clustered, cluster_summary) = if cluster_status.clustered {
+            (true, cluster_status.summary.clone())
+        } else {
+            match &backend.connection {
+                crate::backend::Connection::Daemon(status)
+                | crate::backend::Connection::InProcessDaemon(status) => {
+                    let summary = status.cluster.as_ref().map(|cluster| {
+                        format!(
+                            "cluster {} · {:?}",
+                            short(&format!("{:?}", cluster.cluster_id), 14),
+                            cluster.member_state
+                        )
+                    });
+                    (summary.is_some(), summary)
+                }
+                crate::backend::Connection::LocalFallback => (false, None),
             }
-            crate::backend::Connection::LocalFallback => None,
         };
 
         Self {
@@ -188,8 +200,13 @@ impl SettingsState {
             status_detail: backend.status_detail(),
             node_id: backend.node.node_id.to_string(),
             role: format!("{:?}", backend.node.role).to_lowercase(),
-            clustered: backend.connection.is_clustered(),
+            clustered,
             cluster_summary,
+            join_invite: String::new(),
+            invite_result: None,
+            cluster_action_error: cluster_status.error,
+            cluster_action_status: None,
+            leave_confirming: false,
             version: env!("CARGO_PKG_VERSION").to_string(),
             selected: None,
             field_errors: std::collections::HashMap::new(),
@@ -224,6 +241,44 @@ impl SettingsState {
     fn reload(&mut self) {
         self.config_items = resolve_items(self.config.as_ref());
         self.provider_forms = provider_forms(self.config.as_ref());
+    }
+
+    fn set_join_invite(&mut self, value: String) {
+        self.join_invite = value;
+        self.cluster_action_error = None;
+        self.cluster_action_status = None;
+    }
+
+    fn apply_cluster_status(&mut self, status: AppClusterStatus) {
+        self.clustered = status.clustered;
+        self.cluster_summary = status.summary;
+        self.cluster_action_error = status.error;
+        self.leave_confirming = false;
+        if self.clustered {
+            self.join_invite.clear();
+        } else {
+            self.invite_result = None;
+        }
+    }
+
+    fn set_cluster_action_status(&mut self, message: impl Into<String>) {
+        self.cluster_action_status = Some(message.into());
+        self.cluster_action_error = None;
+    }
+
+    fn set_cluster_action_error(&mut self, error: impl Into<String>) {
+        self.cluster_action_error = Some(error.into());
+        self.cluster_action_status = None;
+    }
+
+    fn confirm_leave_cluster(&mut self) {
+        self.leave_confirming = true;
+        self.cluster_action_error = None;
+        self.cluster_action_status = None;
+    }
+
+    fn cancel_leave_cluster(&mut self) {
+        self.leave_confirming = false;
     }
 
     /// Write an edited (non-boolean) config value at `index`. On a parse error the prior value is
@@ -472,6 +527,21 @@ fn value_row(
         .theme_when(clone_reader(reader))
 }
 
+/// A stacked text field used to present generated values that users may copy.
+fn copyable_text_row(
+    reader: &ThemeReader,
+    name: &str,
+    label: &str,
+    value: impl Into<String>,
+) -> FormRow {
+    let input = TextInput::new(name)
+        .value(value)
+        .theme_when(clone_reader(reader));
+    FormRow::new(label, input)
+        .stacked()
+        .theme_when(clone_reader(reader))
+}
+
 /// A toggle row: `label` + a `Switch` seeded `on`, calling `on_toggle` when flipped.
 fn switch_row<F>(reader: &ThemeReader, label: &str, on: bool, on_toggle: F) -> FormRow
 where
@@ -529,6 +599,52 @@ where
     FormRow::new(label, select)
         .inline()
         .theme_when(clone_reader(reader))
+}
+
+fn ready_backend(shared: &Shared) -> Option<Backend> {
+    shared
+        .borrow()
+        .ready
+        .as_ref()
+        .map(|ready| ready.backend.clone())
+}
+
+fn apply_cluster_success(
+    shared: &Shared,
+    backend: &Backend,
+    status: AppClusterStatus,
+    message: impl Into<String>,
+) {
+    let snapshot = backend.cluster_snapshot();
+    let mut app = shared.borrow_mut();
+    if let Some(ready) = app.ready.as_mut() {
+        ready.settings.apply_cluster_status(status);
+        ready.settings.set_cluster_action_status(message);
+        ready.cluster.snapshot = snapshot;
+    }
+}
+
+fn apply_cluster_invite_success(
+    shared: &Shared,
+    backend: &Backend,
+    invite: AppClusterInvite,
+) {
+    let status = backend.app_cluster_status();
+    let snapshot = backend.cluster_snapshot();
+    let mut app = shared.borrow_mut();
+    if let Some(ready) = app.ready.as_mut() {
+        ready.settings.apply_cluster_status(status);
+        ready.settings.invite_result = Some(invite);
+        ready.settings.set_cluster_action_status("Invitation generated");
+        ready.cluster.snapshot = snapshot;
+    }
+}
+
+fn apply_cluster_error(shared: &Shared, error: impl Into<String>) {
+    let mut app = shared.borrow_mut();
+    if let Some(ready) = app.ready.as_mut() {
+        ready.settings.set_cluster_action_error(error);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -596,25 +712,199 @@ fn section_node(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 }
 
 fn section_cluster(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let body = {
-        let s = shared.settings();
-        if s.clustered {
-            let summary = s
+    let (
+        clustered,
+        cluster_summary,
+        invite_result,
+        action_error,
+        action_status,
+        leave_confirming,
+    ) = {
+        let settings = shared.settings();
+        (
+            settings.clustered,
+            settings
                 .cluster_summary
                 .clone()
-                .unwrap_or_else(|| "connected".to_string());
-            drop(s);
-            FieldGroup::new()
-                .spacing(6.0)
-                .with_child(value_row(shared, reader, "Cluster", summary))
-        } else {
-            drop(s);
-            FieldGroup::new()
-                .spacing(6.0)
-                .with_child(value_row(shared, reader, "State", "running locally"))
-                .with_child(value_row(shared, reader, "Nodes", "this device only"))
-        }
+                .unwrap_or_else(|| "connected".to_string()),
+            settings.invite_result.clone(),
+            settings.cluster_action_error.clone(),
+            settings.cluster_action_status.clone(),
+            settings.leave_confirming,
+        )
     };
+
+    let mut body = FieldGroup::new().spacing(8.0);
+    if clustered {
+        body = body.with_child(value_row(shared, reader, "Cluster", cluster_summary));
+
+        let generate = {
+            let s = shared.clone();
+            sui::Button::new("Generate invitation")
+                .icon(sui::IconGlyph::Link)
+                .theme_when(clone_reader(reader))
+                .on_press(move || {
+                    let Some(backend) = ready_backend(&s) else {
+                        apply_cluster_error(&s, "backend is not ready");
+                        return;
+                    };
+                    match backend.create_cluster_invite() {
+                        Ok(invite) => apply_cluster_invite_success(&s, &backend, invite),
+                        Err(error) => apply_cluster_error(&s, error),
+                    }
+                })
+        };
+        body = body.with_child(
+            FormRow::new("Invite", generate)
+                .inline()
+                .theme_when(clone_reader(reader)),
+        );
+
+        if let Some(invite) = invite_result {
+            body = body
+                .with_child(copyable_text_row(
+                    reader,
+                    "cluster-invite-link",
+                    "Join link",
+                    invite.uri,
+                ))
+                .with_child(copyable_text_row(
+                    reader,
+                    "cluster-invite-command",
+                    "Join command",
+                    invite.join_command,
+                ))
+                .with_child(value_row(shared, reader, "Expires", invite.expires_at))
+                .with_child(value_row(
+                    shared,
+                    reader,
+                    "Saved key",
+                    invite.persisted_key,
+                ));
+        }
+
+        if leave_confirming {
+            let confirm = {
+                let s = shared.clone();
+                sui::Button::new("Confirm leave")
+                    .icon(sui::IconGlyph::Trash)
+                    .theme_when(clone_reader(reader))
+                    .on_press(move || {
+                        let Some(backend) = ready_backend(&s) else {
+                            apply_cluster_error(&s, "backend is not ready");
+                            return;
+                        };
+                        match backend.leave_cluster() {
+                            Ok(status) => {
+                                apply_cluster_success(&s, &backend, status, "Left cluster");
+                            }
+                            Err(error) => apply_cluster_error(&s, error),
+                        }
+                    })
+            };
+            let cancel = {
+                let s = shared.clone();
+                sui::Button::new("Cancel")
+                    .icon(sui::IconGlyph::Close)
+                    .theme_when(clone_reader(reader))
+                    .on_press(move || {
+                        s.settings_mut().cancel_leave_cluster();
+                    })
+            };
+            let controls = Stack::vertical()
+                .spacing(8.0)
+                .alignment(Alignment::Stretch)
+                .with_child(muted_label(
+                    shared,
+                    "This removes local cluster state from this node.",
+                ))
+                .with_child(
+                    Stack::horizontal()
+                        .spacing(8.0)
+                        .alignment(Alignment::Start)
+                        .with_child(confirm)
+                        .with_child(cancel),
+                );
+            body = body.with_child(
+                FormRow::new("Leave cluster", controls)
+                    .stacked()
+                    .theme_when(clone_reader(reader)),
+            );
+        } else {
+            let leave = {
+                let s = shared.clone();
+                sui::Button::new("Leave cluster")
+                    .icon(sui::IconGlyph::Trash)
+                    .theme_when(clone_reader(reader))
+                    .on_press(move || {
+                        s.settings_mut().confirm_leave_cluster();
+                    })
+            };
+            body = body.with_child(
+                FormRow::new("Leave", leave)
+                    .inline()
+                    .theme_when(clone_reader(reader)),
+            );
+        }
+    } else {
+        body = body
+            .with_child(value_row(shared, reader, "State", "running locally"))
+            .with_child(value_row(shared, reader, "Nodes", "this device only"));
+
+        let join_on_change = {
+            let s = shared.clone();
+            move |value: String| {
+                s.settings_mut().set_join_invite(value);
+            }
+        };
+        let join_value = shared.settings().join_invite.clone();
+        body = body.with_child(text_row(
+            reader,
+            "cluster-join-link",
+            "Join link",
+            join_value,
+            "sinomo cluster join ...",
+            join_on_change,
+        ));
+
+        let join = {
+            let s = shared.clone();
+            sui::Button::new("Join cluster")
+                .icon(sui::IconGlyph::Check)
+                .theme_when(clone_reader(reader))
+                .enabled_when({
+                    let s = s.clone();
+                    move || !s.settings().join_invite.trim().is_empty()
+                })
+                .on_press(move || {
+                    let invite = s.settings().join_invite.clone();
+                    if invite.trim().is_empty() {
+                        apply_cluster_error(&s, "enter an invitation link before joining");
+                        return;
+                    }
+                    let Some(backend) = ready_backend(&s) else {
+                        apply_cluster_error(&s, "backend is not ready");
+                        return;
+                    };
+                    match backend.join_cluster(&invite) {
+                        Ok(status) => apply_cluster_success(&s, &backend, status, "Joined cluster"),
+                        Err(error) => apply_cluster_error(&s, error),
+                    }
+                })
+        };
+        body = body.with_child(
+            FormRow::new("Join", join)
+                .inline()
+                .theme_when(clone_reader(reader)),
+        );
+    }
+
+    if let Some(error) = action_error {
+        body = body.with_child(value_row(shared, reader, "Error", error));
+    } else if let Some(status) = action_status {
+        body = body.with_child(value_row(shared, reader, "Status", status));
+    }
+
     FormSection::new("Cluster", body).theme_when(clone_reader(reader))
 }
 
@@ -1543,6 +1833,57 @@ mod tests {
         assert!(
             api_key_seed.is_empty(),
             "the API-key field seeds blank, never surfacing a stored key"
+        );
+    }
+
+    #[test]
+    fn cluster_join_status_hides_join_input() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+        state.set_join_invite("sinomo://cluster/join/test".to_string());
+        state.leave_confirming = true;
+
+        state.apply_cluster_status(AppClusterStatus {
+            clustered: true,
+            cluster_id: Some("cluster_test".to_string()),
+            local_node_id: Some("node_test".to_string()),
+            summary: Some("cluster cluster_test · authorized".to_string()),
+            error: None,
+        });
+
+        assert!(state.clustered);
+        assert_eq!(
+            state.cluster_summary.as_deref(),
+            Some("cluster cluster_test · authorized")
+        );
+        assert!(
+            state.join_invite.is_empty(),
+            "joining hides and clears the join-link input"
+        );
+        assert!(
+            !state.leave_confirming,
+            "status changes reset the leave confirmation"
+        );
+    }
+
+    #[test]
+    fn cluster_leave_status_reveals_join_input_and_clears_invite() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+        state.clustered = true;
+        state.invite_result = Some(AppClusterInvite {
+            uri: "sinomo://cluster/join/test".to_string(),
+            join_command: "sinomo cluster join sinomo://cluster/join/test".to_string(),
+            expires_at: "2026-06-14T00:00:00Z".to_string(),
+            persisted_key: "cluster/invitations/test".to_string(),
+        });
+
+        state.apply_cluster_status(AppClusterStatus::default());
+
+        assert!(!state.clustered);
+        assert!(
+            state.invite_result.is_none(),
+            "leaving clears generated invite details and returns to join mode"
         );
     }
 

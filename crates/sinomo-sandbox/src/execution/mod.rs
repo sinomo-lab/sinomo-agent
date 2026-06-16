@@ -5,12 +5,14 @@
 //! local sandbox store.
 
 mod audit;
+mod cancellation;
 mod container;
 mod errors;
 mod output;
 mod process;
 
 pub use audit::*;
+pub use cancellation::*;
 pub use container::*;
 pub use errors::*;
 pub use output::*;

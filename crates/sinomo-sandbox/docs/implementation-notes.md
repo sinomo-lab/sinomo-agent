@@ -1,12 +1,12 @@
 # Sandbox Implementation Notes
 
-This document is the detailed implementation record for `sinomo-sandbox`. The project plan stays roadmap-level in `docs/plans/sifs-wasm-sandbox-plan.md`; current implementation status, remaining gaps, and detailed design notes belong here.
+This document is the detailed implementation record for `sinomo-sandbox`. Current implementation status, remaining gaps, and detailed design notes belong here.
 
 ## Reading Guide
 
 - Start with the current implementation snapshot for the active runtime, filesystem, toolchain, and shell status.
 - Use the remaining gaps section as the working backlog for POSIX, SIFS, operations, and verification work.
-- Use the detailed design notes as the implementation record behind the roadmap. They intentionally keep lower-level details out of the plan document and the crate README.
+- Use the detailed design notes as the implementation record. They intentionally keep lower-level details out of the crate README.
 - Use the appendices for settled decisions, open questions, near-term recommendations, and references.
 
 ## Current Implementation Snapshot

@@ -1,4 +1,5 @@
 use super::*;
+use serde::Serialize;
 use sinomo_runtime::test::{
     SinomoTestCaseMetadata, SinomoTestContext, SinomoTestRegistry, SinomoTestReport,
     SinomoTestStatus,
@@ -20,7 +21,8 @@ pub(crate) struct TestListOptions {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct TestRunOptions {
-    pub id: String,
+    pub id: Option<String>,
+    pub tag: Option<String>,
     pub provider: Option<String>,
     pub account: String,
     pub model: Option<String>,
@@ -38,6 +40,18 @@ pub(crate) struct TestSmokeOptions {
     pub live: bool,
     pub require_cluster: bool,
     pub json: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SinomoTestSuiteReport {
+    selector: String,
+    status: SinomoTestStatus,
+    total: usize,
+    passed: usize,
+    failed: usize,
+    skipped: usize,
+    duration_ms: u64,
+    reports: Vec<SinomoTestReport>,
 }
 
 pub(crate) fn parse_test_command(args: &[String]) -> Result<TestCliCommand, CliError> {
@@ -84,6 +98,7 @@ fn parse_test_list_options(args: &[String]) -> Result<TestListOptions, CliError>
 
 fn parse_test_run_options(args: &[String]) -> Result<TestRunOptions, CliError> {
     let mut id = None;
+    let mut tag = None;
     let mut provider = None;
     let mut account = DEFAULT_PROVIDER_ACCOUNT.to_string();
     let mut model = None;
@@ -119,6 +134,12 @@ fn parse_test_run_options(args: &[String]) -> Result<TestRunOptions, CliError> {
             "--live" => live = true,
             "--require-cluster" => require_cluster = true,
             "--json" => json = true,
+            "--tag" => {
+                index += 1;
+                tag = Some(args.get(index).cloned().ok_or_else(|| CliError::Parse {
+                    detail: "--tag requires a value".to_string(),
+                })?);
+            }
             "--param" => {
                 index += 1;
                 let raw = args.get(index).ok_or_else(|| CliError::Parse {
@@ -143,10 +164,19 @@ fn parse_test_run_options(args: &[String]) -> Result<TestRunOptions, CliError> {
         }
         index += 1;
     }
+    if id.is_some() && tag.is_some() {
+        return Err(CliError::Parse {
+            detail: "test run accepts either <test-id> or --tag <tag>, not both".to_string(),
+        });
+    }
+    if id.is_none() && tag.is_none() {
+        return Err(CliError::Parse {
+            detail: "test run requires <test-id> or --tag <tag>".to_string(),
+        });
+    }
     Ok(TestRunOptions {
-        id: id.ok_or_else(|| CliError::Parse {
-            detail: "test run requires <test-id>".to_string(),
-        })?,
+        id,
+        tag,
         provider,
         account,
         model,
@@ -230,10 +260,15 @@ pub(crate) fn run_test_command(command: TestCliCommand) -> Result<(), CliError> 
     }
 }
 
-fn test_registry() -> Result<SinomoTestRegistry, CliError> {
+pub(crate) fn test_registry() -> Result<SinomoTestRegistry, CliError> {
     let builder = sinomo_lm::register_lm_test_cases(SinomoTestRegistry::builder());
     let builder = crate::commands::test_cases_network::register_network_cluster_test_cases(builder);
+    let builder = crate::commands::test_cases_agent::register_agent_cluster_test_cases(builder);
     let builder = crate::commands::test_cases_dfs::register_dfs_cluster_test_cases(builder);
+    let builder = cli_runtime_config()
+        .test_registry_hooks
+        .iter()
+        .fold(builder, |builder, hook| hook(builder));
     builder.try_build().map_err(|source| CliError::Parse {
         detail: source.to_string(),
     })
@@ -276,13 +311,80 @@ fn test_run(options: TestRunOptions) -> Result<(), CliError> {
         options.require_cluster,
         &options.params,
     )?;
+    if let Some(tag) = options.tag.as_deref() {
+        let report = test_run_tag(&registry, &mut context, tag)?;
+        print_test_suite_report(&report, options.json)?;
+        return test_suite_report_result(&report);
+    }
+    let id = options.id.as_deref().ok_or_else(|| CliError::Parse {
+        detail: "test run requires <test-id> or --tag <tag>".to_string(),
+    })?;
     let report = registry
-        .run(&options.id, &mut context)
+        .run(id, &mut context)
         .map_err(|source| CliError::Parse {
             detail: source.to_string(),
         })?;
     print_test_report(&report, options.json)?;
     test_report_result(&report)
+}
+
+fn test_run_tag(
+    registry: &SinomoTestRegistry,
+    context: &mut SinomoTestContext,
+    tag: &str,
+) -> Result<SinomoTestSuiteReport, CliError> {
+    let started = std::time::Instant::now();
+    let mut ids = registry
+        .metadata()
+        .into_iter()
+        .filter(|case| case.tags.iter().any(|candidate| candidate == tag))
+        .map(|case| case.id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    if ids.is_empty() {
+        return Err(CliError::Parse {
+            detail: format!("no tests matched tag `{tag}`"),
+        });
+    }
+    let mut reports = Vec::new();
+    for id in ids {
+        reports.push(
+            registry
+                .run(&id, context)
+                .map_err(|source| CliError::Parse {
+                    detail: source.to_string(),
+                })?,
+        );
+    }
+    let passed = reports
+        .iter()
+        .filter(|report| report.status == SinomoTestStatus::Passed)
+        .count();
+    let failed = reports
+        .iter()
+        .filter(|report| report.status == SinomoTestStatus::Failed)
+        .count();
+    let skipped = reports
+        .iter()
+        .filter(|report| report.status == SinomoTestStatus::Skipped)
+        .count();
+    let status = if failed > 0 {
+        SinomoTestStatus::Failed
+    } else if skipped > 0 {
+        SinomoTestStatus::Skipped
+    } else {
+        SinomoTestStatus::Passed
+    };
+    Ok(SinomoTestSuiteReport {
+        selector: format!("tag:{tag}"),
+        status,
+        total: reports.len(),
+        passed,
+        failed,
+        skipped,
+        duration_ms: started.elapsed().as_millis() as u64,
+        reports,
+    })
 }
 
 fn test_smoke(options: TestSmokeOptions) -> Result<(), CliError> {
@@ -300,7 +402,8 @@ fn test_smoke(options: TestSmokeOptions) -> Result<(), CliError> {
         }
     };
     test_run(TestRunOptions {
-        id: test_id.to_string(),
+        id: Some(test_id.to_string()),
+        tag: None,
         provider: Some(provider),
         account: options.account,
         model: options.model,
@@ -348,12 +451,21 @@ fn test_context(
 
 fn test_report_result(report: &SinomoTestReport) -> Result<(), CliError> {
     match report.status {
-        SinomoTestStatus::Passed => Ok(()),
-        SinomoTestStatus::Skipped => Err(CliError::Parse {
-            detail: format!("test skipped: {}", report.summary),
-        }),
+        SinomoTestStatus::Passed | SinomoTestStatus::Skipped => Ok(()),
         SinomoTestStatus::Failed => Err(CliError::Parse {
             detail: format!("test failed: {}", report.summary),
+        }),
+    }
+}
+
+fn test_suite_report_result(report: &SinomoTestSuiteReport) -> Result<(), CliError> {
+    match report.status {
+        SinomoTestStatus::Passed | SinomoTestStatus::Skipped => Ok(()),
+        SinomoTestStatus::Failed => Err(CliError::Parse {
+            detail: format!(
+                "test suite failed: {} selected, {} failed, {} skipped",
+                report.total, report.failed, report.skipped
+            ),
         }),
     }
 }
@@ -399,12 +511,85 @@ fn print_test_report(report: &SinomoTestReport, json: bool) -> Result<(), CliErr
     Ok(())
 }
 
+fn print_test_suite_report(report: &SinomoTestSuiteReport, json: bool) -> Result<(), CliError> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(report).map_err(|source| CliError::Parse {
+                detail: source.to_string(),
+            })?
+        );
+        return Ok(());
+    }
+    println!(
+        "{} {} ({} ms): {} selected, {} passed, {} failed, {} skipped",
+        match report.status {
+            SinomoTestStatus::Passed => "PASS",
+            SinomoTestStatus::Failed => "FAIL",
+            SinomoTestStatus::Skipped => "SKIP",
+        },
+        report.selector,
+        report.duration_ms,
+        report.total,
+        report.passed,
+        report.failed,
+        report.skipped
+    );
+    for case_report in &report.reports {
+        println!(
+            "  {} {} ({} ms): {}",
+            match case_report.status {
+                SinomoTestStatus::Passed => "PASS",
+                SinomoTestStatus::Failed => "FAIL",
+                SinomoTestStatus::Skipped => "SKIP",
+            },
+            case_report.case.id,
+            case_report.duration_ms,
+            case_report.summary
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn test_report(status: SinomoTestStatus) -> SinomoTestReport {
+        SinomoTestReport {
+            case: SinomoTestCaseMetadata {
+                id: "test.example".to_string(),
+                summary: "example test".to_string(),
+                tags: Vec::new(),
+                requirements: Vec::new(),
+            },
+            status,
+            summary: "example result".to_string(),
+            duration_ms: 0,
+            diagnostics: serde_json::Value::Object(Default::default()),
+            errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn skipped_test_outcomes_do_not_fail_cli_result() {
+        assert!(test_report_result(&test_report(SinomoTestStatus::Skipped)).is_ok());
+
+        let suite = SinomoTestSuiteReport {
+            selector: "tag:example".to_string(),
+            status: SinomoTestStatus::Skipped,
+            total: 1,
+            passed: 0,
+            failed: 0,
+            skipped: 1,
+            duration_ms: 0,
+            reports: vec![test_report(SinomoTestStatus::Skipped)],
+        };
+        assert!(test_suite_report_result(&suite).is_ok());
     }
 
     #[test]
@@ -418,7 +603,8 @@ mod tests {
             "payload=hello=world",
         ]))
         .expect("options");
-        assert_eq!(options.id, "cluster.dfs.write");
+        assert_eq!(options.id.as_deref(), Some("cluster.dfs.write"));
+        assert_eq!(options.tag, None);
         assert!(options.require_cluster);
         assert_eq!(
             options.params,
@@ -430,10 +616,28 @@ mod tests {
     }
 
     #[test]
+    fn run_options_accept_tag_selector() {
+        let options = parse_test_run_options(&args(&[
+            "--tag",
+            "agent-readiness",
+            "--require-cluster",
+            "--json",
+        ]))
+        .expect("options");
+        assert_eq!(options.id, None);
+        assert_eq!(options.tag.as_deref(), Some("agent-readiness"));
+        assert!(options.require_cluster);
+        assert!(options.json);
+    }
+
+    #[test]
     fn run_options_reject_malformed_params() {
         assert!(parse_test_run_options(&args(&["x", "--param"])).is_err());
         assert!(parse_test_run_options(&args(&["x", "--param", "no-equals"])).is_err());
         assert!(parse_test_run_options(&args(&["x", "--param", "=value"])).is_err());
+        assert!(parse_test_run_options(&args(&["--tag"])).is_err());
+        assert!(parse_test_run_options(&args(&["x", "--tag", "agent-readiness"])).is_err());
+        assert!(parse_test_run_options(&args(&[])).is_err());
     }
 
     #[test]
@@ -458,5 +662,45 @@ mod tests {
         ] {
             assert!(ids.iter().any(|candidate| candidate == id), "missing {id}");
         }
+    }
+
+    #[test]
+    fn registry_includes_agent_cluster_cases() {
+        let registry = test_registry().expect("registry");
+        let ids: Vec<String> = registry
+            .metadata()
+            .into_iter()
+            .map(|case| case.id)
+            .collect();
+        assert!(
+            ids.iter()
+                .any(|candidate| candidate == "cluster.agent.runtime-routes"),
+            "missing cluster.agent.runtime-routes"
+        );
+        assert!(
+            ids.iter()
+                .any(|candidate| candidate == "cluster.agent.runtime-persisted-session-routes"),
+            "missing cluster.agent.runtime-persisted-session-routes"
+        );
+        assert!(
+            ids.iter()
+                .any(|candidate| candidate == "cluster.agent.sandbox-cancel-route"),
+            "missing cluster.agent.sandbox-cancel-route"
+        );
+        assert!(
+            ids.iter()
+                .any(|candidate| candidate == "cluster.agent.module-native-dylib-cancel-route"),
+            "missing cluster.agent.module-native-dylib-cancel-route"
+        );
+        assert!(
+            ids.iter()
+                .any(|candidate| candidate == "cluster.agent.module-native-dylib-active-cancel"),
+            "missing cluster.agent.module-native-dylib-active-cancel"
+        );
+        assert!(
+            ids.iter()
+                .any(|candidate| candidate == "cluster.agent.sandbox-active-cancel"),
+            "missing cluster.agent.sandbox-active-cancel"
+        );
     }
 }

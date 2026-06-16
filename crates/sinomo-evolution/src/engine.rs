@@ -23,11 +23,12 @@ use crate::{
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use sinomo_agent::{
-    Agent, AgentConfig, AgentContextAttachment, AgentContextBudget, AgentLoopInput,
-    AgentModelEvent, AgentOp, AgentPolicyBundle, AgentRole, AgentSession, AgentSessionRuntime,
-    AgentStoragePaths, AgentToolRegistry, BoundedContext, FileAgentTraceStore, InteractionModel,
-    InteractionSession, InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig,
-    default_coding_agent_tools, user_interaction_input_event,
+    Agent, AgentConfig, AgentContextAttachment, AgentContextBudget, AgentItem, AgentLoopInput,
+    AgentModelEvent, AgentOp, AgentRole, AgentSession, AgentSessionRuntime, AgentStoragePaths,
+    AgentToolPairIntegrity, AgentToolRegistry, AgentToolSurface, BoundedContext,
+    FileAgentTraceStore, InteractionModel, InteractionSession, InteractionSurface,
+    InteractionSurfaceKind, LocalWorkspaceAgentConfig, default_coding_agent_tools,
+    user_interaction_input_event,
 };
 use sinomo_lm::{
     AnthropicConfig, AnthropicProvider, CLAUDE_CODE_DEFAULT_MODEL, CODEX_CLI_DEFAULT_MODEL,
@@ -65,6 +66,10 @@ use time::OffsetDateTime;
 pub const CANDIDATE_REGRESSION_EVIDENCE_RELATIVE_PATH: &str = "regression-evidence.json";
 pub const CANDIDATE_EVOLUTION_LESSON_RELATIVE_PATH: &str = "evolution-lesson.json";
 pub const CANDIDATE_EVIDENCE_SUMMARY_RELATIVE_PATH: &str = "candidate-evidence-summary.md";
+pub const AGENT_EVENTS_RELATIVE_PATH: &str = "agent-events.jsonl";
+pub const CODING_RUN_STATE_RELATIVE_PATH: &str = "coding-run-state.json";
+pub const PATCH_SNAPSHOTS_RELATIVE_PATH: &str = "patch-snapshots.json";
+pub const VALIDATION_RECORDS_RELATIVE_PATH: &str = "validation-records.json";
 const SINOMO_BENCHMARK_MODULE_ROOT_ENV: &str = "SINOMO_BENCHMARK_MODULE_ROOT";
 const DEFAULT_BENCHMARK_MODULE_ROOT: &str = "modules/benchmark/sinomo-benchmarks";
 
@@ -3985,6 +3990,14 @@ pub struct ModelMutationResult {
     pub agent_resource_usage: Option<CandidateResourceUsageSummary>,
     #[serde(skip)]
     pub agent_run: Option<serde_json::Value>,
+    #[serde(skip)]
+    pub agent_events: Vec<serde_json::Value>,
+    #[serde(skip)]
+    pub coding_run_state: Option<serde_json::Value>,
+    #[serde(skip)]
+    pub patch_snapshots: Vec<serde_json::Value>,
+    #[serde(skip)]
+    pub validation_records: Vec<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -3996,6 +4009,10 @@ pub struct AgentMutationSummary {
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_metrics: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_pair_integrity: Option<AgentToolPairIntegrity>,
     pub final_text: String,
 }
 
@@ -4250,6 +4267,10 @@ impl<P: LanguageModelProvider> MutationModel for LanguageModelMutationBridge<P> 
             agent_summary: None,
             agent_resource_usage: None,
             agent_run: None,
+            agent_events: Vec::new(),
+            coding_run_state: None,
+            patch_snapshots: Vec::new(),
+            validation_records: Vec::new(),
         })
     }
 }
@@ -4488,7 +4509,7 @@ where
             self.model.clone(),
         )
         .with_config(config)
-        .with_policy(AgentPolicyBundle::default_for_role(AgentRole::Evolution))
+        .with_tool_surface(AgentToolSurface::default_for_role(AgentRole::Evolution))
         .with_tool_registry(AgentToolRegistry::local_workspace_with_config(
             workspace_config,
         ))
@@ -4555,6 +4576,12 @@ where
             tool_results: run.tool_results.len(),
             input_tokens,
             output_tokens,
+            model_metrics: Some(serde_json::to_value(&run.model_metrics).map_err(|source| {
+                MutationModelError::Serialization {
+                    detail: source.to_string(),
+                }
+            })?),
+            tool_pair_integrity: Some(run.tool_pair_integrity()),
             final_text: final_text.clone(),
         };
         let agent_resource_usage = agent_resource_usage_summary(
@@ -4568,6 +4595,46 @@ where
             serde_json::to_value(&run).map_err(|source| MutationModelError::Serialization {
                 detail: source.to_string(),
             })?;
+        let agent_events = run
+            .events
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| MutationModelError::Serialization {
+                detail: source.to_string(),
+            })?;
+        let coding_run_state = run
+            .coding_state
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|source| MutationModelError::Serialization {
+                detail: source.to_string(),
+            })?;
+        let patch_snapshots = run
+            .items
+            .iter()
+            .filter(|item| matches!(item, AgentItem::PatchSnapshot { .. }))
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| MutationModelError::Serialization {
+                detail: source.to_string(),
+            })?;
+        let validation_records = run
+            .coding_state
+            .as_ref()
+            .map(|state| {
+                state
+                    .validation_attempts
+                    .iter()
+                    .map(serde_json::to_value)
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()
+            .map_err(|source| MutationModelError::Serialization {
+                detail: source.to_string(),
+            })?
+            .unwrap_or_default();
         Ok(ModelMutationResult {
             provider: self.provider.clone(),
             model: self.model.clone(),
@@ -4580,6 +4647,10 @@ where
             agent_summary: Some(agent_summary),
             agent_resource_usage: Some(agent_resource_usage),
             agent_run: Some(agent_run),
+            agent_events,
+            coding_run_state,
+            patch_snapshots,
+            validation_records,
         })
     }
 }
@@ -4644,6 +4715,8 @@ fn evolution_agent_context_attachment(
             "verification": &packet.verification,
             "candidate_bundle": bundle,
         }),
+        payload_original_bytes: None,
+        payload_model_visible_truncated: false,
     }
 }
 
@@ -4982,6 +5055,20 @@ pub struct EvolutionOrchestrator<W, R, B> {
     pub bundles: B,
 }
 
+#[derive(Clone, Debug)]
+pub struct EvolutionLifecycleUpdate {
+    pub job: EvolutionJob,
+    pub candidate_workspace: CandidateWorkspace,
+    pub bundle: CandidateBundleManifest,
+    pub verification_outcome: Option<EvaluationOutcome>,
+    pub changed_files: Vec<String>,
+    pub summary: String,
+}
+
+pub trait EvolutionLifecycleObserver {
+    fn on_update(&self, update: &EvolutionLifecycleUpdate) -> Result<(), String>;
+}
+
 impl<W, R, B> EvolutionOrchestrator<W, R, B> {
     pub fn new(workspace: W, evaluator: ExecutingEvalHarness<R>, bundles: B) -> Self {
         Self {
@@ -5003,180 +5090,370 @@ where
         request: EvolutionRequest,
         model: Option<&dyn MutationModel>,
     ) -> Result<EvolutionReport, EvolutionError> {
-        let job = create_bootstrap_job(&request, self.workspace.root());
+        self.propose_with_lifecycle(request, model, None)
+    }
+
+    pub fn propose_with_lifecycle(
+        &self,
+        request: EvolutionRequest,
+        model: Option<&dyn MutationModel>,
+        observer: Option<&dyn EvolutionLifecycleObserver>,
+    ) -> Result<EvolutionReport, EvolutionError> {
+        let mut job = create_bootstrap_job(&request, self.workspace.root());
         let mut bundle = self.bundles.create(&job)?;
         let candidate_workspace = self.workspace.prepare_candidate(&job)?;
+        notify_lifecycle(
+            observer,
+            &job,
+            &candidate_workspace,
+            &bundle,
+            None,
+            &[],
+            "candidate job created",
+        )?;
         let packet = mutation_packet_for_job(&job);
 
         self.bundles.write_json(&bundle, "job.json", &job)?;
         self.bundles
             .write_json(&bundle, "mutation-packet.json", &packet)?;
-
-        let mut mutation_result = None;
-        if request.dry_run {
-            // Dry-run proposals only prepare candidate artifacts and verification evidence.
-        } else if let Some(model) = model {
-            let result = model.mutate(&packet, &candidate_workspace, Some(&bundle))?;
-            self.bundles
-                .write_text(&bundle, "model-output.txt", &result.raw_output)?;
-            self.bundles
-                .write_json(&bundle, "model-result.json", &result)?;
-            if let Some(agent_run) = &result.agent_run {
-                self.bundles
-                    .write_json(&bundle, "agent-run.json", agent_run)?;
-                bundle.agent_run_path = Some(
-                    PathBuf::from(&bundle.bundle_path)
-                        .join("agent-run.json")
-                        .display()
-                        .to_string(),
-                );
-            }
-            if let Some(agent_summary) = &result.agent_summary {
-                self.bundles
-                    .write_json(&bundle, "agent-summary.json", agent_summary)?;
-                bundle.agent_summary_path = Some(
-                    PathBuf::from(&bundle.bundle_path)
-                        .join("agent-summary.json")
-                        .display()
-                        .to_string(),
-                );
-            }
-            if let Some(patch) = &result.parsed_patch {
-                self.bundles.write_text(&bundle, "model.patch", patch)?;
-            }
-            if !result.tool_results.is_empty() {
-                self.bundles.write_json(
-                    &bundle,
-                    "model-tool-results.json",
-                    &result.tool_results,
-                )?;
-            }
-            if !result.model_turns.is_empty() {
-                self.bundles
-                    .write_json(&bundle, "model-turns.json", &result.model_turns)?;
-            }
-            bundle.model_output_path = Some(
-                PathBuf::from(&bundle.bundle_path)
-                    .join("model-output.txt")
-                    .display()
-                    .to_string(),
-            );
-            mutation_result = Some(result);
-        }
-
-        let changed_files = self.workspace.changed_files(&candidate_workspace)?;
-        let diff = self.workspace.diff(&candidate_workspace)?;
-        self.bundles
-            .write_json(&bundle, "changed-files.json", &changed_files)?;
-        self.bundles.write_text(&bundle, "diff.patch", &diff)?;
-        bundle.changed_files_path = Some(
-            PathBuf::from(&bundle.bundle_path)
-                .join("changed-files.json")
-                .display()
-                .to_string(),
-        );
-        bundle.diff_path = Some(
-            PathBuf::from(&bundle.bundle_path)
-                .join("diff.patch")
-                .display()
-                .to_string(),
-        );
-
-        let benchmark_executions = prepare_benchmark_gate_executions(&request, &bundle);
-        let mut verification_plan = job.verification.clone();
-        verification_plan.commands.extend(
-            benchmark_executions
-                .iter()
-                .map(|execution| execution.command.clone()),
-        );
-        let (mut scorecard, command_results) = self
-            .evaluator
-            .run_verification_plan(verification_plan.into(), &candidate_workspace.path)?;
-        for result in &command_results {
-            let log_ref = write_command_log_via_store(&self.bundles, &bundle, result)?;
-            bundle.command_logs.push(log_ref);
-        }
-        let benchmark_reports =
-            finalize_benchmark_gate_reports(benchmark_executions, &command_results, &bundle);
-        apply_benchmark_reports_to_scorecard(&mut scorecard, &benchmark_reports);
-        if !benchmark_reports.is_empty() {
-            self.bundles
-                .write_json(&bundle, "benchmark-results.json", &benchmark_reports)?;
-            bundle.benchmark_results_path = Some(
-                PathBuf::from(&bundle.bundle_path)
-                    .join("benchmark-results.json")
-                    .display()
-                    .to_string(),
-            );
-        }
-        let resource_usage_summary = candidate_resource_usage_summary(
-            &job,
-            mutation_result.as_ref(),
-            &command_results,
-            &benchmark_reports,
-        );
-        self.bundles
-            .write_json(&bundle, "resource-usage.json", &resource_usage_summary)?;
-        bundle.resource_usage_path = Some(
-            PathBuf::from(&bundle.bundle_path)
-                .join("resource-usage.json")
-                .display()
-                .to_string(),
-        );
-        self.bundles
-            .write_json(&bundle, "scorecard.json", &scorecard)?;
-        bundle.scorecard_path = Some(
-            PathBuf::from(&bundle.bundle_path)
-                .join("scorecard.json")
-                .display()
-                .to_string(),
-        );
-        let regression_evidence = candidate_regression_evidence_summary(
-            &job,
-            &bundle,
-            &request,
-            &scorecard,
-            &changed_files,
-            &command_results,
-            &benchmark_reports,
-        );
-        self.bundles.write_json(
-            &bundle,
-            CANDIDATE_REGRESSION_EVIDENCE_RELATIVE_PATH,
-            &regression_evidence,
-        )?;
-        self.bundles.write_text(
-            &bundle,
-            CANDIDATE_EVIDENCE_SUMMARY_RELATIVE_PATH,
-            &render_candidate_evidence_summary(&regression_evidence),
-        )?;
-        if scorecard.outcome != EvaluationOutcome::Passed {
-            let lesson = candidate_evolution_lesson_record(&job, &regression_evidence);
-            self.bundles
-                .write_json(&bundle, CANDIDATE_EVOLUTION_LESSON_RELATIVE_PATH, &lesson)?;
-        }
-
-        finalize_candidate_bundle_integrity(
-            &mut bundle,
+        job.status = EvolutionJobStatus::PacketWritten;
+        notify_lifecycle(
+            observer,
             &job,
             &candidate_workspace,
-            mutation_result.as_ref(),
-            scorecard.outcome.clone(),
-            &changed_files,
+            &bundle,
+            None,
+            &[],
+            "mutation packet written",
         )?;
-        self.bundles.write_json(&bundle, "manifest.json", &bundle)?;
 
-        Ok(EvolutionReport {
-            job: EvolutionJob {
-                status: EvolutionJobStatus::AwaitingApproval,
-                ..job
-            },
-            candidate_workspace,
-            bundle,
-            scorecard: Some(scorecard),
-            changed_files,
-        })
+        let mut mutation_result = None;
+        let run_result = (|| -> Result<EvolutionReport, EvolutionError> {
+            if request.dry_run {
+                // Dry-run proposals only prepare candidate artifacts and verification evidence.
+                job.status = EvolutionJobStatus::MutationFinished;
+                notify_lifecycle(
+                    observer,
+                    &job,
+                    &candidate_workspace,
+                    &bundle,
+                    None,
+                    &[],
+                    "dry-run mutation skipped",
+                )?;
+            } else if let Some(model) = model {
+                job.status = EvolutionJobStatus::MutationStarted;
+                notify_lifecycle(
+                    observer,
+                    &job,
+                    &candidate_workspace,
+                    &bundle,
+                    None,
+                    &[],
+                    "mutation agent started",
+                )?;
+                let result = model.mutate(&packet, &candidate_workspace, Some(&bundle))?;
+                self.bundles
+                    .write_text(&bundle, "model-output.txt", &result.raw_output)?;
+                self.bundles
+                    .write_json(&bundle, "model-result.json", &result)?;
+                if let Some(agent_run) = &result.agent_run {
+                    self.bundles
+                        .write_json(&bundle, "agent-run.json", agent_run)?;
+                    bundle.agent_run_path = Some(
+                        PathBuf::from(&bundle.bundle_path)
+                            .join("agent-run.json")
+                            .display()
+                            .to_string(),
+                    );
+                }
+                if let Some(agent_summary) = &result.agent_summary {
+                    self.bundles
+                        .write_json(&bundle, "agent-summary.json", agent_summary)?;
+                    bundle.agent_summary_path = Some(
+                        PathBuf::from(&bundle.bundle_path)
+                            .join("agent-summary.json")
+                            .display()
+                            .to_string(),
+                    );
+                }
+                if !result.agent_events.is_empty() {
+                    self.bundles.write_text(
+                        &bundle,
+                        AGENT_EVENTS_RELATIVE_PATH,
+                        &render_jsonl(&result.agent_events)?,
+                    )?;
+                    bundle.artifact_refs.push(
+                        PathBuf::from(&bundle.bundle_path)
+                            .join(AGENT_EVENTS_RELATIVE_PATH)
+                            .display()
+                            .to_string(),
+                    );
+                }
+                if let Some(coding_run_state) = &result.coding_run_state {
+                    self.bundles.write_json(
+                        &bundle,
+                        CODING_RUN_STATE_RELATIVE_PATH,
+                        coding_run_state,
+                    )?;
+                    bundle.artifact_refs.push(
+                        PathBuf::from(&bundle.bundle_path)
+                            .join(CODING_RUN_STATE_RELATIVE_PATH)
+                            .display()
+                            .to_string(),
+                    );
+                }
+                if !result.patch_snapshots.is_empty() {
+                    self.bundles.write_json(
+                        &bundle,
+                        PATCH_SNAPSHOTS_RELATIVE_PATH,
+                        &result.patch_snapshots,
+                    )?;
+                    bundle.artifact_refs.push(
+                        PathBuf::from(&bundle.bundle_path)
+                            .join(PATCH_SNAPSHOTS_RELATIVE_PATH)
+                            .display()
+                            .to_string(),
+                    );
+                }
+                if !result.validation_records.is_empty() {
+                    self.bundles.write_json(
+                        &bundle,
+                        VALIDATION_RECORDS_RELATIVE_PATH,
+                        &result.validation_records,
+                    )?;
+                    bundle.artifact_refs.push(
+                        PathBuf::from(&bundle.bundle_path)
+                            .join(VALIDATION_RECORDS_RELATIVE_PATH)
+                            .display()
+                            .to_string(),
+                    );
+                }
+                if let Some(patch) = &result.parsed_patch {
+                    self.bundles.write_text(&bundle, "model.patch", patch)?;
+                }
+                if !result.tool_results.is_empty() {
+                    self.bundles.write_json(
+                        &bundle,
+                        "model-tool-results.json",
+                        &result.tool_results,
+                    )?;
+                }
+                if !result.model_turns.is_empty() {
+                    self.bundles
+                        .write_json(&bundle, "model-turns.json", &result.model_turns)?;
+                }
+                bundle.model_output_path = Some(
+                    PathBuf::from(&bundle.bundle_path)
+                        .join("model-output.txt")
+                        .display()
+                        .to_string(),
+                );
+                mutation_result = Some(result);
+                job.status = EvolutionJobStatus::MutationFinished;
+                notify_lifecycle(
+                    observer,
+                    &job,
+                    &candidate_workspace,
+                    &bundle,
+                    None,
+                    &[],
+                    "mutation agent finished",
+                )?;
+            }
+
+            let changed_files = self.workspace.changed_files(&candidate_workspace)?;
+            let diff = self.workspace.diff(&candidate_workspace)?;
+            self.bundles
+                .write_json(&bundle, "changed-files.json", &changed_files)?;
+            self.bundles.write_text(&bundle, "diff.patch", &diff)?;
+            bundle.changed_files_path = Some(
+                PathBuf::from(&bundle.bundle_path)
+                    .join("changed-files.json")
+                    .display()
+                    .to_string(),
+            );
+            bundle.diff_path = Some(
+                PathBuf::from(&bundle.bundle_path)
+                    .join("diff.patch")
+                    .display()
+                    .to_string(),
+            );
+            job.status = EvolutionJobStatus::Implemented;
+            notify_lifecycle(
+                observer,
+                &job,
+                &candidate_workspace,
+                &bundle,
+                None,
+                &changed_files,
+                "candidate diff captured",
+            )?;
+
+            let benchmark_executions = prepare_benchmark_gate_executions(&request, &bundle);
+            let mut verification_plan = job.verification.clone();
+            verification_plan.commands.extend(
+                benchmark_executions
+                    .iter()
+                    .map(|execution| execution.command.clone()),
+            );
+            job.status = EvolutionJobStatus::Built;
+            notify_lifecycle(
+                observer,
+                &job,
+                &candidate_workspace,
+                &bundle,
+                None,
+                &changed_files,
+                "verification plan prepared",
+            )?;
+            let (mut scorecard, command_results) = self
+                .evaluator
+                .run_verification_plan(verification_plan.into(), &candidate_workspace.path)?;
+            for result in &command_results {
+                let log_ref = write_command_log_via_store(&self.bundles, &bundle, result)?;
+                bundle.command_logs.push(log_ref);
+            }
+            let benchmark_reports =
+                finalize_benchmark_gate_reports(benchmark_executions, &command_results, &bundle);
+            apply_benchmark_reports_to_scorecard(&mut scorecard, &benchmark_reports);
+            if !benchmark_reports.is_empty() {
+                self.bundles
+                    .write_json(&bundle, "benchmark-results.json", &benchmark_reports)?;
+                bundle.benchmark_results_path = Some(
+                    PathBuf::from(&bundle.bundle_path)
+                        .join("benchmark-results.json")
+                        .display()
+                        .to_string(),
+                );
+            }
+            let resource_usage_summary = candidate_resource_usage_summary(
+                &job,
+                mutation_result.as_ref(),
+                &command_results,
+                &benchmark_reports,
+            );
+            self.bundles
+                .write_json(&bundle, "resource-usage.json", &resource_usage_summary)?;
+            bundle.resource_usage_path = Some(
+                PathBuf::from(&bundle.bundle_path)
+                    .join("resource-usage.json")
+                    .display()
+                    .to_string(),
+            );
+            self.bundles
+                .write_json(&bundle, "scorecard.json", &scorecard)?;
+            bundle.scorecard_path = Some(
+                PathBuf::from(&bundle.bundle_path)
+                    .join("scorecard.json")
+                    .display()
+                    .to_string(),
+            );
+            let regression_evidence = candidate_regression_evidence_summary(
+                &job,
+                &bundle,
+                &request,
+                &scorecard,
+                &changed_files,
+                &command_results,
+                &benchmark_reports,
+            );
+            self.bundles.write_json(
+                &bundle,
+                CANDIDATE_REGRESSION_EVIDENCE_RELATIVE_PATH,
+                &regression_evidence,
+            )?;
+            self.bundles.write_text(
+                &bundle,
+                CANDIDATE_EVIDENCE_SUMMARY_RELATIVE_PATH,
+                &render_candidate_evidence_summary(&regression_evidence),
+            )?;
+            if scorecard.outcome != EvaluationOutcome::Passed {
+                let lesson = candidate_evolution_lesson_record(&job, &regression_evidence);
+                self.bundles.write_json(
+                    &bundle,
+                    CANDIDATE_EVOLUTION_LESSON_RELATIVE_PATH,
+                    &lesson,
+                )?;
+            }
+            job.status = EvolutionJobStatus::Evaluated;
+            notify_lifecycle(
+                observer,
+                &job,
+                &candidate_workspace,
+                &bundle,
+                Some(&scorecard.outcome),
+                &changed_files,
+                "evaluation scorecard written",
+            )?;
+
+            finalize_candidate_bundle_integrity(
+                &mut bundle,
+                &job,
+                &candidate_workspace,
+                mutation_result.as_ref(),
+                scorecard.outcome.clone(),
+                &changed_files,
+            )?;
+            self.bundles.write_json(&bundle, "manifest.json", &bundle)?;
+
+            job.status = EvolutionJobStatus::AwaitingApproval;
+            notify_lifecycle(
+                observer,
+                &job,
+                &candidate_workspace,
+                &bundle,
+                Some(&scorecard.outcome),
+                &changed_files,
+                "candidate awaiting approval",
+            )?;
+
+            Ok(EvolutionReport {
+                job: job.clone(),
+                candidate_workspace: candidate_workspace.clone(),
+                bundle: bundle.clone(),
+                scorecard: Some(scorecard),
+                changed_files,
+            })
+        })();
+        if let Err(error) = &run_result {
+            job.status = EvolutionJobStatus::Failed;
+            let _ = notify_lifecycle(
+                observer,
+                &job,
+                &candidate_workspace,
+                &bundle,
+                None,
+                &[],
+                &format!("candidate failed: {error}"),
+            );
+        }
+        run_result
     }
+}
+
+fn notify_lifecycle(
+    observer: Option<&dyn EvolutionLifecycleObserver>,
+    job: &EvolutionJob,
+    candidate_workspace: &CandidateWorkspace,
+    bundle: &CandidateBundleManifest,
+    verification_outcome: Option<&EvaluationOutcome>,
+    changed_files: &[String],
+    summary: &str,
+) -> Result<(), EvolutionError> {
+    if let Some(observer) = observer {
+        observer
+            .on_update(&EvolutionLifecycleUpdate {
+                job: job.clone(),
+                candidate_workspace: candidate_workspace.clone(),
+                bundle: bundle.clone(),
+                verification_outcome: verification_outcome.cloned(),
+                changed_files: changed_files.to_vec(),
+                summary: summary.to_string(),
+            })
+            .map_err(|detail| EvolutionError::LifecycleObserver { detail })?;
+    }
+    Ok(())
 }
 
 fn finalize_candidate_bundle_integrity(
@@ -5380,6 +5657,10 @@ fn candidate_bundle_artifact_refs(bundle: &CandidateBundleManifest) -> Vec<Strin
         CANDIDATE_REGRESSION_EVIDENCE_RELATIVE_PATH,
         CANDIDATE_EVOLUTION_LESSON_RELATIVE_PATH,
         CANDIDATE_EVIDENCE_SUMMARY_RELATIVE_PATH,
+        AGENT_EVENTS_RELATIVE_PATH,
+        CODING_RUN_STATE_RELATIVE_PATH,
+        PATCH_SNAPSHOTS_RELATIVE_PATH,
+        VALIDATION_RECORDS_RELATIVE_PATH,
     ] {
         let path = PathBuf::from(&bundle.bundle_path).join(relative);
         if path.exists() {
@@ -5426,6 +5707,18 @@ fn write_json_file_for_bundle<T: Serialize>(path: &Path, value: &T) -> Result<()
         path: path.display().to_string(),
         detail: source.to_string(),
     })
+}
+
+fn render_jsonl(values: &[serde_json::Value]) -> Result<String, BundleError> {
+    let mut content = String::new();
+    for value in values {
+        content.push_str(
+            &serde_json::to_string(value)
+                .map_err(|source| BundleError::Serialize(source.to_string()))?,
+        );
+        content.push('\n');
+    }
+    Ok(content)
 }
 
 fn candidate_resource_usage_summary(
@@ -5497,6 +5790,10 @@ fn candidate_regression_evidence_summary(
     command_results: &[CommandRunResult],
     benchmark_reports: &[BenchmarkGateReport],
 ) -> CandidateRegressionEvidenceSummary {
+    let benchmark_result_names: BTreeSet<&str> = benchmark_reports
+        .iter()
+        .map(|report| report.name.as_str())
+        .collect();
     let failed_gates = scorecard
         .gates
         .iter()
@@ -5510,6 +5807,7 @@ fn candidate_regression_evidence_summary(
     let failed_commands = command_results
         .iter()
         .filter(|result| !result.passed())
+        .filter(|result| !benchmark_result_names.contains(result.name.as_str()))
         .map(|result| {
             let command_log_path = bundle
                 .command_logs
@@ -6244,7 +6542,9 @@ fn enrich_benchmark_report_from_summary(report: &mut BenchmarkGateReport) {
         match verdict_outcome {
             EvaluationOutcome::Failed => report.outcome = EvaluationOutcome::Failed,
             EvaluationOutcome::Inconclusive => {
-                if report.outcome == EvaluationOutcome::Passed {
+                if report.outcome == EvaluationOutcome::Passed
+                    || summary_host_dependency_blocking_issue_count(&summary) > 0
+                {
                     report.outcome = EvaluationOutcome::Inconclusive;
                 }
             }
@@ -6340,6 +6640,24 @@ fn benchmark_metrics_from_summary(summary: &serde_json::Value) -> Vec<Evaluation
     );
     push_summary_integer_metric(
         &mut metrics,
+        "swebench_harness_blocked_instances",
+        summary,
+        &[
+            &["harness_blocked_instances"],
+            &["sinomo", "harness_blocked_instances"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_missing_report_instances",
+        summary,
+        &[
+            &["missing_report_instances"],
+            &["sinomo", "missing_report_instances"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
         "swebench_unresolved_instances",
         summary,
         &[
@@ -6382,6 +6700,48 @@ fn benchmark_metrics_from_summary(summary: &serde_json::Value) -> Vec<Evaluation
     );
     push_summary_integer_metric(
         &mut metrics,
+        "agent_event_count",
+        summary,
+        &[&["agent_event_count"], &["sinomo", "agent_event_count"]],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "agent_item_count",
+        summary,
+        &[&["agent_item_count"], &["sinomo", "agent_item_count"]],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "agent_tool_call_items",
+        summary,
+        &[
+            &["agent_tool_call_items"],
+            &["sinomo", "agent_tool_call_items"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "agent_tool_result_items",
+        summary,
+        &[
+            &["agent_tool_result_items"],
+            &["sinomo", "agent_tool_result_items"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "agent_orphan_tool_calls",
+        summary,
+        &[&["orphan_tool_calls"], &["sinomo", "orphan_tool_calls"]],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "agent_orphan_tool_results",
+        summary,
+        &[&["orphan_tool_results"], &["sinomo", "orphan_tool_results"]],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
         "agent_input_tokens",
         summary,
         &[&["agent_input_tokens"], &["sinomo", "agent_input_tokens"]],
@@ -6391,6 +6751,283 @@ fn benchmark_metrics_from_summary(summary: &serde_json::Value) -> Vec<Evaluation
         "agent_output_tokens",
         summary,
         &[&["agent_output_tokens"], &["sinomo", "agent_output_tokens"]],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "agent_model_response_count",
+        summary,
+        &[
+            &["agent_model_response_count"],
+            &["sinomo", "agent_model_response_count"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "agent_model_response_parse_failures",
+        summary,
+        &[
+            &["agent_model_response_parse_failures"],
+            &["sinomo", "agent_model_response_parse_failures"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "agent_strict_json_decision_turns",
+        summary,
+        &[
+            &["agent_strict_json_decision_turns"],
+            &["sinomo", "agent_strict_json_decision_turns"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "agent_text_fallback_turns",
+        summary,
+        &[
+            &["agent_text_fallback_turns"],
+            &["sinomo", "agent_text_fallback_turns"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "agent_native_tool_call_turns",
+        summary,
+        &[
+            &["agent_native_tool_call_turns"],
+            &["sinomo", "agent_native_tool_call_turns"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "agent_native_tool_calls",
+        summary,
+        &[
+            &["agent_native_tool_calls"],
+            &["sinomo", "agent_native_tool_calls"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "agent_vendor_fallback_tool_call_turns",
+        summary,
+        &[
+            &["agent_vendor_fallback_tool_call_turns"],
+            &["sinomo", "agent_vendor_fallback_tool_call_turns"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "agent_vendor_fallback_tool_calls",
+        summary,
+        &[
+            &["agent_vendor_fallback_tool_calls"],
+            &["sinomo", "agent_vendor_fallback_tool_calls"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "agent_model_repair_attempts",
+        summary,
+        &[
+            &["agent_model_repair_attempts"],
+            &["sinomo", "agent_model_repair_attempts"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "agent_repair_request_model_visible_bytes",
+        summary,
+        &[
+            &["agent_repair_request_model_visible_bytes"],
+            &["sinomo", "agent_repair_request_model_visible_bytes"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_instances_with_successful_patch",
+        summary,
+        &[
+            &["instances_with_successful_patch"],
+            &["sinomo", "instances_with_successful_patch"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_first_successful_patch_turn_sum",
+        summary,
+        &[
+            &["first_successful_patch_turn_sum"],
+            &["sinomo", "first_successful_patch_turn_sum"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_first_successful_patch_turn_min",
+        summary,
+        &[
+            &["first_successful_patch_turn_min"],
+            &["sinomo", "first_successful_patch_turn_min"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_first_successful_patch_turn_max",
+        summary,
+        &[
+            &["first_successful_patch_turn_max"],
+            &["sinomo", "first_successful_patch_turn_max"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_coding_validation_attempts",
+        summary,
+        &[
+            &["coding_validation_attempts"],
+            &["sinomo", "coding_validation_attempts"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_coding_finish_with_patch_instances",
+        summary,
+        &[
+            &["coding_stop_recommendation_counts", "finish_with_patch"],
+            &[
+                "sinomo",
+                "coding_stop_recommendation_counts",
+                "finish_with_patch",
+            ],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_coding_finish_blocked_instances",
+        summary,
+        &[
+            &["coding_stop_recommendation_counts", "finish_blocked"],
+            &[
+                "sinomo",
+                "coding_stop_recommendation_counts",
+                "finish_blocked",
+            ],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_coding_failed_environment_instances",
+        summary,
+        &[
+            &["coding_validation_status_counts", "failed_environment"],
+            &[
+                "sinomo",
+                "coding_validation_status_counts",
+                "failed_environment",
+            ],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_coding_failed_patch_relevant_instances",
+        summary,
+        &[
+            &["coding_validation_status_counts", "failed_patch_relevant"],
+            &[
+                "sinomo",
+                "coding_validation_status_counts",
+                "failed_patch_relevant",
+            ],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_coding_missing_command_failures",
+        summary,
+        &[
+            &["coding_validation_failure_kind_counts", "missing_command"],
+            &[
+                "sinomo",
+                "coding_validation_failure_kind_counts",
+                "missing_command",
+            ],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_coding_missing_dependency_failures",
+        summary,
+        &[
+            &[
+                "coding_validation_failure_kind_counts",
+                "missing_dependency",
+            ],
+            &[
+                "sinomo",
+                "coding_validation_failure_kind_counts",
+                "missing_dependency",
+            ],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_coding_patch_relevant_failures",
+        summary,
+        &[
+            &["coding_validation_failure_kind_counts", "patch_relevant"],
+            &[
+                "sinomo",
+                "coding_validation_failure_kind_counts",
+                "patch_relevant",
+            ],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_command_observation_turns",
+        summary,
+        &[
+            &["command_observation_turns"],
+            &["sinomo", "command_observation_turns"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_command_tool_results",
+        summary,
+        &[
+            &["command_tool_results"],
+            &["sinomo", "command_tool_results"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_cancelled_tool_results",
+        summary,
+        &[
+            &["cancelled_tool_results"],
+            &["sinomo", "cancelled_tool_results"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_cancelled_runs",
+        summary,
+        &[&["cancelled_runs"], &["sinomo", "cancelled_runs"]],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_extra_turns_after_patch",
+        summary,
+        &[
+            &["extra_turns_after_patch"],
+            &["sinomo", "extra_turns_after_patch"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_host_dependency_blocking_issues",
+        summary,
+        &[&["host_dependencies", "blocking_issue_count"]],
     );
     push_summary_integer_metric(
         &mut metrics,
@@ -6485,6 +7122,46 @@ fn benchmark_summary_verdict(summary: &serde_json::Value) -> Option<BenchmarkSum
         return None;
     }
 
+    let host_dependency_blockers = summary_host_dependency_blocking_issue_count(summary);
+    if host_dependency_blockers > 0 {
+        return Some(BenchmarkSummaryVerdict {
+            outcome: EvaluationOutcome::Inconclusive,
+            summary: format!(
+                "SWE-bench host dependencies blocked {host_dependency_blockers} issue(s)"
+            ),
+        });
+    }
+
+    let (harness_blocked, missing_reports) = summary_harness_incomplete_counts(summary);
+    if harness_blocked > 0 || missing_reports > 0 {
+        return Some(BenchmarkSummaryVerdict {
+            outcome: EvaluationOutcome::Inconclusive,
+            summary: format!(
+                "SWE-bench harness evidence incomplete: {harness_blocked} harness-blocked instance(s), {missing_reports} missing report instance(s)"
+            ),
+        });
+    }
+
+    let (orphan_tool_calls, orphan_tool_results) = summary_orphan_tool_pair_counts(summary);
+    if orphan_tool_calls > 0 || orphan_tool_results > 0 {
+        return Some(BenchmarkSummaryVerdict {
+            outcome: EvaluationOutcome::Failed,
+            summary: format!(
+                "SWE-bench reported {orphan_tool_calls} orphan tool call(s) and {orphan_tool_results} orphan tool result(s)"
+            ),
+        });
+    }
+    if let Some((tool_call_items, tool_result_items)) =
+        summary_tool_pair_item_count_mismatch(summary)
+    {
+        return Some(BenchmarkSummaryVerdict {
+            outcome: EvaluationOutcome::Failed,
+            summary: format!(
+                "SWE-bench reported tool call/result item mismatch: {tool_call_items} call item(s), {tool_result_items} result item(s)"
+            ),
+        });
+    }
+
     let total = summary_integer_at(summary, &["total_instances"])
         .or_else(|| summary_integer_at(summary, &["suite", "total_instances"]));
     let resolved = summary_integer_at(summary, &["resolved_instances"])
@@ -6576,6 +7253,40 @@ fn summary_integer_at(summary: &serde_json::Value, path: &[&str]) -> Option<i64>
         .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
 }
 
+fn summary_host_dependency_blocking_issue_count(summary: &serde_json::Value) -> i64 {
+    summary_integer_at(summary, &["host_dependencies", "blocking_issue_count"]).unwrap_or(0)
+}
+
+fn summary_harness_incomplete_counts(summary: &serde_json::Value) -> (i64, i64) {
+    (
+        summary_integer_at(summary, &["harness_blocked_instances"])
+            .or_else(|| summary_integer_at(summary, &["sinomo", "harness_blocked_instances"]))
+            .unwrap_or(0),
+        summary_integer_at(summary, &["missing_report_instances"])
+            .or_else(|| summary_integer_at(summary, &["sinomo", "missing_report_instances"]))
+            .unwrap_or(0),
+    )
+}
+
+fn summary_orphan_tool_pair_counts(summary: &serde_json::Value) -> (i64, i64) {
+    (
+        summary_integer_at(summary, &["orphan_tool_calls"])
+            .or_else(|| summary_integer_at(summary, &["sinomo", "orphan_tool_calls"]))
+            .unwrap_or(0),
+        summary_integer_at(summary, &["orphan_tool_results"])
+            .or_else(|| summary_integer_at(summary, &["sinomo", "orphan_tool_results"]))
+            .unwrap_or(0),
+    )
+}
+
+fn summary_tool_pair_item_count_mismatch(summary: &serde_json::Value) -> Option<(i64, i64)> {
+    let tool_call_items = summary_integer_at(summary, &["agent_tool_call_items"])
+        .or_else(|| summary_integer_at(summary, &["sinomo", "agent_tool_call_items"]))?;
+    let tool_result_items = summary_integer_at(summary, &["agent_tool_result_items"])
+        .or_else(|| summary_integer_at(summary, &["sinomo", "agent_tool_result_items"]))?;
+    (tool_call_items != tool_result_items).then_some((tool_call_items, tool_result_items))
+}
+
 fn apply_benchmark_reports_to_scorecard(
     scorecard: &mut EvaluationScorecard,
     reports: &[BenchmarkGateReport],
@@ -6583,6 +7294,7 @@ fn apply_benchmark_reports_to_scorecard(
     if reports.is_empty() {
         return;
     }
+    remove_raw_benchmark_gates(scorecard, reports);
     scorecard.metrics.push(EvaluationMetric {
         name: "benchmark_count".to_string(),
         value: MetricValue::Integer(reports.len() as i64),
@@ -6637,6 +7349,41 @@ fn apply_benchmark_reports_to_scorecard(
             scorecard.outcome = EvaluationOutcome::Inconclusive;
         }
     }
+}
+
+fn remove_raw_benchmark_gates(
+    scorecard: &mut EvaluationScorecard,
+    reports: &[BenchmarkGateReport],
+) {
+    let benchmark_gate_prefixes: Vec<String> = reports
+        .iter()
+        .map(|report| format!("`{}` exited", report.command))
+        .collect();
+    scorecard.gates.retain(|gate| {
+        gate.gate != EvaluationGate::PrivateRegressionEvals
+            || !benchmark_gate_prefixes
+                .iter()
+                .any(|prefix| gate.summary.starts_with(prefix))
+    });
+    scorecard.outcome = scorecard_outcome_from_gates(&scorecard.gates);
+}
+
+fn scorecard_outcome_from_gates(
+    gates: &[sinomo_runtime::core::EvaluationGateResult],
+) -> EvaluationOutcome {
+    if gates
+        .iter()
+        .any(|gate| gate.outcome == EvaluationOutcome::Failed)
+    {
+        return EvaluationOutcome::Failed;
+    }
+    if gates
+        .iter()
+        .any(|gate| gate.outcome == EvaluationOutcome::Inconclusive)
+    {
+        return EvaluationOutcome::Inconclusive;
+    }
+    EvaluationOutcome::Passed
 }
 
 fn create_bootstrap_job(request: &EvolutionRequest, source_root: &Path) -> EvolutionJob {
@@ -7374,8 +8121,9 @@ fn write_candidate_summary(
     let rollout_material = rollout_material_path
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "not recorded".to_string());
+    let agent_run_summary = render_candidate_agent_run_summary(record)?;
     let summary = format!(
-        "# Candidate Summary\n\njob: {}\nstatus: awaiting approval\nobjective: {}\nverification: {:?}\nbenchmark: {:?}\noverride_used: {}\nregistry_record: {}\nverified_rollout_material: {}\n\n## Diff\n{}\n\n## Changed Files\n{}\n\n## Approval Preflight\n{}\n\n## Recovery\n{}\n",
+        "# Candidate Summary\n\njob: {}\nstatus: awaiting approval\nobjective: {}\nverification: {:?}\nbenchmark: {:?}\noverride_used: {}\nregistry_record: {}\nverified_rollout_material: {}\n\n## Agent Run\n{}\n\n## Diff\n{}\n\n## Changed Files\n{}\n\n## Approval Preflight\n{}\n\n## Recovery\n{}\n",
         record.job.job_id,
         record.job.objective,
         record.verification_outcome,
@@ -7383,6 +8131,7 @@ fn write_candidate_summary(
         report.override_used,
         registry_record,
         rollout_material,
+        agent_run_summary,
         report.diff_summary,
         changed_files,
         checks,
@@ -7397,6 +8146,60 @@ fn write_candidate_summary(
     Ok(path)
 }
 
+fn render_candidate_agent_run_summary(
+    record: &StoredEvolutionJob,
+) -> Result<String, EvolutionError> {
+    let Some(path) = record.bundle.agent_summary_path.as_deref() else {
+        return Ok("not recorded".to_string());
+    };
+    let path = PathBuf::from(path);
+    let content = fs::read_to_string(&path).map_err(|source| {
+        EvolutionError::Bundle(BundleError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })
+    })?;
+    let summary: AgentMutationSummary = serde_json::from_str(&content).map_err(|source| {
+        EvolutionError::Bundle(BundleError::Deserialize {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })
+    })?;
+    Ok(render_agent_mutation_summary(&summary, &path))
+}
+
+fn render_agent_mutation_summary(summary: &AgentMutationSummary, path: &Path) -> String {
+    let final_decision_source = summary
+        .model_metrics
+        .as_ref()
+        .and_then(|metrics| metrics.get("final_decision_source"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("not recorded");
+    let tool_pair_integrity = summary
+        .tool_pair_integrity
+        .map(|integrity| {
+            format!(
+                "calls={}, results={}, orphan_calls={}, orphan_results={}",
+                integrity.tool_calls,
+                integrity.tool_results,
+                integrity.orphan_tool_calls,
+                integrity.orphan_tool_results
+            )
+        })
+        .unwrap_or_else(|| "not recorded".to_string());
+    format!(
+        "artifact: {}\n- stop_reason: {}\n- model_turns: {}\n- tool_results: {}\n- tokens: input={}, output={}\n- final_decision_source: {}\n- tool_pair_integrity: {}\n",
+        path.display(),
+        summary.stop_reason,
+        summary.model_turns,
+        summary.tool_results,
+        summary.input_tokens,
+        summary.output_tokens,
+        final_decision_source,
+        tool_pair_integrity
+    )
+}
+
 #[derive(Debug, Error)]
 pub enum EvolutionError {
     #[error(transparent)]
@@ -7409,6 +8212,8 @@ pub enum EvolutionError {
     Eval(#[from] sinomo_runtime::eval::EvalError),
     #[error(transparent)]
     MutationModel(#[from] MutationModelError),
+    #[error("lifecycle observer failed: {detail}")]
+    LifecycleObserver { detail: String },
     #[error("approval preflight failed: {detail}")]
     ApprovalPreflight { detail: String },
     #[error(transparent)]
@@ -7431,6 +8236,8 @@ pub enum BundleError {
     Io { path: String, detail: String },
     #[error("failed to serialize bundle artifact: {0}")]
     Serialize(String),
+    #[error("failed to deserialize bundle artifact at {path}: {detail}")]
+    Deserialize { path: String, detail: String },
 }
 
 #[derive(Debug, Error)]

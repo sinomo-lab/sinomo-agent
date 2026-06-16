@@ -43,6 +43,11 @@ pub struct StoredTranscript {
     pub messages: Vec<StoredMessage>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SessionSaveReport {
+    pub sifs: Result<(), String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct StoredSessionRecord {
     meta: SessionMeta,
@@ -70,8 +75,19 @@ pub fn save(
     title: &str,
     messages: &[StoredMessage],
 ) -> std::io::Result<()> {
+    save_with_report(data_dir, id, title, messages).map(|_| ())
+}
+
+/// Persist a session and report whether the cluster-visible SIFS mirror also
+/// succeeded. Local disk persistence remains authoritative for offline UI use.
+pub fn save_with_report(
+    data_dir: &SinomoDataDir,
+    id: &str,
+    title: &str,
+    messages: &[StoredMessage],
+) -> std::io::Result<SessionSaveReport> {
     if id.is_empty() {
-        return Ok(());
+        return Ok(SessionSaveReport { sifs: Ok(()) });
     }
     if !valid_session_id(id) {
         return Err(std::io::Error::new(
@@ -95,8 +111,8 @@ pub fn save(
         dir.join("transcript.json"),
         serde_json::to_vec(&transcript)?,
     )?;
-    let _ = save_sifs(data_dir, id, &meta, &transcript);
-    Ok(())
+    let sifs = save_sifs(data_dir, id, &meta, &transcript);
+    Ok(SessionSaveReport { sifs })
 }
 
 /// List stored sessions (metadata only), newest first.

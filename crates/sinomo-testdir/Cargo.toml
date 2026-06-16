@@ -3,4 +3,7 @@ name = "sinomo-testdir"
 version.workspace = true
 edition.workspace = true
 
+[package.metadata.sinomo]
+ring = "application"
+
 [dependencies]

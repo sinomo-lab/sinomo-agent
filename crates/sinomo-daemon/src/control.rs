@@ -167,6 +167,16 @@ pub fn run_daemon_control_loop(
     label: &str,
     cluster: Option<DaemonClusterStatus>,
 ) -> Result<(), DaemonError> {
+    run_daemon_control_loop_with_services(options, paths, label, cluster, Vec::new())
+}
+
+pub fn run_daemon_control_loop_with_services(
+    options: crate::DaemonRunOptions,
+    paths: DaemonPaths,
+    label: &str,
+    cluster: Option<DaemonClusterStatus>,
+    service_hooks: Vec<crate::DaemonServiceRegistryHook>,
+) -> Result<(), DaemonError> {
     let _lock = DaemonLock::acquire(&paths, &options, cluster.clone())?;
     if let Err(error) = prune_local_cluster_raft_uncommitted_tail(&paths) {
         eprintln!("sinomo {label} cluster raft startup repair skipped: {error}");
@@ -253,9 +263,10 @@ pub fn run_daemon_control_loop(
     ));
 
     let service_host = daemon_runtime.block_on(
-        crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime(
+        crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime_with_services(
             paths.clone(),
             daemon_runtime_handle.clone(),
+            service_hooks,
         ),
     )?;
 
@@ -2320,7 +2331,28 @@ pub(crate) fn handle_daemon_sandbox_run_toolchain_on_runtime(
     request: sinomo_sandbox::SandboxRunToolchainRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxLocalCommandOutcome, DaemonError> {
-    handle_daemon_sandbox_run_toolchain_with_output_sink_on_runtime(paths, request, None, runtime)
+    handle_daemon_sandbox_run_toolchain_with_output_sink_on_runtime(
+        paths,
+        request,
+        None,
+        runtime,
+        sinomo_sandbox::SandboxCancellationToken::new(),
+    )
+}
+
+pub(crate) fn handle_daemon_sandbox_run_toolchain_with_cancellation_on_runtime(
+    paths: &DaemonPaths,
+    request: sinomo_sandbox::SandboxRunToolchainRequest,
+    runtime: Option<&tokio::runtime::Handle>,
+    cancellation_token: sinomo_sandbox::SandboxCancellationToken,
+) -> Result<sinomo_sandbox::SandboxLocalCommandOutcome, DaemonError> {
+    handle_daemon_sandbox_run_toolchain_with_output_sink_on_runtime(
+        paths,
+        request,
+        None,
+        runtime,
+        cancellation_token,
+    )
 }
 
 pub fn handle_daemon_sandbox_run_process_plan(
@@ -2336,7 +2368,26 @@ pub(crate) fn handle_daemon_sandbox_run_process_plan_on_runtime(
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxProcessPlanOutcome, DaemonError> {
     handle_daemon_sandbox_run_process_plan_with_output_sink_on_runtime(
-        paths, request, None, runtime,
+        paths,
+        request,
+        None,
+        runtime,
+        sinomo_sandbox::SandboxCancellationToken::new(),
+    )
+}
+
+pub(crate) fn handle_daemon_sandbox_run_process_plan_with_cancellation_on_runtime(
+    paths: &DaemonPaths,
+    request: sinomo_sandbox::SandboxRunProcessPlanRequest,
+    runtime: Option<&tokio::runtime::Handle>,
+    cancellation_token: sinomo_sandbox::SandboxCancellationToken,
+) -> Result<sinomo_sandbox::SandboxProcessPlanOutcome, DaemonError> {
+    handle_daemon_sandbox_run_process_plan_with_output_sink_on_runtime(
+        paths,
+        request,
+        None,
+        runtime,
+        cancellation_token,
     )
 }
 
@@ -2356,6 +2407,7 @@ fn handle_daemon_sandbox_run_process_plan_with_output_sink_on_runtime(
     _request: sinomo_sandbox::SandboxRunProcessPlanRequest,
     _output_sink: Option<Arc<dyn sinomo_sandbox::SandboxOutputSink>>,
     _runtime: Option<&tokio::runtime::Handle>,
+    _cancellation_token: sinomo_sandbox::SandboxCancellationToken,
 ) -> Result<sinomo_sandbox::SandboxProcessPlanOutcome, DaemonError> {
     Err(sandbox_runtime_not_compiled_error())
 }
@@ -2366,6 +2418,7 @@ fn handle_daemon_sandbox_run_process_plan_with_output_sink_on_runtime(
     request: sinomo_sandbox::SandboxRunProcessPlanRequest,
     output_sink: Option<Arc<dyn sinomo_sandbox::SandboxOutputSink>>,
     runtime: Option<&tokio::runtime::Handle>,
+    cancellation_token: sinomo_sandbox::SandboxCancellationToken,
 ) -> Result<sinomo_sandbox::SandboxProcessPlanOutcome, DaemonError> {
     let config = load_daemon_sandbox_policy_config(paths)?;
     let data_dir = daemon_data_dir_path(paths)?;
@@ -2405,7 +2458,7 @@ fn handle_daemon_sandbox_run_process_plan_with_output_sink_on_runtime(
                 detail: source.to_string(),
             })?
             .with_replica_candidates(replica_candidates);
-    let outcome = match runner.run_toolchain_process_plan_with_policy_and_output_sink(
+    let outcome = match runner.run_toolchain_process_plan_with_policy_output_sink_and_cancellation(
         dfs,
         &local_store,
         &request.sandbox_id,
@@ -2413,6 +2466,7 @@ fn handle_daemon_sandbox_run_process_plan_with_output_sink_on_runtime(
         request.timeout_ms,
         &config.policy,
         output_sink,
+        cancellation_token,
     ) {
         Ok(outcome) => outcome,
         Err(source) => {
@@ -2567,6 +2621,7 @@ fn handle_daemon_sandbox_run_toolchain_with_output_sink_on_runtime(
     _request: sinomo_sandbox::SandboxRunToolchainRequest,
     _output_sink: Option<Arc<dyn sinomo_sandbox::SandboxOutputSink>>,
     _runtime: Option<&tokio::runtime::Handle>,
+    _cancellation_token: sinomo_sandbox::SandboxCancellationToken,
 ) -> Result<sinomo_sandbox::SandboxLocalCommandOutcome, DaemonError> {
     Err(sandbox_runtime_not_compiled_error())
 }
@@ -2577,6 +2632,7 @@ fn handle_daemon_sandbox_run_toolchain_with_output_sink_on_runtime(
     request: sinomo_sandbox::SandboxRunToolchainRequest,
     output_sink: Option<Arc<dyn sinomo_sandbox::SandboxOutputSink>>,
     runtime: Option<&tokio::runtime::Handle>,
+    cancellation_token: sinomo_sandbox::SandboxCancellationToken,
 ) -> Result<sinomo_sandbox::SandboxLocalCommandOutcome, DaemonError> {
     let config = load_daemon_sandbox_policy_config(paths)?;
     let data_dir = daemon_data_dir_path(paths)?;
@@ -2610,7 +2666,7 @@ fn handle_daemon_sandbox_run_toolchain_with_output_sink_on_runtime(
                 detail: source.to_string(),
             })?
             .with_replica_candidates(replica_candidates);
-    let outcome = match runner.run_toolchain_command_with_stdin_policy_and_output_sink(
+    let outcome = match runner.run_toolchain_command_with_stdin_policy_output_sink_and_cancellation(
         dfs,
         &local_store,
         &request.sandbox_id,
@@ -2620,6 +2676,7 @@ fn handle_daemon_sandbox_run_toolchain_with_output_sink_on_runtime(
         request.timeout_ms,
         &config.policy,
         output_sink,
+        cancellation_token,
     ) {
         Ok(outcome) => outcome,
         Err(source) => {
@@ -2734,6 +2791,7 @@ pub(crate) async fn handle_daemon_sandbox_run_toolchain_stream_async_on_runtime(
             request,
             Some(output_sink),
             Some(&runtime),
+            sinomo_sandbox::SandboxCancellationToken::new(),
         )
         .map_err(|error| error.to_string());
         let _ = sender.blocking_send(StreamMessage::Complete { sandbox_id, result });
@@ -2838,6 +2896,7 @@ pub(crate) async fn handle_daemon_sandbox_run_process_plan_stream_async_on_runti
             request,
             Some(output_sink),
             Some(&runtime),
+            sinomo_sandbox::SandboxCancellationToken::new(),
         )
         .map_err(|error| error.to_string());
         let _ = sender.blocking_send(StreamMessage::Complete(result));

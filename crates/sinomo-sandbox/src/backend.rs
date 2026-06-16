@@ -124,10 +124,28 @@ pub trait SandboxBackend: Send {
         request: SandboxRunToolchainRequest,
     ) -> Result<SandboxLocalCommandOutcome, SandboxBackendError>;
 
+    fn run_toolchain_with_cancellation(
+        &mut self,
+        request: SandboxRunToolchainRequest,
+        cancellation_token: SandboxCancellationToken,
+    ) -> Result<SandboxLocalCommandOutcome, SandboxBackendError> {
+        let _ = cancellation_token;
+        self.run_toolchain(request)
+    }
+
     fn run_process_plan(
         &mut self,
         request: SandboxRunProcessPlanRequest,
     ) -> Result<SandboxProcessPlanOutcome, SandboxBackendError>;
+
+    fn run_process_plan_with_cancellation(
+        &mut self,
+        request: SandboxRunProcessPlanRequest,
+        cancellation_token: SandboxCancellationToken,
+    ) -> Result<SandboxProcessPlanOutcome, SandboxBackendError> {
+        let _ = cancellation_token;
+        self.run_process_plan(request)
+    }
 }
 
 /// Daemonless sandbox backend backed by the local filesystem store. Works with no cluster
@@ -400,11 +418,19 @@ impl SandboxBackend for LocalSandboxBackend {
         &mut self,
         request: SandboxRunToolchainRequest,
     ) -> Result<SandboxLocalCommandOutcome, SandboxBackendError> {
+        self.run_toolchain_with_cancellation(request, SandboxCancellationToken::new())
+    }
+
+    fn run_toolchain_with_cancellation(
+        &mut self,
+        request: SandboxRunToolchainRequest,
+        cancellation_token: SandboxCancellationToken,
+    ) -> Result<SandboxLocalCommandOutcome, SandboxBackendError> {
         let Some(runner) = &self.container_runner else {
             return Err(local_mode_unsupported("toolchain execution"));
         };
         runner
-            .run_toolchain_command_with_stdin_and_output_sink(
+            .run_toolchain_command_with_stdin_and_output_sink_and_cancellation(
                 &self.store,
                 &request.sandbox_id,
                 &request.command_name,
@@ -412,6 +438,7 @@ impl SandboxBackend for LocalSandboxBackend {
                 request.stdin,
                 request.timeout_ms,
                 None,
+                cancellation_token,
             )
             .map_err(|error| SandboxBackendError::Other(error.to_string()))
     }
@@ -420,16 +447,25 @@ impl SandboxBackend for LocalSandboxBackend {
         &mut self,
         request: SandboxRunProcessPlanRequest,
     ) -> Result<SandboxProcessPlanOutcome, SandboxBackendError> {
+        self.run_process_plan_with_cancellation(request, SandboxCancellationToken::new())
+    }
+
+    fn run_process_plan_with_cancellation(
+        &mut self,
+        request: SandboxRunProcessPlanRequest,
+        cancellation_token: SandboxCancellationToken,
+    ) -> Result<SandboxProcessPlanOutcome, SandboxBackendError> {
         let Some(runner) = &self.container_runner else {
             return Err(local_mode_unsupported("process-plan execution"));
         };
         runner
-            .run_process_plan_with_output_sink(
+            .run_process_plan_with_output_sink_and_cancellation(
                 &self.store,
                 &request.sandbox_id,
                 &request.plan,
                 request.timeout_ms,
                 None,
+                cancellation_token,
             )
             .map_err(|error| SandboxBackendError::Other(error.to_string()))
     }

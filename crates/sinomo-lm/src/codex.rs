@@ -98,6 +98,11 @@ pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
     crate::openai::inferred_context_window_tokens(model)
 }
 
+pub(crate) fn prefers_native_tool_protocol(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("gpt") || model.contains("codex")
+}
+
 fn read_codex_chatgpt_tokens(
     credentials_path: &PathBuf,
 ) -> Result<Option<CodexChatGptTokens>, LanguageModelError> {
@@ -2686,6 +2691,13 @@ mod tests {
             .expect("tokens");
         assert_eq!(tokens.access_token, "access-token");
         assert_eq!(tokens.account_id.as_deref(), Some("account_123"));
+    }
+
+    #[test]
+    fn native_tool_protocol_preference_uses_codex_model_family() {
+        assert!(prefers_native_tool_protocol("gpt-5.2-codex"));
+        assert!(prefers_native_tool_protocol("codex-mini"));
+        assert!(!prefers_native_tool_protocol("claude-sonnet-4-6"));
     }
 
     fn fake_chatgpt_id_token(account_id: &str, fedramp: bool) -> String {

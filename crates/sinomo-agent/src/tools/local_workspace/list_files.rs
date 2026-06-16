@@ -45,9 +45,13 @@ impl AgentTool for ListFilesTool {
             include_dirs,
             max_entries,
             &mut entries,
+            &request.cancellation_token,
         ) {
             Ok(truncated) => truncated,
             Err(detail) => {
+                if request.cancellation_token.is_cancelled() {
+                    return local_tool_cancelled_result("list_files", detail);
+                }
                 return AgentToolResult::failed(
                     detail.clone(),
                     serde_json::json!({ "error": "list_files_failed", "detail": detail }),
@@ -65,8 +69,9 @@ impl AgentTool for ListFilesTool {
             "count": entries.len(),
             "entries": entries,
         });
-        let evidence = AgentToolEvidence::policy_only(true, "path resolved inside workspace root")
-            .with_output_value(&payload, truncated);
+        let evidence =
+            AgentToolEvidence::availability_only(true, "path resolved inside workspace root")
+                .with_output_value(&payload, truncated);
         AgentToolResult::succeeded(format!("listed {} entrie(s)", entries.len()), payload)
             .with_evidence(evidence)
     }
@@ -124,7 +129,9 @@ fn collect_workspace_file_entries(
     include_dirs: bool,
     max_entries: usize,
     entries: &mut Vec<WorkspaceFileEntry>,
+    cancellation_token: &AgentCancellationToken,
 ) -> Result<bool, String> {
+    ensure_local_tool_not_cancelled(cancellation_token, "list_files")?;
     if entries.len() >= max_entries {
         return Ok(true);
     }
@@ -149,6 +156,7 @@ fn collect_workspace_file_entries(
         .map_err(|source| format!("failed to read entry in {}: {source}", path.display()))?;
     dir_entries.sort_by_key(|entry| entry.file_name());
     for entry in dir_entries {
+        ensure_local_tool_not_cancelled(cancellation_token, "list_files")?;
         if entries.len() >= max_entries {
             return Ok(true);
         }
@@ -177,6 +185,7 @@ fn collect_workspace_file_entries(
                 include_dirs,
                 max_entries,
                 entries,
+                cancellation_token,
             )?;
             if truncated {
                 return Ok(true);

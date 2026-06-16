@@ -17,7 +17,7 @@ impl AgentTool for RequestUserInputTool {
             payload.clone(),
         )
         .with_evidence(
-            AgentToolEvidence::policy_only(false, "missing interactive runtime bridge")
+            AgentToolEvidence::availability_only(false, "missing interactive runtime bridge")
                 .with_output_value(&payload, false),
         )
     }

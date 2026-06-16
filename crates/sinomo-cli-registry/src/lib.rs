@@ -235,6 +235,9 @@ pub trait CliCommandHandler: Send + Sync {
 pub trait CliCommand: Send {
     fn name(&self) -> &'static str;
     fn policy(&self) -> CliCommandPolicy;
+    fn is_help(&self) -> bool {
+        false
+    }
     fn help(&self) -> CliCommandHelp {
         CliCommandHelp::new(self.name(), std::iter::empty::<String>())
     }
@@ -259,6 +262,10 @@ impl RegisteredCliCommand {
 
     pub fn policy(&self) -> CliCommandPolicy {
         self.inner.policy()
+    }
+
+    pub fn is_help(&self) -> bool {
+        self.inner.is_help()
     }
 
     pub fn help(&self) -> CliCommandHelp {

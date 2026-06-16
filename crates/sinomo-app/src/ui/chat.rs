@@ -4,7 +4,7 @@
 //! tree: [`view`] returns a responsive host ([`ChatView`]) over pre-built pods
 //! (wide split with the agents/sessions sidebar, narrow transcript-only), each
 //! assembled from stock `ListView` / `ScrollView` / `Select` / `TextArea` /
-//! `Button` / `Spinner` / `Separator` / `Label` widgets, plus a small set of
+//! `Button` / `Separator` / `Label` widgets, plus a small set of
 //! bespoke painters for the parts whose *shape* changes live.
 //!
 //! The data layer — [`ChatState`] + its methods, the [`ChatHandle`] worker
@@ -39,14 +39,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use sui::{
-    Alignment, ArrangeCtx, Constraints, DefaultTheme, Event, EventCtx, FontWeight, IconButton,
+    Alignment, ArrangeCtx, Color, Constraints, DefaultTheme, Event, EventCtx, FontWeight, IconButton,
     IconGlyph, Insets, KeyState, Label, ListItem, ListView, MeasureCtx, PaintCtx, PointerEventKind,
     Rect, ScrollDelta, SemanticsCtx, Separator, Size, SizedBox, Stack, Surface, SurfaceBorder,
     SurfaceRole, TextArea, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, draw_glyph,
 };
 
 use sinomo_cli::app_api::{
-    AgentSummary, ChatHistoryMessage, ProviderSummary, agent_summaries, reasoning_efforts,
+    AgentSummary, ChatContextSnapshot, ChatHistoryMessage, ChatProcessSnapshot, ChatToolCallSnapshot,
+    ChatTaskSnapshot, ChatUsageSnapshot, ProviderSummary, agent_summaries, reasoning_efforts,
 };
 use sinomo_runtime::local::SinomoDataDir;
 
@@ -60,6 +61,8 @@ use crate::ui::widgets;
 /// Below this content width the sidebar collapses away (transcript + composer only).
 const WIDE_THRESHOLD: f32 = 620.0;
 const SIDEBAR_W: f32 = 250.0;
+const ACTIVITY_RAIL_W: f32 = 286.0;
+const OVERVIEW_H: f32 = 86.0;
 const COMPOSER_H: f32 = 132.0;
 const PAD: f32 = 16.0;
 const SIDEBAR_ROW_H: f32 = 36.0;
@@ -68,6 +71,8 @@ const COMPOSER_PAD_Y: f32 = 12.0;
 const COMPOSER_SECTION_GAP: f32 = 10.0;
 const INPUT_ACTION_GAP: f32 = 10.0;
 const SEND_BUTTON_SIZE: f32 = 40.0;
+const COMPOSER_TEXT_SIZE: f32 = 13.5;
+const COMPOSER_LINE_HEIGHT: f32 = 19.0;
 
 /// A shared closure that resolves the current widget theme — threaded into every control so the
 /// Appearance toggle restyles the whole tab live, with no rebuild. (Same pattern as the other tabs.)
@@ -84,6 +89,50 @@ type ThemeReader = Rc<dyn Fn() -> DefaultTheme>;
 pub struct ChatMessage {
     pub role: ChatRole,
     pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivityTone {
+    Neutral,
+    Running,
+    Good,
+    Warn,
+    Bad,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChatActivityEntry {
+    pub title: String,
+    pub detail: String,
+    pub tone: ActivityTone,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ChatControlOverview {
+    pub active_turn: bool,
+    pub task_count: usize,
+    pub terminal_result_count: usize,
+    pub steering_count: usize,
+    pub follow_up_count: usize,
+    pub runtime_attached: bool,
+    pub tasks: Vec<ChatTaskSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChatToolActivity {
+    pub step_index: usize,
+    pub call_index: Option<usize>,
+    pub call_id: Option<String>,
+    pub tool: String,
+    pub input_preview: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuntimeHealth {
+    label: &'static str,
+    detail: String,
+    tone: ActivityTone,
 }
 
 /// A previously-created in-session reference (sidebar list).
@@ -103,6 +152,11 @@ pub struct ChatState {
     pub cursor: usize,
     pub streaming: bool,
     pub notice: Option<String>,
+    pub context: Option<ChatContextSnapshot>,
+    pub usage: Option<ChatUsageSnapshot>,
+    pub activity: Vec<ChatActivityEntry>,
+    pub tool_calls: Vec<ChatToolActivity>,
+    pub control: ChatControlOverview,
     pub scroll: f32,
     pub stick_bottom: bool,
     pub agents: Vec<AgentSummary>,
@@ -119,7 +173,11 @@ pub struct ChatState {
 impl ChatState {
     pub fn new(backend: &Backend) -> Self {
         let daemon_connected = backend.connection.is_daemon();
-        let handle = ChatHandle::spawn((*backend.data_dir).clone(), daemon_connected);
+        let handle = ChatHandle::spawn(
+            (*backend.data_dir).clone(),
+            daemon_connected,
+            backend.agent_runtime_control.clone(),
+        );
 
         let agents = agent_summaries(&backend.data_dir);
         let providers = crate::backend::config::cluster_provider_summaries(backend.config.as_ref());
@@ -143,6 +201,11 @@ impl ChatState {
             cursor: 0,
             streaming: false,
             notice: None,
+            context: None,
+            usage: None,
+            activity: Vec::new(),
+            tool_calls: Vec::new(),
+            control: ChatControlOverview::default(),
             scroll: 0.0,
             stick_bottom: true,
             agents,
@@ -195,7 +258,22 @@ impl ChatState {
                 text: m.text.clone(),
             })
             .collect();
-        let _ = sessions::save(&self.data_dir, &self.session_id, &title, &stored);
+        match sessions::save_with_report(&self.data_dir, &self.session_id, &title, &stored) {
+            Ok(report) => {
+                if let Err(error) = report.sifs {
+                    self.notice = Some(format!(
+                        "session saved locally; SIFS mirror failed: {}",
+                        compact_line(&error, 160)
+                    ));
+                    self.push_activity("session mirror", error, ActivityTone::Warn);
+                }
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                self.notice = Some(format!("session save failed: {detail}"));
+                self.push_activity("session save", detail, ActivityTone::Warn);
+            }
+        }
         self.sessions = sessions::list(&self.data_dir)
             .into_iter()
             .map(|meta| SessionRef {
@@ -203,6 +281,228 @@ impl ChatState {
                 title: meta.title,
             })
             .collect();
+    }
+
+    fn push_activity(
+        &mut self,
+        title: impl Into<String>,
+        detail: impl Into<String>,
+        tone: ActivityTone,
+    ) {
+        self.activity.push(ChatActivityEntry {
+            title: title.into(),
+            detail: detail.into(),
+            tone,
+        });
+        let excess = self.activity.len().saturating_sub(18);
+        if excess > 0 {
+            self.activity.drain(0..excess);
+        }
+    }
+
+    fn record_tool_call(
+        &mut self,
+        prefix: &str,
+        call: ChatToolCallSnapshot,
+        status: &str,
+        tone: ActivityTone,
+    ) {
+        let mut detail = format!("step {}", call.step_index);
+        if let Some(call_index) = call.call_index {
+            detail.push_str(&format!(" · call {}", call_index + 1));
+        }
+        if let Some(input) = call.input_preview.clone().filter(|input| !input.is_empty()) {
+            detail.push_str(&format!(" · {input}"));
+        }
+        let tool_title = call.tool.clone();
+        self.upsert_tool_activity_from_snapshot(call, status);
+        self.push_activity(format!("{prefix} {tool_title}"), detail, tone);
+    }
+
+    fn upsert_tool_activity_from_snapshot(&mut self, call: ChatToolCallSnapshot, status: &str) {
+        let input_preview = call.input_preview.unwrap_or_default();
+        if let Some(existing) = self
+            .tool_calls
+            .iter_mut()
+            .find(|existing| tool_activity_matches(existing, call.step_index, call.call_index, call.call_id.as_deref(), Some(call.tool.as_str())))
+        {
+            existing.tool = call.tool;
+            if !input_preview.trim().is_empty() {
+                existing.input_preview = compact_line(&input_preview, 120);
+            }
+            existing.status = status.to_string();
+            return;
+        }
+
+        self.tool_calls.push(ChatToolActivity {
+            step_index: call.step_index,
+            call_index: call.call_index,
+            call_id: call.call_id,
+            tool: call.tool,
+            input_preview: compact_line(&input_preview, 120),
+            status: status.to_string(),
+        });
+        let excess = self.tool_calls.len().saturating_sub(8);
+        if excess > 0 {
+            self.tool_calls.drain(0..excess);
+        }
+    }
+
+    fn record_tool_delta(
+        &mut self,
+        step_index: usize,
+        call_id: Option<String>,
+        tool: Option<String>,
+        arguments_delta: &str,
+    ) {
+        let Some(existing) = self.tool_calls.iter_mut().find(|existing| {
+            tool_activity_matches(
+                existing,
+                step_index,
+                None,
+                call_id.as_deref(),
+                tool.as_deref(),
+            )
+        }) else {
+            return;
+        };
+        if let Some(tool) = tool.filter(|tool| !tool.trim().is_empty()) {
+            existing.tool = tool;
+        }
+        if !arguments_delta.trim().is_empty() {
+            existing.input_preview = compact_line(
+                &format!("{}{}", existing.input_preview, arguments_delta),
+                120,
+            );
+        }
+        existing.status = "streaming".to_string();
+    }
+
+    fn record_process(&mut self, process: ChatProcessSnapshot) {
+        let tone = match process.status.as_str() {
+            "completed" => ActivityTone::Good,
+            "failed" | "cancelled" => ActivityTone::Bad,
+            "running" => ActivityTone::Running,
+            _ => ActivityTone::Neutral,
+        };
+        let mut detail = format!("{} ms", process.elapsed_ms);
+        if let Some(code) = process.exit_code {
+            detail.push_str(&format!(" · exit {code}"));
+        }
+        if !process.stderr_tail.trim().is_empty() {
+            detail.push_str(" · stderr ");
+            detail.push_str(process.stderr_tail.trim());
+        } else if !process.stdout_tail.trim().is_empty() {
+            detail.push_str(" · stdout ");
+            detail.push_str(process.stdout_tail.trim());
+        }
+        self.push_activity(process.command, detail, tone);
+    }
+
+    fn runtime_health(&self) -> RuntimeHealth {
+        if let Some(task) = self
+            .control
+            .tasks
+            .iter()
+            .find(|task| task_tone(&task.status) == ActivityTone::Bad)
+        {
+            return RuntimeHealth {
+                label: "ATTENTION",
+                detail: format!("{}: {}", task.status, compact_line(&task.summary, 72)),
+                tone: ActivityTone::Bad,
+            };
+        }
+
+        if let Some(entry) = self
+            .activity
+            .iter()
+            .rev()
+            .find(|entry| entry.tone == ActivityTone::Bad)
+        {
+            return RuntimeHealth {
+                label: "ATTENTION",
+                detail: format!(
+                    "{}: {}",
+                    compact_line(&entry.title, 32),
+                    compact_line(&entry.detail, 72)
+                ),
+                tone: ActivityTone::Bad,
+            };
+        }
+
+        if let Some(detail) = self.runtime_degraded_detail() {
+            return RuntimeHealth {
+                label: "DEGRADED",
+                detail,
+                tone: ActivityTone::Warn,
+            };
+        }
+
+        if self.streaming || self.control.active_turn {
+            return RuntimeHealth {
+                label: "RUNNING",
+                detail: format!(
+                    "{} task(s), {} queued",
+                    self.control.task_count,
+                    self.control.steering_count + self.control.follow_up_count
+                ),
+                tone: ActivityTone::Running,
+            };
+        }
+
+        if let Some(task) = self
+            .control
+            .tasks
+            .iter()
+            .find(|task| matches!(task.status.as_str(), "running" | "pending"))
+        {
+            return RuntimeHealth {
+                label: "RUNNING",
+                detail: format!("{}: {}", task.status, compact_line(&task.summary, 72)),
+                tone: ActivityTone::Running,
+            };
+        }
+
+        if !self.info.provider.is_empty() && !self.info.model.is_empty() {
+            return RuntimeHealth {
+                label: "READY",
+                detail: format!("{} / {}", self.info.provider, self.info.model),
+                tone: ActivityTone::Good,
+            };
+        }
+
+        RuntimeHealth {
+            label: "PENDING",
+            detail: "runtime discovery pending".to_string(),
+            tone: ActivityTone::Neutral,
+        }
+    }
+
+    fn runtime_degraded_detail(&self) -> Option<String> {
+        if let Some(notice) = self.notice.as_deref()
+            && text_mentions_runtime_problem(notice)
+        {
+            return Some(compact_line(notice, 96));
+        }
+
+        if !self.control.runtime_attached
+            && (self.control.active_turn
+                || self.control.task_count > 0
+                || self.control.terminal_result_count > 0
+                || self.control.steering_count > 0
+                || self.control.follow_up_count > 0)
+        {
+            return Some("runtime control metadata is detached".to_string());
+        }
+
+        self.activity
+            .iter()
+            .rev()
+            .filter(|entry| entry.tone == ActivityTone::Warn)
+            .find_map(|entry| {
+                let combined = format!("{} {}", entry.title, entry.detail);
+                text_mentions_runtime_problem(&combined).then(|| compact_line(&combined, 96))
+            })
     }
 
     /// Open a stored session: load its transcript for display and tell the worker
@@ -236,6 +536,11 @@ impl ChatState {
         self.session_id = id.clone();
         self.streaming = false;
         self.notice = None;
+        self.context = None;
+        self.usage = None;
+        self.activity.clear();
+        self.tool_calls.clear();
+        self.control = ChatControlOverview::default();
         self.scroll = f32::MAX;
         self.stick_bottom = true;
         self.handle.send_command(ChatCommand::Resume {
@@ -301,6 +606,59 @@ impl ChatState {
                 }
             }
             ChatEvent::Notice(notice) => self.notice = Some(notice),
+            ChatEvent::Context(context) => {
+                self.notice = Some(format!(
+                    "context assembled: {}",
+                    format_bytes(context.total_bytes)
+                ));
+                self.context = Some(context);
+            }
+            ChatEvent::ToolCallStarted(call) => {
+                self.record_tool_call("tool", call, "running", ActivityTone::Running);
+                self.notice = Some("tool call requested".to_string());
+            }
+            ChatEvent::ToolCallDelta {
+                step_index,
+                call_id,
+                tool,
+                arguments_delta,
+            } => {
+                self.record_tool_delta(
+                    step_index,
+                    call_id.clone(),
+                    tool.clone(),
+                    &arguments_delta,
+                );
+                if !arguments_delta.trim().is_empty() {
+                    self.push_activity(
+                        format!("tool input {}", tool.unwrap_or_else(|| "stream".to_string())),
+                        format!("step {step_index} · {}", compact_line(&arguments_delta, 120)),
+                        ActivityTone::Neutral,
+                    );
+                }
+            }
+            ChatEvent::ToolCallCompleted(call) => {
+                self.record_tool_call("tool done", call, "completed", ActivityTone::Good);
+            }
+            ChatEvent::Process(process) => {
+                self.record_process(process);
+            }
+            ChatEvent::Usage(usage) => {
+                self.usage = Some(usage.clone());
+                let input = usage
+                    .input_tokens
+                    .map(|tokens| tokens.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let output = usage
+                    .output_tokens
+                    .map(|tokens| tokens.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                self.push_activity(
+                    "model usage",
+                    format!("{} input · {} output", input, output),
+                    ActivityTone::Neutral,
+                );
+            }
             ChatEvent::TurnDone => {
                 self.streaming = false;
                 self.notice = None;
@@ -311,6 +669,45 @@ impl ChatState {
                 }
                 self.persist();
             }
+            ChatEvent::ControlStatus(status) => {
+                self.control.active_turn = status.active_turn;
+                self.control.task_count = status.task_count;
+                self.control.terminal_result_count = status.terminal_result_count;
+                self.control.tasks = status.tasks;
+                self.notice = Some(format!(
+                    "agent control {} at sequence {}",
+                    if status.accepted {
+                        "accepted"
+                    } else {
+                        "rejected"
+                    },
+                    status.sequence
+                ));
+                self.push_activity(
+                    "runtime control",
+                    format!(
+                        "{} task(s), {} terminal result(s)",
+                        status.task_count, status.terminal_result_count
+                    ),
+                    if status.accepted {
+                        ActivityTone::Good
+                    } else {
+                        ActivityTone::Warn
+                    },
+                );
+            }
+            ChatEvent::ControlState(state) => {
+                self.control.active_turn = state.active_turn;
+                self.control.task_count = state.task_count;
+                self.control.tasks = state.tasks;
+                self.control.steering_count = state.steering_count;
+                self.control.follow_up_count = state.follow_up_count;
+                self.control.runtime_attached = state.runtime_attached;
+                self.notice = Some(format!(
+                    "agent control: {} steering, {} follow-ups",
+                    state.steering_count, state.follow_up_count
+                ));
+            }
             ChatEvent::RuntimeInfo(info) => {
                 self.info = info;
                 self.sync_selection_from_info();
@@ -320,6 +717,11 @@ impl ChatState {
                 self.messages.clear();
                 self.streaming = false;
                 self.notice = None;
+                self.context = None;
+                self.usage = None;
+                self.activity.clear();
+                self.tool_calls.clear();
+                self.control = ChatControlOverview::default();
                 self.scroll = 0.0;
             }
             ChatEvent::Models { provider, models } => {
@@ -338,6 +740,7 @@ impl ChatState {
             }
             ChatEvent::Error(error) => {
                 self.streaming = false;
+                self.push_activity("agent error", error.clone(), ActivityTone::Bad);
                 self.messages.push(ChatMessage {
                     role: ChatRole::Agent,
                     text: format!("⚠ {error}"),
@@ -376,7 +779,20 @@ impl ChatState {
 
     fn submit(&mut self) {
         let text = self.input.trim().to_string();
-        if text.is_empty() || self.streaming {
+        if text.is_empty() {
+            return;
+        }
+        if self.streaming {
+            self.handle.send_command(ChatCommand::FollowUp(text.clone()));
+            self.messages.push(ChatMessage {
+                role: ChatRole::User,
+                text,
+            });
+            self.input.clear();
+            self.cursor = 0;
+            self.notice = Some("queued follow-up".to_string());
+            self.stick_bottom = true;
+            self.scroll = f32::MAX;
             return;
         }
         self.messages.push(ChatMessage {
@@ -387,6 +803,11 @@ impl ChatState {
             role: ChatRole::Agent,
             text: String::new(),
         });
+        self.context = None;
+        self.usage = None;
+        self.activity.clear();
+        self.tool_calls.clear();
+        self.control.active_turn = true;
         self.input.clear();
         self.cursor = 0;
         self.streaming = true;
@@ -396,11 +817,20 @@ impl ChatState {
         self.handle.send_command(ChatCommand::Send(text));
     }
 
+    fn interrupt_turn(&mut self) {
+        if !self.streaming {
+            return;
+        }
+        self.handle
+            .send_command(ChatCommand::Interrupt("user interrupted from app chat".to_string()));
+        self.notice = Some("interrupting…".to_string());
+    }
+
     // -- Composed-view action methods (mutation entry points for the widgets) --
 
-    /// Whether the Send button should be enabled (non-empty draft, not streaming).
+    /// Whether the composer has a non-empty draft that can be submitted.
     fn can_send(&self) -> bool {
-        !self.input.trim().is_empty() && !self.streaming
+        !self.input.trim().is_empty()
     }
 
     /// Update the composer draft (bound to the composer `TextArea` via its `on_change`).
@@ -505,10 +935,111 @@ fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     move || reader()
 }
 
+fn composer_control_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || {
+        let mut theme = reader();
+        theme.typography.body_font_size = COMPOSER_TEXT_SIZE;
+        theme.typography.body_line_height = COMPOSER_LINE_HEIGHT;
+        theme
+    }
+}
+
 /// Resolve the app chrome palette for the current theme (used by the `Label` color readers and the
 /// bespoke painters so muted/accent text matches the chrome).
 fn palette(shared: &Shared) -> Palette {
     Palette::from_theme(&shared.theme(), widgets::theme_is_dark(shared))
+}
+
+fn format_bytes(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f32 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f32 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn compact_line(text: &str, max_chars: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+    let head: String = collapsed
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect();
+    format!("{head}...")
+}
+
+fn tone_color(pal: &Palette, tone: ActivityTone) -> sui::Color {
+    match tone {
+        ActivityTone::Neutral => pal.text_faint,
+        ActivityTone::Running => pal.accent,
+        ActivityTone::Good => pal.good,
+        ActivityTone::Warn => pal.warn,
+        ActivityTone::Bad => pal.bad,
+    }
+}
+
+fn task_tone(status: &str) -> ActivityTone {
+    match status {
+        "running" | "pending" => ActivityTone::Running,
+        "completed" => ActivityTone::Good,
+        "failed" | "cancelled" | "timed-out" => ActivityTone::Bad,
+        _ => ActivityTone::Neutral,
+    }
+}
+
+fn tool_status_tone(status: &str) -> ActivityTone {
+    match status {
+        "running" | "streaming" => ActivityTone::Running,
+        "completed" => ActivityTone::Good,
+        "failed" | "cancelled" | "timed-out" => ActivityTone::Bad,
+        _ => ActivityTone::Neutral,
+    }
+}
+
+fn tool_activity_matches(
+    existing: &ChatToolActivity,
+    step_index: usize,
+    call_index: Option<usize>,
+    call_id: Option<&str>,
+    tool: Option<&str>,
+) -> bool {
+    if existing.step_index != step_index {
+        return false;
+    }
+    if let (Some(existing_id), Some(call_id)) = (existing.call_id.as_deref(), call_id) {
+        return existing_id == call_id;
+    }
+    if let (Some(existing_index), Some(call_index)) = (existing.call_index, call_index) {
+        return existing_index == call_index;
+    }
+    if let Some(tool) = tool {
+        return existing.tool == tool;
+    }
+    false
+}
+
+fn text_mentions_runtime_problem(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "sifs mirror failed",
+        "dfs",
+        "sandbox",
+        "policy",
+        "unavailable",
+        "denied",
+        "rejected",
+        "blocked",
+        "timed out",
+        "timeout",
+        "failed",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 /// A small uppercase section heading `Label` (AGENTS / SESSIONS), color tracking the theme.
@@ -631,6 +1162,421 @@ fn sidebar_signature(shared: &Shared) -> (String, String) {
         .collect::<Vec<_>>()
         .join("\u{1f}");
     (active, sessions)
+}
+
+struct RuntimeOverview {
+    shared: Shared,
+}
+
+impl RuntimeOverview {
+    fn new(shared: Shared) -> Self {
+        Self { shared }
+    }
+}
+
+impl Widget for RuntimeOverview {
+    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        constraints.clamp(Size::new(constraints.max.width, OVERVIEW_H))
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let theme = self.shared.theme();
+        let pal = palette(&self.shared);
+        let bounds = ctx.bounds();
+        ctx.fill_bounds(pal.titlebar);
+        widgets::hairline_bottom(ctx, bounds, pal.border);
+
+        let chat = self.shared.chat();
+        let title_style = pal.text_style(&theme, 12.5, FontWeight::SEMIBOLD, pal.text);
+        let meta_style = pal.text_style(&theme, 11.5, FontWeight::NORMAL, pal.text_faint);
+        let label_style = pal.text_style(&theme, 10.5, FontWeight::MEDIUM, pal.text_muted);
+        let x = bounds.x() + PAD;
+        let top = bounds.y() + 10.0;
+        let health = chat.runtime_health();
+        let chip_w = 112.0_f32.min((bounds.width() * 0.34).max(92.0));
+        let chip = Rect::new(
+            bounds.x() + bounds.width() - PAD - chip_w,
+            top - 1.0,
+            chip_w,
+            20.0,
+        );
+        draw_health_chip(ctx, &pal, &theme, chip, &health);
+        let title_w = (chip.x() - x - 10.0).max(80.0);
+        let runtime = if chat.info.provider.is_empty() || chat.info.model.is_empty() {
+            "runtime pending".to_string()
+        } else {
+            format!("{} / {}", chat.info.provider, chat.info.model)
+        };
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(x, top, title_w, 18.0),
+            &runtime,
+            title_style,
+        );
+
+        let usage = chat
+            .usage
+            .as_ref()
+            .map(|usage| {
+                let output = usage
+                    .output_tokens
+                    .map(format_token_count)
+                    .unwrap_or_else(|| "?".to_string());
+                let input = usage
+                    .input_tokens
+                    .map(format_token_count)
+                    .unwrap_or_else(|| "?".to_string());
+                format!("{input} in · {output} out")
+            })
+            .unwrap_or_else(|| "usage pending".to_string());
+        let monitor = format!(
+            "{} · {} tasks · {} queued",
+            if chat.streaming || chat.control.active_turn {
+                "active"
+            } else {
+                "idle"
+            },
+            chat.control.task_count,
+            chat.control.steering_count + chat.control.follow_up_count
+        );
+        let monitor = if matches!(health.tone, ActivityTone::Warn | ActivityTone::Bad) {
+            format!("{} · {monitor}", compact_line(&health.detail, 42))
+        } else {
+            monitor
+        };
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(x, top + 20.0, title_w, 16.0),
+            &format!("{monitor} · {usage}"),
+            meta_style,
+        );
+
+        let bar = Rect::new(x, bounds.y() + 58.0, (bounds.width() - PAD * 2.0).max(0.0), 10.0);
+        widgets::fill_round_rect(ctx, bar, pal.field, 5.0);
+        if let Some(context) = &chat.context {
+            let denominator = context
+                .max_context_bytes
+                .or(context.compaction_threshold_bytes)
+                .unwrap_or(context.total_bytes.max(1))
+                .max(1);
+            let mut offset = 0.0;
+            let used_w = (bar.width() * (context.total_bytes as f32 / denominator as f32))
+                .clamp(2.0, bar.width());
+            let lane_total: usize = context.lanes.iter().map(|lane| lane.bytes).sum();
+            if lane_total > 0 {
+                for lane in &context.lanes {
+                    if lane.bytes == 0 {
+                        continue;
+                    }
+                    let lane_w = (used_w * lane.bytes as f32 / lane_total as f32)
+                        .max(2.0)
+                        .min(used_w - offset);
+                    if lane_w <= 0.0 {
+                        continue;
+                    }
+                    let segment = Rect::new(bar.x() + offset, bar.y(), lane_w, bar.height());
+                    widgets::fill_round_rect(ctx, segment, context_lane_color(&pal, lane.kind.as_str()), 5.0);
+                    offset += lane_w;
+                    if offset >= used_w {
+                        break;
+                    }
+                }
+            }
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(x, bounds.y() + 40.0, bounds.width() - PAD * 2.0, 16.0),
+                &format!(
+                    "context {} / {} · {} source(s) · {} omitted",
+                    format_bytes(context.total_bytes),
+                    format_bytes(denominator),
+                    context.included_count,
+                    context.omitted_count
+                ),
+                label_style,
+            );
+        } else {
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(x, bounds.y() + 40.0, bounds.width() - PAD * 2.0, 16.0),
+                "context pending",
+                label_style,
+            );
+        }
+    }
+}
+
+fn draw_health_chip(
+    ctx: &mut PaintCtx,
+    pal: &Palette,
+    theme: &DefaultTheme,
+    rect: Rect,
+    health: &RuntimeHealth,
+) {
+    widgets::fill_round_rect(ctx, rect, pal.field, 6.0);
+    let color = tone_color(pal, health.tone);
+    widgets::fill_round_rect(
+        ctx,
+        Rect::new(rect.x() + 8.0, rect.y() + 7.0, 6.0, 6.0),
+        color,
+        3.0,
+    );
+    widgets::draw_text_in(
+        ctx,
+        Rect::new(rect.x() + 20.0, rect.y() + 2.0, rect.width() - 24.0, 16.0),
+        health.label,
+        pal.text_style(theme, 10.0, FontWeight::SEMIBOLD, color),
+    );
+}
+
+fn context_lane_color(pal: &Palette, kind: &str) -> Color {
+    match kind {
+        "fixed_prompt" => pal.accent,
+        "current_work" | "context_attachments" | "async_update" => pal.good,
+        "recent_tail" => pal.warn,
+        "retrieved_memories" => pal.selected,
+        "old_summaries" => pal.text_faint,
+        _ => pal.border_strong,
+    }
+}
+
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}m", tokens as f32 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f32 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn context_lane_summary(label: &str, bytes: usize, total: usize) -> String {
+    let share = if total == 0 {
+        0.0
+    } else {
+        bytes as f32 * 100.0 / total as f32
+    };
+    format!(
+        "{} · {} · {:.0}%",
+        compact_line(label, 28),
+        format_bytes(bytes),
+        share
+    )
+}
+
+struct ActivityRail {
+    shared: Shared,
+}
+
+impl ActivityRail {
+    fn new(shared: Shared) -> Self {
+        Self { shared }
+    }
+}
+
+impl Widget for ActivityRail {
+    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        constraints.max
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let theme = self.shared.theme();
+        let pal = palette(&self.shared);
+        let bounds = ctx.bounds();
+        ctx.fill_bounds(pal.sidebar);
+        widgets::hairline_left(ctx, bounds, pal.border);
+
+        let chat = self.shared.chat();
+        let x = bounds.x() + 14.0;
+        let w = (bounds.width() - 28.0).max(0.0);
+        let heading_style = pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_muted);
+        let text_style = pal.text_style(&theme, 12.0, FontWeight::MEDIUM, pal.text);
+        let detail_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(x, bounds.y() + 14.0, w, 16.0),
+            "ACTIVITY",
+            heading_style.clone(),
+        );
+
+        let mut y = bounds.y() + 42.0;
+        if chat.control.tasks.is_empty()
+            && chat.tool_calls.is_empty()
+            && chat.activity.is_empty()
+            && chat.context.is_none()
+        {
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(x, y, w, 18.0),
+                "No runtime activity yet",
+                detail_style,
+            );
+            return;
+        }
+
+        if !chat.control.tasks.is_empty() {
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(x, y, w, 14.0),
+                "TASKS",
+                heading_style.clone(),
+            );
+            y += 22.0;
+            for task in chat.control.tasks.iter().take(4) {
+                if y + 42.0 > bounds.y() + bounds.height() {
+                    return;
+                }
+                let dot = Rect::new(x, y + 5.0, 7.0, 7.0);
+                widgets::fill_round_rect(ctx, dot, tone_color(&pal, task_tone(&task.status)), 3.5);
+                let detail = task
+                    .progress_summary
+                    .as_deref()
+                    .or(task.result_ref.as_deref())
+                    .unwrap_or(task.kind.as_str());
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(x + 14.0, y, w - 14.0, 16.0),
+                    &compact_line(&task.summary, 34),
+                    text_style.clone(),
+                );
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(x + 14.0, y + 17.0, w - 14.0, 16.0),
+                    &format!("{} · {}", task.status, compact_line(detail, 40)),
+                    detail_style.clone(),
+                );
+                y += 42.0;
+            }
+            y += 4.0;
+        }
+
+        if !chat.tool_calls.is_empty() {
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(x, y, w, 14.0),
+                "TOOLS",
+                heading_style.clone(),
+            );
+            y += 22.0;
+            for call in chat.tool_calls.iter().rev().take(3) {
+                if y + 42.0 > bounds.y() + bounds.height() {
+                    return;
+                }
+                let dot = Rect::new(x, y + 5.0, 7.0, 7.0);
+                widgets::fill_round_rect(
+                    ctx,
+                    dot,
+                    tone_color(&pal, tool_status_tone(&call.status)),
+                    3.5,
+                );
+                let mut detail = format!("{} · step {}", call.status, call.step_index);
+                if let Some(input) = (!call.input_preview.trim().is_empty())
+                    .then(|| compact_line(&call.input_preview, 30))
+                {
+                    detail.push_str(" · ");
+                    detail.push_str(&input);
+                }
+                let detail = compact_line(&detail, 34);
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(x + 14.0, y, w - 14.0, 16.0),
+                    &compact_line(&call.tool, 34),
+                    text_style.clone(),
+                );
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(x + 14.0, y + 17.0, w - 14.0, 16.0),
+                    &detail,
+                    detail_style.clone(),
+                );
+                y += 42.0;
+            }
+            y += 4.0;
+        }
+
+        if let Some(context) = &chat.context {
+            if y + 40.0 > bounds.y() + bounds.height() {
+                return;
+            }
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(x, y, w, 14.0),
+                "CONTEXT",
+                heading_style.clone(),
+            );
+            y += 20.0;
+
+            let lane_total: usize = context.lanes.iter().map(|lane| lane.bytes).sum();
+            let visible_lane_count = context.lanes.iter().filter(|lane| lane.bytes > 0).count();
+            let mut drawn = 0usize;
+            for lane in context.lanes.iter().filter(|lane| lane.bytes > 0).take(4) {
+                if y + 24.0 > bounds.y() + bounds.height() {
+                    return;
+                }
+                let dot = Rect::new(x, y + 5.0, 7.0, 7.0);
+                widgets::fill_round_rect(
+                    ctx,
+                    dot,
+                    context_lane_color(&pal, lane.kind.as_str()),
+                    3.5,
+                );
+                let label = if lane.label.trim().is_empty() {
+                    lane.kind.as_str()
+                } else {
+                    lane.label.as_str()
+                };
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(x + 14.0, y, w - 14.0, 16.0),
+                    &context_lane_summary(label, lane.bytes, lane_total),
+                    detail_style.clone(),
+                );
+                y += 22.0;
+                drawn += 1;
+            }
+            if visible_lane_count > drawn {
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(x + 14.0, y, w - 14.0, 16.0),
+                    &format!("{} more lane(s)", visible_lane_count - drawn),
+                    detail_style.clone(),
+                );
+                y += 20.0;
+            }
+            y += 4.0;
+        }
+
+        if chat.activity.is_empty() {
+            return;
+        }
+
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(x, y, w, 14.0),
+            "EVENTS",
+            heading_style,
+        );
+        y += 22.0;
+        for entry in chat.activity.iter().rev().take(10) {
+            if y + 48.0 > bounds.y() + bounds.height() {
+                break;
+            }
+            let dot = Rect::new(x, y + 5.0, 7.0, 7.0);
+            widgets::fill_round_rect(ctx, dot, tone_color(&pal, entry.tone), 3.5);
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(x + 14.0, y, w - 14.0, 16.0),
+                &compact_line(&entry.title, 34),
+                text_style.clone(),
+            );
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(x + 14.0, y + 17.0, w - 14.0, 16.0),
+                &compact_line(&entry.detail, 54),
+                detail_style.clone(),
+            );
+            y += 44.0;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -892,7 +1838,7 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         sui::Select::new("chat-provider")
             .options(names)
             .placeholder("Provider")
-            .theme_when(clone_reader(reader))
+            .theme_when(composer_control_reader(reader))
             .selected_when({
                 let s = s.clone();
                 move || Some(s.chat().provider_idx)
@@ -916,7 +1862,7 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         sui::Select::new("chat-model")
             .options(models)
             .placeholder(placeholder)
-            .theme_when(clone_reader(reader))
+            .theme_when(composer_control_reader(reader))
             .selected_when({
                 let s = s.clone();
                 move || Some(s.chat().model_idx)
@@ -938,7 +1884,7 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         let effort = sui::Select::new("chat-effort")
             .options(efforts)
             .placeholder("Effort")
-            .theme_when(clone_reader(reader))
+            .theme_when(composer_control_reader(reader))
             .selected_when({
                 let s = s.clone();
                 move || Some(s.chat().effort_idx)
@@ -952,29 +1898,23 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     WidgetPod::new(row)
 }
 
-/// The composer's bottom row: a flexible message `TextArea` and a fixed-size send action slot. The
-/// input is bound to the draft via `on_change`; the send action is wired to `ChatState::submit`.
-/// The Send control swaps to a `Spinner` while streaming.
+/// The composer's bottom row: a flexible message `TextArea` and a fixed-size action slot. The input
+/// is bound to the draft via `on_change`; Enter submits normally, or queues a follow-up during an
+/// active stream. The action control swaps from Send to Interrupt while streaming.
 fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let input = {
         let s = shared.clone();
         let draft = shared.chat().input.clone();
-        let theme = shared.theme();
         TextArea::new("chat-input")
             .value(draft)
             .placeholder("Message Sinomo…  (⏎ to send, ⇧⏎ for newline)")
-            .text_style(sui::TextStyle {
-                font_size: 13.5,
-                line_height: 19.0,
-                ..theme.body_text_style()
-            })
             .padding(Insets {
                 left: 12.0,
                 top: 8.0,
                 right: 12.0,
                 bottom: 8.0,
             })
-            .theme_when(clone_reader(reader))
+            .theme_when(composer_control_reader(reader))
             .on_change({
                 let s = s.clone();
                 move |value| {
@@ -982,8 +1922,8 @@ fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                 }
             })
             // Enter sends, Shift+Enter inserts a newline (the on_submit only fires while the
-            // TextArea is focused — Enter only reaches a focused input). `submit()` already no-ops
-            // when the draft is empty or a turn is streaming, so this matches `can_send`.
+            // TextArea is focused — Enter only reaches a focused input). While streaming, `submit()`
+            // queues the draft as a follow-up for the active runtime turn.
             .on_submit(move |_text| {
                 s.chat_mut().submit();
             })
@@ -991,10 +1931,15 @@ fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
 
     let streaming = shared.chat().streaming;
     let send: WidgetPod = if streaming {
+        let s = shared.clone();
         WidgetPod::new(
-            sui::Spinner::new("chat-sending")
-                .size(22.0)
-                .theme_when(clone_reader(reader)),
+            IconButton::new(IconGlyph::Close, "Interrupt")
+                .size(SEND_BUTTON_SIZE)
+                .icon_size(17.0)
+                .theme_when(clone_reader(reader))
+                .on_press(move || {
+                    s.chat_mut().interrupt_turn();
+                }),
         )
     } else {
         let s = shared.clone();
@@ -1037,7 +1982,7 @@ fn composer(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         )
     };
 
-    // The input row is rebuilt when the streaming flag flips (Send <-> Spinner). The draft text is
+    // The input row is rebuilt when the streaming flag flips (Send <-> Interrupt). The draft text is
     // owned by the `TextArea`, so we do NOT rebuild on every keystroke.
     let input_host = {
         let s = shared.clone();
@@ -1081,13 +2026,20 @@ fn composer(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 /// invisible overlay widget is needed here.
 fn main_column(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     widgets::Dock::new(TranscriptView::new(shared.clone()))
+        .top(OVERVIEW_H, RuntimeOverview::new(shared.clone()))
         .bottom(COMPOSER_H, composer(shared, reader))
 }
 
 fn wide_pod(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let work_area = Split::right_fixed(
+        main_column(shared, reader),
+        ActivityRail::new(shared.clone()),
+        ACTIVITY_RAIL_W,
+        reader,
+    );
     let row = Split::left_fixed(
         sidebar(shared, reader),
-        main_column(shared, reader),
+        work_area,
         SIDEBAR_W,
         reader,
     );
@@ -1187,7 +2139,7 @@ impl ChatView {
     /// plain `ctx.request_measure()` here would only invalidate `ChatView`'s own measure path, which
     /// can short-circuit before reaching those hosts. Targeting the *window* makes sui's
     /// `build_measure_scope` upgrade the pass to `force_all`, so every pod (including those hosts)
-    /// re-measures and the newly-built option lists / Send<->Spinner swap take effect.
+    /// re-measures and the newly-built option lists / Send<->Interrupt swap take effect.
     fn force_window_relayout(&self, ctx: &mut EventCtx) {
         use sui::{InvalidationKind, InvalidationRequest, InvalidationTarget};
         let window = InvalidationTarget::Window(ctx.window_id());
@@ -1212,7 +2164,7 @@ impl ChatView {
 
         // Recompute the coarse signature each tick: a worker event (RuntimeInfo / Models / TurnDone,
         // or a token that resolved the selection) may have changed the selector option lists, the
-        // sidebar sessions, or the streaming flag (Send <-> Spinner) — anything the inner
+        // sidebar sessions, or the streaming flag (Send <-> Interrupt) — anything the inner
         // `RebuildOnChange` hosts key on. On a signature change, force a full relayout so those hosts
         // rebuild; on a bare token (same signature) just repaint the live-reading transcript.
         let sig = view_signature(&self.shared);
@@ -1543,6 +2495,21 @@ impl Split {
         }
     }
 
+    /// Right pane fixed `right_width`, left pane flexible.
+    fn right_fixed<L, R>(left: L, right: R, right_width: f32, reader: &ThemeReader) -> Self
+    where
+        L: Widget + 'static,
+        R: Widget + 'static,
+    {
+        Self {
+            left: WidgetPod::new(left),
+            separator: WidgetPod::new(Separator::vertical().theme_when(clone_reader(reader))),
+            right: WidgetPod::new(right),
+            fixed_width: right_width.max(0.0),
+            fixed_is_left: false,
+        }
+    }
+
     /// (left_width, right_width) for a given total width.
     fn split_widths(&self, total: f32) -> (f32, f32) {
         let fixed = self.fixed_width.min((total - SPLIT_SEPARATOR_W).max(0.0));
@@ -1695,6 +2662,19 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn composer_control_reader_keeps_footer_text_compact() {
+        let reader: ThemeReader = Rc::new(DefaultTheme::default);
+        let theme = composer_control_reader(&reader)();
+        let body = theme.body_text_style();
+        let placeholder = theme.placeholder_text_style();
+
+        assert_eq!(body.font_size, COMPOSER_TEXT_SIZE);
+        assert_eq!(body.line_height, COMPOSER_LINE_HEIGHT);
+        assert_eq!(placeholder.font_size, COMPOSER_TEXT_SIZE);
+        assert_eq!(placeholder.line_height, COMPOSER_LINE_HEIGHT);
+    }
+
+    #[test]
     fn submit_pushes_user_and_agent_placeholder_and_sets_streaming() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
@@ -1713,22 +2693,37 @@ mod tests {
     }
 
     #[test]
-    fn empty_or_streaming_submit_is_a_noop() {
+    fn empty_submit_is_noop_and_streaming_submit_queues_follow_up() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
         // Empty draft → nothing happens.
         state.submit();
         assert!(!state.streaming);
         assert!(state.messages.is_empty());
-        // While streaming, a submit is ignored.
+        // While streaming, a submit is queued as a follow-up for the active runtime turn.
         state.set_draft("queued".to_string());
         state.streaming = true;
         state.submit();
-        assert!(
-            state.messages.is_empty(),
-            "a submit while streaming is ignored"
-        );
-        assert_eq!(state.input, "queued", "the draft is preserved");
+        assert_eq!(state.messages.len(), 1, "queued follow-up is echoed");
+        assert_eq!(state.messages[0].role, ChatRole::User);
+        assert_eq!(state.messages[0].text, "queued");
+        assert!(state.input.is_empty(), "the queued draft is cleared");
+        assert!(state.streaming, "queueing follow-up keeps active stream state");
+        assert_eq!(state.notice.as_deref(), Some("queued follow-up"));
+    }
+
+    #[test]
+    fn interrupt_turn_only_updates_notice_while_streaming() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+
+        state.interrupt_turn();
+        assert!(state.notice.is_none(), "idle interrupt is a no-op");
+
+        state.streaming = true;
+        state.interrupt_turn();
+        assert_eq!(state.notice.as_deref(), Some("interrupting…"));
+        assert!(state.streaming, "interrupt request waits for runtime event");
     }
 
     #[test]
@@ -1749,14 +2744,241 @@ mod tests {
     }
 
     #[test]
-    fn can_send_requires_nonempty_draft_and_not_streaming() {
+    fn control_events_update_notice_without_touching_streaming_state() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.streaming = true;
+
+        state.apply_event(ChatEvent::ControlStatus(
+            sinomo_cli::app_api::ChatControlStatus {
+                session_id: "sess_ui_control".to_string(),
+                accepted: true,
+                sequence: 3,
+                event_count: 1,
+                active_turn: true,
+                task_count: 0,
+                terminal_result_count: 0,
+                tasks: Vec::new(),
+            },
+        ));
+        assert!(state.streaming);
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("agent control accepted at sequence 3")
+        );
+
+        state.apply_event(ChatEvent::ControlState(
+            sinomo_cli::app_api::ChatControlState {
+                session_id: "sess_ui_control".to_string(),
+                accepted: true,
+                steering_count: 2,
+                follow_up_count: 1,
+                ..Default::default()
+            },
+        ));
+        assert!(state.streaming);
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("agent control: 2 steering, 1 follow-ups")
+        );
+    }
+
+    #[test]
+    fn structured_runtime_events_update_context_usage_and_activity() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.streaming = true;
+
+        state.apply_event(ChatEvent::Context(ChatContextSnapshot {
+            step_index: 0,
+            provider: "codex".to_string(),
+            model: "gpt-5.5-codex".to_string(),
+            total_bytes: 4096,
+            max_context_bytes: Some(8192),
+            compaction_threshold_bytes: Some(7000),
+            lanes: vec![sinomo_cli::app_api::ChatContextLane {
+                kind: "recent_tail".to_string(),
+                label: "recent transcript".to_string(),
+                bytes: 1024,
+                priority: 2,
+            }],
+            included_count: 3,
+            omitted_count: 1,
+        }));
+        assert_eq!(state.context.as_ref().map(|ctx| ctx.total_bytes), Some(4096));
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("context assembled: 4.0 KB")
+        );
+
+        state.apply_event(ChatEvent::ToolCallCompleted(ChatToolCallSnapshot {
+            step_index: 0,
+            call_index: Some(0),
+            call_id: Some("call_1".to_string()),
+            tool: "run_command".to_string(),
+            input_preview: Some("{\"cmd\":\"date\"}".to_string()),
+        }));
+        state.apply_event(ChatEvent::Process(ChatProcessSnapshot {
+            process_id: "proc_1".to_string(),
+            command: "date".to_string(),
+            status: "completed".to_string(),
+            exit_code: Some(0),
+            elapsed_ms: 12,
+            stdout_tail: "Mon Jun 15".to_string(),
+            stderr_tail: String::new(),
+        }));
+        state.apply_event(ChatEvent::Usage(ChatUsageSnapshot {
+            provider: "codex".to_string(),
+            model: "gpt-5.5-codex".to_string(),
+            input_tokens: Some(120),
+            output_tokens: Some(18),
+        }));
+
+        assert_eq!(state.usage.as_ref().and_then(|usage| usage.input_tokens), Some(120));
+        assert!(
+            state
+                .activity
+                .iter()
+                .any(|entry| entry.title.contains("run_command"))
+        );
+        assert!(
+            state
+                .activity
+                .iter()
+                .any(|entry| entry.title == "date" && entry.detail.contains("exit 0"))
+        );
+        assert!(
+            state
+                .activity
+                .iter()
+                .any(|entry| entry.title == "model usage"
+                    && entry.detail.contains("120 input"))
+        );
+    }
+
+    #[test]
+    fn tool_call_monitor_tracks_started_streaming_and_completed_calls() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+
+        state.apply_event(ChatEvent::ToolCallStarted(ChatToolCallSnapshot {
+            step_index: 0,
+            call_index: Some(0),
+            call_id: Some("call_1".to_string()),
+            tool: "run_command".to_string(),
+            input_preview: None,
+        }));
+        assert_eq!(state.tool_calls.len(), 1);
+        assert_eq!(state.tool_calls[0].status, "running");
+
+        state.apply_event(ChatEvent::ToolCallDelta {
+            step_index: 0,
+            call_id: Some("call_1".to_string()),
+            tool: Some("run_command".to_string()),
+            arguments_delta: "{\"cmd\":\"date\"}".to_string(),
+        });
+        assert_eq!(state.tool_calls.len(), 1);
+        assert_eq!(state.tool_calls[0].status, "streaming");
+        assert!(state.tool_calls[0].input_preview.contains("date"));
+
+        state.apply_event(ChatEvent::ToolCallCompleted(ChatToolCallSnapshot {
+            step_index: 0,
+            call_index: Some(0),
+            call_id: Some("call_1".to_string()),
+            tool: "run_command".to_string(),
+            input_preview: Some("{\"cmd\":\"date\"}".to_string()),
+        }));
+        assert_eq!(state.tool_calls.len(), 1);
+        assert_eq!(state.tool_calls[0].status, "completed");
+        assert_eq!(state.tool_calls[0].tool, "run_command");
+    }
+
+    #[test]
+    fn runtime_health_surfaces_degraded_cluster_and_persistence_state() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.notice = Some(
+            "session saved locally; SIFS mirror failed: DFS services shard replay delayed"
+                .to_string(),
+        );
+
+        let health = state.runtime_health();
+        assert_eq!(health.label, "DEGRADED");
+        assert_eq!(health.tone, ActivityTone::Warn);
+        assert!(
+            health.detail.contains("SIFS mirror failed"),
+            "health detail should preserve the operator-relevant degraded signal"
+        );
+
+        state.notice = None;
+        state.control.active_turn = true;
+        state.control.task_count = 1;
+        state.control.runtime_attached = false;
+        let health = state.runtime_health();
+        assert_eq!(health.label, "DEGRADED");
+        assert_eq!(health.tone, ActivityTone::Warn);
+        assert!(health.detail.contains("detached"));
+    }
+
+    #[test]
+    fn runtime_health_prioritizes_failed_tasks_and_errors() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.control.tasks.push(ChatTaskSnapshot {
+            task_id: "task_failed".to_string(),
+            kind: "verification".to_string(),
+            summary: "cluster readiness gate".to_string(),
+            status: "failed".to_string(),
+            progress_summary: None,
+            result_ref: None,
+            active_op_id: None,
+        });
+
+        let health = state.runtime_health();
+        assert_eq!(health.label, "ATTENTION");
+        assert_eq!(health.tone, ActivityTone::Bad);
+        assert!(health.detail.contains("cluster readiness gate"));
+
+        state.control.tasks.clear();
+        state.apply_event(ChatEvent::Error("provider stream failed".to_string()));
+        let health = state.runtime_health();
+        assert_eq!(health.label, "ATTENTION");
+        assert_eq!(health.tone, ActivityTone::Bad);
+        assert!(
+            state
+                .activity
+                .iter()
+                .any(|entry| entry.title == "agent error" && entry.tone == ActivityTone::Bad)
+        );
+    }
+
+    #[test]
+    fn context_lane_summary_formats_bytes_and_share() {
+        assert_eq!(
+            context_lane_summary("recent turn tail", 2_048, 8_192),
+            "recent turn tail · 2.0 KB · 25%"
+        );
+        assert_eq!(
+            context_lane_summary("empty", 0, 0),
+            "empty · 0 B · 0%"
+        );
+        let long = context_lane_summary(
+            "very long prompt reference label that should compact",
+            1_048_576,
+            2_097_152,
+        );
+        assert!(long.starts_with("very long prompt referenc... · 1.0 MB · 50%"));
+    }
+
+    #[test]
+    fn can_send_requires_nonempty_draft() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
         assert!(!state.can_send(), "empty draft cannot send");
         state.set_draft("ok".to_string());
         assert!(state.can_send(), "a non-empty draft can send");
         state.streaming = true;
-        assert!(!state.can_send(), "cannot send while streaming");
+        assert!(state.can_send(), "a non-empty draft can queue while streaming");
     }
 
     #[test]
@@ -1844,7 +3066,7 @@ mod tests {
 
     #[test]
     #[ignore]
-    fn live_app_chat_persists_and_reloads_session_through_sifs() {
+    fn live_app_chat_streams_and_persists_session_locally() {
         if std::env::var_os("SINOMO_LIVE_APP_CHAT_SMOKE").is_none() {
             return;
         }
@@ -1854,16 +3076,21 @@ mod tests {
             !state.session_id.is_empty()
         });
 
+        let provider =
+            std::env::var("SINOMO_LIVE_APP_CHAT_PROVIDER").unwrap_or_else(|_| "codex".to_string());
+        let model =
+            std::env::var("SINOMO_LIVE_APP_CHAT_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
+
         state.handle.send_command(ChatCommand::SetModel {
-            provider: "deepseek".to_string(),
-            model: "deepseek-v4-pro".to_string(),
+            provider: provider.clone(),
+            model: model.clone(),
             account: "default".to_string(),
         });
         wait_for(&mut state, Duration::from_secs(20), |state| {
-            state.info.provider == "deepseek" && state.info.model == "deepseek-v4-pro"
+            state.info.provider == provider && state.info.model == model
         });
 
-        let prompt = "Reply with exactly: sinomo-app-live-ok";
+        let prompt = "Reply only with this exact text: sinomo-app-live-ok";
         state.set_draft(prompt.to_string());
         state.submit();
         wait_for(&mut state, Duration::from_secs(90), |state| {
@@ -1875,16 +3102,9 @@ mod tests {
 
         let session_id = state.session_id.clone();
         assert!(!session_id.is_empty(), "session id is assigned");
-        let local_session_dir = state
-            .data_dir
-            .root()
-            .join("app")
-            .join("sessions")
-            .join(&session_id);
-        std::fs::remove_dir_all(&local_session_dir).expect("remove local session cache");
 
         let reloaded =
-            sessions::load_transcript(&state.data_dir, &session_id).expect("reload from sifs");
+            sessions::load_transcript(&state.data_dir, &session_id).expect("reload session");
         assert!(
             reloaded
                 .messages
@@ -1900,6 +3120,18 @@ mod tests {
                     && message.text.contains("sinomo-app-live-ok")),
             "agent response persisted"
         );
+
+        if let Some(notice) = state.notice.as_deref()
+            && notice.contains("SIFS mirror failed")
+        {
+            assert!(
+                state
+                    .activity
+                    .iter()
+                    .any(|entry| entry.title == "session mirror" && entry.tone == ActivityTone::Warn),
+                "SIFS mirror failures should be visible as degraded app-layer activity"
+            );
+        }
     }
 
     fn wait_for(

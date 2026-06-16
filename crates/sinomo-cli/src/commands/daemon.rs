@@ -248,7 +248,16 @@ pub(crate) fn run_daemon_with_paths(
     let cluster = registration
         .map(|registration| register_daemon_cluster_node(&registration))
         .transpose()?;
-    daemon_run_daemon_control_loop(options, paths, label, cluster).map_err(Into::into)
+    daemon_run_daemon_control_loop_with_services(
+        options,
+        paths,
+        label,
+        cluster,
+        vec![sinomo_runtime::daemon::DaemonServiceRegistryHook::new(
+            sinomo_agent::register_services,
+        )],
+    )
+    .map_err(Into::into)
 }
 
 pub(crate) fn start_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
