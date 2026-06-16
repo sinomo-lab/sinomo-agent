@@ -607,6 +607,10 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("publish_elapsed_ms", publish_elapsed.as_millis() as u64);
     ctx.record("files_per_second", files_per_second);
     ctx.record("bytes_per_second", bytes_per_second);
+    ctx.record(
+        "data_write_bytes_per_second",
+        rate_per_second(total_bytes as f64, write_elapsed),
+    );
     ctx.record("min_files_per_second", min_files_per_second);
     ctx.record("max_proc_wchar_amplification", max_proc_wchar_amplification);
     ctx.record(
@@ -686,6 +690,11 @@ fn run_bulk_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let read_pool = backend
         .open_parallel_read_pool(files)
         .map_err(SinomoTestError::failed)?;
+    let expected_started = Instant::now();
+    let expected_payloads = (0..files)
+        .map(|index| bulk_payload(&base, index, bytes))
+        .collect::<Vec<_>>();
+    let expected_payload_build_elapsed = expected_started.elapsed();
     let measurement_started = Instant::now();
     let proc_io_before = current_proc_io();
     let mut matched = vec![false; files];
@@ -706,9 +715,9 @@ fn run_bulk_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             if Instant::now() >= deadline {
                 break;
             }
-            let expected = bulk_payload(&base, index, bytes);
+            let expected = &expected_payloads[index];
             match result {
-                Ok(actual) if actual == expected => {
+                Ok(actual) if actual.as_slice() == expected.as_slice() => {
                     matched[index] = true;
                     matched_count += 1;
                 }
@@ -740,6 +749,10 @@ fn run_bulk_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             ctx.record("read_workers", read_pool.worker_count());
             ctx.record("bytes_per_file", bytes);
             ctx.record("total_bytes", total_bytes);
+            ctx.record(
+                "expected_payload_build_elapsed_ms",
+                expected_payload_build_elapsed.as_millis() as u64,
+            );
             ctx.record("elapsed_ms", elapsed_ms);
             ctx.record("files_per_second", files_per_second);
             ctx.record("bytes_per_second", bytes_per_second);
