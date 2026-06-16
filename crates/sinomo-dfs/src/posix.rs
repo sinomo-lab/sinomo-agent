@@ -1951,6 +1951,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         }
         let mut prepared = Vec::with_capacity(files.len());
         let mut seen_objects = BTreeSet::new();
+        let mut existing_children_by_parent = BTreeMap::<String, BTreeSet<String>>::new();
         let mut resolved_parents = BTreeMap::<String, String>::new();
         for (path, bytes) in files {
             let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
@@ -1972,6 +1973,24 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 return Err(DfsPosixError::InvalidPath { path });
             };
             let path = join_posix_path(&resolved_parent, child_name);
+            if !existing_children_by_parent.contains_key(&resolved_parent) {
+                let existing_children = self
+                    .child_objects_for_sifs_dir(&resolved_parent)?
+                    .into_iter()
+                    .filter_map(|child| {
+                        normalize_posix_path(&child.path).ok().and_then(|path| {
+                            path.rsplit_once('/').map(|(_, name)| name.to_string())
+                        })
+                    })
+                    .collect::<BTreeSet<_>>();
+                existing_children_by_parent.insert(resolved_parent.clone(), existing_children);
+            }
+            let existing_children = existing_children_by_parent
+                .get_mut(&resolved_parent)
+                .expect("parent children inserted");
+            if !existing_children.insert(child_name.to_string()) {
+                return Err(DfsPosixError::AlreadyExists { path });
+            }
             let object = self.metadata_object_for_new_path(&path, DfsObjectKind::File);
             if !seen_objects.insert(object.object_id.clone()) {
                 return Err(DfsPosixError::AlreadyExists { path });

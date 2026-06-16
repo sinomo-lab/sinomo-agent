@@ -45,6 +45,8 @@
 #   SINOMO_TEST_NETWORK_MAX_P50_MS          max network ping p50 latency (default 50)
 #   SINOMO_TEST_NETWORK_MAX_P95_MS          max network ping p95 latency (default 250)
 #   SINOMO_TEST_NETWORK_MIN_RPS             min network ping throughput (default 50)
+#   SINOMO_TEST_NETWORK_PAYLOAD_BYTES       bytes per network-baseline ping payload (default 0)
+#   SINOMO_TEST_NETWORK_REQUIRE_DIRECT      require direct, non-relayed network routes (default 0; this compose is segmented)
 #   SINOMO_TEST_NETWORK_READY_WAIT          network/auth convergence gate seconds (default 120)
 #   SINOMO_TEST_NETWORK_READY_REQUESTS_PER_TARGET requests per target during readiness warmup (default 20)
 #   SINOMO_TEST_NETWORK_READY_CONCURRENCY   readiness warmup concurrency (default 32)
@@ -83,6 +85,8 @@ NETWORK_MAX_FAILURES="${SINOMO_TEST_NETWORK_MAX_FAILURES:-0}"
 NETWORK_MAX_P50_MS="${SINOMO_TEST_NETWORK_MAX_P50_MS:-50}"
 NETWORK_MAX_P95_MS="${SINOMO_TEST_NETWORK_MAX_P95_MS:-250}"
 NETWORK_MIN_RPS="${SINOMO_TEST_NETWORK_MIN_RPS:-50}"
+NETWORK_PAYLOAD_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_BYTES:-0}"
+NETWORK_REQUIRE_DIRECT="${SINOMO_TEST_NETWORK_REQUIRE_DIRECT:-0}"
 NETWORK_READY_WAIT="${SINOMO_TEST_NETWORK_READY_WAIT:-120}"
 NETWORK_READY_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_READY_REQUESTS_PER_TARGET:-20}"
 NETWORK_READY_CONCURRENCY="${SINOMO_TEST_NETWORK_READY_CONCURRENCY:-32}"
@@ -182,6 +186,7 @@ wait_for_network_ready() {
           --param "max-failures=0" \
           --param "max-p50-ms=$NETWORK_MAX_P50_MS" \
           --param "max-p95-ms=$NETWORK_MAX_P95_MS" \
+          --param "require-direct=$NETWORK_REQUIRE_DIRECT" \
           --param "min-requests-per-second=$NETWORK_MIN_RPS" \
           >"$ARTIFACTS/network-ready-$node.last.json" 2>&1; then
         log "  network-ready: $node"
@@ -252,6 +257,8 @@ network_baseline() {
       --param "max-failures=$NETWORK_MAX_FAILURES" \
       --param "max-p50-ms=$NETWORK_MAX_P50_MS" \
       --param "max-p95-ms=$NETWORK_MAX_P95_MS" \
+      --param "payload-bytes=$NETWORK_PAYLOAD_BYTES" \
+      --param "require-direct=$NETWORK_REQUIRE_DIRECT" \
       --param "min-requests-per-second=$NETWORK_MIN_RPS" || rc=1
   done
   return $rc

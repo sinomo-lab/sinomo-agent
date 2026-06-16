@@ -1547,12 +1547,25 @@ pub fn cluster_endpoint_prefers_relay_with_graph(
         | Some(crate::ClusterConnectivityState::Unreachable) => return true,
         None => {}
     }
+    if unknown_hostname_lan_endpoint_should_try_direct(endpoint) {
+        return false;
+    }
     // No healthy direct edge. Relay iff the relay would actually make progress -- i.e. the same
     // best-effort first-hop the relay uses resolves (a full healthy path OR a healthy neighbor
     // to hand off to). Unknown direct reachability is still skipped when a route exists: in
     // segmented clusters, spending the caller's entire health/command budget on an unprobed
     // cross-segment direct dial prevents the already-stabilized graph from being used.
     !cluster_relay_next_hops(graph, state, &state.local_node_id, &endpoint.node_id, &[]).is_empty()
+}
+
+fn unknown_hostname_lan_endpoint_should_try_direct(endpoint: &ClusterEndpointRecord) -> bool {
+    matches!(
+        endpoint.transport,
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+    ) && endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
+        && endpoint.address.contains(':')
+        && !endpoint.address.contains("://")
+        && endpoint.address.parse::<std::net::SocketAddr>().is_err()
 }
 
 /// Whether endpoint RPC delivery should skip direct dial and relay immediately,
@@ -1812,6 +1825,47 @@ mod tests {
         assert!(
             cluster_endpoint_prefers_relay_with_graph(&graph, &state, &endpoint),
             "known-unreachable endpoints should skip stale direct dials even when no relay route is currently available"
+        );
+    }
+
+    #[test]
+    fn endpoint_tries_unknown_hostname_lan_direct_before_relay() {
+        let now = OffsetDateTime::now_utc();
+        let local = nid("node_prefers_hostname_direct_local");
+        let target = nid("node_prefers_hostname_direct_target");
+        let bridge = nid("node_prefers_hostname_direct_bridge");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_prefers_hostname_direct").expect("cluster"),
+            "prefers hostname direct",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        for node in [&target, &bridge] {
+            let mut member = ClusterMemberRecord::local_non_voting(
+                state.cluster_id.clone(),
+                node.clone(),
+                node.as_str(),
+                format!("pk-{node}"),
+                now,
+            );
+            member.capabilities = main_daemon_capabilities(&member.role);
+            member.allowed_capabilities = member.capabilities.clone();
+            state.members.push(member);
+        }
+        let endpoint = crate::daemon_lan_endpoint(&target, "node-target:21353".to_string(), 5);
+        let graph = ClusterConnectivityGraph::from_records(
+            local.clone(),
+            [
+                edge(&local, &bridge, ClusterConnectivityState::Healthy),
+                edge(&bridge, &target, ClusterConnectivityState::Healthy),
+            ],
+        );
+
+        assert!(
+            !cluster_endpoint_prefers_relay_with_graph(&graph, &state, &endpoint),
+            "unknown hostname LAN endpoints should get a direct async attempt before relay"
         );
     }
 

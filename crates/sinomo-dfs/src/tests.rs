@@ -17510,6 +17510,55 @@ fn sifs_posix_bulk_local_eventual_writes_visible_files() {
 }
 
 #[test]
+fn sifs_posix_create_bulk_local_eventual_rejects_existing_paths() {
+    let root = temp_root("sifs-posix-create-bulk-local-eventual");
+    let node_id = NodeId::from_legacy_named("node_sifs_create_bulk_local").expect("node");
+    let work = "/services/sandbox/instances/sandbox_create_bulk_local/work";
+    let path_a = "/services/sandbox/instances/sandbox_create_bulk_local/work/a.txt";
+    let path_b = "/services/sandbox/instances/sandbox_create_bulk_local/work/b.txt";
+
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.posix_mkdir_all(work).expect("mkdir");
+    let stats = dfs
+        .posix_create_files_local_eventual_with_known_parents(vec![
+            (path_a, b"bulk create alpha".as_slice()),
+            (path_b, b"bulk create beta".as_slice()),
+        ])
+        .expect("bulk create");
+
+    assert_eq!(stats.len(), 2);
+    assert_eq!(stats[0].path, path_a);
+    assert_eq!(stats[0].current_locations, vec![node_id.clone()]);
+    assert_eq!(stats[1].path, path_b);
+    assert_eq!(stats[1].current_locations, vec![node_id]);
+    assert_eq!(
+        dfs.posix_read_file(path_a).expect("read a"),
+        b"bulk create alpha"
+    );
+    assert_eq!(
+        dfs.posix_read_file(path_b).expect("read b"),
+        b"bulk create beta"
+    );
+
+    assert!(
+        matches!(
+            dfs.posix_create_files_local_eventual_with_known_parents(vec![(
+                path_a,
+                b"must not overwrite".as_slice()
+            )]),
+            Err(DfsPosixError::AlreadyExists { path }) if path == path_a
+        ),
+        "create-only batch must reject existing paths"
+    );
+    assert_eq!(
+        dfs.posix_read_file(path_a).expect("read unchanged a"),
+        b"bulk create alpha"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn sifs_posix_write_at_merges_bytes_and_preserves_hardlink_identity() {
     let root = temp_root("sifs-posix-write-at-hardlink");
     let node_id = NodeId::from_legacy_named("node_sifs_write_at").expect("node");
