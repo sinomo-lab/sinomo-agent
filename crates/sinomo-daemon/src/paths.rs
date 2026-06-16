@@ -7,6 +7,7 @@ use std::path::PathBuf;
 pub struct DaemonPaths {
     pub root: PathBuf,
     pub lock: PathBuf,
+    pub data_owner_lock: PathBuf,
     pub status: PathBuf,
 }
 
@@ -22,6 +23,7 @@ impl DaemonPaths {
     pub fn with_root(root: PathBuf) -> Self {
         Self {
             lock: root.join("daemon.lock"),
+            data_owner_lock: root.join("data-owner.lock"),
             status: root.join("status.sobj"),
             root,
         }

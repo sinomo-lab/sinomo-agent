@@ -4804,12 +4804,8 @@ async fn send_cluster_relay_request_to_next_hop_async(
     .map_err(DaemonError::from)
 }
 
-fn relay_local_node_id(paths: &DaemonPaths, state: &ClusterBootstrapState) -> NodeId {
-    if daemon_paths_are_shadow(paths) {
-        sinomo_node::shadow_daemon_node_id(&state.local_node_id)
-    } else {
-        state.local_node_id.clone()
-    }
+fn relay_local_node_id(_paths: &DaemonPaths, state: &ClusterBootstrapState) -> NodeId {
+    state.local_node_id.clone()
 }
 
 enum RelayLocalDeliveryTarget {
@@ -4822,7 +4818,10 @@ fn relay_local_delivery_target(
     state: &ClusterBootstrapState,
     target_node_id: &NodeId,
 ) -> Result<Option<RelayLocalDeliveryTarget>, DaemonError> {
-    if *target_node_id == relay_local_node_id(paths, state) {
+    if *target_node_id == relay_local_node_id(paths, state)
+        || (daemon_paths_are_shadow(paths)
+            && *target_node_id == sinomo_node::shadow_daemon_node_id(&state.local_node_id))
+    {
         return Ok(Some(RelayLocalDeliveryTarget::CurrentProcess(
             paths.clone(),
         )));
@@ -5109,10 +5108,10 @@ mod tests {
         match relay_local_delivery_target(&shadow_paths, &state, &main_node_id)
             .expect("shadow to main")
         {
-            Some(RelayLocalDeliveryTarget::LoopbackAddress(address)) => {
-                assert_eq!(address, "127.0.0.1:32153")
+            Some(RelayLocalDeliveryTarget::CurrentProcess(paths)) => {
+                assert_eq!(paths.root, shadow_paths.root)
             }
-            _ => panic!("main target from shadow should use sibling loopback"),
+            _ => panic!("main target from shadow should dispatch in-process"),
         }
         assert!(
             relay_local_delivery_target(
@@ -5201,14 +5200,8 @@ mod tests {
                 .all(|endpoint| endpoint.address != "127.0.0.1:21353")
         );
 
-        let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
-        let shadow_member = state
-            .members
-            .iter()
-            .find(|member| member.node_id == shadow_node_id)
-            .expect("shadow member");
         assert!(
-            shadow_member
+            main_member
                 .endpoints
                 .iter()
                 .any(
@@ -5217,7 +5210,7 @@ mod tests {
                 )
         );
         assert!(
-            shadow_member
+            main_member
                 .endpoints
                 .iter()
                 .all(|endpoint| endpoint.address != "127.0.0.1:21354")
@@ -5293,14 +5286,8 @@ mod tests {
                 .all(|endpoint| endpoint.address != "127.0.0.1:21353")
         );
 
-        let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
-        let shadow_member = state
-            .members
-            .iter()
-            .find(|member| member.node_id == shadow_node_id)
-            .expect("shadow member");
         assert!(
-            shadow_member
+            main_member
                 .endpoints
                 .iter()
                 .any(
@@ -5309,7 +5296,7 @@ mod tests {
                 )
         );
         assert!(
-            shadow_member
+            main_member
                 .endpoints
                 .iter()
                 .all(|endpoint| endpoint.address != "127.0.0.1:21354")
@@ -7602,8 +7589,8 @@ mod tests {
 
         assert_eq!(status.cluster_id, state.cluster_id);
         assert_eq!(status.process, crate::DAEMON_SHADOW_CLUSTER_ROLE);
-        assert_eq!(status.member_role, ClusterMemberRole::NonVoting);
-        assert_eq!(status.member_state, ClusterMemberState::NonVoting);
+        assert_eq!(status.member_role, ClusterMemberRole::Voter);
+        assert_eq!(status.member_state, ClusterMemberState::Voter);
     }
 
     #[test]
@@ -7687,7 +7674,6 @@ mod tests {
             port: 21_354,
         };
         ensure_daemon_cluster_members(&mut state, &main_options, &shadow_options, now);
-        let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
         let shadow_cluster = daemon_cluster_status(&state, crate::DaemonClusterProcess::Shadow)
             .expect("shadow cluster status");
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write local state");
@@ -7700,7 +7686,7 @@ mod tests {
             &cluster_paths,
             &IrohEndpointRecord {
                 cluster_id: state.cluster_id.clone(),
-                node_id: shadow_node_id.clone(),
+                node_id: state.local_node_id.clone(),
                 endpoint_public_key: "iroh_public_key_shadow_repair_route".to_string(),
                 direct_addresses: Vec::new(),
                 relay_url: Some("https://relay.example./".to_string()),
@@ -7716,12 +7702,12 @@ mod tests {
         );
         let updated =
             sinomo_network::read_cluster_state_without_kv(&cluster_paths).expect("read state");
-        let shadow_member = updated
+        let main_member = updated
             .members
             .iter()
-            .find(|member| member.node_id == shadow_node_id)
-            .expect("shadow member");
-        assert!(shadow_member.endpoints.iter().any(|endpoint| {
+            .find(|member| member.node_id == state.local_node_id)
+            .expect("main member");
+        assert!(main_member.endpoints.iter().any(|endpoint| {
             endpoint.transport == ClusterTransportKind::Iroh
                 && endpoint.address
                     == "iroh://iroh_public_key_shadow_repair_route?relay=https://relay.example./"
@@ -10076,7 +10062,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_next_hop_endpoints_keep_locally_learned_hostname_fallback() {
+    fn relay_next_hop_endpoints_suppress_unknown_hostname_fallback_after_healthy_route() {
         let root = unique_cluster_test_root("sinomo-daemon-relay-local-hostname-fallback");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -10148,8 +10134,8 @@ mod tests {
         assert!(
             endpoints
                 .iter()
-                .any(|endpoint| endpoint.address == learned_endpoint.address),
-            "relay should retain the locally learned hostname as a fallback for segmented startup"
+                .all(|endpoint| endpoint.address != learned_endpoint.address),
+            "healthy next-hop routing suppresses unknown hostname fallbacks"
         );
     }
 

@@ -94,10 +94,7 @@ pub fn daemon_cluster_status(
     state: &ClusterBootstrapState,
     process: DaemonClusterProcess,
 ) -> Option<DaemonClusterStatus> {
-    let node_id = match process {
-        DaemonClusterProcess::Main => state.local_node_id.clone(),
-        DaemonClusterProcess::Shadow => sinomo_node::shadow_daemon_node_id(&state.local_node_id),
-    };
+    let node_id = state.local_node_id.clone();
     let member = state
         .members
         .iter()
@@ -561,6 +558,64 @@ impl DaemonLock {
     }
 }
 
+#[derive(Debug)]
+pub struct DaemonDataOwnerLock {
+    file: File,
+    path: PathBuf,
+}
+
+impl DaemonDataOwnerLock {
+    pub fn acquire(paths: &DaemonPaths) -> Result<Self, DaemonError> {
+        paths.ensure()?;
+        let path = paths.data_owner_lock.clone();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| DaemonError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        file.try_lock_exclusive()
+            .map_err(|source| DaemonError::AlreadyRunning {
+                lock_file: path.display().to_string(),
+                detail: format!(
+                    "main daemon data directory is already owned by another process: {source}"
+                ),
+            })?;
+        file.set_len(0).map_err(|source| DaemonError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        (&file)
+            .seek(SeekFrom::Start(0))
+            .map_err(|source| DaemonError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        (&file)
+            .write_all(format!("pid={}\n", std::process::id()).as_bytes())
+            .map_err(|source| DaemonError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        (&file).flush().map_err(|source| DaemonError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        Ok(Self { file, path })
+    }
+}
+
+impl Drop for DaemonDataOwnerLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 impl Drop for DaemonLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.paths.status);
@@ -808,6 +863,18 @@ mod tests {
             &DaemonPaths::with_root(root.join("daemon")),
             Some(cluster),
         )
+    }
+
+    #[test]
+    fn daemon_data_owner_lock_excludes_second_owner() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-data-owner-lock");
+        let paths = DaemonPaths::with_root(root.join("daemon"));
+        let owner = DaemonDataOwnerLock::acquire(&paths).expect("owner lock");
+
+        assert!(DaemonDataOwnerLock::acquire(&paths).is_err());
+
+        drop(owner);
+        DaemonDataOwnerLock::acquire(&paths).expect("lock released");
     }
 
     #[test]

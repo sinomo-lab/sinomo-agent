@@ -411,7 +411,8 @@ bridge or managed server.
 
 Product runtime configuration is stored through model runtime settings rather
 than prompt text. Cluster-scoped settings live in cluster KV at
-`/config/lm/runtime`; local-only test overrides use `sinomo --local`.
+`/config/lm/runtime`; local-only test overrides use internal degraded-mode test
+helpers rather than a public process flag.
 
 ## Background Agent and Cluster Operations
 

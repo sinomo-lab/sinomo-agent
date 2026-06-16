@@ -1065,8 +1065,8 @@ pub struct SifsEntry {
     pub size: Option<u64>,
 }
 
-/// A handle to browse SIFS (the distributed filesystem). In local mode this is
-/// backed by the local content store + metadata; with a daemon it spans the
+/// A handle to browse SIFS (the distributed filesystem). Degraded fallback can
+/// read local content store metadata, while daemon-backed operation spans the
 /// cluster.
 pub struct SifsBrowser {
     backend: SifsFileManagerBackend,

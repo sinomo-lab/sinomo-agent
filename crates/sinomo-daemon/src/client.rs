@@ -318,6 +318,47 @@ pub fn send_daemon_rpc_to_endpoint(
     output
 }
 
+pub fn send_daemon_rpc_direct_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    request: &ObjectRpcRequest,
+    timeout: Duration,
+) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
+    let timeouts = sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout);
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return if matches!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            let runtime = handle.clone();
+            tokio::task::block_in_place(|| {
+                runtime.block_on(send_daemon_rpc_direct_to_endpoint_async(
+                    endpoint, request, timeouts, &runtime,
+                ))
+            })
+        } else {
+            Err(DaemonError::Network {
+                address: "daemon client runtime".to_string(),
+                detail: "daemon RPC sync client cannot run inside a current-thread Tokio runtime; use the async or owner-runtime API".to_string(),
+            })
+        };
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| DaemonError::Network {
+            address: "daemon client runtime".to_string(),
+            detail: source.to_string(),
+        })?;
+    let output = runtime.block_on(send_daemon_rpc_direct_to_endpoint_async(
+        endpoint,
+        request,
+        timeouts,
+        runtime.handle(),
+    ));
+    runtime.shutdown_timeout(Duration::from_millis(250));
+    output
+}
+
 pub(crate) fn send_daemon_rpc_to_endpoint_on_runtime(
     endpoint: &ClusterEndpointRecord,
     request: &ObjectRpcRequest,
@@ -334,6 +375,32 @@ pub(crate) fn send_daemon_rpc_to_endpoint_on_runtime(
             &runtime_for_future,
         ),
     )
+}
+
+pub async fn send_daemon_rpc_direct_to_endpoint_async(
+    endpoint: &ClusterEndpointRecord,
+    request: &ObjectRpcRequest,
+    timeouts: sinomo_network::DaemonRpcTimeouts,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
+    let request_for_signing = request.clone();
+    let signed = runtime
+        .spawn_blocking(move || sign_daemon_rpc_request_for_local_node(&request_for_signing))
+        .await
+        .map_err(|source| DaemonError::Network {
+            address: endpoint.address.clone(),
+            detail: format!("daemon RPC signing task failed: {source}"),
+        })??;
+    let command = daemon_rpc_command(&request.route);
+    sinomo_network::send_daemon_rpc_to_cluster_endpoint_async(
+        endpoint,
+        &command,
+        Some(&signed),
+        request,
+        timeouts,
+    )
+    .await
+    .map_err(DaemonError::from)
 }
 
 pub async fn send_daemon_rpc_to_endpoint_async(

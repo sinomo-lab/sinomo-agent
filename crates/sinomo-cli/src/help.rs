@@ -30,18 +30,12 @@ pub fn print_usage() {
         }
     }
     println!();
-    println!("Global flags:");
-    println!(
-        "  --local                    Force local file-backed mode; skip daemon/cluster probes and ignore cluster KV."
-    );
-    println!();
     println!("Run `sinomo <subcommand> help` for detailed commands.");
     println!();
     println!("TUI:");
     println!(
         "  Run `sinomo` with no arguments to connect the command-line user interface to the local daemon when available."
     );
-    println!("  Run `sinomo --local` to start without probing the daemon or cluster.");
     println!("  Inside the TUI, prefix any CLI command with `/`, for example `/models list`.");
     println!("  Use `/quit` or `/exit` to end the session.");
     println!();
@@ -153,6 +147,10 @@ pub(super) fn print_cluster_help() {
     );
     println!(
         "      Record intent to join an existing cluster from a signed sinomo-join URI or invite file."
+    );
+    println!("  sinomo cluster migrate plan <invite> [--mode single-node|cluster-merge]");
+    println!(
+        "      Plan migration from the current initialized cluster into another cluster without mutating local state."
     );
     println!("  sinomo cluster role <node-id> <workstation|mobile|server|sensor|test>");
     println!("      Change the documented node role in quorum-backed cluster membership.");

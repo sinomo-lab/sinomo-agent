@@ -6070,7 +6070,7 @@ fn cluster_network_probe_targets_include_remote_shadow_endpoints() {
         ClusterMemberRecord::local_voter(cluster_id, shadow, "shadow", "pk-shadow", now);
     shadow_member.role = ClusterMemberRole::NonVoting;
     shadow_member.state = ClusterMemberState::NonVoting;
-    shadow_member.capabilities = shadow_daemon_capabilities();
+    shadow_member.capabilities = sinomo_node::shadow_daemon_capabilities();
     shadow_member.allowed_capabilities = shadow_member.capabilities.clone();
     shadow_member.endpoints = vec![shadow_endpoint.clone()];
     state.members.push(main_member);
@@ -9489,13 +9489,11 @@ fn cluster_member_mutation_driver_prepares_state_from_local_membership_observer(
         .expect("main member");
     assert_eq!(main.node_public_key, "new-main-public-key");
     assert!(main.endpoints.contains(&main_endpoint));
-    let shadow_member = state
-        .members
-        .iter()
-        .find(|member| member.node_id == shadow)
-        .expect("shadow member");
-    assert_eq!(shadow_member.node_public_key, "new-shadow-public-key");
-    assert!(shadow_member.endpoints.contains(&shadow_endpoint));
+    assert!(
+        main.endpoints
+            .iter()
+            .any(|endpoint| endpoint.address == shadow_endpoint.address)
+    );
 }
 
 #[test]
@@ -11687,15 +11685,12 @@ fn cluster_join_registration_state_preparation_applies_local_daemon_member_facts
     assert_eq!(main.node_public_key, "main-pk");
     assert_eq!(main.state, ClusterMemberState::Pending);
     assert!(main.endpoints.contains(&main_endpoint));
-    let shadow = state
-        .members
-        .iter()
-        .find(|member| member.node_id == shadow_node_id)
-        .expect("shadow daemon member");
-    assert_eq!(shadow.node_public_key, "shadow-pk");
-    assert_eq!(shadow.role, ClusterMemberRole::NonVoting);
-    assert_eq!(shadow.state, ClusterMemberState::Pending);
-    assert!(shadow.endpoints.contains(&shadow_endpoint));
+    assert_eq!(main.role, ClusterMemberRole::Learner);
+    assert!(
+        main.endpoints
+            .iter()
+            .any(|endpoint| endpoint.address == shadow_endpoint.address)
+    );
 }
 
 #[derive(Default)]
@@ -23170,13 +23165,11 @@ fn local_daemon_membership_observation_updates_members_and_public_keys() {
         .expect("main member");
     assert_eq!(main.node_public_key, "new-main-public-key");
     assert!(main.endpoints.contains(&main_endpoint));
-    let shadow = state
-        .members
-        .iter()
-        .find(|member| member.node_id == shadow_node_id)
-        .expect("shadow member");
-    assert_eq!(shadow.node_public_key, "new-shadow-public-key");
-    assert!(shadow.endpoints.contains(&shadow_endpoint));
+    assert!(
+        main.endpoints
+            .iter()
+            .any(|endpoint| endpoint.address == shadow_endpoint.address)
+    );
 }
 
 #[test]
@@ -23306,15 +23299,11 @@ fn refresh_local_iroh_endpoints_from_disk_updates_local_daemon_members() {
                 == stable_iroh_endpoint_id(&local_node_id, "main_iroh_public_key")
             && endpoint.address == "iroh://main_iroh_public_key"
     }));
-    let shadow = state
-        .members
-        .iter()
-        .find(|member| member.node_id == shadow_node_id)
-        .expect("shadow member");
-    assert!(shadow.endpoints.iter().any(|endpoint| {
+    assert!(main.endpoints.iter().any(|endpoint| {
         endpoint.transport == ClusterTransportKind::Iroh
             && endpoint.endpoint_id
-                == stable_iroh_endpoint_id(&shadow_node_id, "shadow_iroh_public_key")
+                == stable_iroh_endpoint_id(&local_node_id, "shadow_iroh_public_key")
+            && endpoint.node_id == local_node_id
             && endpoint.address == "iroh://shadow_iroh_public_key?relay=https://relay.example/"
     }));
 

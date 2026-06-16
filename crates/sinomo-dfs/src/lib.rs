@@ -549,6 +549,10 @@ pub fn register_storage_paths(
             "dynamic DFS metadata shard directories with object records and journal entries",
         ),
         (
+            "dfs/imports",
+            "quarantined DFS metadata imported from migrated source clusters",
+        ),
+        (
             "dfs/operator",
             "dynamic DFS operator intent records stored as sinomo-object files",
         ),
@@ -768,6 +772,29 @@ pub fn default_dfs_metadata_root(data_dir: &SinomoDataDir) -> PathBuf {
 
 pub fn default_dfs_metadata_shards_root(data_dir: &SinomoDataDir) -> PathBuf {
     data_dir.dfs_dir().join("metadata")
+}
+
+pub const DFS_IMPORTS_NAMESPACE_ROOT: &str = "/sinomo/imports";
+
+pub fn dfs_import_namespace_root(source_cluster_id: impl std::fmt::Display) -> String {
+    format!("{DFS_IMPORTS_NAMESPACE_ROOT}/{source_cluster_id}")
+}
+
+pub fn dfs_import_root(
+    data_dir: &SinomoDataDir,
+    source_cluster_id: impl std::fmt::Display,
+) -> PathBuf {
+    data_dir
+        .dfs_dir()
+        .join("imports")
+        .join(source_cluster_id.to_string())
+}
+
+pub fn dfs_import_metadata_root(
+    data_dir: &SinomoDataDir,
+    source_cluster_id: impl std::fmt::Display,
+) -> PathBuf {
+    dfs_import_root(data_dir, source_cluster_id).join("metadata")
 }
 
 pub fn resolve_dfs_metadata_root(explicit: Option<PathBuf>) -> Result<PathBuf, LocalDataError> {

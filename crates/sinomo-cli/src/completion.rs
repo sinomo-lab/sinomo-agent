@@ -341,9 +341,7 @@ pub(crate) fn slash_completions_for_layer(
     }
 
     let (tokens, replace_start, replace_end, prefix) = completion_tokens(input, cursor)?;
-    if layer == SlashCommandCompletionLayer::Tui
-        && tokens.iter().any(|token| token.text == "--local")
-    {
+    if tokens.iter().any(|token| token.text == "--local") {
         return None;
     }
     if layer == SlashCommandCompletionLayer::Tui
@@ -1278,7 +1276,7 @@ fn slash_command_registry() -> CommandSpec {
                 vec![],
             ),
         ],
-        vec![option("--local", "force local file-backed mode", None)],
+        vec![],
         vec![],
     );
     append_registered_slash_commands(&mut registry);
@@ -1355,9 +1353,6 @@ fn choice_from_autocomplete(choice: CliAutocompleteChoice) -> ValueChoice {
 }
 
 fn apply_tui_slash_command_layer(registry: &mut CommandSpec) {
-    registry
-        .options
-        .retain(|option| option.name.as_ref() != "--local");
     registry.children.extend(tui_slash_command_layer());
     if let Some(model) = registry
         .children
@@ -1784,7 +1779,6 @@ fn option_for_name(name: &'static str) -> OptionSpec {
             TELEMETRY_WEIGHT_CHOICES,
         )),
         "--json"
-        | "--local"
         | "--no-start"
         | "--no-stop"
         | "--remote-build"
@@ -1913,7 +1907,6 @@ fn option_placeholder(name: &str) -> &'static str {
 
 fn option_detail(name: &str) -> &'static str {
     match name {
-        "--local" => "force local file-backed mode",
         "--json" => "print JSON output",
         "--provider" => "provider id",
         "--model" => "model id",
@@ -2019,9 +2012,13 @@ mod tests {
     }
 
     #[test]
-    fn tui_slash_completion_blocks_local_process_option() {
-        let standard = slash_completions("/--", "/--".len()).expect("standard options");
-        assert!(standard.items.iter().any(|item| item.label == "--local"));
+    fn slash_completion_blocks_removed_local_process_option() {
+        let standard = slash_completions("/--", "/--".len());
+        assert!(
+            standard
+                .as_ref()
+                .is_none_or(|set| !set.items.iter().any(|item| item.label == "--local"))
+        );
 
         let tui = slash_completions_for_layer("/--", "/--".len(), SlashCommandCompletionLayer::Tui);
         assert!(

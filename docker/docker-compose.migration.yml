@@ -1,0 +1,65 @@
+# Two-node Docker harness for the cluster join migration path.
+#
+# This compose file intentionally starts inert containers. The driver script
+# (`docker/test-cluster-migration.sh`) initializes the target and source in a
+# controlled sequence:
+#
+#   1. target becomes a live cluster introducer
+#   2. source initializes as its own settled single-node cluster
+#   3. source seeds migration fixture KV/DFS state
+#   4. source joins target, exercising the migration path
+#   5. source daemon starts and the script verifies health/evidence
+
+x-node-defaults: &node-defaults
+  image: sinomo-dev-runtime
+  build:
+    context: .
+    dockerfile: Dockerfile.dev
+  entrypoint: ["/bin/sh", "-lc", "sleep infinity"]
+  environment:
+    SINOMO_DATA_DIR: /data
+    SINOMO_DISABLE_IROH: "1"
+    SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+    SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-4}"
+  volumes:
+    - ../target/debug/sinomo:/usr/local/bin/sinomo:ro
+    - migration-shared:/shared
+  networks: [migration]
+
+services:
+  target:
+    <<: *node-defaults
+    hostname: target
+    environment:
+      SINOMO_DATA_DIR: /data
+      SINOMO_DISABLE_IROH: "1"
+      SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      SINOMO_DAEMON_ADVERTISE_HOST: target
+      SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-4}"
+    volumes:
+      - target-data:/data
+      - migration-shared:/shared
+      - ../target/debug/sinomo:/usr/local/bin/sinomo:ro
+
+  source:
+    <<: *node-defaults
+    hostname: source
+    environment:
+      SINOMO_DATA_DIR: /data
+      SINOMO_DISABLE_IROH: "1"
+      SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      SINOMO_DAEMON_ADVERTISE_HOST: source
+      SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-4}"
+    volumes:
+      - source-data:/data
+      - migration-shared:/shared
+      - ../target/debug/sinomo:/usr/local/bin/sinomo:ro
+
+networks:
+  migration:
+    driver: bridge
+
+volumes:
+  target-data:
+  source-data:
+  migration-shared:

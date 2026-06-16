@@ -5,39 +5,41 @@ use super::{
     AgentSessionTerminalResultsOptions, AgentValidateOptions, BUILTIN_TOP_LEVEL_USAGE_COMMANDS,
     CliClusterMemberMutationHost, CliCommand, CliError, CliRuntimeOptions, ClusterCliCommand,
     ClusterInitOptions, ClusterInviteOptions, ClusterJoinOptions, ClusterJoinRegistrationRequest,
-    ClusterPaths, ClusterRaftRoleOptions, ClusterRemoveOptions, ClusterRoleOptions,
-    ClusterRolloutBuildRequest, DaemonCliCommand, DaemonClusterStatus, DaemonPaths,
-    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DebugCliCommand, DfsCliCommand,
-    DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions, DfsMountOptions, DfsPinCliCommand,
-    InstallLayout, InstallOptions, InteractionModel, InteractionRuntime, InteractionSession,
-    InteractionSurface, InteractionSurfaceKind, ModelBackedInteractionHandler,
-    ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions, ModelOptionsTarget,
-    ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand,
-    ProviderCommandOptions, ProviderName, RolloutAdvanceOptions, RolloutCliCommand,
-    RolloutMainActivation, RolloutModuleNativeDylibOptions, RolloutOptions,
-    RolloutProgressExpectation, RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler,
-    SelfRolloutPaths, TestCliCommand, UninstallOptions, advertised_peer_route_targets,
-    apply_cluster_node_role, apply_cluster_raft_role, authenticate_daemon_control_request,
+    ClusterMigrateCommand, ClusterMigrationPlanOptions, ClusterPaths, ClusterRaftRoleOptions,
+    ClusterRemoveOptions, ClusterRoleOptions, ClusterRolloutBuildRequest, DaemonCliCommand,
+    DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
+    DebugCliCommand, DfsCliCommand, DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions,
+    DfsMountOptions, DfsPinCliCommand, InstallLayout, InstallOptions, InteractionModel,
+    InteractionRuntime, InteractionSession, InteractionSurface, InteractionSurfaceKind,
+    ModelBackedInteractionHandler, ModelOptionValueUpdate, ModelOptionsCliCommand,
+    ModelOptionsSetOptions, ModelOptionsTarget, ModelRuntimeCliCommand, ModelRuntimeSetOptions,
+    ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions, ProviderName,
+    RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation,
+    RolloutModuleNativeDylibOptions, RolloutOptions, RolloutProgressExpectation,
+    RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler, SelfRolloutPaths,
+    TestCliCommand, UninstallOptions, advertised_peer_route_targets, apply_cluster_node_role,
+    apply_cluster_raft_role, authenticate_daemon_control_request,
     build_cluster_raft_append_request_from_next_index, cli_command_is_help,
     cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
     cli_invocation_force_local_mode, cluster_connectivity_sync_ops, cluster_doctor_findings,
     cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_with_paths,
-    cluster_join_with_paths, cluster_node_status_from_daemon_status, cluster_peer_members,
-    cluster_raft_known_leader_id, cluster_state_sync_txn, cluster_sync_targets,
-    compact_default_invite_introducers, daemon_advertised_endpoints_for_state,
-    daemon_handle_daemon_sandbox_http_fetch, daemon_package_version,
-    data_dir_storage_contract_findings, decode_cluster_join_invite, encode_cluster_join_invite,
-    ensure_rollout_layout, expire_cluster_network_records_in_kv, extend_rollout_endpoints_from_kv,
-    format_rollout_progress_line, handle_daemon_cluster_join_request,
-    handle_daemon_cluster_kv_txn_request, handle_daemon_rollout_build_request,
-    install_should_update_binary, install_with_layout, invite_channels_for_join_registration,
-    invite_communication_channels, invite_introducer_endpoint,
-    invite_introducer_endpoint_from_state, load_tui_model_runtime_config,
-    main_agent_config_tool_registry, main_agent_handler_for_tui_with_data_dir,
-    managed_source_status, model_config_uses_cluster, models_default_with_data_dir,
-    normalize_model_provider, open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command,
-    parse_cli_invocation, parse_cluster_command, parse_cluster_join_invite_argument,
-    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
+    cluster_join_with_paths, cluster_migration_plan_with_paths,
+    cluster_node_status_from_daemon_status, cluster_peer_members, cluster_raft_known_leader_id,
+    cluster_state_sync_txn, cluster_sync_targets, compact_default_invite_introducers,
+    daemon_advertised_endpoints_for_state, daemon_handle_daemon_sandbox_http_fetch,
+    daemon_package_version, data_dir_storage_contract_findings, decode_cluster_join_invite,
+    encode_cluster_join_invite, ensure_rollout_layout, expire_cluster_network_records_in_kv,
+    extend_rollout_endpoints_from_kv, format_rollout_progress_line,
+    handle_daemon_cluster_join_request, handle_daemon_cluster_kv_txn_request,
+    handle_daemon_rollout_build_request, install_should_update_binary, install_with_layout,
+    invite_channels_for_join_registration, invite_communication_channels,
+    invite_introducer_endpoint, invite_introducer_endpoint_from_state,
+    load_tui_model_runtime_config, main_agent_config_tool_registry,
+    main_agent_handler_for_tui_with_data_dir, managed_source_status, model_config_uses_cluster,
+    models_default_with_data_dir, normalize_model_provider,
+    open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
+    parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
+    parse_dfs_command, parse_install_options, parse_model_default_options,
     parse_model_options_command, parse_models_list_options, parse_models_runtime_command,
     parse_provider_command, parse_rollout_command, parse_slash_command, parse_test_command,
     parse_uninstall_options, parse_usage_options, push_unique_introducer, read_cluster_kv_snapshot,
@@ -75,15 +77,17 @@ use sinomo_runtime::cli_registry::{
 use sinomo_runtime::core::{
     CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
     ClusterEndpointSource, ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole,
-    ClusterMemberState, ClusterNodeAvailability, ClusterNodeRole, ClusterTransportKind, Confidence,
-    DfsObjectPolicy, EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventKind, Id,
-    LatencyClass, PrivacyClass, RollbackPolicy, RollbackTrigger, RolloutPlan, RolloutStrategy,
-    RoutingMetadata, RoutingScope, Salience, Source, TrustDomain, TrustRing,
+    ClusterMemberState, ClusterMigrationMode, ClusterMigrationPhase, ClusterMigrationRecord,
+    ClusterNodeAvailability, ClusterNodeRole, ClusterTransportKind, Confidence, DfsObjectPolicy,
+    EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventKind, Id, LatencyClass,
+    PrivacyClass, RollbackPolicy, RollbackTrigger, RolloutPlan, RolloutStrategy, RoutingMetadata,
+    RoutingScope, Salience, Source, TrustDomain, TrustRing, cluster_migration_key,
 };
 use sinomo_runtime::daemon::daemon_status_matches_options;
 use sinomo_runtime::dfs::{
     DfsMetadataBackend, DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsObjectVersionRecord,
-    distributed_sifs, distributed_sifs_bootstrap_objects, metadata_shard_key,
+    default_dfs_metadata_shards_root, dfs_import_metadata_root, distributed_sifs,
+    distributed_sifs_bootstrap_objects, metadata_shard_key,
 };
 use sinomo_runtime::events::{
     EventId, EventStore, InMemoryEventStore, JsonlEventStore, ReplayQuery, SessionId,
@@ -107,6 +111,7 @@ use sinomo_runtime::sandbox::*;
 use std::collections::BTreeMap;
 #[cfg(feature = "sandbox")]
 use std::collections::BTreeSet;
+use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -497,23 +502,18 @@ fn provider_commands_reject_provider_before_action_order() {
 }
 
 #[test]
-fn top_level_cli_parser_accepts_local_flag_before_command() {
-    let invocation = parse_cli_invocation(&[
+fn top_level_cli_parser_rejects_removed_local_flag() {
+    let error = parse_cli_invocation(&[
         "--local".to_string(),
         "providers".to_string(),
         "test".to_string(),
         "openai".to_string(),
     ])
-    .expect("local invocation");
+    .expect_err("local flag should be removed");
 
-    assert!(invocation.options.force_local);
-    assert!(matches!(
-        invocation.command,
-        CliCommand::Providers(ProviderCliCommand::Test(ProviderCommandOptions {
-            provider: ProviderName::OpenAi,
-            account: _,
-        }))
-    ));
+    assert!(
+        matches!(error, CliError::Parse { detail } if detail.contains("`--local` has been removed"))
+    );
 }
 
 #[test]
@@ -7147,6 +7147,20 @@ fn cluster_parser_accepts_init_and_join_options() {
     );
     assert_eq!(
         parse_cluster_command(&[
+            "migrate".to_string(),
+            "plan".to_string(),
+            "sinomo-join://token".to_string(),
+            "--mode".to_string(),
+            "cluster-merge".to_string(),
+        ])
+        .expect("cluster migrate plan"),
+        ClusterCliCommand::Migrate(ClusterMigrateCommand::Plan(ClusterMigrationPlanOptions {
+            invite: "sinomo-join://token".to_string(),
+            mode: ClusterMigrationMode::ClusterMerge,
+        }))
+    );
+    assert_eq!(
+        parse_cluster_command(&[
             "role".to_string(),
             "01hxy6qa9k0t9vr4g9n8d3q5d6".to_string(),
             "server".to_string(),
@@ -7222,7 +7236,7 @@ fn cluster_init_persists_local_cluster_state() {
     );
     assert_eq!(state.term, 1);
     assert_eq!(state.kv_revision, 1);
-    assert_eq!(state.members.len(), 2);
+    assert_eq!(state.members.len(), 1);
     let main = state
         .members
         .iter()
@@ -7231,22 +7245,18 @@ fn cluster_init_persists_local_cluster_state() {
     assert_eq!(main.role, ClusterMemberRole::Voter);
     assert_eq!(main.state, ClusterMemberState::Voter);
     assert!(!main.node_public_key.trim().is_empty());
-    assert_eq!(main.endpoints[0].address, "127.0.0.1:21353");
-    let shadow = state
-        .members
-        .iter()
-        .find(|member| {
-            member.node_id
-                == shadow_daemon_node_id(&NodeId::from_legacy_named("node_local").expect("node"))
-        })
-        .expect("shadow daemon member");
-    assert_eq!(shadow.role, ClusterMemberRole::NonVoting);
-    assert_eq!(shadow.state, ClusterMemberState::NonVoting);
-    assert!(!shadow.node_public_key.trim().is_empty());
-    assert_ne!(shadow.node_public_key, main.node_public_key);
-    assert_eq!(shadow.endpoints[0].address, "127.0.0.1:21354");
+    assert!(
+        main.endpoints
+            .iter()
+            .any(|endpoint| endpoint.address == "127.0.0.1:21353")
+    );
+    assert!(
+        main.endpoints
+            .iter()
+            .any(|endpoint| endpoint.address == "127.0.0.1:21354")
+    );
     let kv_members = read_cluster_members_from_kv(&paths).expect("kv members");
-    assert_eq!(kv_members.len(), 2);
+    assert_eq!(kv_members.len(), 1);
     let kv_main = kv_members
         .iter()
         .find(|member| member.node_id == NodeId::from_legacy_named("node_local").expect("node"))
@@ -7267,6 +7277,231 @@ fn cluster_init_persists_local_cluster_state() {
     assert_eq!(
         cluster_raft_known_leader_id(&paths, &state).expect("reelected leader"),
         Some(NodeId::from_legacy_named("node_local").expect("node"))
+    );
+}
+
+#[test]
+fn cluster_migration_plan_accepts_settled_single_node_source() {
+    let source_root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-migrate-source");
+    let target_root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-migrate-target");
+    let source_paths = ClusterPaths::new(&SinomoDataDir::new(&source_root));
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::from_legacy_named("cluster_source").expect("cluster")),
+            node_id: Some(NodeId::from_legacy_named("node_source").expect("node")),
+            name: "source cluster".to_string(),
+        },
+        &source_paths,
+    )
+    .expect("cluster init");
+
+    let invite = signed_test_invite_uri(&target_root, "cluster_target", "node_target");
+    let parsed_invite = decode_cluster_join_invite(&invite).expect("decode invite");
+    let report = cluster_migration_plan_with_paths(
+        ClusterMigrationPlanOptions {
+            invite,
+            mode: ClusterMigrationMode::SingleNode,
+        },
+        &source_paths,
+    )
+    .expect("migration plan");
+
+    assert_eq!(report.migration.mode, ClusterMigrationMode::SingleNode);
+    assert_eq!(report.migration.phase, ClusterMigrationPhase::Planned);
+    assert_eq!(
+        report.migration.source_cluster_id,
+        ClusterId::from_legacy_named("cluster_source").expect("source cluster")
+    );
+    assert_eq!(report.migration.target_cluster_id, parsed_invite.cluster_id);
+    assert_eq!(
+        report.migration.source_local_node_id,
+        NodeId::from_legacy_named("node_source").expect("source node")
+    );
+    assert_eq!(
+        report.migration.preserved_node_ids,
+        vec![NodeId::from_legacy_named("node_source").expect("preserved node")]
+    );
+    assert_eq!(report.source_member_count, 1);
+    assert_eq!(report.source_remote_member_count, 0);
+    assert_eq!(report.target_introducer_count, 0);
+    assert_eq!(report.target_communication_channel_count, 0);
+    assert!(
+        report
+            .migration
+            .detail
+            .as_deref()
+            .expect("plan detail")
+            .contains("quarantine old cluster KV/Raft state")
+    );
+}
+
+#[test]
+fn cluster_migration_plan_rejects_single_node_mode_with_remote_peers() {
+    let source_root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-migrate-multi-source");
+    let target_root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-migrate-multi-target");
+    let source_paths = ClusterPaths::new(&SinomoDataDir::new(&source_root));
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(
+                ClusterId::from_legacy_named("cluster_multi_source").expect("cluster"),
+            ),
+            node_id: Some(NodeId::from_legacy_named("node_multi_source").expect("node")),
+            name: "source cluster".to_string(),
+        },
+        &source_paths,
+    )
+    .expect("cluster init");
+    let mut state = read_cluster_state(&source_paths).expect("cluster state");
+    let remote = ClusterMemberRecord::local_non_voting(
+        state.cluster_id.clone(),
+        NodeId::from_legacy_named("node_remote_peer").expect("remote node"),
+        "remote peer",
+        "pk_remote_peer",
+        OffsetDateTime::now_utc(),
+    );
+    state.members.push(remote);
+    network::write_cluster_state(&source_paths, &state).expect("write state");
+    sync_cluster_state_to_kv(&source_paths, &state).expect("sync remote peer");
+
+    let error = cluster_migration_plan_with_paths(
+        ClusterMigrationPlanOptions {
+            invite: signed_test_invite_uri(&target_root, "cluster_multi_target", "node_target"),
+            mode: ClusterMigrationMode::SingleNode,
+        },
+        &source_paths,
+    )
+    .expect_err("single-node mode should reject remote peers");
+
+    match error {
+        CliError::Parse { detail } => {
+            assert!(detail.contains("single-node migration requires"));
+            assert!(detail.contains("--mode cluster-merge"));
+        }
+        other => panic!("unexpected migration mode error: {other:?}"),
+    }
+}
+
+#[test]
+fn cluster_join_on_initialized_node_runs_single_node_migration() {
+    let source_root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-join-migrate-source");
+    let target_root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-join-migrate-target");
+    let source_paths = ClusterPaths::new(&SinomoDataDir::new(&source_root));
+    let source_cluster_id = ClusterId::from_legacy_named("cluster_join_source").expect("cluster");
+    let source_node_id = NodeId::from_legacy_named("node_join_source").expect("node");
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(source_cluster_id.clone()),
+            node_id: Some(source_node_id.clone()),
+            name: "source cluster".to_string(),
+        },
+        &source_paths,
+    )
+    .expect("cluster init");
+    let source_data_dir = SinomoDataDir::new(&source_root);
+    let dfs_marker = default_dfs_metadata_shards_root(&source_data_dir)
+        .join("root")
+        .join("marker.txt");
+    fs::create_dir_all(dfs_marker.parent().expect("marker parent")).expect("metadata root");
+    fs::write(&dfs_marker, b"source metadata").expect("metadata marker");
+    let node_local_config_key = format!("/config/nodes/{source_node_id}/local-test");
+    let source_cluster_config_key = "/config/source-cluster-only".to_string();
+    append_cluster_raft_command(
+        &source_paths,
+        &source_node_id,
+        KvCommand::Txn(KvTxn {
+            compares: Vec::new(),
+            success: vec![
+                KvOp::Put {
+                    key: node_local_config_key.clone(),
+                    value: b"node-local".to_vec(),
+                    lease_id: None,
+                },
+                KvOp::Put {
+                    key: source_cluster_config_key.clone(),
+                    value: b"source-cluster".to_vec(),
+                    lease_id: None,
+                },
+            ],
+            failure: Vec::new(),
+        }),
+    )
+    .expect("seed source kv");
+
+    let invite = signed_test_invite_uri(&target_root, "cluster_join_target", "node_target");
+    let parsed_invite = decode_cluster_join_invite(&invite).expect("decode invite");
+    cluster_join_with_paths(
+        ClusterJoinOptions {
+            invite,
+            cluster_id: None,
+            node_id: None,
+            name: "joiner".to_string(),
+        },
+        &source_paths,
+    )
+    .expect("initialized join should migrate");
+
+    let migrated = read_cluster_state(&source_paths).expect("target state");
+    assert_eq!(migrated.cluster_id, parsed_invite.cluster_id);
+    assert_eq!(migrated.local_node_id, source_node_id);
+    let migrations_root = source_paths.root.join("migrations");
+    let migration_dirs: Vec<_> = fs::read_dir(&migrations_root)
+        .expect("migration dirs")
+        .map(|entry| entry.expect("migration entry").path())
+        .collect();
+    assert_eq!(migration_dirs.len(), 1);
+    let source_quarantine = migration_dirs[0].join("source");
+    assert!(source_quarantine.join("state.sobj").exists());
+    assert!(source_quarantine.join("migration.json").exists());
+    assert!(source_quarantine.join("kv-import.json").exists());
+    let local_migration: ClusterMigrationRecord = serde_json::from_slice(
+        &fs::read(source_quarantine.join("migration.json")).expect("record"),
+    )
+    .expect("local migration record");
+    assert!(
+        local_migration
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence == "source-kv-policy:target-authoritative")
+    );
+    let kv_import: serde_json::Value = serde_json::from_slice(
+        &fs::read(source_quarantine.join("kv-import.json")).expect("import report"),
+    )
+    .expect("decode import report");
+    assert_eq!(kv_import["target_kv_authoritative"], true);
+    assert_eq!(
+        kv_import["deferred_node_local_config_keys"],
+        serde_json::json!([node_local_config_key.clone()])
+    );
+    assert_eq!(kv_import["skipped_cluster_level_config_count"], 1);
+    assert_eq!(
+        kv_import["skipped_cluster_level_config_key_samples"],
+        serde_json::json!([source_cluster_config_key.clone()])
+    );
+    let quarantined_snapshot = sinomo_runtime::kv::read_cluster_kv_cached_snapshot(
+        &sinomo_runtime::kv::ClusterKvPaths::new(source_quarantine.clone()),
+    )
+    .expect("quarantined source kv snapshot");
+    let kv_migration: ClusterMigrationRecord = quarantined_snapshot
+        .get(&cluster_migration_key(&local_migration.migration_id))
+        .expect("source kv migration record")
+        .decode()
+        .expect("decode source kv migration record");
+    assert_eq!(kv_migration.phase, ClusterMigrationPhase::Planned);
+    assert_eq!(kv_migration.source_cluster_id, source_cluster_id);
+    assert_eq!(kv_migration.target_cluster_id, parsed_invite.cluster_id);
+    assert!(quarantined_snapshot.get(&node_local_config_key).is_some());
+    assert!(
+        quarantined_snapshot
+            .get(&source_cluster_config_key)
+            .is_some()
+    );
+    let target_snapshot = read_cluster_kv_snapshot(&source_paths).expect("target kv snapshot");
+    assert!(target_snapshot.get(&source_cluster_config_key).is_none());
+    assert!(
+        dfs_import_metadata_root(&source_data_dir, source_cluster_id)
+            .join("root")
+            .join("marker.txt")
+            .exists()
     );
 }
 
@@ -7409,21 +7644,20 @@ fn local_voter_republishes_local_members_missing_from_kv() {
     .expect("cluster init");
     let local_state =
         super::network::read_cluster_state_without_kv(&paths).expect("state without kv");
-    let shadow_id = shadow_daemon_node_id(&local_state.local_node_id);
 
     append_cluster_raft_command_with_response(
         &paths,
         &local_state.local_node_id,
         sinomo_runtime::kv::KvCommand::Op(KvOp::Delete {
-            key: sinomo_runtime::network::cluster_member_key(&shadow_id),
+            key: sinomo_runtime::network::cluster_member_key(&local_state.local_node_id),
         }),
     )
-    .expect("delete shadow from kv");
+    .expect("delete local member from kv");
     assert!(
         !read_cluster_members_from_kv(&paths)
             .expect("members after delete")
             .iter()
-            .any(|member| member.node_id == shadow_id)
+            .any(|member| member.node_id == local_state.local_node_id)
     );
 
     let merged_state = read_cluster_state(&paths).expect("merged local state");
@@ -7431,7 +7665,7 @@ fn local_voter_republishes_local_members_missing_from_kv() {
         merged_state
             .members
             .iter()
-            .any(|member| member.node_id == shadow_id)
+            .any(|member| member.node_id == local_state.local_node_id)
     );
     network::publish_local_members_to_quorum_if_needed_with_host(
         &paths,
@@ -7448,7 +7682,7 @@ fn local_voter_republishes_local_members_missing_from_kv() {
         read_cluster_members_from_kv(&paths)
             .expect("members after republish")
             .iter()
-            .any(|member| member.node_id == shadow_id)
+            .any(|member| member.node_id == local_state.local_node_id)
     );
 }
 
@@ -7948,16 +8182,13 @@ fn cluster_join_records_pending_learner_state() {
     assert_eq!(local.role, ClusterMemberRole::Learner);
     assert_eq!(local.state, ClusterMemberState::Pending);
     assert!(!local.node_public_key.trim().is_empty());
-    let shadow = state
-        .members
-        .iter()
-        .find(|member| {
-            member.node_id
-                == shadow_daemon_node_id(&NodeId::from_legacy_named("node_joiner").expect("node"))
-        })
-        .expect("shadow daemon member");
-    assert_eq!(shadow.role, ClusterMemberRole::NonVoting);
-    assert_eq!(shadow.state, ClusterMemberState::Pending);
+    assert_eq!(state.members.len(), 1);
+    assert!(
+        local
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.address == "127.0.0.1:21354")
+    );
 }
 
 #[test]
