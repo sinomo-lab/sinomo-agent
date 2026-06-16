@@ -19,6 +19,9 @@
 //! - `cluster.dfs.bulk-write` / `cluster.dfs.bulk-expect` — deterministic bulk
 //!   write/read probes for cluster-level throughput, convergence evidence, and
 //!   steady-state process I/O accounting.
+//! - `cluster.dfs.disk-baseline` — node-local raw file write/read baseline used
+//!   to compare DFS large-object throughput against the container's current
+//!   storage path.
 //! - `cluster.dfs.large-write` / `cluster.dfs.large-expect` — deterministic
 //!   large-object throughput probes that exercise chunked transfer and read-side
 //!   no-write accounting.
@@ -31,6 +34,7 @@ use sinomo_runtime::test::{
     SinomoTestRequirement, SinomoTestResult,
 };
 use std::fs;
+use std::io::{Read, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_EXPECT_TIMEOUT_SECONDS: u64 = 30;
@@ -55,6 +59,7 @@ pub fn register_dfs_cluster_test_cases(
         .register(dfs_remove())
         .register(dfs_bulk_write())
         .register(dfs_bulk_expect())
+        .register(dfs_disk_baseline())
         .register(dfs_large_write())
         .register(dfs_large_expect())
 }
@@ -187,6 +192,18 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_bulk_expect(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_disk_baseline(ctx) {
+        id: "cluster.dfs.disk-baseline",
+        summary: "Measure node-local raw file write/read throughput under SINOMO_DATA_DIR (--param bytes=N)",
+        tags: ["cluster-dfs", "probe", "performance"],
+        requirements: [],
+        run: {
+            run_disk_baseline(ctx)
         }
     }
 }
@@ -831,11 +848,55 @@ fn run_bulk_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     }
 }
 
+fn run_disk_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let bytes = optional_usize_parameter(ctx, "bytes", DEFAULT_LARGE_FILE_BYTES)?;
+    let sync_write = optional_bool_parameter(ctx, "sync-write", true)?;
+    let min_write_bytes_per_second =
+        optional_f64_parameter(ctx, "min-write-bytes-per-second", 0.0)?;
+    let min_read_bytes_per_second = optional_f64_parameter(ctx, "min-read-bytes-per-second", 0.0)?;
+    require_positive("bytes", bytes)?;
+
+    let benchmark = raw_disk_baseline(ctx, bytes, "disk-baseline", sync_write)?;
+    record_raw_disk_baseline(ctx, &benchmark, "raw_disk");
+    ctx.record("min_write_bytes_per_second", min_write_bytes_per_second);
+    ctx.record("min_read_bytes_per_second", min_read_bytes_per_second);
+
+    if min_write_bytes_per_second > 0.0
+        && benchmark.write_bytes_per_second < min_write_bytes_per_second
+    {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "raw disk baseline wrote {} bytes in {}ms ({:.2} bytes/s), below required {:.2} bytes/s",
+            benchmark.bytes,
+            benchmark.write_elapsed.as_millis(),
+            benchmark.write_bytes_per_second,
+            min_write_bytes_per_second
+        )));
+    }
+    if min_read_bytes_per_second > 0.0
+        && benchmark.read_bytes_per_second < min_read_bytes_per_second
+    {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "raw disk baseline read {} bytes in {}ms ({:.2} bytes/s), below required {:.2} bytes/s",
+            benchmark.bytes,
+            benchmark.read_elapsed.as_millis(),
+            benchmark.read_bytes_per_second,
+            min_read_bytes_per_second
+        )));
+    }
+
+    Ok(SinomoTestOutcome::passed(format!(
+        "raw disk baseline wrote {:.2} bytes/s and read {:.2} bytes/s for {} bytes",
+        benchmark.write_bytes_per_second, benchmark.read_bytes_per_second, benchmark.bytes
+    )))
+}
+
 fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let path = ctx.required_parameter("path")?.to_string();
     let bytes = optional_usize_parameter(ctx, "bytes", DEFAULT_LARGE_FILE_BYTES)?;
     let timeout = expect_timeout(ctx)?;
     let min_bytes_per_second = optional_f64_parameter(ctx, "min-bytes-per-second", 0.0)?;
+    let min_raw_write_ratio = optional_f64_parameter(ctx, "min-raw-write-ratio", 0.0)?;
+    let raw_sync_write = optional_bool_parameter(ctx, "raw-sync-write", true)?;
     let max_proc_wchar_amplification =
         optional_f64_parameter(ctx, "max-proc-wchar-amplification", 0.0)?;
     let max_proc_write_bytes_amplification =
@@ -845,6 +906,16 @@ fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let payload_started = Instant::now();
     let payload = large_payload(&path, bytes);
     let payload_build_elapsed = payload_started.elapsed();
+    let raw_baseline = if min_raw_write_ratio > 0.0 {
+        Some(raw_disk_baseline(
+            ctx,
+            bytes,
+            &format!("large-write-{path}"),
+            raw_sync_write,
+        )?)
+    } else {
+        None
+    };
     let backend = open_backend(ctx)?;
     let node = backend.node_label();
     let started = Instant::now();
@@ -903,6 +974,18 @@ fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("bytes_per_second", bytes_per_second);
     ctx.record("data_write_bytes_per_second", data_write_bytes_per_second);
     ctx.record("min_bytes_per_second", min_bytes_per_second);
+    ctx.record("min_raw_write_ratio", min_raw_write_ratio);
+    if let Some(raw_baseline) = raw_baseline.as_ref() {
+        record_raw_disk_baseline(ctx, raw_baseline, "raw_disk");
+        ctx.record(
+            "raw_write_ratio",
+            ratio(
+                data_write_bytes_per_second,
+                raw_baseline.write_bytes_per_second,
+            )
+            .unwrap_or(0.0),
+        );
+    }
     ctx.record("max_proc_wchar_amplification", max_proc_wchar_amplification);
     ctx.record(
         "max_proc_write_bytes_amplification",
@@ -952,6 +1035,20 @@ fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             write_elapsed.as_millis()
         )));
     }
+    if let Some(raw_baseline) = raw_baseline.as_ref()
+        && min_raw_write_ratio > 0.0
+    {
+        let raw_ratio = ratio(
+            data_write_bytes_per_second,
+            raw_baseline.write_bytes_per_second,
+        )
+        .unwrap_or(0.0);
+        if raw_ratio < min_raw_write_ratio {
+            return Ok(SinomoTestOutcome::failed(format!(
+                "large write on node {node} wrote {total_bytes} bytes at {data_write_bytes_per_second:.2} bytes/s, {raw_ratio:.2}x raw disk write baseline, below required {min_raw_write_ratio:.2}x"
+            )));
+        }
+    }
 
     Ok(SinomoTestOutcome::passed(format!(
         "large write on node {node} wrote {total_bytes} bytes in {}ms ({data_write_bytes_per_second:.2} bytes/s)",
@@ -964,12 +1061,24 @@ fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let bytes = optional_usize_parameter(ctx, "bytes", DEFAULT_LARGE_FILE_BYTES)?;
     let timeout = expect_timeout(ctx)?;
     let min_bytes_per_second = optional_f64_parameter(ctx, "min-bytes-per-second", 0.0)?;
+    let min_raw_read_ratio = optional_f64_parameter(ctx, "min-raw-read-ratio", 0.0)?;
+    let raw_sync_write = optional_bool_parameter(ctx, "raw-sync-write", true)?;
     let max_proc_write_bytes = optional_u64_parameter(ctx, "max-proc-write-bytes")?;
     require_positive("bytes", bytes)?;
 
     let payload_started = Instant::now();
     let expected = large_payload(&path, bytes);
     let payload_build_elapsed = payload_started.elapsed();
+    let raw_baseline = if min_raw_read_ratio > 0.0 {
+        Some(raw_disk_baseline(
+            ctx,
+            bytes,
+            &format!("large-expect-{path}"),
+            raw_sync_write,
+        )?)
+    } else {
+        None
+    };
     let started = Instant::now();
     let deadline = started + timeout;
     let backend = open_read_only_backend_until(ctx, deadline)?;
@@ -998,6 +1107,14 @@ fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 ctx.record("elapsed_ms", elapsed_ms);
                 ctx.record("bytes_per_second", bytes_per_second);
                 ctx.record("min_bytes_per_second", min_bytes_per_second);
+                ctx.record("min_raw_read_ratio", min_raw_read_ratio);
+                if let Some(raw_baseline) = raw_baseline.as_ref() {
+                    record_raw_disk_baseline(ctx, raw_baseline, "raw_disk");
+                    ctx.record(
+                        "raw_read_ratio",
+                        ratio(bytes_per_second, raw_baseline.read_bytes_per_second).unwrap_or(0.0),
+                    );
+                }
                 if let Some(max_proc_write_bytes) = max_proc_write_bytes {
                     ctx.record("max_proc_write_bytes", max_proc_write_bytes);
                 }
@@ -1020,6 +1137,17 @@ fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     return Ok(SinomoTestOutcome::failed(format!(
                         "large expect on node {node} read {total_bytes} bytes in {elapsed_ms}ms ({bytes_per_second:.2} bytes/s), below required {min_bytes_per_second:.2} bytes/s"
                     )));
+                }
+                if let Some(raw_baseline) = raw_baseline.as_ref()
+                    && min_raw_read_ratio > 0.0
+                {
+                    let raw_ratio =
+                        ratio(bytes_per_second, raw_baseline.read_bytes_per_second).unwrap_or(0.0);
+                    if raw_ratio < min_raw_read_ratio {
+                        return Ok(SinomoTestOutcome::failed(format!(
+                            "large expect on node {node} read {total_bytes} bytes at {bytes_per_second:.2} bytes/s, {raw_ratio:.2}x raw disk read baseline, below required {min_raw_read_ratio:.2}x"
+                        )));
+                    }
                 }
                 return Ok(SinomoTestOutcome::passed(format!(
                     "large expect on node {node} read {total_bytes} bytes in {elapsed_ms}ms ({bytes_per_second:.2} bytes/s)"
@@ -1167,6 +1295,24 @@ fn optional_f64_parameter(
     }
 }
 
+fn optional_bool_parameter(
+    ctx: &SinomoTestContext,
+    key: &str,
+    default: bool,
+) -> Result<bool, SinomoTestError> {
+    match ctx.parameter(key) {
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            other => Err(SinomoTestError::InvalidParameter {
+                name: key.to_string(),
+                detail: format!("expected boolean, got {other}"),
+            }),
+        },
+        None => Ok(default),
+    }
+}
+
 fn optional_u64_parameter(
     ctx: &SinomoTestContext,
     key: &str,
@@ -1240,6 +1386,174 @@ fn large_payload(path: &str, bytes: usize) -> Vec<u8> {
     pattern_payload(&format!("{path}|sinomo-dfs-large"), bytes)
 }
 
+#[derive(Clone, Debug)]
+struct RawDiskBaseline {
+    path: String,
+    bytes: u64,
+    sync_write: bool,
+    payload_build_elapsed: Duration,
+    write_elapsed: Duration,
+    read_elapsed: Duration,
+    write_bytes_per_second: f64,
+    read_bytes_per_second: f64,
+    write_proc_io_delta: Option<ProcIoSample>,
+    read_proc_io_delta: Option<ProcIoSample>,
+}
+
+fn raw_disk_baseline(
+    ctx: &SinomoTestContext,
+    bytes: usize,
+    seed: &str,
+    sync_write: bool,
+) -> Result<RawDiskBaseline, SinomoTestError> {
+    require_positive("bytes", bytes)?;
+    let root = ctx
+        .data_dir()
+        .join("test-artifacts")
+        .join("dfs-disk-baseline");
+    fs::create_dir_all(&root).map_err(|source| {
+        SinomoTestError::failed(format!(
+            "cannot create raw disk baseline directory {}: {source}",
+            root.display()
+        ))
+    })?;
+    let path = root.join(format!("baseline-{}.bin", probe_nonce()));
+    let payload_started = Instant::now();
+    let payload = pattern_payload(seed, bytes);
+    let payload_build_elapsed = payload_started.elapsed();
+
+    let write_proc_before = current_proc_io();
+    let write_started = Instant::now();
+    {
+        let mut file = fs::File::create(&path).map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot create raw disk baseline file {}: {source}",
+                path.display()
+            ))
+        })?;
+        file.write_all(&payload).map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot write raw disk baseline file {}: {source}",
+                path.display()
+            ))
+        })?;
+        if sync_write {
+            file.sync_all().map_err(|source| {
+                SinomoTestError::failed(format!(
+                    "cannot sync raw disk baseline file {}: {source}",
+                    path.display()
+                ))
+            })?;
+        }
+    }
+    let write_elapsed = write_started.elapsed();
+    let write_proc_after = current_proc_io();
+
+    let read_proc_before = current_proc_io();
+    let read_started = Instant::now();
+    let mut actual = Vec::with_capacity(bytes);
+    {
+        let mut file = fs::File::open(&path).map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot open raw disk baseline file {}: {source}",
+                path.display()
+            ))
+        })?;
+        file.read_to_end(&mut actual).map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot read raw disk baseline file {}: {source}",
+                path.display()
+            ))
+        })?;
+    }
+    let read_elapsed = read_started.elapsed();
+    let read_proc_after = current_proc_io();
+    if actual != payload {
+        let _ = fs::remove_file(&path);
+        return Err(SinomoTestError::failed(format!(
+            "raw disk baseline file {} read back {} bytes, expected {} bytes",
+            path.display(),
+            actual.len(),
+            payload.len()
+        )));
+    }
+    let cleanup_result = fs::remove_file(&path);
+    if let Err(source) = cleanup_result {
+        return Err(SinomoTestError::failed(format!(
+            "cannot remove raw disk baseline file {}: {source}",
+            path.display()
+        )));
+    }
+
+    let total_bytes = bytes as u64;
+    Ok(RawDiskBaseline {
+        path: path.display().to_string(),
+        bytes: total_bytes,
+        sync_write,
+        payload_build_elapsed,
+        write_elapsed,
+        read_elapsed,
+        write_bytes_per_second: rate_per_second(total_bytes as f64, write_elapsed),
+        read_bytes_per_second: rate_per_second(total_bytes as f64, read_elapsed),
+        write_proc_io_delta: write_proc_before
+            .zip(write_proc_after)
+            .map(|(before, after)| after.saturating_delta(before)),
+        read_proc_io_delta: read_proc_before
+            .zip(read_proc_after)
+            .map(|(before, after)| after.saturating_delta(before)),
+    })
+}
+
+fn record_raw_disk_baseline(ctx: &mut SinomoTestContext, baseline: &RawDiskBaseline, prefix: &str) {
+    ctx.record(format!("{prefix}_path"), &baseline.path);
+    ctx.record(format!("{prefix}_bytes"), baseline.bytes);
+    ctx.record(format!("{prefix}_sync_write"), baseline.sync_write);
+    ctx.record(
+        format!("{prefix}_payload_build_elapsed_ms"),
+        baseline.payload_build_elapsed.as_millis() as u64,
+    );
+    ctx.record(
+        format!("{prefix}_write_elapsed_ms"),
+        baseline.write_elapsed.as_millis() as u64,
+    );
+    ctx.record(
+        format!("{prefix}_read_elapsed_ms"),
+        baseline.read_elapsed.as_millis() as u64,
+    );
+    ctx.record(
+        format!("{prefix}_write_bytes_per_second"),
+        baseline.write_bytes_per_second,
+    );
+    ctx.record(
+        format!("{prefix}_read_bytes_per_second"),
+        baseline.read_bytes_per_second,
+    );
+    if let Some(delta) = baseline.write_proc_io_delta {
+        record_proc_io_delta(ctx, prefix, "write", delta);
+    }
+    if let Some(delta) = baseline.read_proc_io_delta {
+        record_proc_io_delta(ctx, prefix, "read", delta);
+    }
+}
+
+fn record_proc_io_delta(
+    ctx: &mut SinomoTestContext,
+    prefix: &str,
+    phase: &str,
+    delta: ProcIoSample,
+) {
+    ctx.record(format!("{prefix}_{phase}_proc_rchar_delta"), delta.rchar);
+    ctx.record(format!("{prefix}_{phase}_proc_wchar_delta"), delta.wchar);
+    ctx.record(
+        format!("{prefix}_{phase}_proc_read_bytes_delta"),
+        delta.read_bytes,
+    );
+    ctx.record(
+        format!("{prefix}_{phase}_proc_write_bytes_delta"),
+        delta.write_bytes,
+    );
+}
+
 fn parent_probe_path(path: &str) -> Option<String> {
     let path = path.trim_end_matches('/');
     let slash = path.rfind('/')?;
@@ -1299,6 +1613,13 @@ fn amplification_ratio(written_bytes: u64, logical_bytes: u64) -> Option<f64> {
         return None;
     }
     Some(written_bytes as f64 / logical_bytes as f64)
+}
+
+fn ratio(numerator: f64, denominator: f64) -> Option<f64> {
+    if denominator <= f64::EPSILON {
+        return None;
+    }
+    Some(numerator / denominator)
 }
 
 fn expect_payload_now(

@@ -16,12 +16,13 @@
 #                       observed (and the old path absent) on far nodes
 #   7. bulk perf      — small-file bulk write/read throughput with process I/O
 #                       amplification checks and read-side write_bytes == 0
-#   8. large-file perf — large object write/read throughput with process I/O
+#   8. disk baseline — node-local raw file write/read baseline for DFS comparison
+#   9. large-file perf — large object write/read throughput with process I/O
 #                       amplification checks and read-side write_bytes == 0
-#   9. disk damage    — delete one durable loose blob and read through the
+#   10. disk damage   — delete one durable loose blob and read through the
 #                       remaining replica without read-side disk writes
-#   10. restart       — restart a member, re-gate formation, re-read its data
-#   11. final sweep   — invariants again on every node
+#   11. restart       — restart a member, re-gate formation, re-read its data
+#   12. final sweep   — invariants again on every node
 #
 # Usage:
 #   docker/test-cluster.sh                  # build-if-missing, up, test, down -v
@@ -45,9 +46,16 @@
 #   SINOMO_TEST_LARGE_TIMEOUT  large-file write/read timeout seconds (default 180)
 #   SINOMO_TEST_LARGE_MIN_WRITE_BYTES_PER_SEC min large writer throughput (default 4194304)
 #   SINOMO_TEST_LARGE_MIN_READ_BYTES_PER_SEC  min cross-node large read/convergence throughput (default 4194304)
+#   SINOMO_TEST_LARGE_MIN_RAW_WRITE_RATIO min large DFS write / raw write baseline ratio (default 0.5)
+#   SINOMO_TEST_LARGE_MIN_RAW_READ_RATIO  min large DFS read / raw read baseline ratio (default 0, disabled)
+#   SINOMO_TEST_LARGE_RAW_SYNC_WRITE      sync raw baseline writes before timing completes (default 1)
 #   SINOMO_TEST_LARGE_MAX_PROC_WCHAR_AMPLIFICATION       max large writer-process wchar/logical bytes (default 0, disabled)
 #   SINOMO_TEST_LARGE_MAX_PROC_WRITE_BYTES_AMPLIFICATION max large writer-process write_bytes/logical bytes (default 4)
 #   SINOMO_TEST_LARGE_MAX_READ_PROC_WRITE_BYTES max reader-process write_bytes during large-expect (default 0)
+#   SINOMO_TEST_DISK_BASELINE_BYTES bytes in raw disk baseline leg (default same as SINOMO_TEST_LARGE_BYTES)
+#   SINOMO_TEST_DISK_BASELINE_SYNC_WRITE sync raw disk baseline writes before timing completes (default 1)
+#   SINOMO_TEST_DISK_BASELINE_MIN_WRITE_BYTES_PER_SEC min raw write throughput (default 0, disabled)
+#   SINOMO_TEST_DISK_BASELINE_MIN_READ_BYTES_PER_SEC  min raw read throughput (default 0, disabled)
 #   SINOMO_TEST_DAMAGE_BYTES    bytes in loose-blob disk damage scenario (default 65536)
 #   SINOMO_TEST_NETWORK_REQUESTS_PER_TARGET cluster network ping RPCs per remote node (default 20)
 #   SINOMO_TEST_NETWORK_CONCURRENCY         concurrent network ping workers (default 32)
@@ -101,9 +109,16 @@ LARGE_BYTES="${SINOMO_TEST_LARGE_BYTES:-16777216}"
 LARGE_TIMEOUT="${SINOMO_TEST_LARGE_TIMEOUT:-180}"
 LARGE_MIN_WRITE_BYTES_PER_SEC="${SINOMO_TEST_LARGE_MIN_WRITE_BYTES_PER_SEC:-4194304}"
 LARGE_MIN_READ_BYTES_PER_SEC="${SINOMO_TEST_LARGE_MIN_READ_BYTES_PER_SEC:-4194304}"
+LARGE_MIN_RAW_WRITE_RATIO="${SINOMO_TEST_LARGE_MIN_RAW_WRITE_RATIO:-0.5}"
+LARGE_MIN_RAW_READ_RATIO="${SINOMO_TEST_LARGE_MIN_RAW_READ_RATIO:-0}"
+LARGE_RAW_SYNC_WRITE="${SINOMO_TEST_LARGE_RAW_SYNC_WRITE:-1}"
 LARGE_MAX_PROC_WCHAR_AMPLIFICATION="${SINOMO_TEST_LARGE_MAX_PROC_WCHAR_AMPLIFICATION:-0}"
 LARGE_MAX_PROC_WRITE_BYTES_AMPLIFICATION="${SINOMO_TEST_LARGE_MAX_PROC_WRITE_BYTES_AMPLIFICATION:-4}"
 LARGE_MAX_READ_PROC_WRITE_BYTES="${SINOMO_TEST_LARGE_MAX_READ_PROC_WRITE_BYTES:-0}"
+DISK_BASELINE_BYTES="${SINOMO_TEST_DISK_BASELINE_BYTES:-$LARGE_BYTES}"
+DISK_BASELINE_SYNC_WRITE="${SINOMO_TEST_DISK_BASELINE_SYNC_WRITE:-1}"
+DISK_BASELINE_MIN_WRITE_BYTES_PER_SEC="${SINOMO_TEST_DISK_BASELINE_MIN_WRITE_BYTES_PER_SEC:-0}"
+DISK_BASELINE_MIN_READ_BYTES_PER_SEC="${SINOMO_TEST_DISK_BASELINE_MIN_READ_BYTES_PER_SEC:-0}"
 DAMAGE_BYTES="${SINOMO_TEST_DAMAGE_BYTES:-65536}"
 NETWORK_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_REQUESTS_PER_TARGET:-20}"
 NETWORK_CONCURRENCY="${SINOMO_TEST_NETWORK_CONCURRENCY:-32}"
@@ -432,6 +447,18 @@ bulk_performance() {
     --param "max-proc-write-bytes=$PERF_MAX_READ_PROC_WRITE_BYTES"
 }
 
+disk_baseline() {
+  local rc=0 node
+  for node in node2 node6 node5 node1; do
+    run_probe "$node" cluster.dfs.disk-baseline \
+      --param "bytes=$DISK_BASELINE_BYTES" \
+      --param "sync-write=$DISK_BASELINE_SYNC_WRITE" \
+      --param "min-write-bytes-per-second=$DISK_BASELINE_MIN_WRITE_BYTES_PER_SEC" \
+      --param "min-read-bytes-per-second=$DISK_BASELINE_MIN_READ_BYTES_PER_SEC" || rc=1
+  done
+  return $rc
+}
+
 large_file_performance() {
   local a="/services/cluster-tests/$RUN_ID/large-a.bin"
   local b="/services/cluster-tests/$RUN_ID/large-b.bin"
@@ -440,6 +467,8 @@ large_file_performance() {
     --param "bytes=$LARGE_BYTES" \
     --param "timeout-seconds=$LARGE_TIMEOUT" \
     --param "min-bytes-per-second=$LARGE_MIN_WRITE_BYTES_PER_SEC" \
+    --param "min-raw-write-ratio=$LARGE_MIN_RAW_WRITE_RATIO" \
+    --param "raw-sync-write=$LARGE_RAW_SYNC_WRITE" \
     --param "max-proc-wchar-amplification=$LARGE_MAX_PROC_WCHAR_AMPLIFICATION" \
     --param "max-proc-write-bytes-amplification=$LARGE_MAX_PROC_WRITE_BYTES_AMPLIFICATION" \
   && run_probe node6 cluster.dfs.large-expect \
@@ -447,12 +476,16 @@ large_file_performance() {
     --param "bytes=$LARGE_BYTES" \
     --param "timeout-seconds=$LARGE_TIMEOUT" \
     --param "min-bytes-per-second=$LARGE_MIN_READ_BYTES_PER_SEC" \
+    --param "min-raw-read-ratio=$LARGE_MIN_RAW_READ_RATIO" \
+    --param "raw-sync-write=$LARGE_RAW_SYNC_WRITE" \
     --param "max-proc-write-bytes=$LARGE_MAX_READ_PROC_WRITE_BYTES" \
   && run_probe node5 cluster.dfs.large-write \
     --param "path=$b" \
     --param "bytes=$LARGE_BYTES" \
     --param "timeout-seconds=$LARGE_TIMEOUT" \
     --param "min-bytes-per-second=$LARGE_MIN_WRITE_BYTES_PER_SEC" \
+    --param "min-raw-write-ratio=$LARGE_MIN_RAW_WRITE_RATIO" \
+    --param "raw-sync-write=$LARGE_RAW_SYNC_WRITE" \
     --param "max-proc-wchar-amplification=$LARGE_MAX_PROC_WCHAR_AMPLIFICATION" \
     --param "max-proc-write-bytes-amplification=$LARGE_MAX_PROC_WRITE_BYTES_AMPLIFICATION" \
   && run_probe node1 cluster.dfs.large-expect \
@@ -460,6 +493,8 @@ large_file_performance() {
     --param "bytes=$LARGE_BYTES" \
     --param "timeout-seconds=$LARGE_TIMEOUT" \
     --param "min-bytes-per-second=$LARGE_MIN_READ_BYTES_PER_SEC" \
+    --param "min-raw-read-ratio=$LARGE_MIN_RAW_READ_RATIO" \
+    --param "raw-sync-write=$LARGE_RAW_SYNC_WRITE" \
     --param "max-proc-write-bytes=$LARGE_MAX_READ_PROC_WRITE_BYTES"
 }
 
@@ -601,6 +636,7 @@ scenario "read-your-write"      read_your_write
 scenario "cross-node"           cross_node
 scenario "rename-across-prefixes" rename_across_prefixes
 scenario "bulk-performance"     bulk_performance
+scenario "disk-baseline"        disk_baseline
 scenario "large-file-performance" large_file_performance
 scenario "disk-damage-recovery" disk_damage_recovery
 scenario "restart-durability"   restart_durability
