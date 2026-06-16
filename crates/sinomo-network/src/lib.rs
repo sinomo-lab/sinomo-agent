@@ -43,14 +43,18 @@ pub const NETWORK_PROTOCOL: &str = "sinomo.network.v1";
 pub const SINOMO_NETWORK_MODULE_LEGACY_ID: &str = "module.network";
 pub const SINOMO_NETWORK_MODULE_OWNER: &str = "sinomo-network";
 pub const SINOMO_NETWORK_NATIVE_REGISTRATION_KEY: &str = "sinomo-network";
-pub const NETWORK_OBJECT_RPC_ROUTES: &[&str] = &[CLUSTER_HEALTH_ROUTE];
+pub const NETWORK_OBJECT_RPC_ROUTES: &[&str] = &[CLUSTER_HEALTH_ROUTE, CLUSTER_NETWORK_PING_ROUTE];
 pub const CLUSTER_HEALTH_READ_CAPABILITY: &str = "cluster.health.read";
+pub const CLUSTER_NETWORK_PING_CAPABILITY: &str = "cluster.network.ping";
 pub const NETWORK_CAPABILITY_IMPORTS: &[&str] = &[
     "storage.local.read",
     "storage.local.write",
     "cluster.kv.read",
 ];
-pub const NETWORK_CAPABILITY_EXPORTS: &[&str] = &[CLUSTER_HEALTH_READ_CAPABILITY];
+pub const NETWORK_CAPABILITY_EXPORTS: &[&str] = &[
+    CLUSTER_HEALTH_READ_CAPABILITY,
+    CLUSTER_NETWORK_PING_CAPABILITY,
+];
 pub const CLUSTER_NETWORK_INSPECTION_SKILL_ID: &str = "skill.cluster-network.inspect";
 pub const CLUSTER_NETWORK_INSPECTION_SKILL_PATH: &str = "skills/cluster-network/SKILL.md";
 pub const CLUSTER_NETWORK_INSPECTION_PROMPT_ID: &str = "prompt.cluster-network.inspect";
@@ -106,13 +110,20 @@ pub struct NetworkObjectRpcToolSurface {
     pub auth: NetworkModuleRouteAuth,
 }
 
-pub const NETWORK_OBJECT_RPC_TOOL_SURFACES: &[NetworkObjectRpcToolSurface] =
-    &[NetworkObjectRpcToolSurface {
+pub const NETWORK_OBJECT_RPC_TOOL_SURFACES: &[NetworkObjectRpcToolSurface] = &[
+    NetworkObjectRpcToolSurface {
         route: CLUSTER_HEALTH_ROUTE,
         category: CLUSTER_HEALTH_RPC_CATEGORY,
         operation: CLUSTER_HEALTH_READ_CAPABILITY,
         auth: NetworkModuleRouteAuth::LocalOrClusterMember,
-    }];
+    },
+    NetworkObjectRpcToolSurface {
+        route: CLUSTER_NETWORK_PING_ROUTE,
+        category: CLUSTER_NETWORK_RPC_CATEGORY,
+        operation: CLUSTER_NETWORK_PING_CAPABILITY,
+        auth: NetworkModuleRouteAuth::LocalOrClusterMember,
+    },
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NetworkDeclarativeResourceKind {
@@ -208,7 +219,7 @@ pub(crate) mod prelude {
         RaftAppendEntriesResponse, RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot,
     };
     #[cfg(test)]
-    pub(crate) use sinomo_kv::{KvRevision, KvWalPaths, WatchId};
+    pub(crate) use sinomo_kv::{KvWalPaths, WatchId};
     pub(crate) use sinomo_local::SinomoDataDir;
     pub(crate) use sinomo_node::{
         NodeAvailability, NodeHealth, NodeId, NodeProfile, daemon_lan_endpoint_id,

@@ -11,6 +11,7 @@ mod support;
 mod test;
 mod test_cases_agent;
 mod test_cases_dfs;
+mod test_cases_network;
 
 pub(crate) use cluster::*;
 pub(crate) use daemon::*;

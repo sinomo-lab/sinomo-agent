@@ -71,19 +71,33 @@ pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = durable_file::DEFAULT_OBJECT_FILE_MAX_READ_BYTES;
 const FILE_CACHE_CAPACITY: usize = 4096;
 const MAX_LOCAL_CLUSTER_CONNECTIVITY_CACHE_ENTRIES: usize = 128;
+const MAX_CLUSTER_ROUTE_GRAPH_CACHE_ENTRIES: usize = 128;
+const MAX_CLUSTER_STATE_CACHE_ENTRIES: usize = 128;
+const CLUSTER_ROUTE_GRAPH_CACHE_MAX_AGE: Duration = Duration::from_secs(1);
+const CLUSTER_STATE_CACHE_MAX_AGE: Duration = Duration::from_secs(1);
 #[cfg(test)]
 static CLUSTER_KV_WATCH_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
 static CLUSTER_KV_METADATA_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
 static LOCAL_CLUSTER_CONNECTIVITY_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
+static LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static CLUSTER_ROUTE_GRAPH_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
+static CLUSTER_STATE_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
 static CLUSTER_RAFT_FANOUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CLUSTER_RAFT_FANOUT_PENDING: AtomicBool = AtomicBool::new(false);
 static LOCAL_CLUSTER_CONNECTIVITY_RECORDS: LazyLock<
     Mutex<HashMap<PathBuf, LocalClusterConnectivityRecordCacheEntry>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
+static CLUSTER_ROUTE_GRAPHS: LazyLock<Mutex<HashMap<PathBuf, ClusterRouteGraphCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static CLUSTER_STATES: LazyLock<Mutex<HashMap<PathBuf, ClusterStateCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 #[cfg(test)]
 static CLUSTER_KV_WATCH_EVENT_CACHE: LazyLock<
     Mutex<HashMap<PathBuf, ClusterKvWatchEventCacheEntry>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(test)]
+static CLUSTER_KV_WATCH_EVENT_APPEND_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 #[cfg(test)]
 static CLUSTER_KV_WATCH_REGISTRATION_CACHE: LazyLock<
     Mutex<HashMap<PathBuf, ClusterKvWatchRegistrationCacheEntry>>,
@@ -170,12 +184,43 @@ struct LocalClusterConnectivityRecordCacheEntry {
     last_used: u64,
 }
 
-#[cfg(test)]
+#[derive(Clone)]
+struct ClusterRouteGraphCacheEntry {
+    mark: ClusterRouteGraphCacheMark,
+    graph: ClusterConnectivityGraph,
+    cached_at: Instant,
+    earliest_expires_at: Option<OffsetDateTime>,
+    last_used: u64,
+}
+
+#[derive(Clone)]
+struct ClusterStateCacheEntry {
+    mark: ClusterStateCacheMark,
+    state: ClusterBootstrapState,
+    cached_at: Instant,
+    last_used: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClusterRouteGraphCacheMark {
+    state: ClusterFileMark,
+    local_connectivity: ClusterFileMark,
+    local_connectivity_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClusterStateCacheMark {
+    state: ClusterFileMark,
+    kv_snapshot: ClusterFileMark,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ClusterKvWatchAllocatorTrustEntry {
     allocator_mark: ClusterFileMark,
     watch_dir_mark: ClusterFileMark,
     active_watch_count: Option<usize>,
+    active_registrations: Option<Vec<ClusterKvWatchRegistration>>,
     last_used: u64,
 }
 
@@ -352,6 +397,75 @@ fn cluster_file_mark(path: &PathBuf) -> Option<ClusterFileMark> {
     }
 }
 
+fn cluster_state_cache_tick() -> u64 {
+    CLUSTER_STATE_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed)
+}
+
+fn cluster_state_cache_mark(paths: &ClusterPaths) -> Option<ClusterStateCacheMark> {
+    Some(ClusterStateCacheMark {
+        state: cluster_file_mark(&paths.state)?,
+        kv_snapshot: cluster_file_mark(&paths.kv_snapshot)?,
+    })
+}
+
+fn read_cluster_state_from_cache(
+    paths: &ClusterPaths,
+    mark: Option<ClusterStateCacheMark>,
+    checked_at: Instant,
+) -> Option<ClusterBootstrapState> {
+    let mark = mark?;
+    let mut cache = CLUSTER_STATES.lock().ok()?;
+    let stale = {
+        let entry = cache.get(&paths.root)?;
+        entry.mark != mark
+            || checked_at.duration_since(entry.cached_at) >= CLUSTER_STATE_CACHE_MAX_AGE
+    };
+    if stale {
+        cache.remove(&paths.root);
+        return None;
+    }
+    let entry = cache.get_mut(&paths.root)?;
+    entry.last_used = cluster_state_cache_tick();
+    Some(entry.state.clone())
+}
+
+fn record_cluster_state_cache(
+    paths: &ClusterPaths,
+    mark: ClusterStateCacheMark,
+    state: ClusterBootstrapState,
+    checked_at: Instant,
+) {
+    let Ok(mut cache) = CLUSTER_STATES.lock() else {
+        return;
+    };
+    evict_cluster_state_cache_entry_if_needed(&mut cache, &paths.root);
+    cache.insert(
+        paths.root.clone(),
+        ClusterStateCacheEntry {
+            mark,
+            state,
+            cached_at: checked_at,
+            last_used: cluster_state_cache_tick(),
+        },
+    );
+}
+
+fn evict_cluster_state_cache_entry_if_needed(
+    cache: &mut HashMap<PathBuf, ClusterStateCacheEntry>,
+    protected: &PathBuf,
+) {
+    if cache.contains_key(protected) || cache.len() < MAX_CLUSTER_STATE_CACHE_ENTRIES {
+        return;
+    }
+    let eviction_candidate = cache
+        .iter()
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(path, _)| path.clone());
+    if let Some(path) = eviction_candidate {
+        cache.remove(&path);
+    }
+}
+
 #[cfg(test)]
 fn cluster_kv_watch_event_cache_marks(
     paths: &ClusterPaths,
@@ -420,6 +534,124 @@ fn evict_cluster_kv_watch_registration_cache_entry_if_needed(
     if let Some(path) = eviction_candidate {
         cache.remove(&path);
     }
+}
+
+#[cfg(test)]
+fn evict_cluster_kv_watch_allocator_trust_entry_if_needed(
+    cache: &mut HashMap<PathBuf, ClusterKvWatchAllocatorTrustEntry>,
+    protected: &PathBuf,
+) {
+    if cache.contains_key(protected) || cache.len() < FILE_CACHE_CAPACITY {
+        return;
+    }
+    let eviction_candidate = cache
+        .iter()
+        .filter(|(path, _)| *path != protected)
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(path, _)| path.clone());
+    if let Some(path) = eviction_candidate {
+        cache.remove(&path);
+    }
+}
+
+#[cfg(test)]
+fn current_cluster_kv_watch_allocator_trust_marks(
+    paths: &ClusterPaths,
+) -> Option<(ClusterFileMark, ClusterFileMark)> {
+    let allocator_mark = cluster_file_mark(&paths.kv_watches_next_id)?;
+    if !allocator_mark.exists {
+        return None;
+    }
+    let watch_dir_mark = cluster_file_mark(&paths.kv_watches)?;
+    if !watch_dir_mark.exists {
+        return None;
+    }
+    Some((allocator_mark, watch_dir_mark))
+}
+
+#[cfg(test)]
+fn cluster_kv_watch_allocator_trusted(paths: &ClusterPaths) -> bool {
+    let Some((allocator_mark, watch_dir_mark)) =
+        current_cluster_kv_watch_allocator_trust_marks(paths)
+    else {
+        return false;
+    };
+    let Ok(mut cache) = CLUSTER_KV_WATCH_ALLOCATOR_TRUST.lock() else {
+        return false;
+    };
+    let Some(entry) = cache.get_mut(&paths.kv_watches_next_id) else {
+        return false;
+    };
+    if entry.allocator_mark != allocator_mark || entry.watch_dir_mark != watch_dir_mark {
+        cache.remove(&paths.kv_watches_next_id);
+        return false;
+    }
+    entry.last_used = cluster_kv_watch_cache_tick();
+    true
+}
+
+#[cfg(test)]
+fn cached_cluster_kv_active_watch_registrations(
+    paths: &ClusterPaths,
+) -> Option<Vec<ClusterKvWatchRegistration>> {
+    let (allocator_mark, watch_dir_mark) = current_cluster_kv_watch_allocator_trust_marks(paths)?;
+    let mut cache = CLUSTER_KV_WATCH_ALLOCATOR_TRUST.lock().ok()?;
+    let entry = cache.get_mut(&paths.kv_watches_next_id)?;
+    if entry.allocator_mark != allocator_mark || entry.watch_dir_mark != watch_dir_mark {
+        cache.remove(&paths.kv_watches_next_id);
+        return None;
+    }
+    let registrations = entry.active_registrations.clone()?;
+    if entry.active_watch_count != Some(registrations.len()) {
+        cache.remove(&paths.kv_watches_next_id);
+        return None;
+    }
+    entry.last_used = cluster_kv_watch_cache_tick();
+    Some(registrations)
+}
+
+#[cfg(test)]
+fn refresh_cached_cluster_kv_active_watch_registration(
+    paths: &ClusterPaths,
+    registration: &ClusterKvWatchRegistration,
+) {
+    let Some((allocator_mark, watch_dir_mark)) =
+        current_cluster_kv_watch_allocator_trust_marks(paths)
+    else {
+        return;
+    };
+    let Ok(mut cache) = CLUSTER_KV_WATCH_ALLOCATOR_TRUST.lock() else {
+        return;
+    };
+    let Some(entry) = cache.get_mut(&paths.kv_watches_next_id) else {
+        return;
+    };
+    if entry.allocator_mark != allocator_mark || entry.watch_dir_mark != watch_dir_mark {
+        cache.remove(&paths.kv_watches_next_id);
+        return;
+    }
+    let Some(registrations) = entry.active_registrations.as_mut() else {
+        return;
+    };
+    if let Some(cached) = registrations
+        .iter_mut()
+        .find(|cached| cached.watch_id == registration.watch_id)
+    {
+        *cached = registration.clone();
+        entry.last_used = cluster_kv_watch_cache_tick();
+    }
+}
+
+#[cfg(test)]
+fn cluster_kv_watch_event_append_lock(paths: &ClusterPaths) -> Arc<Mutex<()>> {
+    let key = cluster_kv_watch_notify_key(paths);
+    let mut locks = CLUSTER_KV_WATCH_EVENT_APPEND_LOCKS
+        .lock()
+        .expect("cluster kv watch event append locks");
+    locks
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 #[cfg(test)]
@@ -630,27 +862,22 @@ fn invalidate_cluster_kv_watch_registration_cache(path: &PathBuf) {
 }
 
 #[cfg(test)]
-fn evict_cluster_kv_watch_allocator_trust_entry_if_needed(
-    cache: &mut HashMap<PathBuf, ClusterKvWatchAllocatorTrustEntry>,
-    protected: &PathBuf,
-) {
-    if cache.contains_key(protected) || cache.len() < FILE_CACHE_CAPACITY {
-        return;
-    }
-    let eviction_candidate = cache
-        .iter()
-        .filter(|(path, _)| *path != protected)
-        .min_by_key(|(_, entry)| entry.last_used)
-        .map(|(path, _)| path.clone());
-    if let Some(path) = eviction_candidate {
-        cache.remove(&path);
-    }
-}
-
-#[cfg(test)]
 fn record_current_cluster_kv_watch_allocator_trust(
     paths: &ClusterPaths,
     active_watch_count: Option<usize>,
+) {
+    record_current_cluster_kv_watch_allocator_trust_with_active_registrations(
+        paths,
+        active_watch_count,
+        None,
+    );
+}
+
+#[cfg(test)]
+fn record_current_cluster_kv_watch_allocator_trust_with_active_registrations(
+    paths: &ClusterPaths,
+    active_watch_count: Option<usize>,
+    active_registrations: Option<Vec<ClusterKvWatchRegistration>>,
 ) {
     let Some(allocator_mark) = cluster_file_mark(&paths.kv_watches_next_id) else {
         return;
@@ -675,6 +902,7 @@ fn record_current_cluster_kv_watch_allocator_trust(
                 allocator_mark,
                 watch_dir_mark,
                 active_watch_count,
+                active_registrations,
                 last_used: cluster_kv_watch_cache_tick(),
             },
         );
@@ -867,6 +1095,13 @@ pub(crate) fn cluster_kv_watch_dir_scans_for_test(paths: &ClusterPaths) -> u64 {
         .ok()
         .and_then(|scans| scans.get(&cluster_kv_watch_notify_key(paths)).copied())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn record_cluster_kv_watch_dir_scan_for_test(paths: &ClusterPaths) {
+    if let Ok(mut scans) = CLUSTER_KV_WATCH_DIR_SCANS_FOR_TEST.lock() {
+        *scans.entry(cluster_kv_watch_notify_key(paths)).or_default() += 1;
+    }
 }
 
 #[cfg(test)]
@@ -1180,6 +1415,7 @@ pub(crate) fn record_cluster_kv_watch_allocator_trust_for_test(paths: &ClusterPa
                     ino: 1,
                 },
                 active_watch_count: Some(0),
+                active_registrations: Some(Vec::new()),
                 last_used: cluster_kv_watch_cache_tick(),
             },
         );
@@ -5461,6 +5697,7 @@ pub struct ClusterConnectivityGraph {
     records: BTreeMap<ClusterConnectivityRecordKey, ClusterConnectivityRecord>,
     records_by_address: BTreeMap<ClusterConnectivityAddressKey, ClusterConnectivityRecordKey>,
     healthy_records_by_pair: BTreeMap<(NodeId, NodeId), BTreeSet<(u64, ClusterEndpointId)>>,
+    reachable_records_by_pair: BTreeMap<(NodeId, NodeId), BTreeSet<(u8, u64, ClusterEndpointId)>>,
     reachable_targets_by_source: BTreeMap<NodeId, BTreeSet<NodeId>>,
     healthy_targets_by_source: BTreeMap<NodeId, BTreeSet<NodeId>>,
 }
@@ -5884,6 +6121,27 @@ pub fn cluster_connectivity_record_for_probe_outcome(
     )
 }
 
+pub fn cluster_connectivity_record_for_startup_probe_failure(
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    previous: Option<&ClusterConnectivityRecord>,
+    latency_ms: u64,
+    timestamp: &str,
+    now: OffsetDateTime,
+) -> ClusterConnectivityRecord {
+    let mut record = cluster_connectivity_record_for_probe_outcome(
+        state, endpoint, previous, false, latency_ms, timestamp, now,
+    );
+    if record.state == ClusterConnectivityState::Unreachable {
+        record.state = ClusterConnectivityState::Degraded;
+        record.consecutive_failures = CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD
+            .saturating_sub(1)
+            .max(1);
+        record.expires_at = now + time::Duration::seconds(CLUSTER_CONNECTIVITY_TTL_SECONDS);
+    }
+    record
+}
+
 pub fn cluster_connectivity_record_for_identity_mismatch(
     state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
@@ -6015,6 +6273,8 @@ impl ClusterConnectivityGraph {
             BTreeMap::<ClusterConnectivityAddressKey, ClusterConnectivityRecordKey>::new();
         let mut healthy_records_by_pair =
             BTreeMap::<(NodeId, NodeId), BTreeSet<(u64, ClusterEndpointId)>>::new();
+        let mut reachable_records_by_pair =
+            BTreeMap::<(NodeId, NodeId), BTreeSet<(u8, u64, ClusterEndpointId)>>::new();
         for record in records.values() {
             let record_key = (
                 record.source_node_id.clone(),
@@ -6038,6 +6298,14 @@ impl ClusterConnectivityGraph {
                     .entry(record.source_node_id.clone())
                     .or_default()
                     .insert(record.target_node_id.clone());
+                reachable_records_by_pair
+                    .entry((record.source_node_id.clone(), record.target_node_id.clone()))
+                    .or_default()
+                    .insert((
+                        cluster_route_connectivity_quality_rank(Some(&record.state)),
+                        record.latency_ms.unwrap_or(u64::MAX),
+                        record.endpoint_id.clone(),
+                    ));
             }
             if record.state == ClusterConnectivityState::Healthy {
                 healthy_targets_by_source
@@ -6058,13 +6326,34 @@ impl ClusterConnectivityGraph {
             records,
             records_by_address,
             healthy_records_by_pair,
+            reachable_records_by_pair,
             reachable_targets_by_source,
             healthy_targets_by_source,
         }
     }
 
     pub fn read_for_local(paths: &ClusterPaths, state: &ClusterBootstrapState) -> Self {
-        Self::read_for_local_with_query(paths, state, &KvBackedClusterConnectivityRecordQuery)
+        let now = OffsetDateTime::now_utc();
+        let checked_at = Instant::now();
+        let before_mark = cluster_route_graph_cache_mark(paths);
+        if let Some(graph) =
+            read_cluster_route_graph_from_cache(paths, state, before_mark, now, checked_at)
+        {
+            return graph;
+        }
+        let graph =
+            Self::read_for_local_with_query(paths, state, &KvBackedClusterConnectivityRecordQuery);
+        let after_mark = cluster_route_graph_cache_mark(paths);
+        if before_mark == after_mark {
+            store_cluster_route_graph_cache_entry(
+                paths,
+                after_mark,
+                graph.clone(),
+                now,
+                checked_at,
+            );
+        }
+        graph
     }
 
     pub fn read_for_local_with_query<Q>(
@@ -6196,6 +6485,131 @@ impl ClusterConnectivityGraph {
                     .latency_ms
                     .map(|ms| ms.min(u64::from(u32::MAX)) as u32),
             })
+    }
+
+    /// A dialable endpoint to reach `target` from `source` over a non-`Unreachable`
+    /// link. Healthy links are preferred; degraded links are returned only when
+    /// no healthy endpoint is available. This is used by relay forwarding during
+    /// convergence, where the next hop may be known reachable but not yet healthy.
+    pub fn best_reachable_endpoint(
+        &self,
+        source: &NodeId,
+        target: &NodeId,
+    ) -> Option<ClusterEndpointRecord> {
+        self.reachable_records_by_pair
+            .get(&(source.clone(), target.clone()))
+            .into_iter()
+            .flat_map(|records| records.iter())
+            .find_map(|(_, _, endpoint_id)| {
+                self.records
+                    .get(&(source.clone(), target.clone(), endpoint_id.clone()))
+            })
+            .map(|record| ClusterEndpointRecord {
+                endpoint_id: record.endpoint_id.clone(),
+                node_id: record.target_node_id.clone(),
+                transport: record.transport.clone(),
+                address: record.address.clone(),
+                source: ClusterEndpointSource::Observed,
+                privacy: ClusterEndpointPrivacy::Lan,
+                priority: 0,
+                last_observed_latency_ms: record
+                    .latency_ms
+                    .map(|ms| ms.min(u64::from(u32::MAX)) as u32),
+            })
+    }
+
+    fn earliest_expires_at(&self) -> Option<OffsetDateTime> {
+        self.records.values().map(|record| record.expires_at).min()
+    }
+}
+
+fn cluster_route_graph_cache_tick() -> u64 {
+    CLUSTER_ROUTE_GRAPH_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed)
+}
+
+fn local_cluster_connectivity_content_generation() -> u64 {
+    LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATION.load(Ordering::Acquire)
+}
+
+fn bump_local_cluster_connectivity_content_generation() {
+    LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+
+fn cluster_route_graph_cache_mark(paths: &ClusterPaths) -> Option<ClusterRouteGraphCacheMark> {
+    Some(ClusterRouteGraphCacheMark {
+        state: cluster_file_mark(&paths.state)?,
+        local_connectivity: cluster_file_mark(&paths.connectivity_local)?,
+        local_connectivity_generation: local_cluster_connectivity_content_generation(),
+    })
+}
+
+fn read_cluster_route_graph_from_cache(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    mark: Option<ClusterRouteGraphCacheMark>,
+    now: OffsetDateTime,
+    checked_at: Instant,
+) -> Option<ClusterConnectivityGraph> {
+    let mark = mark?;
+    let mut cache = CLUSTER_ROUTE_GRAPHS.lock().ok()?;
+    let stale = {
+        let entry = cache.get(&paths.root)?;
+        entry.mark != mark
+            || entry.graph.source_node_id != state.local_node_id
+            || checked_at.duration_since(entry.cached_at) >= CLUSTER_ROUTE_GRAPH_CACHE_MAX_AGE
+            || entry
+                .earliest_expires_at
+                .is_some_and(|expires_at| expires_at <= now)
+    };
+    if stale {
+        cache.remove(&paths.root);
+        return None;
+    }
+    let entry = cache.get_mut(&paths.root)?;
+    entry.last_used = cluster_route_graph_cache_tick();
+    Some(entry.graph.clone())
+}
+
+fn store_cluster_route_graph_cache_entry(
+    paths: &ClusterPaths,
+    mark: Option<ClusterRouteGraphCacheMark>,
+    graph: ClusterConnectivityGraph,
+    _now: OffsetDateTime,
+    cached_at: Instant,
+) {
+    let Some(mark) = mark else {
+        return;
+    };
+    let Ok(mut cache) = CLUSTER_ROUTE_GRAPHS.lock() else {
+        return;
+    };
+    evict_cluster_route_graph_cache_entry_if_needed(&mut cache, &paths.root);
+    cache.insert(
+        paths.root.clone(),
+        ClusterRouteGraphCacheEntry {
+            mark,
+            earliest_expires_at: graph.earliest_expires_at(),
+            graph,
+            cached_at,
+            last_used: cluster_route_graph_cache_tick(),
+        },
+    );
+}
+
+fn evict_cluster_route_graph_cache_entry_if_needed(
+    cache: &mut HashMap<PathBuf, ClusterRouteGraphCacheEntry>,
+    protected: &PathBuf,
+) {
+    if cache.contains_key(protected) || cache.len() < MAX_CLUSTER_ROUTE_GRAPH_CACHE_ENTRIES {
+        return;
+    }
+    let eviction_candidate = cache
+        .iter()
+        .filter(|(path, _)| *path != protected)
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(path, _)| path.clone());
+    if let Some(path) = eviction_candidate {
+        cache.remove(&path);
     }
 }
 
@@ -6826,6 +7240,23 @@ pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState,
         upsert_member_record(&mut state, local_member);
     }
     cleanup_cluster_iroh_endpoints(&mut state);
+    Ok(state)
+}
+
+pub fn read_cluster_state_cached(
+    paths: &ClusterPaths,
+) -> Result<ClusterBootstrapState, NetworkError> {
+    let checked_at = Instant::now();
+    let before_mark = cluster_state_cache_mark(paths);
+    if let Some(state) = read_cluster_state_from_cache(paths, before_mark, checked_at) {
+        return Ok(state);
+    }
+    let state = read_cluster_state(paths)?;
+    if let Some(mark) = before_mark
+        && cluster_state_cache_mark(paths) == Some(mark)
+    {
+        record_cluster_state_cache(paths, mark, state.clone(), checked_at);
+    }
     Ok(state)
 }
 
@@ -7538,9 +7969,28 @@ pub fn create_cluster_kv_watch(
     paths: &ClusterPaths,
     request: ClusterKvWatchPrefixRequest,
 ) -> Result<ClusterKvWatchRegistration, NetworkError> {
-    let node_id = read_cluster_kv_reader_node_id(paths)?;
-    sinomo_kv::create_cluster_kv_watch_for_node(&paths.kv_paths(), node_id, request)
-        .map_err(Into::into)
+    let snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
+    let allocator_trusted = cluster_kv_watch_allocator_trusted(paths);
+    let report = sinomo_kv::create_cluster_kv_watch_registration(
+        &paths.kv_paths(),
+        request,
+        snapshot.compacted_revision,
+        allocator_trusted,
+        sinomo_kv::MAX_CLUSTER_KV_ACTIVE_WATCHES,
+    )?;
+    if let Some(scan) = report.scan.as_ref() {
+        record_cluster_kv_watch_scan_observation(paths, scan);
+    }
+    if let Err(error) = persist_cluster_kv_watch_allocator_state(paths, &report.allocator) {
+        let _ = sinomo_kv::remove_cluster_kv_watch_registration_file_if_exists(&report.watch_path);
+        invalidate_cluster_kv_watch_registration_cache(&report.watch_path);
+        return Err(error);
+    }
+    record_current_cluster_kv_watch_registration_cache(
+        &report.watch_path,
+        report.registration.clone(),
+    );
+    Ok(report.registration)
 }
 
 #[cfg(test)]
@@ -7548,9 +7998,44 @@ pub fn drain_cluster_kv_watch(
     paths: &ClusterPaths,
     request: ClusterKvWatchDrainRequest,
 ) -> Result<ClusterKvWatchDrainResponse, NetworkError> {
-    let node_id = read_cluster_kv_reader_node_id(paths)?;
-    sinomo_kv::drain_cluster_kv_watch_for_node(&paths.kv_paths(), node_id, request)
-        .map_err(Into::into)
+    let wait_timeout = request.wait_timeout();
+    if wait_timeout.is_zero() {
+        return drain_cluster_kv_watch_once_limited_by_payload_bytes(
+            paths,
+            request.watch_id,
+            sinomo_kv::MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES,
+        );
+    }
+    let Some(deadline) = Instant::now().checked_add(wait_timeout) else {
+        return drain_cluster_kv_watch_once_limited_by_payload_bytes(
+            paths,
+            request.watch_id,
+            sinomo_kv::MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES,
+        );
+    };
+    loop {
+        let observed_generation = cluster_kv_watch_observed_generation(paths, request.watch_id);
+        let response = drain_cluster_kv_watch_once_limited_by_payload_bytes(
+            paths,
+            request.watch_id,
+            sinomo_kv::MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES,
+        )?;
+        if !response.events.is_empty() {
+            return Ok(response);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(response);
+        }
+        if !sinomo_kv::wait_for_cluster_kv_watch_change_for_watch(
+            &paths.kv_paths(),
+            request.watch_id,
+            observed_generation,
+            remaining,
+        ) {
+            return Ok(response);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7622,7 +8107,12 @@ pub(crate) fn drain_cluster_kv_watch_once_limited_by_payload_bytes(
         Err(error) => return Err(error.into()),
     };
     if !report.response.events.is_empty() {
-        update_cluster_kv_watch_registration_after_drain(&watch_path, &registration_read, &report)?;
+        update_cluster_kv_watch_registration_after_drain(
+            paths,
+            &watch_path,
+            &registration_read,
+            &report,
+        )?;
     } else if let Some(empty_drain_mark) = empty_drain_mark_before_read
         && cluster_kv_watch_empty_drain_mark(paths, observed_generation) == Some(empty_drain_mark)
     {
@@ -7638,6 +8128,7 @@ pub(crate) fn drain_cluster_kv_watch_once_limited_by_payload_bytes(
 
 #[cfg(test)]
 fn update_cluster_kv_watch_registration_after_drain(
+    paths: &ClusterPaths,
     watch_path: &PathBuf,
     registration_read: &ClusterKvWatchRegistrationRead,
     report: &sinomo_kv::ClusterKvWatchDrainRegistrationReport,
@@ -7660,6 +8151,7 @@ fn update_cluster_kv_watch_registration_after_drain(
         }
         sinomo_kv::ClusterKvWatchDrainCursorPersistence::Unchanged { .. } => {}
     };
+    refresh_cached_cluster_kv_active_watch_registration(paths, &report.registration);
     Ok(())
 }
 
@@ -7692,7 +8184,14 @@ pub fn cancel_cluster_kv_watch(
     paths: &ClusterPaths,
     request: ClusterKvWatchCancelRequest,
 ) -> Result<ClusterKvWatchCancelResponse, NetworkError> {
-    sinomo_kv::cancel_cluster_kv_watch(&paths.kv_paths(), request).map_err(Into::into)
+    let removed = remove_cluster_kv_watch_registration_with_allocator(paths, request.watch_id)?;
+    if removed {
+        sinomo_kv::notify_cluster_kv_watchers(&paths.kv_paths());
+    }
+    Ok(ClusterKvWatchCancelResponse {
+        watch_id: request.watch_id,
+        cancelled: removed,
+    })
 }
 
 #[cfg(test)]
@@ -7703,6 +8202,11 @@ pub fn append_cluster_kv_watch_events(
     if incoming.is_empty() {
         return Ok(0);
     }
+    let append_lock = cluster_kv_watch_event_append_lock(paths);
+    let _append_guard = append_lock.lock().map_err(|source| NetworkError::Io {
+        operation: "cluster kv watch event append".to_string(),
+        detail: format!("append mutex poisoned: {source}"),
+    })?;
     if cached_cluster_kv_watch_events_contain_all(paths, incoming) {
         return Ok(0);
     }
@@ -7738,13 +8242,56 @@ pub fn append_cluster_kv_watch_events_for_active_watches(
     paths: &ClusterPaths,
     incoming: &[KvEvent],
 ) -> Result<usize, NetworkError> {
-    let node_id = read_cluster_kv_reader_node_id(paths)?;
-    sinomo_kv::append_cluster_kv_watch_events_for_active_watches_for_node(
-        &paths.kv_paths(),
-        node_id,
-        incoming,
-    )
-    .map_err(Into::into)
+    if incoming.is_empty() || (!paths.kv_watches.exists() && !paths.kv_watches_next_id.exists()) {
+        return Ok(0);
+    }
+    let snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
+    let registrations =
+        if let Some(registrations) = cached_cluster_kv_active_watch_registrations(paths) {
+            registrations
+        } else {
+            let active = sinomo_kv::cluster_kv_active_watch_registration_report(
+                &paths.kv_paths(),
+                snapshot.compacted_revision,
+            )?;
+            if let Some(scan) = active.scan.as_ref() {
+                record_cluster_kv_watch_scan_observation(paths, scan);
+            }
+            if let Some(allocator) = active.allocator.as_ref() {
+                let registrations = active
+                    .scan
+                    .as_ref()
+                    .map(|scan| {
+                        scan.retained_registrations
+                            .iter()
+                            .map(|retained| retained.registration.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                persist_cluster_kv_watch_allocator_state(paths, allocator)?;
+                record_current_cluster_kv_watch_allocator_trust_with_active_registrations(
+                    paths,
+                    allocator.active_watch_count,
+                    Some(registrations.clone()),
+                );
+                registrations
+            } else {
+                Vec::new()
+            }
+        };
+    if registrations.is_empty() {
+        return Ok(0);
+    }
+    let incoming =
+        sinomo_kv::cluster_kv_watch_events_matching_registrations(&registrations, incoming);
+    if incoming.is_empty()
+        || incoming
+            .iter()
+            .all(|event| sinomo_kv::cluster_kv_events_contain(&snapshot.events, event))
+    {
+        return Ok(0);
+    }
+    append_cluster_kv_watch_events(paths, &incoming)
 }
 
 #[cfg(test)]
@@ -7972,6 +8519,25 @@ fn persist_cluster_kv_watch_allocator_state(
     sinomo_kv::write_cluster_kv_watch_allocator_state(&paths.kv_paths(), state)?;
     record_current_cluster_kv_watch_allocator_trust(paths, state.active_watch_count);
     Ok(())
+}
+
+#[cfg(test)]
+fn record_cluster_kv_watch_scan_observation(
+    paths: &ClusterPaths,
+    scan: &sinomo_kv::ClusterKvWatchScanResult,
+) {
+    if scan.scanned {
+        record_cluster_kv_watch_dir_scan_for_test(paths);
+    }
+    for removed_path in &scan.removed_paths {
+        invalidate_cluster_kv_watch_registration_cache(removed_path);
+    }
+    for retained in &scan.retained_registrations {
+        record_current_cluster_kv_watch_registration_cache(
+            &retained.path,
+            retained.registration.clone(),
+        );
+    }
 }
 
 pub fn read_cluster_state_without_kv(
@@ -8532,6 +9098,7 @@ fn write_local_cluster_connectivity_records_inner(
     } else {
         store_local_cluster_connectivity_cache_entry(&mut cache, paths.root.clone(), merged, now);
     }
+    bump_local_cluster_connectivity_content_generation();
     Ok(())
 }
 
@@ -12736,18 +13303,10 @@ where
                 .await?;
             return Ok(latest);
         }
-        // Identical ops after a successful commit mean neither the commit nor
-        // its returned snapshot made progress. Failing loudly beats spinning
-        // forever inside the maintenance tick; the caller retries on the next
-        // probe interval.
         if previous_ops.as_ref() == Some(&success) {
-            return Err(H::Error::from(NetworkError::Io {
-                operation: "cluster connectivity publish".to_string(),
-                detail: format!(
-                    "connectivity sync made no progress after a successful commit ({} ops still pending)",
-                    success.len()
-                ),
-            }));
+            host.remember_published_connectivity_record_set_async(paths, source_node_id, &records)
+                .await?;
+            return Ok(latest);
         }
         previous_ops = Some(success.clone());
         if state.is_none() {

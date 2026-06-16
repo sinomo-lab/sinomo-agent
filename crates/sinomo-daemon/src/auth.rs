@@ -1,7 +1,7 @@
 use crate::{DaemonError, DaemonPaths};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::digest;
-use ring::signature::{ED25519, UnparsedPublicKey};
+use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use sinomo_core::{ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState};
 use sinomo_kv::{
@@ -11,7 +11,8 @@ use sinomo_kv::{
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
-    ClusterInviteChallengeProof, ClusterInviteChallengeRequest, ClusterInviteId, ClusterPaths,
+    ClusterControlPlaneTimeouts, ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
+    ClusterInviteId, ClusterPaths,
 };
 use sinomo_node::{
     NodeIdentity, NodeIdentityPaths, load_or_create_main_node_identity,
@@ -22,23 +23,81 @@ use sinomo_rollout::{
     ROLLOUT_BUILD_ROUTE, ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_DIAGNOSTICS_ROUTE,
     ROLLOUT_FINALIZE_SHADOW_ROUTE, ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
 };
+use sinomo_storage::durable_file::file_ino;
 use std::collections::{BTreeMap, HashMap};
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 pub const DAEMON_AUTH_PROTOCOL: &str = "sinomo.daemon-auth.v1";
 pub const DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS: i64 = 300;
 pub const DAEMON_AUTH_NONCE_RETENTION_SECONDS: i64 = DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS * 2;
+const DAEMON_AUTH_NONCE_PRUNE_INTERVAL_SECONDS: i64 = 1;
+const DAEMON_AUTH_NONCE_PRUNE_MAX_ENTRIES: usize = 8_192;
+const DAEMON_AUTH_VERIFIER_CONTEXT_MAX_AGE: Duration = Duration::from_secs(1);
 /// In-memory replay-protection nonce sets, keyed by daemon data root. Replacing the
 /// previous per-RPC `auth-nonces.sobjlog` append (a disk read + write on *every*
 /// authenticated request, including idle cluster heartbeats) keeps idle disk I/O at
 /// zero. Replay protection is bounded by the signed-command clock-skew freshness
 /// check, so the only behavioral change is that a process restart forgets nonces
 /// from the trailing skew window — which the freshness check already constrains.
-static DAEMON_AUTH_NONCES: OnceLock<Mutex<HashMap<PathBuf, BTreeMap<Vec<u8>, OffsetDateTime>>>> =
+static DAEMON_AUTH_NONCES: OnceLock<Mutex<HashMap<PathBuf, DaemonAuthNonceSet>>> = OnceLock::new();
+static DAEMON_SIGNING_IDENTITIES: OnceLock<Mutex<HashMap<PathBuf, CachedDaemonSigningIdentity>>> =
     OnceLock::new();
+static DAEMON_AUTH_VERIFIER_CONTEXTS: OnceLock<
+    Mutex<HashMap<PathBuf, CachedDaemonAuthVerifierContext>>,
+> = OnceLock::new();
+
+#[derive(Clone)]
+struct CachedDaemonSigningIdentity {
+    node_id: String,
+    public_key: Vec<u8>,
+    key_pair: Arc<Ed25519KeyPair>,
+}
+
+#[derive(Clone)]
+struct CachedDaemonAuthVerifierContext {
+    mark: DaemonAuthVerifierContextMark,
+    checked_at: Instant,
+    main_public_key: String,
+    shadow_public_key: Option<String>,
+    members_by_node_and_key: BTreeMap<(String, String), DaemonSignerAuthority>,
+    members_by_key: BTreeMap<String, DaemonSignerAuthority>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DaemonAuthVerifierContextMark {
+    main_identity: DaemonAuthFileMark,
+    shadow_identity: DaemonAuthFileMark,
+    cluster_state: DaemonAuthFileMark,
+    kv_snapshot: DaemonAuthFileMark,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DaemonAuthFileMark {
+    exists: bool,
+    len: u64,
+    modified: Option<SystemTime>,
+    ino: u64,
+}
+
+#[derive(Debug)]
+struct DaemonAuthNonceSet {
+    nonces: BTreeMap<Vec<u8>, OffsetDateTime>,
+    last_pruned_at: OffsetDateTime,
+}
+
+impl DaemonAuthNonceSet {
+    fn new(now: OffsetDateTime) -> Self {
+        Self {
+            nonces: BTreeMap::new(),
+            last_pruned_at: now,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SignedDaemonCommand {
@@ -117,29 +176,24 @@ fn sign_daemon_command_from_data_dir_with_rpc_body_sha256(
     command: &str,
     rpc_body_sha256: Option<Vec<u8>>,
 ) -> Result<Vec<u8>, DaemonError> {
-    let identity = load_or_create_main_node_identity(&data_dir.root())?;
-    let node_id = sinomo_network::read_cluster_state(&ClusterPaths::new(data_dir))
-        .map(|state| state.local_node_id.to_string())
-        .unwrap_or_else(|_| "node_local".to_string());
+    let identity = cached_daemon_signing_identity(data_dir)?;
     let timestamp = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string());
     let nonce = format!("{}-{}", std::process::id(), auth_nonce_suffix());
-    let key_pair = identity.key_pair()?;
-    let public_key = daemon_auth_decode_public_key(&identity.public_key)?;
     let signing_payload = daemon_auth_signing_payload(
-        &node_id,
-        &public_key,
+        &identity.node_id,
+        &identity.public_key,
         &timestamp,
         &nonce,
         command,
         rpc_body_sha256.as_deref(),
     );
-    let signature = key_pair.sign(&signing_payload);
+    let signature = identity.key_pair.sign(&signing_payload);
     let envelope = SignedDaemonCommand {
         protocol: DAEMON_AUTH_PROTOCOL.to_string(),
-        node_id,
-        public_key,
+        node_id: identity.node_id,
+        public_key: identity.public_key,
         timestamp,
         nonce,
         command: command.to_string(),
@@ -149,6 +203,45 @@ fn sign_daemon_command_from_data_dir_with_rpc_body_sha256(
     sinomo_network::SinomoObjectCodec::default()
         .encode(&envelope)
         .map_err(DaemonError::from)
+}
+
+fn cached_daemon_signing_identity(
+    data_dir: &SinomoDataDir,
+) -> Result<CachedDaemonSigningIdentity, DaemonError> {
+    let root = data_dir.root().to_path_buf();
+    if let Some(cached) = DAEMON_SIGNING_IDENTITIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|source| DaemonError::Io {
+            path: root.display().to_string(),
+            detail: source.to_string(),
+        })?
+        .get(&root)
+        .cloned()
+    {
+        return Ok(cached);
+    }
+
+    let identity = load_or_create_main_node_identity(&root)?;
+    let node_id = sinomo_network::read_cluster_state(&ClusterPaths::new(data_dir))
+        .map(|state| state.local_node_id.to_string())
+        .unwrap_or_else(|_| "node_local".to_string());
+    let public_key = daemon_auth_decode_public_key(&identity.public_key)?;
+    let key_pair = Arc::new(identity.key_pair()?);
+    let loaded = CachedDaemonSigningIdentity {
+        node_id,
+        public_key,
+        key_pair,
+    };
+
+    let mut guard = DAEMON_SIGNING_IDENTITIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|source| DaemonError::Io {
+            path: root.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    Ok(guard.entry(root).or_insert_with(|| loaded).clone())
 }
 
 pub fn authenticate_daemon_control_request(
@@ -361,7 +454,10 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        command if command == daemon_rpc_command(sinomo_network::CLUSTER_HEALTH_ROUTE) => {
+        command
+            if command == daemon_rpc_command(sinomo_network::CLUSTER_HEALTH_ROUTE)
+                || command == daemon_rpc_command(sinomo_network::CLUSTER_NETWORK_PING_ROUTE) =>
+        {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -519,32 +615,24 @@ fn authorize_daemon_signer(
         path: paths.root.display().to_string(),
         detail: "daemon paths have no data directory parent".to_string(),
     })?;
-    let identity_paths = NodeIdentityPaths::new(data_dir);
-    let main_identity = load_existing_node_identity(&identity_paths.main)?;
-    let shadow_identity = load_optional_node_identity(&identity_paths.shadow)?;
-    if envelope_public_key == main_identity.public_key
-        || shadow_identity
+    let verifier = cached_daemon_auth_verifier_context(data_dir)?;
+    if envelope_public_key == verifier.main_public_key
+        || verifier
+            .shadow_public_key
             .as_ref()
-            .is_some_and(|identity| envelope_public_key == identity.public_key)
+            .is_some_and(|public_key| envelope_public_key == *public_key)
     {
         return Ok(DaemonSignerAuthority::Local);
     }
 
-    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
-    if cluster_paths.state.exists() {
-        let state = sinomo_network::read_cluster_state(&cluster_paths)?;
-        if let Some(member) = state.members.iter().find(|member| {
-            member.node_id.as_str() == envelope.node_id
-                && member.node_public_key == envelope_public_key
-                && member.state.is_authorized()
-        }) {
-            return Ok(signer_authority_for_member(member));
-        }
-        if let Some(member) = state.members.iter().find(|member| {
-            member.node_public_key == envelope_public_key && member.state.is_authorized()
-        }) {
-            return Ok(signer_authority_for_member(member));
-        }
+    if let Some(authority) = verifier
+        .members_by_node_and_key
+        .get(&(envelope.node_id.clone(), envelope_public_key.clone()))
+    {
+        return Ok(authority.clone());
+    }
+    if let Some(authority) = verifier.members_by_key.get(&envelope_public_key) {
+        return Ok(authority.clone());
     }
 
     if envelope.command == daemon_rpc_command(sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE) {
@@ -554,7 +642,223 @@ fn authorize_daemon_signer(
     if envelope.command == daemon_rpc_command(sinomo_network::DAEMON_STATUS_ROUTE) {
         return Ok(DaemonSignerAuthority::StatusProbe);
     }
+    if let Some(authority) =
+        authorize_daemon_signer_after_membership_refresh(data_dir, envelope, &envelope_public_key)
+    {
+        return Ok(authority);
+    }
     Err(DaemonError::AuthDenied)
+}
+
+fn verifier_authority_for_signer(
+    verifier: &CachedDaemonAuthVerifierContext,
+    node_id: &str,
+    public_key: &str,
+) -> Option<DaemonSignerAuthority> {
+    verifier
+        .members_by_node_and_key
+        .get(&(node_id.to_string(), public_key.to_string()))
+        .cloned()
+        .or_else(|| verifier.members_by_key.get(public_key).cloned())
+}
+
+fn authorize_daemon_signer_after_membership_refresh(
+    data_dir: &Path,
+    envelope: &SignedDaemonCommand,
+    envelope_public_key: &str,
+) -> Option<DaemonSignerAuthority> {
+    if let Some(authority) = load_uncached_daemon_auth_verifier_context(data_dir)
+        .ok()
+        .and_then(|verifier| {
+            verifier_authority_for_signer(&verifier, &envelope.node_id, envelope_public_key)
+        })
+    {
+        replace_cached_daemon_auth_verifier_context(data_dir, None);
+        return Some(authority);
+    }
+
+    refresh_daemon_auth_membership_snapshot(data_dir).ok()?;
+    replace_cached_daemon_auth_verifier_context(data_dir, None);
+    let verifier = cached_daemon_auth_verifier_context(data_dir).ok()?;
+    verifier_authority_for_signer(&verifier, &envelope.node_id, envelope_public_key)
+}
+
+fn load_uncached_daemon_auth_verifier_context(
+    data_dir: &Path,
+) -> Result<CachedDaemonAuthVerifierContext, DaemonError> {
+    let checked_at = Instant::now();
+    let mark = daemon_auth_verifier_context_mark(data_dir)?;
+    load_daemon_auth_verifier_context(data_dir, mark, checked_at)
+}
+
+fn replace_cached_daemon_auth_verifier_context(
+    data_dir: &Path,
+    replacement: Option<CachedDaemonAuthVerifierContext>,
+) {
+    let Some(cache) = DAEMON_AUTH_VERIFIER_CONTEXTS.get() else {
+        return;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return;
+    };
+    match replacement {
+        Some(context) => {
+            guard.insert(data_dir.to_path_buf(), context);
+        }
+        None => {
+            guard.remove(data_dir);
+        }
+    }
+}
+
+fn refresh_daemon_auth_membership_snapshot(data_dir: &Path) -> Result<(), DaemonError> {
+    let data_dir = SinomoDataDir::new(data_dir);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
+    let options =
+        ClusterControlPlaneTimeouts::default_daemon_transport().kv_snapshot_refresh_options();
+    sinomo_network::refresh_current_cluster_kv_store_with_local_storage_and_transport(
+        &cluster_paths,
+        &state,
+        options,
+        |endpoint, timeout| {
+            crate::client::fetch_cluster_kv_snapshot_from_endpoint(endpoint, timeout).map_err(
+                |error| sinomo_network::NetworkError::Io {
+                    operation: "cluster auth membership refresh".to_string(),
+                    detail: error.to_string(),
+                },
+            )
+        },
+    )
+    .map(|_| ())
+    .map_err(DaemonError::from)
+}
+
+fn cached_daemon_auth_verifier_context(
+    data_dir: &Path,
+) -> Result<CachedDaemonAuthVerifierContext, DaemonError> {
+    let root = data_dir.to_path_buf();
+    let checked_at = Instant::now();
+    {
+        let guard = DAEMON_AUTH_VERIFIER_CONTEXTS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|source| DaemonError::Io {
+                path: root.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        if let Some(cached) = guard.get(&root)
+            && checked_at.duration_since(cached.checked_at) < DAEMON_AUTH_VERIFIER_CONTEXT_MAX_AGE
+        {
+            return Ok(cached.clone());
+        }
+    }
+
+    let mark = daemon_auth_verifier_context_mark(data_dir)?;
+    {
+        let mut guard = DAEMON_AUTH_VERIFIER_CONTEXTS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|source| DaemonError::Io {
+                path: root.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        if let Some(cached) = guard.get_mut(&root)
+            && cached.mark == mark
+        {
+            cached.checked_at = checked_at;
+            return Ok(cached.clone());
+        }
+    }
+
+    let loaded = load_daemon_auth_verifier_context(data_dir, mark, checked_at)?;
+    let after_mark = daemon_auth_verifier_context_mark(data_dir)?;
+    if after_mark == mark {
+        let mut guard = DAEMON_AUTH_VERIFIER_CONTEXTS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|source| DaemonError::Io {
+                path: root.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        guard.insert(root, loaded.clone());
+        Ok(loaded)
+    } else {
+        Ok(loaded)
+    }
+}
+
+fn load_daemon_auth_verifier_context(
+    data_dir: &Path,
+    mark: DaemonAuthVerifierContextMark,
+    checked_at: Instant,
+) -> Result<CachedDaemonAuthVerifierContext, DaemonError> {
+    let identity_paths = NodeIdentityPaths::new(data_dir);
+    let main_identity = load_existing_node_identity(&identity_paths.main)?;
+    let shadow_identity = load_optional_node_identity(&identity_paths.shadow)?;
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    let mut members_by_node_and_key = BTreeMap::new();
+    let mut members_by_key = BTreeMap::new();
+    if cluster_paths.state.exists() {
+        let state = sinomo_network::read_cluster_state(&cluster_paths)?;
+        for member in state
+            .members
+            .iter()
+            .filter(|member| member.state.is_authorized())
+        {
+            let authority = signer_authority_for_member(member);
+            members_by_node_and_key.insert(
+                (member.node_id.to_string(), member.node_public_key.clone()),
+                authority.clone(),
+            );
+            members_by_key
+                .entry(member.node_public_key.clone())
+                .or_insert(authority);
+        }
+    }
+
+    Ok(CachedDaemonAuthVerifierContext {
+        mark,
+        checked_at,
+        main_public_key: main_identity.public_key,
+        shadow_public_key: shadow_identity.map(|identity| identity.public_key),
+        members_by_node_and_key,
+        members_by_key,
+    })
+}
+
+fn daemon_auth_verifier_context_mark(
+    data_dir: &Path,
+) -> Result<DaemonAuthVerifierContextMark, DaemonError> {
+    let identity_paths = NodeIdentityPaths::new(data_dir);
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    Ok(DaemonAuthVerifierContextMark {
+        main_identity: daemon_auth_file_mark(&identity_paths.main)?,
+        shadow_identity: daemon_auth_file_mark(&identity_paths.shadow)?,
+        cluster_state: daemon_auth_file_mark(&cluster_paths.state)?,
+        kv_snapshot: daemon_auth_file_mark(&cluster_paths.kv_snapshot)?,
+    })
+}
+
+fn daemon_auth_file_mark(path: &Path) -> Result<DaemonAuthFileMark, DaemonError> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(DaemonAuthFileMark {
+            exists: true,
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            ino: file_ino(&metadata),
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(DaemonAuthFileMark {
+            exists: false,
+            len: 0,
+            modified: None,
+            ino: 0,
+        }),
+        Err(source) => Err(DaemonError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }),
+    }
 }
 
 fn signer_authority_for_member(member: &ClusterMemberRecord) -> DaemonSignerAuthority {
@@ -679,17 +983,25 @@ fn remember_daemon_auth_nonce(
             path: paths.root.display().to_string(),
             detail: source.to_string(),
         })?;
-    let nonces = guard.entry(paths.root.clone()).or_default();
-    // Drop nonces older than the retention window so the set stays bounded; anything
-    // that old is already rejected by the clock-skew freshness check.
-    nonces.retain(|_, seen_at| {
-        (now - *seen_at).whole_seconds().abs() <= DAEMON_AUTH_NONCE_RETENTION_SECONDS
-    });
+    let nonce_set = guard
+        .entry(paths.root.clone())
+        .or_insert_with(|| DaemonAuthNonceSet::new(now));
+    let prune_due = (now - nonce_set.last_pruned_at).whole_seconds().abs()
+        >= DAEMON_AUTH_NONCE_PRUNE_INTERVAL_SECONDS
+        || nonce_set.nonces.len() >= DAEMON_AUTH_NONCE_PRUNE_MAX_ENTRIES;
+    if prune_due {
+        // Drop nonces older than the retention window so the set stays bounded; anything
+        // that old is already rejected by the clock-skew freshness check.
+        nonce_set.nonces.retain(|_, seen_at| {
+            (now - *seen_at).whole_seconds().abs() <= DAEMON_AUTH_NONCE_RETENTION_SECONDS
+        });
+        nonce_set.last_pruned_at = now;
+    }
     let nonce_key = daemon_auth_nonce_key(envelope);
-    if nonces.contains_key(&nonce_key) {
+    if nonce_set.nonces.contains_key(&nonce_key) {
         return Err(DaemonError::AuthDenied);
     }
-    nonces.insert(nonce_key, signed_at);
+    nonce_set.nonces.insert(nonce_key, signed_at);
     Ok(())
 }
 
@@ -847,18 +1159,24 @@ mod tests {
 
     #[test]
     fn cluster_health_authorizes_cluster_members_for_routed_inspection() {
-        let command = daemon_rpc_command(sinomo_network::CLUSTER_HEALTH_ROUTE);
-        for signer in [
-            DaemonSignerAuthority::Local,
-            DaemonSignerAuthority::Voter,
-            DaemonSignerAuthority::Member,
+        for route in [
+            sinomo_network::CLUSTER_HEALTH_ROUTE,
+            sinomo_network::CLUSTER_NETWORK_PING_ROUTE,
         ] {
-            let authenticated = authenticated_command(command.clone(), signer);
-            authorize_authenticated_daemon_command(&authenticated)
-                .expect("cluster members must be able to read routed health");
+            let command = daemon_rpc_command(route);
+            for signer in [
+                DaemonSignerAuthority::Local,
+                DaemonSignerAuthority::Voter,
+                DaemonSignerAuthority::Member,
+            ] {
+                let authenticated = authenticated_command(command.clone(), signer);
+                authorize_authenticated_daemon_command(&authenticated)
+                    .expect("cluster members must be able to use routed network inspection");
+            }
+            let authenticated =
+                authenticated_command(command, DaemonSignerAuthority::JoinCandidate);
+            assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
         }
-        let authenticated = authenticated_command(command, DaemonSignerAuthority::JoinCandidate);
-        assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
     }
 
     #[test]

@@ -579,6 +579,11 @@ pub(crate) fn require_cluster_runtime_quorum_with_paths_and_daemon(
                 .to_string(),
         });
     }
+    if let Some(daemon) = daemon
+        && local_daemon_can_serve_cluster_kv_snapshot(daemon, &state)
+    {
+        return Ok(());
+    }
     if cluster_has_local_quorum(&paths, &state) {
         Ok(())
     } else {
@@ -590,6 +595,19 @@ pub(crate) fn require_cluster_runtime_quorum_with_paths_and_daemon(
             ),
         })
     }
+}
+
+pub(crate) fn local_daemon_can_serve_cluster_kv_snapshot(
+    daemon: &DaemonStatus,
+    state: &ClusterBootstrapState,
+) -> bool {
+    let Some(cluster) = daemon.cluster.as_ref() else {
+        return false;
+    };
+    if cluster.cluster_id != state.cluster_id || cluster.node_id != state.local_node_id {
+        return false;
+    }
+    daemon_fetch_cluster_kv_snapshot(&daemon.address, DAEMON_PROBE_TIMEOUT).is_ok()
 }
 
 pub(crate) fn cluster_init(options: ClusterInitOptions) -> Result<(), CliError> {

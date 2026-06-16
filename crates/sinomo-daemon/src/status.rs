@@ -292,7 +292,15 @@ pub fn daemon_cluster_status_matches(
     status: &DaemonStatus,
 ) -> bool {
     status.cluster.as_ref().is_some_and(|cluster| {
-        cluster.cluster_id == state.cluster_id && cluster.node_id == endpoint.node_id
+        if cluster.node_id != endpoint.node_id {
+            return false;
+        }
+        cluster.cluster_id == state.cluster_id
+            || state
+                .members
+                .iter()
+                .find(|member| member.node_id == endpoint.node_id)
+                .is_some_and(|member| member.cluster_id == cluster.cluster_id)
     })
 }
 
@@ -777,8 +785,30 @@ pub fn write_daemon_status(paths: &DaemonPaths, status: &DaemonStatus) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::{ClusterEndpointPrivacy, ClusterTransportKind};
+    use sinomo_core::{
+        ClusterEndpointPrivacy, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState,
+        ClusterTransportKind,
+    };
     use sinomo_node::shadow_daemon_node_id;
+
+    fn cluster_status(cluster_id: ClusterId, node_id: NodeId) -> DaemonClusterStatus {
+        DaemonClusterStatus {
+            cluster_id,
+            node_id,
+            process: DAEMON_MAIN_CLUSTER_ROLE.to_string(),
+            member_role: ClusterMemberRole::NonVoting,
+            member_state: ClusterMemberState::NonVoting,
+        }
+    }
+
+    fn daemon_status_for_cluster(cluster: DaemonClusterStatus) -> DaemonStatus {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-status-cluster-match");
+        DaemonStatus::new(
+            &DaemonRunOptions::default(),
+            &DaemonPaths::with_root(root.join("daemon")),
+            Some(cluster),
+        )
+    }
 
     #[test]
     fn local_shadow_advertisement_includes_public_route_ip() {
@@ -834,5 +864,75 @@ mod tests {
                 && endpoint.privacy == ClusterEndpointPrivacy::Lan
                 && endpoint.priority == 5
         }));
+    }
+
+    #[test]
+    fn cluster_status_match_accepts_member_cluster_id_when_state_cluster_is_stale() {
+        let now = OffsetDateTime::now_utc();
+        let stale_cluster =
+            ClusterId::from_legacy_named("cluster_status_match_stale").expect("cluster");
+        let member_cluster =
+            ClusterId::from_legacy_named("cluster_status_match_member").expect("cluster");
+        let local = NodeId::from_legacy_named("node_status_match_local").expect("node");
+        let remote = NodeId::from_legacy_named("node_status_match_remote").expect("node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            stale_cluster,
+            "stale cluster",
+            local,
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut member = ClusterMemberRecord::local_non_voting(
+            member_cluster.clone(),
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        let endpoint =
+            sinomo_network::daemon_lan_endpoint(&remote, "172.23.0.2:21353".to_string(), 5);
+        member.endpoints = vec![endpoint.clone()];
+        state.members.push(member);
+
+        let status = daemon_status_for_cluster(cluster_status(member_cluster, remote));
+
+        assert!(daemon_cluster_status_matches(&state, &endpoint, &status));
+    }
+
+    #[test]
+    fn cluster_status_match_rejects_unrelated_cluster_id() {
+        let now = OffsetDateTime::now_utc();
+        let state_cluster =
+            ClusterId::from_legacy_named("cluster_status_match_state").expect("cluster");
+        let member_cluster =
+            ClusterId::from_legacy_named("cluster_status_match_member_two").expect("cluster");
+        let other_cluster =
+            ClusterId::from_legacy_named("cluster_status_match_other").expect("cluster");
+        let local = NodeId::from_legacy_named("node_status_match_local_two").expect("node");
+        let remote = NodeId::from_legacy_named("node_status_match_remote_two").expect("node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            state_cluster,
+            "state cluster",
+            local,
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut member = ClusterMemberRecord::local_non_voting(
+            member_cluster,
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        let endpoint =
+            sinomo_network::daemon_lan_endpoint(&remote, "172.23.0.3:21353".to_string(), 5);
+        member.endpoints = vec![endpoint.clone()];
+        state.members.push(member);
+
+        let status = daemon_status_for_cluster(cluster_status(other_cluster, remote));
+
+        assert!(!daemon_cluster_status_matches(&state, &endpoint, &status));
     }
 }

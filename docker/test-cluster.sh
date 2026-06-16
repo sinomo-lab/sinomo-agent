@@ -30,6 +30,20 @@
 #   SINOMO_TEST_PERF_TIMEOUT    bulk write/read timeout seconds (default 120)
 #   SINOMO_TEST_PERF_MIN_WRITE_FILES_PER_SEC  min writer throughput (default 0.75)
 #   SINOMO_TEST_PERF_MIN_READ_FILES_PER_SEC   min cross-node read/convergence throughput (default 1)
+#   SINOMO_TEST_PERF_MAX_PROC_WCHAR_AMPLIFICATION       max writer-process wchar/logical bytes (default 0, disabled)
+#   SINOMO_TEST_PERF_MAX_PROC_WRITE_BYTES_AMPLIFICATION max writer-process write_bytes/logical bytes (default 0, disabled)
+#   SINOMO_TEST_PERF_MAX_READ_PROC_WRITE_BYTES max reader-process write_bytes during bulk-expect (default 0)
+#   SINOMO_TEST_NETWORK_REQUESTS_PER_TARGET cluster network ping RPCs per remote node (default 20)
+#   SINOMO_TEST_NETWORK_CONCURRENCY         concurrent network ping workers (default 32)
+#   SINOMO_TEST_NETWORK_TIMEOUT_MS          per network ping RPC timeout (default 2000)
+#   SINOMO_TEST_NETWORK_MAX_FAILURES        allowed failed network ping RPCs (default 0)
+#   SINOMO_TEST_NETWORK_MAX_P50_MS          max network ping p50 latency (default 50)
+#   SINOMO_TEST_NETWORK_MAX_P95_MS          max network ping p95 latency (default 250)
+#   SINOMO_TEST_NETWORK_MIN_RPS             min network ping throughput (default 50)
+#   SINOMO_TEST_NETWORK_READY_WAIT          network/auth convergence gate seconds (default 120)
+#   SINOMO_TEST_NETWORK_READY_REQUESTS_PER_TARGET requests per target during readiness warmup (default 20)
+#   SINOMO_TEST_NETWORK_READY_CONCURRENCY   readiness warmup concurrency (default 32)
+#   SINOMO_TEST_NETWORK_ONLY=1              stop after network baseline
 #   SINOMO_TEST_BUILD=1         force `cargo build -p sinomo` first
 #   SINOMO_TEST_ARTIFACTS       artifact dir (default target/cluster-test-artifacts/<run>)
 #
@@ -53,6 +67,19 @@ PERF_BYTES="${SINOMO_TEST_PERF_BYTES:-4096}"
 PERF_TIMEOUT="${SINOMO_TEST_PERF_TIMEOUT:-120}"
 PERF_MIN_WRITE_FILES_PER_SEC="${SINOMO_TEST_PERF_MIN_WRITE_FILES_PER_SEC:-0.75}"
 PERF_MIN_READ_FILES_PER_SEC="${SINOMO_TEST_PERF_MIN_READ_FILES_PER_SEC:-1}"
+PERF_MAX_PROC_WCHAR_AMPLIFICATION="${SINOMO_TEST_PERF_MAX_PROC_WCHAR_AMPLIFICATION:-0}"
+PERF_MAX_PROC_WRITE_BYTES_AMPLIFICATION="${SINOMO_TEST_PERF_MAX_PROC_WRITE_BYTES_AMPLIFICATION:-0}"
+PERF_MAX_READ_PROC_WRITE_BYTES="${SINOMO_TEST_PERF_MAX_READ_PROC_WRITE_BYTES:-0}"
+NETWORK_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_REQUESTS_PER_TARGET:-20}"
+NETWORK_CONCURRENCY="${SINOMO_TEST_NETWORK_CONCURRENCY:-32}"
+NETWORK_TIMEOUT_MS="${SINOMO_TEST_NETWORK_TIMEOUT_MS:-2000}"
+NETWORK_MAX_FAILURES="${SINOMO_TEST_NETWORK_MAX_FAILURES:-0}"
+NETWORK_MAX_P50_MS="${SINOMO_TEST_NETWORK_MAX_P50_MS:-50}"
+NETWORK_MAX_P95_MS="${SINOMO_TEST_NETWORK_MAX_P95_MS:-250}"
+NETWORK_MIN_RPS="${SINOMO_TEST_NETWORK_MIN_RPS:-50}"
+NETWORK_READY_WAIT="${SINOMO_TEST_NETWORK_READY_WAIT:-120}"
+NETWORK_READY_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_READY_REQUESTS_PER_TARGET:-20}"
+NETWORK_READY_CONCURRENCY="${SINOMO_TEST_NETWORK_READY_CONCURRENCY:-32}"
 NODES="node1 node2 node3 node4 node5 node6"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 ARTIFACTS="${SINOMO_TEST_ARTIFACTS:-$SINOMO_ROOT/target/cluster-test-artifacts/$RUN_ID}"
@@ -134,6 +161,41 @@ wait_for_dfs_ready() {
   done
 }
 
+wait_for_network_ready() {
+  local deadline node still
+  log "network-ready: waiting for relay/auth convergence (<=${NETWORK_READY_WAIT}s)"
+  deadline=$(( $(date +%s) + NETWORK_READY_WAIT ))
+  while :; do
+    still=""
+    for node in node1 node6; do
+      if compose exec -T "$node" sinomo test run cluster.network.ping-benchmark \
+          --require-cluster \
+          --param "requests-per-target=$NETWORK_READY_REQUESTS_PER_TARGET" \
+          --param "concurrency=$NETWORK_READY_CONCURRENCY" \
+          --param "timeout-ms=$NETWORK_TIMEOUT_MS" \
+          --param "max-failures=0" \
+          --param "max-p50-ms=$NETWORK_MAX_P50_MS" \
+          --param "max-p95-ms=$NETWORK_MAX_P95_MS" \
+          --param "min-requests-per-second=$NETWORK_MIN_RPS" \
+          >"$ARTIFACTS/network-ready-$node.last.json" 2>&1; then
+        log "  network-ready: $node"
+      else
+        still="$still $node"
+      fi
+    done
+    [ -z "$still" ] && return 0
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      log "network-ready: nodes never became ready:$still"
+      for node in $still; do
+        log "  $node last probe output:"
+        sed 's/^/      /' "$ARTIFACTS/network-ready-$node.last.json" | tail -12
+      done
+      return 1
+    fi
+    sleep "$POLL_INTERVAL"
+  done
+}
+
 PROBE_INDEX=0
 run_probe() {
   local node="$1" id="$2"
@@ -170,6 +232,21 @@ invariants_sweep() {
   local rc=0 node
   for node in $NODES; do
     run_probe "$node" cluster.dfs.invariants --param timeout-seconds=60 || rc=1
+  done
+  return $rc
+}
+
+network_baseline() {
+  local rc=0 node
+  for node in node1 node6; do
+    run_probe "$node" cluster.network.ping-benchmark \
+      --param "requests-per-target=$NETWORK_REQUESTS_PER_TARGET" \
+      --param "concurrency=$NETWORK_CONCURRENCY" \
+      --param "timeout-ms=$NETWORK_TIMEOUT_MS" \
+      --param "max-failures=$NETWORK_MAX_FAILURES" \
+      --param "max-p50-ms=$NETWORK_MAX_P50_MS" \
+      --param "max-p95-ms=$NETWORK_MAX_P95_MS" \
+      --param "min-requests-per-second=$NETWORK_MIN_RPS" || rc=1
   done
   return $rc
 }
@@ -230,30 +307,37 @@ bulk_performance() {
     --param "files=$PERF_WARMUP_FILES" \
     --param "bytes=$PERF_BYTES" \
     --param "timeout-seconds=$PERF_TIMEOUT" \
+    --param "max-proc-write-bytes=$PERF_MAX_READ_PROC_WRITE_BYTES" \
   && run_probe node2 cluster.dfs.bulk-write \
     --param "base=$a" \
     --param "files=$PERF_FILES" \
     --param "bytes=$PERF_BYTES" \
     --param "timeout-seconds=$PERF_TIMEOUT" \
     --param "min-files-per-second=$PERF_MIN_WRITE_FILES_PER_SEC" \
+    --param "max-proc-wchar-amplification=$PERF_MAX_PROC_WCHAR_AMPLIFICATION" \
+    --param "max-proc-write-bytes-amplification=$PERF_MAX_PROC_WRITE_BYTES_AMPLIFICATION" \
   && run_probe node6 cluster.dfs.bulk-expect \
     --param "base=$a" \
     --param "files=$PERF_FILES" \
     --param "bytes=$PERF_BYTES" \
     --param "timeout-seconds=$PERF_TIMEOUT" \
     --param "min-files-per-second=$PERF_MIN_READ_FILES_PER_SEC" \
+    --param "max-proc-write-bytes=$PERF_MAX_READ_PROC_WRITE_BYTES" \
   && run_probe node5 cluster.dfs.bulk-write \
     --param "base=$b" \
     --param "files=$PERF_FILES" \
     --param "bytes=$PERF_BYTES" \
     --param "timeout-seconds=$PERF_TIMEOUT" \
     --param "min-files-per-second=$PERF_MIN_WRITE_FILES_PER_SEC" \
+    --param "max-proc-wchar-amplification=$PERF_MAX_PROC_WCHAR_AMPLIFICATION" \
+    --param "max-proc-write-bytes-amplification=$PERF_MAX_PROC_WRITE_BYTES_AMPLIFICATION" \
   && run_probe node1 cluster.dfs.bulk-expect \
     --param "base=$b" \
     --param "files=$PERF_FILES" \
     --param "bytes=$PERF_BYTES" \
     --param "timeout-seconds=$PERF_TIMEOUT" \
-    --param "min-files-per-second=$PERF_MIN_READ_FILES_PER_SEC"
+    --param "min-files-per-second=$PERF_MIN_READ_FILES_PER_SEC" \
+    --param "max-proc-write-bytes=$PERF_MAX_READ_PROC_WRITE_BYTES"
 }
 
 restart_durability() {
@@ -309,6 +393,15 @@ teardown() {
   fi
   log "tearing down compose project $PROJECT"
   compose down -v --remove-orphans >/dev/null 2>&1 || true
+  local attempt
+  for attempt in 1 2 3; do
+    if [ -z "$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT" 2>/dev/null)" ] \
+      && [ -z "$(docker volume ls -q --filter "label=com.docker.compose.project=$PROJECT" 2>/dev/null)" ]; then
+      return
+    fi
+    sleep 2
+    compose down -v --remove-orphans >/dev/null 2>&1 || true
+  done
 }
 trap teardown EXIT
 
@@ -334,6 +427,19 @@ if ! wait_for_cluster_ready "formation"; then
   cluster_health
   FAILED_SCENARIOS="formation"
   exit 1
+fi
+if ! wait_for_network_ready; then
+  FAILED_SCENARIOS="network-ready"
+  exit 1
+fi
+
+scenario "network-baseline" network_baseline
+if [ -n "$FAILED_SCENARIOS" ]; then
+  exit 1
+fi
+if [ "${SINOMO_TEST_NETWORK_ONLY:-0}" = 1 ]; then
+  log "RESULT: PASS — network baseline green (probe reports in $ARTIFACTS)"
+  exit 0
 fi
 
 if ! wait_for_dfs_ready; then

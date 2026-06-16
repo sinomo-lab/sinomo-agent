@@ -21,8 +21,9 @@ use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, UNIX_EPOCH};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -2016,6 +2017,7 @@ pub struct LocalSobjMetadataBackend {
     tables: DfsMetadataTables,
     table_log_offset: u64,
     table_snapshot_fingerprint: Option<MetadataTableSnapshotFingerprint>,
+    read_snapshot_cache: Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -2061,7 +2063,14 @@ struct DfsMetadataTableState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MetadataTableSnapshotFingerprint {
     len: u64,
-    hash: String,
+    modified_unix_nanos: Option<u128>,
+}
+
+#[derive(Clone, Debug)]
+struct MetadataTableReadSnapshotCache {
+    snapshot_fingerprint: Option<MetadataTableSnapshotFingerprint>,
+    table_log_offset: u64,
+    tables: DfsMetadataTables,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -2842,13 +2851,31 @@ impl LocalShardedMetadataBackend {
     ) -> Result<()> {
         write_sobj_atomic(
             &self.object_shard_index_path(&object.object_id),
-            &DfsObjectShardIndexRecord {
-                object_id: object.object_id.clone(),
-                file_system_id: object.file_system_id.clone(),
-                path: normalize_path(&object.path),
-                shard_id: shard_id.clone(),
-            },
+            &object_shard_index_record(object, shard_id),
         )
+    }
+
+    fn write_new_object_shard_indexes_relaxed(
+        &self,
+        objects: &[DfsObjectMetadata],
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<bool> {
+        if objects.len() <= 1
+            || objects
+                .iter()
+                .any(|object| self.object_shard_index_path(&object.object_id).exists())
+        {
+            return Ok(false);
+        }
+        let mut files = Vec::with_capacity(objects.len());
+        for object in objects {
+            files.push((
+                self.object_shard_index_path(&object.object_id),
+                encode_sobj(&object_shard_index_record(object, shard_id))?,
+            ));
+        }
+        write_sobj_files_create_new_relaxed(files)?;
+        Ok(true)
     }
 
     fn remove_object_shard_index(&self, object_id: &DfsObjectId) -> Result<()> {
@@ -4560,8 +4587,12 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             let entry = self
                 .shard_backend_mut(&shard_id)?
                 .apply_namespace_transaction(&shard_transaction)?;
-            for object in &shard_transaction.objects {
-                self.write_object_shard_index(object, &shard_id)?;
+            if !self
+                .write_new_object_shard_indexes_relaxed(&shard_transaction.objects, &shard_id)?
+            {
+                for object in &shard_transaction.objects {
+                    self.write_object_shard_index(object, &shard_id)?;
+                }
             }
             last_entry = Some(entry);
         }
@@ -5032,6 +5063,7 @@ impl LocalSobjMetadataBackend {
             tables: DfsMetadataTables::default(),
             table_log_offset: 0,
             table_snapshot_fingerprint: None,
+            read_snapshot_cache: Arc::new(Mutex::new(None)),
         };
         {
             let _lock = backend.metadata_write_lock()?;
@@ -6272,30 +6304,83 @@ impl LocalSobjMetadataBackend {
     }
 
     fn current_tables_snapshot(&self) -> Result<Cow<'_, DfsMetadataTables>> {
-        if metadata_table_snapshot_fingerprint(&self.root)? != self.table_snapshot_fingerprint {
-            let state = read_metadata_table_state_lenient(&self.root)?;
-            return Ok(Cow::Owned(state.tables));
-        }
         let path = metadata_table_path(&self.root);
+        let current_snapshot_fingerprint = metadata_table_snapshot_fingerprint(&self.root)?;
         let metadata = match fs::metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                return Ok(Cow::Borrowed(&self.tables));
-            }
+            Ok(metadata) => Some(metadata),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => None,
             Err(source) => {
                 return Err(MetadataBackendError::Io { path, source });
             }
         };
-        if metadata.len() < self.table_log_offset {
-            let state = read_metadata_table_state_lenient(&self.root)?;
-            return Ok(Cow::Owned(state.tables));
+        if current_snapshot_fingerprint == self.table_snapshot_fingerprint {
+            match metadata.as_ref().map(fs::Metadata::len) {
+                None => return Ok(Cow::Borrowed(&self.tables)),
+                Some(len) if len == self.table_log_offset => {
+                    return Ok(Cow::Borrowed(&self.tables));
+                }
+                Some(len) => {
+                    if let Some(tables) =
+                        self.cached_read_snapshot(&current_snapshot_fingerprint, len)
+                    {
+                        return Ok(Cow::Owned(tables));
+                    }
+                    if len < self.table_log_offset {
+                        let state = read_metadata_table_state_lenient(&self.root)?;
+                        self.store_read_snapshot(&state);
+                        return Ok(Cow::Owned(state.tables));
+                    }
+                    let mut tables = self.tables.clone();
+                    let table_log_offset = replay_metadata_table_batches_from(
+                        &path,
+                        self.table_log_offset,
+                        &mut tables,
+                    )?;
+                    let state = DfsMetadataTableState {
+                        tables,
+                        table_log_offset,
+                        snapshot_format_version: None,
+                        snapshot_fingerprint: current_snapshot_fingerprint,
+                    };
+                    self.store_read_snapshot(&state);
+                    return Ok(Cow::Owned(state.tables));
+                }
+            }
         }
-        if metadata.len() == self.table_log_offset {
-            return Ok(Cow::Borrowed(&self.tables));
+        let table_log_offset = metadata.as_ref().map(fs::Metadata::len).unwrap_or(0);
+        if let Some(tables) =
+            self.cached_read_snapshot(&current_snapshot_fingerprint, table_log_offset)
+        {
+            return Ok(Cow::Owned(tables));
         }
-        let mut tables = self.tables.clone();
-        replay_metadata_table_batches_from(&path, self.table_log_offset, &mut tables)?;
-        Ok(Cow::Owned(tables))
+        let state = read_metadata_table_state_lenient(&self.root)?;
+        self.store_read_snapshot(&state);
+        Ok(Cow::Owned(state.tables))
+    }
+
+    fn cached_read_snapshot(
+        &self,
+        snapshot_fingerprint: &Option<MetadataTableSnapshotFingerprint>,
+        table_log_offset: u64,
+    ) -> Option<DfsMetadataTables> {
+        let cache = self.read_snapshot_cache.lock().ok()?;
+        let cache = cache.as_ref()?;
+        if cache.snapshot_fingerprint == *snapshot_fingerprint
+            && cache.table_log_offset == table_log_offset
+        {
+            return Some(cache.tables.clone());
+        }
+        None
+    }
+
+    fn store_read_snapshot(&self, state: &DfsMetadataTableState) {
+        if let Ok(mut cache) = self.read_snapshot_cache.lock() {
+            *cache = Some(MetadataTableReadSnapshotCache {
+                snapshot_fingerprint: state.snapshot_fingerprint.clone(),
+                table_log_offset: state.table_log_offset,
+                tables: state.tables.clone(),
+            });
+        }
     }
 
     fn reload_metadata_tables_if_snapshot_changed(&mut self) -> Result<()> {
@@ -9348,13 +9433,14 @@ fn metadata_table_snapshot_fingerprint(
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(MetadataBackendError::Io { path, source }),
     };
-    let bytes = fs::read(&path).map_err(|source| MetadataBackendError::Io {
-        path: path.clone(),
-        source,
-    })?;
+    let modified_unix_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
     Ok(Some(MetadataTableSnapshotFingerprint {
         len: metadata.len(),
-        hash: blake3::hash(&bytes).to_hex().to_string(),
+        modified_unix_nanos,
     }))
 }
 
@@ -10504,8 +10590,7 @@ fn write_sobj_atomic_if_changed<T>(path: &Path, value: &T) -> Result<bool>
 where
     T: Serialize,
 {
-    let bytes = sinomo_object_serde::to_bytes(value, 1, LengthMode::U32)
-        .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
+    let bytes = encode_sobj(value)?;
     if path.is_file() {
         match fs::read(path) {
             Ok(existing) if existing == bytes => return Ok(false),
@@ -10521,6 +10606,75 @@ where
     }
     write_file_atomic(path, &bytes)?;
     Ok(true)
+}
+
+fn object_shard_index_record(
+    object: &DfsObjectMetadata,
+    shard_id: &DfsMetadataShardId,
+) -> DfsObjectShardIndexRecord {
+    DfsObjectShardIndexRecord {
+        object_id: object.object_id.clone(),
+        file_system_id: object.file_system_id.clone(),
+        path: normalize_path(&object.path),
+        shard_id: shard_id.clone(),
+    }
+}
+
+fn encode_sobj<T>(value: &T) -> Result<Vec<u8>>
+where
+    T: Serialize,
+{
+    sinomo_object_serde::to_bytes(value, 1, LengthMode::U32)
+        .map_err(|source| MetadataBackendError::Serde(source.to_string()))
+}
+
+fn write_sobj_files_create_new_relaxed(files: Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
+    for (path, bytes) in files {
+        if path.is_file() {
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            create_dir_all(parent.to_owned())?;
+        }
+        let tmp_path = temporary_path_for(&path);
+        let mut file = fs::File::create(&tmp_path).map_err(|source| MetadataBackendError::Io {
+            path: tmp_path.clone(),
+            source,
+        })?;
+        file.write_all(&bytes)
+            .map_err(|source| MetadataBackendError::Io {
+                path: tmp_path.clone(),
+                source,
+            })?;
+        drop(file);
+        match fs::hard_link(&tmp_path, &path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(MetadataBackendError::Io { path, source });
+            }
+        }
+        fs::remove_file(&tmp_path).map_err(|source| MetadataBackendError::Io {
+            path: tmp_path,
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+fn temporary_path_for(path: &Path) -> PathBuf {
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+    let counter = TMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("tmp");
+    path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        counter
+    ))
 }
 
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {

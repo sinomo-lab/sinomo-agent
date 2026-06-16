@@ -204,10 +204,16 @@ impl AsyncDaemonControlListener {
         self.listener
             .accept()
             .await
-            .map(|(stream, _address)| AsyncDaemonControlStream::new(stream))
             .map_err(|source| NetworkError::Io {
                 operation: format!("accept async daemon control listener {}", self.bind_address),
                 detail: source.to_string(),
+            })
+            .and_then(|(stream, _address)| {
+                configure_daemon_control_tcp_stream(
+                    &stream,
+                    &format!("accepted daemon control stream {}", self.bind_address),
+                )?;
+                Ok(AsyncDaemonControlStream::new(stream))
             })
     }
 }
@@ -241,6 +247,16 @@ fn mark_daemon_control_listener_non_inheritable(
     _listener: &tokio::net::TcpListener,
 ) -> std::io::Result<()> {
     Ok(())
+}
+
+fn configure_daemon_control_tcp_stream(
+    stream: &tokio::net::TcpStream,
+    operation: &str,
+) -> Result<(), NetworkError> {
+    stream.set_nodelay(true).map_err(|source| NetworkError::Io {
+        operation: operation.to_string(),
+        detail: source.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -307,6 +323,10 @@ impl AsyncDaemonControlStream {
             operation: format!("connect async daemon control stream {address}"),
             detail: source.to_string(),
         })?;
+        configure_daemon_control_tcp_stream(
+            &stream,
+            &format!("connected daemon control stream {address}"),
+        )?;
         Ok(Self::new(stream))
     }
 

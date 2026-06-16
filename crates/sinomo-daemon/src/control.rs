@@ -2,7 +2,8 @@ use crate::cluster::{
     ClusterNetworkMaintenance, DAEMON_CLUSTER_PUBLISH_INTERVAL, DAEMON_CLUSTER_TICK_INTERVAL,
     cluster_paths_from_daemon_paths, ensure_daemon_status_cluster,
     ensure_daemon_status_cluster_async, handle_daemon_cluster_kv_snapshot,
-    prune_local_cluster_raft_uncommitted_tail, start_daemon_iroh_proxy_if_clustered,
+    handle_daemon_cluster_relay_request_on_runtime, prune_local_cluster_raft_uncommitted_tail,
+    start_daemon_iroh_proxy_if_clustered,
 };
 use crate::dfs::{
     daemon_dfs_endpoint_transport, daemon_dfs_endpoint_transport_on_runtime,
@@ -731,6 +732,9 @@ pub(crate) async fn dispatch_daemon_control_request_in_process_async(
             detail: "sandbox stream routes cannot be delivered through cluster relay".to_string(),
         });
     }
+    if rpc_request.route == sinomo_network::CLUSTER_NETWORK_PING_ROUTE {
+        return daemon_cluster_network_ping_response(&paths, rpc_request);
+    }
     let service_host = crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime(
         paths.clone(),
         service_runtime,
@@ -766,6 +770,22 @@ pub(crate) async fn dispatch_daemon_control_request_in_process_async(
                 .map_err(DaemonError::from)
         }
     }
+}
+
+fn daemon_cluster_network_ping_response(
+    paths: &DaemonPaths,
+    request: sinomo_network::ObjectRpcRequest,
+) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
+    let data_dir = sinomo_local::SinomoDataDir::new(daemon_data_dir_path(paths)?);
+    let cluster_paths = cluster_paths_from_daemon_paths(paths)
+        .unwrap_or_else(|_| sinomo_network::ClusterPaths::new(&data_dir));
+    let state = sinomo_network::read_cluster_state_cached(&cluster_paths)?;
+    sinomo_network::handle_cluster_network_ping_rpc_request_for_node(
+        &state.local_node_id,
+        request,
+        time::OffsetDateTime::now_utc(),
+    )
+    .map_err(DaemonError::from)
 }
 
 pub(crate) fn daemon_dfs_frame_replay_key(
@@ -906,6 +926,42 @@ async fn handle_authenticated_daemon_command_async(
             service_runtime.clone(),
         )
         .await;
+    }
+    if let Some(request) = rpc_request.as_ref()
+        && request.route == sinomo_network::CLUSTER_NETWORK_PING_ROUTE
+    {
+        let response = daemon_cluster_network_ping_response(&paths, request.clone())?;
+        write_daemon_rpc_response_frame_async(&mut stream, &stream_address, response).await?;
+        return Ok(false);
+    }
+    if let Some(request) = rpc_request.as_ref()
+        && request.route == sinomo_network::CLUSTER_RELAY_ROUTE
+    {
+        let response = match sinomo_network::RelayEnvelope::from_request(request) {
+            Ok(envelope) => {
+                match handle_daemon_cluster_relay_request_on_runtime(
+                    &paths,
+                    envelope,
+                    Some(&service_runtime),
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(error) => sinomo_network::ObjectRpcResponse::encode_error(
+                        sinomo_network::CLUSTER_RELAY_ROUTE,
+                        error.to_string(),
+                    )
+                    .map_err(DaemonError::from)?,
+                }
+            }
+            Err(error) => sinomo_network::ObjectRpcResponse::encode_error(
+                sinomo_network::CLUSTER_RELAY_ROUTE,
+                error.to_string(),
+            )
+            .map_err(DaemonError::from)?,
+        };
+        write_daemon_rpc_response_frame_async(&mut stream, &stream_address, response).await?;
+        return Ok(false);
     }
     if let Some(result) = crate::service_adapter::try_dispatch_via_registry_async(
         &authenticated,

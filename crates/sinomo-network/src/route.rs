@@ -17,9 +17,12 @@ use crate::{
     ClusterConnectivityGraph, ClusterPaths, DaemonControlRequest, DaemonRpcTimeouts, NetworkError,
     ObjectRpcRequest, ObjectRpcResponse,
 };
+use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
-use std::time::Instant;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 /// RPC category for routing/relay traffic.
 pub const CLUSTER_ROUTING_RPC_CATEGORY: &str = "cluster.routing";
@@ -32,6 +35,32 @@ pub const CLUSTER_ROUTING_RPC_ROUTE_METADATA: &[(&str, &str)] =
 pub const CLUSTER_RELAY_DEFAULT_TTL: u8 = 8;
 const CLUSTER_RELAY_MAX_FAILURE_DETAILS: usize = 8;
 const CLUSTER_RELAY_FAILURE_DETAIL_MAX_CHARS: usize = 512;
+const CLUSTER_RELAY_ROUTE_PLAN_CACHE_MAX_AGE: Duration = Duration::from_secs(1);
+
+static CLUSTER_RELAY_ROUTE_PLANS: LazyLock<
+    Mutex<HashMap<ClusterRelayRoutePlanCacheKey, ClusterRelayRoutePlanCacheEntry>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ClusterRelayRoutePlanMode {
+    Standard,
+    DirectTargetFallback,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ClusterRelayRoutePlanCacheKey {
+    root: PathBuf,
+    mode: ClusterRelayRoutePlanMode,
+    local_node_id: String,
+    target_node_id: String,
+    excluded: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ClusterRelayRoutePlanCacheEntry {
+    recorded_at: Instant,
+    plan: Vec<(NodeId, Vec<ClusterEndpointRecord>)>,
+}
 
 /// A discovered route to a target node: the immediate next hop to send to, and the full
 /// node path (`local` … `target`, inclusive) for diagnostics.
@@ -135,8 +164,10 @@ pub fn cluster_route_next_hops_best_effort(
     target: &NodeId,
     excluded: &[NodeId],
 ) -> Vec<NodeId> {
-    if let Some(route) = cluster_route_next_hop_excluding(graph, local, target, excluded) {
-        return vec![route.next_hop];
+    let full_path_next_hops =
+        cluster_route_shortest_first_hops_excluding(graph, local, target, excluded);
+    if !full_path_next_hops.is_empty() {
+        return full_path_next_hops;
     }
     let excluded = excluded.iter().collect::<BTreeSet<_>>();
     let mut candidates = graph
@@ -146,6 +177,7 @@ pub fn cluster_route_next_hops_best_effort(
         })
         .cloned()
         .collect::<Vec<_>>();
+    retain_best_effort_candidates_with_onward_evidence(graph, local, &excluded, &mut candidates);
     candidates.sort_by(|left, right| {
         best_effort_candidate_rank(graph, local, target, &excluded, left)
             .cmp(&best_effort_candidate_rank(
@@ -156,6 +188,71 @@ pub fn cluster_route_next_hops_best_effort(
     candidates
 }
 
+fn cluster_route_shortest_first_hops_excluding(
+    graph: &ClusterConnectivityGraph,
+    local: &NodeId,
+    target: &NodeId,
+    excluded: &[NodeId],
+) -> Vec<NodeId> {
+    if local == target {
+        return Vec::new();
+    }
+    let excluded_set = excluded.iter().collect::<BTreeSet<_>>();
+    let mut excluded_after_first_hop = excluded.to_vec();
+    excluded_after_first_hop.push(local.clone());
+    let mut candidates = graph
+        .healthy_target_refs(local)
+        .filter(|candidate| *candidate != local && !excluded_set.contains(candidate))
+        .filter_map(|candidate| {
+            if candidate == target {
+                return Some((1_usize, candidate.clone()));
+            }
+            let route = cluster_route_next_hop_excluding(
+                graph,
+                candidate,
+                target,
+                &excluded_after_first_hop,
+            )?;
+            Some((route.path.len(), candidate.clone()))
+        })
+        .collect::<Vec<_>>();
+    let Some(shortest) = candidates.iter().map(|(distance, _)| *distance).min() else {
+        return Vec::new();
+    };
+    candidates.retain(|(distance, _)| *distance == shortest);
+    candidates.sort_by(|(_, left), (_, right)| {
+        best_effort_candidate_rank(graph, local, target, &excluded_set, left)
+            .cmp(&best_effort_candidate_rank(
+                graph,
+                local,
+                target,
+                &excluded_set,
+                right,
+            ))
+            .then_with(|| left.cmp(right))
+    });
+    candidates
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect()
+}
+
+fn retain_best_effort_candidates_with_onward_evidence(
+    graph: &ClusterConnectivityGraph,
+    local: &NodeId,
+    excluded: &BTreeSet<&NodeId>,
+    candidates: &mut Vec<NodeId>,
+) {
+    let has_onward_evidence = candidates.iter().any(|candidate| {
+        best_effort_candidate_forward_frontier(graph, local, excluded, candidate) > 0
+    });
+    if has_onward_evidence {
+        candidates.retain(|candidate| {
+            best_effort_candidate_forward_frontier(graph, local, excluded, candidate) > 0
+        });
+    }
+}
+
 fn best_effort_candidate_rank(
     graph: &ClusterConnectivityGraph,
     local: &NodeId,
@@ -164,16 +261,26 @@ fn best_effort_candidate_rank(
     candidate: &NodeId,
 ) -> (u8, usize) {
     let mut target_hint = 1;
-    let mut forward_frontier = 0;
     for next in graph.healthy_target_refs(candidate) {
         if next == target {
             target_hint = 0;
         }
-        if next != local && next != candidate && !excluded.contains(next) {
-            forward_frontier += 1;
-        }
     }
+    let forward_frontier =
+        best_effort_candidate_forward_frontier(graph, local, excluded, candidate);
     (target_hint, usize::MAX - forward_frontier)
+}
+
+fn best_effort_candidate_forward_frontier(
+    graph: &ClusterConnectivityGraph,
+    local: &NodeId,
+    excluded: &BTreeSet<&NodeId>,
+    candidate: &NodeId,
+) -> usize {
+    graph
+        .healthy_target_refs(candidate)
+        .filter(|next| *next != local && *next != candidate && !excluded.contains(*next))
+        .count()
 }
 
 /// An inner cluster RPC wrapped for hop-by-hop delivery toward `target_node_id`.
@@ -184,6 +291,10 @@ pub struct RelayEnvelope {
     pub ttl: u8,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub visited: Vec<NodeId>,
+    /// Maximum per-hop transport timeout, in milliseconds, inherited from the
+    /// originating caller. Intermediate relays must not expand this budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_hop_timeout_ms: Option<u64>,
     /// The original signed request to deliver at the target, re-injected through its
     /// normal auth + dispatch path (its own signature/invite-proof is carried within).
     pub inner: DaemonControlRequest,
@@ -197,6 +308,7 @@ impl RelayEnvelope {
             target_node_id,
             ttl: CLUSTER_RELAY_DEFAULT_TTL,
             visited: Vec::new(),
+            max_hop_timeout_ms: None,
             inner,
         }
     }
@@ -443,17 +555,20 @@ fn cluster_relay_hop_transport_timeouts(
     remaining_route_budget: Option<Duration>,
 ) -> DaemonRpcTimeouts {
     let shaped = cluster_endpoint_transport_timeouts(timeouts, remaining_route_budget);
-    let Some(remaining) = remaining_route_budget else {
+    let Some(idle_timeout) = shaped.idle_timeout else {
         return shaped;
     };
-    let Some(idle_timeout) = timeouts.idle_timeout else {
-        return shaped;
-    };
-    shaped.with_idle_timeout(Some(
-        idle_timeout
-            .max(CLUSTER_RELAY_MIN_RESPONSE_BUDGET)
-            .min(remaining),
-    ))
+    shaped.with_idle_timeout(Some(idle_timeout.min(CLUSTER_RELAY_MIN_RESPONSE_BUDGET)))
+}
+
+fn relay_envelope_hop_transport_timeouts(
+    timeouts: DaemonRpcTimeouts,
+    envelope: &RelayEnvelope,
+) -> DaemonRpcTimeouts {
+    let remaining = envelope
+        .max_hop_timeout_ms
+        .map(|timeout_ms| Duration::from_millis(timeout_ms.max(1)));
+    cluster_relay_hop_transport_timeouts(timeouts, remaining)
 }
 
 const CLUSTER_ENDPOINT_DIRECT_ATTEMPT_MAX_BEFORE_RELAY: Duration = Duration::from_secs(3);
@@ -519,6 +634,26 @@ pub fn relay_request_for_signed_rpc(
     request_command: impl Into<String>,
     visited: impl IntoIterator<Item = NodeId>,
 ) -> Result<ObjectRpcRequest, NetworkError> {
+    relay_request_for_signed_rpc_with_max_hop_timeout(
+        cluster_id,
+        target_node_id,
+        request,
+        request_auth,
+        request_command,
+        visited,
+        None,
+    )
+}
+
+fn relay_request_for_signed_rpc_with_max_hop_timeout(
+    cluster_id: &ClusterId,
+    target_node_id: &NodeId,
+    request: &ObjectRpcRequest,
+    request_auth: impl Into<Vec<u8>>,
+    request_command: impl Into<String>,
+    visited: impl IntoIterator<Item = NodeId>,
+    max_hop_timeout: Option<Duration>,
+) -> Result<ObjectRpcRequest, NetworkError> {
     let inner = DaemonControlRequest::authenticated_rpc(
         request_command.into(),
         request.clone(),
@@ -526,7 +661,12 @@ pub fn relay_request_for_signed_rpc(
     );
     let mut envelope = RelayEnvelope::new(cluster_id.clone(), target_node_id.clone(), inner);
     envelope.visited.extend(visited);
+    envelope.max_hop_timeout_ms = max_hop_timeout.map(duration_millis_u64);
     envelope.into_request()
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().clamp(1, u128::from(u64::MAX)) as u64
 }
 
 /// Wrap an already-built object RPC for relay to `target_node_id` through `peer`.
@@ -544,13 +684,14 @@ pub async fn relay_rpc_to_node_via_peer_async_with_host(
     host: &mut impl ClusterSignedRelayRpcAsyncHost,
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let request_auth = host.sign_relay_rpc_request_async(request).await?;
-    let outer = relay_request_for_signed_rpc(
+    let outer = relay_request_for_signed_rpc_with_max_hop_timeout(
         &state.cluster_id,
         target_node_id,
         request,
         request_auth,
         request_command,
         std::iter::once(state.local_node_id.clone()),
+        options.timeouts.connect_timeout,
     )?;
     let outer_auth = host.sign_relay_rpc_request_async(&outer).await?;
     let response = host
@@ -672,10 +813,24 @@ pub async fn relay_rpc_to_endpoint_async_with_host(
     if request.route == CLUSTER_RELAY_ROUTE {
         return Ok(None);
     }
-    let route_plan = relay_route_plan(runtime, paths, state, endpoint).await?;
+    // Keep the inner target-auth stable across alternate relay paths. The
+    // outer relay request is signed per hop below; re-signing the inner RPC on
+    // route fallback would turn a lost response into multiple valid target
+    // deliveries instead of letting target-side replay protection suppress it.
+    let request_auth = request_auth.into();
+    let request_command = request_command.into();
+    let rotation_seed = relay_inner_next_hop_rotation_seed(
+        &endpoint.node_id,
+        &request_command,
+        Some(request_auth.as_slice()),
+        Some(request),
+    );
+    let mut route_plan = relay_route_plan(runtime, paths, state, endpoint).await?;
     if route_plan.is_empty() {
         return Ok(None);
     }
+    let rotation = rotation_seed % route_plan.len();
+    route_plan.rotate_left(rotation);
 
     // A relay spans several hop attempts plus the remote leg; callers tuned
     // for fast direct probes (sub-second connect timeouts) must not starve
@@ -685,12 +840,6 @@ pub async fn relay_rpc_to_endpoint_async_with_host(
         .connect_timeout
         .map(|timeout| timeout.max(CLUSTER_RELAY_MIN_RESPONSE_BUDGET));
     let deadline = ClusterEndpointRpcDeadline::new(relay_budget);
-    // Keep the inner target-auth stable across alternate relay paths. The
-    // outer relay request is signed per hop below; re-signing the inner RPC on
-    // route fallback would turn a lost response into multiple valid target
-    // deliveries instead of letting target-side replay protection suppress it.
-    let request_auth = request_auth.into();
-    let request_command = request_command.into();
     let mut failures = Vec::new();
     'relay_hops: for (next_hop_id, endpoints) in route_plan {
         if endpoints.is_empty() {
@@ -709,13 +858,14 @@ pub async fn relay_rpc_to_endpoint_async_with_host(
                 );
                 break 'relay_hops;
             };
-            let outer = relay_request_for_signed_rpc(
+            let outer = relay_request_for_signed_rpc_with_max_hop_timeout(
                 &state.cluster_id,
                 &endpoint.node_id,
                 request,
                 request_auth.clone(),
                 request_command.clone(),
                 std::iter::once(state.local_node_id.clone()),
+                options.timeouts.connect_timeout,
             )?;
             let outer_auth = host.sign_relay_rpc_request_async(&outer).await?;
             let hop_timeouts = cluster_relay_hop_transport_timeouts(options.timeouts, remaining);
@@ -765,7 +915,7 @@ pub async fn relay_rpc_to_endpoint_async_with_host(
 }
 
 const CLUSTER_RELAY_MIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
-const CLUSTER_RELAY_MIN_RESPONSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+const CLUSTER_RELAY_MIN_RESPONSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn push_cluster_relay_failure(failures: &mut Vec<String>, detail: impl Into<String>) {
     if failures.len() >= CLUSTER_RELAY_MAX_FAILURE_DETAILS {
@@ -793,49 +943,138 @@ async fn relay_route_plan(
     state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
 ) -> Result<Vec<(NodeId, Vec<ClusterEndpointRecord>)>, NetworkError> {
+    relay_route_plan_cached(
+        runtime,
+        paths,
+        state,
+        &state.local_node_id,
+        &endpoint.node_id,
+        vec![endpoint.node_id.clone()],
+        ClusterRelayRoutePlanMode::Standard,
+    )
+    .await
+}
+
+async fn relay_route_plan_cached(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+    excluded: Vec<NodeId>,
+    mode: ClusterRelayRoutePlanMode,
+) -> Result<Vec<(NodeId, Vec<ClusterEndpointRecord>)>, NetworkError> {
+    let key =
+        cluster_relay_route_plan_cache_key(paths, mode, local_node_id, target_node_id, &excluded);
+    if let Some(plan) = read_cached_cluster_relay_route_plan(&key) {
+        return Ok(plan);
+    }
+
     let paths = paths.clone();
     let state = state.clone();
-    let endpoint = endpoint.clone();
-    runtime
+    let local_node_id = local_node_id.clone();
+    let target_node_id = target_node_id.clone();
+    let excluded_for_compute = excluded.clone();
+    let plan = runtime
         .spawn_blocking(move || {
             let graph = ClusterConnectivityGraph::read_for_local(&paths, &state);
-            let excluded = vec![endpoint.node_id.clone()];
-            let next_hops = cluster_relay_next_hops(
-                &graph,
-                &state,
-                &state.local_node_id,
-                &endpoint.node_id,
-                &excluded,
-            );
+            let next_hops = match mode {
+                ClusterRelayRoutePlanMode::Standard => cluster_relay_next_hops(
+                    &graph,
+                    &state,
+                    &local_node_id,
+                    &target_node_id,
+                    &excluded_for_compute,
+                ),
+                ClusterRelayRoutePlanMode::DirectTargetFallback => {
+                    cluster_relay_next_hops_with_direct_target_fallback(
+                        &paths,
+                        &graph,
+                        &state,
+                        &local_node_id,
+                        &target_node_id,
+                        &excluded_for_compute,
+                    )
+                }
+            };
             if std::env::var_os("SINOMO_TRACE_CLUSTER_RELAY").is_some() {
                 eprintln!(
                     "sinomo relay route plan: local={} target={} healthy={:?} excluded={:?} next_hops={:?}",
-                    state.local_node_id,
-                    endpoint.node_id,
-                    graph.healthy_targets(&state.local_node_id),
-                    excluded,
+                    local_node_id,
+                    target_node_id,
+                    graph.healthy_targets(&local_node_id),
+                    excluded_for_compute,
                     next_hops,
                 );
             }
-            Ok(next_hops
+            Ok::<Vec<(NodeId, Vec<ClusterEndpointRecord>)>, NetworkError>(next_hops
                 .into_iter()
                 .map(|next_hop_id| {
                     let endpoints = cluster_relay_next_hop_endpoints_with_graph(
                         &paths,
                         &graph,
                         &state,
-                        &state.local_node_id,
+                        &local_node_id,
                         &next_hop_id,
                     );
                     (next_hop_id, endpoints)
                 })
-                .collect())
+                .collect::<Vec<_>>())
         })
         .await
         .map_err(|source| NetworkError::Io {
             operation: "cluster relay route plan".to_string(),
             detail: format!("relay route planning task failed: {source}"),
-        })?
+        })??;
+    record_cached_cluster_relay_route_plan(key, plan.clone());
+    Ok(plan)
+}
+
+fn cluster_relay_route_plan_cache_key(
+    paths: &ClusterPaths,
+    mode: ClusterRelayRoutePlanMode,
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+    excluded: &[NodeId],
+) -> ClusterRelayRoutePlanCacheKey {
+    ClusterRelayRoutePlanCacheKey {
+        root: paths.root.clone(),
+        mode,
+        local_node_id: local_node_id.to_string(),
+        target_node_id: target_node_id.to_string(),
+        excluded: excluded.iter().map(ToString::to_string).collect(),
+    }
+}
+
+fn read_cached_cluster_relay_route_plan(
+    key: &ClusterRelayRoutePlanCacheKey,
+) -> Option<Vec<(NodeId, Vec<ClusterEndpointRecord>)>> {
+    let now = Instant::now();
+    let mut cache = CLUSTER_RELAY_ROUTE_PLANS.lock().ok()?;
+    cache.retain(|_, entry| {
+        now.saturating_duration_since(entry.recorded_at) <= CLUSTER_RELAY_ROUTE_PLAN_CACHE_MAX_AGE
+    });
+    cache.get(key).map(|entry| entry.plan.clone())
+}
+
+fn record_cached_cluster_relay_route_plan(
+    key: ClusterRelayRoutePlanCacheKey,
+    plan: Vec<(NodeId, Vec<ClusterEndpointRecord>)>,
+) {
+    let Ok(mut cache) = CLUSTER_RELAY_ROUTE_PLANS.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    cache.retain(|_, entry| {
+        now.saturating_duration_since(entry.recorded_at) <= CLUSTER_RELAY_ROUTE_PLAN_CACHE_MAX_AGE
+    });
+    cache.insert(
+        key,
+        ClusterRelayRoutePlanCacheEntry {
+            recorded_at: now,
+            plan,
+        },
+    );
 }
 
 pub async fn handle_cluster_relay_async_with_host(
@@ -847,11 +1086,13 @@ pub async fn handle_cluster_relay_async_with_host(
     options: ClusterRelayOptions,
     host: &mut impl ClusterRelayAsyncHost,
 ) -> Result<ObjectRpcResponse, NetworkError> {
-    if let Some(response) = host
-        .try_deliver_local_async(state, &envelope, options.timeouts)
-        .await?
-    {
-        return Ok(response);
+    if crate::cluster_node_is_local_process(state, &envelope.target_node_id) {
+        if let Some(response) = host
+            .try_deliver_local_async(state, &envelope, options.timeouts)
+            .await?
+        {
+            return Ok(response);
+        }
     }
 
     if envelope.visited.iter().any(|node| node == local_node_id) {
@@ -893,10 +1134,7 @@ pub async fn handle_cluster_relay_async_with_host(
             forwarded.ttl = envelope.ttl.saturating_sub(1);
             forwarded.visited.push(local_node_id.clone());
             let outer = forwarded.into_request()?;
-            let hop_timeouts = cluster_relay_hop_transport_timeouts(
-                options.timeouts,
-                Some(CLUSTER_RELAY_MIN_RESPONSE_BUDGET),
-            );
+            let hop_timeouts = relay_envelope_hop_transport_timeouts(options.timeouts, &envelope);
             match host
                 .send_relay_request_async(&endpoint, &outer, hop_timeouts)
                 .await
@@ -943,41 +1181,59 @@ async fn cluster_relay_forward_plan(
     local_node_id: &NodeId,
     envelope: &RelayEnvelope,
 ) -> Result<Vec<(NodeId, Vec<ClusterEndpointRecord>)>, NetworkError> {
-    let paths = paths.clone();
-    let state = state.clone();
-    let local_node_id = local_node_id.clone();
-    let target_node_id = envelope.target_node_id.clone();
-    let visited = envelope.visited.clone();
-    runtime
-        .spawn_blocking(move || {
-            let graph = ClusterConnectivityGraph::read_for_local(&paths, &state);
-            let next_hops = cluster_relay_next_hops_with_direct_target_fallback(
-                &paths,
-                &graph,
-                &state,
-                &local_node_id,
-                &target_node_id,
-                &visited,
-            );
-            Ok(next_hops
-                .into_iter()
-                .map(|next_hop| {
-                    let endpoints = cluster_relay_next_hop_endpoints_with_graph(
-                        &paths,
-                        &graph,
-                        &state,
-                        &local_node_id,
-                        &next_hop,
-                    );
-                    (next_hop, endpoints)
-                })
-                .collect())
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster relay route plan".to_string(),
-            detail: format!("relay route planning task failed: {source}"),
-        })?
+    let rotation_seed = relay_envelope_next_hop_rotation_seed(envelope);
+    let mut plan = relay_route_plan_cached(
+        runtime,
+        paths,
+        state,
+        local_node_id,
+        &envelope.target_node_id,
+        envelope.visited.clone(),
+        ClusterRelayRoutePlanMode::DirectTargetFallback,
+    )
+    .await?;
+    if !plan.is_empty() {
+        let rotation = rotation_seed % plan.len();
+        plan.rotate_left(rotation);
+    }
+    Ok(plan)
+}
+
+fn relay_envelope_next_hop_rotation_seed(envelope: &RelayEnvelope) -> usize {
+    relay_inner_next_hop_rotation_seed(
+        &envelope.target_node_id,
+        &envelope.inner.command,
+        envelope.inner.auth.as_deref(),
+        envelope.inner.rpc.as_ref(),
+    )
+}
+
+fn relay_inner_next_hop_rotation_seed(
+    target_node_id: &NodeId,
+    command: &str,
+    auth: Option<&[u8]>,
+    rpc: Option<&ObjectRpcRequest>,
+) -> usize {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(target_node_id.as_str().as_bytes());
+    hasher.update(b"\n");
+    hasher.update(command.as_bytes());
+    hasher.update(b"\n");
+    if let Some(auth) = auth {
+        hasher.update(auth);
+    }
+    hasher.update(b"\n");
+    if let Some(rpc) = rpc {
+        hasher.update(rpc.route.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(&rpc.body);
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; std::mem::size_of::<usize>()];
+    let digest_bytes = digest.as_bytes();
+    let copy_len = bytes.len().min(digest_bytes.len());
+    bytes[..copy_len].copy_from_slice(&digest_bytes[..copy_len]);
+    usize::from_le_bytes(bytes)
 }
 
 pub fn relay_response_is_routing_error(response: &ObjectRpcResponse) -> bool {
@@ -994,13 +1250,62 @@ pub fn cluster_relay_next_hops(
     let mut next_hops =
         cluster_route_next_hops_best_effort(graph, local_node_id, target_node_id, excluded)
             .into_iter()
-            .filter(|candidate| relay_candidate_can_transit(state, candidate, target_node_id))
+            .filter(|candidate| {
+                relay_candidate_can_transit(graph, state, local_node_id, candidate, target_node_id)
+            })
             .collect::<Vec<_>>();
     if next_hops.is_empty() {
         next_hops =
             cluster_relay_degraded_next_hops(graph, state, local_node_id, target_node_id, excluded);
     }
+    retain_relay_candidates_with_best_member_bridge_evidence(state, &mut next_hops);
     next_hops
+}
+
+fn retain_relay_candidates_with_best_member_bridge_evidence(
+    state: &ClusterBootstrapState,
+    candidates: &mut Vec<NodeId>,
+) {
+    let Some(best_rank) = candidates
+        .iter()
+        .map(|candidate| relay_candidate_member_bridge_rank(state, candidate))
+        .min()
+    else {
+        return;
+    };
+    if best_rank < RELAY_CANDIDATE_NO_BRIDGE_EVIDENCE_RANK {
+        candidates
+            .retain(|candidate| relay_candidate_member_bridge_rank(state, candidate) == best_rank);
+    }
+}
+
+const RELAY_CANDIDATE_NO_BRIDGE_EVIDENCE_RANK: u8 = 3;
+
+fn relay_candidate_member_bridge_rank(state: &ClusterBootstrapState, candidate: &NodeId) -> u8 {
+    let Some(member) = state
+        .members
+        .iter()
+        .find(|member| member.node_id == *candidate)
+    else {
+        return RELAY_CANDIDATE_NO_BRIDGE_EVIDENCE_RANK;
+    };
+    let distinct_non_local_hosts = member
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly)
+        .filter_map(|endpoint| {
+            endpoint
+                .address
+                .rsplit_once(':')
+                .map(|(host, _)| host)
+                .or(Some(endpoint.address.as_str()))
+        })
+        .collect::<BTreeSet<_>>()
+        .len();
+    if distinct_non_local_hosts >= 3 {
+        return 0;
+    }
+    RELAY_CANDIDATE_NO_BRIDGE_EVIDENCE_RANK
 }
 
 fn cluster_relay_degraded_next_hops(
@@ -1014,13 +1319,21 @@ fn cluster_relay_degraded_next_hops(
     let mut candidates = graph
         .reachable_targets(local_node_id)
         .into_iter()
-        .filter(|candidate| relay_candidate_can_transit(state, candidate, target_node_id))
+        .filter(|candidate| {
+            relay_candidate_can_transit(graph, state, local_node_id, candidate, target_node_id)
+        })
         .filter(|candidate| {
             candidate != target_node_id
                 && candidate != local_node_id
                 && !excluded.contains(candidate)
         })
         .collect::<Vec<_>>();
+    retain_best_effort_candidates_with_onward_evidence(
+        graph,
+        local_node_id,
+        &excluded,
+        &mut candidates,
+    );
     candidates.sort_by(|left, right| {
         best_effort_candidate_rank(graph, local_node_id, target_node_id, &excluded, left)
             .cmp(&best_effort_candidate_rank(
@@ -1046,6 +1359,7 @@ pub fn cluster_relay_next_hops_with_direct_target_fallback(
     let mut next_hops =
         cluster_relay_next_hops(graph, state, local_node_id, target_node_id, excluded);
     if next_hops.is_empty()
+        && cluster_relay_can_try_direct_target_fallback(graph, local_node_id, target_node_id)
         && !cluster_relay_next_hop_endpoints_with_graph(
             paths,
             graph,
@@ -1056,21 +1370,52 @@ pub fn cluster_relay_next_hops_with_direct_target_fallback(
         .is_empty()
     {
         // Startup joins can race ahead of connectivity publication. If the graph has not
-        // learned a route yet but this relay node has a normal command endpoint for the
-        // final target, try delivering directly instead of dropping the relay.
+        // learned any local edges yet, or it has a concrete reachable edge to the final
+        // target, try delivering directly instead of dropping the relay. Once the graph
+        // has local reachability data, do not dial an unverified final-target member
+        // endpoint from a segmented bridge: that stalls the relay on a path the graph
+        // already failed to prove.
         next_hops.push(target_node_id.clone());
     }
     next_hops
 }
 
 fn relay_candidate_can_transit(
+    graph: &ClusterConnectivityGraph,
     state: &ClusterBootstrapState,
+    local_node_id: &NodeId,
     candidate: &NodeId,
     target_node_id: &NodeId,
 ) -> bool {
     if candidate == target_node_id {
         return true;
     }
+    if relay_candidate_is_known_shadow_daemon(state, candidate) {
+        return false;
+    }
+    if graph
+        .best_healthy_endpoint(local_node_id, candidate)
+        .is_some()
+    {
+        return true;
+    }
+    state
+        .members
+        .iter()
+        .find(|member| member.node_id == *candidate)
+        .is_some_and(|member| {
+            member.state.is_authorized()
+                && member
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.as_str() == crate::DAEMON_MAIN_RUN_CAPABILITY)
+        })
+}
+
+fn relay_candidate_is_known_shadow_daemon(
+    state: &ClusterBootstrapState,
+    candidate: &NodeId,
+) -> bool {
     state
         .members
         .iter()
@@ -1079,8 +1424,19 @@ fn relay_candidate_can_transit(
             member
                 .capabilities
                 .iter()
-                .any(|capability| capability.as_str() == crate::DAEMON_MAIN_RUN_CAPABILITY)
+                .any(|capability| capability.as_str() == crate::DAEMON_SHADOW_SUPERVISE_CAPABILITY)
         })
+}
+
+fn cluster_relay_can_try_direct_target_fallback(
+    graph: &ClusterConnectivityGraph,
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+) -> bool {
+    graph
+        .best_reachable_endpoint(local_node_id, target_node_id)
+        .is_some()
+        || graph.reachable_targets(local_node_id).is_empty()
 }
 
 pub fn cluster_relay_next_hop_endpoints(
@@ -1109,6 +1465,11 @@ pub fn cluster_relay_next_hop_endpoints_with_graph(
         } else {
             false
         };
+    if !has_healthy_next_hop_endpoint
+        && let Some(endpoint) = graph.best_reachable_endpoint(source_node_id, node_id)
+    {
+        push_unique_cluster_endpoint(&mut endpoints, &mut seen, endpoint);
+    }
     if let Some(member) = state
         .members
         .iter()
@@ -1204,7 +1565,7 @@ pub fn cluster_endpoint_prefers_relay(
     paths: &ClusterPaths,
     endpoint: &ClusterEndpointRecord,
 ) -> bool {
-    let Ok(state) = crate::read_cluster_state(paths) else {
+    let Ok(state) = crate::read_cluster_state_cached(paths) else {
         return false;
     };
     if endpoint.node_id == state.local_node_id {
@@ -1230,7 +1591,7 @@ pub async fn relay_rpc_to_endpoint_from_paths_async_with_host(
     }
     let state_paths = paths.clone();
     let state = match runtime
-        .spawn_blocking(move || crate::read_cluster_state(&state_paths))
+        .spawn_blocking(move || crate::read_cluster_state_cached(&state_paths))
         .await
     {
         Ok(Ok(state)) => state,
@@ -1492,6 +1853,31 @@ mod tests {
     }
 
     #[test]
+    fn best_effort_candidates_keep_equal_shortest_full_routes() {
+        let (a, b, c, target) = (
+            nid("node_a"),
+            nid("node_b"),
+            nid("node_c"),
+            nid("node_target"),
+        );
+        let g = graph(vec![
+            edge(&a, &b, ClusterConnectivityState::Healthy),
+            edge(&a, &c, ClusterConnectivityState::Healthy),
+            edge(&b, &target, ClusterConnectivityState::Healthy),
+            edge(&c, &target, ClusterConnectivityState::Healthy),
+        ]);
+
+        assert_eq!(
+            cluster_route_next_hops_best_effort(&g, &a, &target, &[]),
+            vec![b.clone(), c.clone()]
+        );
+        assert_eq!(
+            cluster_route_next_hops_best_effort(&g, &a, &target, std::slice::from_ref(&b)),
+            vec![c]
+        );
+    }
+
+    #[test]
     fn best_effort_candidates_include_alternate_neighbors() {
         let (a, b, c, target) = (
             nid("node_a"),
@@ -1531,8 +1917,297 @@ mod tests {
 
         assert_eq!(
             cluster_route_next_hops_best_effort(&g, &a, &target, &[]),
-            vec![bridge, leaf]
+            vec![bridge]
         );
+    }
+
+    #[test]
+    fn degraded_relay_fallback_skips_leaf_when_bridge_has_onward_evidence() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_relay_degraded_skip_leaf").expect("cluster");
+        let local = nid("node_relay_degraded_skip_leaf_local");
+        let leaf = nid("node_relay_degraded_skip_leaf_leaf");
+        let bridge = nid("node_relay_degraded_skip_leaf_bridge");
+        let onward = nid("node_relay_degraded_skip_leaf_onward");
+        let target = nid("node_relay_degraded_skip_leaf_target");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "relay degraded skip leaf",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        for node in [&leaf, &bridge] {
+            let mut member = ClusterMemberRecord::local_non_voting(
+                state.cluster_id.clone(),
+                node.clone(),
+                node.as_str(),
+                format!("pk-{node}"),
+                now,
+            );
+            member.capabilities = main_daemon_capabilities(&member.role);
+            member.allowed_capabilities = member.capabilities.clone();
+            state.members.push(member);
+        }
+        let graph = graph(vec![
+            edge(&local, &leaf, ClusterConnectivityState::Degraded),
+            edge(&local, &bridge, ClusterConnectivityState::Degraded),
+            edge(&bridge, &onward, ClusterConnectivityState::Healthy),
+        ]);
+
+        let next_hops = cluster_relay_next_hops(&graph, &state, &local, &target, &[]);
+
+        assert_eq!(next_hops, vec![bridge]);
+    }
+
+    #[test]
+    fn relay_fallback_skips_leaf_when_member_endpoints_identify_bridge() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_relay_member_bridge_rank").expect("cluster");
+        let local = nid("node_relay_member_bridge_rank_local");
+        let leaf = nid("node_relay_member_bridge_rank_leaf");
+        let bridge = nid("node_relay_member_bridge_rank_bridge");
+        let target = nid("node_relay_member_bridge_rank_target");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "relay member bridge rank",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut leaf_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            leaf.clone(),
+            "leaf",
+            "pk-leaf",
+            now,
+        );
+        leaf_member.capabilities = main_daemon_capabilities(&leaf_member.role);
+        leaf_member.allowed_capabilities = leaf_member.capabilities.clone();
+        leaf_member.endpoints = vec![
+            crate::daemon_lan_endpoint(&leaf, "node2:21353".to_string(), 5),
+            crate::daemon_lan_endpoint(&leaf, "172.23.0.3:21353".to_string(), 10),
+        ];
+        state.members.push(leaf_member);
+        let mut bridge_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            bridge.clone(),
+            "bridge",
+            "pk-bridge",
+            now,
+        );
+        bridge_member.capabilities = main_daemon_capabilities(&bridge_member.role);
+        bridge_member.allowed_capabilities = bridge_member.capabilities.clone();
+        bridge_member.endpoints = vec![
+            crate::daemon_lan_endpoint(&bridge, "node3:21353".to_string(), 5),
+            crate::daemon_lan_endpoint(&bridge, "172.23.0.4:21353".to_string(), 10),
+            crate::daemon_lan_endpoint(&bridge, "172.24.0.2:21353".to_string(), 10),
+        ];
+        state.members.push(bridge_member);
+        let graph = graph(vec![
+            edge(&local, &leaf, ClusterConnectivityState::Healthy),
+            edge(&local, &bridge, ClusterConnectivityState::Healthy),
+        ]);
+
+        let next_hops = cluster_relay_next_hops(&graph, &state, &local, &target, &[]);
+
+        assert_eq!(next_hops, vec![bridge]);
+    }
+
+    #[test]
+    fn relay_uses_healthy_graph_neighbor_when_member_capability_is_stale() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_relay_graph_neighbor_stale_member")
+            .expect("cluster");
+        let local = nid("node_relay_graph_neighbor_stale_local");
+        let bridge = nid("node_relay_graph_neighbor_stale_bridge");
+        let target = nid("node_relay_graph_neighbor_stale_target");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "relay graph neighbor stale member",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut bridge_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            bridge.clone(),
+            "bridge",
+            "pk-bridge",
+            now,
+        );
+        bridge_member.capabilities.clear();
+        bridge_member.allowed_capabilities.clear();
+        state.members.push(bridge_member);
+        let graph = graph(vec![edge(
+            &local,
+            &bridge,
+            ClusterConnectivityState::Healthy,
+        )]);
+
+        let next_hops = cluster_relay_next_hops(&graph, &state, &local, &target, &[]);
+
+        assert_eq!(
+            next_hops,
+            vec![bridge],
+            "a healthy observed daemon edge should be a valid handoff even when member capabilities lag"
+        );
+    }
+
+    #[test]
+    fn relay_transit_skips_known_shadow_daemon_neighbor() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_relay_shadow_transit").expect("cluster");
+        let local = nid("node_relay_shadow_transit_local");
+        let shadow = nid("node_relay_shadow_transit_shadow");
+        let bridge = nid("node_relay_shadow_transit_bridge");
+        let target = nid("node_relay_shadow_transit_target");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "relay shadow transit",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut shadow_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            shadow.clone(),
+            "shadow",
+            "pk-shadow",
+            now,
+        );
+        shadow_member.capabilities = sinomo_node::shadow_daemon_capabilities();
+        shadow_member.allowed_capabilities = shadow_member.capabilities.clone();
+        state.members.push(shadow_member);
+        let mut bridge_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            bridge.clone(),
+            "bridge",
+            "pk-bridge",
+            now,
+        );
+        bridge_member.capabilities = main_daemon_capabilities(&bridge_member.role);
+        bridge_member.allowed_capabilities = bridge_member.capabilities.clone();
+        state.members.push(bridge_member);
+        let graph = graph(vec![
+            edge(&local, &shadow, ClusterConnectivityState::Healthy),
+            edge(&shadow, &target, ClusterConnectivityState::Healthy),
+            edge(&local, &bridge, ClusterConnectivityState::Healthy),
+            edge(&bridge, &target, ClusterConnectivityState::Healthy),
+        ]);
+
+        let next_hops = cluster_relay_next_hops(&graph, &state, &local, &target, &[]);
+
+        assert_eq!(
+            next_hops,
+            vec![bridge],
+            "shadow daemons use a separate node identity and cannot be selected as transit for main-daemon RPC routing"
+        );
+    }
+
+    #[test]
+    fn direct_target_fallback_requires_target_reachability_once_graph_has_edges() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-relay-direct-fallback-reachable");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_relay_direct_fallback_reachable")
+            .expect("cluster");
+        let local = nid("node_relay_direct_fallback_local");
+        let bridge = nid("node_relay_direct_fallback_bridge");
+        let target = nid("node_relay_direct_fallback_target");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "relay direct fallback reachable",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let target_endpoint = crate::daemon_lan_endpoint(&target, "node1:21353".to_string(), 5);
+        let mut target_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            target.clone(),
+            "target",
+            "pk-target",
+            now,
+        );
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        target_member.endpoints = vec![target_endpoint];
+        state.members.push(target_member);
+        let graph = graph(vec![edge(
+            &local,
+            &bridge,
+            ClusterConnectivityState::Healthy,
+        )]);
+
+        let next_hops = cluster_relay_next_hops_with_direct_target_fallback(
+            &paths,
+            &graph,
+            &state,
+            &local,
+            &target,
+            std::slice::from_ref(&bridge),
+        );
+
+        assert!(
+            next_hops.is_empty(),
+            "a segmented bridge must not dial a final target directly just because membership lists an endpoint"
+        );
+    }
+
+    #[test]
+    fn direct_target_fallback_keeps_startup_path_when_graph_is_empty() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-relay-direct-fallback-startup");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_relay_direct_fallback_startup").expect("cluster");
+        let local = nid("node_relay_direct_fallback_startup_local");
+        let target = nid("node_relay_direct_fallback_startup_target");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "relay direct fallback startup",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let target_endpoint = crate::daemon_lan_endpoint(&target, "node1:21353".to_string(), 5);
+        let mut target_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            target.clone(),
+            "target",
+            "pk-target",
+            now,
+        );
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        target_member.endpoints = vec![target_endpoint];
+        state.members.push(target_member);
+        let graph = ClusterConnectivityGraph::from_records(local.clone(), []);
+
+        let next_hops = cluster_relay_next_hops_with_direct_target_fallback(
+            &paths,
+            &graph,
+            &state,
+            &local,
+            &target,
+            &[],
+        );
+
+        assert_eq!(next_hops, vec![target]);
     }
 
     #[test]
@@ -1791,6 +2466,81 @@ mod tests {
     }
 
     #[test]
+    fn relay_next_hop_endpoints_uses_degraded_graph_endpoint_when_fallbacks_are_unreachable() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-relay-endpoint-degraded-graph");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_relay_endpoint_degraded_graph").expect("cluster");
+        let local = nid("node_relay_endpoint_degraded_graph_local");
+        let next_hop = nid("node_relay_endpoint_degraded_graph_next");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "relay endpoint degraded graph",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let stale_member_endpoint =
+            crate::daemon_lan_endpoint(&next_hop, "node3:21353".to_string(), 5);
+        let mut next_hop_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            next_hop.clone(),
+            "next-hop",
+            "pk-next-hop",
+            now,
+        );
+        next_hop_member.capabilities = main_daemon_capabilities(&next_hop_member.role);
+        next_hop_member.allowed_capabilities = next_hop_member.capabilities.clone();
+        next_hop_member.endpoints = vec![stale_member_endpoint.clone()];
+        state.members.push(next_hop_member);
+        let reachable_graph_endpoint =
+            crate::daemon_lan_endpoint(&next_hop, "172.24.0.4:21353".to_string(), 1);
+        let graph = ClusterConnectivityGraph::from_records(
+            local.clone(),
+            [
+                crate::cluster_connectivity_record(
+                    &state,
+                    &stale_member_endpoint,
+                    ClusterConnectivityState::Unreachable,
+                    None,
+                    3,
+                    None,
+                    Some("stale hostname failure".to_string()),
+                    now,
+                    60,
+                ),
+                crate::cluster_connectivity_record(
+                    &state,
+                    &reachable_graph_endpoint,
+                    ClusterConnectivityState::Degraded,
+                    Some(6),
+                    1,
+                    Some("recent success".to_string()),
+                    Some("transient failure".to_string()),
+                    now,
+                    60,
+                ),
+            ],
+        );
+
+        let endpoints =
+            cluster_relay_next_hop_endpoints_with_graph(&paths, &graph, &state, &local, &next_hop);
+
+        assert_eq!(
+            endpoints
+                .iter()
+                .map(|endpoint| endpoint.address.as_str())
+                .collect::<Vec<_>>(),
+            vec![reachable_graph_endpoint.address.as_str()],
+            "relay should keep a concrete graph-observed endpoint for a reachable next hop even when member fallbacks are stale-unreachable"
+        );
+    }
+
+    #[test]
     fn relay_next_hop_endpoints_suppress_degraded_fallback_after_healthy_graph_edge() {
         let root =
             sinomo_testdir::TestDir::new("sinomo-network-relay-endpoint-degraded-suppressed");
@@ -1937,6 +2687,25 @@ mod tests {
         );
 
         assert_eq!(next_hops, vec![bridge]);
+    }
+
+    #[test]
+    fn relay_hop_timeouts_cap_large_idle_budget() {
+        let shaped = cluster_relay_hop_transport_timeouts(
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(10)),
+            Some(Duration::from_secs(9)),
+        );
+
+        assert_eq!(shaped.connect_timeout, Some(Duration::from_secs(9)));
+        assert_eq!(shaped.idle_timeout, Some(Duration::from_secs(5)));
+
+        let short = cluster_relay_hop_transport_timeouts(
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(3)),
+            Some(Duration::from_secs(9)),
+        );
+
+        assert_eq!(short.connect_timeout, Some(Duration::from_secs(3)));
+        assert_eq!(short.idle_timeout, Some(Duration::from_secs(3)));
     }
 
     #[derive(Default)]
@@ -2103,13 +2872,15 @@ mod tests {
         assert!(timeout <= Duration::from_secs(3));
         assert_eq!(host.sent_timeouts.len(), 1);
         assert!(host.sent_timeouts[0].connect_timeout <= Some(Duration::from_secs(3)));
-        assert!(
-            host.sent_timeouts[0].idle_timeout >= Some(Duration::from_secs(14)),
-            "relay response idle budget should expand for multi-hop forwarding"
+        assert_eq!(
+            host.sent_timeouts[0].idle_timeout,
+            Some(Duration::from_secs(3)),
+            "relay should keep a short caller idle budget instead of expanding every hop"
         );
         assert_eq!(envelope.cluster_id, cluster_id);
         assert_eq!(envelope.target_node_id, target);
         assert_eq!(envelope.visited, vec![local]);
+        assert_eq!(envelope.max_hop_timeout_ms, Some(3_000));
         assert_eq!(envelope.inner.command, "RPC /cluster/kv/range");
         assert_eq!(envelope.inner.auth, Some(b"inner-auth".to_vec()));
         assert_eq!(envelope.inner.rpc.as_ref(), Some(&request));
@@ -2217,6 +2988,7 @@ mod tests {
         assert_eq!(envelope.cluster_id, cluster_id);
         assert_eq!(envelope.target_node_id, target);
         assert_eq!(envelope.visited, vec![local]);
+        assert_eq!(envelope.max_hop_timeout_ms, Some(20_000));
         assert_eq!(envelope.inner.command, "RPC /cluster/kv/range");
         assert_eq!(envelope.inner.auth, Some(b"inner-auth".to_vec()));
         assert_eq!(envelope.inner.rpc.as_ref(), Some(&request));
@@ -2342,6 +3114,150 @@ mod tests {
             Some(b"stable-inner-auth".to_vec())
         );
         assert_ne!(host.sent[0].0.node_id, host.sent[1].0.node_id);
+    }
+
+    #[tokio::test]
+    async fn signed_relay_endpoint_async_spreads_origin_next_hops_by_inner_auth() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-signed-relay-origin-spread");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_signed_relay_origin_spread").expect("cluster");
+        let local = nid("node_signed_relay_origin_spread_local");
+        let bridge_a = nid("node_signed_relay_origin_spread_bridge_a");
+        let bridge_b = nid("node_signed_relay_origin_spread_bridge_b");
+        let target = nid("node_signed_relay_origin_spread_target");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "signed endpoint relay origin spread",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let bridge_a_endpoint =
+            crate::daemon_lan_endpoint(&bridge_a, "10.86.0.2:21353".to_string(), 5);
+        let bridge_b_endpoint =
+            crate::daemon_lan_endpoint(&bridge_b, "10.86.0.3:21353".to_string(), 5);
+        let target_endpoint = crate::daemon_lan_endpoint(&target, "10.87.0.3:21353".to_string(), 5);
+        for (node, endpoint) in [
+            (bridge_a.clone(), bridge_a_endpoint.clone()),
+            (bridge_b.clone(), bridge_b_endpoint.clone()),
+            (target.clone(), target_endpoint.clone()),
+        ] {
+            let mut member = ClusterMemberRecord::local_non_voting(
+                cluster_id.clone(),
+                node.clone(),
+                node.as_str(),
+                format!("pk-{node}"),
+                now,
+            );
+            member.capabilities = main_daemon_capabilities(&member.role);
+            member.allowed_capabilities = member.capabilities.clone();
+            member.endpoints = vec![endpoint];
+            state.members.push(member);
+        }
+        crate::write_cluster_state(&paths, &state).expect("write state");
+        crate::sync_cluster_connectivity_records_to_kv(
+            &paths,
+            &local,
+            vec![
+                crate::cluster_connectivity_record(
+                    &state,
+                    &bridge_a_endpoint,
+                    ClusterConnectivityState::Healthy,
+                    Some(3),
+                    0,
+                    Some("ok".to_string()),
+                    None,
+                    now,
+                    60,
+                ),
+                crate::cluster_connectivity_record(
+                    &state,
+                    &bridge_b_endpoint,
+                    ClusterConnectivityState::Healthy,
+                    Some(3),
+                    0,
+                    Some("ok".to_string()),
+                    None,
+                    now,
+                    60,
+                ),
+            ],
+        )
+        .expect("connectivity");
+        let request = ObjectRpcRequest {
+            route: "/cluster/kv/range".to_string(),
+            category: "cluster.kv".to_string(),
+            metadata: BTreeMap::new(),
+            body: vec![1, 2, 3],
+        };
+        let command = "RPC /cluster/kv/range";
+        let mut even_auth = None;
+        let mut odd_auth = None;
+        for attempt in 0..128 {
+            let auth = format!("inner-auth-{attempt}").into_bytes();
+            let rotation = relay_inner_next_hop_rotation_seed(
+                &target,
+                command,
+                Some(auth.as_slice()),
+                Some(&request),
+            ) % 2;
+            if rotation == 0 && even_auth.is_none() {
+                even_auth = Some(auth.clone());
+            }
+            if rotation == 1 && odd_auth.is_none() {
+                odd_auth = Some(auth);
+            }
+            if even_auth.is_some() && odd_auth.is_some() {
+                break;
+            }
+        }
+        let auth_a = even_auth.expect("auth with rotation 0");
+        let auth_b = odd_auth.expect("auth with rotation 1");
+
+        let runtime = tokio::runtime::Handle::current();
+        let mut host_a = RecordingSignedRelayRpcHost::default();
+        relay_rpc_to_endpoint_from_paths_async_with_host(
+            &runtime,
+            &paths,
+            &target_endpoint,
+            &request,
+            auth_a,
+            command,
+            "RPC /cluster/relay",
+            ClusterSignedRelayRpcOptions {
+                timeouts: DaemonRpcTimeouts::connect_only(Duration::from_secs(20)),
+            },
+            &mut host_a,
+        )
+        .await
+        .expect("endpoint relay a")
+        .expect("route a");
+        let mut host_b = RecordingSignedRelayRpcHost::default();
+        relay_rpc_to_endpoint_from_paths_async_with_host(
+            &runtime,
+            &paths,
+            &target_endpoint,
+            &request,
+            auth_b,
+            command,
+            "RPC /cluster/relay",
+            ClusterSignedRelayRpcOptions {
+                timeouts: DaemonRpcTimeouts::connect_only(Duration::from_secs(20)),
+            },
+            &mut host_b,
+        )
+        .await
+        .expect("endpoint relay b")
+        .expect("route b");
+
+        assert_eq!(host_a.sent.len(), 1);
+        assert_eq!(host_b.sent.len(), 1);
+        assert_ne!(host_a.sent[0].0.node_id, host_b.sent[0].0.node_id);
     }
 
     struct RecordingSignedEndpointRpcHost {
@@ -2698,7 +3614,10 @@ mod tests {
         .expect("endpoint rpc");
 
         assert_eq!(response.decode_body::<String>().expect("body"), "direct");
-        assert_eq!(host.calls, vec!["prefer_relay", "gateway", "direct"]);
+        assert_eq!(
+            host.calls,
+            vec!["prefer_relay", "gateway", "cluster_id", "direct"]
+        );
         assert_eq!(
             host.direct_timeout_policies,
             vec![DaemonRpcTimeouts::none()]
@@ -2841,7 +3760,8 @@ mod tests {
             )],
         )
         .expect("connectivity");
-        let envelope = RelayEnvelope::new(cluster_id, target.clone(), inner_request());
+        let mut envelope = RelayEnvelope::new(cluster_id, target.clone(), inner_request());
+        envelope.max_hop_timeout_ms = Some(1_500);
 
         let mut async_host = RecordingRelayHost::default();
         let runtime = tokio::runtime::Handle::current();
@@ -2860,22 +3780,19 @@ mod tests {
         .expect("async relay");
 
         assert_eq!(async_response.decode_body::<String>().expect("body"), "ok");
-        assert_eq!(async_host.local_deliveries, 1);
-        assert_eq!(
-            async_host.local_timeouts,
-            vec![DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5))]
-        );
+        assert_eq!(async_host.local_deliveries, 0);
+        assert!(async_host.local_timeouts.is_empty());
         assert_eq!(async_host.sent.len(), 1);
         assert_eq!(
             async_host.sent_timeouts,
-            vec![
-                DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5))
-                    .with_idle_timeout(Some(Duration::from_secs(15)))
-            ]
+            vec![DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(
+                1_500
+            ))]
         );
         assert_eq!(async_host.sent[0].0.node_id, bridge);
         assert_eq!(async_host.sent[0].1.target_node_id, target);
         assert_eq!(async_host.sent[0].1.ttl, CLUSTER_RELAY_DEFAULT_TTL - 1);
         assert_eq!(async_host.sent[0].1.visited, vec![local]);
+        assert_eq!(async_host.sent[0].1.max_hop_timeout_ms, Some(1_500));
     }
 }

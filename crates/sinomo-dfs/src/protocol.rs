@@ -1,8 +1,8 @@
 use crate::{
     DfsConflictRecord, DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataShardId,
-    DfsMetadataTableSnapshot, DfsObjectId, DfsObjectMetadata, DfsObjectVersionRecord,
-    DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsVersion, DfsWriteIntentRecord,
-    NetworkedDfsWriteOutcome,
+    DfsMetadataTableSnapshot, DfsNamespaceTransaction, DfsObjectId, DfsObjectMetadata,
+    DfsObjectVersionRecord, DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsVersion,
+    DfsWriteIntentRecord, NetworkedDfsWriteOutcome,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::{DfsWriteReceipt, DfsWriteRequest};
@@ -42,6 +42,12 @@ pub struct DfsReadRequest {
     pub request_id: String,
     pub object_id: DfsObjectId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<DfsVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range_offset: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range_max_bytes: Option<usize>,
@@ -75,6 +81,34 @@ pub struct DfsReadResponseChunk {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_hash: Option<String>,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsBulkReadItem {
+    pub request_id: String,
+    pub object_id: DfsObjectId,
+    pub version: DfsVersion,
+    pub content_hash: String,
+    pub content_size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsBulkReadRequest {
+    pub request_id: String,
+    pub reads: Vec<DfsBulkReadItem>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsBulkReadItemResponse {
+    pub request_id: String,
+    pub object_id: DfsObjectId,
+    pub result: DfsReadResult,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsBulkReadResponse {
+    pub request_id: String,
+    pub results: Vec<DfsBulkReadItemResponse>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -133,6 +167,8 @@ pub struct DfsDistributedWriteCommand {
     pub object_metadata: Option<DfsObjectMetadata>,
     #[serde(default = "default_true")]
     pub touch_parent_on_create: bool,
+    #[serde(default = "default_true")]
+    pub foreground_replica_repair: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -237,6 +273,18 @@ pub enum DfsNamespaceOperation {
     SyncPath {
         path: String,
     },
+    /// Read-only lookup against the path's metadata primary. The primary may
+    /// include the authoritative object in the response, but requesters must
+    /// not replay journals or materialize the object into their local mirror.
+    LookupPath {
+        path: String,
+    },
+    /// Same-shard namespace batch routed to the metadata primary. This is used
+    /// for bulk local-eventual writes so the requester sends one authoritative
+    /// metadata transaction instead of N per-file routed mutations.
+    ApplyTransaction {
+        transaction: DfsNamespaceTransaction,
+    },
     /// Cross-shard-primary move, sent by the source-shard primary
     /// (coordinator) to the destination-shard primary: atomically validate
     /// the destination and install the moved object record at its new path,
@@ -284,12 +332,18 @@ impl DfsNamespaceOperation {
             | DfsNamespaceOperation::SetTimes { path, .. }
             | DfsNamespaceOperation::TouchDirectoryModified { path }
             | DfsNamespaceOperation::ClearDirRecursive { path }
-            | DfsNamespaceOperation::SyncPath { path } => vec![path],
+            | DfsNamespaceOperation::SyncPath { path }
+            | DfsNamespaceOperation::LookupPath { path } => vec![path],
             DfsNamespaceOperation::Rename { from, to } => vec![from, to],
             DfsNamespaceOperation::Hardlink {
                 existing_path,
                 link_path,
             } => vec![existing_path, link_path],
+            DfsNamespaceOperation::ApplyTransaction { transaction } => transaction
+                .objects
+                .iter()
+                .map(|object| object.path.as_str())
+                .collect(),
             DfsNamespaceOperation::AdoptObjectAtPath { object, .. } => vec![object.path.as_str()],
             DfsNamespaceOperation::AdoptHardlinkAlias { alias, .. } => vec![alias.path.as_str()],
         }
@@ -300,6 +354,11 @@ impl DfsNamespaceOperation {
 pub struct DfsNamespaceResponse {
     pub request_id: String,
     pub result: DfsNamespaceResult,
+    /// For SyncPath, the primary may include the authoritative object at the
+    /// requested path so an outsider read is not blocked on unrelated shard
+    /// journal backlog. Journal batches remain the durable convergence path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synced_path_object: Option<DfsObjectMetadata>,
     /// Journal catch-up batches for every shard the operation touched, built
     /// from the requester's reported cursors.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -645,6 +704,8 @@ pub enum DfsNetworkMessage {
     ReadRequest(DfsReadRequest),
     ReadResponse(DfsReadResponse),
     ReadResponseChunk(DfsReadResponseChunk),
+    BulkReadRequest(DfsBulkReadRequest),
+    BulkReadResponse(DfsBulkReadResponse),
     WriteRequest(DfsWriteCommand),
     WriteResponse(DfsWriteResponse),
     DistributedWriteRequest(DfsDistributedWriteCommand),

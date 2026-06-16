@@ -47,6 +47,7 @@ pub(crate) struct PendingNetworkedRead {
     pub(crate) window_end_chunk_index: Option<u32>,
     pub(crate) target_node_id: NodeId,
     pub(crate) next_retry_at: Instant,
+    pub(crate) cache_response: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -169,6 +170,173 @@ impl InProgressReadTransfer {
 }
 
 impl_chunked_transfer_common!(InProgressReadTransfer);
+
+#[derive(Debug)]
+pub(crate) struct InProgressReadMemoryTransfer {
+    pub(crate) object_id: DfsObjectId,
+    pub(crate) version: DfsVersion,
+    pub(crate) content_hash: String,
+    total_size_bytes: u64,
+    total_chunks: u32,
+    chunk_size_bytes: usize,
+    received_chunks: Vec<Option<Vec<u8>>>,
+    received_count: u32,
+    last_updated_at: Instant,
+}
+
+impl InProgressReadMemoryTransfer {
+    pub(crate) fn new(
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        content_hash: String,
+        total_size_bytes: u64,
+        total_chunks: u32,
+        chunk_size_bytes: usize,
+    ) -> Result<Self, DfsError> {
+        validate_chunked_transfer_shape(
+            "chunked DFS read response",
+            total_size_bytes,
+            total_chunks,
+        )?;
+        let received_len = usize::try_from(total_chunks).map_err(|_| DfsError::Distributed {
+            message: format!("chunk count is too large for this platform: {total_chunks}"),
+        })?;
+        Ok(Self {
+            object_id,
+            version,
+            content_hash,
+            total_size_bytes,
+            total_chunks,
+            chunk_size_bytes,
+            received_chunks: vec![None; received_len],
+            received_count: 0,
+            last_updated_at: Instant::now(),
+        })
+    }
+
+    pub(crate) fn total_size_bytes(&self) -> u64 {
+        self.total_size_bytes
+    }
+
+    pub(crate) fn last_updated_at(&self) -> Instant {
+        self.last_updated_at
+    }
+
+    pub(crate) fn insert_chunk(
+        &mut self,
+        chunk_index: u32,
+        total_chunks: u32,
+        bytes: Vec<u8>,
+    ) -> Result<bool, DfsError> {
+        if total_chunks != self.total_chunks {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "chunked DFS read response chunk count changed: expected {}, actual {total_chunks}",
+                    self.total_chunks
+                ),
+            });
+        }
+        validate_chunk_bytes(
+            "chunked DFS read response",
+            self.total_size_bytes,
+            chunk_index,
+            total_chunks,
+            &bytes,
+        )?;
+        let index = usize::try_from(chunk_index).map_err(|_| DfsError::Distributed {
+            message: format!("chunk index is too large for this platform: {chunk_index}"),
+        })?;
+        self.last_updated_at = Instant::now();
+        if let Some(existing) = self.received_chunks.get(index).and_then(Option::as_ref) {
+            if existing != &bytes {
+                return Err(DfsError::ContentHashMismatch {
+                    expected: format!("consistent chunk {chunk_index}"),
+                    actual: "conflicting duplicate chunk".to_string(),
+                });
+            }
+            return Ok(self.is_complete());
+        }
+        let Some(slot) = self.received_chunks.get_mut(index) else {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "chunk index out of range: {chunk_index}/{}",
+                    self.total_chunks
+                ),
+            });
+        };
+        *slot = Some(bytes);
+        self.received_count += 1;
+        Ok(self.is_complete())
+    }
+
+    pub(crate) fn contiguous_received_chunk_count(&self) -> u32 {
+        self.received_chunks
+            .iter()
+            .take_while(|chunk| chunk.is_some())
+            .count()
+            .try_into()
+            .expect("chunk count fits in u32")
+    }
+
+    pub(crate) fn into_bytes(self) -> Result<Vec<u8>, DfsError> {
+        if !self.is_complete() {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "incomplete chunked DFS read response for object {}, version {}",
+                    self.object_id, self.version
+                ),
+            });
+        }
+        let capacity =
+            usize::try_from(self.total_size_bytes).map_err(|_| DfsError::Distributed {
+                message: format!(
+                    "chunked DFS read response is too large for this platform: {}",
+                    self.total_size_bytes
+                ),
+            })?;
+        let mut bytes = Vec::with_capacity(capacity);
+        for (chunk_index, chunk) in self.received_chunks.into_iter().enumerate() {
+            let Some(chunk) = chunk else {
+                return Err(DfsError::Distributed {
+                    message: format!("missing chunked DFS read response chunk {chunk_index}"),
+                });
+            };
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len() as u64 != self.total_size_bytes {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "assembled chunked DFS read response has wrong size: expected {}, actual {}",
+                    self.total_size_bytes,
+                    bytes.len()
+                ),
+            });
+        }
+        let actual_hash = chunk_hash(&bytes);
+        if actual_hash != self.content_hash {
+            return Err(DfsError::ContentHashMismatch {
+                expected: self.content_hash,
+                actual: actual_hash,
+            });
+        }
+        Ok(bytes)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.received_count == self.total_chunks
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn set_last_updated_at_for_test(&mut self, last_updated_at: Instant) {
+        self.last_updated_at = last_updated_at;
+    }
+
+    #[allow(dead_code)]
+    fn chunk_size_bytes(&self) -> usize {
+        self.chunk_size_bytes
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct InProgressFetchBlobTransfer {

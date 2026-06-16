@@ -21,6 +21,7 @@ const PACKED_BLOB_INDEX_VERSION: u32 = 1;
 const PACKED_BLOB_DIR: &str = "blob-packs";
 const PACKED_BLOB_SEGMENT_DIR: &str = "segments";
 const PACKED_BLOB_INDEX_FILE: &str = "index.sobj";
+const PACKED_BLOB_INDEX_LOG_FILE: &str = "index.slog";
 const PACKED_BLOB_LOCK_FILE: &str = "pack.lock";
 const PACKED_BLOB_SMALL_LIMIT_BYTES: u64 = 16 * 1024;
 const PACKED_BLOB_SEGMENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
@@ -137,6 +138,15 @@ struct PackedBlobLocation {
     segment_id: String,
     offset: u64,
     size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PackedBlobIndexLogEntry {
+    version: u32,
+    content_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    location: Option<PackedBlobLocation>,
+    next_segment_id: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -492,6 +502,26 @@ impl ContentStoreStatsDelta {
             && self.staging_file_count == 0
             && self.staging_bytes == 0
     }
+
+    fn add(&mut self, other: Self) {
+        self.blob_count += other.blob_count;
+        self.blob_bytes += other.blob_bytes;
+        self.manifest_count += other.manifest_count;
+        self.manifest_bytes += other.manifest_bytes;
+        self.logical_object_bytes += other.logical_object_bytes;
+        self.extent_manifest_count += other.extent_manifest_count;
+        self.extent_count += other.extent_count;
+        self.staging_file_count += other.staging_file_count;
+        self.staging_bytes += other.staging_bytes;
+    }
+}
+
+struct PreparedSmallObjectVersion<'a> {
+    bytes: &'a [u8],
+    blob_path: PathBuf,
+    manifest: ContentManifest,
+    manifest_bytes: Vec<u8>,
+    manifest_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -835,6 +865,102 @@ impl LocalContentStore {
         bytes: &[u8],
     ) -> Result<ContentManifest> {
         self.write_object_version(object_id, version, bytes)
+    }
+
+    pub fn put_object_versions<'a, I>(&self, versions: I) -> Result<Vec<ContentManifest>>
+    where
+        I: IntoIterator<Item = (&'a str, &'a str, &'a [u8])>,
+    {
+        let versions = versions.into_iter().collect::<Vec<_>>();
+        if versions.is_empty() {
+            return Ok(Vec::new());
+        }
+        if versions
+            .iter()
+            .any(|(_, _, bytes)| bytes.len() as u64 > PACKED_BLOB_SMALL_LIMIT_BYTES)
+        {
+            return versions
+                .into_iter()
+                .map(|(object_id, version, bytes)| {
+                    self.write_object_version(object_id, version, bytes)
+                })
+                .collect();
+        }
+        self.write_small_object_versions_batch(&versions)
+    }
+
+    pub fn put_object_version_blobs_only<'a, I>(&self, versions: I) -> Result<Vec<ContentManifest>>
+    where
+        I: IntoIterator<Item = (&'a str, &'a str, &'a [u8])>,
+    {
+        let versions = versions.into_iter().collect::<Vec<_>>();
+        if versions.is_empty() {
+            return Ok(Vec::new());
+        }
+        if versions
+            .iter()
+            .any(|(_, _, bytes)| bytes.len() as u64 > PACKED_BLOB_SMALL_LIMIT_BYTES)
+        {
+            return versions
+                .into_iter()
+                .map(|(object_id, version, bytes)| {
+                    self.write_object_version(object_id, version, bytes)
+                })
+                .collect();
+        }
+
+        let mut manifests = Vec::with_capacity(versions.len());
+        let mut blob_writes = Vec::new();
+        let mut quota_delta = ContentStoreQuotaDelta::default();
+        {
+            let _lock = self.lock_packed_blobs()?;
+            let mut index = self.read_packed_blob_index_for_update_unlocked()?;
+            for (object_id, version, bytes) in &versions {
+                let hash = content_hash(bytes);
+                let manifest_path = self.manifest_path(object_id, version);
+                if manifest_path.is_file() {
+                    let existing = decode_manifest(&read_file(&manifest_path)?)?;
+                    if existing.content_hash != hash {
+                        return Err(ContentStoreError::VersionHashConflict {
+                            object_id: (*object_id).to_owned(),
+                            version: (*version).to_owned(),
+                            existing_hash: existing.content_hash,
+                            new_hash: hash,
+                        });
+                    }
+                    manifests.push(existing);
+                    continue;
+                }
+
+                let blob_path = self.blob_path(&hash)?;
+                let manifest = ContentManifest {
+                    object_id: (*object_id).to_owned(),
+                    version: (*version).to_owned(),
+                    content_hash: hash,
+                    size_bytes: bytes.len() as u64,
+                    extents: Vec::new(),
+                };
+                let loose_readable = blob_path.is_file()
+                    && file_content_hash(&blob_path)
+                        .is_ok_and(|actual| actual == manifest.content_hash);
+                let packed_readable = match index.entries.get(&manifest.content_hash) {
+                    Some(location) => self.packed_blob_location_readable(location)?,
+                    None => false,
+                };
+                if !loose_readable && !packed_readable {
+                    quota_delta.blob_bytes =
+                        quota_delta.blob_bytes.saturating_add(bytes.len() as u64);
+                    blob_writes.push((manifest.content_hash.clone(), *bytes));
+                }
+                manifests.push(manifest);
+            }
+            self.ensure_quota_delta(quota_delta)?;
+            let blob_delta = self.write_packed_blobs_unlocked_relaxed(&mut index, &blob_writes)?;
+            if !blob_delta.is_zero() {
+                self.apply_stats_delta(blob_delta)?;
+            }
+        }
+        Ok(manifests)
     }
 
     pub fn put_object_version_from_reader<R: Read>(
@@ -2006,6 +2132,101 @@ impl LocalContentStore {
         Ok(manifest)
     }
 
+    fn write_small_object_versions_batch<'a>(
+        &self,
+        versions: &[(&'a str, &'a str, &'a [u8])],
+    ) -> Result<Vec<ContentManifest>> {
+        let mut prepared = Vec::with_capacity(versions.len());
+        let mut quota_delta = ContentStoreQuotaDelta::default();
+        for (object_id, version, bytes) in versions {
+            let hash = content_hash(bytes);
+            let manifest_path = self.manifest_path(object_id, version);
+            if manifest_path.is_file() {
+                return versions
+                    .iter()
+                    .map(|(object_id, version, bytes)| {
+                        self.write_object_version(object_id, version, bytes)
+                    })
+                    .collect();
+            }
+            let blob_path = self.blob_path(&hash)?;
+            let manifest = ContentManifest {
+                object_id: (*object_id).to_owned(),
+                version: (*version).to_owned(),
+                content_hash: hash,
+                size_bytes: bytes.len() as u64,
+                extents: Vec::new(),
+            };
+            let manifest_bytes = encode_manifest(&manifest)?;
+            quota_delta.logical_object_bytes = quota_delta
+                .logical_object_bytes
+                .saturating_add(manifest.size_bytes);
+            quota_delta.manifest_bytes = quota_delta
+                .manifest_bytes
+                .saturating_add(manifest_bytes.len() as u64);
+            prepared.push(PreparedSmallObjectVersion {
+                bytes,
+                blob_path,
+                manifest,
+                manifest_bytes,
+                manifest_path,
+            });
+        }
+
+        let mut blob_writes = Vec::new();
+        let mut invalid_loose_blobs = Vec::new();
+        {
+            let _lock = self.lock_packed_blobs()?;
+            let mut index = self.read_packed_blob_index_for_update_unlocked()?;
+            for prepared in &prepared {
+                let hash = prepared.manifest.content_hash.as_str();
+                if prepared.blob_path.is_file() {
+                    if file_content_hash(&prepared.blob_path).is_ok_and(|actual| actual == hash) {
+                        continue;
+                    }
+                    invalid_loose_blobs.push(prepared.blob_path.clone());
+                }
+                if let Some(location) = index.entries.get(hash)
+                    && self.packed_blob_location_readable(location)?
+                {
+                    continue;
+                }
+                quota_delta.blob_bytes = quota_delta
+                    .blob_bytes
+                    .saturating_add(prepared.bytes.len() as u64);
+                blob_writes.push((prepared.manifest.content_hash.clone(), prepared.bytes));
+            }
+            self.ensure_quota_delta(quota_delta)?;
+            let blob_delta = self.write_packed_blobs_unlocked(&mut index, &blob_writes)?;
+            if !blob_delta.is_zero() {
+                self.apply_stats_delta(blob_delta)?;
+            }
+        }
+
+        for path in invalid_loose_blobs {
+            remove_file_if_exists(&path)?;
+        }
+
+        let mut manifest_delta = ContentStoreStatsDelta::default();
+        write_files_create_new_relaxed(prepared.iter().map(|prepared| {
+            (
+                prepared.manifest_path.clone(),
+                prepared.manifest_bytes.as_slice(),
+            )
+        }))?;
+        for prepared in &prepared {
+            manifest_delta.add(ContentStoreStatsDelta::manifest_created(
+                &prepared.manifest,
+                prepared.manifest_bytes.len() as u64,
+            ));
+        }
+        self.apply_stats_delta(manifest_delta)?;
+        Ok(prepared
+            .into_iter()
+            .map(|prepared| prepared.manifest)
+            .collect())
+    }
+
     fn write_object_version_from_file(
         &self,
         object_id: &str,
@@ -2212,6 +2433,9 @@ impl LocalContentStore {
             self.write_stats_snapshot_unlocked(&stats)?;
             return Ok(());
         }
+        if self.quota.is_none() {
+            return Ok(());
+        }
         let stats = self.scan_stats()?;
         self.write_stats_snapshot_unlocked(&stats)
     }
@@ -2337,16 +2561,21 @@ impl LocalContentStore {
     }
 
     fn read_packed_blob_index_unlocked(&self) -> Result<PackedBlobIndex> {
+        self.read_packed_blob_index_unlocked_with_tail_policy(false)
+    }
+
+    fn read_packed_blob_index_for_update_unlocked(&self) -> Result<PackedBlobIndex> {
+        self.read_packed_blob_index_unlocked_with_tail_policy(true)
+    }
+
+    fn read_packed_blob_index_unlocked_with_tail_policy(
+        &self,
+        truncate_torn_tail: bool,
+    ) -> Result<PackedBlobIndex> {
         let path = self.packed_blob_index_path();
-        let bytes = match fs::read(&path) {
+        let index = match fs::read(&path) {
             Ok(bytes) => bytes,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                return Ok(PackedBlobIndex {
-                    version: PACKED_BLOB_INDEX_VERSION,
-                    next_segment_id: 1,
-                    entries: BTreeMap::new(),
-                });
-            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(source) => {
                 return Err(ContentStoreError::Io {
                     path: path.clone(),
@@ -2354,12 +2583,32 @@ impl LocalContentStore {
                 });
             }
         };
-        let mut index = decode_packed_blob_index(&bytes)?;
-        if index.version != PACKED_BLOB_INDEX_VERSION {
-            return Err(ContentStoreError::Serde(format!(
-                "unsupported packed blob index version: {}",
-                index.version
-            )));
+        let mut index = if index.is_empty() {
+            PackedBlobIndex {
+                version: PACKED_BLOB_INDEX_VERSION,
+                next_segment_id: 1,
+                entries: BTreeMap::new(),
+            }
+        } else {
+            let mut index = decode_packed_blob_index(&index)?;
+            if index.version != PACKED_BLOB_INDEX_VERSION {
+                return Err(ContentStoreError::Serde(format!(
+                    "unsupported packed blob index version: {}",
+                    index.version
+                )));
+            }
+            if index.next_segment_id == 0 {
+                index.next_segment_id = 1;
+            }
+            index
+        };
+
+        let log_path = self.packed_blob_index_log_path();
+        if log_path.is_file() {
+            let replayed_offset = replay_packed_blob_index_log(&log_path, &mut index)?;
+            if truncate_torn_tail {
+                truncate_torn_packed_blob_index_log_tail(&log_path, replayed_offset)?;
+            }
         }
         if index.next_segment_id == 0 {
             index.next_segment_id = 1;
@@ -2367,22 +2616,17 @@ impl LocalContentStore {
         Ok(index)
     }
 
-    fn write_packed_blob_index_unlocked(&self, index: &PackedBlobIndex) -> Result<()> {
-        let bytes = encode_packed_blob_index(index)?;
-        write_file_atomic(&self.packed_blob_index_path(), &bytes)
-    }
-
     fn packed_blob_location(&self, hash: &str) -> Result<Option<PackedBlobLocation>> {
         hash_hex(hash)?;
         let _lock = self.lock_packed_blobs()?;
-        let index = self.read_packed_blob_index_unlocked()?;
+        let index = self.read_packed_blob_index_for_update_unlocked()?;
         Ok(index.entries.get(hash).cloned())
     }
 
     fn write_packed_blob(&self, hash: &str, bytes: &[u8]) -> Result<bool> {
         hash_hex(hash)?;
         let _lock = self.lock_packed_blobs()?;
-        let mut index = self.read_packed_blob_index_unlocked()?;
+        let mut index = self.read_packed_blob_index_for_update_unlocked()?;
         if let Some(location) = index.entries.get(hash)
             && self.packed_blob_location_readable(location)?
         {
@@ -2426,25 +2670,161 @@ impl LocalContentStore {
         if let Some(parent) = segment_path.parent() {
             sync_dir(parent)?;
         }
-        index.entries.insert(
-            hash.to_owned(),
-            PackedBlobLocation {
-                segment_id,
+        let location = PackedBlobLocation {
+            segment_id,
+            offset,
+            size_bytes: bytes.len() as u64,
+        };
+        index.entries.insert(hash.to_owned(), location.clone());
+        self.append_packed_blob_index_log_entry_unlocked(&PackedBlobIndexLogEntry {
+            version: PACKED_BLOB_INDEX_VERSION,
+            content_hash: hash.to_owned(),
+            location: Some(location),
+            next_segment_id: index.next_segment_id,
+        })?;
+        Ok(true)
+    }
+
+    fn write_packed_blobs_unlocked(
+        &self,
+        index: &mut PackedBlobIndex,
+        blobs: &[(String, &[u8])],
+    ) -> Result<ContentStoreStatsDelta> {
+        self.write_packed_blobs_unlocked_with_sync(index, blobs, true)
+    }
+
+    fn write_packed_blobs_unlocked_relaxed(
+        &self,
+        index: &mut PackedBlobIndex,
+        blobs: &[(String, &[u8])],
+    ) -> Result<ContentStoreStatsDelta> {
+        self.write_packed_blobs_unlocked_with_sync(index, blobs, false)
+    }
+
+    fn write_packed_blobs_unlocked_with_sync(
+        &self,
+        index: &mut PackedBlobIndex,
+        blobs: &[(String, &[u8])],
+        sync_writes: bool,
+    ) -> Result<ContentStoreStatsDelta> {
+        if blobs.is_empty() {
+            return Ok(ContentStoreStatsDelta::default());
+        }
+
+        let mut segment_files = BTreeMap::<String, fs::File>::new();
+        let mut segment_lengths = BTreeMap::<String, u64>::new();
+        let mut new_segment_parent_dirs = BTreeSet::<PathBuf>::new();
+        let mut records = Vec::new();
+        let mut stats_delta = ContentStoreStatsDelta::default();
+
+        for (hash, bytes) in blobs {
+            hash_hex(hash)?;
+            if let Some(location) = index.entries.get(hash)
+                && self.packed_blob_location_readable(location)?
+            {
+                continue;
+            }
+
+            let mut segment_id = if index.next_segment_id == 1 {
+                "0000000000000000.pack".to_string()
+            } else {
+                format!("{:016x}.pack", index.next_segment_id.saturating_sub(1))
+            };
+            let mut segment_path = self.packed_blob_segment_path(&segment_id);
+            let mut segment_len = match segment_lengths.get(&segment_id).copied() {
+                Some(len) => len,
+                None => {
+                    let len = file_len_if_exists(&segment_path)?.unwrap_or(0);
+                    segment_lengths.insert(segment_id.clone(), len);
+                    len
+                }
+            };
+            if segment_len.saturating_add(bytes.len() as u64) > PACKED_BLOB_SEGMENT_MAX_BYTES {
+                segment_id = format!("{:016x}.pack", index.next_segment_id);
+                index.next_segment_id = index.next_segment_id.saturating_add(1);
+                segment_path = self.packed_blob_segment_path(&segment_id);
+                segment_len = 0;
+                segment_lengths.insert(segment_id.clone(), 0);
+            } else if index.next_segment_id == 1 {
+                index.next_segment_id = 1;
+            }
+
+            if let Some(parent) = segment_path.parent() {
+                create_dir_all(parent.to_owned())?;
+            }
+            let existed = segment_path.exists();
+            if !segment_files.contains_key(&segment_id) {
+                let file = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&segment_path)
+                    .map_err(|source| ContentStoreError::Io {
+                        path: segment_path.clone(),
+                        source,
+                    })?;
+                segment_files.insert(segment_id.clone(), file);
+            }
+            let file = segment_files
+                .get_mut(&segment_id)
+                .expect("segment file was inserted");
+            let offset = segment_len;
+            file.write_all(bytes)
+                .map_err(|source| ContentStoreError::Io {
+                    path: segment_path.clone(),
+                    source,
+                })?;
+            segment_len = segment_len.saturating_add(bytes.len() as u64);
+            segment_lengths.insert(segment_id.clone(), segment_len);
+            if !existed && let Some(parent) = segment_path.parent() {
+                new_segment_parent_dirs.insert(parent.to_owned());
+            }
+
+            let location = PackedBlobLocation {
+                segment_id: segment_id.clone(),
                 offset,
                 size_bytes: bytes.len() as u64,
-            },
-        );
-        self.write_packed_blob_index_unlocked(&index)?;
-        Ok(true)
+            };
+            index.entries.insert(hash.clone(), location.clone());
+            records.push(PackedBlobIndexLogEntry {
+                version: PACKED_BLOB_INDEX_VERSION,
+                content_hash: hash.clone(),
+                location: Some(location),
+                next_segment_id: index.next_segment_id,
+            });
+            stats_delta.blob_count += 1;
+            stats_delta.blob_bytes += bytes.len() as i128;
+        }
+
+        if sync_writes {
+            for (segment_id, file) in segment_files {
+                let path = self.packed_blob_segment_path(&segment_id);
+                file.sync_all()
+                    .map_err(|source| ContentStoreError::Io { path, source })?;
+            }
+            for parent in new_segment_parent_dirs {
+                sync_dir(&parent)?;
+            }
+        }
+        if sync_writes {
+            self.append_packed_blob_index_log_entries_unlocked(&records)?;
+        } else {
+            self.append_packed_blob_index_log_entries_unlocked_relaxed(&records)?;
+        }
+        Ok(stats_delta)
     }
 
     fn remove_packed_blob_index_entry(&self, hash: &str) -> Result<bool> {
         hash_hex(hash)?;
         let _lock = self.lock_packed_blobs()?;
-        let mut index = self.read_packed_blob_index_unlocked()?;
+        let mut index = self.read_packed_blob_index_for_update_unlocked()?;
         let removed = index.entries.remove(hash).is_some();
         if removed {
-            self.write_packed_blob_index_unlocked(&index)?;
+            self.append_packed_blob_index_log_entry_unlocked(&PackedBlobIndexLogEntry {
+                version: PACKED_BLOB_INDEX_VERSION,
+                content_hash: hash.to_owned(),
+                location: None,
+                next_segment_id: index.next_segment_id,
+            })?;
         }
         Ok(removed)
     }
@@ -2585,11 +2965,93 @@ impl LocalContentStore {
         self.root.join(PACKED_BLOB_DIR).join(PACKED_BLOB_INDEX_FILE)
     }
 
+    fn packed_blob_index_log_path(&self) -> PathBuf {
+        self.root
+            .join(PACKED_BLOB_DIR)
+            .join(PACKED_BLOB_INDEX_LOG_FILE)
+    }
+
     fn packed_blob_segment_path(&self, segment_id: &str) -> PathBuf {
         self.root
             .join(PACKED_BLOB_DIR)
             .join(PACKED_BLOB_SEGMENT_DIR)
             .join(segment_id)
+    }
+
+    fn append_packed_blob_index_log_entry_unlocked(
+        &self,
+        entry: &PackedBlobIndexLogEntry,
+    ) -> Result<()> {
+        self.append_packed_blob_index_log_entries_unlocked(std::slice::from_ref(entry))
+    }
+
+    fn append_packed_blob_index_log_entries_unlocked(
+        &self,
+        entries: &[PackedBlobIndexLogEntry],
+    ) -> Result<()> {
+        self.append_packed_blob_index_log_entries_unlocked_with_sync(entries, true)
+    }
+
+    fn append_packed_blob_index_log_entries_unlocked_relaxed(
+        &self,
+        entries: &[PackedBlobIndexLogEntry],
+    ) -> Result<()> {
+        self.append_packed_blob_index_log_entries_unlocked_with_sync(entries, false)
+    }
+
+    fn append_packed_blob_index_log_entries_unlocked_with_sync(
+        &self,
+        entries: &[PackedBlobIndexLogEntry],
+        sync_writes: bool,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let path = self.packed_blob_index_log_path();
+        let existed = path.exists();
+        if let Some(parent) = path.parent() {
+            create_dir_all(parent.to_owned())?;
+        }
+        let mut record = Vec::new();
+        for entry in entries {
+            let bytes = encode_packed_blob_index_log_entry(entry)?;
+            let length = u32::try_from(bytes.len()).map_err(|_| {
+                ContentStoreError::Serde(format!(
+                    "packed blob index entry for {} is too large: {} bytes",
+                    entry.content_hash,
+                    bytes.len()
+                ))
+            })?;
+            record.extend_from_slice(&length.to_le_bytes());
+            record.extend_from_slice(&bytes);
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.write_all(&record)
+            .map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        if sync_writes {
+            file.sync_all().map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        }
+        drop(file);
+        if sync_writes
+            && !existed
+            && let Some(parent) = path.parent()
+        {
+            sync_dir(parent)?;
+        }
+        Ok(())
     }
 
     fn collect_version_manifest_entries(
@@ -3320,14 +3782,158 @@ fn decode_stats_snapshot(bytes: &[u8]) -> Result<ContentStoreStatsSnapshot> {
         .map_err(|source| ContentStoreError::Serde(source.to_string()))
 }
 
-fn encode_packed_blob_index(index: &PackedBlobIndex) -> Result<Vec<u8>> {
-    sinomo_object_serde::to_bytes(index, 1, LengthMode::U32)
-        .map_err(|source| ContentStoreError::Serde(source.to_string()))
-}
-
 fn decode_packed_blob_index(bytes: &[u8]) -> Result<PackedBlobIndex> {
     sinomo_object_serde::from_bytes(bytes)
         .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn encode_packed_blob_index_log_entry(entry: &PackedBlobIndexLogEntry) -> Result<Vec<u8>> {
+    sinomo_object_serde::to_bytes(entry, 1, LengthMode::U32)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn replay_packed_blob_index_log(path: &Path, index: &mut PackedBlobIndex) -> Result<u64> {
+    let mut file = fs::File::open(path).map_err(|source| ContentStoreError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    while let Some((entry, record_end)) = read_next_packed_blob_index_log_entry(&mut file, path)? {
+        if entry.version != PACKED_BLOB_INDEX_VERSION {
+            return Err(ContentStoreError::Serde(format!(
+                "unsupported packed blob index log version: {}",
+                entry.version
+            )));
+        }
+        if let Some(location) = entry.location {
+            index.entries.insert(entry.content_hash, location);
+        } else {
+            index.entries.remove(&entry.content_hash);
+        }
+        index.next_segment_id = index.next_segment_id.max(entry.next_segment_id.max(1));
+        if record_end
+            != file
+                .stream_position()
+                .map_err(|source| ContentStoreError::Io {
+                    path: path.to_owned(),
+                    source,
+                })?
+        {
+            return Err(ContentStoreError::Serde(
+                "packed blob index log reader lost record alignment".to_string(),
+            ));
+        }
+    }
+    file.stream_position()
+        .map_err(|source| ContentStoreError::Io {
+            path: path.to_owned(),
+            source,
+        })
+}
+
+fn read_next_packed_blob_index_log_entry(
+    file: &mut fs::File,
+    path: &Path,
+) -> Result<Option<(PackedBlobIndexLogEntry, u64)>> {
+    let record_start = file
+        .stream_position()
+        .map_err(|source| ContentStoreError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    let mut length_bytes = [0_u8; 4];
+    match file.read_exact(&mut length_bytes) {
+        Ok(()) => {}
+        Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => {
+            file.seek(SeekFrom::Start(record_start))
+                .map_err(|source| ContentStoreError::Io {
+                    path: path.to_owned(),
+                    source,
+                })?;
+            return Ok(None);
+        }
+        Err(source) => {
+            return Err(ContentStoreError::Io {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    }
+    let length = u32::from_le_bytes(length_bytes) as usize;
+    let record_end = record_start
+        .saturating_add(4)
+        .saturating_add(u64::from(u32::from_le_bytes(length_bytes)));
+    let file_len = file
+        .metadata()
+        .map_err(|source| ContentStoreError::Io {
+            path: path.to_owned(),
+            source,
+        })?
+        .len();
+    if record_end > file_len {
+        file.seek(SeekFrom::Start(record_start))
+            .map_err(|source| ContentStoreError::Io {
+                path: path.to_owned(),
+                source,
+            })?;
+        return Ok(None);
+    }
+    let mut bytes = vec![0_u8; length];
+    match file.read_exact(&mut bytes) {
+        Ok(()) => {}
+        Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => {
+            file.seek(SeekFrom::Start(record_start))
+                .map_err(|source| ContentStoreError::Io {
+                    path: path.to_owned(),
+                    source,
+                })?;
+            return Ok(None);
+        }
+        Err(source) => {
+            return Err(ContentStoreError::Io {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    }
+    let entry = match sinomo_object_serde::from_bytes(&bytes) {
+        Ok(entry) => entry,
+        Err(_) if record_end >= file_len => {
+            file.seek(SeekFrom::Start(record_start))
+                .map_err(|source| ContentStoreError::Io {
+                    path: path.to_owned(),
+                    source,
+                })?;
+            return Ok(None);
+        }
+        Err(source) => return Err(ContentStoreError::Serde(source.to_string())),
+    };
+    Ok(Some((entry, record_end)))
+}
+
+fn truncate_torn_packed_blob_index_log_tail(path: &Path, offset: u64) -> Result<()> {
+    let len = fs::metadata(path)
+        .map_err(|source| ContentStoreError::Io {
+            path: path.to_owned(),
+            source,
+        })?
+        .len();
+    if offset >= len {
+        return Ok(());
+    }
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|source| ContentStoreError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    file.set_len(offset)
+        .and_then(|()| file.sync_all())
+        .map_err(|source| ContentStoreError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    Ok(())
 }
 
 fn file_count_delta(before_len: Option<u64>, after_len: Option<u64>) -> i128 {
@@ -3906,6 +4512,45 @@ fn write_file_create_new_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn write_files_create_new_relaxed<'a, I>(files: I) -> Result<()>
+where
+    I: IntoIterator<Item = (PathBuf, &'a [u8])>,
+{
+    for (path, bytes) in files {
+        if path.is_file() {
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            create_dir_all(parent.to_owned())?;
+        }
+
+        let tmp_path = temporary_path_for(&path);
+        let mut file = fs::File::create(&tmp_path).map_err(|source| ContentStoreError::Io {
+            path: tmp_path.clone(),
+            source,
+        })?;
+        file.write_all(bytes)
+            .map_err(|source| ContentStoreError::Io {
+                path: tmp_path.clone(),
+                source,
+            })?;
+        drop(file);
+        match fs::hard_link(&tmp_path, &path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(ContentStoreError::Io { path, source });
+            }
+        }
+        fs::remove_file(&tmp_path).map_err(|source| ContentStoreError::Io {
+            path: tmp_path,
+            source,
+        })?;
+    }
+    Ok(())
+}
+
 fn sync_dir(path: &Path) -> Result<()> {
     durable_file::sync_directory(path).map_err(content_durable_file_error)
 }
@@ -3968,6 +4613,95 @@ mod tests {
                 .manifests_for_object("object-a")
                 .expect("object manifests"),
             vec![manifest]
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn put_object_versions_batches_small_blobs_and_manifests() {
+        let root = temp_root("put_object_versions_batches_small_blobs_and_manifests");
+        let store = LocalContentStore::new(&root).expect("create store");
+
+        let first = b"small batch object one";
+        let second = b"small batch object two";
+        let manifests = store
+            .put_object_versions(vec![
+                ("object-batch-a", "v1", first.as_slice()),
+                ("object-batch-b", "v1", second.as_slice()),
+            ])
+            .expect("put object versions");
+
+        assert_eq!(manifests.len(), 2);
+        assert_eq!(
+            store
+                .read_blob(&manifests[0].content_hash)
+                .expect("read first"),
+            first
+        );
+        assert_eq!(
+            store
+                .read_blob(&manifests[1].content_hash)
+                .expect("read second"),
+            second
+        );
+        assert_eq!(
+            store
+                .read_manifest("object-batch-a", "v1")
+                .expect("first manifest"),
+            manifests[0]
+        );
+        assert_eq!(
+            store
+                .read_manifest("object-batch-b", "v1")
+                .expect("second manifest"),
+            manifests[1]
+        );
+        let stats = store.stats().expect("stats");
+        assert_eq!(stats.blob_count, 2);
+        assert_eq!(stats.manifest_count, 2);
+        assert_eq!(
+            stats.logical_object_bytes,
+            (first.len() + second.len()) as u64
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn put_object_version_blobs_only_batches_small_blobs_without_manifests() {
+        let root = temp_root("put_object_version_blobs_only_batches_small_blobs_without_manifests");
+        let store = LocalContentStore::new(&root).expect("create store");
+
+        let first = b"blob only batch object one";
+        let second = b"blob only batch object two";
+        let manifests = store
+            .put_object_version_blobs_only(vec![
+                ("object-blob-only-a", "v1", first.as_slice()),
+                ("object-blob-only-b", "v1", second.as_slice()),
+            ])
+            .expect("put blob-only object versions");
+
+        assert_eq!(manifests.len(), 2);
+        assert_eq!(
+            store
+                .read_blob(&manifests[0].content_hash)
+                .expect("read first blob"),
+            first
+        );
+        assert_eq!(
+            store
+                .read_blob(&manifests[1].content_hash)
+                .expect("read second blob"),
+            second
+        );
+        assert!(
+            store.read_manifest("object-blob-only-a", "v1").is_err(),
+            "blob-only batch writes should not create per-object manifests"
+        );
+        assert!(
+            store.read_manifest("object-blob-only-b", "v1").is_err(),
+            "blob-only batch writes should not create per-object manifests"
         );
 
         cleanup(&root);
@@ -4168,6 +4902,86 @@ mod tests {
         assert_eq!(scrub.referenced_blob_count, 2);
         assert_eq!(scrub.orphan_blob_count, 0);
         assert_eq!(store.stats().expect("stats after scrub"), scrub.stats);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn small_object_packed_index_uses_append_log_instead_of_per_write_snapshot() {
+        let root =
+            temp_root("small_object_packed_index_uses_append_log_instead_of_per_write_snapshot");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let first_bytes = b"tiny packed index log alpha";
+        let second_bytes = b"tiny packed index log bravo";
+
+        let first = store
+            .put_object_version("object-packed-index-log-a", "v1", first_bytes)
+            .expect("put first packed object");
+        let second = store
+            .put_object_version("object-packed-index-log-b", "v1", second_bytes)
+            .expect("put second packed object");
+
+        assert!(
+            store.packed_blob_index_log_path().is_file(),
+            "small packed writes should append compact index records"
+        );
+        assert!(
+            !store.packed_blob_index_path().exists(),
+            "small packed writes should not rewrite the full index snapshot on every object"
+        );
+
+        let reopened = LocalContentStore::new(&root).expect("reopen store");
+        assert_eq!(
+            reopened
+                .read_blob(&first.content_hash)
+                .expect("read first packed blob after replay"),
+            first_bytes
+        );
+        assert_eq!(
+            reopened
+                .read_blob(&second.content_hash)
+                .expect("read second packed blob after replay"),
+            second_bytes
+        );
+        let index = reopened
+            .read_packed_blob_index_unlocked()
+            .expect("replayed packed index");
+        assert_eq!(index.entries.len(), 2);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn content_writes_do_not_create_stats_snapshot_until_stats_are_requested() {
+        let root =
+            temp_root("content_writes_do_not_create_stats_snapshot_until_stats_are_requested");
+        let store = LocalContentStore::new(&root).expect("create store");
+
+        store
+            .put_object_version("object-lazy-stats", "v1", b"lazy stats alpha")
+            .expect("put first object");
+        assert!(
+            !store.stats_snapshot_path().exists(),
+            "ordinary writes without quotas should not force a stats snapshot write"
+        );
+
+        let initial = store.stats().expect("stats scan materializes snapshot");
+        assert_eq!(initial.blob_count, 1);
+        assert_eq!(initial.manifest_count, 1);
+        assert!(store.stats_snapshot_path().exists());
+
+        store
+            .put_object_version("object-lazy-stats", "v2", b"lazy stats bravo")
+            .expect("put second object");
+        let updated = store
+            .stats()
+            .expect("cached stats stay current once requested");
+        assert_eq!(updated.blob_count, 2);
+        assert_eq!(updated.manifest_count, 2);
+        assert_eq!(
+            updated.logical_object_bytes,
+            b"lazy stats alpha".len() as u64 + b"lazy stats bravo".len() as u64
+        );
 
         cleanup(&root);
     }
