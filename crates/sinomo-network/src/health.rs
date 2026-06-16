@@ -30,6 +30,8 @@ pub struct ClusterNetworkPingRequest {
     pub nonce: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub payload: Vec<u8>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub response_payload_bytes: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -37,6 +39,8 @@ pub struct ClusterNetworkPingResponse {
     pub nonce: String,
     pub responder_node_id: NodeId,
     pub payload_bytes: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub response_payload: Vec<u8>,
     #[serde(with = "time::serde::rfc3339")]
     pub observed_at: OffsetDateTime,
 }
@@ -49,12 +53,21 @@ pub fn cluster_network_ping_rpc_request(
     nonce: impl Into<String>,
     payload_bytes: usize,
 ) -> Result<ObjectRpcRequest, NetworkError> {
+    cluster_network_ping_rpc_request_with_response_payload(nonce, payload_bytes, 0)
+}
+
+pub fn cluster_network_ping_rpc_request_with_response_payload(
+    nonce: impl Into<String>,
+    payload_bytes: usize,
+    response_payload_bytes: usize,
+) -> Result<ObjectRpcRequest, NetworkError> {
     ObjectRpcRequest::encode_body(
         CLUSTER_NETWORK_PING_ROUTE,
         CLUSTER_NETWORK_RPC_CATEGORY,
         &ClusterNetworkPingRequest {
             nonce: nonce.into(),
             payload: vec![0_u8; payload_bytes],
+            response_payload_bytes,
         },
     )
 }
@@ -187,6 +200,7 @@ pub fn handle_cluster_network_ping_rpc_request_for_node(
                 nonce: request.nonce,
                 responder_node_id: responder_node_id.clone(),
                 payload_bytes: request.payload.len(),
+                response_payload: vec![0_u8; request.response_payload_bytes],
                 observed_at,
             };
             ObjectRpcResponse::encode_body(CLUSTER_NETWORK_PING_ROUTE, &response)
@@ -195,6 +209,10 @@ pub fn handle_cluster_network_ping_rpc_request_for_node(
             route: other.to_string(),
         }),
     }
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

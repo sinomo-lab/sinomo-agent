@@ -171,6 +171,25 @@ fn network_publishes_agent_cluster_inspection_specs() {
 }
 
 #[test]
+fn cluster_network_ping_can_measure_request_and_response_payload_bytes() {
+    let request = cluster_network_ping_rpc_request_with_response_payload("payload-probe", 7, 11)
+        .expect("ping request");
+    let responder = NodeId::from_legacy_named("node.payload").expect("legacy node id");
+    let response = handle_cluster_network_ping_rpc_request_for_node(
+        &responder,
+        request,
+        time::OffsetDateTime::UNIX_EPOCH,
+    )
+    .expect("ping response");
+    let response = decode_cluster_network_ping_rpc_response(&response).expect("decode response");
+
+    assert_eq!(response.nonce, "payload-probe");
+    assert_eq!(response.responder_node_id, responder);
+    assert_eq!(response.payload_bytes, 7);
+    assert_eq!(response.response_payload.len(), 11);
+}
+
+#[test]
 fn direct_cluster_rpc_handlers_return_unknown_route_errors() {
     struct NoopClusterStatusProbe;
 

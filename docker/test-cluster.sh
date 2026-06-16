@@ -3,23 +3,25 @@
 #
 # Brings up a DEDICATED compose project (so it never collides with a manually
 # started dev cluster), waits for clean 6-node formation, then drives the
-# in-binary `cluster-dfs` runtime test cases (sinomo test run --require-cluster)
-# from different nodes to verify cluster-wide POSIX behavior:
+# in-binary cluster runtime test cases (sinomo test run --require-cluster)
+# from different nodes to verify network health and cluster-wide POSIX behavior:
 #
-#   1. invariants     — per-node DFS operational invariants (baseline)
-#   2. read-your-write — write/read/rename/delete roundtrip on node1 and node5
-#   3. cross-node     — write on one segment, poll-read on the other (both
+#   1. network latency — signed object-RPC latency/RPS with no failed requests
+#   2. network payload — signed object-RPC payload throughput with no failed requests
+#   3. invariants     — per-node DFS operational invariants (baseline)
+#   4. read-your-write — write/read/rename/delete roundtrip on node1 and node5
+#   5. cross-node     — write on one segment, poll-read on the other (both
 #                       directions), then a routed delete observed cluster-wide
-#   4. rename         — /users -> /services rename issued by a NON-writer node,
+#   6. rename         — /users -> /services rename issued by a NON-writer node,
 #                       observed (and the old path absent) on far nodes
-#   5. bulk perf      — small-file bulk write/read throughput with process I/O
+#   7. bulk perf      — small-file bulk write/read throughput with process I/O
 #                       amplification checks and read-side write_bytes == 0
-#   6. large-file perf — large object write/read throughput with process I/O
+#   8. large-file perf — large object write/read throughput with process I/O
 #                       amplification checks and read-side write_bytes == 0
-#   7. disk damage    — delete one durable loose blob and read through the
+#   9. disk damage    — delete one durable loose blob and read through the
 #                       remaining replica without read-side disk writes
-#   8. restart        — restart a member, re-gate formation, re-read its data
-#   9. final sweep    — invariants again on every node
+#   10. restart       — restart a member, re-gate formation, re-read its data
+#   11. final sweep   — invariants again on every node
 #
 # Usage:
 #   docker/test-cluster.sh                  # build-if-missing, up, test, down -v
@@ -54,7 +56,15 @@
 #   SINOMO_TEST_NETWORK_MAX_P50_MS          max network ping p50 latency (default 50)
 #   SINOMO_TEST_NETWORK_MAX_P95_MS          max network ping p95 latency (default 250)
 #   SINOMO_TEST_NETWORK_MIN_RPS             min network ping throughput (default 50)
-#   SINOMO_TEST_NETWORK_PAYLOAD_BYTES       bytes per network-baseline ping payload (default 0)
+#   SINOMO_TEST_NETWORK_PAYLOAD_BYTES       request bytes per latency-baseline ping payload (default 0)
+#   SINOMO_TEST_NETWORK_RESPONSE_PAYLOAD_BYTES response bytes per latency-baseline ping payload (default 0)
+#   SINOMO_TEST_NETWORK_MIN_PAYLOAD_BYTES_PER_SEC min latency-baseline payload throughput (default 0, disabled)
+#   SINOMO_TEST_NETWORK_PAYLOAD_REQUESTS_PER_TARGET payload-throughput RPCs per remote node (default 4)
+#   SINOMO_TEST_NETWORK_PAYLOAD_CONCURRENCY payload-throughput workers (default 8)
+#   SINOMO_TEST_NETWORK_PAYLOAD_TIMEOUT_MS  payload-throughput RPC timeout (default 5000)
+#   SINOMO_TEST_NETWORK_PAYLOAD_REQUEST_BYTES request bytes per payload-throughput RPC (default 262144)
+#   SINOMO_TEST_NETWORK_PAYLOAD_RESPONSE_BYTES response bytes per payload-throughput RPC (default 262144)
+#   SINOMO_TEST_NETWORK_PAYLOAD_MIN_BYTES_PER_SEC min payload-throughput rate (default 4194304)
 #   SINOMO_TEST_NETWORK_REQUIRE_DIRECT      require direct, non-relayed network routes (default 0; this compose is segmented)
 #   SINOMO_TEST_NETWORK_READY_WAIT          network/auth convergence gate seconds (default 120)
 #   SINOMO_TEST_NETWORK_READY_REQUESTS_PER_TARGET requests per target during readiness warmup (default 20)
@@ -103,6 +113,14 @@ NETWORK_MAX_P50_MS="${SINOMO_TEST_NETWORK_MAX_P50_MS:-50}"
 NETWORK_MAX_P95_MS="${SINOMO_TEST_NETWORK_MAX_P95_MS:-250}"
 NETWORK_MIN_RPS="${SINOMO_TEST_NETWORK_MIN_RPS:-50}"
 NETWORK_PAYLOAD_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_BYTES:-0}"
+NETWORK_RESPONSE_PAYLOAD_BYTES="${SINOMO_TEST_NETWORK_RESPONSE_PAYLOAD_BYTES:-0}"
+NETWORK_MIN_PAYLOAD_BYTES_PER_SEC="${SINOMO_TEST_NETWORK_MIN_PAYLOAD_BYTES_PER_SEC:-0}"
+NETWORK_PAYLOAD_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_PAYLOAD_REQUESTS_PER_TARGET:-4}"
+NETWORK_PAYLOAD_CONCURRENCY="${SINOMO_TEST_NETWORK_PAYLOAD_CONCURRENCY:-8}"
+NETWORK_PAYLOAD_TIMEOUT_MS="${SINOMO_TEST_NETWORK_PAYLOAD_TIMEOUT_MS:-5000}"
+NETWORK_PAYLOAD_REQUEST_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_REQUEST_BYTES:-262144}"
+NETWORK_PAYLOAD_RESPONSE_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_RESPONSE_BYTES:-262144}"
+NETWORK_PAYLOAD_MIN_BYTES_PER_SEC="${SINOMO_TEST_NETWORK_PAYLOAD_MIN_BYTES_PER_SEC:-4194304}"
 NETWORK_REQUIRE_DIRECT="${SINOMO_TEST_NETWORK_REQUIRE_DIRECT:-0}"
 NETWORK_READY_WAIT="${SINOMO_TEST_NETWORK_READY_WAIT:-120}"
 NETWORK_READY_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_READY_REQUESTS_PER_TARGET:-20}"
@@ -298,8 +316,29 @@ network_baseline() {
       --param "max-p50-ms=$NETWORK_MAX_P50_MS" \
       --param "max-p95-ms=$NETWORK_MAX_P95_MS" \
       --param "payload-bytes=$NETWORK_PAYLOAD_BYTES" \
+      --param "response-payload-bytes=$NETWORK_RESPONSE_PAYLOAD_BYTES" \
+      --param "min-payload-bytes-per-second=$NETWORK_MIN_PAYLOAD_BYTES_PER_SEC" \
       --param "require-direct=$NETWORK_REQUIRE_DIRECT" \
       --param "min-requests-per-second=$NETWORK_MIN_RPS" || rc=1
+  done
+  return $rc
+}
+
+network_payload_baseline() {
+  local rc=0 node
+  for node in node1 node6; do
+    run_probe "$node" cluster.network.ping-benchmark \
+      --param "requests-per-target=$NETWORK_PAYLOAD_REQUESTS_PER_TARGET" \
+      --param "concurrency=$NETWORK_PAYLOAD_CONCURRENCY" \
+      --param "timeout-ms=$NETWORK_PAYLOAD_TIMEOUT_MS" \
+      --param "max-failures=0" \
+      --param "max-p50-ms=0" \
+      --param "max-p95-ms=0" \
+      --param "payload-bytes=$NETWORK_PAYLOAD_REQUEST_BYTES" \
+      --param "response-payload-bytes=$NETWORK_PAYLOAD_RESPONSE_BYTES" \
+      --param "require-direct=$NETWORK_REQUIRE_DIRECT" \
+      --param "min-requests-per-second=0" \
+      --param "min-payload-bytes-per-second=$NETWORK_PAYLOAD_MIN_BYTES_PER_SEC" || rc=1
   done
   return $rc
 }
@@ -540,12 +579,13 @@ if ! wait_for_network_ready; then
   exit 1
 fi
 
-scenario "network-baseline" network_baseline
+scenario "network-latency-baseline" network_baseline
+scenario "network-payload-baseline" network_payload_baseline
 if [ -n "$FAILED_SCENARIOS" ]; then
   exit 1
 fi
 if [ "${SINOMO_TEST_NETWORK_ONLY:-0}" = 1 ]; then
-  log "RESULT: PASS — network baseline green (probe reports in $ARTIFACTS)"
+  log "RESULT: PASS — network baselines green (probe reports in $ARTIFACTS)"
   exit 0
 fi
 
