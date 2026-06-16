@@ -2,6 +2,7 @@ use super::*;
 use sinomo_core::{ClusterEndpointPrivacy, ClusterEndpointSource, ClusterTransportKind};
 use sinomo_kv::InProcessRaftKvCluster;
 use sinomo_network::{AsyncInProcessNetwork, InProcessNetwork};
+use sinomo_object::Value;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -92,6 +93,240 @@ fn dfs_adaptive_transfer_windows_stay_byte_bounded() {
             DFS_READ_CHUNK_WINDOW_SIZE,
         ),
         16
+    );
+}
+
+fn object_field<'a>(value: &'a Value, key: &str) -> &'a Value {
+    let Value::Object(object) = value else {
+        panic!("expected object value for field {key}, got {value:?}");
+    };
+    object
+        .fields
+        .iter()
+        .find(|field| field.key == key)
+        .map(|field| &field.value)
+        .unwrap_or_else(|| panic!("missing object field {key} in {object:?}"))
+}
+
+fn assert_native_bytes_field(value: &impl serde::Serialize, key: &str) {
+    let value = sinomo_object::serde_ext::to_value(value).expect("serialize value");
+    let field = object_field(&value, key);
+    assert!(
+        matches!(field, Value::Bytes(_)),
+        "expected {key} to serialize as native bytes, got {field:?}"
+    );
+}
+
+fn protocol_test_bytes() -> Vec<u8> {
+    vec![0, 1, 2, 3, 253, 254, 255]
+}
+
+fn protocol_test_write_request() -> DfsWriteRequest {
+    DfsWriteRequest {
+        file_system_id: sinomo_core::Id::from_legacy_named("fs").expect("fs id"),
+        object_id: sinomo_core::Id::from_legacy_named("object").expect("object id"),
+        target_version: sinomo_core::Id::from_legacy_named("version").expect("version id"),
+        requesting_node_id: sinomo_core::Id::from_legacy_named("node").expect("node id"),
+    }
+}
+
+#[test]
+fn dfs_protocol_binary_payloads_use_native_bytes_codec() {
+    let object_id = DfsObjectId::from_legacy_named("object").expect("object id");
+    let version = DfsVersion::from_legacy_named("version").expect("version id");
+    let node_id = NodeId::from_legacy_named("node").expect("node id");
+    let file_system_id = DfsFileSystemId::from_legacy_named(SIFS_FILE_SYSTEM_ID).expect("fs id");
+    let bytes = protocol_test_bytes();
+
+    assert_native_bytes_field(
+        &DfsReadData {
+            object_id: object_id.clone(),
+            version: version.clone(),
+            content_hash: Some("hash".to_string()),
+            bytes: bytes.clone(),
+        },
+        "bytes",
+    );
+    assert_native_bytes_field(
+        &DfsReadRangeData {
+            object_id: object_id.clone(),
+            version: version.clone(),
+            content_hash: Some("hash".to_string()),
+            offset: 0,
+            total_size_bytes: bytes.len() as u64,
+            bytes: bytes.clone(),
+        },
+        "bytes",
+    );
+    assert_native_bytes_field(
+        &DfsReadResponseChunk {
+            request_id: "read".to_string(),
+            object_id: object_id.clone(),
+            version: version.clone(),
+            content_hash: Some("hash".to_string()),
+            range_offset: None,
+            object_total_size_bytes: None,
+            total_size_bytes: bytes.len() as u64,
+            chunk_index: 0,
+            total_chunks: 1,
+            chunk_hash: None,
+            bytes: bytes.clone(),
+        },
+        "bytes",
+    );
+    assert_native_bytes_field(
+        &DfsWriteCommand {
+            request_id: "write".to_string(),
+            request: protocol_test_write_request(),
+            bytes: bytes.clone(),
+        },
+        "bytes",
+    );
+    assert_native_bytes_field(
+        &DfsDistributedWriteCommand {
+            request_id: "distributed-write".to_string(),
+            request: protocol_test_write_request(),
+            expected_base_version: None,
+            metadata_journal_after_sequence: None,
+            bytes: bytes.clone(),
+            content_hash: Some("hash".to_string()),
+            content_size_bytes: Some(bytes.len() as u64),
+            desired_replica_nodes: vec![node_id.clone()],
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            object_metadata: None,
+            touch_parent_on_create: true,
+            foreground_replica_repair: true,
+        },
+        "bytes",
+    );
+    assert_native_bytes_field(
+        &DfsStageBlobCommand {
+            request_id: "stage".to_string(),
+            intent_id: "intent".to_string(),
+            file_system_id: file_system_id.clone(),
+            object_id: object_id.clone(),
+            expected_base_version: None,
+            version: version.clone(),
+            content_hash: "hash".to_string(),
+            bytes: bytes.clone(),
+            object_metadata: None,
+        },
+        "bytes",
+    );
+    assert_native_bytes_field(
+        &DfsStageBlobChunkCommand {
+            request_id: "stage-chunk".to_string(),
+            intent_id: "intent".to_string(),
+            file_system_id: file_system_id.clone(),
+            object_id: object_id.clone(),
+            expected_base_version: None,
+            version: version.clone(),
+            content_hash: "hash".to_string(),
+            total_size_bytes: bytes.len() as u64,
+            chunk_index: 0,
+            total_chunks: 1,
+            chunk_hash: None,
+            bytes: bytes.clone(),
+            object_metadata: None,
+        },
+        "bytes",
+    );
+    assert_native_bytes_field(
+        &DfsStagePatchCommand {
+            request_id: "stage-patch".to_string(),
+            intent_id: "intent".to_string(),
+            file_system_id: file_system_id.clone(),
+            object_id: object_id.clone(),
+            base_version: version.clone(),
+            version: version.clone(),
+            content_hash: "hash".to_string(),
+            offset: 0,
+            patch_hash: "patch".to_string(),
+            bytes: bytes.clone(),
+            object_metadata: None,
+        },
+        "bytes",
+    );
+    assert_native_bytes_field(
+        &DfsStagePatchChunkCommand {
+            request_id: "stage-patch-chunk".to_string(),
+            intent_id: "intent".to_string(),
+            file_system_id: file_system_id.clone(),
+            object_id: object_id.clone(),
+            base_version: version.clone(),
+            version: version.clone(),
+            content_hash: "hash".to_string(),
+            offset: 0,
+            patch_hash: "patch".to_string(),
+            total_size_bytes: bytes.len() as u64,
+            chunk_index: 0,
+            total_chunks: 1,
+            chunk_hash: None,
+            bytes: bytes.clone(),
+            object_metadata: None,
+        },
+        "bytes",
+    );
+    assert_native_bytes_field(
+        &DfsRepairReplicaCommand {
+            request_id: "repair".to_string(),
+            intent_id: "intent".to_string(),
+            file_system_id: file_system_id.clone(),
+            object_id: object_id.clone(),
+            expected_base_version: None,
+            version: version.clone(),
+            content_hash: "hash".to_string(),
+            bytes: bytes.clone(),
+            object_metadata: None,
+        },
+        "bytes",
+    );
+    assert_native_bytes_field(
+        &DfsRepairReplicaChunkCommand {
+            request_id: "repair-chunk".to_string(),
+            intent_id: "intent".to_string(),
+            file_system_id,
+            object_id: object_id.clone(),
+            expected_base_version: None,
+            version: version.clone(),
+            content_hash: "hash".to_string(),
+            total_size_bytes: bytes.len() as u64,
+            chunk_index: 0,
+            total_chunks: 1,
+            chunk_hash: None,
+            bytes: bytes.clone(),
+            object_metadata: None,
+        },
+        "bytes",
+    );
+    assert_native_bytes_field(
+        &DfsFetchBlobResponseChunk {
+            request_id: "fetch-chunk".to_string(),
+            intent_id: "intent".to_string(),
+            object_id: object_id.clone(),
+            version,
+            source_node_id: node_id,
+            content_hash: "hash".to_string(),
+            total_size_bytes: bytes.len() as u64,
+            chunk_index: 0,
+            total_chunks: 1,
+            chunk_hash: None,
+            bytes: bytes.clone(),
+        },
+        "bytes",
+    );
+
+    let found = sinomo_object::serde_ext::to_value(&DfsFetchBlobResult::Found {
+        content_hash: "hash".to_string(),
+        bytes,
+    })
+    .expect("serialize fetch result");
+    assert!(
+        matches!(
+            object_field(object_field(&found, "found"), "bytes"),
+            Value::Bytes(_)
+        ),
+        "expected DfsFetchBlobResult::Found bytes to serialize as native bytes"
     );
 }
 

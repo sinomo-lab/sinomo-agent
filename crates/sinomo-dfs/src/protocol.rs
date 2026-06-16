@@ -23,6 +23,7 @@ pub struct DfsReadData {
     pub version: DfsVersion,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
+    #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
 }
 
@@ -34,6 +35,7 @@ pub struct DfsReadRangeData {
     pub content_hash: Option<String>,
     pub offset: u64,
     pub total_size_bytes: u64,
+    #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
 }
 
@@ -80,6 +82,7 @@ pub struct DfsReadResponseChunk {
     pub total_chunks: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_hash: Option<String>,
+    #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
 }
 
@@ -124,6 +127,7 @@ pub enum DfsReadResult {
 pub struct DfsWriteCommand {
     pub request_id: String,
     pub request: DfsWriteRequest,
+    #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
 }
 
@@ -156,6 +160,7 @@ pub struct DfsDistributedWriteCommand {
     pub expected_base_version: Option<DfsVersion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_journal_after_sequence: Option<u64>,
+    #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
@@ -433,6 +438,7 @@ pub struct DfsStageBlobCommand {
     pub expected_base_version: Option<DfsVersion>,
     pub version: DfsVersion,
     pub content_hash: String,
+    #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
@@ -464,6 +470,7 @@ pub struct DfsStageBlobChunkCommand {
     pub total_chunks: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_hash: Option<String>,
+    #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
@@ -480,6 +487,7 @@ pub struct DfsStagePatchCommand {
     pub content_hash: String,
     pub offset: u64,
     pub patch_hash: String,
+    #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
@@ -501,6 +509,7 @@ pub struct DfsStagePatchChunkCommand {
     pub total_chunks: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_hash: Option<String>,
+    #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
@@ -541,6 +550,7 @@ pub struct DfsRepairReplicaCommand {
     pub expected_base_version: Option<DfsVersion>,
     pub version: DfsVersion,
     pub content_hash: String,
+    #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
@@ -572,6 +582,7 @@ pub struct DfsRepairReplicaChunkCommand {
     pub total_chunks: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_hash: Option<String>,
+    #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
@@ -613,6 +624,7 @@ pub struct DfsFetchBlobResponseChunk {
     pub total_chunks: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_hash: Option<String>,
+    #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
 }
 
@@ -621,6 +633,7 @@ pub struct DfsFetchBlobResponseChunk {
 pub enum DfsFetchBlobResult {
     Found {
         content_hash: String,
+        #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
     },
     NotFound,
