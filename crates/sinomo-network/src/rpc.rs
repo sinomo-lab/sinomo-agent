@@ -37,6 +37,8 @@ pub const CLUSTER_HEALTH_RPC_CATEGORY: &str = "cluster.health";
 pub const CLUSTER_HEALTH_ROUTE: &str = "/cluster/health";
 pub const CLUSTER_HEALTH_SCOPE_METADATA_KEY: &str = "sinomo-health-scope";
 pub const CLUSTER_HEALTH_SCOPE_LOCAL: &str = "local";
+pub const CLUSTER_NETWORK_RPC_CATEGORY: &str = "cluster.network";
+pub const CLUSTER_NETWORK_PING_ROUTE: &str = "/cluster/network/ping";
 pub const CLUSTER_MEMBERSHIP_RPC_CATEGORY: &str = "cluster.membership";
 pub const CLUSTER_MEMBER_PUBLISH_ROUTE: &str = "/cluster/membership/member-publish";
 pub const CLUSTER_INVITE_PUBLISH_ROUTE: &str = "/cluster/membership/invite-publish";
@@ -44,6 +46,8 @@ pub const CLUSTER_JOIN_CHALLENGE_ROUTE: &str = "/cluster/join/challenge";
 pub const CLUSTER_JOIN_REGISTER_ROUTE: &str = "/cluster/join/register";
 pub const CLUSTER_HEALTH_RPC_ROUTE_METADATA: &[(&str, &str)] =
     &[(CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY)];
+pub const CLUSTER_NETWORK_RPC_ROUTE_METADATA: &[(&str, &str)] =
+    &[(CLUSTER_NETWORK_PING_ROUTE, CLUSTER_NETWORK_RPC_CATEGORY)];
 pub const CLUSTER_MEMBERSHIP_RPC_ROUTE_METADATA: &[(&str, &str)] = &[
     (
         CLUSTER_JOIN_CHALLENGE_ROUTE,

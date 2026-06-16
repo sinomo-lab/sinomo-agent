@@ -44,10 +44,11 @@ use time::OffsetDateTime;
 // out-of-band metadata writes, and doing it every few seconds makes multi-node
 // DFS writes pay repeated disk scans while a request is still in flight.
 const DAEMON_DFS_PROTOCOL_FRAME_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-const DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 1;
+const DAEMON_DFS_REPAIR_MAX_JOBS_PER_TICK: usize = 8;
+const DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
 const DAEMON_DFS_METADATA_REPLICATION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
 const DAEMON_DFS_METADATA_REPLICATION_TARGET_TIMEOUT: Duration = Duration::from_secs(1);
-const DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS: usize = 0;
+const DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS: usize = 3;
 
 type DaemonDfsProtocolFrameService = NetworkedDfsService<DfsEndpointServedProtocolFrameTransport>;
 
@@ -58,10 +59,17 @@ struct DaemonDfsProtocolFrameServiceSignature {
 }
 
 #[derive(Debug)]
-struct DaemonDfsProtocolFrameServiceCacheEntry {
-    signature: DaemonDfsProtocolFrameServiceSignature,
+struct DaemonDfsProtocolFrameServiceLane {
     service: DaemonDfsProtocolFrameService,
     last_metadata_refresh: Instant,
+}
+
+#[derive(Debug)]
+struct DaemonDfsProtocolFrameServiceCacheEntry {
+    signature: DaemonDfsProtocolFrameServiceSignature,
+    primary_service: Arc<Mutex<DaemonDfsProtocolFrameServiceLane>>,
+    read_services: Vec<Arc<Mutex<DaemonDfsProtocolFrameServiceLane>>>,
+    next_read_service: usize,
 }
 
 static DAEMON_DFS_PROTOCOL_FRAME_SERVICE_CACHE: OnceLock<
@@ -504,6 +512,17 @@ fn daemon_dfs_protocol_frame_service_cache()
     DAEMON_DFS_PROTOCOL_FRAME_SERVICE_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+fn daemon_dfs_read_service_pool_size() -> usize {
+    const DEFAULT_POOL_SIZE: usize = 16;
+    const MAX_POOL_SIZE: usize = 64;
+    std::env::var("SINOMO_DAEMON_DFS_READ_SERVICE_POOL_SIZE")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_POOL_SIZE)
+        .clamp(1, MAX_POOL_SIZE)
+}
+
 fn daemon_dfs_cache_lock_error() -> sinomo_dfs::DfsError {
     sinomo_dfs::DfsError::Network {
         message: "daemon DFS protocol frame service cache lock poisoned".to_string(),
@@ -514,6 +533,31 @@ fn daemon_dfs_network_error(source: sinomo_network::NetworkError) -> sinomo_dfs:
     sinomo_dfs::DfsError::Network {
         message: source.to_string(),
     }
+}
+
+fn open_daemon_dfs_protocol_frame_service_lane(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    local_node_id: &sinomo_node::NodeId,
+    endpoints: Vec<ClusterEndpointRecord>,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Arc<Mutex<DaemonDfsProtocolFrameServiceLane>>, sinomo_dfs::DfsError> {
+    let content = sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+    let metadata_backend =
+        sinomo_dfs::open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
+    let transport = DfsEndpointServedProtocolFrameTransport::new(
+        local_node_id.clone(),
+        endpoints,
+        daemon_dfs_protocol_frame_sender_on_runtime(runtime),
+        sinomo_dfs::DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT,
+    );
+    let service = NetworkedDfsService::new(transport, content);
+    let service = with_daemon_dfs_control_plane_on_runtime(service, cluster_paths, Some(runtime))
+        .with_boxed_metadata_backend(metadata_backend)?;
+    Ok(Arc::new(Mutex::new(DaemonDfsProtocolFrameServiceLane {
+        service,
+        last_metadata_refresh: Instant::now(),
+    })))
 }
 
 fn process_daemon_dfs_protocol_frame_command_on_runtime(
@@ -539,46 +583,73 @@ fn process_daemon_dfs_protocol_frame_command_on_runtime(
         kv_snapshot_available: cluster_paths.kv_snapshot.exists(),
     };
     let cache_key = data_dir.root();
-    let mut cache = daemon_dfs_protocol_frame_service_cache()
+    let use_read_lane = sinomo_dfs::dfs_protocol_frame_is_read_only_request(&command.frame);
+    let requires_fresh_metadata =
+        sinomo_dfs::dfs_protocol_frame_requires_fresh_metadata(&command.frame);
+    let request_id = command.request_id;
+    let service_lane = {
+        let mut cache = daemon_dfs_protocol_frame_service_cache()
+            .lock()
+            .map_err(|_| daemon_dfs_cache_lock_error())?;
+        let should_rebuild = cache
+            .get(&cache_key)
+            .is_none_or(|entry| entry.signature != signature);
+        if should_rebuild {
+            let primary_service = open_daemon_dfs_protocol_frame_service_lane(
+                data_dir,
+                cluster_paths,
+                &signature.local_node_id,
+                endpoints.clone(),
+                runtime,
+            )?;
+            let read_services = (0..daemon_dfs_read_service_pool_size())
+                .map(|_| {
+                    open_daemon_dfs_protocol_frame_service_lane(
+                        data_dir,
+                        cluster_paths,
+                        &signature.local_node_id,
+                        endpoints.clone(),
+                        runtime,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            cache.insert(
+                cache_key.clone(),
+                DaemonDfsProtocolFrameServiceCacheEntry {
+                    signature: signature.clone(),
+                    primary_service,
+                    read_services,
+                    next_read_service: 0,
+                },
+            );
+        }
+
+        let entry = cache
+            .get_mut(&cache_key)
+            .expect("daemon DFS protocol frame cache entry inserted");
+        if use_read_lane && !entry.read_services.is_empty() {
+            let index = entry.next_read_service % entry.read_services.len();
+            entry.next_read_service = entry.next_read_service.wrapping_add(1);
+            Arc::clone(&entry.read_services[index])
+        } else {
+            Arc::clone(&entry.primary_service)
+        }
+    };
+
+    let mut service_lane = service_lane
         .lock()
         .map_err(|_| daemon_dfs_cache_lock_error())?;
-    let should_rebuild = cache
-        .get(&cache_key)
-        .is_none_or(|entry| entry.signature != signature);
-    if should_rebuild {
-        let content = sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
-        let metadata_backend =
-            sinomo_dfs::open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
-        let transport = DfsEndpointServedProtocolFrameTransport::new(
-            signature.local_node_id.clone(),
-            endpoints.clone(),
-            daemon_dfs_protocol_frame_sender_on_runtime(runtime),
-            sinomo_dfs::DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT,
-        );
-        let service = NetworkedDfsService::new(transport, content);
-        let service =
-            with_daemon_dfs_control_plane_on_runtime(service, cluster_paths, Some(runtime))
-                .with_boxed_metadata_backend(metadata_backend)?;
-        cache.insert(
-            cache_key.clone(),
-            DaemonDfsProtocolFrameServiceCacheEntry {
-                signature: signature.clone(),
-                service,
-                last_metadata_refresh: Instant::now(),
-            },
-        );
+    service_lane
+        .service
+        .refresh_protocol_frame_endpoints(endpoints);
+    if requires_fresh_metadata
+        || service_lane.last_metadata_refresh.elapsed()
+            >= DAEMON_DFS_PROTOCOL_FRAME_CACHE_REFRESH_INTERVAL
+    {
+        service_lane.service.hydrate_from_metadata_backend()?;
+        service_lane.last_metadata_refresh = Instant::now();
     }
-
-    let entry = cache
-        .get_mut(&cache_key)
-        .expect("daemon DFS protocol frame cache entry inserted");
-    entry.service.refresh_protocol_frame_endpoints(endpoints);
-    if entry.last_metadata_refresh.elapsed() >= DAEMON_DFS_PROTOCOL_FRAME_CACHE_REFRESH_INTERVAL {
-        entry.service.hydrate_from_metadata_backend()?;
-        entry.last_metadata_refresh = Instant::now();
-    }
-    let request_id = command.request_id;
-    let result = entry.service.process_protocol_frame(command.frame)?;
+    let result = service_lane.service.process_protocol_frame(command.frame)?;
     Ok(Some(sinomo_dfs::DfsProtocolFrameCommandProcessResult {
         response: DfsProtocolFrameResponse {
             request_id,
@@ -741,6 +812,7 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
 
 fn daemon_dfs_maintenance_tick_options() -> DfsMaintenanceTickOptions {
     let mut options = DfsMaintenanceTickOptions::default();
+    options.repair_max_jobs = DAEMON_DFS_REPAIR_MAX_JOBS_PER_TICK;
     options.metadata_replication = daemon_dfs_metadata_replication_options();
     options
 }
@@ -893,6 +965,10 @@ mod tests {
         assert_eq!(
             daemon_dfs_metadata_replication_options().max_batches_per_target,
             DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET
+        );
+        assert_eq!(
+            daemon_dfs_maintenance_tick_options().repair_max_jobs,
+            DAEMON_DFS_REPAIR_MAX_JOBS_PER_TICK
         );
         assert_eq!(
             daemon_dfs_metadata_replication_options().attempt_timeout,
@@ -2731,11 +2807,15 @@ mod tests {
         }
 
         let cache_key = SinomoDataDir::new(&data_root).root();
-        let first_refresh = daemon_dfs_protocol_frame_service_cache()
+        let primary_service = {
+            let cache = daemon_dfs_protocol_frame_service_cache()
+                .lock()
+                .expect("cache lock");
+            Arc::clone(&cache.get(&cache_key).expect("cache entry").primary_service)
+        };
+        let first_refresh = primary_service
             .lock()
-            .expect("cache lock")
-            .get(&cache_key)
-            .expect("cache entry")
+            .expect("primary service lock")
             .last_metadata_refresh;
         write_test_cluster_state_with_remote_endpoint(
             &data_root,
@@ -2766,11 +2846,9 @@ mod tests {
         )
         .expect("third protocol frame");
         assert_eq!(response.request_id, "dfs_protocol_frame_warm_cache_3");
-        let second_refresh = daemon_dfs_protocol_frame_service_cache()
+        let second_refresh = primary_service
             .lock()
-            .expect("cache lock")
-            .get(&cache_key)
-            .expect("cache entry")
+            .expect("primary service lock")
             .last_metadata_refresh;
         assert_eq!(
             first_refresh, second_refresh,
@@ -3008,6 +3086,136 @@ mod tests {
                 .primary_node_id,
             by_id.get("root").expect("root shard").primary_node_id,
             "default path-prefix shards start on the root primary until explicit primary transfer is used"
+        );
+    }
+
+    #[test]
+    fn default_cluster_metadata_shards_replicate_to_all_service_nodes() {
+        let root = temp_root("default_cluster_metadata_shards_replicate_to_all_services");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let state = test_cluster_state_with_members(
+            "cluster_dfs_default_all_service_replicas",
+            "node_dfs_default_all_replicas_local",
+            &[
+                "node_dfs_default_all_replicas_remote_a",
+                "node_dfs_default_all_replicas_remote_b",
+                "node_dfs_default_all_replicas_remote_c",
+                "node_dfs_default_all_replicas_remote_d",
+                "node_dfs_default_all_replicas_remote_e",
+            ],
+        );
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        let file_system = sinomo_dfs::default_cluster_sifs(&state);
+        let service_nodes = sinomo_dfs::stable_dfs_service_node_ids(&state);
+        assert_eq!(service_nodes.len(), 6);
+        let runtime = daemon_test_runtime("default-dfs-bootstrap-all-service-replicas");
+        let mut host = test_default_cluster_bootstrap_host(
+            &data_dir,
+            &cluster_paths,
+            state.local_node_id.clone(),
+            runtime.handle(),
+        );
+
+        let shards =
+            sinomo_dfs::default_cluster_metadata_shards_with_host(&mut host, &state, &file_system)
+                .expect("metadata shards");
+
+        for shard in shards {
+            let expected_replicas = service_nodes
+                .iter()
+                .filter(|node_id| *node_id != &shard.primary_node_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                shard.replica_node_ids, expected_replicas,
+                "default shard {} should push metadata to every non-primary DFS service node",
+                shard.shard_id
+            );
+        }
+    }
+
+    #[test]
+    fn default_cluster_metadata_shard_expands_replicas_before_primary_transfer() {
+        let root = temp_root("default_cluster_metadata_shard_expands_before_transfer");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let mut state = test_cluster_state_with_members(
+            "cluster_dfs_default_expand_replicas",
+            "node_dfs_default_expand_local",
+            &[
+                "node_dfs_default_expand_remote_a",
+                "node_dfs_default_expand_remote_b",
+                "node_dfs_default_expand_remote_c",
+                "node_dfs_default_expand_remote_d",
+                "node_dfs_default_expand_remote_e",
+            ],
+        );
+        let service_nodes = sinomo_dfs::stable_dfs_service_node_ids(&state);
+        assert_eq!(service_nodes.len(), 6);
+        let bootstrap_primary = service_nodes[0].clone();
+        let target_primary = service_nodes[1].clone();
+        state.local_node_id = bootstrap_primary.clone();
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        let file_system = sinomo_dfs::default_cluster_sifs(&state);
+        let old_services_shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "services".to_string(),
+            primary_node_id: bootstrap_primary.clone(),
+            replica_node_ids: service_nodes[2..4].to_vec(),
+            epoch: 4,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: sinomo_dfs::SIFS_SERVICES_PATH.to_string(),
+            },
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        append_cluster_raft_command(
+            &cluster_paths,
+            &state.local_node_id,
+            sinomo_kv::KvCommand::Op(
+                sinomo_kv::KvOp::put_serde(
+                    metadata_shard_key(&file_system.file_system_id, "services"),
+                    &old_services_shard,
+                    None,
+                )
+                .expect("put old services shard op"),
+            ),
+        )
+        .expect("write old services shard");
+
+        let runtime = daemon_test_runtime("default-dfs-bootstrap-expands-before-transfer");
+        let mut host = test_default_cluster_bootstrap_host(
+            &data_dir,
+            &cluster_paths,
+            state.local_node_id.clone(),
+            runtime.handle(),
+        );
+        let expanded =
+            sinomo_dfs::default_cluster_metadata_shards_with_host(&mut host, &state, &file_system)
+                .expect("expanded shards")
+                .into_iter()
+                .find(|shard| shard.shard_id == "services")
+                .expect("services shard");
+        let expected_replicas = service_nodes
+            .iter()
+            .filter(|node_id| *node_id != &bootstrap_primary)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expanded.primary_node_id, bootstrap_primary,
+            "primary should not move until the candidate has replayed the current journal"
+        );
+        assert_eq!(expanded.replica_node_ids, expected_replicas);
+        assert_eq!(expanded.epoch, old_services_shard.epoch + 1);
+        assert!(
+            expanded
+                .replica_node_ids
+                .iter()
+                .any(|node_id| node_id == &target_primary),
+            "the future primary must become a replica before primary transfer can become ready"
         );
     }
 

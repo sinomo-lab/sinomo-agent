@@ -56,6 +56,10 @@ fn cluster_network_rpc_route_metadata_matches_owned_routes() {
         &[(CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY)]
     );
     assert_eq!(
+        CLUSTER_NETWORK_RPC_ROUTE_METADATA,
+        &[(CLUSTER_NETWORK_PING_ROUTE, CLUSTER_NETWORK_RPC_CATEGORY)]
+    );
+    assert_eq!(
         CLUSTER_MEMBERSHIP_RPC_ROUTE_METADATA,
         &[
             (
@@ -81,10 +85,16 @@ fn cluster_network_rpc_route_metadata_matches_owned_routes() {
 
 #[test]
 fn network_publishes_agent_cluster_inspection_specs() {
-    assert_eq!(NETWORK_OBJECT_RPC_ROUTES, &[CLUSTER_HEALTH_ROUTE]);
+    assert_eq!(
+        NETWORK_OBJECT_RPC_ROUTES,
+        &[CLUSTER_HEALTH_ROUTE, CLUSTER_NETWORK_PING_ROUTE]
+    );
     assert_eq!(
         NETWORK_CAPABILITY_EXPORTS,
-        &[CLUSTER_HEALTH_READ_CAPABILITY]
+        &[
+            CLUSTER_HEALTH_READ_CAPABILITY,
+            CLUSTER_NETWORK_PING_CAPABILITY
+        ]
     );
     assert!(NETWORK_CAPABILITY_IMPORTS.contains(&"cluster.kv.read"));
 
@@ -96,6 +106,16 @@ fn network_publishes_agent_cluster_inspection_specs() {
     assert_eq!(tool.operation, CLUSTER_HEALTH_READ_CAPABILITY);
     assert_eq!(
         tool.auth.as_scope(),
+        NetworkModuleRouteAuth::LocalOrClusterMember.as_scope()
+    );
+    let ping = NETWORK_OBJECT_RPC_TOOL_SURFACES
+        .iter()
+        .find(|surface| surface.route == CLUSTER_NETWORK_PING_ROUTE)
+        .expect("cluster network ping tool surface");
+    assert_eq!(ping.category, CLUSTER_NETWORK_RPC_CATEGORY);
+    assert_eq!(ping.operation, CLUSTER_NETWORK_PING_CAPABILITY);
+    assert_eq!(
+        ping.auth.as_scope(),
         NetworkModuleRouteAuth::LocalOrClusterMember.as_scope()
     );
 
@@ -4040,6 +4060,67 @@ fn cluster_connectivity_identity_mismatch_bypasses_transient_failure_grace() {
     assert_eq!(
         (mismatch.expires_at - mismatch.observed_at).whole_seconds(),
         CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS
+    );
+}
+
+#[test]
+fn cluster_connectivity_startup_failure_stays_degraded_after_failure_budget() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_connectivity_startup_failure").expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_connectivity_startup_failure_local").expect("local node");
+    let target =
+        NodeId::from_legacy_named("node_connectivity_startup_failure_target").expect("target node");
+    let endpoint = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_connectivity_startup_failure")
+            .expect("endpoint"),
+        node_id: target,
+        transport: ClusterTransportKind::LanTcp,
+        address: "10.0.0.93:21353".to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 0,
+        last_observed_latency_ms: None,
+    };
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "connectivity startup failure",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+    let previous = cluster_connectivity_record_for_probe_outcome(
+        &state, &endpoint, None, false, 0, "previous", now,
+    );
+    let previous = cluster_connectivity_record_for_probe_outcome(
+        &state,
+        &endpoint,
+        Some(&previous),
+        false,
+        0,
+        "previous",
+        now,
+    );
+
+    let startup_failure = cluster_connectivity_record_for_startup_probe_failure(
+        &state,
+        &endpoint,
+        Some(&previous),
+        0,
+        "startup",
+        now,
+    );
+
+    assert_eq!(startup_failure.state, ClusterConnectivityState::Degraded);
+    assert_eq!(
+        startup_failure.consecutive_failures,
+        CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD - 1
+    );
+    assert_eq!(
+        (startup_failure.expires_at - startup_failure.observed_at).whole_seconds(),
+        CLUSTER_CONNECTIVITY_TTL_SECONDS
     );
 }
 
@@ -18606,14 +18687,15 @@ fn async_connectivity_quorum_sync_terminates_when_local_kv_lags_forwarded_commit
         "response snapshot should hold the published record"
     );
 
-    // Pathological voter that acknowledges commits without applying them: the
-    // loop must fail loudly instead of spinning inside the maintenance tick.
+    // A stale response snapshot can still be returned after the commit was accepted
+    // by the quorum path. The publisher should stop retrying the identical batch and
+    // let the next maintenance cycle refresh from KV instead of wedging the tick.
     let mut stale_host = ForwardingOnlyConnectivityPublishAsyncHost {
         voter_store: InProcessKvStore::new(),
         commits: 0,
         apply_commits: false,
     };
-    let error = runtime
+    let stale_result = runtime
         .block_on(sync_cluster_connectivity_records_to_quorum_async_with_host(
             runtime.handle(),
             &paths,
@@ -18621,15 +18703,12 @@ fn async_connectivity_quorum_sync_terminates_when_local_kv_lags_forwarded_commit
             vec![record],
             &mut stale_host,
         ))
-        .expect_err("no-progress sync must error out, not spin");
+        .expect("stale response snapshot should not wedge connectivity sync");
     assert_eq!(
         stale_host.commits, 1,
-        "no-progress must be detected on the iteration after the first commit"
+        "stale response progress must be detected on the iteration after the first commit"
     );
-    assert!(
-        error.to_string().contains("no progress"),
-        "error should name the no-progress condition: {error}"
-    );
+    assert!(stale_result.is_some());
 }
 
 #[test]

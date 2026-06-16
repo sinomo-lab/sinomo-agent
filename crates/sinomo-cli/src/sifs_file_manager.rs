@@ -5,11 +5,12 @@ use crate::file_manager::{
 };
 use sinomo_runtime::core::ClusterEndpointRecord;
 use sinomo_runtime::dfs::{
-    DfsControlPlaneKvClient, DfsEndpointTransport, DfsMetadataJournalBatchSender,
-    DfsMetadataJournalReplicationOptions, DfsMetadataPeerTransportError, DfsMetadataShardConfig,
-    DfsMetadataSnapshotInstallSender, DfsNodeAdvertisement, DfsObjectKind, DfsPeerTransportError,
-    DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsProtocolFrameSender, DfsWriteOptions,
-    LocalContentStore, NetworkedDfsService, content_services_prefix, default_dfs_metadata_root,
+    AsyncDfsProtocolFrameSender, DfsControlPlaneKvClient, DfsEndpointTransport,
+    DfsMetadataJournalBatchSender, DfsMetadataJournalReplicationOptions,
+    DfsMetadataPeerTransportError, DfsMetadataShardConfig, DfsMetadataSnapshotInstallSender,
+    DfsNodeAdvertisement, DfsObjectKind, DfsPeerTransportError, DfsProtocolFrameCommand,
+    DfsProtocolFrameResponse, DfsProtocolFrameSender, DfsWriteOptions, LocalContentStore,
+    NetworkedDfsService, content_services_prefix, default_dfs_metadata_root,
     default_dfs_metadata_shards_root, fallback_dfs_node_id, metadata_shards_prefix,
     open_local_sharded_metadata_backend, open_root_local_metadata_backend,
     publish_cluster_dfs_metadata_journal, sifs_file_system_id,
@@ -24,28 +25,45 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug)]
 pub(crate) struct SifsFileManagerBackend {
     data_dir: SinomoDataDir,
+    _rpc_runtime: SifsRpcRuntime,
     service: Mutex<NetworkedDfsService<DfsEndpointTransport>>,
     replica_candidates: Vec<NodeId>,
 }
 
+#[derive(Debug)]
+pub(crate) struct SifsParallelReadPool {
+    workers: Vec<SifsFileManagerBackend>,
+}
+
 impl SifsFileManagerBackend {
     pub(crate) fn open(data_dir: &SinomoDataDir) -> Result<Self, String> {
-        let service = open_sifs_service(data_dir)?;
-        Self::from_service(data_dir, service)
+        let rpc_runtime = SifsRpcRuntime::new()?;
+        let service = open_sifs_service(data_dir, &rpc_runtime)?;
+        Self::from_service(data_dir, rpc_runtime, service)
     }
 
     pub(crate) fn open_read_only(data_dir: &SinomoDataDir) -> Result<Self, String> {
-        let service = open_sifs_service_read_only(data_dir)?;
-        Self::from_service(data_dir, service)
+        let rpc_runtime = SifsRpcRuntime::new()?;
+        Self::open_read_only_with_runtime(data_dir, rpc_runtime)
+    }
+
+    fn open_read_only_with_runtime(
+        data_dir: &SinomoDataDir,
+        rpc_runtime: SifsRpcRuntime,
+    ) -> Result<Self, String> {
+        let service = open_sifs_service_read_only(data_dir, &rpc_runtime)?;
+        Self::from_service(data_dir, rpc_runtime, service)
     }
 
     fn from_service(
         data_dir: &SinomoDataDir,
+        rpc_runtime: SifsRpcRuntime,
         service: NetworkedDfsService<DfsEndpointTransport>,
     ) -> Result<Self, String> {
         let replica_candidates = sifs_replica_candidates(data_dir, service.node_id());
         Ok(Self {
             data_dir: data_dir.clone(),
+            _rpc_runtime: rpc_runtime,
             service: Mutex::new(service),
             replica_candidates,
         })
@@ -76,6 +94,70 @@ impl SifsFileManagerBackend {
         service
             .posix_read_file_distributed(&path)
             .map_err(|error| format!("cannot read SIFS file {path}: {error}"))
+    }
+
+    pub(crate) fn read_files(&self, paths: &[String]) -> Vec<Result<Vec<u8>, String>> {
+        let mut normalized = Vec::with_capacity(paths.len());
+        let mut results = (0..paths.len()).map(|_| None).collect::<Vec<_>>();
+        for (index, path) in paths.iter().enumerate() {
+            match normalize_sifs_path(path) {
+                Ok(path) => normalized.push((index, path)),
+                Err(error) => results[index] = Some(Err(error)),
+            }
+        }
+        if !normalized.is_empty() {
+            match self.lock_service() {
+                Ok(mut service) => {
+                    let read_paths = normalized
+                        .iter()
+                        .map(|(_, path)| path.clone())
+                        .collect::<Vec<_>>();
+                    for ((index, path), result) in normalized
+                        .into_iter()
+                        .zip(service.posix_read_files_distributed(&read_paths))
+                    {
+                        results[index] = Some(
+                            result
+                                .map_err(|error| format!("cannot read SIFS file {path}: {error}")),
+                        );
+                    }
+                }
+                Err(error) => {
+                    for (index, path) in normalized {
+                        results[index] =
+                            Some(Err(format!("cannot read SIFS file {path}: {error}")));
+                    }
+                }
+            }
+        }
+        results
+            .into_iter()
+            .enumerate()
+            .map(|(index, result)| {
+                result.unwrap_or_else(|| {
+                    Err(format!(
+                        "cannot read SIFS file {}: batch read did not report a result",
+                        paths[index]
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn open_parallel_read_pool(
+        &self,
+        requested_workers: usize,
+    ) -> Result<SifsParallelReadPool, String> {
+        let worker_count = sifs_parallel_read_worker_count(requested_workers);
+        let rpc_runtime = SifsRpcRuntime::new()?;
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            workers.push(Self::open_read_only_with_runtime(
+                &self.data_dir,
+                rpc_runtime.clone(),
+            )?);
+        }
+        Ok(SifsParallelReadPool { workers })
     }
 
     pub(crate) fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
@@ -116,24 +198,27 @@ impl SifsFileManagerBackend {
             .map(|(path, bytes)| normalize_sifs_path(path).map(|path| (path, bytes.as_slice())))
             .collect::<Result<Vec<_>, _>>()?;
         let mut service = self.lock_service()?;
-        let options = sifs_write_options(&service, &self.replica_candidates);
         let mut created_dirs = BTreeSet::new();
-        for (path, bytes) in normalized {
+        for (path, _) in &normalized {
             if let Some(parent) = parent_sifs_path(&path)
                 && created_dirs.insert(parent.clone())
             {
                 service
-                    .posix_mkdir_all(&parent)
+                    .posix_mkdir_all_without_local_replay(&parent)
                     .map_err(|error| format!("cannot create SIFS directory {parent}: {error}"))?;
             }
-            service
-                .posix_write_file_with_known_parent(&path, bytes, options.clone())
-                .map(|_| ())
-                .map_err(|error| format!("cannot write SIFS file {path}: {error}"))?;
         }
+        service
+            .posix_write_files_local_eventual_with_known_parents(
+                normalized
+                    .iter()
+                    .map(|(path, bytes)| (path.as_str(), *bytes)),
+            )
+            .map(|_| ())
+            .map_err(|error| format!("cannot write SIFS bulk batch: {error}"))?;
         for parent in created_dirs {
             service
-                .posix_touch_directory_modified(&parent)
+                .posix_touch_directory_modified_without_local_replay(&parent)
                 .map_err(|error| format!("cannot touch SIFS directory {parent}: {error}"))?;
         }
         Ok(())
@@ -157,6 +242,68 @@ impl SifsFileManagerBackend {
         drop(service);
         self.publish_metadata_after_mutation();
         Ok(())
+    }
+
+    pub(crate) fn create_dir_all_deferred_local_replay(&self, path: &str) -> Result<(), String> {
+        let path = normalize_sifs_path(path)?;
+        let mut service = self.lock_service()?;
+        service
+            .posix_mkdir_all_without_local_replay(&path)
+            .map_err(|error| format!("cannot create SIFS directory {path}: {error}"))
+    }
+}
+
+impl SifsParallelReadPool {
+    pub(crate) fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
+    pub(crate) fn read_files(&self, paths: &[String]) -> Vec<Result<Vec<u8>, String>> {
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        if self.workers.is_empty() {
+            return paths
+                .iter()
+                .map(|path| Err(format!("cannot read SIFS file {path}: no read workers")))
+                .collect();
+        }
+        if paths.len() > 1 {
+            return self.workers[0].read_files(paths);
+        }
+        let results = Arc::new(Mutex::new(
+            (0..paths.len()).map(|_| None).collect::<Vec<_>>(),
+        ));
+        let worker_count = self.workers.len();
+        std::thread::scope(|scope| {
+            for (worker_index, worker) in self.workers.iter().enumerate() {
+                let results = Arc::clone(&results);
+                scope.spawn(move || {
+                    for index in (worker_index..paths.len()).step_by(worker_count) {
+                        let result = worker.read_file(&paths[index]);
+                        if let Ok(mut results) = results.lock() {
+                            results[index] = Some(result);
+                        }
+                    }
+                });
+            }
+        });
+        let mut results = results
+            .lock()
+            .map(|mut results| std::mem::take(&mut *results))
+            .unwrap_or_default();
+        results
+            .drain(..)
+            .enumerate()
+            .map(|(index, result)| {
+                result.unwrap_or_else(|| {
+                    Err(format!(
+                        "cannot read SIFS file {}: read worker did not report a result",
+                        paths[index]
+                    ))
+                })
+            })
+            .collect()
     }
 }
 
@@ -346,20 +493,73 @@ impl FileManagerBackend for SifsFileManagerBackend {
     }
 }
 
+#[derive(Clone)]
+struct SifsRpcRuntime {
+    runtime: Arc<tokio::runtime::Runtime>,
+}
+
+impl std::fmt::Debug for SifsRpcRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SifsRpcRuntime")
+    }
+}
+
+impl SifsRpcRuntime {
+    fn new() -> Result<Self, String> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(sifs_rpc_runtime_worker_threads())
+            .thread_name("sinomo-sifs-rpc")
+            .enable_all()
+            .build()
+            .map_err(|error| format!("cannot create SIFS RPC runtime: {error}"))?;
+        Ok(Self {
+            runtime: Arc::new(runtime),
+        })
+    }
+}
+
+fn sifs_rpc_runtime_worker_threads() -> usize {
+    const DEFAULT_WORKERS: usize = 16;
+    const MAX_WORKERS: usize = 64;
+    std::env::var("SINOMO_SIFS_RPC_WORKER_THREADS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_WORKERS)
+        .clamp(1, MAX_WORKERS)
+}
+
+fn sifs_parallel_read_worker_count(requested_workers: usize) -> usize {
+    const DEFAULT_WORKERS: usize = 32;
+    const MAX_WORKERS: usize = 64;
+    if requested_workers == 0 {
+        return 1;
+    }
+    let configured = std::env::var("SINOMO_SIFS_PARALLEL_READ_WORKERS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_WORKERS);
+    configured.min(requested_workers).clamp(1, MAX_WORKERS)
+}
+
 fn open_sifs_service(
     data_dir: &SinomoDataDir,
+    rpc_runtime: &SifsRpcRuntime,
 ) -> Result<NetworkedDfsService<DfsEndpointTransport>, String> {
-    open_sifs_service_with_hydration(data_dir, true)
+    open_sifs_service_with_hydration(data_dir, rpc_runtime, true)
 }
 
 fn open_sifs_service_read_only(
     data_dir: &SinomoDataDir,
+    rpc_runtime: &SifsRpcRuntime,
 ) -> Result<NetworkedDfsService<DfsEndpointTransport>, String> {
-    open_sifs_service_with_hydration(data_dir, false)
+    open_sifs_service_with_hydration(data_dir, rpc_runtime, false)
 }
 
 fn open_sifs_service_with_hydration(
     data_dir: &SinomoDataDir,
+    rpc_runtime: &SifsRpcRuntime,
     hydrate_metadata: bool,
 ) -> Result<NetworkedDfsService<DfsEndpointTransport>, String> {
     data_dir
@@ -377,7 +577,12 @@ fn open_sifs_service_with_hydration(
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
         .map_err(|error| format!("cannot open DFS content store: {error}"))?;
     let mut service = NetworkedDfsService::new(
-        DfsEndpointTransport::new(local_node_id, endpoints, sifs_protocol_frame_sender()),
+        DfsEndpointTransport::new_with_senders(
+            local_node_id,
+            endpoints,
+            sifs_protocol_frame_sender(rpc_runtime.clone()),
+            async_sifs_protocol_frame_sender(rpc_runtime.clone()),
+        ),
         content,
     );
     if cluster_paths.state.exists() {
@@ -582,20 +787,61 @@ fn sifs_replica_candidate_rank(
     (3, u64::MAX, node_id.to_string())
 }
 
-fn sifs_protocol_frame_sender() -> DfsProtocolFrameSender {
-    Arc::new(sifs_send_dfs_protocol_frame)
+fn sifs_protocol_frame_sender(rpc_runtime: SifsRpcRuntime) -> DfsProtocolFrameSender {
+    Arc::new(move |endpoint, command, timeout| {
+        sifs_send_dfs_protocol_frame(&rpc_runtime, endpoint, command, timeout)
+    })
+}
+
+fn async_sifs_protocol_frame_sender(rpc_runtime: SifsRpcRuntime) -> AsyncDfsProtocolFrameSender {
+    Arc::new(move |endpoint, command, timeout| {
+        let handle = rpc_runtime.runtime.handle().clone();
+        Box::pin(async move {
+            sinomo_runtime::daemon::send_dfs_protocol_frame_to_endpoint_async(
+                endpoint, command, timeout, &handle,
+            )
+            .await
+            .map_err(|error| DfsPeerTransportError::new(error.to_string()))
+        })
+    })
 }
 
 fn sifs_send_dfs_protocol_frame(
+    rpc_runtime: &SifsRpcRuntime,
     endpoint: &ClusterEndpointRecord,
     command: &DfsProtocolFrameCommand,
     timeout: std::time::Duration,
 ) -> Result<DfsProtocolFrameResponse, DfsPeerTransportError> {
-    let request = sinomo_runtime::dfs::dfs_protocol_frame_rpc_request(command)
-        .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
-    let response = sinomo_runtime::daemon::send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
-        .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
-    sinomo_runtime::dfs::decode_dfs_protocol_frame_rpc_response(&response)
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if matches!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            return tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    sinomo_runtime::daemon::send_dfs_protocol_frame_to_endpoint_async(
+                        endpoint, command, timeout, &handle,
+                    )
+                    .await
+                    .map_err(|error| DfsPeerTransportError::new(error.to_string()))
+                })
+            });
+        }
+        return Err(DfsPeerTransportError::new(
+            "SIFS protocol frame sync sender cannot run inside a current-thread Tokio runtime",
+        ));
+    }
+    rpc_runtime
+        .runtime
+        .block_on(async {
+            sinomo_runtime::daemon::send_dfs_protocol_frame_to_endpoint_async(
+                endpoint,
+                command,
+                timeout,
+                rpc_runtime.runtime.handle(),
+            )
+            .await
+        })
         .map_err(|error| DfsPeerTransportError::new(error.to_string()))
 }
 

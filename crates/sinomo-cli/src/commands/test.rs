@@ -232,6 +232,7 @@ pub(crate) fn run_test_command(command: TestCliCommand) -> Result<(), CliError> 
 
 fn test_registry() -> Result<SinomoTestRegistry, CliError> {
     let builder = sinomo_lm::register_lm_test_cases(SinomoTestRegistry::builder());
+    let builder = crate::commands::test_cases_network::register_network_cluster_test_cases(builder);
     let builder = crate::commands::test_cases_dfs::register_dfs_cluster_test_cases(builder);
     builder.try_build().map_err(|source| CliError::Parse {
         detail: source.to_string(),
@@ -444,6 +445,7 @@ mod tests {
             .map(|case| case.id)
             .collect();
         for id in [
+            "cluster.network.ping-benchmark",
             "cluster.dfs.read-your-write",
             "cluster.dfs.invariants",
             "cluster.dfs.write",

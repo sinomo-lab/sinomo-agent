@@ -685,22 +685,17 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
                 timeouts,
             )
             .await;
-            let connectivity_state = if result.is_ok() {
-                sinomo_network::ClusterConnectivityState::Healthy
-            } else {
-                sinomo_network::ClusterConnectivityState::Unreachable
-            };
-            let latency_ms = result
-                .as_ref()
-                .ok()
-                .map(|_| daemon_rpc_elapsed_latency_ms(started));
-            remember_endpoint_command_connectivity_from_env_async(
-                runtime,
-                endpoint.clone(),
-                connectivity_state,
-                latency_ms,
-            )
-            .await;
+            if let Some((connectivity_state, latency_ms)) =
+                daemon_rpc_connectivity_observation(result.as_ref(), started)
+            {
+                remember_endpoint_command_connectivity_from_env_async(
+                    runtime,
+                    endpoint.clone(),
+                    connectivity_state,
+                    latency_ms,
+                )
+                .await;
+            }
             result
         })
     }
@@ -774,24 +769,35 @@ impl sinomo_network::ClusterSignedRelayRpcAsyncHost for DaemonSignedEndpointRpcA
                 timeouts,
             )
             .await;
-            let connectivity_state = if result.is_ok() {
-                sinomo_network::ClusterConnectivityState::Healthy
-            } else {
-                sinomo_network::ClusterConnectivityState::Unreachable
-            };
-            let latency_ms = result
-                .as_ref()
-                .ok()
-                .map(|_| daemon_rpc_elapsed_latency_ms(started));
-            remember_endpoint_command_connectivity_from_env_async(
-                runtime,
-                endpoint.clone(),
-                connectivity_state,
-                latency_ms,
-            )
-            .await;
+            if let Some((connectivity_state, latency_ms)) =
+                daemon_rpc_connectivity_observation(result.as_ref(), started)
+            {
+                remember_endpoint_command_connectivity_from_env_async(
+                    runtime,
+                    endpoint.clone(),
+                    connectivity_state,
+                    latency_ms,
+                )
+                .await;
+            }
             result
         })
+    }
+}
+
+fn daemon_rpc_connectivity_observation(
+    result: Result<&sinomo_network::ObjectRpcResponse, &sinomo_network::NetworkError>,
+    started: Instant,
+) -> Option<(sinomo_network::ClusterConnectivityState, Option<u64>)> {
+    match result {
+        Ok(_) => Some((
+            sinomo_network::ClusterConnectivityState::Healthy,
+            Some(daemon_rpc_elapsed_latency_ms(started)),
+        )),
+        Err(sinomo_network::NetworkError::Io { .. }) => {
+            Some((sinomo_network::ClusterConnectivityState::Degraded, None))
+        }
+        Err(_) => None,
     }
 }
 
@@ -839,6 +845,11 @@ fn daemon_client_network_error(
     error: DaemonError,
 ) -> sinomo_network::NetworkError {
     match error {
+        DaemonError::AuthDenied => sinomo_network::NetworkError::AuthDenied,
+        DaemonError::AuthExpired => sinomo_network::NetworkError::AuthExpired,
+        DaemonError::ClusterReadOnly { detail } => {
+            sinomo_network::NetworkError::ClusterReadOnly { detail }
+        }
         DaemonError::Network { address, detail } => sinomo_network::NetworkError::Io {
             operation: format!("{operation} {address}"),
             detail,
@@ -1220,6 +1231,20 @@ pub(crate) fn fetch_cluster_kv_snapshot_from_endpoint_on_runtime(
         &rpc_request,
         timeout,
         runtime,
+        decode_cluster_kv_snapshot_rpc_response,
+    )
+}
+
+pub(crate) fn fetch_cluster_kv_snapshot_from_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    timeout: Duration,
+) -> Result<KvSnapshot, DaemonError> {
+    let rpc_request =
+        object_rpc_request_from_kv_payload(sinomo_kv::cluster_kv_snapshot_rpc_payload()?);
+    send_daemon_rpc_request_to_endpoint_with_decoder(
+        endpoint,
+        &rpc_request,
+        timeout,
         decode_cluster_kv_snapshot_rpc_response,
     )
 }
@@ -1773,5 +1798,62 @@ mod tests {
             deadline.checked_remaining_policy(DaemonRpcTimeouts::none()),
             Some(DaemonRpcTimeouts::none())
         );
+    }
+
+    #[test]
+    fn daemon_rpc_connectivity_observation_ignores_non_transport_errors() {
+        let response = ObjectRpcResponse::encode_body(sinomo_network::DAEMON_STATUS_ROUTE, &())
+            .expect("response");
+        let started = Instant::now() - Duration::from_millis(5);
+
+        let healthy = super::daemon_rpc_connectivity_observation(Ok(&response), started)
+            .expect("healthy observation");
+        assert_eq!(healthy.0, sinomo_network::ClusterConnectivityState::Healthy);
+        assert!(healthy.1.is_some());
+
+        let io_error = sinomo_network::NetworkError::Io {
+            operation: "read".to_string(),
+            detail: "timed out".to_string(),
+        };
+        let degraded = super::daemon_rpc_connectivity_observation(Err(&io_error), Instant::now())
+            .expect("transport failure observation");
+        assert_eq!(
+            degraded,
+            (sinomo_network::ClusterConnectivityState::Degraded, None)
+        );
+
+        assert_eq!(
+            super::daemon_rpc_connectivity_observation(
+                Err(&sinomo_network::NetworkError::AuthDenied),
+                Instant::now()
+            ),
+            None
+        );
+        assert_eq!(
+            super::daemon_rpc_connectivity_observation(
+                Err(&sinomo_network::NetworkError::ClusterReadOnly {
+                    detail: "quorum unavailable".to_string(),
+                }),
+                Instant::now()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn daemon_client_network_error_preserves_auth_classification() {
+        assert!(matches!(
+            super::daemon_client_network_error("cluster endpoint", crate::DaemonError::AuthDenied),
+            sinomo_network::NetworkError::AuthDenied
+        ));
+        assert!(matches!(
+            super::daemon_client_network_error(
+                "cluster endpoint",
+                crate::DaemonError::ClusterReadOnly {
+                    detail: "quorum unavailable".to_string(),
+                },
+            ),
+            sinomo_network::NetworkError::ClusterReadOnly { .. }
+        ));
     }
 }

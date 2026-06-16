@@ -997,7 +997,10 @@ fn cli_local_cluster_quorum_if_relevant(
     }
     let paths = cluster_paths_from_defaults()?;
     match read_cluster_state(&paths) {
-        Ok(state) => Ok(Some(cluster_has_local_quorum(&paths, &state))),
+        Ok(state) => Ok(Some(
+            daemon.is_some_and(|daemon| local_daemon_can_serve_cluster_kv_snapshot(daemon, &state))
+                || cluster_has_local_quorum(&paths, &state),
+        )),
         Err(CliError::ClusterOrphan) => Ok(None),
         Err(error) => Err(error),
     }

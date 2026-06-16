@@ -1,7 +1,8 @@
 use crate::prelude::*;
 use crate::rpc::{
     CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_HEALTH_SCOPE_LOCAL,
-    CLUSTER_HEALTH_SCOPE_METADATA_KEY, ObjectRpcRequest, ObjectRpcResponse,
+    CLUSTER_HEALTH_SCOPE_METADATA_KEY, CLUSTER_NETWORK_PING_ROUTE, CLUSTER_NETWORK_RPC_CATEGORY,
+    ObjectRpcRequest, ObjectRpcResponse,
 };
 use crate::storage::{
     ClusterMembershipRpcFuture, DAEMON_MAIN_CLUSTER_ROLE, DAEMON_MAIN_RUN_CAPABILITY,
@@ -24,8 +25,38 @@ pub struct ClusterHealthRow {
     pub availability: ClusterNodeAvailability,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterNetworkPingRequest {
+    pub nonce: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterNetworkPingResponse {
+    pub nonce: String,
+    pub responder_node_id: NodeId,
+    pub payload_bytes: usize,
+    #[serde(with = "time::serde::rfc3339")]
+    pub observed_at: OffsetDateTime,
+}
+
 pub fn cluster_health_rpc_request() -> Result<ObjectRpcRequest, NetworkError> {
     ObjectRpcRequest::encode_body(CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, &())
+}
+
+pub fn cluster_network_ping_rpc_request(
+    nonce: impl Into<String>,
+    payload_bytes: usize,
+) -> Result<ObjectRpcRequest, NetworkError> {
+    ObjectRpcRequest::encode_body(
+        CLUSTER_NETWORK_PING_ROUTE,
+        CLUSTER_NETWORK_RPC_CATEGORY,
+        &ClusterNetworkPingRequest {
+            nonce: nonce.into(),
+            payload: vec![0_u8; payload_bytes],
+        },
+    )
 }
 
 pub fn cluster_local_health_rpc_request() -> Result<ObjectRpcRequest, NetworkError> {
@@ -50,6 +81,12 @@ pub fn decode_cluster_health_rpc_response(
     response.decode_body()
 }
 
+pub fn decode_cluster_network_ping_rpc_response(
+    response: &ObjectRpcResponse,
+) -> Result<ClusterNetworkPingResponse, NetworkError> {
+    response.decode_body()
+}
+
 pub fn handle_cluster_health_rpc_request<P: ClusterStatusProbe + ?Sized>(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -68,6 +105,9 @@ pub fn handle_cluster_health_rpc_request<P: ClusterStatusProbe + ?Sized>(
                 observed_at,
             )?;
             ObjectRpcResponse::encode_body(CLUSTER_HEALTH_ROUTE, &rows)
+        }
+        CLUSTER_NETWORK_PING_ROUTE => {
+            handle_cluster_network_ping_rpc_request(state, request, observed_at)
         }
         other => Err(NetworkError::UnknownRoute {
             route: other.to_string(),
@@ -105,6 +145,9 @@ pub async fn handle_cluster_health_rpc_request_async<P: ClusterStatusAsyncProbe 
             .await?;
             ObjectRpcResponse::encode_body(CLUSTER_HEALTH_ROUTE, &rows)
         }
+        CLUSTER_NETWORK_PING_ROUTE => {
+            handle_cluster_network_ping_rpc_request(state, request, observed_at)
+        }
         other => Err(NetworkError::UnknownRoute {
             route: other.to_string(),
         }),
@@ -122,6 +165,36 @@ pub async fn handle_current_cluster_health_rpc_request_async<
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let state = read_cluster_state_async(runtime, paths).await?;
     handle_cluster_health_rpc_request_async(paths, &state, probe, request, observed_at).await
+}
+
+pub fn handle_cluster_network_ping_rpc_request(
+    state: &ClusterBootstrapState,
+    request: ObjectRpcRequest,
+    observed_at: OffsetDateTime,
+) -> Result<ObjectRpcResponse, NetworkError> {
+    handle_cluster_network_ping_rpc_request_for_node(&state.local_node_id, request, observed_at)
+}
+
+pub fn handle_cluster_network_ping_rpc_request_for_node(
+    responder_node_id: &NodeId,
+    request: ObjectRpcRequest,
+    observed_at: OffsetDateTime,
+) -> Result<ObjectRpcResponse, NetworkError> {
+    match request.route.as_str() {
+        CLUSTER_NETWORK_PING_ROUTE => {
+            let request: ClusterNetworkPingRequest = request.decode_body()?;
+            let response = ClusterNetworkPingResponse {
+                nonce: request.nonce,
+                responder_node_id: responder_node_id.clone(),
+                payload_bytes: request.payload.len(),
+                observed_at,
+            };
+            ObjectRpcResponse::encode_body(CLUSTER_NETWORK_PING_ROUTE, &response)
+        }
+        other => Err(NetworkError::UnknownRoute {
+            route: other.to_string(),
+        }),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

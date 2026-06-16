@@ -158,6 +158,7 @@ struct ClusterConnectivityProbePlan {
     entries: Vec<sinomo_network::ClusterConnectivityProbeBatchEntry>,
     timestamp: String,
     now: time::OffsetDateTime,
+    startup_settle_active: bool,
 }
 
 pub(crate) struct ClusterConnectivityPendingProbe {
@@ -2353,6 +2354,7 @@ impl ClusterNetworkMaintenance {
             plan.entries.clone(),
             plan.timestamp.clone(),
             plan.now,
+            plan.startup_settle_active,
         )
         .await;
         self.apply_connectivity_probe_plan(plan, probed)
@@ -2388,6 +2390,7 @@ impl ClusterNetworkMaintenance {
             entries: batch.entries,
             timestamp,
             now,
+            startup_settle_active,
         }
     }
 
@@ -2409,6 +2412,7 @@ async fn probe_connectivity_batch_async(
     entries: Vec<sinomo_network::ClusterConnectivityProbeBatchEntry>,
     timestamp: String,
     now: time::OffsetDateTime,
+    startup_settle_active: bool,
 ) -> Vec<(String, ClusterConnectivityRecord)> {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(
         CLUSTER_CONNECTIVITY_PROBE_CONCURRENCY,
@@ -2430,7 +2434,13 @@ async fn probe_connectivity_batch_async(
             .await;
             let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
             connectivity_record_for_daemon_status_probe(
-                &state, entry, result, latency_ms, &timestamp, now,
+                &state,
+                entry,
+                result,
+                latency_ms,
+                &timestamp,
+                now,
+                startup_settle_active,
             )
         }));
     }
@@ -2451,6 +2461,7 @@ fn connectivity_record_for_daemon_status_probe(
     latency_ms: u64,
     timestamp: &str,
     now: time::OffsetDateTime,
+    startup_settle_active: bool,
 ) -> (String, ClusterConnectivityRecord) {
     let record = match &result {
         Ok(status) if daemon_cluster_status_matches(state, &entry.endpoint, status) => {
@@ -2479,6 +2490,15 @@ fn connectivity_record_for_daemon_status_probe(
                     timestamp,
                     now,
                 )
+            } else if startup_settle_active {
+                sinomo_network::cluster_connectivity_record_for_startup_probe_failure(
+                    state,
+                    &entry.endpoint,
+                    entry.previous.as_ref(),
+                    latency_ms,
+                    timestamp,
+                    now,
+                )
             } else {
                 sinomo_network::cluster_connectivity_record_for_probe_outcome(
                     state,
@@ -2490,6 +2510,16 @@ fn connectivity_record_for_daemon_status_probe(
                     now,
                 )
             }
+        }
+        Err(_) if startup_settle_active => {
+            sinomo_network::cluster_connectivity_record_for_startup_probe_failure(
+                state,
+                &entry.endpoint,
+                entry.previous.as_ref(),
+                latency_ms,
+                timestamp,
+                now,
+            )
         }
         Err(_) => sinomo_network::cluster_connectivity_record_for_probe_outcome(
             state,
@@ -3045,10 +3075,17 @@ async fn probe_member_daemon_status_async(
             );
             continue;
         };
-        if cluster.cluster_id != state.cluster_id || cluster.node_id != member.node_id {
+        let cluster_id_matches =
+            cluster.cluster_id == state.cluster_id || cluster.cluster_id == member.cluster_id;
+        if !cluster_id_matches || cluster.node_id != member.node_id {
             eprintln!(
-                "sinomo daemon cluster health probe of {} via {}: identity mismatch (responder {})",
-                member.node_id, endpoint.address, cluster.node_id
+                "sinomo daemon cluster health probe of {} via {}: identity mismatch (expected cluster {} or member cluster {}, responder cluster {} node {})",
+                member.node_id,
+                endpoint.address,
+                state.cluster_id,
+                member.cluster_id,
+                cluster.cluster_id,
+                cluster.node_id
             );
             continue;
         }
@@ -4579,7 +4616,7 @@ pub(crate) async fn handle_daemon_cluster_relay_request_on_runtime(
     let state_paths = cluster_paths.clone();
     let state_path = state_paths.root.display().to_string();
     let state = runtime
-        .spawn_blocking(move || sinomo_network::read_cluster_state(&state_paths))
+        .spawn_blocking(move || sinomo_network::read_cluster_state_cached(&state_paths))
         .await
         .map_err(|source| DaemonError::Io {
             path: state_path,
@@ -4625,6 +4662,16 @@ impl sinomo_network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost<'_> {
         let target_node_id = envelope.target_node_id.clone();
         let envelope = envelope.clone();
         Box::pin(async move {
+            if target_node_id == relay_local_node_id(&paths, &state) {
+                return crate::control::dispatch_daemon_control_request_in_process_async(
+                    paths,
+                    runtime,
+                    envelope.inner,
+                )
+                .await
+                .map(Some)
+                .map_err(|error| daemon_host_network_error("cluster relay local delivery", error));
+            }
             let delivery = tokio::task::spawn_blocking(move || {
                 relay_local_delivery_target(&paths, &state, &target_node_id)
             })
@@ -4685,35 +4732,23 @@ impl sinomo_network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost<'_> {
         let endpoint = endpoint.clone();
         let request = request.clone();
         Box::pin(async move {
-            let started = Instant::now();
             let result =
                 send_cluster_relay_request_to_next_hop_async(&endpoint, &request, timeouts)
                     .await
                     .map_err(|error| daemon_host_network_error("cluster relay", error));
-            let connectivity_state = if result.is_ok() {
-                sinomo_network::ClusterConnectivityState::Healthy
-            } else {
-                sinomo_network::ClusterConnectivityState::Unreachable
-            };
-            let latency_ms = result
-                .as_ref()
-                .ok()
-                .map(|_| daemon_cluster_elapsed_latency_ms(started));
-            remember_relay_endpoint_command_connectivity_async(
-                paths,
-                runtime,
-                endpoint,
-                connectivity_state,
-                latency_ms,
-            )
-            .await;
+            if matches!(result, Err(sinomo_network::NetworkError::Io { .. })) {
+                remember_relay_endpoint_command_connectivity_async(
+                    paths,
+                    runtime,
+                    endpoint,
+                    sinomo_network::ClusterConnectivityState::Degraded,
+                    None,
+                )
+                .await;
+            }
             result
         })
     }
-}
-
-fn daemon_cluster_elapsed_latency_ms(started: Instant) -> u64 {
-    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 async fn remember_relay_endpoint_command_connectivity_async(
@@ -4815,9 +4850,20 @@ fn relay_local_delivery_target(
 }
 
 fn daemon_host_network_error(operation: &str, error: DaemonError) -> sinomo_network::NetworkError {
-    sinomo_network::NetworkError::Io {
-        operation: operation.to_string(),
-        detail: error.to_string(),
+    match error {
+        DaemonError::AuthDenied => sinomo_network::NetworkError::AuthDenied,
+        DaemonError::AuthExpired => sinomo_network::NetworkError::AuthExpired,
+        DaemonError::ClusterReadOnly { detail } => {
+            sinomo_network::NetworkError::ClusterReadOnly { detail }
+        }
+        DaemonError::Network { address, detail } => sinomo_network::NetworkError::Io {
+            operation: format!("{operation} {address}"),
+            detail,
+        },
+        other => sinomo_network::NetworkError::Io {
+            operation: operation.to_string(),
+            detail: other.to_string(),
+        },
     }
 }
 
@@ -4899,6 +4945,37 @@ mod tests {
                 assert_eq!(operation, "daemon cluster runtime");
                 assert!(detail.contains("owner-runtime bridge"));
                 assert!(detail.contains("current-thread Tokio runtime"));
+            }
+            error => panic!("unexpected error: {error}"),
+        }
+    }
+
+    #[test]
+    fn daemon_host_network_error_preserves_auth_classification() {
+        assert!(matches!(
+            daemon_host_network_error("cluster relay", DaemonError::AuthDenied),
+            sinomo_network::NetworkError::AuthDenied
+        ));
+        assert!(matches!(
+            daemon_host_network_error(
+                "cluster relay",
+                DaemonError::ClusterReadOnly {
+                    detail: "quorum unavailable".to_string(),
+                },
+            ),
+            sinomo_network::NetworkError::ClusterReadOnly { .. }
+        ));
+
+        match daemon_host_network_error(
+            "cluster relay",
+            DaemonError::Network {
+                address: "node2:21353".to_string(),
+                detail: "timed out".to_string(),
+            },
+        ) {
+            sinomo_network::NetworkError::Io { operation, detail } => {
+                assert_eq!(operation, "cluster relay node2:21353");
+                assert_eq!(detail, "timed out");
             }
             error => panic!("unexpected error: {error}"),
         }
@@ -8922,6 +8999,7 @@ mod tests {
                     0,
                     &plan.timestamp,
                     plan.now,
+                    false,
                 )
             })
             .collect();

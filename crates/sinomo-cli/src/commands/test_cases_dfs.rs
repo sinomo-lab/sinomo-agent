@@ -14,7 +14,8 @@
 //!   (`--param path=... --param payload=...`); the expect-* probes poll with a
 //!   bounded deadline to absorb cross-node replication lag.
 //! - `cluster.dfs.bulk-write` / `cluster.dfs.bulk-expect` — deterministic bulk
-//!   write/read probes for cluster-level throughput and convergence evidence.
+//!   write/read probes for cluster-level throughput, convergence evidence, and
+//!   steady-state process I/O accounting.
 
 use crate::file_manager::FileManagerBackend;
 use crate::sifs_file_manager::SifsFileManagerBackend;
@@ -23,6 +24,7 @@ use sinomo_runtime::test::{
     SinomoTestContext, SinomoTestError, SinomoTestOutcome, SinomoTestRegistryBuilder,
     SinomoTestRequirement, SinomoTestResult,
 };
+use std::fs;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_EXPECT_TIMEOUT_SECONDS: u64 = 30;
@@ -145,7 +147,7 @@ sinomo_runtime::test::sinomo_test_case! {
 sinomo_runtime::test::sinomo_test_case! {
     pub fn dfs_bulk_expect(ctx) {
         id: "cluster.dfs.bulk-expect",
-        summary: "Poll deterministic SIFS files from this node and report convergence/read throughput (--param base=... [--param files=N] [--param bytes=N])",
+        summary: "Poll deterministic SIFS files from this node and report convergence/read throughput and read-side process I/O (--param base=... [--param files=N] [--param bytes=N])",
         tags: ["cluster-dfs", "probe", "performance"],
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
@@ -408,19 +410,25 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let bytes = optional_usize_parameter(ctx, "bytes", DEFAULT_BULK_FILE_BYTES)?;
     let timeout = expect_timeout(ctx)?;
     let min_files_per_second = optional_f64_parameter(ctx, "min-files-per-second", 0.0)?;
+    let max_proc_wchar_amplification =
+        optional_f64_parameter(ctx, "max-proc-wchar-amplification", 0.0)?;
+    let max_proc_write_bytes_amplification =
+        optional_f64_parameter(ctx, "max-proc-write-bytes-amplification", 0.0)?;
     require_positive("files", files)?;
     require_positive("bytes", bytes)?;
 
     let backend = open_backend(ctx)?;
     let node = backend.node_label();
+    let proc_io_before = current_proc_io();
 
     let started = Instant::now();
     let deadline = started + timeout;
     retry_bulk_mutation(
         deadline,
-        || backend.create_dir_all(&base),
+        || backend.create_dir_all_deferred_local_replay(&base),
         || format!("cannot create SIFS directory {base}"),
     )?;
+    let proc_io_after_mkdir = current_proc_io();
     let batch = (0..files)
         .map(|index| (bulk_path(&base, index), bulk_payload(&base, index, bytes)))
         .collect::<Vec<_>>();
@@ -429,8 +437,22 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         || backend.write_files_deferred_publish(&batch),
         || format!("cannot write SIFS bulk batch under {base}"),
     )?;
+    let proc_io_after_write = current_proc_io();
     backend.publish_metadata_after_mutation();
+    let proc_io_after_publish = current_proc_io();
     let elapsed = started.elapsed();
+    let proc_io_delta = proc_io_before
+        .zip(current_proc_io())
+        .map(|(before, after)| after.saturating_delta(before));
+    let proc_io_mkdir_delta = proc_io_before
+        .zip(proc_io_after_mkdir)
+        .map(|(before, after)| after.saturating_delta(before));
+    let proc_io_write_delta = proc_io_after_mkdir
+        .zip(proc_io_after_write)
+        .map(|(before, after)| after.saturating_delta(before));
+    let proc_io_publish_delta = proc_io_after_write
+        .zip(proc_io_after_publish)
+        .map(|(before, after)| after.saturating_delta(before));
     let elapsed_ms = elapsed.as_millis() as u64;
     let total_bytes = (files as u64).saturating_mul(bytes as u64);
     let files_per_second = rate_per_second(files as f64, elapsed);
@@ -445,6 +467,52 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("files_per_second", files_per_second);
     ctx.record("bytes_per_second", bytes_per_second);
     ctx.record("min_files_per_second", min_files_per_second);
+    ctx.record("max_proc_wchar_amplification", max_proc_wchar_amplification);
+    ctx.record(
+        "max_proc_write_bytes_amplification",
+        max_proc_write_bytes_amplification,
+    );
+    if let Some(proc_io_delta) = proc_io_delta {
+        let proc_wchar_amplification =
+            amplification_ratio(proc_io_delta.wchar, total_bytes).unwrap_or(0.0);
+        let proc_write_bytes_amplification =
+            amplification_ratio(proc_io_delta.write_bytes, total_bytes).unwrap_or(0.0);
+        ctx.record("proc_rchar_delta", proc_io_delta.rchar);
+        ctx.record("proc_wchar_delta", proc_io_delta.wchar);
+        ctx.record("proc_read_bytes_delta", proc_io_delta.read_bytes);
+        ctx.record("proc_write_bytes_delta", proc_io_delta.write_bytes);
+        ctx.record("proc_wchar_amplification", proc_wchar_amplification);
+        ctx.record(
+            "proc_write_bytes_amplification",
+            proc_write_bytes_amplification,
+        );
+        if let Some(delta) = proc_io_mkdir_delta {
+            ctx.record("proc_write_bytes_after_mkdir_delta", delta.write_bytes);
+            ctx.record("proc_wchar_after_mkdir_delta", delta.wchar);
+        }
+        if let Some(delta) = proc_io_write_delta {
+            ctx.record("proc_write_bytes_bulk_write_delta", delta.write_bytes);
+            ctx.record("proc_wchar_bulk_write_delta", delta.wchar);
+        }
+        if let Some(delta) = proc_io_publish_delta {
+            ctx.record("proc_write_bytes_publish_delta", delta.write_bytes);
+            ctx.record("proc_wchar_publish_delta", delta.wchar);
+        }
+        if max_proc_wchar_amplification > 0.0
+            && proc_wchar_amplification > max_proc_wchar_amplification
+        {
+            return Ok(SinomoTestOutcome::failed(format!(
+                "bulk write on node {node} wrote {files} files with proc wchar amplification {proc_wchar_amplification:.2}x, above allowed {max_proc_wchar_amplification:.2}x"
+            )));
+        }
+        if max_proc_write_bytes_amplification > 0.0
+            && proc_write_bytes_amplification > max_proc_write_bytes_amplification
+        {
+            return Ok(SinomoTestOutcome::failed(format!(
+                "bulk write on node {node} wrote {files} files with proc write_bytes amplification {proc_write_bytes_amplification:.2}x, above allowed {max_proc_write_bytes_amplification:.2}x"
+            )));
+        }
+    }
 
     if min_files_per_second > 0.0 && files_per_second < min_files_per_second {
         return Ok(SinomoTestOutcome::failed(format!(
@@ -466,6 +534,7 @@ fn run_bulk_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let bytes = optional_usize_parameter(ctx, "bytes", DEFAULT_BULK_FILE_BYTES)?;
     let timeout = expect_timeout(ctx)?;
     let min_files_per_second = optional_f64_parameter(ctx, "min-files-per-second", 0.0)?;
+    let max_proc_write_bytes = optional_u64_parameter(ctx, "max-proc-write-bytes")?;
     require_positive("files", files)?;
     require_positive("bytes", bytes)?;
 
@@ -473,21 +542,31 @@ fn run_bulk_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let deadline = started + timeout;
     let backend = open_read_only_backend_until(ctx, deadline)?;
     let node = backend.node_label();
+    let read_pool = backend
+        .open_parallel_read_pool(files)
+        .map_err(SinomoTestError::failed)?;
+    let measurement_started = Instant::now();
+    let proc_io_before = current_proc_io();
     let mut matched = vec![false; files];
     let mut matched_count = 0usize;
     let mut last_state = String::new();
 
     loop {
-        for index in 0..files {
+        let pending = (0..files)
+            .filter(|index| !matched[*index])
+            .map(|index| (index, bulk_path(&base, index)))
+            .collect::<Vec<_>>();
+        let pending_paths = pending
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect::<Vec<_>>();
+        let read_results = read_pool.read_files(&pending_paths);
+        for ((index, path), result) in pending.into_iter().zip(read_results) {
             if Instant::now() >= deadline {
                 break;
             }
-            if matched[index] {
-                continue;
-            }
-            let path = bulk_path(&base, index);
             let expected = bulk_payload(&base, index, bytes);
-            match backend.read_file(&path) {
+            match result {
                 Ok(actual) if actual == expected => {
                     matched[index] = true;
                     matched_count += 1;
@@ -506,20 +585,41 @@ fn run_bulk_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         }
 
         if matched_count == files {
-            let elapsed = started.elapsed();
+            let elapsed = measurement_started.elapsed();
             let elapsed_ms = elapsed.as_millis() as u64;
             let total_bytes = (files as u64).saturating_mul(bytes as u64);
             let files_per_second = rate_per_second(files as f64, elapsed);
             let bytes_per_second = rate_per_second(total_bytes as f64, elapsed);
+            let proc_io_delta = proc_io_before
+                .zip(current_proc_io())
+                .map(|(before, after)| after.saturating_delta(before));
             ctx.record("node", &node);
             ctx.record("base", &base);
             ctx.record("files", files);
+            ctx.record("read_workers", read_pool.worker_count());
             ctx.record("bytes_per_file", bytes);
             ctx.record("total_bytes", total_bytes);
             ctx.record("elapsed_ms", elapsed_ms);
             ctx.record("files_per_second", files_per_second);
             ctx.record("bytes_per_second", bytes_per_second);
             ctx.record("min_files_per_second", min_files_per_second);
+            if let Some(max_proc_write_bytes) = max_proc_write_bytes {
+                ctx.record("max_proc_write_bytes", max_proc_write_bytes);
+            }
+            if let Some(proc_io_delta) = proc_io_delta {
+                ctx.record("proc_rchar_delta", proc_io_delta.rchar);
+                ctx.record("proc_wchar_delta", proc_io_delta.wchar);
+                ctx.record("proc_read_bytes_delta", proc_io_delta.read_bytes);
+                ctx.record("proc_write_bytes_delta", proc_io_delta.write_bytes);
+                if let Some(max_proc_write_bytes) = max_proc_write_bytes
+                    && proc_io_delta.write_bytes > max_proc_write_bytes
+                {
+                    return Ok(SinomoTestOutcome::failed(format!(
+                        "bulk expect on node {node} read {files} files with proc write_bytes delta {}, above allowed {max_proc_write_bytes}",
+                        proc_io_delta.write_bytes
+                    )));
+                }
+            }
 
             if min_files_per_second > 0.0 && files_per_second < min_files_per_second {
                 return Ok(SinomoTestOutcome::failed(format!(
@@ -535,6 +635,7 @@ fn run_bulk_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             ctx.record("node", &node);
             ctx.record("base", &base);
             ctx.record("files", files);
+            ctx.record("read_workers", read_pool.worker_count());
             ctx.record("matched_files", matched_count);
             ctx.record("last_state", &last_state);
             return Ok(SinomoTestOutcome::failed(format!(
@@ -662,6 +763,21 @@ fn optional_f64_parameter(
     }
 }
 
+fn optional_u64_parameter(
+    ctx: &SinomoTestContext,
+    key: &str,
+) -> Result<Option<u64>, SinomoTestError> {
+    match ctx.parameter(key) {
+        Some(raw) => raw.trim().parse::<u64>().map(Some).map_err(|source| {
+            SinomoTestError::InvalidParameter {
+                name: key.to_string(),
+                detail: source.to_string(),
+            }
+        }),
+        None => Ok(None),
+    }
+}
+
 fn require_positive(name: &str, value: usize) -> Result<(), SinomoTestError> {
     if value == 0 {
         return Err(SinomoTestError::InvalidParameter {
@@ -692,6 +808,49 @@ fn rate_per_second(count: f64, elapsed: Duration) -> f64 {
         return count;
     }
     count / seconds
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ProcIoSample {
+    rchar: u64,
+    wchar: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+impl ProcIoSample {
+    fn saturating_delta(self, before: Self) -> Self {
+        Self {
+            rchar: self.rchar.saturating_sub(before.rchar),
+            wchar: self.wchar.saturating_sub(before.wchar),
+            read_bytes: self.read_bytes.saturating_sub(before.read_bytes),
+            write_bytes: self.write_bytes.saturating_sub(before.write_bytes),
+        }
+    }
+}
+
+fn current_proc_io() -> Option<ProcIoSample> {
+    let raw = fs::read_to_string("/proc/self/io").ok()?;
+    let mut sample = ProcIoSample::default();
+    for line in raw.lines() {
+        let (key, value) = line.split_once(':')?;
+        let value = value.trim().parse::<u64>().ok()?;
+        match key {
+            "rchar" => sample.rchar = value,
+            "wchar" => sample.wchar = value,
+            "read_bytes" => sample.read_bytes = value,
+            "write_bytes" => sample.write_bytes = value,
+            _ => {}
+        }
+    }
+    Some(sample)
+}
+
+fn amplification_ratio(written_bytes: u64, logical_bytes: u64) -> Option<f64> {
+    if logical_bytes == 0 {
+        return None;
+    }
+    Some(written_bytes as f64 / logical_bytes as f64)
 }
 
 fn expect_payload_now(

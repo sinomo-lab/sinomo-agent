@@ -14,9 +14,9 @@
 //! handlers. Consuming services receive a real
 //! [`DaemonClusterAccess`] via [`ServiceContext::cluster`] when the node is clustered.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use sinomo_config::{
     ConfigRegistry, ConfigRegistryBuilder, register_services as register_config_services,
@@ -32,15 +32,15 @@ use sinomo_kv::{
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
-    AsyncDaemonControlStream, CLUSTER_HEALTH_ROUTE, CLUSTER_INVITE_PUBLISH_ROUTE,
-    CLUSTER_JOIN_CHALLENGE_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE, CLUSTER_MEMBER_PUBLISH_ROUTE,
-    CLUSTER_MEMBERSHIP_RPC_CATEGORY, CLUSTER_MEMBERSHIP_RPC_ROUTE_METADATA, CLUSTER_RELAY_ROUTE,
+    AsyncDaemonControlStream, CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_CHALLENGE_ROUTE,
+    CLUSTER_JOIN_REGISTER_ROUTE, CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+    CLUSTER_MEMBERSHIP_RPC_ROUTE_METADATA, CLUSTER_NETWORK_PING_ROUTE, CLUSTER_RELAY_ROUTE,
     CLUSTER_ROUTING_RPC_ROUTE_METADATA, ClusterPaths, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
-    DAEMON_STATUS_ROUTE, DaemonControlRequest, DaemonControlResponse, NetworkError,
-    ObjectRouteDescriptor, ObjectRpcAuthorizationLayer, ObjectRpcRequest, ObjectRpcResponse,
-    ObjectRpcRouteCatalog, ObjectRpcRoutePolicyLayer, ObjectRpcRouteRegistry, ObjectRpcRouter,
-    RelayEnvelope, SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE, SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
-    ServiceCatalog,
+    DAEMON_STATUS_ROUTE, DaemonControlRequest, DaemonControlResponse, NETWORK_OBJECT_RPC_ROUTES,
+    NetworkError, ObjectRouteDescriptor, ObjectRpcAuthorizationLayer, ObjectRpcRequest,
+    ObjectRpcResponse, ObjectRpcRouteCatalog, ObjectRpcRoutePolicyLayer, ObjectRpcRouteRegistry,
+    ObjectRpcRouter, RelayEnvelope, SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
+    SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE, ServiceCatalog,
 };
 use sinomo_network_module::network_module_surfaces;
 use sinomo_rollout::{
@@ -106,6 +106,10 @@ use crate::rollout::{
     handle_daemon_rollout_binary_upload_finalize_request, handle_daemon_rollout_build_request,
     handle_daemon_rollout_native_dylib_module_request,
 };
+
+static DAEMON_CLUSTER_NETWORK_PING_NODE_IDS: OnceLock<
+    Mutex<HashMap<PathBuf, sinomo_node::NodeId>>,
+> = OnceLock::new();
 
 fn daemon_error(error: DaemonError) -> ServiceError {
     ServiceError::Service(error.to_string())
@@ -507,26 +511,44 @@ impl Service for ClusterKvService {
 /// Daemon adapter for the cluster health RPC. `sinomo-network` owns health aggregation;
 /// this service only supplies daemon-local probing through the existing cluster host code.
 struct ClusterHealthService {
+    paths: DaemonPaths,
     runtime: Option<tokio::runtime::Handle>,
 }
 
 impl Service for ClusterHealthService {
     fn name(&self) -> &'static str {
-        "cluster-health"
+        "cluster-network"
     }
 
     fn routes(&self) -> &'static [&'static str] {
-        &[CLUSTER_HEALTH_ROUTE]
+        NETWORK_OBJECT_RPC_ROUTES
     }
 
     fn route_categories(&self) -> Vec<ServiceRoute> {
-        vec![network_module_service_route(CLUSTER_HEALTH_ROUTE)]
+        NETWORK_OBJECT_RPC_ROUTES
+            .iter()
+            .copied()
+            .map(network_module_service_route)
+            .collect()
     }
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+        let paths = self.paths.clone();
         let runtime = self.runtime.clone();
         Box::pin(async move {
             let cluster_paths = ClusterPaths::new(ctx.data_dir.as_ref());
+            if request.route == CLUSTER_NETWORK_PING_ROUTE {
+                let responder_node_id =
+                    cached_cluster_network_ping_node_id(&paths, ctx.data_dir.as_ref())?;
+                let response = sinomo_network::handle_cluster_network_ping_rpc_request_for_node(
+                    &responder_node_id,
+                    request,
+                    time::OffsetDateTime::now_utc(),
+                )
+                .map_err(ServiceError::from)?;
+                ctx.respond(response)?;
+                return Ok(ServiceDisposition::Continue);
+            }
             let runtime = require_service_runtime(runtime.as_ref(), "cluster health")?;
             let probe = DaemonClusterStatusProbe::new(&cluster_paths, runtime);
             let response = sinomo_network::handle_current_cluster_health_rpc_request_async(
@@ -542,6 +564,33 @@ impl Service for ClusterHealthService {
             Ok(ServiceDisposition::Continue)
         })
     }
+}
+
+fn cached_cluster_network_ping_node_id(
+    paths: &DaemonPaths,
+    data_dir: &SinomoDataDir,
+) -> Result<sinomo_node::NodeId, ServiceError> {
+    let cache = DAEMON_CLUSTER_NETWORK_PING_NODE_IDS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(node_id) = cache
+        .lock()
+        .map_err(|source| ServiceError::Service(source.to_string()))?
+        .get(&paths.root)
+        .cloned()
+    {
+        return Ok(node_id);
+    }
+
+    let cluster_paths = ClusterPaths::new(data_dir);
+    let node_id = sinomo_network::read_cluster_state_without_kv(&cluster_paths)
+        .map(|state| state.local_node_id)
+        .map_err(ServiceError::from)?;
+    let mut guard = cache
+        .lock()
+        .map_err(|source| ServiceError::Service(source.to_string()))?;
+    Ok(guard
+        .entry(paths.root.clone())
+        .or_insert_with(|| node_id)
+        .clone())
 }
 
 /// Daemon adapter for one-hop cluster relay routing. `sinomo-network` owns the relay
@@ -1224,6 +1273,7 @@ fn daemon_service_registry(
             runtime: service_runtime.cloned(),
         })
         .register(ClusterHealthService {
+            paths: paths.clone(),
             runtime: service_runtime.cloned(),
         })
         .register(ClusterRelayService {
@@ -1271,6 +1321,9 @@ pub(crate) struct DaemonServiceRegistryHost {
     router: ObjectRpcRouter,
     route_policy: ObjectRpcRoutePolicyLayer,
 }
+
+static DAEMON_SERVICE_REGISTRY_HOSTS: OnceLock<Mutex<HashMap<PathBuf, DaemonServiceRegistryHost>>> =
+    OnceLock::new();
 
 impl DaemonServiceRegistryHost {
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1349,11 +1402,32 @@ impl DaemonServiceRegistryHost {
         paths: DaemonPaths,
         service_runtime: tokio::runtime::Handle,
     ) -> Result<Self, DaemonError> {
+        let cache_key = paths.root.clone();
+        if let Some(host) = DAEMON_SERVICE_REGISTRY_HOSTS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|source| DaemonError::Network {
+                address: "daemon service registry cache".to_string(),
+                detail: source.to_string(),
+            })?
+            .get(&cache_key)
+            .cloned()
+        {
+            return Ok(host);
+        }
         let registry_paths = paths.clone();
         let registry =
             daemon_service_registry_on_blocking_pool(registry_paths, service_runtime.clone())
                 .await?;
-        Self::from_registry_for_paths_on_runtime(registry, &paths, service_runtime)
+        let host = Self::from_registry_for_paths_on_runtime(registry, &paths, service_runtime)?;
+        let mut cache = DAEMON_SERVICE_REGISTRY_HOSTS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|source| DaemonError::Network {
+                address: "daemon service registry cache".to_string(),
+                detail: source.to_string(),
+            })?;
+        Ok(cache.entry(cache_key).or_insert_with(|| host).clone())
     }
 
     fn active_router(&self) -> ObjectRpcRouter {
@@ -3029,7 +3103,8 @@ mod tests {
         let registry = daemon_service_registry(&paths, Some(runtime.handle()));
 
         for route in CLUSTER_KV_RPC_ROUTES.iter().copied().chain([
-            CLUSTER_HEALTH_ROUTE,
+            sinomo_network::CLUSTER_HEALTH_ROUTE,
+            sinomo_network::CLUSTER_NETWORK_PING_ROUTE,
             CLUSTER_RELAY_ROUTE,
             sinomo_dfs::DFS_SMOKE_ROUTE,
             sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE,
@@ -3045,8 +3120,12 @@ mod tests {
             Some(sinomo_kv::CLUSTER_KV_RPC_CATEGORY)
         );
         assert_eq!(
-            registry.category_for_route(CLUSTER_HEALTH_ROUTE),
+            registry.category_for_route(sinomo_network::CLUSTER_HEALTH_ROUTE),
             Some(sinomo_network::CLUSTER_HEALTH_RPC_CATEGORY)
+        );
+        assert_eq!(
+            registry.category_for_route(sinomo_network::CLUSTER_NETWORK_PING_ROUTE),
+            Some(sinomo_network::CLUSTER_NETWORK_RPC_CATEGORY)
         );
         assert_eq!(
             registry.category_for_route(CLUSTER_RELAY_ROUTE),
@@ -3063,7 +3142,7 @@ mod tests {
         let route_metadata = registry.route_categories();
         let health = route_metadata
             .iter()
-            .find(|route| route.route == CLUSTER_HEALTH_ROUTE)
+            .find(|route| route.route == sinomo_network::CLUSTER_HEALTH_ROUTE)
             .expect("cluster health route metadata");
         let network_module_routes = sinomo_network_module::network_module_surfaces()
             .object_rpc_route_descriptors()
@@ -3072,7 +3151,7 @@ mod tests {
             .map(|descriptor| (descriptor.route.clone(), descriptor))
             .collect::<std::collections::BTreeMap<_, _>>();
         let health_module_route = network_module_routes
-            .get(CLUSTER_HEALTH_ROUTE)
+            .get(sinomo_network::CLUSTER_HEALTH_ROUTE)
             .expect("cluster health module route");
         assert_eq!(health.category, health_module_route.category);
         assert_eq!(
@@ -3082,6 +3161,26 @@ mod tests {
         assert_eq!(
             health.required_capabilities,
             health_module_route
+                .required_capabilities
+                .iter()
+                .map(|capability| capability.as_str().to_string())
+                .collect::<Vec<_>>()
+        );
+        let ping = route_metadata
+            .iter()
+            .find(|route| route.route == sinomo_network::CLUSTER_NETWORK_PING_ROUTE)
+            .expect("cluster network ping route metadata");
+        let ping_module_route = network_module_routes
+            .get(sinomo_network::CLUSTER_NETWORK_PING_ROUTE)
+            .expect("cluster network ping module route");
+        assert_eq!(ping.category, ping_module_route.category);
+        assert_eq!(
+            ping.auth_scope.as_deref(),
+            Some(ping_module_route.auth_scope.as_str())
+        );
+        assert_eq!(
+            ping.required_capabilities,
+            ping_module_route
                 .required_capabilities
                 .iter()
                 .map(|capability| capability.as_str().to_string())

@@ -49,6 +49,7 @@ services:
       CLUSTER_NAME: dev-cluster
       SINOMO_DISABLE_IROH: "1"
       SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       # The seed (voter) publishes a join invite for every segment, each naming the
       # reachable bridge as that segment's introducer (node2,3 reach node1; node4 reaches
       # node3; node5,6 reach node4). Bridge learners cannot mint invites, so only node1 does.
@@ -70,6 +71,7 @@ services:
       CLUSTER_NAME: dev-cluster
       SINOMO_DISABLE_IROH: "1"
       SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       INTRODUCER: node1:21353
       JOIN_INVITE: /shared/seg-a-invite.json
     volumes:
@@ -90,6 +92,7 @@ services:
       CLUSTER_NAME: dev-cluster
       SINOMO_DISABLE_IROH: "1"
       SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       INTRODUCER: node1:21353
       JOIN_INVITE: /shared/seg-a-invite.json
     volumes:
@@ -110,6 +113,7 @@ services:
       CLUSTER_NAME: dev-cluster
       SINOMO_DISABLE_IROH: "1"
       SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       INTRODUCER: node3:21353
       JOIN_INVITE: /shared/seg-ab-invite.json
       # Two segments deep: node3 must finish joining before node4 can; give it
@@ -132,6 +136,7 @@ services:
       CLUSTER_NAME: dev-cluster
       SINOMO_DISABLE_IROH: "1"
       SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       INTRODUCER: node4:21353
       JOIN_INVITE: /shared/seg-b-invite.json
       # Three segments deep (waits on node4, which waits on node3).
@@ -153,6 +158,7 @@ services:
       CLUSTER_NAME: dev-cluster
       SINOMO_DISABLE_IROH: "1"
       SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       INTRODUCER: node4:21353
       JOIN_INVITE: /shared/seg-b-invite.json
       # Three segments deep (waits on node4, which waits on node3).

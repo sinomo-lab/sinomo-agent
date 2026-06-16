@@ -63,6 +63,96 @@ impl DfsFrameTransport for ReceiveOnlyTransport {
     }
 }
 
+#[test]
+fn dfs_protocol_frame_read_only_classifier_routes_lookup_path_to_read_lane() {
+    let local = NodeId::from_legacy_named("node_read_classifier_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_read_classifier_remote").expect("remote");
+    let file_system_id = sifs_file_system_id();
+    let read_frame = build_dfs_network_frame(
+        &local,
+        &remote,
+        1,
+        1,
+        DfsNetworkMessage::ReadRequest(DfsReadRequest {
+            request_id: "read-request".to_string(),
+            object_id: DfsObjectId::from_legacy_named("read_object").expect("object id"),
+            version: None,
+            content_hash: None,
+            content_size_bytes: None,
+            range_offset: None,
+            range_max_bytes: None,
+            start_chunk_index: 0,
+            max_chunks: 0,
+        }),
+    )
+    .expect("read frame");
+    assert!(dfs_protocol_frame_is_read_only_request(&read_frame));
+    assert!(!dfs_protocol_frame_requires_fresh_metadata(&read_frame));
+
+    let lookup_frame = build_dfs_network_frame(
+        &local,
+        &remote,
+        2,
+        2,
+        DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+            request_id: "lookup-request".to_string(),
+            file_system_id: file_system_id.clone(),
+            requesting_node_id: local.clone(),
+            metadata_journal_after_sequences: Vec::new(),
+            operation: DfsNamespaceOperation::LookupPath {
+                path: "/services/example.txt".to_string(),
+            },
+        }),
+    )
+    .expect("lookup frame");
+    assert!(dfs_protocol_frame_is_read_only_request(&lookup_frame));
+    assert!(!dfs_protocol_frame_requires_fresh_metadata(&lookup_frame));
+
+    let sync_frame = build_dfs_network_frame(
+        &local,
+        &remote,
+        3,
+        3,
+        DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+            request_id: "sync-request".to_string(),
+            file_system_id: file_system_id.clone(),
+            requesting_node_id: local.clone(),
+            metadata_journal_after_sequences: Vec::new(),
+            operation: DfsNamespaceOperation::SyncPath {
+                path: "/services/example.txt".to_string(),
+            },
+        }),
+    )
+    .expect("sync frame");
+    assert!(!dfs_protocol_frame_is_read_only_request(&sync_frame));
+    assert!(!dfs_protocol_frame_requires_fresh_metadata(&sync_frame));
+
+    let apply_frame = build_dfs_network_frame(
+        &local,
+        &remote,
+        4,
+        4,
+        DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+            request_id: "apply-request".to_string(),
+            file_system_id: file_system_id.clone(),
+            requesting_node_id: local.clone(),
+            metadata_journal_after_sequences: Vec::new(),
+            operation: DfsNamespaceOperation::ApplyTransaction {
+                transaction: DfsNamespaceTransaction {
+                    transaction_id: "bulk-transaction".to_string(),
+                    file_system_id,
+                    objects: Vec::new(),
+                    versions: Vec::new(),
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                },
+            },
+        }),
+    )
+    .expect("apply frame");
+    assert!(!dfs_protocol_frame_is_read_only_request(&apply_frame));
+    assert!(!dfs_protocol_frame_requires_fresh_metadata(&apply_frame));
+}
+
 struct FailingSendTransport {
     local_node_id: NodeId,
 }
@@ -129,6 +219,7 @@ fn test_routed_write_command(
         policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
         object_metadata: None,
         touch_parent_on_create: true,
+        foreground_replica_repair: true,
     }
 }
 
@@ -1324,6 +1415,7 @@ fn endpoint_transport_completes_synchronous_replica_write() {
                 policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
                 replica_candidates: vec![local.clone(), remote.clone()],
                 wait_for_commit: true,
+                foreground_replica_repair: true,
             },
         )
         .expect("replicated write");
@@ -1724,6 +1816,9 @@ fn networked_dfs_builds_protocol_frames_without_transport_send() {
             DfsNetworkMessage::ReadRequest(DfsReadRequest {
                 request_id: "read-1".to_string(),
                 object_id: object_id.clone(),
+                version: None,
+                content_hash: None,
+                content_size_bytes: None,
                 range_offset: None,
                 range_max_bytes: None,
                 start_chunk_index: 0,
@@ -1760,6 +1855,9 @@ fn networked_dfs_builds_protocol_frames_without_transport_send() {
                 request_id: "read-2".to_string(),
                 object_id: DfsObjectId::from_legacy_named("obj_build_frame_second")
                     .expect("object"),
+                version: None,
+                content_hash: None,
+                content_size_bytes: None,
                 range_offset: None,
                 range_max_bytes: None,
                 start_chunk_index: 0,
@@ -1795,6 +1893,9 @@ fn networked_dfs_async_send_uses_shared_protocol_frame_path() {
                 DfsNetworkMessage::ReadRequest(DfsReadRequest {
                     request_id: "async-read-1".to_string(),
                     object_id: object_id.clone(),
+                    version: None,
+                    content_hash: None,
+                    content_size_bytes: None,
                     range_offset: None,
                     range_max_bytes: None,
                     start_chunk_index: 0,
@@ -3212,6 +3313,77 @@ fn local_content_anti_entropy_pages_and_repairs_stale_locations() {
 }
 
 #[test]
+fn local_content_anti_entropy_accepts_hash_addressed_blob_without_version_manifest() {
+    let root = temp_root("local-content-anti-entropy-hash-addressed");
+    let node_id = NodeId::from_legacy_named("node_anti_entropy_hash").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("fs_anti_entropy_hash").expect("fs");
+    let network = InProcessNetwork::new();
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let metadata =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+            .expect("metadata");
+    let mut dfs = NetworkedDfsService::new(network.add_node(node_id.clone()), content)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "anti entropy hash".to_string(),
+        owner_node_id: node_id.clone(),
+        subtree_policies: Vec::new(),
+    };
+    dfs.metadata_backend
+        .as_mut()
+        .expect("metadata backend")
+        .put_file_system(&file_system)
+        .expect("filesystem");
+
+    let bytes = b"hash-addressed bytes without matching manifest";
+    let seed_manifest = dfs
+        .content
+        .put_object_version("obj_seed_for_hash_addressed_blob", "version_seed", bytes)
+        .expect("seed blob");
+    let mut object = file_metadata(node_id.clone());
+    object.file_system_id = file_system_id.clone();
+    object.object_id =
+        DfsObjectId::from_legacy_named("obj_anti_entropy_hash_blob").expect("object");
+    object.version = DfsVersion::from_legacy_named("version_hash_addressed").expect("ver");
+    object.path = "/anti/hash-addressed.bin".to_string();
+    object.current_locations = vec![node_id.clone()];
+    object.content_hash = Some(seed_manifest.content_hash.clone());
+    object.content_size_bytes = Some(seed_manifest.size_bytes);
+    dfs.metadata_backend
+        .as_mut()
+        .expect("metadata backend")
+        .put_object(&object)
+        .expect("hash-addressed object metadata");
+
+    let report = dfs
+        .run_local_content_anti_entropy(DfsAntiEntropyOptions {
+            file_system_id: file_system_id.clone(),
+            after: None,
+            max_objects: 8,
+            max_issues: 8,
+            repair_metadata: true,
+        })
+        .expect("anti entropy");
+
+    assert_eq!(report.scanned_object_count, 1);
+    assert_eq!(report.checked_local_location_count, 1);
+    assert_eq!(report.stale_local_location_count, 0);
+    assert_eq!(report.repaired_location_count, 0);
+    assert_eq!(report.issue_count, 0);
+    let retained = dfs
+        .metadata_backend()
+        .expect("metadata backend")
+        .get_object(&object.object_id)
+        .expect("object")
+        .expect("retained object");
+    assert!(retained.current_locations.contains(&node_id));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn add_object_metadata_batch_persists_visible_versions_in_one_transaction() {
     let root = temp_root("add-object-metadata-batch-visible-versions");
     let owner = NodeId::from_legacy_named("node_batch_visible_owner").expect("node");
@@ -3642,6 +3814,12 @@ fn dfs_metadata_publish_gate_tracks_mutating_events() {
                 current_primary_node_id: None,
             },
         },
+        NetworkedDfsServiceEvent::RemoteNamespaceServed {
+            request_id: "namespace_lookup".to_string(),
+            requester_node_id: node.clone(),
+            result: DfsNamespaceResult::Applied,
+            mutates_metadata: false,
+        },
     ]));
     assert!(dfs_events_should_publish_metadata(&[
         NetworkedDfsServiceEvent::BlobStaged {
@@ -3658,6 +3836,14 @@ fn dfs_metadata_publish_gate_tracks_mutating_events() {
             object_id,
             version,
             content_hash,
+        },
+    ]));
+    assert!(dfs_events_should_publish_metadata(&[
+        NetworkedDfsServiceEvent::RemoteNamespaceServed {
+            request_id: "namespace_mutation".to_string(),
+            requester_node_id: node,
+            result: DfsNamespaceResult::Applied,
+            mutates_metadata: true,
         },
     ]));
 }
@@ -5247,6 +5433,7 @@ fn metadata_journal_intent_conflict_applies_incrementally_without_full_hydrate()
             window_end_chunk_index: None,
             target_node_id: replica.clone(),
             next_retry_at: std::time::Instant::now(),
+            cache_response: true,
         },
     );
 
@@ -5653,6 +5840,7 @@ fn routed_write_replay_uses_existing_committed_intent_after_service_restart() {
         policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
         object_metadata: Some(object.clone()),
         touch_parent_on_create: false,
+        foreground_replica_repair: true,
     };
 
     let mut primary_service = NetworkedDfsService::new(
@@ -5675,6 +5863,7 @@ fn routed_write_replay_uses_existing_committed_intent_after_service_restart() {
             31,
             command.desired_replica_nodes.clone(),
             command.policy.clone(),
+            true,
         )
         .expect("first routed write");
     let NetworkedDfsWriteOutcome::Committed { intent_id, .. } = first_outcome else {
@@ -5976,6 +6165,7 @@ fn fetch_receipt_completion_sends_untracked_routed_write_response() {
             manifest.size_bytes,
             vec![requester.clone(), primary.clone()],
             DfsReplicationPolicy::new(2, 2).expect("policy"),
+            true,
         )
         .expect("pending remote-manifest write");
     let NetworkedDfsWriteOutcome::Pending {
@@ -6244,6 +6434,7 @@ fn committed_remote_manifest_repair_fetches_from_durable_requester() {
             bytes.len() as u64,
             vec![writer.clone(), replica.clone()],
             DfsReplicationPolicy::new(1, 2).expect("policy"),
+            true,
         )
         .expect("remote manifest write");
     let intent_id = match outcome {
@@ -6361,6 +6552,7 @@ fn committed_remote_manifest_self_repair_fetches_from_durable_requester() {
             bytes.len() as u64,
             vec![writer.clone(), primary.clone()],
             DfsReplicationPolicy::new(1, 2).expect("policy"),
+            true,
         )
         .expect("remote manifest write");
     let intent_id = match outcome {
@@ -6615,6 +6807,7 @@ fn posix_transient_create_routes_precommit_records_to_path_shard() {
                 policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
                 replica_candidates: vec![owner.clone(), replica],
                 wait_for_commit: true,
+                foreground_replica_repair: true,
             },
         )
         .expect("transient create write");
@@ -6700,6 +6893,139 @@ fn eventual_write_with_local_receipt_tolerates_unreachable_desired_replica() {
     };
     assert_eq!(repair_jobs.len(), 1);
     assert_eq!(repair_jobs[0].missing_replica_node_id, replica);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn reader_write_can_defer_post_commit_replica_repair() {
+    let root = temp_root("reader-write-defer-repair");
+    let owner = NodeId::from_legacy_named("node_defer_repair_owner").expect("owner node");
+    let replica = NodeId::from_legacy_named("node_defer_repair_replica").expect("replica node");
+    let object_id = DfsObjectId::from_legacy_named("obj_defer_repair").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_defer_repair_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_defer_repair_2").expect("version");
+    let network = InProcessNetwork::new();
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    );
+    let mut replica_transport = network.add_node(replica.clone());
+    owner_dfs
+        .add_file_system(file_system(owner.clone()))
+        .expect("filesystem");
+    let mut metadata = file_metadata(owner.clone());
+    metadata.object_id = object_id.clone();
+    metadata.version = version_1;
+    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    owner_dfs.add_object_metadata(metadata).expect("object");
+
+    let write = owner_dfs
+        .write_distributed_eventual_from_reader_with_candidates_and_parent_touch(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                target_version: version_2,
+                requesting_node_id: owner.clone(),
+            },
+            std::io::Cursor::new(b"deferred foreground repair".to_vec()),
+            vec![owner, replica.clone()],
+            DfsReplicationPolicy::new(1, 2).expect("policy"),
+            true,
+            false,
+        )
+        .expect("write should commit");
+
+    let NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } = write else {
+        panic!("expected committed write, got {write:?}");
+    };
+    assert_eq!(repair_jobs.len(), 1);
+    assert_eq!(repair_jobs[0].missing_replica_node_id, replica);
+    let foreground_messages = replica_transport
+        .drain_incoming()
+        .expect("replica foreground frames")
+        .into_iter()
+        .filter_map(|frame| match frame.frame.message.body {
+            MeshMessageBody::Protocol(protocol) if protocol.protocol == DFS_PROTOCOL => {
+                protocol.decode::<DfsNetworkMessage>().ok()
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        foreground_messages.iter().all(|message| !matches!(
+            message,
+            DfsNetworkMessage::StageBlob(_) | DfsNetworkMessage::StageBlobChunk(_)
+        )),
+        "deferred foreground repair must not stage a post-commit replica inline"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn retry_pending_repairs_bounded_limits_scheduled_transfers() {
+    let root = temp_root("retry-repairs-bounded");
+    let owner = NodeId::from_legacy_named("node_bounded_repair_owner").expect("owner node");
+    let replica_a = NodeId::from_legacy_named("node_bounded_repair_replica_a").expect("replica");
+    let replica_b = NodeId::from_legacy_named("node_bounded_repair_replica_b").expect("replica");
+    let object_id = DfsObjectId::from_legacy_named("obj_bounded_repair").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_bounded_repair_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_bounded_repair_2").expect("version");
+    let network = InProcessNetwork::new();
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    );
+    let mut replica_a_transport = network.add_node(replica_a.clone());
+    let mut replica_b_transport = network.add_node(replica_b.clone());
+    owner_dfs
+        .add_file_system(file_system(owner.clone()))
+        .expect("filesystem");
+    let mut metadata = file_metadata(owner.clone());
+    metadata.object_id = object_id.clone();
+    metadata.version = version_1;
+    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    owner_dfs.add_object_metadata(metadata).expect("object");
+
+    let write = owner_dfs
+        .write_distributed_eventual_from_reader_with_candidates_and_parent_touch(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id,
+                target_version: version_2,
+                requesting_node_id: owner.clone(),
+            },
+            std::io::Cursor::new(b"bounded repair body".to_vec()),
+            vec![owner, replica_a, replica_b],
+            DfsReplicationPolicy::new(1, 3).expect("policy"),
+            true,
+            false,
+        )
+        .expect("write should commit");
+    let NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } = write else {
+        panic!("expected committed write, got {write:?}");
+    };
+    assert_eq!(repair_jobs.len(), 2);
+    let _ = drain_dfs_messages(&mut replica_a_transport);
+    let _ = drain_dfs_messages(&mut replica_b_transport);
+
+    let scheduled = owner_dfs
+        .retry_pending_repairs_bounded(1)
+        .expect("bounded retry");
+    assert_eq!(scheduled.len(), 1);
+
+    let replica_messages = drain_dfs_messages(&mut replica_a_transport)
+        .into_iter()
+        .chain(drain_dfs_messages(&mut replica_b_transport))
+        .filter(|message| {
+            matches!(
+                message,
+                DfsNetworkMessage::RepairReplica(_) | DfsNetworkMessage::RepairReplicaChunk(_)
+            )
+        })
+        .count();
+    assert_eq!(replica_messages, 1);
+
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -6814,6 +7140,167 @@ fn retry_pending_repairs_skips_sender_that_lost_metadata_primary_authority() {
         !dfs.pending_writes.contains_key(&intent_id),
         "stale committed repair state should be dropped after authority moves"
     );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn retry_pending_repairs_suppresses_stale_content_target_after_object_advances() {
+    let root = temp_root("retry-repair-suppresses-stale-content");
+    let owner = NodeId::from_legacy_named("node_repair_stale_content_owner").expect("owner");
+    let replica = NodeId::from_legacy_named("node_repair_stale_content_replica").expect("replica");
+    let object_id = DfsObjectId::from_legacy_named("obj_repair_stale_content").expect("object");
+    let version_1 =
+        DfsVersion::from_legacy_named("version_repair_stale_content_1").expect("version");
+    let version_2 =
+        DfsVersion::from_legacy_named("version_repair_stale_content_2").expect("version");
+    let version_3 =
+        DfsVersion::from_legacy_named("version_repair_stale_content_3").expect("version");
+    let network = InProcessNetwork::new();
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+    let mut dfs = NetworkedDfsService::new(network.add_node(owner.clone()), content)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    let mut object = file_metadata(owner.clone());
+    object.object_id = object_id.clone();
+    object.version = version_1.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![owner.clone()];
+    dfs.add_object_metadata(object).expect("object");
+
+    let write = dfs
+        .write_distributed_eventual(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                target_version: version_2,
+                requesting_node_id: owner.clone(),
+            },
+            b"stale repair target bytes".to_vec(),
+            vec![owner.clone(), replica.clone()],
+            DfsReplicationPolicy::new(1, 2).expect("policy"),
+        )
+        .expect("write should commit locally");
+    let NetworkedDfsWriteOutcome::Committed {
+        intent_id,
+        repair_jobs,
+        ..
+    } = write
+    else {
+        panic!("expected committed write, got {write:?}");
+    };
+    assert_eq!(repair_jobs.len(), 1);
+    assert_eq!(repair_jobs[0].missing_replica_node_id, replica);
+
+    let mut replica_mailbox = network.add_node(replica.clone());
+    let replacement_bytes = b"newer visible content should retire stale repair";
+    let mut advanced = dfs
+        .current_read_object_metadata(&object_id)
+        .expect("current object");
+    advanced.version = version_3;
+    advanced.content_hash = Some(content_hash(replacement_bytes));
+    advanced.content_size_bytes = Some(replacement_bytes.len() as u64);
+    advanced.current_locations = vec![owner];
+    dfs.add_object_metadata(advanced).expect("advanced object");
+
+    dfs.repair_retry_tick = 32;
+    let scheduled = dfs.retry_pending_repairs().expect("retry repairs");
+
+    assert!(
+        scheduled.is_empty(),
+        "stale content repair must not schedule a remote frame"
+    );
+    assert!(
+        drain_dfs_messages(&mut replica_mailbox).is_empty(),
+        "stale content repair must not send repair or fetch frames"
+    );
+    assert!(
+        !dfs.pending_writes.contains_key(&intent_id),
+        "committed stale repair state should be dropped once the object content advances"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn retry_pending_repairs_keeps_same_content_after_metadata_only_advance() {
+    let root = temp_root("retry-repair-keeps-same-content");
+    let owner = NodeId::from_legacy_named("node_repair_same_content_owner").expect("owner");
+    let replica = NodeId::from_legacy_named("node_repair_same_content_replica").expect("replica");
+    let object_id = DfsObjectId::from_legacy_named("obj_repair_same_content").expect("object");
+    let version_1 =
+        DfsVersion::from_legacy_named("version_repair_same_content_1").expect("version");
+    let version_2 =
+        DfsVersion::from_legacy_named("version_repair_same_content_2").expect("version");
+    let version_3 =
+        DfsVersion::from_legacy_named("version_repair_same_content_3").expect("version");
+    let network = InProcessNetwork::new();
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+    let mut dfs = NetworkedDfsService::new(network.add_node(owner.clone()), content)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    let mut object = file_metadata(owner.clone());
+    object.object_id = object_id.clone();
+    object.version = version_1.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![owner.clone()];
+    dfs.add_object_metadata(object).expect("object");
+
+    let bytes = b"metadata-only version keeps this content";
+    let expected_hash = content_hash(bytes);
+    let write = dfs
+        .write_distributed_eventual(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: owner.clone(),
+            },
+            bytes.to_vec(),
+            vec![owner.clone(), replica.clone()],
+            DfsReplicationPolicy::new(1, 2).expect("policy"),
+        )
+        .expect("write should commit locally");
+    let NetworkedDfsWriteOutcome::Committed {
+        intent_id,
+        repair_jobs,
+        ..
+    } = write
+    else {
+        panic!("expected committed write, got {write:?}");
+    };
+    assert_eq!(repair_jobs.len(), 1);
+    assert_eq!(repair_jobs[0].missing_replica_node_id, replica);
+
+    let mut replica_mailbox = network.add_node(replica.clone());
+    let mut advanced = dfs
+        .current_read_object_metadata(&object_id)
+        .expect("current object");
+    advanced.version = version_3;
+    advanced.content_hash = Some(expected_hash.clone());
+    advanced.content_size_bytes = Some(bytes.len() as u64);
+    advanced.current_locations = vec![owner];
+    dfs.add_object_metadata(advanced).expect("advanced object");
+
+    dfs.repair_retry_tick = 32;
+    let scheduled = dfs.retry_pending_repairs().expect("retry repairs");
+
+    assert_eq!(scheduled.len(), 1);
+    assert!(
+        dfs.pending_writes.contains_key(&intent_id),
+        "same-content repair should remain pending until the replica receives it"
+    );
+    let messages = drain_dfs_messages(&mut replica_mailbox);
+    assert!(matches!(
+        messages.as_slice(),
+        [DfsNetworkMessage::RepairReplica(command)]
+            if command.intent_id == intent_id
+                && command.object_id == object_id
+                && command.version == version_2
+                && command.content_hash == expected_hash
+    ));
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -8924,6 +9411,9 @@ fn malformed_dfs_protocol_frame_does_not_block_following_valid_frame() {
                             &DfsNetworkMessage::ReadRequest(DfsReadRequest {
                                 request_id: "dfs_net_req_after_bad_frame".to_string(),
                                 object_id: object_id.clone(),
+                                version: None,
+                                content_hash: None,
+                                content_size_bytes: None,
                                 range_offset: None,
                                 range_max_bytes: None,
                                 start_chunk_index: 0,
@@ -8958,6 +9448,57 @@ fn malformed_dfs_protocol_frame_does_not_block_following_valid_frame() {
         .drain_incoming()
         .expect("requester response mailbox");
     assert_eq!(responses.len(), 1);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn hinted_remote_read_serves_blob_without_local_metadata() {
+    let root = temp_root("hinted-remote-read-without-metadata");
+    let requester = NodeId::from_legacy_named("node_hinted_read_requester").expect("node");
+    let server = NodeId::from_legacy_named("node_hinted_read_server").expect("node");
+    let object_id = DfsObjectId::from_legacy_named("obj_hinted_read_no_metadata").expect("object");
+    let version = DfsVersion::from_legacy_named("version_hinted_read").expect("version");
+    let bytes = b"content-addressed remote read must not require metadata";
+    let network = InProcessNetwork::new();
+    let mut requester_transport = network.add_node(requester.clone());
+    let content = LocalContentStore::new(root.join("server-content")).expect("server content");
+    let manifest = content
+        .put_object_version(object_id.as_str(), version.as_str(), bytes)
+        .expect("seed content blob");
+    let mut dfs = NetworkedDfsService::new(network.add_node(server), content);
+
+    let event = dfs
+        .handle_networked_read_request(
+            requester.clone(),
+            DfsReadRequest {
+                request_id: "dfs_net_req_hinted_read_no_metadata".to_string(),
+                object_id: object_id.clone(),
+                version: Some(version.clone()),
+                content_hash: Some(manifest.content_hash.clone()),
+                content_size_bytes: Some(manifest.size_bytes),
+                range_offset: None,
+                range_max_bytes: None,
+                start_chunk_index: 0,
+                max_chunks: 0,
+            },
+        )
+        .expect("hinted read is served");
+
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::RemoteReadServed {
+            result: DfsReadResult::Found(DfsReadData { bytes: result_bytes, .. }),
+            ..
+        } if result_bytes == bytes
+    ));
+    let responses = drain_dfs_messages(&mut requester_transport);
+    assert!(matches!(
+        responses.as_slice(),
+        [DfsNetworkMessage::ReadResponse(DfsReadResponse {
+            result: DfsReadResult::Found(DfsReadData { bytes: result_bytes, .. }),
+            ..
+        })] if result_bytes == bytes
+    ));
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -9462,6 +10003,7 @@ fn process_incoming_prunes_expired_pending_remote_reads() {
             next_retry_at: Instant::now()
                 - DFS_CHUNK_TRANSFER_IDLE_TIMEOUT
                 - Duration::from_millis(1),
+            cache_response: true,
         },
     );
     dfs.incoming_read_transfers.insert(request_id.clone(), {
@@ -9543,6 +10085,7 @@ fn process_incoming_accepts_queued_remote_read_response_before_expiry_prune() {
             next_retry_at: Instant::now()
                 - DFS_CHUNK_TRANSFER_IDLE_TIMEOUT
                 - Duration::from_millis(1),
+            cache_response: true,
         },
     );
 
@@ -10368,6 +10911,7 @@ fn remote_read_content_mismatch_prunes_stale_location() {
             window_end_chunk_index: None,
             target_node_id: source.clone(),
             next_retry_at: Instant::now() + DFS_REMOTE_READ_RETRY_DELAY,
+            cache_response: true,
         },
     );
 
@@ -10503,6 +11047,7 @@ fn idle_chunk_transfer_pruning_releases_request_state() {
             window_end_chunk_index: None,
             target_node_id: replica.clone(),
             next_retry_at: Instant::now() + DFS_REMOTE_READ_RETRY_DELAY,
+            cache_response: true,
         },
     );
     dfs.incoming_read_transfers
@@ -10719,6 +11264,7 @@ fn retry_pending_repairs_prunes_idle_reads_without_distributed_writes() {
             window_end_chunk_index: None,
             target_node_id: reader,
             next_retry_at: Instant::now() + DFS_REMOTE_READ_RETRY_DELAY,
+            cache_response: true,
         },
     );
     dfs.incoming_read_transfers.insert(request_id.clone(), {
@@ -12045,6 +12591,224 @@ fn repair_command_accepts_current_replica_after_metadata_primary_moves() {
 }
 
 #[test]
+fn repair_command_accepts_metadata_primary_for_stored_intent() {
+    let root = temp_root("repair-command-metadata-primary-stored-intent");
+    let coordinator =
+        NodeId::from_legacy_named("node_repair_stored_intent_coordinator").expect("coordinator");
+    let primary = NodeId::from_legacy_named("node_repair_stored_intent_primary").expect("primary");
+    let target = NodeId::from_legacy_named("node_repair_stored_intent_target").expect("target");
+    let object_id = DfsObjectId::from_legacy_named("obj_repair_stored_intent").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_repair_stored_1").expect("base version");
+    let version_2 =
+        DfsVersion::from_legacy_named("version_repair_stored_2").expect("target version");
+    let intent_id = "dfs_intent_repair_stored_primary";
+    let file_system = file_system(coordinator.clone());
+    let shared_kv = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![primary.clone()]).expect("kv"),
+    );
+    shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        control
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system.file_system_id.clone(),
+                shard_id: "services".to_string(),
+                primary_node_id: primary.clone(),
+                replica_node_ids: vec![target.clone()],
+                epoch: 3,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("metadata shard");
+    });
+    let mut object = file_metadata(coordinator.clone());
+    object.file_system_id = file_system.file_system_id.clone();
+    object.object_id = object_id.clone();
+    object.path = "/services/repair-stored-intent.bin".to_string();
+    object.version = version_1.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![coordinator.clone()];
+    let bytes = b"stored intent repair bytes from the metadata primary";
+    let content_hash = content_hash(bytes);
+    let mut backend = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+    backend.put_file_system(&file_system).expect("filesystem");
+    backend.put_object(&object).expect("object");
+    backend
+        .put_intent(&DfsWriteIntentRecord {
+            intent_id: intent_id.to_string(),
+            file_system_id: file_system.file_system_id.clone(),
+            object_id: object_id.clone(),
+            base_version: Some(version_1.clone()),
+            target_version: version_2.clone(),
+            coordinator_node_id: coordinator.clone(),
+            owner_epoch: 3,
+            desired_replica_node_ids: vec![coordinator.clone(), target.clone()],
+            policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+            status: DfsWriteIntentStatus::Committed,
+            content_hash: Some(content_hash.clone()),
+            object_metadata: Some(object.clone()),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+        })
+        .expect("intent");
+
+    let network = InProcessNetwork::new();
+    let _primary_mailbox = network.add_node(primary.clone());
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let mut dfs = NetworkedDfsService::new(network.add_node(target.clone()), content)
+        .with_control_plane(shared_kv)
+        .with_metadata_backend(backend)
+        .expect("metadata backend");
+
+    let event = dfs
+        .handle_repair_replica(
+            primary.clone(),
+            DfsRepairReplicaCommand {
+                request_id: "dfs_net_req_repair_stored_primary".to_string(),
+                intent_id: intent_id.to_string(),
+                file_system_id: file_system.file_system_id,
+                object_id: object_id.clone(),
+                expected_base_version: Some(version_1),
+                version: version_2.clone(),
+                content_hash: content_hash.clone(),
+                bytes: bytes.to_vec(),
+                object_metadata: Some(object),
+            },
+        )
+        .expect("repair command");
+
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::ReplicaRepaired {
+            object_id: repaired_object_id,
+            replica_node_id,
+            ..
+        } if repaired_object_id == object_id && replica_node_id == target
+    ));
+    let manifest = dfs
+        .content()
+        .read_manifest(object_id.as_str(), version_2.as_str())
+        .expect("repaired manifest");
+    assert_eq!(manifest.content_hash, content_hash);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn fetch_blob_accepts_metadata_primary_for_stored_intent() {
+    let root = temp_root("fetch-blob-metadata-primary-stored-intent");
+    let coordinator =
+        NodeId::from_legacy_named("node_fetch_stored_intent_coordinator").expect("coordinator");
+    let primary = NodeId::from_legacy_named("node_fetch_stored_intent_primary").expect("primary");
+    let source = NodeId::from_legacy_named("node_fetch_stored_intent_source").expect("source");
+    let target = NodeId::from_legacy_named("node_fetch_stored_intent_target").expect("target");
+    let object_id = DfsObjectId::from_legacy_named("obj_fetch_stored_intent").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_fetch_stored_1").expect("base version");
+    let version_2 =
+        DfsVersion::from_legacy_named("version_fetch_stored_2").expect("target version");
+    let intent_id = "dfs_intent_fetch_stored_primary";
+    let file_system = file_system(coordinator.clone());
+    let shared_kv = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![primary.clone()]).expect("kv"),
+    );
+    shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        control
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system.file_system_id.clone(),
+                shard_id: "services".to_string(),
+                primary_node_id: primary.clone(),
+                replica_node_ids: vec![source.clone(), target.clone()],
+                epoch: 4,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("metadata shard");
+    });
+    let mut object = file_metadata(coordinator.clone());
+    object.file_system_id = file_system.file_system_id.clone();
+    object.object_id = object_id.clone();
+    object.path = "/services/fetch-stored-intent.bin".to_string();
+    object.version = version_2.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![source.clone()];
+    let bytes = b"stored intent fetch bytes for metadata-primary repair";
+    let content_hash = content_hash(bytes);
+    object.content_hash = Some(content_hash.clone());
+    object.content_size_bytes = Some(bytes.len() as u64);
+    let mut backend = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+    backend.put_file_system(&file_system).expect("filesystem");
+    backend.put_object(&object).expect("object");
+    backend
+        .put_intent(&DfsWriteIntentRecord {
+            intent_id: intent_id.to_string(),
+            file_system_id: file_system.file_system_id.clone(),
+            object_id: object_id.clone(),
+            base_version: Some(version_1),
+            target_version: version_2.clone(),
+            coordinator_node_id: coordinator.clone(),
+            owner_epoch: 4,
+            desired_replica_node_ids: vec![source.clone(), target.clone()],
+            policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+            status: DfsWriteIntentStatus::Committed,
+            content_hash: Some(content_hash.clone()),
+            object_metadata: Some(object.clone()),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+        })
+        .expect("intent");
+
+    let network = InProcessNetwork::new();
+    let _primary_mailbox = network.add_node(primary.clone());
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let mut dfs = NetworkedDfsService::new(network.add_node(source.clone()), content)
+        .with_control_plane(shared_kv)
+        .with_metadata_backend(backend)
+        .expect("metadata backend");
+    dfs.content
+        .put_object_version(object_id.as_str(), version_2.as_str(), bytes)
+        .expect("content");
+
+    let event = dfs
+        .handle_fetch_blob(
+            primary,
+            DfsFetchBlobCommand {
+                request_id: "dfs_net_req_fetch_stored_primary".to_string(),
+                intent_id: intent_id.to_string(),
+                object_id: object_id.clone(),
+                version: version_2,
+                content_hash: content_hash.clone(),
+                start_chunk_index: 0,
+                max_chunks: 0,
+            },
+        )
+        .expect("fetch blob");
+
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::BlobFetched {
+            object_id: fetched_object_id,
+            source_node_id,
+            content_hash: fetched_hash,
+            ..
+        } if fetched_object_id == object_id
+            && source_node_id == source
+            && fetched_hash == content_hash
+    ));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn repair_command_rejects_unknown_object_from_non_primary_metadata_source() {
     let root = temp_root("repair-command-unknown-object-non-primary-source");
     let source = NodeId::from_legacy_named("node_repair_unknown_source").expect("source");
@@ -12616,6 +13380,164 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
             .expect("transient local cache")
             .version,
         version_2
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn replica_remote_read_cache_and_prune_do_not_append_authoritative_metadata() {
+    let root = temp_root("replica-read-cache-no-authoritative-metadata");
+    let owner = NodeId::from_legacy_named("node_replica_read_cache_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica_read_cache_replica").expect("node");
+    let object_id = DfsObjectId::from_legacy_named("obj_replica_read_cache").expect("object");
+    let version = DfsVersion::from_legacy_named("version_replica_read_cache").expect("version");
+    let bytes = b"replica remote read cache";
+    let content_hash = content_hash(bytes);
+    let mut object = file_metadata(owner.clone());
+    object.object_id = object_id.clone();
+    object.path = "/services/read-cache/no-authority.txt".to_string();
+    object.version = version.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![owner.clone()];
+    object.content_hash = Some(content_hash.clone());
+    object.content_size_bytes = None;
+    let shared_kv = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![owner.clone()]).expect("kv"),
+    );
+    shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig {
+                file_system_id: sifs_file_system_id(),
+                display_name: "SIFS".to_string(),
+                owner_node_id: owner.clone(),
+                subtree_policies: Vec::new(),
+            })
+            .expect("filesystem config");
+        control
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: sifs_file_system_id(),
+                shard_id: "root".to_string(),
+                primary_node_id: owner.clone(),
+                replica_node_ids: vec![owner.clone(), replica.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("metadata shard");
+    });
+    let mut dfs = NetworkedDfsService::new(
+        ReceiveOnlyTransport::new(replica.clone()),
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_control_plane(shared_kv)
+    .with_metadata_backend(
+        open_root_local_metadata_backend(root.join("metadata")).expect("metadata"),
+    )
+    .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    let version_record = object_version_record(&object, None);
+    {
+        let backend = dfs.metadata_backend.as_mut().expect("metadata backend");
+        backend.put_object(&object).expect("backend object");
+        backend
+            .put_version(&version_record)
+            .expect("backend version");
+    }
+    dfs.apply_metadata_object_to_service_state(object.clone())
+        .expect("service object");
+    dfs.apply_metadata_version_to_service_state(&version_record);
+    let before_journal = dfs
+        .metadata_backend()
+        .expect("metadata backend")
+        .metadata_shard_statuses()
+        .expect("metadata status")
+        .pop()
+        .expect("root shard status")
+        .journal_last_sequence;
+
+    dfs.mark_remote_read_location_missing(
+        &object_id,
+        &version,
+        &Some(content_hash.clone()),
+        &owner,
+    )
+    .expect("transient stale location prune");
+
+    let current = dfs
+        .current_read_object_metadata(&object_id)
+        .expect("current object");
+    assert!(
+        !current.current_locations.contains(&owner),
+        "reader should remember the stale source transiently"
+    );
+    assert_eq!(
+        dfs.metadata_backend()
+            .expect("metadata backend")
+            .get_object(&object_id)
+            .expect("backend object")
+            .expect("backend object")
+            .current_locations,
+        vec![owner.clone()],
+        "replica read prune must not rewrite the durable metadata mirror"
+    );
+    assert_eq!(
+        dfs.metadata_backend()
+            .expect("metadata backend")
+            .metadata_shard_statuses()
+            .expect("metadata status")
+            .pop()
+            .expect("root shard status")
+            .journal_last_sequence,
+        before_journal,
+        "replica read prune must not append to the authoritative shard journal"
+    );
+
+    dfs.store_remote_read_data(
+        &owner,
+        &DfsReadData {
+            object_id: object_id.clone(),
+            version: version.clone(),
+            content_hash: Some(content_hash.clone()),
+            bytes: bytes.to_vec(),
+        },
+    )
+    .expect("store remote read cache");
+
+    assert_eq!(
+        dfs.read_local_object_with_state(&object_id, false)
+            .expect("read local cache"),
+        NetworkedDfsReadOutcome::Found {
+            data: DfsReadData {
+                object_id: object_id.clone(),
+                version: version.clone(),
+                content_hash: Some(content_hash.clone()),
+                bytes: bytes.to_vec(),
+            },
+            freshness: NetworkedDfsReadFreshness::Current,
+        }
+    );
+    assert_eq!(
+        dfs.metadata_backend()
+            .expect("metadata backend")
+            .get_version(&object_id, &version)
+            .expect("backend version")
+            .expect("backend version")
+            .size_bytes,
+        None,
+        "replica remote-read size discovery must stay local"
+    );
+    assert_eq!(
+        dfs.metadata_backend()
+            .expect("metadata backend")
+            .metadata_shard_statuses()
+            .expect("metadata status")
+            .pop()
+            .expect("root shard status")
+            .journal_last_sequence,
+        before_journal,
+        "replica remote-read cache must not append to the authoritative shard journal"
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -13446,6 +14368,9 @@ fn chunked_read_response_to_unroutable_requester_stops_after_first_unsent_chunk(
         &DfsReadRequest {
             request_id: "dfs_net_req_read_response_unroutable".to_string(),
             object_id: object_id.clone(),
+            version: None,
+            content_hash: None,
+            content_size_bytes: None,
             range_offset: None,
             range_max_bytes: None,
             start_chunk_index: 0,
@@ -15983,6 +16908,36 @@ fn sifs_posix_write_updates_mtime_without_changing_atime() {
 }
 
 #[test]
+fn sifs_posix_bulk_local_eventual_writes_visible_files() {
+    let root = temp_root("sifs-posix-bulk-local-eventual");
+    let node_id = NodeId::from_legacy_named("node_sifs_bulk_local").expect("node");
+    let work = "/services/sandbox/instances/sandbox_bulk_local/work";
+    let path_a = "/services/sandbox/instances/sandbox_bulk_local/work/a.txt";
+    let path_b = "/services/sandbox/instances/sandbox_bulk_local/work/b.txt";
+
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.posix_mkdir_all(work).expect("mkdir");
+    let stats = dfs
+        .posix_write_files_local_eventual_with_known_parents(vec![
+            (path_a, b"bulk alpha".as_slice()),
+            (path_b, b"bulk beta".as_slice()),
+        ])
+        .expect("bulk write");
+
+    assert_eq!(stats.len(), 2);
+    assert_eq!(stats[0].path, path_a);
+    assert_eq!(stats[0].current_locations, vec![node_id.clone()]);
+    assert_eq!(stats[0].size_bytes, Some("bulk alpha".len() as u64));
+    assert_eq!(stats[1].path, path_b);
+    assert_eq!(stats[1].current_locations, vec![node_id]);
+    assert_eq!(stats[1].size_bytes, Some("bulk beta".len() as u64));
+    assert_eq!(dfs.posix_read_file(path_a).expect("read a"), b"bulk alpha");
+    assert_eq!(dfs.posix_read_file(path_b).expect("read b"), b"bulk beta");
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn sifs_posix_write_at_merges_bytes_and_preserves_hardlink_identity() {
     let root = temp_root("sifs-posix-write-at-hardlink");
     let node_id = NodeId::from_legacy_named("node_sifs_write_at").expect("node");
@@ -16260,6 +17215,7 @@ fn sifs_posix_write_at_replicates_extent_patch_without_full_blob() {
                 policy: DfsReplicationPolicy::new(2, 2).expect("strict policy"),
                 replica_candidates: vec![owner.clone(), replica.clone()],
                 wait_for_commit: false,
+                foreground_replica_repair: true,
             },
         )
         .expect("owner patch write");
@@ -16421,6 +17377,7 @@ fn sifs_posix_write_at_replicates_large_extent_patch_in_chunks_without_full_blob
                 policy: DfsReplicationPolicy::new(2, 2).expect("strict policy"),
                 replica_candidates: vec![owner.clone(), replica.clone()],
                 wait_for_commit: false,
+                foreground_replica_repair: true,
             },
         )
         .expect("owner large patch write");
@@ -16527,6 +17484,7 @@ fn sifs_posix_write_at_retries_lost_patch_stage_as_patch() {
                 policy: DfsReplicationPolicy::new(2, 2).expect("strict policy"),
                 replica_candidates: vec![owner.clone(), replica.clone()],
                 wait_for_commit: false,
+                foreground_replica_repair: true,
             },
         )
         .expect("patch write");
@@ -16650,6 +17608,7 @@ fn sifs_posix_write_at_retries_lost_large_patch_stage_as_patch_chunks() {
                 policy: DfsReplicationPolicy::new(2, 2).expect("strict policy"),
                 replica_candidates: vec![owner.clone(), replica.clone()],
                 wait_for_commit: false,
+                foreground_replica_repair: true,
             },
         )
         .expect("large patch write");
@@ -17629,6 +18588,7 @@ fn sifs_cluster_write_options(node_id: &NodeId) -> DfsWriteOptions {
         policy: DfsReplicationPolicy::new(1, 1).expect("cluster write policy"),
         replica_candidates: vec![node_id.clone()],
         wait_for_commit: false,
+        foreground_replica_repair: true,
     }
 }
 
@@ -19334,6 +20294,214 @@ fn sifs_two_primary_cluster(name: &str) -> SifsTwoPrimaryCluster {
 }
 
 #[test]
+fn sifs_cluster_bulk_local_eventual_splits_mixed_primary_batch() {
+    let mut cluster = sifs_two_primary_cluster("sifs-bulk-mixed-primary");
+    let local_dir = "/users/bulk-mixed";
+    let remote_dir = "/services/bulk-mixed";
+    let local_path = "/users/bulk-mixed/local.txt";
+    let remote_path = "/services/bulk-mixed/remote.txt";
+    let local_bytes = b"bulk bytes owned by the local users shard".as_slice();
+    let remote_bytes = b"bulk bytes owned by the remote services shard".as_slice();
+
+    cluster
+        .users_primary
+        .posix_mkdir_all(local_dir)
+        .expect("local bulk parent");
+    cluster
+        .services_primary
+        .posix_mkdir_all(remote_dir)
+        .expect("remote bulk parent");
+    sifs_two_primary_publish_until(&mut cluster, "mixed bulk parents", |cluster| {
+        cluster.users_primary.posix_stat(remote_dir).is_ok()
+            && cluster.services_primary.posix_stat(local_dir).is_ok()
+            && cluster.replica.posix_stat(local_dir).is_ok()
+            && cluster.replica.posix_stat(remote_dir).is_ok()
+    });
+
+    let SifsTwoPrimaryCluster {
+        root,
+        users_primary_node,
+        services_primary_node,
+        replica_node,
+        shared_kv,
+        mut users_primary,
+        services_primary,
+        replica,
+        rejections,
+    } = cluster;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let services_stop = Arc::clone(&stop);
+    let services_thread = std::thread::spawn(move || {
+        let mut services_primary = services_primary;
+        while !services_stop.load(Ordering::SeqCst) {
+            services_primary
+                .process_incoming()
+                .expect("services primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        services_primary
+    });
+
+    let stats = users_primary
+        .posix_write_files_local_eventual_with_known_parents(vec![
+            (local_path, local_bytes),
+            (remote_path, remote_bytes),
+        ])
+        .expect("mixed-primary bulk write");
+    assert_eq!(stats.len(), 2);
+    assert_eq!(stats[0].path, local_path);
+    assert_eq!(
+        stats[0].content_hash.as_deref(),
+        Some(content_hash(local_bytes).as_str())
+    );
+    assert_eq!(stats[1].path, remote_path);
+    assert_eq!(
+        stats[1].content_hash.as_deref(),
+        Some(content_hash(remote_bytes).as_str())
+    );
+    assert_eq!(
+        users_primary
+            .posix_read_file(local_path)
+            .expect("read local bulk file"),
+        local_bytes
+    );
+    assert_eq!(
+        users_primary
+            .posix_stat_distributed(remote_path)
+            .expect("remote stat through primary")
+            .content_hash
+            .as_deref(),
+        Some(content_hash(remote_bytes).as_str())
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    let services_primary = services_thread.join().expect("services thread");
+    assert_eq!(
+        services_primary
+            .posix_stat(remote_path)
+            .expect("remote primary stat")
+            .content_hash
+            .as_deref(),
+        Some(content_hash(remote_bytes).as_str())
+    );
+    assert_eq!(
+        users_primary
+            .posix_stat(local_path)
+            .expect("local primary stat")
+            .content_hash
+            .as_deref(),
+        Some(content_hash(local_bytes).as_str())
+    );
+
+    let mut cluster = SifsTwoPrimaryCluster {
+        root,
+        users_primary_node,
+        services_primary_node,
+        replica_node,
+        shared_kv,
+        users_primary,
+        services_primary,
+        replica,
+        rejections,
+    };
+    sifs_two_primary_publish_until(&mut cluster, "mixed bulk convergence", |cluster| {
+        cluster.replica.posix_stat(local_path).is_ok_and(|stat| {
+            stat.content_hash.as_deref() == Some(content_hash(local_bytes).as_str())
+        }) && cluster.replica.posix_stat(remote_path).is_ok_and(|stat| {
+            stat.content_hash.as_deref() == Some(content_hash(remote_bytes).as_str())
+        })
+    });
+    assert!(
+        cluster.rejections.is_empty(),
+        "mixed-primary bulk write must not fork metadata journals: {:?}",
+        cluster.rejections
+    );
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible() {
+    let mut cluster = sifs_two_primary_cluster("sifs-bulk-remote-primary-large");
+    let remote_dir = "/services/bulk-remote-large";
+    cluster
+        .services_primary
+        .posix_mkdir_all(remote_dir)
+        .expect("remote bulk parent");
+    sifs_two_primary_publish_until(&mut cluster, "remote bulk parent", |cluster| {
+        cluster.users_primary.posix_stat(remote_dir).is_ok()
+            && cluster.replica.posix_stat(remote_dir).is_ok()
+    });
+
+    let SifsTwoPrimaryCluster {
+        root,
+        mut users_primary,
+        services_primary,
+        mut replica,
+        ..
+    } = cluster;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let services_stop = Arc::clone(&stop);
+    let services_thread = std::thread::spawn(move || {
+        let mut services_primary = services_primary;
+        while !services_stop.load(Ordering::SeqCst) {
+            services_primary
+                .process_incoming()
+                .expect("services primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        services_primary
+    });
+
+    let batch = (0..100)
+        .map(|index| {
+            (
+                format!("{remote_dir}/bulk-{index:06}.bin"),
+                format!("bulk remote primary payload {index:06}").into_bytes(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let stats = replica
+        .posix_write_files_local_eventual_with_known_parents(
+            batch
+                .iter()
+                .map(|(path, bytes)| (path.as_str(), bytes.as_slice())),
+        )
+        .expect("remote-primary bulk write");
+    assert_eq!(stats.len(), batch.len());
+
+    for (path, bytes) in &batch {
+        assert_eq!(
+            users_primary
+                .posix_stat_distributed(path)
+                .expect("remote-primary stat through primary")
+                .content_hash
+                .as_deref(),
+            Some(content_hash(bytes).as_str()),
+            "missing remote-primary bulk path {path}"
+        );
+    }
+
+    stop.store(true, Ordering::SeqCst);
+    let services_primary = services_thread.join().expect("services thread");
+    for (path, bytes) in &batch {
+        assert_eq!(
+            services_primary
+                .posix_stat(path)
+                .expect("remote primary local stat")
+                .content_hash
+                .as_deref(),
+            Some(content_hash(bytes).as_str()),
+            "remote primary did not materialize {path}"
+        );
+    }
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn sifs_cluster_posix_rename_across_shard_primaries_moves_object_transactionally() {
     let cluster = sifs_two_primary_cluster("sifs-xshard-rename");
     let SifsTwoPrimaryCluster {
@@ -19762,6 +20930,7 @@ fn sifs_cluster_posix_cross_shard_rename_recovers_after_destination_outage() {
                 policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
                 replica_candidates: vec![cluster.users_primary_node.clone()],
                 wait_for_commit: true,
+                foreground_replica_repair: true,
             },
         )
         .expect("primary local create");
@@ -19807,6 +20976,7 @@ fn sifs_cluster_posix_cross_shard_rename_recovers_after_destination_outage() {
                 policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
                 replica_candidates: vec![cluster.users_primary_node.clone()],
                 wait_for_commit: true,
+                foreground_replica_repair: true,
             },
         )
         .expect_err("writes to an in-flight cross-shard path must be rejected");
@@ -19917,6 +21087,7 @@ fn sifs_cluster_posix_cross_shard_rename_recovers_after_destination_outage() {
                 policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
                 replica_candidates: vec![cluster.users_primary_node.clone()],
                 wait_for_commit: true,
+                foreground_replica_repair: true,
             },
         )
         .expect("the freed source path accepts new files after recovery");
@@ -19938,6 +21109,7 @@ fn sifs_cluster_posix_cross_shard_rename_retry_resumes_existing_job() {
                 policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
                 replica_candidates: vec![cluster.users_primary_node.clone()],
                 wait_for_commit: true,
+                foreground_replica_repair: true,
             },
         )
         .expect("primary local create");
@@ -20216,6 +21388,7 @@ fn sifs_cluster_posix_directory_rename_across_shard_primaries_recovers_with_subt
         policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
         replica_candidates: vec![cluster.users_primary_node.clone()],
         wait_for_commit: true,
+        foreground_replica_repair: true,
     };
 
     cluster
@@ -20478,6 +21651,7 @@ fn sifs_cluster_posix_cross_shard_move_fences_open_write_intents() {
         policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
         replica_candidates: vec![cluster.users_primary_node.clone()],
         wait_for_commit: true,
+        foreground_replica_repair: true,
     };
 
     cluster
@@ -20499,6 +21673,7 @@ fn sifs_cluster_posix_cross_shard_move_fences_open_write_intents() {
                     cluster.services_primary_node.clone(),
                 ],
                 wait_for_commit: false,
+                foreground_replica_repair: true,
             },
         )
         .expect("open staged write");
@@ -20600,6 +21775,7 @@ fn sifs_cluster_posix_cross_shard_move_allows_committed_pending_repair() {
                     cluster.services_primary_node.clone(),
                 ],
                 wait_for_commit: true,
+                foreground_replica_repair: true,
             },
         )
         .expect("min-replica write commits");
@@ -20705,6 +21881,7 @@ fn late_routed_responses_are_discarded_without_failing_the_event_loop() {
             DfsNamespaceResponse {
                 request_id: "dfs_net_req_untracked_ns".to_string(),
                 result: DfsNamespaceResult::Applied,
+                synced_path_object: None,
                 metadata_journal_batches: Vec::new(),
             },
         )
@@ -20780,6 +21957,78 @@ fn late_routed_responses_are_discarded_without_failing_the_event_loop() {
 }
 
 #[test]
+fn sync_path_response_object_updates_outsider_read_view_without_journal_batches() {
+    let root = temp_root("sync-path-response-object");
+    let local = NodeId::from_legacy_named("node_sync_path_response_local").expect("local");
+    let primary = NodeId::from_legacy_named("node_sync_path_response_primary").expect("primary");
+    let object_id = DfsObjectId::from_legacy_named("obj_sync_path_response").expect("object");
+    let mut dfs = NetworkedDfsService::new(
+        FailingSendTransport {
+            local_node_id: local.clone(),
+        },
+        LocalContentStore::new(root.join("content")).expect("content"),
+    );
+    dfs.add_file_system(distributed_sifs(primary.clone()))
+        .expect("filesystem");
+    dfs.pending_routed_namespace_ops.insert(
+        "dfs_net_req_sync_path".to_string(),
+        PendingRoutedNamespaceOp {
+            primary_node_id: primary.clone(),
+            replay_journal_batches: true,
+            apply_synced_path_object: true,
+            result: None,
+        },
+    );
+
+    let object = DfsObjectMetadata {
+        object_id: object_id.clone(),
+        file_system_id: sifs_file_system_id(),
+        path: "/users/late-visible.txt".to_string(),
+        kind: DfsObjectKind::File,
+        owner_node_id: primary.clone(),
+        current_locations: vec![primary.clone()],
+        content_hash: Some("blake3:sync-path-response".to_string()),
+        content_size_bytes: Some(32),
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
+        version: DfsVersion::from_legacy_named("version_sync_path_response").expect("version"),
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    };
+
+    let event = dfs
+        .handle_namespace_response(
+            primary,
+            DfsNamespaceResponse {
+                request_id: "dfs_net_req_sync_path".to_string(),
+                result: DfsNamespaceResult::Applied,
+                synced_path_object: Some(object.clone()),
+                metadata_journal_batches: Vec::new(),
+            },
+        )
+        .expect("sync response");
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::RemoteNamespaceCompleted { .. }
+    ));
+    assert_eq!(
+        dfs.metadata()
+            .object_by_normalized_posix_path(&sifs_file_system_id(), "/users/late-visible.txt")
+            .map(|stored| (&stored.object_id, stored.content_hash.as_deref())),
+        Some((&object_id, Some("blake3:sync-path-response")))
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
     // A requester far behind the primary's journal (more entries than one
     // batch carries) must still read its own routed mutation immediately:
@@ -20800,6 +22049,7 @@ fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
         policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
         replica_candidates: vec![users_primary.node_id().clone()],
         wait_for_commit: true,
+        foreground_replica_repair: true,
     };
     for index in 0..150 {
         users_primary
@@ -20914,6 +22164,7 @@ fn sifs_cluster_posix_cross_shard_resume_honors_step_budget() {
         policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
         replica_candidates: vec![cluster.users_primary_node.clone()],
         wait_for_commit: true,
+        foreground_replica_repair: true,
     };
     cluster
         .users_primary
@@ -21101,6 +22352,7 @@ fn sifs_cluster_in_service_publish_repairs_forked_replica_with_snapshot() {
                 policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
                 replica_candidates: vec![primary_node.clone()],
                 wait_for_commit: true,
+                foreground_replica_repair: true,
             },
         )
         .expect("primary create");
@@ -21148,6 +22400,7 @@ fn sifs_cluster_in_service_publish_repairs_forked_replica_with_snapshot() {
                 policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
                 replica_candidates: vec![primary_node.clone()],
                 wait_for_commit: true,
+                foreground_replica_repair: true,
             },
         )
         .expect("primary incremental create");
@@ -21354,6 +22607,57 @@ fn sifs_non_replica_node_reads_converge_via_sync_pulls() {
 
     stop_primary.store(true, Ordering::SeqCst);
     primary_thread.join().expect("primary thread");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sifs_replica_read_miss_queries_primary_without_pulling_metadata() {
+    let cluster = sifs_posix_cluster("sifs-replica-read-no-sync-pull");
+    let SifsPosixCluster {
+        root,
+        primary_node,
+        mut primary,
+        mut observer,
+        ..
+    } = cluster;
+    let path = "/users/replica-read-no-sync.txt";
+    let bytes = b"replica reads query primary without local metadata writes".to_vec();
+    primary
+        .posix_write_file(
+            path,
+            &bytes,
+            DfsWriteOptions::replicated_eventual(vec![primary_node.clone()]),
+        )
+        .expect("primary local write");
+
+    let stop_primary = Arc::new(AtomicBool::new(false));
+    let primary_stop = Arc::clone(&stop_primary);
+    let primary_thread = std::thread::spawn(move || {
+        let mut primary = primary;
+        while !primary_stop.load(Ordering::SeqCst) {
+            primary.process_incoming().expect("primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        primary
+    });
+
+    assert_eq!(
+        observer
+            .posix_read_file_distributed(path)
+            .expect("replica miss queries primary and fetches content"),
+        bytes
+    );
+    assert!(
+        matches!(
+            observer.posix_stat(path),
+            Err(DfsPosixError::NotFound { .. })
+        ),
+        "distributed reads on a configured replica must not pull and replay metadata"
+    );
+
+    stop_primary.store(true, Ordering::SeqCst);
+    primary_thread.join().expect("primary thread");
+
     std::fs::remove_dir_all(&root).ok();
 }
 

@@ -167,6 +167,18 @@ mod tests {
                     && route.operation == sinomo_network::CLUSTER_HEALTH_READ_CAPABILITY
                     && route.auth == sinomo_module::ModuleRouteAuth::LocalOrClusterMember)
         );
+        assert!(
+            registration
+                .surfaces
+                .object_rpc_routes
+                .iter()
+                .any(
+                    |route| route.route == sinomo_network::CLUSTER_NETWORK_PING_ROUTE
+                        && route.category == sinomo_network::CLUSTER_NETWORK_RPC_CATEGORY
+                        && route.operation == sinomo_network::CLUSTER_NETWORK_PING_CAPABILITY
+                        && route.auth == sinomo_module::ModuleRouteAuth::LocalOrClusterMember
+                )
+        );
 
         let descriptor = registration
             .surfaces
@@ -192,6 +204,15 @@ mod tests {
                 .iter()
                 .any(|capability| capability.as_str()
                     == sinomo_network::CLUSTER_HEALTH_READ_CAPABILITY)
+        );
+        assert!(
+            registration
+                .surfaces
+                .capabilities
+                .exports
+                .iter()
+                .any(|capability| capability.as_str()
+                    == sinomo_network::CLUSTER_NETWORK_PING_CAPABILITY)
         );
 
         let skill = registration

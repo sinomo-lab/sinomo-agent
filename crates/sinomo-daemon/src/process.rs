@@ -53,15 +53,38 @@ pub fn prepare_background_command(command: &mut Command) {
 pub(crate) fn build_daemon_async_runtime(
     label: &str,
 ) -> Result<tokio::runtime::Runtime, DaemonError> {
+    let worker_threads = daemon_async_runtime_worker_threads();
     tokio::runtime::Builder::new_multi_thread()
         .thread_name(format!("sinomo-{label}-async"))
-        .worker_threads(2)
+        .worker_threads(worker_threads)
         .enable_all()
         .build()
         .map_err(|source| DaemonError::Io {
             path: format!("build sinomo {label} async runtime"),
             detail: source.to_string(),
         })
+}
+
+fn daemon_async_runtime_worker_threads() -> usize {
+    const MAX_WORKER_THREADS: usize = 64;
+    env::var("SINOMO_DAEMON_WORKER_THREADS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(MAX_WORKER_THREADS))
+        .unwrap_or_else(default_daemon_async_runtime_worker_threads)
+}
+
+fn default_daemon_async_runtime_worker_threads() -> usize {
+    const MIN_DEFAULT_WORKER_THREADS: usize = 4;
+    const MAX_DEFAULT_WORKER_THREADS: usize = 16;
+    std::thread::available_parallelism()
+        .map(|count| {
+            count
+                .get()
+                .clamp(MIN_DEFAULT_WORKER_THREADS, MAX_DEFAULT_WORKER_THREADS)
+        })
+        .unwrap_or(MIN_DEFAULT_WORKER_THREADS)
 }
 
 /// Stdio for the supervised main daemon's stdout/stderr. Captures to
