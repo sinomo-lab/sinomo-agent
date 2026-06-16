@@ -9,6 +9,9 @@
 //!   roundtrip; read-your-write must hold immediately on the writing node.
 //! - `cluster.dfs.invariants` — operational-metric sweep: no open conflicts,
 //!   no stuck routed namespace ops, no leaked cross-shard locks.
+//! - `cluster.dfs.protocol-codec-baseline` — in-memory DFS data-plane
+//!   protocol-frame/object-RPC codec throughput for representative chunk
+//!   messages, independent of disk and live network conditions.
 //! - `cluster.dfs.write` / `cluster.dfs.expect-file` / `cluster.dfs.expect-absent`
 //!   / `cluster.dfs.rename` / `cluster.dfs.remove` — parameterized probes
 //!   (`--param path=... --param payload=...`); the expect-* probes poll with a
@@ -31,7 +34,16 @@
 
 use crate::file_manager::FileManagerBackend;
 use crate::sifs_file_manager::SifsFileManagerBackend;
+use sinomo_runtime::dfs::{
+    self, DfsFetchBlobResponseChunk, DfsFileSystemId, DfsNetworkMessage, DfsObjectId,
+    DfsProtocolFrameCommand, DfsReadResponseChunk, DfsStageBlobChunkCommand, DfsVersion,
+    SIFS_FILE_SYSTEM_ID,
+};
 use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::network::{
+    MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrame, NetworkFrameId, ProtocolMessage,
+};
+use sinomo_runtime::node::NodeId;
 use sinomo_runtime::test::{
     SinomoTestContext, SinomoTestError, SinomoTestOutcome, SinomoTestRegistryBuilder,
     SinomoTestRequirement, SinomoTestResult,
@@ -44,6 +56,8 @@ const DEFAULT_EXPECT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_BULK_FILE_COUNT: usize = 128;
 const DEFAULT_BULK_FILE_BYTES: usize = 4 * 1024;
 const DEFAULT_LARGE_FILE_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_PROTOCOL_CODEC_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_PROTOCOL_CODEC_ITERATIONS: usize = 8;
 const EXPECT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_ROUNDTRIP_BASE: &str = "/services/cluster-tests";
 
@@ -53,6 +67,7 @@ pub fn register_dfs_cluster_test_cases(
     builder
         .register(dfs_read_your_write())
         .register(dfs_invariants())
+        .register(dfs_protocol_codec_baseline())
         .register(dfs_write())
         .register(dfs_expect_file())
         .register(dfs_expect_absent())
@@ -88,6 +103,18 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_invariants(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_protocol_codec_baseline(ctx) {
+        id: "cluster.dfs.protocol-codec-baseline",
+        summary: "Measure in-memory DFS protocol-frame object-RPC encode/decode throughput for chunk payloads",
+        tags: ["cluster-dfs", "probe", "performance"],
+        requirements: [],
+        run: {
+            run_protocol_codec_baseline(ctx)
         }
     }
 }
@@ -282,6 +309,152 @@ fn run_read_your_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 
     Ok(SinomoTestOutcome::passed(format!(
         "write/read/rename/delete roundtrip held read-your-write on node {node}"
+    )))
+}
+
+fn run_protocol_codec_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let bytes = optional_usize_parameter(ctx, "bytes", DEFAULT_PROTOCOL_CODEC_BYTES)?;
+    let iterations =
+        optional_usize_parameter(ctx, "iterations", DEFAULT_PROTOCOL_CODEC_ITERATIONS)?;
+    let min_encode_bytes_per_second =
+        optional_f64_parameter(ctx, "min-encode-bytes-per-second", 0.0)?;
+    let min_decode_bytes_per_second =
+        optional_f64_parameter(ctx, "min-decode-bytes-per-second", 0.0)?;
+    require_positive("bytes", bytes)?;
+    require_positive("iterations", iterations)?;
+
+    let payload = bulk_payload("dfs-protocol-codec", 0, bytes);
+    let samples = dfs_protocol_codec_samples(&payload)?;
+    let encoded_samples = samples
+        .iter()
+        .map(|sample| {
+            let request =
+                dfs::dfs_protocol_frame_rpc_request(&sample.command).map_err(|error| {
+                    SinomoTestError::failed(format!(
+                        "cannot encode {} DFS protocol frame request: {error}",
+                        sample.label
+                    ))
+                })?;
+            Ok(EncodedDfsProtocolCodecSample {
+                label: sample.label,
+                request_body_bytes: request.body.len(),
+                protocol_payload_bytes: sample.protocol_payload_bytes,
+                request,
+            })
+        })
+        .collect::<Result<Vec<_>, SinomoTestError>>()?;
+    let messages_per_iteration = encoded_samples.len();
+    let total_messages = messages_per_iteration.saturating_mul(iterations);
+    let total_payload_bytes = bytes.saturating_mul(total_messages);
+    let request_body_bytes_per_iteration = encoded_samples
+        .iter()
+        .map(|sample| sample.request_body_bytes)
+        .sum::<usize>();
+    let protocol_payload_bytes_per_iteration = encoded_samples
+        .iter()
+        .map(|sample| sample.protocol_payload_bytes)
+        .sum::<usize>();
+
+    let encode_started = Instant::now();
+    let mut encoded_request_body_bytes = 0_usize;
+    for _ in 0..iterations {
+        for sample in &samples {
+            let request =
+                dfs::dfs_protocol_frame_rpc_request(&sample.command).map_err(|error| {
+                    SinomoTestError::failed(format!(
+                        "cannot encode {} DFS protocol frame request: {error}",
+                        sample.label
+                    ))
+                })?;
+            encoded_request_body_bytes =
+                encoded_request_body_bytes.saturating_add(request.body.len());
+            std::hint::black_box(&request);
+        }
+    }
+    let encode_elapsed = encode_started.elapsed();
+
+    let decode_started = Instant::now();
+    let mut decoded_request_body_bytes = 0_usize;
+    for _ in 0..iterations {
+        for sample in &encoded_samples {
+            let decoded = sample
+                .request
+                .decode_body::<DfsProtocolFrameCommand>()
+                .map_err(|error| {
+                    SinomoTestError::failed(format!(
+                        "cannot decode {} DFS protocol frame request body: {error}",
+                        sample.label
+                    ))
+                })?;
+            let decoded_payload_bytes = decoded_dfs_protocol_payload_bytes(&decoded)?;
+            if decoded_payload_bytes != bytes {
+                return Ok(SinomoTestOutcome::failed(format!(
+                    "decoded {} DFS protocol payload had {decoded_payload_bytes} bytes, expected {bytes}",
+                    sample.label
+                )));
+            }
+            decoded_request_body_bytes =
+                decoded_request_body_bytes.saturating_add(sample.request_body_bytes);
+            std::hint::black_box(decoded);
+        }
+    }
+    let decode_elapsed = decode_started.elapsed();
+
+    let encode_bytes_per_second = rate_per_second(total_payload_bytes as f64, encode_elapsed);
+    let decode_bytes_per_second = rate_per_second(total_payload_bytes as f64, decode_elapsed);
+    let request_body_encode_bytes_per_second =
+        rate_per_second(encoded_request_body_bytes as f64, encode_elapsed);
+    let request_body_decode_bytes_per_second =
+        rate_per_second(decoded_request_body_bytes as f64, decode_elapsed);
+
+    ctx.record("payload_bytes_per_message", bytes as u64);
+    ctx.record("iterations", iterations);
+    ctx.record("messages_per_iteration", messages_per_iteration);
+    ctx.record("total_messages", total_messages);
+    ctx.record("total_payload_bytes", total_payload_bytes as u64);
+    ctx.record(
+        "request_body_bytes_per_iteration",
+        request_body_bytes_per_iteration as u64,
+    );
+    ctx.record(
+        "protocol_payload_bytes_per_iteration",
+        protocol_payload_bytes_per_iteration as u64,
+    );
+    ctx.record("encode_elapsed_ms", encode_elapsed.as_millis() as u64);
+    ctx.record("decode_elapsed_ms", decode_elapsed.as_millis() as u64);
+    ctx.record("encode_bytes_per_second", encode_bytes_per_second);
+    ctx.record("decode_bytes_per_second", decode_bytes_per_second);
+    ctx.record(
+        "request_body_encode_bytes_per_second",
+        request_body_encode_bytes_per_second,
+    );
+    ctx.record(
+        "request_body_decode_bytes_per_second",
+        request_body_decode_bytes_per_second,
+    );
+    ctx.record("min_encode_bytes_per_second", min_encode_bytes_per_second);
+    ctx.record("min_decode_bytes_per_second", min_decode_bytes_per_second);
+    ctx.record(
+        "sample_labels",
+        samples
+            .iter()
+            .map(|sample| sample.label)
+            .collect::<Vec<_>>(),
+    );
+
+    if min_encode_bytes_per_second > 0.0 && encode_bytes_per_second < min_encode_bytes_per_second {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "DFS protocol frame encode throughput {encode_bytes_per_second:.2} bytes/s is below required {min_encode_bytes_per_second:.2} bytes/s"
+        )));
+    }
+    if min_decode_bytes_per_second > 0.0 && decode_bytes_per_second < min_decode_bytes_per_second {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "DFS protocol frame decode throughput {decode_bytes_per_second:.2} bytes/s is below required {min_decode_bytes_per_second:.2} bytes/s"
+        )));
+    }
+
+    Ok(SinomoTestOutcome::passed(format!(
+        "DFS protocol codec processed {total_messages} messages of {bytes} bytes (encode {encode_bytes_per_second:.2} bytes/s, decode {decode_bytes_per_second:.2} bytes/s)"
     )))
 }
 
@@ -1306,6 +1479,157 @@ where
                 std::thread::sleep(EXPECT_POLL_INTERVAL);
             }
         }
+    }
+}
+
+struct DfsProtocolCodecSample {
+    label: &'static str,
+    command: DfsProtocolFrameCommand,
+    protocol_payload_bytes: usize,
+}
+
+struct EncodedDfsProtocolCodecSample {
+    label: &'static str,
+    request: sinomo_runtime::network::ObjectRpcRequest,
+    request_body_bytes: usize,
+    protocol_payload_bytes: usize,
+}
+
+fn dfs_protocol_codec_samples(
+    payload: &[u8],
+) -> Result<Vec<DfsProtocolCodecSample>, SinomoTestError> {
+    let source_node_id = NodeId::from_legacy_named("dfs_codec_source").expect("source node id");
+    let target_node_id = NodeId::from_legacy_named("dfs_codec_target").expect("target node id");
+    let file_system_id =
+        DfsFileSystemId::from_legacy_named(SIFS_FILE_SYSTEM_ID).expect("filesystem id");
+    let object_id = DfsObjectId::from_legacy_named("dfs_codec_object").expect("object id");
+    let version = DfsVersion::from_legacy_named("dfs_codec_version").expect("version id");
+    let total_size_bytes = payload.len() as u64;
+
+    Ok(vec![
+        dfs_protocol_codec_sample(
+            "stage-blob-chunk",
+            1,
+            1,
+            &source_node_id,
+            &target_node_id,
+            DfsNetworkMessage::StageBlobChunk(DfsStageBlobChunkCommand {
+                request_id: "dfs-codec-stage".to_string(),
+                intent_id: "dfs-codec-intent".to_string(),
+                file_system_id: file_system_id.clone(),
+                object_id: object_id.clone(),
+                expected_base_version: None,
+                version: version.clone(),
+                content_hash: "dfs-codec-hash".to_string(),
+                total_size_bytes,
+                chunk_index: 0,
+                total_chunks: 1,
+                chunk_hash: None,
+                bytes: payload.to_vec(),
+                object_metadata: None,
+            }),
+        )?,
+        dfs_protocol_codec_sample(
+            "read-response-chunk",
+            2,
+            2,
+            &target_node_id,
+            &source_node_id,
+            DfsNetworkMessage::ReadResponseChunk(DfsReadResponseChunk {
+                request_id: "dfs-codec-read".to_string(),
+                object_id: object_id.clone(),
+                version: version.clone(),
+                content_hash: Some("dfs-codec-hash".to_string()),
+                range_offset: None,
+                object_total_size_bytes: None,
+                total_size_bytes,
+                chunk_index: 0,
+                total_chunks: 1,
+                chunk_hash: None,
+                bytes: payload.to_vec(),
+            }),
+        )?,
+        dfs_protocol_codec_sample(
+            "fetch-blob-response-chunk",
+            3,
+            3,
+            &target_node_id,
+            &source_node_id,
+            DfsNetworkMessage::FetchBlobResponseChunk(DfsFetchBlobResponseChunk {
+                request_id: "dfs-codec-fetch".to_string(),
+                intent_id: "dfs-codec-intent".to_string(),
+                object_id,
+                version,
+                source_node_id: target_node_id.clone(),
+                content_hash: "dfs-codec-hash".to_string(),
+                total_size_bytes,
+                chunk_index: 0,
+                total_chunks: 1,
+                chunk_hash: None,
+                bytes: payload.to_vec(),
+            }),
+        )?,
+    ])
+}
+
+fn dfs_protocol_codec_sample(
+    label: &'static str,
+    frame_id: u64,
+    message_id: u64,
+    source_node_id: &NodeId,
+    target_node_id: &NodeId,
+    message: DfsNetworkMessage,
+) -> Result<DfsProtocolCodecSample, SinomoTestError> {
+    let protocol_message =
+        ProtocolMessage::encode(dfs::DFS_PROTOCOL, &message).map_err(|error| {
+            SinomoTestError::failed(format!(
+                "cannot encode {label} DFS protocol message: {error}"
+            ))
+        })?;
+    let protocol_payload_bytes = protocol_message.payload.len();
+    let frame = NetworkFrame {
+        frame_id: NetworkFrameId(frame_id),
+        source_node_id: source_node_id.clone(),
+        target_node_id: target_node_id.clone(),
+        message: MeshMessage {
+            message_id: MeshMessageId(message_id),
+            origin_node_id: source_node_id.clone(),
+            target_node_id: target_node_id.clone(),
+            body: MeshMessageBody::Protocol(protocol_message),
+        },
+    };
+    Ok(DfsProtocolCodecSample {
+        label,
+        command: DfsProtocolFrameCommand {
+            request_id: format!("dfs-codec-{label}-{frame_id}"),
+            frame,
+        },
+        protocol_payload_bytes,
+    })
+}
+
+fn decoded_dfs_protocol_payload_bytes(
+    command: &DfsProtocolFrameCommand,
+) -> Result<usize, SinomoTestError> {
+    let MeshMessageBody::Protocol(protocol_message) = &command.frame.message.body else {
+        return Err(SinomoTestError::failed(
+            "decoded DFS protocol frame was not a protocol message",
+        ));
+    };
+    let message = protocol_message
+        .decode::<DfsNetworkMessage>()
+        .map_err(|error| {
+            SinomoTestError::failed(format!(
+                "cannot decode nested DFS protocol message: {error}"
+            ))
+        })?;
+    match message {
+        DfsNetworkMessage::StageBlobChunk(command) => Ok(command.bytes.len()),
+        DfsNetworkMessage::ReadResponseChunk(command) => Ok(command.bytes.len()),
+        DfsNetworkMessage::FetchBlobResponseChunk(command) => Ok(command.bytes.len()),
+        other => Err(SinomoTestError::failed(format!(
+            "decoded unexpected DFS protocol message variant: {other:?}"
+        ))),
     }
 }
 

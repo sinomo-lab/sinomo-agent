@@ -6,24 +6,25 @@
 # in-binary cluster runtime test cases (sinomo test run --require-cluster)
 # from different nodes to verify network health and cluster-wide POSIX behavior:
 #
-#   1. network latency — signed object-RPC latency/RPS with no failed requests
-#   2. network payload — signed object-RPC payload throughput with no failed requests
-#   3. invariants     — per-node DFS operational invariants (baseline)
-#   4. read-your-write — write/read/rename/delete roundtrip on node1 and node5
-#   5. cross-node     — write on one segment, poll-read on the other (both
+#   1. DFS protocol codec — in-memory DFS data-plane frame encode/decode baseline
+#   2. network latency — signed object-RPC latency/RPS with no failed requests
+#   3. network payload — signed object-RPC payload throughput with no failed requests
+#   4. invariants     — per-node DFS operational invariants (baseline)
+#   5. read-your-write — write/read/rename/delete roundtrip on node1 and node5
+#   6. cross-node     — write on one segment, poll-read on the other (both
 #                       directions), then a routed delete observed cluster-wide
-#   6. rename         — /users -> /services rename issued by a NON-writer node,
+#   7. rename         — /users -> /services rename issued by a NON-writer node,
 #                       observed (and the old path absent) on far nodes
-#   7. small baseline — node-local raw tiny-file write baseline for DFS comparison
-#   8. bulk perf      — small-file bulk write/read throughput with process I/O
+#   8. small baseline — node-local raw tiny-file write baseline for DFS comparison
+#   9. bulk perf      — small-file bulk write/read throughput with process I/O
 #                       amplification checks and read-side write_bytes == 0
-#   9. disk baseline — node-local raw file write/read baseline for DFS comparison
-#   10. large-file perf — large object write/read throughput with process I/O
+#   10. disk baseline — node-local raw file write/read baseline for DFS comparison
+#   11. large-file perf — large object write/read throughput with process I/O
 #                       amplification checks and read-side write_bytes == 0
-#   11. disk damage   — delete one durable loose blob and read through the
+#   12. disk damage   — delete one durable loose blob and read through the
 #                       remaining replica without read-side disk writes
-#   12. restart       — restart a member, re-gate formation, re-read its data
-#   13. final sweep   — invariants again on every node
+#   13. restart       — restart a member, re-gate formation, re-read its data
+#   14. final sweep   — invariants again on every node
 #
 # Usage:
 #   docker/test-cluster.sh                  # build-if-missing, up, test, down -v
@@ -63,6 +64,10 @@
 #   SINOMO_TEST_DISK_BASELINE_MIN_WRITE_BYTES_PER_SEC min raw write throughput (default 0, disabled)
 #   SINOMO_TEST_DISK_BASELINE_MIN_READ_BYTES_PER_SEC  min raw read throughput (default 0, disabled)
 #   SINOMO_TEST_DAMAGE_BYTES    bytes in loose-blob disk damage scenario (default 65536)
+#   SINOMO_TEST_DFS_PROTOCOL_CODEC_BYTES bytes per DFS protocol codec message (default 4194304)
+#   SINOMO_TEST_DFS_PROTOCOL_CODEC_ITERATIONS codec encode/decode iterations per sample (default 8)
+#   SINOMO_TEST_DFS_PROTOCOL_CODEC_MIN_ENCODE_BYTES_PER_SEC min codec payload encode throughput (default 67108864)
+#   SINOMO_TEST_DFS_PROTOCOL_CODEC_MIN_DECODE_BYTES_PER_SEC min codec payload decode throughput (default 67108864)
 #   SINOMO_TEST_NETWORK_REQUESTS_PER_TARGET cluster network ping RPCs per remote node (default 20)
 #   SINOMO_TEST_NETWORK_CONCURRENCY         concurrent network ping workers (default 32)
 #   SINOMO_TEST_NETWORK_TIMEOUT_MS          per network ping RPC timeout (default 2000)
@@ -131,6 +136,10 @@ DISK_BASELINE_SYNC_WRITE="${SINOMO_TEST_DISK_BASELINE_SYNC_WRITE:-1}"
 DISK_BASELINE_MIN_WRITE_BYTES_PER_SEC="${SINOMO_TEST_DISK_BASELINE_MIN_WRITE_BYTES_PER_SEC:-0}"
 DISK_BASELINE_MIN_READ_BYTES_PER_SEC="${SINOMO_TEST_DISK_BASELINE_MIN_READ_BYTES_PER_SEC:-0}"
 DAMAGE_BYTES="${SINOMO_TEST_DAMAGE_BYTES:-65536}"
+DFS_PROTOCOL_CODEC_BYTES="${SINOMO_TEST_DFS_PROTOCOL_CODEC_BYTES:-4194304}"
+DFS_PROTOCOL_CODEC_ITERATIONS="${SINOMO_TEST_DFS_PROTOCOL_CODEC_ITERATIONS:-8}"
+DFS_PROTOCOL_CODEC_MIN_ENCODE_BYTES_PER_SEC="${SINOMO_TEST_DFS_PROTOCOL_CODEC_MIN_ENCODE_BYTES_PER_SEC:-67108864}"
+DFS_PROTOCOL_CODEC_MIN_DECODE_BYTES_PER_SEC="${SINOMO_TEST_DFS_PROTOCOL_CODEC_MIN_DECODE_BYTES_PER_SEC:-67108864}"
 NETWORK_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_REQUESTS_PER_TARGET:-20}"
 NETWORK_CONCURRENCY="${SINOMO_TEST_NETWORK_CONCURRENCY:-32}"
 NETWORK_TIMEOUT_MS="${SINOMO_TEST_NETWORK_TIMEOUT_MS:-2000}"
@@ -329,6 +338,14 @@ invariants_sweep() {
     run_probe "$node" cluster.dfs.invariants --param timeout-seconds=60 || rc=1
   done
   return $rc
+}
+
+dfs_protocol_codec_baseline() {
+  run_probe node1 cluster.dfs.protocol-codec-baseline \
+    --param "bytes=$DFS_PROTOCOL_CODEC_BYTES" \
+    --param "iterations=$DFS_PROTOCOL_CODEC_ITERATIONS" \
+    --param "min-encode-bytes-per-second=$DFS_PROTOCOL_CODEC_MIN_ENCODE_BYTES_PER_SEC" \
+    --param "min-decode-bytes-per-second=$DFS_PROTOCOL_CODEC_MIN_DECODE_BYTES_PER_SEC"
 }
 
 network_baseline() {
@@ -639,6 +656,7 @@ if ! wait_for_network_ready; then
   exit 1
 fi
 
+scenario "dfs-protocol-codec-baseline" dfs_protocol_codec_baseline
 scenario "network-latency-baseline" network_baseline
 scenario "network-payload-baseline" network_payload_baseline
 if [ -n "$FAILED_SCENARIOS" ]; then

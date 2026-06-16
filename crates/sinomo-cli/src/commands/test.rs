@@ -650,6 +650,7 @@ mod tests {
             .collect();
         for id in [
             "cluster.network.ping-benchmark",
+            "cluster.dfs.protocol-codec-baseline",
             "cluster.dfs.read-your-write",
             "cluster.dfs.invariants",
             "cluster.dfs.write",
