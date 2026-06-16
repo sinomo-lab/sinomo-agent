@@ -2016,6 +2016,7 @@ pub struct LocalSobjMetadataBackend {
     next_sequence: u64,
     tables: DfsMetadataTables,
     table_log_offset: u64,
+    materialized_through_sequence: u64,
     table_snapshot_fingerprint: Option<MetadataTableSnapshotFingerprint>,
     read_snapshot_cache: Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
 }
@@ -2056,6 +2057,7 @@ struct DfsMetadataTables {
 struct DfsMetadataTableState {
     tables: DfsMetadataTables,
     table_log_offset: u64,
+    materialized_through_sequence: Option<u64>,
     snapshot_format_version: Option<u16>,
     snapshot_fingerprint: Option<MetadataTableSnapshotFingerprint>,
 }
@@ -2073,9 +2075,25 @@ struct MetadataTableReadSnapshotCache {
     tables: DfsMetadataTables,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MetadataTableReplay {
+    offset: u64,
+    materialized_through_sequence: Option<u64>,
+}
+
+fn max_optional_sequence(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(sequence), None) | (None, Some(sequence)) => Some(sequence),
+        (None, None) => None,
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsMetadataTableSnapshot {
     format_version: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    materialized_through_sequence: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tables: Option<DfsMetadataTableSnapshotTables>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -4960,6 +4978,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         }
         Ok(DfsMetadataTableSnapshot {
             format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+            materialized_through_sequence: None,
             tables: Some(tables),
             ops: Vec::new(),
         })
@@ -5062,6 +5081,7 @@ impl LocalSobjMetadataBackend {
             next_sequence: 1,
             tables: DfsMetadataTables::default(),
             table_log_offset: 0,
+            materialized_through_sequence: 0,
             table_snapshot_fingerprint: None,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
         };
@@ -5070,10 +5090,13 @@ impl LocalSobjMetadataBackend {
             migrate_legacy_journal_entries(&backend.root)?;
             backend.next_sequence = recover_next_journal_sequence(&backend.root)?;
             let state = load_or_migrate_metadata_tables(&backend.root)?;
+            let materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
             backend.tables = state.tables;
             backend.table_log_offset = state.table_log_offset;
+            backend.materialized_through_sequence = materialized_through_sequence;
             backend.table_snapshot_fingerprint = state.snapshot_fingerprint;
             backend.ensure_local_materialization_cursor()?;
+            backend.reconcile_local_materialization_cursor(materialized_through_sequence)?;
             backend.recover_unmaterialized_local_journal_entries()?;
         }
         backend.recover_namespace_transactions()?;
@@ -5142,6 +5165,9 @@ impl LocalSobjMetadataBackend {
         }
         self.append_preapplied_table_ops(table_sequence, table_ops, rollback)?;
         if local_cursor_advanced {
+            self.materialized_through_sequence = self
+                .materialized_through_sequence
+                .max(local_cursor.last_sequence);
             self.write_local_materialization_cursor(&local_cursor)?;
         }
         for shard_id in advanced_cursors {
@@ -5159,6 +5185,7 @@ impl LocalSobjMetadataBackend {
     pub fn export_table_snapshot(&self) -> DfsMetadataTableSnapshot {
         DfsMetadataTableSnapshot {
             format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+            materialized_through_sequence: Some(self.materialized_through_sequence),
             tables: Some(metadata_tables_snapshot(&self.tables)),
             ops: Vec::new(),
         }
@@ -5178,7 +5205,12 @@ impl LocalSobjMetadataBackend {
         self.tables = tables;
         self.table_log_offset = 0;
         self.next_sequence = replayed_through_sequence.saturating_add(1).max(1);
-        persist_metadata_table_snapshot(&self.root, &self.tables)?;
+        self.materialized_through_sequence = replayed_through_sequence;
+        persist_metadata_table_snapshot(
+            &self.root,
+            &self.tables,
+            Some(self.materialized_through_sequence),
+        )?;
         self.table_snapshot_fingerprint = metadata_table_snapshot_fingerprint(&self.root)?;
         write_sobj_atomic(
             &self.replay_cursor_path(&source_shard_id),
@@ -5296,6 +5328,30 @@ impl LocalSobjMetadataBackend {
         )
     }
 
+    fn replayed_visible_commit_already_materialized(
+        &self,
+        object_id: &DfsObjectId,
+        committed_version: &DfsVersion,
+        commit: &DfsVisibleVersionCommitRecord,
+    ) -> Result<bool> {
+        if &commit.committed_object.version != committed_version {
+            return Ok(false);
+        }
+        let commit_key = (object_id.clone(), committed_version.clone());
+        let Some(existing) = self.tables.visible_commits.get(&commit_key) else {
+            return Ok(false);
+        };
+        if existing.expected_version != commit.expected_version
+            || existing.committed_object != commit.committed_object
+            || existing.visible_version != commit.visible_version
+            || existing.required_replica_node_ids != commit.required_replica_node_ids
+        {
+            return Ok(false);
+        }
+        let visible_version = normalized_version_record(&commit.visible_version);
+        Ok(self.get_version(object_id, committed_version)?.as_ref() == Some(&visible_version))
+    }
+
     fn materialize_replayed_journal_entry_unlocked(
         &mut self,
         entry: &DfsMetadataJournalEntry,
@@ -5404,6 +5460,15 @@ impl LocalSobjMetadataBackend {
                     "commit-visible-version visible version",
                     visible_version.as_ref(),
                 )?;
+                let commit_record = DfsVisibleVersionCommitRecord {
+                    expected_version: previous_version.clone(),
+                    committed_object: normalized_object_metadata(committed_object),
+                    visible_version: normalized_version_record(visible_version),
+                    required_replica_node_ids: normalized_node_location_list(
+                        required_replica_node_ids,
+                    ),
+                    created_at: entry.created_at,
+                };
                 if self
                     .get_object(object_id)?
                     .as_ref()
@@ -5411,6 +5476,13 @@ impl LocalSobjMetadataBackend {
                     && self.get_version(object_id, committed_version)?.as_ref()
                         == Some(&normalized_version_record(visible_version))
                 {
+                    return Ok(false);
+                }
+                if self.replayed_visible_commit_already_materialized(
+                    object_id,
+                    committed_version,
+                    &commit_record,
+                )? {
                     return Ok(false);
                 }
                 let current = self.get_object(object_id)?.ok_or_else(|| {
@@ -5428,15 +5500,6 @@ impl LocalSobjMetadataBackend {
                 // A replayed commit entry is authoritative after source validation. Short
                 // read-your-write replay windows can arrive without every receipt entry; the
                 // commit payload is still enough to make the object/version visible locally.
-                let commit_record = DfsVisibleVersionCommitRecord {
-                    expected_version: previous_version.clone(),
-                    committed_object: normalized_object_metadata(committed_object),
-                    visible_version: normalized_version_record(visible_version),
-                    required_replica_node_ids: normalized_node_location_list(
-                        required_replica_node_ids,
-                    ),
-                    created_at: entry.created_at,
-                };
                 self.materialize_visible_version_commit(&commit_record, entry.sequence)?;
                 Ok(true)
             }
@@ -5630,6 +5693,15 @@ impl LocalSobjMetadataBackend {
                     "commit-visible-version visible version",
                     visible_version.as_ref(),
                 )?;
+                let commit_record = DfsVisibleVersionCommitRecord {
+                    expected_version: previous_version.clone(),
+                    committed_object: normalized_object_metadata(committed_object),
+                    visible_version: normalized_version_record(visible_version),
+                    required_replica_node_ids: normalized_node_location_list(
+                        required_replica_node_ids,
+                    ),
+                    created_at: entry.created_at,
+                };
                 if self
                     .get_object(object_id)?
                     .as_ref()
@@ -5637,6 +5709,13 @@ impl LocalSobjMetadataBackend {
                     && self.get_version(object_id, committed_version)?.as_ref()
                         == Some(&normalized_version_record(visible_version))
                 {
+                    return Ok(false);
+                }
+                if self.replayed_visible_commit_already_materialized(
+                    object_id,
+                    committed_version,
+                    &commit_record,
+                )? {
                     return Ok(false);
                 }
                 let current = self.get_object(object_id)?.ok_or_else(|| {
@@ -5654,15 +5733,6 @@ impl LocalSobjMetadataBackend {
                 // A replayed commit entry is authoritative after source validation. Short
                 // read-your-write replay windows can arrive without every receipt entry; the
                 // commit payload is still enough to make the object/version visible locally.
-                let commit_record = DfsVisibleVersionCommitRecord {
-                    expected_version: previous_version.clone(),
-                    committed_object: normalized_object_metadata(committed_object),
-                    visible_version: normalized_version_record(visible_version),
-                    required_replica_node_ids: normalized_node_location_list(
-                        required_replica_node_ids,
-                    ),
-                    created_at: entry.created_at,
-                };
                 self.plan_visible_version_commit_table_ops(&commit_record, table_ops, rollback)?;
                 Ok(true)
             }
@@ -5979,6 +6049,15 @@ impl LocalSobjMetadataBackend {
         self.write_local_materialization_cursor(&cursor)
     }
 
+    fn reconcile_local_materialization_cursor(&self, materialized_sequence: u64) -> Result<()> {
+        if materialized_sequence == 0 {
+            return Ok(());
+        }
+        self.advance_local_materialization_cursor(
+            materialized_sequence.min(self.next_sequence.saturating_sub(1)),
+        )
+    }
+
     fn checkpoint_local_materialization_cursor_if_due(&self, sequence: u64) -> Result<()> {
         let cursor = self.local_materialization_cursor()?;
         if sequence <= cursor.last_sequence
@@ -6024,6 +6103,8 @@ impl LocalSobjMetadataBackend {
                 }
             }
             if advanced {
+                self.materialized_through_sequence =
+                    self.materialized_through_sequence.max(cursor.last_sequence);
                 self.write_local_materialization_cursor(&cursor)?;
             }
         }
@@ -6229,6 +6310,7 @@ impl LocalSobjMetadataBackend {
         for op in ops {
             self.tables.apply(op);
         }
+        self.materialized_through_sequence = self.materialized_through_sequence.max(sequence);
         self.compact_metadata_table_log_if_needed(DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES)?;
         Ok(())
     }
@@ -6252,6 +6334,7 @@ impl LocalSobjMetadataBackend {
                 }
             };
         self.table_log_offset = self.table_log_offset.saturating_add(written);
+        self.materialized_through_sequence = self.materialized_through_sequence.max(sequence);
         self.compact_metadata_table_log_if_needed(DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES)?;
         Ok(())
     }
@@ -6271,7 +6354,11 @@ impl LocalSobjMetadataBackend {
         if len <= max_log_bytes {
             return Ok(());
         }
-        persist_metadata_table_snapshot(&self.root, &self.tables)?;
+        persist_metadata_table_snapshot(
+            &self.root,
+            &self.tables,
+            Some(self.materialized_through_sequence),
+        )?;
         self.table_snapshot_fingerprint = metadata_table_snapshot_fingerprint(&self.root)?;
         self.table_log_offset = fs::metadata(&path)
             .map(|metadata| metadata.len())
@@ -6295,11 +6382,16 @@ impl LocalSobjMetadataBackend {
             let state = read_metadata_table_state(&self.root)?;
             self.tables = state.tables;
             self.table_log_offset = state.table_log_offset;
+            self.materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
             self.table_snapshot_fingerprint = state.snapshot_fingerprint;
             return Ok(());
         }
-        self.table_log_offset =
+        let replay =
             replay_metadata_table_batches_from(&path, self.table_log_offset, &mut self.tables)?;
+        self.table_log_offset = replay.offset;
+        if let Some(sequence) = replay.materialized_through_sequence {
+            self.materialized_through_sequence = self.materialized_through_sequence.max(sequence);
+        }
         Ok(())
     }
 
@@ -6331,14 +6423,18 @@ impl LocalSobjMetadataBackend {
                         return Ok(Cow::Owned(state.tables));
                     }
                     let mut tables = self.tables.clone();
-                    let table_log_offset = replay_metadata_table_batches_from(
+                    let replay = replay_metadata_table_batches_from(
                         &path,
                         self.table_log_offset,
                         &mut tables,
                     )?;
                     let state = DfsMetadataTableState {
                         tables,
-                        table_log_offset,
+                        table_log_offset: replay.offset,
+                        materialized_through_sequence: max_optional_sequence(
+                            Some(self.materialized_through_sequence),
+                            replay.materialized_through_sequence,
+                        ),
                         snapshot_format_version: None,
                         snapshot_fingerprint: current_snapshot_fingerprint,
                     };
@@ -9323,7 +9419,7 @@ fn load_or_migrate_metadata_tables(root: &Path) -> Result<DfsMetadataTableState>
     if state.snapshot_format_version.is_some_and(|version| {
         version < METADATA_TABLE_SNAPSHOT_FORMAT_VERSION && state.tables.has_materialized_state()
     }) {
-        persist_metadata_table_snapshot(root, &state.tables)?;
+        persist_metadata_table_snapshot(root, &state.tables, state.materialized_through_sequence)?;
         state.table_log_offset = 0;
         state.snapshot_format_version = Some(METADATA_TABLE_SNAPSHOT_FORMAT_VERSION);
         state.snapshot_fingerprint = metadata_table_snapshot_fingerprint(root)?;
@@ -9334,7 +9430,7 @@ fn load_or_migrate_metadata_tables(root: &Path) -> Result<DfsMetadataTableState>
     }
     state.tables = load_legacy_metadata_tables(root)?;
     if state.tables.has_materialized_state() {
-        persist_metadata_table_snapshot(root, &state.tables)?;
+        persist_metadata_table_snapshot(root, &state.tables, state.materialized_through_sequence)?;
         state.table_log_offset = 0;
         state.snapshot_format_version = Some(METADATA_TABLE_SNAPSHOT_FORMAT_VERSION);
         state.snapshot_fingerprint = metadata_table_snapshot_fingerprint(root)?;
@@ -9357,8 +9453,12 @@ fn read_metadata_table_state_with_tail_policy(
     let mut state = read_metadata_table_snapshot(root)?;
     let table_path = metadata_table_path(root);
     if table_path.is_file() {
-        state.table_log_offset =
-            replay_metadata_table_batches_from(&table_path, 0, &mut state.tables)?;
+        let replay = replay_metadata_table_batches_from(&table_path, 0, &mut state.tables)?;
+        state.table_log_offset = replay.offset;
+        state.materialized_through_sequence = max_optional_sequence(
+            state.materialized_through_sequence,
+            replay.materialized_through_sequence,
+        );
         if truncate_torn_tail {
             truncate_torn_metadata_table_log_tail(&table_path, state.table_log_offset)?;
         }
@@ -9412,6 +9512,7 @@ fn read_metadata_table_snapshot(root: &Path) -> Result<DfsMetadataTableState> {
     }
     let snapshot: DfsMetadataTableSnapshot = read_sobj(&path)?;
     let format_version = snapshot.format_version;
+    let materialized_through_sequence = snapshot.materialized_through_sequence;
     let tables = metadata_tables_from_table_snapshot(
         snapshot,
         &format!("DFS metadata table snapshot at {}", path.display()),
@@ -9419,6 +9520,7 @@ fn read_metadata_table_snapshot(root: &Path) -> Result<DfsMetadataTableState> {
     Ok(DfsMetadataTableState {
         tables,
         table_log_offset: 0,
+        materialized_through_sequence,
         snapshot_format_version: Some(format_version),
         snapshot_fingerprint: metadata_table_snapshot_fingerprint(root)?,
     })
@@ -9475,7 +9577,7 @@ fn replay_metadata_table_batches_from(
     path: &Path,
     offset: u64,
     tables: &mut DfsMetadataTables,
-) -> Result<u64> {
+) -> Result<MetadataTableReplay> {
     let mut file = fs::File::open(path).map_err(|source| MetadataBackendError::Io {
         path: path.to_owned(),
         source,
@@ -9507,13 +9609,14 @@ fn replay_metadata_table_batches(
     file: &mut fs::File,
     path: &Path,
     tables: &mut DfsMetadataTables,
-) -> Result<u64> {
+) -> Result<MetadataTableReplay> {
     let mut offset = file
         .stream_position()
         .map_err(|source| MetadataBackendError::Io {
             path: path.to_owned(),
             source,
         })?;
+    let mut materialized_through_sequence = None;
     loop {
         let mut length_bytes = [0_u8; 4];
         match file.read_exact(&mut length_bytes) {
@@ -9557,6 +9660,8 @@ fn replay_metadata_table_batches(
             Err(_) if record_end >= file_len => break,
             Err(source) => return Err(MetadataBackendError::Serde(source.to_string())),
         };
+        materialized_through_sequence =
+            max_optional_sequence(materialized_through_sequence, Some(batch.sequence));
         for op in batch.ops {
             tables.apply(op);
         }
@@ -9569,7 +9674,10 @@ fn replay_metadata_table_batches(
             .saturating_add(4)
             .saturating_add(u64::try_from(length).unwrap_or(u64::MAX));
     }
-    Ok(offset)
+    Ok(MetadataTableReplay {
+        offset,
+        materialized_through_sequence,
+    })
 }
 
 fn append_metadata_table_batch(root: &Path, batch: &DfsMetadataTableBatch) -> Result<u64> {
@@ -9611,11 +9719,16 @@ fn append_metadata_table_batch(root: &Path, batch: &DfsMetadataTableBatch) -> Re
     Ok(u64::try_from(record.len()).unwrap_or(u64::MAX))
 }
 
-fn persist_metadata_table_snapshot(root: &Path, tables: &DfsMetadataTables) -> Result<()> {
+fn persist_metadata_table_snapshot(
+    root: &Path,
+    tables: &DfsMetadataTables,
+    materialized_through_sequence: Option<u64>,
+) -> Result<()> {
     write_sobj_atomic(
         &metadata_table_snapshot_path(root),
         &DfsMetadataTableSnapshot {
             format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+            materialized_through_sequence,
             tables: Some(metadata_tables_snapshot(tables)),
             ops: Vec::new(),
         },
@@ -12583,6 +12696,131 @@ mod tests {
     }
 
     #[test]
+    fn local_backend_replays_already_materialized_visible_commits_after_newer_head() {
+        fn commit_test_version(
+            backend: &mut LocalSobjMetadataBackend,
+            previous: &DfsObjectMetadata,
+            committed_version: &str,
+            content_hash: &str,
+            event_id: &str,
+        ) -> (DfsObjectMetadata, DfsMetadataJournalEntry) {
+            let replica_node_id = node("node_replica");
+            let mut committed = previous.clone();
+            committed.version = version(committed_version);
+            committed.content_hash = Some(content_hash.to_string());
+            committed.content_size_bytes = Some(content_hash.len() as u64);
+            committed.current_locations = vec![replica_node_id.clone()];
+            let visible_version = DfsObjectVersionRecord {
+                file_system_id: committed.file_system_id.clone(),
+                object_id: committed.object_id.clone(),
+                version: committed.version.clone(),
+                content_hash: committed.content_hash.clone(),
+                size_bytes: committed.content_size_bytes,
+                locations: committed.current_locations.clone(),
+                created_by_event_id: None,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                visible: true,
+            };
+            let receipt = DfsReplicaReceiptRecord {
+                receipt: DfsWriteReceipt {
+                    file_system_id: committed.file_system_id.clone(),
+                    object_id: committed.object_id.clone(),
+                    committed_version: committed.version.clone(),
+                    owner_node_id: committed.owner_node_id.clone(),
+                    event_id: EventId::from_legacy_named(event_id).expect("event"),
+                },
+                replica_node_id,
+                content_hash: committed.content_hash.clone(),
+                received_at: OffsetDateTime::UNIX_EPOCH,
+            };
+            backend.put_receipt(&receipt).expect("receipt");
+            let entry = backend
+                .commit_visible_version(
+                    &previous.version,
+                    &committed,
+                    &visible_version,
+                    std::slice::from_ref(&receipt.replica_node_id),
+                )
+                .expect("commit visible version");
+            (committed, entry)
+        }
+
+        let root = temp_root("local_backend_replays_chained_visible_commits_after_newer_head");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let (final_object, final_sequence) = {
+            let mut backend =
+                LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+            backend.put_file_system(&file_system()).expect("filesystem");
+            let initial = object(version("version_1"));
+            backend.put_object(&initial).expect("initial object");
+            let (committed_v2, commit_v2) = commit_test_version(
+                &mut backend,
+                &initial,
+                "version_2",
+                "blake3:version-2",
+                "evt_replay_commit_v2",
+            );
+            let (committed_v3, commit_v3) = commit_test_version(
+                &mut backend,
+                &committed_v2,
+                "version_3",
+                "blake3:version-3",
+                "evt_replay_commit_v3",
+            );
+
+            write_sobj_atomic(
+                &metadata_table_snapshot_path(&root),
+                &DfsMetadataTableSnapshot {
+                    format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+                    materialized_through_sequence: None,
+                    tables: Some(metadata_tables_snapshot(&backend.tables)),
+                    ops: Vec::new(),
+                },
+            )
+            .expect("legacy structured snapshot without materialized sequence");
+            truncate_metadata_table_log(&root).expect("truncate table log");
+            write_sobj_atomic(
+                &backend.local_materialization_cursor_path(),
+                &DfsMetadataReplayCursor {
+                    shard_id: shard_id.clone(),
+                    last_sequence: commit_v2.sequence.saturating_sub(1),
+                },
+            )
+            .expect("stale materialization cursor before visible commits");
+            (committed_v3, commit_v3.sequence)
+        };
+
+        let reopened = LocalSobjMetadataBackend::new(shard_id, &root).expect("reopen");
+
+        assert_eq!(
+            reopened
+                .get_object(&final_object.object_id)
+                .expect("object lookup"),
+            Some(final_object),
+            "replay must not reject or roll back an already-materialized older visible commit"
+        );
+        assert_eq!(
+            read_sobj::<DfsMetadataReplayCursor>(&reopened.local_materialization_cursor_path())
+                .expect("materialization cursor")
+                .last_sequence,
+            final_sequence
+        );
+        assert_eq!(
+            reopened.materialized_through_sequence, final_sequence,
+            "legacy snapshots should learn the durable materialization sequence from replay"
+        );
+        assert_eq!(
+            fs::metadata(metadata_table_path(&root))
+                .expect("metadata table")
+                .len(),
+            0,
+            "idempotent replay should not rewrite table batches for already-materialized commits"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn local_backend_open_does_not_rewrite_existing_metadata_table() {
         let root = temp_root("local_backend_open_preserves_metadata_table");
         let mut backend =
@@ -12791,6 +13029,7 @@ mod tests {
                 &metadata_table_snapshot_path(&root),
                 &DfsMetadataTableSnapshot {
                     format_version: LEGACY_METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+                    materialized_through_sequence: None,
                     tables: None,
                     ops: metadata_table_snapshot_ops(&backend.tables),
                 },
@@ -12905,8 +13144,12 @@ mod tests {
             LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("writer backend");
         writer.put_file_system(&file_system()).expect("filesystem");
-        persist_metadata_table_snapshot(&root, &writer.tables)
-            .expect("snapshot filesystem before table-log shrink");
+        persist_metadata_table_snapshot(
+            &root,
+            &writer.tables,
+            Some(writer.materialized_through_sequence),
+        )
+        .expect("snapshot filesystem before table-log shrink");
         truncate_metadata_table_log(&root).expect("truncate table log after snapshot");
         drop(writer);
         let mut writer =
