@@ -570,7 +570,7 @@ impl Service for ClusterHealthService {
     }
 }
 
-fn cached_cluster_network_ping_node_id(
+pub(crate) fn cached_cluster_network_ping_node_id(
     paths: &DaemonPaths,
     data_dir: &SinomoDataDir,
 ) -> Result<sinomo_node::NodeId, ServiceError> {

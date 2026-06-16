@@ -74,7 +74,9 @@
 #   SINOMO_TEST_NETWORK_MAX_FAILURES        allowed failed network ping RPCs (default 0)
 #   SINOMO_TEST_NETWORK_MAX_P50_MS          max network ping p50 latency (default 50)
 #   SINOMO_TEST_NETWORK_MAX_P95_MS          max network ping p95 latency (default 250)
-#   SINOMO_TEST_NETWORK_MIN_RPS             min network ping throughput (default 50)
+#   SINOMO_TEST_NETWORK_MAX_P50_US          max network ping p50 latency (default 10000)
+#   SINOMO_TEST_NETWORK_MAX_P95_US          max network ping p95 latency (default 50000)
+#   SINOMO_TEST_NETWORK_MIN_RPS             min network ping throughput (default 250)
 #   SINOMO_TEST_NETWORK_PAYLOAD_BYTES       request bytes per latency-baseline ping payload (default 0)
 #   SINOMO_TEST_NETWORK_RESPONSE_PAYLOAD_BYTES response bytes per latency-baseline ping payload (default 0)
 #   SINOMO_TEST_NETWORK_MIN_PAYLOAD_BYTES_PER_SEC min latency-baseline payload throughput (default 0, disabled)
@@ -83,7 +85,7 @@
 #   SINOMO_TEST_NETWORK_PAYLOAD_TIMEOUT_MS  payload-throughput RPC timeout (default 5000)
 #   SINOMO_TEST_NETWORK_PAYLOAD_REQUEST_BYTES request bytes per payload-throughput RPC (default 262144)
 #   SINOMO_TEST_NETWORK_PAYLOAD_RESPONSE_BYTES response bytes per payload-throughput RPC (default 262144)
-#   SINOMO_TEST_NETWORK_PAYLOAD_MIN_BYTES_PER_SEC min payload-throughput rate (default 4194304)
+#   SINOMO_TEST_NETWORK_PAYLOAD_MIN_BYTES_PER_SEC min payload-throughput rate (default 16777216)
 #   SINOMO_TEST_NETWORK_REQUIRE_DIRECT      require direct, non-relayed network routes (default 0; this compose is segmented)
 #   SINOMO_TEST_NETWORK_READY_WAIT          network/auth convergence gate seconds (default 120)
 #   SINOMO_TEST_NETWORK_READY_REQUESTS_PER_TARGET requests per target during readiness warmup (default 20)
@@ -146,7 +148,9 @@ NETWORK_TIMEOUT_MS="${SINOMO_TEST_NETWORK_TIMEOUT_MS:-2000}"
 NETWORK_MAX_FAILURES="${SINOMO_TEST_NETWORK_MAX_FAILURES:-0}"
 NETWORK_MAX_P50_MS="${SINOMO_TEST_NETWORK_MAX_P50_MS:-50}"
 NETWORK_MAX_P95_MS="${SINOMO_TEST_NETWORK_MAX_P95_MS:-250}"
-NETWORK_MIN_RPS="${SINOMO_TEST_NETWORK_MIN_RPS:-50}"
+NETWORK_MAX_P50_US="${SINOMO_TEST_NETWORK_MAX_P50_US:-10000}"
+NETWORK_MAX_P95_US="${SINOMO_TEST_NETWORK_MAX_P95_US:-50000}"
+NETWORK_MIN_RPS="${SINOMO_TEST_NETWORK_MIN_RPS:-250}"
 NETWORK_PAYLOAD_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_BYTES:-0}"
 NETWORK_RESPONSE_PAYLOAD_BYTES="${SINOMO_TEST_NETWORK_RESPONSE_PAYLOAD_BYTES:-0}"
 NETWORK_MIN_PAYLOAD_BYTES_PER_SEC="${SINOMO_TEST_NETWORK_MIN_PAYLOAD_BYTES_PER_SEC:-0}"
@@ -155,7 +159,7 @@ NETWORK_PAYLOAD_CONCURRENCY="${SINOMO_TEST_NETWORK_PAYLOAD_CONCURRENCY:-8}"
 NETWORK_PAYLOAD_TIMEOUT_MS="${SINOMO_TEST_NETWORK_PAYLOAD_TIMEOUT_MS:-5000}"
 NETWORK_PAYLOAD_REQUEST_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_REQUEST_BYTES:-262144}"
 NETWORK_PAYLOAD_RESPONSE_BYTES="${SINOMO_TEST_NETWORK_PAYLOAD_RESPONSE_BYTES:-262144}"
-NETWORK_PAYLOAD_MIN_BYTES_PER_SEC="${SINOMO_TEST_NETWORK_PAYLOAD_MIN_BYTES_PER_SEC:-4194304}"
+NETWORK_PAYLOAD_MIN_BYTES_PER_SEC="${SINOMO_TEST_NETWORK_PAYLOAD_MIN_BYTES_PER_SEC:-16777216}"
 NETWORK_REQUIRE_DIRECT="${SINOMO_TEST_NETWORK_REQUIRE_DIRECT:-0}"
 NETWORK_READY_WAIT="${SINOMO_TEST_NETWORK_READY_WAIT:-120}"
 NETWORK_READY_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_READY_REQUESTS_PER_TARGET:-20}"
@@ -279,6 +283,8 @@ wait_for_network_ready() {
           --param "max-failures=0" \
           --param "max-p50-ms=$NETWORK_MAX_P50_MS" \
           --param "max-p95-ms=$NETWORK_MAX_P95_MS" \
+          --param "max-p50-us=$NETWORK_MAX_P50_US" \
+          --param "max-p95-us=$NETWORK_MAX_P95_US" \
           --param "require-direct=$NETWORK_REQUIRE_DIRECT" \
           --param "min-requests-per-second=$NETWORK_MIN_RPS" \
           >"$ARTIFACTS/network-ready-$node.last.json" 2>&1; then
@@ -358,6 +364,8 @@ network_baseline() {
       --param "max-failures=$NETWORK_MAX_FAILURES" \
       --param "max-p50-ms=$NETWORK_MAX_P50_MS" \
       --param "max-p95-ms=$NETWORK_MAX_P95_MS" \
+      --param "max-p50-us=$NETWORK_MAX_P50_US" \
+      --param "max-p95-us=$NETWORK_MAX_P95_US" \
       --param "payload-bytes=$NETWORK_PAYLOAD_BYTES" \
       --param "response-payload-bytes=$NETWORK_RESPONSE_PAYLOAD_BYTES" \
       --param "min-payload-bytes-per-second=$NETWORK_MIN_PAYLOAD_BYTES_PER_SEC" \
@@ -377,6 +385,8 @@ network_payload_baseline() {
       --param "max-failures=0" \
       --param "max-p50-ms=0" \
       --param "max-p95-ms=0" \
+      --param "max-p50-us=0" \
+      --param "max-p95-us=0" \
       --param "payload-bytes=$NETWORK_PAYLOAD_REQUEST_BYTES" \
       --param "response-payload-bytes=$NETWORK_PAYLOAD_RESPONSE_BYTES" \
       --param "require-direct=$NETWORK_REQUIRE_DIRECT" \

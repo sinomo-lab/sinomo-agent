@@ -777,11 +777,9 @@ fn daemon_cluster_network_ping_response(
     request: sinomo_network::ObjectRpcRequest,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     let data_dir = sinomo_local::SinomoDataDir::new(daemon_data_dir_path(paths)?);
-    let cluster_paths = cluster_paths_from_daemon_paths(paths)
-        .unwrap_or_else(|_| sinomo_network::ClusterPaths::new(&data_dir));
-    let state = sinomo_network::read_cluster_state_cached(&cluster_paths)?;
+    let node_id = crate::service_adapter::cached_cluster_network_ping_node_id(paths, &data_dir)?;
     sinomo_network::handle_cluster_network_ping_rpc_request_for_node(
-        &state.local_node_id,
+        &node_id,
         request,
         time::OffsetDateTime::now_utc(),
     )
