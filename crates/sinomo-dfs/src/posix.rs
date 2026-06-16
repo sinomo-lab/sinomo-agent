@@ -17,7 +17,7 @@ use crate::{
     DfsReplicationPolicy, DfsWriteIntentState, DfsWriteIntentStatus, NetworkedDfsRangeReadOutcome,
     NetworkedDfsRangeReadStreamOutcome, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
     NetworkedDfsReadStreamOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
-    NetworkedDfsWriteOutcome, ObjectVersionReader, sifs_file_system_id,
+    NetworkedDfsWriteOutcome, ObjectVersionReader, object_version_record, sifs_file_system_id,
 };
 use crate::{DfsFileSystemId, DfsMetadataShardId, DfsObjectId, DfsVersion};
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
@@ -191,6 +191,13 @@ pub struct DfsNamespaceJobFailure {
     pub reason: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RoutedNamespaceNetworkRecovery {
+    Completed,
+    Retry,
+    Unchanged,
+}
+
 struct PosixBulkLocalWrite<'a> {
     path: String,
     object: DfsObjectMetadata,
@@ -303,11 +310,41 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         &mut self,
         path: &str,
     ) -> Result<Option<DfsMetadataShardConfig>> {
-        let shard = self.select_sifs_metadata_shard_for_path_cached(path)?;
+        let shard = self.select_sifs_metadata_shard_for_path_fresh(path)?;
         Ok(match shard {
             Some(shard) if shard.primary_node_id != self.node_id => Some(shard),
             _ => None,
         })
+    }
+
+    fn select_sifs_metadata_shard_for_path_fresh(
+        &mut self,
+        path: &str,
+    ) -> Result<Option<DfsMetadataShardConfig>> {
+        if self.control_plane.is_none() {
+            return Ok(None);
+        }
+        let shards = {
+            let kv = self
+                .control_plane
+                .as_mut()
+                .expect("control plane checked before metadata shard refresh");
+            DfsControlPlaneStore::new(kv.as_mut())
+                .list_metadata_shards(&sifs_file_system_id())
+                .map_err(DfsError::from)?
+        };
+        self.cached_sifs_metadata_shards = Some(crate::CachedSifsMetadataShards {
+            recorded_at: Instant::now(),
+            shards: shards.clone(),
+        });
+        Ok(
+            crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                &sifs_file_system_id(),
+                shards,
+                path,
+            )
+            .map_err(DfsError::from)?,
+        )
     }
 
     fn select_sifs_metadata_shard_for_path_cached(
@@ -473,11 +510,27 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     ) -> Result<()> {
         let mut primary = primary_node_id;
         for _ in 0..POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT {
-            match self.route_namespace_operation_to_metadata_primary(
+            let routed = match self.route_namespace_operation_to_metadata_primary(
                 sifs_file_system_id(),
                 primary.clone(),
                 operation.clone(),
-            )? {
+            ) {
+                Ok(result) => result,
+                Err(error @ DfsError::Network { .. }) => {
+                    match self.refresh_routed_namespace_primary_after_network_error(
+                        &operation,
+                        &mut primary,
+                    )? {
+                        RoutedNamespaceNetworkRecovery::Completed => return Ok(()),
+                        RoutedNamespaceNetworkRecovery::Retry => continue,
+                        RoutedNamespaceNetworkRecovery::Unchanged => {
+                            return Err(DfsPosixError::Dfs(error));
+                        }
+                    }
+                }
+                Err(error) => return Err(DfsPosixError::Dfs(error)),
+            };
+            match routed {
                 DfsNamespaceResult::Applied => return Ok(()),
                 DfsNamespaceResult::Rejected {
                     reason,
@@ -509,11 +562,28 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     ) -> Result<()> {
         let mut primary = primary_node_id;
         for _ in 0..POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT {
-            match self.route_namespace_operation_to_metadata_primary_without_local_replay(
-                sifs_file_system_id(),
-                primary.clone(),
-                operation.clone(),
-            )? {
+            let routed = match self
+                .route_namespace_operation_to_metadata_primary_without_local_replay(
+                    sifs_file_system_id(),
+                    primary.clone(),
+                    operation.clone(),
+                ) {
+                Ok(result) => result,
+                Err(error @ DfsError::Network { .. }) => {
+                    match self.refresh_routed_namespace_primary_after_network_error(
+                        &operation,
+                        &mut primary,
+                    )? {
+                        RoutedNamespaceNetworkRecovery::Completed => return Ok(()),
+                        RoutedNamespaceNetworkRecovery::Retry => continue,
+                        RoutedNamespaceNetworkRecovery::Unchanged => {
+                            return Err(DfsPosixError::Dfs(error));
+                        }
+                    }
+                }
+                Err(error) => return Err(DfsPosixError::Dfs(error)),
+            };
+            match routed {
                 DfsNamespaceResult::Applied => return Ok(()),
                 DfsNamespaceResult::Rejected {
                     reason,
@@ -535,6 +605,29 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 "routed namespace operation exceeded {POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT} authority redirects"
             ),
         }))
+    }
+
+    fn refresh_routed_namespace_primary_after_network_error(
+        &mut self,
+        operation: &DfsNamespaceOperation,
+        primary: &mut NodeId,
+    ) -> Result<RoutedNamespaceNetworkRecovery> {
+        self.cached_sifs_metadata_shards = None;
+        let Some(path) = namespace_operation_routing_path(operation) else {
+            return Ok(RoutedNamespaceNetworkRecovery::Unchanged);
+        };
+        let Some(shard) = self.select_sifs_metadata_shard_for_path_fresh(path)? else {
+            return Ok(RoutedNamespaceNetworkRecovery::Unchanged);
+        };
+        if shard.primary_node_id == self.node_id {
+            self.execute_namespace_operation_local(operation)?;
+            return Ok(RoutedNamespaceNetworkRecovery::Completed);
+        }
+        if shard.primary_node_id != *primary {
+            *primary = shard.primary_node_id;
+            return Ok(RoutedNamespaceNetworkRecovery::Retry);
+        }
+        Ok(RoutedNamespaceNetworkRecovery::Unchanged)
     }
 
     /// Executes a routed namespace operation on the namespace authority.
@@ -1647,11 +1740,12 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         }
         self.ensure_parent_directory(&path)?;
         transaction_objects.push(object.clone());
+        let visible_version = object_version_record(object, object.content_size_bytes);
         self.apply_namespace_transaction(DfsNamespaceTransaction {
             transaction_id: namespace_transaction_id("adopt-cross-shard", &object.object_id, &path),
             file_system_id: object.file_system_id.clone(),
             objects: transaction_objects,
-            versions: Vec::new(),
+            versions: vec![visible_version],
             created_at: time::OffsetDateTime::now_utc(),
         })?;
         if let Some(backend) = self.metadata_backend.as_mut() {
@@ -6217,6 +6311,30 @@ fn namespace_job_id(
         blake3::hash(format!("{file_system_id}\0{path}\0{object_id}\0{version}").as_bytes())
             .to_hex()
     )
+}
+
+fn namespace_operation_routing_path(operation: &DfsNamespaceOperation) -> Option<&str> {
+    match operation {
+        DfsNamespaceOperation::Mkdir { path }
+        | DfsNamespaceOperation::MkdirAll { path }
+        | DfsNamespaceOperation::Rmdir { path }
+        | DfsNamespaceOperation::Unlink { path }
+        | DfsNamespaceOperation::SetMode { path, .. }
+        | DfsNamespaceOperation::SetOwner { path, .. }
+        | DfsNamespaceOperation::SetTimes { path, .. }
+        | DfsNamespaceOperation::TouchDirectoryModified { path }
+        | DfsNamespaceOperation::ClearDirRecursive { path }
+        | DfsNamespaceOperation::SyncPath { path }
+        | DfsNamespaceOperation::LookupPath { path } => Some(path.as_str()),
+        DfsNamespaceOperation::Rename { from, .. } => Some(from.as_str()),
+        DfsNamespaceOperation::Hardlink { existing_path, .. } => Some(existing_path.as_str()),
+        DfsNamespaceOperation::ApplyTransaction { transaction } => transaction
+            .objects
+            .first()
+            .map(|object| object.path.as_str()),
+        DfsNamespaceOperation::AdoptObjectAtPath { object, .. } => Some(object.path.as_str()),
+        DfsNamespaceOperation::AdoptHardlinkAlias { alias, .. } => Some(alias.path.as_str()),
+    }
 }
 
 fn subtree_prefix(path: &str) -> String {

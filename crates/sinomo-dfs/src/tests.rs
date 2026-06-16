@@ -64,6 +64,38 @@ impl DfsFrameTransport for ReceiveOnlyTransport {
 }
 
 #[test]
+fn dfs_adaptive_transfer_windows_stay_byte_bounded() {
+    assert_eq!(DFS_BLOB_CHUNK_BYTES, 1024 * 1024);
+    assert_eq!(DFS_BLOB_INLINE_LIMIT_BYTES, DFS_BLOB_CHUNK_BYTES);
+
+    let large_transfer = 128 * 1024 * 1024;
+    assert_eq!(
+        dfs_adaptive_chunk_window_size(
+            DfsTransferProfile::Conservative,
+            large_transfer,
+            DFS_READ_CHUNK_WINDOW_SIZE,
+        ),
+        4
+    );
+    assert_eq!(
+        dfs_adaptive_chunk_window_size(
+            DfsTransferProfile::Lan,
+            large_transfer,
+            DFS_READ_CHUNK_WINDOW_SIZE,
+        ),
+        16
+    );
+    assert_eq!(
+        dfs_adaptive_chunk_window_size(
+            DfsTransferProfile::Local,
+            large_transfer,
+            DFS_READ_CHUNK_WINDOW_SIZE,
+        ),
+        16
+    );
+}
+
+#[test]
 fn dfs_protocol_frame_read_only_classifier_routes_lookup_path_to_read_lane() {
     let local = NodeId::from_legacy_named("node_read_classifier_local").expect("local");
     let remote = NodeId::from_legacy_named("node_read_classifier_remote").expect("remote");
@@ -2347,6 +2379,12 @@ fn test_chunked_assembler(
         )
         .expect("chunk assembler");
     (store, assembler)
+}
+
+fn chunked_test_bytes(extra_bytes: usize) -> Vec<u8> {
+    (0..(DFS_BLOB_CHUNK_BYTES + extra_bytes))
+        .map(|index| (index % 251) as u8)
+        .collect()
 }
 
 #[test]
@@ -10158,9 +10196,7 @@ fn chunk_assemblers_ignore_identical_duplicate_chunks() {
     let object_id = DfsObjectId::from_legacy_named("obj_duplicate_chunk").expect("object");
     let version = DfsVersion::from_legacy_named("version_2").expect("version");
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
-    let bytes = (0..70_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let first_chunk = bytes[..DFS_BLOB_CHUNK_BYTES].to_vec();
     let second_chunk = bytes[DFS_BLOB_CHUNK_BYTES..].to_vec();
     let hash = content_hash(&bytes);
@@ -10306,9 +10342,7 @@ fn chunk_assemblers_reject_conflicting_duplicate_chunks() {
     let object_id =
         DfsObjectId::from_legacy_named("obj_conflicting_duplicate_chunk").expect("object");
     let version = DfsVersion::from_legacy_named("version_2").expect("version");
-    let bytes = (0..70_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let mut first_chunk = bytes[..DFS_BLOB_CHUNK_BYTES].to_vec();
     let mut conflicting_chunk = first_chunk.clone();
     conflicting_chunk[0] ^= 0xff;
@@ -10555,7 +10589,9 @@ fn process_incoming_prunes_expired_pending_remote_reads() {
     let object_id = DfsObjectId::from_legacy_named("obj_read_prune").expect("object");
     let version = DfsVersion::from_legacy_named("version_1").expect("version");
     let request_id = "dfs_net_req_read_prune".to_string();
-    let hash = content_hash(b"expired read bytes");
+    let bytes = chunked_test_bytes(4_464);
+    let size_bytes = bytes.len() as u64;
+    let hash = content_hash(&bytes);
     let mut dfs = NetworkedDfsService::new(
         ReceiveOnlyTransport::new(reader.clone()),
         LocalContentStore::new(root.join("reader")).expect("reader content"),
@@ -10566,7 +10602,7 @@ fn process_incoming_prunes_expired_pending_remote_reads() {
             object_id: object_id.clone(),
             version: version.clone(),
             content_hash: Some(hash.clone()),
-            content_size_bytes: Some(70_000),
+            content_size_bytes: Some(size_bytes),
             range_offset: None,
             range_max_bytes: None,
             next_chunk_index: 0,
@@ -10585,10 +10621,10 @@ fn process_incoming_prunes_expired_pending_remote_reads() {
             &object_id,
             &version,
             &hash,
-            70_000,
+            size_bytes,
             2,
         );
-        InProgressReadTransfer::new(object_id, version, hash, 70_000, 2, assembler)
+        InProgressReadTransfer::new(object_id, version, hash, size_bytes, 2, assembler)
             .expect("expired read transfer")
     });
 
@@ -11597,7 +11633,9 @@ fn idle_chunk_transfer_pruning_releases_request_state() {
     let object_id = DfsObjectId::from_legacy_named("obj_prune_transfer").expect("object");
     let version = DfsVersion::from_legacy_named("version_2").expect("version");
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
-    let content_hash = content_hash(b"prune bytes");
+    let bytes = chunked_test_bytes(4_464);
+    let size_bytes = bytes.len() as u64;
+    let content_hash = content_hash(&bytes);
     let network = InProcessNetwork::new();
     let mut dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -11612,7 +11650,7 @@ fn idle_chunk_transfer_pruning_releases_request_state() {
             object_id: object_id.clone(),
             version: version.clone(),
             content_hash: Some(content_hash.clone()),
-            content_size_bytes: Some(70_000),
+            content_size_bytes: Some(size_bytes),
             range_offset: None,
             range_max_bytes: None,
             next_chunk_index: 0,
@@ -11630,14 +11668,14 @@ fn idle_chunk_transfer_pruning_releases_request_state() {
                 &object_id,
                 &version,
                 &content_hash,
-                70_000,
+                size_bytes,
                 2,
             );
             let mut transfer = InProgressReadTransfer::new(
                 object_id.clone(),
                 version.clone(),
                 content_hash.clone(),
-                70_000,
+                size_bytes,
                 2,
                 assembler,
             )
@@ -11654,7 +11692,7 @@ fn idle_chunk_transfer_pruning_releases_request_state() {
             object_id: object_id.clone(),
             version: version.clone(),
             content_hash: content_hash.clone(),
-            size_bytes: 70_000,
+            size_bytes,
             patch: None,
             stage_retries: BTreeMap::from([(
                 replica.clone(),
@@ -11683,7 +11721,7 @@ fn idle_chunk_transfer_pruning_releases_request_state() {
             )]),
             fetch_inflight_started_ticks: BTreeMap::from([(replica.clone(), 0)]),
             fetch_next_chunk_indexes: BTreeMap::from([(replica.clone(), 1)]),
-            fetch_window_end_chunk_indexes: BTreeMap::from([(replica.clone(), 64)]),
+            fetch_window_end_chunk_indexes: BTreeMap::from([(replica.clone(), 2)]),
             fetch_failed_from: BTreeSet::new(),
         },
     );
@@ -11695,14 +11733,14 @@ fn idle_chunk_transfer_pruning_releases_request_state() {
                 &object_id,
                 &version,
                 &content_hash,
-                70_000,
+                size_bytes,
                 2,
             );
             let mut transfer = InProgressFetchBlobTransfer::new(
                 object_id.clone(),
                 version.clone(),
                 content_hash.clone(),
-                70_000,
+                size_bytes,
                 2,
                 assembler,
             )
@@ -11719,7 +11757,7 @@ fn idle_chunk_transfer_pruning_releases_request_state() {
             &object_id,
             &version,
             &content_hash,
-            70_000,
+            size_bytes,
             2,
         );
         let mut transfer = InProgressBlobTransfer::new(
@@ -11730,7 +11768,7 @@ fn idle_chunk_transfer_pruning_releases_request_state() {
             None,
             version,
             content_hash,
-            70_000,
+            size_bytes,
             2,
             assembler,
         )
@@ -11814,7 +11852,9 @@ fn retry_pending_repairs_prunes_idle_reads_without_distributed_writes() {
     let reader = NodeId::from_legacy_named("node_retry_prune_reader").expect("node");
     let object_id = DfsObjectId::from_legacy_named("obj_retry_prune").expect("object");
     let version = DfsVersion::from_legacy_named("version_2").expect("version");
-    let content_hash = content_hash(b"retry prune read bytes");
+    let bytes = chunked_test_bytes(4_464);
+    let size_bytes = bytes.len() as u64;
+    let content_hash = content_hash(&bytes);
     let network = InProcessNetwork::new();
     let mut dfs = NetworkedDfsService::new(
         network.add_node(owner),
@@ -11829,7 +11869,7 @@ fn retry_pending_repairs_prunes_idle_reads_without_distributed_writes() {
             object_id: object_id.clone(),
             version: version.clone(),
             content_hash: Some(content_hash.clone()),
-            content_size_bytes: Some(70_000),
+            content_size_bytes: Some(size_bytes),
             range_offset: None,
             range_max_bytes: None,
             next_chunk_index: 0,
@@ -11846,11 +11886,11 @@ fn retry_pending_repairs_prunes_idle_reads_without_distributed_writes() {
             &object_id,
             &version,
             &content_hash,
-            70_000,
+            size_bytes,
             2,
         );
         let mut transfer =
-            InProgressReadTransfer::new(object_id, version, content_hash, 70_000, 2, assembler)
+            InProgressReadTransfer::new(object_id, version, content_hash, size_bytes, 2, assembler)
                 .expect("read transfer");
         transfer.set_last_updated_at_for_test(stale_at);
         transfer
@@ -18179,7 +18219,7 @@ fn sifs_posix_write_at_retries_lost_large_patch_stage_as_patch_chunks() {
         )
         .expect("initial self write");
 
-    let mut patch = vec![0_u8; 160 * 1024 + 5];
+    let mut patch = vec![0_u8; DFS_BLOB_CHUNK_BYTES + 160 * 1024 + 5];
     for (index, byte) in patch.iter_mut().enumerate() {
         *byte = (index % 239) as u8;
     }
@@ -20806,6 +20846,21 @@ fn sifs_two_primary_publish_until(
     }
 }
 
+fn pump_sifs_service_until_stop(
+    mut service: NetworkedDfsService<sinomo_network::InProcessTransport>,
+    stop: Arc<AtomicBool>,
+) -> NetworkedDfsService<sinomo_network::InProcessTransport> {
+    while !stop.load(Ordering::SeqCst) {
+        service.process_incoming().expect("services primary pump");
+        if !stop.load(Ordering::SeqCst) {
+            let _ = service
+                .transport
+                .wait_for_incoming(Duration::from_millis(10));
+        }
+    }
+    service
+}
+
 fn sifs_two_primary_cluster(name: &str) -> SifsTwoPrimaryCluster {
     let root = temp_root(name);
     let node_prefix = name.replace('-', "_");
@@ -20953,16 +21008,8 @@ fn sifs_cluster_bulk_local_eventual_splits_mixed_primary_batch() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let services_stop = Arc::clone(&stop);
-    let services_thread = std::thread::spawn(move || {
-        let mut services_primary = services_primary;
-        while !services_stop.load(Ordering::SeqCst) {
-            services_primary
-                .process_incoming()
-                .expect("services primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        services_primary
-    });
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
     let stats = users_primary
         .posix_write_files_local_eventual_with_known_parents(vec![
@@ -21065,16 +21112,8 @@ fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible(
 
     let stop = Arc::new(AtomicBool::new(false));
     let services_stop = Arc::clone(&stop);
-    let services_thread = std::thread::spawn(move || {
-        let mut services_primary = services_primary;
-        while !services_stop.load(Ordering::SeqCst) {
-            services_primary
-                .process_incoming()
-                .expect("services primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        services_primary
-    });
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
     let batch = (0..100)
         .map(|index| {
@@ -21152,16 +21191,8 @@ fn sifs_cluster_posix_rename_across_shard_primaries_moves_object_transactionally
         users_primary
     });
     let services_stop = Arc::clone(&stop);
-    let services_thread = std::thread::spawn(move || {
-        let mut services_primary = services_primary;
-        while !services_stop.load(Ordering::SeqCst) {
-            services_primary
-                .process_incoming()
-                .expect("services primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        services_primary
-    });
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
     // Create under /users (routed to the users primary).
     replica
@@ -21316,16 +21347,8 @@ fn sifs_cluster_posix_rename_across_shard_primaries_rejects_invalid_destinations
         users_primary
     });
     let services_stop = Arc::clone(&stop);
-    let services_thread = std::thread::spawn(move || {
-        let mut services_primary = services_primary;
-        while !services_stop.load(Ordering::SeqCst) {
-            services_primary
-                .process_incoming()
-                .expect("services primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        services_primary
-    });
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
     let bytes = b"survives every failed rename".to_vec();
     replica
@@ -21430,16 +21453,8 @@ fn sifs_cluster_posix_hardlink_across_shard_primaries_links_and_promotes() {
         users_primary
     });
     let services_stop = Arc::clone(&stop);
-    let services_thread = std::thread::spawn(move || {
-        let mut services_primary = services_primary;
-        while !services_stop.load(Ordering::SeqCst) {
-            services_primary
-                .process_incoming()
-                .expect("services primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        services_primary
-    });
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
     replica
         .posix_write_file(
@@ -21663,16 +21678,8 @@ fn sifs_cluster_posix_cross_shard_rename_recovers_after_destination_outage() {
     );
     let stop = Arc::new(AtomicBool::new(false));
     let services_stop = Arc::clone(&stop);
-    let services_thread = std::thread::spawn(move || {
-        let mut services_primary = services_primary;
-        while !services_stop.load(Ordering::SeqCst) {
-            services_primary
-                .process_incoming()
-                .expect("services primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        services_primary
-    });
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
     let report = cluster
         .users_primary
         .posix_resume_namespace_jobs_bounded(8, 512)
@@ -21792,16 +21799,8 @@ fn sifs_cluster_posix_cross_shard_rename_retry_resumes_existing_job() {
     );
     let stop = Arc::new(AtomicBool::new(false));
     let services_stop = Arc::clone(&stop);
-    let services_thread = std::thread::spawn(move || {
-        let mut services_primary = services_primary;
-        while !services_stop.load(Ordering::SeqCst) {
-            services_primary
-                .process_incoming()
-                .expect("services primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        services_primary
-    });
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
     cluster
         .users_primary
@@ -21855,16 +21854,8 @@ fn sifs_cluster_posix_directory_rename_across_shard_primaries_moves_subtree() {
         users_primary
     });
     let services_stop = Arc::clone(&stop);
-    let services_thread = std::thread::spawn(move || {
-        let mut services_primary = services_primary;
-        while !services_stop.load(Ordering::SeqCst) {
-            services_primary
-                .process_incoming()
-                .expect("services primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        services_primary
-    });
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
     // Build a small subtree under /users from the replica.
     replica.posix_mkdir("/users/proj").expect("mkdir proj");
@@ -22108,16 +22099,8 @@ fn sifs_cluster_posix_directory_rename_across_shard_primaries_recovers_with_subt
     );
     let stop = Arc::new(AtomicBool::new(false));
     let services_stop = Arc::clone(&stop);
-    let services_thread = std::thread::spawn(move || {
-        let mut services_primary = services_primary;
-        while !services_stop.load(Ordering::SeqCst) {
-            services_primary
-                .process_incoming()
-                .expect("services primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        services_primary
-    });
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
     let report = cluster
         .users_primary
         .posix_resume_namespace_jobs_bounded(8, 512)
@@ -22184,16 +22167,8 @@ fn sifs_cluster_posix_reverse_direction_move_resolves_by_id_on_replicas() {
         users_primary
     });
     let services_stop = Arc::clone(&stop);
-    let services_thread = std::thread::spawn(move || {
-        let mut services_primary = services_primary;
-        while !services_stop.load(Ordering::SeqCst) {
-            services_primary
-                .process_incoming()
-                .expect("services primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        services_primary
-    });
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
     replica
         .posix_write_file(
@@ -22330,16 +22305,8 @@ fn sifs_cluster_posix_cross_shard_move_fences_open_write_intents() {
     );
     let stop = Arc::new(AtomicBool::new(false));
     let services_stop = Arc::clone(&stop);
-    let services_thread = std::thread::spawn(move || {
-        let mut services_primary = services_primary;
-        while !services_stop.load(Ordering::SeqCst) {
-            services_primary
-                .process_incoming()
-                .expect("services primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        services_primary
-    });
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
     let staged_hash = content_hash(&staged);
     let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
     loop {
@@ -22420,16 +22387,8 @@ fn sifs_cluster_posix_cross_shard_move_allows_committed_pending_repair() {
     );
     let stop = Arc::new(AtomicBool::new(false));
     let services_stop = Arc::clone(&stop);
-    let services_thread = std::thread::spawn(move || {
-        let mut services_primary = services_primary;
-        while !services_stop.load(Ordering::SeqCst) {
-            services_primary
-                .process_incoming()
-                .expect("services primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        services_primary
-    });
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
     let moved = cluster
         .users_primary
@@ -22695,16 +22654,8 @@ fn sifs_cluster_posix_routed_op_replays_deep_catch_up_across_batches() {
         users_primary
     });
     let services_stop = Arc::clone(&stop);
-    let services_thread = std::thread::spawn(move || {
-        let mut services_primary = services_primary;
-        while !services_stop.load(Ordering::SeqCst) {
-            services_primary
-                .process_incoming()
-                .expect("services primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        services_primary
-    });
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
     // One routed namespace op must catch the replica up through the entire
     // backlog, not just the first bounded batch.
@@ -22858,16 +22809,8 @@ fn sifs_cluster_posix_cross_shard_resume_honors_step_budget() {
     );
     let stop = Arc::new(AtomicBool::new(false));
     let services_stop = Arc::clone(&stop);
-    let services_thread = std::thread::spawn(move || {
-        let mut services_primary = services_primary;
-        while !services_stop.load(Ordering::SeqCst) {
-            services_primary
-                .process_incoming()
-                .expect("services primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        services_primary
-    });
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
     let first = cluster
         .users_primary

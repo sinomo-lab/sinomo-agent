@@ -460,13 +460,13 @@ pub fn decode_dfs_protocol_frame_rpc_response(
     response.decode_body()
 }
 
-pub(crate) const DFS_BLOB_INLINE_LIMIT_BYTES: usize = 64 * 1024;
-const DFS_BLOB_CHUNK_BYTES: usize = 64 * 1024;
-const DFS_STAGE_CHUNK_WINDOW_SIZE: u32 = 64;
-const DFS_READ_CHUNK_WINDOW_SIZE: u32 = 64;
-const DFS_FETCH_CHUNK_WINDOW_SIZE: u32 = 64;
-const DFS_LAN_CHUNK_WINDOW_SIZE: u32 = 128;
-const DFS_LOCAL_CHUNK_WINDOW_SIZE: u32 = 256;
+pub(crate) const DFS_BLOB_INLINE_LIMIT_BYTES: usize = 1024 * 1024;
+const DFS_BLOB_CHUNK_BYTES: usize = 1024 * 1024;
+const DFS_STAGE_CHUNK_WINDOW_SIZE: u32 = 4;
+const DFS_READ_CHUNK_WINDOW_SIZE: u32 = 4;
+const DFS_FETCH_CHUNK_WINDOW_SIZE: u32 = 4;
+const DFS_LAN_CHUNK_WINDOW_SIZE: u32 = 16;
+const DFS_LOCAL_CHUNK_WINDOW_SIZE: u32 = 16;
 const DFS_ADAPTIVE_TRANSFER_WINDOW_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const DFS_REMOTE_READ_RETRY_DELAY: Duration = Duration::from_secs(1);
 const DFS_CHUNK_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -14998,7 +14998,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
         let request_id = self.next_request_id();
-        let sent = self.send_dfs_message_if_routable(
+        let sent = match self.send_dfs_message_if_routable(
             &primary_node_id,
             DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
                 request_id: request_id.clone(),
@@ -15007,8 +15007,16 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 metadata_journal_after_sequences: self.local_metadata_shard_cursors()?,
                 operation,
             }),
-        )?;
+        ) {
+            Ok(sent) => sent,
+            Err(error @ DfsError::Network { .. }) => {
+                self.cached_sifs_metadata_shards = None;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         if !sent {
+            self.cached_sifs_metadata_shards = None;
             return Err(DfsError::Network {
                 message: format!(
                     "metadata primary {primary_node_id} is not routable for namespace operation"
@@ -15075,6 +15083,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             let elapsed = started_at.elapsed();
             if elapsed >= timeout {
                 self.pending_routed_namespace_ops.remove(request_id);
+                self.cached_sifs_metadata_shards = None;
                 return Err(DfsError::Network {
                     message: format!(
                         "routed namespace operation {request_id} timed out waiting for the metadata primary"

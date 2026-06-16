@@ -28,6 +28,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
+const TEST_DFS_CHUNK_BYTES: usize = 1024 * 1024;
+
+fn chunked_test_bytes(extra_bytes: usize) -> Vec<u8> {
+    (0..(TEST_DFS_CHUNK_BYTES + extra_bytes))
+        .map(|index| (index % 251) as u8)
+        .collect()
+}
+
 #[test]
 fn networked_dfs_commits_after_stage_ack_and_replica_reads_content() {
     let owner = NodeId::from_legacy_named("node_owner").expect("node");
@@ -835,9 +843,7 @@ fn networked_dfs_retries_lost_inflight_stage_after_retry_delay() {
         .add_object_metadata(metadata)
         .expect("replica object");
 
-    let bytes = (0..90_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let write = owner_dfs
         .write_distributed_eventual(
             DfsWriteRequest {
@@ -966,9 +972,7 @@ fn networked_dfs_fetches_lost_stage_blob_from_durable_replica_before_commit() {
         dfs.add_object_metadata(metadata.clone()).expect("object");
     }
 
-    let bytes = (0..90_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let hash = content_hash(&bytes);
     let write = owner_dfs
         .write_distributed_eventual(
@@ -1118,9 +1122,7 @@ fn networked_dfs_stage_fetch_rotates_after_durable_source_misses_blob() {
         dfs.add_object_metadata(metadata.clone()).expect("object");
     }
 
-    let bytes = (0..90_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let hash = content_hash(&bytes);
     let write = owner_dfs
         .write_distributed_eventual(
@@ -1270,7 +1272,7 @@ fn networked_dfs_transfers_large_writes_in_chunks() {
         .add_object_metadata(metadata)
         .expect("replica object");
 
-    let bytes: Vec<u8> = (0..150_000).map(|index| (index % 251) as u8).collect();
+    let bytes = chunked_test_bytes(4_464);
     let write = owner_dfs
         .write_distributed_eventual(
             DfsWriteRequest {
@@ -1362,7 +1364,7 @@ fn networked_dfs_streams_large_writes_from_reader() {
         .add_object_metadata(metadata)
         .expect("replica object");
 
-    let byte_count = 150_000;
+    let byte_count = TEST_DFS_CHUNK_BYTES + 4_464;
     let write = owner_dfs
         .write_distributed_eventual_from_reader(
             DfsWriteRequest {
@@ -1547,7 +1549,7 @@ fn networked_dfs_large_stage_chunks_are_self_describing() {
         })
         .expect("owner object");
 
-    let bytes: Vec<u8> = (0..150_000).map(|index| (index % 251) as u8).collect();
+    let bytes = chunked_test_bytes(4_464);
     owner_dfs
         .write_distributed_eventual(
             DfsWriteRequest {
@@ -2183,9 +2185,7 @@ fn networked_dfs_repair_fetch_rotates_after_durable_source_misses_blob() {
         dfs.add_object_metadata(metadata.clone()).expect("object");
     }
 
-    let bytes = (0..90_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let hash = content_hash(&bytes);
     let write = owner_dfs
         .write_distributed_eventual(
@@ -5080,7 +5080,7 @@ fn networked_dfs_large_repair_chunks_are_self_describing() {
         })
         .expect("owner object");
 
-    let bytes: Vec<u8> = (0..150_000).map(|index| (index % 251) as u8).collect();
+    let bytes = chunked_test_bytes(4_464);
     let write = owner_dfs
         .write_distributed_eventual(
             DfsWriteRequest {
@@ -9216,11 +9216,9 @@ fn networked_dfs_chunked_stage_accepts_out_of_order_chunks() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     );
     let mut owner_transport = network.add_node(owner.clone());
-    let bytes = (0..70_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let hash = content_hash(&bytes);
-    let chunk_size = 64 * 1024;
+    let chunk_size = TEST_DFS_CHUNK_BYTES;
     let metadata = DfsObjectMetadata {
         object_id: object_id.clone(),
         file_system_id: file_system_id.clone(),
@@ -9313,11 +9311,9 @@ fn networked_dfs_chunked_repair_accepts_out_of_order_chunks() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     );
     let mut owner_transport = network.add_node(owner.clone());
-    let bytes = (0..70_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let hash = content_hash(&bytes);
-    let chunk_size = 64 * 1024;
+    let chunk_size = TEST_DFS_CHUNK_BYTES;
     let metadata = DfsObjectMetadata {
         object_id: object_id.clone(),
         file_system_id: file_system_id.clone(),
@@ -9419,11 +9415,9 @@ fn networked_dfs_chunked_stage_retry_uses_latest_request_id() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     );
     let mut owner_transport = network.add_node(owner.clone());
-    let bytes = (0..70_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let hash = content_hash(&bytes);
-    let chunk_size = 64 * 1024;
+    let chunk_size = TEST_DFS_CHUNK_BYTES;
     let metadata = DfsObjectMetadata {
         object_id: object_id.clone(),
         file_system_id: file_system_id.clone(),
@@ -9543,11 +9537,9 @@ fn networked_dfs_chunked_repair_retry_uses_latest_request_id() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     );
     let mut owner_transport = network.add_node(owner.clone());
-    let bytes = (0..70_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let hash = content_hash(&bytes);
-    let chunk_size = 64 * 1024;
+    let chunk_size = TEST_DFS_CHUNK_BYTES;
     let metadata = DfsObjectMetadata {
         object_id: object_id.clone(),
         file_system_id: file_system_id.clone(),
@@ -9667,11 +9659,9 @@ fn networked_dfs_stage_chunk_duplicate_is_idempotent() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     );
     let mut owner_transport = network.add_node(owner.clone());
-    let bytes = (0..70_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let hash = content_hash(&bytes);
-    let chunk_size = 64 * 1024;
+    let chunk_size = TEST_DFS_CHUNK_BYTES;
     let first_chunk = bytes[..chunk_size].to_vec();
     let second_chunk = bytes[chunk_size..].to_vec();
     let metadata = DfsObjectMetadata {
@@ -10052,7 +10042,7 @@ fn networked_sifs_remote_read_retries_lost_request_within_readthrough_budget() {
     reader_dfs
         .posix_mkdir_all("/services/readthrough-retry")
         .expect("reader mkdir");
-    let bytes = vec![0x5a; 70_000];
+    let bytes = vec![0x5a; TEST_DFS_CHUNK_BYTES + 4_464];
     let stat = owner_dfs
         .posix_write_file(
             "/services/readthrough-retry/file.txt",
@@ -11013,9 +11003,7 @@ fn networked_dfs_retries_offline_repair_when_replica_appears() {
         .add_object_metadata(metadata.clone())
         .expect("owner object");
 
-    let bytes = (0..90_000)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let bytes = chunked_test_bytes(4_464);
     let write = owner_dfs
         .write_distributed_eventual(
             DfsWriteRequest {
