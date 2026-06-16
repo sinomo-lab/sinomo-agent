@@ -17559,6 +17559,7 @@ fn sifs_posix_create_bulk_local_eventual_rejects_existing_paths() {
 
     let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
     dfs.posix_mkdir_all(work).expect("mkdir");
+    let parent_before = dfs.posix_stat(work).expect("parent before bulk create");
     let stats = dfs
         .posix_create_files_local_eventual_with_known_parents(vec![
             (path_a, b"bulk create alpha".as_slice()),
@@ -17578,6 +17579,15 @@ fn sifs_posix_create_bulk_local_eventual_rejects_existing_paths() {
     assert_eq!(
         dfs.posix_read_file(path_b).expect("read b"),
         b"bulk create beta"
+    );
+    let parent_after = dfs.posix_stat(work).expect("parent after bulk create");
+    assert_ne!(
+        parent_after.version, parent_before.version,
+        "bulk create should advance the parent directory metadata version"
+    );
+    assert!(
+        parent_after.modified_at_unix_nanos >= parent_before.modified_at_unix_nanos,
+        "bulk create should refresh the parent directory mtime"
     );
 
     assert!(

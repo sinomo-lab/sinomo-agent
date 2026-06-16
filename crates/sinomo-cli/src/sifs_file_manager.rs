@@ -224,7 +224,7 @@ impl SifsFileManagerBackend {
         Ok(())
     }
 
-    pub(crate) fn write_files_deferred_publish(
+    pub(crate) fn write_files_with_known_parents_deferred_publish(
         &self,
         files: &[(String, Vec<u8>)],
     ) -> Result<(), String> {
@@ -233,16 +233,6 @@ impl SifsFileManagerBackend {
             .map(|(path, bytes)| normalize_sifs_path(path).map(|path| (path, bytes.as_slice())))
             .collect::<Result<Vec<_>, _>>()?;
         let mut service = self.lock_service()?;
-        let mut created_dirs = BTreeSet::new();
-        for (path, _) in &normalized {
-            if let Some(parent) = parent_sifs_path(&path)
-                && created_dirs.insert(parent.clone())
-            {
-                service
-                    .posix_mkdir_all_without_local_replay(&parent)
-                    .map_err(|error| format!("cannot create SIFS directory {parent}: {error}"))?;
-            }
-        }
         service
             .posix_create_files_local_eventual_with_known_parents(
                 normalized
@@ -251,11 +241,6 @@ impl SifsFileManagerBackend {
             )
             .map(|_| ())
             .map_err(|error| format!("cannot write SIFS bulk batch: {error}"))?;
-        for parent in created_dirs {
-            service
-                .posix_touch_directory_modified_without_local_replay(&parent)
-                .map_err(|error| format!("cannot touch SIFS directory {parent}: {error}"))?;
-        }
         Ok(())
     }
 

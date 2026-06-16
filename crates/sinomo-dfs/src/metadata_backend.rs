@@ -2915,7 +2915,7 @@ impl LocalShardedMetadataBackend {
     ) -> Result<DfsMetadataShardId> {
         let selected = select_metadata_shard_config_for_path(
             file_system_id,
-            self.shard_configs_for_file_system(file_system_id),
+            &self.shard_configs_for_file_system(file_system_id),
             path,
         )
         .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;

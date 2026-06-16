@@ -204,6 +204,13 @@ struct PosixBulkLocalWrite<'a> {
     target_version: DfsVersion,
     bytes: &'a [u8],
     metadata_primary: Option<NodeId>,
+    parent_touch: Option<PosixBulkParentTouch>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PosixBulkParentTouch {
+    path: String,
+    metadata_primary: Option<NodeId>,
 }
 
 fn namespace_job_kind_is_cross_shard(kind: &DfsNamespaceJobKind) -> bool {
@@ -321,6 +328,13 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         &mut self,
         path: &str,
     ) -> Result<Option<DfsMetadataShardConfig>> {
+        let Some(shards) = self.refresh_sifs_metadata_shards()? else {
+            return Ok(None);
+        };
+        self.select_sifs_metadata_shard_for_path_from_snapshot(path, &shards)
+    }
+
+    fn refresh_sifs_metadata_shards(&mut self) -> Result<Option<Vec<DfsMetadataShardConfig>>> {
         if self.control_plane.is_none() {
             return Ok(None);
         }
@@ -337,13 +351,34 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             recorded_at: Instant::now(),
             shards: shards.clone(),
         });
+        Ok(Some(shards))
+    }
+
+    fn select_sifs_metadata_shard_for_path_from_snapshot(
+        &self,
+        path: &str,
+        shards: &[DfsMetadataShardConfig],
+    ) -> Result<Option<DfsMetadataShardConfig>> {
         Ok(
             crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
                 &sifs_file_system_id(),
-                shards,
+                &shards,
                 path,
             )
             .map_err(DfsError::from)?,
+        )
+    }
+
+    fn routed_namespace_primary_for_path_from_snapshot(
+        &self,
+        path: &str,
+        shards: &[DfsMetadataShardConfig],
+    ) -> Result<Option<NodeId>> {
+        Ok(
+            match self.select_sifs_metadata_shard_for_path_from_snapshot(path, shards)? {
+                Some(shard) if shard.primary_node_id != self.node_id => Some(shard.primary_node_id),
+                _ => None,
+            },
         )
     }
 
@@ -378,7 +413,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         Ok(
             crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
                 &sifs_file_system_id(),
-                shards,
+                &shards,
                 path,
             )
             .map_err(DfsError::from)?,
@@ -1958,6 +1993,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         let mut prepared = Vec::with_capacity(files.len());
         let mut seen_objects = BTreeSet::new();
         let mut resolved_parents = BTreeMap::<String, String>::new();
+        let metadata_shard_snapshot = self.refresh_sifs_metadata_shards()?;
         for (path, bytes) in &files {
             let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
             if requires_directory {
@@ -2018,7 +2054,12 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             {
                 return self.posix_write_files_local_eventual_fallback(&files);
             }
-            let metadata_primary = self.routed_namespace_primary_for_path(&path)?;
+            let metadata_primary = match metadata_shard_snapshot.as_deref() {
+                Some(shards) => {
+                    self.routed_namespace_primary_for_path_from_snapshot(&path, shards)?
+                }
+                None => None,
+            };
             let target_version = next_version(&object.version);
             prepared.push(PosixBulkLocalWrite {
                 path,
@@ -2026,6 +2067,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 target_version,
                 bytes: *bytes,
                 metadata_primary,
+                parent_touch: None,
             });
         }
 
@@ -2047,6 +2089,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         let mut seen_objects = BTreeSet::new();
         let mut existing_children_by_parent = BTreeMap::<String, BTreeSet<String>>::new();
         let mut resolved_parents = BTreeMap::<String, String>::new();
+        let metadata_shard_snapshot = self.refresh_sifs_metadata_shards()?;
         for (path, bytes) in files {
             let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
             if requires_directory {
@@ -2089,7 +2132,22 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             if !seen_objects.insert(object.object_id.clone()) {
                 return Err(DfsPosixError::AlreadyExists { path });
             }
-            let metadata_primary = self.routed_namespace_primary_for_path(&path)?;
+            let metadata_primary = match metadata_shard_snapshot.as_deref() {
+                Some(shards) => {
+                    self.routed_namespace_primary_for_path_from_snapshot(&path, shards)?
+                }
+                None => None,
+            };
+            let parent_touch = Some(PosixBulkParentTouch {
+                path: resolved_parent.clone(),
+                metadata_primary: match metadata_shard_snapshot.as_deref() {
+                    Some(shards) => self.routed_namespace_primary_for_path_from_snapshot(
+                        &resolved_parent,
+                        shards,
+                    )?,
+                    None => None,
+                },
+            });
             let target_version = next_version(&object.version);
             prepared.push(PosixBulkLocalWrite {
                 path,
@@ -2097,6 +2155,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 target_version,
                 bytes,
                 metadata_primary,
+                parent_touch,
             });
         }
         self.commit_posix_bulk_local_writes(prepared)
@@ -2135,6 +2194,50 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         for (write, object) in prepared.iter().zip(committed_objects.iter().cloned()) {
             objects_by_metadata_primary
                 .entry(write.metadata_primary.clone())
+                .or_default()
+                .push(object);
+        }
+        let mut touched_parent_objects =
+            BTreeMap::<(Option<NodeId>, DfsObjectId), DfsObjectMetadata>::new();
+        for write in &prepared {
+            let Some(parent_touch) = write.parent_touch.as_ref() else {
+                continue;
+            };
+            let mut parent = match self.lookup_sifs_path(&parent_touch.path)? {
+                Some(parent) if parent.kind != DfsObjectKind::Tombstone => parent,
+                _ => {
+                    let (_, parent) =
+                        self.lookup_sifs_path_distributed_synced(&parent_touch.path, false)?;
+                    parent.ok_or_else(|| DfsPosixError::MissingParent {
+                        path: parent_touch.path.clone(),
+                    })?
+                }
+            };
+            if parent.kind == DfsObjectKind::Tombstone {
+                return Err(DfsPosixError::MissingParent {
+                    path: parent_touch.path.clone(),
+                });
+            }
+            if parent.kind != DfsObjectKind::Directory {
+                return Err(DfsPosixError::NotDirectory {
+                    path: parent_touch.path.clone(),
+                });
+            }
+            let key = (
+                parent_touch.metadata_primary.clone(),
+                parent.object_id.clone(),
+            );
+            touched_parent_objects.entry(key).or_insert_with(|| {
+                parent.version = next_version(&parent.version);
+                parent.modified_at_unix_nanos = write_time;
+                parent.changed_at_unix_nanos = write_time;
+                parent.last_modified_by_event_id = Some(EventId::generate());
+                parent
+            });
+        }
+        for ((metadata_primary, _), object) in touched_parent_objects {
+            objects_by_metadata_primary
+                .entry(metadata_primary)
                 .or_default()
                 .push(object);
         }

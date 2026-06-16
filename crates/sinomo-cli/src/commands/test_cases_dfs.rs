@@ -565,7 +565,7 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let write_started = Instant::now();
     retry_bulk_mutation(
         deadline,
-        || backend.write_files_deferred_publish(&batch),
+        || backend.write_files_with_known_parents_deferred_publish(&batch),
         || format!("cannot write SIFS bulk batch under {base}"),
     )?;
     let write_elapsed = write_started.elapsed();

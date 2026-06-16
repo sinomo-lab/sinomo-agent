@@ -101,6 +101,8 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         )));
     }
 
+    let benchmark_started = Instant::now();
+    let prepare_started = Instant::now();
     let nonce_prefix = format!("{}-{}", current_millis(), std::process::id());
     let total_requests = target_count.saturating_mul(requests_per_target);
     let concurrency_limit = concurrency.min(total_requests).max(1);
@@ -120,18 +122,38 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
         for attempt in 0..requests_per_target {
+            let nonce = format!("ping-{nonce_prefix}-{}-{attempt}", endpoint.node_id);
+            let request = network::cluster_network_ping_rpc_request(&nonce, payload_bytes)
+                .map_err(|source| {
+                    SinomoTestError::failed(format!(
+                        "cannot prepare network ping request for {}: {source}",
+                        endpoint.node_id
+                    ))
+                })?;
+            let request_auth =
+                sign_daemon_rpc_request_for_local_node(&request).map_err(|source| {
+                    SinomoTestError::failed(format!(
+                        "cannot sign network ping request for {}: {source}",
+                        endpoint.node_id
+                    ))
+                })?;
+            let request_command = daemon_rpc_command(&request.route);
             jobs.push(NetworkPingJob {
                 target_node_id: endpoint.node_id.clone(),
                 endpoint: endpoint.clone(),
-                nonce: format!("ping-{nonce_prefix}-{}-{attempt}", endpoint.node_id),
                 timeout: Duration::from_millis(timeout_ms),
                 payload_bytes,
+                nonce,
+                request,
+                request_auth,
+                request_command,
                 route_mode: route_mode.clone(),
                 runtime: runtime_handle.clone(),
                 paths: cluster_paths.clone(),
             });
         }
     }
+    let prepare_elapsed = prepare_started.elapsed();
     let total_requests = jobs.len();
     ctx.record("requests_per_target", requests_per_target);
     ctx.record("total_requests", total_requests);
@@ -144,10 +166,19 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("max_p95_ms", max_p95_ms);
     ctx.record("min_requests_per_second", min_requests_per_second);
     ctx.record("require_direct", require_direct);
+    ctx.record(
+        "request_prepare_elapsed_ms",
+        prepare_elapsed.as_millis() as u64,
+    );
+    ctx.record(
+        "request_prepare_requests_per_second",
+        rate_per_second(total_requests as f64, prepare_elapsed),
+    );
 
     let started = Instant::now();
     let mut results = runtime.block_on(run_network_ping_jobs_async(jobs, concurrency_limit))?;
     let elapsed = started.elapsed();
+    let total_elapsed = benchmark_started.elapsed();
     results.sort_by_key(|result| (result.target_node_id.clone(), result.latency_ms));
 
     let mut latencies = Vec::new();
@@ -228,6 +259,10 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("success_count", success_count);
     ctx.record("failure_count", failure_count);
     ctx.record("elapsed_ms", elapsed.as_millis() as u64);
+    ctx.record(
+        "total_elapsed_including_prepare_ms",
+        total_elapsed.as_millis() as u64,
+    );
     ctx.record("requests_per_second", requests_per_second);
     ctx.record("latency_min_ms", min_ms);
     ctx.record("latency_p50_ms", p50_ms);
@@ -378,6 +413,9 @@ struct NetworkPingJob {
     nonce: String,
     timeout: Duration,
     payload_bytes: usize,
+    request: network::ObjectRpcRequest,
+    request_auth: Vec<u8>,
+    request_command: String,
     route_mode: String,
     runtime: tokio::runtime::Handle,
     paths: ClusterPaths,
@@ -411,24 +449,15 @@ async fn run_network_ping_job(job: NetworkPingJob) -> NetworkPingResult {
 }
 
 async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome {
-    let request = match network::cluster_network_ping_rpc_request(&job.nonce, job.payload_bytes) {
-        Ok(request) => request,
-        Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
-    };
-    let auth = match sign_daemon_rpc_request_for_local_node(&request) {
-        Ok(auth) => auth,
-        Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
-    };
-    let command = daemon_rpc_command(&request.route);
     let mut host = NetworkPingEndpointRpcHost {
         runtime: job.runtime.clone(),
         paths: job.paths.clone(),
     };
     let response = match network::send_signed_rpc_to_endpoint_async_with_host(
         &job.endpoint,
-        &request,
-        &auth,
-        &command,
+        &job.request,
+        &job.request_auth,
+        &job.request_command,
         &daemon_rpc_command(network::CLUSTER_RELAY_ROUTE),
         network::ClusterSignedEndpointRpcOptions {
             timeouts: network::DaemonRpcTimeouts::connect_and_idle(job.timeout),
