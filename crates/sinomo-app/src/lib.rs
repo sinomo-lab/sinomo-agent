@@ -4,7 +4,7 @@
 //! (self-evolution jobs and evidence), **Cluster** (network topology graph), **Files**
 //! (the SIFS distributed file browser) and **Settings** (app + cluster config).
 //! The app probes for a local daemon and, if none is found, runs as an embedded
-//! mobile node so it stays useful in local mode.
+//! mobile node so it stays daemon-backed during bootstrap.
 
 pub mod backend;
 pub mod state;

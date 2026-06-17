@@ -23,7 +23,7 @@ use super::{
     cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
     cli_invocation_force_local_mode, cluster_connectivity_sync_ops, cluster_doctor_findings,
     cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_with_paths,
-    cluster_join_with_paths, cluster_migration_plan_with_paths,
+    cluster_join_with_paths, cluster_leave_with_paths, cluster_migration_plan_with_paths,
     cluster_node_status_from_daemon_status, cluster_peer_members, cluster_raft_known_leader_id,
     cluster_state_sync_txn, cluster_sync_targets, compact_default_invite_introducers,
     daemon_advertised_endpoints_for_state, daemon_handle_daemon_sandbox_http_fetch,
@@ -6679,7 +6679,7 @@ fn install_detects_daemon_option_mismatch() {
 }
 
 #[test]
-fn orphan_guard_applies_to_distributed_runtime_commands() {
+fn cluster_state_guard_applies_to_distributed_runtime_commands() {
     assert!(!cli_command_requires_cluster_state(&CliCommand::Daemon(
         DaemonCliCommand::Status(DaemonRunOptions::default())
     )));
@@ -7277,6 +7277,65 @@ fn cluster_init_persists_local_cluster_state() {
     assert_eq!(
         cluster_raft_known_leader_id(&paths, &state).expect("reelected leader"),
         Some(NodeId::from_legacy_named("node_local").expect("node"))
+    );
+}
+
+#[test]
+fn cluster_leave_reinitializes_single_node_cluster() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-leave");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    let old_cluster_id = ClusterId::from_legacy_named("cluster_leave_source").expect("cluster");
+    let local_node_id = NodeId::from_legacy_named("node_leave_local").expect("node");
+    cluster_init_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(old_cluster_id.clone()),
+            node_id: Some(local_node_id.clone()),
+            name: "leave node".to_string(),
+        },
+        &paths,
+    )
+    .expect("cluster init");
+    append_cluster_raft_command(
+        &paths,
+        &local_node_id,
+        KvCommand::Op(KvOp::Put {
+            key: "/config/source-only".to_string(),
+            value: b"source".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("seed source kv");
+
+    let report = cluster_leave_with_paths(&paths).expect("cluster leave");
+
+    assert_eq!(report.previous_cluster_id, Some(old_cluster_id.clone()));
+    assert_ne!(report.new_cluster_id, old_cluster_id);
+    assert_eq!(report.local_node_id, local_node_id);
+    let quarantine_root = report.quarantine_root.expect("source quarantine");
+    assert!(quarantine_root.join("state.sobj").exists());
+    assert!(quarantine_root.join("kv-snapshot.sobj").exists());
+    assert!(quarantine_root.join("kv-raft").exists());
+
+    let state = read_cluster_state(&paths).expect("new cluster state");
+    assert_eq!(state.cluster_id, report.new_cluster_id);
+    assert_eq!(state.local_node_id, report.local_node_id);
+    assert_eq!(state.local_node_display_name, "leave node");
+    assert_eq!(state.members.len(), 1);
+    assert_eq!(state.members[0].node_id, report.local_node_id);
+    assert_eq!(state.members[0].role, ClusterMemberRole::Voter);
+    assert_eq!(state.members[0].state, ClusterMemberState::Voter);
+    assert_eq!(
+        cluster_raft_known_leader_id(&paths, &state).expect("known leader"),
+        Some(report.local_node_id.clone())
+    );
+
+    let snapshot = read_cluster_kv_snapshot(&paths).expect("new kv snapshot");
+    assert!(
+        !snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.key == "/config/source-only"),
+        "leave should not import source cluster KV into the new single-node cluster"
     );
 }
 

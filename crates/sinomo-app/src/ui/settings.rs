@@ -103,6 +103,7 @@ pub struct SettingsState {
     pub node_id: String,
     pub role: String,
     pub clustered: bool,
+    pub cluster_id: Option<String>,
     pub cluster_summary: Option<String>,
     pub join_invite: String,
     pub invite_result: Option<AppClusterInvite>,
@@ -201,6 +202,7 @@ impl SettingsState {
             node_id: backend.node.node_id.to_string(),
             role: format!("{:?}", backend.node.role).to_lowercase(),
             clustered,
+            cluster_id: cluster_status.cluster_id.clone(),
             cluster_summary,
             join_invite: String::new(),
             invite_result: None,
@@ -250,12 +252,17 @@ impl SettingsState {
     }
 
     fn apply_cluster_status(&mut self, status: AppClusterStatus) {
+        let previous_cluster_id = self.cluster_id.clone();
         self.clustered = status.clustered;
+        self.cluster_id = status.cluster_id;
         self.cluster_summary = status.summary;
         self.cluster_action_error = status.error;
         self.leave_confirming = false;
         if self.clustered {
             self.join_invite.clear();
+            if previous_cluster_id != self.cluster_id {
+                self.invite_result = None;
+            }
         } else {
             self.invite_result = None;
         }
@@ -796,7 +803,12 @@ fn section_cluster(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
                         };
                         match backend.leave_cluster() {
                             Ok(status) => {
-                                apply_cluster_success(&s, &backend, status, "Left cluster");
+                                apply_cluster_success(
+                                    &s,
+                                    &backend,
+                                    status,
+                                    "Started single-node cluster",
+                                );
                             }
                             Err(error) => apply_cluster_error(&s, error),
                         }
@@ -816,7 +828,7 @@ fn section_cluster(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
                 .alignment(Alignment::Stretch)
                 .with_child(muted_label(
                     shared,
-                    "This removes local cluster state from this node.",
+                    "This leaves the current cluster and starts a fresh single-node cluster on this device.",
                 ))
                 .with_child(
                     Stack::horizontal()
@@ -1867,10 +1879,11 @@ mod tests {
     }
 
     #[test]
-    fn cluster_leave_status_reveals_join_input_and_clears_invite() {
+    fn cluster_leave_status_keeps_single_node_cluster_and_clears_invite() {
         let backend = Backend::local_fallback();
         let mut state = SettingsState::new(&backend);
         state.clustered = true;
+        state.cluster_id = Some("cluster_old".to_string());
         state.invite_result = Some(AppClusterInvite {
             uri: "sinomo://cluster/join/test".to_string(),
             join_command: "sinomo cluster join sinomo://cluster/join/test".to_string(),
@@ -1878,12 +1891,19 @@ mod tests {
             persisted_key: "cluster/invitations/test".to_string(),
         });
 
-        state.apply_cluster_status(AppClusterStatus::default());
+        state.apply_cluster_status(AppClusterStatus {
+            clustered: true,
+            cluster_id: Some("cluster_new".to_string()),
+            local_node_id: Some("node_test".to_string()),
+            summary: Some("cluster cluster_new · voter".to_string()),
+            error: None,
+        });
 
-        assert!(!state.clustered);
+        assert!(state.clustered);
+        assert_eq!(state.cluster_id.as_deref(), Some("cluster_new"));
         assert!(
             state.invite_result.is_none(),
-            "leaving clears generated invite details and returns to join mode"
+            "leaving clears generated invite details from the previous cluster"
         );
     }
 

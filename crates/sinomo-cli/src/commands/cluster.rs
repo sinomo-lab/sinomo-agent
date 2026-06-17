@@ -691,6 +691,17 @@ pub(crate) fn cluster_init_with_paths(
     options: ClusterInitOptions,
     paths: &ClusterPaths,
 ) -> Result<(), CliError> {
+    let state = initialize_single_node_cluster_with_paths(options, paths)?;
+    println!("cluster initialized: {}", state.cluster_id);
+    println!("local node: {}", state.local_node_id);
+    println!("state: {}", paths.state.display());
+    Ok(())
+}
+
+fn initialize_single_node_cluster_with_paths(
+    options: ClusterInitOptions,
+    paths: &ClusterPaths,
+) -> Result<ClusterBootstrapState, CliError> {
     paths.ensure()?;
     if paths.state.exists() {
         return Err(CliError::Parse {
@@ -725,10 +736,7 @@ pub(crate) fn cluster_init_with_paths(
     locked_set_cluster_raft_leader(paths, &state.local_node_id, 1)?;
     sync_cluster_state_to_kv(paths, &state)?;
 
-    println!("cluster initialized: {}", state.cluster_id);
-    println!("local node: {}", state.local_node_id);
-    println!("state: {}", paths.state.display());
-    Ok(())
+    Ok(state)
 }
 
 pub(crate) fn cluster_invite(options: ClusterInviteOptions) -> Result<(), CliError> {
@@ -762,6 +770,15 @@ pub(crate) struct ClusterMigrationPlanReport {
     pub(crate) source_remote_member_count: usize,
     pub(crate) target_introducer_count: usize,
     pub(crate) target_communication_channel_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ClusterLeaveReport {
+    pub(crate) previous_cluster_id: Option<ClusterId>,
+    pub(crate) new_cluster_id: ClusterId,
+    pub(crate) local_node_id: NodeId,
+    pub(crate) quarantine_root: Option<PathBuf>,
+    pub(crate) state_path: PathBuf,
 }
 
 pub(crate) fn cluster_migrate(command: ClusterMigrateCommand) -> Result<(), CliError> {
@@ -1312,6 +1329,84 @@ fn quarantine_cluster_storage_for_migration(
     Ok(quarantine)
 }
 
+fn quarantine_cluster_storage_for_leave(
+    paths: &ClusterPaths,
+    leave_id: &Id,
+) -> Result<ClusterMigrationQuarantine, CliError> {
+    let root = paths
+        .root
+        .join("migrations")
+        .join(leave_id.to_string())
+        .join("leave-source");
+    fs::create_dir_all(&root).map_err(|source| CliError::Io {
+        path: root.display().to_string(),
+        detail: source.to_string(),
+    })?;
+
+    let mut quarantine = ClusterMigrationQuarantine {
+        root,
+        moved: Vec::new(),
+    };
+    move_cluster_path_if_exists(
+        paths.state.clone(),
+        quarantine.root.join("state.sobj"),
+        &mut quarantine,
+    )?;
+    move_cluster_path_if_exists(
+        paths.connectivity_local.clone(),
+        quarantine.root.join("connectivity-local.sobj"),
+        &mut quarantine,
+    )?;
+    move_cluster_path_if_exists(
+        paths.kv_snapshot.clone(),
+        quarantine.root.join("kv-snapshot.sobj"),
+        &mut quarantine,
+    )?;
+    move_cluster_path_if_exists(
+        paths.kv_raft.clone(),
+        quarantine.root.join("kv-raft"),
+        &mut quarantine,
+    )?;
+    move_cluster_path_if_exists(
+        paths.kv_watches.clone(),
+        quarantine.root.join("watches"),
+        &mut quarantine,
+    )?;
+    move_cluster_path_if_exists(
+        paths.kv_watches_lock.clone(),
+        quarantine.root.join("watches.lock"),
+        &mut quarantine,
+    )?;
+    move_cluster_path_if_exists(
+        paths.kv_watches_next_id.clone(),
+        quarantine.root.join("watches-next.sobj"),
+        &mut quarantine,
+    )?;
+    move_cluster_path_if_exists(
+        paths.kv_watch_events.clone(),
+        quarantine.root.join("watch-events.sobj"),
+        &mut quarantine,
+    )?;
+    move_cluster_path_if_exists(
+        paths.kv_watch_events_log.clone(),
+        quarantine.root.join("watch-events.sobjlog"),
+        &mut quarantine,
+    )?;
+    Ok(quarantine)
+}
+
+fn cluster_storage_has_live_artifacts(paths: &ClusterPaths) -> bool {
+    paths.state.exists()
+        || paths.connectivity_local.exists()
+        || paths.kv_snapshot.exists()
+        || paths.kv_raft.exists()
+        || paths.kv_watches.exists()
+        || paths.kv_watches_lock.exists()
+        || paths.kv_watches_next_id.exists()
+        || paths.kv_watch_events.exists()
+        || paths.kv_watch_events_log.exists()
+}
+
 fn move_cluster_path_if_exists(
     original: PathBuf,
     quarantined: PathBuf,
@@ -1843,7 +1938,7 @@ pub(crate) fn cluster_status() -> Result<(), CliError> {
             Ok(())
         }
         Err(CliError::ClusterOrphan) => {
-            println!("cluster: orphan");
+            println!("cluster: not initialized");
             println!("state: not initialized");
             println!("next: run `sinomo cluster init` or `sinomo cluster join <invite>`");
             Ok(())
@@ -2267,9 +2362,78 @@ pub(crate) fn cluster_peer_members(
 
 pub(crate) fn cluster_leave() -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
-    network::remove_local_cluster_state(&paths)?;
-    println!("cluster state removed: {}", paths.state.display());
+    let report = cluster_leave_with_paths(&paths)?;
+    match &report.previous_cluster_id {
+        Some(cluster_id) => println!("cluster left: {cluster_id}"),
+        None => println!("cluster left: no previous local cluster state"),
+    }
+    println!("single-node cluster: {}", report.new_cluster_id);
+    println!("local node: {}", report.local_node_id);
+    if let Some(root) = &report.quarantine_root {
+        println!("source quarantine: {}", root.display());
+    }
+    println!("state: {}", report.state_path.display());
     Ok(())
+}
+
+pub(crate) fn cluster_leave_with_paths(
+    paths: &ClusterPaths,
+) -> Result<ClusterLeaveReport, CliError> {
+    paths.ensure()?;
+    let existing = match network::read_cluster_state_without_kv(paths) {
+        Ok(state) => Some(state),
+        Err(network::NetworkError::ClusterOrphan) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let previous_cluster_id = existing.as_ref().map(|state| state.cluster_id.clone());
+    let local_node_id = existing
+        .as_ref()
+        .map(|state| state.local_node_id.clone())
+        .unwrap_or_else(NodeId::generate);
+    let name = existing
+        .as_ref()
+        .map(|state| state.local_node_display_name.trim())
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            existing
+                .as_ref()
+                .map(|state| state.cluster_name.trim())
+                .filter(|name| !name.is_empty())
+        })
+        .unwrap_or("sinomo-local")
+        .to_string();
+
+    let quarantine = if existing.is_some() || cluster_storage_has_live_artifacts(paths) {
+        Some(quarantine_cluster_storage_for_leave(
+            paths,
+            &Id::generate(),
+        )?)
+    } else {
+        None
+    };
+
+    match initialize_single_node_cluster_with_paths(
+        ClusterInitOptions {
+            cluster_id: Some(ClusterId::generate()),
+            node_id: Some(local_node_id),
+            name,
+        },
+        paths,
+    ) {
+        Ok(state) => Ok(ClusterLeaveReport {
+            previous_cluster_id,
+            new_cluster_id: state.cluster_id,
+            local_node_id: state.local_node_id,
+            quarantine_root: quarantine.map(|quarantine| quarantine.root),
+            state_path: paths.state.clone(),
+        }),
+        Err(error) => {
+            if let Some(quarantine) = quarantine {
+                rollback_cluster_storage_quarantine(&quarantine)?;
+            }
+            Err(error)
+        }
+    }
 }
 
 pub(crate) fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState, CliError> {

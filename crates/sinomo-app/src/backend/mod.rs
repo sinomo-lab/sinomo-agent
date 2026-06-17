@@ -3,8 +3,8 @@
 //! The app shares the cluster's data directory and always operates *through a daemon*: on
 //! launch it probes for one and attaches over RPC if present. If none is running it starts its
 //! own daemon **in-process** (a background thread running the daemon control loop) and attaches
-//! to that as a **mobile node** — unlike the CLI, which degrades to daemonless local mode. The
-//! app is a pure frontend; it holds no config/runtime state of its own.
+//! to that as a **mobile node**. The app is a pure frontend; it holds no config/runtime state of
+//! its own.
 
 pub mod chat_engine;
 pub mod cluster;
@@ -118,9 +118,9 @@ impl Backend {
                 progress("Connecting to daemon…");
                 (Connection::Daemon(Box::new(status)), None)
             }
-            // No usable daemon. The app is near-useless without one, so — unlike the CLI, which
-            // degrades to daemonless local mode — we start our own daemon in-process and run as
-            // a mobile node, falling back to direct local config only if that fails.
+            // No usable daemon. The app is near-useless without one, so start our own daemon
+            // in-process and run as a mobile node, falling back to direct config only if that
+            // fails.
             DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
                 progress("Starting a local daemon…");
                 match start_in_process_daemon(&paths, &progress, agent_runtime_control.clone()) {
@@ -251,7 +251,7 @@ fn build_config_client(
 }
 
 /// Start an in-process daemon (mobile node) on a background thread and wait for it to become
-/// reachable. Returns `None` — leaving the app on the degraded local fallback — if it can't be
+/// reachable. Returns `None` — leaving the app on the daemonless fallback — if it can't be
 /// started or doesn't come up within [`IN_PROCESS_DAEMON_READY_TIMEOUT`].
 fn start_in_process_daemon(
     paths: &DaemonPaths,
@@ -264,8 +264,8 @@ fn start_in_process_daemon(
     let thread = thread::Builder::new()
         .name("sinomo-app-daemon".to_string())
         .spawn(move || {
-            // A fresh mobile node has no cluster to resume; the daemon serves local config and
-            // joins a cluster later if one is available.
+            // A fresh mobile node may still be pre-bootstrap; the daemon serves config and joins
+            // a cluster later if one is available.
             let hooks = vec![agent_runtime_control_service_hook(control_host)];
             if let Err(error) =
                 run_daemon_control_loop_with_services(options, loop_paths, "daemon", None, hooks)

@@ -23,13 +23,13 @@ use sinomo_lm::{
 };
 use sinomo_runtime::events::{InMemoryEventStore, SessionId};
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::network::{self, ClusterPaths};
+use sinomo_runtime::network::ClusterPaths;
 use sinomo_runtime::node::NodeId;
 use time::format_description::well_known::Rfc3339;
 
 use crate::commands::{
     ClusterInviteOptions, ClusterJoinOptions, cluster_invite_with_paths, cluster_join_with_paths,
-    read_cluster_state as read_cli_cluster_state,
+    cluster_leave_with_paths, read_cluster_state as read_cli_cluster_state,
 };
 use crate::error::CliError;
 use crate::tui::{
@@ -1019,13 +1019,11 @@ pub fn join_cluster(
     Ok(cluster_status(data_dir))
 }
 
-/// Leave the local cluster by removing this node's local cluster state.
+/// Leave the current cluster and reinitialize this node as a single-node cluster.
 pub fn leave_cluster(data_dir: &SinomoDataDir) -> Result<AppClusterStatus, CliError> {
     let paths = ClusterPaths::new(data_dir);
-    match network::remove_local_cluster_state(&paths) {
-        Ok(()) | Err(network::NetworkError::ClusterOrphan) => Ok(cluster_status(data_dir)),
-        Err(error) => Err(error.into()),
-    }
+    cluster_leave_with_paths(&paths)?;
+    Ok(cluster_status(data_dir))
 }
 
 fn dedup(values: Vec<String>) -> Vec<String> {

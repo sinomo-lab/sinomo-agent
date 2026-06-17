@@ -135,7 +135,7 @@ pub(super) fn print_cluster_help() {
     println!(
         "  sinomo cluster init [--name <name>] [--cluster-id cluster_...] [--node-id node_...]"
     );
-    println!("      Bootstrap a new single-node cluster and clear orphan-node state.");
+    println!("      Bootstrap a new single-node cluster.");
     println!(
         "  sinomo cluster invite [--introducer <host:port>] [--ttl-seconds <seconds>] [--output <path>]"
     );
@@ -173,9 +173,9 @@ pub(super) fn print_cluster_help() {
         "      Diagnose endpoint advertisement, reachability records, stale status, and duplicated roaming endpoints."
     );
     println!("  sinomo cluster peers");
-    println!("      List known peers. Fails while the node is orphaned.");
+    println!("      List known peers. Fails when the node has no local cluster state.");
     println!("  sinomo cluster leave");
-    println!("      Remove local cluster state.");
+    println!("      Leave the current cluster and start a fresh single-node cluster.");
 }
 
 pub(super) fn print_install_help() {

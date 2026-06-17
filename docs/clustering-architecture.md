@@ -34,7 +34,7 @@ sinomo cluster peers
 sinomo cluster leave
 ```
 
-An uninitialized node is an orphan. Orphan nodes must not run distributed operations, write distributed config, mount distributed DFS namespaces, accept remote action requests, or publish cluster-routed events. The only allowed cluster operations while orphaned are:
+A node's normal lifecycle starts as a single-node cluster. A data directory with no cluster state is a pre-bootstrap or recovery condition, not an operating mode. A node with no cluster state must not run distributed operations, write distributed config, mount distributed DFS namespaces, accept remote action requests, or publish cluster-routed events. The only allowed operations before cluster state exists are:
 
 - `sinomo cluster status`
 - `sinomo cluster init`
@@ -42,7 +42,7 @@ An uninitialized node is an orphan. Orphan nodes must not run distributed operat
 - local daemon lifecycle and install commands, so a machine can be prepared before joining
 - local help and credential setup commands that do not mutate cluster state
 
-`sinomo cluster init` creates a single-node cluster. `sinomo cluster join` records an intent to join an existing cluster and moves an uninitialized node into pending learner state until the cluster control plane accepts it. When a node already has initialized cluster state, joining another cluster is treated as migration rather than leave-and-join.
+`sinomo cluster init` creates a single-node cluster. `sinomo cluster join` records an intent to join an existing cluster and moves a pre-bootstrap node into pending learner state until the cluster control plane accepts it. When a node already has initialized cluster state, joining another cluster is treated as migration rather than delete-and-join. `sinomo cluster leave` leaves the current cluster by quarantining old cluster state/KV/Raft/watch storage under `$SINOMO_DATA_DIR/cluster/migrations/<leave_id>/leave-source/`, then creates a fresh single-node cluster with the preserved local node identity. The left cluster's KV remains archived evidence and is not imported into the new single-node cluster.
 
 `sinomo cluster invite` creates a portable `sinomo-join://v1/...` invite. The URI is intentionally small because invites are short-lived. It carries only the cluster's current public key, the invitation ID, the invitation secret, and communication channels the invited node can use to reach the cluster. Full invite metadata, expiry, allowed roles, issuer identity, and policy stay in the cluster KV under the invitation ID and are verified by the contacted introducer during join.
 
@@ -147,16 +147,16 @@ The persisted invitation record is larger than the URI. It contains the cluster 
 
 Join tokens are one-time or short-lived. A leaked token should not grant ongoing authority after the token expires or after a successful use.
 
-## Orphan Guard
+## Cluster-State Guard
 
-The orphan guard is a hard runtime boundary.
+The cluster-state guard is a hard runtime boundary.
 
-Allowed while orphaned:
+Allowed before local cluster state exists:
 
 - create or inspect local cluster state
 - print help
 
-Blocked while orphaned:
+Blocked before local cluster state exists:
 
 - starting the cluster-aware daemon
 - distributed DFS mounts
@@ -449,7 +449,7 @@ Phase 0, local cluster state:
 
 - Add `sinomo cluster` CLI. Implemented in `crates/sinomo-cli`.
 - Persist local cluster state. Implemented as `$SINOMO_DATA_DIR/cluster/state.sobj`.
-- Add orphan guard hooks around distributed operations. Implemented for every non-help, non-`cluster` top-level command.
+- Add cluster-state guard hooks around distributed operations. Implemented for every non-help, non-`cluster` top-level command.
 - Require short-lived join material. Implemented by storing signed invitation records in cluster KV while the portable `sinomo-join://v1` URI carries only the public key, invite ID, secret, and communication channels needed to reach an introducer.
 
 Phase 1, contracts:

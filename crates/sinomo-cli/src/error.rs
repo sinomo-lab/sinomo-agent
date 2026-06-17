@@ -436,7 +436,7 @@ impl std::fmt::Display for CliError {
             ),
             Self::ClusterOrphan => write!(
                 formatter,
-                "this node is not part of a cluster; run `sinomo cluster init` or `sinomo cluster join <invite>`"
+                "this node has no local cluster state; run `sinomo cluster init` or `sinomo cluster join <invite>`"
             ),
             Self::ClusterReadOnly { detail } => {
                 write!(formatter, "cluster KV is read-only: {detail}")
