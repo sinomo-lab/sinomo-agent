@@ -2929,6 +2929,23 @@ impl LocalContentStore {
         Ok(file)
     }
 
+    fn lock_packed_blobs_for_read(&self) -> Result<Option<fs::File>> {
+        let path = self.root.join(PACKED_BLOB_DIR).join(PACKED_BLOB_LOCK_FILE);
+        let file = match fs::OpenOptions::new().read(true).open(&path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(ContentStoreError::Io {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        };
+        file.lock_shared()
+            .map_err(|source| ContentStoreError::Io { path, source })?;
+        Ok(Some(file))
+    }
+
     fn read_packed_blob_index_unlocked(&self) -> Result<PackedBlobIndex> {
         self.read_packed_blob_index_unlocked_with_tail_policy(false)
     }
@@ -2987,8 +3004,8 @@ impl LocalContentStore {
 
     fn packed_blob_location(&self, hash: &str) -> Result<Option<PackedBlobLocation>> {
         hash_hex(hash)?;
-        let _lock = self.lock_packed_blobs()?;
-        let index = self.read_packed_blob_index_for_update_unlocked()?;
+        let _lock = self.lock_packed_blobs_for_read()?;
+        let index = self.read_packed_blob_index_unlocked()?;
         Ok(index.entries.get(hash).cloned())
     }
 
@@ -5445,6 +5462,30 @@ mod tests {
             store.open_blob_stream("blake3:not-a-real-hash"),
             Err(ContentStoreError::InvalidHash(_))
         ));
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn read_missing_blob_does_not_create_packed_blob_lock() {
+        let root = temp_root("read_missing_blob_does_not_create_packed_blob_lock");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let missing_hash = content_hash(b"missing read-only packed blob lookup");
+        let lock_path = root.join(PACKED_BLOB_DIR).join(PACKED_BLOB_LOCK_FILE);
+
+        assert!(!store.has_blob(&missing_hash).expect("missing blob check"));
+        assert!(
+            !lock_path.exists(),
+            "read-side packed lookup must not create pack.lock"
+        );
+        assert!(matches!(
+            store.open_blob_stream(&missing_hash),
+            Err(ContentStoreError::Io { .. })
+        ));
+        assert!(
+            !lock_path.exists(),
+            "streaming read miss must not create pack.lock"
+        );
 
         cleanup(&root);
     }

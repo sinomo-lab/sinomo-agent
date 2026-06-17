@@ -34,7 +34,7 @@ use sinomo_local::SinomoDataDir;
 use sinomo_network::ClusterPaths;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 #[cfg(test)]
 use time::OffsetDateTime;
@@ -616,12 +616,27 @@ fn schedule_daemon_dfs_protocol_frame_deferred_work(cache_key: PathBuf) {
     }
     let _deferred_work = tokio::task::spawn_blocking(move || {
         for lane in lanes {
-            let Ok(mut lane) = lane.lock() else {
-                continue;
-            };
-            lane.service.drain_protocol_frame_deferred_work();
+            let _ = drain_daemon_dfs_protocol_frame_lane_deferred_work(&lane);
         }
     });
+}
+
+fn drain_daemon_dfs_protocol_frame_lane_deferred_work(
+    lane: &Arc<Mutex<DaemonDfsProtocolFrameServiceLane>>,
+) -> bool {
+    match lane.try_lock() {
+        Ok(mut lane) => {
+            lane.service.drain_protocol_frame_deferred_work();
+            true
+        }
+        Err(TryLockError::WouldBlock) => {
+            daemon_dfs_perf_trace(format_args!(
+                "protocol-frame-deferred-work skipped_busy_lane=true"
+            ));
+            false
+        }
+        Err(TryLockError::Poisoned(_)) => false,
+    }
 }
 
 fn open_daemon_dfs_protocol_frame_service_lane(
@@ -2998,6 +3013,36 @@ mod tests {
         assert_eq!(
             first_refresh, second_refresh,
             "endpoint-list refreshes should not rebuild the hydrated service cache"
+        );
+    }
+
+    #[test]
+    fn daemon_dfs_deferred_protocol_frame_work_skips_busy_lane() {
+        let root = temp_root("daemon_dfs_deferred_work_skips_busy_lane");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let local = NodeId::from_legacy_named("node_dfs_deferred_busy_local").expect("local");
+        write_test_cluster_state(&data_root, &local);
+        let runtime = daemon_test_runtime("daemon-dfs-deferred-work-skips-busy-lane");
+        let lane = open_daemon_dfs_protocol_frame_service_lane(
+            &data_dir,
+            &cluster_paths,
+            &local,
+            Vec::new(),
+            runtime.handle(),
+        )
+        .expect("open protocol frame service lane");
+
+        let guard = lane.lock().expect("hold lane lock");
+        assert!(
+            !drain_daemon_dfs_protocol_frame_lane_deferred_work(&lane),
+            "deferred work must not wait behind a foreground protocol frame"
+        );
+        drop(guard);
+        assert!(
+            drain_daemon_dfs_protocol_frame_lane_deferred_work(&lane),
+            "deferred work should run once the lane is idle"
         );
     }
 

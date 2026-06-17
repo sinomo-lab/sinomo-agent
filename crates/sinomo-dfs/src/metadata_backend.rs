@@ -2916,27 +2916,29 @@ impl LocalShardedMetadataBackend {
         )
     }
 
-    fn write_new_object_shard_indexes_relaxed(
+    fn write_transaction_object_shard_indexes(
         &self,
         objects: &[DfsObjectMetadata],
         shard_id: &DfsMetadataShardId,
-    ) -> Result<bool> {
-        if objects.len() <= 1
-            || objects
-                .iter()
-                .any(|object| self.object_shard_index_path(&object.object_id).exists())
-        {
-            return Ok(false);
-        }
-        let mut files = Vec::with_capacity(objects.len());
+    ) -> Result<()> {
+        let mut new_files = Vec::new();
+        let mut existing_objects = Vec::new();
         for object in objects {
-            files.push((
-                self.object_shard_index_path(&object.object_id),
-                encode_sobj(&object_shard_index_record(object, shard_id))?,
-            ));
+            let path = self.object_shard_index_path(&object.object_id);
+            if path.is_file() {
+                existing_objects.push(object);
+            } else {
+                new_files.push((
+                    path,
+                    encode_sobj(&object_shard_index_record(object, shard_id))?,
+                ));
+            }
         }
-        write_sobj_files_create_new_relaxed(files)?;
-        Ok(true)
+        write_sobj_files_create_new_relaxed(new_files)?;
+        for object in existing_objects {
+            self.write_object_shard_index(object, shard_id)?;
+        }
+        Ok(())
     }
 
     fn remove_object_shard_index(&self, object_id: &DfsObjectId) -> Result<()> {
@@ -3011,6 +3013,17 @@ impl LocalShardedMetadataBackend {
             }
         }
         Ok(tombstone_shard)
+    }
+
+    fn indexed_shard_id_for_object(
+        &self,
+        object_id: &DfsObjectId,
+    ) -> Result<Option<DfsMetadataShardId>> {
+        Ok(self.read_object_shard_index(object_id)?.and_then(|index| {
+            self.shards
+                .contains_key(&index.shard_id)
+                .then_some(index.shard_id)
+        }))
     }
 
     fn object_is_visible_from_shard(
@@ -4650,7 +4663,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             let target_shard_id =
                 self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
             object_shards.insert(object.object_id.clone(), target_shard_id.clone());
-            if let Some(source_shard_id) = self.shard_id_for_object(&object.object_id)?
+            if let Some(source_shard_id) = self.indexed_shard_id_for_object(&object.object_id)?
                 && source_shard_id != target_shard_id
             {
                 cross_shard_tombstones.push((
@@ -4689,13 +4702,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             let entry = self
                 .shard_backend_mut(&shard_id)?
                 .apply_namespace_transaction(&shard_transaction)?;
-            if !self
-                .write_new_object_shard_indexes_relaxed(&shard_transaction.objects, &shard_id)?
-            {
-                for object in &shard_transaction.objects {
-                    self.write_object_shard_index(object, &shard_id)?;
-                }
-            }
+            self.write_transaction_object_shard_indexes(&shard_transaction.objects, &shard_id)?;
             last_entry = Some(entry);
         }
         for (object, source_shard_id, target_shard_id) in cross_shard_tombstones {

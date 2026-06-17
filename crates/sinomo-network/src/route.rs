@@ -526,10 +526,14 @@ async fn send_targeted_direct_signed_endpoint_rpc_async(
 }
 
 fn endpoint_rpc_should_use_targeted_direct(request: &ObjectRpcRequest) -> bool {
-    request.route != CLUSTER_RELAY_ROUTE
-        && request.route != crate::CLUSTER_NETWORK_PING_ROUTE
-        && request.category != crate::CLUSTER_MEMBERSHIP_RPC_CATEGORY
-        && !request
+    !endpoint_rpc_requests_raw_direct(request)
+}
+
+fn endpoint_rpc_requests_raw_direct(request: &ObjectRpcRequest) -> bool {
+    request.route == CLUSTER_RELAY_ROUTE
+        || request.route == crate::CLUSTER_NETWORK_PING_ROUTE
+        || request.category == crate::CLUSTER_MEMBERSHIP_RPC_CATEGORY
+        || request
             .metadata
             .get(crate::ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY)
             .is_some_and(|value| {
@@ -726,6 +730,7 @@ pub async fn send_signed_rpc_to_endpoint_async_with_host(
     let deadline = ClusterEndpointRpcDeadline::new(options.timeouts.connect_timeout);
     let prefers_relay = host.endpoint_prefers_relay_async(endpoint).await?;
     if !prefers_relay
+        && !endpoint_rpc_requests_raw_direct(request)
         && let Some(remaining) = deadline.checked_remaining()
         && let Some(response) = host
             .try_gateway_signed_rpc_async(
@@ -3563,7 +3568,7 @@ mod tests {
         .expect("endpoint rpc");
 
         assert_eq!(response.decode_body::<String>().expect("body"), "direct");
-        assert_eq!(host.calls, vec!["prefer_relay", "gateway", "direct"]);
+        assert_eq!(host.calls, vec!["prefer_relay", "direct"]);
         assert!(host.signed_routes.is_empty());
         assert_eq!(host.direct_commands, vec!["RPC /cluster/join/register"]);
         assert_eq!(host.direct_auth, vec![b"inner-auth".to_vec()]);
@@ -3601,7 +3606,7 @@ mod tests {
         .expect("endpoint rpc");
 
         assert_eq!(response.decode_body::<String>().expect("body"), "direct");
-        assert_eq!(host.calls, vec!["prefer_relay", "gateway", "direct"]);
+        assert_eq!(host.calls, vec!["prefer_relay", "direct"]);
         assert!(host.signed_routes.is_empty());
         assert_eq!(host.direct_commands, vec!["RPC /cluster/network/ping"]);
         assert_eq!(host.direct_auth, vec![b"inner-auth".to_vec()]);
@@ -3639,7 +3644,7 @@ mod tests {
         .expect("endpoint rpc");
 
         assert_eq!(response.decode_body::<String>().expect("body"), "direct");
-        assert_eq!(host.calls, vec!["prefer_relay", "gateway", "direct"]);
+        assert_eq!(host.calls, vec!["prefer_relay", "direct"]);
         assert!(host.signed_routes.is_empty());
         assert_eq!(host.direct_commands, vec!["RPC /cluster/kv/range"]);
         assert_eq!(host.direct_auth, vec![b"inner-auth".to_vec()]);

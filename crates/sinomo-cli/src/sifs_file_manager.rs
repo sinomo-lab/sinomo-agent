@@ -258,10 +258,9 @@ impl SifsFileManagerBackend {
     ) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
-        let mut options = sifs_write_options(&service, &self.replica_candidates);
-        options.wait_for_commit = false;
+        let options = sifs_write_options(&service, &self.replica_candidates);
         service
-            .posix_write_file(&path, bytes, options)
+            .posix_write_file_with_known_parent_deferred_local_replay(&path, bytes, options)
             .map(|_| ())
             .map_err(|error| format!("cannot write SIFS file {path}: {error}"))?;
         Ok(())

@@ -4124,7 +4124,6 @@ impl<T: DfsFrameTransport> LocalOwnedDfsService<T> {
             let Ok(message) = protocol_message.decode::<DfsNetworkMessage>() else {
                 continue;
             };
-
             match message {
                 DfsNetworkMessage::ReadRequest(request) => {
                     let event = self.handle_read_request(source_node_id, request)?;
@@ -4861,6 +4860,62 @@ fn dfs_perf_trace_enabled() -> bool {
 fn dfs_perf_trace(args: std::fmt::Arguments<'_>) {
     if dfs_perf_trace_enabled() {
         eprintln!("[sinomo-dfs-perf] {args}");
+    }
+}
+
+fn dfs_network_message_trace_label(message: &DfsNetworkMessage) -> &'static str {
+    match message {
+        DfsNetworkMessage::ReadRequest(_) => "read-request",
+        DfsNetworkMessage::ReadResponse(_) => "read-response",
+        DfsNetworkMessage::ReadResponseChunk(_) => "read-response-chunk",
+        DfsNetworkMessage::BulkReadRequest(_) => "bulk-read-request",
+        DfsNetworkMessage::BulkReadResponse(_) => "bulk-read-response",
+        DfsNetworkMessage::WriteRequest(_) => "write-request",
+        DfsNetworkMessage::WriteResponse(_) => "write-response",
+        DfsNetworkMessage::DistributedWriteRequest(_) => "distributed-write-request",
+        DfsNetworkMessage::DistributedWriteResponse(_) => "distributed-write-response",
+        DfsNetworkMessage::NamespaceRequest(_) => "namespace-request",
+        DfsNetworkMessage::NamespaceResponse(_) => "namespace-response",
+        DfsNetworkMessage::StageBlob(_) => "stage-blob",
+        DfsNetworkMessage::StageBlobChunk(_) => "stage-blob-chunk",
+        DfsNetworkMessage::StagePatch(_) => "stage-patch",
+        DfsNetworkMessage::StagePatchChunk(_) => "stage-patch-chunk",
+        DfsNetworkMessage::StageBlobResponse(_) => "stage-blob-response",
+        DfsNetworkMessage::CommitVersion(_) => "commit-version",
+        DfsNetworkMessage::CommitVersionResponse(_) => "commit-version-response",
+        DfsNetworkMessage::RepairReplica(_) => "repair-replica",
+        DfsNetworkMessage::RepairReplicaChunk(_) => "repair-replica-chunk",
+        DfsNetworkMessage::RepairReplicaResponse(_) => "repair-replica-response",
+        DfsNetworkMessage::FetchBlob(_) => "fetch-blob",
+        DfsNetworkMessage::FetchBlobResponse(_) => "fetch-blob-response",
+        DfsNetworkMessage::FetchBlobResponseChunk(_) => "fetch-blob-response-chunk",
+        DfsNetworkMessage::MetadataJournalBatch(_) => "metadata-journal-batch",
+        DfsNetworkMessage::MetadataJournalBatchResponse(_) => "metadata-journal-batch-response",
+        DfsNetworkMessage::MetadataSnapshotInstall(_) => "metadata-snapshot-install",
+        DfsNetworkMessage::MetadataSnapshotInstallResponse(_) => {
+            "metadata-snapshot-install-response"
+        }
+    }
+}
+
+fn dfs_namespace_operation_trace_label(operation: &DfsNamespaceOperation) -> &'static str {
+    match operation {
+        DfsNamespaceOperation::Mkdir { .. } => "mkdir",
+        DfsNamespaceOperation::MkdirAll { .. } => "mkdir-all",
+        DfsNamespaceOperation::Rmdir { .. } => "rmdir",
+        DfsNamespaceOperation::Unlink { .. } => "unlink",
+        DfsNamespaceOperation::Rename { .. } => "rename",
+        DfsNamespaceOperation::Hardlink { .. } => "hardlink",
+        DfsNamespaceOperation::SetMode { .. } => "set-mode",
+        DfsNamespaceOperation::SetOwner { .. } => "set-owner",
+        DfsNamespaceOperation::SetTimes { .. } => "set-times",
+        DfsNamespaceOperation::TouchDirectoryModified { .. } => "touch-directory-modified",
+        DfsNamespaceOperation::ClearDirRecursive { .. } => "clear-dir-recursive",
+        DfsNamespaceOperation::SyncPath { .. } => "sync-path",
+        DfsNamespaceOperation::LookupPath { .. } => "lookup-path",
+        DfsNamespaceOperation::ApplyTransaction { .. } => "apply-transaction",
+        DfsNamespaceOperation::AdoptObjectAtPath { .. } => "adopt-object-at-path",
+        DfsNamespaceOperation::AdoptHardlinkAlias { .. } => "adopt-hardlink-alias",
     }
 }
 
@@ -11177,7 +11232,16 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         &mut self,
         transaction: DfsNamespaceTransaction,
     ) -> Result<(), DfsError> {
+        let trace_started = Instant::now();
+        let trace_object_count = transaction.objects.len();
+        let trace_version_count = transaction.versions.len();
+        let mut trace_ensure_fs_ms = 0;
+        let mut trace_backend_apply_ms = 0;
+        let mut trace_memory_coordinator_ms = 0;
+        let mut trace_memory_tombstone_ms = 0;
+        let mut trace_memory_add_ms = 0;
         if let Some(backend) = self.metadata_backend.as_mut() {
+            let ensure_started = Instant::now();
             let file_system = backend
                 .get_file_system(&transaction.file_system_id)?
                 .unwrap_or_else(|| DfsFileSystem {
@@ -11187,7 +11251,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     subtree_policies: Vec::new(),
                 });
             backend.ensure_file_system(&file_system)?;
+            trace_ensure_fs_ms = ensure_started.elapsed().as_millis();
+            let backend_apply_started = Instant::now();
             backend.apply_namespace_transaction(&transaction)?;
+            trace_backend_apply_ms = backend_apply_started.elapsed().as_millis();
         }
         for object in transaction
             .objects
@@ -11201,14 +11268,32 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             )
             .cloned()
         {
+            let coordinator_started = Instant::now();
             self.coordinator.set_committed_version(
                 object.file_system_id.clone(),
                 object.object_id.clone(),
                 object.version.clone(),
             );
+            trace_memory_coordinator_ms += coordinator_started.elapsed().as_millis();
+            let tombstone_started = Instant::now();
             self.track_metadata_tombstone(&object);
+            trace_memory_tombstone_ms += tombstone_started.elapsed().as_millis();
+            let add_started = Instant::now();
             self.metadata.add_object(object)?;
+            trace_memory_add_ms += add_started.elapsed().as_millis();
         }
+        dfs_perf_trace(format_args!(
+            "apply-namespace-transaction node={} objects={} versions={} ensure_fs_ms={} backend_apply_ms={} memory_coordinator_ms={} memory_tombstone_ms={} memory_add_ms={} total_ms={}",
+            self.node_id,
+            trace_object_count,
+            trace_version_count,
+            trace_ensure_fs_ms,
+            trace_backend_apply_ms,
+            trace_memory_coordinator_ms,
+            trace_memory_tombstone_ms,
+            trace_memory_add_ms,
+            trace_started.elapsed().as_millis()
+        ));
         Ok(())
     }
 
@@ -12326,6 +12411,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         touch_parent_on_create: bool,
         foreground_replica_repair: bool,
         detach_request: bool,
+        replay_response_journal: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let plan =
             self.plan_distributed_eventual_replicas(&request, candidate_nodes, policy.clone())?;
@@ -12347,6 +12433,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     touch_parent_on_create,
                     foreground_replica_repair,
                     detach_request,
+                    replay_response_journal,
                 );
             }
             if detach_request {
@@ -12362,6 +12449,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     touch_parent_on_create,
                     foreground_replica_repair,
                     true,
+                    false,
                 );
             }
         }
@@ -13937,10 +14025,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         touch_parent_on_create: bool,
         foreground_replica_repair: bool,
         detach_request: bool,
+        replay_response_journal: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let request_id = self.next_request_id();
         let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
-        let metadata_journal_after_sequence = if foreground_replica_repair {
+        let metadata_journal_after_sequence = if !detach_request && replay_response_journal {
             self.metadata_journal_last_sequence_for_shard(&shard_id)?
         } else {
             None
@@ -14189,6 +14278,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             let Ok(message) = protocol_message.decode::<DfsNetworkMessage>() else {
                 continue;
             };
+            let trace_message_label = dfs_network_message_trace_label(&message);
 
             match message {
                 DfsNetworkMessage::StageBlob(command) => {
@@ -14299,9 +14389,24 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 | DfsNetworkMessage::WriteRequest(_)
                 | DfsNetworkMessage::WriteResponse(_) => {}
             }
+            let flush_started = Instant::now();
             self.flush_completed_pending_remote_write_responses(&mut events)?;
+            let flush_ms = flush_started.elapsed().as_millis();
             if drain_deferred_parent_touches {
+                let drain_started = Instant::now();
+                let deferred_parent_touches = self.deferred_routed_create_parent_touches.len();
                 self.drain_deferred_routed_create_parent_touches();
+                let drain_ms = drain_started.elapsed().as_millis();
+                if flush_ms > 0 || drain_ms > 0 || deferred_parent_touches > 0 {
+                    dfs_perf_trace(format_args!(
+                        "inbound-post-message node={} message={} flush_ms={} deferred_parent_touches={} drain_ms={}",
+                        self.node_id,
+                        trace_message_label,
+                        flush_ms,
+                        deferred_parent_touches,
+                        drain_ms
+                    ));
+                }
             }
         }
 
@@ -15123,6 +15228,12 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         command: DfsNamespaceCommand,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let request_id = command.request_id.clone();
+        let trace_started = Instant::now();
+        let trace_operation = dfs_namespace_operation_trace_label(&command.operation);
+        let trace_involved_paths = command.operation.involved_paths().len();
+        let mut trace_affected_ms = 0;
+        let mut trace_affected_shards = 0;
+        let mut trace_execute_ms = 0;
         let mut affected_shard_ids: Vec<DfsMetadataShardId> = Vec::new();
         // The authority the requester should retry against when this node is
         // not the shard primary (the requester routed on a stale shard view).
@@ -15147,13 +15258,19 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 current_primary_node_id: None,
             }
         } else {
+            let affected_started = Instant::now();
             match self.affected_namespace_shards(&command.file_system_id, &command.operation) {
-                Err(error) => DfsNamespaceResult::Rejected {
-                    reason: error.to_string(),
-                    posix_error: None,
-                    current_primary_node_id: None,
-                },
+                Err(error) => {
+                    trace_affected_ms = affected_started.elapsed().as_millis();
+                    DfsNamespaceResult::Rejected {
+                        reason: error.to_string(),
+                        posix_error: None,
+                        current_primary_node_id: None,
+                    }
+                }
                 Ok(shards) => {
+                    trace_affected_ms = affected_started.elapsed().as_millis();
+                    trace_affected_shards = shards.len();
                     // Response batches may only carry shards this node is
                     // primary for; foreign halves of coordinated operations
                     // are synced from their own primaries.
@@ -15166,6 +15283,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                         .iter()
                         .find(|shard| shard.primary_node_id != self.node_id)
                         .cloned();
+                    let execute_started = Instant::now();
                     let outcome = match (&foreign_shard, &command.operation) {
                         (None, _) => self.execute_namespace_operation_local(&command.operation),
                         // Operations spanning another primary's shard run
@@ -15208,6 +15326,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                             }))
                         }
                     };
+                    trace_execute_ms = execute_started.elapsed().as_millis();
                     match outcome {
                         Ok(()) => DfsNamespaceResult::Applied,
                         Err(error) => DfsNamespaceResult::Rejected {
@@ -15220,7 +15339,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 }
             }
         };
-        let metadata_journal_batches = if matches!(result, DfsNamespaceResult::Applied)
+        let journal_started = Instant::now();
+        let metadata_journal_batches = if command.include_metadata_journal_batches
+            && matches!(result, DfsNamespaceResult::Applied)
             && !matches!(command.operation, DfsNamespaceOperation::LookupPath { .. })
         {
             let mut batches = Vec::new();
@@ -15239,11 +15360,17 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         } else {
             Vec::new()
         };
+        let trace_journal_ms = journal_started.elapsed().as_millis();
+        let trace_journal_batches = metadata_journal_batches.len();
+        let sync_started = Instant::now();
         let synced_path_object = if matches!(result, DfsNamespaceResult::Applied) {
             self.synced_namespace_object_for_operation(&command.file_system_id, &command.operation)?
         } else {
             None
         };
+        let trace_sync_ms = sync_started.elapsed().as_millis();
+        let trace_synced_path_object = synced_path_object.is_some();
+        let send_started = Instant::now();
         self.send_dfs_message_if_routable(
             &requester_node_id,
             DfsNetworkMessage::NamespaceResponse(DfsNamespaceResponse {
@@ -15253,6 +15380,28 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 metadata_journal_batches,
             }),
         )?;
+        let trace_send_ms = send_started.elapsed().as_millis();
+        dfs_perf_trace(format_args!(
+            "namespace-request node={} requester={} request={} operation={} involved_paths={} affected_shards={} result={} affected_ms={} execute_ms={} journal_batches={} journal_ms={} synced_path_object={} sync_ms={} response_send_ms={} total_ms={}",
+            self.node_id,
+            requester_node_id,
+            request_id,
+            trace_operation,
+            trace_involved_paths,
+            trace_affected_shards,
+            match &result {
+                DfsNamespaceResult::Applied => "applied",
+                DfsNamespaceResult::Rejected { .. } => "rejected",
+            },
+            trace_affected_ms,
+            trace_execute_ms,
+            trace_journal_batches,
+            trace_journal_ms,
+            trace_synced_path_object,
+            trace_sync_ms,
+            trace_send_ms,
+            trace_started.elapsed().as_millis()
+        ));
         let mutates_metadata = !matches!(
             command.operation,
             DfsNamespaceOperation::LookupPath { .. } | DfsNamespaceOperation::SyncPath { .. }
@@ -15317,6 +15466,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         operation: &DfsNamespaceOperation,
     ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
+        if let DfsNamespaceOperation::ApplyTransaction { transaction } = operation {
+            return self.affected_namespace_transaction_shards(file_system_id, transaction);
+        }
         let mut shards: Vec<DfsMetadataShardConfig> = Vec::new();
         for path in operation.involved_paths() {
             for shard in self.namespace_shards_for_path(file_system_id, path)? {
@@ -15329,6 +15481,59 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             }
         }
         Ok(shards)
+    }
+
+    fn affected_namespace_transaction_shards(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        transaction: &DfsNamespaceTransaction,
+    ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
+        if transaction.objects.is_empty() || self.control_plane.is_none() {
+            return Ok(Vec::new());
+        }
+        let shards = {
+            let kv = self
+                .control_plane
+                .as_mut()
+                .expect("control plane checked before namespace transaction shard selection");
+            DfsControlPlaneStore::new(kv.as_mut())
+                .list_metadata_shards(file_system_id)
+                .map_err(DfsError::from)?
+        };
+        let mut candidate_paths = BTreeSet::new();
+        for object in &transaction.objects {
+            let normalized =
+                crate::posix::normalized_posix_path_key(&object.path).ok_or_else(|| {
+                    DfsError::Distributed {
+                        message: format!("invalid namespace transaction path: {}", object.path),
+                    }
+                })?;
+            if let Some(parent) = crate::posix::parent_posix_path(&normalized) {
+                candidate_paths.insert(parent);
+            }
+            candidate_paths.insert(normalized);
+        }
+
+        let mut affected = Vec::new();
+        for path in candidate_paths {
+            let Some(shard) =
+                crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                    file_system_id,
+                    &shards,
+                    &path,
+                )
+                .map_err(DfsError::from)?
+            else {
+                continue;
+            };
+            if !affected
+                .iter()
+                .any(|existing: &DfsMetadataShardConfig| existing.shard_id == shard.shard_id)
+            {
+                affected.push(shard);
+            }
+        }
+        Ok(affected)
     }
 
     /// The metadata shards covering a path and its parent directory.
@@ -15760,6 +15965,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 request_id: request_id.clone(),
                 file_system_id,
                 requesting_node_id: self.node_id.clone(),
+                include_metadata_journal_batches: replay_journal_batches,
                 metadata_journal_after_sequences,
                 operation,
             }),
