@@ -6161,6 +6161,49 @@ pub fn cluster_connectivity_record_for_identity_mismatch(
     )
 }
 
+pub fn cluster_connectivity_record_for_hard_failure(
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    previous: Option<&ClusterConnectivityRecord>,
+    timestamp: &str,
+    now: OffsetDateTime,
+) -> ClusterConnectivityRecord {
+    let observed_failures = previous
+        .map(|record| record.consecutive_failures.saturating_add(1))
+        .unwrap_or(1);
+    let failures = observed_failures.min(CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD);
+    let retained_success = previous.and_then(|record| {
+        if observed_failures < CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD {
+            record.last_success_at.clone()
+        } else {
+            None
+        }
+    });
+    let (state_label, ttl_seconds) = if observed_failures >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD
+    {
+        (
+            ClusterConnectivityState::Unreachable,
+            CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
+        )
+    } else {
+        (
+            ClusterConnectivityState::Degraded,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        )
+    };
+    cluster_connectivity_record(
+        state,
+        endpoint,
+        state_label,
+        previous.and_then(|record| record.latency_ms),
+        failures,
+        retained_success,
+        Some(timestamp.to_string()),
+        now,
+        ttl_seconds,
+    )
+}
+
 pub fn apply_cluster_connectivity_probe_results(
     connectivity: &mut BTreeMap<String, ClusterConnectivityProbeState>,
     active_keys: &BTreeSet<String>,
@@ -8639,7 +8682,11 @@ pub fn read_cluster_node_statuses_from_kv(
     {
         statuses.push(entry.decode()?);
     }
-    statuses.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    statuses.sort_by(|left, right| {
+        left.node_id
+            .cmp(&right.node_id)
+            .then_with(|| left.process.cmp(&right.process))
+    });
     Ok(statuses)
 }
 
@@ -12890,7 +12937,7 @@ pub fn sync_cluster_node_status_to_kv(
         return read_cluster_kv_snapshot(paths);
     }
     let state = read_cluster_state_without_kv(paths)?;
-    let key = cluster_node_status_key(&status.node_id);
+    let key = cluster_node_status_key_for_record(&status);
     append_cluster_raft_command(
         paths,
         &state.local_node_id,
@@ -12918,16 +12965,13 @@ where
         return Ok(None);
     }
     let mut state = read_cluster_state(paths)?;
-    let node_id = status.node_id.clone();
+    let key = cluster_node_status_key_for_record(&status);
     let snapshot = host.commit_cluster_kv_txn_with_quorum(
         paths,
         &mut state,
         KvTxn {
             compares: Vec::new(),
-            success: vec![
-                KvOp::put_serde(cluster_node_status_key(&node_id), &status, None)
-                    .map_err(NetworkError::from)?,
-            ],
+            success: vec![KvOp::put_serde(key, &status, None).map_err(NetworkError::from)?],
             failure: Vec::new(),
         },
     )?;
@@ -12979,7 +13023,7 @@ where
             })
         })?
         .map_err(H::Error::from)?;
-    let node_id = status.node_id.clone();
+    let key = cluster_node_status_key_for_record(&status);
     let snapshot = host
         .commit_cluster_kv_txn_with_quorum_async(
             paths,
@@ -12987,7 +13031,7 @@ where
             KvTxn {
                 compares: Vec::new(),
                 success: vec![
-                    KvOp::put_serde(cluster_node_status_key(&node_id), &status, None)
+                    KvOp::put_serde(key, &status, None)
                         .map_err(NetworkError::from)
                         .map_err(H::Error::from)?,
                 ],
@@ -13326,10 +13370,7 @@ pub fn stored_cluster_node_status_matches(
     let Some(snapshot) = read_cluster_kv_current_or_cached_snapshot_arc_if_present(paths)? else {
         return Ok(false);
     };
-    let Some(entry) = snapshot.get(&cluster_node_status_key(&status.node_id)) else {
-        return Ok(false);
-    };
-    let Ok(existing) = entry.decode::<ClusterNodeStatusRecord>() else {
+    let Some(existing) = cluster_node_status_snapshot_record(&snapshot, status) else {
         return Ok(false);
     };
     // Match on stable content only: node status is not periodically refreshed (no
@@ -13611,7 +13652,7 @@ fn cluster_node_status_put_no_effect_response(
         snapshot,
         key,
         value,
-        |status: &ClusterNodeStatusRecord| key == cluster_node_status_key(&status.node_id),
+        |status: &ClusterNodeStatusRecord| cluster_node_status_key_matches_record(key, status),
         cluster_node_status_stable_eq,
     ))
 }
@@ -14926,6 +14967,38 @@ fn append_cluster_raft_ops_in_batches(
 
 pub fn cluster_node_status_key(node_id: &NodeId) -> String {
     format!("/cluster/node-status/{node_id}")
+}
+
+pub fn cluster_node_status_key_for_record(status: &ClusterNodeStatusRecord) -> String {
+    if status.process == DAEMON_MAIN_CLUSTER_ROLE {
+        cluster_node_status_key(&status.node_id)
+    } else {
+        cluster_node_status_key_for_process(&status.node_id, &status.process)
+    }
+}
+
+pub fn cluster_node_status_key_for_process(node_id: &NodeId, process: &str) -> String {
+    if process == DAEMON_MAIN_CLUSTER_ROLE {
+        cluster_node_status_key(node_id)
+    } else {
+        format!("/cluster/node-status/{node_id}/{process}")
+    }
+}
+
+fn cluster_node_status_key_matches_record(key: &str, status: &ClusterNodeStatusRecord) -> bool {
+    key == cluster_node_status_key_for_record(status)
+        || (status.process == DAEMON_MAIN_CLUSTER_ROLE
+            && key == cluster_node_status_key(&status.node_id))
+}
+
+fn cluster_node_status_snapshot_record(
+    snapshot: &KvSnapshot,
+    status: &ClusterNodeStatusRecord,
+) -> Option<ClusterNodeStatusRecord> {
+    let key = cluster_node_status_key_for_record(status);
+    snapshot
+        .get(&key)
+        .and_then(|entry| entry.decode::<ClusterNodeStatusRecord>().ok())
 }
 
 pub fn cluster_network_info_key(node_id: &NodeId) -> String {

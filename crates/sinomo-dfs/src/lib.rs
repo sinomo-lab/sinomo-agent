@@ -401,7 +401,9 @@ pub fn dfs_protocol_frame_requires_fresh_metadata(frame: &NetworkFrame) -> bool 
         .is_ok_and(|message| {
             matches!(
                 message,
-                DfsNetworkMessage::ReadRequest(_) | DfsNetworkMessage::BulkReadRequest(_)
+                DfsNetworkMessage::ReadRequest(_)
+                    | DfsNetworkMessage::BulkReadRequest(_)
+                    | DfsNetworkMessage::NamespaceRequest(_)
             )
         })
 }
@@ -16068,20 +16070,44 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         path: String,
         timeout: Duration,
     ) -> Result<Option<DfsObjectMetadata>, DfsError> {
-        let settled = self.route_namespace_operation_to_metadata_primary_with_timeout_and_options(
-            file_system_id,
-            primary_node_id,
-            DfsNamespaceOperation::LookupPath { path },
-            timeout,
-            false,
-            false,
-        )?;
-        match settled.result {
-            DfsNamespaceResult::Applied => Ok(settled.synced_path_object),
-            DfsNamespaceResult::Rejected { reason, .. } => {
-                Err(DfsError::Distributed { message: reason })
+        let mut primary = primary_node_id;
+        let operation = DfsNamespaceOperation::LookupPath { path };
+        for _ in 0..DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT {
+            let settled = self
+                .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
+                    file_system_id.clone(),
+                    primary.clone(),
+                    operation.clone(),
+                    timeout,
+                    false,
+                    false,
+                )?;
+            match settled.result {
+                DfsNamespaceResult::Applied => return Ok(settled.synced_path_object),
+                DfsNamespaceResult::Rejected {
+                    reason: _,
+                    current_primary_node_id: Some(current),
+                    ..
+                } if current == self.node_id => {
+                    return self.synced_namespace_object_for_operation(&file_system_id, &operation);
+                }
+                DfsNamespaceResult::Rejected {
+                    current_primary_node_id: Some(current),
+                    ..
+                } if current != primary => {
+                    self.cached_sifs_metadata_shards = None;
+                    primary = current;
+                }
+                DfsNamespaceResult::Rejected { reason, .. } => {
+                    return Err(DfsError::Distributed { message: reason });
+                }
             }
         }
+        Err(DfsError::Distributed {
+            message: format!(
+                "routed namespace lookup exceeded {DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT} authority redirects"
+            ),
+        })
     }
 
     pub(crate) fn route_namespace_operation_to_metadata_primary_without_local_replay(
@@ -22921,11 +22947,12 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             .content
             .open_blob_range_stream(content_hash, offset, max_bytes)?;
         if let Some(expected_size_bytes) = expected_size_bytes {
-            let end = offset.saturating_add(reader.size_bytes());
-            if offset > expected_size_bytes || end > expected_size_bytes {
+            let range_start = reader.offset();
+            let range_end = range_start.saturating_add(reader.remaining_bytes());
+            if range_start > expected_size_bytes || range_end > expected_size_bytes {
                 return Err(DfsError::Distributed {
                     message: format!(
-                        "content blob range for {object_id} {version} exceeds expected size {expected_size_bytes}: {offset}..{end}"
+                        "content blob range for {object_id} {version} exceeds expected size {expected_size_bytes}: {range_start}..{range_end}"
                     ),
                 });
             }

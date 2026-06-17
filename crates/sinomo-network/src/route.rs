@@ -1414,6 +1414,11 @@ fn relay_member_has_usable_bridge_endpoint(
     let has_healthy_next_hop_endpoint = graph
         .best_healthy_endpoint(local_node_id, &member.node_id)
         .is_some();
+    let has_reachable_next_hop_endpoint = has_healthy_next_hop_endpoint
+        || graph
+            .best_reachable_endpoint(local_node_id, &member.node_id)
+            .is_some();
+    let local_graph_has_reachable_targets = !graph.reachable_targets(local_node_id).is_empty();
     member
         .endpoints
         .iter()
@@ -1424,6 +1429,8 @@ fn relay_member_has_usable_bridge_endpoint(
                 local_node_id,
                 endpoint,
                 has_healthy_next_hop_endpoint,
+                has_reachable_next_hop_endpoint,
+                local_graph_has_reachable_targets,
             )
         })
 }
@@ -1449,12 +1456,12 @@ pub fn cluster_relay_next_hops_with_direct_target_fallback(
         )
         .is_empty()
     {
-        // Startup joins can race ahead of connectivity publication. If the graph has not
-        // learned any local edges yet, or it has a concrete reachable edge to the final
-        // target, try delivering directly instead of dropping the relay. Once the graph
-        // has local reachability data, do not dial an unverified final-target member
-        // endpoint from a segmented bridge: that stalls the relay on a path the graph
-        // already failed to prove.
+        // Startup joins and dual-homed bridge nodes can race ahead of onward
+        // connectivity publication. If the graph has not learned local edges or
+        // has concrete target reachability, try delivering directly instead of
+        // dropping the relay on stale graph state. Endpoint selection still
+        // suppresses membership-only hostnames once the local graph has any
+        // reachable edge.
         next_hops.push(target_node_id.clone());
     }
     next_hops
@@ -1545,11 +1552,15 @@ pub fn cluster_relay_next_hop_endpoints_with_graph(
         } else {
             false
         };
-    if !has_healthy_next_hop_endpoint
-        && let Some(endpoint) = graph.best_reachable_endpoint(source_node_id, node_id)
-    {
+    let has_reachable_next_hop_endpoint = if has_healthy_next_hop_endpoint {
+        true
+    } else if let Some(endpoint) = graph.best_reachable_endpoint(source_node_id, node_id) {
         push_unique_cluster_endpoint(&mut endpoints, &mut seen, endpoint);
-    }
+        true
+    } else {
+        false
+    };
+    let local_graph_has_reachable_targets = !graph.reachable_targets(source_node_id).is_empty();
     if let Some(member) = state
         .members
         .iter()
@@ -1565,6 +1576,8 @@ pub fn cluster_relay_next_hop_endpoints_with_graph(
                     source_node_id,
                     *endpoint,
                     has_healthy_next_hop_endpoint,
+                    has_reachable_next_hop_endpoint,
+                    local_graph_has_reachable_targets,
                 )
             })
         {
@@ -1580,6 +1593,8 @@ pub fn cluster_relay_next_hop_endpoints_with_graph(
                 source_node_id,
                 endpoint,
                 has_healthy_next_hop_endpoint,
+                has_reachable_next_hop_endpoint,
+                local_graph_has_reachable_targets,
             )
         })
     {
@@ -1593,17 +1608,19 @@ fn cluster_relay_next_hop_endpoint_is_usable(
     source_node_id: &NodeId,
     endpoint: &ClusterEndpointRecord,
     has_healthy_next_hop_endpoint: bool,
+    has_reachable_next_hop_endpoint: bool,
+    local_graph_has_reachable_targets: bool,
 ) -> bool {
     match graph.state_for_endpoint(endpoint) {
         Some(crate::ClusterConnectivityState::Healthy) => true,
         Some(crate::ClusterConnectivityState::Degraded) => !has_healthy_next_hop_endpoint,
         Some(crate::ClusterConnectivityState::Unreachable) => {
-            !has_healthy_next_hop_endpoint
+            !has_reachable_next_hop_endpoint
                 && graph
                     .reachable_targets(source_node_id)
                     .contains(&endpoint.node_id)
         }
-        None => !has_healthy_next_hop_endpoint,
+        None => !has_healthy_next_hop_endpoint && !local_graph_has_reachable_targets,
     }
 }
 
@@ -2367,17 +2384,17 @@ mod tests {
     }
 
     #[test]
-    fn direct_target_fallback_requires_target_reachability_once_graph_has_edges() {
-        let root = sinomo_testdir::TestDir::new("sinomo-network-relay-direct-fallback-reachable");
+    fn direct_target_fallback_suppresses_member_only_target_endpoint_once_graph_has_edges() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-relay-direct-fallback-member-only");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
         paths.ensure().expect("paths");
         let now = OffsetDateTime::now_utc();
-        let cluster_id = ClusterId::from_legacy_named("cluster_relay_direct_fallback_reachable")
+        let cluster_id = ClusterId::from_legacy_named("cluster_relay_direct_fallback_member_only")
             .expect("cluster");
-        let local = nid("node_relay_direct_fallback_local");
-        let bridge = nid("node_relay_direct_fallback_bridge");
-        let target = nid("node_relay_direct_fallback_target");
+        let local = nid("node_relay_direct_fallback_member_only_local");
+        let bridge = nid("node_relay_direct_fallback_member_only_bridge");
+        let target = nid("node_relay_direct_fallback_member_only_target");
         let mut state = ClusterBootstrapState::initialized_locally(
             cluster_id,
             "relay direct fallback reachable",
@@ -2415,7 +2432,113 @@ mod tests {
 
         assert!(
             next_hops.is_empty(),
-            "a segmented bridge must not dial a final target directly just because membership lists an endpoint"
+            "after the local graph has reachable edges, membership-only target hostnames are not safe relay evidence"
+        );
+    }
+
+    #[test]
+    fn direct_target_fallback_uses_graph_observed_target_endpoint_when_no_transit_route() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-relay-direct-fallback-reachable");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_relay_direct_fallback_reachable")
+            .expect("cluster");
+        let local = nid("node_relay_direct_fallback_local");
+        let bridge = nid("node_relay_direct_fallback_bridge");
+        let target = nid("node_relay_direct_fallback_target");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "relay direct fallback reachable",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let target_endpoint = crate::daemon_lan_endpoint(&target, "node1:21353".to_string(), 5);
+        let mut target_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            target.clone(),
+            "target",
+            "pk-target",
+            now,
+        );
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        target_member.endpoints = vec![target_endpoint.clone()];
+        state.members.push(target_member);
+        let graph = graph(vec![
+            edge(&local, &bridge, ClusterConnectivityState::Healthy),
+            edge(&local, &target, ClusterConnectivityState::Degraded),
+        ]);
+
+        let next_hops = cluster_relay_next_hops_with_direct_target_fallback(
+            &paths,
+            &graph,
+            &state,
+            &local,
+            &target,
+            std::slice::from_ref(&bridge),
+        );
+
+        assert_eq!(
+            next_hops,
+            vec![target],
+            "a graph-observed final-target endpoint remains valid fallback evidence even when no transit route is available"
+        );
+    }
+
+    #[test]
+    fn direct_target_fallback_still_requires_target_evidence_once_graph_has_edges() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-relay-direct-fallback-no-evidence");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_relay_direct_fallback_no_evidence")
+            .expect("cluster");
+        let local = nid("node_relay_direct_fallback_no_evidence_local");
+        let bridge = nid("node_relay_direct_fallback_no_evidence_bridge");
+        let target = nid("node_relay_direct_fallback_no_evidence_target");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "relay direct fallback no evidence",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let target_endpoint = crate::daemon_lan_endpoint(&target, "10.91.0.9:21353".to_string(), 5);
+        let mut target_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            target.clone(),
+            "target",
+            "pk-target",
+            now,
+        );
+        target_member.capabilities = main_daemon_capabilities(&target_member.role);
+        target_member.allowed_capabilities = target_member.capabilities.clone();
+        target_member.endpoints = vec![target_endpoint];
+        state.members.push(target_member);
+        let graph = graph(vec![edge(
+            &local,
+            &bridge,
+            ClusterConnectivityState::Healthy,
+        )]);
+
+        let next_hops = cluster_relay_next_hops_with_direct_target_fallback(
+            &paths,
+            &graph,
+            &state,
+            &local,
+            &target,
+            std::slice::from_ref(&bridge),
+        );
+
+        assert!(
+            next_hops.is_empty(),
+            "a socket-only member endpoint is not enough final-target evidence once the graph has local edges"
         );
     }
 
@@ -2773,7 +2896,8 @@ mod tests {
     }
 
     #[test]
-    fn relay_next_hop_endpoints_keep_member_endpoint_when_pair_is_reachable() {
+    fn relay_next_hop_endpoints_suppress_known_unreachable_member_endpoint_when_pair_is_reachable()
+    {
         let root = sinomo_testdir::TestDir::new("sinomo-network-relay-endpoint-reachable-pair");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -2842,16 +2966,13 @@ mod tests {
                 .iter()
                 .map(|endpoint| endpoint.address.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                observed_reachable_endpoint.address.as_str(),
-                stale_member_endpoint.address.as_str()
-            ],
-            "relay forwarding should keep a member endpoint when the next-hop pair is reachable"
+            vec![observed_reachable_endpoint.address.as_str()],
+            "once a pair has a graph-observed reachable endpoint, relay forwarding must not retain a member endpoint already marked unreachable"
         );
     }
 
     #[test]
-    fn relay_next_hop_endpoints_prefers_degraded_graph_endpoint_before_stale_fallback() {
+    fn relay_next_hop_endpoints_suppresses_stale_fallback_after_degraded_graph_endpoint() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-relay-endpoint-degraded-graph");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -2920,11 +3041,8 @@ mod tests {
                 .iter()
                 .map(|endpoint| endpoint.address.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                reachable_graph_endpoint.address.as_str(),
-                stale_member_endpoint.address.as_str()
-            ],
-            "relay should keep a concrete graph-observed endpoint first while retaining member fallbacks for a reachable next-hop pair"
+            vec![reachable_graph_endpoint.address.as_str()],
+            "a concrete graph-observed degraded endpoint should suppress stale unreachable member fallbacks for the same pair"
         );
     }
 

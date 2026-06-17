@@ -100,6 +100,38 @@ fn dfs_adaptive_transfer_windows_stay_byte_bounded() {
 }
 
 #[test]
+fn content_hash_range_fallback_validates_returned_window_not_full_blob_size() {
+    let root = temp_root("content_hash_range_fallback_validates_window");
+    let node = NodeId::from_legacy_named("node_content_hash_range_window").expect("node");
+    let object_id =
+        DfsObjectId::from_legacy_named("obj_content_hash_range_window").expect("object");
+    let version =
+        DfsVersion::from_legacy_named("version_content_hash_range_window").expect("version");
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let dfs = NetworkedDfsService::new(ReceiveOnlyTransport::new(node), content);
+    let bytes = (0..64).collect::<Vec<u8>>();
+    let manifest = dfs
+        .content
+        .put_object_version_blob_only(object_id.as_str(), version.as_str(), &bytes)
+        .expect("blob-only content");
+
+    let mut reader = dfs
+        .open_content_hash_range_stream(
+            &object_id,
+            &version,
+            &manifest.content_hash,
+            Some(bytes.len() as u64),
+            16,
+            bytes.len(),
+        )
+        .expect("range inside expected object size");
+    let mut actual = Vec::new();
+    reader.read_to_end(&mut actual).expect("read range");
+
+    assert_eq!(actual, bytes[16..]);
+}
+
+#[test]
 fn protocol_frame_read_requests_require_fresh_metadata() {
     let source = NodeId::from_legacy_named("node_protocol_fresh_source").expect("source");
     let target = NodeId::from_legacy_named("node_protocol_fresh_target").expect("target");
@@ -533,7 +565,10 @@ fn dfs_protocol_frame_read_only_classifier_routes_lookup_path_to_read_lane() {
     )
     .expect("lookup frame");
     assert!(dfs_protocol_frame_is_read_only_request(&lookup_frame));
-    assert!(!dfs_protocol_frame_requires_fresh_metadata(&lookup_frame));
+    assert!(
+        dfs_protocol_frame_requires_fresh_metadata(&lookup_frame),
+        "lookup requests must hydrate daemon read lanes before answering primary path checks"
+    );
 
     let sync_frame = build_dfs_network_frame(
         &local,
@@ -553,7 +588,7 @@ fn dfs_protocol_frame_read_only_classifier_routes_lookup_path_to_read_lane() {
     )
     .expect("sync frame");
     assert!(!dfs_protocol_frame_is_read_only_request(&sync_frame));
-    assert!(!dfs_protocol_frame_requires_fresh_metadata(&sync_frame));
+    assert!(dfs_protocol_frame_requires_fresh_metadata(&sync_frame));
 
     let apply_frame = build_dfs_network_frame(
         &local,
@@ -579,7 +614,7 @@ fn dfs_protocol_frame_read_only_classifier_routes_lookup_path_to_read_lane() {
     )
     .expect("apply frame");
     assert!(!dfs_protocol_frame_is_read_only_request(&apply_frame));
-    assert!(!dfs_protocol_frame_requires_fresh_metadata(&apply_frame));
+    assert!(dfs_protocol_frame_requires_fresh_metadata(&apply_frame));
 }
 
 struct FailingSendTransport {
@@ -25616,6 +25651,118 @@ fn sifs_routed_write_follows_authority_redirect() {
         requester
             .posix_read_file_distributed(path)
             .expect("requester reads redirected write"),
+        bytes
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    old_thread.join().expect("old primary thread");
+    new_thread.join().expect("new primary thread");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sifs_routed_lookup_follows_authority_redirect() {
+    let root = temp_root("sifs-lookup-authority-redirect");
+    let primary_node =
+        NodeId::from_legacy_named("node_sifs_lookup_redirect_old_primary").expect("old primary");
+    let writer_node =
+        NodeId::from_legacy_named("node_sifs_lookup_redirect_new_primary").expect("new primary");
+    let requester_node =
+        NodeId::from_legacy_named("node_sifs_lookup_redirect_requester").expect("requester");
+
+    let network = InProcessNetwork::new();
+    let shard_config = |primary: &NodeId, epoch: u64| DfsMetadataShardConfig {
+        file_system_id: sifs_file_system_id(),
+        shard_id: "root".to_string(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![primary_node.clone(), writer_node.clone()],
+        epoch,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+
+    let kv_current = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![primary_node.clone()]).expect("current kv"),
+    );
+    kv_current.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                writer_node.clone(),
+            )))
+            .expect("current filesystem config");
+        control
+            .put_metadata_shard(&shard_config(&writer_node, 2))
+            .expect("current shard config");
+    });
+    let kv_stale = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![requester_node.clone()]).expect("stale kv"),
+    );
+    kv_stale.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                writer_node.clone(),
+            )))
+            .expect("stale filesystem config");
+        control
+            .put_metadata_shard(&shard_config(&primary_node, 1))
+            .expect("stale shard config");
+    });
+
+    let old_primary =
+        sifs_posix_cluster_node(&network, &kv_current, &root, "old-primary", primary_node);
+    let mut new_primary = sifs_posix_cluster_node(
+        &network,
+        &kv_current,
+        &root,
+        "new-primary",
+        writer_node.clone(),
+    );
+    let mut requester =
+        sifs_posix_cluster_node(&network, &kv_stale, &root, "requester", requester_node);
+    new_primary
+        .bootstrap_distributed_sifs()
+        .expect("new primary SIFS bootstrap");
+    let path = "/users/lookup-redirected.txt";
+    let bytes = b"routed lookup follows current primary".to_vec();
+    new_primary
+        .posix_mkdir_all("/users")
+        .expect("new primary creates parent");
+    new_primary
+        .posix_write_file(
+            path,
+            &bytes,
+            DfsWriteOptions::replicated_eventual(vec![writer_node]),
+        )
+        .expect("new primary writes file");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let old_stop = Arc::clone(&stop);
+    let old_thread = std::thread::spawn(move || {
+        let mut node = old_primary;
+        while !old_stop.load(Ordering::SeqCst) {
+            node.process_incoming().expect("old primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let new_stop = Arc::clone(&stop);
+    let new_thread = std::thread::spawn(move || {
+        let mut node = new_primary;
+        while !new_stop.load(Ordering::SeqCst) {
+            node.process_incoming().expect("new primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    let stat = requester
+        .posix_stat_distributed(path)
+        .expect("routed lookup follows authority redirect");
+    assert_eq!(stat.size_bytes, Some(bytes.len() as u64));
+    assert_eq!(
+        requester
+            .posix_read_file_distributed(path)
+            .expect("redirected lookup enables read"),
         bytes
     );
 

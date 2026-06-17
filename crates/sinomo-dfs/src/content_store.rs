@@ -3124,16 +3124,23 @@ impl LocalContentStore {
             return Ok(ContentStoreStatsDelta::default());
         }
 
-        let mut segment_files = BTreeMap::<String, fs::File>::new();
+        struct PendingPackedSegmentWrite {
+            path: PathBuf,
+            bytes: Vec<u8>,
+        }
+
+        let mut segment_writes = BTreeMap::<String, PendingPackedSegmentWrite>::new();
         let mut segment_lengths = BTreeMap::<String, u64>::new();
         let mut new_segment_parent_dirs = BTreeSet::<PathBuf>::new();
+        let mut pending_hashes = BTreeSet::<String>::new();
         let mut records = Vec::new();
         let mut stats_delta = ContentStoreStatsDelta::default();
 
         for (hash, bytes) in blobs {
             hash_hex(hash)?;
             if let Some(location) = index.entries.get(hash)
-                && self.packed_blob_location_readable(location)?
+                && (pending_hashes.contains(hash)
+                    || self.packed_blob_location_readable(location)?)
             {
                 continue;
             }
@@ -3166,26 +3173,15 @@ impl LocalContentStore {
                 create_dir_all(parent.to_owned())?;
             }
             let existed = segment_path.exists();
-            if !segment_files.contains_key(&segment_id) {
-                let file = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&segment_path)
-                    .map_err(|source| ContentStoreError::Io {
-                        path: segment_path.clone(),
-                        source,
-                    })?;
-                segment_files.insert(segment_id.clone(), file);
-            }
-            let file = segment_files
-                .get_mut(&segment_id)
-                .expect("segment file was inserted");
             let offset = segment_len;
-            file.write_all(bytes)
-                .map_err(|source| ContentStoreError::Io {
+            segment_writes
+                .entry(segment_id.clone())
+                .or_insert_with(|| PendingPackedSegmentWrite {
                     path: segment_path.clone(),
-                    source,
-                })?;
+                    bytes: Vec::new(),
+                })
+                .bytes
+                .extend_from_slice(bytes);
             segment_len = segment_len.saturating_add(bytes.len() as u64);
             segment_lengths.insert(segment_id.clone(), segment_len);
             if !existed && let Some(parent) = segment_path.parent() {
@@ -3204,16 +3200,33 @@ impl LocalContentStore {
                 location: Some(location),
                 next_segment_id: index.next_segment_id,
             });
+            pending_hashes.insert(hash.clone());
             stats_delta.blob_count += 1;
             stats_delta.blob_bytes += bytes.len() as i128;
         }
 
-        if sync_writes {
-            for (segment_id, file) in segment_files {
-                let path = self.packed_blob_segment_path(&segment_id);
-                file.sync_all()
-                    .map_err(|source| ContentStoreError::Io { path, source })?;
+        for (_, pending) in segment_writes {
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&pending.path)
+                .map_err(|source| ContentStoreError::Io {
+                    path: pending.path.clone(),
+                    source,
+                })?;
+            file.write_all(&pending.bytes)
+                .map_err(|source| ContentStoreError::Io {
+                    path: pending.path.clone(),
+                    source,
+                })?;
+            if sync_writes {
+                file.sync_all().map_err(|source| ContentStoreError::Io {
+                    path: pending.path.clone(),
+                    source,
+                })?;
             }
+        }
+        if sync_writes {
             for parent in new_segment_parent_dirs {
                 sync_dir(&parent)?;
             }
@@ -5328,6 +5341,38 @@ mod tests {
             store.read_manifest("object-blob-only-b", "v1").is_err(),
             "blob-only batch writes should not create per-object manifests"
         );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn put_object_version_blobs_only_deduplicates_same_batch_packed_hash() {
+        let root = temp_root("put_object_version_blobs_only_deduplicates_same_batch_packed_hash");
+        let store = LocalContentStore::new(&root).expect("create store");
+
+        let bytes = b"same packed blob bytes";
+        let manifests = store
+            .put_object_version_blobs_only(vec![
+                ("object-blob-only-duplicate-a", "v1", bytes.as_slice()),
+                ("object-blob-only-duplicate-b", "v1", bytes.as_slice()),
+            ])
+            .expect("put duplicate blob-only object versions");
+
+        assert_eq!(manifests.len(), 2);
+        assert_eq!(manifests[0].content_hash, manifests[1].content_hash);
+        assert_eq!(
+            store
+                .read_blob(&manifests[0].content_hash)
+                .expect("read packed duplicate blob"),
+            bytes
+        );
+        let index = store
+            .read_packed_blob_index_unlocked()
+            .expect("read packed index");
+        assert_eq!(index.entries.len(), 1);
+        let stats = store.stats().expect("stats");
+        assert_eq!(stats.blob_count, 1);
+        assert_eq!(stats.blob_bytes, bytes.len() as u64);
 
         cleanup(&root);
     }

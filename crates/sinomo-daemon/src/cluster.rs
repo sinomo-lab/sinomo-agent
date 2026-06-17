@@ -684,6 +684,45 @@ pub(crate) fn remember_cluster_endpoint_command_connectivity(
     latency_ms: Option<u64>,
     runtime: Option<&tokio::runtime::Handle>,
 ) {
+    remember_cluster_endpoint_command_connectivity_with_failure_grace(
+        paths,
+        state,
+        endpoint,
+        connectivity_state,
+        latency_ms,
+        true,
+        runtime,
+    );
+}
+
+pub(crate) fn remember_cluster_endpoint_command_connectivity_without_failure_grace(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    connectivity_state: sinomo_network::ClusterConnectivityState,
+    latency_ms: Option<u64>,
+    runtime: Option<&tokio::runtime::Handle>,
+) {
+    remember_cluster_endpoint_command_connectivity_with_failure_grace(
+        paths,
+        state,
+        endpoint,
+        connectivity_state,
+        latency_ms,
+        false,
+        runtime,
+    );
+}
+
+fn remember_cluster_endpoint_command_connectivity_with_failure_grace(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    connectivity_state: sinomo_network::ClusterConnectivityState,
+    latency_ms: Option<u64>,
+    allow_failure_grace: bool,
+    runtime: Option<&tokio::runtime::Handle>,
+) {
     let now = OffsetDateTime::now_utc();
     let timestamp = now
         .format(&Rfc3339)
@@ -706,15 +745,32 @@ pub(crate) fn remember_cluster_endpoint_command_connectivity(
             .and_then(|record| record.latency_ms)
             .unwrap_or(0)
     });
-    let record = sinomo_network::cluster_connectivity_record_for_probe_outcome(
-        state,
-        endpoint,
-        previous.as_ref(),
-        is_healthy,
-        observed_latency_ms,
-        &timestamp,
-        now,
-    );
+    let record = if matches!(
+        connectivity_state,
+        sinomo_network::ClusterConnectivityState::Unreachable
+    ) {
+        sinomo_network::cluster_connectivity_record_for_identity_mismatch(
+            state, endpoint, &timestamp, now,
+        )
+    } else if !is_healthy && !allow_failure_grace {
+        sinomo_network::cluster_connectivity_record_for_hard_failure(
+            state,
+            endpoint,
+            previous.as_ref(),
+            &timestamp,
+            now,
+        )
+    } else {
+        sinomo_network::cluster_connectivity_record_for_probe_outcome(
+            state,
+            endpoint,
+            previous.as_ref(),
+            is_healthy,
+            observed_latency_ms,
+            &timestamp,
+            now,
+        )
+    };
     if sinomo_network::write_local_cluster_connectivity_records(
         paths,
         &state.local_node_id,
@@ -4759,6 +4815,16 @@ impl sinomo_network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost<'_> {
                     )
                     .await;
                 }
+                Err(sinomo_network::NetworkError::AuthDenied) => {
+                    remember_relay_endpoint_command_connectivity_without_failure_grace_async(
+                        paths,
+                        runtime,
+                        endpoint,
+                        sinomo_network::ClusterConnectivityState::Degraded,
+                        None,
+                    )
+                    .await;
+                }
                 Err(_) => {}
             }
             result
@@ -4782,6 +4848,33 @@ async fn remember_relay_endpoint_command_connectivity_async(
                 return;
             };
             remember_cluster_endpoint_command_connectivity(
+                &cluster_paths,
+                &state,
+                &endpoint,
+                connectivity_state,
+                latency_ms,
+                None,
+            );
+        })
+        .await;
+}
+
+async fn remember_relay_endpoint_command_connectivity_without_failure_grace_async(
+    paths: DaemonPaths,
+    runtime: tokio::runtime::Handle,
+    endpoint: ClusterEndpointRecord,
+    connectivity_state: sinomo_network::ClusterConnectivityState,
+    latency_ms: Option<u64>,
+) {
+    let _ = runtime
+        .spawn_blocking(move || {
+            let Ok(cluster_paths) = cluster_paths_from_daemon_paths(&paths) else {
+                return;
+            };
+            let Ok(state) = sinomo_network::read_cluster_state_without_kv(&cluster_paths) else {
+                return;
+            };
+            remember_cluster_endpoint_command_connectivity_without_failure_grace(
                 &cluster_paths,
                 &state,
                 &endpoint,
@@ -8907,6 +9000,84 @@ mod tests {
             targets.first().map(|endpoint| &endpoint.endpoint_id),
             Some(&tcp.endpoint_id),
             "recovered direct command endpoint should become the preferred path again"
+        );
+
+        remember_cluster_endpoint_command_connectivity_without_failure_grace(
+            &paths,
+            &state,
+            &tcp,
+            sinomo_network::ClusterConnectivityState::Degraded,
+            None,
+            None,
+        );
+        let record = read_tcp_record();
+        assert_eq!(
+            record.state,
+            sinomo_network::ClusterConnectivityState::Degraded,
+            "auth-style command failures should bypass transient grace without proving identity mismatch"
+        );
+        assert_eq!(record.consecutive_failures, 1);
+        assert!(
+            record.last_success_at.is_some(),
+            "non-identity hard failures should retain recovery context before the failure budget is exhausted"
+        );
+        remember_cluster_endpoint_command_connectivity(
+            &paths,
+            &state,
+            &tcp,
+            sinomo_network::ClusterConnectivityState::Healthy,
+            Some(13),
+            None,
+        );
+        let targets = sinomo_network::cluster_raft_command_targets(&paths, &state);
+        assert_eq!(
+            targets.first().map(|endpoint| &endpoint.endpoint_id),
+            Some(&tcp.endpoint_id),
+            "a later successful command send should restore a hard-degraded endpoint"
+        );
+
+        remember_cluster_endpoint_command_connectivity(
+            &paths,
+            &state,
+            &tcp,
+            sinomo_network::ClusterConnectivityState::Unreachable,
+            None,
+            None,
+        );
+        let record = read_tcp_record();
+        assert_eq!(
+            record.state,
+            sinomo_network::ClusterConnectivityState::Unreachable,
+            "identity failures should retire the exact endpoint immediately"
+        );
+        assert_eq!(
+            record.consecutive_failures,
+            CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD
+        );
+        assert!(
+            record.last_success_at.is_none(),
+            "identity failures must not retain stale successful reachability"
+        );
+        let targets = sinomo_network::cluster_raft_command_targets(&paths, &state);
+        assert_eq!(
+            targets.first().map(|endpoint| &endpoint.endpoint_id),
+            Some(&iroh.endpoint_id),
+            "identity-failed direct command endpoint should not outrank relay fallback"
+        );
+
+        remember_cluster_endpoint_command_connectivity(
+            &paths,
+            &state,
+            &tcp,
+            sinomo_network::ClusterConnectivityState::Healthy,
+            Some(14),
+            None,
+        );
+        let targets = sinomo_network::cluster_raft_command_targets(&paths, &state);
+        assert_eq!(
+            targets.first().map(|endpoint| &endpoint.endpoint_id),
+            Some(&tcp.endpoint_id),
+            "a later successful command send should restore the direct endpoint"
         );
     }
 
