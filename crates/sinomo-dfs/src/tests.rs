@@ -1472,13 +1472,6 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
     assert_eq!(
         protocol_request
             .metadata
-            .get(sinomo_network::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY)
-            .map(String::as_str),
-        Some(sinomo_network::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE)
-    );
-    assert_eq!(
-        protocol_request
-            .metadata
             .get(sinomo_network::ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY),
         None
     );

@@ -260,17 +260,13 @@ pub async fn send_daemon_rpc_stream_async(
         .await?;
     stream.shutdown_write(address).await?;
     loop {
-        let response = stream
+        let rpc = stream
             .read_response(
                 address,
                 sinomo_network::IROH_DAEMON_COMMAND_MAX_BYTES,
                 frame_options,
             )
             .await?;
-        let rpc = response.rpc.ok_or_else(|| DaemonError::Network {
-            address: address.to_string(),
-            detail: "daemon returned non-rpc stream frame".to_string(),
-        })?;
         if !on_response(rpc)? {
             return Ok(());
         }

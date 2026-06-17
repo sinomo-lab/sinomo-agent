@@ -19,9 +19,6 @@ pub const DAEMON_CONTROL_RPC_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024 * 1024;
 pub const DAEMON_CONTROL_RPC_MAX_FRAME_BYTES: usize = usize::MAX;
 pub const DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY: &str = "sinomo.daemon-control.reuse-stream";
 pub const DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE: &str = "1";
-pub const DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY: &str =
-    "sinomo.daemon-control.raw-rpc-response";
-pub const DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE: &str = "1";
 pub const ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY: &str = "sinomo.endpoint-rpc.raw-direct";
 pub const ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE: &str = "1";
 const OBJECT_STREAM_CHUNK_FRAME_OVERHEAD_BYTES: usize = 4096;
@@ -144,28 +141,7 @@ impl DaemonControlRequest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct DaemonControlResponse {
-    pub body: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rpc: Option<crate::ObjectRpcResponse>,
-}
-
-impl DaemonControlResponse {
-    pub fn new(body: impl Into<String>) -> Self {
-        Self {
-            body: body.into(),
-            rpc: None,
-        }
-    }
-
-    pub fn rpc(body: impl Into<String>, rpc: crate::ObjectRpcResponse) -> Self {
-        Self {
-            body: body.into(),
-            rpc: Some(rpc),
-        }
-    }
-}
+pub type DaemonControlResponse = crate::ObjectRpcResponse;
 
 #[derive(Debug)]
 pub struct AsyncDaemonControlListener {
@@ -369,7 +345,7 @@ impl AsyncDaemonControlStream {
         response: &crate::ObjectRpcResponse,
         options: ObjectFrameIoOptions,
     ) -> Result<(), NetworkError> {
-        self.write_frame(address, response, options).await
+        self.write_response(address, response, options).await
     }
 
     async fn write_frame<T>(
@@ -472,32 +448,6 @@ pub async fn send_daemon_control_request_async(
     .await
 }
 
-pub async fn send_daemon_control_rpc_request_raw_response_async(
-    address: &str,
-    request: &DaemonControlRequest,
-    timeouts: DaemonRpcTimeouts,
-    max_response_bytes: usize,
-) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    if daemon_control_request_allows_stream_reuse(request) {
-        return send_reusable_daemon_control_rpc_request_raw_response_async(
-            address,
-            request,
-            timeouts,
-            max_response_bytes,
-        )
-        .await;
-    }
-    let mut stream = AsyncDaemonControlStream::connect_with_options(address, timeouts).await?;
-    send_daemon_control_rpc_request_raw_response_on_stream_async(
-        address,
-        request,
-        timeouts,
-        max_response_bytes,
-        &mut stream,
-    )
-    .await
-}
-
 async fn send_reusable_daemon_control_request_async(
     address: &str,
     request: &DaemonControlRequest,
@@ -542,50 +492,6 @@ async fn send_reusable_daemon_control_request_async(
     }
 }
 
-async fn send_reusable_daemon_control_rpc_request_raw_response_async(
-    address: &str,
-    request: &DaemonControlRequest,
-    timeouts: DaemonRpcTimeouts,
-    max_response_bytes: usize,
-) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    let (mut stream, reused) = match take_pooled_daemon_control_stream(address) {
-        Some(stream) => (stream, true),
-        None => (
-            AsyncDaemonControlStream::connect_with_options(address, timeouts).await?,
-            false,
-        ),
-    };
-    match send_daemon_control_rpc_request_raw_response_on_stream_async(
-        address,
-        request,
-        timeouts,
-        max_response_bytes,
-        &mut stream,
-    )
-    .await
-    {
-        Ok(response) => {
-            return_pooled_daemon_control_stream(address, stream);
-            Ok(response)
-        }
-        Err(_) if reused => {
-            let mut stream =
-                AsyncDaemonControlStream::connect_with_options(address, timeouts).await?;
-            let response = send_daemon_control_rpc_request_raw_response_on_stream_async(
-                address,
-                request,
-                timeouts,
-                max_response_bytes,
-                &mut stream,
-            )
-            .await?;
-            return_pooled_daemon_control_stream(address, stream);
-            Ok(response)
-        }
-        Err(error) => Err(error),
-    }
-}
-
 async fn send_daemon_control_request_on_stream_async(
     address: &str,
     request: &DaemonControlRequest,
@@ -600,39 +506,6 @@ async fn send_daemon_control_request_on_stream_async(
     stream
         .read_response(address, max_response_bytes, frame_options)
         .await
-}
-
-async fn send_daemon_control_rpc_request_raw_response_on_stream_async(
-    address: &str,
-    request: &DaemonControlRequest,
-    timeouts: DaemonRpcTimeouts,
-    max_response_bytes: usize,
-    stream: &mut AsyncDaemonControlStream,
-) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    let frame_options = ObjectFrameIoOptions::none().with_idle_timeout(timeouts.idle_timeout);
-    stream
-        .write_request(address, request, frame_options)
-        .await?;
-    stream
-        .read_rpc_response(address, max_response_bytes, frame_options)
-        .await
-}
-
-pub fn object_rpc_request_expects_raw_daemon_response(request: &crate::ObjectRpcRequest) -> bool {
-    request
-        .metadata
-        .get(DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY)
-        .is_some_and(|value| {
-            value == DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE
-                || value.eq_ignore_ascii_case("true")
-        })
-}
-
-pub fn daemon_control_request_expects_raw_rpc_response(request: &DaemonControlRequest) -> bool {
-    request
-        .rpc
-        .as_ref()
-        .is_some_and(object_rpc_request_expects_raw_daemon_response)
 }
 
 fn daemon_control_request_allows_stream_reuse(request: &DaemonControlRequest) -> bool {
@@ -1420,8 +1293,8 @@ fn object_frame_eof_detail(part: &str, read: usize, expected: usize) -> String {
 #[cfg(test)]
 mod serde_bytes_tests {
     use super::{
-        AsyncDaemonControlListener, DaemonControlRequest, DaemonControlResponse, DaemonRpcTimeouts,
-        ObjectFrameIoOptions, ObjectStreamChunk, ObjectStreamChunkOptions, SinomoObjectCodec,
+        AsyncDaemonControlListener, DaemonControlRequest, DaemonRpcTimeouts, ObjectFrameIoOptions,
+        ObjectStreamChunk, ObjectStreamChunkOptions, SinomoObjectCodec,
         decode_single_object_frame_from_slice, encode_object_frame_to_vec, read_object_frame_async,
         read_object_frame_blocking, read_object_stream_chunks_async,
         send_daemon_control_request_async, write_all_async_frame, write_object_frame_async,
@@ -1863,10 +1736,13 @@ mod serde_bytes_tests {
                 .await
                 .expect("request");
             assert_eq!(request.command, "ping");
+            let response =
+                crate::ObjectRpcResponse::encode_body("/daemon-control/ping", &"pong".to_string())
+                    .expect("response");
             stream
                 .write_response(
                     "listener",
-                    &DaemonControlResponse::new("pong"),
+                    &response,
                     ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
                 )
                 .await
@@ -1882,7 +1758,7 @@ mod serde_bytes_tests {
         .await
         .expect("control response");
 
-        assert_eq!(response.body, "pong");
+        assert_eq!(response.decode_body::<String>().expect("body"), "pong");
         server.await.expect("server task");
     }
 
@@ -1908,10 +1784,15 @@ mod serde_bytes_tests {
                     request.rpc.as_ref().map(|rpc| rpc.route.as_str()),
                     Some(crate::CLUSTER_NETWORK_PING_ROUTE)
                 );
+                let response = crate::ObjectRpcResponse::encode_body(
+                    crate::CLUSTER_NETWORK_PING_ROUTE,
+                    &expected.to_string(),
+                )
+                .expect("response");
                 stream
                     .write_response(
                         "listener",
-                        &DaemonControlResponse::new(expected),
+                        &response,
                         ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
                     )
                     .await
@@ -1945,8 +1826,8 @@ mod serde_bytes_tests {
         .await
         .expect("second response");
 
-        assert_eq!(first.body, "one");
-        assert_eq!(second.body, "two");
+        assert_eq!(first.decode_body::<String>().expect("first body"), "one");
+        assert_eq!(second.decode_body::<String>().expect("second body"), "two");
         server.await.expect("server task");
     }
 
@@ -1972,10 +1853,13 @@ mod serde_bytes_tests {
                     request.rpc.as_ref().map(|rpc| rpc.route.as_str()),
                     Some("/test/reusable")
                 );
+                let response =
+                    crate::ObjectRpcResponse::encode_body("/test/reusable", &expected.to_string())
+                        .expect("response");
                 stream
                     .write_response(
                         "listener",
-                        &DaemonControlResponse::new(expected),
+                        &response,
                         ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
                     )
                     .await
@@ -2014,13 +1898,13 @@ mod serde_bytes_tests {
         .await
         .expect("second response");
 
-        assert_eq!(first.body, "one");
-        assert_eq!(second.body, "two");
+        assert_eq!(first.decode_body::<String>().expect("first body"), "one");
+        assert_eq!(second.decode_body::<String>().expect("second body"), "two");
         server.await.expect("server task");
     }
 
     #[tokio::test]
-    async fn reusable_daemon_control_request_can_read_raw_rpc_response() {
+    async fn reusable_daemon_control_request_can_read_object_rpc_response() {
         let listener = AsyncDaemonControlListener::bind("127.0.0.1:0")
             .await
             .expect("listener");
@@ -2036,12 +1920,9 @@ mod serde_bytes_tests {
                     )
                     .await
                     .expect("request");
-                assert_eq!(request.command, "RPC /test/raw-reusable");
-                assert!(super::daemon_control_request_expects_raw_rpc_response(
-                    &request
-                ));
+                assert_eq!(request.command, "RPC /test/reusable-rpc-response");
                 let response = crate::ObjectRpcResponse::encode_body(
-                    "/test/raw-reusable",
+                    "/test/reusable-rpc-response",
                     &expected.to_string(),
                 )
                 .expect("response");
@@ -2060,21 +1941,17 @@ mod serde_bytes_tests {
             super::DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY.to_string(),
             super::DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE.to_string(),
         );
-        metadata.insert(
-            super::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY.to_string(),
-            super::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE.to_string(),
-        );
         let request = DaemonControlRequest::rpc(
-            "RPC /test/raw-reusable",
+            "RPC /test/reusable-rpc-response",
             crate::ObjectRpcRequest {
-                route: "/test/raw-reusable".to_string(),
+                route: "/test/reusable-rpc-response".to_string(),
                 category: "test".to_string(),
                 metadata,
                 body: Vec::new(),
             },
         );
 
-        let first = super::send_daemon_control_rpc_request_raw_response_async(
+        let first = send_daemon_control_request_async(
             &address,
             &request,
             DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
@@ -2082,7 +1959,7 @@ mod serde_bytes_tests {
         )
         .await
         .expect("first response");
-        let second = super::send_daemon_control_rpc_request_raw_response_async(
+        let second = send_daemon_control_request_async(
             &address,
             &request,
             DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),

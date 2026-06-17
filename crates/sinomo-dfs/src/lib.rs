@@ -493,10 +493,6 @@ pub fn dfs_protocol_frame_rpc_request(
         sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY.to_string(),
         sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE.to_string(),
     );
-    request.metadata.insert(
-        sinomo_network::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY.to_string(),
-        sinomo_network::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE.to_string(),
-    );
     Ok(request)
 }
 

@@ -5964,10 +5964,7 @@ fn cluster_join_registration_works_over_iroh() {
                     stream
                         .write_response(
                             &fixture_daemon_address,
-                            &sinomo_runtime::network::DaemonControlResponse::rpc(
-                                String::new(),
-                                rpc_response,
-                            ),
+                            &rpc_response,
                             sinomo_runtime::network::ObjectFrameIoOptions::none(),
                         )
                         .await
@@ -6003,10 +6000,7 @@ fn cluster_join_registration_works_over_iroh() {
                     stream
                         .write_response(
                             &fixture_daemon_address,
-                            &sinomo_runtime::network::DaemonControlResponse::rpc(
-                                String::new(),
-                                rpc_response,
-                            ),
+                            &rpc_response,
                             sinomo_runtime::network::ObjectFrameIoOptions::none(),
                         )
                         .await

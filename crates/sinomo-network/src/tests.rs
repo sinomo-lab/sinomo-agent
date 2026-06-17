@@ -1820,13 +1820,9 @@ fn async_daemon_control_client_round_trips_object_frames() {
             assert_eq!(request.rpc.as_ref().expect("rpc").route, "/test/status");
             let rpc_response = ObjectRpcResponse::encode_body("/test/status", &"OK".to_string())
                 .expect("rpc response");
-            write_object_frame_async(
-                &mut stream,
-                &DaemonControlResponse::rpc(String::new(), rpc_response),
-                ObjectFrameIoOptions::none(),
-            )
-            .await
-            .expect("write response");
+            write_object_frame_async(&mut stream, &rpc_response, ObjectFrameIoOptions::none())
+                .await
+                .expect("write response");
         });
         let request =
             ObjectRpcRequest::encode_body("/test/status", "test", &()).expect("rpc request");
@@ -1869,13 +1865,9 @@ fn async_cluster_endpoint_rpc_uses_tcp_transport() {
             let rpc_response =
                 ObjectRpcResponse::encode_body("/test/endpoint-async", &"OK".to_string())
                     .expect("rpc response");
-            write_object_frame_async(
-                &mut stream,
-                &DaemonControlResponse::rpc(String::new(), rpc_response),
-                ObjectFrameIoOptions::none(),
-            )
-            .await
-            .expect("write response");
+            write_object_frame_async(&mut stream, &rpc_response, ObjectFrameIoOptions::none())
+                .await
+                .expect("write response");
         });
         let endpoint = ClusterEndpointRecord {
             endpoint_id: sinomo_core::Id::generate(),
@@ -1926,11 +1918,8 @@ fn async_daemon_control_client_timeout_is_idle_not_total_transfer() {
             let rpc_response = ObjectRpcResponse::encode_body("/test/slow", &"OK".to_string())
                 .expect("rpc response");
             let mut response_frame = Vec::new();
-            write_object_frame_blocking(
-                &mut response_frame,
-                &DaemonControlResponse::rpc(String::new(), rpc_response),
-            )
-            .expect("encode response frame");
+            write_object_frame_blocking(&mut response_frame, &rpc_response)
+                .expect("encode response frame");
 
             for chunk in response_frame.chunks(8) {
                 stream.write_all(chunk).await.expect("write response chunk");
@@ -1976,13 +1965,9 @@ fn async_daemon_control_client_without_idle_timeout_allows_response_gap() {
             let rpc_response =
                 ObjectRpcResponse::encode_body("/test/no-idle-timeout", &"OK".to_string())
                     .expect("rpc response");
-            write_object_frame_async(
-                &mut stream,
-                &DaemonControlResponse::rpc(String::new(), rpc_response),
-                ObjectFrameIoOptions::none(),
-            )
-            .await
-            .expect("write response");
+            write_object_frame_async(&mut stream, &rpc_response, ObjectFrameIoOptions::none())
+                .await
+                .expect("write response");
         });
         let request = ObjectRpcRequest::encode_body("/test/no-idle-timeout", "test", &())
             .expect("rpc request");
@@ -2040,7 +2025,13 @@ fn async_daemon_control_client_explicit_idle_timeout_still_fails_on_stall() {
 }
 
 #[test]
-fn async_daemon_rpc_client_rejects_non_rpc_response() {
+fn async_daemon_rpc_client_rejects_legacy_wrapped_response() {
+    #[derive(serde::Serialize)]
+    struct LegacyDaemonControlResponse {
+        body: String,
+        rpc: Option<ObjectRpcResponse>,
+    }
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2059,7 +2050,10 @@ fn async_daemon_rpc_client_rejects_non_rpc_response() {
             assert_eq!(request.command, "RPC /test/status");
             write_object_frame_async(
                 &mut stream,
-                &DaemonControlResponse::new("OK"),
+                &LegacyDaemonControlResponse {
+                    body: "OK".to_string(),
+                    rpc: None,
+                },
                 ObjectFrameIoOptions::none(),
             )
             .await
@@ -2075,22 +2069,10 @@ fn async_daemon_rpc_client_rejects_non_rpc_response() {
             DaemonRpcTimeouts::connect_only(Duration::from_secs(1)),
         )
         .await
-        .expect_err("non-rpc response");
+        .expect_err("legacy wrapped response");
         server.await.expect("server");
-        assert!(error.to_string().contains("non-rpc response"));
+        assert!(matches!(error, NetworkError::Serialization { .. }));
     });
-}
-
-#[test]
-fn daemon_rpc_response_helper_rejects_framed_rpc_errors() {
-    let response = DaemonControlResponse::rpc(
-        String::new(),
-        ObjectRpcResponse::encode_error("/test/error", "proxy failed").expect("rpc error"),
-    );
-
-    let error = crate::roaming::daemon_rpc_response_from_control_response(response, "not rpc")
-        .expect_err("rpc error");
-    assert!(error.to_string().contains("proxy failed"));
 }
 
 #[cfg(not(feature = "iroh-transport"))]
@@ -2810,12 +2792,11 @@ fn iroh_daemon_proxy_error_frame_preserves_rpc_route_and_budget() {
     .expect("error response frame");
     assert_eq!(budget.in_flight_bytes(), frame.len());
 
-    let response: DaemonControlResponse =
+    let response: ObjectRpcResponse =
         decode_single_object_frame_from_slice(&frame, IROH_DAEMON_COMMAND_MAX_BYTES)
-            .expect("decode control response");
-    let rpc = response.rpc.expect("rpc response");
-    assert_eq!(rpc.route, "/test/proxy-error");
-    let error = rpc.error_detail().expect_err("rpc error detail");
+            .expect("decode rpc response");
+    assert_eq!(response.route, "/test/proxy-error");
+    let error = response.error_detail().expect_err("rpc error detail");
     assert!(error.to_string().contains("daemon forward failed"));
 
     drop(permit);
@@ -2874,7 +2855,8 @@ fn iroh_daemon_response_decode_reports_partial_frame_body() {
 
 #[test]
 fn iroh_daemon_response_decode_rejects_trailing_bytes() {
-    let response = DaemonControlResponse::new("ok");
+    let response =
+        ObjectRpcResponse::encode_body("/test/iroh-response", &"ok".to_string()).expect("response");
     let mut bytes = encode_object_frame_to_vec(&response).expect("encode response frame");
     bytes.extend_from_slice(b"junk");
 
@@ -2991,7 +2973,8 @@ fn iroh_daemon_response_reader_returns_after_complete_frame_without_eof() {
         .expect("runtime");
     runtime.block_on(async {
         let (mut writer, mut reader) = tokio::io::duplex(4096);
-        let response = DaemonControlResponse::new("ok");
+        let response = ObjectRpcResponse::encode_body("/test/iroh-response", &"ok".to_string())
+            .expect("response");
         write_object_frame_async(&mut writer, &response, ObjectFrameIoOptions::none())
             .await
             .expect("write response frame");
@@ -3003,7 +2986,7 @@ fn iroh_daemon_response_reader_returns_after_complete_frame_without_eof() {
         .await
         .expect("complete response frame should not wait for EOF");
 
-        assert_eq!(decoded.body, "ok");
+        assert_eq!(decoded.decode_body::<String>().expect("body"), "ok");
     });
 }
 
@@ -7029,11 +7012,8 @@ async fn iroh_daemon_proxy_round_trips_rpc_request() {
         assert_eq!(request.rpc.as_ref().expect("rpc").route, "/test/ping");
         let rpc_response = crate::ObjectRpcResponse::encode_body("/test/ping", &"PONG".to_string())
             .expect("rpc response");
-        crate::write_object_frame_blocking(
-            &mut stream,
-            &crate::DaemonControlResponse::rpc(String::new(), rpc_response),
-        )
-        .expect("write daemon fixture response");
+        crate::write_object_frame_blocking(&mut stream, &rpc_response)
+            .expect("write daemon fixture response");
     });
 
     let root = sinomo_testdir::TestDir::new("sinomo-network-iroh-proxy");

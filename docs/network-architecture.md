@@ -10,7 +10,7 @@ This keeps crates such as `sinomo-dfs` protocol agnostic. DFS sends `DfsNetworkM
 
 The legacy line-oriented daemon command path is deprecated. It remains only as a migration shim while daemon and CLI control calls move to object RPC routes. New internal communication must not introduce plain text frames. Requests and responses are binary Sinomo Object payloads unless the peer is an external system that requires a textual protocol.
 
-Daemon control frames can carry an authenticated object RPC request alongside the signed route authority. `sinomo daemon status`, daemon health probes, and `sinomo daemon stop` use the `daemon` category routes `/daemon/status` and `/daemon/shutdown`. The older string command names are still accepted for the remaining cluster, rollout, and compatibility handlers while those surfaces are migrated route by route.
+Daemon control requests can carry an authenticated object RPC request alongside the signed route authority. Responses are direct `ObjectRpcResponse` frames, not an outer text response envelope. `sinomo daemon status`, daemon health probes, and `sinomo daemon stop` use the `daemon` category routes `/daemon/status` and `/daemon/shutdown`. The older string command names are still accepted for the remaining cluster, rollout, and compatibility handlers while those surfaces are migrated route by route.
 
 ## Interfaces
 

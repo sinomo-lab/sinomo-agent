@@ -851,10 +851,7 @@ pub(crate) fn encode_iroh_proxy_error_response_frame(
     route: impl Into<String>,
     detail: impl Into<String>,
 ) -> Result<(Vec<u8>, IrohProxyByteBudgetPermit), NetworkError> {
-    let response = crate::DaemonControlResponse::rpc(
-        String::new(),
-        crate::ObjectRpcResponse::encode_error(route, detail)?,
-    );
+    let response = crate::ObjectRpcResponse::encode_error(route, detail)?;
     let frame = crate::encode_object_frame_to_vec(&response)?;
     let permit = budget.try_acquire(frame.len())?;
     Ok((frame, permit))
@@ -2042,20 +2039,6 @@ enum DaemonControlTarget<'a> {
     ClusterEndpoint(&'a ClusterEndpointRecord),
 }
 
-impl DaemonControlTarget<'_> {
-    fn non_rpc_detail(&self) -> String {
-        match self {
-            Self::Address(address) => {
-                format!("daemon control address {address} returned a non-rpc response")
-            }
-            Self::ClusterEndpoint(endpoint) => format!(
-                "daemon control endpoint {:?} returned a non-rpc response",
-                endpoint.node_id
-            ),
-        }
-    }
-}
-
 async fn send_daemon_rpc_to_target_async(
     target: DaemonControlTarget<'_>,
     command: &str,
@@ -2064,54 +2047,10 @@ async fn send_daemon_rpc_to_target_async(
     timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::ObjectRpcResponse, NetworkError> {
     let control_request = daemon_rpc_control_request(command, auth, request);
-    let raw_response_supported = match &target {
-        DaemonControlTarget::Address(_) => true,
-        DaemonControlTarget::ClusterEndpoint(endpoint) => {
-            matches!(
-                endpoint.transport,
-                ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
-            )
-        }
-    };
-    if raw_response_supported && crate::object_rpc_request_expects_raw_daemon_response(request) {
-        let response = match target {
-            DaemonControlTarget::Address(address) => {
-                crate::send_daemon_control_rpc_request_raw_response_async(
-                    address,
-                    &control_request,
-                    timeouts,
-                    IROH_DAEMON_COMMAND_MAX_BYTES,
-                )
-                .await?
-            }
-            DaemonControlTarget::ClusterEndpoint(endpoint) => match endpoint.transport {
-                ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
-                    crate::send_daemon_control_rpc_request_raw_response_async(
-                        &endpoint.address,
-                        &control_request,
-                        timeouts,
-                        IROH_DAEMON_COMMAND_MAX_BYTES,
-                    )
-                    .await?
-                }
-                _ => {
-                    return Err(NetworkError::Io {
-                        operation: format!("send daemon rpc to {}", endpoint.address),
-                        detail: format!(
-                            "unsupported daemon rpc transport {:?}",
-                            endpoint.transport
-                        ),
-                    });
-                }
-            },
-        };
-        response.error_detail()?;
-        return Ok(response);
-    }
-    let non_rpc_detail = target.non_rpc_detail();
     let response =
         send_daemon_control_request_to_target_async(target, &control_request, timeouts).await?;
-    daemon_rpc_response_from_control_response(response, non_rpc_detail)
+    response.error_detail()?;
+    Ok(response)
 }
 
 fn daemon_rpc_control_request(
@@ -2177,17 +2116,6 @@ async fn send_daemon_control_request_to_address_async(
 
 fn daemon_rpc_address_uses_iroh(address: &str) -> bool {
     address.trim_start().starts_with("iroh://")
-}
-
-pub(crate) fn daemon_rpc_response_from_control_response(
-    response: crate::DaemonControlResponse,
-    non_rpc_detail: impl Into<String>,
-) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    let rpc = response.rpc.ok_or_else(|| NetworkError::Serialization {
-        detail: non_rpc_detail.into(),
-    })?;
-    rpc.error_detail()?;
-    Ok(rpc)
 }
 
 #[cfg(feature = "iroh-transport")]
