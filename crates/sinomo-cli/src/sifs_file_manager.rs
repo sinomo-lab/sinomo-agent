@@ -5,14 +5,14 @@ use crate::file_manager::{
 };
 use sinomo_runtime::core::ClusterEndpointRecord;
 use sinomo_runtime::dfs::{
-    AsyncDfsProtocolFrameSender, DfsControlPlaneKvClient, DfsEndpointTransport,
-    DfsMetadataJournalBatchSender, DfsMetadataJournalReplicationOptions,
-    DfsMetadataPeerTransportError, DfsMetadataShardConfig, DfsMetadataSnapshotInstallSender,
-    DfsNodeAdvertisement, DfsObjectKind, DfsPeerTransportError, DfsProtocolFrameCommand,
-    DfsProtocolFrameResponse, DfsProtocolFrameSender, DfsStat, DfsWriteOptions, LocalContentStore,
-    NetworkedDfsService, content_services_prefix, default_dfs_metadata_root,
-    default_dfs_metadata_shards_root, fallback_dfs_node_id, metadata_shards_prefix,
-    open_local_sharded_metadata_backend, open_root_local_metadata_backend,
+    AsyncDfsProtocolFrameSender, DfsControlPlaneKvClient, DfsDirectReadRequest,
+    DfsDirectReadSender, DfsEndpointTransport, DfsMetadataJournalBatchSender,
+    DfsMetadataJournalReplicationOptions, DfsMetadataPeerTransportError, DfsMetadataShardConfig,
+    DfsMetadataSnapshotInstallSender, DfsNodeAdvertisement, DfsObjectKind, DfsPeerTransportError,
+    DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsProtocolFrameSender, DfsReadResponse,
+    DfsStat, DfsWriteOptions, LocalContentStore, NetworkedDfsService, content_services_prefix,
+    default_dfs_metadata_root, default_dfs_metadata_shards_root, fallback_dfs_node_id,
+    metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
     publish_cluster_dfs_metadata_journal, sifs_file_system_id,
 };
 use sinomo_runtime::kv::{self, KvError, KvOp, KvTxn, KvTxnResponse};
@@ -612,7 +612,22 @@ fn sifs_parallel_read_worker_count(requested_workers: usize) -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_WORKERS);
-    configured.min(requested_workers).clamp(1, MAX_WORKERS)
+    sifs_parallel_read_worker_count_for(requested_workers, configured.min(MAX_WORKERS))
+}
+
+fn sifs_parallel_read_worker_count_for(
+    requested_workers: usize,
+    configured_workers: usize,
+) -> usize {
+    const TARGET_PATHS_PER_WORKER: usize = 16;
+    if requested_workers == 0 {
+        return 1;
+    }
+    let batch_limited_workers = requested_workers.div_ceil(TARGET_PATHS_PER_WORKER).max(1);
+    configured_workers
+        .max(1)
+        .min(requested_workers)
+        .min(batch_limited_workers)
 }
 
 fn open_sifs_service(
@@ -649,11 +664,12 @@ fn open_sifs_service_with_hydration(
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
         .map_err(|error| format!("cannot open DFS content store: {error}"))?;
     let mut service = NetworkedDfsService::new(
-        DfsEndpointTransport::new_with_senders(
+        DfsEndpointTransport::new_with_peer_senders(
             local_node_id,
             endpoints,
             sifs_protocol_frame_sender(rpc_runtime.clone()),
             async_sifs_protocol_frame_sender(rpc_runtime.clone()),
+            sifs_direct_read_sender(rpc_runtime.clone()),
         ),
         content,
     );
@@ -878,6 +894,12 @@ fn async_sifs_protocol_frame_sender(rpc_runtime: SifsRpcRuntime) -> AsyncDfsProt
     })
 }
 
+fn sifs_direct_read_sender(rpc_runtime: SifsRpcRuntime) -> DfsDirectReadSender {
+    Arc::new(move |endpoint, request, timeout| {
+        sifs_send_dfs_direct_read(&rpc_runtime, endpoint, request, timeout)
+    })
+}
+
 fn sifs_send_dfs_protocol_frame(
     rpc_runtime: &SifsRpcRuntime,
     endpoint: &ClusterEndpointRecord,
@@ -909,6 +931,45 @@ fn sifs_send_dfs_protocol_frame(
             sinomo_runtime::daemon::send_dfs_protocol_frame_to_endpoint_async(
                 endpoint,
                 command,
+                timeout,
+                rpc_runtime.runtime.handle(),
+            )
+            .await
+        })
+        .map_err(|error| DfsPeerTransportError::new(error.to_string()))
+}
+
+fn sifs_send_dfs_direct_read(
+    rpc_runtime: &SifsRpcRuntime,
+    endpoint: &ClusterEndpointRecord,
+    request: &DfsDirectReadRequest,
+    timeout: std::time::Duration,
+) -> Result<DfsReadResponse, DfsPeerTransportError> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if matches!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            return tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    sinomo_runtime::daemon::send_dfs_direct_read_to_endpoint_async(
+                        endpoint, request, timeout, &handle,
+                    )
+                    .await
+                    .map_err(|error| DfsPeerTransportError::new(error.to_string()))
+                })
+            });
+        }
+        return Err(DfsPeerTransportError::new(
+            "SIFS direct read sync sender cannot run inside a current-thread Tokio runtime",
+        ));
+    }
+    rpc_runtime
+        .runtime
+        .block_on(async {
+            sinomo_runtime::daemon::send_dfs_direct_read_to_endpoint_async(
+                endpoint,
+                request,
                 timeout,
                 rpc_runtime.runtime.handle(),
             )
@@ -1054,6 +1115,16 @@ mod tests {
             normalize_sifs_path("sinomo/nodes").expect("relative"),
             "/sinomo/nodes"
         );
+    }
+
+    #[test]
+    fn parallel_read_worker_count_preserves_bulk_batches() {
+        assert_eq!(sifs_parallel_read_worker_count_for(0, 32), 1);
+        assert_eq!(sifs_parallel_read_worker_count_for(1, 32), 1);
+        assert_eq!(sifs_parallel_read_worker_count_for(2, 32), 1);
+        assert_eq!(sifs_parallel_read_worker_count_for(64, 32), 4);
+        assert_eq!(sifs_parallel_read_worker_count_for(1024, 32), 32);
+        assert_eq!(sifs_parallel_read_worker_count_for(1024, 64), 64);
     }
 
     #[test]

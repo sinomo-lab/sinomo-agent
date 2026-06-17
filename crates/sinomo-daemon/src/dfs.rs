@@ -1,6 +1,7 @@
 use crate::control::DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL;
 use crate::{
-    DaemonError, DaemonPaths, DaemonRunOptions, send_dfs_metadata_journal_batch_to_endpoint_async,
+    DaemonError, DaemonPaths, DaemonRunOptions, send_dfs_direct_read_to_endpoint_on_runtime,
+    send_dfs_metadata_journal_batch_to_endpoint_async,
     send_dfs_metadata_journal_batch_to_endpoint_on_runtime,
     send_dfs_metadata_snapshot_install_to_endpoint_async,
     send_dfs_metadata_snapshot_install_to_endpoint_on_runtime,
@@ -20,14 +21,14 @@ use sinomo_dfs::{
 };
 use sinomo_dfs::{
     DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture,
-    DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions,
+    DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions, DfsDirectReadRequest,
     DfsEndpointServedProtocolFrameTransport, DfsEndpointTransport, DfsMaintenanceTickOptions,
     DfsMetadataBackend, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
     DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
     DfsMetadataPeerTransportError, DfsMetadataPublishScheduleOptions,
     DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse, DfsPeerTransport,
     DfsPeerTransportError, DfsProtocolFrameCommand, DfsProtocolFrameResponse,
-    DfsProtocolFrameSender, NetworkedDfsService,
+    DfsProtocolFrameSender, DfsReadResponse, NetworkedDfsService,
 };
 use sinomo_kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_local::SinomoDataDir;
@@ -309,13 +310,15 @@ pub(crate) fn daemon_dfs_endpoint_transport_on_runtime(
     endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
     runtime: &tokio::runtime::Handle,
 ) -> DfsEndpointTransport {
-    DfsEndpointTransport::new_with_senders(
+    let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(runtime);
+    DfsEndpointTransport::new_with_peer_senders(
         local_node_id,
         endpoints,
-        daemon_dfs_protocol_frame_sender_on_runtime(runtime),
+        sinomo_dfs::dfs_protocol_frame_sender_from_peer_transport(Arc::clone(&peer_transport)),
         sinomo_dfs::async_dfs_protocol_frame_sender_from_peer_transport(
             daemon_dfs_async_peer_transport(runtime),
         ),
+        sinomo_dfs::dfs_direct_read_sender_from_peer_transport(peer_transport),
     )
 }
 
@@ -339,6 +342,21 @@ impl DfsPeerTransport for DaemonDfsBlockingPeerTransport {
         send_dfs_protocol_frame_to_endpoint_on_runtime(
             endpoint,
             command,
+            connect_timeout,
+            &self.runtime,
+        )
+        .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+    }
+
+    fn send_direct_read(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+        request: &DfsDirectReadRequest,
+        connect_timeout: std::time::Duration,
+    ) -> Result<DfsReadResponse, DfsPeerTransportError> {
+        send_dfs_direct_read_to_endpoint_on_runtime(
+            endpoint,
+            request,
             connect_timeout,
             &self.runtime,
         )

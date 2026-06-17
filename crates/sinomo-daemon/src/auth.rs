@@ -388,6 +388,14 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
+        command if command == daemon_rpc_command(sinomo_dfs::DFS_DIRECT_READ_ROUTE) => {
+            matches!(
+                authenticated.signer,
+                DaemonSignerAuthority::Local
+                    | DaemonSignerAuthority::Voter
+                    | DaemonSignerAuthority::Member
+            )
+        }
         command if is_agent_session_rpc_command(command) => {
             matches!(
                 authenticated.signer,
@@ -1398,16 +1406,21 @@ mod tests {
     }
 
     #[test]
-    fn dfs_protocol_frame_authorizes_cluster_members() {
-        let command = daemon_rpc_command(sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE);
-        for signer in [
-            DaemonSignerAuthority::Local,
-            DaemonSignerAuthority::Voter,
-            DaemonSignerAuthority::Member,
+    fn dfs_object_transfer_routes_authorize_cluster_members() {
+        for route in [
+            sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE,
+            sinomo_dfs::DFS_DIRECT_READ_ROUTE,
         ] {
-            let authenticated = authenticated_command(command.clone(), signer);
-            authorize_authenticated_daemon_command(&authenticated)
-                .expect("cluster members must be able to exchange DFS protocol frames");
+            let command = daemon_rpc_command(route);
+            for signer in [
+                DaemonSignerAuthority::Local,
+                DaemonSignerAuthority::Voter,
+                DaemonSignerAuthority::Member,
+            ] {
+                let authenticated = authenticated_command(command.clone(), signer);
+                authorize_authenticated_daemon_command(&authenticated)
+                    .expect("cluster members must be able to exchange DFS object data");
+            }
         }
     }
 

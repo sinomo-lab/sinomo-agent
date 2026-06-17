@@ -9,9 +9,9 @@ use sinomo_config::{
 };
 use sinomo_core::ClusterEndpointRecord;
 use sinomo_dfs::{
-    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
+    DfsDirectReadRequest, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
     DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse, DfsProtocolFrameCommand,
-    DfsProtocolFrameResponse,
+    DfsProtocolFrameResponse, DfsReadResponse,
 };
 use sinomo_kv::{
     ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, ClusterRaftAppendRequest,
@@ -1263,12 +1263,78 @@ pub async fn send_dfs_metadata_snapshot_install_to_endpoint_async(
     .await
 }
 
+pub(crate) fn send_dfs_direct_read_to_endpoint_on_runtime(
+    endpoint: &ClusterEndpointRecord,
+    request: &DfsDirectReadRequest,
+    connect_timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<DfsReadResponse, DaemonError> {
+    let endpoint = endpoint.clone();
+    let request = request.clone();
+    let runtime_for_future = runtime.clone();
+    block_on_daemon_client_on_owner_runtime(runtime, async move {
+        send_dfs_direct_read_to_endpoint_async(
+            &endpoint,
+            &request,
+            connect_timeout,
+            &runtime_for_future,
+        )
+        .await
+    })
+}
+
+pub fn send_dfs_direct_read_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    request: &DfsDirectReadRequest,
+    connect_timeout: Duration,
+) -> Result<DfsReadResponse, DaemonError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| DaemonError::Io {
+            path: "tokio runtime".to_string(),
+            detail: source.to_string(),
+        })?;
+    send_dfs_direct_read_to_endpoint_on_runtime(
+        endpoint,
+        request,
+        connect_timeout,
+        runtime.handle(),
+    )
+}
+
+pub async fn send_dfs_direct_read_to_endpoint_async(
+    endpoint: &ClusterEndpointRecord,
+    request: &DfsDirectReadRequest,
+    connect_timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<DfsReadResponse, DaemonError> {
+    let rpc_request = sinomo_dfs::dfs_direct_read_rpc_request(request)?;
+    let response = send_daemon_rpc_to_endpoint_async_with_connectivity_observation(
+        endpoint,
+        &rpc_request,
+        sinomo_network::DaemonRpcTimeouts::connect_and_idle(connect_timeout),
+        runtime,
+        false,
+    )
+    .await?;
+    sinomo_dfs::dfs_direct_read_response_from_rpc_response(response).map_err(DaemonError::from)
+}
+
 pub(crate) fn send_dfs_protocol_frame_to_endpoint_on_runtime(
     endpoint: &ClusterEndpointRecord,
     request: &DfsProtocolFrameCommand,
     connect_timeout: Duration,
     runtime: &tokio::runtime::Handle,
 ) -> Result<DfsProtocolFrameResponse, DaemonError> {
+    if let Some(response) = try_send_dfs_direct_read_protocol_frame_to_endpoint_on_runtime(
+        endpoint,
+        request,
+        connect_timeout,
+        runtime,
+    )? {
+        return Ok(response);
+    }
     let rpc_request = sinomo_dfs::dfs_protocol_frame_rpc_request(request)?;
     let observe_connectivity = !sinomo_dfs::dfs_protocol_frame_is_read_only_request(&request.frame);
     send_daemon_rpc_request_to_endpoint_with_decoder_on_runtime_with_connectivity_observation(
@@ -1279,6 +1345,33 @@ pub(crate) fn send_dfs_protocol_frame_to_endpoint_on_runtime(
         observe_connectivity,
         |response| sinomo_dfs::decode_dfs_protocol_frame_rpc_response(response),
     )
+}
+
+fn try_send_dfs_direct_read_protocol_frame_to_endpoint_on_runtime(
+    endpoint: &ClusterEndpointRecord,
+    request: &DfsProtocolFrameCommand,
+    connect_timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Option<DfsProtocolFrameResponse>, DaemonError> {
+    let Some(rpc_request) =
+        sinomo_dfs::dfs_direct_read_rpc_request_from_protocol_frame_command(request)?
+    else {
+        return Ok(None);
+    };
+    let endpoint = endpoint.clone();
+    let request = request.clone();
+    let runtime_for_future = runtime.clone();
+    block_on_daemon_client_on_owner_runtime(runtime, async move {
+        send_dfs_direct_read_protocol_frame_to_endpoint_async_inner(
+            &endpoint,
+            &request,
+            rpc_request,
+            connect_timeout,
+            &runtime_for_future,
+        )
+        .await
+    })
+    .map(Some)
 }
 
 pub fn send_dfs_protocol_frame_to_endpoint(
@@ -1307,6 +1400,16 @@ pub async fn send_dfs_protocol_frame_to_endpoint_async(
     connect_timeout: Duration,
     runtime: &tokio::runtime::Handle,
 ) -> Result<DfsProtocolFrameResponse, DaemonError> {
+    if let Some(response) = try_send_dfs_direct_read_protocol_frame_to_endpoint_async(
+        endpoint,
+        request,
+        connect_timeout,
+        runtime,
+    )
+    .await?
+    {
+        return Ok(response);
+    }
     let rpc_request = sinomo_dfs::dfs_protocol_frame_rpc_request(request)?;
     let observe_connectivity = !sinomo_dfs::dfs_protocol_frame_is_read_only_request(&request.frame);
     send_daemon_rpc_request_to_endpoint_with_decoder_async_with_connectivity_observation(
@@ -1318,6 +1421,47 @@ pub async fn send_dfs_protocol_frame_to_endpoint_async(
         |response| sinomo_dfs::decode_dfs_protocol_frame_rpc_response(response),
     )
     .await
+}
+
+async fn try_send_dfs_direct_read_protocol_frame_to_endpoint_async(
+    endpoint: &ClusterEndpointRecord,
+    request: &DfsProtocolFrameCommand,
+    connect_timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Option<DfsProtocolFrameResponse>, DaemonError> {
+    let Some(rpc_request) =
+        sinomo_dfs::dfs_direct_read_rpc_request_from_protocol_frame_command(request)?
+    else {
+        return Ok(None);
+    };
+    send_dfs_direct_read_protocol_frame_to_endpoint_async_inner(
+        endpoint,
+        request,
+        rpc_request,
+        connect_timeout,
+        runtime,
+    )
+    .await
+    .map(Some)
+}
+
+async fn send_dfs_direct_read_protocol_frame_to_endpoint_async_inner(
+    endpoint: &ClusterEndpointRecord,
+    request: &DfsProtocolFrameCommand,
+    rpc_request: ObjectRpcRequest,
+    connect_timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<DfsProtocolFrameResponse, DaemonError> {
+    let response = send_daemon_rpc_to_endpoint_async_with_connectivity_observation(
+        endpoint,
+        &rpc_request,
+        sinomo_network::DaemonRpcTimeouts::connect_and_idle(connect_timeout),
+        runtime,
+        false,
+    )
+    .await?;
+    sinomo_dfs::dfs_protocol_frame_response_from_direct_read_rpc_response(request, response)
+        .map_err(DaemonError::from)
 }
 
 pub fn fetch_daemon_status_from_address(

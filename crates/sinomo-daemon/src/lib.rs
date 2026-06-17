@@ -65,6 +65,7 @@ pub use client::{
     send_daemon_rpc_direct_to_endpoint, send_daemon_rpc_direct_to_endpoint_async,
     send_daemon_rpc_stream, send_daemon_rpc_stream_async, send_daemon_rpc_to_endpoint,
     send_daemon_rpc_to_endpoint_async, send_daemon_rpc_with_timeouts, send_daemon_shutdown_request,
+    send_dfs_direct_read_to_endpoint, send_dfs_direct_read_to_endpoint_async,
     send_dfs_metadata_journal_batch_to_endpoint_async,
     send_dfs_metadata_snapshot_install_to_endpoint_async, send_dfs_protocol_frame_to_endpoint,
     send_dfs_protocol_frame_to_endpoint_async,
@@ -77,7 +78,8 @@ pub(crate) use client::{
     send_cluster_member_publish_async, send_cluster_member_publish_on_runtime,
     send_cluster_raft_append_async, send_cluster_raft_append_on_runtime,
     send_cluster_raft_vote_async, send_cluster_raft_vote_on_runtime, send_daemon_rpc_on_runtime,
-    send_daemon_rpc_to_endpoint_on_runtime, send_dfs_metadata_journal_batch_to_endpoint_on_runtime,
+    send_daemon_rpc_to_endpoint_on_runtime, send_dfs_direct_read_to_endpoint_on_runtime,
+    send_dfs_metadata_journal_batch_to_endpoint_on_runtime,
     send_dfs_metadata_snapshot_install_to_endpoint_on_runtime,
     send_dfs_protocol_frame_to_endpoint_on_runtime,
 };

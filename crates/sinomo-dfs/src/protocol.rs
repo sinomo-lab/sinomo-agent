@@ -60,6 +60,15 @@ pub struct DfsReadRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsDirectReadRequest {
+    pub request_id: String,
+    pub object_id: DfsObjectId,
+    pub version: DfsVersion,
+    pub content_hash: String,
+    pub content_size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsReadResponse {
     pub request_id: String,
     pub object_id: DfsObjectId,
@@ -294,10 +303,14 @@ pub enum DfsNamespaceOperation {
         path: String,
     },
     /// Read-only lookup against the path's metadata primary. The primary may
-    /// include the authoritative object in the response, but requesters must
-    /// not replay journals or materialize the object into their local mirror.
+    /// include the authoritative object in the response; requesters may cache
+    /// it in memory but do not replay journals or write it to the local mirror.
     LookupPath {
         path: String,
+    },
+    /// Batched read-only lookups against one metadata primary.
+    LookupPaths {
+        paths: Vec<String>,
     },
     /// Same-shard namespace batch routed to the metadata primary. This is used
     /// for bulk local-eventual writes so the requester sends one authoritative
@@ -354,6 +367,9 @@ impl DfsNamespaceOperation {
             | DfsNamespaceOperation::ClearDirRecursive { path }
             | DfsNamespaceOperation::SyncPath { path }
             | DfsNamespaceOperation::LookupPath { path } => vec![path],
+            DfsNamespaceOperation::LookupPaths { paths } => {
+                paths.iter().map(String::as_str).collect()
+            }
             DfsNamespaceOperation::Rename { from, to } => vec![from, to],
             DfsNamespaceOperation::Hardlink {
                 existing_path,
@@ -379,6 +395,8 @@ pub struct DfsNamespaceResponse {
     /// journal backlog. Journal batches remain the durable convergence path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synced_path_object: Option<DfsObjectMetadata>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synced_path_objects: Vec<DfsObjectMetadata>,
     /// Journal catch-up batches for every shard the operation touched, built
     /// from the requester's reported cursors.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

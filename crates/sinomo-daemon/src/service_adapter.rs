@@ -15,6 +15,7 @@
 //! [`DaemonClusterAccess`] via [`ServiceContext::cluster`] when the node is clustered.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -114,6 +115,10 @@ use crate::rollout::{
 static DAEMON_CLUSTER_NETWORK_PING_NODE_IDS: OnceLock<
     Mutex<HashMap<PathBuf, sinomo_node::NodeId>>,
 > = OnceLock::new();
+
+const DFS_DIRECT_READ_STREAM_BUFFER_DEPTH: usize = 4;
+const DFS_DIRECT_READ_LARGE_STREAM_BUFFER_DEPTH: usize = 2;
+const DFS_DIRECT_READ_SMALL_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
 fn daemon_error(error: DaemonError) -> ServiceError {
     ServiceError::Service(error.to_string())
@@ -2498,6 +2503,20 @@ pub(crate) async fn try_dispatch_via_registry_async(
     {
         return None;
     }
+    if sinomo_dfs::dfs_direct_read_rpc_request_accepts_streamed_response(request) {
+        return Some(
+            dispatch_dfs_direct_read_stream_via_registry_async(
+                service_host,
+                authenticated,
+                request.clone(),
+                stream,
+                stream_address,
+                paths,
+                replay_key,
+            )
+            .await,
+        );
+    }
     Some(
         dispatch_via_registry_async(
             service_host,
@@ -2510,6 +2529,163 @@ pub(crate) async fn try_dispatch_via_registry_async(
         )
         .await,
     )
+}
+
+async fn dispatch_dfs_direct_read_stream_via_registry_async(
+    service_host: &DaemonServiceRegistryHost,
+    authenticated: &AuthenticatedDaemonCommand,
+    request: ObjectRpcRequest,
+    stream: &mut AsyncDaemonControlStream,
+    stream_address: &str,
+    paths: &DaemonPaths,
+    replay_key: Option<Vec<u8>>,
+) -> Result<bool, DaemonError> {
+    if let Some(descriptor) = service_host.object_rpc_route_descriptor(&request.route) {
+        if let Some(auth_scope) = descriptor.auth_scope.as_deref()
+            && !daemon_signer_authorizes_route_scope(&authenticated.signer, auth_scope)
+        {
+            return Err(DaemonError::AuthDenied);
+        }
+    } else {
+        return Err(DaemonError::Network {
+            address: request.route,
+            detail: "DFS direct-read stream route is not registered".to_string(),
+        });
+    }
+    let data_dir_path = daemon_data_dir_path(paths)?;
+    let stream_response = tokio::task::spawn_blocking(move || {
+        let data_dir = SinomoDataDir::new(data_dir_path);
+        sinomo_dfs::handle_dfs_direct_read_stream_rpc_request(&data_dir, request)
+    })
+    .await
+    .map_err(|source| DaemonError::Network {
+        address: stream_address.to_string(),
+        detail: format!("DFS direct-read stream task failed: {source}"),
+    })??;
+    stream
+        .write_rpc_response(
+            stream_address,
+            &stream_response.response,
+            sinomo_network::ObjectFrameIoOptions::none(),
+        )
+        .await
+        .map_err(DaemonError::from)?;
+    if let Some(reader) = stream_response.reader {
+        write_dfs_direct_read_stream_chunks(stream, stream_address, reader).await?;
+    }
+    if let Some(key) = replay_key.as_ref() {
+        crate::control::complete_daemon_dfs_frame_replay(paths, key, &stream_response.response);
+    }
+    Ok(false)
+}
+
+async fn write_dfs_direct_read_stream_chunks(
+    stream: &mut AsyncDaemonControlStream,
+    stream_address: &str,
+    mut reader: sinomo_dfs::BlobReader,
+) -> Result<u64, DaemonError> {
+    struct Chunk {
+        buffer: Vec<u8>,
+        read: usize,
+    }
+
+    let (chunk_bytes, buffer_depth) = dfs_direct_read_stream_buffer_plan(reader.size_bytes());
+    let (filled_tx, mut filled_rx) =
+        tokio::sync::mpsc::channel::<Result<Chunk, String>>(buffer_depth);
+    let (empty_tx, mut empty_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(buffer_depth);
+    for _ in 0..buffer_depth {
+        empty_tx
+            .try_send(vec![0_u8; chunk_bytes])
+            .map_err(|source| DaemonError::Network {
+                address: stream_address.to_string(),
+                detail: format!("DFS direct-read stream buffer seed failed: {source}"),
+            })?;
+    }
+
+    let producer_stream_address = stream_address.to_string();
+    let producer = tokio::task::spawn_blocking(move || {
+        while let Some(mut buffer) = empty_rx.blocking_recv() {
+            let read = match reader.read(&mut buffer) {
+                Ok(read) => read,
+                Err(source) => {
+                    let _ = filled_tx.blocking_send(Err(source.to_string()));
+                    return;
+                }
+            };
+            if filled_tx.blocking_send(Ok(Chunk { buffer, read })).is_err() {
+                return;
+            }
+            if read == 0 {
+                return;
+            }
+        }
+    });
+
+    let mut total = 0_u64;
+    let write_result = async {
+        while let Some(chunk_result) = filled_rx.recv().await {
+            let chunk = chunk_result.map_err(|detail| DaemonError::Network {
+                address: stream_address.to_string(),
+                detail,
+            })?;
+            stream
+                .write_raw_byte_stream_chunk(
+                    stream_address,
+                    &chunk.buffer[..chunk.read],
+                    sinomo_network::ObjectFrameIoOptions::none(),
+                )
+                .await
+                .map_err(DaemonError::from)?;
+            if chunk.read == 0 {
+                return Ok(total);
+            }
+            total = total
+                .checked_add(chunk.read as u64)
+                .ok_or_else(|| DaemonError::Network {
+                    address: stream_address.to_string(),
+                    detail: "DFS direct-read stream byte count overflowed".to_string(),
+                })?;
+            empty_tx
+                .send(chunk.buffer)
+                .await
+                .map_err(|source| DaemonError::Network {
+                    address: stream_address.to_string(),
+                    detail: format!("DFS direct-read stream buffer return failed: {source}"),
+                })?;
+        }
+        Err(DaemonError::Network {
+            address: stream_address.to_string(),
+            detail: "DFS direct-read stream ended before terminator chunk".to_string(),
+        })
+    }
+    .await;
+
+    drop(empty_tx);
+    drop(filled_rx);
+    producer.await.map_err(|source| DaemonError::Network {
+        address: producer_stream_address,
+        detail: format!("DFS direct-read stream producer task failed: {source}"),
+    })?;
+    write_result
+}
+
+fn dfs_direct_read_stream_buffer_plan(size_bytes: u64) -> (usize, usize) {
+    let max_chunk = sinomo_network::OBJECT_STREAM_MAX_CHUNK_BYTES;
+    if size_bytes >= max_chunk as u64 {
+        return (max_chunk, DFS_DIRECT_READ_LARGE_STREAM_BUFFER_DEPTH);
+    }
+    if size_bytes >= DFS_DIRECT_READ_SMALL_STREAM_CHUNK_BYTES as u64 {
+        return (
+            sinomo_dfs::DFS_DIRECT_READ_STREAM_CHUNK_BYTES.min(max_chunk),
+            DFS_DIRECT_READ_STREAM_BUFFER_DEPTH,
+        );
+    }
+    let chunk_bytes = usize::try_from(size_bytes)
+        .ok()
+        .filter(|size| *size > 0)
+        .unwrap_or(1)
+        .min(DFS_DIRECT_READ_SMALL_STREAM_CHUNK_BYTES);
+    (chunk_bytes, DFS_DIRECT_READ_STREAM_BUFFER_DEPTH)
 }
 
 async fn dispatch_via_registry_async(
@@ -3413,6 +3589,34 @@ mod tests {
     }
 
     #[test]
+    fn dfs_direct_read_stream_buffer_plan_scales_with_blob_size() {
+        assert_eq!(
+            dfs_direct_read_stream_buffer_plan(0),
+            (1, DFS_DIRECT_READ_STREAM_BUFFER_DEPTH)
+        );
+        assert_eq!(
+            dfs_direct_read_stream_buffer_plan(32),
+            (32, DFS_DIRECT_READ_STREAM_BUFFER_DEPTH)
+        );
+        assert_eq!(
+            dfs_direct_read_stream_buffer_plan(DFS_DIRECT_READ_SMALL_STREAM_CHUNK_BYTES as u64),
+            (
+                sinomo_dfs::DFS_DIRECT_READ_STREAM_CHUNK_BYTES,
+                DFS_DIRECT_READ_STREAM_BUFFER_DEPTH
+            )
+        );
+        assert_eq!(
+            dfs_direct_read_stream_buffer_plan(
+                sinomo_network::OBJECT_STREAM_MAX_CHUNK_BYTES as u64
+            ),
+            (
+                sinomo_network::OBJECT_STREAM_MAX_CHUNK_BYTES,
+                DFS_DIRECT_READ_LARGE_STREAM_BUFFER_DEPTH
+            )
+        );
+    }
+
+    #[test]
     fn cluster_registry_hosts_cluster_routes() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-cluster-kv-registry-routes");
         let data_dir = SinomoDataDir::new(&root);
@@ -3430,6 +3634,7 @@ mod tests {
             CLUSTER_RELAY_ROUTE,
             sinomo_dfs::DFS_SMOKE_ROUTE,
             sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE,
+            sinomo_dfs::DFS_DIRECT_READ_ROUTE,
             CLUSTER_JOIN_CHALLENGE_ROUTE,
             CLUSTER_JOIN_REGISTER_ROUTE,
             CLUSTER_INVITE_PUBLISH_ROUTE,
@@ -3459,6 +3664,10 @@ mod tests {
         );
         assert_eq!(
             registry.category_for_route(sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE),
+            Some(sinomo_dfs::DFS_RPC_CATEGORY)
+        );
+        assert_eq!(
+            registry.category_for_route(sinomo_dfs::DFS_DIRECT_READ_ROUTE),
             Some(sinomo_dfs::DFS_RPC_CATEGORY)
         );
         let route_metadata = registry.route_categories();
@@ -3518,6 +3727,18 @@ mod tests {
         );
         assert_eq!(
             dfs_frame.required_capabilities,
+            vec!["dfs.object.transfer".to_string()]
+        );
+        let dfs_direct_read = route_metadata
+            .iter()
+            .find(|route| route.route == sinomo_dfs::DFS_DIRECT_READ_ROUTE)
+            .expect("dfs direct read route metadata");
+        assert_eq!(
+            dfs_direct_read.auth_scope.as_deref(),
+            Some(sinomo_module::ModuleRouteAuth::LocalOrClusterMember.as_scope())
+        );
+        assert_eq!(
+            dfs_direct_read.required_capabilities,
             vec!["dfs.object.transfer".to_string()]
         );
         let rollout_module_routes = rollout_module_surfaces()
