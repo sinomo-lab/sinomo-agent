@@ -19,6 +19,9 @@ pub const DAEMON_CONTROL_RPC_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024 * 1024;
 pub const DAEMON_CONTROL_RPC_MAX_FRAME_BYTES: usize = usize::MAX;
 pub const DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY: &str = "sinomo.daemon-control.reuse-stream";
 pub const DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE: &str = "1";
+pub const DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY: &str =
+    "sinomo.daemon-control.raw-rpc-response";
+pub const DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE: &str = "1";
 pub const ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY: &str = "sinomo.endpoint-rpc.raw-direct";
 pub const ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE: &str = "1";
 const OBJECT_STREAM_CHUNK_FRAME_OVERHEAD_BYTES: usize = 4096;
@@ -360,6 +363,15 @@ impl AsyncDaemonControlStream {
         self.write_frame(address, response, options).await
     }
 
+    pub async fn write_rpc_response(
+        &mut self,
+        address: &str,
+        response: &crate::ObjectRpcResponse,
+        options: ObjectFrameIoOptions,
+    ) -> Result<(), NetworkError> {
+        self.write_frame(address, response, options).await
+    }
+
     async fn write_frame<T>(
         &mut self,
         address: &str,
@@ -393,6 +405,15 @@ impl AsyncDaemonControlStream {
         max_bytes: usize,
         options: ObjectFrameIoOptions,
     ) -> Result<DaemonControlResponse, NetworkError> {
+        self.read_frame(address, max_bytes, options).await
+    }
+
+    pub async fn read_rpc_response(
+        &mut self,
+        address: &str,
+        max_bytes: usize,
+        options: ObjectFrameIoOptions,
+    ) -> Result<crate::ObjectRpcResponse, NetworkError> {
         self.read_frame(address, max_bytes, options).await
     }
 
@@ -451,6 +472,32 @@ pub async fn send_daemon_control_request_async(
     .await
 }
 
+pub async fn send_daemon_control_rpc_request_raw_response_async(
+    address: &str,
+    request: &DaemonControlRequest,
+    timeouts: DaemonRpcTimeouts,
+    max_response_bytes: usize,
+) -> Result<crate::ObjectRpcResponse, NetworkError> {
+    if daemon_control_request_allows_stream_reuse(request) {
+        return send_reusable_daemon_control_rpc_request_raw_response_async(
+            address,
+            request,
+            timeouts,
+            max_response_bytes,
+        )
+        .await;
+    }
+    let mut stream = AsyncDaemonControlStream::connect_with_options(address, timeouts).await?;
+    send_daemon_control_rpc_request_raw_response_on_stream_async(
+        address,
+        request,
+        timeouts,
+        max_response_bytes,
+        &mut stream,
+    )
+    .await
+}
+
 async fn send_reusable_daemon_control_request_async(
     address: &str,
     request: &DaemonControlRequest,
@@ -495,6 +542,50 @@ async fn send_reusable_daemon_control_request_async(
     }
 }
 
+async fn send_reusable_daemon_control_rpc_request_raw_response_async(
+    address: &str,
+    request: &DaemonControlRequest,
+    timeouts: DaemonRpcTimeouts,
+    max_response_bytes: usize,
+) -> Result<crate::ObjectRpcResponse, NetworkError> {
+    let (mut stream, reused) = match take_pooled_daemon_control_stream(address) {
+        Some(stream) => (stream, true),
+        None => (
+            AsyncDaemonControlStream::connect_with_options(address, timeouts).await?,
+            false,
+        ),
+    };
+    match send_daemon_control_rpc_request_raw_response_on_stream_async(
+        address,
+        request,
+        timeouts,
+        max_response_bytes,
+        &mut stream,
+    )
+    .await
+    {
+        Ok(response) => {
+            return_pooled_daemon_control_stream(address, stream);
+            Ok(response)
+        }
+        Err(_) if reused => {
+            let mut stream =
+                AsyncDaemonControlStream::connect_with_options(address, timeouts).await?;
+            let response = send_daemon_control_rpc_request_raw_response_on_stream_async(
+                address,
+                request,
+                timeouts,
+                max_response_bytes,
+                &mut stream,
+            )
+            .await?;
+            return_pooled_daemon_control_stream(address, stream);
+            Ok(response)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 async fn send_daemon_control_request_on_stream_async(
     address: &str,
     request: &DaemonControlRequest,
@@ -509,6 +600,39 @@ async fn send_daemon_control_request_on_stream_async(
     stream
         .read_response(address, max_response_bytes, frame_options)
         .await
+}
+
+async fn send_daemon_control_rpc_request_raw_response_on_stream_async(
+    address: &str,
+    request: &DaemonControlRequest,
+    timeouts: DaemonRpcTimeouts,
+    max_response_bytes: usize,
+    stream: &mut AsyncDaemonControlStream,
+) -> Result<crate::ObjectRpcResponse, NetworkError> {
+    let frame_options = ObjectFrameIoOptions::none().with_idle_timeout(timeouts.idle_timeout);
+    stream
+        .write_request(address, request, frame_options)
+        .await?;
+    stream
+        .read_rpc_response(address, max_response_bytes, frame_options)
+        .await
+}
+
+pub fn object_rpc_request_expects_raw_daemon_response(request: &crate::ObjectRpcRequest) -> bool {
+    request
+        .metadata
+        .get(DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY)
+        .is_some_and(|value| {
+            value == DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE
+                || value.eq_ignore_ascii_case("true")
+        })
+}
+
+pub fn daemon_control_request_expects_raw_rpc_response(request: &DaemonControlRequest) -> bool {
+    request
+        .rpc
+        .as_ref()
+        .is_some_and(object_rpc_request_expects_raw_daemon_response)
 }
 
 fn daemon_control_request_allows_stream_reuse(request: &DaemonControlRequest) -> bool {
@@ -1892,6 +2016,83 @@ mod serde_bytes_tests {
 
         assert_eq!(first.body, "one");
         assert_eq!(second.body, "two");
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn reusable_daemon_control_request_can_read_raw_rpc_response() {
+        let listener = AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("listener address");
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept");
+            for expected in ["one", "two"] {
+                let request = stream
+                    .read_request(
+                        "listener",
+                        1024,
+                        ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
+                    )
+                    .await
+                    .expect("request");
+                assert_eq!(request.command, "RPC /test/raw-reusable");
+                assert!(super::daemon_control_request_expects_raw_rpc_response(
+                    &request
+                ));
+                let response = crate::ObjectRpcResponse::encode_body(
+                    "/test/raw-reusable",
+                    &expected.to_string(),
+                )
+                .expect("response");
+                stream
+                    .write_rpc_response(
+                        "listener",
+                        &response,
+                        ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
+                    )
+                    .await
+                    .expect("response");
+            }
+        });
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert(
+            super::DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY.to_string(),
+            super::DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE.to_string(),
+        );
+        metadata.insert(
+            super::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY.to_string(),
+            super::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE.to_string(),
+        );
+        let request = DaemonControlRequest::rpc(
+            "RPC /test/raw-reusable",
+            crate::ObjectRpcRequest {
+                route: "/test/raw-reusable".to_string(),
+                category: "test".to_string(),
+                metadata,
+                body: Vec::new(),
+            },
+        );
+
+        let first = super::send_daemon_control_rpc_request_raw_response_async(
+            &address,
+            &request,
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
+            1024,
+        )
+        .await
+        .expect("first response");
+        let second = super::send_daemon_control_rpc_request_raw_response_async(
+            &address,
+            &request,
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
+            1024,
+        )
+        .await
+        .expect("second response");
+
+        assert_eq!(first.decode_body::<String>().expect("first body"), "one");
+        assert_eq!(second.decode_body::<String>().expect("second body"), "two");
         server.await.expect("server task");
     }
 }

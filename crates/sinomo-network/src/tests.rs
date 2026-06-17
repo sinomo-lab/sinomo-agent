@@ -4193,6 +4193,60 @@ fn cluster_connectivity_identity_mismatch_bypasses_transient_failure_grace() {
 }
 
 #[test]
+fn cluster_connectivity_hard_failure_bypasses_single_failure_grace_without_identity_poison() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_connectivity_hard_failure").expect("cluster");
+    let local = NodeId::from_legacy_named("node_connectivity_hard_failure_local").expect("local");
+    let target =
+        NodeId::from_legacy_named("node_connectivity_hard_failure_target").expect("target");
+    let endpoint = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_connectivity_hard_failure")
+            .expect("endpoint"),
+        node_id: target.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "10.0.0.94:21353".to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 0,
+        last_observed_latency_ms: None,
+    };
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "connectivity hard failure",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+    let healthy =
+        cluster_connectivity_record_for_probe_outcome(&state, &endpoint, None, true, 7, "ok", now);
+    let hard_failure = cluster_connectivity_record_for_hard_failure(
+        &state,
+        &endpoint,
+        Some(&healthy),
+        "auth-denied",
+        now,
+    );
+
+    assert_eq!(
+        hard_failure.state,
+        ClusterConnectivityState::Degraded,
+        "hard command failures should drop healthy preference immediately"
+    );
+    assert_eq!(hard_failure.consecutive_failures, 1);
+    assert_eq!(
+        hard_failure.last_success_at, healthy.last_success_at,
+        "non-identity hard failures should keep recovery context until the failure budget is exhausted"
+    );
+    assert_eq!(hard_failure.latency_ms, healthy.latency_ms);
+    assert_eq!(
+        (hard_failure.expires_at - hard_failure.observed_at).whole_seconds(),
+        CLUSTER_CONNECTIVITY_TTL_SECONDS
+    );
+}
+
+#[test]
 fn cluster_connectivity_startup_failure_stays_degraded_after_failure_budget() {
     let now = OffsetDateTime::now_utc();
     let cluster_id =
@@ -5624,6 +5678,64 @@ fn main_daemon_command_targets_select_one_route_per_remote_main() {
 
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].endpoint_id, remote_tcp.endpoint_id);
+}
+
+#[test]
+fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-main-daemon-shadow-filter");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_main_daemon_shadow_filter").expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_network_main_daemon_shadow_filter_local").expect("local");
+    let remote =
+        NodeId::from_legacy_named("node_network_main_daemon_shadow_filter_remote").expect("remote");
+    let shadow = shadow_daemon_node_id(&remote);
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network main daemon shadow filter",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+    let main_endpoint = daemon_lan_endpoint(&remote, "node2:21353".to_string(), 5);
+    let mut folded_shadow_endpoint = daemon_lan_endpoint(&shadow, "node2:21354".to_string(), 5);
+    folded_shadow_endpoint.node_id = remote.clone();
+    let port_only_shadow_endpoint = daemon_lan_endpoint(&remote, "node2:21354".to_string(), 5);
+    let mut member =
+        ClusterMemberRecord::local_voter(cluster_id, remote, "remote", "pk-remote", now);
+    member.capabilities = main_daemon_capabilities(&member.role);
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![
+        folded_shadow_endpoint.clone(),
+        port_only_shadow_endpoint.clone(),
+        main_endpoint.clone(),
+    ];
+    state.members.push(member);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let candidates = cluster_main_daemon_command_endpoint_candidates(&paths, &state);
+    let dfs_targets = cluster_dfs_protocol_targets(&paths, &state);
+
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|endpoint| endpoint.endpoint_id.clone())
+            .collect::<Vec<_>>(),
+        vec![main_endpoint.endpoint_id.clone()],
+        "main daemon command candidates must not include shadow supervision endpoints folded under the main member"
+    );
+    assert!(
+        dfs_targets.iter().all(|endpoint| endpoint.endpoint_id
+            != folded_shadow_endpoint.endpoint_id
+            && endpoint.endpoint_id != port_only_shadow_endpoint.endpoint_id),
+        "DFS protocol routing uses the same main-daemon target surface"
+    );
 }
 
 #[test]
@@ -16368,6 +16480,97 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
 }
 
 #[test]
+fn cluster_node_status_storage_keeps_processes_distinct_for_same_node() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-node-status-process-keys");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_node_status_process_keys").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_status_process_keys").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "node status process keys",
+        node_id.clone(),
+        "node",
+        "public-key",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let main_status = ClusterNodeStatusRecord {
+        cluster_id: cluster_id.clone(),
+        node_id: node_id.clone(),
+        process: DAEMON_MAIN_CLUSTER_ROLE.to_string(),
+        availability: ClusterNodeAvailability::Online,
+        daemon_version: "0.1.0-test".to_string(),
+        commit: None,
+        target_os: Some("test-os".to_string()),
+        target_arch: Some("test-arch".to_string()),
+        pid: Some(42),
+        address: Some("127.0.0.1:21353".to_string()),
+        bind_address: Some("0.0.0.0:21353".to_string()),
+        executable: Some("sinomo".to_string()),
+        rollout: None,
+        daemon_started_at: Some("2026-06-17T00:00:00Z".to_string()),
+        observed_at: now,
+    };
+    let mut shadow_status = main_status.clone();
+    shadow_status.process = DAEMON_SHADOW_CLUSTER_ROLE.to_string();
+    shadow_status.pid = Some(43);
+    shadow_status.address = Some("127.0.0.1:21354".to_string());
+    shadow_status.bind_address = Some("0.0.0.0:21354".to_string());
+
+    assert_eq!(
+        cluster_node_status_key_for_record(&main_status),
+        cluster_node_status_key(&node_id),
+        "main status keeps the legacy key for compatibility"
+    );
+    assert_ne!(
+        cluster_node_status_key_for_record(&main_status),
+        cluster_node_status_key_for_record(&shadow_status),
+        "shadow status must not overwrite main status for the same node"
+    );
+
+    sync_cluster_node_status_to_kv(&paths, main_status.clone()).expect("sync main status");
+    sync_cluster_node_status_to_kv(&paths, shadow_status.clone()).expect("sync shadow status");
+
+    let snapshot = read_cluster_kv_current_snapshot(&paths).expect("snapshot");
+    assert!(
+        snapshot
+            .get(&cluster_node_status_key_for_record(&main_status))
+            .is_some(),
+        "main status key should be present"
+    );
+    assert!(
+        snapshot
+            .get(&cluster_node_status_key_for_record(&shadow_status))
+            .is_some(),
+        "shadow status key should be present"
+    );
+    assert!(stored_cluster_node_status_matches(&paths, &main_status).expect("main status match"));
+    assert!(
+        stored_cluster_node_status_matches(&paths, &shadow_status).expect("shadow status match")
+    );
+
+    let statuses = read_cluster_node_statuses_from_kv(&paths).expect("statuses");
+    assert_eq!(statuses.len(), 2);
+    assert!(
+        statuses
+            .iter()
+            .any(|status| status.process == DAEMON_MAIN_CLUSTER_ROLE)
+    );
+    assert!(
+        statuses
+            .iter()
+            .any(|status| status.process == DAEMON_SHADOW_CLUSTER_ROLE)
+    );
+}
+
+#[test]
 fn async_cluster_raft_append_request_builder_matches_sync_builder() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-async-raft-append-build");
     let data_dir = SinomoDataDir::new(&root);
@@ -17114,6 +17317,124 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
         async_current_state_rows.len(),
         current_state_response_rows.len()
     );
+}
+
+#[test]
+fn cluster_health_rows_select_member_process_status() {
+    #[derive(Default)]
+    struct ProcessMismatchProbe {
+        live: BTreeMap<NodeId, ClusterNodeStatusRecord>,
+    }
+
+    impl ClusterStatusProbe for ProcessMismatchProbe {
+        fn probe_member_status(
+            &self,
+            _state: &ClusterBootstrapState,
+            member: &ClusterMemberRecord,
+        ) -> Option<ClusterNodeStatusRecord> {
+            self.live.get(&member.node_id).cloned()
+        }
+    }
+
+    impl ClusterStatusAsyncProbe for ProcessMismatchProbe {
+        fn probe_member_status_async<'a>(
+            &'a self,
+            _state: &'a ClusterBootstrapState,
+            member: &'a ClusterMemberRecord,
+        ) -> ClusterMembershipRpcFuture<'a, Option<ClusterNodeStatusRecord>> {
+            Box::pin(async move { Ok(self.live.get(&member.node_id).cloned()) })
+        }
+    }
+
+    let root = sinomo_testdir::TestDir::new("sinomo-network-health-process-status");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_health_process_status").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_health_process_status").expect("node");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "health process status",
+        node_id.clone(),
+        "node",
+        "public-key",
+        now,
+    );
+    state.members[0].capabilities =
+        vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+    state.members[0].endpoints = vec![daemon_lan_endpoint(
+        &node_id,
+        "127.0.0.1:21353".to_string(),
+        10,
+    )];
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let shadow_status = ClusterNodeStatusRecord {
+        cluster_id: cluster_id.clone(),
+        node_id: node_id.clone(),
+        process: DAEMON_SHADOW_CLUSTER_ROLE.to_string(),
+        availability: ClusterNodeAvailability::Online,
+        daemon_version: "0.1.0-test".to_string(),
+        commit: None,
+        target_os: Some("test-os".to_string()),
+        target_arch: Some("test-arch".to_string()),
+        pid: Some(43),
+        address: Some("127.0.0.1:21354".to_string()),
+        bind_address: Some("0.0.0.0:21354".to_string()),
+        executable: Some("sinomo".to_string()),
+        rollout: None,
+        daemon_started_at: Some("2026-06-17T00:00:00Z".to_string()),
+        observed_at: now,
+    };
+    append_cluster_raft_command(
+        &paths,
+        &node_id,
+        KvCommand::Op(
+            KvOp::put_serde(cluster_node_status_key(&node_id), &shadow_status, None)
+                .expect("legacy shadow status op"),
+        ),
+    )
+    .expect("write legacy shadow status");
+
+    let mut probe = ProcessMismatchProbe::default();
+    probe.live.insert(node_id.clone(), shadow_status);
+
+    let rows =
+        cluster_health_rows_with_probe(&paths, &state, &probe, false, now).expect("health rows");
+    let row = rows
+        .iter()
+        .find(|row| row.member.node_id == node_id)
+        .expect("main member row");
+    assert_eq!(
+        row.status.process, DAEMON_MAIN_CLUSTER_ROLE,
+        "a shadow status must not occupy the main member row"
+    );
+    assert_eq!(
+        row.availability,
+        ClusterNodeAvailability::Offline,
+        "a shadow response should not make the main daemon appear online"
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let async_rows = runtime
+        .block_on(cluster_health_rows_with_async_probe(
+            &paths, &state, &probe, false, now,
+        ))
+        .expect("async health rows");
+    let async_row = async_rows
+        .iter()
+        .find(|row| row.member.node_id == node_id)
+        .expect("async main member row");
+    assert_eq!(async_row.status.process, DAEMON_MAIN_CLUSTER_ROLE);
+    assert_eq!(async_row.availability, ClusterNodeAvailability::Offline);
 }
 
 fn doctor_connectivity_record(

@@ -68,6 +68,7 @@ pub use sinomo_node::DAEMON_MAIN_RUN_CAPABILITY;
 pub const DAEMON_SHADOW_SUPERVISE_CAPABILITY: &str = "daemon.shadow.supervise";
 pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
+const DEFAULT_DAEMON_SHADOW_PORT: u16 = 21_354;
 pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = durable_file::DEFAULT_OBJECT_FILE_MAX_READ_BYTES;
 const FILE_CACHE_CAPACITY: usize = 4096;
 const MAX_LOCAL_CLUSTER_CONNECTIVITY_CACHE_ENTRIES: usize = 128;
@@ -6161,6 +6162,49 @@ pub fn cluster_connectivity_record_for_identity_mismatch(
     )
 }
 
+pub fn cluster_connectivity_record_for_hard_failure(
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    previous: Option<&ClusterConnectivityRecord>,
+    timestamp: &str,
+    now: OffsetDateTime,
+) -> ClusterConnectivityRecord {
+    let observed_failures = previous
+        .map(|record| record.consecutive_failures.saturating_add(1))
+        .unwrap_or(1);
+    let failures = observed_failures.min(CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD);
+    let retained_success = previous.and_then(|record| {
+        if observed_failures < CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD {
+            record.last_success_at.clone()
+        } else {
+            None
+        }
+    });
+    let (state_label, ttl_seconds) = if observed_failures >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD
+    {
+        (
+            ClusterConnectivityState::Unreachable,
+            CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
+        )
+    } else {
+        (
+            ClusterConnectivityState::Degraded,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        )
+    };
+    cluster_connectivity_record(
+        state,
+        endpoint,
+        state_label,
+        previous.and_then(|record| record.latency_ms),
+        failures,
+        retained_success,
+        Some(timestamp.to_string()),
+        now,
+        ttl_seconds,
+    )
+}
+
 pub fn apply_cluster_connectivity_probe_results(
     connectivity: &mut BTreeMap<String, ClusterConnectivityProbeState>,
     active_keys: &BTreeSet<String>,
@@ -6465,26 +6509,25 @@ impl ClusterConnectivityGraph {
         source: &NodeId,
         target: &NodeId,
     ) -> Option<ClusterEndpointRecord> {
+        self.best_healthy_endpoint_matching(source, target, |_| true)
+    }
+
+    pub(crate) fn best_healthy_endpoint_matching(
+        &self,
+        source: &NodeId,
+        target: &NodeId,
+        mut predicate: impl FnMut(&ClusterEndpointRecord) -> bool,
+    ) -> Option<ClusterEndpointRecord> {
         self.healthy_records_by_pair
             .get(&(source.clone(), target.clone()))
             .into_iter()
             .flat_map(|records| records.iter())
-            .find_map(|(_, endpoint_id)| {
+            .filter_map(|(_, endpoint_id)| {
                 self.records
                     .get(&(source.clone(), target.clone(), endpoint_id.clone()))
             })
-            .map(|record| ClusterEndpointRecord {
-                endpoint_id: record.endpoint_id.clone(),
-                node_id: record.target_node_id.clone(),
-                transport: record.transport.clone(),
-                address: record.address.clone(),
-                source: ClusterEndpointSource::Observed,
-                privacy: ClusterEndpointPrivacy::Lan,
-                priority: 0,
-                last_observed_latency_ms: record
-                    .latency_ms
-                    .map(|ms| ms.min(u64::from(u32::MAX)) as u32),
-            })
+            .map(cluster_endpoint_record_for_connectivity_record)
+            .find(|endpoint| predicate(endpoint))
     }
 
     /// A dialable endpoint to reach `target` from `source` over a non-`Unreachable`
@@ -6496,30 +6539,46 @@ impl ClusterConnectivityGraph {
         source: &NodeId,
         target: &NodeId,
     ) -> Option<ClusterEndpointRecord> {
+        self.best_reachable_endpoint_matching(source, target, |_| true)
+    }
+
+    pub(crate) fn best_reachable_endpoint_matching(
+        &self,
+        source: &NodeId,
+        target: &NodeId,
+        mut predicate: impl FnMut(&ClusterEndpointRecord) -> bool,
+    ) -> Option<ClusterEndpointRecord> {
         self.reachable_records_by_pair
             .get(&(source.clone(), target.clone()))
             .into_iter()
             .flat_map(|records| records.iter())
-            .find_map(|(_, _, endpoint_id)| {
+            .filter_map(|(_, _, endpoint_id)| {
                 self.records
                     .get(&(source.clone(), target.clone(), endpoint_id.clone()))
             })
-            .map(|record| ClusterEndpointRecord {
-                endpoint_id: record.endpoint_id.clone(),
-                node_id: record.target_node_id.clone(),
-                transport: record.transport.clone(),
-                address: record.address.clone(),
-                source: ClusterEndpointSource::Observed,
-                privacy: ClusterEndpointPrivacy::Lan,
-                priority: 0,
-                last_observed_latency_ms: record
-                    .latency_ms
-                    .map(|ms| ms.min(u64::from(u32::MAX)) as u32),
-            })
+            .map(cluster_endpoint_record_for_connectivity_record)
+            .find(|endpoint| predicate(endpoint))
     }
 
     fn earliest_expires_at(&self) -> Option<OffsetDateTime> {
         self.records.values().map(|record| record.expires_at).min()
+    }
+}
+
+fn cluster_endpoint_record_for_connectivity_record(
+    record: &ClusterConnectivityRecord,
+) -> ClusterEndpointRecord {
+    ClusterEndpointRecord {
+        endpoint_id: record.endpoint_id.clone(),
+        node_id: record.target_node_id.clone(),
+        transport: record.transport.clone(),
+        address: record.address.clone(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 0,
+        last_observed_latency_ms: record
+            .latency_ms
+            .map(|ms| ms.min(u64::from(u32::MAX)) as u32),
     }
 }
 
@@ -8639,7 +8698,11 @@ pub fn read_cluster_node_statuses_from_kv(
     {
         statuses.push(entry.decode()?);
     }
-    statuses.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    statuses.sort_by(|left, right| {
+        left.node_id
+            .cmp(&right.node_id)
+            .then_with(|| left.process.cmp(&right.process))
+    });
     Ok(statuses)
 }
 
@@ -11809,8 +11872,44 @@ pub fn cluster_main_daemon_command_endpoint_candidates(
         .filter(|endpoint| {
             endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
                 && main_daemon_node_ids.contains(&endpoint.node_id)
+                && !cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
         })
         .collect()
+}
+
+pub(crate) fn cluster_endpoint_identifies_shadow_daemon_for_node(
+    endpoint: &ClusterEndpointRecord,
+) -> bool {
+    let shadow_node_id = shadow_daemon_node_id(&endpoint.node_id);
+    let stable_shadow_endpoint = match endpoint.transport {
+        ClusterTransportKind::LanTcp => {
+            endpoint.endpoint_id == daemon_lan_endpoint_id(&shadow_node_id, &endpoint.address)
+        }
+        ClusterTransportKind::Loopback => {
+            endpoint.endpoint_id == daemon_loopback_endpoint_id(&shadow_node_id)
+        }
+        ClusterTransportKind::Iroh => {
+            iroh_endpoint_public_key(endpoint).is_some_and(|public_key| {
+                endpoint.endpoint_id == crate::stable_iroh_endpoint_id(&shadow_node_id, &public_key)
+            })
+        }
+        _ => false,
+    };
+    stable_shadow_endpoint || cluster_endpoint_uses_default_shadow_daemon_port(endpoint)
+}
+
+fn cluster_endpoint_uses_default_shadow_daemon_port(endpoint: &ClusterEndpointRecord) -> bool {
+    matches!(
+        endpoint.transport,
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+    ) && cluster_endpoint_address_port(&endpoint.address) == Some(DEFAULT_DAEMON_SHADOW_PORT)
+}
+
+fn cluster_endpoint_address_port(address: &str) -> Option<u16> {
+    if let Ok(socket) = address.parse::<std::net::SocketAddr>() {
+        return Some(socket.port());
+    }
+    address.rsplit_once(':')?.1.parse::<u16>().ok()
 }
 
 /// Member-publish targets with voters first. The publish doubles as the
@@ -11857,6 +11956,7 @@ pub fn cluster_member_publish_targets(
             .endpoints
             .iter()
             .filter(|endpoint| locally_learned_bridge_route_endpoint(endpoint))
+            .filter(|endpoint| !cluster_endpoint_identifies_shadow_daemon_for_node(endpoint))
         {
             push_unique_cluster_endpoint(&mut targets, &mut seen, endpoint.clone());
         }
@@ -11866,7 +11966,11 @@ pub fn cluster_member_publish_targets(
         if !main_daemon_node_ids.contains(&node_id) {
             continue;
         }
-        let Some(endpoint) = graph.best_healthy_endpoint(&state.local_node_id, &node_id) else {
+        let Some(endpoint) =
+            graph.best_healthy_endpoint_matching(&state.local_node_id, &node_id, |endpoint| {
+                !cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
+            })
+        else {
             continue;
         };
         push_unique_cluster_endpoint(&mut targets, &mut seen, endpoint);
@@ -12890,7 +12994,7 @@ pub fn sync_cluster_node_status_to_kv(
         return read_cluster_kv_snapshot(paths);
     }
     let state = read_cluster_state_without_kv(paths)?;
-    let key = cluster_node_status_key(&status.node_id);
+    let key = cluster_node_status_key_for_record(&status);
     append_cluster_raft_command(
         paths,
         &state.local_node_id,
@@ -12918,16 +13022,13 @@ where
         return Ok(None);
     }
     let mut state = read_cluster_state(paths)?;
-    let node_id = status.node_id.clone();
+    let key = cluster_node_status_key_for_record(&status);
     let snapshot = host.commit_cluster_kv_txn_with_quorum(
         paths,
         &mut state,
         KvTxn {
             compares: Vec::new(),
-            success: vec![
-                KvOp::put_serde(cluster_node_status_key(&node_id), &status, None)
-                    .map_err(NetworkError::from)?,
-            ],
+            success: vec![KvOp::put_serde(key, &status, None).map_err(NetworkError::from)?],
             failure: Vec::new(),
         },
     )?;
@@ -12979,7 +13080,7 @@ where
             })
         })?
         .map_err(H::Error::from)?;
-    let node_id = status.node_id.clone();
+    let key = cluster_node_status_key_for_record(&status);
     let snapshot = host
         .commit_cluster_kv_txn_with_quorum_async(
             paths,
@@ -12987,7 +13088,7 @@ where
             KvTxn {
                 compares: Vec::new(),
                 success: vec![
-                    KvOp::put_serde(cluster_node_status_key(&node_id), &status, None)
+                    KvOp::put_serde(key, &status, None)
                         .map_err(NetworkError::from)
                         .map_err(H::Error::from)?,
                 ],
@@ -13326,10 +13427,7 @@ pub fn stored_cluster_node_status_matches(
     let Some(snapshot) = read_cluster_kv_current_or_cached_snapshot_arc_if_present(paths)? else {
         return Ok(false);
     };
-    let Some(entry) = snapshot.get(&cluster_node_status_key(&status.node_id)) else {
-        return Ok(false);
-    };
-    let Ok(existing) = entry.decode::<ClusterNodeStatusRecord>() else {
+    let Some(existing) = cluster_node_status_snapshot_record(&snapshot, status) else {
         return Ok(false);
     };
     // Match on stable content only: node status is not periodically refreshed (no
@@ -13611,7 +13709,7 @@ fn cluster_node_status_put_no_effect_response(
         snapshot,
         key,
         value,
-        |status: &ClusterNodeStatusRecord| key == cluster_node_status_key(&status.node_id),
+        |status: &ClusterNodeStatusRecord| cluster_node_status_key_matches_record(key, status),
         cluster_node_status_stable_eq,
     ))
 }
@@ -14928,6 +15026,38 @@ pub fn cluster_node_status_key(node_id: &NodeId) -> String {
     format!("/cluster/node-status/{node_id}")
 }
 
+pub fn cluster_node_status_key_for_record(status: &ClusterNodeStatusRecord) -> String {
+    if status.process == DAEMON_MAIN_CLUSTER_ROLE {
+        cluster_node_status_key(&status.node_id)
+    } else {
+        cluster_node_status_key_for_process(&status.node_id, &status.process)
+    }
+}
+
+pub fn cluster_node_status_key_for_process(node_id: &NodeId, process: &str) -> String {
+    if process == DAEMON_MAIN_CLUSTER_ROLE {
+        cluster_node_status_key(node_id)
+    } else {
+        format!("/cluster/node-status/{node_id}/{process}")
+    }
+}
+
+fn cluster_node_status_key_matches_record(key: &str, status: &ClusterNodeStatusRecord) -> bool {
+    key == cluster_node_status_key_for_record(status)
+        || (status.process == DAEMON_MAIN_CLUSTER_ROLE
+            && key == cluster_node_status_key(&status.node_id))
+}
+
+fn cluster_node_status_snapshot_record(
+    snapshot: &KvSnapshot,
+    status: &ClusterNodeStatusRecord,
+) -> Option<ClusterNodeStatusRecord> {
+    let key = cluster_node_status_key_for_record(status);
+    snapshot
+        .get(&key)
+        .and_then(|entry| entry.decode::<ClusterNodeStatusRecord>().ok())
+}
+
 pub fn cluster_network_info_key(node_id: &NodeId) -> String {
     format!("/cluster/network/info/{node_id}")
 }
@@ -15671,6 +15801,7 @@ pub fn cluster_sync_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpoin
         });
         targets.extend(endpoints.into_iter().filter(|endpoint| {
             endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
+                && !cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
                 && matches!(
                     endpoint.transport,
                     ClusterTransportKind::LanTcp

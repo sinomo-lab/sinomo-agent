@@ -820,7 +820,7 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
             )
             .await;
             if self.observe_connectivity
-                && let Some((connectivity_state, latency_ms)) =
+                && let Some((connectivity_state, latency_ms, bypass_failure_grace)) =
                     daemon_rpc_connectivity_observation(result.as_ref(), started)
             {
                 remember_endpoint_command_connectivity_from_env_async(
@@ -828,6 +828,7 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
                     endpoint.clone(),
                     connectivity_state,
                     latency_ms,
+                    bypass_failure_grace,
                 )
                 .await;
             }
@@ -905,7 +906,7 @@ impl sinomo_network::ClusterSignedRelayRpcAsyncHost for DaemonSignedEndpointRpcA
             )
             .await;
             if self.observe_connectivity
-                && let Some((connectivity_state, latency_ms)) =
+                && let Some((connectivity_state, latency_ms, bypass_failure_grace)) =
                     daemon_rpc_connectivity_observation(result.as_ref(), started)
             {
                 remember_endpoint_command_connectivity_from_env_async(
@@ -913,6 +914,7 @@ impl sinomo_network::ClusterSignedRelayRpcAsyncHost for DaemonSignedEndpointRpcA
                     endpoint.clone(),
                     connectivity_state,
                     latency_ms,
+                    bypass_failure_grace,
                 )
                 .await;
             }
@@ -924,15 +926,23 @@ impl sinomo_network::ClusterSignedRelayRpcAsyncHost for DaemonSignedEndpointRpcA
 fn daemon_rpc_connectivity_observation(
     result: Result<&sinomo_network::ObjectRpcResponse, &sinomo_network::NetworkError>,
     started: Instant,
-) -> Option<(sinomo_network::ClusterConnectivityState, Option<u64>)> {
+) -> Option<(sinomo_network::ClusterConnectivityState, Option<u64>, bool)> {
     match result {
         Ok(_) => Some((
             sinomo_network::ClusterConnectivityState::Healthy,
             Some(daemon_rpc_elapsed_latency_ms(started)),
+            false,
         )),
-        Err(sinomo_network::NetworkError::Io { .. }) => {
-            Some((sinomo_network::ClusterConnectivityState::Degraded, None))
-        }
+        Err(sinomo_network::NetworkError::Io { .. }) => Some((
+            sinomo_network::ClusterConnectivityState::Degraded,
+            None,
+            false,
+        )),
+        Err(sinomo_network::NetworkError::AuthDenied) => Some((
+            sinomo_network::ClusterConnectivityState::Degraded,
+            None,
+            true,
+        )),
         Err(_) => None,
     }
 }
@@ -950,6 +960,7 @@ async fn remember_endpoint_command_connectivity_from_env_async(
     endpoint: ClusterEndpointRecord,
     connectivity_state: sinomo_network::ClusterConnectivityState,
     latency_ms: Option<u64>,
+    bypass_failure_grace: bool,
 ) {
     let Some(paths) = cluster_paths_from_env() else {
         return;
@@ -959,14 +970,25 @@ async fn remember_endpoint_command_connectivity_from_env_async(
             let Ok(state) = sinomo_network::read_cluster_state_without_kv(&paths) else {
                 return;
             };
-            crate::cluster::remember_cluster_endpoint_command_connectivity(
-                &paths,
-                &state,
-                &endpoint,
-                connectivity_state,
-                latency_ms,
-                None,
-            );
+            if bypass_failure_grace {
+                crate::cluster::remember_cluster_endpoint_command_connectivity_without_failure_grace(
+                    &paths,
+                    &state,
+                    &endpoint,
+                    connectivity_state,
+                    latency_ms,
+                    None,
+                );
+            } else {
+                crate::cluster::remember_cluster_endpoint_command_connectivity(
+                    &paths,
+                    &state,
+                    &endpoint,
+                    connectivity_state,
+                    latency_ms,
+                    None,
+                );
+            }
         })
         .await;
 }
@@ -1941,7 +1963,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_rpc_connectivity_observation_ignores_non_transport_errors() {
+    fn daemon_rpc_connectivity_observation_classifies_endpoint_failures() {
         let response = ObjectRpcResponse::encode_body(sinomo_network::DAEMON_STATUS_ROUTE, &())
             .expect("response");
         let started = Instant::now() - Duration::from_millis(5);
@@ -1959,15 +1981,25 @@ mod tests {
             .expect("transport failure observation");
         assert_eq!(
             degraded,
-            (sinomo_network::ClusterConnectivityState::Degraded, None)
+            (
+                sinomo_network::ClusterConnectivityState::Degraded,
+                None,
+                false
+            )
         );
 
+        let auth_denied = super::daemon_rpc_connectivity_observation(
+            Err(&sinomo_network::NetworkError::AuthDenied),
+            Instant::now(),
+        )
+        .expect("auth denied connectivity observation");
         assert_eq!(
-            super::daemon_rpc_connectivity_observation(
-                Err(&sinomo_network::NetworkError::AuthDenied),
-                Instant::now()
-            ),
-            None
+            auth_denied,
+            (
+                sinomo_network::ClusterConnectivityState::Degraded,
+                None,
+                true
+            )
         );
         assert_eq!(
             super::daemon_rpc_connectivity_observation(

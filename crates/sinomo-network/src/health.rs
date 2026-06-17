@@ -277,11 +277,12 @@ pub fn cluster_health_rows_with_probe<P: ClusterStatusProbe + ?Sized>(
         if matches!(member.state, ClusterMemberState::Removed) {
             continue;
         }
-        let live = probe.probe_member_status(state, member);
-        let stored = stored_statuses
-            .iter()
-            .find(|status| status.node_id == member.node_id)
-            .cloned();
+        let expected_process = cluster_member_expected_process(member);
+        let live = probe
+            .probe_member_status(state, member)
+            .filter(|status| cluster_node_status_matches_member(status, member, expected_process));
+        let stored =
+            stored_cluster_node_status_for_member(&stored_statuses, member, expected_process);
         let live_online = live.is_some();
         let mut status = if let Some(live) = live {
             let mut live = live;
@@ -337,11 +338,13 @@ pub async fn cluster_health_rows_with_async_probe<P: ClusterStatusAsyncProbe + ?
         if matches!(member.state, ClusterMemberState::Removed) {
             continue;
         }
-        let live = probe.probe_member_status_async(state, member).await?;
-        let stored = stored_statuses
-            .iter()
-            .find(|status| status.node_id == member.node_id)
-            .cloned();
+        let expected_process = cluster_member_expected_process(member);
+        let live = probe
+            .probe_member_status_async(state, member)
+            .await?
+            .filter(|status| cluster_node_status_matches_member(status, member, expected_process));
+        let stored =
+            stored_cluster_node_status_for_member(&stored_statuses, member, expected_process);
         let live_online = live.is_some();
         let mut status = if let Some(live) = live {
             let mut live = live;
@@ -477,14 +480,8 @@ pub fn unknown_cluster_node_status(
     ClusterNodeStatusRecord {
         cluster_id: state.cluster_id.clone(),
         node_id: member.node_id.clone(),
-        process: member
-            .capabilities
-            .iter()
-            .find_map(|capability| match capability.as_str() {
-                DAEMON_MAIN_RUN_CAPABILITY => Some(DAEMON_MAIN_CLUSTER_ROLE.to_string()),
-                DAEMON_SHADOW_SUPERVISE_CAPABILITY => Some(DAEMON_SHADOW_CLUSTER_ROLE.to_string()),
-                _ => None,
-            })
+        process: cluster_member_expected_process(member)
+            .map(str::to_string)
             .unwrap_or_else(|| "unknown".to_string()),
         availability: ClusterNodeAvailability::Unknown,
         daemon_version: "unknown".to_string(),
@@ -504,6 +501,39 @@ pub fn unknown_cluster_node_status(
         daemon_started_at: None,
         observed_at,
     }
+}
+
+fn cluster_member_expected_process(member: &ClusterMemberRecord) -> Option<&'static str> {
+    member
+        .capabilities
+        .iter()
+        .find_map(|capability| match capability.as_str() {
+            DAEMON_MAIN_RUN_CAPABILITY => Some(DAEMON_MAIN_CLUSTER_ROLE),
+            DAEMON_SHADOW_SUPERVISE_CAPABILITY => Some(DAEMON_SHADOW_CLUSTER_ROLE),
+            _ => None,
+        })
+}
+
+fn cluster_node_status_matches_member(
+    status: &ClusterNodeStatusRecord,
+    member: &ClusterMemberRecord,
+    expected_process: Option<&str>,
+) -> bool {
+    status.node_id == member.node_id
+        && expected_process
+            .map(|process| status.process == process)
+            .unwrap_or(true)
+}
+
+fn stored_cluster_node_status_for_member(
+    statuses: &[ClusterNodeStatusRecord],
+    member: &ClusterMemberRecord,
+    expected_process: Option<&str>,
+) -> Option<ClusterNodeStatusRecord> {
+    statuses
+        .iter()
+        .find(|status| cluster_node_status_matches_member(status, member, expected_process))
+        .cloned()
 }
 
 fn merge_reachable_peer_health_rows<P: ClusterStatusProbe + ?Sized>(

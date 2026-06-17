@@ -2430,7 +2430,7 @@ pub(crate) async fn try_dispatch_pre_auth_via_registry_async(
 ) -> Result<bool, DaemonError> {
     match dispatch_pre_auth_via_registry_to_response_async(request, service_host).await {
         Ok(Some(response)) => {
-            write_async_daemon_rpc_response_frame(stream, stream_address, response).await?;
+            write_async_daemon_rpc_response_frame(stream, stream_address, false, response).await?;
             Ok(true)
         }
         Ok(None) => Ok(false),
@@ -2521,6 +2521,7 @@ async fn dispatch_via_registry_async(
     paths: Option<&DaemonPaths>,
     replay_key: Option<Vec<u8>>,
 ) -> Result<bool, DaemonError> {
+    let raw_response = sinomo_network::object_rpc_request_expects_raw_daemon_response(&request);
     let (response, stop) = dispatch_rpc_via_registry_to_response_async(
         service_host,
         authenticated,
@@ -2529,7 +2530,7 @@ async fn dispatch_via_registry_async(
         replay_key,
     )
     .await?;
-    write_async_daemon_rpc_response_frame(stream, stream_address, response).await?;
+    write_async_daemon_rpc_response_frame(stream, stream_address, raw_response, response).await?;
     if stop {
         stream
             .shutdown_write(stream_address)
@@ -2576,16 +2577,28 @@ pub(crate) async fn dispatch_rpc_via_registry_to_response_async(
 async fn write_async_daemon_rpc_response_frame(
     stream: &mut AsyncDaemonControlStream,
     stream_address: &str,
+    raw_response: bool,
     response: ObjectRpcResponse,
 ) -> Result<(), DaemonError> {
-    stream
-        .write_response(
-            stream_address,
-            &DaemonControlResponse::rpc(String::new(), response),
-            sinomo_network::ObjectFrameIoOptions::none(),
-        )
-        .await
-        .map_err(DaemonError::from)
+    if raw_response {
+        stream
+            .write_rpc_response(
+                stream_address,
+                &response,
+                sinomo_network::ObjectFrameIoOptions::none(),
+            )
+            .await
+            .map_err(DaemonError::from)
+    } else {
+        stream
+            .write_response(
+                stream_address,
+                &DaemonControlResponse::rpc(String::new(), response),
+                sinomo_network::ObjectFrameIoOptions::none(),
+            )
+            .await
+            .map_err(DaemonError::from)
+    }
 }
 
 #[cfg(test)]
