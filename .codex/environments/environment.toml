@@ -6,6 +6,6 @@ name = "sinomo-agent"
 script = ""
 
 [[actions]]
-name = "Run"
+name = "Run App"
 icon = "run"
-command = "cargo run -p sinomo"
+command = "cargo run --manifest-path crates/sinomo-app/Cargo.toml"
