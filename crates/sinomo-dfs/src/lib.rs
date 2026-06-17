@@ -77,7 +77,7 @@ pub use posix::{
 };
 pub use protocol::{
     DfsBlobTransferResult, DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest,
-    DfsBulkReadResponse, DfsCommitVersionCommand, DfsCommitVersionResponse,
+    DfsBulkReadResponse, DfsCommitVersionCommand, DfsCommitVersionResponse, DfsDirectReadRequest,
     DfsDistributedWriteCommand, DfsDistributedWriteResponse, DfsDistributedWriteResult,
     DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResponseChunk, DfsFetchBlobResult,
     DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
@@ -160,6 +160,13 @@ pub enum DfsTransferProfile {
 
 pub trait DfsFrameTransport: DfsTransportIdentity {
     fn send(&mut self, target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError>;
+    fn send_direct_read(
+        &mut self,
+        _target_node_id: &NodeId,
+        _request: &DfsDirectReadRequest,
+    ) -> Result<Option<DfsReadResponse>, NetworkError> {
+        Ok(None)
+    }
     fn send_detached(
         &mut self,
         target_node_id: &NodeId,
@@ -324,6 +331,7 @@ pub const DFS_EXPOSE_CONFIG_ROUTE: &str = "/dfs/expose/config";
 pub const DFS_METADATA_JOURNAL_BATCH_ROUTE: &str = "/dfs/metadata/journal-batch";
 pub const DFS_METADATA_SNAPSHOT_INSTALL_ROUTE: &str = "/dfs/metadata/snapshot-install";
 pub const DFS_PROTOCOL_FRAME_ROUTE: &str = "/dfs/protocol/frame";
+pub const DFS_DIRECT_READ_ROUTE: &str = "/dfs/object/read";
 pub const DFS_POLICY_VIOLATION_EVENT_KIND: &str = "dfs.policy.violation";
 pub const DFS_CONTROL_PLANE_ROUTES: &[&str] = &[
     DFS_STATUS_ROUTE,
@@ -332,7 +340,11 @@ pub const DFS_CONTROL_PLANE_ROUTES: &[&str] = &[
     DFS_METADATA_JOURNAL_BATCH_ROUTE,
     DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
 ];
-pub const DFS_DATA_PLANE_ROUTES: &[&str] = &[DFS_SMOKE_ROUTE, DFS_PROTOCOL_FRAME_ROUTE];
+pub const DFS_DATA_PLANE_ROUTES: &[&str] = &[
+    DFS_SMOKE_ROUTE,
+    DFS_PROTOCOL_FRAME_ROUTE,
+    DFS_DIRECT_READ_ROUTE,
+];
 pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
     DFS_STATUS_ROUTE,
     DFS_EXPOSE_CONFIG_ROUTE,
@@ -341,6 +353,7 @@ pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
     DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
     DFS_SMOKE_ROUTE,
     DFS_PROTOCOL_FRAME_ROUTE,
+    DFS_DIRECT_READ_ROUTE,
 ];
 pub const DEFAULT_DFS_NODE_ID: &str = "node_local";
 pub const SIFS_FILE_SYSTEM_ID: &str = "sifs";
@@ -382,7 +395,8 @@ pub fn dfs_protocol_frame_is_read_only_request(frame: &NetworkFrame) -> bool {
                 DfsNetworkMessage::ReadRequest(_)
                     | DfsNetworkMessage::BulkReadRequest(_)
                     | DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
-                        operation: DfsNamespaceOperation::LookupPath { .. },
+                        operation: DfsNamespaceOperation::LookupPath { .. }
+                            | DfsNamespaceOperation::LookupPaths { .. },
                         ..
                     })
             )
@@ -420,6 +434,10 @@ fn dfs_protocol_frame_allows_write_repair_progress(frame: &NetworkFrame) -> bool
     };
     match message {
         DfsNetworkMessage::DistributedWriteRequest(command) => command.foreground_replica_repair,
+        DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+            operation: DfsNamespaceOperation::SyncPath { .. },
+            ..
+        }) => true,
         _ => false,
     }
 }
@@ -500,6 +518,440 @@ pub fn decode_dfs_protocol_frame_rpc_response(
     response: &ObjectRpcResponse,
 ) -> Result<DfsProtocolFrameResponse, NetworkError> {
     response.decode_body()
+}
+
+const DFS_DIRECT_READ_STATUS_METADATA_KEY: &str = "sinomo.dfs.direct-read.status";
+const DFS_DIRECT_READ_STATUS_FOUND: &str = "found";
+const DFS_DIRECT_READ_STATUS_NOT_FOUND: &str = "not-found";
+const DFS_DIRECT_READ_STATUS_REJECTED: &str = "rejected";
+const DFS_DIRECT_READ_REQUEST_ID_METADATA_KEY: &str = "sinomo.dfs.direct-read.request-id";
+const DFS_DIRECT_READ_OBJECT_ID_METADATA_KEY: &str = "sinomo.dfs.direct-read.object-id";
+const DFS_DIRECT_READ_VERSION_METADATA_KEY: &str = "sinomo.dfs.direct-read.version";
+const DFS_DIRECT_READ_CONTENT_HASH_METADATA_KEY: &str = "sinomo.dfs.direct-read.content-hash";
+const DFS_DIRECT_READ_CONTENT_SIZE_METADATA_KEY: &str = "sinomo.dfs.direct-read.content-size";
+const DFS_DIRECT_READ_REJECTION_METADATA_KEY: &str = "sinomo.dfs.direct-read.rejection";
+pub const DFS_DIRECT_READ_STREAM_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug)]
+pub struct DfsDirectReadStreamResponse {
+    pub response: ObjectRpcResponse,
+    pub reader: Option<BlobReader>,
+}
+
+pub fn dfs_direct_read_rpc_request(
+    request: &DfsDirectReadRequest,
+) -> Result<ObjectRpcRequest, NetworkError> {
+    let mut rpc_request =
+        ObjectRpcRequest::encode_body(DFS_DIRECT_READ_ROUTE, DFS_RPC_CATEGORY, request)?;
+    rpc_request.metadata.insert(
+        sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY.to_string(),
+        sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE.to_string(),
+    );
+    rpc_request.metadata.insert(
+        sinomo_network::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY.to_string(),
+        sinomo_network::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE.to_string(),
+    );
+    rpc_request.metadata.insert(
+        sinomo_network::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY.to_string(),
+        sinomo_network::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE.to_string(),
+    );
+    Ok(rpc_request)
+}
+
+pub fn dfs_direct_read_rpc_request_accepts_streamed_response(request: &ObjectRpcRequest) -> bool {
+    request.route == DFS_DIRECT_READ_ROUTE
+        && sinomo_network::object_rpc_request_accepts_streamed_daemon_response(request)
+}
+
+pub fn dfs_direct_read_rpc_request_from_protocol_frame_command(
+    command: &DfsProtocolFrameCommand,
+) -> Result<Option<ObjectRpcRequest>, NetworkError> {
+    let MeshMessageBody::Protocol(protocol_message) = &command.frame.message.body else {
+        return Ok(None);
+    };
+    if protocol_message.protocol != DFS_PROTOCOL {
+        return Ok(None);
+    }
+    let DfsNetworkMessage::ReadRequest(request) = protocol_message.decode::<DfsNetworkMessage>()?
+    else {
+        return Ok(None);
+    };
+    let Some(request) = dfs_direct_read_request_from_read_request(&request) else {
+        return Ok(None);
+    };
+    dfs_direct_read_rpc_request(&request).map(Some)
+}
+
+fn dfs_direct_read_request_from_read_request(
+    request: &DfsReadRequest,
+) -> Option<DfsDirectReadRequest> {
+    let content_size_bytes = request.content_size_bytes?;
+    if !direct_full_read_response_allowed(request, content_size_bytes) {
+        return None;
+    }
+    Some(DfsDirectReadRequest {
+        request_id: request.request_id.clone(),
+        object_id: request.object_id.clone(),
+        version: request.version.clone()?,
+        content_hash: request.content_hash.clone()?,
+        content_size_bytes,
+    })
+}
+
+pub fn handle_dfs_direct_read_rpc_request(
+    data_dir: &SinomoDataDir,
+    request: ObjectRpcRequest,
+) -> Result<ObjectRpcResponse, DfsError> {
+    if request.route != DFS_DIRECT_READ_ROUTE {
+        return Err(DfsError::Network {
+            message: format!("unknown DFS direct read route {}", request.route),
+        });
+    }
+    let request: DfsDirectReadRequest = request.decode_body().map_err(DfsError::from_network)?;
+    let response = serve_dfs_direct_read_request(data_dir, request)?;
+    dfs_direct_read_rpc_response(response).map_err(DfsError::from_network)
+}
+
+pub fn handle_dfs_direct_read_stream_rpc_request(
+    data_dir: &SinomoDataDir,
+    request: ObjectRpcRequest,
+) -> Result<DfsDirectReadStreamResponse, DfsError> {
+    if request.route != DFS_DIRECT_READ_ROUTE {
+        return Err(DfsError::Network {
+            message: format!("unknown DFS direct read route {}", request.route),
+        });
+    }
+    let request: DfsDirectReadRequest = request.decode_body().map_err(DfsError::from_network)?;
+    serve_dfs_direct_read_stream_request(data_dir, request)
+}
+
+fn serve_dfs_direct_read_request(
+    data_dir: &SinomoDataDir,
+    request: DfsDirectReadRequest,
+) -> Result<DfsReadResponse, DfsError> {
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| DfsError::Metadata {
+            message: source.to_string(),
+        })?;
+    let object_id = request.object_id.clone();
+    let result = if request.content_size_bytes > DFS_DIRECT_REMOTE_READ_MAX_BYTES {
+        DfsReadResult::Rejected {
+            reason: format!(
+                "DFS direct read {} is {} bytes, above direct response limit {}",
+                request.object_id, request.content_size_bytes, DFS_DIRECT_REMOTE_READ_MAX_BYTES
+            ),
+        }
+    } else {
+        let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+        match read_blob_for_direct_read_rpc_response(
+            &content,
+            &request.content_hash,
+            request.content_size_bytes,
+        )? {
+            Some(bytes) => DfsReadResult::Found(DfsReadData {
+                object_id: request.object_id,
+                version: request.version,
+                content_hash: Some(request.content_hash),
+                bytes,
+            }),
+            None => DfsReadResult::NotFound,
+        }
+    };
+    Ok(DfsReadResponse {
+        request_id: request.request_id,
+        object_id,
+        result,
+    })
+}
+
+fn serve_dfs_direct_read_stream_request(
+    data_dir: &SinomoDataDir,
+    request: DfsDirectReadRequest,
+) -> Result<DfsDirectReadStreamResponse, DfsError> {
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| DfsError::Metadata {
+            message: source.to_string(),
+        })?;
+    if request.content_size_bytes > DFS_DIRECT_REMOTE_READ_MAX_BYTES {
+        let response = DfsReadResponse {
+            request_id: request.request_id,
+            object_id: request.object_id.clone(),
+            result: DfsReadResult::Rejected {
+                reason: format!(
+                    "DFS direct read {} is {} bytes, above direct response limit {}",
+                    request.object_id, request.content_size_bytes, DFS_DIRECT_REMOTE_READ_MAX_BYTES
+                ),
+            },
+        };
+        return Ok(DfsDirectReadStreamResponse {
+            response: dfs_direct_read_rpc_response(response).map_err(DfsError::from_network)?,
+            reader: None,
+        });
+    }
+    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+    let reader = match content.open_blob_stream(&request.content_hash) {
+        Ok(reader) => reader,
+        Err(_) => {
+            let response = DfsReadResponse {
+                request_id: request.request_id,
+                object_id: request.object_id,
+                result: DfsReadResult::NotFound,
+            };
+            return Ok(DfsDirectReadStreamResponse {
+                response: dfs_direct_read_rpc_response(response).map_err(DfsError::from_network)?,
+                reader: None,
+            });
+        }
+    };
+    if reader.size_bytes() != request.content_size_bytes {
+        let response = DfsReadResponse {
+            request_id: request.request_id,
+            object_id: request.object_id,
+            result: DfsReadResult::NotFound,
+        };
+        return Ok(DfsDirectReadStreamResponse {
+            response: dfs_direct_read_rpc_response(response).map_err(DfsError::from_network)?,
+            reader: None,
+        });
+    }
+    let mut response = ObjectRpcResponse::from_encoded_body(DFS_DIRECT_READ_ROUTE, Vec::new());
+    response.metadata.insert(
+        DFS_DIRECT_READ_STATUS_METADATA_KEY.to_string(),
+        DFS_DIRECT_READ_STATUS_FOUND.to_string(),
+    );
+    response.metadata.insert(
+        DFS_DIRECT_READ_REQUEST_ID_METADATA_KEY.to_string(),
+        request.request_id,
+    );
+    response.metadata.insert(
+        DFS_DIRECT_READ_OBJECT_ID_METADATA_KEY.to_string(),
+        request.object_id.to_string(),
+    );
+    response.metadata.insert(
+        DFS_DIRECT_READ_VERSION_METADATA_KEY.to_string(),
+        request.version.to_string(),
+    );
+    response.metadata.insert(
+        DFS_DIRECT_READ_CONTENT_HASH_METADATA_KEY.to_string(),
+        request.content_hash,
+    );
+    response.metadata.insert(
+        DFS_DIRECT_READ_CONTENT_SIZE_METADATA_KEY.to_string(),
+        request.content_size_bytes.to_string(),
+    );
+    response.metadata.insert(
+        sinomo_network::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY.to_string(),
+        sinomo_network::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE.to_string(),
+    );
+    Ok(DfsDirectReadStreamResponse {
+        response,
+        reader: Some(reader),
+    })
+}
+
+fn read_blob_for_direct_read_rpc_response(
+    content: &LocalContentStore,
+    content_hash: &str,
+    expected_size_bytes: u64,
+) -> Result<Option<Vec<u8>>, DfsError> {
+    let mut reader = match content.open_blob_stream(content_hash) {
+        Ok(reader) => reader,
+        Err(_) => return Ok(None),
+    };
+    if reader.size_bytes() != expected_size_bytes {
+        return Ok(None);
+    }
+    let capacity = dfs_byte_count_to_usize("DFS direct read RPC", expected_size_bytes)?;
+    let mut bytes = Vec::with_capacity(capacity);
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|source| DfsError::ContentStore {
+            message: format!("failed to read blob {content_hash}: {source}"),
+        })?;
+    if bytes.len() != capacity {
+        return Err(DfsError::ContentStore {
+            message: format!(
+                "failed to read full blob {content_hash}: expected {capacity} bytes, actual {}",
+                bytes.len()
+            ),
+        });
+    }
+    Ok(Some(bytes))
+}
+
+fn dfs_direct_read_rpc_response(
+    response: DfsReadResponse,
+) -> Result<ObjectRpcResponse, NetworkError> {
+    let mut rpc_response = ObjectRpcResponse::from_encoded_body(DFS_DIRECT_READ_ROUTE, Vec::new());
+    rpc_response.metadata.insert(
+        DFS_DIRECT_READ_REQUEST_ID_METADATA_KEY.to_string(),
+        response.request_id.clone(),
+    );
+    rpc_response.metadata.insert(
+        DFS_DIRECT_READ_OBJECT_ID_METADATA_KEY.to_string(),
+        response.object_id.to_string(),
+    );
+    match response.result {
+        DfsReadResult::Found(data) => {
+            rpc_response.metadata.insert(
+                DFS_DIRECT_READ_STATUS_METADATA_KEY.to_string(),
+                DFS_DIRECT_READ_STATUS_FOUND.to_string(),
+            );
+            rpc_response.metadata.insert(
+                DFS_DIRECT_READ_OBJECT_ID_METADATA_KEY.to_string(),
+                data.object_id.to_string(),
+            );
+            rpc_response.metadata.insert(
+                DFS_DIRECT_READ_VERSION_METADATA_KEY.to_string(),
+                data.version.to_string(),
+            );
+            if let Some(content_hash) = data.content_hash {
+                rpc_response.metadata.insert(
+                    DFS_DIRECT_READ_CONTENT_HASH_METADATA_KEY.to_string(),
+                    content_hash,
+                );
+            }
+            rpc_response.metadata.insert(
+                DFS_DIRECT_READ_CONTENT_SIZE_METADATA_KEY.to_string(),
+                data.bytes.len().to_string(),
+            );
+            rpc_response.body = data.bytes;
+        }
+        DfsReadResult::NotFound => {
+            rpc_response.metadata.insert(
+                DFS_DIRECT_READ_STATUS_METADATA_KEY.to_string(),
+                DFS_DIRECT_READ_STATUS_NOT_FOUND.to_string(),
+            );
+        }
+        DfsReadResult::Rejected { reason } => {
+            rpc_response.metadata.insert(
+                DFS_DIRECT_READ_STATUS_METADATA_KEY.to_string(),
+                DFS_DIRECT_READ_STATUS_REJECTED.to_string(),
+            );
+            rpc_response
+                .metadata
+                .insert(DFS_DIRECT_READ_REJECTION_METADATA_KEY.to_string(), reason);
+        }
+        DfsReadResult::RangeFound(_) => {
+            return Err(dfs_network_serialization_error(
+                "DFS direct read route cannot encode range responses",
+            ));
+        }
+    }
+    Ok(rpc_response)
+}
+
+pub fn dfs_protocol_frame_response_from_direct_read_rpc_response(
+    command: &DfsProtocolFrameCommand,
+    response: ObjectRpcResponse,
+) -> Result<DfsProtocolFrameResponse, NetworkError> {
+    let response = dfs_direct_read_response_from_rpc_response(response)?;
+    let frame = build_dfs_network_frame(
+        &command.frame.target_node_id,
+        &command.frame.source_node_id,
+        command.frame.frame_id.0,
+        command.frame.message.message_id.0,
+        DfsNetworkMessage::ReadResponse(response),
+    )
+    .map_err(|error| dfs_network_serialization_error(error.to_string()))?;
+    Ok(DfsProtocolFrameResponse {
+        request_id: command.request_id.clone(),
+        outbound_frames: vec![frame],
+    })
+}
+
+pub fn dfs_direct_read_response_from_rpc_response(
+    mut response: ObjectRpcResponse,
+) -> Result<DfsReadResponse, NetworkError> {
+    response.error_detail()?;
+    let status = dfs_direct_read_metadata(&response, DFS_DIRECT_READ_STATUS_METADATA_KEY)?;
+    let request_id =
+        dfs_direct_read_metadata(&response, DFS_DIRECT_READ_REQUEST_ID_METADATA_KEY)?.to_string();
+    let object_id = dfs_direct_read_metadata_id(&response, DFS_DIRECT_READ_OBJECT_ID_METADATA_KEY)?;
+    let result = match status {
+        DFS_DIRECT_READ_STATUS_FOUND => {
+            let version =
+                dfs_direct_read_metadata_id(&response, DFS_DIRECT_READ_VERSION_METADATA_KEY)?;
+            let content_hash =
+                dfs_direct_read_metadata(&response, DFS_DIRECT_READ_CONTENT_HASH_METADATA_KEY)?
+                    .to_string();
+            let content_size_bytes = dfs_direct_read_metadata_usize(
+                &response,
+                DFS_DIRECT_READ_CONTENT_SIZE_METADATA_KEY,
+            )?;
+            if response.body.len() != content_size_bytes {
+                return Err(dfs_network_serialization_error(format!(
+                    "DFS direct read response body has {} bytes, metadata expected {}",
+                    response.body.len(),
+                    content_size_bytes
+                )));
+            }
+            DfsReadResult::Found(DfsReadData {
+                object_id: object_id.clone(),
+                version,
+                content_hash: Some(content_hash),
+                bytes: std::mem::take(&mut response.body),
+            })
+        }
+        DFS_DIRECT_READ_STATUS_NOT_FOUND => DfsReadResult::NotFound,
+        DFS_DIRECT_READ_STATUS_REJECTED => {
+            let reason =
+                dfs_direct_read_metadata(&response, DFS_DIRECT_READ_REJECTION_METADATA_KEY)?
+                    .to_string();
+            DfsReadResult::Rejected { reason }
+        }
+        other => {
+            return Err(dfs_network_serialization_error(format!(
+                "unknown DFS direct read status {other}"
+            )));
+        }
+    };
+    Ok(DfsReadResponse {
+        request_id,
+        object_id,
+        result,
+    })
+}
+
+fn dfs_direct_read_metadata<'a>(
+    response: &'a ObjectRpcResponse,
+    key: &str,
+) -> Result<&'a str, NetworkError> {
+    response
+        .metadata
+        .get(key)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            dfs_network_serialization_error(format!("missing DFS direct read metadata {key}"))
+        })
+}
+
+fn dfs_direct_read_metadata_id(
+    response: &ObjectRpcResponse,
+    key: &str,
+) -> Result<sinomo_core::Id, NetworkError> {
+    let value = dfs_direct_read_metadata(response, key)?;
+    sinomo_core::Id::new(value).map_err(|source| {
+        dfs_network_serialization_error(format!("invalid DFS direct read metadata {key}: {source}"))
+    })
+}
+
+fn dfs_direct_read_metadata_usize(
+    response: &ObjectRpcResponse,
+    key: &str,
+) -> Result<usize, NetworkError> {
+    let value = dfs_direct_read_metadata(response, key)?;
+    value.parse::<usize>().map_err(|source| {
+        dfs_network_serialization_error(format!("invalid DFS direct read metadata {key}: {source}"))
+    })
+}
+
+fn dfs_network_serialization_error(detail: impl Into<String>) -> NetworkError {
+    NetworkError::Serialization {
+        detail: detail.into(),
+    }
 }
 
 pub(crate) const DFS_BLOB_INLINE_LIMIT_BYTES: usize = 1024 * 1024;
@@ -657,6 +1109,12 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
         ))
         .with_object_rpc_route(ModuleObjectRpcRoute::new(
             DFS_PROTOCOL_FRAME_ROUTE,
+            DFS_RPC_CATEGORY,
+            "dfs.object.transfer",
+            ModuleRouteAuth::LocalOrClusterMember,
+        ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            DFS_DIRECT_READ_ROUTE,
             DFS_RPC_CATEGORY,
             "dfs.object.transfer",
             ModuleRouteAuth::LocalOrClusterMember,
@@ -4663,6 +5121,7 @@ struct PendingRemoteWriteResponse {
 struct PendingRoutedNamespaceResult {
     result: DfsNamespaceResult,
     synced_path_object: Option<DfsObjectMetadata>,
+    synced_path_objects: Vec<DfsObjectMetadata>,
 }
 
 #[derive(Clone, Debug)]
@@ -4850,6 +5309,7 @@ pub struct NetworkedDfsService<T> {
     active_replica_stages: BTreeMap<DfsObjectId, ActiveReplicaStage>,
     pending_writes: BTreeMap<String, PendingNetworkedWrite>,
     pending_reads: BTreeMap<String, PendingNetworkedRead>,
+    completed_direct_read_events: VecDeque<NetworkedDfsServiceEvent>,
     transient_remote_read_pruned_locations:
         BTreeMap<(DfsObjectId, DfsVersion, Option<String>), BTreeSet<NodeId>>,
     incoming_read_transfers: BTreeMap<String, InProgressReadTransfer>,
@@ -4972,6 +5432,7 @@ fn dfs_namespace_operation_trace_label(operation: &DfsNamespaceOperation) -> &'s
         DfsNamespaceOperation::ClearDirRecursive { .. } => "clear-dir-recursive",
         DfsNamespaceOperation::SyncPath { .. } => "sync-path",
         DfsNamespaceOperation::LookupPath { .. } => "lookup-path",
+        DfsNamespaceOperation::LookupPaths { .. } => "lookup-paths",
         DfsNamespaceOperation::ApplyTransaction { .. } => "apply-transaction",
         DfsNamespaceOperation::AdoptObjectAtPath { .. } => "adopt-object-at-path",
         DfsNamespaceOperation::AdoptHardlinkAlias { .. } => "adopt-hardlink-alias",
@@ -7324,6 +7785,16 @@ pub type DfsProtocolFrameSender = Arc<
         + Sync,
 >;
 
+pub type DfsDirectReadSender = Arc<
+    dyn Fn(
+            &ClusterEndpointRecord,
+            &DfsDirectReadRequest,
+            Duration,
+        ) -> Result<DfsReadResponse, DfsPeerTransportError>
+        + Send
+        + Sync,
+>;
+
 pub trait DfsPeerTransport: Send + Sync {
     fn send_protocol_frame(
         &self,
@@ -7331,6 +7802,17 @@ pub trait DfsPeerTransport: Send + Sync {
         command: &DfsProtocolFrameCommand,
         connect_timeout: Duration,
     ) -> Result<DfsProtocolFrameResponse, DfsPeerTransportError>;
+
+    fn send_direct_read(
+        &self,
+        _endpoint: &ClusterEndpointRecord,
+        _request: &DfsDirectReadRequest,
+        _connect_timeout: Duration,
+    ) -> Result<DfsReadResponse, DfsPeerTransportError> {
+        Err(DfsPeerTransportError::new(
+            "DFS peer transport does not support direct reads",
+        ))
+    }
 
     fn send_metadata_journal_batch(
         &self,
@@ -7387,6 +7869,17 @@ pub type AsyncDfsProtocolFrameSender = Arc<
             'a,
             Result<DfsProtocolFrameResponse, DfsPeerTransportError>,
         > + Send
+        + Sync,
+>;
+
+pub type AsyncDfsDirectReadSender = Arc<
+    dyn for<'a> Fn(
+            &'a ClusterEndpointRecord,
+            &'a DfsDirectReadRequest,
+            Duration,
+        )
+            -> DfsPeerTransportFuture<'a, Result<DfsReadResponse, DfsPeerTransportError>>
+        + Send
         + Sync,
 >;
 
@@ -7461,6 +7954,14 @@ pub fn dfs_protocol_frame_sender_from_peer_transport(
     })
 }
 
+pub fn dfs_direct_read_sender_from_peer_transport(
+    peer_transport: Arc<dyn DfsPeerTransport>,
+) -> DfsDirectReadSender {
+    Arc::new(move |endpoint, request, connect_timeout| {
+        peer_transport.send_direct_read(endpoint, request, connect_timeout)
+    })
+}
+
 pub fn dfs_metadata_journal_batch_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsMetadataJournalBatchSender {
@@ -7495,6 +7996,7 @@ pub struct DfsEndpointTransport {
     connect_timeout: Duration,
     sender: Option<DfsProtocolFrameSender>,
     async_sender: Option<AsyncDfsProtocolFrameSender>,
+    direct_read_sender: Option<DfsDirectReadSender>,
 }
 
 impl std::fmt::Debug for DfsEndpointTransport {
@@ -7562,6 +8064,7 @@ impl DfsEndpointTransport {
             connect_timeout,
             Some(sender),
             None,
+            None,
         )
     }
 
@@ -7590,6 +8093,7 @@ impl DfsEndpointTransport {
             connect_timeout,
             None,
             Some(sender),
+            None,
         )
     }
 
@@ -7621,6 +8125,24 @@ impl DfsEndpointTransport {
             connect_timeout,
             Some(sender),
             Some(async_sender),
+            None,
+        )
+    }
+
+    pub fn new_with_peer_senders(
+        local_node_id: NodeId,
+        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+        sender: DfsProtocolFrameSender,
+        async_sender: AsyncDfsProtocolFrameSender,
+        direct_read_sender: DfsDirectReadSender,
+    ) -> Self {
+        Self::with_senders(
+            local_node_id,
+            endpoints,
+            DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT,
+            Some(sender),
+            Some(async_sender),
+            Some(direct_read_sender),
         )
     }
 
@@ -7630,6 +8152,7 @@ impl DfsEndpointTransport {
         connect_timeout: Duration,
         sender: Option<DfsProtocolFrameSender>,
         async_sender: Option<AsyncDfsProtocolFrameSender>,
+        direct_read_sender: Option<DfsDirectReadSender>,
     ) -> Self {
         let mut endpoints_by_node_id: BTreeMap<NodeId, Vec<ClusterEndpointRecord>> =
             BTreeMap::new();
@@ -7649,6 +8172,7 @@ impl DfsEndpointTransport {
             connect_timeout,
             sender,
             async_sender,
+            direct_read_sender,
         }
     }
 
@@ -7712,6 +8236,34 @@ impl DfsEndpointTransport {
             }
         }
         Ok(())
+    }
+
+    fn send_direct_read_to_endpoint(
+        &mut self,
+        target_node_id: &NodeId,
+        request: &DfsDirectReadRequest,
+    ) -> Result<Option<DfsReadResponse>, NetworkError> {
+        if target_node_id == &self.local_node_id {
+            return Ok(None);
+        }
+        let endpoints = self
+            .endpoints_by_node_id
+            .get(target_node_id)
+            .cloned()
+            .ok_or_else(|| NetworkError::UnknownNode {
+                node_id: target_node_id.clone(),
+            })?;
+        let Some(sender) = self.direct_read_sender.as_ref().cloned() else {
+            return Ok(None);
+        };
+        send_dfs_direct_read_to_endpoint(
+            endpoints,
+            sender,
+            self.connect_timeout,
+            target_node_id.clone(),
+            request,
+        )
+        .map(Some)
     }
 
     fn send_frame_to_endpoint_detached(
@@ -7868,14 +8420,17 @@ fn send_dfs_frame_to_endpoint(
         let send_started = Instant::now();
         match sender(endpoint, &command, connect_timeout) {
             Ok(response) => {
+                let outbound_payload_bytes =
+                    dfs_network_frames_protocol_payload_bytes(&response.outbound_frames);
                 dfs_perf_trace(format_args!(
-                    "protocol-frame-send local={} target={} endpoint={} request={} payload_bytes={} outbound_frames={} elapsed_ms={}",
+                    "protocol-frame-send local={} target={} endpoint={} request={} payload_bytes={} outbound_frames={} outbound_payload_bytes={} elapsed_ms={}",
                     command.frame.source_node_id,
                     target_node_id,
                     endpoint.address,
                     command.request_id,
                     payload_bytes,
                     response.outbound_frames.len(),
+                    outbound_payload_bytes,
                     send_started.elapsed().as_millis()
                 ));
                 return Ok(response.outbound_frames);
@@ -7901,6 +8456,49 @@ fn send_dfs_frame_to_endpoint(
     })
 }
 
+fn send_dfs_direct_read_to_endpoint(
+    endpoints: Vec<ClusterEndpointRecord>,
+    sender: DfsDirectReadSender,
+    connect_timeout: Duration,
+    target_node_id: NodeId,
+    request: &DfsDirectReadRequest,
+) -> Result<DfsReadResponse, NetworkError> {
+    let mut failures = Vec::new();
+    for endpoint in &endpoints {
+        let send_started = Instant::now();
+        match sender(endpoint, request, connect_timeout) {
+            Ok(response) => {
+                dfs_perf_trace(format_args!(
+                    "direct-read-send local_request={} target={} endpoint={} request={} bytes={} elapsed_ms={}",
+                    request.object_id,
+                    target_node_id,
+                    endpoint.address,
+                    request.request_id,
+                    request.content_size_bytes,
+                    send_started.elapsed().as_millis()
+                ));
+                return Ok(response);
+            }
+            Err(error) => {
+                dfs_perf_trace(format_args!(
+                    "direct-read-send-error target={} endpoint={} request={} bytes={} elapsed_ms={} error={}",
+                    target_node_id,
+                    endpoint.address,
+                    request.request_id,
+                    request.content_size_bytes,
+                    send_started.elapsed().as_millis(),
+                    error
+                ));
+                failures.push(format!("{} failed: {error}", endpoint.address));
+            }
+        }
+    }
+    Err(NetworkError::Io {
+        operation: format!("direct DFS read from {target_node_id}"),
+        detail: failures.join("; "),
+    })
+}
+
 async fn send_dfs_frame_to_endpoint_async(
     endpoints: Vec<ClusterEndpointRecord>,
     sender: AsyncDfsProtocolFrameSender,
@@ -7918,14 +8516,17 @@ async fn send_dfs_frame_to_endpoint_async(
         let send_started = Instant::now();
         match sender(endpoint, &command, connect_timeout).await {
             Ok(response) => {
+                let outbound_payload_bytes =
+                    dfs_network_frames_protocol_payload_bytes(&response.outbound_frames);
                 dfs_perf_trace(format_args!(
-                    "protocol-frame-send-async local={} target={} endpoint={} request={} payload_bytes={} outbound_frames={} elapsed_ms={}",
+                    "protocol-frame-send-async local={} target={} endpoint={} request={} payload_bytes={} outbound_frames={} outbound_payload_bytes={} elapsed_ms={}",
                     command.frame.source_node_id,
                     target_node_id,
                     endpoint.address,
                     command.request_id,
                     payload_bytes,
                     response.outbound_frames.len(),
+                    outbound_payload_bytes,
                     send_started.elapsed().as_millis()
                 ));
                 return Ok(response.outbound_frames);
@@ -7956,6 +8557,13 @@ fn dfs_network_frame_protocol_payload_bytes(frame: &NetworkFrame) -> usize {
         MeshMessageBody::Protocol(protocol) => protocol.payload.len(),
         _ => 0,
     }
+}
+
+fn dfs_network_frames_protocol_payload_bytes(frames: &[NetworkFrame]) -> usize {
+    frames
+        .iter()
+        .map(dfs_network_frame_protocol_payload_bytes)
+        .sum()
 }
 
 impl DfsTransportIdentity for DfsEndpointTransport {
@@ -7996,6 +8604,14 @@ impl AsyncDfsFrameTransport for DfsEndpointTransport {
 impl DfsFrameTransport for DfsEndpointTransport {
     fn send(&mut self, target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError> {
         self.send_frame_to_endpoint(target_node_id, frame, true)
+    }
+
+    fn send_direct_read(
+        &mut self,
+        target_node_id: &NodeId,
+        request: &DfsDirectReadRequest,
+    ) -> Result<Option<DfsReadResponse>, NetworkError> {
+        self.send_direct_read_to_endpoint(target_node_id, request)
     }
 
     fn send_detached(
@@ -8095,6 +8711,7 @@ impl DfsEndpointServedProtocolFrameTransport {
             endpoints,
             connect_timeout,
             Some(sender),
+            None,
             None,
         );
         Self {
@@ -8550,6 +9167,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             active_replica_stages: BTreeMap::new(),
             pending_writes: BTreeMap::new(),
             pending_reads: BTreeMap::new(),
+            completed_direct_read_events: VecDeque::new(),
             transient_remote_read_pruned_locations: BTreeMap::new(),
             incoming_read_transfers: BTreeMap::new(),
             incoming_read_memory_transfers: BTreeMap::new(),
@@ -8725,6 +9343,10 @@ where
         &mut self,
     ) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
         self.prune_idle_chunk_transfers();
+        let mut direct_events = self
+            .completed_direct_read_events
+            .drain(..)
+            .collect::<Vec<_>>();
         if self
             .transport
             .pending_incoming_count_async()
@@ -8734,14 +9356,18 @@ where
         {
             self.flush_deferred_untracked_routed_write_responses_async()
                 .await?;
-            return Ok(Vec::new());
+            return Ok(direct_events);
         }
         let inbound_frames = self
             .transport
             .drain_incoming_async()
             .await
             .map_err(DfsError::from_network)?;
-        let events = self.process_inbound_frames(inbound_frames)?;
+        let mut events = self.process_inbound_frames(inbound_frames)?;
+        if !direct_events.is_empty() {
+            direct_events.extend(events);
+            events = direct_events;
+        }
         self.flush_deferred_untracked_routed_write_responses_async()
             .await?;
         Ok(events)
@@ -11590,37 +12216,71 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 Self::read_window_end_chunk_index(0, adaptive_read_window),
             ),
         };
+        let read_request = DfsReadRequest {
+            request_id: request_id.clone(),
+            object_id: object.object_id.clone(),
+            version: Some(object.version.clone()),
+            content_hash: object.content_hash.clone(),
+            content_size_bytes: object.content_size_bytes,
+            range_offset: range.map(|(offset, _)| offset),
+            range_max_bytes: range.map(|(_, max_bytes)| max_bytes),
+            start_chunk_index,
+            max_chunks,
+        };
+        let pending = PendingNetworkedRead {
+            object_id: object.object_id.clone(),
+            version: object.version.clone(),
+            content_hash: object.content_hash.clone(),
+            content_size_bytes: object.content_size_bytes,
+            range_offset: range.map(|(offset, _)| offset),
+            range_max_bytes: range.map(|(_, max_bytes)| max_bytes),
+            next_chunk_index: 0,
+            window_end_chunk_index,
+            target_node_id: target_node_id.clone(),
+            next_retry_at: now + DFS_REMOTE_READ_RETRY_DELAY,
+            cache_response,
+        };
+        if direct_uncached_full_read
+            && let (Some(version), Some(content_hash), Some(content_size_bytes)) = (
+                read_request.version.clone(),
+                read_request.content_hash.clone(),
+                read_request.content_size_bytes,
+            )
+        {
+            let direct_request = DfsDirectReadRequest {
+                request_id: request_id.clone(),
+                object_id: read_request.object_id.clone(),
+                version,
+                content_hash,
+                content_size_bytes,
+            };
+            self.pending_reads
+                .insert(request_id.clone(), pending.clone());
+            match self
+                .transport
+                .send_direct_read(target_node_id, &direct_request)
+            {
+                Ok(Some(response)) => {
+                    let event =
+                        self.handle_networked_read_response(target_node_id.clone(), response)?;
+                    self.completed_direct_read_events.push_back(event);
+                    return Ok(true);
+                }
+                Ok(None) => {
+                    self.pending_reads.remove(&request_id);
+                }
+                Err(error) => {
+                    self.pending_reads.remove(&request_id);
+                    return Err(DfsError::from_network(error));
+                }
+            }
+        }
         let sent = self.send_dfs_message_if_routable(
             target_node_id,
-            DfsNetworkMessage::ReadRequest(DfsReadRequest {
-                request_id: request_id.clone(),
-                object_id: object.object_id.clone(),
-                version: Some(object.version.clone()),
-                content_hash: object.content_hash.clone(),
-                content_size_bytes: object.content_size_bytes,
-                range_offset: range.map(|(offset, _)| offset),
-                range_max_bytes: range.map(|(_, max_bytes)| max_bytes),
-                start_chunk_index,
-                max_chunks,
-            }),
+            DfsNetworkMessage::ReadRequest(read_request),
         )?;
         if sent {
-            self.pending_reads.insert(
-                request_id,
-                PendingNetworkedRead {
-                    object_id: object.object_id.clone(),
-                    version: object.version.clone(),
-                    content_hash: object.content_hash.clone(),
-                    content_size_bytes: object.content_size_bytes,
-                    range_offset: range.map(|(offset, _)| offset),
-                    range_max_bytes: range.map(|(_, max_bytes)| max_bytes),
-                    next_chunk_index: 0,
-                    window_end_chunk_index,
-                    target_node_id: target_node_id.clone(),
-                    next_retry_at: now + DFS_REMOTE_READ_RETRY_DELAY,
-                    cache_response,
-                },
-            );
+            self.pending_reads.insert(request_id, pending);
         }
         Ok(sent)
     }
@@ -14378,6 +15038,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         drain_deferred_parent_touches: bool,
     ) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
         self.prune_idle_chunk_transfers();
+        let mut direct_events = self
+            .completed_direct_read_events
+            .drain(..)
+            .collect::<Vec<_>>();
         if self
             .transport
             .pending_incoming_count()
@@ -14386,6 +15050,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         {
             let mut events = Vec::new();
             self.flush_completed_pending_remote_write_responses(&mut events)?;
+            if !direct_events.is_empty() {
+                direct_events.extend(events);
+                events = direct_events;
+            }
             if drain_deferred_parent_touches {
                 self.drain_deferred_routed_create_parent_touches();
             }
@@ -14397,7 +15065,13 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             .transport
             .drain_incoming()
             .map_err(DfsError::from_network)?;
-        self.process_inbound_frames_with_options(inbound_frames, drain_deferred_parent_touches)
+        let mut events = self
+            .process_inbound_frames_with_options(inbound_frames, drain_deferred_parent_touches)?;
+        if !direct_events.is_empty() {
+            direct_events.extend(events);
+            events = direct_events;
+        }
+        Ok(events)
     }
 
     fn process_inbound_frames(
@@ -14932,11 +15606,39 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         operation: &DfsNamespaceOperation,
     ) -> Result<Option<DfsObjectMetadata>, DfsError> {
-        let path = match operation {
+        Ok(self
+            .synced_namespace_objects_for_operation(file_system_id, operation)?
+            .into_iter()
+            .next())
+    }
+
+    fn synced_namespace_objects_for_operation(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        operation: &DfsNamespaceOperation,
+    ) -> Result<Vec<DfsObjectMetadata>, DfsError> {
+        let paths = match operation {
             DfsNamespaceOperation::SyncPath { path }
-            | DfsNamespaceOperation::LookupPath { path } => path,
-            _ => return Ok(None),
+            | DfsNamespaceOperation::LookupPath { path } => vec![path.as_str()],
+            DfsNamespaceOperation::LookupPaths { paths } => {
+                paths.iter().map(String::as_str).collect()
+            }
+            _ => return Ok(Vec::new()),
         };
+        let mut objects = Vec::new();
+        for path in paths {
+            if let Some(object) = self.synced_namespace_object_for_path(file_system_id, path)? {
+                objects.push(object);
+            }
+        }
+        Ok(objects)
+    }
+
+    fn synced_namespace_object_for_path(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<Option<DfsObjectMetadata>, DfsError> {
         let normalized_path = match posix::normalized_posix_path_key(path) {
             Some(path) => path,
             None => return Ok(None),
@@ -15489,8 +16191,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         let journal_started = Instant::now();
         let metadata_journal_batches = if command.include_metadata_journal_batches
             && matches!(result, DfsNamespaceResult::Applied)
-            && !matches!(command.operation, DfsNamespaceOperation::LookupPath { .. })
-        {
+            && !matches!(
+                command.operation,
+                DfsNamespaceOperation::LookupPath { .. }
+                    | DfsNamespaceOperation::LookupPaths { .. }
+            ) {
             let mut batches = Vec::new();
             for shard_id in &affected_shard_ids {
                 let after_sequence = command
@@ -15510,13 +16215,22 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         let trace_journal_ms = journal_started.elapsed().as_millis();
         let trace_journal_batches = metadata_journal_batches.len();
         let sync_started = Instant::now();
-        let synced_path_object = if matches!(result, DfsNamespaceResult::Applied) {
-            self.synced_namespace_object_for_operation(&command.file_system_id, &command.operation)?
+        let synced_path_objects = if matches!(result, DfsNamespaceResult::Applied) {
+            self.synced_namespace_objects_for_operation(
+                &command.file_system_id,
+                &command.operation,
+            )?
         } else {
-            None
+            Vec::new()
+        };
+        let synced_path_object = match &command.operation {
+            DfsNamespaceOperation::SyncPath { .. } | DfsNamespaceOperation::LookupPath { .. } => {
+                synced_path_objects.first().cloned()
+            }
+            _ => None,
         };
         let trace_sync_ms = sync_started.elapsed().as_millis();
-        let trace_synced_path_object = synced_path_object.is_some();
+        let trace_synced_path_objects = synced_path_objects.len();
         let send_started = Instant::now();
         self.send_dfs_message_if_routable(
             &requester_node_id,
@@ -15524,12 +16238,13 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 request_id: request_id.clone(),
                 result: result.clone(),
                 synced_path_object,
+                synced_path_objects,
                 metadata_journal_batches,
             }),
         )?;
         let trace_send_ms = send_started.elapsed().as_millis();
         dfs_perf_trace(format_args!(
-            "namespace-request node={} requester={} request={} operation={} involved_paths={} affected_shards={} result={} affected_ms={} execute_ms={} journal_batches={} journal_ms={} synced_path_object={} sync_ms={} response_send_ms={} total_ms={}",
+            "namespace-request node={} requester={} request={} operation={} involved_paths={} affected_shards={} result={} affected_ms={} execute_ms={} journal_batches={} journal_ms={} synced_path_objects={} sync_ms={} response_send_ms={} total_ms={}",
             self.node_id,
             requester_node_id,
             request_id,
@@ -15544,14 +16259,16 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             trace_execute_ms,
             trace_journal_batches,
             trace_journal_ms,
-            trace_synced_path_object,
+            trace_synced_path_objects,
             trace_sync_ms,
             trace_send_ms,
             trace_started.elapsed().as_millis()
         ));
         let mutates_metadata = !matches!(
             command.operation,
-            DfsNamespaceOperation::LookupPath { .. } | DfsNamespaceOperation::SyncPath { .. }
+            DfsNamespaceOperation::LookupPath { .. }
+                | DfsNamespaceOperation::LookupPaths { .. }
+                | DfsNamespaceOperation::SyncPath { .. }
         );
         Ok(NetworkedDfsServiceEvent::RemoteNamespaceServed {
             request_id,
@@ -15946,6 +16663,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                                 current_primary_node_id: None,
                             },
                             synced_path_object: None,
+                            synced_path_objects: Vec::new(),
                         });
                     }
                     return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
@@ -15973,6 +16691,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                         current_primary_node_id: None,
                     },
                     synced_path_object: None,
+                    synced_path_objects: Vec::new(),
                 });
             }
             return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
@@ -15981,6 +16700,35 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 reason,
             });
         }
+        if apply_synced_path_object {
+            for object in &response.synced_path_objects {
+                if self.routed_response_object_targets_local_primary(object)? {
+                    continue;
+                }
+                if let Err(error) = self.apply_metadata_object_to_service_state(object.clone()) {
+                    let reason = format!("routed namespace path sync failed: {error}");
+                    if let Some(pending) = self
+                        .pending_routed_namespace_ops
+                        .get_mut(&response.request_id)
+                    {
+                        pending.result = Some(PendingRoutedNamespaceResult {
+                            result: DfsNamespaceResult::Rejected {
+                                reason: reason.clone(),
+                                posix_error: None,
+                                current_primary_node_id: None,
+                            },
+                            synced_path_object: None,
+                            synced_path_objects: Vec::new(),
+                        });
+                    }
+                    return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
+                        request_id: response.request_id,
+                        source_node_id: primary_node_id,
+                        reason,
+                    });
+                }
+            }
+        }
         let pending = self
             .pending_routed_namespace_ops
             .get_mut(&response.request_id)
@@ -15988,6 +16736,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         pending.result = Some(PendingRoutedNamespaceResult {
             result: response.result.clone(),
             synced_path_object: response.synced_path_object.clone(),
+            synced_path_objects: response.synced_path_objects.clone(),
         });
         Ok(NetworkedDfsServiceEvent::RemoteNamespaceCompleted {
             request_id: response.request_id,
@@ -16067,7 +16816,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     operation.clone(),
                     timeout,
                     false,
-                    false,
+                    true,
                 )?;
             match settled.result {
                 DfsNamespaceResult::Applied => return Ok(settled.synced_path_object),
@@ -16077,6 +16826,57 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     ..
                 } if current == self.node_id => {
                     return self.synced_namespace_object_for_operation(&file_system_id, &operation);
+                }
+                DfsNamespaceResult::Rejected {
+                    current_primary_node_id: Some(current),
+                    ..
+                } if current != primary => {
+                    self.cached_sifs_metadata_shards = None;
+                    primary = current;
+                }
+                DfsNamespaceResult::Rejected { reason, .. } => {
+                    return Err(DfsError::Distributed { message: reason });
+                }
+            }
+        }
+        Err(DfsError::Distributed {
+            message: format!(
+                "routed namespace lookup exceeded {DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT} authority redirects"
+            ),
+        })
+    }
+
+    pub(crate) fn route_namespace_lookup_paths_to_metadata_primary(
+        &mut self,
+        file_system_id: DfsFileSystemId,
+        primary_node_id: NodeId,
+        paths: Vec<String>,
+        timeout: Duration,
+    ) -> Result<Vec<DfsObjectMetadata>, DfsError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut primary = primary_node_id;
+        let operation = DfsNamespaceOperation::LookupPaths { paths };
+        for _ in 0..DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT {
+            let settled = self
+                .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
+                    file_system_id.clone(),
+                    primary.clone(),
+                    operation.clone(),
+                    timeout,
+                    false,
+                    true,
+                )?;
+            match settled.result {
+                DfsNamespaceResult::Applied => return Ok(settled.synced_path_objects),
+                DfsNamespaceResult::Rejected {
+                    reason: _,
+                    current_primary_node_id: Some(current),
+                    ..
+                } if current == self.node_id => {
+                    return self
+                        .synced_namespace_objects_for_operation(&file_system_id, &operation);
                 }
                 DfsNamespaceResult::Rejected {
                     current_primary_node_id: Some(current),
@@ -21152,11 +21952,20 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                         },
                     });
                 }
+                let validation_started = Instant::now();
                 let validation = if pending.cache_response {
                     self.validate_remote_read_data(data)
                 } else {
                     self.validate_remote_read_data_for_pending(&pending, data)
                 };
+                dfs_perf_trace(format_args!(
+                    "remote-read-validate request={} object={} bytes={} cache_response={} elapsed_ms={}",
+                    response.request_id,
+                    pending.object_id,
+                    data.bytes.len(),
+                    pending.cache_response,
+                    validation_started.elapsed().as_millis()
+                ));
                 if let Err(error) = validation {
                     if matches!(error, DfsError::ContentHashMismatch { .. }) {
                         self.mark_remote_read_location_missing(

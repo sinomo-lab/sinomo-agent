@@ -2,8 +2,9 @@ use crate::cluster::{
     ClusterNetworkMaintenance, DAEMON_CLUSTER_PUBLISH_INTERVAL, DAEMON_CLUSTER_TICK_INTERVAL,
     cluster_paths_from_daemon_paths, ensure_daemon_status_cluster,
     ensure_daemon_status_cluster_async, handle_daemon_cluster_kv_snapshot,
-    handle_daemon_cluster_relay_request_on_runtime, prune_local_cluster_raft_uncommitted_tail,
-    start_daemon_iroh_proxy_if_clustered,
+    handle_daemon_cluster_relay_request_on_runtime,
+    handle_daemon_cluster_relay_stream_forward_on_runtime,
+    prune_local_cluster_raft_uncommitted_tail, start_daemon_iroh_proxy_if_clustered,
 };
 use crate::dfs::{
     daemon_dfs_endpoint_transport, daemon_dfs_endpoint_transport_on_runtime,
@@ -684,6 +685,18 @@ pub(crate) async fn handle_daemon_connection_async(
         if let Some(request) = rpc_request.as_ref()
             && request.route == sinomo_network::CLUSTER_RELAY_ROUTE
         {
+            if try_handle_streamed_cluster_relay_request_async(
+                request,
+                &mut stream,
+                &paths,
+                &service_host,
+                &service_runtime,
+                &stream_address,
+            )
+            .await?
+            {
+                continue;
+            }
             let response = match sinomo_network::RelayEnvelope::from_request(request) {
                 Ok(envelope) => {
                     match handle_daemon_cluster_relay_request_on_runtime(
@@ -875,6 +888,130 @@ fn daemon_cluster_network_ping_response(
     .map_err(DaemonError::from)
 }
 
+async fn try_handle_streamed_cluster_relay_request_async(
+    request: &sinomo_network::ObjectRpcRequest,
+    stream: &mut sinomo_network::AsyncDaemonControlStream,
+    paths: &DaemonPaths,
+    service_host: &crate::service_adapter::DaemonServiceRegistryHost,
+    service_runtime: &tokio::runtime::Handle,
+    stream_address: &str,
+) -> Result<bool, DaemonError> {
+    let envelope =
+        sinomo_network::RelayEnvelope::from_request(request).map_err(DaemonError::from)?;
+    if !relay_envelope_inner_expects_streamed_response(&envelope) {
+        return Ok(false);
+    }
+    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+    let state =
+        sinomo_network::read_cluster_state_without_kv(&cluster_paths).map_err(DaemonError::from)?;
+    if envelope.target_node_id == state.local_node_id {
+        dispatch_streamed_cluster_relay_local_request_async(
+            envelope.inner,
+            stream,
+            paths,
+            service_host,
+            stream_address,
+        )
+        .await?;
+    } else {
+        handle_daemon_cluster_relay_stream_forward_on_runtime(
+            paths,
+            envelope,
+            service_runtime,
+            stream,
+            stream_address,
+        )
+        .await?;
+    }
+    Ok(true)
+}
+
+fn relay_envelope_inner_expects_streamed_response(
+    envelope: &sinomo_network::RelayEnvelope,
+) -> bool {
+    sinomo_network::object_rpc_request_expects_raw_daemon_response(&envelope.inner)
+        && sinomo_network::object_rpc_request_accepts_streamed_daemon_response(&envelope.inner)
+}
+
+async fn dispatch_streamed_cluster_relay_local_request_async(
+    request: sinomo_network::ObjectRpcRequest,
+    stream: &mut sinomo_network::AsyncDaemonControlStream,
+    paths: &DaemonPaths,
+    service_host: &crate::service_adapter::DaemonServiceRegistryHost,
+    stream_address: &str,
+) -> Result<(), DaemonError> {
+    let replay_key = daemon_dfs_frame_replay_key(&request);
+    if let Some(key) = replay_key.as_ref()
+        && let Some(response) = wait_for_daemon_dfs_frame_replay(paths, key).await
+    {
+        write_daemon_rpc_response_frame_async_for_rpc_request(
+            stream,
+            stream_address,
+            &request,
+            response,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let authenticated = match authenticate_daemon_control_request(paths, &request) {
+        Ok(authenticated) => authenticated,
+        Err(error) => {
+            write_daemon_rpc_response_frame_async_for_rpc_request(
+                stream,
+                stream_address,
+                &request,
+                sinomo_network::ObjectRpcResponse::encode_error(
+                    request.route.clone(),
+                    error.to_string(),
+                )
+                .map_err(DaemonError::from)?,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if let Some(key) = replay_key.as_ref() {
+        begin_daemon_dfs_frame_replay(paths, key);
+    }
+    let route = request.route.clone();
+    let rpc_request = Some(request);
+    match crate::service_adapter::try_dispatch_via_registry_async(
+        &authenticated,
+        &rpc_request,
+        stream,
+        stream_address,
+        service_host,
+        paths,
+        replay_key.clone(),
+    )
+    .await
+    {
+        Some(Ok(_)) => Ok(()),
+        Some(Err(error)) => {
+            if let Some(response) = rpc_error_response_for_request(&rpc_request, &error) {
+                let _ =
+                    write_daemon_rpc_response_frame_async(stream, stream_address, response).await;
+            }
+            if let Some(key) = replay_key.as_ref() {
+                abandon_daemon_dfs_frame_replay(paths, key);
+            }
+            Ok(())
+        }
+        None => {
+            if let Some(key) = replay_key.as_ref() {
+                abandon_daemon_dfs_frame_replay(paths, key);
+            }
+            let response = sinomo_network::ObjectRpcResponse::encode_error(
+                route,
+                "streamed relay local delivery has no registered object RPC route",
+            )
+            .map_err(DaemonError::from)?;
+            write_daemon_rpc_response_frame_async(stream, stream_address, response).await
+        }
+    }
+}
+
 fn daemon_rpc_request_allows_reusable_stream(request: &sinomo_network::ObjectRpcRequest) -> bool {
     request
         .metadata
@@ -1039,6 +1176,18 @@ async fn handle_authenticated_daemon_command_async(
     if let Some(request) = rpc_request.as_ref()
         && request.route == sinomo_network::CLUSTER_RELAY_ROUTE
     {
+        if try_handle_streamed_cluster_relay_request_async(
+            request,
+            &mut stream,
+            &paths,
+            &service_host,
+            &service_runtime,
+            &stream_address,
+        )
+        .await?
+        {
+            return Ok(false);
+        }
         let response = match sinomo_network::RelayEnvelope::from_request(request) {
             Ok(envelope) => {
                 match handle_daemon_cluster_relay_request_on_runtime(

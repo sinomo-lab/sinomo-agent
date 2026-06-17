@@ -665,6 +665,32 @@ fn dfs_protocol_frame_read_only_classifier_routes_lookup_path_to_read_lane() {
         "lookup requests must hydrate daemon read lanes before answering primary path checks"
     );
 
+    let lookup_paths_frame = build_dfs_network_frame(
+        &local,
+        &remote,
+        4,
+        4,
+        DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+            request_id: "lookup-paths-request".to_string(),
+            file_system_id: file_system_id.clone(),
+            requesting_node_id: local.clone(),
+            include_metadata_journal_batches: true,
+            metadata_journal_after_sequences: Vec::new(),
+            operation: DfsNamespaceOperation::LookupPaths {
+                paths: vec![
+                    "/services/example-a.txt".to_string(),
+                    "/services/example-b.txt".to_string(),
+                ],
+            },
+        }),
+    )
+    .expect("lookup paths frame");
+    assert!(dfs_protocol_frame_is_read_only_request(&lookup_paths_frame));
+    assert!(
+        dfs_protocol_frame_requires_fresh_metadata(&lookup_paths_frame),
+        "batched lookup requests must hydrate daemon read lanes before answering primary path checks"
+    );
+
     let sync_frame = build_dfs_network_frame(
         &local,
         &remote,
@@ -752,6 +778,100 @@ impl DfsFrameTransport for DroppingSendTransport {
 
     fn drain_incoming(&mut self) -> Result<Vec<sinomo_network::InboundFrame>, NetworkError> {
         Ok(Vec::new())
+    }
+}
+
+struct DirectReadTransport {
+    local_node_id: NodeId,
+    bytes: Vec<u8>,
+    direct_error: Option<String>,
+    direct_calls: Arc<Mutex<Vec<DfsDirectReadRequest>>>,
+    protocol_send_calls: Arc<Mutex<usize>>,
+}
+
+impl DirectReadTransport {
+    fn new(
+        local_node_id: NodeId,
+        bytes: Vec<u8>,
+        direct_calls: Arc<Mutex<Vec<DfsDirectReadRequest>>>,
+        protocol_send_calls: Arc<Mutex<usize>>,
+    ) -> Self {
+        Self {
+            local_node_id,
+            bytes,
+            direct_error: None,
+            direct_calls,
+            protocol_send_calls,
+        }
+    }
+
+    fn with_direct_error(
+        local_node_id: NodeId,
+        direct_error: impl Into<String>,
+        direct_calls: Arc<Mutex<Vec<DfsDirectReadRequest>>>,
+        protocol_send_calls: Arc<Mutex<usize>>,
+    ) -> Self {
+        Self {
+            local_node_id,
+            bytes: Vec::new(),
+            direct_error: Some(direct_error.into()),
+            direct_calls,
+            protocol_send_calls,
+        }
+    }
+}
+
+impl DfsTransportIdentity for DirectReadTransport {
+    fn local_node_id(&self) -> &NodeId {
+        &self.local_node_id
+    }
+}
+
+impl DfsFrameTransport for DirectReadTransport {
+    fn send(&mut self, _target_node_id: &NodeId, _frame: NetworkFrame) -> Result<(), NetworkError> {
+        *self
+            .protocol_send_calls
+            .lock()
+            .expect("protocol send calls") += 1;
+        Err(NetworkError::Io {
+            operation: "test protocol send".to_string(),
+            detail: "direct read test should not use protocol send".to_string(),
+        })
+    }
+
+    fn send_direct_read(
+        &mut self,
+        _target_node_id: &NodeId,
+        request: &DfsDirectReadRequest,
+    ) -> Result<Option<DfsReadResponse>, NetworkError> {
+        self.direct_calls
+            .lock()
+            .expect("direct calls")
+            .push(request.clone());
+        if let Some(detail) = &self.direct_error {
+            return Err(NetworkError::Io {
+                operation: "test direct read".to_string(),
+                detail: detail.clone(),
+            });
+        }
+        Ok(Some(DfsReadResponse {
+            request_id: request.request_id.clone(),
+            object_id: request.object_id.clone(),
+            result: DfsReadResult::Found(DfsReadData {
+                object_id: request.object_id.clone(),
+                version: request.version.clone(),
+                content_hash: Some(request.content_hash.clone()),
+                bytes: self.bytes.clone(),
+            }),
+        }))
+    }
+
+    fn drain_incoming(&mut self) -> Result<Vec<sinomo_network::InboundFrame>, NetworkError> {
+        Ok(Vec::new())
+    }
+
+    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+        Ok(Some(0))
     }
 }
 
@@ -1499,6 +1619,184 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
 }
 
 #[test]
+fn direct_read_rpc_uses_raw_body_and_reconstructs_protocol_response() {
+    let root = temp_root("direct-read-rpc-raw-body");
+    let data_dir = SinomoDataDir::new(&root);
+    data_dir.ensure_root_layout().expect("root layout");
+    let local = NodeId::from_legacy_named("node_direct_read_rpc_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_direct_read_rpc_remote").expect("remote");
+    let object_id = DfsObjectId::generate();
+    let version = DfsVersion::generate();
+    let bytes = (0..(DFS_BLOB_INLINE_LIMIT_BYTES + 8192))
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let content = LocalContentStore::new(data_dir.dfs_dir().join("content")).expect("content");
+    let manifest = content
+        .put_object_version(object_id.as_str(), version.as_str(), &bytes)
+        .expect("put object version");
+    let read_request = DfsReadRequest {
+        request_id: "direct-read-rpc-request".to_string(),
+        object_id: object_id.clone(),
+        version: Some(version.clone()),
+        content_hash: Some(manifest.content_hash.clone()),
+        content_size_bytes: Some(bytes.len() as u64),
+        range_offset: None,
+        range_max_bytes: None,
+        start_chunk_index: 0,
+        max_chunks: 0,
+    };
+    let command = DfsProtocolFrameCommand {
+        request_id: "direct-read-protocol-frame".to_string(),
+        frame: build_dfs_network_frame(
+            &local,
+            &remote,
+            10,
+            11,
+            DfsNetworkMessage::ReadRequest(read_request),
+        )
+        .expect("read request frame"),
+    };
+
+    let direct_request = dfs_direct_read_rpc_request_from_protocol_frame_command(&command)
+        .expect("direct read request")
+        .expect("direct read eligible");
+    assert_eq!(direct_request.route, DFS_DIRECT_READ_ROUTE);
+    assert_eq!(
+        direct_request
+            .metadata
+            .get(sinomo_network::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY)
+            .map(String::as_str),
+        Some(sinomo_network::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE)
+    );
+    assert_eq!(
+        direct_request
+            .metadata
+            .get(sinomo_network::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY)
+            .map(String::as_str),
+        Some(sinomo_network::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE)
+    );
+    assert_eq!(
+        direct_request
+            .metadata
+            .get(sinomo_network::ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY)
+            .map(String::as_str),
+        None
+    );
+    let decoded_direct_request = direct_request
+        .decode_body::<DfsDirectReadRequest>()
+        .expect("decode direct request");
+    assert_eq!(decoded_direct_request.object_id, object_id);
+    assert_eq!(decoded_direct_request.version, version);
+    assert_eq!(decoded_direct_request.content_hash, manifest.content_hash);
+
+    let direct_response =
+        handle_dfs_direct_read_rpc_request(&data_dir, direct_request).expect("direct read");
+    assert_eq!(direct_response.route, DFS_DIRECT_READ_ROUTE);
+    assert_eq!(
+        direct_response
+            .metadata
+            .get(DFS_DIRECT_READ_STATUS_METADATA_KEY)
+            .map(String::as_str),
+        Some(DFS_DIRECT_READ_STATUS_FOUND)
+    );
+    assert_eq!(direct_response.body, bytes);
+
+    let protocol_response =
+        dfs_protocol_frame_response_from_direct_read_rpc_response(&command, direct_response)
+            .expect("protocol response");
+    assert_eq!(protocol_response.request_id, command.request_id);
+    assert_eq!(protocol_response.outbound_frames.len(), 1);
+    let returned_frame = &protocol_response.outbound_frames[0];
+    assert_eq!(returned_frame.source_node_id, remote);
+    assert_eq!(returned_frame.target_node_id, local);
+    let MeshMessageBody::Protocol(protocol_message) = &returned_frame.message.body else {
+        panic!("expected protocol response frame");
+    };
+    let message = protocol_message
+        .decode::<DfsNetworkMessage>()
+        .expect("decode read response");
+    let DfsNetworkMessage::ReadResponse(response) = message else {
+        panic!("expected read response");
+    };
+    let DfsReadResult::Found(data) = response.result else {
+        panic!("expected found response");
+    };
+    assert_eq!(data.object_id, decoded_direct_request.object_id);
+    assert_eq!(data.version, decoded_direct_request.version);
+    assert_eq!(
+        data.content_hash.as_deref(),
+        Some(decoded_direct_request.content_hash.as_str())
+    );
+    assert_eq!(data.bytes, bytes);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn direct_read_stream_rpc_keeps_blob_out_of_initial_response() {
+    let root = temp_root("direct-read-rpc-stream-body");
+    let data_dir = SinomoDataDir::new(&root);
+    data_dir.ensure_root_layout().expect("root layout");
+    let object_id = DfsObjectId::generate();
+    let version = DfsVersion::generate();
+    let bytes = (0..(DFS_BLOB_INLINE_LIMIT_BYTES + 16384))
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let content = LocalContentStore::new(data_dir.dfs_dir().join("content")).expect("content");
+    let manifest = content
+        .put_object_version(object_id.as_str(), version.as_str(), &bytes)
+        .expect("put object version");
+    let direct_read = DfsDirectReadRequest {
+        request_id: "direct-read-stream-request".to_string(),
+        object_id: object_id.clone(),
+        version: version.clone(),
+        content_hash: manifest.content_hash.clone(),
+        content_size_bytes: bytes.len() as u64,
+    };
+    let direct_request = dfs_direct_read_rpc_request(&direct_read).expect("direct request");
+    assert!(dfs_direct_read_rpc_request_accepts_streamed_response(
+        &direct_request
+    ));
+
+    let mut stream_response =
+        handle_dfs_direct_read_stream_rpc_request(&data_dir, direct_request).expect("stream");
+    assert_eq!(stream_response.response.route, DFS_DIRECT_READ_ROUTE);
+    assert_eq!(
+        stream_response
+            .response
+            .metadata
+            .get(DFS_DIRECT_READ_STATUS_METADATA_KEY)
+            .map(String::as_str),
+        Some(DFS_DIRECT_READ_STATUS_FOUND)
+    );
+    assert_eq!(
+        stream_response
+            .response
+            .metadata
+            .get(sinomo_network::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY)
+            .map(String::as_str),
+        Some(sinomo_network::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE)
+    );
+    assert!(stream_response.response.body.is_empty());
+    let mut streamed = Vec::new();
+    std::io::Read::read_to_end(
+        stream_response.reader.as_mut().expect("blob reader"),
+        &mut streamed,
+    )
+    .expect("read stream");
+    assert_eq!(streamed, bytes);
+    stream_response.response.body = streamed;
+    let decoded =
+        dfs_direct_read_response_from_rpc_response(stream_response.response).expect("decode");
+    let DfsReadResult::Found(data) = decoded.result else {
+        panic!("expected found response");
+    };
+    assert_eq!(data.object_id, object_id);
+    assert_eq!(data.version, version);
+    assert_eq!(data.bytes, bytes);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn endpoint_transport_sends_rpc_and_queues_returned_frames() {
     let local = NodeId::from_legacy_named("node_dfs_endpoint_send_local").expect("local");
     let remote = NodeId::from_legacy_named("node_dfs_endpoint_send_remote").expect("remote");
@@ -1559,6 +1857,96 @@ fn endpoint_transport_sends_rpc_and_queues_returned_frames() {
     assert_eq!(incoming.len(), 1);
     assert_eq!(incoming[0].received_by, local);
     assert_eq!(incoming[0].frame.source_node_id, remote);
+}
+
+#[test]
+fn endpoint_transport_direct_read_uses_direct_sender_without_queuing_frame() {
+    let local = NodeId::from_legacy_named("node_dfs_endpoint_direct_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_dfs_endpoint_direct_remote").expect("remote");
+    let endpoint = test_endpoint(&remote, "192.0.2.17:21353");
+    let object_id = DfsObjectId::generate();
+    let version = DfsVersion::generate();
+    let bytes = b"direct endpoint read bytes".to_vec();
+    let direct_calls = Arc::new(Mutex::new(Vec::new()));
+    let direct_calls_for_sender = Arc::clone(&direct_calls);
+    let bytes_for_sender = bytes.clone();
+    let direct_sender: DfsDirectReadSender = Arc::new(move |endpoint, request, timeout| {
+        direct_calls_for_sender.lock().expect("direct calls").push((
+            endpoint.node_id.clone(),
+            request.clone(),
+            timeout,
+        ));
+        Ok(DfsReadResponse {
+            request_id: request.request_id.clone(),
+            object_id: request.object_id.clone(),
+            result: DfsReadResult::Found(DfsReadData {
+                object_id: request.object_id.clone(),
+                version: request.version.clone(),
+                content_hash: Some(request.content_hash.clone()),
+                bytes: bytes_for_sender.clone(),
+            }),
+        })
+    });
+    let protocol_sender: DfsProtocolFrameSender = Arc::new(|_endpoint, _command, _timeout| {
+        Err(DfsPeerTransportError::new(
+            "protocol sender should not be used by direct read",
+        ))
+    });
+    let async_sender: AsyncDfsProtocolFrameSender = Arc::new(|_endpoint, _command, _timeout| {
+        Box::pin(async {
+            Err(DfsPeerTransportError::new(
+                "async sender should not be used by direct read",
+            ))
+        })
+    });
+    let mut transport = DfsEndpointTransport::new_with_peer_senders(
+        local.clone(),
+        vec![endpoint],
+        protocol_sender,
+        async_sender,
+        direct_sender,
+    );
+    let request = DfsDirectReadRequest {
+        request_id: "endpoint-direct-read".to_string(),
+        object_id: object_id.clone(),
+        version: version.clone(),
+        content_hash: "blake3:endpoint-direct".to_string(),
+        content_size_bytes: bytes.len() as u64,
+    };
+
+    let response = DfsFrameTransport::send_direct_read(&mut transport, &remote, &request)
+        .expect("send direct read")
+        .expect("direct response");
+
+    assert_eq!(
+        direct_calls.lock().expect("direct calls").as_slice(),
+        &[(
+            remote.clone(),
+            request.clone(),
+            DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT
+        )]
+    );
+    assert_eq!(
+        transport
+            .pending_incoming_count()
+            .expect("pending incoming frames"),
+        Some(0)
+    );
+    assert!(
+        transport
+            .drain_incoming()
+            .expect("incoming frames")
+            .is_empty()
+    );
+    assert!(matches!(
+        response.result,
+        DfsReadResult::Found(DfsReadData {
+            object_id: response_object_id,
+            version: response_version,
+            bytes: response_bytes,
+            ..
+        }) if response_object_id == object_id && response_version == version && response_bytes == bytes
+    ));
 }
 
 #[test]
@@ -11944,7 +12332,7 @@ fn hinted_remote_read_serves_blob_without_local_metadata() {
 }
 
 #[test]
-fn uncached_large_remote_read_uses_direct_response() {
+fn uncached_remote_read_within_direct_budget_uses_direct_response() {
     let root = temp_root("uncached-large-remote-read-direct-response");
     let owner = NodeId::from_legacy_named("node_uncached_direct_owner").expect("node");
     let reader = NodeId::from_legacy_named("node_uncached_direct_reader").expect("node");
@@ -12019,6 +12407,139 @@ fn uncached_large_remote_read_uses_direct_response() {
             } if completed_object_id == &object_id && result_bytes == &bytes
         )
     }));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn uncached_remote_read_direct_transport_completes_without_protocol_frame() {
+    let root = temp_root("uncached-direct-transport-bypass");
+    let owner = NodeId::from_legacy_named("node_uncached_bypass_owner").expect("node");
+    let reader = NodeId::from_legacy_named("node_uncached_bypass_reader").expect("node");
+    let object_id = DfsObjectId::from_legacy_named("obj_uncached_bypass").expect("object");
+    let version = DfsVersion::from_legacy_named("version_uncached_bypass").expect("version");
+    let bytes = (0..(DFS_BLOB_INLINE_LIMIT_BYTES + 8192))
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let owner_content = LocalContentStore::new(root.join("owner")).expect("owner content");
+    let manifest = owner_content
+        .put_object_version(object_id.as_str(), version.as_str(), &bytes)
+        .expect("owner content blob");
+    let direct_calls = Arc::new(Mutex::new(Vec::new()));
+    let protocol_send_calls = Arc::new(Mutex::new(0));
+    let transport = DirectReadTransport::new(
+        reader.clone(),
+        bytes.clone(),
+        Arc::clone(&direct_calls),
+        Arc::clone(&protocol_send_calls),
+    );
+    let mut reader_dfs = NetworkedDfsService::new(
+        transport,
+        LocalContentStore::new(root.join("reader")).expect("reader content"),
+    );
+    reader_dfs
+        .add_file_system(file_system(owner.clone()))
+        .expect("reader filesystem");
+    let mut object = file_metadata(owner.clone());
+    object.object_id = object_id.clone();
+    object.version = version.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![owner.clone()];
+    object.content_hash = Some(manifest.content_hash.clone());
+    object.content_size_bytes = Some(manifest.size_bytes);
+    reader_dfs
+        .add_object_metadata(object)
+        .expect("reader metadata");
+
+    assert_eq!(
+        reader_dfs
+            .request_remote_object_read_without_cache(&object_id)
+            .expect("request uncached read"),
+        vec![owner.clone()]
+    );
+    assert_eq!(
+        *protocol_send_calls.lock().expect("protocol send calls"),
+        0,
+        "direct transport should avoid the normal protocol-frame send path"
+    );
+    let calls = direct_calls.lock().expect("direct calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].object_id, object_id);
+    assert_eq!(calls[0].version, version);
+    assert_eq!(calls[0].content_hash, manifest.content_hash);
+    assert_eq!(calls[0].content_size_bytes, manifest.size_bytes);
+    drop(calls);
+    assert!(
+        reader_dfs.pending_reads.is_empty(),
+        "synchronous direct read completion should clear pending state immediately"
+    );
+
+    let events = reader_dfs
+        .process_incoming()
+        .expect("reader drains completed direct read event");
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteReadCompleted {
+                object_id: completed_object_id,
+                result: DfsReadResult::Found(DfsReadData { bytes: result_bytes, .. }),
+                ..
+            } if completed_object_id == &object_id && result_bytes == &bytes
+        )
+    }));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn failed_uncached_remote_direct_read_cleans_pending_state() {
+    let root = temp_root("uncached-direct-transport-error-cleanup");
+    let owner = NodeId::from_legacy_named("node_uncached_error_owner").expect("node");
+    let reader = NodeId::from_legacy_named("node_uncached_error_reader").expect("node");
+    let object_id = DfsObjectId::from_legacy_named("obj_uncached_error").expect("object");
+    let version = DfsVersion::from_legacy_named("version_uncached_error").expect("version");
+    let direct_calls = Arc::new(Mutex::new(Vec::new()));
+    let protocol_send_calls = Arc::new(Mutex::new(0));
+    let transport = DirectReadTransport::with_direct_error(
+        reader.clone(),
+        "direct read failed",
+        Arc::clone(&direct_calls),
+        Arc::clone(&protocol_send_calls),
+    );
+    let mut reader_dfs = NetworkedDfsService::new(
+        transport,
+        LocalContentStore::new(root.join("reader")).expect("reader content"),
+    );
+    reader_dfs
+        .add_file_system(file_system(owner.clone()))
+        .expect("reader filesystem");
+    let mut object = file_metadata(owner.clone());
+    object.object_id = object_id.clone();
+    object.version = version.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![owner.clone()];
+    object.content_hash = Some("blake3:uncached-error".to_string());
+    object.content_size_bytes = Some(4096);
+    reader_dfs
+        .add_object_metadata(object)
+        .expect("reader metadata");
+
+    let error = reader_dfs
+        .request_remote_object_read_without_cache(&object_id)
+        .expect_err("direct read error should propagate");
+
+    assert!(
+        error.to_string().contains("direct read failed"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(direct_calls.lock().expect("direct calls").len(), 1);
+    assert_eq!(
+        *protocol_send_calls.lock().expect("protocol send calls"),
+        0,
+        "direct-read errors should not fall through to a duplicate protocol send"
+    );
+    assert!(
+        reader_dfs.pending_reads.is_empty(),
+        "failed synchronous direct reads must not leave stale pending entries"
+    );
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -24875,6 +25396,7 @@ fn late_routed_responses_are_discarded_without_failing_the_event_loop() {
                 request_id: "dfs_net_req_untracked_ns".to_string(),
                 result: DfsNamespaceResult::Applied,
                 synced_path_object: None,
+                synced_path_objects: Vec::new(),
                 metadata_journal_batches: Vec::new(),
             },
         )
@@ -25003,6 +25525,7 @@ fn sync_path_response_object_updates_outsider_read_view_without_journal_batches(
                 request_id: "dfs_net_req_sync_path".to_string(),
                 result: DfsNamespaceResult::Applied,
                 synced_path_object: Some(object.clone()),
+                synced_path_objects: Vec::new(),
                 metadata_journal_batches: Vec::new(),
             },
         )

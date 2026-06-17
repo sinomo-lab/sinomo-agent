@@ -823,9 +823,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             DfsNamespaceOperation::ClearDirRecursive { path } => {
                 self.posix_clear_dir_recursive_local(path)
             }
-            DfsNamespaceOperation::SyncPath { .. } | DfsNamespaceOperation::LookupPath { .. } => {
-                Ok(())
-            }
+            DfsNamespaceOperation::SyncPath { .. }
+            | DfsNamespaceOperation::LookupPath { .. }
+            | DfsNamespaceOperation::LookupPaths { .. } => Ok(()),
             DfsNamespaceOperation::ApplyTransaction { transaction } => self
                 .apply_namespace_transaction(transaction.clone())
                 .map_err(DfsPosixError::from),
@@ -3361,11 +3361,14 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_read_file_distributed(&mut self, path: &str) -> Result<Vec<u8>> {
+        let trace_started = Instant::now();
+        let lookup_started = Instant::now();
         let (path, object) = self.lookup_sifs_path_distributed_synced(
             path,
             true,
             PosixDistributedLookupFreshness::LocalHitOk,
         )?;
+        let lookup_elapsed_ms = lookup_started.elapsed().as_millis();
         let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path });
@@ -3374,11 +3377,25 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         if object.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory { path });
         }
-        match self.read_object_metadata_or_fetch_remote_without_cache(&object)? {
+        let fetch_started = Instant::now();
+        let outcome = self.read_object_metadata_or_fetch_remote_without_cache(&object)?;
+        let fetch_elapsed_ms = fetch_started.elapsed().as_millis();
+        match outcome {
             NetworkedDfsReadOutcome::Found {
                 data: DfsReadData { bytes, .. },
                 ..
-            } => Ok(bytes),
+            } => {
+                crate::dfs_perf_trace(format_args!(
+                    "posix-read-distributed path={} object={} bytes={} lookup_ms={} fetch_ms={} total_ms={}",
+                    path,
+                    object.object_id,
+                    bytes.len(),
+                    lookup_elapsed_ms,
+                    fetch_elapsed_ms,
+                    trace_started.elapsed().as_millis()
+                ));
+                Ok(bytes)
+            }
             NetworkedDfsReadOutcome::PendingReplication { .. }
             | NetworkedDfsReadOutcome::NotConfirmed { .. }
             | NetworkedDfsReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
@@ -3398,6 +3415,8 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
 
         let mut results = (0..paths.len()).map(|_| None).collect::<Vec<_>>();
         let mut grouped = BTreeMap::<NodeId, Vec<PosixPendingBulkRead>>::new();
+
+        self.prefetch_sifs_paths_for_bulk_read(paths);
 
         for (index, input_path) in paths.iter().enumerate() {
             match self.prepare_posix_bulk_read(input_path, index) {
@@ -3450,6 +3469,59 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 result.unwrap_or_else(|| self.posix_read_file_distributed(&paths[index]))
             })
             .collect()
+    }
+
+    fn prefetch_sifs_paths_for_bulk_read(&mut self, paths: &[String]) {
+        if paths.len() <= 1 {
+            return;
+        }
+        let trace_started = Instant::now();
+        let mut grouped = BTreeMap::<NodeId, Vec<String>>::new();
+        let mut seen = BTreeSet::<(NodeId, String)>::new();
+        for input_path in paths {
+            let Ok(resolved) = self.resolve_existing_posix_path_distributed(input_path, true)
+            else {
+                continue;
+            };
+            if self.lookup_sifs_path(&resolved).ok().flatten().is_some() {
+                continue;
+            }
+            let Ok(Some(shard)) = self.routed_namespace_shard_for_path(&resolved) else {
+                continue;
+            };
+            if !self.is_local_metadata_replica_for_shard(&shard) {
+                continue;
+            }
+            let key = (shard.primary_node_id.clone(), resolved.clone());
+            if seen.insert(key) {
+                grouped
+                    .entry(shard.primary_node_id)
+                    .or_default()
+                    .push(resolved);
+            }
+        }
+        if grouped.is_empty() {
+            return;
+        }
+        let mut requested_paths = 0_usize;
+        let mut returned_objects = 0_usize;
+        for (primary_node_id, lookup_paths) in grouped {
+            requested_paths = requested_paths.saturating_add(lookup_paths.len());
+            if let Ok(objects) = self.route_namespace_lookup_paths_to_metadata_primary(
+                sifs_file_system_id(),
+                primary_node_id,
+                lookup_paths,
+                POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+            ) {
+                returned_objects = returned_objects.saturating_add(objects.len());
+            }
+        }
+        crate::dfs_perf_trace(format_args!(
+            "bulk-read-prefetch paths={} objects={} elapsed_ms={}",
+            requested_paths,
+            returned_objects,
+            trace_started.elapsed().as_millis()
+        ));
     }
 
     fn prepare_posix_bulk_read(
@@ -6857,6 +6929,7 @@ fn namespace_operation_routing_path(operation: &DfsNamespaceOperation) -> Option
         | DfsNamespaceOperation::ClearDirRecursive { path }
         | DfsNamespaceOperation::SyncPath { path }
         | DfsNamespaceOperation::LookupPath { path } => Some(path.as_str()),
+        DfsNamespaceOperation::LookupPaths { paths } => paths.first().map(String::as_str),
         DfsNamespaceOperation::Rename { from, .. } => Some(from.as_str()),
         DfsNamespaceOperation::Hardlink { existing_path, .. } => Some(existing_path.as_str()),
         DfsNamespaceOperation::ApplyTransaction { transaction } => transaction
