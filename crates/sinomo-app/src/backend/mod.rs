@@ -134,6 +134,7 @@ impl Backend {
             }
         };
 
+        let connection = ensure_app_cluster(connection, &paths, data_dir.as_ref(), &node, &progress);
         progress("Loading workspace…");
         let config = build_config_client(&connection, &data_dir);
 
@@ -226,6 +227,39 @@ impl Backend {
     /// Whether the runtime is healthy enough to talk to.
     pub fn is_online(&self) -> bool {
         true
+    }
+}
+
+fn ensure_app_cluster(
+    connection: Connection,
+    paths: &DaemonPaths,
+    data_dir: &SinomoDataDir,
+    node: &NodeProfile,
+    progress: &impl Fn(&str),
+) -> Connection {
+    if !connection.is_daemon() || connection.is_clustered() {
+        return connection;
+    }
+
+    progress("Initializing single-node cluster...");
+    match sinomo_cli::app_api::ensure_single_node_cluster(data_dir, node.display_name.as_str()) {
+        Ok(_) => match probe_daemon_status(paths, DAEMON_RPC_TIMEOUT) {
+            DaemonProbeStatus::Running(status)
+            | DaemonProbeStatus::Locked {
+                status: Some(status),
+            } => match connection {
+                Connection::Daemon(_) => Connection::Daemon(Box::new(status)),
+                Connection::InProcessDaemon(_) => Connection::InProcessDaemon(Box::new(status)),
+                Connection::LocalFallback => Connection::LocalFallback,
+            },
+            DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
+                connection
+            }
+        },
+        Err(error) => {
+            tracing::warn!(%error, "sinomo-app could not initialize local cluster");
+            connection
+        }
     }
 }
 

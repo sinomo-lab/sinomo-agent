@@ -11,8 +11,9 @@
 use serde_json::Value;
 use sinomo_cli::app_api::ProviderSummary;
 use sinomo_lm::{
-    LM_PROVIDER_CONFIG_KEY, LanguageModelProviderOptions, ModelConfig, ProviderAccountConfig,
-    ProviderReasoningEffort, model_supports_reasoning_effort, upsert_provider_account_config,
+    DEFAULT_PROVIDER_ACCOUNT, LM_PROVIDER_CONFIG_KEY, LanguageModelProviderOptions, ModelConfig,
+    ProviderAccountConfig, ProviderReasoningEffort, model_supports_reasoning_effort,
+    normalize_model_provider, normalize_provider_account_name, upsert_provider_account_config,
 };
 use sinomo_runtime::config::{
     ConfigClient, ConfigStore, ConfigValueSource, ConfigValueType, ConfigWriteTarget,
@@ -154,28 +155,127 @@ pub fn set_bool(client: &dyn ConfigClient, key: &str, value: bool) -> Result<(),
         .map_err(|e| e.to_string())
 }
 
-/// The providers offered in the chat composer: exactly the providers configured and
+/// The provider accounts offered in the chat composer: exactly the accounts configured and
 /// enabled in the cluster's `lm.providers` configuration (resolved cluster-over-local,
 /// the same registry the Settings tab reads). Returns an empty list when the cluster
-/// has no providers configured. Model lists are intentionally left empty here — they are
-/// fetched on demand from `sinomo-lm` (the single source of truth for available models).
+/// has no providers configured. Model lists are seeded with each account's configured default
+/// model when available and otherwise fetched on demand from `sinomo-lm`.
 pub fn cluster_provider_summaries(client: &dyn ConfigClient) -> Vec<ProviderSummary> {
     let Some(config) = load_provider_config(client) else {
         return Vec::new();
     };
 
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for account in config.accounts.iter().filter(|account| account.enabled) {
+        let provider =
+            normalize_model_provider(&account.provider).unwrap_or_else(|| account.provider.clone());
+        *counts.entry(provider).or_default() += 1;
+    }
+
     let mut summaries: Vec<ProviderSummary> = Vec::new();
     for account in config.accounts.iter().filter(|account| account.enabled) {
-        if summaries.iter().any(|p| p.id == account.provider) {
-            continue; // one entry per provider (first enabled account wins)
-        }
+        let provider =
+            normalize_model_provider(&account.provider).unwrap_or_else(|| account.provider.clone());
+        let account_name = normalize_provider_account_name(Some(&account.account));
         summaries.push(ProviderSummary {
-            id: account.provider.clone(),
-            name: provider_display_name(&account.provider),
-            models: Vec::new(),
+            id: provider.clone(),
+            account: account_name.clone(),
+            name: provider_account_display_name(
+                &provider,
+                &account_name,
+                counts.get(&provider).copied().unwrap_or(0),
+            ),
+            models: vec![account.default_model.clone().unwrap_or_else(|| {
+                sinomo_lm::effective_model_name(&provider, sinomo_lm::PROVIDER_DEFAULT_MODEL)
+            })],
         });
     }
     summaries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use sinomo_runtime::config::LocalConfigClient;
+    use sinomo_runtime::local::SinomoDataDir;
+
+    fn test_client(name: &str) -> (LocalConfigClient, std::path::PathBuf) {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-app-config-{name}-{}-{stamp}",
+            std::process::id()
+        ));
+        let data_dir = SinomoDataDir::new(root.clone());
+        let store = Arc::new(build_config_store().expect("config store"));
+        (LocalConfigClient::new(store, data_dir, None), root)
+    }
+
+    #[test]
+    fn provider_config_supports_multiple_accounts_for_same_provider() {
+        let (client, _root) = test_client("multiple-accounts");
+
+        add_provider_account(&client, "openai", "work", "sk-work", "gpt-5", "")
+            .expect("add work account");
+        add_provider_account(
+            &client,
+            "openai",
+            "personal",
+            "sk-personal",
+            "gpt-5-mini",
+            "",
+        )
+        .expect("add personal account");
+
+        let config = load_provider_config(&client).expect("provider config");
+        assert_eq!(config.accounts.len(), 2);
+        assert!(config.accounts.iter().any(|account| {
+            account.provider == "openai"
+                && account.account == "work"
+                && account.api_key.as_deref() == Some("sk-work")
+        }));
+        assert!(config.accounts.iter().any(|account| {
+            account.provider == "openai"
+                && account.account == "personal"
+                && account.api_key.as_deref() == Some("sk-personal")
+        }));
+
+        let forms = provider_forms(&client);
+        assert_eq!(forms.len(), 2);
+        assert!(forms.iter().any(|form| form.account == "work"));
+        assert!(forms.iter().any(|form| form.account == "personal"));
+
+        let summaries = cluster_provider_summaries(&client);
+        assert_eq!(summaries.len(), 2);
+        assert!(summaries.iter().any(|summary| {
+            summary.id == "openai" && summary.account == "work" && summary.name.contains("work")
+        }));
+        assert!(summaries.iter().any(|summary| {
+            summary.id == "openai"
+                && summary.account == "personal"
+                && summary.name.contains("personal")
+        }));
+    }
+
+    #[test]
+    fn disabling_one_provider_account_keeps_other_accounts_available() {
+        let (client, _root) = test_client("disable-one-account");
+        add_provider_account(&client, "openai", "work", "sk-work", "gpt-5", "")
+            .expect("add work account");
+        add_provider_account(&client, "openai", "personal", "sk-personal", "gpt-5-mini", "")
+            .expect("add personal account");
+
+        set_provider_enabled(&client, "openai", "work", false).expect("disable work");
+
+        let summaries = cluster_provider_summaries(&client);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].account, "personal");
+    }
 }
 
 /// Resolve the `lm.providers` config object into a `ModelConfig` via the client.
@@ -203,6 +303,21 @@ pub fn provider_display_name(id: &str) -> String {
     .to_string()
 }
 
+pub fn provider_default_model(id: &str) -> String {
+    normalize_model_provider(id)
+        .map(|provider| sinomo_lm::effective_model_name(&provider, sinomo_lm::PROVIDER_DEFAULT_MODEL))
+        .unwrap_or_default()
+}
+
+fn provider_account_display_name(provider: &str, account: &str, provider_count: usize) -> String {
+    let provider_name = provider_display_name(provider);
+    if provider_count > 1 || account != DEFAULT_PROVIDER_ACCOUNT {
+        format!("{provider_name} ({account})")
+    } else {
+        provider_name
+    }
+}
+
 /// The providers shown in the Providers settings form. Some use API keys; `codex` and
 /// `github-copilot` use the OAuth device-login flow instead.
 pub const CONFIGURABLE_PROVIDERS: &[&str] = &[
@@ -219,7 +334,9 @@ pub const CONFIGURABLE_PROVIDERS: &[&str] = &[
 #[derive(Clone, Debug)]
 pub struct ProviderForm {
     pub provider: String,
+    pub account: String,
     pub display_name: String,
+    pub account_label: String,
     pub enabled: bool,
     pub default_model: String,
     pub api_base_url: String,
@@ -227,7 +344,7 @@ pub struct ProviderForm {
     pub reasoning_effort: Option<String>,
     /// Whether reasoning effort applies to this provider/model at all.
     pub supports_reasoning: bool,
-    /// Whether a local API-key credential is stored for this provider.
+    /// Whether an API-key credential is stored for this account.
     pub has_api_key: bool,
     /// Whether this provider authenticates via OAuth device login (vs an API key).
     pub uses_device_login: bool,
@@ -235,41 +352,65 @@ pub struct ProviderForm {
     pub signed_in: bool,
 }
 
-/// Build the per-provider configuration forms from `lm.providers` (+ local credential presence).
+/// Build the per-account configuration forms from `lm.providers` (+ legacy credential presence).
 pub fn provider_forms(client: &dyn ConfigClient) -> Vec<ProviderForm> {
     let config = load_provider_config(client).unwrap_or_default();
-    CONFIGURABLE_PROVIDERS
-        .iter()
-        .map(|&provider| {
-            let account = config.accounts.iter().find(|a| a.provider == provider);
-            let default_model = account
-                .and_then(|a| a.default_model.clone())
-                .unwrap_or_default();
-            let uses_device_login = sinomo_cli::provider_uses_device_login(provider);
-            let has_api_key = provider_has_api_key(client, provider);
-            let signed_in = if uses_device_login {
-                sinomo_cli::provider_signed_in(provider)
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for account in &config.accounts {
+        let provider =
+            normalize_model_provider(&account.provider).unwrap_or_else(|| account.provider.clone());
+        *counts.entry(provider).or_default() += 1;
+    }
+
+    let mut forms = Vec::new();
+    for account in &config.accounts {
+        let provider =
+            normalize_model_provider(&account.provider).unwrap_or_else(|| account.provider.clone());
+        if !CONFIGURABLE_PROVIDERS.contains(&provider.as_str()) {
+            continue;
+        }
+        let account_name = normalize_provider_account_name(Some(&account.account));
+        let default_model = account.default_model.clone().unwrap_or_default();
+        let uses_device_login = sinomo_cli::provider_uses_device_login(&provider);
+        let has_inline_api_key = account
+            .api_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty());
+        let has_legacy_api_key = account_name == DEFAULT_PROVIDER_ACCOUNT
+            && provider_has_legacy_api_key(client, &provider);
+        let has_api_key = has_inline_api_key || has_legacy_api_key;
+        let signed_in = if uses_device_login {
+            sinomo_cli::provider_signed_in(&provider)
+        } else {
+            has_api_key
+        };
+        forms.push(ProviderForm {
+            provider: provider.clone(),
+            account: account_name.clone(),
+            display_name: provider_account_display_name(
+                &provider,
+                &account_name,
+                counts.get(&provider).copied().unwrap_or(0),
+            ),
+            account_label: if account_name == DEFAULT_PROVIDER_ACCOUNT {
+                "Default".to_string()
             } else {
-                has_api_key
-            };
-            ProviderForm {
-                provider: provider.to_string(),
-                display_name: provider_display_name(provider),
-                enabled: account.map(|a| a.enabled).unwrap_or(false),
-                supports_reasoning: model_supports_reasoning_effort(provider, &default_model),
-                default_model,
-                api_base_url: account
-                    .and_then(|a| a.api_base_url.clone())
-                    .unwrap_or_default(),
-                reasoning_effort: account
-                    .and_then(|a| a.options.reasoning_effort)
-                    .map(|e| e.as_config_value().to_string()),
-                has_api_key,
-                uses_device_login,
-                signed_in,
-            }
-        })
-        .collect()
+                account_name.clone()
+            },
+            enabled: account.enabled,
+            supports_reasoning: model_supports_reasoning_effort(&provider, &default_model),
+            default_model,
+            api_base_url: account.api_base_url.clone().unwrap_or_default(),
+            reasoning_effort: account
+                .options
+                .reasoning_effort
+                .map(|e| e.as_config_value().to_string()),
+            has_api_key,
+            uses_device_login,
+            signed_in,
+        });
+    }
+    forms
 }
 
 /// Run a provider's OAuth device-login flow (codex / github-copilot). Blocks while polling — call
@@ -289,8 +430,8 @@ fn provider_credentials_key(provider: &str) -> String {
     format!("lm.credentials.{provider}")
 }
 
-/// Whether a non-empty local API-key credential is stored for `provider`.
-fn provider_has_api_key(client: &dyn ConfigClient, provider: &str) -> bool {
+/// Whether a non-empty legacy provider-level API-key credential is stored for `provider`.
+fn provider_has_legacy_api_key(client: &dyn ConfigClient, provider: &str) -> bool {
     client
         .get(&provider_credentials_key(provider))
         .ok()
@@ -307,19 +448,21 @@ fn provider_has_api_key(client: &dyn ConfigClient, provider: &str) -> bool {
 pub fn set_provider_enabled(
     client: &dyn ConfigClient,
     provider: &str,
+    account: &str,
     enabled: bool,
 ) -> Result<(), String> {
-    update_provider_account(client, provider, |account| account.enabled = enabled)
+    update_provider_account(client, provider, account, |account| account.enabled = enabled)
 }
 
 /// Set a provider's default model in `lm.providers` (empty clears it).
 pub fn set_provider_model(
     client: &dyn ConfigClient,
     provider: &str,
+    account: &str,
     model: &str,
 ) -> Result<(), String> {
     let model = model.trim().to_string();
-    update_provider_account(client, provider, move |account| {
+    update_provider_account(client, provider, account, move |account| {
         account.default_model = (!model.is_empty()).then_some(model);
     })
 }
@@ -328,10 +471,11 @@ pub fn set_provider_model(
 pub fn set_provider_base_url(
     client: &dyn ConfigClient,
     provider: &str,
+    account: &str,
     url: &str,
 ) -> Result<(), String> {
     let url = url.trim().to_string();
-    update_provider_account(client, provider, move |account| {
+    update_provider_account(client, provider, account, move |account| {
         account.api_base_url = (!url.is_empty()).then_some(url);
     })
 }
@@ -341,8 +485,9 @@ pub fn set_provider_base_url(
 pub fn cycle_provider_reasoning_effort(
     client: &dyn ConfigClient,
     provider: &str,
+    account: &str,
 ) -> Result<(), String> {
-    update_provider_account(client, provider, |account| {
+    update_provider_account(client, provider, account, |account| {
         account.options.reasoning_effort = next_reasoning_effort(account.options.reasoning_effort);
     })
 }
@@ -370,13 +515,14 @@ pub fn reasoning_effort_index(effort: Option<&str>) -> usize {
 pub fn set_provider_effort(
     client: &dyn ConfigClient,
     provider: &str,
+    account: &str,
     index: usize,
 ) -> Result<(), String> {
     let effort = match REASONING_EFFORT_OPTIONS.get(index) {
         Some(&"default") | None => None,
         Some(value) => Some(value.parse::<ProviderReasoningEffort>()?),
     };
-    update_provider_account(client, provider, move |account| {
+    update_provider_account(client, provider, account, move |account| {
         account.options.reasoning_effort = effort;
     })
 }
@@ -394,51 +540,101 @@ fn next_reasoning_effort(
     }
 }
 
-/// Store a provider's API key as a local-only credential (`lm.credentials.<provider>`). Keys are
-/// never written to `lm.providers` (cluster-shareable) — they stay node-local.
+/// Store an API-key credential on a specific provider account.
 pub fn set_provider_api_key(
     client: &dyn ConfigClient,
     provider: &str,
+    account: &str,
     api_key: &str,
 ) -> Result<(), String> {
     let api_key = api_key.trim();
     if api_key.is_empty() {
         return Err("API key cannot be empty".to_string());
     }
-    let created_at_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let value = serde_json::json!({
-        "api_key": api_key,
-        "source": "manual",
-        "created_at_unix": created_at_unix,
-    });
-    client
-        .set(
-            &provider_credentials_key(provider),
-            value,
-            ConfigWriteTarget::Auto,
-        )
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    let api_key = api_key.to_string();
+    update_provider_account(client, provider, account, move |account| {
+        account.api_key = Some(api_key);
+    })
 }
 
-/// Load `lm.providers`, mutate (or create) the account for `provider`, and write it back.
+/// Add a provider account and write its initial credentials/defaults.
+pub fn add_provider_account(
+    client: &dyn ConfigClient,
+    provider: &str,
+    account: &str,
+    api_key: &str,
+    model: &str,
+    api_base_url: &str,
+) -> Result<(), String> {
+    let provider = normalize_configurable_provider(provider)?;
+    let account_name = normalize_provider_account_name(Some(account));
+    let uses_device_login = sinomo_cli::provider_uses_device_login(&provider);
+    let api_key = api_key.trim().to_string();
+    if !uses_device_login && api_key.is_empty() {
+        return Err("API key cannot be empty".to_string());
+    }
+
+    let mut config = load_provider_config(client).unwrap_or_default();
+    if config.accounts.iter().any(|candidate| {
+        normalize_model_provider(&candidate.provider).as_deref() == Some(provider.as_str())
+            && normalize_provider_account_name(Some(&candidate.account)) == account_name
+    }) {
+        return Err(format!(
+            "{} already has an account named {}",
+            provider_display_name(&provider),
+            account_name
+        ));
+    }
+
+    let account_config = ProviderAccountConfig {
+        provider: provider.clone(),
+        account: account_name.clone(),
+        default_model: optional_trimmed(model),
+        api_base_url: optional_trimmed(api_base_url),
+        api_key: (!uses_device_login).then_some(api_key),
+        enabled: true,
+        options: LanguageModelProviderOptions::default(),
+        model_options: Vec::new(),
+    };
+    upsert_provider_account_config(&mut config, account_config).map_err(|e| e.to_string())?;
+    if config.default_provider.is_none() {
+        config.default_provider = Some(provider.clone());
+    }
+    if config.default_account.is_none() {
+        config.default_account = Some(account_name.clone());
+    }
+    if config.default_model.is_none()
+        && let Some(account) = config.accounts.iter().find(|candidate| {
+            candidate.provider == provider
+                && normalize_provider_account_name(Some(&candidate.account)) == account_name
+        })
+    {
+        config.default_model = account.default_model.clone();
+    }
+    write_provider_config(client, &config)
+}
+
+/// Load `lm.providers`, mutate (or create) the account for `provider`/`account`, and write it back.
 fn update_provider_account(
     client: &dyn ConfigClient,
     provider: &str,
+    account: &str,
     edit: impl FnOnce(&mut ProviderAccountConfig),
 ) -> Result<(), String> {
+    let provider = normalize_configurable_provider(provider)?;
+    let account_name = normalize_provider_account_name(Some(account));
     let mut config = load_provider_config(client).unwrap_or_default();
     let mut account = config
         .accounts
         .iter()
-        .find(|a| a.provider == provider)
+        .find(|a| {
+            normalize_model_provider(&a.provider).as_deref() == Some(provider.as_str())
+                && normalize_provider_account_name(Some(&a.account)) == account_name
+        })
         .cloned()
         .unwrap_or_else(|| ProviderAccountConfig {
-            provider: provider.to_string(),
-            account: "default".to_string(),
+            provider: provider.clone(),
+            account: account_name.clone(),
             default_model: None,
             api_base_url: None,
             api_key: None,
@@ -448,6 +644,25 @@ fn update_provider_account(
         });
     edit(&mut account);
     upsert_provider_account_config(&mut config, account).map_err(|e| e.to_string())?;
+    write_provider_config(client, &config)
+}
+
+fn normalize_configurable_provider(provider: &str) -> Result<String, String> {
+    let provider = normalize_model_provider(provider)
+        .ok_or_else(|| format!("unknown provider `{}`", provider.trim()))?;
+    if CONFIGURABLE_PROVIDERS.contains(&provider.as_str()) {
+        Ok(provider)
+    } else {
+        Err(format!("provider `{provider}` is not configurable in the app"))
+    }
+}
+
+fn optional_trimmed(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn write_provider_config(client: &dyn ConfigClient, config: &ModelConfig) -> Result<(), String> {
     let value = serde_json::to_value(&config).map_err(|e| e.to_string())?;
     client
         .set(LM_PROVIDER_CONFIG_KEY, value, ConfigWriteTarget::Auto)

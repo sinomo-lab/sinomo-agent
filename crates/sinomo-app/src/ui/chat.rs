@@ -54,7 +54,7 @@ use sinomo_runtime::local::SinomoDataDir;
 use crate::backend::Backend;
 use crate::backend::chat_engine::{ChatCommand, ChatEvent, ChatHandle, ChatRole, RuntimeInfo};
 use crate::backend::sessions::{self, StoredMessage};
-use crate::state::Shared;
+use crate::state::{Shared, Tab};
 use crate::theme::Palette;
 use crate::ui::widgets;
 
@@ -725,16 +725,20 @@ impl ChatState {
                 self.scroll = 0.0;
             }
             ChatEvent::Models { provider, models } => {
-                if let Some(idx) = self.providers.iter().position(|p| p.id == provider) {
-                    self.providers[idx].models = models;
-                    // Re-align the model index to the current model if it's in the list.
-                    if idx == self.provider_idx {
-                        self.model_idx = self.providers[idx]
-                            .models
-                            .iter()
-                            .position(|m| *m == self.info.model)
-                            .unwrap_or(0);
+                let mut updated_current = false;
+                for (idx, summary) in self.providers.iter_mut().enumerate() {
+                    if summary.id == provider {
+                        summary.models = models.clone();
+                        updated_current |= idx == self.provider_idx;
                     }
+                }
+                // Re-align the model index to the current model if it's in the list.
+                if updated_current {
+                    self.model_idx = self.providers[self.provider_idx]
+                        .models
+                        .iter()
+                        .position(|m| *m == self.info.model)
+                        .unwrap_or(0);
                 }
                 self.models_loading = false;
             }
@@ -755,7 +759,14 @@ impl ChatState {
         if let Some(idx) = self
             .providers
             .iter()
-            .position(|p| p.id == self.info.provider)
+            .position(|p| {
+                p.id == self.info.provider
+                    && self
+                        .info
+                        .account
+                        .as_deref()
+                        .is_none_or(|account| p.account == account)
+            })
         {
             self.provider_idx = idx;
             if let Some(midx) = self.providers[idx]
@@ -780,6 +791,10 @@ impl ChatState {
     fn submit(&mut self) {
         let text = self.input.trim().to_string();
         if text.is_empty() {
+            return;
+        }
+        if self.providers.is_empty() {
+            self.notice = Some("set up a provider before sending".to_string());
             return;
         }
         if self.streaming {
@@ -830,7 +845,36 @@ impl ChatState {
 
     /// Whether the composer has a non-empty draft that can be submitted.
     fn can_send(&self) -> bool {
-        !self.input.trim().is_empty()
+        !self.input.trim().is_empty() && !self.providers.is_empty()
+    }
+
+    /// Replace the configured provider-account list after Settings changes it.
+    pub fn refresh_providers(&mut self, providers: Vec<ProviderSummary>) {
+        let previous = self
+            .current_provider()
+            .map(|provider| (provider.id.clone(), provider.account.clone()));
+        self.providers = providers;
+        self.models_loading = false;
+        if self.providers.is_empty() {
+            self.provider_idx = 0;
+            self.model_idx = 0;
+            return;
+        }
+        self.provider_idx = previous
+            .and_then(|(provider, account)| {
+                self.providers
+                    .iter()
+                    .position(|candidate| candidate.id == provider && candidate.account == account)
+            })
+            .unwrap_or(0);
+        let model_len = self.current_provider().map(|p| p.models.len()).unwrap_or(0);
+        if self.model_idx >= model_len {
+            self.model_idx = 0;
+        }
+        self.maybe_fetch_models();
+        if !self.current_model().is_empty() {
+            self.push_model_selection();
+        }
     }
 
     /// Update the composer draft (bound to the composer `TextArea` via its `on_change`).
@@ -866,12 +910,16 @@ impl ChatState {
             .current_provider()
             .map(|p| p.id.clone())
             .unwrap_or_default();
+        let account = self
+            .current_provider()
+            .map(|p| p.account.clone())
+            .unwrap_or_else(|| sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string());
         let model = self.current_model();
         if !provider.is_empty() {
             self.handle.send_command(ChatCommand::SetModel {
                 provider,
                 model,
-                account: "default".to_string(),
+                account,
             });
         }
     }
@@ -912,7 +960,7 @@ impl ChatState {
         }
         let needs_fetch = self
             .current_provider()
-            .map(|p| p.models.is_empty())
+            .map(|p| p.models.len() <= 1)
             .unwrap_or(false);
         if !needs_fetch {
             return;
@@ -1814,7 +1862,7 @@ impl TranscriptView {
 /// loading flag — anything that changes the *set* of options or which selectors are shown. (The
 /// selected-index reactivity is handled by each `Select`'s `selected_when`; this only drives the
 /// rebuild when the option lists themselves change.)
-fn selector_signature(shared: &Shared) -> (usize, usize, usize, bool, bool) {
+fn selector_signature(shared: &Shared) -> (usize, usize, usize, bool, bool, String) {
     let chat = shared.chat();
     (
         chat.provider_idx,
@@ -1822,11 +1870,31 @@ fn selector_signature(shared: &Shared) -> (usize, usize, usize, bool, bool) {
         chat.current_models().len(),
         chat.effort_visible(),
         chat.models_loading,
+        chat.providers
+            .iter()
+            .map(|provider| format!("{}@{}:{}", provider.id, provider.account, provider.name))
+            .collect::<Vec<_>>()
+            .join("\u{1f}"),
     )
 }
 
 /// Build the provider / model / effort selector row for the current selection.
 fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    if shared.chat().providers.is_empty() {
+        let setup = {
+            let s = shared.clone();
+            sui::Button::new("Setup provider")
+                .icon(IconGlyph::Add)
+                .theme_when(composer_control_reader(reader))
+                .on_press(move || open_provider_setup(&s))
+        };
+        let row = Stack::horizontal()
+            .spacing(8.0)
+            .alignment(Alignment::Center)
+            .with_child(SizedBox::new().height(SELECTOR_H).with_child(setup));
+        return WidgetPod::new(row);
+    }
+
     let provider = {
         let s = shared.clone();
         let names: Vec<String> = shared
@@ -1896,6 +1964,14 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     }
 
     WidgetPod::new(row)
+}
+
+fn open_provider_setup(shared: &Shared) {
+    let mut app = shared.borrow_mut();
+    app.active_tab = Tab::Settings;
+    if let Some(ready) = app.ready.as_mut() {
+        ready.settings.open_provider_add();
+    }
 }
 
 /// The composer's bottom row: a flexible message `TextArea` and a fixed-size action slot. The input
@@ -2204,6 +2280,12 @@ fn view_signature(shared: &Shared) -> u64 {
     chat.effort_visible().hash(&mut h);
     chat.streaming.hash(&mut h);
     chat.models_loading.hash(&mut h);
+    chat.providers.len().hash(&mut h);
+    for provider in &chat.providers {
+        provider.id.hash(&mut h);
+        provider.account.hash(&mut h);
+        provider.name.hash(&mut h);
+    }
     chat.sessions.len().hash(&mut h);
     for s in &chat.sessions {
         s.title.hash(&mut h);
@@ -2661,6 +2743,18 @@ mod tests {
     use crate::backend::Backend;
     use std::time::{Duration, Instant};
 
+    fn seed_default_provider(state: &mut ChatState) {
+        if state.providers.is_empty() {
+            state.providers.push(ProviderSummary {
+                id: "openai".to_string(),
+                account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
+                name: "OpenAI".to_string(),
+                models: vec!["gpt-5".to_string()],
+            });
+        }
+        state.models_loading = false;
+    }
+
     #[test]
     fn composer_control_reader_keeps_footer_text_compact() {
         let reader: ThemeReader = Rc::new(DefaultTheme::default);
@@ -2678,6 +2772,7 @@ mod tests {
     fn submit_pushes_user_and_agent_placeholder_and_sets_streaming() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
         state.set_draft("hello there".to_string());
         state.submit();
         assert!(state.streaming, "submitting begins a streaming turn");
@@ -2696,6 +2791,7 @@ mod tests {
     fn empty_submit_is_noop_and_streaming_submit_queues_follow_up() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
         // Empty draft → nothing happens.
         state.submit();
         assert!(!state.streaming);
@@ -2730,6 +2826,7 @@ mod tests {
     fn streamed_tokens_append_to_the_last_agent_message() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
         state.set_draft("hi".to_string());
         state.submit();
         // Tokens append to the trailing (empty) agent placeholder rather than pushing new bubbles.
@@ -2976,6 +3073,7 @@ mod tests {
         let mut state = ChatState::new(&backend);
         assert!(!state.can_send(), "empty draft cannot send");
         state.set_draft("ok".to_string());
+        seed_default_provider(&mut state);
         assert!(state.can_send(), "a non-empty draft can send");
         state.streaming = true;
         assert!(state.can_send(), "a non-empty draft can queue while streaming");
@@ -2994,11 +3092,9 @@ mod tests {
         assert_eq!(state.model_idx, 0, "switching providers resets the model");
     }
 
-    /// Issue 2: the default/initial provider's model list must be fetched eagerly at construction —
-    /// without waiting for the user to toggle providers — so the model picker is never stuck on
-    /// "No models". `cluster_provider_summaries` always seeds providers with empty model lists, so
-    /// when there is a default provider, `ChatState::new` must have kicked the async fetch
-    /// (`models_loading` set; the result lands later via `ChatEvent::Models`).
+    /// Issue 2: the default/initial provider's full model list must be fetched eagerly at
+    /// construction. Configured accounts seed a usable default model immediately, then
+    /// `ChatState::new` kicks the async full-list fetch.
     #[test]
     fn new_fetches_default_provider_models() {
         let backend = Backend::local_fallback();
@@ -3011,8 +3107,8 @@ mod tests {
         assert!(
             state
                 .current_provider()
-                .is_some_and(|p| p.models.is_empty()),
-            "providers are seeded with empty model lists (fetched on demand)"
+                .is_some_and(|p| !p.models.is_empty()),
+            "providers are seeded with a usable default model"
         );
         assert!(
             state.models_loading,
@@ -3052,6 +3148,7 @@ mod tests {
     fn submit_is_the_enter_to_send_entry_point() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
         state.set_draft("ping".to_string());
         assert!(state.can_send(), "a non-empty draft is sendable on Enter");
         // What `on_submit(|_| s.chat_mut().submit())` runs:
