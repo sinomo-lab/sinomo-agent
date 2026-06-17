@@ -1023,12 +1023,16 @@ async fn relay_route_plan_cached(
             Ok::<Vec<(NodeId, Vec<ClusterEndpointRecord>)>, NetworkError>(next_hops
                 .into_iter()
                 .filter_map(|next_hop_id| {
-                    let endpoints = cluster_relay_next_hop_endpoints_with_graph(
+                    let allow_unknown_locally_learned_endpoint =
+                        mode == ClusterRelayRoutePlanMode::DirectTargetFallback
+                            && next_hop_id == target_node_id;
+                    let endpoints = cluster_relay_next_hop_endpoints_with_graph_and_policy(
                         &paths,
                         &graph,
                         &state,
                         &local_node_id,
                         &next_hop_id,
+                        allow_unknown_locally_learned_endpoint,
                     );
                     (!endpoints.is_empty()).then_some((next_hop_id, endpoints))
                 })
@@ -1431,6 +1435,7 @@ fn relay_member_has_usable_bridge_endpoint(
                 has_healthy_next_hop_endpoint,
                 has_reachable_next_hop_endpoint,
                 local_graph_has_reachable_targets,
+                false,
             )
         })
 }
@@ -1446,22 +1451,23 @@ pub fn cluster_relay_next_hops_with_direct_target_fallback(
     let mut next_hops =
         cluster_relay_next_hops(graph, state, local_node_id, target_node_id, excluded);
     if next_hops.is_empty()
-        && cluster_relay_can_try_direct_target_fallback(graph, local_node_id, target_node_id)
-        && !cluster_relay_next_hop_endpoints_with_graph(
+        && cluster_relay_can_try_direct_target_fallback(graph, state, local_node_id, target_node_id)
+        && !cluster_relay_next_hop_endpoints_with_graph_and_policy(
             paths,
             graph,
             state,
             local_node_id,
             target_node_id,
+            true,
         )
         .is_empty()
     {
         // Startup joins and dual-homed bridge nodes can race ahead of onward
-        // connectivity publication. If the graph has not learned local edges or
-        // has concrete target reachability, try delivering directly instead of
-        // dropping the relay on stale graph state. Endpoint selection still
-        // suppresses membership-only hostnames once the local graph has any
-        // reachable edge.
+        // connectivity publication. If the graph has not learned local edges,
+        // has concrete target reachability, or the target has a locally learned
+        // bridge hostname, try delivering directly instead of dropping the relay
+        // on stale graph state. Endpoint selection still suppresses unproven
+        // socket/IP fallbacks once the local graph has any reachable edge.
         next_hops.push(target_node_id.clone());
     }
     next_hops
@@ -1517,6 +1523,7 @@ fn relay_candidate_is_known_shadow_daemon(
 
 fn cluster_relay_can_try_direct_target_fallback(
     graph: &ClusterConnectivityGraph,
+    state: &ClusterBootstrapState,
     local_node_id: &NodeId,
     target_node_id: &NodeId,
 ) -> bool {
@@ -1524,6 +1531,23 @@ fn cluster_relay_can_try_direct_target_fallback(
         .best_reachable_endpoint(local_node_id, target_node_id)
         .is_some()
         || graph.reachable_targets(local_node_id).is_empty()
+        || cluster_relay_target_has_locally_learned_endpoint(state, target_node_id)
+}
+
+fn cluster_relay_target_has_locally_learned_endpoint(
+    state: &ClusterBootstrapState,
+    target_node_id: &NodeId,
+) -> bool {
+    state
+        .members
+        .iter()
+        .find(|member| member.node_id == *target_node_id && member.state.is_authorized())
+        .is_some_and(|member| {
+            member
+                .endpoints
+                .iter()
+                .any(crate::locally_learned_bridge_route_endpoint)
+        })
 }
 
 pub fn cluster_relay_next_hop_endpoints(
@@ -1542,6 +1566,24 @@ pub fn cluster_relay_next_hop_endpoints_with_graph(
     state: &ClusterBootstrapState,
     source_node_id: &NodeId,
     node_id: &NodeId,
+) -> Vec<ClusterEndpointRecord> {
+    cluster_relay_next_hop_endpoints_with_graph_and_policy(
+        paths,
+        graph,
+        state,
+        source_node_id,
+        node_id,
+        false,
+    )
+}
+
+fn cluster_relay_next_hop_endpoints_with_graph_and_policy(
+    paths: &ClusterPaths,
+    graph: &ClusterConnectivityGraph,
+    state: &ClusterBootstrapState,
+    source_node_id: &NodeId,
+    node_id: &NodeId,
+    allow_unknown_locally_learned_endpoint: bool,
 ) -> Vec<ClusterEndpointRecord> {
     let mut endpoints = Vec::new();
     let mut seen = BTreeSet::new();
@@ -1578,6 +1620,7 @@ pub fn cluster_relay_next_hop_endpoints_with_graph(
                     has_healthy_next_hop_endpoint,
                     has_reachable_next_hop_endpoint,
                     local_graph_has_reachable_targets,
+                    allow_unknown_locally_learned_endpoint,
                 )
             })
         {
@@ -1595,6 +1638,7 @@ pub fn cluster_relay_next_hop_endpoints_with_graph(
                 has_healthy_next_hop_endpoint,
                 has_reachable_next_hop_endpoint,
                 local_graph_has_reachable_targets,
+                allow_unknown_locally_learned_endpoint,
             )
         })
     {
@@ -1610,6 +1654,7 @@ fn cluster_relay_next_hop_endpoint_is_usable(
     has_healthy_next_hop_endpoint: bool,
     has_reachable_next_hop_endpoint: bool,
     local_graph_has_reachable_targets: bool,
+    allow_unknown_locally_learned_endpoint: bool,
 ) -> bool {
     match graph.state_for_endpoint(endpoint) {
         Some(crate::ClusterConnectivityState::Healthy) => true,
@@ -1620,7 +1665,12 @@ fn cluster_relay_next_hop_endpoint_is_usable(
                     .reachable_targets(source_node_id)
                     .contains(&endpoint.node_id)
         }
-        None => !has_healthy_next_hop_endpoint && !local_graph_has_reachable_targets,
+        None => {
+            (!has_healthy_next_hop_endpoint && !local_graph_has_reachable_targets)
+                || (allow_unknown_locally_learned_endpoint
+                    && !has_reachable_next_hop_endpoint
+                    && crate::locally_learned_bridge_route_endpoint(endpoint))
+        }
     }
 }
 
@@ -2384,20 +2434,21 @@ mod tests {
     }
 
     #[test]
-    fn direct_target_fallback_suppresses_member_only_target_endpoint_once_graph_has_edges() {
-        let root = sinomo_testdir::TestDir::new("sinomo-network-relay-direct-fallback-member-only");
+    fn direct_target_fallback_uses_locally_learned_target_hostname_after_stale_bridge() {
+        let root =
+            sinomo_testdir::TestDir::new("sinomo-network-relay-direct-fallback-target-hostname");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
         paths.ensure().expect("paths");
         let now = OffsetDateTime::now_utc();
-        let cluster_id = ClusterId::from_legacy_named("cluster_relay_direct_fallback_member_only")
+        let cluster_id = ClusterId::from_legacy_named("cluster_relay_direct_fallback_hostname")
             .expect("cluster");
-        let local = nid("node_relay_direct_fallback_member_only_local");
-        let bridge = nid("node_relay_direct_fallback_member_only_bridge");
-        let target = nid("node_relay_direct_fallback_member_only_target");
+        let local = nid("node_relay_direct_fallback_hostname_local");
+        let stale_bridge = nid("node_relay_direct_fallback_hostname_stale_bridge");
+        let target = nid("node_relay_direct_fallback_hostname_target");
         let mut state = ClusterBootstrapState::initialized_locally(
             cluster_id,
-            "relay direct fallback reachable",
+            "relay direct fallback target hostname",
             local.clone(),
             "local",
             "pk-local",
@@ -2417,7 +2468,7 @@ mod tests {
         state.members.push(target_member);
         let graph = graph(vec![edge(
             &local,
-            &bridge,
+            &stale_bridge,
             ClusterConnectivityState::Healthy,
         )]);
 
@@ -2427,12 +2478,13 @@ mod tests {
             &state,
             &local,
             &target,
-            std::slice::from_ref(&bridge),
+            std::slice::from_ref(&stale_bridge),
         );
 
-        assert!(
-            next_hops.is_empty(),
-            "after the local graph has reachable edges, membership-only target hostnames are not safe relay evidence"
+        assert_eq!(
+            next_hops,
+            vec![target],
+            "a relay hop that only knows the stale previous bridge should still try the target's locally learned Docker hostname"
         );
     }
 

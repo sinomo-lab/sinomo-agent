@@ -19,8 +19,9 @@
 #   9. bulk perf      — small-file bulk write/read throughput with process I/O
 #                       amplification checks and read-side write_bytes == 0
 #   10. disk baseline — node-local raw file write/read baseline for DFS comparison
-#   11. large-file perf — large object write/read throughput with process I/O
-#                       amplification checks and read-side write_bytes == 0
+#   11. large-file perf — large object write throughput, cross-node convergence
+#                       latency, final-read throughput, process I/O amplification
+#                       checks, and read-side write_bytes == 0
 #   12. disk damage   — delete one durable loose blob and read through the
 #                       remaining replica without read-side disk writes
 #   13. network heal  — temporarily disconnect a leaf node, write while it is
@@ -54,7 +55,7 @@
 #   SINOMO_TEST_LARGE_BYTES    bytes in large-file performance leg (default 67108864)
 #   SINOMO_TEST_LARGE_TIMEOUT  large-file write/read timeout seconds (default 180)
 #   SINOMO_TEST_LARGE_MIN_WRITE_BYTES_PER_SEC min large writer throughput (default 4194304)
-#   SINOMO_TEST_LARGE_MIN_READ_BYTES_PER_SEC  min cross-node large read/convergence throughput (default 4194304)
+#   SINOMO_TEST_LARGE_MIN_READ_BYTES_PER_SEC  min final large read throughput after convergence (default 4194304)
 #   SINOMO_TEST_LARGE_MIN_RAW_WRITE_RATIO min large DFS write / raw write baseline ratio (default 0.33)
 #   SINOMO_TEST_LARGE_MIN_RAW_READ_RATIO  min large DFS read / raw read baseline ratio (default 0, disabled)
 #   SINOMO_TEST_LARGE_RAW_SYNC_WRITE      sync raw baseline writes before timing completes (default 1)

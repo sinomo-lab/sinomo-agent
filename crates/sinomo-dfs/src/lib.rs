@@ -508,6 +508,7 @@ pub fn decode_dfs_protocol_frame_rpc_response(
 
 pub(crate) const DFS_BLOB_INLINE_LIMIT_BYTES: usize = 1024 * 1024;
 const DFS_BLOB_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const DFS_DIRECT_REMOTE_READ_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const DFS_STAGE_CHUNK_WINDOW_SIZE: u32 = 4;
 const DFS_READ_CHUNK_WINDOW_SIZE: u32 = 4;
 const DFS_FETCH_CHUNK_WINDOW_SIZE: u32 = 4;
@@ -11574,6 +11575,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             .unwrap_or((DFS_BLOB_CHUNK_BYTES as u64) * u64::from(DFS_READ_CHUNK_WINDOW_SIZE));
         let adaptive_read_window =
             self.adaptive_read_chunk_window(target_node_id, transfer_size_bytes);
+        let direct_uncached_full_read = !cache_response
+            && range.is_none()
+            && object
+                .content_size_bytes
+                .is_some_and(|size| size <= DFS_DIRECT_REMOTE_READ_MAX_BYTES);
         let (start_chunk_index, max_chunks, window_end_chunk_index) = match range {
             Some(_) if chunked_range => (
                 0,
@@ -11581,6 +11587,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 Self::read_window_end_chunk_index(0, adaptive_read_window),
             ),
             Some(_) => (0, 0, None),
+            None if direct_uncached_full_read => (0, 0, None),
             None => (
                 0,
                 adaptive_read_window,
@@ -20553,7 +20560,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         match &result {
             DfsReadResult::Found(_) if sent_chunked_response => {}
             DfsReadResult::RangeFound(_) if sent_chunked_response => {}
-            DfsReadResult::Found(data) if data.bytes.len() > DFS_BLOB_INLINE_LIMIT_BYTES => {
+            DfsReadResult::Found(data)
+                if data.bytes.len() > DFS_BLOB_INLINE_LIMIT_BYTES
+                    && !direct_full_read_response_allowed(&request, data.bytes.len() as u64) =>
+            {
                 self.send_networked_read_response_chunks(&requester_node_id, &request, data)?;
             }
             _ => {
@@ -20677,6 +20687,24 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     || request.start_chunk_index != 0
                     || request.max_chunks != 0
                 {
+                    if direct_full_read_response_allowed(request, total_size_bytes) {
+                        let Some(bytes) = self.read_blob_for_direct_remote_response(
+                            &content_hash,
+                            total_size_bytes,
+                        )?
+                        else {
+                            return Ok(Some((DfsReadResult::NotFound, false)));
+                        };
+                        return Ok(Some((
+                            DfsReadResult::Found(DfsReadData {
+                                object_id,
+                                version,
+                                content_hash: Some(content_hash),
+                                bytes,
+                            }),
+                            false,
+                        )));
+                    }
                     let window_offset =
                         chunk_prefix_bytes(total_size_bytes, request.start_chunk_index);
                     let range_len = read_response_window_range_len(
@@ -20738,6 +20766,39 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             .map_err(|source| DfsError::ContentStore {
                 message: format!("failed to read blob {content_hash}: {source}"),
             })?;
+        Ok(Some(bytes))
+    }
+
+    fn read_blob_for_direct_remote_response(
+        &self,
+        content_hash: &str,
+        expected_size_bytes: u64,
+    ) -> Result<Option<Vec<u8>>, DfsError> {
+        if expected_size_bytes > DFS_DIRECT_REMOTE_READ_MAX_BYTES {
+            return Ok(None);
+        }
+        let mut reader = match self.content.open_blob_stream(content_hash) {
+            Ok(reader) => reader,
+            Err(_) => return Ok(None),
+        };
+        if reader.size_bytes() != expected_size_bytes {
+            return Ok(None);
+        }
+        let capacity = dfs_byte_count_to_usize("DFS direct remote read", expected_size_bytes)?;
+        let mut bytes = Vec::with_capacity(capacity);
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|source| DfsError::ContentStore {
+                message: format!("failed to read blob {content_hash}: {source}"),
+            })?;
+        if bytes.len() != capacity {
+            return Err(DfsError::ContentStore {
+                message: format!(
+                    "failed to read full blob {content_hash}: expected {capacity} bytes, actual {}",
+                    bytes.len()
+                ),
+            });
+        }
         Ok(Some(bytes))
     }
 
@@ -25750,6 +25811,14 @@ fn range_transfer_size_bytes(
     let start = requested_offset.min(object_total_size_bytes);
     let max_bytes = u64::try_from(requested_max_bytes).unwrap_or(u64::MAX);
     object_total_size_bytes.saturating_sub(start).min(max_bytes)
+}
+
+fn direct_full_read_response_allowed(request: &DfsReadRequest, total_size_bytes: u64) -> bool {
+    request.range_offset.is_none()
+        && request.range_max_bytes.is_none()
+        && request.start_chunk_index == 0
+        && request.max_chunks == 0
+        && total_size_bytes <= DFS_DIRECT_REMOTE_READ_MAX_BYTES
 }
 
 fn dfs_byte_count_to_usize(label: &str, value: u64) -> Result<usize, DfsError> {

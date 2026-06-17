@@ -11688,12 +11688,14 @@ fn hinted_remote_read_serves_blob_without_local_metadata() {
     let server = NodeId::from_legacy_named("node_hinted_read_server").expect("node");
     let object_id = DfsObjectId::from_legacy_named("obj_hinted_read_no_metadata").expect("object");
     let version = DfsVersion::from_legacy_named("version_hinted_read").expect("version");
-    let bytes = b"content-addressed remote read must not require metadata";
+    let bytes = (0..(DFS_BLOB_INLINE_LIMIT_BYTES + 8192))
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
     let network = InProcessNetwork::new();
     let mut requester_transport = network.add_node(requester.clone());
     let content = LocalContentStore::new(root.join("server-content")).expect("server content");
     let manifest = content
-        .put_object_version(object_id.as_str(), version.as_str(), bytes)
+        .put_object_version(object_id.as_str(), version.as_str(), &bytes)
         .expect("seed content blob");
     let mut dfs = NetworkedDfsService::new(network.add_node(server), content);
 
@@ -11727,8 +11729,87 @@ fn hinted_remote_read_serves_blob_without_local_metadata() {
         [DfsNetworkMessage::ReadResponse(DfsReadResponse {
             result: DfsReadResult::Found(DfsReadData { bytes: result_bytes, .. }),
             ..
-        })] if result_bytes == bytes
+        })] if result_bytes == &bytes
     ));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn uncached_large_remote_read_uses_direct_response() {
+    let root = temp_root("uncached-large-remote-read-direct-response");
+    let owner = NodeId::from_legacy_named("node_uncached_direct_owner").expect("node");
+    let reader = NodeId::from_legacy_named("node_uncached_direct_reader").expect("node");
+    let network = InProcessNetwork::new();
+    let mut owner_transport = network.add_node(owner.clone());
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        LocalContentStore::new(root.join("owner")).expect("owner content"),
+    );
+    let mut reader_dfs = NetworkedDfsService::new(
+        network.add_node(reader.clone()),
+        LocalContentStore::new(root.join("reader")).expect("reader content"),
+    );
+    let file_system = file_system(owner.clone());
+    owner_dfs
+        .add_file_system(file_system.clone())
+        .expect("owner filesystem");
+    reader_dfs
+        .add_file_system(file_system)
+        .expect("reader filesystem");
+
+    let mut object = file_metadata(owner.clone());
+    object.object_id = DfsObjectId::from_legacy_named("obj_uncached_direct_read").expect("object");
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![owner.clone()];
+    let object_id = object.object_id.clone();
+    let bytes = (0..(DFS_BLOB_INLINE_LIMIT_BYTES + 8192))
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    owner_dfs
+        .put_local_object_version(object, &bytes)
+        .expect("seed owner object");
+    reader_dfs
+        .add_object_metadata(
+            owner_dfs
+                .metadata()
+                .object(&object_id)
+                .expect("owner metadata")
+                .clone(),
+        )
+        .expect("replicate metadata");
+
+    assert_eq!(
+        reader_dfs
+            .request_remote_object_read_without_cache(&object_id)
+            .expect("request uncached read"),
+        vec![owner.clone()]
+    );
+    let request = drain_dfs_messages(&mut owner_transport)
+        .into_iter()
+        .find_map(|message| match message {
+            DfsNetworkMessage::ReadRequest(request) => Some(request),
+            _ => None,
+        })
+        .expect("read request");
+    assert_eq!(request.start_chunk_index, 0);
+    assert_eq!(request.max_chunks, 0);
+
+    owner_dfs
+        .handle_networked_read_request(reader.clone(), request)
+        .expect("owner sends direct response");
+    let events = reader_dfs
+        .process_incoming()
+        .expect("reader accepts direct response");
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteReadCompleted {
+                object_id: completed_object_id,
+                result: DfsReadResult::Found(DfsReadData { bytes: result_bytes, .. }),
+                ..
+            } if completed_object_id == &object_id && result_bytes == &bytes
+        )
+    }));
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -12100,7 +12181,9 @@ fn chunked_remote_read_retry_resumes_from_received_prefix() {
     object.policy = DfsObjectPolicy::ReplicatedEventual;
     object.current_locations = vec![owner.clone()];
     let object_id = object.object_id.clone();
-    let total_chunks = DFS_LOCAL_CHUNK_WINDOW_SIZE + 1;
+    let byte_budget_window =
+        (DFS_ADAPTIVE_TRANSFER_WINDOW_MAX_BYTES / DFS_BLOB_CHUNK_BYTES as u64) as u32;
+    let total_chunks = byte_budget_window + 1;
     let bytes_len = DFS_BLOB_CHUNK_BYTES * (total_chunks as usize - 1) + 17;
     let bytes = (0..bytes_len)
         .map(|index| (index % 251) as u8)
@@ -12134,7 +12217,8 @@ fn chunked_remote_read_retry_resumes_from_received_prefix() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(first_window.len(), DFS_LOCAL_CHUNK_WINDOW_SIZE as usize);
+    let expected_window = reader_dfs.adaptive_read_chunk_window(&owner, bytes.len() as u64);
+    assert_eq!(first_window.len(), expected_window as usize);
     let first_chunk = first_window.remove(0);
     assert_eq!(first_chunk.chunk_index, 0);
     let request_id = first_chunk.request_id.clone();
@@ -12173,7 +12257,7 @@ fn chunked_remote_read_retry_resumes_from_received_prefix() {
         .expect("retry read request");
     assert_eq!(retry_request.request_id, request_id);
     assert_eq!(retry_request.start_chunk_index, 1);
-    assert_eq!(retry_request.max_chunks, DFS_LOCAL_CHUNK_WINDOW_SIZE);
+    assert_eq!(retry_request.max_chunks, expected_window);
 
     owner_dfs
         .handle_networked_read_request(reader.clone(), retry_request)
@@ -12769,35 +12853,46 @@ fn remote_read_rejection_from_stale_location_falls_back_to_next_source() {
     let hash = object.content_hash.clone();
     reader_dfs.add_object_metadata(object).expect("object");
 
+    let requested = reader_dfs
+        .request_remote_object_read(&object_id)
+        .expect("first read request");
+    assert_eq!(requested.len(), 1);
+    let rejected_source = requested[0].clone();
+    let fallback_source = if rejected_source == source_a {
+        source_b.clone()
+    } else {
+        source_a.clone()
+    };
     assert_eq!(
-        reader_dfs
-            .request_remote_object_read(&object_id)
-            .expect("first read request"),
-        vec![source_a.clone()]
-    );
-    assert_eq!(
-        source_a_transport
-            .drain_incoming()
-            .expect("source a mailbox")
-            .len(),
+        if rejected_source == source_a {
+            source_a_transport
+                .drain_incoming()
+                .expect("source a mailbox")
+                .len()
+        } else {
+            source_b_transport
+                .drain_incoming()
+                .expect("source b mailbox")
+                .len()
+        },
         1
     );
     let request_id = reader_dfs
         .pending_reads
         .iter()
         .find_map(|(request_id, pending)| {
-            (pending.target_node_id == source_a).then_some(request_id.clone())
+            (pending.target_node_id == rejected_source).then_some(request_id.clone())
         })
-        .expect("pending source a read");
+        .expect("pending read for rejected source");
     reader_dfs
         .handle_networked_read_response(
-            source_a.clone(),
+            rejected_source.clone(),
             DfsReadResponse {
                 request_id,
                 object_id: object_id.clone(),
                 result: DfsReadResult::Rejected {
                     reason: format!(
-                        "node {source_a} is not a current location for DFS object {object_id}"
+                        "node {rejected_source} is not a current location for DFS object {object_id}"
                     ),
                 },
             },
@@ -12809,7 +12904,7 @@ fn remote_read_rejection_from_stale_location_falls_back_to_next_source() {
             .current_read_object_metadata(&object_id)
             .expect("current metadata")
             .current_locations,
-        vec![source_b.clone()]
+        vec![fallback_source.clone()]
     );
     assert_eq!(
         reader_dfs
@@ -12820,19 +12915,26 @@ fn remote_read_rejection_from_stale_location_falls_back_to_next_source() {
             .expect("version")
             .expect("version")
             .locations,
-        vec![source_b.clone()]
+        vec![fallback_source.clone()]
     );
     assert_eq!(
         reader_dfs
             .request_remote_object_read(&object_id)
             .expect("fallback after stale-location rejection"),
-        vec![source_b.clone()]
+        vec![fallback_source.clone()]
     );
     assert_eq!(
-        source_b_transport
-            .drain_incoming()
-            .expect("source b mailbox")
-            .len(),
+        if fallback_source == source_a {
+            source_a_transport
+                .drain_incoming()
+                .expect("source a fallback mailbox")
+                .len()
+        } else {
+            source_b_transport
+                .drain_incoming()
+                .expect("source b fallback mailbox")
+                .len()
+        },
         1
     );
     assert_eq!(
@@ -12878,30 +12980,41 @@ fn inline_remote_read_wrong_object_is_isolated_and_falls_back() {
     let hash = object.content_hash.clone();
     reader_dfs.add_object_metadata(object).expect("object");
 
+    let requested = reader_dfs
+        .request_remote_object_read(&object_id)
+        .expect("first read request");
+    assert_eq!(requested.len(), 1);
+    let wrong_source = requested[0].clone();
+    let fallback_source = if wrong_source == source_a {
+        source_b.clone()
+    } else {
+        source_a.clone()
+    };
     assert_eq!(
-        reader_dfs
-            .request_remote_object_read(&object_id)
-            .expect("first read request"),
-        vec![source_a.clone()]
-    );
-    assert_eq!(
-        source_a_transport
-            .drain_incoming()
-            .expect("source a mailbox")
-            .len(),
+        if wrong_source == source_a {
+            source_a_transport
+                .drain_incoming()
+                .expect("source a mailbox")
+                .len()
+        } else {
+            source_b_transport
+                .drain_incoming()
+                .expect("source b mailbox")
+                .len()
+        },
         1
     );
     let request_id = reader_dfs
         .pending_reads
         .iter()
         .find_map(|(request_id, pending)| {
-            (pending.target_node_id == source_a).then_some(request_id.clone())
+            (pending.target_node_id == wrong_source).then_some(request_id.clone())
         })
-        .expect("pending source a read");
+        .expect("pending read for wrong source");
 
     let event = reader_dfs
         .handle_networked_read_response(
-            source_a.clone(),
+            wrong_source.clone(),
             DfsReadResponse {
                 request_id: request_id.clone(),
                 object_id: wrong_object_id.clone(),
@@ -12924,7 +13037,7 @@ fn inline_remote_read_wrong_object_is_isolated_and_falls_back() {
             result: DfsReadResult::Rejected { reason },
         } if completed_request_id == request_id
             && completed_object_id != object_id
-            && source_node_id == source_a
+            && source_node_id == wrong_source
             && reason.contains("unexpected DFS read response object")
     ));
     assert!(!reader_dfs.pending_reads.contains_key(&request_id));
@@ -12933,19 +13046,26 @@ fn inline_remote_read_wrong_object_is_isolated_and_falls_back() {
             .current_read_object_metadata(&object_id)
             .expect("current metadata")
             .current_locations,
-        vec![source_b.clone()]
+        vec![fallback_source.clone()]
     );
     assert_eq!(
         reader_dfs
             .request_remote_object_read(&object_id)
             .expect("fallback after wrong-object response"),
-        vec![source_b.clone()]
+        vec![fallback_source.clone()]
     );
     assert_eq!(
-        source_b_transport
-            .drain_incoming()
-            .expect("source b mailbox")
-            .len(),
+        if fallback_source == source_a {
+            source_a_transport
+                .drain_incoming()
+                .expect("source a fallback mailbox")
+                .len()
+        } else {
+            source_b_transport
+                .drain_incoming()
+                .expect("source b fallback mailbox")
+                .len()
+        },
         1
     );
     std::fs::remove_dir_all(root).ok();

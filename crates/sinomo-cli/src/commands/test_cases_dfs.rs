@@ -1327,12 +1327,36 @@ fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let mut last_state: String;
 
     loop {
+        let read_started = Instant::now();
         match backend.read_file(&path) {
-            Ok(actual) if actual.as_slice() == expected.as_slice() => {
+            Ok(actual) => {
+                let read_elapsed = read_started.elapsed();
+                if actual.as_slice() != expected.as_slice() {
+                    last_state = format!(
+                        "{path} content mismatch ({} bytes, expected {})",
+                        actual.len(),
+                        expected.len()
+                    );
+                    if Instant::now() >= deadline {
+                        ctx.record("node", &node);
+                        ctx.record("path", &path);
+                        ctx.record("bytes", bytes as u64);
+                        ctx.record("last_state", &last_state);
+                        return Ok(SinomoTestOutcome::failed(format!(
+                            "large expect on node {node} did not read matching {bytes} byte file at {path} within {}s: {last_state}",
+                            timeout.as_secs()
+                        )));
+                    }
+                    std::thread::sleep(EXPECT_POLL_INTERVAL);
+                    continue;
+                }
                 let elapsed = measurement_started.elapsed();
                 let elapsed_ms = elapsed.as_millis() as u64;
+                let read_elapsed_ms = read_elapsed.as_millis() as u64;
                 let total_bytes = bytes as u64;
                 let bytes_per_second = rate_per_second(total_bytes as f64, elapsed);
+                let data_read_bytes_per_second = rate_per_second(total_bytes as f64, read_elapsed);
+                let convergence_elapsed = elapsed.saturating_sub(read_elapsed);
                 let proc_io_delta = proc_io_before
                     .zip(current_proc_io())
                     .map(|(before, after)| after.saturating_delta(before));
@@ -1344,14 +1368,24 @@ fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     payload_build_elapsed.as_millis() as u64,
                 );
                 ctx.record("elapsed_ms", elapsed_ms);
+                ctx.record(
+                    "convergence_elapsed_ms",
+                    convergence_elapsed.as_millis() as u64,
+                );
+                ctx.record("read_elapsed_ms", read_elapsed_ms);
                 ctx.record("bytes_per_second", bytes_per_second);
+                ctx.record("data_read_bytes_per_second", data_read_bytes_per_second);
                 ctx.record("min_bytes_per_second", min_bytes_per_second);
                 ctx.record("min_raw_read_ratio", min_raw_read_ratio);
                 if let Some(raw_baseline) = raw_baseline.as_ref() {
                     record_raw_disk_baseline(ctx, raw_baseline, "raw_disk");
                     ctx.record(
                         "raw_read_ratio",
-                        ratio(bytes_per_second, raw_baseline.read_bytes_per_second).unwrap_or(0.0),
+                        ratio(
+                            data_read_bytes_per_second,
+                            raw_baseline.read_bytes_per_second,
+                        )
+                        .unwrap_or(0.0),
                     );
                 }
                 if let Some(max_proc_write_bytes) = max_proc_write_bytes {
@@ -1369,32 +1403,28 @@ fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     }
                 }
 
-                if min_bytes_per_second > 0.0 && bytes_per_second < min_bytes_per_second {
+                if min_bytes_per_second > 0.0 && data_read_bytes_per_second < min_bytes_per_second {
                     return Ok(SinomoTestOutcome::failed(format!(
-                        "large expect on node {node} read {total_bytes} bytes in {elapsed_ms}ms ({bytes_per_second:.2} bytes/s), below required {min_bytes_per_second:.2} bytes/s"
+                        "large expect on node {node} read {total_bytes} bytes in {read_elapsed_ms}ms ({data_read_bytes_per_second:.2} bytes/s), below required {min_bytes_per_second:.2} bytes/s"
                     )));
                 }
                 if let Some(raw_baseline) = raw_baseline.as_ref()
                     && min_raw_read_ratio > 0.0
                 {
-                    let raw_ratio =
-                        ratio(bytes_per_second, raw_baseline.read_bytes_per_second).unwrap_or(0.0);
+                    let raw_ratio = ratio(
+                        data_read_bytes_per_second,
+                        raw_baseline.read_bytes_per_second,
+                    )
+                    .unwrap_or(0.0);
                     if raw_ratio < min_raw_read_ratio {
                         return Ok(SinomoTestOutcome::failed(format!(
-                            "large expect on node {node} read {total_bytes} bytes at {bytes_per_second:.2} bytes/s, {raw_ratio:.2}x raw disk read baseline, below required {min_raw_read_ratio:.2}x"
+                            "large expect on node {node} read {total_bytes} bytes at {data_read_bytes_per_second:.2} bytes/s, {raw_ratio:.2}x raw disk read baseline, below required {min_raw_read_ratio:.2}x"
                         )));
                     }
                 }
                 return Ok(SinomoTestOutcome::passed(format!(
-                    "large expect on node {node} read {total_bytes} bytes in {elapsed_ms}ms ({bytes_per_second:.2} bytes/s)"
+                    "large expect on node {node} matched after {elapsed_ms}ms; final read {total_bytes} bytes in {read_elapsed_ms}ms ({data_read_bytes_per_second:.2} bytes/s)"
                 )));
-            }
-            Ok(actual) => {
-                last_state = format!(
-                    "{path} content mismatch ({} bytes, expected {})",
-                    actual.len(),
-                    expected.len()
-                );
             }
             Err(error) => {
                 last_state = format!("{path}: {error}");
