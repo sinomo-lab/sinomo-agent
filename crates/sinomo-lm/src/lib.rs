@@ -1633,7 +1633,6 @@ pub fn upsert_provider_account_config(
     let mut account = ProviderAccountConfig {
         provider,
         account: normalize_provider_account_name(Some(&account.account)),
-        enabled: true,
         ..account
     };
     account.default_model = account

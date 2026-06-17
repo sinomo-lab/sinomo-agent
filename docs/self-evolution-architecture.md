@@ -2,10 +2,12 @@
 
 ## Purpose
 
-Self-evolution is Sinomo's controlled live-mutation loop. The system observes
-runtime behavior, proposes bounded improvements, implements candidates in
-isolated workspaces, evaluates them against replayable evidence, rolls approved
-artifacts out progressively, and rolls back when evidence degrades.
+Self-evolution is Sinomo's controlled live-mutation loop. The same machinery can
+target Sinomo itself or another git-backed project. The system observes runtime
+behavior, proposes bounded improvements, implements candidates in isolated
+workspaces, evaluates them against replayable evidence, rolls approved artifacts
+out progressively when the target supports rollout, and rolls back when evidence
+degrades.
 
 This document defines the stable architecture and invariants. Current
 implementation status is tracked by the code, readiness gates, rollout
@@ -14,12 +16,16 @@ operations, and test evidence rather than by separate plan documents.
 Self-evolution complements the event-centric distributed runtime in
 [architecture.md](architecture.md). It is another control plane: it consumes
 events, traces, metrics, workspaces, scorecards, policy decisions, and rollout
-telemetry, then emits candidate bundles, artifacts, desired-state changes, and
-audit events.
+telemetry, then emits candidate bundles, artifacts, desired-state changes when
+applicable, and audit events. Sinomo self-mutation is the default target when no
+repository is supplied; `sinomo evolve ... --repo <path>` uses the same
+candidate, verification, and evidence lifecycle for another project.
 
 ## Design Goals
 
 - Keep Sinomo running while it changes itself.
+- Reuse the candidate/evidence lifecycle for external projects without assuming
+  Sinomo-specific rollout material.
 - Make every mutation scoped, replayable, inspectable, and reversible.
 - Let models propose and implement changes, but never grant them direct
   authority over the live runtime.

@@ -107,7 +107,6 @@ pub struct SignedDaemonCommand {
     pub public_key: Vec<u8>,
     pub timestamp: String,
     pub nonce: String,
-    pub command: String,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
     pub rpc_body_sha256: Option<Vec<u8>>,
     #[serde(with = "serde_bytes")]
@@ -116,7 +115,7 @@ pub struct SignedDaemonCommand {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthenticatedDaemonCommand {
-    pub command: String,
+    pub route: String,
     pub signer: DaemonSignerAuthority,
     pub signer_node_id: String,
     /// Existing cluster membership state stores node public keys as URL-safe base64 strings.
@@ -142,10 +141,6 @@ impl DaemonSignerAuthority {
     }
 }
 
-pub fn daemon_rpc_command(route: &str) -> String {
-    format!("RPC {route}")
-}
-
 pub fn sign_daemon_rpc_request_for_local_node(
     request: &sinomo_network::ObjectRpcRequest,
 ) -> Result<Vec<u8>, DaemonError> {
@@ -157,9 +152,10 @@ pub fn sign_daemon_rpc_request_from_data_dir(
     data_dir: &SinomoDataDir,
     request: &sinomo_network::ObjectRpcRequest,
 ) -> Result<Vec<u8>, DaemonError> {
-    sign_daemon_command_from_data_dir_with_rpc_body_sha256(
+    sign_daemon_rpc_request_from_data_dir_with_body_sha256(
         data_dir,
-        &daemon_rpc_command(&request.route),
+        &request.route,
+        &request.category,
         Some(daemon_rpc_body_sha256(request)),
     )
 }
@@ -170,9 +166,10 @@ pub fn daemon_rpc_body_sha256(request: &sinomo_network::ObjectRpcRequest) -> Vec
         .to_vec()
 }
 
-fn sign_daemon_command_from_data_dir_with_rpc_body_sha256(
+fn sign_daemon_rpc_request_from_data_dir_with_body_sha256(
     data_dir: &SinomoDataDir,
-    command: &str,
+    route: &str,
+    category: &str,
     rpc_body_sha256: Option<Vec<u8>>,
 ) -> Result<Vec<u8>, DaemonError> {
     let identity = cached_daemon_signing_identity(data_dir)?;
@@ -185,7 +182,8 @@ fn sign_daemon_command_from_data_dir_with_rpc_body_sha256(
         &identity.public_key,
         &timestamp,
         &nonce,
-        command,
+        route,
+        category,
         rpc_body_sha256.as_deref(),
     );
     let signature = identity.key_pair.sign(&signing_payload);
@@ -195,7 +193,6 @@ fn sign_daemon_command_from_data_dir_with_rpc_body_sha256(
         public_key: identity.public_key,
         timestamp,
         nonce,
-        command: command.to_string(),
         rpc_body_sha256,
         signature: signature.as_ref().to_vec(),
     };
@@ -248,26 +245,15 @@ pub fn authenticate_daemon_control_request(
     paths: &DaemonPaths,
     request: &sinomo_network::DaemonControlRequest,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
-    authenticate_daemon_control_request_with_rpc_request(paths, request, request.rpc.as_ref())
-}
-
-fn authenticate_daemon_control_request_with_rpc_request(
-    paths: &DaemonPaths,
-    request: &sinomo_network::DaemonControlRequest,
-    rpc_request: Option<&sinomo_network::ObjectRpcRequest>,
-) -> Result<AuthenticatedDaemonCommand, DaemonError> {
     let auth = request.auth.as_deref().ok_or(DaemonError::AuthDenied)?;
     let envelope: SignedDaemonCommand =
         sinomo_network::SinomoObjectCodec::default().decode(auth)?;
-    if envelope.command != request.command {
-        return Err(DaemonError::AuthDenied);
-    }
-    verify_daemon_rpc_body_binding(&envelope, rpc_request)?;
-    let signer = verify_signed_daemon_command(paths, &envelope, rpc_request)?;
+    verify_daemon_rpc_body_binding(&envelope, request)?;
+    let signer = verify_signed_daemon_command(paths, &envelope, request)?;
     remember_daemon_auth_nonce(paths, &envelope)?;
     let signer_public_key = daemon_auth_encode_public_key(&envelope.public_key);
     let authenticated = AuthenticatedDaemonCommand {
-        command: envelope.command,
+        route: request.route.clone(),
         signer,
         signer_node_id: envelope.node_id,
         signer_public_key,
@@ -278,17 +264,11 @@ fn authenticate_daemon_control_request_with_rpc_request(
 
 fn verify_daemon_rpc_body_binding(
     envelope: &SignedDaemonCommand,
-    rpc_request: Option<&sinomo_network::ObjectRpcRequest>,
+    request: &sinomo_network::ObjectRpcRequest,
 ) -> Result<(), DaemonError> {
-    let is_rpc_command = envelope.command.starts_with("RPC ");
     let Some(expected) = envelope.rpc_body_sha256.as_deref() else {
-        return if is_rpc_command {
-            Err(DaemonError::AuthDenied)
-        } else {
-            Ok(())
-        };
+        return Err(DaemonError::AuthDenied);
     };
-    let request = rpc_request.ok_or(DaemonError::AuthDenied)?;
     let actual = daemon_rpc_body_sha256(request);
     if expected == actual.as_slice() {
         Ok(())
@@ -320,38 +300,36 @@ pub fn create_cluster_invite_challenge_proof(
 pub fn authorize_authenticated_daemon_command(
     authenticated: &AuthenticatedDaemonCommand,
 ) -> Result<(), DaemonError> {
-    let command = authenticated.command.as_str();
-    let allowed = match command {
-        command if command == daemon_rpc_command(sinomo_network::DAEMON_STATUS_ROUTE) => true,
-        command if command == daemon_rpc_command(CLUSTER_KV_SNAPSHOT_ROUTE) => true,
-        command if command == daemon_rpc_command(sinomo_network::DAEMON_SHUTDOWN_ROUTE) => {
+    let route = authenticated.route.as_str();
+    let allowed = match route {
+        route if route == sinomo_network::DAEMON_STATUS_ROUTE => true,
+        route if route == CLUSTER_KV_SNAPSHOT_ROUTE => true,
+        route if route == sinomo_network::DAEMON_SHUTDOWN_ROUTE => {
             authenticated.signer.can_run_local_command()
         }
-        command if command == daemon_rpc_command(ROLLOUT_FINALIZE_SHADOW_ROUTE) => {
+        route if route == ROLLOUT_FINALIZE_SHADOW_ROUTE => {
             authenticated.signer.can_run_local_command()
         }
-        command if command == daemon_rpc_command(ROLLOUT_DIAGNOSTICS_ROUTE) => {
+        route if route == ROLLOUT_DIAGNOSTICS_ROUTE => authenticated.signer.can_run_admin_command(),
+        route if route == ROLLOUT_CLEAR_STATUS_ROUTE => {
             authenticated.signer.can_run_admin_command()
         }
-        command if command == daemon_rpc_command(ROLLOUT_CLEAR_STATUS_ROUTE) => {
-            authenticated.signer.can_run_admin_command()
-        }
-        command
-            if command == daemon_rpc_command(sinomo_observe::OBSERVE_EVENTS_ROUTE)
-                || command == daemon_rpc_command(sinomo_observe::OBSERVE_LOGS_ROUTE) =>
+        route
+            if route == sinomo_observe::OBSERVE_EVENTS_ROUTE
+                || route == sinomo_observe::OBSERVE_LOGS_ROUTE =>
         {
             authenticated.signer.can_run_local_command()
         }
-        command if command == daemon_rpc_command(sinomo_dfs::DFS_EXPOSE_CONFIG_ROUTE) => {
+        route if route == sinomo_dfs::DFS_EXPOSE_CONFIG_ROUTE => {
             authenticated.signer.can_run_local_command()
         }
-        command if command == daemon_rpc_command(sinomo_dfs::DFS_STATUS_ROUTE) => matches!(
+        route if route == sinomo_dfs::DFS_STATUS_ROUTE => matches!(
             authenticated.signer,
             DaemonSignerAuthority::Local
                 | DaemonSignerAuthority::Voter
                 | DaemonSignerAuthority::Member
         ),
-        command if command == daemon_rpc_command(sinomo_dfs::DFS_INSPECTION_ROUTE) => {
+        route if route == sinomo_dfs::DFS_INSPECTION_ROUTE => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -359,10 +337,10 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        command if command == daemon_rpc_command(sinomo_dfs::DFS_SMOKE_ROUTE) => {
+        route if route == sinomo_dfs::DFS_SMOKE_ROUTE => {
             authenticated.signer.can_run_local_command()
         }
-        command if command == daemon_rpc_command(sinomo_dfs::DFS_METADATA_JOURNAL_BATCH_ROUTE) => {
+        route if route == sinomo_dfs::DFS_METADATA_JOURNAL_BATCH_ROUTE => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -370,9 +348,7 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        command
-            if command == daemon_rpc_command(sinomo_dfs::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE) =>
-        {
+        route if route == sinomo_dfs::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -380,7 +356,7 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        command if command == daemon_rpc_command(sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE) => {
+        route if route == sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -388,7 +364,7 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        command if command == daemon_rpc_command(sinomo_dfs::DFS_DIRECT_READ_ROUTE) => {
+        route if route == sinomo_dfs::DFS_DIRECT_READ_ROUTE => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -396,7 +372,7 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        command if is_agent_session_rpc_command(command) => {
+        route if is_agent_session_rpc_route(route) => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -404,9 +380,7 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        command
-            if command == daemon_rpc_command(sinomo_network::MODULE_NATIVE_DYLIB_CANCEL_ROUTE) =>
-        {
+        route if route == sinomo_network::MODULE_NATIVE_DYLIB_CANCEL_ROUTE => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -414,7 +388,7 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        command if command == daemon_rpc_command("/benchmarks/cancel-probe") => {
+        route if route == "/benchmarks/cancel-probe" => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -422,10 +396,8 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        command if is_local_sandbox_rpc_command(command) => {
-            authenticated.signer.can_run_local_command()
-        }
-        command if command == daemon_rpc_command(sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE) => {
+        route if is_local_sandbox_rpc_route(route) => authenticated.signer.can_run_local_command(),
+        route if route == sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -434,9 +406,9 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::JoinCandidate
             )
         }
-        command
-            if command == daemon_rpc_command(sinomo_network::CLUSTER_INVITE_PUBLISH_ROUTE)
-                || command == daemon_rpc_command(sinomo_network::CLUSTER_MEMBER_PUBLISH_ROUTE) =>
+        route
+            if route == sinomo_network::CLUSTER_INVITE_PUBLISH_ROUTE
+                || route == sinomo_network::CLUSTER_MEMBER_PUBLISH_ROUTE =>
         {
             matches!(
                 authenticated.signer,
@@ -445,16 +417,13 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        command
-            if command == daemon_rpc_command(CLUSTER_RAFT_APPEND_ROUTE)
-                || command == daemon_rpc_command(CLUSTER_RAFT_VOTE_ROUTE) =>
-        {
+        route if route == CLUSTER_RAFT_APPEND_ROUTE || route == CLUSTER_RAFT_VOTE_ROUTE => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local | DaemonSignerAuthority::Voter
             )
         }
-        command if command == daemon_rpc_command(CLUSTER_KV_RANGE_PREFIX_ROUTE) => {
+        route if route == CLUSTER_KV_RANGE_PREFIX_ROUTE => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -462,9 +431,9 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        command
-            if command == daemon_rpc_command(sinomo_network::CLUSTER_HEALTH_ROUTE)
-                || command == daemon_rpc_command(sinomo_network::CLUSTER_NETWORK_PING_ROUTE) =>
+        route
+            if route == sinomo_network::CLUSTER_HEALTH_ROUTE
+                || route == sinomo_network::CLUSTER_NETWORK_PING_ROUTE =>
         {
             matches!(
                 authenticated.signer,
@@ -473,11 +442,11 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        command
-            if command == daemon_rpc_command(CLUSTER_KV_WATCH_PREFIX_ROUTE)
-                || command == daemon_rpc_command(CLUSTER_KV_WATCH_DRAIN_ROUTE)
-                || command == daemon_rpc_command(CLUSTER_KV_WATCH_CANCEL_ROUTE)
-                || command == daemon_rpc_command(CLUSTER_KV_WATCH_EVENTS_ROUTE) =>
+        route
+            if route == CLUSTER_KV_WATCH_PREFIX_ROUTE
+                || route == CLUSTER_KV_WATCH_DRAIN_ROUTE
+                || route == CLUSTER_KV_WATCH_CANCEL_ROUTE
+                || route == CLUSTER_KV_WATCH_EVENTS_ROUTE =>
         {
             matches!(
                 authenticated.signer,
@@ -486,16 +455,16 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        command
-            if command == daemon_rpc_command(ROLLOUT_BINARY_ROUTE)
-                || command == daemon_rpc_command(ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE)
-                || command == daemon_rpc_command(ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE)
-                || command == daemon_rpc_command(ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE)
-                || command == daemon_rpc_command(ROLLOUT_BUILD_ROUTE) =>
+        route
+            if route == ROLLOUT_BINARY_ROUTE
+                || route == ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE
+                || route == ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE
+                || route == ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE
+                || route == ROLLOUT_BUILD_ROUTE =>
         {
             authenticated.signer.can_run_admin_command()
         }
-        command if command == daemon_rpc_command(CLUSTER_KV_TXN_ROUTE) => {
+        route if route == CLUSTER_KV_TXN_ROUTE => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -503,7 +472,7 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        command if command == daemon_rpc_command(sinomo_network::CLUSTER_RELAY_ROUTE) => {
+        route if route == sinomo_network::CLUSTER_RELAY_ROUTE => {
             // A relay envelope is forwarded on behalf of another node by any authenticated
             // cluster member (e.g. a bridge learner relaying a joiner's challenge toward a
             // voter). The wrapped inner request carries its own signature/invite-proof and is
@@ -524,40 +493,39 @@ pub fn authorize_authenticated_daemon_command(
     }
 }
 
-fn is_agent_session_rpc_command(command: &str) -> bool {
-    command.strip_prefix("RPC /agent/session/").is_some()
+fn is_agent_session_rpc_route(route: &str) -> bool {
+    route.strip_prefix("/agent/session/").is_some()
 }
 
-fn is_local_sandbox_rpc_command(command: &str) -> bool {
-    command == daemon_rpc_command(sinomo_network::SANDBOX_CREATE_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_STATUS_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_UPDATE_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_CHECKPOINT_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_RESUME_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_REBOOT_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_DESTROY_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_LIST_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_READ_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_WRITE_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_HTTP_FETCH_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_HTTP_FETCH_TO_FILE_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_RUN_TOOLCHAIN_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_RUN_PROCESS_PLAN_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_RUN_CANCEL_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_IMPORT_BUSYBOX_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE)
-        || command
-            == daemon_rpc_command(sinomo_network::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE)
+fn is_local_sandbox_rpc_route(route: &str) -> bool {
+    route == sinomo_network::SANDBOX_CREATE_ROUTE
+        || route == sinomo_network::SANDBOX_STATUS_ROUTE
+        || route == sinomo_network::SANDBOX_UPDATE_ROUTE
+        || route == sinomo_network::SANDBOX_CHECKPOINT_ROUTE
+        || route == sinomo_network::SANDBOX_RESUME_ROUTE
+        || route == sinomo_network::SANDBOX_REBOOT_ROUTE
+        || route == sinomo_network::SANDBOX_DESTROY_ROUTE
+        || route == sinomo_network::SANDBOX_LIST_ROUTE
+        || route == sinomo_network::SANDBOX_READ_ROUTE
+        || route == sinomo_network::SANDBOX_WRITE_ROUTE
+        || route == sinomo_network::SANDBOX_HTTP_FETCH_ROUTE
+        || route == sinomo_network::SANDBOX_HTTP_FETCH_TO_FILE_ROUTE
+        || route == sinomo_network::SANDBOX_RUN_TOOLCHAIN_ROUTE
+        || route == sinomo_network::SANDBOX_RUN_PROCESS_PLAN_ROUTE
+        || route == sinomo_network::SANDBOX_RUN_CANCEL_ROUTE
+        || route == sinomo_network::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE
+        || route == sinomo_network::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE
+        || route == sinomo_network::SANDBOX_IMPORT_BUSYBOX_ROUTE
+        || route == sinomo_network::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE
+        || route == sinomo_network::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE
+        || route == sinomo_network::SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE
+        || route == sinomo_network::SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE
 }
 
 fn verify_signed_daemon_command(
     paths: &DaemonPaths,
     envelope: &SignedDaemonCommand,
-    rpc_request: Option<&sinomo_network::ObjectRpcRequest>,
+    request: &sinomo_network::ObjectRpcRequest,
 ) -> Result<DaemonSignerAuthority, DaemonError> {
     if envelope.protocol != DAEMON_AUTH_PROTOCOL {
         return Err(DaemonError::AuthDenied);
@@ -569,7 +537,7 @@ fn verify_signed_daemon_command(
     if skew > DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS {
         return Err(DaemonError::AuthExpired);
     }
-    if envelope.nonce.trim().is_empty() || envelope.command.trim().is_empty() {
+    if envelope.nonce.trim().is_empty() || request.route.trim().is_empty() {
         return Err(DaemonError::AuthDenied);
     }
     let signing_payload = daemon_auth_signing_payload(
@@ -577,13 +545,14 @@ fn verify_signed_daemon_command(
         &envelope.public_key,
         &envelope.timestamp,
         &envelope.nonce,
-        &envelope.command,
+        &request.route,
+        &request.category,
         envelope.rpc_body_sha256.as_deref(),
     );
     UnparsedPublicKey::new(&ED25519, &envelope.public_key)
         .verify(&signing_payload, &envelope.signature)
         .map_err(|_| DaemonError::AuthDenied)?;
-    authorize_daemon_signer(paths, envelope, rpc_request)
+    authorize_daemon_signer(paths, envelope, request)
 }
 
 fn daemon_auth_signing_payload(
@@ -591,7 +560,8 @@ fn daemon_auth_signing_payload(
     public_key: &[u8],
     timestamp: &str,
     nonce: &str,
-    command: &str,
+    route: &str,
+    category: &str,
     rpc_body_sha256: Option<&[u8]>,
 ) -> Vec<u8> {
     let mut payload = Vec::new();
@@ -605,7 +575,9 @@ fn daemon_auth_signing_payload(
     payload.push(b'\n');
     payload.extend_from_slice(nonce.as_bytes());
     payload.push(b'\n');
-    payload.extend_from_slice(command.as_bytes());
+    payload.extend_from_slice(route.as_bytes());
+    payload.push(b'\n');
+    payload.extend_from_slice(category.as_bytes());
     payload.push(b'\n');
     if let Some(rpc_body_sha256) = rpc_body_sha256 {
         payload.extend_from_slice(rpc_body_sha256);
@@ -616,7 +588,7 @@ fn daemon_auth_signing_payload(
 fn authorize_daemon_signer(
     paths: &DaemonPaths,
     envelope: &SignedDaemonCommand,
-    rpc_request: Option<&sinomo_network::ObjectRpcRequest>,
+    request: &sinomo_network::ObjectRpcRequest,
 ) -> Result<DaemonSignerAuthority, DaemonError> {
     let envelope_public_key = daemon_auth_encode_public_key(&envelope.public_key);
     let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
@@ -643,11 +615,11 @@ fn authorize_daemon_signer(
         return Ok(authority.clone());
     }
 
-    if envelope.command == daemon_rpc_command(sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE) {
-        authorize_cluster_join_rpc_signer(paths, rpc_request, &envelope_public_key)?;
+    if request.route == sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE {
+        authorize_cluster_join_rpc_signer(paths, Some(request), &envelope_public_key)?;
         return Ok(DaemonSignerAuthority::JoinCandidate);
     }
-    if envelope.command == daemon_rpc_command(sinomo_network::DAEMON_STATUS_ROUTE) {
+    if request.route == sinomo_network::DAEMON_STATUS_ROUTE {
         return Ok(DaemonSignerAuthority::StatusProbe);
     }
     if let Some(authority) =
@@ -896,12 +868,8 @@ fn authorize_cluster_join_rpc_signer(
 pub(crate) fn is_cluster_join_register_control_request(
     request: &sinomo_network::DaemonControlRequest,
 ) -> bool {
-    let Some(rpc) = request.rpc.as_ref() else {
-        return false;
-    };
-    request.command.trim() == daemon_rpc_command(sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE)
-        && rpc.route == sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE
-        && rpc.category == sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
+    request.route == sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE
+        && request.category == sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
 }
 
 fn authorize_cluster_join_request_signer(
@@ -1044,11 +1012,11 @@ mod tests {
     use super::*;
 
     fn authenticated_command(
-        command: String,
+        route: String,
         signer: DaemonSignerAuthority,
     ) -> AuthenticatedDaemonCommand {
         AuthenticatedDaemonCommand {
-            command,
+            route,
             signer,
             signer_node_id: "node_test".to_string(),
             signer_public_key: "public-key".to_string(),
@@ -1064,7 +1032,6 @@ mod tests {
                 .format(&Rfc3339)
                 .expect("timestamp"),
             nonce: nonce.to_string(),
-            command: daemon_rpc_command(sinomo_network::DAEMON_STATUS_ROUTE),
             rpc_body_sha256: None,
             signature: b"signature".to_vec(),
         }
@@ -1158,8 +1125,10 @@ mod tests {
 
     #[test]
     fn cluster_kv_txn_authorizes_cluster_members_for_voter_forwarding() {
-        let command = daemon_rpc_command(CLUSTER_KV_TXN_ROUTE);
-        let authenticated = authenticated_command(command, DaemonSignerAuthority::Member);
+        let authenticated = authenticated_command(
+            CLUSTER_KV_TXN_ROUTE.to_string(),
+            DaemonSignerAuthority::Member,
+        );
 
         authorize_authenticated_daemon_command(&authenticated)
             .expect("cluster members must be able to forward KV txns to voters");
@@ -1171,18 +1140,17 @@ mod tests {
             sinomo_network::CLUSTER_HEALTH_ROUTE,
             sinomo_network::CLUSTER_NETWORK_PING_ROUTE,
         ] {
-            let command = daemon_rpc_command(route);
             for signer in [
                 DaemonSignerAuthority::Local,
                 DaemonSignerAuthority::Voter,
                 DaemonSignerAuthority::Member,
             ] {
-                let authenticated = authenticated_command(command.clone(), signer);
+                let authenticated = authenticated_command(route.to_string(), signer);
                 authorize_authenticated_daemon_command(&authenticated)
                     .expect("cluster members must be able to use routed network inspection");
             }
             let authenticated =
-                authenticated_command(command, DaemonSignerAuthority::JoinCandidate);
+                authenticated_command(route.to_string(), DaemonSignerAuthority::JoinCandidate);
             assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
         }
     }
@@ -1190,14 +1158,14 @@ mod tests {
     #[test]
     fn status_probe_authority_is_limited_to_daemon_status() {
         let status = authenticated_command(
-            daemon_rpc_command(sinomo_network::DAEMON_STATUS_ROUTE),
+            sinomo_network::DAEMON_STATUS_ROUTE.to_string(),
             DaemonSignerAuthority::StatusProbe,
         );
         authorize_authenticated_daemon_command(&status)
             .expect("unknown signed probes may read daemon status");
 
         let cluster_health = authenticated_command(
-            daemon_rpc_command(sinomo_network::CLUSTER_HEALTH_ROUTE),
+            sinomo_network::CLUSTER_HEALTH_ROUTE.to_string(),
             DaemonSignerAuthority::StatusProbe,
         );
         assert!(authorize_authenticated_daemon_command(&cluster_health).is_err());
@@ -1245,15 +1213,20 @@ mod tests {
             public_key: peer_public_key,
             timestamp: now.format(&Rfc3339).expect("timestamp"),
             nonce: "same-key-drift".to_string(),
-            command: daemon_rpc_command(sinomo_network::CLUSTER_HEALTH_ROUTE),
             rpc_body_sha256: None,
             signature: Vec::new(),
         };
+        let request = sinomo_network::ObjectRpcRequest::encode_body(
+            sinomo_network::CLUSTER_HEALTH_ROUTE,
+            sinomo_network::CLUSTER_HEALTH_RPC_CATEGORY,
+            &(),
+        )
+        .expect("health rpc request");
 
         state.members.push(peer.clone());
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write pending state");
         assert!(matches!(
-            authorize_daemon_signer(&daemon_paths, &envelope, None),
+            authorize_daemon_signer(&daemon_paths, &envelope, &request),
             Err(DaemonError::AuthDenied)
         ));
 
@@ -1261,7 +1234,7 @@ mod tests {
         *state.members.last_mut().expect("peer member") = peer;
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write accepted state");
         assert_eq!(
-            authorize_daemon_signer(&daemon_paths, &envelope, None)
+            authorize_daemon_signer(&daemon_paths, &envelope, &request)
                 .expect("authorize accepted same-key member"),
             DaemonSignerAuthority::Member
         );
@@ -1275,27 +1248,26 @@ mod tests {
             CLUSTER_KV_WATCH_CANCEL_ROUTE,
             CLUSTER_KV_WATCH_EVENTS_ROUTE,
         ] {
-            let command = daemon_rpc_command(route);
             for signer in [
                 DaemonSignerAuthority::Local,
                 DaemonSignerAuthority::Voter,
                 DaemonSignerAuthority::Member,
             ] {
-                let authenticated = authenticated_command(command.clone(), signer);
+                let authenticated = authenticated_command(route.to_string(), signer);
                 authorize_authenticated_daemon_command(&authenticated)
                     .expect("cluster members must be able to manage cluster KV watches");
             }
             let authenticated =
-                authenticated_command(command, DaemonSignerAuthority::JoinCandidate);
+                authenticated_command(route.to_string(), DaemonSignerAuthority::JoinCandidate);
             assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
         }
     }
 
     #[test]
     fn rollout_clear_status_authorizes_admin_signers() {
-        let command = daemon_rpc_command(ROLLOUT_CLEAR_STATUS_ROUTE);
         for signer in [DaemonSignerAuthority::Local, DaemonSignerAuthority::Voter] {
-            let authenticated = authenticated_command(command.clone(), signer);
+            let authenticated =
+                authenticated_command(ROLLOUT_CLEAR_STATUS_ROUTE.to_string(), signer);
             authorize_authenticated_daemon_command(&authenticated)
                 .expect("admin signers must be able to clear stale rollout status");
         }
@@ -1303,7 +1275,8 @@ mod tests {
             DaemonSignerAuthority::Member,
             DaemonSignerAuthority::JoinCandidate,
         ] {
-            let authenticated = authenticated_command(command.clone(), signer);
+            let authenticated =
+                authenticated_command(ROLLOUT_CLEAR_STATUS_ROUTE.to_string(), signer);
             assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
         }
     }
@@ -1315,9 +1288,8 @@ mod tests {
             ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
             ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
         ] {
-            let command = daemon_rpc_command(route);
             for signer in [DaemonSignerAuthority::Local, DaemonSignerAuthority::Voter] {
-                let authenticated = authenticated_command(command.clone(), signer);
+                let authenticated = authenticated_command(route.to_string(), signer);
                 authorize_authenticated_daemon_command(&authenticated)
                     .expect("rollout upload routes require admin signers");
             }
@@ -1325,7 +1297,7 @@ mod tests {
                 DaemonSignerAuthority::Member,
                 DaemonSignerAuthority::JoinCandidate,
             ] {
-                let authenticated = authenticated_command(command.clone(), signer);
+                let authenticated = authenticated_command(route.to_string(), signer);
                 assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
             }
         }
@@ -1333,13 +1305,15 @@ mod tests {
 
     #[test]
     fn dfs_metadata_journal_batch_authorizes_cluster_members() {
-        let command = daemon_rpc_command(sinomo_dfs::DFS_METADATA_JOURNAL_BATCH_ROUTE);
         for signer in [
             DaemonSignerAuthority::Local,
             DaemonSignerAuthority::Voter,
             DaemonSignerAuthority::Member,
         ] {
-            let authenticated = authenticated_command(command.clone(), signer);
+            let authenticated = authenticated_command(
+                sinomo_dfs::DFS_METADATA_JOURNAL_BATCH_ROUTE.to_string(),
+                signer,
+            );
             authorize_authenticated_daemon_command(&authenticated)
                 .expect("cluster members must be able to replicate DFS metadata journals");
         }
@@ -1347,13 +1321,15 @@ mod tests {
 
     #[test]
     fn dfs_metadata_snapshot_install_authorizes_cluster_members() {
-        let command = daemon_rpc_command(sinomo_dfs::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE);
         for signer in [
             DaemonSignerAuthority::Local,
             DaemonSignerAuthority::Voter,
             DaemonSignerAuthority::Member,
         ] {
-            let authenticated = authenticated_command(command.clone(), signer);
+            let authenticated = authenticated_command(
+                sinomo_dfs::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE.to_string(),
+                signer,
+            );
             authorize_authenticated_daemon_command(&authenticated)
                 .expect("cluster members must be able to repair DFS metadata replicas");
         }
@@ -1361,13 +1337,13 @@ mod tests {
 
     #[test]
     fn dfs_status_authorizes_cluster_members() {
-        let command = daemon_rpc_command(sinomo_dfs::DFS_STATUS_ROUTE);
         for signer in [
             DaemonSignerAuthority::Local,
             DaemonSignerAuthority::Voter,
             DaemonSignerAuthority::Member,
         ] {
-            let authenticated = authenticated_command(command.clone(), signer);
+            let authenticated =
+                authenticated_command(sinomo_dfs::DFS_STATUS_ROUTE.to_string(), signer);
             authorize_authenticated_daemon_command(&authenticated)
                 .expect("cluster members must be able to inspect local DFS metadata status");
         }
@@ -1375,13 +1351,13 @@ mod tests {
 
     #[test]
     fn dfs_inspection_authorizes_cluster_members() {
-        let command = daemon_rpc_command(sinomo_dfs::DFS_INSPECTION_ROUTE);
         for signer in [
             DaemonSignerAuthority::Local,
             DaemonSignerAuthority::Voter,
             DaemonSignerAuthority::Member,
         ] {
-            let authenticated = authenticated_command(command.clone(), signer);
+            let authenticated =
+                authenticated_command(sinomo_dfs::DFS_INSPECTION_ROUTE.to_string(), signer);
             authorize_authenticated_daemon_command(&authenticated)
                 .expect("cluster members must be able to inspect local DFS metadata");
         }
@@ -1389,9 +1365,8 @@ mod tests {
 
     #[test]
     fn dfs_smoke_authorizes_only_local_signer() {
-        let command = daemon_rpc_command(sinomo_dfs::DFS_SMOKE_ROUTE);
         authorize_authenticated_daemon_command(&authenticated_command(
-            command.clone(),
+            sinomo_dfs::DFS_SMOKE_ROUTE.to_string(),
             DaemonSignerAuthority::Local,
         ))
         .expect("local operators must be able to run DFS smoke through the daemon");
@@ -1400,7 +1375,8 @@ mod tests {
             DaemonSignerAuthority::Member,
             DaemonSignerAuthority::JoinCandidate,
         ] {
-            let authenticated = authenticated_command(command.clone(), signer);
+            let authenticated =
+                authenticated_command(sinomo_dfs::DFS_SMOKE_ROUTE.to_string(), signer);
             assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
         }
     }
@@ -1411,13 +1387,12 @@ mod tests {
             sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE,
             sinomo_dfs::DFS_DIRECT_READ_ROUTE,
         ] {
-            let command = daemon_rpc_command(route);
             for signer in [
                 DaemonSignerAuthority::Local,
                 DaemonSignerAuthority::Voter,
                 DaemonSignerAuthority::Member,
             ] {
-                let authenticated = authenticated_command(command.clone(), signer);
+                let authenticated = authenticated_command(route.to_string(), signer);
                 authorize_authenticated_daemon_command(&authenticated)
                     .expect("cluster members must be able to exchange DFS object data");
             }
@@ -1426,49 +1401,54 @@ mod tests {
 
     #[test]
     fn agent_session_routes_authorize_cluster_members() {
-        let command = daemon_rpc_command("/agent/session/inspect");
+        let route = "/agent/session/inspect".to_string();
         for signer in [
             DaemonSignerAuthority::Local,
             DaemonSignerAuthority::Voter,
             DaemonSignerAuthority::Member,
         ] {
-            let authenticated = authenticated_command(command.clone(), signer);
+            let authenticated = authenticated_command(route.clone(), signer);
             authorize_authenticated_daemon_command(&authenticated)
                 .expect("cluster members must be able to access agent session routes");
         }
-        let authenticated = authenticated_command(command, DaemonSignerAuthority::JoinCandidate);
+        let authenticated = authenticated_command(route, DaemonSignerAuthority::JoinCandidate);
         assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
     }
 
     #[test]
     fn native_dylib_cancel_route_authorizes_cluster_members() {
-        let command = daemon_rpc_command(sinomo_network::MODULE_NATIVE_DYLIB_CANCEL_ROUTE);
         for signer in [
             DaemonSignerAuthority::Local,
             DaemonSignerAuthority::Voter,
             DaemonSignerAuthority::Member,
         ] {
-            let authenticated = authenticated_command(command.clone(), signer);
+            let authenticated = authenticated_command(
+                sinomo_network::MODULE_NATIVE_DYLIB_CANCEL_ROUTE.to_string(),
+                signer,
+            );
             authorize_authenticated_daemon_command(&authenticated)
                 .expect("cluster members must be able to cancel native dylib module operations");
         }
-        let authenticated = authenticated_command(command, DaemonSignerAuthority::JoinCandidate);
+        let authenticated = authenticated_command(
+            sinomo_network::MODULE_NATIVE_DYLIB_CANCEL_ROUTE.to_string(),
+            DaemonSignerAuthority::JoinCandidate,
+        );
         assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
     }
 
     #[test]
     fn benchmark_cancel_probe_route_authorizes_cluster_members() {
-        let command = daemon_rpc_command("/benchmarks/cancel-probe");
+        let route = "/benchmarks/cancel-probe".to_string();
         for signer in [
             DaemonSignerAuthority::Local,
             DaemonSignerAuthority::Voter,
             DaemonSignerAuthority::Member,
         ] {
-            let authenticated = authenticated_command(command.clone(), signer);
+            let authenticated = authenticated_command(route.clone(), signer);
             authorize_authenticated_daemon_command(&authenticated)
                 .expect("cluster members must be able to invoke benchmark cancel probes");
         }
-        let authenticated = authenticated_command(command, DaemonSignerAuthority::JoinCandidate);
+        let authenticated = authenticated_command(route, DaemonSignerAuthority::JoinCandidate);
         assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
     }
 }

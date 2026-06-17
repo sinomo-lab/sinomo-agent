@@ -839,7 +839,7 @@ pub fn evolution_config_definition() -> Result<ConfigDefinition, EvolutionPersis
         ConfigValueType::Object {
             schema_name: "EvolutionConfig".to_string(),
         },
-        "Local self-evolution defaults such as source repo and preferred model.",
+        "Local evolution defaults such as target repo and preferred model.",
         ConfigClusterMode::LocalOnly,
     )
     .map_err(map_evolution_config_error)

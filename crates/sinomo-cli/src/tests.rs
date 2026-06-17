@@ -389,13 +389,13 @@ fn registered_test_command_with_help(
 }
 
 fn authenticated_test_command(
-    command: impl Into<String>,
+    route: impl Into<String>,
     signer: super::DaemonSignerAuthority,
     signer_node_id: impl Into<String>,
     signer_public_key: impl Into<String>,
 ) -> super::AuthenticatedDaemonCommand {
     super::AuthenticatedDaemonCommand {
-        command: command.into(),
+        route: route.into(),
         signer,
         signer_node_id: signer_node_id.into(),
         signer_public_key: signer_public_key.into(),
@@ -5914,21 +5914,18 @@ fn cluster_join_registration_works_over_iroh() {
                     )
                     .await
                     .expect("read fake iroh join command");
-                let request_line = request.command;
+                let request_route = request.route.clone();
                 if index == 0 {
                     assert_eq!(
-                        request_line,
-                        super::daemon_rpc_command(
-                            sinomo_runtime::network::CLUSTER_JOIN_CHALLENGE_ROUTE
-                        )
+                        request_route,
+                        sinomo_runtime::network::CLUSTER_JOIN_CHALLENGE_ROUTE
                     );
-                    let rpc = request.rpc.expect("challenge rpc");
                     assert_eq!(
-                        rpc.route,
+                        request.route,
                         sinomo_runtime::network::CLUSTER_JOIN_CHALLENGE_ROUTE
                     );
                     let challenge: super::ClusterInviteChallengeRequest =
-                        rpc.decode_body().expect("challenge request");
+                        request.decode_body().expect("challenge request");
                     assert_eq!(challenge.invite_id, fixture_invite_id);
                     let timestamp = OffsetDateTime::now_utc()
                         .format(&time::format_description::well_known::Rfc3339)
@@ -5964,29 +5961,28 @@ fn cluster_join_registration_works_over_iroh() {
                     stream
                         .write_response(
                             &fixture_daemon_address,
-                            &sinomo_runtime::network::DaemonControlResponse::rpc(
-                                String::new(),
-                                rpc_response,
-                            ),
+                            &rpc_response,
                             sinomo_runtime::network::ObjectFrameIoOptions::none(),
                         )
                         .await
                         .expect("write proof");
                 } else {
                     assert_eq!(
-                        request_line,
-                        super::daemon_rpc_command(
-                            sinomo_runtime::network::CLUSTER_JOIN_REGISTER_ROUTE
-                        )
+                        request_route,
+                        sinomo_runtime::network::CLUSTER_JOIN_REGISTER_ROUTE
                     );
                     let auth: super::SignedDaemonCommand =
                         sinomo_runtime::network::SinomoObjectCodec::default()
                             .decode(request.auth.as_deref().expect("join auth"))
                             .expect("decode join auth");
-                    assert_eq!(auth.command, request_line);
-                    let rpc = request.rpc.expect("join rpc");
+                    let expected_body_hash =
+                        ring::digest::digest(&ring::digest::SHA256, &request.body);
                     assert_eq!(
-                        rpc.route,
+                        auth.rpc_body_sha256.as_deref(),
+                        Some(expected_body_hash.as_ref())
+                    );
+                    assert_eq!(
+                        request.route,
                         sinomo_runtime::network::CLUSTER_JOIN_REGISTER_ROUTE
                     );
                     let response = super::ClusterJoinRegistrationResponse {
@@ -6003,10 +5999,7 @@ fn cluster_join_registration_works_over_iroh() {
                     stream
                         .write_response(
                             &fixture_daemon_address,
-                            &sinomo_runtime::network::DaemonControlResponse::rpc(
-                                String::new(),
-                                rpc_response,
-                            ),
+                            &rpc_response,
                             sinomo_runtime::network::ObjectFrameIoOptions::none(),
                         )
                         .await
@@ -7773,15 +7766,11 @@ fn daemon_auth_accepts_signed_local_command_and_rejects_tampering() {
     assert_eq!(
         authenticate_daemon_control_request(
             &daemon_paths,
-            &sinomo_runtime::network::DaemonControlRequest::authenticated_rpc(
-                super::daemon_rpc_command(sinomo_runtime::network::DAEMON_STATUS_ROUTE),
-                rpc_request.clone(),
-                signed_rpc.clone(),
-            )
+            &rpc_request.clone().with_auth(signed_rpc.clone())
         )
         .expect("auth rpc command"),
         authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::DAEMON_STATUS_ROUTE),
+            sinomo_runtime::network::DAEMON_STATUS_ROUTE,
             super::DaemonSignerAuthority::Local,
             NodeId::from_legacy_named("node_auth")
                 .expect("node")
@@ -7790,10 +7779,7 @@ fn daemon_auth_accepts_signed_local_command_and_rejects_tampering() {
         )
     );
     assert!(matches!(
-        authenticate_daemon_control_request(
-            &daemon_paths,
-            &sinomo_runtime::network::DaemonControlRequest::new("INVALID_CONTROL_FRAME")
-        ),
+        authenticate_daemon_control_request(&daemon_paths, &rpc_request),
         Err(super::DaemonError::AuthDenied)
     ));
     let tampered_rpc_request = sinomo_runtime::network::ObjectRpcRequest::encode_body(
@@ -7805,11 +7791,7 @@ fn daemon_auth_accepts_signed_local_command_and_rejects_tampering() {
     assert!(matches!(
         authenticate_daemon_control_request(
             &daemon_paths,
-            &sinomo_runtime::network::DaemonControlRequest::authenticated_rpc(
-                super::daemon_rpc_command(sinomo_runtime::network::DAEMON_STATUS_ROUTE),
-                tampered_rpc_request,
-                signed_rpc,
-            )
+            &tampered_rpc_request.with_auth(signed_rpc)
         ),
         Err(super::DaemonError::AuthDenied)
     ));
@@ -7866,11 +7848,7 @@ fn daemon_auth_only_accepts_active_signed_join_invites() {
     assert_eq!(
         authenticate_daemon_control_request(
             &DaemonPaths::with_root(host_root.join("daemon")),
-            &sinomo_runtime::network::DaemonControlRequest::authenticated_rpc(
-                super::daemon_rpc_command(sinomo_runtime::network::CLUSTER_JOIN_REGISTER_ROUTE),
-                rpc_request,
-                signed,
-            )
+            &rpc_request.with_auth(signed)
         )
         .expect("active invite auth")
         .signer,
@@ -7891,11 +7869,7 @@ fn daemon_auth_only_accepts_active_signed_join_invites() {
     assert!(matches!(
         authenticate_daemon_control_request(
             &DaemonPaths::with_root(host_root.join("daemon")),
-            &sinomo_runtime::network::DaemonControlRequest::authenticated_rpc(
-                super::daemon_rpc_command(sinomo_runtime::network::CLUSTER_JOIN_REGISTER_ROUTE),
-                tampered_rpc_request,
-                tampered_signed,
-            )
+            &tampered_rpc_request.with_auth(tampered_signed)
         ),
         Err(super::DaemonError::AuthDenied)
     ));
@@ -7905,7 +7879,7 @@ fn daemon_auth_only_accepts_active_signed_join_invites() {
 fn daemon_authorization_restricts_admin_and_local_commands() {
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::DAEMON_STATUS_ROUTE),
+            sinomo_runtime::network::DAEMON_STATUS_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -7914,7 +7888,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::kv::CLUSTER_KV_SNAPSHOT_ROUTE),
+            sinomo_runtime::kv::CLUSTER_KV_SNAPSHOT_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -7923,7 +7897,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::kv::CLUSTER_KV_RANGE_PREFIX_ROUTE),
+            sinomo_runtime::kv::CLUSTER_KV_RANGE_PREFIX_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -7932,7 +7906,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::kv::CLUSTER_KV_WATCH_PREFIX_ROUTE),
+            sinomo_runtime::kv::CLUSTER_KV_WATCH_PREFIX_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -7941,7 +7915,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::kv::CLUSTER_KV_TXN_ROUTE),
+            sinomo_runtime::kv::CLUSTER_KV_TXN_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -7950,7 +7924,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::kv::CLUSTER_KV_TXN_ROUTE),
+            sinomo_runtime::kv::CLUSTER_KV_TXN_ROUTE,
             super::DaemonSignerAuthority::Voter,
             "node_voter",
             "pk_voter"
@@ -7959,7 +7933,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::kv::CLUSTER_RAFT_APPEND_ROUTE),
+            sinomo_runtime::kv::CLUSTER_RAFT_APPEND_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -7968,7 +7942,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::kv::CLUSTER_RAFT_VOTE_ROUTE),
+            sinomo_runtime::kv::CLUSTER_RAFT_VOTE_ROUTE,
             super::DaemonSignerAuthority::Voter,
             "node_voter",
             "pk_voter"
@@ -7977,7 +7951,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::CLUSTER_MEMBER_PUBLISH_ROUTE),
+            sinomo_runtime::network::CLUSTER_MEMBER_PUBLISH_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -7986,7 +7960,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::CLUSTER_INVITE_PUBLISH_ROUTE),
+            sinomo_runtime::network::CLUSTER_INVITE_PUBLISH_ROUTE,
             super::DaemonSignerAuthority::JoinCandidate,
             "node_join",
             "pk_join"
@@ -7995,7 +7969,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::CLUSTER_JOIN_REGISTER_ROUTE),
+            sinomo_runtime::network::CLUSTER_JOIN_REGISTER_ROUTE,
             super::DaemonSignerAuthority::JoinCandidate,
             "node_join",
             "pk_join"
@@ -8004,7 +7978,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::dfs::DFS_EXPOSE_CONFIG_ROUTE),
+            sinomo_runtime::dfs::DFS_EXPOSE_CONFIG_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -8013,7 +7987,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::dfs::DFS_EXPOSE_CONFIG_ROUTE),
+            sinomo_runtime::dfs::DFS_EXPOSE_CONFIG_ROUTE,
             super::DaemonSignerAuthority::Local,
             "node_local",
             "pk_local"
@@ -8022,7 +7996,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::dfs::DFS_SMOKE_ROUTE),
+            sinomo_runtime::dfs::DFS_SMOKE_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -8031,7 +8005,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::dfs::DFS_SMOKE_ROUTE),
+            sinomo_runtime::dfs::DFS_SMOKE_ROUTE,
             super::DaemonSignerAuthority::Local,
             "node_local",
             "pk_local"
@@ -8040,7 +8014,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::SANDBOX_HTTP_FETCH_ROUTE),
+            sinomo_runtime::network::SANDBOX_HTTP_FETCH_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -8049,7 +8023,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::SANDBOX_HTTP_FETCH_ROUTE),
+            sinomo_runtime::network::SANDBOX_HTTP_FETCH_ROUTE,
             super::DaemonSignerAuthority::Local,
             "node_local",
             "pk_local"
@@ -8081,7 +8055,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     ] {
         assert!(
             super::authorize_authenticated_daemon_command(&authenticated_test_command(
-                &super::daemon_rpc_command(route),
+                route,
                 super::DaemonSignerAuthority::Member,
                 "node_member",
                 "pk_member"
@@ -8091,7 +8065,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
         );
         assert!(
             super::authorize_authenticated_daemon_command(&authenticated_test_command(
-                &super::daemon_rpc_command(route),
+                route,
                 super::DaemonSignerAuthority::Local,
                 "node_local",
                 "pk_local"
@@ -8102,7 +8076,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     }
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::SANDBOX_RUN_TOOLCHAIN_ROUTE),
+            sinomo_runtime::network::SANDBOX_RUN_TOOLCHAIN_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -8111,7 +8085,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::SANDBOX_RUN_TOOLCHAIN_ROUTE),
+            sinomo_runtime::network::SANDBOX_RUN_TOOLCHAIN_ROUTE,
             super::DaemonSignerAuthority::Local,
             "node_local",
             "pk_local"
@@ -8120,7 +8094,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::SANDBOX_WRITE_ROUTE),
+            sinomo_runtime::network::SANDBOX_WRITE_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -8129,7 +8103,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::SANDBOX_WRITE_ROUTE),
+            sinomo_runtime::network::SANDBOX_WRITE_ROUTE,
             super::DaemonSignerAuthority::Local,
             "node_local",
             "pk_local"
@@ -8138,7 +8112,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::rollout::ROLLOUT_DIAGNOSTICS_ROUTE),
+            sinomo_runtime::rollout::ROLLOUT_DIAGNOSTICS_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -8147,7 +8121,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::rollout::ROLLOUT_DIAGNOSTICS_ROUTE),
+            sinomo_runtime::rollout::ROLLOUT_DIAGNOSTICS_ROUTE,
             super::DaemonSignerAuthority::Voter,
             "node_voter",
             "pk_voter"
@@ -8156,7 +8130,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::rollout::ROLLOUT_BUILD_ROUTE),
+            sinomo_runtime::rollout::ROLLOUT_BUILD_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -8165,7 +8139,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::rollout::ROLLOUT_BUILD_ROUTE),
+            sinomo_runtime::rollout::ROLLOUT_BUILD_ROUTE,
             super::DaemonSignerAuthority::Voter,
             "node_voter",
             "pk_voter"
@@ -8174,7 +8148,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::rollout::ROLLOUT_BINARY_ROUTE),
+            sinomo_runtime::rollout::ROLLOUT_BINARY_ROUTE,
             super::DaemonSignerAuthority::Voter,
             "node_voter",
             "pk_voter"
@@ -8183,7 +8157,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::DAEMON_SHUTDOWN_ROUTE),
+            sinomo_runtime::network::DAEMON_SHUTDOWN_ROUTE,
             super::DaemonSignerAuthority::Voter,
             "node_voter",
             "pk_voter"
@@ -8192,7 +8166,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::rollout::ROLLOUT_FINALIZE_SHADOW_ROUTE),
+            sinomo_runtime::rollout::ROLLOUT_FINALIZE_SHADOW_ROUTE,
             super::DaemonSignerAuthority::Local,
             "node_local",
             "pk_local"
@@ -9959,7 +9933,7 @@ fn network_raft_handlers_reject_mismatched_authenticated_peer() {
     super::network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
         .expect("sync state to kv");
     let bad_auth = authenticated_test_command(
-        &super::daemon_rpc_command(sinomo_runtime::kv::CLUSTER_RAFT_APPEND_ROUTE),
+        sinomo_runtime::kv::CLUSTER_RAFT_APPEND_ROUTE,
         super::DaemonSignerAuthority::Voter,
         "node_other",
         "pk_other",
@@ -10000,7 +9974,7 @@ fn network_raft_handlers_reject_mismatched_authenticated_peer() {
     forged_member.endpoints.clear();
     forged_state.members.push(forged_member);
     let forged_auth = authenticated_test_command(
-        &super::daemon_rpc_command(sinomo_runtime::kv::CLUSTER_RAFT_APPEND_ROUTE),
+        sinomo_runtime::kv::CLUSTER_RAFT_APPEND_ROUTE,
         super::DaemonSignerAuthority::Voter,
         remote_node_id.as_str(),
         "pk_forged_voter",
@@ -10305,7 +10279,7 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
     let host_state = read_cluster_state(&host_paths).expect("host state");
     let peer_state = read_cluster_state(&peer_paths).expect("peer state");
     let host_auth = authenticated_test_command(
-        &super::daemon_rpc_command(sinomo_runtime::kv::CLUSTER_RAFT_APPEND_ROUTE),
+        sinomo_runtime::kv::CLUSTER_RAFT_APPEND_ROUTE,
         super::DaemonSignerAuthority::Voter,
         host_state.local_node_id.as_str(),
         host_identity.public_key.clone(),

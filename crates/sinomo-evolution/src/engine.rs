@@ -1790,7 +1790,15 @@ pub fn prepare_scheduled_iteration(
     let mut command_texts = task.verification_commands.clone();
     command_texts.extend(request.extra_verification_commands);
     if command_texts.is_empty() {
-        command_texts.push("cargo check".to_string());
+        let project = campaign
+            .source_repo
+            .as_deref()
+            .map(|repo| project_profile_for_root(Path::new(repo)))
+            .unwrap_or_else(|| EvolutionProjectProfile {
+                kind: EvolutionProjectKind::Sinomo,
+                name: "sinomo".to_string(),
+            });
+        command_texts.extend(default_campaign_task_verification_commands(&project));
     }
     let verification_commands = command_texts
         .into_iter()
@@ -3033,8 +3041,16 @@ pub fn propose_evolution_campaign(request: CampaignProposalRequest) -> Evolution
     let campaign_id = generated_id("camp");
     let objective_id = generated_id("objcard");
     let objective_kind = classify_objective(&request.objective);
+    let project = request
+        .source_repo
+        .as_deref()
+        .map(|repo| project_profile_for_root(Path::new(repo)))
+        .unwrap_or_else(|| EvolutionProjectProfile {
+            kind: EvolutionProjectKind::Sinomo,
+            name: "sinomo".to_string(),
+        });
     let stages = stages_for_objective(objective_kind);
-    let near_term_tasks = tasks_for_objective(objective_kind, &stages);
+    let near_term_tasks = tasks_for_objective(objective_kind, &stages, &project);
     let budget_policy = CampaignBudgetPolicy {
         policy_id: request.budget_policy.clone(),
         reserve_floors: request.reserve_floors.clone(),
@@ -3146,6 +3162,11 @@ fn proposal_constraints(request: &CampaignProposalRequest) -> Vec<String> {
         format!("budget policy: {}", request.budget_policy),
         "no formal capability registry is required for phase 0".to_string(),
     ];
+    if let Some(source_repo) = &request.source_repo {
+        let project = project_profile_for_root(Path::new(source_repo));
+        constraints.push(format!("target project: {}", project.summary()));
+        constraints.push(format!("source repo: {source_repo}"));
+    }
     if let Some(max_wall_time) = &request.max_wall_time {
         constraints.push(format!("max wall time: {max_wall_time}"));
     }
@@ -3401,6 +3422,7 @@ fn stages_for_objective(kind: ObjectiveKind) -> Vec<EvolutionStage> {
 fn tasks_for_objective(
     kind: ObjectiveKind,
     stages: &[EvolutionStage],
+    project: &EvolutionProjectProfile,
 ) -> Vec<NearTermEvolutionTask> {
     stages
         .iter()
@@ -3418,7 +3440,7 @@ fn tasks_for_objective(
             objective: format!("Make progress on stage `{}` while preserving evidence and approval gates.", stage.name),
             rationale: "Selected because it is small, inspectable, and failure would produce useful adaptation evidence.".to_string(),
             required_evidence: vec!["changed artifacts or scorecard".to_string(), "decision rationale".to_string(), "verification output".to_string()],
-            verification_commands: vec!["cargo test --workspace".to_string()],
+            verification_commands: default_campaign_task_verification_commands(project),
             estimated_budget: "one focused implementation iteration after approval".to_string(),
             approval_required: true,
             expected_result_kind: if kind == ObjectiveKind::Scheduler && index == 1 {
@@ -3430,6 +3452,16 @@ fn tasks_for_objective(
             },
         })
         .collect()
+}
+
+fn default_campaign_task_verification_commands(project: &EvolutionProjectProfile) -> Vec<String> {
+    match project.kind {
+        EvolutionProjectKind::Sinomo => vec!["cargo test --workspace".to_string()],
+        EvolutionProjectKind::Rust => vec!["cargo check".to_string()],
+        EvolutionProjectKind::Node
+        | EvolutionProjectKind::Python
+        | EvolutionProjectKind::Generic => vec!["git diff --check".to_string()],
+    }
 }
 
 fn budget_notes(request: &CampaignProposalRequest) -> Vec<String> {
@@ -4831,7 +4863,7 @@ pub fn render_agent_mutation_prompt(
         prompt.push_str(&format!("source_revision: {revision}\n"));
     }
     prompt.push_str(
-        "Treat this workspace as the only mutation target. The running Sinomo instance may be using the source workspace separately.\n",
+        "Treat this workspace as the only mutation target. The source checkout or owning runtime may be using the source workspace separately.\n",
     );
     prompt.push_str("\n## Agent Harness Instructions\n");
     prompt.push_str(
@@ -4847,10 +4879,13 @@ pub fn render_agent_mutation_prompt(
 }
 
 pub fn render_mutation_prompt(packet: &MutationPacket) -> String {
+    let project = project_profile_for_root(Path::new(&packet.edit_scope.workspace_root));
     let mut prompt = String::new();
-    prompt.push_str("# Sinomo Mutation Packet\n\n");
+    prompt.push_str("# Evolution Mutation Packet\n\n");
     prompt.push_str(&format!("job_id: {}\n", packet.job_id));
-    prompt.push_str("target_ring: ignored during current bootstrap pass\n");
+    prompt.push_str(&format!("target_project: {}\n", project.summary()));
+    prompt
+        .push_str("target_ring: used as a risk/evidence hint during the current bootstrap pass\n");
     prompt.push_str(&format!("objective: {}\n\n", packet.objective));
     prompt.push_str("## Intended Edit Scope\n");
     prompt.push_str(&format!(
@@ -4921,7 +4956,7 @@ pub fn render_mutation_bridge_prompt(
         prompt.push_str(&format!("source_revision: {revision}\n"));
     }
     prompt.push_str(
-        "Treat this workspace as the only mutation target. The running Sinomo instance may be using the source workspace separately.\n",
+        "Treat this workspace as the only mutation target. The source checkout or owning runtime may be using the source workspace separately.\n",
     );
 
     prompt.push_str("\n## Tool Substrate\n");
@@ -4966,7 +5001,7 @@ pub fn render_mutation_bridge_prompt(
 
 fn render_mutation_system_prompt(structured_json: bool, direct_edit: bool) -> String {
     let mut prompt = String::from(
-        "You are Sinomo's supervised bootstrap mutation worker. Work only on the requested R0/R1 candidate and produce durable evidence.",
+        "You are Sinomo's supervised evolution mutation worker. Work only on the requested candidate workspace and produce durable evidence.",
     );
     if direct_edit {
         prompt.push_str(
@@ -7386,15 +7421,116 @@ fn scorecard_outcome_from_gates(
     EvaluationOutcome::Passed
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EvolutionProjectKind {
+    Sinomo,
+    Rust,
+    Node,
+    Python,
+    Generic,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EvolutionProjectProfile {
+    kind: EvolutionProjectKind,
+    name: String,
+}
+
+impl EvolutionProjectProfile {
+    fn summary(&self) -> String {
+        format!("{} ({})", self.name, self.kind.label())
+    }
+
+    fn default_verification_commands(&self) -> Vec<VerificationCommand> {
+        match self.kind {
+            EvolutionProjectKind::Sinomo | EvolutionProjectKind::Rust => {
+                vec![VerificationCommand {
+                    name: "cargo check".to_string(),
+                    command: "cargo check".to_string(),
+                    expected_exit_code: 0,
+                    gate: EvaluationGate::StaticChecks,
+                }]
+            }
+            EvolutionProjectKind::Node
+            | EvolutionProjectKind::Python
+            | EvolutionProjectKind::Generic => {
+                vec![VerificationCommand {
+                    name: "git diff check".to_string(),
+                    command: "git diff --check".to_string(),
+                    expected_exit_code: 0,
+                    gate: EvaluationGate::StaticChecks,
+                }]
+            }
+        }
+    }
+
+    fn edit_notes(&self) -> String {
+        match self.kind {
+            EvolutionProjectKind::Sinomo => {
+                "bootstrap supervised Sinomo self-evolution iteration".to_string()
+            }
+            EvolutionProjectKind::Rust => {
+                "supervised evolution iteration for an external Rust project".to_string()
+            }
+            EvolutionProjectKind::Node => {
+                "supervised evolution iteration for an external Node/JavaScript project; provide explicit --verify commands for project-specific tests".to_string()
+            }
+            EvolutionProjectKind::Python => {
+                "supervised evolution iteration for an external Python project; provide explicit --verify commands for project-specific tests".to_string()
+            }
+            EvolutionProjectKind::Generic => {
+                "supervised evolution iteration for an external project; provide explicit --verify commands for project-specific tests".to_string()
+            }
+        }
+    }
+}
+
+impl EvolutionProjectKind {
+    fn label(self) -> &'static str {
+        match self {
+            EvolutionProjectKind::Sinomo => "sinomo",
+            EvolutionProjectKind::Rust => "rust",
+            EvolutionProjectKind::Node => "node",
+            EvolutionProjectKind::Python => "python",
+            EvolutionProjectKind::Generic => "generic",
+        }
+    }
+}
+
+fn project_profile_for_root(source_root: &Path) -> EvolutionProjectProfile {
+    let kind = if source_root.join("crates").join("sinomo-evolution").exists()
+        && source_root
+            .join("docs")
+            .join("self-evolution-architecture.md")
+            .exists()
+    {
+        EvolutionProjectKind::Sinomo
+    } else if source_root.join("Cargo.toml").exists() {
+        EvolutionProjectKind::Rust
+    } else if source_root.join("package.json").exists() {
+        EvolutionProjectKind::Node
+    } else if source_root.join("pyproject.toml").exists()
+        || source_root.join("setup.py").exists()
+        || source_root.join("requirements.txt").exists()
+    {
+        EvolutionProjectKind::Python
+    } else {
+        EvolutionProjectKind::Generic
+    };
+    let name = source_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("project")
+        .to_string();
+    EvolutionProjectProfile { kind, name }
+}
+
 fn create_bootstrap_job(request: &EvolutionRequest, source_root: &Path) -> EvolutionJob {
     let job_id = EvolutionJobId::generate();
+    let project = project_profile_for_root(source_root);
     let commands = if request.verification_commands.is_empty() {
-        vec![VerificationCommand {
-            name: "cargo check".to_string(),
-            command: "cargo check".to_string(),
-            expected_exit_code: 0,
-            gate: EvaluationGate::StaticChecks,
-        }]
+        project.default_verification_commands()
     } else {
         request.verification_commands.clone()
     };
@@ -7418,7 +7554,7 @@ fn create_bootstrap_job(request: &EvolutionRequest, source_root: &Path) -> Evolu
         edit_scope: EditScope {
             workspace_root: source_root.display().to_string(),
             intended_paths: request.intended_paths.clone(),
-            notes: "bootstrap supervised self-evolution iteration".to_string(),
+            notes: project.edit_notes(),
         },
         verification: VerificationPlan {
             commands,
@@ -7532,12 +7668,20 @@ fn is_relevant_source_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    if matches!(name, "Cargo.toml" | "README.md") {
+    if matches!(
+        name,
+        "Cargo.toml"
+            | "README.md"
+            | "package.json"
+            | "pyproject.toml"
+            | "requirements.txt"
+            | "setup.py"
+    ) {
         return true;
     }
     matches!(
         path.extension().and_then(|extension| extension.to_str()),
-        Some("rs" | "toml" | "md" | "json")
+        Some("rs" | "toml" | "md" | "json" | "js" | "jsx" | "ts" | "tsx" | "py" | "yaml" | "yml")
     )
 }
 

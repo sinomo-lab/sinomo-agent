@@ -1565,11 +1565,7 @@ impl network::ClusterKvTxnForwardHost for DfsFuseClusterKvTxnForwardHost {
     ) -> std::result::Result<network::ObjectRpcResponse, NetworkError> {
         let signed = daemon::sign_daemon_rpc_request_for_local_node(request)
             .map_err(|error| dfs_fuse_network_error("cluster relay sign inner", error))?;
-        let inner = network::DaemonControlRequest::authenticated_rpc(
-            daemon::daemon_rpc_command(&request.route),
-            request.clone(),
-            signed,
-        );
+        let inner = request.clone().with_auth(signed);
         let outer =
             network::RelayEnvelope::new(state.cluster_id.clone(), target_node_id.clone(), inner)
                 .into_request()?;

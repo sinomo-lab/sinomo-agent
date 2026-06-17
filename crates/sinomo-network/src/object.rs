@@ -109,67 +109,8 @@ impl ObjectFrameIoOptions {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct DaemonControlRequest {
-    pub command: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rpc: Option<crate::ObjectRpcRequest>,
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
-    pub auth: Option<Vec<u8>>,
-}
-
-impl DaemonControlRequest {
-    pub fn new(command: impl Into<String>) -> Self {
-        Self {
-            command: command.into(),
-            rpc: None,
-            auth: None,
-        }
-    }
-
-    pub fn rpc(command: impl Into<String>, rpc: crate::ObjectRpcRequest) -> Self {
-        Self {
-            command: command.into(),
-            rpc: Some(rpc),
-            auth: None,
-        }
-    }
-
-    pub fn authenticated_rpc(
-        command: impl Into<String>,
-        rpc: crate::ObjectRpcRequest,
-        auth: Vec<u8>,
-    ) -> Self {
-        Self {
-            command: command.into(),
-            rpc: Some(rpc),
-            auth: Some(auth),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct DaemonControlResponse {
-    pub body: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rpc: Option<crate::ObjectRpcResponse>,
-}
-
-impl DaemonControlResponse {
-    pub fn new(body: impl Into<String>) -> Self {
-        Self {
-            body: body.into(),
-            rpc: None,
-        }
-    }
-
-    pub fn rpc(body: impl Into<String>, rpc: crate::ObjectRpcResponse) -> Self {
-        Self {
-            body: body.into(),
-            rpc: Some(rpc),
-        }
-    }
-}
+pub type DaemonControlRequest = crate::ObjectRpcRequest;
+pub type DaemonControlResponse = crate::ObjectRpcResponse;
 
 #[derive(Debug)]
 pub struct AsyncDaemonControlListener {
@@ -373,7 +314,7 @@ impl AsyncDaemonControlStream {
         response: &crate::ObjectRpcResponse,
         options: ObjectFrameIoOptions,
     ) -> Result<(), NetworkError> {
-        self.write_frame(address, response, options).await
+        self.write_response(address, response, options).await
     }
 
     pub async fn write_object_stream_chunk(
@@ -704,24 +645,19 @@ pub fn object_rpc_response_has_streamed_daemon_body(response: &crate::ObjectRpcR
 }
 
 pub fn daemon_control_request_expects_raw_rpc_response(request: &DaemonControlRequest) -> bool {
-    request
-        .rpc
-        .as_ref()
-        .is_some_and(object_rpc_request_expects_raw_daemon_response)
+    object_rpc_request_expects_raw_daemon_response(request)
 }
 
 fn daemon_control_request_allows_stream_reuse(request: &DaemonControlRequest) -> bool {
-    request.rpc.as_ref().is_some_and(|rpc| {
-        rpc.route == crate::CLUSTER_NETWORK_PING_ROUTE
-            || rpc.route == crate::CLUSTER_RELAY_ROUTE
-            || rpc
-                .metadata
-                .get(DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY)
-                .is_some_and(|value| {
-                    value == DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE
-                        || value.eq_ignore_ascii_case("true")
-                })
-    })
+    request.route == crate::CLUSTER_NETWORK_PING_ROUTE
+        || request.route == crate::CLUSTER_RELAY_ROUTE
+        || request
+            .metadata
+            .get(DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY)
+            .is_some_and(|value| {
+                value == DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE
+                    || value.eq_ignore_ascii_case("true")
+            })
 }
 
 fn take_pooled_daemon_control_stream(address: &str) -> Option<AsyncDaemonControlStream> {
@@ -1668,12 +1604,11 @@ fn object_frame_eof_detail(part: &str, read: usize, expected: usize) -> String {
 #[cfg(test)]
 mod serde_bytes_tests {
     use super::{
-        AsyncDaemonControlListener, DaemonControlRequest, DaemonControlResponse, DaemonRpcTimeouts,
-        ObjectFrameIoOptions, ObjectStreamChunk, ObjectStreamChunkOptions, SinomoObjectCodec,
-        decode_single_object_frame_from_slice, encode_object_frame_to_vec, read_object_frame_async,
-        read_object_frame_blocking, read_object_stream_chunks_async,
-        send_daemon_control_request_async, write_all_async_frame, write_object_frame_async,
-        write_object_frame_blocking, write_object_stream_chunks_async,
+        AsyncDaemonControlListener, DaemonRpcTimeouts, ObjectFrameIoOptions, ObjectStreamChunk,
+        ObjectStreamChunkOptions, SinomoObjectCodec, decode_single_object_frame_from_slice,
+        encode_object_frame_to_vec, read_object_frame_async, read_object_frame_blocking,
+        read_object_stream_chunks_async, send_daemon_control_request_async, write_all_async_frame,
+        write_object_frame_async, write_object_frame_blocking, write_object_stream_chunks_async,
     };
     use crate::error::NetworkError;
     use serde::{Deserialize, Serialize};
@@ -2110,11 +2045,14 @@ mod serde_bytes_tests {
                 )
                 .await
                 .expect("request");
-            assert_eq!(request.command, "ping");
+            assert_eq!(request.route, "/daemon-control/ping");
+            let response =
+                crate::ObjectRpcResponse::encode_body("/daemon-control/ping", &"pong".to_string())
+                    .expect("response");
             stream
                 .write_response(
                     "listener",
-                    &DaemonControlResponse::new("pong"),
+                    &response,
                     ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
                 )
                 .await
@@ -2123,14 +2061,15 @@ mod serde_bytes_tests {
 
         let response = send_daemon_control_request_async(
             &address,
-            &DaemonControlRequest::new("ping"),
+            &crate::ObjectRpcRequest::encode_body("/daemon-control/ping", "daemon-control", &())
+                .expect("request"),
             DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
             1024,
         )
         .await
         .expect("control response");
 
-        assert_eq!(response.body, "pong");
+        assert_eq!(response.decode_body::<String>().expect("body"), "pong");
         server.await.expect("server task");
     }
 
@@ -2151,30 +2090,29 @@ mod serde_bytes_tests {
                     )
                     .await
                     .expect("request");
-                assert_eq!(request.command, "RPC /cluster/network/ping");
-                assert_eq!(
-                    request.rpc.as_ref().map(|rpc| rpc.route.as_str()),
-                    Some(crate::CLUSTER_NETWORK_PING_ROUTE)
-                );
+                assert_eq!(request.route, crate::CLUSTER_NETWORK_PING_ROUTE);
+                let response = crate::ObjectRpcResponse::encode_body(
+                    crate::CLUSTER_NETWORK_PING_ROUTE,
+                    &expected.to_string(),
+                )
+                .expect("response");
                 stream
                     .write_response(
                         "listener",
-                        &DaemonControlResponse::new(expected),
+                        &response,
                         ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
                     )
                     .await
                     .expect("response");
             }
         });
-        let request = DaemonControlRequest::rpc(
-            "RPC /cluster/network/ping",
-            crate::ObjectRpcRequest {
-                route: crate::CLUSTER_NETWORK_PING_ROUTE.to_string(),
-                category: crate::CLUSTER_NETWORK_RPC_CATEGORY.to_string(),
-                metadata: std::collections::BTreeMap::new(),
-                body: Vec::new(),
-            },
-        );
+        let request = crate::ObjectRpcRequest {
+            route: crate::CLUSTER_NETWORK_PING_ROUTE.to_string(),
+            category: crate::CLUSTER_NETWORK_RPC_CATEGORY.to_string(),
+            metadata: std::collections::BTreeMap::new(),
+            auth: None,
+            body: Vec::new(),
+        };
 
         let first = send_daemon_control_request_async(
             &address,
@@ -2193,8 +2131,8 @@ mod serde_bytes_tests {
         .await
         .expect("second response");
 
-        assert_eq!(first.body, "one");
-        assert_eq!(second.body, "two");
+        assert_eq!(first.decode_body::<String>().expect("first body"), "one");
+        assert_eq!(second.decode_body::<String>().expect("second body"), "two");
         server.await.expect("server task");
     }
 
@@ -2215,15 +2153,14 @@ mod serde_bytes_tests {
                     )
                     .await
                     .expect("request");
-                assert_eq!(request.command, "RPC /test/reusable");
-                assert_eq!(
-                    request.rpc.as_ref().map(|rpc| rpc.route.as_str()),
-                    Some("/test/reusable")
-                );
+                assert_eq!(request.route, "/test/reusable");
+                let response =
+                    crate::ObjectRpcResponse::encode_body("/test/reusable", &expected.to_string())
+                        .expect("response");
                 stream
                     .write_response(
                         "listener",
-                        &DaemonControlResponse::new(expected),
+                        &response,
                         ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
                     )
                     .await
@@ -2235,15 +2172,13 @@ mod serde_bytes_tests {
             super::DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY.to_string(),
             super::DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE.to_string(),
         );
-        let request = DaemonControlRequest::rpc(
-            "RPC /test/reusable",
-            crate::ObjectRpcRequest {
-                route: "/test/reusable".to_string(),
-                category: "test".to_string(),
-                metadata,
-                body: Vec::new(),
-            },
-        );
+        let request = crate::ObjectRpcRequest {
+            route: "/test/reusable".to_string(),
+            category: "test".to_string(),
+            metadata,
+            auth: None,
+            body: Vec::new(),
+        };
 
         let first = send_daemon_control_request_async(
             &address,
@@ -2262,13 +2197,13 @@ mod serde_bytes_tests {
         .await
         .expect("second response");
 
-        assert_eq!(first.body, "one");
-        assert_eq!(second.body, "two");
+        assert_eq!(first.decode_body::<String>().expect("first body"), "one");
+        assert_eq!(second.decode_body::<String>().expect("second body"), "two");
         server.await.expect("server task");
     }
 
     #[tokio::test]
-    async fn reusable_daemon_control_request_can_read_raw_rpc_response() {
+    async fn reusable_daemon_control_request_can_read_object_rpc_response() {
         let listener = AsyncDaemonControlListener::bind("127.0.0.1:0")
             .await
             .expect("listener");
@@ -2284,12 +2219,9 @@ mod serde_bytes_tests {
                     )
                     .await
                     .expect("request");
-                assert_eq!(request.command, "RPC /test/raw-reusable");
-                assert!(super::daemon_control_request_expects_raw_rpc_response(
-                    &request
-                ));
+                assert_eq!(request.route, "/test/reusable-rpc-response");
                 let response = crate::ObjectRpcResponse::encode_body(
-                    "/test/raw-reusable",
+                    "/test/reusable-rpc-response",
                     &expected.to_string(),
                 )
                 .expect("response");
@@ -2308,21 +2240,15 @@ mod serde_bytes_tests {
             super::DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY.to_string(),
             super::DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE.to_string(),
         );
-        metadata.insert(
-            super::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY.to_string(),
-            super::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE.to_string(),
-        );
-        let request = DaemonControlRequest::rpc(
-            "RPC /test/raw-reusable",
-            crate::ObjectRpcRequest {
-                route: "/test/raw-reusable".to_string(),
-                category: "test".to_string(),
-                metadata,
-                body: Vec::new(),
-            },
-        );
+        let request = crate::ObjectRpcRequest {
+            route: "/test/reusable-rpc-response".to_string(),
+            category: "test".to_string(),
+            metadata,
+            auth: None,
+            body: Vec::new(),
+        };
 
-        let first = super::send_daemon_control_rpc_request_raw_response_async(
+        let first = send_daemon_control_request_async(
             &address,
             &request,
             DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
@@ -2330,7 +2256,7 @@ mod serde_bytes_tests {
         )
         .await
         .expect("first response");
-        let second = super::send_daemon_control_rpc_request_raw_response_async(
+        let second = send_daemon_control_request_async(
             &address,
             &request,
             DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
@@ -2360,16 +2286,13 @@ mod serde_bytes_tests {
                 )
                 .await
                 .expect("request");
-            assert_eq!(request.command, "RPC /test/raw-stream");
+            assert_eq!(request.route, "/test/raw-stream");
             assert!(super::daemon_control_request_expects_raw_rpc_response(
                 &request
             ));
-            assert!(
-                request
-                    .rpc
-                    .as_ref()
-                    .is_some_and(super::object_rpc_request_accepts_streamed_daemon_response)
-            );
+            assert!(super::object_rpc_request_accepts_streamed_daemon_response(
+                &request
+            ));
             let mut response =
                 crate::ObjectRpcResponse::from_encoded_body("/test/raw-stream", Vec::new());
             response.metadata.insert(
@@ -2412,15 +2335,13 @@ mod serde_bytes_tests {
             super::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY.to_string(),
             super::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE.to_string(),
         );
-        let request = DaemonControlRequest::rpc(
-            "RPC /test/raw-stream",
-            crate::ObjectRpcRequest {
-                route: "/test/raw-stream".to_string(),
-                category: "test".to_string(),
-                metadata,
-                body: Vec::new(),
-            },
-        );
+        let request = crate::DaemonControlRequest {
+            route: "/test/raw-stream".to_string(),
+            category: "test".to_string(),
+            metadata,
+            auth: None,
+            body: Vec::new(),
+        };
 
         let response = super::send_daemon_control_rpc_request_raw_response_async(
             &address,

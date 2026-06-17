@@ -47,8 +47,7 @@ impl DaemonServiceRegistryHook {
 pub use auth::{
     AuthenticatedDaemonCommand, DaemonSignerAuthority, SignedDaemonCommand,
     authenticate_daemon_control_request, authorize_authenticated_daemon_command,
-    daemon_rpc_command, sign_daemon_rpc_request_for_local_node,
-    sign_daemon_rpc_request_from_data_dir,
+    sign_daemon_rpc_request_for_local_node, sign_daemon_rpc_request_from_data_dir,
 };
 #[cfg(test)]
 pub(crate) use client::send_daemon_rpc_raw;

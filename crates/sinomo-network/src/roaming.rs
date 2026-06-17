@@ -711,16 +711,7 @@ pub(crate) fn iroh_proxy_route_hint(payload: &[u8]) -> String {
     ) else {
         return IROH_DAEMON_PROXY_ERROR_ROUTE.to_string();
     };
-    if let Some(rpc) = request.rpc {
-        return rpc.route;
-    }
-    request
-        .command
-        .strip_prefix("RPC ")
-        .map(str::trim)
-        .filter(|route| !route.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| IROH_DAEMON_PROXY_ERROR_ROUTE.to_string())
+    request.route
 }
 
 #[cfg(any(feature = "iroh-transport", test))]
@@ -851,10 +842,7 @@ pub(crate) fn encode_iroh_proxy_error_response_frame(
     route: impl Into<String>,
     detail: impl Into<String>,
 ) -> Result<(Vec<u8>, IrohProxyByteBudgetPermit), NetworkError> {
-    let response = crate::DaemonControlResponse::rpc(
-        String::new(),
-        crate::ObjectRpcResponse::encode_error(route, detail)?,
-    );
+    let response = crate::ObjectRpcResponse::encode_error(route, detail)?;
     let frame = crate::encode_object_frame_to_vec(&response)?;
     let permit = budget.try_acquire(frame.len())?;
     Ok((frame, permit))
@@ -1790,11 +1778,8 @@ fn iroh_daemon_control_attempt_should_retry(
 pub(crate) fn iroh_daemon_control_request_allows_response_retry(
     request: &crate::DaemonControlRequest,
 ) -> bool {
-    let Some(rpc) = request.rpc.as_ref() else {
-        return false;
-    };
     matches!(
-        rpc.route.as_str(),
+        request.route.as_str(),
         crate::CLUSTER_HEALTH_ROUTE
             | sinomo_kv::CLUSTER_KV_RANGE_PREFIX_ROUTE
             | sinomo_kv::CLUSTER_KV_SNAPSHOT_ROUTE
@@ -2005,14 +1990,12 @@ fn iroh_endpoint_addr_from_record(
 
 pub async fn send_daemon_rpc_to_cluster_endpoint_async(
     endpoint: &ClusterEndpointRecord,
-    command: &str,
     auth: Option<&[u8]>,
     request: &crate::ObjectRpcRequest,
     timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::ObjectRpcResponse, NetworkError> {
     send_daemon_rpc_to_target_async(
         DaemonControlTarget::ClusterEndpoint(endpoint),
-        command,
         auth,
         request,
         timeouts,
@@ -2022,14 +2005,12 @@ pub async fn send_daemon_rpc_to_cluster_endpoint_async(
 
 pub async fn send_daemon_rpc_to_address_async(
     address: &str,
-    command: &str,
     auth: Option<&[u8]>,
     request: &crate::ObjectRpcRequest,
     timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::ObjectRpcResponse, NetworkError> {
     send_daemon_rpc_to_target_async(
         DaemonControlTarget::Address(address),
-        command,
         auth,
         request,
         timeouts,
@@ -2042,88 +2023,26 @@ enum DaemonControlTarget<'a> {
     ClusterEndpoint(&'a ClusterEndpointRecord),
 }
 
-impl DaemonControlTarget<'_> {
-    fn non_rpc_detail(&self) -> String {
-        match self {
-            Self::Address(address) => {
-                format!("daemon control address {address} returned a non-rpc response")
-            }
-            Self::ClusterEndpoint(endpoint) => format!(
-                "daemon control endpoint {:?} returned a non-rpc response",
-                endpoint.node_id
-            ),
-        }
-    }
-}
-
 async fn send_daemon_rpc_to_target_async(
     target: DaemonControlTarget<'_>,
-    command: &str,
     auth: Option<&[u8]>,
     request: &crate::ObjectRpcRequest,
     timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    let control_request = daemon_rpc_control_request(command, auth, request);
-    let raw_response_supported = match &target {
-        DaemonControlTarget::Address(_) => true,
-        DaemonControlTarget::ClusterEndpoint(endpoint) => {
-            matches!(
-                endpoint.transport,
-                ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
-            )
-        }
-    };
-    if raw_response_supported && crate::object_rpc_request_expects_raw_daemon_response(request) {
-        let response = match target {
-            DaemonControlTarget::Address(address) => {
-                crate::send_daemon_control_rpc_request_raw_response_async(
-                    address,
-                    &control_request,
-                    timeouts,
-                    IROH_DAEMON_COMMAND_MAX_BYTES,
-                )
-                .await?
-            }
-            DaemonControlTarget::ClusterEndpoint(endpoint) => match endpoint.transport {
-                ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
-                    crate::send_daemon_control_rpc_request_raw_response_async(
-                        &endpoint.address,
-                        &control_request,
-                        timeouts,
-                        IROH_DAEMON_COMMAND_MAX_BYTES,
-                    )
-                    .await?
-                }
-                _ => {
-                    return Err(NetworkError::Io {
-                        operation: format!("send daemon rpc to {}", endpoint.address),
-                        detail: format!(
-                            "unsupported daemon rpc transport {:?}",
-                            endpoint.transport
-                        ),
-                    });
-                }
-            },
-        };
-        response.error_detail()?;
-        return Ok(response);
-    }
-    let non_rpc_detail = target.non_rpc_detail();
+    let control_request = daemon_rpc_control_request(auth, request);
     let response =
         send_daemon_control_request_to_target_async(target, &control_request, timeouts).await?;
-    daemon_rpc_response_from_control_response(response, non_rpc_detail)
+    response.error_detail()?;
+    Ok(response)
 }
 
 fn daemon_rpc_control_request(
-    command: &str,
     auth: Option<&[u8]>,
     request: &crate::ObjectRpcRequest,
 ) -> crate::DaemonControlRequest {
     match auth {
-        Some(auth) => {
-            crate::DaemonControlRequest::authenticated_rpc(command, request.clone(), auth.to_vec())
-        }
-        None => crate::DaemonControlRequest::rpc(command, request.clone()),
+        Some(auth) => request.clone().with_auth(auth.to_vec()),
+        None => request.clone(),
     }
 }
 
@@ -2177,17 +2096,6 @@ async fn send_daemon_control_request_to_address_async(
 
 fn daemon_rpc_address_uses_iroh(address: &str) -> bool {
     address.trim_start().starts_with("iroh://")
-}
-
-pub(crate) fn daemon_rpc_response_from_control_response(
-    response: crate::DaemonControlResponse,
-    non_rpc_detail: impl Into<String>,
-) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    let rpc = response.rpc.ok_or_else(|| NetworkError::Serialization {
-        detail: non_rpc_detail.into(),
-    })?;
-    rpc.error_detail()?;
-    Ok(rpc)
 }
 
 #[cfg(feature = "iroh-transport")]

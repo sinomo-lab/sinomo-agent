@@ -1,6 +1,4 @@
-use crate::{
-    DaemonError, DaemonStatus, daemon_rpc_command, sign_daemon_rpc_request_for_local_node,
-};
+use crate::{DaemonError, DaemonStatus, sign_daemon_rpc_request_for_local_node};
 use sinomo_config::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_RPC_CATEGORY, CONFIG_SET_ROUTE,
     ConfigCatalogRequest, ConfigCatalogResponse, ConfigClient, ConfigDefinition, ConfigError,
@@ -20,7 +18,7 @@ use sinomo_kv::{
 };
 use sinomo_network::{
     AsyncDaemonControlStream, ClusterMemberPublishRequest, ClusterMemberPublishResponse,
-    DaemonControlRequest, ObjectRpcRequest,
+    ObjectRpcRequest,
 };
 use sinomo_rollout::{
     ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse,
@@ -43,13 +41,7 @@ pub fn send_daemon_rpc(
     timeout: Duration,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     let signed = sign_daemon_rpc_request_for_local_node(request)?;
-    send_daemon_rpc_raw(
-        address,
-        &daemon_rpc_command(&request.route),
-        Some(&signed),
-        request,
-        timeout,
-    )
+    send_daemon_rpc_raw(address, Some(&signed), request, timeout)
 }
 
 pub(crate) fn send_daemon_rpc_on_runtime(
@@ -84,28 +76,20 @@ pub async fn send_daemon_rpc_async(
             address: address.to_string(),
             detail: format!("daemon RPC signing task failed: {source}"),
         })??;
-    let command = daemon_rpc_command(&request.route);
-    let response = sinomo_network::send_daemon_rpc_to_address_async(
-        address,
-        &command,
-        Some(&signed),
-        request,
-        timeouts,
-    )
-    .await?;
+    let response =
+        sinomo_network::send_daemon_rpc_to_address_async(address, Some(&signed), request, timeouts)
+            .await?;
     Ok(response)
 }
 
 pub(crate) fn send_daemon_rpc_raw(
     address: &str,
-    command: &str,
     auth: Option<&[u8]>,
     request: &ObjectRpcRequest,
     timeout: Duration,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     send_daemon_rpc_raw_with_timeouts(
         address,
-        command,
         auth,
         request,
         sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
@@ -122,24 +106,17 @@ pub fn send_daemon_rpc_with_timeouts(
     timeouts: sinomo_network::DaemonRpcTimeouts,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     let signed = sign_daemon_rpc_request_for_local_node(request)?;
-    send_daemon_rpc_raw_with_timeouts(
-        address,
-        &daemon_rpc_command(&request.route),
-        Some(&signed),
-        request,
-        timeouts,
-    )
+    send_daemon_rpc_raw_with_timeouts(address, Some(&signed), request, timeouts)
 }
 
 pub(crate) fn send_daemon_rpc_raw_with_timeouts(
     address: &str,
-    command: &str,
     auth: Option<&[u8]>,
     request: &ObjectRpcRequest,
     timeouts: sinomo_network::DaemonRpcTimeouts,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     block_on_daemon_client(async {
-        sinomo_network::send_daemon_rpc_to_address_async(address, command, auth, request, timeouts)
+        sinomo_network::send_daemon_rpc_to_address_async(address, auth, request, timeouts)
             .await
             .map_err(DaemonError::from)
     })
@@ -247,11 +224,7 @@ pub async fn send_daemon_rpc_stream_async(
         address: address.to_string(),
         detail: format!("daemon streaming RPC signing task failed: {source}"),
     })??;
-    let control_request = DaemonControlRequest::authenticated_rpc(
-        daemon_rpc_command(&request.route),
-        request.clone(),
-        signed,
-    );
+    let control_request = request.clone().with_auth(signed);
     let mut stream = AsyncDaemonControlStream::connect_with_options(address, timeouts).await?;
     let frame_options =
         sinomo_network::ObjectFrameIoOptions::none().with_idle_timeout(timeouts.idle_timeout);
@@ -260,17 +233,13 @@ pub async fn send_daemon_rpc_stream_async(
         .await?;
     stream.shutdown_write(address).await?;
     loop {
-        let response = stream
+        let rpc = stream
             .read_response(
                 address,
                 sinomo_network::IROH_DAEMON_COMMAND_MAX_BYTES,
                 frame_options,
             )
             .await?;
-        let rpc = response.rpc.ok_or_else(|| DaemonError::Network {
-            address: address.to_string(),
-            detail: "daemon returned non-rpc stream frame".to_string(),
-        })?;
         if !on_response(rpc)? {
             return Ok(());
         }
@@ -391,10 +360,8 @@ pub async fn send_daemon_rpc_direct_to_endpoint_async(
             address: endpoint.address.clone(),
             detail: format!("daemon RPC signing task failed: {source}"),
         })??;
-    let command = daemon_rpc_command(&request.route);
     sinomo_network::send_daemon_rpc_to_cluster_endpoint_async(
         endpoint,
-        &command,
         Some(&signed),
         request,
         timeouts,
@@ -430,7 +397,6 @@ async fn send_daemon_rpc_to_endpoint_async_with_connectivity_observation(
             address: endpoint.address.clone(),
             detail: format!("daemon RPC signing task failed: {source}"),
         })??;
-    let command = daemon_rpc_command(&request.route);
     let mut host = DaemonSignedEndpointRpcAsyncHost {
         runtime: runtime.clone(),
         observe_connectivity,
@@ -439,8 +405,6 @@ async fn send_daemon_rpc_to_endpoint_async_with_connectivity_observation(
         endpoint,
         request,
         &signed,
-        &command,
-        &daemon_rpc_command(sinomo_network::CLUSTER_RELAY_ROUTE),
         sinomo_network::ClusterSignedEndpointRpcOptions { timeouts },
         &mut host,
     )
@@ -725,14 +689,12 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
         endpoint: &'a ClusterEndpointRecord,
         request: &'a ObjectRpcRequest,
         request_auth: &'a [u8],
-        request_command: &'a str,
         timeouts: sinomo_network::DaemonRpcTimeouts,
     ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_network::ObjectRpcResponse>>
     {
         let endpoint = endpoint.clone();
         let request = request.clone();
         let request_auth = request_auth.to_vec();
-        let request_command = request_command.to_string();
         let runtime = self.runtime.clone();
         Box::pin(async move {
             match route_endpoint_request_via_local_daemon_async(
@@ -740,7 +702,6 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
                 &endpoint,
                 &request,
                 &request_auth,
-                &request_command,
                 timeouts,
                 &DaemonRpcAttemptDeadline::from_policy(timeouts),
             )
@@ -803,7 +764,6 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
     fn send_signed_endpoint_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
-        command: &'a str,
         auth: &'a [u8],
         request: &'a ObjectRpcRequest,
         timeouts: sinomo_network::DaemonRpcTimeouts,
@@ -813,7 +773,6 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
             let started = Instant::now();
             let result = sinomo_network::send_daemon_rpc_to_cluster_endpoint_async(
                 endpoint,
-                command,
                 Some(auth),
                 request,
                 timeouts,
@@ -841,8 +800,6 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
         endpoint: &'a ClusterEndpointRecord,
         request: &'a ObjectRpcRequest,
         request_auth: &'a [u8],
-        request_command: &'a str,
-        relay_command: &'a str,
         timeouts: sinomo_network::DaemonRpcTimeouts,
     ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_network::ObjectRpcResponse>>
     {
@@ -857,8 +814,6 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
                 endpoint,
                 request,
                 request_auth.to_vec(),
-                request_command.to_string(),
-                relay_command,
                 sinomo_network::ClusterSignedRelayRpcOptions { timeouts },
                 self,
             )
@@ -889,7 +844,6 @@ impl sinomo_network::ClusterSignedRelayRpcAsyncHost for DaemonSignedEndpointRpcA
     fn send_signed_relay_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
-        command: &'a str,
         auth: &'a [u8],
         request: &'a sinomo_network::ObjectRpcRequest,
         timeouts: sinomo_network::DaemonRpcTimeouts,
@@ -899,7 +853,6 @@ impl sinomo_network::ClusterSignedRelayRpcAsyncHost for DaemonSignedEndpointRpcA
             let started = Instant::now();
             let result = sinomo_network::send_daemon_rpc_to_cluster_endpoint_async(
                 endpoint,
-                command,
                 Some(auth),
                 request,
                 timeouts,
@@ -1085,7 +1038,6 @@ async fn route_endpoint_request_via_local_daemon_async(
     endpoint: &ClusterEndpointRecord,
     request: &ObjectRpcRequest,
     request_auth: &[u8],
-    request_command: &str,
     timeouts: sinomo_network::DaemonRpcTimeouts,
     deadline: &DaemonRpcAttemptDeadline,
 ) -> Option<Result<sinomo_network::ObjectRpcResponse, DaemonError>> {
@@ -1116,7 +1068,6 @@ async fn route_endpoint_request_via_local_daemon_async(
         &endpoint.node_id,
         request,
         request_auth.to_vec(),
-        request_command.to_string(),
         std::iter::empty::<sinomo_node::NodeId>(),
     ) {
         Ok(outer) => outer,
@@ -1958,7 +1909,6 @@ mod tests {
         let error = runtime.block_on(async {
             super::send_daemon_rpc_raw_with_timeouts(
                 "127.0.0.1:21353",
-                "RPC /daemon/status",
                 None,
                 &request,
                 sinomo_network::DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(1)),

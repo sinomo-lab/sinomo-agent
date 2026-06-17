@@ -271,6 +271,172 @@ fn evolution_request_preparation_selects_model_defaults_and_verification() {
 }
 
 #[test]
+fn bootstrap_job_preserves_rust_default_verification_for_sinomo_repo() {
+    let root = temp_dir("sinomo-project-profile");
+    fs::create_dir_all(root.join("crates").join("sinomo-evolution")).expect("crate dir");
+    fs::create_dir_all(root.join("docs")).expect("docs dir");
+    fs::write(root.join("Cargo.toml"), "[workspace]\n").expect("cargo toml");
+    fs::write(
+        root.join("docs").join("self-evolution-architecture.md"),
+        "# Self Evolution\n",
+    )
+    .expect("self evolution doc");
+    let request = EvolutionRequest {
+        objective: "keep Sinomo defaults".to_string(),
+        target_ring: TrustRing::R1TrustedRuntime,
+        intended_paths: Vec::new(),
+        verification_commands: Vec::new(),
+        benchmark_gates: Vec::new(),
+        module_replay_reports: Vec::new(),
+        model_provider: None,
+        model: None,
+        dry_run: true,
+    };
+
+    let job = create_bootstrap_job(&request, &root);
+
+    assert_eq!(job.verification.commands.len(), 1);
+    assert_eq!(job.verification.commands[0].command, "cargo check");
+    assert!(job.edit_scope.notes.contains("Sinomo self-evolution"));
+}
+
+#[test]
+fn bootstrap_job_uses_generic_verification_for_external_python_repo() {
+    let root = temp_dir("external-python-project-profile");
+    fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = 'external'\n",
+    )
+    .expect("pyproject");
+    let request = EvolutionRequest {
+        objective: "improve external project".to_string(),
+        target_ring: TrustRing::R2TrustedService,
+        intended_paths: Vec::new(),
+        verification_commands: Vec::new(),
+        benchmark_gates: Vec::new(),
+        module_replay_reports: Vec::new(),
+        model_provider: None,
+        model: None,
+        dry_run: true,
+    };
+
+    let job = create_bootstrap_job(&request, &root);
+    let packet = mutation_packet_for_job(&job);
+    let prompt = render_mutation_prompt(&packet);
+
+    assert_eq!(job.verification.commands.len(), 1);
+    assert_eq!(job.verification.commands[0].command, "git diff --check");
+    assert!(job.edit_scope.notes.contains("external Python project"));
+    assert!(prompt.contains("# Evolution Mutation Packet"));
+    assert!(prompt.contains("target_project:"));
+    assert!(prompt.contains("(python)"));
+}
+
+#[test]
+fn external_campaign_uses_target_project_verification_defaults() {
+    let root = temp_dir("external-campaign-project");
+    fs::write(
+        root.join("package.json"),
+        "{\"scripts\":{\"test\":\"node test.js\"}}\n",
+    )
+    .expect("package json");
+
+    let campaign = propose_evolution_campaign(CampaignProposalRequest {
+        objective: "improve another project".to_string(),
+        horizon: "7 days".to_string(),
+        budget_policy: "free-and-prepaid".to_string(),
+        reserve_floors: Vec::new(),
+        approval_policy: "stage-rollout".to_string(),
+        max_wall_time: None,
+        pause_after_proposal: true,
+        dry_run: true,
+        approved: false,
+        target_ring: TrustRing::R2TrustedService,
+        source_repo: Some(root.display().to_string()),
+    });
+
+    assert!(
+        campaign
+            .near_term_tasks
+            .iter()
+            .all(|task| task.verification_commands == vec!["git diff --check".to_string()])
+    );
+    assert!(
+        campaign
+            .objective_card
+            .constraints
+            .iter()
+            .any(|constraint| constraint.contains("(node)"))
+    );
+}
+
+#[test]
+fn orchestrator_dry_run_supports_external_python_git_repo_without_cargo() {
+    let source = git_repo("external-python-dry-run-source");
+    fs::write(
+        source.join("pyproject.toml"),
+        "[project]\nname = 'external'\n",
+    )
+    .expect("pyproject");
+    fs::write(source.join("tool.py"), "print('ok')\n").expect("python source");
+    run_in(&source, "git add pyproject.toml tool.py").expect("git add");
+    run_in(&source, "git commit -m init").expect("git commit");
+    let jobs_root = temp_dir("external-python-dry-run-jobs");
+    let orchestrator = EvolutionOrchestrator::new(
+        GitWorkspaceAdapter::new(&source, &jobs_root),
+        ExecutingEvalHarness::new(LocalCommandRunner::new()),
+        LocalCandidateBundleStore::new(&jobs_root),
+    );
+
+    let report = orchestrator
+        .propose(
+            EvolutionRequest {
+                objective: "dry run external python repo".to_string(),
+                target_ring: TrustRing::R2TrustedService,
+                intended_paths: vec!["*.py".to_string()],
+                verification_commands: Vec::new(),
+                benchmark_gates: Vec::new(),
+                module_replay_reports: Vec::new(),
+                model_provider: None,
+                model: None,
+                dry_run: true,
+            },
+            None,
+        )
+        .expect("external dry run");
+
+    assert_eq!(
+        report
+            .scorecard
+            .as_ref()
+            .map(|scorecard| &scorecard.outcome),
+        Some(&EvaluationOutcome::Passed)
+    );
+    assert_eq!(
+        report
+            .bundle
+            .command_logs
+            .first()
+            .map(|log| log.command.as_str()),
+        Some("git diff --check")
+    );
+    assert!(
+        report
+            .job
+            .edit_scope
+            .notes
+            .contains("external Python project")
+    );
+    let _ = run_in(
+        &source,
+        &format!(
+            "git worktree remove --force {}",
+            report.candidate_workspace.path.display()
+        ),
+    );
+}
+
+#[test]
 fn swebench_benchmark_gate_records_progress_path() {
     let root = temp_dir("swebench-benchmark-progress-path");
     let request = EvolutionRequest {

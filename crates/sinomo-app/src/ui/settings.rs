@@ -24,6 +24,7 @@ use sui::{
     FormRow, FormSection, Label, ListItem, ListView, MeasureCtx, PaintCtx, Rect, ScrollState,
     ScrollView, Select, SemanticsCtx, Separator, Size, SizedBox, Stack, Switch, SwitchView, TabBar,
     TextInput, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
+    PointerEventKind,
 };
 
 use sinomo_runtime::config::ConfigClient;
@@ -32,9 +33,11 @@ use crate::backend::Backend;
 use crate::backend::cluster::{AppClusterInvite, AppClusterStatus};
 use crate::backend::config::{
     CONFIGURABLE_PROVIDERS, ConfigEditKind, ConfigItem, ProviderForm, REASONING_EFFORT_OPTIONS,
-    cycle_provider_reasoning_effort, provider_forms, reasoning_effort_index, resolve_items,
-    run_provider_device_login, set_bool, set_provider_api_key, set_provider_base_url,
-    set_provider_effort, set_provider_enabled, set_provider_model, set_value,
+    add_provider_account, cluster_provider_summaries, cycle_provider_reasoning_effort,
+    provider_default_model, provider_display_name, provider_forms, reasoning_effort_index,
+    resolve_items, run_provider_device_login, set_bool, set_provider_api_key,
+    set_provider_base_url, set_provider_effort, set_provider_enabled, set_provider_model,
+    set_value,
 };
 use crate::state::Shared;
 use crate::theme::{AppThemeMode, Palette};
@@ -120,6 +123,13 @@ pub struct SettingsState {
     pub field_errors: std::collections::HashMap<String, String>,
     /// An in-progress provider device-login flow (Providers section), if any.
     pub device_login: Option<DeviceLogin>,
+    pub provider_add_open: bool,
+    pub provider_add_provider_index: usize,
+    pub provider_add_account: String,
+    pub provider_add_api_key: String,
+    pub provider_add_model: String,
+    pub provider_add_base_url: String,
+    pub provider_add_error: Option<String>,
 }
 
 /// A text-editable field of a provider in the Providers section.
@@ -134,6 +144,7 @@ pub enum ProviderField {
 /// background thread and drained when the UI is woken.
 pub struct DeviceLogin {
     pub provider: String,
+    pub account: String,
     pub status: DeviceLoginStatus,
     rx: Receiver<DeviceLoginEvent>,
 }
@@ -213,12 +224,103 @@ impl SettingsState {
             selected: None,
             field_errors: std::collections::HashMap::new(),
             device_login: None,
+            provider_add_open: false,
+            provider_add_provider_index: 0,
+            provider_add_account: "default".to_string(),
+            provider_add_api_key: String::new(),
+            provider_add_model: provider_default_model(CONFIGURABLE_PROVIDERS[0]),
+            provider_add_base_url: String::new(),
+            provider_add_error: None,
         }
     }
 
     /// Open a section's detail page.
-    fn open(&mut self, section: SettingsSection) {
+    pub fn open(&mut self, section: SettingsSection) {
         self.selected = Some(section);
+    }
+
+    pub fn open_provider_add(&mut self) {
+        self.selected = Some(SettingsSection::Providers);
+        self.provider_add_open = true;
+        self.provider_add_error = None;
+        if self.provider_add_model.trim().is_empty() {
+            self.provider_add_model = provider_default_model(self.provider_add_provider());
+        }
+    }
+
+    fn close_provider_add(&mut self) {
+        self.provider_add_open = false;
+        self.provider_add_error = None;
+    }
+
+    fn provider_add_provider(&self) -> &'static str {
+        CONFIGURABLE_PROVIDERS
+            .get(self.provider_add_provider_index)
+            .copied()
+            .unwrap_or(CONFIGURABLE_PROVIDERS[0])
+    }
+
+    fn provider_add_uses_device_login(&self) -> bool {
+        sinomo_cli::provider_uses_device_login(self.provider_add_provider())
+    }
+
+    fn set_provider_add_provider(&mut self, index: usize) {
+        if index >= CONFIGURABLE_PROVIDERS.len() {
+            return;
+        }
+        self.provider_add_provider_index = index;
+        self.provider_add_model = provider_default_model(self.provider_add_provider());
+        self.provider_add_api_key.clear();
+        self.provider_add_error = None;
+    }
+
+    fn set_provider_add_account(&mut self, value: String) {
+        self.provider_add_account = value;
+        self.provider_add_error = None;
+    }
+
+    fn set_provider_add_api_key(&mut self, value: String) {
+        self.provider_add_api_key = value;
+        self.provider_add_error = None;
+    }
+
+    fn set_provider_add_model(&mut self, value: String) {
+        self.provider_add_model = value;
+        self.provider_add_error = None;
+    }
+
+    fn set_provider_add_base_url(&mut self, value: String) {
+        self.provider_add_base_url = value;
+        self.provider_add_error = None;
+    }
+
+    fn add_provider_from_form(&mut self) -> Result<(String, String, bool), String> {
+        let provider = self.provider_add_provider().to_string();
+        let account = self.provider_add_account.trim().to_string();
+        let uses_device_login = self.provider_add_uses_device_login();
+        match add_provider_account(
+            self.config.as_ref(),
+            &provider,
+            &account,
+            &self.provider_add_api_key,
+            &self.provider_add_model,
+            &self.provider_add_base_url,
+        ) {
+            Ok(()) => {
+                let account = sinomo_lm::normalize_provider_account_name(Some(&account));
+                self.close_provider_add();
+                self.provider_add_account = "default".to_string();
+                self.provider_add_api_key.clear();
+                self.provider_add_base_url.clear();
+                self.provider_add_model = provider_default_model(self.provider_add_provider());
+                self.reload();
+                Ok((provider, account, uses_device_login))
+            }
+            Err(error) => {
+                self.provider_add_error = Some(error.clone());
+                Err(error)
+            }
+        }
     }
 
     /// Return to the menu level (narrow layout).
@@ -312,15 +414,18 @@ impl SettingsState {
         }
     }
 
-    fn toggle_provider(&mut self, index: usize) {
+    fn toggle_provider(&mut self, index: usize) -> bool {
         let Some(form) = self.provider_forms.get(index) else {
-            return;
+            return false;
         };
         let provider = form.provider.clone();
+        let account = form.account.clone();
         let enabled = !form.enabled;
-        if set_provider_enabled(self.config.as_ref(), &provider, enabled).is_ok() {
+        if set_provider_enabled(self.config.as_ref(), &provider, &account, enabled).is_ok() {
             self.reload();
+            return true;
         }
+        false
     }
 
     /// Write a provider text field (API key / model / base URL) at `index`. Like
@@ -331,12 +436,17 @@ impl SettingsState {
             return;
         };
         let provider = form.provider.clone();
+        let account = form.account.clone();
         let result = match field {
-            ProviderField::ApiKey => set_provider_api_key(self.config.as_ref(), &provider, raw),
-            ProviderField::Model => set_provider_model(self.config.as_ref(), &provider, raw),
-            ProviderField::BaseUrl => set_provider_base_url(self.config.as_ref(), &provider, raw),
+            ProviderField::ApiKey => {
+                set_provider_api_key(self.config.as_ref(), &provider, &account, raw)
+            }
+            ProviderField::Model => set_provider_model(self.config.as_ref(), &provider, &account, raw),
+            ProviderField::BaseUrl => {
+                set_provider_base_url(self.config.as_ref(), &provider, &account, raw)
+            }
         };
-        let row = provider_field_key(&provider, field);
+        let row = provider_field_key(&provider, &account, field);
         match result {
             Ok(()) => {
                 self.field_errors.remove(&row);
@@ -355,7 +465,8 @@ impl SettingsState {
             return;
         };
         let provider = form.provider.clone();
-        if cycle_provider_reasoning_effort(self.config.as_ref(), &provider).is_ok() {
+        let account = form.account.clone();
+        if cycle_provider_reasoning_effort(self.config.as_ref(), &provider, &account).is_ok() {
             self.reload();
         }
     }
@@ -367,7 +478,8 @@ impl SettingsState {
             return;
         };
         let provider = form.provider.clone();
-        if set_provider_effort(self.config.as_ref(), &provider, effort_index).is_ok() {
+        let account = form.account.clone();
+        if set_provider_effort(self.config.as_ref(), &provider, &account, effort_index).is_ok() {
             self.reload();
         }
     }
@@ -383,6 +495,7 @@ impl SettingsState {
             return;
         }
         let provider = form.provider.clone();
+        let account = form.account.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let worker_provider = provider.clone();
         let spawned = std::thread::Builder::new()
@@ -410,6 +523,7 @@ impl SettingsState {
         if spawned {
             self.device_login = Some(DeviceLogin {
                 provider,
+                account,
                 status: DeviceLoginStatus::Starting,
                 rx,
             });
@@ -462,13 +576,13 @@ fn config_field_key(key: &str) -> String {
 }
 
 /// Field-error map key for a provider text field (Providers section).
-fn provider_field_key(provider: &str, field: ProviderField) -> String {
+fn provider_field_key(provider: &str, account: &str, field: ProviderField) -> String {
     let suffix = match field {
         ProviderField::ApiKey => "api_key",
         ProviderField::Model => "model",
         ProviderField::BaseUrl => "base_url",
     };
-    format!("provider:{provider}:{suffix}")
+    format!("provider:{provider}:{account}:{suffix}")
 }
 
 /// A short, right-aligned value preview for a section, shown in the narrow menu rows.
@@ -486,8 +600,12 @@ pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
             }
         }
         SettingsSection::Providers => {
-            let enabled = settings.provider_forms.iter().filter(|f| f.enabled).count();
-            format!("{enabled} enabled")
+            if settings.provider_forms.is_empty() {
+                "Not set up".to_string()
+            } else {
+                let enabled = settings.provider_forms.iter().filter(|f| f.enabled).count();
+                format!("{enabled} enabled")
+            }
         }
         SettingsSection::Configuration => {
             if settings.config_error.is_some() {
@@ -614,6 +732,14 @@ fn ready_backend(shared: &Shared) -> Option<Backend> {
         .ready
         .as_ref()
         .map(|ready| ready.backend.clone())
+}
+
+fn refresh_chat_provider_summaries(shared: &Shared) {
+    let mut app = shared.borrow_mut();
+    if let Some(ready) = app.ready.as_mut() {
+        let providers = cluster_provider_summaries(ready.settings.config.as_ref());
+        ready.chat.refresh_providers(providers);
+    }
 }
 
 fn apply_cluster_success(
@@ -945,11 +1071,20 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
             .on(form.enabled)
             .theme_when(clone_reader(reader))
             .on_toggle(move |_| {
-                s.settings_mut().toggle_provider(index);
+                let changed = { s.settings_mut().toggle_provider(index) };
+                if changed {
+                    refresh_chat_provider_summaries(&s);
+                }
             })
     };
 
     let mut body = FieldGroup::new().spacing(8.0);
+    body = body.with_child(value_row(
+        shared,
+        reader,
+        "Account",
+        form.account_label.clone(),
+    ));
 
     // Authentication: device-login (status + button) or an API-key field.
     if form.uses_device_login {
@@ -1066,13 +1201,229 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
 }
 
 fn section_providers(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || provider_section_signature(&s)
+        },
+        move |_sig| provider_section_body(&s, &r),
+    )
+}
+
+fn provider_section_body(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    if shared.settings().provider_add_open {
+        WidgetPod::new(provider_add_view(shared, reader))
+    } else {
+        WidgetPod::new(provider_list_view(shared, reader))
+    }
+}
+
+fn provider_section_signature(shared: &Shared) -> String {
+    let settings = shared.settings();
+    let mut parts = vec![
+        format!("add:{}", settings.provider_add_open),
+        format!("add-provider:{}", settings.provider_add_provider_index),
+        format!("error:{:?}", settings.provider_add_error),
+    ];
+    parts.extend(settings.provider_forms.iter().map(|form| {
+        format!(
+            "{}@{}:{}:{}:{}",
+            form.provider, form.account, form.enabled, form.signed_in, form.display_name
+        )
+    }));
+    parts.join("\u{1f}")
+}
+
+fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let mut stack = Stack::vertical()
         .spacing(14.0)
         .alignment(Alignment::Stretch);
-    for index in 0..CONFIGURABLE_PROVIDERS.len() {
+    let add = {
+        let s = shared.clone();
+        sui::Button::new("Add provider")
+            .icon(sui::IconGlyph::Add)
+            .theme_when(clone_reader(reader))
+            .on_press(move || {
+                s.settings_mut().open_provider_add();
+            })
+    };
+    let body = if shared.settings().provider_forms.is_empty() {
+        FieldGroup::new()
+            .spacing(8.0)
+            .with_child(muted_label(shared, "No provider accounts configured"))
+    } else {
+        FieldGroup::new()
+            .spacing(8.0)
+            .with_child(value_row(
+                shared,
+                reader,
+                "Accounts",
+                shared.settings().provider_forms.len().to_string(),
+            ))
+    };
+    stack = stack.with_child(
+        FormSection::new("Providers", body)
+            .header_action(add)
+            .theme_when(clone_reader(reader)),
+    );
+    let count = shared.settings().provider_forms.len();
+    for index in 0..count {
         stack = stack.with_child(provider_card(shared, reader, index));
     }
     stack
+}
+
+fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let (selected_index, uses_device_login, error) = {
+        let settings = shared.settings();
+        (
+            settings.provider_add_provider_index,
+            settings.provider_add_uses_device_login(),
+            settings.provider_add_error.clone(),
+        )
+    };
+    let provider_labels: Vec<String> = CONFIGURABLE_PROVIDERS
+        .iter()
+        .map(|provider| provider_display_name(provider))
+        .collect();
+    let provider_select = {
+        let s = shared.clone();
+        Select::new("provider-add-provider")
+            .options(provider_labels)
+            .selected_when({
+                let s = s.clone();
+                move || Some(s.settings().provider_add_provider_index)
+            })
+            .theme_when(clone_reader(reader))
+            .on_change(move |index, _label| {
+                s.settings_mut().set_provider_add_provider(index);
+            })
+    };
+
+    let mut body = FieldGroup::new()
+        .spacing(8.0)
+        .with_child(
+            FormRow::new("Provider", provider_select)
+                .inline()
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(text_row(
+            reader,
+            "provider-add-account",
+            "Account",
+            shared.settings().provider_add_account.clone(),
+            "default",
+            {
+                let s = shared.clone();
+                move |value| s.settings_mut().set_provider_add_account(value)
+            },
+        ));
+
+    if uses_device_login {
+        body = body.with_child(value_row(
+            shared,
+            reader,
+            "Authentication",
+            "Device login after add",
+        ));
+    } else {
+        body = body.with_child(text_row(
+            reader,
+            "provider-add-api-key",
+            "API key",
+            "",
+            "Paste API key",
+            {
+                let s = shared.clone();
+                move |value| s.settings_mut().set_provider_add_api_key(value)
+            },
+        ));
+    }
+
+    body = body
+        .with_child(text_row(
+            reader,
+            "provider-add-model",
+            "Default model",
+            shared.settings().provider_add_model.clone(),
+            "Provider default",
+            {
+                let s = shared.clone();
+                move |value| s.settings_mut().set_provider_add_model(value)
+            },
+        ))
+        .with_child(text_row(
+            reader,
+            "provider-add-base-url",
+            "API base URL",
+            shared.settings().provider_add_base_url.clone(),
+            "Provider default",
+            {
+                let s = shared.clone();
+                move |value| s.settings_mut().set_provider_add_base_url(value)
+            },
+        ));
+
+    if let Some(error) = error {
+        body = body.with_child(value_row(shared, reader, "Error", error));
+    }
+
+    let cancel = {
+        let s = shared.clone();
+        sui::Button::new("Cancel")
+            .icon(sui::IconGlyph::ChevronLeft)
+            .theme_when(clone_reader(reader))
+            .on_press(move || s.settings_mut().close_provider_add())
+    };
+    let add_label = if uses_device_login {
+        "Add and sign in"
+    } else {
+        "Add provider"
+    };
+    let add = {
+        let s = shared.clone();
+        sui::Button::new(add_label)
+            .icon(sui::IconGlyph::Check)
+            .theme_when(clone_reader(reader))
+            .on_press(move || {
+                let result = { s.settings_mut().add_provider_from_form() };
+                let Ok((provider, account, uses_device_login)) = result else {
+                    return;
+                };
+                refresh_chat_provider_summaries(&s);
+                if uses_device_login {
+                    let waker = s.borrow().waker.clone();
+                    let index = {
+                        let settings = s.settings();
+                        settings
+                            .provider_forms
+                            .iter()
+                            .position(|form| form.provider == provider && form.account == account)
+                    };
+                    if let Some(index) = index {
+                        s.settings_mut().begin_device_login(index, waker);
+                    }
+                }
+            })
+    };
+    let actions = Stack::horizontal()
+        .spacing(8.0)
+        .alignment(Alignment::Center)
+        .with_child(cancel)
+        .with_child(add);
+    body = body.with_child(
+        FormRow::new("Actions", actions)
+            .inline()
+            .theme_when(clone_reader(reader)),
+    );
+
+    let title = CONFIGURABLE_PROVIDERS
+        .get(selected_index)
+        .map(|provider| format!("Add {}", provider_display_name(provider)))
+        .unwrap_or_else(|| "Add provider".to_string());
+    FormSection::new(title, body).theme_when(clone_reader(reader))
 }
 
 fn section_configuration(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -1350,6 +1701,80 @@ fn narrow_pod(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState)
 // Tiny layout helpers
 // ---------------------------------------------------------------------------
 
+struct RebuildOnChange<K: PartialEq + Clone> {
+    key_fn: Box<dyn Fn() -> K>,
+    build: Box<dyn Fn(&K) -> WidgetPod>,
+    last_key: K,
+    child: WidgetPod,
+}
+
+impl<K: PartialEq + Clone> RebuildOnChange<K> {
+    fn new<KF, BF>(key_fn: KF, build: BF) -> Self
+    where
+        KF: Fn() -> K + 'static,
+        BF: Fn(&K) -> WidgetPod + 'static,
+    {
+        let last_key = key_fn();
+        let child = build(&last_key);
+        Self {
+            key_fn: Box::new(key_fn),
+            build: Box::new(build),
+            last_key,
+            child,
+        }
+    }
+
+    fn refresh(&mut self) -> bool {
+        let key = (self.key_fn)();
+        if key != self.last_key {
+            self.child = (self.build)(&key);
+            self.last_key = key;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl<K: PartialEq + Clone + 'static> Widget for RebuildOnChange<K> {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        let pointer_up = matches!(
+            event,
+            Event::Pointer(pointer) if matches!(pointer.kind, PointerEventKind::Up)
+        );
+        if pointer_up && self.refresh() {
+            ctx.request_measure();
+            ctx.request_arrange();
+            ctx.request_paint();
+        }
+    }
+
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.refresh();
+        self.child.measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.child.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
+}
+
 /// A container that hosts a pre-built [`WidgetPod`] (so a section body can be chosen at build time
 /// behind a branch and still be a single widget). Delegates everything to the pod.
 struct PodHost {
@@ -1477,7 +1902,7 @@ impl StatusReflector {
         match settings
             .device_login
             .as_ref()
-            .filter(|d| d.provider == form.provider)
+            .filter(|d| d.provider == form.provider && d.account == form.account)
             .map(|d| &d.status)
         {
             Some(DeviceLoginStatus::Starting) => "starting".to_string(),
@@ -1503,7 +1928,7 @@ impl StatusReflector {
         match settings
             .device_login
             .as_ref()
-            .filter(|d| d.provider == form.provider)
+            .filter(|d| d.provider == form.provider && d.account == form.account)
             .map(|d| &d.status)
         {
             Some(DeviceLoginStatus::Starting) => ("Requesting code…".to_string(), None),
@@ -1598,7 +2023,7 @@ impl StatusReflector {
                 settings
                     .device_login
                     .as_ref()
-                    .filter(|d| d.provider == form.provider)
+                    .filter(|d| d.provider == form.provider && d.account == form.account)
                     .map(|d| matches!(d.status, DeviceLoginStatus::Failed(_)))
             })
             .unwrap_or(false)
@@ -1832,20 +2257,10 @@ mod tests {
     #[test]
     fn provider_api_key_field_seeds_blank() {
         // The API-key TextInput is seeded with an empty value (the stored key is never surfaced).
-        // This mirrors the build-time seed used by text_row in provider_card.
+        // This mirrors the build-time seed used by the add-provider form and provider cards.
         let backend = Backend::local_fallback();
         let state = SettingsState::new(&backend);
-        assert!(
-            !state.provider_forms.is_empty(),
-            "the configurable provider list is non-empty"
-        );
-        // The seed is the literal "" passed to text_row(...) for the API-key row — assert that the
-        // form never exposes a key to surface.
-        let api_key_seed = "";
-        assert!(
-            api_key_seed.is_empty(),
-            "the API-key field seeds blank, never surfacing a stored key"
-        );
+        assert!(state.provider_add_api_key.is_empty());
     }
 
     #[test]
@@ -1914,6 +2329,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         state.device_login = Some(DeviceLogin {
             provider: "codex".to_string(),
+            account: "default".to_string(),
             status: DeviceLoginStatus::Starting,
             rx,
         });

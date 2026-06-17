@@ -1570,8 +1570,6 @@ fn relay_rpc_to_node_via_peer(
             target_node_id,
             peer,
             rpc_request,
-            crate::daemon_rpc_command(&rpc_request.route),
-            &crate::daemon_rpc_command(sinomo_network::CLUSTER_RELAY_ROUTE),
             sinomo_network::ClusterSignedRelayRpcOptions {
                 timeouts: sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
             },
@@ -1597,8 +1595,6 @@ async fn relay_rpc_to_node_via_peer_async(
         target_node_id,
         peer,
         rpc_request,
-        crate::daemon_rpc_command(&rpc_request.route),
-        &crate::daemon_rpc_command(sinomo_network::CLUSTER_RELAY_ROUTE),
         sinomo_network::ClusterSignedRelayRpcOptions {
             timeouts: sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
         },
@@ -1634,7 +1630,6 @@ impl sinomo_network::ClusterSignedRelayRpcAsyncHost for DaemonSignedRelayRpcAsyn
     fn send_signed_relay_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
-        command: &'a str,
         auth: &'a [u8],
         request: &'a sinomo_network::ObjectRpcRequest,
         timeouts: sinomo_network::DaemonRpcTimeouts,
@@ -1642,7 +1637,6 @@ impl sinomo_network::ClusterSignedRelayRpcAsyncHost for DaemonSignedRelayRpcAsyn
         Box::pin(async move {
             sinomo_network::send_daemon_rpc_to_cluster_endpoint_async(
                 endpoint,
-                command,
                 Some(auth),
                 request,
                 timeouts,
@@ -2624,11 +2618,9 @@ async fn fetch_daemon_status_from_endpoint_direct_async(
         address: endpoint.address.clone(),
         detail: format!("cluster connectivity probe signing task failed: {source}"),
     })??;
-    let command = crate::daemon_rpc_command(sinomo_network::DAEMON_STATUS_ROUTE);
     let timeouts = sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout);
     let response = sinomo_network::send_daemon_rpc_to_cluster_endpoint_async(
         endpoint,
-        &command,
         Some(&signed),
         &request,
         timeouts,
@@ -4755,19 +4747,10 @@ impl sinomo_network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost<'_> {
                 }
                 RelayLocalDeliveryTarget::LoopbackAddress(local_address) => {
                     let inner = &envelope.inner;
-                    let inner_rpc =
-                        inner
-                            .rpc
-                            .as_ref()
-                            .ok_or_else(|| sinomo_network::NetworkError::Io {
-                                operation: "cluster relay local delivery".to_string(),
-                                detail: "relayed request carried no rpc payload".to_string(),
-                            })?;
                     sinomo_network::send_daemon_rpc_to_address_async(
                         &local_address,
-                        &inner.command,
                         inner.auth.as_deref(),
-                        inner_rpc,
+                        inner,
                         timeouts,
                     )
                     .await
@@ -4900,10 +4883,8 @@ async fn send_cluster_relay_request_to_next_hop_async(
         address: format!("cluster relay {}", endpoint.address),
         detail: format!("cluster relay signing task failed: {source}"),
     })??;
-    let command = crate::daemon_rpc_command(sinomo_network::CLUSTER_RELAY_ROUTE);
     sinomo_network::send_daemon_rpc_to_cluster_endpoint_async(
         endpoint,
-        &command,
         Some(&request_auth),
         request,
         timeouts,
@@ -7063,7 +7044,7 @@ mod tests {
                 .expect("sync cluster state");
 
         let authenticated = AuthenticatedDaemonCommand {
-            command: "cluster-member-publish".to_string(),
+            route: sinomo_network::CLUSTER_MEMBER_PUBLISH_ROUTE.to_string(),
             signer: crate::DaemonSignerAuthority::Local,
             signer_node_id: local.to_string(),
             signer_public_key: state.members[0].node_public_key.clone(),
