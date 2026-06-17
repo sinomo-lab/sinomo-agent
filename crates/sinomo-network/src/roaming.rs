@@ -2030,8 +2030,16 @@ async fn send_daemon_rpc_to_target_async(
     timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::ObjectRpcResponse, NetworkError> {
     let control_request = daemon_rpc_control_request(auth, request);
-    let response =
-        send_daemon_control_request_to_target_async(target, &control_request, timeouts).await?;
+    let response = if crate::object_rpc_request_expects_raw_daemon_response(request) {
+        send_daemon_control_rpc_request_raw_response_to_target_async(
+            target,
+            &control_request,
+            timeouts,
+        )
+        .await?
+    } else {
+        send_daemon_control_request_to_target_async(target, &control_request, timeouts).await?
+    };
     response.error_detail()?;
     Ok(response)
 }
@@ -2076,6 +2084,41 @@ async fn send_daemon_control_request_to_target_async(
     }
 }
 
+async fn send_daemon_control_rpc_request_raw_response_to_target_async(
+    target: DaemonControlTarget<'_>,
+    request: &crate::DaemonControlRequest,
+    timeouts: DaemonRpcTimeouts,
+) -> Result<crate::ObjectRpcResponse, NetworkError> {
+    match target {
+        DaemonControlTarget::Address(address) => {
+            send_daemon_control_rpc_request_raw_response_to_address_async(
+                address, request, timeouts,
+            )
+            .await
+        }
+        DaemonControlTarget::ClusterEndpoint(endpoint) => match endpoint.transport {
+            ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
+                crate::send_daemon_control_rpc_request_raw_response_async(
+                    &endpoint.address,
+                    request,
+                    timeouts,
+                    IROH_DAEMON_COMMAND_MAX_BYTES,
+                )
+                .await
+            }
+            ClusterTransportKind::Iroh => Err(NetworkError::Io {
+                operation: format!("send streamed daemon rpc to {}", endpoint.address),
+                detail: "streamed raw RPC responses are not supported over iroh proxy transport"
+                    .to_string(),
+            }),
+            _ => Err(NetworkError::Io {
+                operation: format!("send streamed daemon rpc to {}", endpoint.address),
+                detail: format!("unsupported daemon rpc transport {:?}", endpoint.transport),
+            }),
+        },
+    }
+}
+
 async fn send_daemon_control_request_to_address_async(
     address: &str,
     request: &crate::DaemonControlRequest,
@@ -2085,6 +2128,28 @@ async fn send_daemon_control_request_to_address_async(
         send_iroh_daemon_control_request_to_address_async(address, request, timeouts).await
     } else {
         crate::send_daemon_control_request_async(
+            address,
+            request,
+            timeouts,
+            IROH_DAEMON_COMMAND_MAX_BYTES,
+        )
+        .await
+    }
+}
+
+async fn send_daemon_control_rpc_request_raw_response_to_address_async(
+    address: &str,
+    request: &crate::DaemonControlRequest,
+    timeouts: DaemonRpcTimeouts,
+) -> Result<crate::ObjectRpcResponse, NetworkError> {
+    if daemon_rpc_address_uses_iroh(address) {
+        Err(NetworkError::Io {
+            operation: format!("send streamed daemon rpc to {address}"),
+            detail: "streamed raw RPC responses are not supported over iroh proxy transport"
+                .to_string(),
+        })
+    } else {
+        crate::send_daemon_control_rpc_request_raw_response_async(
             address,
             request,
             timeouts,

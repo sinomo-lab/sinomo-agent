@@ -2567,7 +2567,15 @@ async fn dispatch_dfs_direct_read_stream_via_registry_async(
         .await
         .map_err(DaemonError::from)?;
     if let Some(reader) = stream_response.reader {
-        write_dfs_direct_read_stream_chunks(stream, stream_address, reader).await?;
+        if let Err(error) =
+            write_dfs_direct_read_stream_chunks(stream, stream_address, reader).await
+        {
+            if let Some(key) = replay_key.as_ref() {
+                crate::control::abandon_daemon_dfs_frame_replay(paths, key);
+            }
+            let _ = stream.shutdown_write(stream_address).await;
+            return Err(error);
+        }
     }
     if let Some(key) = replay_key.as_ref() {
         crate::control::complete_daemon_dfs_frame_replay(paths, key, &stream_response.response);
@@ -2641,13 +2649,7 @@ async fn write_dfs_direct_read_stream_chunks(
                     address: stream_address.to_string(),
                     detail: "DFS direct-read stream byte count overflowed".to_string(),
                 })?;
-            empty_tx
-                .send(chunk.buffer)
-                .await
-                .map_err(|source| DaemonError::Network {
-                    address: stream_address.to_string(),
-                    detail: format!("DFS direct-read stream buffer return failed: {source}"),
-                })?;
+            let _ = empty_tx.send(chunk.buffer).await;
         }
         Err(DaemonError::Network {
             address: stream_address.to_string(),

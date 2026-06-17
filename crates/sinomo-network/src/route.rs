@@ -316,7 +316,10 @@ impl RelayEnvelope {
     /// Encode this envelope as an [`ObjectRpcRequest`] on [`CLUSTER_RELAY_ROUTE`] for
     /// transport to the next hop.
     pub fn into_request(&self) -> Result<ObjectRpcRequest, NetworkError> {
-        ObjectRpcRequest::encode_body(CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY, self)
+        let mut request =
+            ObjectRpcRequest::encode_body(CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY, self)?;
+        propagate_relay_response_metadata(&self.inner, &mut request);
+        Ok(request)
     }
 
     /// Decode an envelope from a relay-route [`ObjectRpcRequest`].
@@ -514,6 +517,8 @@ fn endpoint_rpc_requests_raw_direct(request: &ObjectRpcRequest) -> bool {
         || request.route == crate::CLUSTER_NETWORK_PING_ROUTE
         || request.category == crate::CLUSTER_MEMBERSHIP_RPC_CATEGORY
         || endpoint_rpc_has_explicit_raw_direct_metadata(request)
+        || crate::object_rpc_request_expects_raw_daemon_response(request)
+        || crate::object_rpc_request_accepts_streamed_daemon_response(request)
 }
 
 fn endpoint_rpc_has_explicit_raw_direct_metadata(request: &ObjectRpcRequest) -> bool {
@@ -524,6 +529,21 @@ fn endpoint_rpc_has_explicit_raw_direct_metadata(request: &ObjectRpcRequest) -> 
             value == crate::ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE
                 || value.eq_ignore_ascii_case("true")
         })
+}
+
+fn propagate_relay_response_metadata(inner: &ObjectRpcRequest, outer: &mut ObjectRpcRequest) {
+    if crate::object_rpc_request_expects_raw_daemon_response(inner) {
+        outer.metadata.insert(
+            crate::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY.to_string(),
+            crate::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE.to_string(),
+        );
+    }
+    if crate::object_rpc_request_accepts_streamed_daemon_response(inner) {
+        outer.metadata.insert(
+            crate::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY.to_string(),
+            crate::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE.to_string(),
+        );
+    }
 }
 
 fn cluster_endpoint_transport_timeouts(
@@ -557,7 +577,7 @@ fn cluster_relay_hop_transport_timeouts(
     shaped.with_idle_timeout(Some(idle_timeout.min(CLUSTER_RELAY_MIN_RESPONSE_BUDGET)))
 }
 
-fn relay_envelope_hop_transport_timeouts(
+pub fn relay_envelope_hop_transport_timeouts(
     timeouts: DaemonRpcTimeouts,
     envelope: &RelayEnvelope,
 ) -> DaemonRpcTimeouts {
@@ -1145,7 +1165,7 @@ pub async fn handle_cluster_relay_async_with_host(
     )
 }
 
-async fn cluster_relay_forward_plan(
+pub async fn cluster_relay_forward_plan(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -2846,6 +2866,39 @@ mod tests {
     }
 
     #[test]
+    fn relay_envelope_propagates_streamed_raw_response_metadata() {
+        let mut inner = inner_request();
+        inner.metadata.insert(
+            crate::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY.to_string(),
+            crate::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE.to_string(),
+        );
+        inner.metadata.insert(
+            crate::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY.to_string(),
+            crate::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE.to_string(),
+        );
+        let envelope = RelayEnvelope::new(
+            ClusterId::from_legacy_named("cluster_route_test").expect("cluster"),
+            nid("node_target"),
+            inner,
+        );
+
+        let request = envelope.into_request().expect("encode");
+
+        assert_eq!(
+            request
+                .metadata
+                .get(crate::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY),
+            Some(&crate::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE.to_string())
+        );
+        assert_eq!(
+            request
+                .metadata
+                .get(crate::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY),
+            Some(&crate::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE.to_string())
+        );
+    }
+
+    #[test]
     fn relay_next_hop_endpoints_suppress_unverified_fallback_after_healthy_graph_edge() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-relay-endpoint-healthy-filter");
         let data_dir = SinomoDataDir::new(&root);
@@ -4421,6 +4474,46 @@ mod tests {
         );
         let direct_response =
             endpoint_rpc_response("/test/endpoint-raw-direct-opt-in-ok", "direct");
+        let mut host = RecordingSignedEndpointRpcHost::new(false, Ok(direct_response), Ok(None))
+            .with_cluster_id(cluster_id);
+
+        let response = send_signed_rpc_to_endpoint_async_with_host(
+            &endpoint,
+            &request,
+            b"inner-auth",
+            ClusterSignedEndpointRpcOptions {
+                timeouts: DaemonRpcTimeouts::connect_only(Duration::from_secs(5)),
+            },
+            &mut host,
+        )
+        .await
+        .expect("endpoint rpc");
+
+        assert_eq!(response.decode_body::<String>().expect("body"), "direct");
+        assert_eq!(host.calls, vec!["prefer_relay", "direct"]);
+        assert!(host.signed_routes.is_empty());
+        assert_eq!(host.direct_auth, vec![b"inner-auth".to_vec()]);
+        assert_eq!(host.direct_requests, vec![request]);
+    }
+
+    #[tokio::test]
+    async fn signed_endpoint_rpc_async_keeps_raw_streamed_response_requests_direct() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_signed_endpoint_raw_streamed_response")
+                .expect("cluster");
+        let target = nid("node_signed_endpoint_raw_streamed_response_target");
+        let endpoint = crate::daemon_lan_endpoint(&target, "10.90.0.44:21353".to_string(), 5);
+        let mut request = endpoint_rpc_request();
+        request.metadata.insert(
+            crate::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY.to_string(),
+            crate::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE.to_string(),
+        );
+        request.metadata.insert(
+            crate::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY.to_string(),
+            crate::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE.to_string(),
+        );
+        let direct_response =
+            endpoint_rpc_response("/test/endpoint-raw-streamed-response-ok", "direct");
         let mut host = RecordingSignedEndpointRpcHost::new(false, Ok(direct_response), Ok(None))
             .with_cluster_id(cluster_id);
 
