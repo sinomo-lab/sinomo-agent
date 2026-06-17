@@ -348,12 +348,18 @@ fn cli_probe_member_daemon_status(
         if cluster.cluster_id != state.cluster_id || cluster.node_id != member.node_id {
             continue;
         }
-        return Some(cluster_node_status_from_daemon_status(
+        let status = cluster_node_status_from_daemon_status(
             &status,
             cluster,
             None,
             OffsetDateTime::now_utc(),
-        ));
+        );
+        if network::cluster_member_expected_daemon_process(member)
+            .is_some_and(|process| status.process != process)
+        {
+            continue;
+        }
+        return Some(status);
     }
     None
 }
@@ -382,12 +388,14 @@ fn cli_probe_local_member_daemon_status(
     if cluster.cluster_id != state.cluster_id || cluster.node_id != member.node_id {
         return None;
     }
-    Some(cluster_node_status_from_daemon_status(
-        &status,
-        cluster,
-        None,
-        OffsetDateTime::now_utc(),
-    ))
+    let status =
+        cluster_node_status_from_daemon_status(&status, cluster, None, OffsetDateTime::now_utc());
+    if network::cluster_member_expected_daemon_process(member)
+        .is_some_and(|process| status.process != process)
+    {
+        return None;
+    }
+    Some(status)
 }
 
 fn cli_fetch_local_cluster_health_rows_from_member(

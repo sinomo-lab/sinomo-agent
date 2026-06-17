@@ -66,7 +66,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub const DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT: Duration = Duration::from_millis(1500);
 pub const DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
-pub const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
+pub const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DAEMON_CLUSTER_TICK_INTERVAL: Duration = Duration::from_secs(15);
 #[cfg(test)]
 const DAEMON_CLUSTER_CONVERGENCE_TICK_INTERVAL: Duration =
@@ -3099,14 +3099,29 @@ async fn probe_member_daemon_status_async(
         address: member_node_id,
         detail: format!("cluster health target selection task failed: {source}"),
     })?;
+    let mut probes = tokio::task::JoinSet::new();
     for endpoint in endpoints {
-        let status = match fetch_daemon_status_from_endpoint_async(
-            &endpoint,
-            CLUSTER_HEALTH_PROBE_TIMEOUT,
-            runtime,
-        )
-        .await
-        {
+        probes.spawn(async move {
+            let result = fetch_daemon_status_from_endpoint_direct_async(
+                &endpoint,
+                CLUSTER_HEALTH_PROBE_TIMEOUT,
+            )
+            .await;
+            (endpoint, result)
+        });
+    }
+    while let Some(joined) = probes.join_next().await {
+        let (endpoint, status) = match joined {
+            Ok(probe) => probe,
+            Err(error) => {
+                eprintln!(
+                    "sinomo daemon cluster health probe task for {} failed: {error}",
+                    member.node_id
+                );
+                continue;
+            }
+        };
+        let status = match status {
             Ok(status) => status,
             Err(error) => {
                 eprintln!(
@@ -3137,12 +3152,25 @@ async fn probe_member_daemon_status_async(
             );
             continue;
         }
-        return Ok(Some(cluster_node_status_from_daemon_status(
+        let status = cluster_node_status_from_daemon_status(
             &status,
             cluster,
             None,
             OffsetDateTime::now_utc(),
-        )));
+        );
+        if sinomo_network::cluster_member_expected_daemon_process(member)
+            .is_some_and(|process| status.process != process)
+        {
+            eprintln!(
+                "sinomo daemon cluster health probe of {} via {}: process mismatch (expected {}, responder {})",
+                member.node_id,
+                endpoint.address,
+                sinomo_network::cluster_member_expected_daemon_process(member).unwrap_or("unknown"),
+                status.process
+            );
+            continue;
+        }
+        return Ok(Some(status));
     }
     Ok(None)
 }
@@ -3184,12 +3212,14 @@ async fn probe_local_member_daemon_status_async(
     if cluster.cluster_id != state.cluster_id || cluster.node_id != member.node_id {
         return Ok(None);
     }
-    Ok(Some(cluster_node_status_from_daemon_status(
-        &status,
-        cluster,
-        None,
-        OffsetDateTime::now_utc(),
-    )))
+    let status =
+        cluster_node_status_from_daemon_status(&status, cluster, None, OffsetDateTime::now_utc());
+    if sinomo_network::cluster_member_expected_daemon_process(member)
+        .is_some_and(|process| status.process != process)
+    {
+        return Ok(None);
+    }
+    Ok(Some(status))
 }
 
 pub(crate) fn prepare_local_cluster_state(

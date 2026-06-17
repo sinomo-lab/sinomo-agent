@@ -162,6 +162,10 @@ pub(super) fn print_cluster_help() {
     );
     println!("  sinomo cluster remove <node-id> [node-id ...]");
     println!("      Remove non-voter members from quorum-backed cluster membership.");
+    println!("  sinomo cluster cleanup-legacy-shadow-members");
+    println!(
+        "      Remove stale shadow-only daemon member records from quorum-backed cluster membership."
+    );
     println!("  sinomo cluster status");
     println!("      Show local cluster status and node health counts.");
     println!("  sinomo cluster health");

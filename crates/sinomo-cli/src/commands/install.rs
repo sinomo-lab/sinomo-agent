@@ -89,7 +89,9 @@ pub(crate) fn data_dir_storage_contract_findings(
     data_dir: impl AsRef<Path>,
 ) -> Result<Vec<ClusterDoctorFinding>, CliError> {
     let report = cli_data_dir_layout()?.verify_data_dir(data_dir)?;
-    if report.is_complete() {
+    let mut unregistered = report.unregistered;
+    unregistered.retain(|path| !known_transient_data_dir_path(path));
+    if unregistered.is_empty() {
         Ok(Vec::new())
     } else {
         Ok(vec![ClusterDoctorFinding {
@@ -97,10 +99,20 @@ pub(crate) fn data_dir_storage_contract_findings(
             code: "storage-unregistered-paths".to_string(),
             detail: format!(
                 "local Sinomo data directory contains unregistered paths: {}",
-                report.unregistered.join(", ")
+                unregistered.join(", ")
             ),
         }])
     }
+}
+
+fn known_transient_data_dir_path(relative_path: &str) -> bool {
+    if !relative_path.starts_with("cluster/.") {
+        return false;
+    }
+    let Some(file_name) = relative_path.rsplit('/').next() else {
+        return false;
+    };
+    file_name.contains(".tmp-") || file_name.contains(".create-new-tmp-")
 }
 
 pub(crate) fn warn_data_dir_storage_contracts(data_dir: impl AsRef<Path>) -> Result<(), CliError> {
@@ -115,10 +127,28 @@ fn cli_data_dir_layout()
     let mut layout = sinomo_runtime::storage::sinomo_data_dir_layout()?;
     sinomo_agent::register_storage_paths(&mut layout)?;
     sinomo_pytorch::register_storage_paths(&mut layout)?;
+    register_cli_application_storage_paths(&mut layout)?;
     for hook in &crate::cli_runtime_config().storage_layout_hooks {
         hook(&mut layout)?;
     }
     Ok(layout)
+}
+
+fn register_cli_application_storage_paths(
+    layout: &mut sinomo_runtime::storage::StorageLayout,
+) -> Result<(), sinomo_runtime::storage::StorageContractError> {
+    layout.register_escape_path(
+        "sinomo-cli",
+        sinomo_runtime::storage::StorageRing::Application,
+        "events/tui/sessions",
+        "terminal UI session records, transcripts, and event logs",
+    )?;
+    layout.register_escape_path(
+        "sinomo-app",
+        sinomo_runtime::storage::StorageRing::Application,
+        "app/sessions",
+        "desktop app chat session cache and metadata",
+    )
 }
 
 pub(crate) fn install(options: InstallOptions) -> Result<(), CliError> {

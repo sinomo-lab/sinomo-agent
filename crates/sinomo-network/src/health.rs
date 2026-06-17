@@ -5,8 +5,8 @@ use crate::rpc::{
     ObjectRpcRequest, ObjectRpcResponse,
 };
 use crate::storage::{
-    ClusterMembershipRpcFuture, DAEMON_MAIN_CLUSTER_ROLE, DAEMON_MAIN_RUN_CAPABILITY,
-    DAEMON_SHADOW_CLUSTER_ROLE, DAEMON_SHADOW_SUPERVISE_CAPABILITY, advertised_peer_route_targets,
+    ClusterMembershipRpcFuture, DAEMON_MAIN_RUN_CAPABILITY, advertised_peer_route_targets,
+    cluster_member_expected_daemon_process, cluster_member_is_legacy_shadow_daemon,
     discover_peer_route_ip_candidates, iroh_endpoint_public_key,
     live_cluster_member_probe_possible, read_cluster_node_statuses_from_kv, read_cluster_state,
     read_cluster_state_async,
@@ -274,10 +274,12 @@ pub fn cluster_health_rows_with_probe<P: ClusterStatusProbe + ?Sized>(
     let stored_statuses = read_cluster_node_statuses_from_kv(paths)?;
     let mut rows = Vec::new();
     for member in &state.members {
-        if matches!(member.state, ClusterMemberState::Removed) {
+        if matches!(member.state, ClusterMemberState::Removed)
+            || !cluster_health_member_is_reportable(member)
+        {
             continue;
         }
-        let expected_process = cluster_member_expected_process(member);
+        let expected_process = cluster_member_expected_daemon_process(member);
         let live = probe
             .probe_member_status(state, member)
             .filter(|status| cluster_node_status_matches_member(status, member, expected_process));
@@ -335,10 +337,12 @@ pub async fn cluster_health_rows_with_async_probe<P: ClusterStatusAsyncProbe + ?
     })??;
     let mut rows = Vec::new();
     for member in &state.members {
-        if matches!(member.state, ClusterMemberState::Removed) {
+        if matches!(member.state, ClusterMemberState::Removed)
+            || !cluster_health_member_is_reportable(member)
+        {
             continue;
         }
-        let expected_process = cluster_member_expected_process(member);
+        let expected_process = cluster_member_expected_daemon_process(member);
         let live = probe
             .probe_member_status_async(state, member)
             .await?
@@ -385,6 +389,9 @@ pub fn cluster_doctor_findings(
 ) -> Vec<ClusterDoctorFinding> {
     let mut findings = Vec::new();
     for row in health {
+        if cluster_health_node_is_nonreportable_member(state, &row.member.node_id) {
+            continue;
+        }
         if row.availability == ClusterNodeAvailability::Offline {
             findings.push(ClusterDoctorFinding::warning(
                 "node-offline",
@@ -407,10 +414,18 @@ pub fn cluster_doctor_findings(
     );
     let online_nodes = health
         .iter()
-        .filter(|row| row.availability == ClusterNodeAvailability::Online)
+        .filter(|row| {
+            row.availability == ClusterNodeAvailability::Online
+                && !cluster_health_node_is_nonreportable_member(state, &row.member.node_id)
+        })
         .map(|row| row.member.node_id.clone())
         .collect::<BTreeSet<_>>();
     for record in connectivity {
+        if cluster_health_node_is_nonreportable_member(state, &record.source_node_id)
+            || cluster_health_node_is_nonreportable_member(state, &record.target_node_id)
+        {
+            continue;
+        }
         if record.state == ClusterConnectivityState::Unreachable
             && !online_nodes.contains(&record.target_node_id)
             && cluster_route_next_hop(
@@ -435,6 +450,9 @@ pub fn cluster_doctor_findings(
     }
 
     for member in &state.members {
+        if !cluster_health_member_is_reportable(member) {
+            continue;
+        }
         let mut by_public_key = BTreeMap::<String, usize>::new();
         for endpoint in &member.endpoints {
             if let Some(public_key) = iroh_endpoint_public_key(endpoint) {
@@ -472,6 +490,27 @@ pub fn cluster_doctor_findings(
     findings
 }
 
+fn cluster_health_node_is_nonreportable_member(
+    state: &ClusterBootstrapState,
+    node_id: &NodeId,
+) -> bool {
+    if *node_id == sinomo_node::shadow_daemon_node_id(&state.local_node_id) {
+        return true;
+    }
+    state
+        .members
+        .iter()
+        .find(|member| member.node_id == *node_id)
+        .is_some_and(|member| {
+            matches!(member.state, ClusterMemberState::Removed)
+                || !cluster_health_member_is_reportable(member)
+        })
+}
+
+fn cluster_health_member_is_reportable(member: &ClusterMemberRecord) -> bool {
+    !cluster_member_is_legacy_shadow_daemon(member)
+}
+
 pub fn unknown_cluster_node_status(
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,
@@ -480,7 +519,7 @@ pub fn unknown_cluster_node_status(
     ClusterNodeStatusRecord {
         cluster_id: state.cluster_id.clone(),
         node_id: member.node_id.clone(),
-        process: cluster_member_expected_process(member)
+        process: cluster_member_expected_daemon_process(member)
             .map(str::to_string)
             .unwrap_or_else(|| "unknown".to_string()),
         availability: ClusterNodeAvailability::Unknown,
@@ -501,17 +540,6 @@ pub fn unknown_cluster_node_status(
         daemon_started_at: None,
         observed_at,
     }
-}
-
-fn cluster_member_expected_process(member: &ClusterMemberRecord) -> Option<&'static str> {
-    member
-        .capabilities
-        .iter()
-        .find_map(|capability| match capability.as_str() {
-            DAEMON_MAIN_RUN_CAPABILITY => Some(DAEMON_MAIN_CLUSTER_ROLE),
-            DAEMON_SHADOW_SUPERVISE_CAPABILITY => Some(DAEMON_SHADOW_CLUSTER_ROLE),
-            _ => None,
-        })
 }
 
 fn cluster_node_status_matches_member(

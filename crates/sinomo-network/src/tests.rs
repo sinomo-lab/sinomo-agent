@@ -5692,6 +5692,21 @@ fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
             && endpoint.endpoint_id != port_only_shadow_endpoint.endpoint_id),
         "DFS protocol routing uses the same main-daemon target surface"
     );
+    let remote_member = state
+        .members
+        .iter()
+        .find(|member| member.node_id == main_endpoint.node_id)
+        .expect("remote main member");
+    let status_targets =
+        cluster_member_daemon_status_targets_with_connectivity(&paths, &state, remote_member);
+    assert_eq!(
+        status_targets
+            .iter()
+            .map(|endpoint| endpoint.endpoint_id.clone())
+            .collect::<Vec<_>>(),
+        vec![main_endpoint.endpoint_id],
+        "main daemon status probes must keep trying main endpoints instead of accepting folded shadow endpoints"
+    );
 }
 
 #[test]
@@ -8128,6 +8143,300 @@ fn cluster_member_removal_txns_bound_large_endpoint_prefix_cleanup() {
     assert!(
         store.range_prefix(&endpoint_prefix).is_empty(),
         "endpoint records should be removed"
+    );
+}
+
+#[test]
+fn cleanup_legacy_shadow_daemon_members_removes_only_shadow_only_records() {
+    struct MemoryMutationHost {
+        store: InProcessKvStore,
+        commits: usize,
+    }
+
+    impl ClusterMemberMutationHost for MemoryMutationHost {
+        fn current_cluster_kv_store(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+        ) -> Result<InProcessKvStore, NetworkError> {
+            Ok(self.store.clone())
+        }
+
+        fn commit_cluster_kv_txn_with_quorum(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &mut ClusterBootstrapState,
+            txn: KvTxn,
+        ) -> Result<KvSnapshot, NetworkError> {
+            self.commits += 1;
+            self.store.txn(txn)?;
+            Ok(self.store.snapshot())
+        }
+    }
+
+    let root = sinomo_testdir::TestDir::new("sinomo-network-cleanup-legacy-shadow-members");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_cleanup_legacy_shadow").expect("cluster");
+    let local_node_id =
+        NodeId::from_legacy_named("node_cleanup_legacy_shadow_local").expect("local");
+    let local_shadow_node_id = shadow_daemon_node_id(&local_node_id);
+    let remote_node_id =
+        NodeId::from_legacy_named("node_cleanup_legacy_shadow_remote").expect("remote");
+    let remote_shadow_node_id = shadow_daemon_node_id(&remote_node_id);
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "legacy shadow cleanup",
+        local_node_id.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    state.members[0].capabilities = main_daemon_capabilities(&state.members[0].role);
+    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+
+    let mut remote_main = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        remote_node_id.clone(),
+        "remote",
+        "pk-remote",
+        now,
+    );
+    remote_main.capabilities = main_daemon_capabilities(&remote_main.role);
+    remote_main.allowed_capabilities = remote_main.capabilities.clone();
+
+    let mut local_shadow = ClusterMemberRecord::local_non_voting(
+        cluster_id.clone(),
+        local_shadow_node_id.clone(),
+        "local shadow",
+        "pk-local-shadow",
+        now,
+    );
+    local_shadow.capabilities =
+        vec![CapabilityName::new(DAEMON_SHADOW_SUPERVISE_CAPABILITY).expect("shadow capability")];
+    local_shadow.allowed_capabilities = local_shadow.capabilities.clone();
+    local_shadow.endpoints = vec![daemon_lan_endpoint(
+        &local_shadow_node_id,
+        "127.0.0.1:21354".to_string(),
+        10,
+    )];
+
+    let mut remote_shadow = ClusterMemberRecord::local_non_voting(
+        cluster_id.clone(),
+        remote_shadow_node_id.clone(),
+        "remote shadow",
+        "pk-remote-shadow",
+        now,
+    );
+    remote_shadow.capabilities =
+        vec![CapabilityName::new(DAEMON_SHADOW_SUPERVISE_CAPABILITY).expect("shadow capability")];
+    remote_shadow.allowed_capabilities = remote_shadow.capabilities.clone();
+    remote_shadow.endpoints = vec![daemon_lan_endpoint(
+        &remote_shadow_node_id,
+        "192.0.2.45:21354".to_string(),
+        10,
+    )];
+
+    let mut host = MemoryMutationHost {
+        store: InProcessKvStore::new(),
+        commits: 0,
+    };
+    for member in [
+        state.members[0].clone(),
+        remote_main.clone(),
+        local_shadow.clone(),
+        remote_shadow.clone(),
+    ] {
+        host.store
+            .put_serde(cluster_member_key(&member.node_id), &member, None)
+            .expect("member");
+        host.store
+            .put_serde(
+                cluster_capability_policy_key(&member.node_id),
+                &ClusterCapabilityPolicyRecord::from(&member),
+                None,
+            )
+            .expect("policy");
+        for endpoint in &member.endpoints {
+            host.store
+                .put_serde(
+                    cluster_endpoint_key(&member.node_id, endpoint),
+                    endpoint,
+                    None,
+                )
+                .expect("endpoint");
+        }
+    }
+    let local_shadow_connectivity = doctor_connectivity_record(
+        &cluster_id,
+        &local_node_id,
+        &local_shadow_node_id,
+        "endpoint_cleanup_legacy_local_shadow",
+        "127.0.0.1:21354",
+        ClusterConnectivityState::Unreachable,
+    );
+    let remote_shadow_connectivity = doctor_connectivity_record(
+        &cluster_id,
+        &remote_shadow_node_id,
+        &remote_node_id,
+        "endpoint_cleanup_legacy_remote_shadow",
+        "192.0.2.45:21354",
+        ClusterConnectivityState::Unreachable,
+    );
+    let retained_connectivity = doctor_connectivity_record(
+        &cluster_id,
+        &local_node_id,
+        &remote_node_id,
+        "endpoint_cleanup_legacy_main_peer",
+        "192.0.2.45:21353",
+        ClusterConnectivityState::Healthy,
+    );
+    let retained_connectivity_key = cluster_connectivity_key(
+        &retained_connectivity.source_node_id,
+        &retained_connectivity.target_node_id,
+        &retained_connectivity.endpoint_id,
+    );
+    for record in [
+        &local_shadow_connectivity,
+        &remote_shadow_connectivity,
+        &retained_connectivity,
+    ] {
+        host.store
+            .put_serde(
+                cluster_connectivity_key(
+                    &record.source_node_id,
+                    &record.target_node_id,
+                    &record.endpoint_id,
+                ),
+                record,
+                None,
+            )
+            .expect("connectivity");
+    }
+
+    let removal = cleanup_legacy_shadow_daemon_members_with_host(&paths, state.clone(), &mut host)
+        .expect("cleanup");
+    let removed_node_ids = removal
+        .removed
+        .iter()
+        .map(|member| member.node_id.clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        removed_node_ids,
+        vec![local_shadow_node_id, remote_shadow_node_id]
+    );
+    assert!(host.commits >= 1);
+    assert!(
+        host.store
+            .get(&cluster_member_key(&local_node_id))
+            .is_some()
+    );
+    assert!(
+        host.store
+            .get(&cluster_member_key(&remote_node_id))
+            .is_some()
+    );
+    for member in [local_shadow, remote_shadow] {
+        assert!(
+            host.store
+                .get(&cluster_member_key(&member.node_id))
+                .is_none()
+        );
+        assert!(
+            host.store
+                .get(&cluster_capability_policy_key(&member.node_id))
+                .is_none()
+        );
+        for endpoint in &member.endpoints {
+            assert!(
+                host.store
+                    .get(&cluster_endpoint_key(&member.node_id, endpoint))
+                    .is_none()
+            );
+        }
+    }
+    assert!(
+        host.store.get(&retained_connectivity_key).is_some(),
+        "main-member connectivity should be retained"
+    );
+    for record in [local_shadow_connectivity, remote_shadow_connectivity] {
+        assert!(
+            host.store
+                .get(&cluster_connectivity_key(
+                    &record.source_node_id,
+                    &record.target_node_id,
+                    &record.endpoint_id,
+                ))
+                .is_none(),
+            "shadow connectivity should be removed"
+        );
+    }
+
+    let orphan_shadow_node_id =
+        NodeId::from_legacy_named("node_cleanup_legacy_shadow_orphan").expect("orphan shadow");
+    let orphan_status = ClusterNodeStatusRecord {
+        cluster_id: cluster_id.clone(),
+        node_id: orphan_shadow_node_id.clone(),
+        process: DAEMON_SHADOW_CLUSTER_ROLE.to_string(),
+        availability: ClusterNodeAvailability::Offline,
+        daemon_version: "0.1.0".to_string(),
+        commit: None,
+        target_os: None,
+        target_arch: None,
+        pid: None,
+        address: None,
+        bind_address: None,
+        executable: None,
+        rollout: None,
+        daemon_started_at: None,
+        observed_at: now,
+    };
+    let orphan_connectivity = doctor_connectivity_record(
+        &cluster_id,
+        &local_node_id,
+        &orphan_shadow_node_id,
+        "endpoint_cleanup_legacy_orphan_shadow",
+        "127.0.0.1:21354",
+        ClusterConnectivityState::Unreachable,
+    );
+    let orphan_connectivity_key = cluster_connectivity_key(
+        &orphan_connectivity.source_node_id,
+        &orphan_connectivity.target_node_id,
+        &orphan_connectivity.endpoint_id,
+    );
+    host.store
+        .put_serde(
+            cluster_node_status_key_for_process(&orphan_shadow_node_id, DAEMON_SHADOW_CLUSTER_ROLE),
+            &orphan_status,
+            None,
+        )
+        .expect("orphan status");
+    host.store
+        .put_serde(orphan_connectivity_key.clone(), &orphan_connectivity, None)
+        .expect("orphan connectivity");
+
+    let orphan_cleanup = cleanup_legacy_shadow_daemon_members_with_host(&paths, state, &mut host)
+        .expect("orphan cleanup");
+    assert!(
+        orphan_cleanup.removed.is_empty(),
+        "orphan artifact cleanup should not report member removals"
+    );
+    assert!(
+        host.store.get(&orphan_connectivity_key).is_none(),
+        "orphan shadow connectivity should be removed"
+    );
+    assert!(
+        host.store
+            .get(&cluster_node_status_key_for_process(
+                &orphan_shadow_node_id,
+                DAEMON_SHADOW_CLUSTER_ROLE
+            ))
+            .is_none(),
+        "orphan shadow status should be removed"
     );
 }
 
@@ -17386,6 +17695,149 @@ fn cluster_health_rows_select_member_process_status() {
         .expect("async main member row");
     assert_eq!(async_row.status.process, DAEMON_MAIN_CLUSTER_ROLE);
     assert_eq!(async_row.availability, ClusterNodeAvailability::Offline);
+}
+
+#[test]
+fn cluster_health_and_doctor_ignore_legacy_shadow_members() {
+    struct EmptyStatusProbe;
+
+    impl ClusterStatusProbe for EmptyStatusProbe {
+        fn probe_member_status(
+            &self,
+            _state: &ClusterBootstrapState,
+            _member: &ClusterMemberRecord,
+        ) -> Option<ClusterNodeStatusRecord> {
+            None
+        }
+    }
+
+    impl ClusterStatusAsyncProbe for EmptyStatusProbe {
+        fn probe_member_status_async<'a>(
+            &'a self,
+            _state: &'a ClusterBootstrapState,
+            _member: &'a ClusterMemberRecord,
+        ) -> ClusterMembershipRpcFuture<'a, Option<ClusterNodeStatusRecord>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    let root = sinomo_testdir::TestDir::new("sinomo-network-health-legacy-shadow-member");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_health_legacy_shadow").expect("cluster");
+    let main_node_id = NodeId::from_legacy_named("node_health_legacy_shadow_main").expect("main");
+    let shadow_node_id = sinomo_node::shadow_daemon_node_id(&main_node_id);
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "legacy shadow health",
+        main_node_id.clone(),
+        "main",
+        "main-public-key",
+        now,
+    );
+    state.members[0].capabilities =
+        vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("main capability")];
+    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+    let mut legacy_shadow = ClusterMemberRecord::local_non_voting(
+        cluster_id.clone(),
+        shadow_node_id.clone(),
+        "main shadow",
+        "shadow-public-key",
+        now,
+    );
+    legacy_shadow.capabilities =
+        vec![CapabilityName::new(DAEMON_SHADOW_SUPERVISE_CAPABILITY).expect("shadow capability")];
+    legacy_shadow.allowed_capabilities = legacy_shadow.capabilities.clone();
+    legacy_shadow.endpoints = vec![daemon_lan_endpoint(
+        &shadow_node_id,
+        "127.0.0.1:21354".to_string(),
+        10,
+    )];
+    state.members.push(legacy_shadow.clone());
+
+    let rows = cluster_health_rows_with_probe(&paths, &state, &EmptyStatusProbe, false, now)
+        .expect("health rows");
+
+    assert!(
+        rows.iter().all(|row| row.member.node_id != shadow_node_id),
+        "legacy shadow-only members must not appear as cluster health rows: {rows:?}"
+    );
+
+    let shadow_health = ClusterHealthRow {
+        member: legacy_shadow.clone(),
+        status: unknown_cluster_node_status(&state, &legacy_shadow, now),
+        availability: ClusterNodeAvailability::Offline,
+    };
+    let findings = cluster_doctor_findings(
+        &state,
+        &[
+            doctor_connectivity_record(
+                &cluster_id,
+                &main_node_id,
+                &shadow_node_id,
+                "endpoint_health_legacy_shadow_target",
+                "127.0.0.1:21354",
+                ClusterConnectivityState::Unreachable,
+            ),
+            doctor_connectivity_record(
+                &cluster_id,
+                &shadow_node_id,
+                &main_node_id,
+                "endpoint_health_legacy_shadow_source",
+                "127.0.0.1:21353",
+                ClusterConnectivityState::Unreachable,
+            ),
+        ],
+        &[shadow_health],
+    );
+
+    assert!(
+        findings.is_empty(),
+        "legacy shadow-only members should not create doctor warnings: {findings:?}"
+    );
+
+    let mut state_without_shadow = state.clone();
+    state_without_shadow
+        .members
+        .retain(|member| member.node_id != shadow_node_id);
+    let findings = cluster_doctor_findings(
+        &state_without_shadow,
+        &[doctor_connectivity_record(
+            &cluster_id,
+            &main_node_id,
+            &shadow_node_id,
+            "endpoint_health_removed_local_shadow",
+            "127.0.0.1:21354",
+            ClusterConnectivityState::Unreachable,
+        )],
+        &[],
+    );
+    assert!(
+        findings.is_empty(),
+        "removed local shadow records should not create doctor warnings: {findings:?}"
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let async_rows = runtime
+        .block_on(cluster_health_rows_with_async_probe(
+            &paths,
+            &state,
+            &EmptyStatusProbe,
+            false,
+            now,
+        ))
+        .expect("async health rows");
+    assert!(
+        async_rows
+            .iter()
+            .all(|row| row.member.node_id != shadow_node_id)
+    );
 }
 
 fn doctor_connectivity_record(

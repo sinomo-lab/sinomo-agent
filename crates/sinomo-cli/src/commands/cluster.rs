@@ -58,6 +58,7 @@ pub(crate) enum ClusterCliCommand {
     RaftRole(ClusterRaftRoleOptions),
     RepairMembers(ClusterRepairMembersOptions),
     Remove(ClusterRemoveOptions),
+    CleanupLegacyShadowMembers,
     Status,
     Health,
     Doctor,
@@ -174,6 +175,14 @@ pub(crate) fn parse_cluster_command(args: &[String]) -> Result<ClusterCliCommand
         Some((command, rest)) if matches!(command.as_str(), "remove" | "rm") => Ok(
             ClusterCliCommand::Remove(parse_cluster_remove_options(rest)?),
         ),
+        Some((command, []))
+            if matches!(
+                command.as_str(),
+                "cleanup-legacy-shadow-members" | "cleanup-shadow-members" | "cleanup-shadows"
+            ) =>
+        {
+            Ok(ClusterCliCommand::CleanupLegacyShadowMembers)
+        }
         Some((command, [])) if command == "status" => Ok(ClusterCliCommand::Status),
         Some((command, [])) if matches!(command.as_str(), "health" | "nodes") => {
             Ok(ClusterCliCommand::Health)
@@ -539,6 +548,7 @@ pub(crate) fn run_cluster_cli_command(command: ClusterCliCommand) -> Result<(), 
         ClusterCliCommand::RaftRole(options) => cluster_raft_role(options),
         ClusterCliCommand::RepairMembers(options) => cluster_repair_members(options),
         ClusterCliCommand::Remove(options) => cluster_remove(options),
+        ClusterCliCommand::CleanupLegacyShadowMembers => cluster_cleanup_legacy_shadow_members(),
         ClusterCliCommand::Status => cluster_status(),
         ClusterCliCommand::Health => cluster_health(),
         ClusterCliCommand::Doctor => cluster_doctor(),
@@ -2332,6 +2342,30 @@ pub(crate) fn cluster_remove(options: ClusterRemoveOptions) -> Result<(), CliErr
     for member in removal.removed {
         println!(
             "cluster member {} removed: {} {}",
+            member.node_id,
+            format_node_role(&member.node_role),
+            format_member_state(&member.state)
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn cluster_cleanup_legacy_shadow_members() -> Result<(), CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    refresh_cluster_kv_from_local_daemon(&paths)?;
+    let state = network::read_cluster_state(&paths)?;
+    let removal = network::cleanup_legacy_shadow_daemon_members_with_host(
+        &paths,
+        state,
+        &mut CliClusterMemberMutationHost,
+    )?;
+    if removal.removed.is_empty() {
+        println!("no legacy shadow-only cluster members found");
+        return Ok(());
+    }
+    for member in removal.removed {
+        println!(
+            "legacy shadow cluster member {} removed: {} {}",
             member.node_id,
             format_node_role(&member.node_role),
             format_member_state(&member.state)

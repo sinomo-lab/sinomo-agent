@@ -6632,6 +6632,33 @@ fn install_reports_unregistered_storage_without_blocking_startup() {
 }
 
 #[test]
+fn doctor_storage_contract_covers_cli_and_app_sessions() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-doctor-storage-owned-sessions");
+    std::fs::create_dir_all(root.join("events/tui/sessions/session-1"))
+        .expect("create tui session");
+    std::fs::write(
+        root.join("events/tui/sessions/session-1/session.json"),
+        b"{}",
+    )
+    .expect("write tui session");
+    std::fs::create_dir_all(root.join("app/sessions/session-1")).expect("create app session");
+    std::fs::write(root.join("app/sessions/session-1/meta.json"), b"{}")
+        .expect("write app session");
+    std::fs::create_dir_all(root.join("cluster")).expect("create cluster");
+    std::fs::write(root.join("cluster/.kv-snapshot.sobj.tmp-1-2"), b"partial")
+        .expect("write leftover temp file");
+
+    let findings = data_dir_storage_contract_findings(&root).expect("storage findings");
+
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding.code != "storage-unregistered-paths"),
+        "owned session paths and durable-write temp files should not create storage findings: {findings:?}"
+    );
+}
+
+#[test]
 fn install_detects_existing_binary_update() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-install-update");
     let destination = root.join("bin").join(if cfg!(windows) {
@@ -7200,6 +7227,11 @@ fn cluster_parser_accepts_init_and_join_options() {
                 NodeId::new("01hxy6qa9k0t9vr4g9n8d3q5d7").expect("node"),
             ],
         })
+    );
+    assert_eq!(
+        parse_cluster_command(&["cleanup-legacy-shadow-members".to_string()])
+            .expect("cluster cleanup legacy shadow members"),
+        ClusterCliCommand::CleanupLegacyShadowMembers
     );
 }
 

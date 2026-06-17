@@ -9711,6 +9711,52 @@ pub fn remove_cluster_members_with_host(
     Ok(ClusterMemberRemoval { removed })
 }
 
+pub fn cleanup_legacy_shadow_daemon_members_with_host(
+    paths: &ClusterPaths,
+    mut state: ClusterBootstrapState,
+    host: &mut impl ClusterMemberMutationHost,
+) -> Result<ClusterMemberRemoval, NetworkError> {
+    let store = host.current_cluster_kv_store(paths, &state)?;
+    let snapshot = store.snapshot();
+    let policies = read_cluster_capability_policies_from_snapshot(&snapshot)?;
+    let mut current_member_ids = BTreeSet::new();
+    let mut removed = Vec::new();
+    for entry in store.prefix_entries("/cluster/members/") {
+        let mut member: ClusterMemberRecord = entry.decode()?;
+        current_member_ids.insert(member.node_id.clone());
+        if let Some(policy) = policies.get(&member.node_id) {
+            member.capabilities = policy.capabilities.clone();
+            member.allowed_capabilities = policy.allowed_capabilities.clone();
+        }
+        if !cluster_member_is_legacy_shadow_daemon(&member) {
+            continue;
+        }
+        if sinomo_kv::cluster_kv_store_member_is_raft_voter(&store, &member.node_id)? {
+            return Err(NetworkError::ClusterReadOnly {
+                detail: format!(
+                    "legacy shadow member `{}` is a voter; change its raft role before cleanup",
+                    member.node_id
+                ),
+            });
+        }
+        removed.push(member);
+    }
+    removed.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    let orphan_artifact_node_ids =
+        cluster_legacy_shadow_orphan_artifact_node_ids_from_store(&store, &current_member_ids)?;
+
+    for txn in cluster_member_removal_txns_from_store(&store, &removed)? {
+        host.commit_cluster_kv_txn_with_quorum(paths, &mut state, txn)?;
+    }
+    for txn in cluster_legacy_shadow_orphan_artifact_cleanup_txns_from_store(
+        &store,
+        &orphan_artifact_node_ids,
+    )? {
+        host.commit_cluster_kv_txn_with_quorum(paths, &mut state, txn)?;
+    }
+    Ok(ClusterMemberRemoval { removed })
+}
+
 pub(crate) fn cluster_member_removal_txns_from_store(
     store: &InProcessKvStore,
     members: &[ClusterMemberRecord],
@@ -9721,6 +9767,25 @@ pub(crate) fn cluster_member_removal_txns_from_store(
     let explicit_delete_batch_limit =
         sinomo_kv::MAX_KV_TXN_OPS_PER_BRANCH.min(sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND);
     for member in members {
+        let mut connectivity_delete_ops = Vec::new();
+        for key in cluster_member_connectivity_delete_keys_from_store(store, &member.node_id)? {
+            connectivity_delete_ops.push(KvOp::Delete { key });
+            if connectivity_delete_ops.len() >= explicit_delete_batch_limit {
+                txns.push(KvTxn {
+                    compares: Vec::new(),
+                    success: std::mem::take(&mut connectivity_delete_ops),
+                    failure: Vec::new(),
+                });
+            }
+        }
+        if !connectivity_delete_ops.is_empty() {
+            txns.push(KvTxn {
+                compares: Vec::new(),
+                success: connectivity_delete_ops,
+                failure: Vec::new(),
+            });
+        }
+
         let endpoint_prefix = cluster_endpoint_prefix(&member.node_id);
         let mut residual_endpoint_keys = VecDeque::new();
         let mut explicit_delete_ops = Vec::new();
@@ -9761,6 +9826,108 @@ pub(crate) fn cluster_member_removal_txns_from_store(
                     prefix: endpoint_prefix,
                 },
             ],
+            failure: Vec::new(),
+        });
+    }
+    Ok(txns)
+}
+
+fn cluster_member_connectivity_delete_keys_from_store(
+    store: &InProcessKvStore,
+    node_id: &NodeId,
+) -> Result<Vec<String>, NetworkError> {
+    let mut keys = BTreeSet::new();
+    for entry in store.prefix_entries(&cluster_connectivity_source_prefix(node_id)) {
+        keys.insert(entry.key.clone());
+    }
+    for entry in store.prefix_entries("/cluster/network/connectivity/") {
+        if keys.contains(&entry.key) {
+            continue;
+        }
+        let record: ClusterConnectivityRecord = entry.decode()?;
+        if record.source_node_id == *node_id || record.target_node_id == *node_id {
+            keys.insert(entry.key.clone());
+        }
+    }
+    Ok(keys.into_iter().collect())
+}
+
+fn cluster_legacy_shadow_orphan_artifact_node_ids_from_store(
+    store: &InProcessKvStore,
+    current_member_ids: &BTreeSet<NodeId>,
+) -> Result<BTreeSet<NodeId>, NetworkError> {
+    let mut node_ids = BTreeSet::new();
+    for entry in store.prefix_entries("/cluster/policy/capabilities/") {
+        let policy: ClusterCapabilityPolicyRecord = entry.decode()?;
+        if !current_member_ids.contains(&policy.node_id)
+            && cluster_capabilities_are_legacy_shadow_only(&policy.capabilities)
+        {
+            node_ids.insert(policy.node_id);
+        }
+    }
+    for entry in store.prefix_entries("/cluster/node-status/") {
+        let status: ClusterNodeStatusRecord = entry.decode()?;
+        if !current_member_ids.contains(&status.node_id)
+            && status.process == DAEMON_SHADOW_CLUSTER_ROLE
+        {
+            node_ids.insert(status.node_id);
+        }
+    }
+    for entry in store.prefix_entries("/cluster/network/connectivity/") {
+        let record: ClusterConnectivityRecord = entry.decode()?;
+        if !current_member_ids.contains(&record.source_node_id) {
+            node_ids.insert(record.source_node_id);
+        }
+        if !current_member_ids.contains(&record.target_node_id) {
+            node_ids.insert(record.target_node_id);
+        }
+    }
+    Ok(node_ids)
+}
+
+fn cluster_legacy_shadow_orphan_artifact_cleanup_txns_from_store(
+    store: &InProcessKvStore,
+    node_ids: &BTreeSet<NodeId>,
+) -> Result<Vec<KvTxn>, NetworkError> {
+    let explicit_delete_batch_limit =
+        sinomo_kv::MAX_KV_TXN_OPS_PER_BRANCH.min(sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND);
+    let mut txns = Vec::new();
+    let mut ops = Vec::new();
+    for node_id in node_ids {
+        for key in cluster_member_connectivity_delete_keys_from_store(store, node_id)? {
+            ops.push(KvOp::Delete { key });
+            if ops.len() >= explicit_delete_batch_limit {
+                txns.push(KvTxn {
+                    compares: Vec::new(),
+                    success: std::mem::take(&mut ops),
+                    failure: Vec::new(),
+                });
+            }
+        }
+        ops.push(KvOp::Delete {
+            key: cluster_capability_policy_key(node_id),
+        });
+        ops.push(KvOp::Delete {
+            key: cluster_node_status_key(node_id),
+        });
+        ops.push(KvOp::Delete {
+            key: cluster_node_status_key_for_process(node_id, DAEMON_SHADOW_CLUSTER_ROLE),
+        });
+        ops.push(KvOp::DeletePrefix {
+            prefix: cluster_endpoint_prefix(node_id),
+        });
+        if ops.len() >= explicit_delete_batch_limit {
+            txns.push(KvTxn {
+                compares: Vec::new(),
+                success: std::mem::take(&mut ops),
+                failure: Vec::new(),
+            });
+        }
+    }
+    if !ops.is_empty() {
+        txns.push(KvTxn {
+            compares: Vec::new(),
+            success: ops,
             failure: Vec::new(),
         });
     }
@@ -12068,6 +12235,7 @@ fn cluster_member_daemon_status_targets_with_graph(
     graph: &ClusterConnectivityGraph,
 ) -> Vec<ClusterEndpointRecord> {
     let is_local_process = cluster_member_is_local_process(state, member);
+    let member_runs_main_daemon = cluster_member_has_main_daemon_capability(member);
     let mut endpoints = prefer_bounded_daemon_command_targets(member.endpoints.clone());
     endpoints.sort_by_key(|endpoint| {
         (
@@ -12083,7 +12251,41 @@ fn cluster_member_daemon_status_targets_with_graph(
         .filter(|endpoint| {
             is_local_process || !matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly)
         })
+        .filter(|endpoint| {
+            !member_runs_main_daemon
+                || !cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
+        })
         .collect()
+}
+
+pub fn cluster_member_is_legacy_shadow_daemon(member: &ClusterMemberRecord) -> bool {
+    cluster_capabilities_are_legacy_shadow_only(&member.capabilities)
+}
+
+fn cluster_capabilities_are_legacy_shadow_only(capabilities: &[CapabilityName]) -> bool {
+    let mut has_main_capability = false;
+    let mut has_shadow_capability = false;
+    for capability in capabilities {
+        match capability.as_str() {
+            DAEMON_MAIN_RUN_CAPABILITY => has_main_capability = true,
+            DAEMON_SHADOW_SUPERVISE_CAPABILITY => has_shadow_capability = true,
+            _ => {}
+        }
+    }
+    has_shadow_capability && !has_main_capability
+}
+
+pub fn cluster_member_expected_daemon_process(
+    member: &ClusterMemberRecord,
+) -> Option<&'static str> {
+    member
+        .capabilities
+        .iter()
+        .find_map(|capability| match capability.as_str() {
+            DAEMON_MAIN_RUN_CAPABILITY => Some(DAEMON_MAIN_CLUSTER_ROLE),
+            DAEMON_SHADOW_SUPERVISE_CAPABILITY => Some(DAEMON_SHADOW_CLUSTER_ROLE),
+            _ => None,
+        })
 }
 
 pub fn cluster_rollout_endpoint_candidates(
