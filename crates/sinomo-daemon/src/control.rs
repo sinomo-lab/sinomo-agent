@@ -616,8 +616,13 @@ pub(crate) async fn handle_daemon_connection_async(
         if let Some(key) = replay_key.as_ref()
             && let Some(response) = wait_for_daemon_dfs_frame_replay(&paths, key).await
         {
-            let _ =
-                write_daemon_rpc_response_frame_async(&mut stream, &stream_address, response).await;
+            let _ = write_daemon_rpc_response_frame_async_for_control_request(
+                &mut stream,
+                &stream_address,
+                &request,
+                response,
+            )
+            .await;
             let _ = stream.shutdown_write(&stream_address).await;
             return Ok(false);
         }
@@ -632,9 +637,10 @@ pub(crate) async fn handle_daemon_connection_async(
                 if let Some(key) = replay_key.as_ref()
                     && let Some(response) = wait_for_daemon_dfs_frame_replay(&paths, key).await
                 {
-                    let _ = write_daemon_rpc_response_frame_async(
+                    let _ = write_daemon_rpc_response_frame_async_for_control_request(
                         &mut stream,
                         &stream_address,
+                        &request,
                         response,
                     )
                     .await;
@@ -647,9 +653,10 @@ pub(crate) async fn handle_daemon_connection_async(
                         DaemonError::AuthDenied.to_string(),
                     )
                 {
-                    let _ = write_daemon_rpc_response_frame_async(
+                    let _ = write_daemon_rpc_response_frame_async_for_rpc_request(
                         &mut stream,
                         &stream_address,
+                        rpc_request,
                         response,
                     )
                     .await;
@@ -667,7 +674,13 @@ pub(crate) async fn handle_daemon_connection_async(
             && request.route == sinomo_network::CLUSTER_NETWORK_PING_ROUTE
         {
             let response = daemon_cluster_network_ping_response(&paths, request.clone())?;
-            write_daemon_rpc_response_frame_async(&mut stream, &stream_address, response).await?;
+            write_daemon_rpc_response_frame_async_for_rpc_request(
+                &mut stream,
+                &stream_address,
+                request,
+                response,
+            )
+            .await?;
             continue;
         }
         if let Some(request) = rpc_request.as_ref()
@@ -696,7 +709,13 @@ pub(crate) async fn handle_daemon_connection_async(
                 )
                 .map_err(DaemonError::from)?,
             };
-            write_daemon_rpc_response_frame_async(&mut stream, &stream_address, response).await?;
+            write_daemon_rpc_response_frame_async_for_rpc_request(
+                &mut stream,
+                &stream_address,
+                request,
+                response,
+            )
+            .await?;
             continue;
         }
         if let Some(request) = rpc_request.as_ref()
@@ -717,9 +736,13 @@ pub(crate) async fn handle_daemon_connection_async(
                 Ok(_) => continue,
                 Err(error) => {
                     if let Some(response) = rpc_error_response_for_request(&rpc_request, &error) {
-                        let _ = write_daemon_rpc_response_frame_async(
+                        let raw_response = rpc_request.as_ref().is_some_and(
+                            sinomo_network::object_rpc_request_expects_raw_daemon_response,
+                        );
+                        let _ = write_daemon_rpc_response_frame_async_with_raw(
                             &mut stream,
                             &stream_address,
+                            raw_response,
                             response,
                         )
                         .await;
@@ -1026,7 +1049,13 @@ async fn handle_authenticated_daemon_command_async(
         && request.route == sinomo_network::CLUSTER_NETWORK_PING_ROUTE
     {
         let response = daemon_cluster_network_ping_response(&paths, request.clone())?;
-        write_daemon_rpc_response_frame_async(&mut stream, &stream_address, response).await?;
+        write_daemon_rpc_response_frame_async_for_rpc_request(
+            &mut stream,
+            &stream_address,
+            request,
+            response,
+        )
+        .await?;
         return Ok(false);
     }
     if let Some(request) = rpc_request.as_ref()
@@ -1055,7 +1084,13 @@ async fn handle_authenticated_daemon_command_async(
             )
             .map_err(DaemonError::from)?,
         };
-        write_daemon_rpc_response_frame_async(&mut stream, &stream_address, response).await?;
+        write_daemon_rpc_response_frame_async_for_rpc_request(
+            &mut stream,
+            &stream_address,
+            request,
+            response,
+        )
+        .await?;
         return Ok(false);
     }
     if let Some(result) = crate::service_adapter::try_dispatch_via_registry_async(
@@ -1072,8 +1107,16 @@ async fn handle_authenticated_daemon_command_async(
         if let Err(error) = &result
             && let Some(response) = rpc_error_response_for_request(&rpc_request, error)
         {
-            let _ =
-                write_daemon_rpc_response_frame_async(&mut stream, &stream_address, response).await;
+            let raw_response = rpc_request
+                .as_ref()
+                .is_some_and(sinomo_network::object_rpc_request_expects_raw_daemon_response);
+            let _ = write_daemon_rpc_response_frame_async_with_raw(
+                &mut stream,
+                &stream_address,
+                raw_response,
+                response,
+            )
+            .await;
         }
         if result.is_err()
             && let Some(key) = replay_key.as_ref()
@@ -1139,7 +1182,16 @@ async fn handle_authenticated_daemon_command_async(
     if let Err(error) = &result
         && let Some(response) = rpc_error_response_for_request(&error_response_request, error)
     {
-        let _ = write_daemon_rpc_response_frame_async(&mut stream, &stream_address, response).await;
+        let raw_response = error_response_request
+            .as_ref()
+            .is_some_and(sinomo_network::object_rpc_request_expects_raw_daemon_response);
+        let _ = write_daemon_rpc_response_frame_async_with_raw(
+            &mut stream,
+            &stream_address,
+            raw_response,
+            response,
+        )
+        .await;
     }
     if result.is_err()
         && let Some(key) = replay_key.as_ref()
@@ -1186,6 +1238,55 @@ async fn write_daemon_rpc_response_frame_async(
     address: &str,
     response: sinomo_network::ObjectRpcResponse,
 ) -> Result<(), DaemonError> {
+    write_daemon_rpc_response_frame_async_with_raw(stream, address, false, response).await
+}
+
+async fn write_daemon_rpc_response_frame_async_for_control_request(
+    stream: &mut sinomo_network::AsyncDaemonControlStream,
+    address: &str,
+    request: &sinomo_network::DaemonControlRequest,
+    response: sinomo_network::ObjectRpcResponse,
+) -> Result<(), DaemonError> {
+    write_daemon_rpc_response_frame_async_with_raw(
+        stream,
+        address,
+        sinomo_network::daemon_control_request_expects_raw_rpc_response(request),
+        response,
+    )
+    .await
+}
+
+async fn write_daemon_rpc_response_frame_async_for_rpc_request(
+    stream: &mut sinomo_network::AsyncDaemonControlStream,
+    address: &str,
+    request: &sinomo_network::ObjectRpcRequest,
+    response: sinomo_network::ObjectRpcResponse,
+) -> Result<(), DaemonError> {
+    write_daemon_rpc_response_frame_async_with_raw(
+        stream,
+        address,
+        sinomo_network::object_rpc_request_expects_raw_daemon_response(request),
+        response,
+    )
+    .await
+}
+
+async fn write_daemon_rpc_response_frame_async_with_raw(
+    stream: &mut sinomo_network::AsyncDaemonControlStream,
+    address: &str,
+    raw_response: bool,
+    response: sinomo_network::ObjectRpcResponse,
+) -> Result<(), DaemonError> {
+    if raw_response {
+        return stream
+            .write_rpc_response(
+                address,
+                &response,
+                sinomo_network::ObjectFrameIoOptions::none(),
+            )
+            .await
+            .map_err(DaemonError::from);
+    }
     stream
         .write_response(
             address,

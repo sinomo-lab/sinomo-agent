@@ -533,13 +533,17 @@ fn endpoint_rpc_requests_raw_direct(request: &ObjectRpcRequest) -> bool {
     request.route == CLUSTER_RELAY_ROUTE
         || request.route == crate::CLUSTER_NETWORK_PING_ROUTE
         || request.category == crate::CLUSTER_MEMBERSHIP_RPC_CATEGORY
-        || request
-            .metadata
-            .get(crate::ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY)
-            .is_some_and(|value| {
-                value == crate::ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE
-                    || value.eq_ignore_ascii_case("true")
-            })
+        || endpoint_rpc_has_explicit_raw_direct_metadata(request)
+}
+
+fn endpoint_rpc_has_explicit_raw_direct_metadata(request: &ObjectRpcRequest) -> bool {
+    request
+        .metadata
+        .get(crate::ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY)
+        .is_some_and(|value| {
+            value == crate::ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE
+                || value.eq_ignore_ascii_case("true")
+        })
 }
 
 fn cluster_endpoint_transport_timeouts(
@@ -729,8 +733,10 @@ pub async fn send_signed_rpc_to_endpoint_async_with_host(
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let deadline = ClusterEndpointRpcDeadline::new(options.timeouts.connect_timeout);
     let prefers_relay = host.endpoint_prefers_relay_async(endpoint).await?;
+    let requests_raw_direct = endpoint_rpc_requests_raw_direct(request);
+    let direct_attempt_override = endpoint_rpc_has_explicit_raw_direct_metadata(request);
     if !prefers_relay
-        && !endpoint_rpc_requests_raw_direct(request)
+        && !requests_raw_direct
         && let Some(remaining) = deadline.checked_remaining()
         && let Some(response) = host
             .try_gateway_signed_rpc_async(
@@ -745,7 +751,7 @@ pub async fn send_signed_rpc_to_endpoint_async_with_host(
         return Ok(response);
     }
 
-    if !prefers_relay {
+    if !prefers_relay || direct_attempt_override {
         let Some(remaining) = deadline.checked_remaining() else {
             return Err(deadline.timeout_error(endpoint));
         };
@@ -1416,13 +1422,22 @@ fn relay_member_has_usable_bridge_endpoint(
     member: &ClusterMemberRecord,
 ) -> bool {
     let has_healthy_next_hop_endpoint = graph
-        .best_healthy_endpoint(local_node_id, &member.node_id)
+        .best_healthy_endpoint_matching(
+            local_node_id,
+            &member.node_id,
+            cluster_relay_endpoint_can_carry_main_daemon_rpc,
+        )
         .is_some();
     let has_reachable_next_hop_endpoint = has_healthy_next_hop_endpoint
         || graph
-            .best_reachable_endpoint(local_node_id, &member.node_id)
+            .best_reachable_endpoint_matching(
+                local_node_id,
+                &member.node_id,
+                cluster_relay_endpoint_can_carry_main_daemon_rpc,
+            )
             .is_some();
-    let local_graph_has_reachable_targets = !graph.reachable_targets(local_node_id).is_empty();
+    let local_graph_has_reachable_targets =
+        cluster_graph_has_reachable_main_daemon_route_targets(graph, local_node_id);
     member
         .endpoints
         .iter()
@@ -1437,6 +1452,28 @@ fn relay_member_has_usable_bridge_endpoint(
                 local_graph_has_reachable_targets,
                 false,
             )
+        })
+}
+
+fn cluster_relay_endpoint_can_carry_main_daemon_rpc(endpoint: &ClusterEndpointRecord) -> bool {
+    !crate::storage::cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
+}
+
+fn cluster_graph_has_reachable_main_daemon_route_targets(
+    graph: &ClusterConnectivityGraph,
+    source_node_id: &NodeId,
+) -> bool {
+    graph
+        .reachable_targets(source_node_id)
+        .iter()
+        .any(|target| {
+            graph
+                .best_reachable_endpoint_matching(
+                    source_node_id,
+                    target,
+                    cluster_relay_endpoint_can_carry_main_daemon_rpc,
+                )
+                .is_some()
         })
 }
 
@@ -1487,7 +1524,11 @@ fn relay_candidate_can_transit(
         return false;
     }
     if graph
-        .best_healthy_endpoint(local_node_id, candidate)
+        .best_healthy_endpoint_matching(
+            local_node_id,
+            candidate,
+            cluster_relay_endpoint_can_carry_main_daemon_rpc,
+        )
         .is_some()
     {
         return true;
@@ -1528,9 +1569,13 @@ fn cluster_relay_can_try_direct_target_fallback(
     target_node_id: &NodeId,
 ) -> bool {
     graph
-        .best_reachable_endpoint(local_node_id, target_node_id)
+        .best_reachable_endpoint_matching(
+            local_node_id,
+            target_node_id,
+            cluster_relay_endpoint_can_carry_main_daemon_rpc,
+        )
         .is_some()
-        || graph.reachable_targets(local_node_id).is_empty()
+        || !cluster_graph_has_reachable_main_daemon_route_targets(graph, local_node_id)
         || cluster_relay_target_has_locally_learned_endpoint(state, target_node_id)
 }
 
@@ -1587,22 +1632,31 @@ fn cluster_relay_next_hop_endpoints_with_graph_and_policy(
 ) -> Vec<ClusterEndpointRecord> {
     let mut endpoints = Vec::new();
     let mut seen = BTreeSet::new();
-    let has_healthy_next_hop_endpoint =
-        if let Some(endpoint) = graph.best_healthy_endpoint(source_node_id, node_id) {
-            push_unique_cluster_endpoint(&mut endpoints, &mut seen, endpoint);
-            true
-        } else {
-            false
-        };
-    let has_reachable_next_hop_endpoint = if has_healthy_next_hop_endpoint {
-        true
-    } else if let Some(endpoint) = graph.best_reachable_endpoint(source_node_id, node_id) {
+    let has_healthy_next_hop_endpoint = if let Some(endpoint) = graph
+        .best_healthy_endpoint_matching(
+            source_node_id,
+            node_id,
+            cluster_relay_endpoint_can_carry_main_daemon_rpc,
+        ) {
         push_unique_cluster_endpoint(&mut endpoints, &mut seen, endpoint);
         true
     } else {
         false
     };
-    let local_graph_has_reachable_targets = !graph.reachable_targets(source_node_id).is_empty();
+    let has_reachable_next_hop_endpoint = if has_healthy_next_hop_endpoint {
+        true
+    } else if let Some(endpoint) = graph.best_reachable_endpoint_matching(
+        source_node_id,
+        node_id,
+        cluster_relay_endpoint_can_carry_main_daemon_rpc,
+    ) {
+        push_unique_cluster_endpoint(&mut endpoints, &mut seen, endpoint);
+        true
+    } else {
+        false
+    };
+    let local_graph_has_reachable_targets =
+        cluster_graph_has_reachable_main_daemon_route_targets(graph, source_node_id);
     if let Some(member) = state
         .members
         .iter()
@@ -1612,6 +1666,7 @@ fn cluster_relay_next_hop_endpoints_with_graph_and_policy(
             .endpoints
             .iter()
             .filter(|endpoint| crate::locally_learned_bridge_route_endpoint(endpoint))
+            .filter(|endpoint| cluster_relay_endpoint_can_carry_main_daemon_rpc(endpoint))
             .filter(|endpoint| {
                 cluster_relay_next_hop_endpoint_is_usable(
                     graph,
@@ -1696,21 +1751,25 @@ pub fn cluster_endpoint_prefers_relay_with_graph(
     if endpoint.node_id == state.local_node_id {
         return false;
     }
+    let unknown_hostname_lan = unknown_hostname_lan_endpoint_should_try_direct(endpoint);
+    let has_complete_relay_route =
+        cluster_route_next_hop(graph, &state.local_node_id, &endpoint.node_id).is_some();
     match graph.state_for_endpoint(endpoint) {
         Some(crate::ClusterConnectivityState::Healthy) => return false,
         Some(crate::ClusterConnectivityState::Degraded)
-        | Some(crate::ClusterConnectivityState::Unreachable) => return true,
+        | Some(crate::ClusterConnectivityState::Unreachable) => {
+            return !unknown_hostname_lan || has_complete_relay_route;
+        }
         None => {}
     }
-    if unknown_hostname_lan_endpoint_should_try_direct(endpoint) {
-        return false;
+    // Unknown Docker hostnames are cheap and correct when the nodes share a segment,
+    // but can burn the caller's budget cross-segment. Skip direct only for a complete
+    // healthy route; best-effort bridge handoff is still available after a bounded
+    // direct attempt fails.
+    if unknown_hostname_lan {
+        return has_complete_relay_route;
     }
-    // No healthy direct edge. Relay iff the relay would actually make progress -- i.e. the same
-    // best-effort first-hop the relay uses resolves (a full healthy path OR a healthy neighbor
-    // to hand off to). Unknown direct reachability is still skipped when a route exists: in
-    // segmented clusters, spending the caller's entire health/command budget on an unprobed
-    // cross-segment direct dial prevents the already-stabilized graph from being used.
-    !cluster_relay_next_hops(graph, state, &state.local_node_id, &endpoint.node_id, &[]).is_empty()
+    true
 }
 
 fn unknown_hostname_lan_endpoint_should_try_direct(endpoint: &ClusterEndpointRecord) -> bool {
@@ -1984,7 +2043,52 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_tries_unknown_hostname_lan_direct_before_relay() {
+    fn endpoint_retries_unknown_hostname_direct_for_stale_unreachable_without_complete_route() {
+        let now = OffsetDateTime::now_utc();
+        let local = nid("node_prefers_stale_hostname_local");
+        let target = nid("node_prefers_stale_hostname_target");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_prefers_stale_hostname").expect("cluster"),
+            "prefers stale hostname",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            target.clone(),
+            "target",
+            "pk-target",
+            now,
+        );
+        member.capabilities = main_daemon_capabilities(&member.role);
+        member.allowed_capabilities = member.capabilities.clone();
+        state.members.push(member);
+        let endpoint = crate::daemon_lan_endpoint(&target, "node-target:21353".to_string(), 5);
+        let graph = ClusterConnectivityGraph::from_records(
+            local,
+            [ClusterConnectivityRecord {
+                endpoint_id: endpoint.endpoint_id.clone(),
+                target_node_id: endpoint.node_id.clone(),
+                transport: endpoint.transport.clone(),
+                address: endpoint.address.clone(),
+                ..edge(
+                    &state.local_node_id,
+                    &target,
+                    ClusterConnectivityState::Unreachable,
+                )
+            }],
+        );
+
+        assert!(
+            !cluster_endpoint_prefers_relay_with_graph(&graph, &state, &endpoint),
+            "a stale unreachable Docker hostname should get a bounded direct retry when no complete relay route exists"
+        );
+    }
+
+    #[test]
+    fn endpoint_prefers_relay_over_unknown_hostname_lan_when_graph_has_route() {
         let now = OffsetDateTime::now_utc();
         let local = nid("node_prefers_hostname_direct_local");
         let target = nid("node_prefers_hostname_direct_target");
@@ -2019,8 +2123,93 @@ mod tests {
         );
 
         assert!(
+            cluster_endpoint_prefers_relay_with_graph(&graph, &state, &endpoint),
+            "segmented clusters should use a known relay route instead of burning the command budget on an unprobed Docker hostname"
+        );
+    }
+
+    #[test]
+    fn endpoint_tries_unknown_hostname_lan_direct_when_graph_has_no_route() {
+        let now = OffsetDateTime::now_utc();
+        let local = nid("node_prefers_hostname_startup_direct_local");
+        let target = nid("node_prefers_hostname_startup_direct_target");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_prefers_hostname_startup_direct")
+                .expect("cluster"),
+            "prefers hostname startup direct",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            target.clone(),
+            "target",
+            "pk-target",
+            now,
+        );
+        member.capabilities = main_daemon_capabilities(&member.role);
+        member.allowed_capabilities = member.capabilities.clone();
+        state.members.push(member);
+        let endpoint = crate::daemon_lan_endpoint(&target, "node-target:21353".to_string(), 5);
+        let graph = ClusterConnectivityGraph::from_records(local, []);
+
+        assert!(
             !cluster_endpoint_prefers_relay_with_graph(&graph, &state, &endpoint),
-            "unknown hostname LAN endpoints should get a direct async attempt before relay"
+            "startup with no graph route should still try an advertised Docker hostname directly"
+        );
+    }
+
+    #[test]
+    fn endpoint_tries_unknown_hostname_direct_when_only_best_effort_bridge_exists() {
+        let now = OffsetDateTime::now_utc();
+        let local = nid("node_prefers_hostname_bridge_fallback_local");
+        let target = nid("node_prefers_hostname_bridge_fallback_target");
+        let bridge = nid("node_prefers_hostname_bridge_fallback_bridge");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_prefers_hostname_bridge_fallback")
+                .expect("cluster"),
+            "prefers hostname bridge fallback",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        for (node, name, endpoints) in [
+            (&target, "target", Vec::new()),
+            (
+                &bridge,
+                "bridge",
+                vec![
+                    crate::daemon_lan_endpoint(&bridge, "node-bridge-a:21353".to_string(), 5),
+                    crate::daemon_lan_endpoint(&bridge, "node-bridge-b:21353".to_string(), 5),
+                    crate::daemon_lan_endpoint(&bridge, "node-bridge-c:21353".to_string(), 5),
+                ],
+            ),
+        ] {
+            let mut member = ClusterMemberRecord::local_non_voting(
+                state.cluster_id.clone(),
+                node.clone(),
+                name,
+                format!("pk-{node}"),
+                now,
+            );
+            member.capabilities = main_daemon_capabilities(&member.role);
+            member.allowed_capabilities = member.capabilities.clone();
+            member.endpoints = endpoints;
+            state.members.push(member);
+        }
+        let endpoint = crate::daemon_lan_endpoint(&target, "node-target:21353".to_string(), 5);
+        let graph = ClusterConnectivityGraph::from_records(local.clone(), []);
+
+        assert!(
+            !cluster_relay_next_hops(&graph, &state, &local, &target, &[]).is_empty(),
+            "member bridge endpoint should still be a best-effort relay fallback"
+        );
+        assert!(
+            !cluster_endpoint_prefers_relay_with_graph(&graph, &state, &endpoint),
+            "best-effort relay fallback without a complete route must not suppress a bounded direct hostname attempt"
         );
     }
 
@@ -2944,6 +3133,191 @@ mod tests {
                 seg_b_endpoint.address.as_str()
             ]),
             "relay next-hop dialing must keep every usable address for a dual-homed bridge"
+        );
+    }
+
+    #[test]
+    fn relay_next_hop_endpoints_skip_folded_shadow_daemon_candidates() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-relay-endpoint-shadow-filter");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_relay_endpoint_shadow_filter").expect("cluster");
+        let local = nid("node_relay_endpoint_shadow_filter_local");
+        let next_hop = nid("node_relay_endpoint_shadow_filter_next");
+        let shadow = shadow_daemon_node_id(&next_hop);
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "relay endpoint shadow filter",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let main_endpoint = crate::daemon_lan_endpoint(&next_hop, "node4:21353".to_string(), 5);
+        let mut folded_shadow_endpoint =
+            crate::daemon_lan_endpoint(&shadow, "node4:21354".to_string(), 5);
+        folded_shadow_endpoint.node_id = next_hop.clone();
+        let mut next_hop_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            next_hop.clone(),
+            "next-hop",
+            "pk-next-hop",
+            now,
+        );
+        next_hop_member.capabilities = main_daemon_capabilities(&next_hop_member.role);
+        next_hop_member.allowed_capabilities = next_hop_member.capabilities.clone();
+        next_hop_member.endpoints = vec![folded_shadow_endpoint, main_endpoint.clone()];
+        state.members.push(next_hop_member);
+        let graph = ClusterConnectivityGraph::from_records(local.clone(), []);
+
+        let endpoints =
+            cluster_relay_next_hop_endpoints_with_graph(&paths, &graph, &state, &local, &next_hop);
+
+        assert_eq!(
+            endpoints
+                .iter()
+                .map(|endpoint| endpoint.address.as_str())
+                .collect::<Vec<_>>(),
+            vec![main_endpoint.address.as_str()],
+            "main-daemon relay next hops must not dial folded shadow supervision ports"
+        );
+    }
+
+    #[test]
+    fn relay_next_hop_endpoints_skip_graph_shadow_daemon_port_candidate() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-relay-graph-shadow-port-filter");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_relay_graph_shadow_port_filter")
+            .expect("cluster");
+        let local = nid("node_relay_graph_shadow_port_filter_local");
+        let next_hop = nid("node_relay_graph_shadow_port_filter_next");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "relay graph shadow port filter",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let main_endpoint = crate::daemon_lan_endpoint(&next_hop, "node4:21353".to_string(), 5);
+        let shadow_port_endpoint =
+            crate::daemon_lan_endpoint(&next_hop, "node4:21354".to_string(), 1);
+        let mut next_hop_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            next_hop.clone(),
+            "next-hop",
+            "pk-next-hop",
+            now,
+        );
+        next_hop_member.capabilities = main_daemon_capabilities(&next_hop_member.role);
+        next_hop_member.allowed_capabilities = next_hop_member.capabilities.clone();
+        next_hop_member.endpoints = vec![shadow_port_endpoint.clone(), main_endpoint.clone()];
+        state.members.push(next_hop_member);
+        let graph = ClusterConnectivityGraph::from_records(
+            local.clone(),
+            [
+                crate::cluster_connectivity_record(
+                    &state,
+                    &shadow_port_endpoint,
+                    ClusterConnectivityState::Healthy,
+                    Some(1),
+                    0,
+                    Some("shadow supervision port answered".to_string()),
+                    None,
+                    now,
+                    60,
+                ),
+                crate::cluster_connectivity_record(
+                    &state,
+                    &main_endpoint,
+                    ClusterConnectivityState::Healthy,
+                    Some(9),
+                    0,
+                    Some("main daemon answered".to_string()),
+                    None,
+                    now,
+                    60,
+                ),
+            ],
+        );
+
+        let endpoints =
+            cluster_relay_next_hop_endpoints_with_graph(&paths, &graph, &state, &local, &next_hop);
+
+        assert_eq!(
+            endpoints
+                .iter()
+                .map(|endpoint| endpoint.address.as_str())
+                .collect::<Vec<_>>(),
+            vec![main_endpoint.address.as_str()],
+            "main-daemon relay must skip graph records that point at the shadow supervision port"
+        );
+    }
+
+    #[test]
+    fn relay_next_hop_endpoints_shadow_only_graph_allows_member_main_fallback() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-relay-shadow-only-graph-fallback");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_relay_shadow_only_graph_fallback")
+            .expect("cluster");
+        let local = nid("node_relay_shadow_only_graph_fallback_local");
+        let next_hop = nid("node_relay_shadow_only_graph_fallback_next");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "relay shadow-only graph fallback",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let main_endpoint = crate::daemon_lan_endpoint(&next_hop, "node4:21353".to_string(), 5);
+        let shadow_port_endpoint =
+            crate::daemon_lan_endpoint(&next_hop, "node4:21354".to_string(), 1);
+        let mut next_hop_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            next_hop.clone(),
+            "next-hop",
+            "pk-next-hop",
+            now,
+        );
+        next_hop_member.capabilities = main_daemon_capabilities(&next_hop_member.role);
+        next_hop_member.allowed_capabilities = next_hop_member.capabilities.clone();
+        next_hop_member.endpoints = vec![main_endpoint.clone()];
+        state.members.push(next_hop_member);
+        let graph = ClusterConnectivityGraph::from_records(
+            local.clone(),
+            [crate::cluster_connectivity_record(
+                &state,
+                &shadow_port_endpoint,
+                ClusterConnectivityState::Healthy,
+                Some(1),
+                0,
+                Some("shadow supervision port answered".to_string()),
+                None,
+                now,
+                60,
+            )],
+        );
+
+        let endpoints =
+            cluster_relay_next_hop_endpoints_with_graph(&paths, &graph, &state, &local, &next_hop);
+
+        assert_eq!(
+            endpoints
+                .iter()
+                .map(|endpoint| endpoint.address.as_str())
+                .collect::<Vec<_>>(),
+            vec![main_endpoint.address.as_str()],
+            "shadow-only graph reachability must not suppress a member main-daemon fallback"
         );
     }
 
@@ -3962,8 +4336,17 @@ mod tests {
         ) -> ClusterSignedEndpointRpcFuture<'a, Option<ObjectRpcResponse>> {
             Box::pin(async move {
                 self.calls.push("relay");
-                assert_eq!(request.route, "/cluster/kv/range");
-                assert_eq!(request_command, "RPC /cluster/kv/range");
+                assert!(
+                    request.route == "/cluster/kv/range"
+                        || request.route == crate::CLUSTER_NETWORK_PING_ROUTE,
+                    "unexpected relay route {}",
+                    request.route
+                );
+                assert!(
+                    request_command == "RPC /cluster/kv/range"
+                        || request_command == "RPC /cluster/network/ping",
+                    "unexpected relay command {request_command}"
+                );
                 assert_eq!(relay_command, "RPC /cluster/relay");
                 self.relay_auth.push(request_auth.to_vec());
                 self.relay_timeout_policies.push(timeouts);
@@ -4105,6 +4488,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signed_endpoint_rpc_async_relays_network_ping_when_relay_is_preferred() {
+        let cluster_id = ClusterId::from_legacy_named("cluster_signed_endpoint_ping_prefers_relay")
+            .expect("cluster");
+        let target = nid("node_signed_endpoint_ping_prefers_relay_target");
+        let endpoint = crate::daemon_lan_endpoint(&target, "10.90.0.46:21353".to_string(), 5);
+        let request = ObjectRpcRequest {
+            route: crate::CLUSTER_NETWORK_PING_ROUTE.to_string(),
+            category: crate::CLUSTER_NETWORK_RPC_CATEGORY.to_string(),
+            metadata: BTreeMap::new(),
+            body: vec![1, 2, 3],
+        };
+        let relay_response = endpoint_rpc_response(crate::CLUSTER_NETWORK_PING_ROUTE, "relay");
+        let mut host = RecordingSignedEndpointRpcHost::new(
+            true,
+            Ok(relay_response.clone()),
+            Ok(Some(relay_response)),
+        )
+        .with_cluster_id(cluster_id);
+
+        let response = send_signed_rpc_to_endpoint_async_with_host(
+            &endpoint,
+            &request,
+            b"inner-auth",
+            "RPC /cluster/network/ping",
+            "RPC /cluster/relay",
+            ClusterSignedEndpointRpcOptions {
+                timeouts: DaemonRpcTimeouts::connect_only(Duration::from_secs(5)),
+            },
+            &mut host,
+        )
+        .await
+        .expect("endpoint rpc");
+
+        assert_eq!(response.decode_body::<String>().expect("body"), "relay");
+        assert_eq!(host.calls, vec!["prefer_relay", "relay"]);
+        assert!(host.direct_auth.is_empty());
+        assert_eq!(host.relay_auth, vec![b"inner-auth".to_vec()]);
+    }
+
+    #[tokio::test]
     async fn signed_endpoint_rpc_async_keeps_metadata_opt_in_raw_direct() {
         let cluster_id = ClusterId::from_legacy_named("cluster_signed_endpoint_raw_direct_opt_in")
             .expect("cluster");
@@ -4137,6 +4560,46 @@ mod tests {
         assert_eq!(response.decode_body::<String>().expect("body"), "direct");
         assert_eq!(host.calls, vec!["prefer_relay", "direct"]);
         assert!(host.signed_routes.is_empty());
+        assert_eq!(host.direct_commands, vec!["RPC /cluster/kv/range"]);
+        assert_eq!(host.direct_auth, vec![b"inner-auth".to_vec()]);
+        assert_eq!(host.direct_requests, vec![request]);
+    }
+
+    #[tokio::test]
+    async fn signed_endpoint_rpc_async_keeps_raw_direct_when_relay_is_preferred() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_signed_endpoint_raw_direct_prefers_relay")
+                .expect("cluster");
+        let target = nid("node_signed_endpoint_raw_direct_prefers_relay_target");
+        let endpoint = crate::daemon_lan_endpoint(&target, "10.90.0.45:21353".to_string(), 5);
+        let mut request = endpoint_rpc_request();
+        request.metadata.insert(
+            crate::ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY.to_string(),
+            crate::ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE.to_string(),
+        );
+        let direct_response =
+            endpoint_rpc_response("/test/endpoint-raw-direct-prefers-relay-ok", "direct");
+        let mut host = RecordingSignedEndpointRpcHost::new(true, Ok(direct_response), Ok(None))
+            .with_cluster_id(cluster_id);
+
+        let response = send_signed_rpc_to_endpoint_async_with_host(
+            &endpoint,
+            &request,
+            b"inner-auth",
+            "RPC /cluster/kv/range",
+            "RPC /cluster/relay",
+            ClusterSignedEndpointRpcOptions {
+                timeouts: DaemonRpcTimeouts::connect_only(Duration::from_secs(5)),
+            },
+            &mut host,
+        )
+        .await
+        .expect("endpoint rpc");
+
+        assert_eq!(response.decode_body::<String>().expect("body"), "direct");
+        assert_eq!(host.calls, vec!["prefer_relay", "direct"]);
+        assert!(host.signed_routes.is_empty());
+        assert!(host.relay_auth.is_empty());
         assert_eq!(host.direct_commands, vec!["RPC /cluster/kv/range"]);
         assert_eq!(host.direct_auth, vec![b"inner-auth".to_vec()]);
         assert_eq!(host.direct_requests, vec![request]);

@@ -2064,6 +2064,50 @@ async fn send_daemon_rpc_to_target_async(
     timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::ObjectRpcResponse, NetworkError> {
     let control_request = daemon_rpc_control_request(command, auth, request);
+    let raw_response_supported = match &target {
+        DaemonControlTarget::Address(_) => true,
+        DaemonControlTarget::ClusterEndpoint(endpoint) => {
+            matches!(
+                endpoint.transport,
+                ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+            )
+        }
+    };
+    if raw_response_supported && crate::object_rpc_request_expects_raw_daemon_response(request) {
+        let response = match target {
+            DaemonControlTarget::Address(address) => {
+                crate::send_daemon_control_rpc_request_raw_response_async(
+                    address,
+                    &control_request,
+                    timeouts,
+                    IROH_DAEMON_COMMAND_MAX_BYTES,
+                )
+                .await?
+            }
+            DaemonControlTarget::ClusterEndpoint(endpoint) => match endpoint.transport {
+                ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
+                    crate::send_daemon_control_rpc_request_raw_response_async(
+                        &endpoint.address,
+                        &control_request,
+                        timeouts,
+                        IROH_DAEMON_COMMAND_MAX_BYTES,
+                    )
+                    .await?
+                }
+                _ => {
+                    return Err(NetworkError::Io {
+                        operation: format!("send daemon rpc to {}", endpoint.address),
+                        detail: format!(
+                            "unsupported daemon rpc transport {:?}",
+                            endpoint.transport
+                        ),
+                    });
+                }
+            },
+        };
+        response.error_detail()?;
+        return Ok(response);
+    }
     let non_rpc_detail = target.non_rpc_detail();
     let response =
         send_daemon_control_request_to_target_async(target, &control_request, timeouts).await?;

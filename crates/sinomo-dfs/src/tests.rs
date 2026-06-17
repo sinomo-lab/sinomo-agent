@@ -177,6 +177,101 @@ fn protocol_frame_read_requests_require_fresh_metadata() {
     assert!(dfs_protocol_frame_requires_fresh_metadata(&bulk));
 }
 
+#[test]
+fn protocol_frame_repair_progress_is_only_inline_for_explicit_foreground_repair_writes() {
+    let source = NodeId::from_legacy_named("node_protocol_repair_source").expect("source");
+    let target = NodeId::from_legacy_named("node_protocol_repair_target").expect("target");
+    let file_system_id = sifs_file_system_id();
+    let namespace_command = |request_id: &str, operation| {
+        DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+            request_id: request_id.to_string(),
+            file_system_id: file_system_id.clone(),
+            requesting_node_id: source.clone(),
+            include_metadata_journal_batches: false,
+            metadata_journal_after_sequences: Vec::new(),
+            operation,
+        })
+    };
+    let lookup = build_dfs_network_frame(
+        &source,
+        &target,
+        1,
+        1,
+        namespace_command(
+            "dfs_lookup_no_inline_repair",
+            DfsNamespaceOperation::LookupPath {
+                path: "/services/no-inline-repair".to_string(),
+            },
+        ),
+    )
+    .expect("lookup frame");
+    let mkdir = build_dfs_network_frame(
+        &source,
+        &target,
+        2,
+        2,
+        namespace_command(
+            "dfs_mkdir_no_inline_repair",
+            DfsNamespaceOperation::MkdirAll {
+                path: "/services/no-inline-repair".to_string(),
+            },
+        ),
+    )
+    .expect("mkdir frame");
+    let read = build_dfs_network_frame(
+        &source,
+        &target,
+        3,
+        3,
+        DfsNetworkMessage::ReadRequest(DfsReadRequest {
+            request_id: "dfs_read_no_inline_repair".to_string(),
+            object_id: DfsObjectId::from_legacy_named("obj_no_inline_repair").expect("object"),
+            version: None,
+            content_hash: Some("blake3:noinline".to_string()),
+            content_size_bytes: Some(0),
+            range_offset: None,
+            range_max_bytes: None,
+            start_chunk_index: 0,
+            max_chunks: 0,
+        }),
+    )
+    .expect("read frame");
+    let object_id = DfsObjectId::from_legacy_named("obj_foreground_repair_write").expect("object");
+    let mut background_write =
+        test_routed_write_command("dfs_background_write_no_inline_repair", &source, &object_id);
+    background_write.foreground_replica_repair = false;
+    let background_write = build_dfs_network_frame(
+        &source,
+        &target,
+        4,
+        4,
+        DfsNetworkMessage::DistributedWriteRequest(background_write),
+    )
+    .expect("background write frame");
+    let foreground_repair_write = build_dfs_network_frame(
+        &source,
+        &target,
+        5,
+        5,
+        DfsNetworkMessage::DistributedWriteRequest(test_routed_write_command(
+            "dfs_foreground_repair_write",
+            &source,
+            &object_id,
+        )),
+    )
+    .expect("foreground repair write frame");
+
+    assert!(!dfs_protocol_frame_allows_write_repair_progress(&lookup));
+    assert!(!dfs_protocol_frame_allows_write_repair_progress(&mkdir));
+    assert!(!dfs_protocol_frame_allows_write_repair_progress(&read));
+    assert!(!dfs_protocol_frame_allows_write_repair_progress(
+        &background_write
+    ));
+    assert!(dfs_protocol_frame_allows_write_repair_progress(
+        &foreground_repair_write
+    ));
+}
+
 fn object_field<'a>(value: &'a Value, key: &str) -> &'a Value {
     let Value::Object(object) = value else {
         panic!("expected object value for field {key}, got {value:?}");
@@ -1377,9 +1472,15 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
     assert_eq!(
         protocol_request
             .metadata
-            .get(sinomo_network::ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY)
+            .get(sinomo_network::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY)
             .map(String::as_str),
-        Some(sinomo_network::ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE)
+        Some(sinomo_network::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE)
+    );
+    assert_eq!(
+        protocol_request
+            .metadata
+            .get(sinomo_network::ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY),
+        None
     );
     assert_eq!(
         protocol_request
@@ -7985,6 +8086,121 @@ fn posix_routed_large_write_sends_manifest_only_request() {
             .expect("writer retained local blob"),
         bytes
     );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn posix_local_primary_detached_manifest_write_persists_visible_metadata_without_self_rpc() {
+    let root = temp_root("posix-local-primary-detached-manifest");
+    let local =
+        NodeId::from_legacy_named("node_posix_local_manifest_primary").expect("local primary");
+    let peer = NodeId::from_legacy_named("node_posix_local_manifest_peer").expect("peer");
+    let file_system = file_system(local.clone());
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: local.clone(),
+        replica_node_ids: vec![peer.clone()],
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let control_plane = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![local.clone(), peer.clone()]).expect("kv"),
+    );
+    control_plane.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        control.put_metadata_shard(&shard).expect("metadata shard");
+    });
+
+    let send_count = Arc::new(AtomicUsize::new(0));
+    let send_count_for_sender = Arc::clone(&send_count);
+    let sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, command, _timeout| {
+        send_count_for_sender.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(DfsProtocolFrameResponse {
+            request_id: command.request_id.clone(),
+            outbound_frames: Vec::new(),
+        })
+    });
+    let transport = DfsEndpointTransport::with_connect_timeout(
+        local.clone(),
+        vec![test_endpoint(&local, "127.0.0.1:21353")],
+        Duration::from_millis(1),
+        sender,
+    );
+    let content_root = root.join("content");
+    let metadata_root = root.join("metadata");
+    let content = LocalContentStore::new(&content_root).expect("content");
+    let mut dfs = NetworkedDfsService::new(transport, content)
+        .with_control_plane(control_plane.clone())
+        .with_metadata_backend(
+            open_local_sharded_metadata_backend(&metadata_root, vec![shard.clone()])
+                .expect("metadata backend"),
+        )
+        .expect("attach metadata backend");
+    dfs.add_file_system(file_system.clone())
+        .expect("filesystem");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    dfs.posix_mkdir_all("/services").expect("parent");
+
+    let path = "/services/local-primary-large.bin";
+    let bytes = vec![0x63; DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT as usize + 8192];
+    let expected_hash = content_hash(&bytes);
+    let stat = dfs
+        .posix_write_file_with_known_parent_deferred_local_replay(
+            path,
+            &bytes,
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+                replica_candidates: vec![local.clone(), peer.clone()],
+                wait_for_commit: false,
+                foreground_replica_repair: false,
+            },
+        )
+        .expect("detached local-primary write");
+
+    assert_eq!(send_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(stat.content_hash.as_deref(), Some(expected_hash.as_str()));
+    assert_eq!(dfs.posix_read_file(path).expect("read local"), bytes);
+
+    let reload_sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, command, _timeout| {
+        Ok(DfsProtocolFrameResponse {
+            request_id: command.request_id.clone(),
+            outbound_frames: Vec::new(),
+        })
+    });
+    let reload_transport = DfsEndpointTransport::with_connect_timeout(
+        local.clone(),
+        vec![test_endpoint(&local, "127.0.0.1:21353")],
+        Duration::from_millis(1),
+        reload_sender,
+    );
+    let reload_content = LocalContentStore::new(&content_root).expect("reload content");
+    let mut reloaded = NetworkedDfsService::new(reload_transport, reload_content)
+        .with_control_plane(control_plane)
+        .with_metadata_backend(
+            open_local_sharded_metadata_backend(&metadata_root, vec![shard])
+                .expect("reload metadata backend"),
+        )
+        .expect("attach reload metadata backend");
+    reloaded
+        .add_file_system(file_system)
+        .expect("reload filesystem");
+    reloaded.bootstrap_distributed_sifs().expect("reload sifs");
+
+    assert_eq!(
+        reloaded
+            .posix_stat(path)
+            .expect("reloaded stat")
+            .content_hash
+            .as_deref(),
+        Some(expected_hash.as_str())
+    );
+    assert_eq!(reloaded.posix_read_file(path).expect("reload read"), bytes);
 
     std::fs::remove_dir_all(root).ok();
 }

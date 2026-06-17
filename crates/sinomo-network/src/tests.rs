@@ -5681,6 +5681,64 @@ fn main_daemon_command_targets_select_one_route_per_remote_main() {
 }
 
 #[test]
+fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-main-daemon-shadow-filter");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_main_daemon_shadow_filter").expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_network_main_daemon_shadow_filter_local").expect("local");
+    let remote =
+        NodeId::from_legacy_named("node_network_main_daemon_shadow_filter_remote").expect("remote");
+    let shadow = shadow_daemon_node_id(&remote);
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network main daemon shadow filter",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+    let main_endpoint = daemon_lan_endpoint(&remote, "node2:21353".to_string(), 5);
+    let mut folded_shadow_endpoint = daemon_lan_endpoint(&shadow, "node2:21354".to_string(), 5);
+    folded_shadow_endpoint.node_id = remote.clone();
+    let port_only_shadow_endpoint = daemon_lan_endpoint(&remote, "node2:21354".to_string(), 5);
+    let mut member =
+        ClusterMemberRecord::local_voter(cluster_id, remote, "remote", "pk-remote", now);
+    member.capabilities = main_daemon_capabilities(&member.role);
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![
+        folded_shadow_endpoint.clone(),
+        port_only_shadow_endpoint.clone(),
+        main_endpoint.clone(),
+    ];
+    state.members.push(member);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let candidates = cluster_main_daemon_command_endpoint_candidates(&paths, &state);
+    let dfs_targets = cluster_dfs_protocol_targets(&paths, &state);
+
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|endpoint| endpoint.endpoint_id.clone())
+            .collect::<Vec<_>>(),
+        vec![main_endpoint.endpoint_id.clone()],
+        "main daemon command candidates must not include shadow supervision endpoints folded under the main member"
+    );
+    assert!(
+        dfs_targets.iter().all(|endpoint| endpoint.endpoint_id
+            != folded_shadow_endpoint.endpoint_id
+            && endpoint.endpoint_id != port_only_shadow_endpoint.endpoint_id),
+        "DFS protocol routing uses the same main-daemon target surface"
+    );
+}
+
+#[test]
 fn main_daemon_command_targets_filter_known_unreachable_endpoints() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-main-daemon-targets-unreachable");
     let data_dir = SinomoDataDir::new(&root);

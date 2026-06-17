@@ -68,6 +68,7 @@ pub use sinomo_node::DAEMON_MAIN_RUN_CAPABILITY;
 pub const DAEMON_SHADOW_SUPERVISE_CAPABILITY: &str = "daemon.shadow.supervise";
 pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
+const DEFAULT_DAEMON_SHADOW_PORT: u16 = 21_354;
 pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = durable_file::DEFAULT_OBJECT_FILE_MAX_READ_BYTES;
 const FILE_CACHE_CAPACITY: usize = 4096;
 const MAX_LOCAL_CLUSTER_CONNECTIVITY_CACHE_ENTRIES: usize = 128;
@@ -6508,26 +6509,25 @@ impl ClusterConnectivityGraph {
         source: &NodeId,
         target: &NodeId,
     ) -> Option<ClusterEndpointRecord> {
+        self.best_healthy_endpoint_matching(source, target, |_| true)
+    }
+
+    pub(crate) fn best_healthy_endpoint_matching(
+        &self,
+        source: &NodeId,
+        target: &NodeId,
+        mut predicate: impl FnMut(&ClusterEndpointRecord) -> bool,
+    ) -> Option<ClusterEndpointRecord> {
         self.healthy_records_by_pair
             .get(&(source.clone(), target.clone()))
             .into_iter()
             .flat_map(|records| records.iter())
-            .find_map(|(_, endpoint_id)| {
+            .filter_map(|(_, endpoint_id)| {
                 self.records
                     .get(&(source.clone(), target.clone(), endpoint_id.clone()))
             })
-            .map(|record| ClusterEndpointRecord {
-                endpoint_id: record.endpoint_id.clone(),
-                node_id: record.target_node_id.clone(),
-                transport: record.transport.clone(),
-                address: record.address.clone(),
-                source: ClusterEndpointSource::Observed,
-                privacy: ClusterEndpointPrivacy::Lan,
-                priority: 0,
-                last_observed_latency_ms: record
-                    .latency_ms
-                    .map(|ms| ms.min(u64::from(u32::MAX)) as u32),
-            })
+            .map(cluster_endpoint_record_for_connectivity_record)
+            .find(|endpoint| predicate(endpoint))
     }
 
     /// A dialable endpoint to reach `target` from `source` over a non-`Unreachable`
@@ -6539,30 +6539,46 @@ impl ClusterConnectivityGraph {
         source: &NodeId,
         target: &NodeId,
     ) -> Option<ClusterEndpointRecord> {
+        self.best_reachable_endpoint_matching(source, target, |_| true)
+    }
+
+    pub(crate) fn best_reachable_endpoint_matching(
+        &self,
+        source: &NodeId,
+        target: &NodeId,
+        mut predicate: impl FnMut(&ClusterEndpointRecord) -> bool,
+    ) -> Option<ClusterEndpointRecord> {
         self.reachable_records_by_pair
             .get(&(source.clone(), target.clone()))
             .into_iter()
             .flat_map(|records| records.iter())
-            .find_map(|(_, _, endpoint_id)| {
+            .filter_map(|(_, _, endpoint_id)| {
                 self.records
                     .get(&(source.clone(), target.clone(), endpoint_id.clone()))
             })
-            .map(|record| ClusterEndpointRecord {
-                endpoint_id: record.endpoint_id.clone(),
-                node_id: record.target_node_id.clone(),
-                transport: record.transport.clone(),
-                address: record.address.clone(),
-                source: ClusterEndpointSource::Observed,
-                privacy: ClusterEndpointPrivacy::Lan,
-                priority: 0,
-                last_observed_latency_ms: record
-                    .latency_ms
-                    .map(|ms| ms.min(u64::from(u32::MAX)) as u32),
-            })
+            .map(cluster_endpoint_record_for_connectivity_record)
+            .find(|endpoint| predicate(endpoint))
     }
 
     fn earliest_expires_at(&self) -> Option<OffsetDateTime> {
         self.records.values().map(|record| record.expires_at).min()
+    }
+}
+
+fn cluster_endpoint_record_for_connectivity_record(
+    record: &ClusterConnectivityRecord,
+) -> ClusterEndpointRecord {
+    ClusterEndpointRecord {
+        endpoint_id: record.endpoint_id.clone(),
+        node_id: record.target_node_id.clone(),
+        transport: record.transport.clone(),
+        address: record.address.clone(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 0,
+        last_observed_latency_ms: record
+            .latency_ms
+            .map(|ms| ms.min(u64::from(u32::MAX)) as u32),
     }
 }
 
@@ -11856,8 +11872,44 @@ pub fn cluster_main_daemon_command_endpoint_candidates(
         .filter(|endpoint| {
             endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
                 && main_daemon_node_ids.contains(&endpoint.node_id)
+                && !cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
         })
         .collect()
+}
+
+pub(crate) fn cluster_endpoint_identifies_shadow_daemon_for_node(
+    endpoint: &ClusterEndpointRecord,
+) -> bool {
+    let shadow_node_id = shadow_daemon_node_id(&endpoint.node_id);
+    let stable_shadow_endpoint = match endpoint.transport {
+        ClusterTransportKind::LanTcp => {
+            endpoint.endpoint_id == daemon_lan_endpoint_id(&shadow_node_id, &endpoint.address)
+        }
+        ClusterTransportKind::Loopback => {
+            endpoint.endpoint_id == daemon_loopback_endpoint_id(&shadow_node_id)
+        }
+        ClusterTransportKind::Iroh => {
+            iroh_endpoint_public_key(endpoint).is_some_and(|public_key| {
+                endpoint.endpoint_id == crate::stable_iroh_endpoint_id(&shadow_node_id, &public_key)
+            })
+        }
+        _ => false,
+    };
+    stable_shadow_endpoint || cluster_endpoint_uses_default_shadow_daemon_port(endpoint)
+}
+
+fn cluster_endpoint_uses_default_shadow_daemon_port(endpoint: &ClusterEndpointRecord) -> bool {
+    matches!(
+        endpoint.transport,
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
+    ) && cluster_endpoint_address_port(&endpoint.address) == Some(DEFAULT_DAEMON_SHADOW_PORT)
+}
+
+fn cluster_endpoint_address_port(address: &str) -> Option<u16> {
+    if let Ok(socket) = address.parse::<std::net::SocketAddr>() {
+        return Some(socket.port());
+    }
+    address.rsplit_once(':')?.1.parse::<u16>().ok()
 }
 
 /// Member-publish targets with voters first. The publish doubles as the
@@ -11904,6 +11956,7 @@ pub fn cluster_member_publish_targets(
             .endpoints
             .iter()
             .filter(|endpoint| locally_learned_bridge_route_endpoint(endpoint))
+            .filter(|endpoint| !cluster_endpoint_identifies_shadow_daemon_for_node(endpoint))
         {
             push_unique_cluster_endpoint(&mut targets, &mut seen, endpoint.clone());
         }
@@ -11913,7 +11966,11 @@ pub fn cluster_member_publish_targets(
         if !main_daemon_node_ids.contains(&node_id) {
             continue;
         }
-        let Some(endpoint) = graph.best_healthy_endpoint(&state.local_node_id, &node_id) else {
+        let Some(endpoint) =
+            graph.best_healthy_endpoint_matching(&state.local_node_id, &node_id, |endpoint| {
+                !cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
+            })
+        else {
             continue;
         };
         push_unique_cluster_endpoint(&mut targets, &mut seen, endpoint);
@@ -15744,6 +15801,7 @@ pub fn cluster_sync_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpoin
         });
         targets.extend(endpoints.into_iter().filter(|endpoint| {
             endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
+                && !cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
                 && matches!(
                     endpoint.transport,
                     ClusterTransportKind::LanTcp

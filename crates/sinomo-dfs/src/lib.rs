@@ -410,17 +410,17 @@ pub fn dfs_protocol_frame_requires_fresh_metadata(frame: &NetworkFrame) -> bool 
 
 fn dfs_protocol_frame_allows_write_repair_progress(frame: &NetworkFrame) -> bool {
     let MeshMessageBody::Protocol(protocol_message) = &frame.message.body else {
-        return true;
+        return false;
     };
     if protocol_message.protocol != DFS_PROTOCOL {
-        return true;
+        return false;
     }
     let Ok(message) = protocol_message.decode::<DfsNetworkMessage>() else {
-        return true;
+        return false;
     };
     match message {
         DfsNetworkMessage::DistributedWriteRequest(command) => command.foreground_replica_repair,
-        _ => true,
+        _ => false,
     }
 }
 
@@ -494,8 +494,8 @@ pub fn dfs_protocol_frame_rpc_request(
         sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE.to_string(),
     );
     request.metadata.insert(
-        sinomo_network::ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY.to_string(),
-        sinomo_network::ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE.to_string(),
+        sinomo_network::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY.to_string(),
+        sinomo_network::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE.to_string(),
     );
     Ok(request)
 }
@@ -12583,22 +12583,6 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     foreground_replica_repair,
                     detach_request,
                     replay_response_journal,
-                );
-            }
-            if detach_request {
-                return self.route_distributed_manifest_write_to_metadata_primary(
-                    request,
-                    expected_base_version,
-                    content_hash,
-                    content_size_bytes,
-                    plan.desired_replica_nodes,
-                    policy,
-                    object,
-                    shard,
-                    touch_parent_on_create,
-                    foreground_replica_repair,
-                    true,
-                    false,
                 );
             }
         }
