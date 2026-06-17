@@ -2916,6 +2916,28 @@ impl LocalShardedMetadataBackend {
         )
     }
 
+    fn write_content_commit_object_shard_index(
+        &self,
+        object: &DfsObjectMetadata,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<()> {
+        let path = self.object_shard_index_path(&object.object_id);
+        if let Some(index) = self.read_object_shard_index(&object.object_id)? {
+            let normalized_path = normalize_path(&object.path);
+            if index.file_system_id == object.file_system_id
+                && index.path == normalized_path
+                && index.shard_id == *shard_id
+            {
+                return Ok(());
+            }
+            return self.write_object_shard_index(object, shard_id);
+        }
+        write_sobj_files_create_new_relaxed(vec![(
+            path,
+            encode_sobj(&object_shard_index_record(object, shard_id))?,
+        )])
+    }
+
     fn write_transaction_object_shard_indexes(
         &self,
         objects: &[DfsObjectMetadata],
@@ -3970,7 +3992,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let entries = self
             .shard_backend_mut(&target_shard_id)?
             .put_object_version_intent_and_receipts(&object, version, intent, receipts)?;
-        self.write_object_shard_index(&object, &target_shard_id)?;
+        self.write_content_commit_object_shard_index(&object, &target_shard_id)?;
         if let Some(source_shard_id) = source_shard_id {
             self.put_cross_shard_tombstone(&object, &source_shard_id, &target_shard_id)?;
         }
@@ -4644,7 +4666,10 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             visible_version,
             required_replica_node_ids,
         )?;
-        self.write_object_shard_index(&normalized_object_metadata(committed_object), &shard_id)?;
+        self.write_content_commit_object_shard_index(
+            &normalized_object_metadata(committed_object),
+            &shard_id,
+        )?;
         Ok(entry)
     }
 
@@ -12833,6 +12858,206 @@ mod tests {
                 .expect("object by path"),
             Some(object),
             "an index that names an unopened shard must not hide source-shard path reads"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_content_commit_creates_missing_object_shard_index() {
+        let root = temp_root("sharded_backend_content_commit_new_index");
+        let file_system = file_system();
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let mut object = object(version("version_1"));
+        object.path = "/services/content-commit.bin".to_string();
+        object.content_hash = Some("blake3:content-commit".to_string());
+        object.content_size_bytes = Some(4096);
+        let version_record = DfsObjectVersionRecord {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            version: object.version.clone(),
+            content_hash: object.content_hash.clone(),
+            size_bytes: object.content_size_bytes,
+            locations: object.current_locations.clone(),
+            created_by_event_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            visible: true,
+        };
+        let intent = DfsWriteIntentRecord {
+            intent_id: "intent-content-commit-new-index".to_string(),
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            base_version: None,
+            target_version: object.version.clone(),
+            coordinator_node_id: node("node_owner"),
+            owner_epoch: 1,
+            desired_replica_node_ids: object.current_locations.clone(),
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            status: DfsWriteIntentStatus::Committed,
+            content_hash: object.content_hash.clone(),
+            object_metadata: Some(object.clone()),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+        };
+        let receipt = DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                committed_version: object.version.clone(),
+                owner_node_id: node("node_owner"),
+                event_id: EventId::from_legacy_named("evt_content_commit_new_index")
+                    .expect("event"),
+            },
+            replica_node_id: node("node_owner"),
+            content_hash: object.content_hash.clone(),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        backend.put_file_system(&file_system).expect("filesystem");
+
+        backend
+            .put_object_version_intent_and_receipts(
+                &object,
+                &version_record,
+                &intent,
+                std::slice::from_ref(&receipt),
+            )
+            .expect("content commit batch");
+
+        assert_eq!(
+            backend
+                .read_object_shard_index(&object.object_id)
+                .expect("object shard index")
+                .as_ref()
+                .map(|index| (&index.path, &index.shard_id)),
+            Some((
+                &normalize_path(&object.path),
+                &DfsMetadataShardId::new("services")
+            )),
+            "content commits for new objects should still publish a lookup index"
+        );
+        assert_eq!(
+            backend
+                .get_object_by_path(&file_system.file_system_id, &object.path)
+                .expect("path lookup"),
+            Some(object),
+            "the relaxed index publish must leave path lookup correct"
+        );
+
+        cleanup(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sharded_backend_content_commit_skips_matching_object_shard_index_rewrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("sharded_backend_content_commit_skip_index_rewrite");
+        let file_system = file_system();
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let mut object = object(version("version_1"));
+        object.path = "/services/existing-content.bin".to_string();
+        object.content_hash = Some("blake3:old-content".to_string());
+        object.content_size_bytes = Some(128);
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&object).expect("initial object");
+
+        let mut committed = object.clone();
+        committed.version = version("version_2");
+        committed.content_hash = Some("blake3:new-content".to_string());
+        committed.content_size_bytes = Some(4096);
+        let version_record = DfsObjectVersionRecord {
+            file_system_id: committed.file_system_id.clone(),
+            object_id: committed.object_id.clone(),
+            version: committed.version.clone(),
+            content_hash: committed.content_hash.clone(),
+            size_bytes: committed.content_size_bytes,
+            locations: committed.current_locations.clone(),
+            created_by_event_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            visible: true,
+        };
+        let intent = DfsWriteIntentRecord {
+            intent_id: "intent-content-commit-existing-index".to_string(),
+            file_system_id: committed.file_system_id.clone(),
+            object_id: committed.object_id.clone(),
+            base_version: Some(object.version.clone()),
+            target_version: committed.version.clone(),
+            coordinator_node_id: node("node_owner"),
+            owner_epoch: 1,
+            desired_replica_node_ids: committed.current_locations.clone(),
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            status: DfsWriteIntentStatus::Committed,
+            content_hash: committed.content_hash.clone(),
+            object_metadata: Some(committed.clone()),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+        };
+        let receipt = DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: committed.file_system_id.clone(),
+                object_id: committed.object_id.clone(),
+                committed_version: committed.version.clone(),
+                owner_node_id: node("node_owner"),
+                event_id: EventId::from_legacy_named("evt_content_commit_existing_index")
+                    .expect("event"),
+            },
+            replica_node_id: node("node_owner"),
+            content_hash: committed.content_hash.clone(),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let index_parent = backend
+            .object_shard_index_path(&committed.object_id)
+            .parent()
+            .expect("index parent")
+            .to_path_buf();
+        let original_permissions = fs::metadata(&index_parent)
+            .expect("index parent metadata")
+            .permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_mode(0o500);
+        fs::set_permissions(&index_parent, read_only_permissions)
+            .expect("make shard index directory read-only");
+
+        let result = backend.put_object_version_intent_and_receipts(
+            &committed,
+            &version_record,
+            &intent,
+            std::slice::from_ref(&receipt),
+        );
+
+        fs::set_permissions(&index_parent, original_permissions)
+            .expect("restore shard index directory permissions");
+        result.expect("content commit should not rewrite an already-correct shard index");
+        assert_eq!(
+            backend
+                .get_object(&committed.object_id)
+                .expect("object by id"),
+            Some(committed),
+            "content commit should still advance the object metadata"
         );
 
         cleanup(&root);
