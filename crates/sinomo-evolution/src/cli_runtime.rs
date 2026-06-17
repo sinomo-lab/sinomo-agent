@@ -193,7 +193,7 @@ fn evolve_cli_metadata() -> CliCommandMetadata {
     CliCommandMetadata::new(
         "evolve",
         &[],
-        "Run self-evolution workflows.",
+        "Run evolution workflows for Sinomo or another target repository.",
         EVOLVE_POLICY,
     )
 }
@@ -205,7 +205,7 @@ fn evolve_cli_help() -> CliCommandHelp {
             "  sinomo evolve",
             "      Show evolution commands.",
             "  sinomo evolve propose \"<objective>\" [--repo <path>] [--provider <provider>] [--model <model>] [--verify \"<command>\"] [--benchmark swebench:<instance_id>] [--module-replay-report [name=]<path>] [--no-model]",
-            "      Create an evolution job, candidate bundle, diff, and evaluation report.",
+            "      Create an evolution job, candidate bundle, diff, and evaluation report for the target repository.",
             "  sinomo evolve propose \"<objective>\" --dry-run [--horizon <text>] [--budget-policy <policy>] [--reserve <resource:floor>] [--approval <policy>] [--pause-after-proposal] [--approve]",
             "      Create and persist a long-horizon campaign proposal without running a mutation model.",
             "  sinomo evolve schedule <campaign> --dry-run [--resource <resource:used/total[:window]>] [--estimate <resource:units>]",
@@ -243,7 +243,7 @@ fn evolve_cli_help() -> CliCommandHelp {
 }
 
 fn evolve_cli_autocomplete() -> CliAutocompleteSpec {
-    CliAutocompleteSpec::new("evolve", "run self-evolution workflows").with_children([
+    CliAutocompleteSpec::new("evolve", "run evolution workflows").with_children([
         CliAutocompleteSpec::new("propose", "create an evolution proposal").with_options([
             CliAutocompleteOption::with_value(
                 "--objective",
@@ -252,8 +252,8 @@ fn evolve_cli_autocomplete() -> CliAutocompleteSpec {
             ),
             CliAutocompleteOption::with_value(
                 "--repo",
-                "source repository",
-                CliAutocompleteValue::new("path", "repository path", []),
+                "target repository",
+                CliAutocompleteValue::new("path", "target repository path", []),
             ),
             CliAutocompleteOption::with_value(
                 "--allow",
@@ -390,8 +390,8 @@ fn evolve_cli_autocomplete() -> CliAutocompleteSpec {
             ),
             CliAutocompleteOption::with_value(
                 "--repo",
-                "source repository",
-                CliAutocompleteValue::new("path", "repository path", []),
+                "target repository",
+                CliAutocompleteValue::new("path", "target repository path", []),
             ),
             CliAutocompleteOption::with_value(
                 "--provider",
