@@ -448,11 +448,13 @@ fn seed_chat_providers(shared: &sinomo_app::state::Shared) {
     chat.providers = vec![
         ProviderSummary {
             id: "openai".to_string(),
+            account: "default".to_string(),
             name: "OpenAI".to_string(),
             models: vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
         },
         ProviderSummary {
             id: "anthropic".to_string(),
+            account: "default".to_string(),
             name: "Anthropic".to_string(),
             models: vec!["claude-opus".to_string(), "claude-sonnet".to_string()],
         },
@@ -974,6 +976,7 @@ fn capture_chat_composed() {
             let mut chat = shared.chat_mut();
             chat.providers = vec![ProviderSummary {
                 id: "anthropic".to_string(),
+                account: "default".to_string(),
                 name: "Anthropic".to_string(),
                 models: vec![
                     "claude-opus-4".to_string(),

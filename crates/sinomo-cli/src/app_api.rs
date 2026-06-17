@@ -207,6 +207,7 @@ pub struct AgentSummary {
 #[derive(Clone, Debug)]
 pub struct ProviderSummary {
     pub id: String,
+    pub account: String,
     pub name: String,
     pub models: Vec<String>,
 }
@@ -885,6 +886,7 @@ pub fn provider_summaries() -> Vec<ProviderSummary> {
     vec![
         ProviderSummary {
             id: "anthropic".to_string(),
+            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "Anthropic".to_string(),
             models: dedup(vec![
                 AnthropicConfig::default().default_model,
@@ -895,6 +897,7 @@ pub fn provider_summaries() -> Vec<ProviderSummary> {
         },
         ProviderSummary {
             id: "openai".to_string(),
+            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "OpenAI".to_string(),
             models: dedup(vec![
                 OpenAiConfig::default().default_model,
@@ -904,6 +907,7 @@ pub fn provider_summaries() -> Vec<ProviderSummary> {
         },
         ProviderSummary {
             id: "gemini".to_string(),
+            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "Google Gemini".to_string(),
             models: dedup(vec![
                 GeminiConfig::default().default_model,
@@ -913,16 +917,19 @@ pub fn provider_summaries() -> Vec<ProviderSummary> {
         },
         ProviderSummary {
             id: "claude-code".to_string(),
+            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "Claude Code (CLI)".to_string(),
             models: dedup(vec![ClaudeCodeConfig::default().model]),
         },
         ProviderSummary {
             id: "codex-cli".to_string(),
+            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "Codex (CLI)".to_string(),
             models: dedup(vec![CodexCliConfig::default().model]),
         },
         ProviderSummary {
             id: "github-copilot".to_string(),
+            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "GitHub Copilot".to_string(),
             models: dedup(vec![GitHubCopilotConfig::default().default_model]),
         },
