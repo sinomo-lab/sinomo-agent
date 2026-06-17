@@ -396,9 +396,14 @@ pub fn dfs_protocol_frame_requires_fresh_metadata(frame: &NetworkFrame) -> bool 
     if protocol_message.protocol != DFS_PROTOCOL {
         return false;
     }
-    // Lookups answer from the metadata backend's path index directly; forcing
-    // a full service hydrate per read request causes avoidable read amplification.
-    false
+    protocol_message
+        .decode::<DfsNetworkMessage>()
+        .is_ok_and(|message| {
+            matches!(
+                message,
+                DfsNetworkMessage::ReadRequest(_) | DfsNetworkMessage::BulkReadRequest(_)
+            )
+        })
 }
 
 fn dfs_protocol_frame_allows_write_repair_progress(frame: &NetworkFrame) -> bool {
@@ -2425,6 +2430,32 @@ pub fn open_cluster_dfs_service_with_async_protocol_sender(
     service.with_boxed_metadata_backend(metadata)
 }
 
+pub fn open_cluster_dfs_service_with_protocol_senders(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    local_node_id: NodeId,
+    endpoints: Vec<ClusterEndpointRecord>,
+    protocol_sender: DfsProtocolFrameSender,
+    async_protocol_sender: AsyncDfsProtocolFrameSender,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+) -> Result<NetworkedDfsService<DfsEndpointTransport>, DfsError> {
+    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+    let mut service = NetworkedDfsService::new(
+        DfsEndpointTransport::new_with_senders(
+            local_node_id,
+            endpoints,
+            protocol_sender,
+            async_protocol_sender,
+        ),
+        content,
+    );
+    if let Some(control_plane) = control_plane {
+        service = service.with_boxed_control_plane(control_plane);
+    }
+    let metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
+    service.with_boxed_metadata_backend(metadata)
+}
+
 pub fn run_cluster_dfs_maintenance_tick(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
@@ -2478,6 +2509,7 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport(
     runtime: &tokio::runtime::Handle,
     data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
+    sync_peer_transport: Arc<dyn DfsPeerTransport>,
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
     control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
     options: DfsMaintenanceTickOptions,
@@ -2498,11 +2530,12 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport(
     let file_system = distributed_sifs(local_node_id.clone());
     let metadata_shards = cluster_dfs_metadata_shards(&cluster_paths, &file_system.file_system_id)?;
     let endpoints = sinomo_network::cluster_dfs_protocol_targets(&cluster_paths, &state);
-    let mut service = open_cluster_dfs_service_with_async_protocol_sender(
+    let mut service = open_cluster_dfs_service_with_protocol_senders(
         &data_dir,
         &cluster_paths,
         local_node_id.clone(),
         endpoints.clone(),
+        dfs_protocol_frame_sender_from_peer_transport(sync_peer_transport),
         async_dfs_protocol_frame_sender_from_peer_transport(Arc::clone(&peer_transport)),
         control_plane,
     )?;
@@ -7968,6 +8001,12 @@ impl DfsFrameTransport for DfsEndpointTransport {
     }
 }
 
+impl NetworkedDfsService<DfsEndpointTransport> {
+    pub fn refresh_endpoint_targets(&mut self, endpoints: Vec<ClusterEndpointRecord>) {
+        self.transport.replace_endpoints(endpoints);
+    }
+}
+
 #[derive(Debug)]
 struct SingleDfsProtocolFrameTransport {
     local_node_id: NodeId,
@@ -11216,6 +11255,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         &mut self,
         object: DfsObjectMetadata,
     ) -> Result<(), DfsError> {
+        self.track_metadata_tombstone(&object);
         self.metadata.add_object(object)
     }
 
@@ -11952,7 +11992,14 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         object_id: &DfsObjectId,
     ) -> Result<NetworkedDfsReadStreamOutcome, DfsError> {
         let object = self.current_read_object_metadata(object_id)?;
-        let open_conflicts = self.open_conflicts_for_object(object_id)?;
+        self.open_local_object_metadata_stream_with_state(&object)
+    }
+
+    pub(crate) fn open_local_object_metadata_stream_with_state(
+        &self,
+        object: &DfsObjectMetadata,
+    ) -> Result<NetworkedDfsReadStreamOutcome, DfsError> {
+        let open_conflicts = self.open_conflicts_for_object(&object.object_id)?;
         if !open_conflicts.is_empty() {
             return Ok(NetworkedDfsReadStreamOutcome::Conflicted {
                 conflicts: open_conflicts
@@ -12020,7 +12067,20 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         max_chunks: u32,
     ) -> Result<NetworkedDfsReadStreamOutcome, DfsError> {
         let object = self.current_read_object_metadata(object_id)?;
-        let open_conflicts = self.open_conflicts_for_object(object_id)?;
+        self.open_local_object_metadata_read_window_stream_with_state(
+            &object,
+            start_chunk_index,
+            max_chunks,
+        )
+    }
+
+    fn open_local_object_metadata_read_window_stream_with_state(
+        &self,
+        object: &DfsObjectMetadata,
+        start_chunk_index: u32,
+        max_chunks: u32,
+    ) -> Result<NetworkedDfsReadStreamOutcome, DfsError> {
+        let open_conflicts = self.open_conflicts_for_object(&object.object_id)?;
         if !open_conflicts.is_empty() {
             return Ok(NetworkedDfsReadStreamOutcome::Conflicted {
                 conflicts: open_conflicts
@@ -12103,7 +12163,22 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         start_chunk_index: u32,
     ) -> Result<NetworkedDfsRangeReadStreamOutcome, DfsError> {
         let object = self.current_read_object_metadata(object_id)?;
-        let open_conflicts = self.open_conflicts_for_object(object_id)?;
+        self.open_local_object_metadata_range_stream_with_state(
+            &object,
+            offset,
+            max_bytes,
+            start_chunk_index,
+        )
+    }
+
+    pub(crate) fn open_local_object_metadata_range_stream_with_state(
+        &self,
+        object: &DfsObjectMetadata,
+        offset: u64,
+        max_bytes: usize,
+        start_chunk_index: u32,
+    ) -> Result<NetworkedDfsRangeReadStreamOutcome, DfsError> {
+        let open_conflicts = self.open_conflicts_for_object(&object.object_id)?;
         if !open_conflicts.is_empty() {
             return Ok(NetworkedDfsRangeReadStreamOutcome::Conflicted {
                 conflicts: open_conflicts
@@ -12204,7 +12279,17 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         allow_stale: bool,
     ) -> Result<NetworkedDfsRangeReadOutcome, DfsError> {
         let object = self.current_read_object_metadata(object_id)?;
-        let open_conflicts = self.open_conflicts_for_object(object_id)?;
+        self.read_object_metadata_local_range_with_state(&object, offset, max_bytes, allow_stale)
+    }
+
+    pub(crate) fn read_object_metadata_local_range_with_state(
+        &self,
+        object: &DfsObjectMetadata,
+        offset: u64,
+        max_bytes: usize,
+        allow_stale: bool,
+    ) -> Result<NetworkedDfsRangeReadOutcome, DfsError> {
+        let open_conflicts = self.open_conflicts_for_object(&object.object_id)?;
         if !open_conflicts.is_empty() {
             return Ok(NetworkedDfsRangeReadOutcome::Conflicted {
                 object_id: object.object_id.clone(),
@@ -13615,10 +13700,19 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     &content_hash,
                 )
                 .is_none();
-        if (!is_committed || (foreground_replica_repair && local_desired_copy_missing))
-            && let Some(pending) = self.pending_writes.get(&updated_intent.intent_id).cloned()
-        {
-            let _ = self.request_stage_blob_from_alternate(&updated_intent, &pending)?;
+        if let Some(pending) = self.pending_writes.get(&updated_intent.intent_id).cloned() {
+            if !is_committed {
+                if self.open_pending_write_blob_stream(&pending).is_ok() {
+                    self.stage_missing_desired_replicas_for_intent(
+                        &updated_intent.intent_id,
+                        object.clone(),
+                    )?;
+                } else {
+                    let _ = self.request_stage_blob_from_alternate(&updated_intent, &pending)?;
+                }
+            } else if local_desired_copy_missing {
+                let _ = self.request_stage_blob_from_alternate(&updated_intent, &pending)?;
+            }
         }
         let stage_elapsed = stage_started.elapsed();
 
@@ -13993,6 +14087,15 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         let metadata_journal_after_sequence =
             self.metadata_journal_last_sequence_for_shard(&shard_id)?;
         let primary_node_id = shard.primary_node_id.clone();
+        if request.requesting_node_id == self.node_id
+            && desired_replica_nodes.contains(&self.node_id)
+        {
+            self.content.put_object_version_blob_only(
+                request.object_id.as_str(),
+                request.target_version.as_str(),
+                &bytes,
+            )?;
+        }
         let command = DfsDistributedWriteCommand {
             request_id: request_id.clone(),
             request,

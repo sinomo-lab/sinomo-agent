@@ -465,6 +465,12 @@ struct ContentStoreStatsDelta {
     staging_bytes: i128,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlobOnlyDurability {
+    Deferred,
+    Synchronous,
+}
+
 impl ContentStoreStatsDelta {
     fn blob_file_change(before_len: Option<u64>, after_len: Option<u64>) -> Self {
         Self {
@@ -952,7 +958,12 @@ impl LocalContentStore {
             return versions
                 .into_iter()
                 .map(|(object_id, version, bytes)| {
-                    self.write_object_version_blob_only(object_id, version, bytes)
+                    self.write_object_version_blob_only(
+                        object_id,
+                        version,
+                        bytes,
+                        BlobOnlyDurability::Deferred,
+                    )
                 })
                 .collect();
         }
@@ -1017,7 +1028,21 @@ impl LocalContentStore {
         version: &str,
         bytes: &[u8],
     ) -> Result<ContentManifest> {
-        self.write_object_version_blob_only(object_id, version, bytes)
+        self.write_object_version_blob_only(object_id, version, bytes, BlobOnlyDurability::Deferred)
+    }
+
+    pub fn put_object_version_blob_only_durable(
+        &self,
+        object_id: &str,
+        version: &str,
+        bytes: &[u8],
+    ) -> Result<ContentManifest> {
+        self.write_object_version_blob_only(
+            object_id,
+            version,
+            bytes,
+            BlobOnlyDurability::Synchronous,
+        )
     }
 
     pub fn flush_deferred_durable_dirs(&self) -> Result<()> {
@@ -2276,6 +2301,7 @@ impl LocalContentStore {
         object_id: &str,
         version: &str,
         bytes: &[u8],
+        durability: BlobOnlyDurability,
     ) -> Result<ContentManifest> {
         let trace_started = Instant::now();
         let hash_started = Instant::now();
@@ -2315,7 +2341,8 @@ impl LocalContentStore {
             extents: Vec::new(),
         };
 
-        let defer_blob_dir_sync = !self.tracks_stats_deltas();
+        let defer_blob_dir_sync =
+            durability == BlobOnlyDurability::Deferred && !self.tracks_stats_deltas();
         let has_blob_started = Instant::now();
         let blob_exists = if defer_blob_dir_sync {
             false
@@ -5324,6 +5351,32 @@ mod tests {
         assert!(
             store.read_manifest("object-blob-only-large", "v1").is_err(),
             "blob-only large writes should not create per-object manifests"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn put_object_version_blob_only_durable_large_blob_skips_manifest() {
+        let root = temp_root("put_object_version_blob_only_durable_large_blob_skips_manifest");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let bytes = vec![0x73; PACKED_BLOB_SMALL_LIMIT_BYTES as usize + 4096];
+
+        let manifest = store
+            .put_object_version_blob_only_durable("object-blob-only-durable-large", "v1", &bytes)
+            .expect("put durable blob-only large object");
+
+        assert_eq!(
+            store
+                .read_blob(&manifest.content_hash)
+                .expect("read durable large blob"),
+            bytes
+        );
+        assert!(
+            store
+                .read_manifest("object-blob-only-durable-large", "v1")
+                .is_err(),
+            "durable blob-only large writes should not create per-object manifests"
         );
 
         cleanup(&root);

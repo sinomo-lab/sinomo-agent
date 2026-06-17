@@ -99,6 +99,52 @@ fn dfs_adaptive_transfer_windows_stay_byte_bounded() {
     );
 }
 
+#[test]
+fn protocol_frame_read_requests_require_fresh_metadata() {
+    let source = NodeId::from_legacy_named("node_protocol_fresh_source").expect("source");
+    let target = NodeId::from_legacy_named("node_protocol_fresh_target").expect("target");
+    let object_id = DfsObjectId::from_legacy_named("obj_protocol_fresh").expect("object");
+    let version = DfsVersion::from_legacy_named("version_protocol_fresh").expect("version");
+    let read = build_dfs_network_frame(
+        &source,
+        &target,
+        1,
+        1,
+        DfsNetworkMessage::ReadRequest(DfsReadRequest {
+            request_id: "dfs_read_fresh_metadata".to_string(),
+            object_id: object_id.clone(),
+            version: Some(version.clone()),
+            content_hash: Some("blake3:readfresh".to_string()),
+            content_size_bytes: Some(12),
+            range_offset: None,
+            range_max_bytes: None,
+            start_chunk_index: 0,
+            max_chunks: 0,
+        }),
+    )
+    .expect("read frame");
+    let bulk = build_dfs_network_frame(
+        &source,
+        &target,
+        2,
+        2,
+        DfsNetworkMessage::BulkReadRequest(DfsBulkReadRequest {
+            request_id: "dfs_bulk_read_fresh_metadata".to_string(),
+            reads: vec![DfsBulkReadItem {
+                request_id: "dfs_bulk_read_item".to_string(),
+                object_id,
+                version,
+                content_hash: "blake3:bulkreadfresh".to_string(),
+                content_size_bytes: 12,
+            }],
+        }),
+    )
+    .expect("bulk read frame");
+
+    assert!(dfs_protocol_frame_requires_fresh_metadata(&read));
+    assert!(dfs_protocol_frame_requires_fresh_metadata(&bulk));
+}
+
 fn object_field<'a>(value: &'a Value, key: &str) -> &'a Value {
     let Value::Object(object) = value else {
         panic!("expected object value for field {key}, got {value:?}");
@@ -467,7 +513,7 @@ fn dfs_protocol_frame_read_only_classifier_routes_lookup_path_to_read_lane() {
     )
     .expect("read frame");
     assert!(dfs_protocol_frame_is_read_only_request(&read_frame));
-    assert!(!dfs_protocol_frame_requires_fresh_metadata(&read_frame));
+    assert!(dfs_protocol_frame_requires_fresh_metadata(&read_frame));
 
     let lookup_frame = build_dfs_network_frame(
         &local,
@@ -20983,6 +21029,264 @@ fn sifs_cluster_posix_routed_write_is_visible_on_primary() {
     // it locally readable through the remote-read path.
     let read = sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.primary, path);
     assert_eq!(read, bytes.to_vec());
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_writer_recovers_from_local_blob_loss_after_async_repair() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-writer-blob-loss");
+    let path = "/services/async-repaired-writer-loss.bin";
+    let bytes = (0..64 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let expected_hash = content_hash(&bytes);
+
+    match cluster.writer.posix_write_file(
+        path,
+        &bytes,
+        DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+            replica_candidates: vec![cluster.writer_node.clone(), cluster.primary_node.clone()],
+            wait_for_commit: true,
+            foreground_replica_repair: false,
+        },
+    ) {
+        Ok(stat) => assert_eq!(
+            stat.content_hash.as_deref(),
+            Some(expected_hash.as_str()),
+            "committed writer stat should expose the written content hash"
+        ),
+        Err(DfsPosixError::PendingWrite { .. }) => {}
+        Err(error) => panic!("async routed write failed: {error}"),
+    }
+    sifs_posix_cluster_pump_until(&mut cluster, "writer observes async write", |cluster| {
+        cluster
+            .writer
+            .posix_stat(path)
+            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
+    });
+
+    sifs_posix_cluster_pump_until(&mut cluster, "primary async repair", |cluster| {
+        cluster
+            .primary
+            .retry_pending_repairs()
+            .expect("primary repair tick");
+        cluster
+            .primary
+            .posix_read_file(path)
+            .is_ok_and(|read| read == bytes)
+    });
+    sifs_cluster_publish_metadata_until(
+        &mut cluster,
+        "writer learns repaired primary location",
+        |cluster| {
+            cluster.writer.posix_stat(path).is_ok_and(|stat| {
+                stat.current_locations.contains(&cluster.writer_node)
+                    && stat.current_locations.contains(&cluster.primary_node)
+            })
+        },
+    );
+
+    cluster
+        .writer
+        .content
+        .debug_remove_loose_blob(&expected_hash)
+        .expect("remove writer loose blob");
+    assert!(
+        matches!(
+            cluster.writer.posix_read_file(path),
+            Err(DfsPosixError::NotFound { .. })
+        ),
+        "fault injection must remove the writer's local readable content"
+    );
+
+    let recovered =
+        sifs_cluster_fetch_for_local_read(&mut cluster, |cluster| &mut cluster.writer, path);
+    assert_eq!(recovered, bytes);
+    assert!(
+        cluster.rejections.is_empty(),
+        "journal replication should remain clean: {:?}",
+        cluster.rejections
+    );
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_async_commit_fetches_missing_local_desired_copy_without_maintenance() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-async-local-fetch");
+    let path = "/services/async-local-fetch.bin";
+    let bytes = (0..64 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let expected_hash = content_hash(&bytes);
+
+    match cluster.writer.posix_write_file(
+        path,
+        &bytes,
+        DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+            replica_candidates: vec![cluster.writer_node.clone(), cluster.primary_node.clone()],
+            wait_for_commit: true,
+            foreground_replica_repair: false,
+        },
+    ) {
+        Ok(stat) => assert_eq!(stat.content_hash.as_deref(), Some(expected_hash.as_str())),
+        Err(DfsPosixError::PendingWrite { .. }) => {}
+        Err(error) => panic!("async routed write failed: {error}"),
+    }
+
+    sifs_posix_cluster_pump_until(
+        &mut cluster,
+        "primary fetches missing local desired copy after async commit",
+        |cluster| {
+            cluster
+                .primary
+                .posix_read_file(path)
+                .is_ok_and(|read| read == bytes)
+        },
+    );
+
+    assert!(
+        cluster.rejections.is_empty(),
+        "journal replication should remain clean: {:?}",
+        cluster.rejections
+    );
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_distributed_read_refreshes_metadata_after_local_location_prune() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-stale-reader-prune");
+    let path = "/services/stale-reader-prune.bin";
+    let bytes = (0..64 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let expected_hash = content_hash(&bytes);
+
+    match cluster.writer.posix_write_file(
+        path,
+        &bytes,
+        DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+            replica_candidates: vec![cluster.writer_node.clone(), cluster.primary_node.clone()],
+            wait_for_commit: true,
+            foreground_replica_repair: false,
+        },
+    ) {
+        Ok(stat) => assert_eq!(
+            stat.content_hash.as_deref(),
+            Some(expected_hash.as_str()),
+            "committed writer stat should expose the written content hash"
+        ),
+        Err(DfsPosixError::PendingWrite { .. }) => {}
+        Err(error) => panic!("async routed write failed: {error}"),
+    }
+    sifs_posix_cluster_pump_until(&mut cluster, "writer observes async write", |cluster| {
+        cluster
+            .writer
+            .posix_stat(path)
+            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
+    });
+    sifs_posix_cluster_pump_until(&mut cluster, "primary async repair", |cluster| {
+        cluster
+            .primary
+            .retry_pending_repairs()
+            .expect("primary repair tick");
+        cluster
+            .primary
+            .posix_read_file(path)
+            .is_ok_and(|read| read == bytes)
+    });
+    sifs_cluster_publish_metadata_until(
+        &mut cluster,
+        "writer learns repaired primary location",
+        |cluster| {
+            cluster.writer.posix_stat(path).is_ok_and(|stat| {
+                stat.current_locations.contains(&cluster.writer_node)
+                    && stat.current_locations.contains(&cluster.primary_node)
+            })
+        },
+    );
+    let stale_stat = cluster.writer.posix_stat(path).expect("writer stale stat");
+
+    cluster
+        .writer
+        .content
+        .debug_remove_loose_blob(&expected_hash)
+        .expect("remove writer loose blob");
+    assert!(
+        matches!(
+            cluster.writer.posix_read_file(path),
+            Err(DfsPosixError::NotFound { .. })
+        ),
+        "fault injection must remove the writer's local readable content"
+    );
+
+    {
+        let mut backend =
+            open_root_local_metadata_backend(cluster.root.join("writer").join("metadata"))
+                .expect("writer metadata backend");
+        let mut object = backend
+            .get_object(&stale_stat.object_id)
+            .expect("writer backend object")
+            .expect("writer backend object");
+        object
+            .current_locations
+            .retain(|node_id| node_id != &cluster.writer_node);
+        backend.put_object(&object).expect("prune writer object");
+        let mut version = backend
+            .get_version(&stale_stat.object_id, &stale_stat.version)
+            .expect("writer backend version")
+            .expect("writer backend version");
+        version
+            .locations
+            .retain(|node_id| node_id != &cluster.writer_node);
+        backend.put_version(&version).expect("prune writer version");
+        backend
+            .remove_receipt(
+                &stale_stat.object_id,
+                &stale_stat.version,
+                &cluster.writer_node,
+            )
+            .expect("remove writer receipt");
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let distributed_read_path = path.to_string();
+    let primary = &mut cluster.primary;
+    let writer = &mut cluster.writer;
+    let recovered = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let result = writer.posix_read_file_distributed(&distributed_read_path);
+            tx.send(result).expect("send distributed read result");
+        });
+        let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+        loop {
+            primary
+                .process_incoming()
+                .expect("primary handles distributed read");
+            match rx.try_recv() {
+                Ok(result) => break result.expect("distributed read after backend prune"),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("distributed read worker disconnected")
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("distributed read after backend prune did not complete");
+            }
+            std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+        }
+    });
+    assert_eq!(recovered, bytes);
+    assert!(
+        cluster.rejections.is_empty(),
+        "journal replication should remain clean: {:?}",
+        cluster.rejections
+    );
 
     std::fs::remove_dir_all(&cluster.root).ok();
 }

@@ -11609,6 +11609,7 @@ fn cluster_sync_targets_with_connectivity_context(
         let node_status_rank = cluster_node_status_route_rank(node_statuses.get(&endpoint.node_id));
         (
             node_status_rank,
+            cluster_endpoint_connectivity_attempt_rank(graph, endpoint),
             graph.unavailability_rank(endpoint),
             cluster_endpoint_static_fallback_rank(endpoint),
             graph.quality_rank(endpoint),
@@ -12200,6 +12201,18 @@ fn cluster_route_connectivity_quality_rank(connectivity: Option<&ClusterConnecti
         Some(ClusterConnectivityState::Healthy) => 0,
         Some(ClusterConnectivityState::Degraded) => 1,
         None => 2,
+        Some(ClusterConnectivityState::Unreachable) => 3,
+    }
+}
+
+fn cluster_endpoint_connectivity_attempt_rank(
+    graph: &ClusterConnectivityGraph,
+    endpoint: &ClusterEndpointRecord,
+) -> u8 {
+    match graph.state_for_endpoint(endpoint) {
+        Some(ClusterConnectivityState::Healthy) => 0,
+        None => 1,
+        Some(ClusterConnectivityState::Degraded) => 2,
         Some(ClusterConnectivityState::Unreachable) => 3,
     }
 }

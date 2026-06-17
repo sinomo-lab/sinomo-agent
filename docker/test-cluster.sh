@@ -23,8 +23,10 @@
 #                       amplification checks and read-side write_bytes == 0
 #   12. disk damage   — delete one durable loose blob and read through the
 #                       remaining replica without read-side disk writes
-#   13. restart       — restart a member, re-gate formation, re-read its data
-#   14. final sweep   — invariants again on every node
+#   13. network heal  — temporarily disconnect a leaf node, write while it is
+#                       isolated, reconnect it, and verify convergence
+#   14. restart       — restart a member, re-gate formation, re-read its data
+#   15. final sweep   — invariants again on every node
 #
 # Usage:
 #   docker/test-cluster.sh                  # build-if-missing, up, test, down -v
@@ -92,6 +94,7 @@
 #   SINOMO_TEST_NETWORK_READY_WAIT          network/auth convergence gate seconds (default 120)
 #   SINOMO_TEST_NETWORK_READY_REQUESTS_PER_TARGET requests per target during readiness warmup (default 20)
 #   SINOMO_TEST_NETWORK_READY_CONCURRENCY   readiness warmup concurrency (default 32)
+#   SINOMO_TEST_NETWORK_PARTITION_SECONDS   seconds to keep node6 disconnected in network-heal leg (default 5)
 #   SINOMO_TEST_NETWORK_ONLY=1              stop after network baseline
 #   SINOMO_TEST_BUILD=1         force `cargo build -p sinomo` first
 #   SINOMO_TEST_ARTIFACTS       artifact dir (default target/cluster-test-artifacts/<run>)
@@ -168,6 +171,7 @@ NETWORK_REQUIRE_DIRECT="${SINOMO_TEST_NETWORK_REQUIRE_DIRECT:-0}"
 NETWORK_READY_WAIT="${SINOMO_TEST_NETWORK_READY_WAIT:-120}"
 NETWORK_READY_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_READY_REQUESTS_PER_TARGET:-20}"
 NETWORK_READY_CONCURRENCY="${SINOMO_TEST_NETWORK_READY_CONCURRENCY:-32}"
+NETWORK_PARTITION_SECONDS="${SINOMO_TEST_NETWORK_PARTITION_SECONDS:-5}"
 NODES="node1 node2 node3 node4 node5 node6"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 ARTIFACTS="${SINOMO_TEST_ARTIFACTS:-$SINOMO_ROOT/target/cluster-test-artifacts/$RUN_ID}"
@@ -578,6 +582,43 @@ disk_damage_recovery() {
     --param "max-proc-write-bytes=0"
 }
 
+temporary_network_recovery() {
+  local path="/services/cluster-tests/$RUN_ID/network-heal.txt"
+  local payload="network heal $RUN_ID"
+  local network="${PROJECT}_seg_b"
+  local node6_container
+  node6_container="$(compose ps -q node6)"
+  if [ -z "$node6_container" ]; then
+    log "cannot find node6 container id"
+    return 1
+  fi
+
+  log "disconnecting node6 from $network for ${NETWORK_PARTITION_SECONDS}s"
+  if ! docker network disconnect "$network" "$node6_container" >/dev/null 2>&1; then
+    log "failed to disconnect node6 from $network"
+    return 1
+  fi
+
+  local rc=0
+  sleep "$NETWORK_PARTITION_SECONDS"
+  run_probe node2 cluster.dfs.write \
+    --param "path=$path" --param "payload=$payload" || rc=1
+
+  log "reconnecting node6 to $network"
+  if ! docker network connect --alias node6 "$network" "$node6_container" >/dev/null 2>&1; then
+    log "failed to reconnect node6 to $network"
+    return 1
+  fi
+
+  wait_for_cluster_ready "post-network-heal" || rc=1
+  wait_for_dfs_ready || rc=1
+  if [ "$rc" = 0 ]; then
+    run_probe node6 cluster.dfs.expect-file \
+      --param "path=$path" --param "payload=$payload" --param "timeout-seconds=$EXPECT_TIMEOUT" || rc=1
+  fi
+  return "$rc"
+}
+
 restart_durability() {
   local path="/services/cluster-tests/$RUN_ID/durable.txt"
   local payload="durable $RUN_ID"
@@ -700,6 +741,7 @@ scenario "bulk-performance"     bulk_performance
 scenario "disk-baseline"        disk_baseline
 scenario "large-file-performance" large_file_performance
 scenario "disk-damage-recovery" disk_damage_recovery
+scenario "temporary-network-recovery" temporary_network_recovery
 scenario "restart-durability"   restart_durability
 scenario "invariants-final"     invariants_sweep
 

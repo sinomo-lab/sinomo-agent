@@ -4,7 +4,9 @@
 //! The Docker cluster gate uses them before DFS scenarios so routing, relay,
 //! authentication, and concurrent request handling must be healthy first.
 
-use sinomo_runtime::core::{ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord};
+use sinomo_runtime::core::{
+    ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
+};
 use sinomo_runtime::daemon::{daemon_rpc_command, sign_daemon_rpc_request_for_local_node};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
@@ -14,6 +16,7 @@ use sinomo_runtime::test::{
     SinomoTestRequirement, SinomoTestResult,
 };
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_REQUESTS_PER_TARGET: usize = 20;
@@ -77,10 +80,18 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     require_positive("concurrency", concurrency)?;
     require_positive("timeout-ms", timeout_ms as usize)?;
 
-    let targets = network_ping_targets(ctx)?;
-    let target_count = targets.len();
     let data_dir = SinomoDataDir::new(ctx.data_dir());
     let cluster_paths = ClusterPaths::new(&data_dir);
+    let cluster_state = Arc::new(
+        network::read_cluster_state(&cluster_paths)
+            .map_err(|error| SinomoTestError::failed(error.to_string()))?,
+    );
+    let route_graph = Arc::new(network::ClusterConnectivityGraph::read_for_local(
+        &cluster_paths,
+        &cluster_state,
+    ));
+    let targets = network_ping_targets_from_state(&cluster_paths, &cluster_state)?;
+    let target_count = targets.len();
     ctx.record("target_count", target_count);
     ctx.record(
         "targets",
@@ -95,7 +106,7 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             .collect::<Vec<_>>(),
     );
     let (target_routes, route_by_target) =
-        network_ping_target_route_descriptions(&cluster_paths, &targets);
+        network_ping_target_route_descriptions(&cluster_state, &route_graph, &targets);
     ctx.record("target_routes", target_routes.clone());
     ctx.record(
         "target_route_modes",
@@ -174,6 +185,8 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     route_mode: route_mode.clone(),
                     runtime: runtime_handle.clone(),
                     paths: cluster_paths.clone(),
+                    cluster_state: Arc::clone(&cluster_state),
+                    route_graph: Arc::clone(&route_graph),
                 });
             }
         }
@@ -473,13 +486,10 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     )))
 }
 
-fn network_ping_targets(
-    ctx: &SinomoTestContext,
+fn network_ping_targets_from_state(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
 ) -> Result<Vec<ClusterEndpointRecord>, SinomoTestError> {
-    let data_dir = SinomoDataDir::new(ctx.data_dir());
-    let paths = ClusterPaths::new(&data_dir);
-    let state = network::read_cluster_state(&paths)
-        .map_err(|error| SinomoTestError::failed(error.to_string()))?;
     let mut targets = BTreeMap::<NodeId, ClusterEndpointRecord>::new();
     for member in &state.members {
         if member.node_id == state.local_node_id
@@ -501,26 +511,10 @@ fn network_ping_targets(
 }
 
 fn network_ping_target_route_descriptions(
-    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    graph: &network::ClusterConnectivityGraph,
     targets: &[ClusterEndpointRecord],
 ) -> (Vec<String>, BTreeMap<NodeId, String>) {
-    let Ok(state) = network::read_cluster_state(paths) else {
-        let routes = targets
-            .iter()
-            .map(|target| {
-                format!(
-                    "{} {} {:?} route=unknown",
-                    target.node_id, target.address, target.transport
-                )
-            })
-            .collect();
-        let route_by_target = targets
-            .iter()
-            .map(|target| (target.node_id.clone(), "unknown".to_string()))
-            .collect();
-        return (routes, route_by_target);
-    };
-    let graph = network::ClusterConnectivityGraph::read_for_local(paths, &state);
     let mut route_by_target = BTreeMap::new();
     let routes = targets
         .iter()
@@ -570,6 +564,8 @@ struct NetworkPingJob {
     route_mode: String,
     runtime: tokio::runtime::Handle,
     paths: ClusterPaths,
+    cluster_state: Arc<ClusterBootstrapState>,
+    route_graph: Arc<network::ClusterConnectivityGraph>,
 }
 
 #[derive(Debug)]
@@ -606,6 +602,8 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
     let mut host = NetworkPingEndpointRpcHost {
         runtime: job.runtime.clone(),
         paths: job.paths.clone(),
+        cluster_state: Arc::clone(&job.cluster_state),
+        route_graph: Arc::clone(&job.route_graph),
     };
     let response = match network::send_signed_rpc_to_endpoint_async_with_host(
         &job.endpoint,
@@ -658,6 +656,8 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
 struct NetworkPingEndpointRpcHost {
     runtime: tokio::runtime::Handle,
     paths: ClusterPaths,
+    cluster_state: Arc<ClusterBootstrapState>,
+    route_graph: Arc<network::ClusterConnectivityGraph>,
 }
 
 impl network::ClusterSignedEndpointRpcAsyncHost for NetworkPingEndpointRpcHost {
@@ -687,21 +687,22 @@ impl network::ClusterSignedEndpointRpcAsyncHost for NetworkPingEndpointRpcHost {
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
     ) -> network::ClusterSignedEndpointRpcFuture<'a, bool> {
-        let paths = self.paths.clone();
         let endpoint = endpoint.clone();
-        Box::pin(async move { Ok(network::cluster_endpoint_prefers_relay(&paths, &endpoint)) })
+        let state = Arc::clone(&self.cluster_state);
+        let graph = Arc::clone(&self.route_graph);
+        Box::pin(async move {
+            Ok(network::cluster_endpoint_prefers_relay_with_graph(
+                &graph, &state, &endpoint,
+            ))
+        })
     }
 
     fn endpoint_rpc_cluster_id_async<'a>(
         &'a mut self,
         _endpoint: &'a ClusterEndpointRecord,
     ) -> network::ClusterSignedEndpointRpcFuture<'a, Option<network::ClusterId>> {
-        let paths = self.paths.clone();
-        Box::pin(async move {
-            Ok(network::read_cluster_state(&paths)
-                .ok()
-                .map(|state| state.cluster_id))
-        })
+        let cluster_id = self.cluster_state.cluster_id.clone();
+        Box::pin(async move { Ok(Some(cluster_id)) })
     }
 
     fn send_signed_endpoint_rpc_async<'a>(
@@ -735,10 +736,12 @@ impl network::ClusterSignedEndpointRpcAsyncHost for NetworkPingEndpointRpcHost {
     ) -> network::ClusterSignedEndpointRpcFuture<'a, Option<network::ObjectRpcResponse>> {
         let runtime = self.runtime.clone();
         let paths = self.paths.clone();
+        let state = Arc::clone(&self.cluster_state);
         Box::pin(async move {
-            network::relay_rpc_to_endpoint_from_paths_async_with_host(
+            network::relay_rpc_to_endpoint_async_with_host(
                 &runtime,
                 &paths,
+                &state,
                 endpoint,
                 request,
                 request_auth.to_vec(),
