@@ -2097,13 +2097,8 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     self.resolve_hardlink_target(&object)?
                 }
                 Some(object) if object.kind == DfsObjectKind::Tombstone => {
-                    let mut object = object;
-                    object.kind = DfsObjectKind::File;
-                    object.content_hash = None;
-                    object.content_size_bytes = None;
-                    object.link_target_object_id = None;
-                    object.current_locations = vec![self.node_id.clone()];
-                    set_object_create_timestamps(&mut object);
+                    let object =
+                        self.metadata_object_for_recreated_path(&path, DfsObjectKind::File);
                     link_count_hint = Some(1);
                     object
                 }
@@ -2428,13 +2423,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 self.resolve_hardlink_target(&object)?
             }
             Some(object) if object.kind == DfsObjectKind::Tombstone => {
-                let mut object = object;
-                object.kind = DfsObjectKind::File;
-                object.content_hash = None;
-                object.content_size_bytes = None;
-                object.link_target_object_id = None;
-                object.current_locations = vec![self.node_id.clone()];
-                set_object_create_timestamps(&mut object);
+                let object = self.metadata_object_for_recreated_path(&path, DfsObjectKind::File);
                 self.add_transient_object_metadata(object.clone())?;
                 transient_create = true;
                 object
@@ -2451,11 +2440,20 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
         let committed_locations = candidates.clone();
         let content_started = Instant::now();
-        let manifest = match self.content.put_object_version_blob_only(
-            object.object_id.as_str(),
-            target_version.as_str(),
-            bytes,
-        ) {
+        let manifest_result = if options.wait_for_commit {
+            self.content.put_object_version_blob_only_durable(
+                object.object_id.as_str(),
+                target_version.as_str(),
+                bytes,
+            )
+        } else {
+            self.content.put_object_version_blob_only(
+                object.object_id.as_str(),
+                target_version.as_str(),
+                bytes,
+            )
+        };
+        let manifest = match manifest_result {
             Ok(manifest) => manifest,
             Err(error) => {
                 if transient_create {
@@ -2686,13 +2684,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 self.resolve_hardlink_target(&object)?
             }
             Some(object) if object.kind == DfsObjectKind::Tombstone => {
-                let mut object = object;
-                object.kind = DfsObjectKind::File;
-                object.content_hash = None;
-                object.content_size_bytes = None;
-                object.link_target_object_id = None;
-                object.current_locations = vec![self.node_id.clone()];
-                set_object_create_timestamps(&mut object);
+                let object = self.metadata_object_for_recreated_path(&path, DfsObjectKind::File);
                 self.add_transient_object_metadata(object.clone())?;
                 transient_create = true;
                 object
@@ -3251,7 +3243,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         if object.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory { path });
         }
-        match self.read_local_object_with_state(&object.object_id, false)? {
+        match self.read_object_metadata_local_content_with_state(&object, false)? {
             NetworkedDfsReadOutcome::Found {
                 data: DfsReadData { bytes, .. },
                 ..
@@ -3282,12 +3274,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         if object.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory { path });
         }
-        match self.read_local_object_range_with_state(
-            &object.object_id,
-            offset,
-            max_bytes,
-            false,
-        )? {
+        match self.read_object_metadata_local_range_with_state(&object, offset, max_bytes, false)? {
             NetworkedDfsRangeReadOutcome::Found {
                 data: DfsReadRangeData { bytes, .. },
                 ..
@@ -3313,7 +3300,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         if object.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory { path });
         }
-        match self.open_local_current_object_stream_with_state(&object.object_id)? {
+        match self.open_local_object_metadata_stream_with_state(&object)? {
             NetworkedDfsReadStreamOutcome::Found(stream) => Ok(DfsPosixFileReadStream {
                 object_id: stream.data.object_id,
                 version: stream.data.version,
@@ -3346,12 +3333,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         if object.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory { path });
         }
-        match self.open_local_current_object_range_stream_with_state(
-            &object.object_id,
-            offset,
-            max_bytes,
-            0,
-        )? {
+        match self
+            .open_local_object_metadata_range_stream_with_state(&object, offset, max_bytes, 0)?
+        {
             NetworkedDfsRangeReadStreamOutcome::Found(stream) => Ok(DfsPosixFileRangeReadStream {
                 object_id: stream.data.object_id,
                 version: stream.data.version,
@@ -3766,8 +3750,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         &mut self,
         object: &DfsObjectMetadata,
     ) -> Result<NetworkedDfsReadOutcome> {
-        let mut object = object.clone();
-        self.apply_transient_remote_read_location_prunes(&mut object);
+        let mut object = self.current_read_object_metadata_or_path_object(object)?;
         let initial = self.read_object_metadata_local_if_current_location(&object)?;
         if !matches!(initial, NetworkedDfsReadOutcome::PendingReplication { .. }) {
             return Ok(initial);
@@ -3797,7 +3780,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     });
                 }
             }
-            self.apply_transient_remote_read_location_prunes(&mut object);
+            object = self.current_read_object_metadata_or_path_object(&object)?;
             let current = self.read_object_metadata_local_if_current_location(&object)?;
             if !matches!(current, NetworkedDfsReadOutcome::PendingReplication { .. }) {
                 return Ok(current);
@@ -3840,6 +3823,42 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     .min(POSIX_REMOTE_READ_IDLE_WAIT_MAX);
             }
         }
+    }
+
+    fn current_read_object_metadata_or_path_object(
+        &self,
+        path_object: &DfsObjectMetadata,
+    ) -> Result<DfsObjectMetadata> {
+        let memory_object = self.metadata.object(&path_object.object_id).cloned();
+        let backend_object = if let Some(backend) = self.metadata_backend.as_ref() {
+            backend.get_object(&path_object.object_id)?
+        } else {
+            None
+        };
+        let refreshed = match (memory_object.as_ref(), backend_object.as_ref()) {
+            (Some(memory_object), Some(backend_object)) => {
+                Some(self.resolve_authoritative_object_metadata(
+                    &path_object.object_id,
+                    Some(memory_object),
+                    Some(backend_object),
+                )?)
+            }
+            (Some(memory_object), None) => Some(memory_object.clone()),
+            (None, Some(backend_object)) => Some(backend_object.clone()),
+            (None, None) => None,
+        };
+        let mut object = match refreshed {
+            Some(refreshed)
+                if refreshed.version == path_object.version
+                    && refreshed.content_hash == path_object.content_hash =>
+            {
+                refreshed
+            }
+            _ => path_object.clone(),
+        };
+        object = self.object_metadata_with_receipt_locations(object)?;
+        self.apply_transient_remote_read_location_prunes(&mut object);
+        Ok(object)
     }
 
     fn read_object_metadata_local_if_current_location(
@@ -3891,7 +3910,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         if object.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory { path });
         }
-        match self.read_local_object_with_state(&object.object_id, false)? {
+        match self.read_object_metadata_local_content_with_state(&object, false)? {
             NetworkedDfsReadOutcome::Found { .. } => Ok(Vec::new()),
             NetworkedDfsReadOutcome::PendingReplication { .. } => self
                 .request_remote_object_read(&object.object_id)
@@ -3927,14 +3946,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             Some(object) if object.kind != DfsObjectKind::Tombstone => {
                 return Err(DfsPosixError::AlreadyExists { path: link_path });
             }
-            Some(object) => {
-                let mut object = object;
-                object.kind = DfsObjectKind::Symlink;
-                object.content_hash = None;
-                object.content_size_bytes = None;
-                object.link_target_object_id = None;
-                object.current_locations = vec![self.node_id.clone()];
-                set_object_create_timestamps(&mut object);
+            Some(_) => {
+                let object =
+                    self.metadata_object_for_recreated_path(&link_path, DfsObjectKind::Symlink);
                 self.add_transient_object_metadata(object.clone())?;
                 object
             }
@@ -6441,6 +6455,16 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             created_by_event_id: None,
             last_modified_by_event_id: None,
         }
+    }
+
+    fn metadata_object_for_recreated_path(
+        &self,
+        path: &str,
+        kind: DfsObjectKind,
+    ) -> DfsObjectMetadata {
+        let mut object = self.metadata_object_for_new_path(path, kind);
+        object.object_id = DfsObjectId::generate();
+        object
     }
 
     fn stat_object(&self, object: &DfsObjectMetadata) -> Result<DfsStat> {

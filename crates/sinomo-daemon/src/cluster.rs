@@ -4732,19 +4732,34 @@ impl sinomo_network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost<'_> {
         let endpoint = endpoint.clone();
         let request = request.clone();
         Box::pin(async move {
+            let started = Instant::now();
             let result =
                 send_cluster_relay_request_to_next_hop_async(&endpoint, &request, timeouts)
                     .await
                     .map_err(|error| daemon_host_network_error("cluster relay", error));
-            if matches!(result, Err(sinomo_network::NetworkError::Io { .. })) {
-                remember_relay_endpoint_command_connectivity_async(
-                    paths,
-                    runtime,
-                    endpoint,
-                    sinomo_network::ClusterConnectivityState::Degraded,
-                    None,
-                )
-                .await;
+            match &result {
+                Ok(_) => {
+                    let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    remember_relay_endpoint_command_connectivity_async(
+                        paths,
+                        runtime,
+                        endpoint,
+                        sinomo_network::ClusterConnectivityState::Healthy,
+                        Some(latency_ms),
+                    )
+                    .await;
+                }
+                Err(sinomo_network::NetworkError::Io { .. }) => {
+                    remember_relay_endpoint_command_connectivity_async(
+                        paths,
+                        runtime,
+                        endpoint,
+                        sinomo_network::ClusterConnectivityState::Degraded,
+                        None,
+                    )
+                    .await;
+                }
+                Err(_) => {}
             }
             result
         })

@@ -1022,7 +1022,7 @@ async fn relay_route_plan_cached(
             }
             Ok::<Vec<(NodeId, Vec<ClusterEndpointRecord>)>, NetworkError>(next_hops
                 .into_iter()
-                .map(|next_hop_id| {
+                .filter_map(|next_hop_id| {
                     let endpoints = cluster_relay_next_hop_endpoints_with_graph(
                         &paths,
                         &graph,
@@ -1030,7 +1030,7 @@ async fn relay_route_plan_cached(
                         &local_node_id,
                         &next_hop_id,
                     );
-                    (next_hop_id, endpoints)
+                    (!endpoints.is_empty()).then_some((next_hop_id, endpoints))
                 })
                 .collect::<Vec<_>>())
         })
@@ -1271,6 +1271,15 @@ pub fn cluster_relay_next_hops(
         next_hops =
             cluster_relay_degraded_next_hops(graph, state, local_node_id, target_node_id, excluded);
     }
+    if next_hops.is_empty() {
+        next_hops = cluster_relay_member_bridge_next_hops(
+            graph,
+            state,
+            local_node_id,
+            target_node_id,
+            excluded,
+        );
+    }
     retain_relay_candidates_with_best_member_bridge_evidence(state, &mut next_hops);
     next_hops
 }
@@ -1359,6 +1368,64 @@ fn cluster_relay_degraded_next_hops(
             .then_with(|| left.cmp(right))
     });
     candidates
+}
+
+fn cluster_relay_member_bridge_next_hops(
+    graph: &ClusterConnectivityGraph,
+    state: &ClusterBootstrapState,
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+    excluded: &[NodeId],
+) -> Vec<NodeId> {
+    let excluded = excluded.iter().collect::<BTreeSet<_>>();
+    let mut candidates = state
+        .members
+        .iter()
+        .filter(|member| {
+            member.node_id != *local_node_id
+                && member.node_id != *target_node_id
+                && !excluded.contains(&member.node_id)
+                && member.state.is_authorized()
+                && !relay_candidate_is_known_shadow_daemon(state, &member.node_id)
+                && member
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.as_str() == crate::DAEMON_MAIN_RUN_CAPABILITY)
+                && relay_candidate_member_bridge_rank(state, &member.node_id)
+                    < RELAY_CANDIDATE_NO_BRIDGE_EVIDENCE_RANK
+                && relay_member_has_usable_bridge_endpoint(graph, local_node_id, member)
+        })
+        .map(|member| member.node_id.clone())
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| {
+        (
+            relay_candidate_member_bridge_rank(state, candidate),
+            candidate.clone(),
+        )
+    });
+    candidates
+}
+
+fn relay_member_has_usable_bridge_endpoint(
+    graph: &ClusterConnectivityGraph,
+    local_node_id: &NodeId,
+    member: &ClusterMemberRecord,
+) -> bool {
+    let has_healthy_next_hop_endpoint = graph
+        .best_healthy_endpoint(local_node_id, &member.node_id)
+        .is_some();
+    member
+        .endpoints
+        .iter()
+        .filter(|endpoint| crate::locally_learned_bridge_route_endpoint(endpoint))
+        .any(|endpoint| {
+            cluster_relay_next_hop_endpoint_is_usable(
+                graph,
+                local_node_id,
+                endpoint,
+                has_healthy_next_hop_endpoint,
+            )
+        })
 }
 
 pub fn cluster_relay_next_hops_with_direct_target_fallback(
@@ -1495,6 +1562,7 @@ pub fn cluster_relay_next_hop_endpoints_with_graph(
             .filter(|endpoint| {
                 cluster_relay_next_hop_endpoint_is_usable(
                     graph,
+                    source_node_id,
                     *endpoint,
                     has_healthy_next_hop_endpoint,
                 )
@@ -1503,12 +1571,13 @@ pub fn cluster_relay_next_hop_endpoints_with_graph(
             push_unique_cluster_endpoint(&mut endpoints, &mut seen, endpoint.clone());
         }
     }
-    for endpoint in crate::cluster_main_daemon_command_targets(paths, state)
+    for endpoint in crate::cluster_main_daemon_command_endpoint_candidates(paths, state)
         .into_iter()
         .filter(|endpoint| endpoint.node_id == *node_id)
         .filter(|endpoint| {
             cluster_relay_next_hop_endpoint_is_usable(
                 graph,
+                source_node_id,
                 endpoint,
                 has_healthy_next_hop_endpoint,
             )
@@ -1521,13 +1590,19 @@ pub fn cluster_relay_next_hop_endpoints_with_graph(
 
 fn cluster_relay_next_hop_endpoint_is_usable(
     graph: &ClusterConnectivityGraph,
+    source_node_id: &NodeId,
     endpoint: &ClusterEndpointRecord,
     has_healthy_next_hop_endpoint: bool,
 ) -> bool {
     match graph.state_for_endpoint(endpoint) {
         Some(crate::ClusterConnectivityState::Healthy) => true,
         Some(crate::ClusterConnectivityState::Degraded) => !has_healthy_next_hop_endpoint,
-        Some(crate::ClusterConnectivityState::Unreachable) => false,
+        Some(crate::ClusterConnectivityState::Unreachable) => {
+            !has_healthy_next_hop_endpoint
+                && graph
+                    .reachable_targets(source_node_id)
+                    .contains(&endpoint.node_id)
+        }
         None => !has_healthy_next_hop_endpoint,
     }
 }
@@ -2086,6 +2161,118 @@ mod tests {
     }
 
     #[test]
+    fn relay_fallback_uses_member_bridge_when_graph_has_no_next_hop() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_relay_stale_graph_member_bridge")
+            .expect("cluster");
+        let local = nid("node_relay_stale_graph_local");
+        let leaf = nid("node_relay_stale_graph_leaf");
+        let bridge = nid("node_relay_stale_graph_bridge");
+        let target = nid("node_relay_stale_graph_target");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "relay stale graph member bridge",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut leaf_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            leaf,
+            "leaf",
+            "pk-leaf",
+            now,
+        );
+        leaf_member.capabilities = main_daemon_capabilities(&leaf_member.role);
+        leaf_member.allowed_capabilities = leaf_member.capabilities.clone();
+        leaf_member.endpoints = vec![
+            crate::daemon_lan_endpoint(&leaf_member.node_id, "node6:21353".to_string(), 5),
+            crate::daemon_lan_endpoint(&leaf_member.node_id, "172.24.0.4:21353".to_string(), 20),
+        ];
+        state.members.push(leaf_member);
+        let mut bridge_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            bridge.clone(),
+            "bridge",
+            "pk-bridge",
+            now,
+        );
+        bridge_member.capabilities = main_daemon_capabilities(&bridge_member.role);
+        bridge_member.allowed_capabilities = bridge_member.capabilities.clone();
+        bridge_member.endpoints = vec![
+            crate::daemon_lan_endpoint(&bridge, "node4:21353".to_string(), 5),
+            crate::daemon_lan_endpoint(&bridge, "172.23.0.3:21353".to_string(), 20),
+            crate::daemon_lan_endpoint(&bridge, "172.24.0.2:21353".to_string(), 20),
+        ];
+        state.members.push(bridge_member);
+        let graph = graph(Vec::new());
+
+        let next_hops = cluster_relay_next_hops(&graph, &state, &local, &target, &[]);
+
+        assert_eq!(
+            next_hops,
+            vec![bridge],
+            "a stale local graph should still relay through a stable hostname bridge candidate"
+        );
+    }
+
+    #[test]
+    fn relay_fallback_skips_member_bridge_when_local_pair_is_unreachable() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_relay_unreachable_member_bridge")
+            .expect("cluster");
+        let local = nid("node_relay_unreachable_bridge_local");
+        let bridge = nid("node_relay_unreachable_bridge_bridge");
+        let target = nid("node_relay_unreachable_bridge_target");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "relay unreachable member bridge",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut bridge_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            bridge.clone(),
+            "bridge",
+            "pk-bridge",
+            now,
+        );
+        bridge_member.capabilities = main_daemon_capabilities(&bridge_member.role);
+        bridge_member.allowed_capabilities = bridge_member.capabilities.clone();
+        let stale_endpoint = crate::daemon_lan_endpoint(&bridge, "node4:21353".to_string(), 5);
+        bridge_member.endpoints = vec![
+            stale_endpoint.clone(),
+            crate::daemon_lan_endpoint(&bridge, "172.23.0.3:21353".to_string(), 20),
+            crate::daemon_lan_endpoint(&bridge, "172.24.0.2:21353".to_string(), 20),
+        ];
+        state.members.push(bridge_member);
+        let graph = ClusterConnectivityGraph::from_records(
+            local.clone(),
+            [crate::cluster_connectivity_record(
+                &state,
+                &stale_endpoint,
+                ClusterConnectivityState::Unreachable,
+                None,
+                3,
+                None,
+                Some("stale bridge endpoint failed".to_string()),
+                now,
+                60,
+            )],
+        );
+
+        let next_hops = cluster_relay_next_hops(&graph, &state, &local, &target, &[]);
+
+        assert!(
+            next_hops.is_empty(),
+            "a member bridge with only unreachable local-pair evidence must not be selected"
+        );
+    }
+
+    #[test]
     fn relay_uses_healthy_graph_neighbor_when_member_capability_is_stale() {
         let now = OffsetDateTime::now_utc();
         let cluster_id = ClusterId::from_legacy_named("cluster_relay_graph_neighbor_stale_member")
@@ -2533,7 +2720,138 @@ mod tests {
     }
 
     #[test]
-    fn relay_next_hop_endpoints_uses_degraded_graph_endpoint_when_fallbacks_are_unreachable() {
+    fn relay_next_hop_endpoints_keep_all_usable_main_daemon_candidates() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-relay-endpoint-dual-home");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_relay_endpoint_dual_home").expect("cluster");
+        let local = nid("node_relay_endpoint_dual_home_local");
+        let next_hop = nid("node_relay_endpoint_dual_home_next");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "relay endpoint dual home",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let seg_a_endpoint =
+            crate::daemon_lan_endpoint(&next_hop, "172.24.0.4:21353".to_string(), 5);
+        let seg_b_endpoint =
+            crate::daemon_lan_endpoint(&next_hop, "172.23.0.2:21353".to_string(), 10);
+        let mut next_hop_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            next_hop.clone(),
+            "next-hop",
+            "pk-next-hop",
+            now,
+        );
+        next_hop_member.capabilities = main_daemon_capabilities(&next_hop_member.role);
+        next_hop_member.allowed_capabilities = next_hop_member.capabilities.clone();
+        next_hop_member.endpoints = vec![seg_b_endpoint.clone(), seg_a_endpoint.clone()];
+        state.members.push(next_hop_member);
+        let graph = ClusterConnectivityGraph::from_records(local.clone(), []);
+
+        let endpoints =
+            cluster_relay_next_hop_endpoints_with_graph(&paths, &graph, &state, &local, &next_hop);
+        let addresses = endpoints
+            .iter()
+            .map(|endpoint| endpoint.address.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            addresses,
+            BTreeSet::from([
+                seg_a_endpoint.address.as_str(),
+                seg_b_endpoint.address.as_str()
+            ]),
+            "relay next-hop dialing must keep every usable address for a dual-homed bridge"
+        );
+    }
+
+    #[test]
+    fn relay_next_hop_endpoints_keep_member_endpoint_when_pair_is_reachable() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-relay-endpoint-reachable-pair");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_relay_endpoint_reachable_pair").expect("cluster");
+        let local = nid("node_relay_endpoint_reachable_pair_local");
+        let next_hop = nid("node_relay_endpoint_reachable_pair_next");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "relay endpoint reachable pair",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let stale_member_endpoint =
+            crate::daemon_lan_endpoint(&next_hop, "node3:21353".to_string(), 5);
+        let observed_reachable_endpoint =
+            crate::daemon_lan_endpoint(&next_hop, "172.24.0.3:21353".to_string(), 1);
+        let mut next_hop_member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            next_hop.clone(),
+            "next-hop",
+            "pk-next-hop",
+            now,
+        );
+        next_hop_member.capabilities = main_daemon_capabilities(&next_hop_member.role);
+        next_hop_member.allowed_capabilities = next_hop_member.capabilities.clone();
+        next_hop_member.endpoints = vec![stale_member_endpoint.clone()];
+        state.members.push(next_hop_member);
+        let graph = ClusterConnectivityGraph::from_records(
+            local.clone(),
+            [
+                crate::cluster_connectivity_record(
+                    &state,
+                    &observed_reachable_endpoint,
+                    ClusterConnectivityState::Degraded,
+                    Some(8),
+                    1,
+                    Some("recent relay hop".to_string()),
+                    None,
+                    now,
+                    60,
+                ),
+                crate::cluster_connectivity_record(
+                    &state,
+                    &stale_member_endpoint,
+                    ClusterConnectivityState::Unreachable,
+                    None,
+                    1,
+                    None,
+                    Some("stale before reconnect".to_string()),
+                    now,
+                    60,
+                ),
+            ],
+        );
+
+        let endpoints =
+            cluster_relay_next_hop_endpoints_with_graph(&paths, &graph, &state, &local, &next_hop);
+
+        assert_eq!(
+            endpoints
+                .iter()
+                .map(|endpoint| endpoint.address.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                observed_reachable_endpoint.address.as_str(),
+                stale_member_endpoint.address.as_str()
+            ],
+            "relay forwarding should keep a member endpoint when the next-hop pair is reachable"
+        );
+    }
+
+    #[test]
+    fn relay_next_hop_endpoints_prefers_degraded_graph_endpoint_before_stale_fallback() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-relay-endpoint-degraded-graph");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -2602,8 +2920,11 @@ mod tests {
                 .iter()
                 .map(|endpoint| endpoint.address.as_str())
                 .collect::<Vec<_>>(),
-            vec![reachable_graph_endpoint.address.as_str()],
-            "relay should keep a concrete graph-observed endpoint for a reachable next hop even when member fallbacks are stale-unreachable"
+            vec![
+                reachable_graph_endpoint.address.as_str(),
+                stale_member_endpoint.address.as_str()
+            ],
+            "relay should keep a concrete graph-observed endpoint first while retaining member fallbacks for a reachable next-hop pair"
         );
     }
 

@@ -949,6 +949,7 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
         runtime,
         data_dir,
         cluster_paths.clone(),
+        daemon_dfs_blocking_peer_transport_on_runtime(runtime),
         daemon_dfs_async_peer_transport(runtime),
         daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(runtime)),
         daemon_dfs_maintenance_tick_options(),

@@ -77,6 +77,23 @@ impl SifsFileManagerBackend {
             .map_err(|_| "SIFS service lock is poisoned".to_string())
     }
 
+    fn refresh_service_endpoint_targets(
+        &self,
+        service: &mut NetworkedDfsService<DfsEndpointTransport>,
+    ) {
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        if !cluster_paths.state.exists() {
+            return;
+        }
+        let Ok(state) = network::read_cluster_state_without_kv(&cluster_paths) else {
+            return;
+        };
+        service.refresh_endpoint_targets(network::cluster_dfs_protocol_targets(
+            &cluster_paths,
+            &state,
+        ));
+    }
+
     pub(crate) fn publish_metadata_after_mutation(&self) {
         if let Ok(mut service) = self.lock_service() {
             if service.flush_deferred_content_durability().is_err() {
@@ -98,6 +115,7 @@ impl SifsFileManagerBackend {
     pub(crate) fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
         service
             .posix_read_file_distributed(&path)
             .map_err(|error| format!("cannot read SIFS file {path}: {error}"))
@@ -106,6 +124,7 @@ impl SifsFileManagerBackend {
     pub(crate) fn dfs_stat(&self, path: &str) -> Result<DfsStat, String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
         service
             .posix_stat_distributed(&path)
             .map_err(|error| format!("cannot inspect {path}: {error}"))
@@ -150,6 +169,7 @@ impl SifsFileManagerBackend {
         if !normalized.is_empty() {
             match self.lock_service() {
                 Ok(mut service) => {
+                    self.refresh_service_endpoint_targets(&mut service);
                     let read_paths = normalized
                         .iter()
                         .map(|(_, path)| path.clone())
@@ -258,7 +278,7 @@ impl SifsFileManagerBackend {
     ) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
-        let options = sifs_write_options(&service, &self.replica_candidates);
+        let options = sifs_deferred_publish_write_options(&service, &self.replica_candidates);
         service
             .posix_write_file_with_known_parent_deferred_local_replay(&path, bytes, options)
             .map(|_| ())
@@ -941,9 +961,26 @@ fn sifs_write_options(
     sifs_write_options_for_candidates(candidates)
 }
 
+fn sifs_deferred_publish_write_options(
+    service: &NetworkedDfsService<DfsEndpointTransport>,
+    replica_candidates: &[NodeId],
+) -> DfsWriteOptions {
+    let mut candidates = replica_candidates.to_vec();
+    if !candidates.contains(service.node_id()) {
+        candidates.insert(0, service.node_id().clone());
+    }
+    sifs_deferred_publish_write_options_for_candidates(candidates)
+}
+
 fn sifs_write_options_for_candidates(candidates: Vec<NodeId>) -> DfsWriteOptions {
     let mut options = DfsWriteOptions::replicated_eventual(candidates);
     options.foreground_replica_repair = false;
+    options
+}
+
+fn sifs_deferred_publish_write_options_for_candidates(candidates: Vec<NodeId>) -> DfsWriteOptions {
+    let mut options = sifs_write_options_for_candidates(candidates);
+    options.wait_for_commit = false;
     options
 }
 
@@ -1131,6 +1168,22 @@ mod tests {
         assert!(
             !options.foreground_replica_repair,
             "normal SIFS writes should not wait for the async replica repair path"
+        );
+    }
+
+    #[test]
+    fn sifs_deferred_publish_write_options_do_not_wait_for_commit() {
+        let local = NodeId::from_legacy_named("node_sifs_deferred_policy_local").expect("node");
+        let remote = NodeId::from_legacy_named("node_sifs_deferred_policy_remote").expect("node");
+
+        let options = sifs_deferred_publish_write_options_for_candidates(vec![local, remote]);
+
+        assert_eq!(options.policy.min_commit_replicas, 1);
+        assert_eq!(options.policy.desired_replicas, 2);
+        assert!(!options.wait_for_commit);
+        assert!(
+            !options.foreground_replica_repair,
+            "deferred publish writes should not block on the async replica repair path"
         );
     }
 

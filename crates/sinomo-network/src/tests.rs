@@ -13816,6 +13816,80 @@ fn advertised_hostname_outranks_opportunistic_private_ip_for_docker_routes() {
 }
 
 #[test]
+fn dfs_protocol_targets_prefer_healthy_bridge_ip_over_degraded_hostname() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-dfs-healthy-bridge-before-hostname");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_dfs_bridge_before_hostname").expect("cluster");
+    let local = NodeId::from_legacy_named("node_dfs_bridge_before_hostname_local").expect("local");
+    let remote =
+        NodeId::from_legacy_named("node_dfs_bridge_before_hostname_remote").expect("remote");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "dfs bridge before hostname",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let stable_hostname = daemon_lan_endpoint(&remote, "node1:21353".to_string(), 5);
+    let bridge_ip = daemon_lan_endpoint(&remote, "172.25.0.2:21353".to_string(), 20);
+    let mut member =
+        ClusterMemberRecord::local_voter(cluster_id, remote, "remote", "pk-remote", now);
+    member.capabilities = main_daemon_capabilities(&member.role);
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![stable_hostname.clone(), bridge_ip.clone()];
+    state.members.push(member);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &local,
+        vec![
+            cluster_connectivity_record(
+                &state,
+                &stable_hostname,
+                ClusterConnectivityState::Degraded,
+                None,
+                1,
+                None,
+                Some("relay denied".to_string()),
+                now,
+                60,
+            ),
+            cluster_connectivity_record(
+                &state,
+                &bridge_ip,
+                ClusterConnectivityState::Healthy,
+                Some(1),
+                0,
+                Some("ok".to_string()),
+                None,
+                now,
+                60,
+            ),
+        ],
+    )
+    .expect("connectivity records");
+
+    let dfs_targets = cluster_dfs_protocol_targets(&paths, &state);
+    let ordered_endpoint_ids = dfs_targets
+        .iter()
+        .filter(|endpoint| endpoint.node_id == bridge_ip.node_id)
+        .map(|endpoint| endpoint.endpoint_id.clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        ordered_endpoint_ids,
+        vec![bridge_ip.endpoint_id, stable_hostname.endpoint_id],
+        "DFS should try the proven bridge path first, then retain the hostname fallback"
+    );
+}
+
+#[test]
 fn connectivity_sort_uses_lan_public_iroh_fallback_order() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-lan-public-iroh-sort");
     let data_dir = SinomoDataDir::new(&root);
