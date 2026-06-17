@@ -3,6 +3,9 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::digest;
 use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
+use sinomo_config::{
+    CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_SEARCH_ROUTE, CONFIG_SET_ROUTE,
+};
 use sinomo_core::{ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState};
 use sinomo_kv::{
     CLUSTER_KV_RANGE_PREFIX_ROUTE, CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_TXN_ROUTE,
@@ -323,6 +326,7 @@ pub fn authorize_authenticated_daemon_command(
         route if route == sinomo_dfs::DFS_EXPOSE_CONFIG_ROUTE => {
             authenticated.signer.can_run_local_command()
         }
+        route if is_config_rpc_route(route) => authenticated.signer.can_run_local_command(),
         route if route == sinomo_dfs::DFS_STATUS_ROUTE => matches!(
             authenticated.signer,
             DaemonSignerAuthority::Local
@@ -487,6 +491,13 @@ pub fn authorize_authenticated_daemon_command(
 
 fn is_agent_session_rpc_route(route: &str) -> bool {
     route.strip_prefix("/agent/session/").is_some()
+}
+
+fn is_config_rpc_route(route: &str) -> bool {
+    route == CONFIG_CATALOG_ROUTE
+        || route == CONFIG_SEARCH_ROUTE
+        || route == CONFIG_GET_ROUTE
+        || route == CONFIG_SET_ROUTE
 }
 
 fn is_local_sandbox_rpc_route(route: &str) -> bool {
@@ -1161,6 +1172,31 @@ mod tests {
             DaemonSignerAuthority::StatusProbe,
         );
         assert!(authorize_authenticated_daemon_command(&cluster_health).is_err());
+    }
+
+    #[test]
+    fn config_routes_authorize_only_local_signer() {
+        for route in [
+            CONFIG_CATALOG_ROUTE,
+            CONFIG_SEARCH_ROUTE,
+            CONFIG_GET_ROUTE,
+            CONFIG_SET_ROUTE,
+        ] {
+            let authenticated =
+                authenticated_command(route.to_string(), DaemonSignerAuthority::Local);
+            authorize_authenticated_daemon_command(&authenticated)
+                .expect("local clients must be able to use daemon config service routes");
+
+            for signer in [
+                DaemonSignerAuthority::Voter,
+                DaemonSignerAuthority::Member,
+                DaemonSignerAuthority::JoinCandidate,
+                DaemonSignerAuthority::StatusProbe,
+            ] {
+                let authenticated = authenticated_command(route.to_string(), signer);
+                assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+            }
+        }
     }
 
     #[test]
