@@ -17,19 +17,18 @@ use sinomo_core::{
 };
 use sinomo_events::{EventId, EventStore, InMemoryEventStore, ReplayQuery, SessionId};
 use sinomo_kv::{
-    CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, CLUSTER_KV_RANGE_PREFIX_ROUTE, CLUSTER_KV_SNAPSHOT_ROUTE,
-    CLUSTER_KV_TXN_ROUTE, CLUSTER_KV_WATCH_DEFERRED_CURSOR_MAX_REVISION_LAG,
-    CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_RPC_CATEGORY, CLUSTER_RAFT_VOTE_ROUTE,
-    ClusterKvRaftCommandStorage, ClusterKvRaftLeaderElectionOptions,
-    ClusterKvRaftUncommittedAppend, ClusterKvWatchAllocatorState, ClusterKvWatchCancelRequest,
-    ClusterKvWatchCancelResponse, ClusterKvWatchDrainRequest, ClusterKvWatchEventsRequest,
-    ClusterKvWatchEventsResponse, ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration,
-    ClusterRaftAppendRequest, ClusterRaftAppendResponse, ClusterRaftVoteRequest,
-    ClusterRaftVoteResponse, InProcessKvStore, KvCommand, KvCompare, KvEntry, KvError, KvEventKind,
-    KvOp, KvOpResponse, KvRevision, KvSnapshot, KvTxn, LeaseId, MAX_CLUSTER_KV_ACTIVE_WATCHES,
-    MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS, MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES,
-    MAX_CLUSTER_KV_WATCH_EVENTS, RaftAppendEntriesRequest, RaftAppendEntriesResponse,
-    RaftRequestVoteRequest, RaftSnapshot,
+    CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_TXN_ROUTE,
+    CLUSTER_KV_WATCH_DEFERRED_CURSOR_MAX_REVISION_LAG, CLUSTER_RAFT_APPEND_ROUTE,
+    CLUSTER_RAFT_RPC_CATEGORY, CLUSTER_RAFT_VOTE_ROUTE, ClusterKvRaftCommandStorage,
+    ClusterKvRaftLeaderElectionOptions, ClusterKvRaftUncommittedAppend,
+    ClusterKvWatchAllocatorState, ClusterKvWatchCancelRequest, ClusterKvWatchCancelResponse,
+    ClusterKvWatchDrainRequest, ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse,
+    ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration, ClusterRaftAppendRequest,
+    ClusterRaftAppendResponse, ClusterRaftVoteRequest, ClusterRaftVoteResponse, InProcessKvStore,
+    KvCommand, KvCompare, KvEntry, KvError, KvEventKind, KvOp, KvOpResponse, KvRevision,
+    KvSnapshot, KvTxn, LeaseId, MAX_CLUSTER_KV_ACTIVE_WATCHES, MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+    MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES, MAX_CLUSTER_KV_WATCH_EVENTS, RaftAppendEntriesRequest,
+    RaftAppendEntriesResponse, RaftRequestVoteRequest, RaftSnapshot,
 };
 use sinomo_node::NodeId;
 use std::io::Write;
@@ -1784,7 +1783,7 @@ fn async_object_frame_helpers_round_trip_binary_payloads() {
         let writer = tokio::spawn(async move {
             write_object_frame_async(
                 &mut client,
-                &DaemonControlRequest::new("RPC /test/status"),
+                &ObjectRpcRequest::encode_body("/test/status", "test", &()).expect("request"),
                 ObjectFrameIoOptions::none(),
             )
             .await
@@ -1795,7 +1794,7 @@ fn async_object_frame_helpers_round_trip_binary_payloads() {
                 .await
                 .expect("read frame");
         writer.await.expect("writer task");
-        assert_eq!(request.command, "RPC /test/status");
+        assert_eq!(request.route, "/test/status");
     });
 }
 
@@ -1816,8 +1815,7 @@ fn async_daemon_control_client_round_trips_object_frames() {
                 read_object_frame_async(&mut stream, 4096, ObjectFrameIoOptions::none())
                     .await
                     .expect("read request");
-            assert_eq!(request.command, "RPC /test/status");
-            assert_eq!(request.rpc.as_ref().expect("rpc").route, "/test/status");
+            assert_eq!(request.route, "/test/status");
             let rpc_response = ObjectRpcResponse::encode_body("/test/status", &"OK".to_string())
                 .expect("rpc response");
             write_object_frame_async(&mut stream, &rpc_response, ObjectFrameIoOptions::none())
@@ -1828,7 +1826,6 @@ fn async_daemon_control_client_round_trips_object_frames() {
             ObjectRpcRequest::encode_body("/test/status", "test", &()).expect("rpc request");
         let response = send_daemon_rpc_to_address_async(
             &address,
-            "RPC /test/status",
             None,
             &request,
             DaemonRpcTimeouts::connect_only(Duration::from_secs(1)),
@@ -1857,11 +1854,7 @@ fn async_cluster_endpoint_rpc_uses_tcp_transport() {
                 read_object_frame_async(&mut stream, 4096, ObjectFrameIoOptions::none())
                     .await
                     .expect("read request");
-            assert_eq!(request.command, "RPC /test/endpoint-async");
-            assert_eq!(
-                request.rpc.as_ref().expect("rpc").route,
-                "/test/endpoint-async"
-            );
+            assert_eq!(request.route, "/test/endpoint-async");
             let rpc_response =
                 ObjectRpcResponse::encode_body("/test/endpoint-async", &"OK".to_string())
                     .expect("rpc response");
@@ -1883,7 +1876,6 @@ fn async_cluster_endpoint_rpc_uses_tcp_transport() {
             ObjectRpcRequest::encode_body("/test/endpoint-async", "test", &()).expect("request");
         let response = send_daemon_rpc_to_cluster_endpoint_async(
             &endpoint,
-            "RPC /test/endpoint-async",
             None,
             &request,
             DaemonRpcTimeouts::connect_only(Duration::from_secs(1)),
@@ -1914,7 +1906,7 @@ fn async_daemon_control_client_timeout_is_idle_not_total_transfer() {
                 read_object_frame_async(&mut stream, 4096, ObjectFrameIoOptions::none())
                     .await
                     .expect("read request");
-            assert_eq!(request.command, "RPC /test/slow");
+            assert_eq!(request.route, "/test/slow");
             let rpc_response = ObjectRpcResponse::encode_body("/test/slow", &"OK".to_string())
                 .expect("rpc response");
             let mut response_frame = Vec::new();
@@ -1931,7 +1923,6 @@ fn async_daemon_control_client_timeout_is_idle_not_total_transfer() {
             ObjectRpcRequest::encode_body("/test/slow", "test", &()).expect("rpc request");
         let response = send_daemon_rpc_to_address_async(
             &address,
-            "RPC /test/slow",
             None,
             &request,
             DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(25)),
@@ -1960,7 +1951,7 @@ fn async_daemon_control_client_without_idle_timeout_allows_response_gap() {
                 read_object_frame_async(&mut stream, 4096, ObjectFrameIoOptions::none())
                     .await
                     .expect("read request");
-            assert_eq!(request.command, "RPC /test/no-idle-timeout");
+            assert_eq!(request.route, "/test/no-idle-timeout");
             tokio::time::sleep(Duration::from_millis(75)).await;
             let rpc_response =
                 ObjectRpcResponse::encode_body("/test/no-idle-timeout", &"OK".to_string())
@@ -1973,7 +1964,6 @@ fn async_daemon_control_client_without_idle_timeout_allows_response_gap() {
             .expect("rpc request");
         let response = send_daemon_rpc_to_address_async(
             &address,
-            "RPC /test/no-idle-timeout",
             None,
             &request,
             DaemonRpcTimeouts::connect_only(Duration::from_millis(20)),
@@ -2002,14 +1992,13 @@ fn async_daemon_control_client_explicit_idle_timeout_still_fails_on_stall() {
                 read_object_frame_async(&mut stream, 4096, ObjectFrameIoOptions::none())
                     .await
                     .expect("read request");
-            assert_eq!(request.command, "RPC /test/idle-timeout");
+            assert_eq!(request.route, "/test/idle-timeout");
             tokio::time::sleep(Duration::from_millis(75)).await;
         });
         let request =
             ObjectRpcRequest::encode_body("/test/idle-timeout", "test", &()).expect("rpc request");
         let error = send_daemon_rpc_to_address_async(
             &address,
-            "RPC /test/idle-timeout",
             None,
             &request,
             DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(20)),
@@ -2047,7 +2036,7 @@ fn async_daemon_rpc_client_rejects_legacy_wrapped_response() {
                 read_object_frame_async(&mut stream, 4096, ObjectFrameIoOptions::none())
                     .await
                     .expect("read request");
-            assert_eq!(request.command, "RPC /test/status");
+            assert_eq!(request.route, "/test/status");
             write_object_frame_async(
                 &mut stream,
                 &LegacyDaemonControlResponse {
@@ -2063,7 +2052,6 @@ fn async_daemon_rpc_client_rejects_legacy_wrapped_response() {
             ObjectRpcRequest::encode_body("/test/status", "test", &()).expect("rpc request");
         let error = send_daemon_rpc_to_address_async(
             &address,
-            "RPC /test/status",
             None,
             &request,
             DaemonRpcTimeouts::connect_only(Duration::from_secs(1)),
@@ -2088,7 +2076,6 @@ fn iroh_daemon_rpc_async_reports_missing_transport_feature() {
     let error = runtime
         .block_on(send_daemon_rpc_to_address_async(
             "iroh://example",
-            "daemon/status",
             None,
             &request,
             DaemonRpcTimeouts::connect_only(Duration::from_millis(1)),
@@ -2777,8 +2764,7 @@ fn iroh_daemon_proxy_byte_budget_releases_permits() {
 fn iroh_daemon_proxy_error_frame_preserves_rpc_route_and_budget() {
     let request =
         ObjectRpcRequest::encode_body("/test/proxy-error", "test", &()).expect("rpc request");
-    let control = DaemonControlRequest::rpc("RPC /test/proxy-error", request);
-    let payload = encode_object_frame_to_vec(&control).expect("control frame");
+    let payload = encode_object_frame_to_vec(&request).expect("control frame");
 
     let route = crate::roaming::iroh_proxy_route_hint(&payload);
     assert_eq!(route, "/test/proxy-error");
@@ -2877,23 +2863,12 @@ fn iroh_daemon_response_retry_is_limited_to_idempotent_routes() {
     let upload_chunk =
         ObjectRpcRequest::encode_body(ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE, ROLLOUT_RPC_CATEGORY, &())
             .expect("upload chunk request");
-    assert!(
-        crate::roaming::iroh_daemon_control_request_allows_response_retry(
-            &DaemonControlRequest::rpc(
-                format!("RPC {ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE}"),
-                upload_chunk
-            )
-        )
-    );
+    assert!(crate::roaming::iroh_daemon_control_request_allows_response_retry(&upload_chunk));
 
     let range = object_rpc_request_from_kv_payload(
         sinomo_kv::cluster_kv_range_prefix_rpc_payload("/").expect("range request"),
     );
-    assert!(
-        crate::roaming::iroh_daemon_control_request_allows_response_retry(
-            &DaemonControlRequest::rpc(format!("RPC {CLUSTER_KV_RANGE_PREFIX_ROUTE}"), range)
-        )
-    );
+    assert!(crate::roaming::iroh_daemon_control_request_allows_response_retry(&range));
 
     for route in [
         ROLLOUT_BINARY_ROUTE,
@@ -2905,9 +2880,7 @@ fn iroh_daemon_response_retry_is_limited_to_idempotent_routes() {
         let request =
             ObjectRpcRequest::encode_body(route, ROLLOUT_RPC_CATEGORY, &()).expect("rpc request");
         assert!(
-            !crate::roaming::iroh_daemon_control_request_allows_response_retry(
-                &DaemonControlRequest::rpc(format!("RPC {route}"), request)
-            ),
+            !crate::roaming::iroh_daemon_control_request_allows_response_retry(&request),
             "{route} should not be retried after the remote may have accepted the request"
         );
     }
@@ -7008,8 +6981,7 @@ async fn iroh_daemon_proxy_round_trips_rpc_request() {
         let request: crate::DaemonControlRequest =
             crate::read_object_frame_blocking(&mut stream, crate::IROH_DAEMON_COMMAND_MAX_BYTES)
                 .expect("read daemon fixture request");
-        assert_eq!(request.command, "RPC /test/ping");
-        assert_eq!(request.rpc.as_ref().expect("rpc").route, "/test/ping");
+        assert_eq!(request.route, "/test/ping");
         let rpc_response = crate::ObjectRpcResponse::encode_body("/test/ping", &"PONG".to_string())
             .expect("rpc response");
         crate::write_object_frame_blocking(&mut stream, &rpc_response)
@@ -7032,7 +7004,6 @@ async fn iroh_daemon_proxy_round_trips_rpc_request() {
     let request = ObjectRpcRequest::encode_body("/test/ping", "test", &()).expect("rpc request");
     let response = send_daemon_rpc_to_cluster_endpoint_async(
         &proxy.endpoint(),
-        "RPC /test/ping",
         None,
         &request,
         DaemonRpcTimeouts::connect_only(std::time::Duration::from_secs(5)),

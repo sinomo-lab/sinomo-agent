@@ -144,8 +144,7 @@ use sinomo_runtime::daemon::{
 };
 #[cfg(test)]
 use sinomo_runtime::daemon::{
-    DaemonLock, daemon_rpc_command,
-    handle_daemon_rollout_build_request as daemon_handle_daemon_rollout_build_request,
+    DaemonLock, handle_daemon_rollout_build_request as daemon_handle_daemon_rollout_build_request,
     handle_daemon_sandbox_http_fetch as daemon_handle_daemon_sandbox_http_fetch,
 };
 #[cfg(not(windows))]

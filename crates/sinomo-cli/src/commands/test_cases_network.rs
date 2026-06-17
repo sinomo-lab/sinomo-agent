@@ -7,7 +7,7 @@
 use sinomo_runtime::core::{
     ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
 };
-use sinomo_runtime::daemon::{daemon_rpc_command, sign_daemon_rpc_request_for_local_node};
+use sinomo_runtime::daemon::sign_daemon_rpc_request_for_local_node;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::NodeId;
@@ -171,7 +171,6 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                             endpoint.node_id
                         ))
                     })?;
-                let request_command = daemon_rpc_command(&request.route);
                 jobs.push(NetworkPingJob {
                     target_node_id: endpoint.node_id.clone(),
                     endpoint: endpoint.clone(),
@@ -181,7 +180,6 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     nonce,
                     request,
                     request_auth,
-                    request_command,
                     route_mode: route_mode.clone(),
                     runtime: runtime_handle.clone(),
                     paths: cluster_paths.clone(),
@@ -560,7 +558,6 @@ struct NetworkPingJob {
     response_payload_bytes: usize,
     request: network::ObjectRpcRequest,
     request_auth: Vec<u8>,
-    request_command: String,
     route_mode: String,
     runtime: tokio::runtime::Handle,
     paths: ClusterPaths,
@@ -609,8 +606,6 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
         &job.endpoint,
         &job.request,
         &job.request_auth,
-        &job.request_command,
-        &daemon_rpc_command(network::CLUSTER_RELAY_ROUTE),
         network::ClusterSignedEndpointRpcOptions {
             timeouts: network::DaemonRpcTimeouts::connect_and_idle(job.timeout),
         },
@@ -677,7 +672,6 @@ impl network::ClusterSignedEndpointRpcAsyncHost for NetworkPingEndpointRpcHost {
         _endpoint: &'a ClusterEndpointRecord,
         _request: &'a network::ObjectRpcRequest,
         _request_auth: &'a [u8],
-        _request_command: &'a str,
         _timeouts: network::DaemonRpcTimeouts,
     ) -> network::ClusterSignedEndpointRpcFuture<'a, Option<network::ObjectRpcResponse>> {
         Box::pin(async { Ok(None) })
@@ -708,7 +702,6 @@ impl network::ClusterSignedEndpointRpcAsyncHost for NetworkPingEndpointRpcHost {
     fn send_signed_endpoint_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
-        command: &'a str,
         auth: &'a [u8],
         request: &'a network::ObjectRpcRequest,
         timeouts: network::DaemonRpcTimeouts,
@@ -716,7 +709,6 @@ impl network::ClusterSignedEndpointRpcAsyncHost for NetworkPingEndpointRpcHost {
         Box::pin(async move {
             network::send_daemon_rpc_to_cluster_endpoint_async(
                 endpoint,
-                command,
                 Some(auth),
                 request,
                 timeouts,
@@ -730,8 +722,6 @@ impl network::ClusterSignedEndpointRpcAsyncHost for NetworkPingEndpointRpcHost {
         endpoint: &'a ClusterEndpointRecord,
         request: &'a network::ObjectRpcRequest,
         request_auth: &'a [u8],
-        request_command: &'a str,
-        relay_command: &'a str,
         timeouts: network::DaemonRpcTimeouts,
     ) -> network::ClusterSignedEndpointRpcFuture<'a, Option<network::ObjectRpcResponse>> {
         let runtime = self.runtime.clone();
@@ -745,8 +735,6 @@ impl network::ClusterSignedEndpointRpcAsyncHost for NetworkPingEndpointRpcHost {
                 endpoint,
                 request,
                 request_auth.to_vec(),
-                request_command.to_string(),
-                relay_command,
                 network::ClusterSignedRelayRpcOptions { timeouts },
                 self,
             )
@@ -770,7 +758,6 @@ impl network::ClusterSignedRelayRpcAsyncHost for NetworkPingEndpointRpcHost {
     fn send_signed_relay_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
-        command: &'a str,
         auth: &'a [u8],
         request: &'a network::ObjectRpcRequest,
         timeouts: network::DaemonRpcTimeouts,
@@ -778,7 +765,6 @@ impl network::ClusterSignedRelayRpcAsyncHost for NetworkPingEndpointRpcHost {
         Box::pin(async move {
             network::send_daemon_rpc_to_cluster_endpoint_async(
                 endpoint,
-                command,
                 Some(auth),
                 request,
                 timeouts,

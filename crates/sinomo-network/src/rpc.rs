@@ -107,6 +107,8 @@ pub struct ObjectRpcRequest {
     pub category: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub auth: Option<Vec<u8>>,
     #[serde(with = "serde_bytes")]
     pub body: Vec<u8>,
 }
@@ -121,6 +123,7 @@ impl ObjectRpcRequest {
             route: route.into(),
             category: category.into(),
             metadata: BTreeMap::new(),
+            auth: None,
             body,
         }
     }
@@ -134,6 +137,7 @@ impl ObjectRpcRequest {
             route: route.into(),
             category: category.into(),
             metadata: BTreeMap::new(),
+            auth: None,
             body: SinomoObjectCodec::network_frame().encode(body)?,
         })
     }
@@ -144,6 +148,11 @@ impl ObjectRpcRequest {
 
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.metadata.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn with_auth(mut self, auth: Vec<u8>) -> Self {
+        self.auth = Some(auth);
         self
     }
 

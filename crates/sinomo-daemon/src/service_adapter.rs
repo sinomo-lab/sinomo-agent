@@ -73,7 +73,7 @@ use sinomo_service::{
 };
 use tower_layer::Layer;
 
-use crate::auth::{AuthenticatedDaemonCommand, DaemonSignerAuthority, daemon_rpc_command};
+use crate::auth::{AuthenticatedDaemonCommand, DaemonSignerAuthority};
 use crate::cluster::{
     DaemonClusterJoinRegistrationHost, DaemonClusterMemberMutationHost, DaemonClusterStatusProbe,
     cluster_paths_from_daemon_paths, forward_cluster_invite_challenge_to_voter_async_on_runtime,
@@ -2446,18 +2446,14 @@ pub(crate) async fn dispatch_pre_auth_via_registry_to_response_async(
     request: &DaemonControlRequest,
     service_host: &DaemonServiceRegistryHost,
 ) -> Result<Option<ObjectRpcResponse>, DaemonError> {
-    let Some(rpc_request) = request.rpc.as_ref() else {
-        return Ok(None);
-    };
-    if request.command.trim() != daemon_rpc_command(CLUSTER_JOIN_CHALLENGE_ROUTE)
-        || rpc_request.route != CLUSTER_JOIN_CHALLENGE_ROUTE
-        || rpc_request.category != CLUSTER_MEMBERSHIP_RPC_CATEGORY
+    if request.route != CLUSTER_JOIN_CHALLENGE_ROUTE
+        || request.category != CLUSTER_MEMBERSHIP_RPC_CATEGORY
     {
         return Ok(None);
     }
 
     let authenticated = AuthenticatedDaemonCommand {
-        command: request.command.trim().to_string(),
+        route: request.route.clone(),
         signer: DaemonSignerAuthority::JoinCandidate,
         signer_node_id: String::new(),
         signer_public_key: String::new(),
@@ -2471,7 +2467,7 @@ pub(crate) async fn dispatch_pre_auth_via_registry_to_response_async(
     let (response, _stop) = dispatch_rpc_via_registry_to_response_async(
         service_host,
         &authenticated,
-        rpc_request.clone(),
+        request.clone(),
         None,
         None,
     )
@@ -2709,7 +2705,7 @@ mod tests {
 
     fn test_authenticated_command(signer: DaemonSignerAuthority) -> AuthenticatedDaemonCommand {
         AuthenticatedDaemonCommand {
-            command: daemon_rpc_command("/test"),
+            route: "/test".to_string(),
             signer,
             signer_node_id: "node_test".to_string(),
             signer_public_key: "public-key".to_string(),
@@ -2901,15 +2897,12 @@ mod tests {
             .build()
             .expect("runtime");
         let host = test_service_host(&root, registry);
-        let request = sinomo_network::DaemonControlRequest::rpc(
-            daemon_rpc_command(CLUSTER_JOIN_CHALLENGE_ROUTE),
-            ObjectRpcRequest::encode_body(
-                CLUSTER_JOIN_CHALLENGE_ROUTE,
-                CLUSTER_MEMBERSHIP_RPC_CATEGORY,
-                &(),
-            )
-            .expect("join challenge rpc"),
-        );
+        let request = ObjectRpcRequest::encode_body(
+            CLUSTER_JOIN_CHALLENGE_ROUTE,
+            CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+            &(),
+        )
+        .expect("join challenge rpc");
 
         let response = runtime
             .block_on(dispatch_pre_auth_via_registry_to_response_async(

@@ -13,7 +13,7 @@ use crate::dfs::{
 };
 use crate::{
     AuthenticatedDaemonCommand, DaemonClusterStatus, DaemonDataOwnerLock, DaemonError, DaemonLock,
-    DaemonPaths, authenticate_daemon_control_request, daemon_paths_are_shadow, daemon_rpc_command,
+    DaemonPaths, authenticate_daemon_control_request, daemon_paths_are_shadow,
     handle_daemon_clear_rollout_status, handle_daemon_finalize_shadow_rollout, read_daemon_status,
 };
 use sinomo_core::{
@@ -627,12 +627,12 @@ pub(crate) async fn handle_daemon_connection_async(
             return Ok(false);
         }
 
-        let command = request.command.trim().to_string();
+        let route = request.route.trim().to_string();
         let authenticated = match authenticate_daemon_control_request(&paths, &request) {
             Ok(authenticated) => authenticated,
             Err(error) => {
                 if crate::auth::is_cluster_join_register_control_request(&request) {
-                    eprintln!("sinomo daemon client auth failed for {command}: {error}");
+                    eprintln!("sinomo daemon client auth failed for {route}: {error}");
                 }
                 if let Some(key) = replay_key.as_ref()
                     && let Some(response) = wait_for_daemon_dfs_frame_replay(&paths, key).await
@@ -647,16 +647,14 @@ pub(crate) async fn handle_daemon_connection_async(
                     let _ = stream.shutdown_write(&stream_address).await;
                     return Ok(false);
                 }
-                if let Some(rpc_request) = request.rpc.as_ref()
-                    && let Ok(response) = sinomo_network::ObjectRpcResponse::encode_error(
-                        rpc_request.route.clone(),
-                        DaemonError::AuthDenied.to_string(),
-                    )
-                {
+                if let Ok(response) = sinomo_network::ObjectRpcResponse::encode_error(
+                    request.route.clone(),
+                    DaemonError::AuthDenied.to_string(),
+                ) {
                     let _ = write_daemon_rpc_response_frame_async_for_rpc_request(
                         &mut stream,
                         &stream_address,
-                        rpc_request,
+                        &request,
                         response,
                     )
                     .await;
@@ -669,7 +667,7 @@ pub(crate) async fn handle_daemon_connection_async(
         if let Some(key) = replay_key.as_ref() {
             begin_daemon_dfs_frame_replay(&paths, key);
         }
-        let rpc_request = request.rpc;
+        let rpc_request = Some(request);
         if let Some(request) = rpc_request.as_ref()
             && request.route == sinomo_network::CLUSTER_NETWORK_PING_ROUTE
         {
@@ -777,12 +775,8 @@ pub(crate) async fn dispatch_daemon_control_request_in_process_async(
         return Ok(response);
     }
 
-    let command = request.command.trim().to_string();
-    if command == daemon_rpc_command(sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE)
-        && request.rpc.as_ref().is_some_and(|rpc| {
-            rpc.route == sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE
-                && rpc.category == sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
-        })
+    if request.route == sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE
+        && request.category == sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
     {
         let service_host = crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime(
             paths.clone(),
@@ -808,11 +802,8 @@ pub(crate) async fn dispatch_daemon_control_request_in_process_async(
             {
                 return Ok(response);
             }
-            let Some(route) = request.rpc.as_ref().map(|rpc| rpc.route.clone()) else {
-                return Err(error);
-            };
             let detail = error.to_string();
-            return sinomo_network::ObjectRpcResponse::encode_error(route, detail)
+            return sinomo_network::ObjectRpcResponse::encode_error(request.route.clone(), detail)
                 .map_err(DaemonError::from);
         }
     };
@@ -820,15 +811,7 @@ pub(crate) async fn dispatch_daemon_control_request_in_process_async(
         begin_daemon_dfs_frame_replay(&paths, key);
     }
 
-    let Some(rpc_request) = request.rpc else {
-        if let Some(key) = replay_key.as_ref() {
-            abandon_daemon_dfs_frame_replay(&paths, key);
-        }
-        return Err(DaemonError::Network {
-            address: command,
-            detail: "in-process daemon dispatch requires an object RPC payload".to_string(),
-        });
-    };
+    let rpc_request = request;
     if crate::service_adapter::is_sandbox_stream_route(&rpc_request) {
         if let Some(key) = replay_key.as_ref() {
             abandon_daemon_dfs_frame_replay(&paths, key);
@@ -905,13 +888,12 @@ fn daemon_rpc_request_allows_reusable_stream(request: &sinomo_network::ObjectRpc
 pub(crate) fn daemon_dfs_frame_replay_key(
     request: &sinomo_network::DaemonControlRequest,
 ) -> Option<Vec<u8>> {
-    let rpc = request.rpc.as_ref()?;
-    if rpc.route != sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE {
+    if request.route != sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE {
         return None;
     }
     let auth = request.auth.as_ref()?;
-    let mut key = Vec::with_capacity(rpc.route.len() + 1 + auth.len());
-    key.extend_from_slice(rpc.route.as_bytes());
+    let mut key = Vec::with_capacity(request.route.len() + 1 + auth.len());
+    key.extend_from_slice(request.route.as_bytes());
     key.push(0);
     key.extend_from_slice(auth);
     Some(key)
@@ -1114,10 +1096,10 @@ async fn handle_authenticated_daemon_command_async(
         return result;
     }
 
-    let command = authenticated.command.as_str();
+    let route = authenticated.route.as_str();
     let error_response_request = rpc_request.clone();
-    let result = match command {
-        command if command == daemon_rpc_command(ROLLOUT_FINALIZE_SHADOW_ROUTE) => {
+    let result = match route {
+        route if route == ROLLOUT_FINALIZE_SHADOW_ROUTE => {
             let request = require_daemon_rpc_request(
                 rpc_request,
                 ROLLOUT_FINALIZE_SHADOW_ROUTE,
@@ -1141,7 +1123,7 @@ async fn handle_authenticated_daemon_command_async(
             write_daemon_rpc_response_frame_async(&mut stream, &stream_address, response).await?;
             Ok(false)
         }
-        command if command == daemon_rpc_command(ROLLOUT_CLEAR_STATUS_ROUTE) => {
+        route if route == ROLLOUT_CLEAR_STATUS_ROUTE => {
             let request = require_daemon_rpc_request(
                 rpc_request,
                 ROLLOUT_CLEAR_STATUS_ROUTE,
@@ -3895,11 +3877,7 @@ mod tests {
             &(),
         )
         .expect("request");
-        let control_request = sinomo_network::DaemonControlRequest::authenticated_rpc(
-            daemon_rpc_command(sinomo_rollout::ROLLOUT_DIAGNOSTICS_ROUTE),
-            request,
-            b"not-a-signed-command".to_vec(),
-        );
+        let control_request = request.with_auth(b"not-a-signed-command".to_vec());
         let (address_tx, address_rx) = std::sync::mpsc::channel();
         let server = thread::spawn(move || {
             let runtime = crate::build_daemon_async_runtime("daemon-auth-test").expect("runtime");
@@ -5079,13 +5057,7 @@ mod tests {
         timeout: Duration,
     ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
         let signed = sign_daemon_rpc_request_from_data_dir(data_dir, request)?;
-        crate::send_daemon_rpc_raw(
-            address,
-            &daemon_rpc_command(&request.route),
-            Some(&signed),
-            request,
-            timeout,
-        )
-        .map_err(DaemonError::from)
+        crate::send_daemon_rpc_raw(address, Some(&signed), request, timeout)
+            .map_err(DaemonError::from)
     }
 }
