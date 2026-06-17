@@ -56,7 +56,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_EXPECT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_BULK_FILE_COUNT: usize = 128;
 const DEFAULT_BULK_FILE_BYTES: usize = 4 * 1024;
-const DEFAULT_LARGE_FILE_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_LARGE_FILE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_PROTOCOL_CODEC_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_PROTOCOL_CODEC_ITERATIONS: usize = 8;
 const EXPECT_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -1146,16 +1146,6 @@ fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let payload_started = Instant::now();
     let payload = large_payload(&path, bytes);
     let payload_build_elapsed = payload_started.elapsed();
-    let raw_baseline = if min_raw_write_ratio > 0.0 {
-        Some(raw_disk_baseline(
-            ctx,
-            bytes,
-            &format!("large-write-{path}"),
-            raw_sync_write,
-        )?)
-    } else {
-        None
-    };
     let backend = open_backend(ctx)?;
     let node = backend.node_label();
     let started = Instant::now();
@@ -1188,7 +1178,7 @@ fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let bytes_per_second = rate_per_second(total_bytes as f64, elapsed);
     let data_write_bytes_per_second = rate_per_second(total_bytes as f64, write_elapsed);
     let proc_io_delta = proc_io_before
-        .zip(current_proc_io())
+        .zip(proc_io_after_publish)
         .map(|(before, after)| after.saturating_delta(before));
     let proc_io_write_delta = proc_io_before
         .zip(proc_io_after_write)
@@ -1196,6 +1186,16 @@ fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let proc_io_publish_delta = proc_io_after_write
         .zip(proc_io_after_publish)
         .map(|(before, after)| after.saturating_delta(before));
+    let raw_baseline = if min_raw_write_ratio > 0.0 {
+        Some(raw_disk_baseline(
+            ctx,
+            bytes,
+            &format!("large-write-{path}"),
+            raw_sync_write,
+        )?)
+    } else {
+        None
+    };
 
     ctx.record("node", &node);
     ctx.record("path", &path);

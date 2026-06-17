@@ -10543,6 +10543,20 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 }
                 self.apply_metadata_receipt_to_service_state(object_id, version, replica_node_id)?;
             }
+            DfsMetadataMutation::RemoveReceipt {
+                object_id,
+                version,
+                replica_node_id,
+                ..
+            } => {
+                if let Some(object) = self.metadata.objects.get_mut(object_id)
+                    && object.version == *version
+                {
+                    object
+                        .current_locations
+                        .retain(|node_id| node_id != replica_node_id);
+                }
+            }
             DfsMetadataMutation::PutIntent { intent, .. } => {
                 let Some(intent) = intent.as_ref() else {
                     self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
@@ -10634,6 +10648,20 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                         version,
                         replica_node_id,
                     )?;
+                }
+            }
+            DfsMetadataMutation::RemoveReceipt {
+                object_id,
+                version,
+                replica_node_id,
+                ..
+            } => {
+                if let Some(object) = self.metadata.objects.get_mut(object_id)
+                    && object.version == *version
+                {
+                    object
+                        .current_locations
+                        .retain(|node_id| node_id != replica_node_id);
                 }
             }
             DfsMetadataMutation::PutIntent {
@@ -21244,6 +21272,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             backend_object.as_ref(),
             backend_version.as_ref(),
         )?;
+        if should_persist && let Some(backend) = self.metadata_backend.as_mut() {
+            let _ = backend.remove_receipt(object_id, version, source_node_id)?;
+        }
         if should_persist && let Some(object) = backend_object {
             self.put_visible_object_in_metadata_backend(&object)?;
         } else if should_persist
@@ -25695,6 +25726,7 @@ fn metadata_journal_batch_file_system_id(
             | DfsMetadataMutation::PutObject { file_system_id, .. }
             | DfsMetadataMutation::PutVersion { file_system_id, .. }
             | DfsMetadataMutation::PutReceipt { file_system_id, .. }
+            | DfsMetadataMutation::RemoveReceipt { file_system_id, .. }
             | DfsMetadataMutation::PutIntent { file_system_id, .. }
             | DfsMetadataMutation::CommitVisibleVersion { file_system_id, .. }
             | DfsMetadataMutation::PutConflict { file_system_id, .. }

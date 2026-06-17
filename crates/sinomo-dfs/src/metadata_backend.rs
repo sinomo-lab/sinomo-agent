@@ -350,6 +350,12 @@ pub enum DfsMetadataMutation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         receipt: Option<DfsReplicaReceiptRecord>,
     },
+    RemoveReceipt {
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        replica_node_id: NodeId,
+    },
     PutIntent {
         file_system_id: DfsFileSystemId,
         object_id: DfsObjectId,
@@ -1448,6 +1454,12 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     ) -> Result<DfsObjectVersionPage>;
     fn put_receipt(&mut self, receipt: &DfsReplicaReceiptRecord)
     -> Result<DfsMetadataJournalEntry>;
+    fn remove_receipt(
+        &mut self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+    ) -> Result<Option<DfsMetadataJournalEntry>>;
     fn put_receipt_for_object(
         &mut self,
         object: Option<&DfsObjectMetadata>,
@@ -2334,6 +2346,17 @@ impl DfsMetadataTables {
                     receipt,
                 );
             }
+            DfsMetadataTableOp::RemoveReceipt {
+                object_id,
+                version,
+                replica_node_id,
+            } => {
+                self.receipts.remove(&(
+                    object_id.clone(),
+                    version.clone(),
+                    replica_node_id.clone(),
+                ));
+            }
             DfsMetadataTableOp::PutIntent { intent } => {
                 self.put_intent_indexed(intent);
             }
@@ -2607,6 +2630,15 @@ impl DfsMetadataTableRollback {
                     receipt.replica_node_id.clone(),
                 ),
             ),
+            DfsMetadataTableOp::RemoveReceipt {
+                object_id,
+                version,
+                replica_node_id,
+            } => record_rollback_value(
+                &mut self.receipts,
+                &tables.receipts,
+                (object_id.clone(), version.clone(), replica_node_id.clone()),
+            ),
             DfsMetadataTableOp::PutIntent { intent } => record_rollback_value(
                 &mut self.intents,
                 &tables.intents,
@@ -2810,6 +2842,11 @@ enum DfsMetadataTableOp {
     },
     PutReceipt {
         receipt: DfsReplicaReceiptRecord,
+    },
+    RemoveReceipt {
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        replica_node_id: NodeId,
     },
     PutIntent {
         intent: DfsWriteIntentRecord,
@@ -4061,6 +4098,19 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     ) -> Result<DfsMetadataJournalEntry> {
         let shard_id = self.require_shard_id_for_object(&receipt.receipt.object_id)?;
         self.shard_backend_mut(&shard_id)?.put_receipt(receipt)
+    }
+
+    fn remove_receipt(
+        &mut self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+    ) -> Result<Option<DfsMetadataJournalEntry>> {
+        let Some(shard_id) = self.shard_id_for_object(object_id)? else {
+            return Ok(None);
+        };
+        self.shard_backend_mut(&shard_id)?
+            .remove_receipt(object_id, version, replica_node_id)
     }
 
     fn put_receipt_for_object(
@@ -5544,6 +5594,20 @@ impl LocalSobjMetadataBackend {
                 self.materialize_local_journal_entry(entry)?;
                 Ok(true)
             }
+            DfsMetadataMutation::RemoveReceipt {
+                object_id,
+                version,
+                replica_node_id,
+                ..
+            } => {
+                if receipt_for_replica_from_backend(self, object_id, version, replica_node_id)?
+                    .is_none()
+                {
+                    return Ok(false);
+                }
+                self.materialize_local_journal_entry(entry)?;
+                Ok(true)
+            }
             DfsMetadataMutation::PutIntent {
                 object_id,
                 intent_id,
@@ -5765,6 +5829,28 @@ impl LocalSobjMetadataBackend {
                 self.plan_preapplied_table_op(
                     DfsMetadataTableOp::PutReceipt {
                         receipt: receipt.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
+            DfsMetadataMutation::RemoveReceipt {
+                object_id,
+                version,
+                replica_node_id,
+                ..
+            } => {
+                if receipt_for_replica_from_backend(self, object_id, version, replica_node_id)?
+                    .is_none()
+                {
+                    return Ok(false);
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::RemoveReceipt {
+                        object_id: object_id.clone(),
+                        version: version.clone(),
+                        replica_node_id: replica_node_id.clone(),
                     },
                     table_ops,
                     rollback,
@@ -6298,6 +6384,19 @@ impl LocalSobjMetadataBackend {
                     }],
                 )
             }
+            DfsMetadataMutation::RemoveReceipt {
+                object_id,
+                version,
+                replica_node_id,
+                ..
+            } => self.append_and_apply_table_ops(
+                entry.sequence,
+                vec![DfsMetadataTableOp::RemoveReceipt {
+                    object_id: object_id.clone(),
+                    version: version.clone(),
+                    replica_node_id: replica_node_id.clone(),
+                }],
+            ),
             DfsMetadataMutation::PutIntent { intent, .. } => {
                 let Some(intent) = intent.as_ref() else {
                     return Ok(());
@@ -7692,6 +7791,39 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         )?;
         self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
         Ok(entry)
+    }
+
+    fn remove_receipt(
+        &mut self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+    ) -> Result<Option<DfsMetadataJournalEntry>> {
+        let _lock = self.begin_metadata_write()?;
+        let Some(existing) = self
+            .tables
+            .receipts
+            .get(&(object_id.clone(), version.clone(), replica_node_id.clone()))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let entry = self.write_journal_unlocked(DfsMetadataMutation::RemoveReceipt {
+            file_system_id: existing.receipt.file_system_id,
+            object_id: object_id.clone(),
+            version: version.clone(),
+            replica_node_id: replica_node_id.clone(),
+        })?;
+        self.append_and_apply_table_ops(
+            entry.sequence,
+            vec![DfsMetadataTableOp::RemoveReceipt {
+                object_id: object_id.clone(),
+                version: version.clone(),
+                replica_node_id: replica_node_id.clone(),
+            }],
+        )?;
+        self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
+        Ok(Some(entry))
     }
 
     fn receipts_for_version(
@@ -9612,6 +9744,7 @@ fn journal_entry_has_replay_payloads(entry: &DfsMetadataJournalEntry) -> bool {
         DfsMetadataMutation::PutObject { object, .. } => object.is_some(),
         DfsMetadataMutation::PutVersion { version_record, .. } => version_record.is_some(),
         DfsMetadataMutation::PutReceipt { receipt, .. } => receipt.is_some(),
+        DfsMetadataMutation::RemoveReceipt { .. } => true,
         DfsMetadataMutation::PutIntent { intent, .. } => intent.is_some(),
         DfsMetadataMutation::CommitVisibleVersion {
             committed_object,

@@ -13137,6 +13137,23 @@ fn remote_read_location_prune_updates_stale_backend_version_record() {
             visible: true,
         })
         .expect("stale version locations");
+    dfs.metadata_backend
+        .as_mut()
+        .expect("backend")
+        .put_receipt(&DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object_id.clone(),
+                committed_version: version.clone(),
+                owner_node_id: source.clone(),
+                event_id: EventId::from_legacy_named("evt_read_prune_stale_receipt")
+                    .expect("event"),
+            },
+            replica_node_id: source.clone(),
+            content_hash: Some(hash.clone()),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+        })
+        .expect("stale receipt");
 
     dfs.mark_remote_read_location_missing(&object_id, &version, &Some(hash), &source)
         .expect("prune stale version location");
@@ -13160,6 +13177,15 @@ fn remote_read_location_prune_updates_stale_backend_version_record() {
             .expect("backend version")
             .locations,
         Vec::<NodeId>::new()
+    );
+    assert!(
+        dfs.metadata_backend
+            .as_ref()
+            .expect("backend")
+            .receipts_for_version(&object_id, &version)
+            .expect("backend receipts")
+            .is_empty(),
+        "authoritative stale-location prune should remove the matching receipt"
     );
     std::fs::remove_dir_all(root).ok();
 }
