@@ -30,18 +30,12 @@ pub fn print_usage() {
         }
     }
     println!();
-    println!("Global flags:");
-    println!(
-        "  --local                    Force local file-backed mode; skip daemon/cluster probes and ignore cluster KV."
-    );
-    println!();
     println!("Run `sinomo <subcommand> help` for detailed commands.");
     println!();
     println!("TUI:");
     println!(
         "  Run `sinomo` with no arguments to connect the command-line user interface to the local daemon when available."
     );
-    println!("  Run `sinomo --local` to start without probing the daemon or cluster.");
     println!("  Inside the TUI, prefix any CLI command with `/`, for example `/models list`.");
     println!("  Use `/quit` or `/exit` to end the session.");
     println!();
@@ -141,7 +135,7 @@ pub(super) fn print_cluster_help() {
     println!(
         "  sinomo cluster init [--name <name>] [--cluster-id cluster_...] [--node-id node_...]"
     );
-    println!("      Bootstrap a new single-node cluster and clear orphan-node state.");
+    println!("      Bootstrap a new single-node cluster.");
     println!(
         "  sinomo cluster invite [--introducer <host:port>] [--ttl-seconds <seconds>] [--output <path>]"
     );
@@ -153,6 +147,10 @@ pub(super) fn print_cluster_help() {
     );
     println!(
         "      Record intent to join an existing cluster from a signed sinomo-join URI or invite file."
+    );
+    println!("  sinomo cluster migrate plan <invite> [--mode single-node|cluster-merge]");
+    println!(
+        "      Plan migration from the current initialized cluster into another cluster without mutating local state."
     );
     println!("  sinomo cluster role <node-id> <workstation|mobile|server|sensor|test>");
     println!("      Change the documented node role in quorum-backed cluster membership.");
@@ -175,9 +173,9 @@ pub(super) fn print_cluster_help() {
         "      Diagnose endpoint advertisement, reachability records, stale status, and duplicated roaming endpoints."
     );
     println!("  sinomo cluster peers");
-    println!("      List known peers. Fails while the node is orphaned.");
+    println!("      List known peers. Fails when the node has no local cluster state.");
     println!("  sinomo cluster leave");
-    println!("      Remove local cluster state.");
+    println!("      Leave the current cluster and start a fresh single-node cluster.");
 }
 
 pub(super) fn print_install_help() {

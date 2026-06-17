@@ -2862,8 +2862,9 @@ fn parse_tui_slash_command(line: &str) -> Result<Option<TuiSlashCommand>, CliErr
     };
     if args.iter().any(|arg| arg == "--local") {
         return Err(CliError::Parse {
-            detail: "`--local` is a process option; start the TUI with `sinomo --local` instead"
-                .to_string(),
+            detail:
+                "`--local` has been removed; start the main daemon and use cluster-backed commands"
+                    .to_string(),
         });
     }
     match args.as_slice() {

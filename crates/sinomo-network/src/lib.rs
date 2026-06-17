@@ -223,8 +223,7 @@ pub(crate) mod prelude {
     pub(crate) use sinomo_local::SinomoDataDir;
     pub(crate) use sinomo_node::{
         NodeAvailability, NodeHealth, NodeId, NodeProfile, daemon_lan_endpoint_id,
-        daemon_loopback_endpoint_id, main_daemon_capabilities, shadow_daemon_capabilities,
-        shadow_daemon_node_id,
+        daemon_loopback_endpoint_id, main_daemon_capabilities, shadow_daemon_node_id,
     };
     pub(crate) use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
     pub(crate) use std::fs;

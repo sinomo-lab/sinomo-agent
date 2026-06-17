@@ -27,13 +27,14 @@ sinomo cluster
 sinomo cluster init [--name <name>] [--cluster-id cluster_...] [--node-id node_...]
 sinomo cluster invite [--introducer <host:port>] [--ttl-seconds <seconds>] [--output <path>]
 sinomo cluster join <invite> [--name <name>] [--cluster-id cluster_...] [--node-id node_...]
+sinomo cluster migrate plan <invite> [--mode single-node|cluster-merge]
 sinomo cluster status
 sinomo cluster health
 sinomo cluster peers
 sinomo cluster leave
 ```
 
-An uninitialized node is an orphan. Orphan nodes must not run distributed operations, write distributed config, mount distributed DFS namespaces, accept remote action requests, or publish cluster-routed events. The only allowed cluster operations while orphaned are:
+A node's normal lifecycle starts as a single-node cluster. A data directory with no cluster state is a pre-bootstrap or recovery condition, not an operating mode. A node with no cluster state must not run distributed operations, write distributed config, mount distributed DFS namespaces, accept remote action requests, or publish cluster-routed events. The only allowed operations before cluster state exists are:
 
 - `sinomo cluster status`
 - `sinomo cluster init`
@@ -41,7 +42,7 @@ An uninitialized node is an orphan. Orphan nodes must not run distributed operat
 - local daemon lifecycle and install commands, so a machine can be prepared before joining
 - local help and credential setup commands that do not mutate cluster state
 
-`sinomo cluster init` creates a single-node cluster. `sinomo cluster join` records an intent to join an existing cluster and moves the node into pending learner state until the cluster control plane accepts it.
+`sinomo cluster init` creates a single-node cluster. `sinomo cluster join` records an intent to join an existing cluster and moves a pre-bootstrap node into pending learner state until the cluster control plane accepts it. When a node already has initialized cluster state, joining another cluster is treated as migration rather than delete-and-join. `sinomo cluster leave` leaves the current cluster by quarantining old cluster state/KV/Raft/watch storage under `$SINOMO_DATA_DIR/cluster/migrations/<leave_id>/leave-source/`, then creates a fresh single-node cluster with the preserved local node identity. The left cluster's KV remains archived evidence and is not imported into the new single-node cluster.
 
 `sinomo cluster invite` creates a portable `sinomo-join://v1/...` invite. The URI is intentionally small because invites are short-lived. It carries only the cluster's current public key, the invitation ID, the invitation secret, and communication channels the invited node can use to reach the cluster. Full invite metadata, expiry, allowed roles, issuer identity, and policy stay in the cluster KV under the invitation ID and are verified by the contacted introducer during join.
 
@@ -63,7 +64,14 @@ The remote machine can run the command from the file directly, append `--name <r
 sinomo cluster join join.txt --name <remote-name>
 ```
 
-On join, the remote node builds local pending cluster state and then contacts the invite introducers over the daemon control channel. A reachable introducer records the joining node's main and shadow daemon members, returns the updated cluster member view, and lets `sinomo cluster peers` show the new node on both sides. If the invite contains introducers but none are reachable, join fails with an actionable connectivity error instead of silently recording an isolated pending state. `sinomo cluster health` combines the KV member view, daemon-published node heartbeats, and live endpoint probes to report online/offline state, daemon version, platform, last-seen time, and rollout state for main and shadow daemon nodes.
+On join, a fresh remote node builds local pending cluster state and then contacts the invite introducers over the daemon control channel. A reachable introducer records the joining installation's main cluster member, with main and shadow daemon endpoints folded into that member's endpoint set, returns the updated cluster member view, and lets `sinomo cluster peers` show the new node on both sides. If the invite contains introducers but none are reachable, join fails with an actionable connectivity error instead of silently recording an isolated pending state. `sinomo cluster health` combines the KV member view, daemon-published node heartbeats, and live endpoint probes to report online/offline state, daemon version, platform, last-seen time, rollout state, and shadow reachability through the main member endpoints.
+
+`sinomo cluster migrate plan <invite>` validates the current initialized cluster as a migration source and validates the target invite without mutating local state. The implemented planner supports:
+
+- `single-node`, the default mode for a device that initialized a local one-node cluster and later needs to join another cluster;
+- `cluster-merge`, the planning mode for a source cluster that already has remote peers.
+
+The durable contract is `ClusterMigrationRecord` under `/cluster/migrations/<migration_id>`. The planner reports the source cluster, target invite identity, local node mapping, member counts, and the required execution steps. `sinomo cluster join <invite>` on an already initialized settled solo node executes the first migration path directly: source cluster state, KV, Raft, watches, and DFS metadata are quarantined under the local migration/import roots, the target join is recorded with the preserved local node identity, and the migration record is finalized or rolled back locally. Target cluster KV is authoritative after the join. Source cluster KV is archived as evidence/import source only: cluster-level `/config/...` keys are skipped, and only explicitly node-local `/config/nodes/<source_node_id>/...` keys are eligible to be reapplied to target KV as normal KV writes. If the target join is still pending, those node-local keys are recorded as deferred in `kv-import.json` next to the quarantined source storage. Shared DFS data import remains future work and is not implemented by this first single-node migration path.
 
 Initial local state lives at:
 
@@ -73,12 +81,7 @@ $SINOMO_DATA_DIR/cluster/state.sobj
 
 The state file uses the shared `ClusterBootstrapState` contract from `sinomo-core` for the local cluster identity, local node identity, current Raft term/revision, and current member records. It records the current cluster status through member records, keeping the documented node role separate from Raft membership state. Durable membership and config state come from the replicated KV log; the file remains the local anchor that tells the daemon which cluster identity and local node identity to use at startup.
 
-Each local installation has two daemon process nodes in the cluster metadata:
-
-- Main daemon node: the user-visible local daemon, eligible to be the local voter when this installation owns a voting role.
-- Shadow daemon node: a derived `<main-node-id>-shadow` member that is active but non-voting.
-
-The shadow daemon intentionally advertises only communication and supervision capabilities. It can receive and send messages when rollout, recovery, or supervision flows need it, but it is not counted in consensus quorum and should not own DFS objects, run normal scheduled workloads, or publish routine cluster services.
+Each local installation has one normal cluster member: the main daemon node, which is eligible to be the local voter when this installation owns a voting role. The shadow daemon is a supervision and routing process, not a `/cluster/members/<node_id>` participant. It advertises reachable endpoints through the main member so other nodes can route to the installation when main is down, but it is not counted in consensus quorum and should not own DFS objects, run normal scheduled workloads, or publish routine cluster services.
 
 ## Identity Model
 
@@ -103,7 +106,7 @@ Node identity:
 
 Cluster membership is explicit. Seeing a node on the LAN is never enough to trust it. Discovery can find candidates, but only signed membership records authorize cluster participation.
 
-Daemon and shadow daemon membership is process-scoped rather than machine-scoped. A workstation can therefore have both `node_desktop` and `node_desktop-shadow` in the same cluster. The main daemon carries normal local runtime capabilities, while the shadow daemon carries only `cluster.message.receive`, `cluster.message.send`, and `daemon.shadow.supervise`.
+Daemon membership is installation-scoped. A workstation contributes one cluster member, while its shadow daemon remains a local process with communication/supervision reachability through the main member endpoint set.
 
 ## Bootstrap and Join
 
@@ -144,16 +147,16 @@ The persisted invitation record is larger than the URI. It contains the cluster 
 
 Join tokens are one-time or short-lived. A leaked token should not grant ongoing authority after the token expires or after a successful use.
 
-## Orphan Guard
+## Cluster-State Guard
 
-The orphan guard is a hard runtime boundary.
+The cluster-state guard is a hard runtime boundary.
 
-Allowed while orphaned:
+Allowed before local cluster state exists:
 
 - create or inspect local cluster state
 - print help
 
-Blocked while orphaned:
+Blocked before local cluster state exists:
 
 - starting the cluster-aware daemon
 - distributed DFS mounts
@@ -334,6 +337,7 @@ Use slash-delimited namespaces:
 /services/<service_name>/<node_id>
 /sessions/<session_id>/summary
 /sessions/<session_id>/participants/<node_id>
+/sinomo/imports/<source_cluster_id>/...
 /dfs/filesystems/<file_system_id>/config
 /dfs/filesystems/<file_system_id>/metadata-shards/<shard_id>
 /dfs/services/metadata/<node_id>
@@ -445,15 +449,16 @@ Phase 0, local cluster state:
 
 - Add `sinomo cluster` CLI. Implemented in `crates/sinomo-cli`.
 - Persist local cluster state. Implemented as `$SINOMO_DATA_DIR/cluster/state.sobj`.
-- Add orphan guard hooks around distributed operations. Implemented for every non-help, non-`cluster` top-level command.
+- Add cluster-state guard hooks around distributed operations. Implemented for every non-help, non-`cluster` top-level command.
 - Require short-lived join material. Implemented by storing signed invitation records in cluster KV while the portable `sinomo-join://v1` URI carries only the public key, invite ID, secret, and communication channels needed to reach an introducer.
 
 Phase 1, contracts:
 
 - Add cluster identity, membership, endpoint, invite, and certificate structs. Implemented in `crates/sinomo-core/src/cluster.rs`.
+- Add cluster migration contract records and CLI planning. Implemented as `ClusterMigrationRecord`, `ClusterMigrationMode`, `ClusterMigrationPhase`, `/cluster/migrations/<migration_id>` keys, and `sinomo cluster migrate plan`.
 - Extend `sinomo-network` transport kinds for QUIC, iroh, and WebRTC candidate metadata. Implemented through `TransportKind`, `NodeEndpoint::from_cluster_endpoint`, and `PeerEndpointCandidate`.
 - Add cluster-aware peer registry records. Implemented through `PeerRegistry` cluster member and endpoint candidate indexes.
-- Represent the local main daemon and shadow daemon as separate cluster members. Implemented in `crates/sinomo-cli`: cluster state writes the main daemon as the local voter/learner and the derived shadow daemon as a non-voting communication-capable member.
+- Represent the local installation as one main cluster member while preserving shadow reachability. Implemented in `crates/sinomo-network`: main and shadow daemon endpoints are folded into the main member, and stale local shadow members are removed during daemon membership refresh.
 - Use real cluster identity material. Implemented by generating the local Ed25519 identity before cluster state creation, storing explicit member public keys in every member record, signing invites with the issuer node identity, and verifying invite signatures before local join or introducer acceptance.
 
 Phase 2, KV core:
@@ -461,7 +466,7 @@ Phase 2, KV core:
 - Implement a real Raft/KV core for tests, local development, and daemon integration. Implemented in `crates/sinomo-kv` with voter quorum commit, append-entries validation, vote requests, leader transfer, follower catch-up, committed-index tracking, hard-state records, and deterministic multi-node tests.
 - Add WAL, snapshots, revisions, compare-and-swap transactions, and watches. Implemented as `DurableRaftKvNode`, `KvWalPaths`, `RaftHardState`, `KvLogEntry`, `RaftSnapshot`, `KvRevision`, `KvTxn`, and prefix watches; durable nodes replay JSONL WAL entries, persist hard state, save and restore snapshots, preserve watchable event history across snapshot restore, and compact WAL after snapshots.
 - Store membership and service registry records in the KV. Implemented for cluster identity under `/cluster/config/identity`, Raft role config under `/cluster/raft/config`, membership records under `/cluster/members/<node_id>`, split endpoint records under `/cluster/endpoints/<node_id>/<endpoint_id>`, capability policy under `/cluster/policy/capabilities/<node_id>`, invitations and invite state under `/cluster/invitations/...`, rollout desired/node state under `/cluster/rollout/...`, and runtime health records under `/cluster/node-status/<node_id>`; service registry records use the same generic keyspace and lease primitives.
-- Generate node identity key pairs and publish public keys in KV membership records. Implemented with node-local Ed25519 identity files under `$SINOMO_DATA_DIR/identity/`; the main daemon and shadow daemon have distinct public keys, and local CLI control messages are signed from the local main identity.
+- Generate node identity key pairs and publish public keys in KV membership records. Implemented with node-local Ed25519 identity files under `$SINOMO_DATA_DIR/identity/`; the main daemon identity is the cluster member identity, and the shadow identity remains local to supervision/routing traffic.
 - Expose the KV through the local daemon control plane for internal Sinomo use. Implemented as daemon-owned object RPC routes backed by a per-node durable Raft WAL under `$SINOMO_DATA_DIR/cluster/kv-raft/<node_id>/`; `$SINOMO_DATA_DIR/cluster/kv-snapshot.sobj` stores the current local snapshot. Cluster init, daemon registration, and join registration persist member records into the KV, daemon maintenance publishes version/health/rollout node-status records, and join responses carry the current snapshot to the joining node.
 - Integrate the daemon's cluster KV transport with the durable Raft core. Implemented with authenticated `CLUSTER_RAFT_APPEND`, `CLUSTER_RAFT_VOTE`, and `CLUSTER_KV_WATCH_EVENTS` daemon messages. The periodic cluster path no longer exchanges and merges whole KV snapshots; the current durable Raft leader sends append-entries with optional Raft snapshot-install payloads to followers, and vote requests are handled against durable local hard state. Daemon maintenance checks leader reachability, starts a new election when the known leader is missing, persists the elected leader after quorum, steps down when it cannot observe quorum during replication, and fans out watch event history over the authenticated transport so local daemon-backed prefix watches can resume and drain committed changes.
 

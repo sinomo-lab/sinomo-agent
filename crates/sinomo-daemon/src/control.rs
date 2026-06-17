@@ -12,8 +12,8 @@ use crate::dfs::{
     run_daemon_dfs_maintenance_tick_on_runtime,
 };
 use crate::{
-    AuthenticatedDaemonCommand, DaemonClusterStatus, DaemonError, DaemonLock, DaemonPaths,
-    authenticate_daemon_control_request, daemon_paths_are_shadow, daemon_rpc_command,
+    AuthenticatedDaemonCommand, DaemonClusterStatus, DaemonDataOwnerLock, DaemonError, DaemonLock,
+    DaemonPaths, authenticate_daemon_control_request, daemon_paths_are_shadow, daemon_rpc_command,
     handle_daemon_clear_rollout_status, handle_daemon_finalize_shadow_rollout, read_daemon_status,
 };
 use sinomo_core::{
@@ -178,6 +178,11 @@ pub fn run_daemon_control_loop_with_services(
     service_hooks: Vec<crate::DaemonServiceRegistryHook>,
 ) -> Result<(), DaemonError> {
     let _lock = DaemonLock::acquire(&paths, &options, cluster.clone())?;
+    let _data_owner_lock = if label == "daemon" {
+        Some(DaemonDataOwnerLock::acquire(&paths)?)
+    } else {
+        None
+    };
     if let Err(error) = prune_local_cluster_raft_uncommitted_tail(&paths) {
         eprintln!("sinomo {label} cluster raft startup repair skipped: {error}");
     }

@@ -53,7 +53,7 @@ sinomo cluster health
 
 `rollout import-source` updates the local managed source checkout. `rollout cluster --remote-build` asks each target to build from its own managed source checkout, usually `~/.sinomo/source/sinomo`.
 
-After a successful rollout, `sinomo cluster health` should show the main and shadow daemon members online with rollout status such as:
+After a successful rollout, `sinomo cluster health` should show the main daemon member online, with shadow reachability reported through the main node's supervision endpoints and rollout status such as:
 
 ```text
 accepted (cluster-remote-build)

@@ -37,6 +37,83 @@ pub struct ClusterBootstrapState {
     pub updated_at: OffsetDateTime,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClusterMigrationMode {
+    SingleNode,
+    ClusterMerge,
+}
+
+impl ClusterMigrationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SingleNode => "single-node",
+            Self::ClusterMerge => "cluster-merge",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClusterMigrationPhase {
+    Planned,
+    SourceFrozen,
+    TargetRegistered,
+    DataImporting,
+    Verifying,
+    Finalized,
+    Aborted,
+    RolledBack,
+}
+
+impl ClusterMigrationPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::SourceFrozen => "source-frozen",
+            Self::TargetRegistered => "target-registered",
+            Self::DataImporting => "data-importing",
+            Self::Verifying => "verifying",
+            Self::Finalized => "finalized",
+            Self::Aborted => "aborted",
+            Self::RolledBack => "rolled-back",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ClusterMigrationNodeIdRemap {
+    pub source_node_id: Id,
+    pub target_node_id: Id,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ClusterMigrationRecord {
+    pub migration_id: Id,
+    pub mode: ClusterMigrationMode,
+    pub phase: ClusterMigrationPhase,
+    pub source_cluster_id: Id,
+    pub source_cluster_name: String,
+    pub target_cluster_id: Id,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_cluster_name: Option<String>,
+    pub source_local_node_id: Id,
+    pub target_node_id: Id,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preserved_node_ids: Vec<Id>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remapped_node_ids: Vec<ClusterMigrationNodeIdRemap>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterRolloutDesiredRecord {
     pub cluster_id: Id,
@@ -131,6 +208,14 @@ pub struct ClusterModuleRolloutReconciliationRecord {
 
 pub fn cluster_rollout_desired_key() -> String {
     "/cluster/rollout/desired".to_string()
+}
+
+pub fn cluster_migration_prefix() -> String {
+    "/cluster/migrations/".to_string()
+}
+
+pub fn cluster_migration_key(migration_id: &Id) -> String {
+    format!("{}{migration_id}", cluster_migration_prefix())
 }
 
 pub fn cluster_module_rollout_node_prefix() -> String {
@@ -666,5 +751,44 @@ mod tests {
             parsed.introducers[0].transport,
             ClusterTransportKind::Loopback
         );
+    }
+
+    #[test]
+    fn cluster_migration_record_round_trips_with_key() {
+        let timestamp = OffsetDateTime::parse(
+            "2026-05-02T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("timestamp");
+        let migration_id = Id::from_legacy_named("migration_desktop_join").expect("migration");
+        let record = ClusterMigrationRecord {
+            migration_id: migration_id.clone(),
+            mode: ClusterMigrationMode::SingleNode,
+            phase: ClusterMigrationPhase::Planned,
+            source_cluster_id: Id::from_legacy_named("cluster_local").expect("source cluster"),
+            source_cluster_name: "local".to_string(),
+            target_cluster_id: Id::from_legacy_named("cluster_home").expect("target cluster"),
+            target_cluster_name: Some("home".to_string()),
+            source_local_node_id: Id::from_legacy_named("node_desktop").expect("source node"),
+            target_node_id: Id::from_legacy_named("node_desktop").expect("target node"),
+            preserved_node_ids: vec![Id::from_legacy_named("node_desktop").expect("preserved")],
+            remapped_node_ids: Vec::new(),
+            evidence_refs: vec!["cluster-state:source".to_string()],
+            detail: Some("planning single-node adoption".to_string()),
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+
+        let json = serde_json::to_value(&record).expect("serialize");
+        assert_eq!(json["mode"], "single-node");
+        assert_eq!(json["phase"], "planned");
+        assert_eq!(
+            cluster_migration_key(&migration_id),
+            format!("/cluster/migrations/{migration_id}")
+        );
+
+        let parsed: ClusterMigrationRecord =
+            serde_json::from_value(json).expect("deserialize migration record");
+        assert_eq!(parsed, record);
     }
 }

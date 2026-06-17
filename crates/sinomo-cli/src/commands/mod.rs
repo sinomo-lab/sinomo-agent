@@ -10,6 +10,7 @@ mod rollout;
 mod support;
 mod test;
 mod test_cases_agent;
+mod test_cases_cluster;
 mod test_cases_dfs;
 mod test_cases_network;
 

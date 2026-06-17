@@ -204,6 +204,29 @@ or gate it with
 `SINOMO_TEST_PERF_MIN_WRITE_FILES_PER_SEC`, and
 `SINOMO_TEST_PERF_MIN_READ_FILES_PER_SEC`.
 
+## Automated cluster migration suite
+
+`docker/test-cluster-migration.sh` runs a focused two-container migration gate in
+its own compose project (`sinomo-migration-test` by default). It uses the same
+host-built `target/debug/sinomo` dev-image pattern as the segmented cluster, but
+starts inert `target` and `source` containers so the script can drive the exact
+single-node migration sequence:
+
+```bash
+docker/test-cluster-migration.sh
+SINOMO_MIGRATION_TEST_KEEP=1 docker/test-cluster-migration.sh
+```
+
+The target initializes a cluster, writes a signed invite, and starts the shadow
+supervisor/main daemon. The source initializes a separate single-node cluster,
+uses the in-binary `cluster.migration.seed-source` probe to write source KV and
+DFS metadata fixtures, then runs `sinomo cluster join /shared/target-invite.txt`.
+After the join, the source daemon starts and `cluster.migration.verify-joined`
+checks the finalized migration record, target KV authority, imported node-local
+config under `/config/nodes/<node_id>/...`, skipped source cluster-level config,
+source KV/Raft quarantine, and DFS metadata import marker. Failure evidence is
+written to `target/cluster-test-artifacts/migration-<run>/`.
+
 ## Validation gates
 
 The hardening harnesses are designed to fail with useful evidence instead of only printing

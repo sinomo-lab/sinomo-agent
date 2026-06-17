@@ -62,6 +62,7 @@ pub use client::{
     send_daemon_rollout_build_to_endpoint, send_daemon_rollout_clear_status,
     send_daemon_rollout_diagnostics, send_daemon_rollout_native_dylib_module,
     send_daemon_rollout_native_dylib_module_to_endpoint, send_daemon_rpc, send_daemon_rpc_async,
+    send_daemon_rpc_direct_to_endpoint, send_daemon_rpc_direct_to_endpoint_async,
     send_daemon_rpc_stream, send_daemon_rpc_stream_async, send_daemon_rpc_to_endpoint,
     send_daemon_rpc_to_endpoint_async, send_daemon_rpc_with_timeouts, send_daemon_shutdown_request,
     send_dfs_metadata_journal_batch_to_endpoint_async,
@@ -137,13 +138,14 @@ pub(crate) use rollout::{
 };
 pub use status::{
     DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, DaemonClusterProcess,
-    DaemonClusterRegistration, DaemonClusterStatus, DaemonLock, DaemonProbeStatus,
-    DaemonRunOptions, DaemonStatus, SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT,
-    SINOMO_SHADOW_DAEMON_DEFAULT_PORT, cluster_node_status_from_daemon_status,
-    current_shadow_daemon_options, daemon_advertised_endpoints_for_state,
-    daemon_advertised_endpoints_for_state_async, daemon_bind_address, daemon_cluster_registration,
-    daemon_cluster_status, daemon_connect_address, daemon_options_from_status,
-    daemon_package_version, daemon_status_matches_options, default_main_daemon_status,
+    DaemonClusterRegistration, DaemonClusterStatus, DaemonDataOwnerLock, DaemonLock,
+    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, SINOMO_DAEMON_DEFAULT_HOST,
+    SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
+    cluster_node_status_from_daemon_status, current_shadow_daemon_options,
+    daemon_advertised_endpoints_for_state, daemon_advertised_endpoints_for_state_async,
+    daemon_bind_address, daemon_cluster_registration, daemon_cluster_status,
+    daemon_connect_address, daemon_options_from_status, daemon_package_version,
+    daemon_status_matches_options, default_main_daemon_status,
     invite_introducers_from_daemon_status, probe_daemon_status, write_daemon_status,
 };
 pub(crate) use status::{
@@ -170,7 +172,11 @@ pub fn register_storage_paths(
                 .field("cluster", "Option<DaemonClusterStatus>"),
         )?;
     }
-    for relative_path in ["daemon/daemon.lock", "shadow-daemon/daemon.lock"] {
+    for relative_path in [
+        "daemon/daemon.lock",
+        "daemon/data-owner.lock",
+        "shadow-daemon/daemon.lock",
+    ] {
         layout.register_binary("sinomo-daemon", StorageRing::R1, relative_path)?;
     }
     for relative_path in ["daemon/auth-nonces.sobj", "shadow-daemon/auth-nonces.sobj"] {

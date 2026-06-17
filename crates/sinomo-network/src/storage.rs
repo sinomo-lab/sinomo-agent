@@ -6930,22 +6930,12 @@ pub async fn refresh_local_daemon_membership_from_disk_async(
 pub fn assign_local_daemon_member_public_keys(
     state: &mut ClusterBootstrapState,
     main_public_key: String,
-    shadow_public_key: String,
+    _shadow_public_key: String,
 ) -> bool {
-    let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
     let mut changed = false;
     for member in &mut state.members {
-        let desired = if member.node_id == state.local_node_id {
-            Some(&main_public_key)
-        } else if member.node_id == shadow_node_id {
-            Some(&shadow_public_key)
-        } else {
-            None
-        };
-        if let Some(desired) = desired
-            && member.node_public_key != *desired
-        {
-            member.node_public_key = desired.clone();
+        if member.node_id == state.local_node_id && member.node_public_key != main_public_key {
+            member.node_public_key = main_public_key.clone();
             changed = true;
         }
     }
@@ -6958,13 +6948,35 @@ pub fn ensure_daemon_cluster_members(
     shadow_endpoints: Vec<ClusterEndpointRecord>,
     timestamp: OffsetDateTime,
 ) -> bool {
-    let main_changed = ensure_main_daemon_cluster_member(state, main_endpoints, timestamp);
-    let shadow_changed = ensure_shadow_daemon_cluster_member(state, shadow_endpoints, timestamp);
-    let changed = main_changed || shadow_changed;
+    let endpoints = main_and_shadow_supervision_endpoints(state, main_endpoints, shadow_endpoints);
+    let changed = remove_local_shadow_daemon_cluster_member(state)
+        | ensure_main_daemon_cluster_member(state, endpoints, timestamp);
     if changed {
         state.updated_at = timestamp;
     }
     changed
+}
+
+fn remove_local_shadow_daemon_cluster_member(state: &mut ClusterBootstrapState) -> bool {
+    let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
+    let before = state.members.len();
+    state
+        .members
+        .retain(|member| member.node_id != shadow_node_id);
+    state.members.len() != before
+}
+
+fn main_and_shadow_supervision_endpoints(
+    state: &ClusterBootstrapState,
+    mut main_endpoints: Vec<ClusterEndpointRecord>,
+    shadow_endpoints: Vec<ClusterEndpointRecord>,
+) -> Vec<ClusterEndpointRecord> {
+    let main_node_id = state.local_node_id.clone();
+    main_endpoints.extend(shadow_endpoints.into_iter().map(|mut endpoint| {
+        endpoint.node_id = main_node_id.clone();
+        endpoint
+    }));
+    main_endpoints
 }
 
 pub fn ensure_main_daemon_cluster_member(
@@ -6999,53 +7011,6 @@ pub fn ensure_main_daemon_cluster_member(
     member.role = role;
     member.state = member_state;
     upsert_daemon_member(state, member, capabilities, endpoints, timestamp)
-}
-
-pub fn ensure_shadow_daemon_cluster_member(
-    state: &mut ClusterBootstrapState,
-    endpoints: Vec<ClusterEndpointRecord>,
-    timestamp: OffsetDateTime,
-) -> bool {
-    let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
-    let existing_shadow_state = state
-        .members
-        .iter()
-        .find(|member| member.node_id == shadow_node_id)
-        .map(|member| member.state.clone())
-        .filter(|state| *state != ClusterMemberState::Pending);
-    let node_public_key = existing_member_public_key(state, &shadow_node_id).unwrap_or_default();
-    let main_authorized = state
-        .members
-        .iter()
-        .find(|member| member.node_id == state.local_node_id)
-        .is_some_and(|member| member.state.is_authorized());
-    let mut member = if main_authorized {
-        ClusterMemberRecord::local_non_voting(
-            state.cluster_id.clone(),
-            shadow_node_id,
-            format!("{} shadow", state.local_node_display_name),
-            node_public_key,
-            timestamp,
-        )
-    } else {
-        ClusterMemberRecord::pending_non_voting(
-            state.cluster_id.clone(),
-            shadow_node_id,
-            format!("{} shadow", state.local_node_display_name),
-            node_public_key,
-            timestamp,
-        )
-    };
-    if let Some(existing_state) = existing_shadow_state {
-        member.state = existing_state;
-    }
-    upsert_daemon_member(
-        state,
-        member,
-        shadow_daemon_capabilities(),
-        endpoints,
-        timestamp,
-    )
 }
 
 pub fn existing_member_public_key(
@@ -15491,7 +15456,11 @@ fn apply_local_iroh_endpoint_record_to_state(
     state: &mut ClusterBootstrapState,
     record: crate::IrohEndpointRecord,
 ) -> bool {
-    let endpoint = record.endpoint();
+    let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
+    let mut endpoint = record.endpoint();
+    if endpoint.node_id == shadow_node_id {
+        endpoint.node_id = state.local_node_id.clone();
+    }
     let Some(member) = state
         .members
         .iter_mut()

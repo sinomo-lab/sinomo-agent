@@ -77,9 +77,10 @@ use sinomo_runtime::cli_registry::{
 };
 use sinomo_runtime::core::{
     ClusterBootstrapState, ClusterEndpointRecord, ClusterJoinInvite, ClusterMemberRecord,
-    ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability, ClusterNodeRole,
-    ClusterNodeRolloutStatus, ClusterNodeStatusRecord, ClusterTransportKind, EvaluationScorecard,
-    EventEnvelope, RollbackTrigger,
+    ClusterMemberRole, ClusterMemberState, ClusterMigrationMode, ClusterMigrationPhase,
+    ClusterMigrationRecord, ClusterNodeAvailability, ClusterNodeRole, ClusterNodeRolloutStatus,
+    ClusterNodeStatusRecord, ClusterTransportKind, EvaluationScorecard, EventEnvelope, Id,
+    RollbackTrigger, cluster_migration_key,
 };
 #[cfg(test)]
 use sinomo_runtime::daemon::{
@@ -128,6 +129,7 @@ use sinomo_runtime::daemon::{
     send_daemon_rollout_native_dylib_module as daemon_send_daemon_rollout_native_dylib_module,
     send_daemon_rollout_native_dylib_module_to_endpoint as daemon_send_daemon_rollout_native_dylib_module_to_endpoint,
     send_daemon_rpc as daemon_send_daemon_rpc,
+    send_daemon_rpc_direct_to_endpoint as daemon_send_daemon_rpc_direct_to_endpoint,
     send_daemon_rpc_to_endpoint as daemon_send_daemon_rpc_to_endpoint,
     send_daemon_rpc_with_timeouts as daemon_send_daemon_rpc_with_timeouts,
     send_daemon_shutdown_request,
@@ -175,10 +177,10 @@ use sinomo_runtime::dfs::{
 use sinomo_runtime::dfs::{
     DfsExposeAddRequest, DfsPinAddRequest, DfsPinMode, add_dfs_expose_entry, add_local_dfs_pin,
     default_dfs_metadata_root, default_dfs_metadata_shards_root, dfs_expose_config_path,
-    ensure_default_dfs_expose_config, fallback_dfs_node_id, list_local_dfs_pins,
-    load_dfs_expose_config, metadata_shards_prefix, open_local_sharded_metadata_backend,
-    open_root_local_metadata_backend, remove_dfs_expose_entry, remove_local_dfs_pin,
-    resolve_dfs_metadata_root, resolve_dfs_pin_root, sifs_file_system_id,
+    dfs_import_metadata_root, dfs_import_namespace_root, ensure_default_dfs_expose_config,
+    fallback_dfs_node_id, list_local_dfs_pins, load_dfs_expose_config, metadata_shards_prefix,
+    open_local_sharded_metadata_backend, open_root_local_metadata_backend, remove_dfs_expose_entry,
+    remove_local_dfs_pin, resolve_dfs_metadata_root, resolve_dfs_pin_root, sifs_file_system_id,
 };
 use sinomo_runtime::events::{EventId, JsonlEventStore, SessionId};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore};
@@ -190,7 +192,7 @@ use sinomo_runtime::network::ClusterJoinRegistrationRequest;
 #[cfg(test)]
 use sinomo_runtime::network::ClusterJoinRegistrationResponse;
 use sinomo_runtime::network::{self, ClusterPaths, cluster_doctor_findings};
-use sinomo_runtime::network::{ClusterDoctorFinding, ClusterHealthRow, ClusterId};
+use sinomo_runtime::network::{ClusterDoctorFinding, ClusterHealthRow, ClusterId, ClusterInviteId};
 #[cfg(test)]
 use sinomo_runtime::network::{ClusterInviteChallengeProof, ClusterInviteChallengeRequest};
 use sinomo_runtime::node::{
@@ -1171,15 +1173,16 @@ fn cli_command_registry() -> &'static CliCommandRegistry {
 }
 
 pub(crate) fn parse_cli_invocation(args: &[String]) -> Result<CliInvocation, CliError> {
-    let mut force_local = false;
-    let mut command_start = 0;
-    while matches!(args.get(command_start).map(String::as_str), Some("--local")) {
-        force_local = true;
-        command_start += 1;
+    if args.iter().any(|arg| arg == "--local") {
+        return Err(CliError::Parse {
+            detail:
+                "`--local` has been removed; start the main daemon and use cluster-backed commands"
+                    .to_string(),
+        });
     }
     Ok(CliInvocation {
-        command: parse_cli_command(&args[command_start..])?,
-        options: CliRuntimeOptions { force_local },
+        command: parse_cli_command(args)?,
+        options: CliRuntimeOptions { force_local: false },
     })
 }
 
