@@ -34,7 +34,7 @@ use sinomo_local::SinomoDataDir;
 use sinomo_network::ClusterPaths;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 #[cfg(test)]
 use time::OffsetDateTime;
@@ -44,6 +44,7 @@ use time::OffsetDateTime;
 // out-of-band metadata writes, and doing it every few seconds makes multi-node
 // DFS writes pay repeated disk scans while a request is still in flight.
 const DAEMON_DFS_PROTOCOL_FRAME_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const DAEMON_DFS_PROTOCOL_FRAME_ROUTE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DAEMON_DFS_REPAIR_MAX_JOBS_PER_TICK: usize = 8;
 const DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
 const DAEMON_DFS_METADATA_REPLICATION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -58,6 +59,12 @@ struct DaemonDfsProtocolFrameServiceSignature {
     kv_snapshot_available: bool,
 }
 
+#[derive(Clone, Debug)]
+struct DaemonDfsProtocolFrameRouteSnapshot {
+    signature: DaemonDfsProtocolFrameServiceSignature,
+    endpoints: Vec<ClusterEndpointRecord>,
+}
+
 #[derive(Debug)]
 struct DaemonDfsProtocolFrameServiceLane {
     service: DaemonDfsProtocolFrameService,
@@ -67,6 +74,8 @@ struct DaemonDfsProtocolFrameServiceLane {
 #[derive(Debug)]
 struct DaemonDfsProtocolFrameServiceCacheEntry {
     signature: DaemonDfsProtocolFrameServiceSignature,
+    endpoints: Vec<ClusterEndpointRecord>,
+    last_route_refresh: Instant,
     primary_service: Arc<Mutex<DaemonDfsProtocolFrameServiceLane>>,
     read_services: Vec<Arc<Mutex<DaemonDfsProtocolFrameServiceLane>>>,
     next_read_service: usize,
@@ -535,6 +544,101 @@ fn daemon_dfs_network_error(source: sinomo_network::NetworkError) -> sinomo_dfs:
     }
 }
 
+fn daemon_dfs_perf_trace_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("SINOMO_DFS_PERF_TRACE")
+            .ok()
+            .is_some_and(|value| {
+                value == "1"
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("yes")
+            })
+    });
+    *ENABLED
+}
+
+fn daemon_dfs_perf_trace(args: std::fmt::Arguments<'_>) {
+    if daemon_dfs_perf_trace_enabled() {
+        eprintln!("[sinomo-dfs-perf] {args}");
+    }
+}
+
+fn read_daemon_dfs_protocol_frame_route_snapshot(
+    cluster_paths: &ClusterPaths,
+) -> Result<Option<DaemonDfsProtocolFrameRouteSnapshot>, sinomo_dfs::DfsError> {
+    if !cluster_paths.state.exists() {
+        return Ok(None);
+    }
+    let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
+        .map_err(daemon_dfs_network_error)?;
+    let endpoints = sinomo_network::cluster_dfs_protocol_targets(cluster_paths, &state);
+    Ok(Some(DaemonDfsProtocolFrameRouteSnapshot {
+        signature: DaemonDfsProtocolFrameServiceSignature {
+            local_node_id: state.local_node_id,
+            kv_snapshot_available: cluster_paths.kv_snapshot.exists(),
+        },
+        endpoints,
+    }))
+}
+
+fn cached_daemon_dfs_protocol_frame_route_snapshot(
+    cache_key: &PathBuf,
+) -> Result<Option<DaemonDfsProtocolFrameRouteSnapshot>, sinomo_dfs::DfsError> {
+    let cache = daemon_dfs_protocol_frame_service_cache()
+        .lock()
+        .map_err(|_| daemon_dfs_cache_lock_error())?;
+    Ok(cache
+        .get(cache_key)
+        .filter(|entry| {
+            entry.last_route_refresh.elapsed() < DAEMON_DFS_PROTOCOL_FRAME_ROUTE_REFRESH_INTERVAL
+        })
+        .map(|entry| DaemonDfsProtocolFrameRouteSnapshot {
+            signature: entry.signature.clone(),
+            endpoints: entry.endpoints.clone(),
+        }))
+}
+
+fn schedule_daemon_dfs_protocol_frame_deferred_work(cache_key: PathBuf) {
+    let lanes = {
+        let Ok(cache) = daemon_dfs_protocol_frame_service_cache().lock() else {
+            return;
+        };
+        let Some(entry) = cache.get(&cache_key) else {
+            return;
+        };
+        let mut lanes = Vec::with_capacity(entry.read_services.len().saturating_add(1));
+        lanes.push(Arc::clone(&entry.primary_service));
+        lanes.extend(entry.read_services.iter().map(Arc::clone));
+        lanes
+    };
+    if lanes.is_empty() {
+        return;
+    }
+    let _deferred_work = tokio::task::spawn_blocking(move || {
+        for lane in lanes {
+            let _ = drain_daemon_dfs_protocol_frame_lane_deferred_work(&lane);
+        }
+    });
+}
+
+fn drain_daemon_dfs_protocol_frame_lane_deferred_work(
+    lane: &Arc<Mutex<DaemonDfsProtocolFrameServiceLane>>,
+) -> bool {
+    match lane.try_lock() {
+        Ok(mut lane) => {
+            lane.service.drain_protocol_frame_deferred_work();
+            true
+        }
+        Err(TryLockError::WouldBlock) => {
+            daemon_dfs_perf_trace(format_args!(
+                "protocol-frame-deferred-work skipped_busy_lane=true"
+            ));
+            false
+        }
+        Err(TryLockError::Poisoned(_)) => false,
+    }
+}
+
 fn open_daemon_dfs_protocol_frame_service_lane(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
@@ -566,31 +670,42 @@ fn process_daemon_dfs_protocol_frame_command_on_runtime(
     command: DfsProtocolFrameCommand,
     runtime: &tokio::runtime::Handle,
 ) -> Result<Option<sinomo_dfs::DfsProtocolFrameCommandProcessResult>, sinomo_dfs::DfsError> {
+    let trace_started = Instant::now();
+    let ensure_started = Instant::now();
     data_dir
         .ensure_root_layout()
         .map_err(|source| sinomo_dfs::DfsError::Metadata {
             message: source.to_string(),
         })?;
-    if !cluster_paths.state.exists() {
-        return Ok(None);
-    }
-
-    let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
-        .map_err(daemon_dfs_network_error)?;
-    let endpoints = sinomo_network::cluster_dfs_protocol_targets(cluster_paths, &state);
-    let signature = DaemonDfsProtocolFrameServiceSignature {
-        local_node_id: state.local_node_id.clone(),
-        kv_snapshot_available: cluster_paths.kv_snapshot.exists(),
-    };
+    let ensure_ms = ensure_started.elapsed().as_millis();
     let cache_key = data_dir.root();
     let use_read_lane = sinomo_dfs::dfs_protocol_frame_is_read_only_request(&command.frame);
     let requires_fresh_metadata =
         sinomo_dfs::dfs_protocol_frame_requires_fresh_metadata(&command.frame);
     let request_id = command.request_id;
-    let service_lane = {
+    let route_started = Instant::now();
+    let cached_route_snapshot = cached_daemon_dfs_protocol_frame_route_snapshot(&cache_key)?;
+    let route_cache_hit = cached_route_snapshot.is_some();
+    let route_snapshot = match cached_route_snapshot {
+        Some(snapshot) => snapshot,
+        None => {
+            let Some(snapshot) = read_daemon_dfs_protocol_frame_route_snapshot(cluster_paths)?
+            else {
+                return Ok(None);
+            };
+            snapshot
+        }
+    };
+    let route_ms = route_started.elapsed().as_millis();
+    let signature = route_snapshot.signature.clone();
+    let endpoints = route_snapshot.endpoints.clone();
+    let cache_select_started = Instant::now();
+    let cache_lock_wait_started = Instant::now();
+    let (service_lane, cache_lock_wait_ms) = {
         let mut cache = daemon_dfs_protocol_frame_service_cache()
             .lock()
             .map_err(|_| daemon_dfs_cache_lock_error())?;
+        let cache_lock_wait_ms = cache_lock_wait_started.elapsed().as_millis();
         let should_rebuild = cache
             .get(&cache_key)
             .is_none_or(|entry| entry.signature != signature);
@@ -617,6 +732,8 @@ fn process_daemon_dfs_protocol_frame_command_on_runtime(
                 cache_key.clone(),
                 DaemonDfsProtocolFrameServiceCacheEntry {
                     signature: signature.clone(),
+                    endpoints: endpoints.clone(),
+                    last_route_refresh: Instant::now(),
                     primary_service,
                     read_services,
                     next_read_service: 0,
@@ -627,29 +744,62 @@ fn process_daemon_dfs_protocol_frame_command_on_runtime(
         let entry = cache
             .get_mut(&cache_key)
             .expect("daemon DFS protocol frame cache entry inserted");
+        if !route_cache_hit {
+            entry.endpoints = endpoints.clone();
+            entry.last_route_refresh = Instant::now();
+        }
         if use_read_lane && !entry.read_services.is_empty() {
             let index = entry.next_read_service % entry.read_services.len();
             entry.next_read_service = entry.next_read_service.wrapping_add(1);
-            Arc::clone(&entry.read_services[index])
+            (Arc::clone(&entry.read_services[index]), cache_lock_wait_ms)
         } else {
-            Arc::clone(&entry.primary_service)
+            (Arc::clone(&entry.primary_service), cache_lock_wait_ms)
         }
     };
+    let cache_select_ms = cache_select_started.elapsed().as_millis();
 
+    let lane_lock_wait_started = Instant::now();
     let mut service_lane = service_lane
         .lock()
         .map_err(|_| daemon_dfs_cache_lock_error())?;
+    let lane_lock_wait_ms = lane_lock_wait_started.elapsed().as_millis();
+    let endpoint_refresh_started = Instant::now();
     service_lane
         .service
         .refresh_protocol_frame_endpoints(endpoints);
+    let endpoint_refresh_ms = endpoint_refresh_started.elapsed().as_millis();
+    let hydrate_started = Instant::now();
+    let mut hydrated_metadata = false;
     if requires_fresh_metadata
         || service_lane.last_metadata_refresh.elapsed()
             >= DAEMON_DFS_PROTOCOL_FRAME_CACHE_REFRESH_INTERVAL
     {
         service_lane.service.hydrate_from_metadata_backend()?;
         service_lane.last_metadata_refresh = Instant::now();
+        hydrated_metadata = true;
     }
+    let hydrate_ms = hydrate_started.elapsed().as_millis();
+    let process_started = Instant::now();
     let result = service_lane.service.process_protocol_frame(command.frame)?;
+    let process_ms = process_started.elapsed().as_millis();
+    daemon_dfs_perf_trace(format_args!(
+        "protocol-frame-dispatch request={} read_lane={} route_cache_hit={} route_ms={} ensure_ms={} cache_select_ms={} cache_lock_wait_ms={} lane_lock_wait_ms={} endpoint_refresh_ms={} hydrate={} hydrate_ms={} process_ms={} outbound_frames={} events={} total_ms={}",
+        request_id,
+        use_read_lane,
+        route_cache_hit,
+        route_ms,
+        ensure_ms,
+        cache_select_ms,
+        cache_lock_wait_ms,
+        lane_lock_wait_ms,
+        endpoint_refresh_ms,
+        hydrated_metadata,
+        hydrate_ms,
+        process_ms,
+        result.outbound_frames.len(),
+        result.events.len(),
+        trace_started.elapsed().as_millis()
+    ));
     Ok(Some(sinomo_dfs::DfsProtocolFrameCommandProcessResult {
         response: DfsProtocolFrameResponse {
             request_id,
@@ -664,12 +814,16 @@ async fn handle_daemon_dfs_protocol_frame_async(
     command: DfsProtocolFrameCommand,
     runtime: &tokio::runtime::Handle,
 ) -> Result<DfsProtocolFrameResponse, DaemonError> {
+    let trace_started = Instant::now();
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
+    let protocol_frame_cache_key = data_dir.root();
     let cluster_paths = ClusterPaths::new(&data_dir);
+    let request_id = command.request_id.clone();
     let process_data_dir = data_dir.clone();
     let process_cluster_paths = cluster_paths.clone();
     let process_runtime = runtime.clone();
+    let spawn_started = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
         process_daemon_dfs_protocol_frame_command_on_runtime(
             &process_data_dir,
@@ -683,11 +837,13 @@ async fn handle_daemon_dfs_protocol_frame_async(
         address: "DFS protocol frame".to_string(),
         detail: format!("DFS protocol frame task failed: {source}"),
     })??;
+    let spawn_blocking_ms = spawn_started.elapsed().as_millis();
     let Some(result) = result else {
         return Err(DaemonError::ClusterOrphan);
     };
     let sinomo_dfs::DfsProtocolFrameCommandProcessResult { response, events } = result;
-    if sinomo_dfs::dfs_events_should_publish_metadata(&events) {
+    let should_publish_metadata = sinomo_dfs::dfs_events_should_publish_metadata(&events);
+    if should_publish_metadata {
         notify_daemon_dfs_maintenance_work();
         sinomo_dfs::schedule_cluster_dfs_metadata_publish_after_events_with_async_peer_transport_on_runtime(
             runtime.clone(),
@@ -704,7 +860,16 @@ async fn handle_daemon_dfs_protocol_frame_async(
                 );
             },
         );
+        schedule_daemon_dfs_protocol_frame_deferred_work(protocol_frame_cache_key);
     }
+    daemon_dfs_perf_trace(format_args!(
+        "protocol-frame-handler request={} spawn_blocking_ms={} publish_metadata={} outbound_frames={} total_ms={}",
+        request_id,
+        spawn_blocking_ms,
+        should_publish_metadata,
+        response.outbound_frames.len(),
+        trace_started.elapsed().as_millis()
+    ));
     Ok(response)
 }
 
@@ -780,21 +945,16 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     if let Some(stats) = crate::process_idle_stats() {
         stats.incr_disk_reads_dfs_metadata();
     }
-    let runtime = runtime.clone();
-    let report = tokio::task::spawn_blocking(move || {
-        sinomo_dfs::run_cluster_dfs_maintenance_tick_with_peer_transport(
-            &data_dir,
-            &cluster_paths,
-            daemon_dfs_blocking_peer_transport_on_runtime(&runtime),
-            daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(&runtime)),
-            daemon_dfs_maintenance_tick_options(),
-        )
-    })
+    let report = sinomo_dfs::run_cluster_dfs_maintenance_tick_with_async_peer_transport(
+        runtime,
+        data_dir,
+        cluster_paths.clone(),
+        daemon_dfs_async_peer_transport(runtime),
+        daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(runtime)),
+        daemon_dfs_maintenance_tick_options(),
+    )
     .await
-    .map_err(|source| DaemonError::Network {
-        address: "DFS maintenance".to_string(),
-        detail: format!("DFS maintenance task failed: {source}"),
-    })??;
+    .map_err(DaemonError::from)?;
     let Some(report) = report else {
         return Ok(());
     };
@@ -2853,6 +3013,36 @@ mod tests {
         assert_eq!(
             first_refresh, second_refresh,
             "endpoint-list refreshes should not rebuild the hydrated service cache"
+        );
+    }
+
+    #[test]
+    fn daemon_dfs_deferred_protocol_frame_work_skips_busy_lane() {
+        let root = temp_root("daemon_dfs_deferred_work_skips_busy_lane");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let local = NodeId::from_legacy_named("node_dfs_deferred_busy_local").expect("local");
+        write_test_cluster_state(&data_root, &local);
+        let runtime = daemon_test_runtime("daemon-dfs-deferred-work-skips-busy-lane");
+        let lane = open_daemon_dfs_protocol_frame_service_lane(
+            &data_dir,
+            &cluster_paths,
+            &local,
+            Vec::new(),
+            runtime.handle(),
+        )
+        .expect("open protocol frame service lane");
+
+        let guard = lane.lock().expect("hold lane lock");
+        assert!(
+            !drain_daemon_dfs_protocol_frame_lane_deferred_work(&lane),
+            "deferred work must not wait behind a foreground protocol frame"
+        );
+        drop(guard);
+        assert!(
+            drain_daemon_dfs_protocol_frame_lane_deferred_work(&lane),
+            "deferred work should run once the lane is idle"
         );
     }
 

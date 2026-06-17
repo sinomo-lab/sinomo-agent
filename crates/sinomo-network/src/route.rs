@@ -526,8 +526,20 @@ async fn send_targeted_direct_signed_endpoint_rpc_async(
 }
 
 fn endpoint_rpc_should_use_targeted_direct(request: &ObjectRpcRequest) -> bool {
-    request.route != CLUSTER_RELAY_ROUTE
-        && request.category != crate::CLUSTER_MEMBERSHIP_RPC_CATEGORY
+    !endpoint_rpc_requests_raw_direct(request)
+}
+
+fn endpoint_rpc_requests_raw_direct(request: &ObjectRpcRequest) -> bool {
+    request.route == CLUSTER_RELAY_ROUTE
+        || request.route == crate::CLUSTER_NETWORK_PING_ROUTE
+        || request.category == crate::CLUSTER_MEMBERSHIP_RPC_CATEGORY
+        || request
+            .metadata
+            .get(crate::ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY)
+            .is_some_and(|value| {
+                value == crate::ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE
+                    || value.eq_ignore_ascii_case("true")
+            })
 }
 
 fn cluster_endpoint_transport_timeouts(
@@ -718,6 +730,7 @@ pub async fn send_signed_rpc_to_endpoint_async_with_host(
     let deadline = ClusterEndpointRpcDeadline::new(options.timeouts.connect_timeout);
     let prefers_relay = host.endpoint_prefers_relay_async(endpoint).await?;
     if !prefers_relay
+        && !endpoint_rpc_requests_raw_direct(request)
         && let Some(remaining) = deadline.checked_remaining()
         && let Some(response) = host
             .try_gateway_signed_rpc_async(
@@ -3424,13 +3437,15 @@ mod tests {
                 assert!(
                     command == "RPC /cluster/kv/range"
                         || command == "RPC /cluster/relay"
-                        || command == "RPC /cluster/join/register",
+                        || command == "RPC /cluster/join/register"
+                        || command == "RPC /cluster/network/ping",
                     "unexpected command {command}"
                 );
                 assert!(
                     request.route == "/cluster/kv/range"
                         || request.route == CLUSTER_RELAY_ROUTE
-                        || request.route == crate::CLUSTER_JOIN_REGISTER_ROUTE,
+                        || request.route == crate::CLUSTER_JOIN_REGISTER_ROUTE
+                        || request.route == crate::CLUSTER_NETWORK_PING_ROUTE,
                     "unexpected route {}",
                     request.route
                 );
@@ -3553,9 +3568,85 @@ mod tests {
         .expect("endpoint rpc");
 
         assert_eq!(response.decode_body::<String>().expect("body"), "direct");
-        assert_eq!(host.calls, vec!["prefer_relay", "gateway", "direct"]);
+        assert_eq!(host.calls, vec!["prefer_relay", "direct"]);
         assert!(host.signed_routes.is_empty());
         assert_eq!(host.direct_commands, vec!["RPC /cluster/join/register"]);
+        assert_eq!(host.direct_auth, vec![b"inner-auth".to_vec()]);
+        assert_eq!(host.direct_requests, vec![request]);
+    }
+
+    #[tokio::test]
+    async fn signed_endpoint_rpc_async_keeps_network_ping_raw_direct() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_signed_endpoint_ping_direct").expect("cluster");
+        let target = nid("node_signed_endpoint_ping_direct_target");
+        let endpoint = crate::daemon_lan_endpoint(&target, "10.90.0.42:21353".to_string(), 5);
+        let request = ObjectRpcRequest {
+            route: crate::CLUSTER_NETWORK_PING_ROUTE.to_string(),
+            category: crate::CLUSTER_NETWORK_RPC_CATEGORY.to_string(),
+            metadata: BTreeMap::new(),
+            body: vec![1, 2, 3],
+        };
+        let direct_response = endpoint_rpc_response(crate::CLUSTER_NETWORK_PING_ROUTE, "direct");
+        let mut host = RecordingSignedEndpointRpcHost::new(false, Ok(direct_response), Ok(None))
+            .with_cluster_id(cluster_id);
+
+        let response = send_signed_rpc_to_endpoint_async_with_host(
+            &endpoint,
+            &request,
+            b"inner-auth",
+            "RPC /cluster/network/ping",
+            "RPC /cluster/relay",
+            ClusterSignedEndpointRpcOptions {
+                timeouts: DaemonRpcTimeouts::connect_only(Duration::from_secs(5)),
+            },
+            &mut host,
+        )
+        .await
+        .expect("endpoint rpc");
+
+        assert_eq!(response.decode_body::<String>().expect("body"), "direct");
+        assert_eq!(host.calls, vec!["prefer_relay", "direct"]);
+        assert!(host.signed_routes.is_empty());
+        assert_eq!(host.direct_commands, vec!["RPC /cluster/network/ping"]);
+        assert_eq!(host.direct_auth, vec![b"inner-auth".to_vec()]);
+        assert_eq!(host.direct_requests, vec![request]);
+    }
+
+    #[tokio::test]
+    async fn signed_endpoint_rpc_async_keeps_metadata_opt_in_raw_direct() {
+        let cluster_id = ClusterId::from_legacy_named("cluster_signed_endpoint_raw_direct_opt_in")
+            .expect("cluster");
+        let target = nid("node_signed_endpoint_raw_direct_opt_in_target");
+        let endpoint = crate::daemon_lan_endpoint(&target, "10.90.0.43:21353".to_string(), 5);
+        let mut request = endpoint_rpc_request();
+        request.metadata.insert(
+            crate::ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY.to_string(),
+            crate::ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE.to_string(),
+        );
+        let direct_response =
+            endpoint_rpc_response("/test/endpoint-raw-direct-opt-in-ok", "direct");
+        let mut host = RecordingSignedEndpointRpcHost::new(false, Ok(direct_response), Ok(None))
+            .with_cluster_id(cluster_id);
+
+        let response = send_signed_rpc_to_endpoint_async_with_host(
+            &endpoint,
+            &request,
+            b"inner-auth",
+            "RPC /cluster/kv/range",
+            "RPC /cluster/relay",
+            ClusterSignedEndpointRpcOptions {
+                timeouts: DaemonRpcTimeouts::connect_only(Duration::from_secs(5)),
+            },
+            &mut host,
+        )
+        .await
+        .expect("endpoint rpc");
+
+        assert_eq!(response.decode_body::<String>().expect("body"), "direct");
+        assert_eq!(host.calls, vec!["prefer_relay", "direct"]);
+        assert!(host.signed_routes.is_empty());
+        assert_eq!(host.direct_commands, vec!["RPC /cluster/kv/range"]);
         assert_eq!(host.direct_auth, vec![b"inner-auth".to_vec()]);
         assert_eq!(host.direct_requests, vec![request]);
     }

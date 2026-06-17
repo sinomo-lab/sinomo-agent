@@ -213,11 +213,26 @@ pub struct DfsNamespaceCommand {
     pub request_id: String,
     pub file_system_id: DfsFileSystemId,
     pub requesting_node_id: NodeId,
+    /// False when the requester only needs the operation result and will not
+    /// replay response journals locally.
+    #[serde(
+        default = "default_include_metadata_journal_batches",
+        skip_serializing_if = "bool_is_true"
+    )]
+    pub include_metadata_journal_batches: bool,
     /// The requester's last applied journal sequence per locally known shard,
     /// so the response batches replay exactly the missing entries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metadata_journal_after_sequences: Vec<DfsNamespaceShardCursor>,
     pub operation: DfsNamespaceOperation,
+}
+
+fn default_include_metadata_journal_batches() -> bool {
+    true
+}
+
+fn bool_is_true(value: &bool) -> bool {
+    *value
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

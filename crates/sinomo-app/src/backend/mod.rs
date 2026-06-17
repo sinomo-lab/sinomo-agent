@@ -3,9 +3,11 @@
 //! The app shares the cluster's data directory and always operates *through a daemon*: on
 //! launch it probes for one and attaches over RPC if present. If none is running it starts its
 //! own daemon **in-process** (a background thread running the daemon control loop) and attaches
-//! to that as a **mobile node**. The app is a pure frontend; it holds no config/runtime state of
-//! its own.
+//! to that as a **mobile node**. The app is a pure frontend; runtime/cluster config still goes
+//! through daemon services.
+//! App-only UI preferences live locally under the Sinomo data directory.
 
+pub mod app_config;
 pub mod chat_engine;
 pub mod cluster;
 pub mod config;
@@ -97,8 +99,7 @@ impl Backend {
     /// each step for the launch status indicator.
     pub fn connect(progress: impl Fn(&str)) -> Self {
         progress("Preparing…");
-        let data_dir = SinomoDataDir::from_env_or_home()
-            .unwrap_or_else(|_| SinomoDataDir::new(std::env::temp_dir().join("sinomo")));
+        let data_dir = app_config::default_data_dir();
         // Best-effort: a missing layout shouldn't stop the app from opening.
         let _ = data_dir.ensure_root_layout();
         let data_dir = Arc::new(data_dir);
@@ -150,8 +151,7 @@ impl Backend {
     /// visual tests, which render the UI without the async connection (and without standing up a
     /// real daemon).
     pub fn local_fallback() -> Self {
-        let data_dir = SinomoDataDir::from_env_or_home()
-            .unwrap_or_else(|_| SinomoDataDir::new(std::env::temp_dir().join("sinomo")));
+        let data_dir = app_config::default_data_dir();
         let _ = data_dir.ensure_root_layout();
         let data_dir = Arc::new(data_dir);
 

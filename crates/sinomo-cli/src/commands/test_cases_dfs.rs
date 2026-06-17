@@ -50,12 +50,13 @@ use sinomo_runtime::test::{
 };
 use std::fs;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_EXPECT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_BULK_FILE_COUNT: usize = 128;
 const DEFAULT_BULK_FILE_BYTES: usize = 4 * 1024;
-const DEFAULT_LARGE_FILE_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_LARGE_FILE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_PROTOCOL_CODEC_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_PROTOCOL_CODEC_ITERATIONS: usize = 8;
 const EXPECT_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -1145,16 +1146,6 @@ fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let payload_started = Instant::now();
     let payload = large_payload(&path, bytes);
     let payload_build_elapsed = payload_started.elapsed();
-    let raw_baseline = if min_raw_write_ratio > 0.0 {
-        Some(raw_disk_baseline(
-            ctx,
-            bytes,
-            &format!("large-write-{path}"),
-            raw_sync_write,
-        )?)
-    } else {
-        None
-    };
     let backend = open_backend(ctx)?;
     let node = backend.node_label();
     let started = Instant::now();
@@ -1187,7 +1178,7 @@ fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let bytes_per_second = rate_per_second(total_bytes as f64, elapsed);
     let data_write_bytes_per_second = rate_per_second(total_bytes as f64, write_elapsed);
     let proc_io_delta = proc_io_before
-        .zip(current_proc_io())
+        .zip(proc_io_after_publish)
         .map(|(before, after)| after.saturating_delta(before));
     let proc_io_write_delta = proc_io_before
         .zip(proc_io_after_write)
@@ -1195,6 +1186,16 @@ fn run_large_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let proc_io_publish_delta = proc_io_after_write
         .zip(proc_io_after_publish)
         .map(|(before, after)| after.saturating_delta(before));
+    let raw_baseline = if min_raw_write_ratio > 0.0 {
+        Some(raw_disk_baseline(
+            ctx,
+            bytes,
+            &format!("large-write-{path}"),
+            raw_sync_write,
+        )?)
+    } else {
+        None
+    };
 
     ctx.record("node", &node);
     ctx.record("path", &path);
@@ -1908,6 +1909,7 @@ struct RawDiskBaseline {
     sync_write: bool,
     payload_build_elapsed: Duration,
     write_elapsed: Duration,
+    write_dir_sync_elapsed: Duration,
     read_elapsed: Duration,
     write_bytes_per_second: f64,
     read_bytes_per_second: f64,
@@ -1961,6 +1963,11 @@ fn raw_disk_baseline(
             })?;
         }
     }
+    let write_dir_sync_started = Instant::now();
+    if sync_write && let Some(parent) = path.parent() {
+        sync_raw_disk_baseline_dir(parent)?;
+    }
+    let write_dir_sync_elapsed = write_dir_sync_started.elapsed();
     let write_elapsed = write_started.elapsed();
     let write_proc_after = current_proc_io();
 
@@ -2007,6 +2014,7 @@ fn raw_disk_baseline(
         sync_write,
         payload_build_elapsed,
         write_elapsed,
+        write_dir_sync_elapsed,
         read_elapsed,
         write_bytes_per_second: rate_per_second(total_bytes as f64, write_elapsed),
         read_bytes_per_second: rate_per_second(total_bytes as f64, read_elapsed),
@@ -2016,6 +2024,21 @@ fn raw_disk_baseline(
         read_proc_io_delta: read_proc_before
             .zip(read_proc_after)
             .map(|(before, after)| after.saturating_delta(before)),
+    })
+}
+
+fn sync_raw_disk_baseline_dir(path: &Path) -> Result<(), SinomoTestError> {
+    let dir = fs::File::open(path).map_err(|source| {
+        SinomoTestError::failed(format!(
+            "cannot open raw disk baseline directory {} for sync: {source}",
+            path.display()
+        ))
+    })?;
+    dir.sync_all().map_err(|source| {
+        SinomoTestError::failed(format!(
+            "cannot sync raw disk baseline directory {}: {source}",
+            path.display()
+        ))
     })
 }
 
@@ -2030,6 +2053,10 @@ fn record_raw_disk_baseline(ctx: &mut SinomoTestContext, baseline: &RawDiskBasel
     ctx.record(
         format!("{prefix}_write_elapsed_ms"),
         baseline.write_elapsed.as_millis() as u64,
+    );
+    ctx.record(
+        format!("{prefix}_write_dir_sync_elapsed_ms"),
+        baseline.write_dir_sync_elapsed.as_millis() as u64,
     );
     ctx.record(
         format!("{prefix}_read_elapsed_ms"),

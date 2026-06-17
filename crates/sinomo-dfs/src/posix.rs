@@ -54,6 +54,12 @@ const POSIX_READ_FRESHNESS_SYNC_TIMEOUT: Duration = Duration::from_secs(3);
 const POSIX_READ_FRESHNESS_SYNC_CACHE_TTL: Duration = Duration::from_secs(5);
 const POSIX_REMOTE_READ_IDLE_WAIT_MAX: Duration = Duration::from_millis(50);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PosixDistributedLookupFreshness {
+    LocalHitOk,
+    VerifyLocalHitWithPrimary,
+}
+
 #[derive(Clone, Debug)]
 struct PosixPendingBulkRead {
     index: usize,
@@ -205,6 +211,7 @@ struct PosixBulkLocalWrite<'a> {
     bytes: &'a [u8],
     metadata_primary: Option<NodeId>,
     parent_touch: Option<PosixBulkParentTouch>,
+    link_count_hint: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -247,11 +254,6 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         let mut ready_drains = 0;
         loop {
             let mut events = self.process_incoming()?;
-            let (scheduled, repair_events) = self.retry_pending_repairs_best_effort();
-            if !repair_events.is_empty() {
-                events.extend(repair_events);
-                self.last_events = events.clone();
-            }
             let outcome = self.write_outcome(&intent_id)?;
             if let NetworkedDfsWriteOutcome::Pending {
                 intent_id: next_intent_id,
@@ -262,6 +264,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             }
             if !matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }) {
                 return Ok(outcome);
+            }
+            let (scheduled, repair_events) = self.retry_pending_repairs_best_effort();
+            if !repair_events.is_empty() {
+                events.extend(repair_events);
+                self.last_events = events.clone();
             }
             if (events.is_empty() && scheduled.is_empty())
                 || ready_drains >= POSIX_WAIT_FOR_COMMIT_READY_DRAIN_LIMIT
@@ -279,6 +286,34 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 ready_drains += 1;
             }
         }
+    }
+
+    fn posix_replica_candidates_for_write(
+        &mut self,
+        object: &DfsObjectMetadata,
+        options: &DfsWriteOptions,
+    ) -> std::result::Result<Vec<NodeId>, DfsError> {
+        let mut candidates = options.replica_candidates.clone();
+        if !candidates.contains(&self.node_id) {
+            candidates.insert(0, self.node_id.clone());
+        }
+
+        if options.policy.is_strict_confirmed()
+            && options.policy.desired_replicas >= 2
+            && candidates.len() == options.policy.desired_replicas
+            && candidates.contains(&self.node_id)
+            && let Some(shard) = self.select_metadata_shard_for_object(object)?
+            && shard.primary_node_id != self.node_id
+            && !candidates.contains(&shard.primary_node_id)
+            && let Some(replica_slot) = candidates
+                .iter_mut()
+                .rev()
+                .find(|node_id| **node_id != self.node_id)
+        {
+            *replica_slot = shard.primary_node_id;
+        }
+
+        Ok(candidates)
     }
 
     pub fn bootstrap_distributed_sifs(&mut self) -> Result<()> {
@@ -476,6 +511,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         &mut self,
         path: &str,
         follow_final: bool,
+        freshness: PosixDistributedLookupFreshness,
     ) -> Result<(String, Option<DfsObjectMetadata>)> {
         let mut resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
         // Non-replica mirrors can be stale in BOTH directions because they do
@@ -504,6 +540,25 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             if let Some(object) = self.lookup_sifs_path(&resolved)?
                 && object.kind != DfsObjectKind::Tombstone
             {
+                if freshness == PosixDistributedLookupFreshness::VerifyLocalHitWithPrimary
+                    && let Some(shard) = self.routed_namespace_shard_for_path(&resolved)?
+                    && self.is_local_metadata_replica_for_shard(&shard)
+                    && shard.primary_node_id != self.node_id
+                {
+                    return self
+                        .route_namespace_lookup_path_to_metadata_primary(
+                            sifs_file_system_id(),
+                            shard.primary_node_id,
+                            resolved.clone(),
+                            POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                        )
+                        .map(|primary_object| {
+                            let object = primary_object
+                                .filter(|object| object.kind != DfsObjectKind::Tombstone);
+                            (resolved, object)
+                        })
+                        .map_err(DfsPosixError::from);
+                }
                 return Ok((resolved, Some(object)));
             }
             let Some(shard) = self.routed_namespace_shard_for_path(&resolved)? else {
@@ -1964,7 +2019,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         bytes: &[u8],
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
-        self.posix_write_file_from_reader(path, Cursor::new(bytes), options)
+        self.posix_write_file_bytes_checked_parent(path, bytes, options, true, true, true)
     }
 
     pub fn posix_write_file_with_known_parent(
@@ -1973,13 +2028,16 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         bytes: &[u8],
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
-        self.posix_write_file_from_reader_checked_parent(
-            path,
-            Cursor::new(bytes),
-            options,
-            false,
-            false,
-        )
+        self.posix_write_file_bytes_checked_parent(path, bytes, options, false, false, true)
+    }
+
+    pub fn posix_write_file_with_known_parent_deferred_local_replay(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
+        self.posix_write_file_bytes_checked_parent(path, bytes, options, false, false, false)
     }
 
     pub fn posix_write_files_local_eventual_with_known_parents<'a, I>(
@@ -2027,6 +2085,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 return Err(DfsPosixError::InvalidPath { path });
             };
             let path = join_posix_path(&resolved_parent, child_name);
+            let mut link_count_hint = None;
             let object = match self.lookup_sifs_path(&path)? {
                 Some(object) if object.kind == DfsObjectKind::Directory => {
                     return Err(DfsPosixError::IsDirectory { path });
@@ -2045,10 +2104,14 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     object.link_target_object_id = None;
                     object.current_locations = vec![self.node_id.clone()];
                     set_object_create_timestamps(&mut object);
+                    link_count_hint = Some(1);
                     object
                 }
                 Some(object) => object,
-                None => self.metadata_object_for_new_path(&path, DfsObjectKind::File),
+                None => {
+                    link_count_hint = Some(1);
+                    self.metadata_object_for_new_path(&path, DfsObjectKind::File)
+                }
             };
             if !seen_objects.insert(object.object_id.clone()) {
                 return self.posix_write_files_local_eventual_fallback(&files);
@@ -2072,6 +2135,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 bytes: *bytes,
                 metadata_primary,
                 parent_touch: None,
+                link_count_hint,
             });
         }
 
@@ -2160,6 +2224,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 bytes,
                 metadata_primary,
                 parent_touch,
+                link_count_hint: Some(1),
             });
         }
         self.commit_posix_bulk_local_writes(prepared)
@@ -2203,19 +2268,34 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         }
         let mut touched_parent_objects =
             BTreeMap::<(Option<NodeId>, DfsObjectId), DfsObjectMetadata>::new();
+        let mut resolved_parent_objects =
+            BTreeMap::<(Option<NodeId>, String), DfsObjectMetadata>::new();
         for write in &prepared {
             let Some(parent_touch) = write.parent_touch.as_ref() else {
                 continue;
             };
-            let mut parent = match self.lookup_sifs_path(&parent_touch.path)? {
-                Some(parent) if parent.kind != DfsObjectKind::Tombstone => parent,
-                _ => {
-                    let (_, parent) =
-                        self.lookup_sifs_path_distributed_synced(&parent_touch.path, false)?;
-                    parent.ok_or_else(|| DfsPosixError::MissingParent {
-                        path: parent_touch.path.clone(),
-                    })?
-                }
+            let parent_cache_key = (
+                parent_touch.metadata_primary.clone(),
+                parent_touch.path.clone(),
+            );
+            let parent = if let Some(parent) = resolved_parent_objects.get(&parent_cache_key) {
+                parent.clone()
+            } else {
+                let parent = match self.lookup_sifs_path(&parent_touch.path)? {
+                    Some(parent) if parent.kind != DfsObjectKind::Tombstone => parent,
+                    _ => {
+                        let (_, parent) = self.lookup_sifs_path_distributed_synced(
+                            &parent_touch.path,
+                            false,
+                            PosixDistributedLookupFreshness::LocalHitOk,
+                        )?;
+                        parent.ok_or_else(|| DfsPosixError::MissingParent {
+                            path: parent_touch.path.clone(),
+                        })?
+                    }
+                };
+                resolved_parent_objects.insert(parent_cache_key, parent.clone());
+                parent
             };
             if parent.kind == DfsObjectKind::Tombstone {
                 return Err(DfsPosixError::MissingParent {
@@ -2232,6 +2312,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 parent.object_id.clone(),
             );
             touched_parent_objects.entry(key).or_insert_with(|| {
+                let mut parent = parent.clone();
                 parent.version = next_version(&parent.version);
                 parent.modified_at_unix_nanos = write_time;
                 parent.changed_at_unix_nanos = write_time;
@@ -2274,7 +2355,13 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         committed_objects
             .iter()
             .zip(prepared.iter())
-            .map(|(object, write)| self.stat_object_for_path(object, &write.path))
+            .map(|(object, write)| {
+                self.stat_object_for_path_with_link_count_hint(
+                    object,
+                    &write.path,
+                    write.link_count_hint,
+                )
+            })
             .collect()
     }
 
@@ -2303,6 +2390,268 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
         self.posix_write_file_from_reader_checked_parent(path, reader, options, true, true)
+    }
+
+    fn posix_write_file_bytes_checked_parent(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+        check_parent: bool,
+        touch_parent_on_create: bool,
+        replay_response_journal: bool,
+    ) -> Result<DfsStat> {
+        let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
+        let path = self.resolve_posix_path_distributed(&path, true)?;
+        if requires_directory {
+            return match self.ensure_resolved_path_is_directory(&path) {
+                Ok(()) => Err(DfsPosixError::IsDirectory { path }),
+                Err(DfsPosixError::NotDirectory { path }) => {
+                    Err(DfsPosixError::NotDirectory { path })
+                }
+                Err(DfsPosixError::NotFound { path }) => Err(DfsPosixError::NotDirectory { path }),
+                Err(error) => Err(error),
+            };
+        }
+        if check_parent {
+            self.ensure_parent_directory(&path)?;
+        }
+        let trace_started = Instant::now();
+        let trace_path = path.clone();
+        let trace_bytes = bytes.len();
+        let mut transient_create = false;
+        let object = match self.lookup_sifs_path(&path)? {
+            Some(object) if object.kind == DfsObjectKind::Directory => {
+                return Err(DfsPosixError::IsDirectory { path });
+            }
+            Some(object) if object.kind == DfsObjectKind::Hardlink => {
+                self.resolve_hardlink_target(&object)?
+            }
+            Some(object) if object.kind == DfsObjectKind::Tombstone => {
+                let mut object = object;
+                object.kind = DfsObjectKind::File;
+                object.content_hash = None;
+                object.content_size_bytes = None;
+                object.link_target_object_id = None;
+                object.current_locations = vec![self.node_id.clone()];
+                set_object_create_timestamps(&mut object);
+                self.add_transient_object_metadata(object.clone())?;
+                transient_create = true;
+                object
+            }
+            Some(object) => object,
+            None => {
+                let object = self.metadata_object_for_new_path(&path, DfsObjectKind::File);
+                self.add_transient_object_metadata(object.clone())?;
+                transient_create = true;
+                object
+            }
+        };
+        let target_version = next_version(&object.version);
+        let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
+        let committed_locations = candidates.clone();
+        let content_started = Instant::now();
+        let manifest = match self.content.put_object_version_blob_only(
+            object.object_id.as_str(),
+            target_version.as_str(),
+            bytes,
+        ) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                if transient_create {
+                    self.remove_transient_object_metadata(&object.object_id);
+                }
+                return Err(DfsPosixError::Dfs(error.into()));
+            }
+        };
+        let content_elapsed = content_started.elapsed();
+        let distributed_started = Instant::now();
+        let detach_request = !options.wait_for_commit && !options.foreground_replica_repair;
+        let outcome = self
+            .write_distributed_eventual_from_local_manifest_with_candidates_and_parent_touch(
+                DfsWriteRequest {
+                    file_system_id: object.file_system_id.clone(),
+                    object_id: object.object_id.clone(),
+                    target_version: target_version.clone(),
+                    requesting_node_id: self.node_id.clone(),
+                },
+                Some(object.version.clone()),
+                manifest.content_hash.clone(),
+                manifest.size_bytes,
+                candidates,
+                options.policy,
+                touch_parent_on_create,
+                options.foreground_replica_repair,
+                detach_request,
+                replay_response_journal,
+            );
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if transient_create {
+                    self.remove_transient_object_metadata(&object.object_id);
+                }
+                return Err(error.into());
+            }
+        };
+        let outcome = if options.wait_for_commit {
+            match self.settle_ready_write_outcome(outcome) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    if transient_create {
+                        self.remove_transient_object_metadata(&object.object_id);
+                    }
+                    return Err(error.into());
+                }
+            }
+        } else {
+            outcome
+        };
+        let distributed_elapsed = distributed_started.elapsed();
+        crate::dfs_perf_trace(format_args!(
+            "posix-byte-write node={} path={} object={} version={} bytes={} content_ms={} distributed_ms={} total_ms={}",
+            self.node_id,
+            trace_path,
+            object.object_id,
+            target_version,
+            trace_bytes,
+            content_elapsed.as_millis(),
+            distributed_elapsed.as_millis(),
+            trace_started.elapsed().as_millis()
+        ));
+        match outcome {
+            NetworkedDfsWriteOutcome::Committed {
+                version,
+                content_hash,
+                repair_jobs,
+                ..
+            } => {
+                let mut committed_object = object.clone();
+                committed_object.version = version;
+                committed_object.content_hash = Some(content_hash);
+                committed_object.current_locations = committed_locations
+                    .into_iter()
+                    .filter(|node_id| {
+                        !repair_jobs
+                            .iter()
+                            .any(|job| job.missing_replica_node_id == *node_id)
+                    })
+                    .collect();
+                committed_object.content_size_bytes = Some(manifest.size_bytes);
+                let now = crate::dfs_now_unix_nanos();
+                committed_object.modified_at_unix_nanos = now;
+                committed_object.changed_at_unix_nanos = now;
+                committed_object.last_modified_by_event_id = Some(EventId::generate());
+                self.add_transient_object_metadata(committed_object.clone())?;
+                if transient_create
+                    && touch_parent_on_create
+                    && self.is_local_metadata_primary_for_object(&object)?
+                {
+                    self.touch_parent_directory_modified(&path)?;
+                }
+                if !options.foreground_replica_repair {
+                    return self.stat_object_for_path(&committed_object, &path);
+                }
+                let object = match self.stat_target_for_path(&path) {
+                    Err(DfsPosixError::NotFound { .. }) => {
+                        let mut refreshed = None;
+                        for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
+                            self.sync_remote_namespace_path(&path)?;
+                            match self.stat_target_for_path(&path) {
+                                Err(DfsPosixError::NotFound { .. }) => continue,
+                                result => {
+                                    refreshed = Some(result);
+                                    break;
+                                }
+                            }
+                        }
+                        refreshed.unwrap_or_else(|| self.stat_target_for_path(&path))?
+                    }
+                    result => result?,
+                };
+                self.stat_object_for_path(&object, &path)
+            }
+            NetworkedDfsWriteOutcome::Pending {
+                intent_id,
+                durable_receipts,
+                required_receipts,
+            } if !options.wait_for_commit && !options.foreground_replica_repair => {
+                let mut pending_object = object.clone();
+                pending_object.version = target_version;
+                pending_object.content_hash = Some(manifest.content_hash);
+                pending_object.current_locations = vec![self.node_id.clone()];
+                pending_object.content_size_bytes = Some(manifest.size_bytes);
+                let now = crate::dfs_now_unix_nanos();
+                pending_object.modified_at_unix_nanos = now;
+                pending_object.changed_at_unix_nanos = now;
+                pending_object.last_modified_by_event_id = Some(EventId::generate());
+                self.add_transient_object_metadata(pending_object.clone())?;
+                if transient_create
+                    && touch_parent_on_create
+                    && self.is_local_metadata_primary_for_object(&pending_object)?
+                {
+                    self.touch_parent_directory_modified(&path)?;
+                }
+                let _ = (intent_id, durable_receipts, required_receipts);
+                self.stat_object_for_path(&pending_object, &path)
+            }
+            NetworkedDfsWriteOutcome::Pending {
+                intent_id,
+                durable_receipts,
+                required_receipts,
+            } if !options.wait_for_commit => {
+                if transient_create {
+                    self.remove_transient_object_metadata(&object.object_id);
+                    return Err(DfsPosixError::PendingWrite {
+                        intent_id,
+                        durable_receipts,
+                        required_receipts,
+                    });
+                }
+                Ok(DfsStat {
+                    file_system_id: object.file_system_id,
+                    path,
+                    object_id: object.object_id,
+                    kind: object.kind,
+                    mode: object.mode,
+                    uid: object.uid,
+                    gid: object.gid,
+                    size_bytes: Some(manifest.size_bytes),
+                    link_count: 1,
+                    version: target_version,
+                    modified_at_unix_nanos: object.modified_at_unix_nanos,
+                    accessed_at_unix_nanos: object.accessed_at_unix_nanos,
+                    created_at_unix_nanos: object.created_at_unix_nanos,
+                    changed_at_unix_nanos: object.changed_at_unix_nanos,
+                    content_hash: Some(manifest.content_hash),
+                    policy: object.policy,
+                    current_locations: object.current_locations,
+                })
+            }
+            NetworkedDfsWriteOutcome::Pending {
+                intent_id,
+                durable_receipts,
+                required_receipts,
+            } => {
+                if transient_create {
+                    self.remove_transient_object_metadata(&object.object_id);
+                }
+                Err(DfsPosixError::PendingWrite {
+                    intent_id,
+                    durable_receipts,
+                    required_receipts,
+                })
+            }
+            NetworkedDfsWriteOutcome::Conflict { conflict } => {
+                if transient_create {
+                    self.remove_transient_object_metadata(&object.object_id);
+                }
+                Err(DfsPosixError::Conflict {
+                    path,
+                    reason: conflict.reason,
+                })
+            }
+        }
     }
 
     fn posix_write_file_from_reader_checked_parent<R: Read>(
@@ -2358,10 +2707,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         };
         let target_version = next_version(&object.version);
         let target_version_for_stat = target_version.clone();
-        let mut candidates = options.replica_candidates;
-        if !candidates.contains(&self.node_id) {
-            candidates.insert(0, self.node_id.clone());
-        }
+        let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
         let committed_locations = candidates.clone();
         let outcome = self.write_distributed_eventual_from_reader_with_candidates_and_parent_touch(
             DfsWriteRequest {
@@ -2402,12 +2748,20 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             NetworkedDfsWriteOutcome::Committed {
                 version,
                 content_hash,
+                repair_jobs,
                 ..
             } => {
                 let mut committed_object = object.clone();
                 committed_object.version = version;
                 committed_object.content_hash = Some(content_hash);
-                committed_object.current_locations = committed_locations;
+                committed_object.current_locations = committed_locations
+                    .into_iter()
+                    .filter(|node_id| {
+                        !repair_jobs
+                            .iter()
+                            .any(|job| job.missing_replica_node_id == *node_id)
+                    })
+                    .collect();
                 committed_object.content_size_bytes =
                     self.object_content_size_hint(&committed_object)?;
                 let now = crate::dfs_now_unix_nanos();
@@ -2424,6 +2778,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     && self.is_local_metadata_primary_for_object(&object)?
                 {
                     self.touch_parent_directory_modified(&path)?;
+                }
+                if !options.foreground_replica_repair {
+                    return self.stat_object_for_path(&committed_object, &path);
                 }
                 // Bounded response replay may not have covered a deep
                 // catch-up; pull further batches before surfacing NotFound
@@ -2541,10 +2898,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         }
         let base_version = object.version.clone();
         let target_version = next_version(&object.version);
-        let mut candidates = options.replica_candidates.clone();
-        if !candidates.contains(&self.node_id) {
-            candidates.insert(0, self.node_id.clone());
-        }
+        let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
         let request = DfsWriteRequest {
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
@@ -2644,10 +2998,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         }
         let base_version = object.version.clone();
         let target_version = next_version(&object.version);
-        let mut candidates = options.replica_candidates.clone();
-        if !candidates.contains(&self.node_id) {
-            candidates.insert(0, self.node_id.clone());
-        }
+        let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
         let request = DfsWriteRequest {
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
@@ -2833,10 +3184,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         })?;
         current.resize(len, 0);
         let target_version = next_version(&object.version);
-        let mut candidates = options.replica_candidates;
-        if !candidates.contains(&self.node_id) {
-            candidates.insert(0, self.node_id.clone());
-        }
+        let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
         let request = DfsWriteRequest {
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
@@ -3022,7 +3370,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_read_file_distributed(&mut self, path: &str) -> Result<Vec<u8>> {
-        let (path, object) = self.lookup_sifs_path_distributed_synced(path, true)?;
+        let (path, object) = self.lookup_sifs_path_distributed_synced(
+            path,
+            true,
+            PosixDistributedLookupFreshness::LocalHitOk,
+        )?;
         let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path });
@@ -3114,7 +3466,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         input_path: &str,
         index: usize,
     ) -> Result<PosixBulkReadPlan> {
-        let (path, object) = self.lookup_sifs_path_distributed_synced(input_path, true)?;
+        let (path, object) = self.lookup_sifs_path_distributed_synced(
+            input_path,
+            true,
+            PosixDistributedLookupFreshness::LocalHitOk,
+        )?;
         let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path });
@@ -3300,7 +3656,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_read_file_update_access(&mut self, path: &str) -> Result<Vec<u8>> {
-        let (path, object) = self.lookup_sifs_path_distributed_synced(path, true)?;
+        let (path, object) = self.lookup_sifs_path_distributed_synced(
+            path,
+            true,
+            PosixDistributedLookupFreshness::LocalHitOk,
+        )?;
         let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path });
@@ -3585,10 +3945,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             }
         };
         let target_version = next_version(&object.version);
-        let mut candidates = options.replica_candidates;
-        if !candidates.contains(&self.node_id) {
-            candidates.insert(0, self.node_id.clone());
-        }
+        let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
         let outcome = self.write_distributed_eventual_with_candidates(
             DfsWriteRequest {
                 file_system_id: object.file_system_id.clone(),
@@ -4590,7 +4947,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_lstat_distributed(&mut self, path: &str) -> Result<DfsStat> {
-        let (path, object) = self.lookup_sifs_path_distributed_synced(path, false)?;
+        let (path, object) = self.lookup_sifs_path_distributed_synced(
+            path,
+            false,
+            PosixDistributedLookupFreshness::VerifyLocalHitWithPrimary,
+        )?;
         let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path });
@@ -4935,15 +5296,22 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         if let Some(backend) = self.metadata_backend.as_ref() {
             let backend_object =
                 backend.get_object_by_path(file_system_id, &metadata_path(path))?;
-            return Ok(match (memory_object, backend_object) {
-                (Some(memory_object), Some(backend_object))
-                    if memory_object.version > backend_object.version =>
-                {
-                    Some(memory_object)
+            let object = match (memory_object.as_ref(), backend_object.as_ref()) {
+                (Some(memory_object), Some(backend_object)) => {
+                    Some(self.resolve_authoritative_object_metadata(
+                        &backend_object.object_id,
+                        Some(memory_object),
+                        Some(backend_object),
+                    )?)
                 }
-                (Some(memory_object), None) => Some(memory_object),
-                (_, backend_object) => backend_object,
-            });
+                (Some(memory_object), None) => Some(memory_object.clone()),
+                (_, Some(backend_object)) => Some(backend_object.clone()),
+                (None, None) => None,
+            };
+            return object
+                .map(|object| self.object_metadata_with_receipt_locations(object))
+                .transpose()
+                .map_err(Into::into);
         }
         Ok(memory_object)
     }
@@ -5868,9 +6236,17 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         if let Some(backend) = self.metadata_backend.as_ref()
             && let Some(object) = backend.get_object(object_id)?
         {
-            return Ok(Some(object));
+            return self
+                .object_metadata_with_receipt_locations(object)
+                .map(Some)
+                .map_err(Into::into);
         }
-        Ok(self.metadata.object(object_id).cloned())
+        self.metadata
+            .object(object_id)
+            .cloned()
+            .map(|object| self.object_metadata_with_receipt_locations(object))
+            .transpose()
+            .map_err(Into::into)
     }
 
     fn resolve_hardlink_target(&self, object: &DfsObjectMetadata) -> Result<DfsObjectMetadata> {
@@ -6072,9 +6448,26 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     fn stat_object_for_path(&self, object: &DfsObjectMetadata, path: &str) -> Result<DfsStat> {
+        self.stat_object_for_path_with_link_count_hint(object, path, None)
+    }
+
+    fn stat_object_for_path_with_link_count_hint(
+        &self,
+        object: &DfsObjectMetadata,
+        path: &str,
+        link_count_hint: Option<u64>,
+    ) -> Result<DfsStat> {
         let object = self.resolve_hardlink_target(object)?;
         let size_bytes = self.object_content_size_hint(&object)?;
-        let link_count = self.link_count_for_object(&object)?;
+        let link_count = match link_count_hint {
+            Some(count)
+                if object.kind != DfsObjectKind::Directory
+                    && object.kind != DfsObjectKind::Hardlink =>
+            {
+                count
+            }
+            _ => self.link_count_for_object(&object)?,
+        };
         Ok(DfsStat {
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),

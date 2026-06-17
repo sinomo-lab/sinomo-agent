@@ -22,8 +22,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::{Duration, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -39,6 +39,25 @@ const SHARD_MIGRATION_PAGE_SIZE: usize = 1024;
 const LEGACY_METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 1;
 const METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 2;
 static METADATA_WRITE_PATH_LOCKS: OnceLock<(Mutex<BTreeSet<PathBuf>>, Condvar)> = OnceLock::new();
+
+fn metadata_backend_perf_trace_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("SINOMO_DFS_PERF_TRACE")
+            .ok()
+            .is_some_and(|value| {
+                value == "1"
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("yes")
+            })
+    });
+    *ENABLED
+}
+
+fn metadata_backend_perf_trace(args: std::fmt::Arguments<'_>) {
+    if metadata_backend_perf_trace_enabled() {
+        eprintln!("[sinomo-dfs-perf] {args}");
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum MetadataBackendError {
@@ -330,6 +349,12 @@ pub enum DfsMetadataMutation {
         replica_node_id: NodeId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         receipt: Option<DfsReplicaReceiptRecord>,
+    },
+    RemoveReceipt {
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        replica_node_id: NodeId,
     },
     PutIntent {
         file_system_id: DfsFileSystemId,
@@ -1374,6 +1399,17 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         let version_entry = self.put_version(version)?;
         Ok(vec![object_entry, version_entry])
     }
+    fn put_object_version_intent_and_receipts(
+        &mut self,
+        object: &DfsObjectMetadata,
+        version: &DfsObjectVersionRecord,
+        intent: &DfsWriteIntentRecord,
+        receipts: &[DfsReplicaReceiptRecord],
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let mut entries = self.put_object_and_version(object, version)?;
+        entries.extend(self.put_intent_and_receipts_for_object(Some(object), intent, receipts)?);
+        Ok(entries)
+    }
     fn get_version(
         &self,
         object_id: &DfsObjectId,
@@ -1418,6 +1454,12 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     ) -> Result<DfsObjectVersionPage>;
     fn put_receipt(&mut self, receipt: &DfsReplicaReceiptRecord)
     -> Result<DfsMetadataJournalEntry>;
+    fn remove_receipt(
+        &mut self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+    ) -> Result<Option<DfsMetadataJournalEntry>>;
     fn put_receipt_for_object(
         &mut self,
         object: Option<&DfsObjectMetadata>,
@@ -1464,6 +1506,19 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     ) -> Result<DfsMetadataJournalEntry> {
         let _ = object;
         self.put_intent(intent)
+    }
+    fn put_intent_and_receipts_for_object(
+        &mut self,
+        object: Option<&DfsObjectMetadata>,
+        intent: &DfsWriteIntentRecord,
+        receipts: &[DfsReplicaReceiptRecord],
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let mut entries = Vec::with_capacity(1 + receipts.len());
+        entries.push(self.put_intent_for_object(object, intent)?);
+        for receipt in receipts {
+            entries.push(self.put_receipt_for_object(object, receipt)?);
+        }
+        Ok(entries)
     }
     fn get_intent(
         &self,
@@ -2291,6 +2346,17 @@ impl DfsMetadataTables {
                     receipt,
                 );
             }
+            DfsMetadataTableOp::RemoveReceipt {
+                object_id,
+                version,
+                replica_node_id,
+            } => {
+                self.receipts.remove(&(
+                    object_id.clone(),
+                    version.clone(),
+                    replica_node_id.clone(),
+                ));
+            }
             DfsMetadataTableOp::PutIntent { intent } => {
                 self.put_intent_indexed(intent);
             }
@@ -2564,6 +2630,15 @@ impl DfsMetadataTableRollback {
                     receipt.replica_node_id.clone(),
                 ),
             ),
+            DfsMetadataTableOp::RemoveReceipt {
+                object_id,
+                version,
+                replica_node_id,
+            } => record_rollback_value(
+                &mut self.receipts,
+                &tables.receipts,
+                (object_id.clone(), version.clone(), replica_node_id.clone()),
+            ),
             DfsMetadataTableOp::PutIntent { intent } => record_rollback_value(
                 &mut self.intents,
                 &tables.intents,
@@ -2768,6 +2843,11 @@ enum DfsMetadataTableOp {
     PutReceipt {
         receipt: DfsReplicaReceiptRecord,
     },
+    RemoveReceipt {
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        replica_node_id: NodeId,
+    },
     PutIntent {
         intent: DfsWriteIntentRecord,
     },
@@ -2873,27 +2953,51 @@ impl LocalShardedMetadataBackend {
         )
     }
 
-    fn write_new_object_shard_indexes_relaxed(
+    fn write_content_commit_object_shard_index(
+        &self,
+        object: &DfsObjectMetadata,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<()> {
+        let path = self.object_shard_index_path(&object.object_id);
+        if let Some(index) = self.read_object_shard_index(&object.object_id)? {
+            let normalized_path = normalize_path(&object.path);
+            if index.file_system_id == object.file_system_id
+                && index.path == normalized_path
+                && index.shard_id == *shard_id
+            {
+                return Ok(());
+            }
+            return self.write_object_shard_index(object, shard_id);
+        }
+        write_sobj_files_create_new_relaxed(vec![(
+            path,
+            encode_sobj(&object_shard_index_record(object, shard_id))?,
+        )])
+    }
+
+    fn write_transaction_object_shard_indexes(
         &self,
         objects: &[DfsObjectMetadata],
         shard_id: &DfsMetadataShardId,
-    ) -> Result<bool> {
-        if objects.len() <= 1
-            || objects
-                .iter()
-                .any(|object| self.object_shard_index_path(&object.object_id).exists())
-        {
-            return Ok(false);
-        }
-        let mut files = Vec::with_capacity(objects.len());
+    ) -> Result<()> {
+        let mut new_files = Vec::new();
+        let mut existing_objects = Vec::new();
         for object in objects {
-            files.push((
-                self.object_shard_index_path(&object.object_id),
-                encode_sobj(&object_shard_index_record(object, shard_id))?,
-            ));
+            let path = self.object_shard_index_path(&object.object_id);
+            if path.is_file() {
+                existing_objects.push(object);
+            } else {
+                new_files.push((
+                    path,
+                    encode_sobj(&object_shard_index_record(object, shard_id))?,
+                ));
+            }
         }
-        write_sobj_files_create_new_relaxed(files)?;
-        Ok(true)
+        write_sobj_files_create_new_relaxed(new_files)?;
+        for object in existing_objects {
+            self.write_object_shard_index(object, shard_id)?;
+        }
+        Ok(())
     }
 
     fn remove_object_shard_index(&self, object_id: &DfsObjectId) -> Result<()> {
@@ -2968,6 +3072,17 @@ impl LocalShardedMetadataBackend {
             }
         }
         Ok(tombstone_shard)
+    }
+
+    fn indexed_shard_id_for_object(
+        &self,
+        object_id: &DfsObjectId,
+    ) -> Result<Option<DfsMetadataShardId>> {
+        Ok(self.read_object_shard_index(object_id)?.and_then(|index| {
+            self.shards
+                .contains_key(&index.shard_id)
+                .then_some(index.shard_id)
+        }))
     }
 
     fn object_is_visible_from_shard(
@@ -3900,6 +4015,27 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         Ok(entries)
     }
 
+    fn put_object_version_intent_and_receipts(
+        &mut self,
+        object: &DfsObjectMetadata,
+        version: &DfsObjectVersionRecord,
+        intent: &DfsWriteIntentRecord,
+        receipts: &[DfsReplicaReceiptRecord],
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let object = normalized_object_metadata(object);
+        let target_shard_id =
+            self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
+        let source_shard_id = self.shard_id_for_object(&object.object_id)?;
+        let entries = self
+            .shard_backend_mut(&target_shard_id)?
+            .put_object_version_intent_and_receipts(&object, version, intent, receipts)?;
+        self.write_content_commit_object_shard_index(&object, &target_shard_id)?;
+        if let Some(source_shard_id) = source_shard_id {
+            self.put_cross_shard_tombstone(&object, &source_shard_id, &target_shard_id)?;
+        }
+        Ok(entries)
+    }
+
     fn get_version(
         &self,
         object_id: &DfsObjectId,
@@ -3962,6 +4098,19 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     ) -> Result<DfsMetadataJournalEntry> {
         let shard_id = self.require_shard_id_for_object(&receipt.receipt.object_id)?;
         self.shard_backend_mut(&shard_id)?.put_receipt(receipt)
+    }
+
+    fn remove_receipt(
+        &mut self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+    ) -> Result<Option<DfsMetadataJournalEntry>> {
+        let Some(shard_id) = self.shard_id_for_object(object_id)? else {
+            return Ok(None);
+        };
+        self.shard_backend_mut(&shard_id)?
+            .remove_receipt(object_id, version, replica_node_id)
     }
 
     fn put_receipt_for_object(
@@ -4052,6 +4201,26 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             self.write_object_shard_index(&normalized_object_metadata(object), &shard_id)?;
         }
         Ok(entry)
+    }
+
+    fn put_intent_and_receipts_for_object(
+        &mut self,
+        object: Option<&DfsObjectMetadata>,
+        intent: &DfsWriteIntentRecord,
+        receipts: &[DfsReplicaReceiptRecord],
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let shard_id = self.shard_id_for_pending_object_record(
+            &intent.object_id,
+            &intent.file_system_id,
+            object,
+        )?;
+        let entries = self
+            .shard_backend_mut(&shard_id)?
+            .put_intent_and_receipts_for_object(object, intent, receipts)?;
+        if let Some(object) = object {
+            self.write_object_shard_index(&normalized_object_metadata(object), &shard_id)?;
+        }
+        Ok(entries)
     }
 
     fn get_intent(
@@ -4547,7 +4716,10 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             visible_version,
             required_replica_node_ids,
         )?;
-        self.write_object_shard_index(&normalized_object_metadata(committed_object), &shard_id)?;
+        self.write_content_commit_object_shard_index(
+            &normalized_object_metadata(committed_object),
+            &shard_id,
+        )?;
         Ok(entry)
     }
 
@@ -4566,7 +4738,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             let target_shard_id =
                 self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
             object_shards.insert(object.object_id.clone(), target_shard_id.clone());
-            if let Some(source_shard_id) = self.shard_id_for_object(&object.object_id)?
+            if let Some(source_shard_id) = self.indexed_shard_id_for_object(&object.object_id)?
                 && source_shard_id != target_shard_id
             {
                 cross_shard_tombstones.push((
@@ -4605,13 +4777,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             let entry = self
                 .shard_backend_mut(&shard_id)?
                 .apply_namespace_transaction(&shard_transaction)?;
-            if !self
-                .write_new_object_shard_indexes_relaxed(&shard_transaction.objects, &shard_id)?
-            {
-                for object in &shard_transaction.objects {
-                    self.write_object_shard_index(object, &shard_id)?;
-                }
-            }
+            self.write_transaction_object_shard_indexes(&shard_transaction.objects, &shard_id)?;
             last_entry = Some(entry);
         }
         for (object, source_shard_id, target_shard_id) in cross_shard_tombstones {
@@ -5428,6 +5594,20 @@ impl LocalSobjMetadataBackend {
                 self.materialize_local_journal_entry(entry)?;
                 Ok(true)
             }
+            DfsMetadataMutation::RemoveReceipt {
+                object_id,
+                version,
+                replica_node_id,
+                ..
+            } => {
+                if receipt_for_replica_from_backend(self, object_id, version, replica_node_id)?
+                    .is_none()
+                {
+                    return Ok(false);
+                }
+                self.materialize_local_journal_entry(entry)?;
+                Ok(true)
+            }
             DfsMetadataMutation::PutIntent {
                 object_id,
                 intent_id,
@@ -5655,6 +5835,28 @@ impl LocalSobjMetadataBackend {
                 );
                 Ok(true)
             }
+            DfsMetadataMutation::RemoveReceipt {
+                object_id,
+                version,
+                replica_node_id,
+                ..
+            } => {
+                if receipt_for_replica_from_backend(self, object_id, version, replica_node_id)?
+                    .is_none()
+                {
+                    return Ok(false);
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::RemoveReceipt {
+                        object_id: object_id.clone(),
+                        version: version.clone(),
+                        replica_node_id: replica_node_id.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
             DfsMetadataMutation::PutIntent {
                 object_id,
                 intent_id,
@@ -5804,7 +6006,12 @@ impl LocalSobjMetadataBackend {
         max_entries: usize,
     ) -> Result<Vec<DfsMetadataJournalEntry>> {
         let _lock = self.metadata_write_lock()?;
-        journal_entries_since_limited(&self.root, after_sequence, max_entries)
+        journal_entries_since_limited_with_next_sequence(
+            &self.root,
+            after_sequence,
+            max_entries,
+            self.next_sequence,
+        )
     }
 
     pub fn journal_batch_since_limited(
@@ -5959,12 +6166,6 @@ impl LocalSobjMetadataBackend {
         };
         append_segmented_journal_entry(&self.root, &entry)?;
         self.next_sequence = sequence.saturating_add(1);
-        write_sobj_atomic(
-            &self.journal_head_path(),
-            &DfsMetadataJournalHead {
-                next_sequence: self.next_sequence,
-            },
-        )?;
         Ok(entry)
     }
 
@@ -5975,9 +6176,13 @@ impl LocalSobjMetadataBackend {
         if mutations.is_empty() {
             return Ok(Vec::new());
         }
+        let trace_started = Instant::now();
+        let sequence_started = Instant::now();
         let mut next_sequence = self
             .next_sequence
             .max(fast_next_journal_sequence(&self.root)?);
+        let sequence_ms = sequence_started.elapsed().as_millis();
+        let build_started = Instant::now();
         let mut entries = Vec::with_capacity(mutations.len());
         for mutation in mutations {
             entries.push(DfsMetadataJournalEntry {
@@ -5988,8 +6193,11 @@ impl LocalSobjMetadataBackend {
             });
             next_sequence = next_sequence.saturating_add(1);
         }
+        let build_ms = build_started.elapsed().as_millis();
 
         let mut chunk_start = 0usize;
+        let mut chunk_count = 0usize;
+        let mut append_ms = 0u128;
         while chunk_start < entries.len() {
             let segment_id = journal_segment_id(entries[chunk_start].sequence);
             let mut chunk_end = chunk_start + 1;
@@ -5999,16 +6207,24 @@ impl LocalSobjMetadataBackend {
                 chunk_end += 1;
             }
             let chunk = entries[chunk_start..chunk_end].iter().collect::<Vec<_>>();
+            let append_started = Instant::now();
             append_segmented_journal_entries(&self.root, &chunk)?;
+            append_ms = append_ms.saturating_add(append_started.elapsed().as_millis());
             self.next_sequence = entries[chunk_end - 1].sequence.saturating_add(1);
-            write_sobj_atomic(
-                &self.journal_head_path(),
-                &DfsMetadataJournalHead {
-                    next_sequence: self.next_sequence,
-                },
-            )?;
+            chunk_count += 1;
             chunk_start = chunk_end;
         }
+        metadata_backend_perf_trace(format_args!(
+            "metadata-journal-entries shard={} entries={} chunks={} sequence_ms={} build_ms={} append_ms={} head_ms={} total_ms={}",
+            self.shard_id.0,
+            entries.len(),
+            chunk_count,
+            sequence_ms,
+            build_ms,
+            append_ms,
+            0,
+            trace_started.elapsed().as_millis()
+        ));
         Ok(entries)
     }
 
@@ -6168,6 +6384,19 @@ impl LocalSobjMetadataBackend {
                     }],
                 )
             }
+            DfsMetadataMutation::RemoveReceipt {
+                object_id,
+                version,
+                replica_node_id,
+                ..
+            } => self.append_and_apply_table_ops(
+                entry.sequence,
+                vec![DfsMetadataTableOp::RemoveReceipt {
+                    object_id: object_id.clone(),
+                    version: version.clone(),
+                    replica_node_id: replica_node_id.clone(),
+                }],
+            ),
             DfsMetadataMutation::PutIntent { intent, .. } => {
                 let Some(intent) = intent.as_ref() else {
                     return Ok(());
@@ -7175,6 +7404,133 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         Ok(entries)
     }
 
+    fn put_object_version_intent_and_receipts(
+        &mut self,
+        object: &DfsObjectMetadata,
+        version: &DfsObjectVersionRecord,
+        intent: &DfsWriteIntentRecord,
+        receipts: &[DfsReplicaReceiptRecord],
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let trace_started = Instant::now();
+        let trace_object_id = object.object_id.clone();
+        let trace_version = version.version.clone();
+        let lock_started = Instant::now();
+        let _lock = self.begin_metadata_write()?;
+        let lock_ms = lock_started.elapsed().as_millis();
+        let validate_started = Instant::now();
+        let object = normalized_object_metadata(object);
+        let version = normalized_version_record(version);
+        if object.file_system_id != version.file_system_id
+            || object.object_id != version.object_id
+            || object.file_system_id != intent.file_system_id
+            || object.object_id != intent.object_id
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "combined object/version/intent metadata mismatch for object {}",
+                object.object_id
+            )));
+        }
+        for receipt in receipts {
+            if receipt.receipt.file_system_id != object.file_system_id
+                || receipt.receipt.object_id != object.object_id
+                || receipt.receipt.committed_version != version.version
+            {
+                return Err(MetadataBackendError::Serde(format!(
+                    "combined receipt metadata mismatch for object {}",
+                    object.object_id
+                )));
+            }
+        }
+        if self.get_file_system(&object.file_system_id)?.is_none() {
+            return Err(MetadataBackendError::UnknownFileSystem {
+                file_system_id: object.file_system_id.clone(),
+            });
+        }
+        let validate_ms = validate_started.elapsed().as_millis();
+        let build_started = Instant::now();
+        let mut mutations = Vec::with_capacity(3 + receipts.len());
+        mutations.push(DfsMetadataMutation::PutObject {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            path: object.path.clone(),
+            object: Some(object.clone()),
+        });
+        mutations.push(DfsMetadataMutation::PutVersion {
+            file_system_id: version.file_system_id.clone(),
+            object_id: version.object_id.clone(),
+            version: version.version.clone(),
+            version_record: Some(version.clone()),
+        });
+        mutations.push(DfsMetadataMutation::PutIntent {
+            file_system_id: intent.file_system_id.clone(),
+            object_id: intent.object_id.clone(),
+            intent_id: intent.intent_id.clone(),
+            status: intent.status.clone(),
+            intent: Some(intent.clone()),
+        });
+        mutations.extend(
+            receipts
+                .iter()
+                .map(|receipt| DfsMetadataMutation::PutReceipt {
+                    file_system_id: receipt.receipt.file_system_id.clone(),
+                    object_id: receipt.receipt.object_id.clone(),
+                    version: receipt.receipt.committed_version.clone(),
+                    replica_node_id: receipt.replica_node_id.clone(),
+                    receipt: Some(receipt.clone()),
+                }),
+        );
+        let build_ms = build_started.elapsed().as_millis();
+        let journal_started = Instant::now();
+        let entries = self.write_journal_entries_unlocked(mutations)?;
+        let journal_ms = journal_started.elapsed().as_millis();
+        let materialize_started = Instant::now();
+        let mut table_ops = Vec::new();
+        let mut rollback = DfsMetadataTableRollback::default();
+        let mut last_materialized_sequence = 0u64;
+        let materialize_result = (|| -> Result<()> {
+            for entry in &entries {
+                if self.materialize_replayed_journal_entry_into_batch(
+                    entry,
+                    &mut table_ops,
+                    &mut rollback,
+                )? {
+                    last_materialized_sequence = entry.sequence;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = materialize_result {
+            rollback.rollback(&mut self.tables);
+            return Err(error);
+        }
+        let materialize_ms = materialize_started.elapsed().as_millis();
+        let table_append_started = Instant::now();
+        self.append_preapplied_table_ops(last_materialized_sequence, table_ops, rollback)?;
+        let table_append_ms = table_append_started.elapsed().as_millis();
+        let checkpoint_started = Instant::now();
+        if let Some(last_sequence) = entries.last().map(|entry| entry.sequence) {
+            self.checkpoint_local_materialization_cursor_if_due(last_sequence)?;
+        }
+        let checkpoint_ms = checkpoint_started.elapsed().as_millis();
+        metadata_backend_perf_trace(format_args!(
+            "metadata-put-object-version-intent-receipts shard={} object={} version={} receipts={} entries={} lock_ms={} validate_ms={} build_ms={} journal_ms={} materialize_ms={} table_append_ms={} checkpoint_ms={} total_ms={}",
+            self.shard_id.0,
+            trace_object_id,
+            trace_version,
+            receipts.len(),
+            entries.len(),
+            lock_ms,
+            validate_ms,
+            build_ms,
+            journal_ms,
+            materialize_ms,
+            table_append_ms,
+            checkpoint_ms,
+            trace_started.elapsed().as_millis()
+        ));
+        Ok(entries)
+    }
+
     fn get_version(
         &self,
         object_id: &DfsObjectId,
@@ -7437,6 +7793,39 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         Ok(entry)
     }
 
+    fn remove_receipt(
+        &mut self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+    ) -> Result<Option<DfsMetadataJournalEntry>> {
+        let _lock = self.begin_metadata_write()?;
+        let Some(existing) = self
+            .tables
+            .receipts
+            .get(&(object_id.clone(), version.clone(), replica_node_id.clone()))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let entry = self.write_journal_unlocked(DfsMetadataMutation::RemoveReceipt {
+            file_system_id: existing.receipt.file_system_id,
+            object_id: object_id.clone(),
+            version: version.clone(),
+            replica_node_id: replica_node_id.clone(),
+        })?;
+        self.append_and_apply_table_ops(
+            entry.sequence,
+            vec![DfsMetadataTableOp::RemoveReceipt {
+                object_id: object_id.clone(),
+                version: version.clone(),
+                replica_node_id: replica_node_id.clone(),
+            }],
+        )?;
+        self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
+        Ok(Some(entry))
+    }
+
     fn receipts_for_version(
         &self,
         object_id: &DfsObjectId,
@@ -7529,6 +7918,60 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         )?;
         self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
         Ok(entry)
+    }
+
+    fn put_intent_and_receipts_for_object(
+        &mut self,
+        object: Option<&DfsObjectMetadata>,
+        intent: &DfsWriteIntentRecord,
+        receipts: &[DfsReplicaReceiptRecord],
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let _ = object;
+        let _lock = self.begin_metadata_write()?;
+        let mut mutations = Vec::with_capacity(1 + receipts.len());
+        mutations.push(DfsMetadataMutation::PutIntent {
+            file_system_id: intent.file_system_id.clone(),
+            object_id: intent.object_id.clone(),
+            intent_id: intent.intent_id.clone(),
+            status: intent.status.clone(),
+            intent: Some(intent.clone()),
+        });
+        mutations.extend(
+            receipts
+                .iter()
+                .map(|receipt| DfsMetadataMutation::PutReceipt {
+                    file_system_id: receipt.receipt.file_system_id.clone(),
+                    object_id: receipt.receipt.object_id.clone(),
+                    version: receipt.receipt.committed_version.clone(),
+                    replica_node_id: receipt.replica_node_id.clone(),
+                    receipt: Some(receipt.clone()),
+                }),
+        );
+        let entries = self.write_journal_entries_unlocked(mutations)?;
+        let mut table_ops = Vec::new();
+        let mut rollback = DfsMetadataTableRollback::default();
+        let mut last_materialized_sequence = 0u64;
+        let materialize_result = (|| -> Result<()> {
+            for entry in &entries {
+                if self.materialize_replayed_journal_entry_into_batch(
+                    entry,
+                    &mut table_ops,
+                    &mut rollback,
+                )? {
+                    last_materialized_sequence = entry.sequence;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = materialize_result {
+            rollback.rollback(&mut self.tables);
+            return Err(error);
+        }
+        self.append_preapplied_table_ops(last_materialized_sequence, table_ops, rollback)?;
+        if let Some(last_sequence) = entries.last().map(|entry| entry.sequence) {
+            self.checkpoint_local_materialization_cursor_if_due(last_sequence)?;
+        }
+        Ok(entries)
     }
 
     fn get_intent(
@@ -9301,6 +9744,7 @@ fn journal_entry_has_replay_payloads(entry: &DfsMetadataJournalEntry) -> bool {
         DfsMetadataMutation::PutObject { object, .. } => object.is_some(),
         DfsMetadataMutation::PutVersion { version_record, .. } => version_record.is_some(),
         DfsMetadataMutation::PutReceipt { receipt, .. } => receipt.is_some(),
+        DfsMetadataMutation::RemoveReceipt { .. } => true,
         DfsMetadataMutation::PutIntent { intent, .. } => intent.is_some(),
         DfsMetadataMutation::CommitVisibleVersion {
             committed_object,
@@ -9681,11 +10125,15 @@ fn replay_metadata_table_batches(
 }
 
 fn append_metadata_table_batch(root: &Path, batch: &DfsMetadataTableBatch) -> Result<u64> {
+    let trace_started = Instant::now();
     let path = metadata_table_path(root);
     let existed = path.exists();
+    let create_dir_started = Instant::now();
     if let Some(parent) = path.parent() {
         create_dir_all(parent.to_owned())?;
     }
+    let create_dir_ms = create_dir_started.elapsed().as_millis();
+    let encode_started = Instant::now();
     let bytes = sinomo_object_serde::to_bytes(batch, 1, LengthMode::U32)
         .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
     let length = u32::try_from(bytes.len()).map_err(|_| {
@@ -9698,6 +10146,8 @@ fn append_metadata_table_batch(root: &Path, batch: &DfsMetadataTableBatch) -> Re
     let mut record = Vec::with_capacity(4 + bytes.len());
     record.extend_from_slice(&length.to_le_bytes());
     record.extend_from_slice(&bytes);
+    let encode_ms = encode_started.elapsed().as_millis();
+    let write_sync_started = Instant::now();
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -9713,9 +10163,24 @@ fn append_metadata_table_batch(root: &Path, batch: &DfsMetadataTableBatch) -> Re
             source,
         })?;
     drop(file);
+    let write_sync_ms = write_sync_started.elapsed().as_millis();
+    let sync_dir_started = Instant::now();
     if !existed && let Some(parent) = path.parent() {
         sync_dir(parent)?;
     }
+    let sync_dir_ms = sync_dir_started.elapsed().as_millis();
+    metadata_backend_perf_trace(format_args!(
+        "metadata-table-batch sequence={} ops={} bytes={} existed={} create_dir_ms={} encode_ms={} write_sync_ms={} sync_dir_ms={} total_ms={}",
+        batch.sequence,
+        batch.ops.len(),
+        record.len(),
+        existed,
+        create_dir_ms,
+        encode_ms,
+        write_sync_ms,
+        sync_dir_ms,
+        trace_started.elapsed().as_millis()
+    ));
     Ok(u64::try_from(record.len()).unwrap_or(u64::MAX))
 }
 
@@ -10253,15 +10718,19 @@ fn append_segmented_journal_entries(
     let Some(first) = entries.first() else {
         return Ok(());
     };
+    let trace_started = Instant::now();
     let segment_id = journal_segment_id(first.sequence);
     let path = root
         .join("journal")
         .join("segments")
         .join(format!("{segment_id:020}.slog"));
     let existed = path.exists();
+    let create_dir_started = Instant::now();
     if let Some(parent) = path.parent() {
         create_dir_all(parent.to_owned())?;
     }
+    let create_dir_ms = create_dir_started.elapsed().as_millis();
+    let encode_started = Instant::now();
     let mut records = Vec::new();
     for entry in entries {
         if journal_segment_id(entry.sequence) != segment_id {
@@ -10282,6 +10751,8 @@ fn append_segmented_journal_entries(
         records.extend_from_slice(&length.to_le_bytes());
         records.extend_from_slice(&bytes);
     }
+    let encode_ms = encode_started.elapsed().as_millis();
+    let write_sync_started = Instant::now();
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -10297,9 +10768,24 @@ fn append_segmented_journal_entries(
             source,
         })?;
     drop(file);
+    let write_sync_ms = write_sync_started.elapsed().as_millis();
+    let sync_dir_started = Instant::now();
     if !existed && let Some(parent) = path.parent() {
         sync_dir(parent)?;
     }
+    let sync_dir_ms = sync_dir_started.elapsed().as_millis();
+    metadata_backend_perf_trace(format_args!(
+        "metadata-journal-segment entries={} bytes={} segment={} existed={} create_dir_ms={} encode_ms={} write_sync_ms={} sync_dir_ms={} total_ms={}",
+        entries.len(),
+        records.len(),
+        segment_id,
+        existed,
+        create_dir_ms,
+        encode_ms,
+        write_sync_ms,
+        sync_dir_ms,
+        trace_started.elapsed().as_millis()
+    ));
     Ok(())
 }
 
@@ -10308,7 +10794,16 @@ fn journal_entries_since_limited(
     after_sequence: u64,
     max_entries: usize,
 ) -> Result<Vec<DfsMetadataJournalEntry>> {
-    segmented_journal_entries_since_limited(root, after_sequence, max_entries)
+    segmented_journal_entries_since_limited(root, after_sequence, max_entries, None)
+}
+
+fn journal_entries_since_limited_with_next_sequence(
+    root: &Path,
+    after_sequence: u64,
+    max_entries: usize,
+    next_sequence: u64,
+) -> Result<Vec<DfsMetadataJournalEntry>> {
+    segmented_journal_entries_since_limited(root, after_sequence, max_entries, Some(next_sequence))
 }
 
 fn bounded_metadata_journal_batch(
@@ -10432,11 +10927,17 @@ fn segmented_journal_entries_since_limited(
     root: &Path,
     after_sequence: u64,
     max_entries: usize,
+    known_next_sequence: Option<u64>,
 ) -> Result<Vec<DfsMetadataJournalEntry>> {
     if max_entries == 0 {
         return Ok(Vec::new());
     }
-    if !journal_has_entries_after_head(root, after_sequence)? {
+    let has_entries = if let Some(next_sequence) = known_next_sequence {
+        after_sequence < next_sequence.saturating_sub(1)
+    } else {
+        journal_has_entries_after_head(root, after_sequence)?
+    };
+    if !has_entries {
         return Ok(Vec::new());
     }
     let segments_dir = root.join("journal").join("segments");
@@ -12496,6 +12997,206 @@ mod tests {
     }
 
     #[test]
+    fn sharded_backend_content_commit_creates_missing_object_shard_index() {
+        let root = temp_root("sharded_backend_content_commit_new_index");
+        let file_system = file_system();
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let mut object = object(version("version_1"));
+        object.path = "/services/content-commit.bin".to_string();
+        object.content_hash = Some("blake3:content-commit".to_string());
+        object.content_size_bytes = Some(4096);
+        let version_record = DfsObjectVersionRecord {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            version: object.version.clone(),
+            content_hash: object.content_hash.clone(),
+            size_bytes: object.content_size_bytes,
+            locations: object.current_locations.clone(),
+            created_by_event_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            visible: true,
+        };
+        let intent = DfsWriteIntentRecord {
+            intent_id: "intent-content-commit-new-index".to_string(),
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            base_version: None,
+            target_version: object.version.clone(),
+            coordinator_node_id: node("node_owner"),
+            owner_epoch: 1,
+            desired_replica_node_ids: object.current_locations.clone(),
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            status: DfsWriteIntentStatus::Committed,
+            content_hash: object.content_hash.clone(),
+            object_metadata: Some(object.clone()),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+        };
+        let receipt = DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                committed_version: object.version.clone(),
+                owner_node_id: node("node_owner"),
+                event_id: EventId::from_legacy_named("evt_content_commit_new_index")
+                    .expect("event"),
+            },
+            replica_node_id: node("node_owner"),
+            content_hash: object.content_hash.clone(),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        backend.put_file_system(&file_system).expect("filesystem");
+
+        backend
+            .put_object_version_intent_and_receipts(
+                &object,
+                &version_record,
+                &intent,
+                std::slice::from_ref(&receipt),
+            )
+            .expect("content commit batch");
+
+        assert_eq!(
+            backend
+                .read_object_shard_index(&object.object_id)
+                .expect("object shard index")
+                .as_ref()
+                .map(|index| (&index.path, &index.shard_id)),
+            Some((
+                &normalize_path(&object.path),
+                &DfsMetadataShardId::new("services")
+            )),
+            "content commits for new objects should still publish a lookup index"
+        );
+        assert_eq!(
+            backend
+                .get_object_by_path(&file_system.file_system_id, &object.path)
+                .expect("path lookup"),
+            Some(object),
+            "the relaxed index publish must leave path lookup correct"
+        );
+
+        cleanup(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sharded_backend_content_commit_skips_matching_object_shard_index_rewrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("sharded_backend_content_commit_skip_index_rewrite");
+        let file_system = file_system();
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let mut object = object(version("version_1"));
+        object.path = "/services/existing-content.bin".to_string();
+        object.content_hash = Some("blake3:old-content".to_string());
+        object.content_size_bytes = Some(128);
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&object).expect("initial object");
+
+        let mut committed = object.clone();
+        committed.version = version("version_2");
+        committed.content_hash = Some("blake3:new-content".to_string());
+        committed.content_size_bytes = Some(4096);
+        let version_record = DfsObjectVersionRecord {
+            file_system_id: committed.file_system_id.clone(),
+            object_id: committed.object_id.clone(),
+            version: committed.version.clone(),
+            content_hash: committed.content_hash.clone(),
+            size_bytes: committed.content_size_bytes,
+            locations: committed.current_locations.clone(),
+            created_by_event_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            visible: true,
+        };
+        let intent = DfsWriteIntentRecord {
+            intent_id: "intent-content-commit-existing-index".to_string(),
+            file_system_id: committed.file_system_id.clone(),
+            object_id: committed.object_id.clone(),
+            base_version: Some(object.version.clone()),
+            target_version: committed.version.clone(),
+            coordinator_node_id: node("node_owner"),
+            owner_epoch: 1,
+            desired_replica_node_ids: committed.current_locations.clone(),
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            status: DfsWriteIntentStatus::Committed,
+            content_hash: committed.content_hash.clone(),
+            object_metadata: Some(committed.clone()),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+        };
+        let receipt = DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: committed.file_system_id.clone(),
+                object_id: committed.object_id.clone(),
+                committed_version: committed.version.clone(),
+                owner_node_id: node("node_owner"),
+                event_id: EventId::from_legacy_named("evt_content_commit_existing_index")
+                    .expect("event"),
+            },
+            replica_node_id: node("node_owner"),
+            content_hash: committed.content_hash.clone(),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let index_parent = backend
+            .object_shard_index_path(&committed.object_id)
+            .parent()
+            .expect("index parent")
+            .to_path_buf();
+        let original_permissions = fs::metadata(&index_parent)
+            .expect("index parent metadata")
+            .permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_mode(0o500);
+        fs::set_permissions(&index_parent, read_only_permissions)
+            .expect("make shard index directory read-only");
+
+        let result = backend.put_object_version_intent_and_receipts(
+            &committed,
+            &version_record,
+            &intent,
+            std::slice::from_ref(&receipt),
+        );
+
+        fs::set_permissions(&index_parent, original_permissions)
+            .expect("restore shard index directory permissions");
+        result.expect("content commit should not rewrite an already-correct shard index");
+        assert_eq!(
+            backend
+                .get_object(&committed.object_id)
+                .expect("object by id"),
+            Some(committed),
+            "content commit should still advance the object metadata"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn local_backend_does_not_materialize_object_when_journal_append_fails() {
         let root = temp_root("local_backend_journal_failure_does_not_materialize_object");
         let mut backend =
@@ -13408,9 +14109,11 @@ mod tests {
         backend.put_file_system(&file_system).expect("filesystem");
         backend.put_object(&object).expect("object");
 
-        assert!(
-            root.join("journal").join("head.sobj").is_file(),
-            "the journal head should track the next sequence without scanning every append"
+        let head = read_sobj::<DfsMetadataJournalHead>(&root.join("journal").join("head.sobj"))
+            .expect("journal head");
+        assert_eq!(
+            head.next_sequence, 1,
+            "local appends should leave the journal head as a recovery cache instead of rewriting it on every mutation"
         );
         assert!(
             root.join("journal")
@@ -16710,6 +17413,87 @@ mod tests {
                 .expect("conflict")
                 .status,
             DfsConflictStatus::Resolved
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_batches_write_intent_and_receipts() {
+        let root = temp_root("local_backend_batches_intent_receipts");
+        let shard_id = DfsMetadataShardId::new("root");
+        let file_system = file_system();
+        let file = object(version("version_0"));
+        let intent = DfsWriteIntentRecord {
+            intent_id: "intent-batched".to_string(),
+            file_system_id: file.file_system_id.clone(),
+            object_id: file.object_id.clone(),
+            base_version: Some(file.version.clone()),
+            target_version: version("version_1"),
+            coordinator_node_id: node("node_owner"),
+            owner_epoch: 1,
+            desired_replica_node_ids: vec![node("node_owner"), node("node_remote")],
+            policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
+            status: DfsWriteIntentStatus::ReceiptsPending,
+            content_hash: Some("blake3:batched".to_string()),
+            object_metadata: Some(file.clone()),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+        };
+        let receipts = ["node_owner", "node_remote"]
+            .into_iter()
+            .map(|replica| DfsReplicaReceiptRecord {
+                receipt: DfsWriteReceipt {
+                    file_system_id: file.file_system_id.clone(),
+                    object_id: file.object_id.clone(),
+                    committed_version: intent.target_version.clone(),
+                    owner_node_id: node("node_owner"),
+                    event_id: EventId::from_legacy_named(&format!("evt_batch_{replica}"))
+                        .expect("event"),
+                },
+                replica_node_id: node(replica),
+                content_hash: intent.content_hash.clone(),
+                received_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .collect::<Vec<_>>();
+
+        {
+            let mut backend =
+                LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+            backend.put_file_system(&file_system).expect("filesystem");
+            backend.put_object(&file).expect("object");
+            let entries = backend
+                .put_intent_and_receipts_for_object(Some(&file), &intent, &receipts)
+                .expect("batched intent receipts");
+            assert_eq!(entries.len(), 3);
+            assert_eq!(
+                backend
+                    .get_intent(&file.object_id, &intent.intent_id)
+                    .expect("intent"),
+                Some(intent.clone())
+            );
+            assert_eq!(
+                backend
+                    .receipts_for_version(&file.object_id, &intent.target_version)
+                    .expect("receipts")
+                    .len(),
+                2
+            );
+        }
+
+        let reopened = LocalSobjMetadataBackend::new(shard_id, &root).expect("reopen");
+        assert_eq!(
+            reopened
+                .get_intent(&file.object_id, &intent.intent_id)
+                .expect("reopened intent"),
+            Some(intent)
+        );
+        assert_eq!(
+            reopened
+                .receipts_for_version(&file.object_id, &version("version_1"))
+                .expect("reopened receipts")
+                .len(),
+            2
         );
 
         cleanup(&root);

@@ -3,7 +3,8 @@ use sinomo_core::{ClusterEndpointPrivacy, ClusterEndpointSource, ClusterTranspor
 use sinomo_kv::InProcessRaftKvCluster;
 use sinomo_network::{AsyncInProcessNetwork, InProcessNetwork};
 use sinomo_object::Value;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -66,17 +67,19 @@ impl DfsFrameTransport for ReceiveOnlyTransport {
 
 #[test]
 fn dfs_adaptive_transfer_windows_stay_byte_bounded() {
-    assert_eq!(DFS_BLOB_CHUNK_BYTES, 1024 * 1024);
-    assert_eq!(DFS_BLOB_INLINE_LIMIT_BYTES, DFS_BLOB_CHUNK_BYTES);
+    assert_eq!(DFS_BLOB_CHUNK_BYTES, 4 * 1024 * 1024);
+    assert_eq!(DFS_BLOB_INLINE_LIMIT_BYTES, 1024 * 1024);
 
     let large_transfer = 128 * 1024 * 1024;
+    let byte_budget_window =
+        (DFS_ADAPTIVE_TRANSFER_WINDOW_MAX_BYTES / DFS_BLOB_CHUNK_BYTES as u64) as u32;
     assert_eq!(
         dfs_adaptive_chunk_window_size(
             DfsTransferProfile::Conservative,
             large_transfer,
             DFS_READ_CHUNK_WINDOW_SIZE,
         ),
-        4
+        byte_budget_window
     );
     assert_eq!(
         dfs_adaptive_chunk_window_size(
@@ -84,7 +87,7 @@ fn dfs_adaptive_transfer_windows_stay_byte_bounded() {
             large_transfer,
             DFS_READ_CHUNK_WINDOW_SIZE,
         ),
-        16
+        byte_budget_window
     );
     assert_eq!(
         dfs_adaptive_chunk_window_size(
@@ -92,7 +95,7 @@ fn dfs_adaptive_transfer_windows_stay_byte_bounded() {
             large_transfer,
             DFS_READ_CHUNK_WINDOW_SIZE,
         ),
-        16
+        byte_budget_window
     );
 }
 
@@ -115,6 +118,116 @@ fn assert_native_bytes_field(value: &impl serde::Serialize, key: &str) {
         matches!(field, Value::Bytes(_)),
         "expected {key} to serialize as native bytes, got {field:?}"
     );
+}
+
+fn dfs_message_trace_label(message: &DfsNetworkMessage) -> String {
+    match message {
+        DfsNetworkMessage::ReadRequest(_) => "read-request".to_string(),
+        DfsNetworkMessage::ReadResponse(_) => "read-response".to_string(),
+        DfsNetworkMessage::ReadResponseChunk(chunk) => format!(
+            "read-response-chunk:{}/{}:{}b",
+            chunk.chunk_index.saturating_add(1),
+            chunk.total_chunks,
+            chunk.bytes.len()
+        ),
+        DfsNetworkMessage::BulkReadRequest(_) => "bulk-read-request".to_string(),
+        DfsNetworkMessage::BulkReadResponse(_) => "bulk-read-response".to_string(),
+        DfsNetworkMessage::WriteRequest(_) => "write-request".to_string(),
+        DfsNetworkMessage::WriteResponse(_) => "write-response".to_string(),
+        DfsNetworkMessage::DistributedWriteRequest(command) => {
+            format!("distributed-write-request:{}", command.request_id)
+        }
+        DfsNetworkMessage::DistributedWriteResponse(response) => {
+            format!("distributed-write-response:{}", response.request_id)
+        }
+        DfsNetworkMessage::NamespaceRequest(_) => "namespace-request".to_string(),
+        DfsNetworkMessage::NamespaceResponse(_) => "namespace-response".to_string(),
+        DfsNetworkMessage::FetchBlob(command) => {
+            format!("fetch-blob:{}", command.intent_id)
+        }
+        DfsNetworkMessage::FetchBlobResponse(response) => {
+            format!("fetch-blob-response:{}", response.intent_id)
+        }
+        DfsNetworkMessage::FetchBlobResponseChunk(chunk) => format!(
+            "fetch-blob-response-chunk:{}:{}/{}:{}b",
+            chunk.intent_id,
+            chunk.chunk_index.saturating_add(1),
+            chunk.total_chunks,
+            chunk.bytes.len()
+        ),
+        DfsNetworkMessage::StageBlob(stage) => {
+            format!("stage-blob:{}", stage.intent_id)
+        }
+        DfsNetworkMessage::StageBlobChunk(chunk) => format!(
+            "stage-blob-chunk:{}:{}/{}:{}b",
+            chunk.intent_id,
+            chunk.chunk_index.saturating_add(1),
+            chunk.total_chunks,
+            chunk.bytes.len()
+        ),
+        DfsNetworkMessage::StageBlobResponse(response) => {
+            format!("stage-blob-response:{}", response.intent_id)
+        }
+        DfsNetworkMessage::StagePatch(_) => "stage-patch".to_string(),
+        DfsNetworkMessage::StagePatchChunk(chunk) => format!(
+            "stage-patch-chunk:{}/{}:{}b",
+            chunk.chunk_index.saturating_add(1),
+            chunk.total_chunks,
+            chunk.bytes.len()
+        ),
+        DfsNetworkMessage::CommitVersion(_) => "commit-version".to_string(),
+        DfsNetworkMessage::CommitVersionResponse(_) => "commit-version-response".to_string(),
+        DfsNetworkMessage::RepairReplica(_) => "repair-replica".to_string(),
+        DfsNetworkMessage::RepairReplicaChunk(chunk) => format!(
+            "repair-replica-chunk:{}/{}:{}b",
+            chunk.chunk_index.saturating_add(1),
+            chunk.total_chunks,
+            chunk.bytes.len()
+        ),
+        DfsNetworkMessage::RepairReplicaResponse(_) => "repair-replica-response".to_string(),
+        DfsNetworkMessage::MetadataJournalBatch(_) => "metadata-journal-batch".to_string(),
+        DfsNetworkMessage::MetadataJournalBatchResponse(_) => {
+            "metadata-journal-batch-response".to_string()
+        }
+        DfsNetworkMessage::MetadataSnapshotInstall(_) => "metadata-snapshot-install".to_string(),
+        DfsNetworkMessage::MetadataSnapshotInstallResponse(_) => {
+            "metadata-snapshot-install-response".to_string()
+        }
+    }
+}
+
+fn networked_dfs_event_trace_label(event: &NetworkedDfsServiceEvent) -> String {
+    match event {
+        NetworkedDfsServiceEvent::BlobFetched {
+            intent_id,
+            source_node_id,
+            ..
+        } => format!("blob-fetched:{intent_id}:from:{source_node_id}"),
+        NetworkedDfsServiceEvent::BlobFetchRejected {
+            intent_id,
+            source_node_id,
+            reason,
+            ..
+        } => format!("blob-fetch-rejected:{intent_id}:from:{source_node_id}:{reason}"),
+        NetworkedDfsServiceEvent::BlobStaged {
+            intent_id,
+            replica_node_id,
+            ..
+        } => format!("blob-staged:{intent_id}:to:{replica_node_id}"),
+        NetworkedDfsServiceEvent::BlobStageRejected {
+            intent_id,
+            replica_node_id,
+            reason,
+            ..
+        } => format!("blob-stage-rejected:{intent_id}:to:{replica_node_id}:{reason}"),
+        NetworkedDfsServiceEvent::RemoteWriteServed {
+            request_id, result, ..
+        } => format!("remote-write-served:{request_id}:{result:?}"),
+        NetworkedDfsServiceEvent::RemoteWriteCompleted {
+            request_id, result, ..
+        } => format!("remote-write-completed:{request_id}:{result:?}"),
+        _ => "event".to_string(),
+    }
 }
 
 fn protocol_test_bytes() -> Vec<u8> {
@@ -365,6 +478,7 @@ fn dfs_protocol_frame_read_only_classifier_routes_lookup_path_to_read_lane() {
             request_id: "lookup-request".to_string(),
             file_system_id: file_system_id.clone(),
             requesting_node_id: local.clone(),
+            include_metadata_journal_batches: true,
             metadata_journal_after_sequences: Vec::new(),
             operation: DfsNamespaceOperation::LookupPath {
                 path: "/services/example.txt".to_string(),
@@ -384,6 +498,7 @@ fn dfs_protocol_frame_read_only_classifier_routes_lookup_path_to_read_lane() {
             request_id: "sync-request".to_string(),
             file_system_id: file_system_id.clone(),
             requesting_node_id: local.clone(),
+            include_metadata_journal_batches: true,
             metadata_journal_after_sequences: Vec::new(),
             operation: DfsNamespaceOperation::SyncPath {
                 path: "/services/example.txt".to_string(),
@@ -403,6 +518,7 @@ fn dfs_protocol_frame_read_only_classifier_routes_lookup_path_to_read_lane() {
             request_id: "apply-request".to_string(),
             file_system_id: file_system_id.clone(),
             requesting_node_id: local.clone(),
+            include_metadata_journal_batches: true,
             metadata_journal_after_sequences: Vec::new(),
             operation: DfsNamespaceOperation::ApplyTransaction {
                 transaction: DfsNamespaceTransaction {
@@ -635,6 +751,47 @@ impl DfsControlPlaneKvClient for ClusterPathDfsControlPlaneKvClient {
     }
 }
 
+#[derive(Debug)]
+struct CountingDfsControlPlaneKvClient {
+    inner: InProcessRaftKvCluster,
+    range_prefix_calls: Arc<AtomicUsize>,
+}
+
+impl CountingDfsControlPlaneKvClient {
+    fn new(inner: InProcessRaftKvCluster, range_prefix_calls: Arc<AtomicUsize>) -> Self {
+        Self {
+            inner,
+            range_prefix_calls,
+        }
+    }
+}
+
+impl DfsControlPlaneKvClient for CountingDfsControlPlaneKvClient {
+    fn get(&self, key: &str) -> Result<Option<sinomo_kv::KvEntry>, sinomo_kv::KvError> {
+        DfsControlPlaneKvClient::get(&self.inner, key)
+    }
+
+    fn range_prefix(&self, prefix: &str) -> Result<Vec<sinomo_kv::KvEntry>, sinomo_kv::KvError> {
+        self.range_prefix_calls.fetch_add(1, Ordering::SeqCst);
+        DfsControlPlaneKvClient::range_prefix(&self.inner, prefix)
+    }
+
+    fn put(
+        &mut self,
+        key: String,
+        value: Vec<u8>,
+    ) -> Result<sinomo_kv::KvRevision, sinomo_kv::KvError> {
+        DfsControlPlaneKvClient::put(&mut self.inner, key, value)
+    }
+
+    fn txn(
+        &mut self,
+        txn: sinomo_kv::KvTxn,
+    ) -> Result<sinomo_kv::KvTxnResponse, sinomo_kv::KvError> {
+        DfsControlPlaneKvClient::txn(&mut self.inner, txn)
+    }
+}
+
 #[derive(Clone)]
 struct CountingEmptyTransport {
     local_node_id: NodeId,
@@ -669,13 +826,15 @@ fn test_endpoint(node_id: &NodeId, address: &str) -> ClusterEndpointRecord {
 #[test]
 fn adaptive_chunk_window_scales_by_profile_and_object_size() {
     let large_object = 64 * 1024 * 1024;
+    let byte_budget_window =
+        (DFS_ADAPTIVE_TRANSFER_WINDOW_MAX_BYTES / DFS_BLOB_CHUNK_BYTES as u64) as u32;
     assert_eq!(
         dfs_adaptive_chunk_window_size(
             DfsTransferProfile::Conservative,
             large_object,
             DFS_STAGE_CHUNK_WINDOW_SIZE,
         ),
-        DFS_STAGE_CHUNK_WINDOW_SIZE
+        byte_budget_window.min(DFS_STAGE_CHUNK_WINDOW_SIZE)
     );
     assert_eq!(
         dfs_adaptive_chunk_window_size(
@@ -683,7 +842,7 @@ fn adaptive_chunk_window_scales_by_profile_and_object_size() {
             large_object,
             DFS_STAGE_CHUNK_WINDOW_SIZE,
         ),
-        DFS_LAN_CHUNK_WINDOW_SIZE
+        byte_budget_window.min(DFS_LAN_CHUNK_WINDOW_SIZE)
     );
     assert_eq!(
         dfs_adaptive_chunk_window_size(
@@ -691,7 +850,7 @@ fn adaptive_chunk_window_scales_by_profile_and_object_size() {
             large_object,
             DFS_STAGE_CHUNK_WINDOW_SIZE,
         ),
-        DFS_LOCAL_CHUNK_WINDOW_SIZE
+        byte_budget_window.min(DFS_LOCAL_CHUNK_WINDOW_SIZE)
     );
     assert_eq!(
         dfs_adaptive_chunk_window_size(
@@ -1127,6 +1286,20 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         dfs_protocol_frame_rpc_request(&protocol_command).expect("protocol request");
     assert_eq!(protocol_request.route, DFS_PROTOCOL_FRAME_ROUTE);
     assert_eq!(protocol_request.category, DFS_RPC_CATEGORY);
+    assert_eq!(
+        protocol_request
+            .metadata
+            .get(sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY)
+            .map(String::as_str),
+        Some(sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE)
+    );
+    assert_eq!(
+        protocol_request
+            .metadata
+            .get(sinomo_network::ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY)
+            .map(String::as_str),
+        Some(sinomo_network::ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE)
+    );
     assert_eq!(
         protocol_request
             .decode_body::<DfsProtocolFrameCommand>()
@@ -2006,6 +2179,172 @@ fn served_protocol_frame_drains_nested_stage_response_before_returning() {
 }
 
 #[test]
+fn served_non_foreground_write_does_not_retry_unrelated_repairs() {
+    let root = temp_root("served-non-foreground-write-skips-unrelated-repairs");
+    let requester = NodeId::from_legacy_named("node_served_deferred_requester").expect("requester");
+    let primary = NodeId::from_legacy_named("node_served_deferred_primary").expect("primary");
+    let replica = NodeId::from_legacy_named("node_served_deferred_replica").expect("replica");
+    let backlog_object =
+        DfsObjectId::from_legacy_named("obj_served_deferred_backlog").expect("object");
+    let routed_object =
+        DfsObjectId::from_legacy_named("obj_served_deferred_routed").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_served_deferred_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_served_deferred_2").expect("version");
+    let endpoint = test_endpoint(&replica, "192.0.2.22:21353");
+    let repair_calls = Arc::new(Mutex::new(Vec::new()));
+    let repair_calls_for_sender = Arc::clone(&repair_calls);
+    let replica_for_sender = replica.clone();
+    let sender: DfsProtocolFrameSender = Arc::new(move |endpoint, command, _timeout| {
+        assert_eq!(endpoint.node_id, replica_for_sender);
+        let MeshMessageBody::Protocol(protocol) = &command.frame.message.body else {
+            panic!("expected protocol frame");
+        };
+        if let Ok(
+            message @ (DfsNetworkMessage::RepairReplica(_)
+            | DfsNetworkMessage::RepairReplicaChunk(_)
+            | DfsNetworkMessage::StageBlob(_)
+            | DfsNetworkMessage::StageBlobChunk(_)),
+        ) = protocol.decode::<DfsNetworkMessage>()
+        {
+            repair_calls_for_sender
+                .lock()
+                .expect("repair calls lock")
+                .push(dfs_message_trace_label(&message).to_string());
+        }
+        Ok(DfsProtocolFrameResponse {
+            request_id: command.request_id.clone(),
+            outbound_frames: Vec::new(),
+        })
+    });
+    let transport = DfsEndpointServedProtocolFrameTransport::new(
+        primary.clone(),
+        vec![endpoint],
+        sender,
+        Duration::from_millis(1),
+    );
+    let content = LocalContentStore::new(root.join("content")).expect("content store");
+    let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+    let mut dfs = NetworkedDfsService::new(transport, content)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+
+    let mut backlog_metadata = file_metadata(primary.clone());
+    backlog_metadata.object_id = backlog_object.clone();
+    backlog_metadata.path = "/services/served-frame/backlog.bin".to_string();
+    backlog_metadata.version = version_1.clone();
+    backlog_metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    backlog_metadata.current_locations = vec![primary.clone()];
+    dfs.add_object_metadata(backlog_metadata)
+        .expect("backlog object metadata");
+
+    let backlog_write = dfs
+        .write_distributed_eventual_from_reader_with_candidates_and_parent_touch(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id: backlog_object,
+                target_version: version_2.clone(),
+                requesting_node_id: primary.clone(),
+            },
+            std::io::Cursor::new(b"repair backlog bytes".to_vec()),
+            vec![primary.clone(), replica.clone()],
+            DfsReplicationPolicy::new(1, 2).expect("policy"),
+            true,
+            false,
+        )
+        .expect("backlog write");
+    let NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } = backlog_write else {
+        panic!("expected committed backlog write, got {backlog_write:?}");
+    };
+    assert_eq!(repair_jobs.len(), 1);
+    assert_eq!(repair_jobs[0].missing_replica_node_id, replica);
+    repair_calls.lock().expect("repair calls lock").clear();
+
+    let mut routed_metadata = file_metadata(primary.clone());
+    routed_metadata.object_id = routed_object.clone();
+    routed_metadata.path = "/services/served-frame/routed-deferred.bin".to_string();
+    routed_metadata.version = version_1.clone();
+    routed_metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    routed_metadata.current_locations = vec![requester.clone()];
+    dfs.add_object_metadata(routed_metadata)
+        .expect("routed object metadata");
+
+    let request_id = "dfs_net_req_served_deferred".to_string();
+    let command = DfsDistributedWriteCommand {
+        request_id: request_id.clone(),
+        request: DfsWriteRequest {
+            file_system_id: sifs_file_system_id(),
+            object_id: routed_object.clone(),
+            target_version: version_2.clone(),
+            requesting_node_id: requester.clone(),
+        },
+        expected_base_version: Some(version_1),
+        metadata_journal_after_sequence: None,
+        bytes: b"served routed deferred bytes".to_vec(),
+        content_hash: None,
+        content_size_bytes: None,
+        desired_replica_nodes: vec![requester.clone(), replica.clone()],
+        policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+        object_metadata: None,
+        touch_parent_on_create: false,
+        foreground_replica_repair: false,
+    };
+    let frame = build_dfs_network_frame(
+        &requester,
+        &primary,
+        12,
+        13,
+        DfsNetworkMessage::DistributedWriteRequest(command),
+    )
+    .expect("request frame");
+
+    let result = dfs.process_protocol_frame(frame).expect("process frame");
+
+    assert!(
+        repair_calls.lock().expect("repair calls lock").is_empty(),
+        "non-foreground routed write must not retry unrelated repair backlog"
+    );
+    let responses = result
+        .outbound_frames
+        .iter()
+        .filter_map(|frame| {
+            if frame.source_node_id != primary || frame.target_node_id != requester {
+                return None;
+            }
+            let MeshMessageBody::Protocol(protocol) = &frame.message.body else {
+                return None;
+            };
+            protocol.decode::<DfsNetworkMessage>().ok()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        responses.iter().any(|message| {
+            matches!(
+                message,
+                DfsNetworkMessage::DistributedWriteResponse(DfsDistributedWriteResponse {
+                    request_id: response_request_id,
+                    object_id: response_object_id,
+                    result:
+                        DfsDistributedWriteResult::Outcome {
+                            outcome:
+                                NetworkedDfsWriteOutcome::Committed {
+                                    version,
+                                    ..
+                                },
+                        },
+                    ..
+                }) if response_request_id == &request_id
+                    && response_object_id == &routed_object
+                    && version == &version_2
+            )
+        }),
+        "served frame should return committed deferred write response, got {responses:?}"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn served_protocol_frame_reports_repair_retry_failure_without_failing_request() {
     let root = temp_root("served-protocol-frame-repair-retry-best-effort");
     let requester =
@@ -2052,6 +2391,14 @@ fn served_protocol_frame_reports_repair_retry_failure_without_failing_request() 
         DfsWriteOptions::replicated_eventual(vec![primary.clone()]),
     )
     .expect("initial self write");
+    let base_object = dfs.posix_stat(path).expect("stat base object");
+    dfs.content()
+        .put_object_version(
+            base_object.object_id.as_str(),
+            base_object.version.as_str(),
+            &initial,
+        )
+        .expect("seed base object version manifest");
 
     let mut patch = vec![0_u8; 80 * 1024 + 7];
     for (index, byte) in patch.iter_mut().enumerate() {
@@ -2099,6 +2446,7 @@ fn served_protocol_frame_reports_repair_retry_failure_without_failing_request() 
             request_id: "served_frame_sync_after_repair_failure".to_string(),
             file_system_id: sifs_file_system_id(),
             requesting_node_id: requester.clone(),
+            include_metadata_journal_batches: true,
             metadata_journal_after_sequences: Vec::new(),
             operation: DfsNamespaceOperation::SyncPath {
                 path: "/services".to_string(),
@@ -7099,6 +7447,108 @@ fn fetch_receipt_completion_sends_untracked_routed_write_response() {
 }
 
 #[test]
+fn routed_inline_blob_records_requester_receipt_without_restaging() {
+    let root = temp_root("routed-inline-records-requester-receipt");
+    let primary = NodeId::from_legacy_named("node_routed_inline_receipt_primary").expect("primary");
+    let writer = NodeId::from_legacy_named("node_routed_inline_receipt_writer").expect("writer");
+    let object_id = DfsObjectId::from_legacy_named("obj_routed_inline_receipt").expect("object");
+    let version_1 =
+        DfsVersion::from_legacy_named("version_routed_inline_receipt_1").expect("version");
+    let version_2 =
+        DfsVersion::from_legacy_named("version_routed_inline_receipt_2").expect("version");
+    let network = InProcessNetwork::new();
+    let mut writer_mailbox = network.add_node(writer.clone());
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let mut dfs = NetworkedDfsService::new(network.add_node(primary.clone()), content);
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    let mut object = file_metadata(primary.clone());
+    object.object_id = object_id.clone();
+    object.path = "/services/routed-inline-receipt.bin".to_string();
+    object.version = version_1.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![writer.clone()];
+    dfs.add_object_metadata(object).expect("object metadata");
+
+    let outcome = dfs
+        .write_distributed_eventual_with_base(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: writer.clone(),
+            },
+            Some(version_1),
+            b"complete inline routed bytes".to_vec(),
+            vec![writer.clone(), primary.clone()],
+            DfsReplicationPolicy::new(2, 2).expect("policy"),
+        )
+        .expect("inline routed write");
+
+    assert!(
+        matches!(
+            &outcome,
+            NetworkedDfsWriteOutcome::Committed {
+                version,
+                repair_jobs,
+                ..
+            } if version == &version_2 && repair_jobs.is_empty()
+        ),
+        "primary should commit from requester+primary receipts without repair: {outcome:?}"
+    );
+    let writer_messages = drain_dfs_messages(&mut writer_mailbox);
+    assert!(
+        writer_messages.iter().all(|message| {
+            !matches!(
+                message,
+                DfsNetworkMessage::StageBlob(_)
+                    | DfsNetworkMessage::StageBlobChunk(_)
+                    | DfsNetworkMessage::FetchBlob(_)
+                    | DfsNetworkMessage::FetchBlobResponse(_)
+                    | DfsNetworkMessage::FetchBlobResponseChunk(_)
+            )
+        }),
+        "primary must not transfer inline blob bytes back to the requester: {writer_messages:?}"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn posix_non_foreground_write_reports_only_durable_locations() {
+    let root = temp_root("posix-non-foreground-current-locations");
+    let local = NodeId::from_legacy_named("node_posix_async_repair_local").expect("local node");
+    let remote = NodeId::from_legacy_named("node_posix_async_repair_remote").expect("remote node");
+    let mut dfs = networked_sifs_with_backend(&root, local.clone());
+    dfs.posix_mkdir_all("/services").expect("services dir");
+
+    let stat = dfs
+        .posix_write_file(
+            "/services/async-repair.txt",
+            b"commit locally and repair the remote replica later",
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
+                replica_candidates: vec![local.clone(), remote.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .expect("non-foreground write");
+
+    assert_eq!(
+        stat.current_locations,
+        vec![local],
+        "the returned POSIX stat must not claim an async repair target is durable"
+    );
+    assert_eq!(
+        dfs.operational_metrics().expect("metrics").repair_job_count,
+        1,
+        "the remote desired replica should remain queued for repair"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn stateless_endpoint_reader_write_commits_after_primary_fetch_receipt() {
     let root = temp_root("stateless-endpoint-reader-write-primary-fetch");
     let writer = NodeId::from_legacy_named("node_stateless_endpoint_writer").expect("writer node");
@@ -7269,6 +7719,350 @@ fn stateless_endpoint_reader_write_commits_after_primary_fetch_receipt() {
 }
 
 #[test]
+fn posix_routed_strict_write_prefers_metadata_primary_replica() {
+    let root = temp_root("posix-routed-strict-prefers-primary");
+    let writer =
+        NodeId::from_legacy_named("node_posix_routed_primary_pref_writer").expect("writer");
+    let primary =
+        NodeId::from_legacy_named("node_posix_routed_primary_pref_primary").expect("primary");
+    let replica =
+        NodeId::from_legacy_named("node_posix_routed_primary_pref_replica").expect("replica");
+    let file_system = file_system(primary.clone());
+    let control_plane = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![writer.clone(), primary.clone()]).expect("kv"),
+    );
+    control_plane.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        control
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system.file_system_id.clone(),
+                shard_id: "root".to_string(),
+                primary_node_id: primary.clone(),
+                replica_node_ids: vec![writer.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("metadata shard");
+    });
+
+    let captured_desired = Arc::new(Mutex::new(None::<Vec<NodeId>>));
+    let captured_desired_for_sender = Arc::clone(&captured_desired);
+    let sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, command, _timeout| {
+        if let MeshMessageBody::Protocol(protocol) = &command.frame.message.body
+            && protocol.protocol == DFS_PROTOCOL
+            && let Ok(DfsNetworkMessage::DistributedWriteRequest(command)) =
+                protocol.decode::<DfsNetworkMessage>()
+        {
+            *captured_desired_for_sender.lock().expect("capture") =
+                Some(command.desired_replica_nodes);
+        }
+        Ok(DfsProtocolFrameResponse {
+            request_id: command.request_id.clone(),
+            outbound_frames: Vec::new(),
+        })
+    });
+    let transport = DfsEndpointTransport::with_connect_timeout(
+        writer.clone(),
+        vec![test_endpoint(&primary, "192.0.2.64:21353")],
+        Duration::from_millis(1),
+        sender,
+    );
+    let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
+    let mut dfs =
+        NetworkedDfsService::new(transport, writer_content).with_control_plane(control_plane);
+    dfs.add_file_system(file_system.clone())
+        .expect("writer filesystem");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+
+    let mut object = file_metadata(primary.clone());
+    object.file_system_id = file_system.file_system_id.clone();
+    object.path = "/routed-primary-preferred.txt".to_string();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![writer.clone()];
+    dfs.add_object_metadata(object).expect("writer object");
+
+    dfs.posix_write_file(
+        "/routed-primary-preferred.txt",
+        b"strict routed POSIX write prefers primary",
+        DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
+            replica_candidates: vec![writer.clone(), replica.clone()],
+            wait_for_commit: false,
+            foreground_replica_repair: true,
+        },
+    )
+    .expect("pending routed write returns stat for existing object");
+
+    assert_eq!(
+        captured_desired.lock().expect("capture").clone(),
+        Some(vec![writer, primary]),
+        "routed strict POSIX write should choose the metadata primary as the second replica"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn posix_routed_large_write_sends_manifest_only_request() {
+    let root = temp_root("posix-routed-large-manifest-only");
+    let writer = NodeId::from_legacy_named("node_posix_routed_manifest_writer").expect("writer");
+    let primary = NodeId::from_legacy_named("node_posix_routed_manifest_primary").expect("primary");
+    let file_system = file_system(primary.clone());
+    let control_plane = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![writer.clone(), primary.clone()]).expect("kv"),
+    );
+    control_plane.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        control
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system.file_system_id.clone(),
+                shard_id: "root".to_string(),
+                primary_node_id: primary.clone(),
+                replica_node_ids: vec![writer.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("metadata shard");
+    });
+
+    let captured_command = Arc::new(Mutex::new(None::<DfsDistributedWriteCommand>));
+    let captured_command_for_sender = Arc::clone(&captured_command);
+    let sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, command, _timeout| {
+        if let MeshMessageBody::Protocol(protocol) = &command.frame.message.body
+            && protocol.protocol == DFS_PROTOCOL
+            && let Ok(DfsNetworkMessage::DistributedWriteRequest(write_command)) =
+                protocol.decode::<DfsNetworkMessage>()
+        {
+            *captured_command_for_sender.lock().expect("capture") = Some(write_command);
+        }
+        Ok(DfsProtocolFrameResponse {
+            request_id: command.request_id.clone(),
+            outbound_frames: Vec::new(),
+        })
+    });
+    let transport = DfsEndpointTransport::with_connect_timeout(
+        writer.clone(),
+        vec![test_endpoint(&primary, "192.0.2.65:21353")],
+        Duration::from_millis(1),
+        sender,
+    );
+    let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
+    let mut dfs =
+        NetworkedDfsService::new(transport, writer_content).with_control_plane(control_plane);
+    dfs.add_file_system(file_system.clone())
+        .expect("writer filesystem");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+
+    let mut object = file_metadata(primary.clone());
+    object.file_system_id = file_system.file_system_id.clone();
+    object.path = "/routed-large-manifest-only.bin".to_string();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![writer.clone()];
+    dfs.add_object_metadata(object).expect("writer object");
+
+    let bytes = vec![0x57; DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT as usize + 8192];
+    let expected_hash = content_hash(&bytes);
+    dfs.posix_write_file(
+        "/routed-large-manifest-only.bin",
+        &bytes,
+        DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
+            replica_candidates: vec![writer.clone(), primary.clone()],
+            wait_for_commit: false,
+            foreground_replica_repair: true,
+        },
+    )
+    .expect("pending routed write returns stat for existing object");
+
+    let command = captured_command
+        .lock()
+        .expect("capture")
+        .clone()
+        .expect("captured routed write command");
+    assert!(
+        command.bytes.is_empty(),
+        "large routed writes must not inline {} bytes into one RPC",
+        bytes.len()
+    );
+    assert_eq!(
+        command.content_hash.as_deref(),
+        Some(expected_hash.as_str())
+    );
+    assert_eq!(command.content_size_bytes, Some(bytes.len() as u64));
+    assert_eq!(command.desired_replica_nodes, vec![writer, primary]);
+    assert_eq!(
+        dfs.content
+            .read_blob(&expected_hash)
+            .expect("writer retained local blob"),
+        bytes
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn routed_manifest_write_controls_response_journal_replay() {
+    let root = temp_root("routed-manifest-sync-nonforeground-journal");
+    let writer = NodeId::from_legacy_named("node_routed_manifest_sync_writer").expect("writer");
+    let primary = NodeId::from_legacy_named("node_routed_manifest_sync_primary").expect("primary");
+    let file_system = file_system(primary.clone());
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![writer.clone()],
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let control_plane = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![writer.clone(), primary.clone()]).expect("kv"),
+    );
+    control_plane.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        control.put_metadata_shard(&shard).expect("metadata shard");
+    });
+
+    let captured_commands = Arc::new(Mutex::new(Vec::<DfsDistributedWriteCommand>::new()));
+    let captured_commands_for_sender = Arc::clone(&captured_commands);
+    let sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, command, _timeout| {
+        if let MeshMessageBody::Protocol(protocol) = &command.frame.message.body
+            && protocol.protocol == DFS_PROTOCOL
+            && let Ok(DfsNetworkMessage::DistributedWriteRequest(write_command)) =
+                protocol.decode::<DfsNetworkMessage>()
+        {
+            captured_commands_for_sender
+                .lock()
+                .expect("capture")
+                .push(write_command);
+        }
+        Ok(DfsProtocolFrameResponse {
+            request_id: command.request_id.clone(),
+            outbound_frames: Vec::new(),
+        })
+    });
+    let transport = DfsEndpointTransport::with_connect_timeout(
+        writer.clone(),
+        vec![test_endpoint(&primary, "192.0.2.66:21353")],
+        Duration::from_millis(1),
+        sender,
+    );
+    let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
+    let mut dfs = NetworkedDfsService::new(transport, writer_content)
+        .with_control_plane(control_plane)
+        .with_metadata_backend(
+            open_local_sharded_metadata_backend(root.join("metadata"), vec![shard.clone()])
+                .expect("metadata backend"),
+        )
+        .expect("attach metadata backend");
+    dfs.add_file_system(file_system.clone())
+        .expect("writer filesystem");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+
+    let mut object = file_metadata(primary.clone());
+    object.file_system_id = file_system.file_system_id.clone();
+    object.path = "/routed-manifest-sync.bin".to_string();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![writer.clone()];
+    dfs.add_object_metadata(object.clone())
+        .expect("writer object");
+
+    dfs.route_distributed_manifest_write_to_metadata_primary(
+        DfsWriteRequest {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            target_version: DfsVersion::from_legacy_named("version_routed_manifest_sync")
+                .expect("version"),
+            requesting_node_id: writer.clone(),
+        },
+        Some(object.version.clone()),
+        content_hash(b"routed-manifest-sync"),
+        b"routed-manifest-sync".len() as u64,
+        vec![writer.clone(), primary.clone()],
+        DfsReplicationPolicy::new(1, 2).expect("policy"),
+        object.clone(),
+        shard.clone(),
+        true,
+        false,
+        false,
+        true,
+    )
+    .expect("route synchronous nonforeground manifest write");
+    dfs.route_distributed_manifest_write_to_metadata_primary(
+        DfsWriteRequest {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            target_version: DfsVersion::from_legacy_named("version_routed_manifest_sync_no_replay")
+                .expect("version"),
+            requesting_node_id: writer.clone(),
+        },
+        Some(object.version.clone()),
+        content_hash(b"routed-manifest-sync-no-replay"),
+        b"routed-manifest-sync-no-replay".len() as u64,
+        vec![writer.clone(), primary.clone()],
+        DfsReplicationPolicy::new(1, 2).expect("policy"),
+        object.clone(),
+        shard.clone(),
+        true,
+        false,
+        false,
+        false,
+    )
+    .expect("route synchronous nonforeground manifest write without response journal");
+    dfs.route_distributed_manifest_write_to_metadata_primary(
+        DfsWriteRequest {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            target_version: DfsVersion::from_legacy_named("version_routed_manifest_detached")
+                .expect("version"),
+            requesting_node_id: writer.clone(),
+        },
+        Some(object.version.clone()),
+        content_hash(b"routed-manifest-detached"),
+        b"routed-manifest-detached".len() as u64,
+        vec![writer, primary],
+        DfsReplicationPolicy::new(1, 2).expect("policy"),
+        object,
+        shard,
+        true,
+        false,
+        true,
+        true,
+    )
+    .expect("route detached nonforeground manifest write");
+    dfs.flush_detached_transport_sends()
+        .expect("flush detached routed write");
+
+    let commands = captured_commands.lock().expect("capture").clone();
+    assert_eq!(commands.len(), 3);
+    assert!(
+        commands[0].metadata_journal_after_sequence.is_some(),
+        "synchronous routed manifest writes must request response journal replay"
+    );
+    assert!(
+        commands[1].metadata_journal_after_sequence.is_none(),
+        "synchronous routed manifest writes may wait for commit without response journal replay"
+    );
+    assert!(
+        commands[2].metadata_journal_after_sequence.is_none(),
+        "detached routed manifest writes should skip response journal replay"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
     let root = temp_root("served-endpoint-reader-write-fetch-stage");
     let writer = NodeId::from_legacy_named("node_served_endpoint_writer").expect("writer node");
@@ -7306,35 +8100,155 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
     });
 
     let trace = Arc::new(Mutex::new(Vec::new()));
+    let staged_chunks = Arc::new(Mutex::new(BTreeMap::<String, Vec<Option<Vec<u8>>>>::new()));
     let replica_for_sender = replica.clone();
     let trace_for_replica_sender = Arc::clone(&trace);
+    let staged_chunks_for_replica_sender = Arc::clone(&staged_chunks);
     let replica_sender: DfsProtocolFrameSender = Arc::new(move |endpoint, command, _timeout| {
         assert_eq!(endpoint.node_id, replica_for_sender);
         let MeshMessageBody::Protocol(protocol) = &command.frame.message.body else {
             panic!("expected protocol frame");
         };
         let message: DfsNetworkMessage = protocol.decode().expect("decode dfs message");
-        let DfsNetworkMessage::StageBlob(stage) = message else {
+        let response = match message {
+            DfsNetworkMessage::StageBlob(stage) => {
+                trace_for_replica_sender
+                    .lock()
+                    .expect("trace")
+                    .push(format!("stage:{}", stage.intent_id));
+                Some(DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
+                    request_id: stage.request_id,
+                    intent_id: stage.intent_id,
+                    file_system_id: stage.file_system_id,
+                    object_id: stage.object_id,
+                    version: stage.version,
+                    replica_node_id: command.frame.target_node_id.clone(),
+                    result: DfsBlobTransferResult::Durable {
+                        content_hash: stage.content_hash,
+                    },
+                }))
+            }
+            DfsNetworkMessage::StageBlobChunk(chunk) => {
+                trace_for_replica_sender
+                    .lock()
+                    .expect("trace")
+                    .push(format!(
+                        "stage-chunk:{}:{}/{}",
+                        chunk.intent_id,
+                        chunk.chunk_index.saturating_add(1),
+                        chunk.total_chunks
+                    ));
+                let mut staged_chunks = staged_chunks_for_replica_sender
+                    .lock()
+                    .expect("staged chunks");
+                let chunks = staged_chunks
+                    .entry(chunk.request_id.clone())
+                    .or_insert_with(|| vec![None; chunk.total_chunks as usize]);
+                chunks[chunk.chunk_index as usize] = Some(chunk.bytes.clone());
+                if chunks.iter().any(Option::is_none) {
+                    None
+                } else {
+                    let bytes = chunks
+                        .iter()
+                        .flat_map(|chunk| chunk.as_ref().expect("chunk").iter().copied())
+                        .collect::<Vec<_>>();
+                    assert_eq!(bytes.len() as u64, chunk.total_size_bytes);
+                    let actual_hash = content_hash(&bytes);
+                    assert_eq!(actual_hash, chunk.content_hash);
+                    staged_chunks.remove(&chunk.request_id);
+                    trace_for_replica_sender
+                        .lock()
+                        .expect("trace")
+                        .push(format!("stage:{}", chunk.intent_id));
+                    Some(DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
+                        request_id: chunk.request_id,
+                        intent_id: chunk.intent_id,
+                        file_system_id: chunk.file_system_id,
+                        object_id: chunk.object_id,
+                        version: chunk.version,
+                        replica_node_id: command.frame.target_node_id.clone(),
+                        result: DfsBlobTransferResult::Durable {
+                            content_hash: actual_hash,
+                        },
+                    }))
+                }
+            }
+            DfsNetworkMessage::RepairReplica(repair) => {
+                trace_for_replica_sender
+                    .lock()
+                    .expect("trace")
+                    .push(format!("repair:{}", repair.intent_id));
+                let actual_hash = content_hash(&repair.bytes);
+                assert_eq!(actual_hash, repair.content_hash);
+                Some(DfsNetworkMessage::RepairReplicaResponse(
+                    DfsRepairReplicaResponse {
+                        request_id: repair.request_id,
+                        intent_id: repair.intent_id,
+                        file_system_id: repair.file_system_id,
+                        object_id: repair.object_id,
+                        version: repair.version,
+                        replica_node_id: command.frame.target_node_id.clone(),
+                        result: DfsBlobTransferResult::Committed {
+                            content_hash: actual_hash,
+                        },
+                    },
+                ))
+            }
+            DfsNetworkMessage::RepairReplicaChunk(chunk) => {
+                trace_for_replica_sender
+                    .lock()
+                    .expect("trace")
+                    .push(format!(
+                        "repair-chunk:{}:{}/{}",
+                        chunk.intent_id,
+                        chunk.chunk_index.saturating_add(1),
+                        chunk.total_chunks
+                    ));
+                let mut staged_chunks = staged_chunks_for_replica_sender
+                    .lock()
+                    .expect("repair chunks");
+                let chunks = staged_chunks
+                    .entry(chunk.request_id.clone())
+                    .or_insert_with(|| vec![None; chunk.total_chunks as usize]);
+                chunks[chunk.chunk_index as usize] = Some(chunk.bytes.clone());
+                if chunks.iter().any(Option::is_none) {
+                    None
+                } else {
+                    let bytes = chunks
+                        .iter()
+                        .flat_map(|chunk| chunk.as_ref().expect("chunk").iter().copied())
+                        .collect::<Vec<_>>();
+                    assert_eq!(bytes.len() as u64, chunk.total_size_bytes);
+                    let actual_hash = content_hash(&bytes);
+                    assert_eq!(actual_hash, chunk.content_hash);
+                    staged_chunks.remove(&chunk.request_id);
+                    trace_for_replica_sender
+                        .lock()
+                        .expect("trace")
+                        .push(format!("repair:{}", chunk.intent_id));
+                    Some(DfsNetworkMessage::RepairReplicaResponse(
+                        DfsRepairReplicaResponse {
+                            request_id: chunk.request_id,
+                            intent_id: chunk.intent_id,
+                            file_system_id: chunk.file_system_id,
+                            object_id: chunk.object_id,
+                            version: chunk.version,
+                            replica_node_id: command.frame.target_node_id.clone(),
+                            result: DfsBlobTransferResult::Committed {
+                                content_hash: actual_hash,
+                            },
+                        },
+                    ))
+                }
+            }
+            _ => None,
+        };
+        let Some(response) = response else {
             return Ok(DfsProtocolFrameResponse {
                 request_id: command.request_id.clone(),
                 outbound_frames: Vec::new(),
             });
         };
-        trace_for_replica_sender
-            .lock()
-            .expect("trace")
-            .push(format!("stage:{}", stage.intent_id));
-        let response = DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
-            request_id: stage.request_id,
-            intent_id: stage.intent_id,
-            file_system_id: stage.file_system_id,
-            object_id: stage.object_id,
-            version: stage.version,
-            replica_node_id: command.frame.target_node_id.clone(),
-            result: DfsBlobTransferResult::Durable {
-                content_hash: stage.content_hash,
-            },
-        });
         Ok(DfsProtocolFrameResponse {
             request_id: command.request_id.clone(),
             outbound_frames: vec![NetworkFrame {
@@ -7392,13 +8306,22 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
             trace_for_primary_sender
                 .lock()
                 .expect("trace")
-                .push(format!("primary-in:{message:?}"));
+                .push(format!("primary-in:{}", dfs_message_trace_label(&message)));
         }
         let result = primary_service_for_sender
             .lock()
             .expect("primary service")
             .process_protocol_frame(command.frame.clone())
             .expect("process primary frame");
+        for event in &result.events {
+            trace_for_primary_sender
+                .lock()
+                .expect("trace")
+                .push(format!(
+                    "primary-event:{}",
+                    networked_dfs_event_trace_label(event)
+                ));
+        }
         for frame in &result.outbound_frames {
             if let MeshMessageBody::Protocol(protocol) = &frame.message.body
                 && protocol.protocol == DFS_PROTOCOL
@@ -7407,7 +8330,7 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
                 trace_for_primary_sender
                     .lock()
                     .expect("trace")
-                    .push(format!("primary-out:{message:?}"));
+                    .push(format!("primary-out:{}", dfs_message_trace_label(&message)));
             }
         }
         Ok(DfsProtocolFrameResponse {
@@ -7436,6 +8359,9 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
     dfs.add_object_metadata(writer_object)
         .expect("writer object");
 
+    let payload = (0..(DFS_BLOB_CHUNK_BYTES + 8192))
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
     let outcome = dfs
         .write_distributed_eventual_from_reader(
             DfsWriteRequest {
@@ -7444,7 +8370,7 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
                 target_version: version_2.clone(),
                 requesting_node_id: writer.clone(),
             },
-            std::io::Cursor::new(b"served endpoint reader bytes".to_vec()),
+            std::io::Cursor::new(payload),
             vec![writer.clone(), replica.clone()],
             DfsReplicationPolicy::new(2, 2).expect("policy"),
         )
@@ -7471,26 +8397,39 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
         }
     }
     let committed = committed.unwrap_or_else(|| {
+        let primary_metrics = primary_service
+            .lock()
+            .expect("primary service")
+            .operational_metrics()
+            .expect("primary metrics");
         panic!(
-            "served routed write should commit; trace={:?}",
-            trace.lock().expect("trace")
+            "served routed write should commit; trace={:?}; primary_metrics={primary_metrics:?}",
+            trace.lock().expect("trace"),
         )
     });
 
     assert!(
         matches!(
             &committed,
-            NetworkedDfsWriteOutcome::Committed { version, .. } if version == &version_2
+            NetworkedDfsWriteOutcome::Committed { version, repair_jobs, .. }
+                if version == &version_2 && repair_jobs.is_empty()
         ),
-        "unexpected served routed write outcome: {committed:?}"
+        "unexpected served routed write outcome: {committed:?}; trace={:?}; primary_metrics={:?}",
+        trace.lock().expect("trace"),
+        primary_service
+            .lock()
+            .expect("primary service")
+            .operational_metrics()
+            .expect("primary metrics")
     );
     assert!(
         trace
             .lock()
             .expect("trace")
             .iter()
-            .any(|entry| entry.starts_with("stage:")),
-        "primary should stage fetched content to the strict replica"
+            .any(|entry| entry.starts_with("stage:") || entry.starts_with("repair:")),
+        "primary should replicate fetched content to the strict replica; trace={:?}",
+        trace.lock().expect("trace")
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -8438,6 +9377,111 @@ fn receipt_updates_visible_current_locations_for_current_version() {
         .current_read_object_metadata(&object_id)
         .expect("current object");
     assert_eq!(object.current_locations, vec![owner, replica]);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn stat_derives_current_locations_from_matching_receipts_without_writing() {
+    let root = temp_root("stat-derives-receipt-locations");
+    let owner = NodeId::from_legacy_named("node_stat_receipt_owner").expect("owner");
+    let replica = NodeId::from_legacy_named("node_stat_receipt_replica").expect("replica");
+    let object_id = DfsObjectId::from_legacy_named("obj_stat_receipt").expect("object");
+    let version = DfsVersion::from_legacy_named("version_2").expect("version");
+    let content_hash = "blake3:stat-receipt-location";
+    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    let mut metadata = file_metadata(owner.clone());
+    metadata.object_id = object_id.clone();
+    metadata.path = "/stat-receipt-location.bin".to_string();
+    metadata.version = version.clone();
+    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    metadata.current_locations = vec![owner.clone()];
+    metadata.content_hash = Some(content_hash.to_string());
+    metadata.content_size_bytes = Some(17);
+    dfs.put_visible_object_in_metadata_backend(&metadata)
+        .expect("visible object");
+    dfs.metadata_backend
+        .as_mut()
+        .expect("metadata backend")
+        .put_receipt(&DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                committed_version: version.clone(),
+                owner_node_id: owner.clone(),
+                event_id: EventId::generate(),
+            },
+            replica_node_id: replica.clone(),
+            content_hash: Some(content_hash.to_string()),
+            received_at: OffsetDateTime::now_utc(),
+        })
+        .expect("receipt");
+
+    let stat = dfs
+        .posix_stat_object(&object_id)
+        .expect("stat")
+        .expect("object");
+
+    assert_eq!(
+        stat.current_locations.iter().collect::<BTreeSet<_>>(),
+        [&owner, &replica].into_iter().collect::<BTreeSet<_>>()
+    );
+    drop(dfs);
+
+    let backend =
+        open_root_local_metadata_backend(root.join("metadata")).expect("reopen metadata backend");
+    assert_eq!(
+        backend
+            .get_object(&object_id)
+            .expect("object")
+            .expect("object")
+            .current_locations,
+        vec![owner.clone()],
+        "stat must not persist read-side location reconciliation"
+    );
+    assert_eq!(
+        backend
+            .get_version(&object_id, &version)
+            .expect("version")
+            .expect("version")
+            .locations,
+        vec![owner],
+        "stat must not rewrite the visible version record"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn stat_prefers_backend_tombstone_over_stale_memory_file() {
+    let root = temp_root("stat-prefers-backend-tombstone");
+    let owner = NodeId::from_legacy_named("node_stat_tombstone_owner").expect("owner");
+    let object_id = DfsObjectId::from_legacy_named("obj_stat_tombstone").expect("object");
+    let path = "/stat-tombstone.txt";
+    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    let mut tombstone = file_metadata(owner.clone());
+    tombstone.object_id = object_id.clone();
+    tombstone.path = path.to_string();
+    tombstone.kind = DfsObjectKind::Tombstone;
+    tombstone.version = DfsVersion::from_legacy_named("version_2").expect("version");
+    tombstone.content_hash = None;
+    tombstone.content_size_bytes = None;
+    tombstone.current_locations = vec![owner.clone()];
+    dfs.put_visible_object_in_metadata_backend(&tombstone)
+        .expect("backend tombstone");
+
+    let mut stale_memory = tombstone.clone();
+    stale_memory.kind = DfsObjectKind::File;
+    stale_memory.version = DfsVersion::from_legacy_named("version_3").expect("version");
+    stale_memory.content_hash = Some("blake3:stale-memory-file".to_string());
+    stale_memory.content_size_bytes = Some(12);
+    dfs.metadata
+        .add_object(stale_memory)
+        .expect("stale memory file");
+
+    let error = dfs
+        .posix_stat_distributed(path)
+        .expect_err("backend tombstone must hide stale memory file");
+
+    assert!(matches!(error, DfsPosixError::NotFound { .. }));
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -12093,6 +13137,23 @@ fn remote_read_location_prune_updates_stale_backend_version_record() {
             visible: true,
         })
         .expect("stale version locations");
+    dfs.metadata_backend
+        .as_mut()
+        .expect("backend")
+        .put_receipt(&DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object_id.clone(),
+                committed_version: version.clone(),
+                owner_node_id: source.clone(),
+                event_id: EventId::from_legacy_named("evt_read_prune_stale_receipt")
+                    .expect("event"),
+            },
+            replica_node_id: source.clone(),
+            content_hash: Some(hash.clone()),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+        })
+        .expect("stale receipt");
 
     dfs.mark_remote_read_location_missing(&object_id, &version, &Some(hash), &source)
         .expect("prune stale version location");
@@ -12116,6 +13177,15 @@ fn remote_read_location_prune_updates_stale_backend_version_record() {
             .expect("backend version")
             .locations,
         Vec::<NodeId>::new()
+    );
+    assert!(
+        dfs.metadata_backend
+            .as_ref()
+            .expect("backend")
+            .receipts_for_version(&object_id, &version)
+            .expect("backend receipts")
+            .is_empty(),
+        "authoritative stale-location prune should remove the matching receipt"
     );
     std::fs::remove_dir_all(root).ok();
 }
@@ -21667,6 +22737,176 @@ fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible(
 }
 
 #[test]
+fn routed_namespace_without_local_replay_omits_response_journal_batches() {
+    let cluster = sifs_two_primary_cluster("sifs-namespace-no-replay-batches");
+    let SifsTwoPrimaryCluster {
+        root,
+        replica_node,
+        mut services_primary,
+        replica,
+        ..
+    } = cluster;
+    let request_id = "dfs_net_req_namespace_no_replay".to_string();
+
+    let event = services_primary
+        .handle_namespace_request(
+            replica_node.clone(),
+            DfsNamespaceCommand {
+                request_id: request_id.clone(),
+                file_system_id: sifs_file_system_id(),
+                requesting_node_id: replica_node,
+                include_metadata_journal_batches: false,
+                metadata_journal_after_sequences: Vec::new(),
+                operation: DfsNamespaceOperation::MkdirAll {
+                    path: "/services/no-replay-batches".to_string(),
+                },
+            },
+        )
+        .expect("serve no-replay namespace request");
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::RemoteNamespaceServed {
+            result: DfsNamespaceResult::Applied,
+            ..
+        }
+    ));
+
+    let mut replica_transport = replica.into_transport();
+    let responses = drain_dfs_messages(&mut replica_transport)
+        .into_iter()
+        .filter_map(|message| match message {
+            DfsNetworkMessage::NamespaceResponse(response) => Some(response),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].request_id, request_id);
+    assert!(matches!(responses[0].result, DfsNamespaceResult::Applied));
+    assert!(
+        responses[0].metadata_journal_batches.is_empty(),
+        "no-local-replay namespace response must not carry journal batches"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn apply_transaction_shard_selection_lists_control_plane_once_for_bulk_paths() {
+    let root = temp_root("apply-transaction-shard-selection-once");
+    let primary = NodeId::from_legacy_named("node_apply_txn_primary").expect("primary");
+    let requester = NodeId::from_legacy_named("node_apply_txn_requester").expect("requester");
+    let shards = sifs_two_primary_shard_configs(
+        &primary,
+        &primary,
+        1,
+        vec![requester.clone()],
+        vec![requester.clone()],
+    );
+    let mut kv = InProcessRaftKvCluster::new(vec![primary.clone()]).expect("kv");
+    {
+        let mut control = DfsControlPlaneStore::new(&mut kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                primary.clone(),
+            )))
+            .expect("sifs filesystem config");
+        for shard in &shards {
+            control.put_metadata_shard(shard).expect("metadata shard");
+        }
+    }
+
+    let range_prefix_calls = Arc::new(AtomicUsize::new(0));
+    let network = InProcessNetwork::new();
+    let _requester_transport = network.add_node(requester.clone());
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(primary.clone()),
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_control_plane(CountingDfsControlPlaneKvClient::new(
+        kv,
+        Arc::clone(&range_prefix_calls),
+    ))
+    .with_metadata_backend(
+        open_local_sharded_metadata_backend(root.join("metadata"), shards).expect("metadata"),
+    )
+    .expect("metadata backend");
+
+    let mut objects = Vec::new();
+    let mut versions = Vec::new();
+    for index in 0..64 {
+        let path = format!("/services/bulk/file-{index:03}.txt");
+        let object = DfsObjectMetadata {
+            object_id: DfsObjectId::from_legacy_named(format!("obj_apply_txn_{index:03}"))
+                .expect("object"),
+            file_system_id: sifs_file_system_id(),
+            path,
+            kind: DfsObjectKind::File,
+            owner_node_id: primary.clone(),
+            current_locations: vec![primary.clone()],
+            content_hash: Some(format!("hash-{index:03}")),
+            content_size_bytes: Some(4096),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 1,
+            modified_at_unix_nanos: 1,
+            created_at_unix_nanos: 1,
+            changed_at_unix_nanos: 1,
+            version: DfsVersion::from_legacy_named(format!("version_apply_txn_{index:03}"))
+                .expect("version"),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        versions.push(object_version_record(&object, object.content_size_bytes));
+        objects.push(object);
+    }
+    let transaction = DfsNamespaceTransaction {
+        transaction_id: namespace_transaction_id_for_batch(
+            "visible-batch",
+            &sifs_file_system_id(),
+            &objects,
+            &versions,
+        ),
+        file_system_id: sifs_file_system_id(),
+        objects,
+        versions,
+        created_at: OffsetDateTime::UNIX_EPOCH,
+    };
+
+    range_prefix_calls.store(0, Ordering::SeqCst);
+    let event = dfs
+        .handle_namespace_request(
+            requester.clone(),
+            DfsNamespaceCommand {
+                request_id: "dfs_net_req_apply_txn_bulk".to_string(),
+                file_system_id: sifs_file_system_id(),
+                requesting_node_id: requester,
+                include_metadata_journal_batches: false,
+                metadata_journal_after_sequences: Vec::new(),
+                operation: DfsNamespaceOperation::ApplyTransaction { transaction },
+            },
+        )
+        .expect("apply transaction namespace request");
+
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::RemoteNamespaceServed {
+            result: DfsNamespaceResult::Applied,
+            ..
+        }
+    ));
+    assert_eq!(
+        range_prefix_calls.load(Ordering::SeqCst),
+        1,
+        "bulk ApplyTransaction shard selection must classify paths from one shard snapshot"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn sifs_cluster_posix_rename_across_shard_primaries_moves_object_transactionally() {
     let cluster = sifs_two_primary_cluster("sifs-xshard-rename");
     let SifsTwoPrimaryCluster {
@@ -23203,6 +24443,7 @@ fn sifs_cluster_posix_rejects_adoption_from_non_source_primary() {
                 request_id: "rogue-adopt-1".to_string(),
                 file_system_id: sifs_file_system_id(),
                 requesting_node_id: cluster.replica_node.clone(),
+                include_metadata_journal_batches: true,
                 metadata_journal_after_sequences: Vec::new(),
                 operation: DfsNamespaceOperation::AdoptObjectAtPath {
                     object: rogue_object,
@@ -23676,6 +24917,55 @@ fn sifs_non_replica_node_reads_converge_via_sync_pulls() {
 
     stop_primary.store(true, Ordering::SeqCst);
     primary_thread.join().expect("primary thread");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sifs_replica_distributed_stat_checks_primary_before_returning_stale_live_entry() {
+    let mut cluster = sifs_posix_cluster("sifs-replica-stat-stale-live");
+    let path = "/users/stat-stale-live.txt";
+    let bytes = b"writer-local stale entry should lose to primary tombstone".to_vec();
+
+    sifs_cluster_routed_posix_write(&mut cluster, path, &bytes);
+    assert_eq!(
+        cluster.writer.posix_read_file(path).expect("writer read"),
+        bytes
+    );
+    assert!(cluster.writer.posix_stat(path).is_ok());
+
+    let SifsPosixCluster {
+        root,
+        mut primary,
+        mut writer,
+        ..
+    } = cluster;
+
+    primary.posix_unlink(path).expect("primary unlink");
+    assert!(matches!(
+        primary.posix_stat(path),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert!(
+        writer.posix_stat(path).is_ok(),
+        "test setup must leave a stale local live entry on the writer"
+    );
+
+    let stop_primary = Arc::new(AtomicBool::new(false));
+    let primary_stop = Arc::clone(&stop_primary);
+    let primary_thread = std::thread::spawn(move || {
+        while !primary_stop.load(Ordering::SeqCst) {
+            primary.process_incoming().expect("primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        primary
+    });
+
+    let stat_result = writer.posix_stat_distributed(path);
+    stop_primary.store(true, Ordering::SeqCst);
+    primary_thread.join().expect("primary thread");
+
+    assert!(matches!(stat_result, Err(DfsPosixError::NotFound { .. })));
+
     std::fs::remove_dir_all(&root).ok();
 }
 

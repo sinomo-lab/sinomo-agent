@@ -9,10 +9,10 @@ use sinomo_runtime::dfs::{
     DfsMetadataJournalBatchSender, DfsMetadataJournalReplicationOptions,
     DfsMetadataPeerTransportError, DfsMetadataShardConfig, DfsMetadataSnapshotInstallSender,
     DfsNodeAdvertisement, DfsObjectKind, DfsPeerTransportError, DfsProtocolFrameCommand,
-    DfsProtocolFrameResponse, DfsProtocolFrameSender, DfsReplicationPolicy, DfsStat,
-    DfsWriteOptions, LocalContentStore, NetworkedDfsService, content_services_prefix,
-    default_dfs_metadata_root, default_dfs_metadata_shards_root, fallback_dfs_node_id,
-    metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
+    DfsProtocolFrameResponse, DfsProtocolFrameSender, DfsStat, DfsWriteOptions, LocalContentStore,
+    NetworkedDfsService, content_services_prefix, default_dfs_metadata_root,
+    default_dfs_metadata_shards_root, fallback_dfs_node_id, metadata_shards_prefix,
+    open_local_sharded_metadata_backend, open_root_local_metadata_backend,
     publish_cluster_dfs_metadata_journal, sifs_file_system_id,
 };
 use sinomo_runtime::kv::{self, KvError, KvOp, KvTxn, KvTxnResponse};
@@ -78,6 +78,13 @@ impl SifsFileManagerBackend {
     }
 
     pub(crate) fn publish_metadata_after_mutation(&self) {
+        if let Ok(mut service) = self.lock_service() {
+            if service.flush_deferred_content_durability().is_err() {
+                return;
+            }
+            let _ = service.flush_detached_transport_sends();
+            let _ = service.process_incoming();
+        }
         let _ = publish_sifs_metadata_journal_from_data_dir(&self.data_dir);
     }
 
@@ -253,7 +260,7 @@ impl SifsFileManagerBackend {
         let mut service = self.lock_service()?;
         let options = sifs_write_options(&service, &self.replica_candidates);
         service
-            .posix_write_file(&path, bytes, options)
+            .posix_write_file_with_known_parent_deferred_local_replay(&path, bytes, options)
             .map(|_| ())
             .map_err(|error| format!("cannot write SIFS file {path}: {error}"))?;
         Ok(())
@@ -931,10 +938,12 @@ fn sifs_write_options(
     if !candidates.contains(service.node_id()) {
         candidates.insert(0, service.node_id().clone());
     }
-    let desired_replicas = candidates.len().max(1).min(2);
+    sifs_write_options_for_candidates(candidates)
+}
+
+fn sifs_write_options_for_candidates(candidates: Vec<NodeId>) -> DfsWriteOptions {
     let mut options = DfsWriteOptions::replicated_eventual(candidates);
-    options.policy = DfsReplicationPolicy::new(desired_replicas, desired_replicas)
-        .expect("valid SIFS replication policy");
+    options.foreground_replica_repair = false;
     options
 }
 
@@ -1106,6 +1115,22 @@ mod tests {
                 &routable,
             ),
             Some(healthy)
+        );
+    }
+
+    #[test]
+    fn sifs_write_options_commit_after_local_receipt_and_repair_async() {
+        let local = NodeId::from_legacy_named("node_sifs_write_policy_local").expect("node");
+        let remote = NodeId::from_legacy_named("node_sifs_write_policy_remote").expect("node");
+
+        let options = sifs_write_options_for_candidates(vec![local, remote]);
+
+        assert_eq!(options.policy.min_commit_replicas, 1);
+        assert_eq!(options.policy.desired_replicas, 2);
+        assert!(options.wait_for_commit);
+        assert!(
+            !options.foreground_replica_repair,
+            "normal SIFS writes should not wait for the async replica repair path"
         );
     }
 
