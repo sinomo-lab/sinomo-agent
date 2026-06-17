@@ -28,8 +28,9 @@ use sinomo_runtime::node::NodeId;
 use time::format_description::well_known::Rfc3339;
 
 use crate::commands::{
-    ClusterInviteOptions, ClusterJoinOptions, cluster_invite_with_paths, cluster_join_with_paths,
-    cluster_leave_with_paths, read_cluster_state as read_cli_cluster_state,
+    ClusterInitOptions, ClusterInviteOptions, ClusterJoinOptions, cluster_invite_with_paths,
+    cluster_join_with_paths, cluster_leave_with_paths, initialize_single_node_cluster_with_paths,
+    read_cluster_state as read_cli_cluster_state,
 };
 use crate::error::CliError;
 use crate::tui::{
@@ -974,6 +975,36 @@ pub fn cluster_status(data_dir: &SinomoDataDir) -> AppClusterStatus {
     }
 }
 
+/// Ensure this data directory has a local single-node cluster, without printing CLI output.
+pub fn ensure_single_node_cluster(
+    data_dir: &SinomoDataDir,
+    name: &str,
+) -> Result<AppClusterStatus, CliError> {
+    let paths = ClusterPaths::new(data_dir);
+    match read_cli_cluster_state(&paths) {
+        Ok(_) => return Ok(cluster_status(data_dir)),
+        Err(CliError::ClusterOrphan) => {}
+        Err(error) => return Err(error),
+    }
+
+    let init = initialize_single_node_cluster_with_paths(
+        ClusterInitOptions {
+            cluster_id: None,
+            node_id: None,
+            name: app_cluster_name(name),
+        },
+        &paths,
+    );
+    if let Err(error) = init {
+        let status = cluster_status(data_dir);
+        if status.clustered {
+            return Ok(status);
+        }
+        return Err(error);
+    }
+    Ok(cluster_status(data_dir))
+}
+
 /// Generate a cluster invitation from the local node.
 pub fn create_cluster_invite(data_dir: &SinomoDataDir) -> Result<AppClusterInvite, CliError> {
     let paths = ClusterPaths::new(data_dir);
@@ -1043,6 +1074,15 @@ fn app_short_id(id: &str, max_chars: usize) -> String {
         let keep = max_chars.saturating_sub(3);
         let head: String = id.chars().take(keep).collect();
         format!("{head}...")
+    }
+}
+
+fn app_cluster_name(name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        "Sinomo App".to_string()
+    } else {
+        name.to_string()
     }
 }
 
@@ -1166,6 +1206,40 @@ mod tests {
 
     fn runtime_event(payload: AgentRuntimeEventPayload) -> AgentRuntimeEvent {
         AgentRuntimeEvent::new(SessionId::generate(), payload)
+    }
+
+    #[test]
+    fn app_api_ensure_single_node_cluster_initializes_missing_cluster() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-api-ensure-cluster");
+        let data_dir = SinomoDataDir::new(&root);
+
+        assert!(!cluster_status(&data_dir).clustered);
+
+        let status = ensure_single_node_cluster(&data_dir, " App Node ").expect("ensure cluster");
+        assert!(status.clustered);
+
+        let state = read_cli_cluster_state(&ClusterPaths::new(&data_dir)).expect("cluster state");
+        assert_eq!(state.cluster_name, "App Node");
+        assert_eq!(state.local_node_display_name, "App Node");
+        assert_eq!(status.cluster_id, Some(state.cluster_id.to_string()));
+        assert_eq!(status.local_node_id, Some(state.local_node_id.to_string()));
+    }
+
+    #[test]
+    fn app_api_ensure_single_node_cluster_is_idempotent() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-api-ensure-existing-cluster");
+        let data_dir = SinomoDataDir::new(&root);
+
+        let first =
+            ensure_single_node_cluster(&data_dir, "First App").expect("first ensure cluster");
+        let second =
+            ensure_single_node_cluster(&data_dir, "Second App").expect("second ensure cluster");
+
+        let state = read_cli_cluster_state(&ClusterPaths::new(&data_dir)).expect("cluster state");
+        assert_eq!(second.cluster_id, first.cluster_id);
+        assert_eq!(second.local_node_id, first.local_node_id);
+        assert_eq!(state.cluster_name, "First App");
+        assert_eq!(state.local_node_display_name, "First App");
     }
 
     #[test]

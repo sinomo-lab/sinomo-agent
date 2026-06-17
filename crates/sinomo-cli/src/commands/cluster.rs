@@ -698,7 +698,7 @@ pub(crate) fn cluster_init_with_paths(
     Ok(())
 }
 
-fn initialize_single_node_cluster_with_paths(
+pub(crate) fn initialize_single_node_cluster_with_paths(
     options: ClusterInitOptions,
     paths: &ClusterPaths,
 ) -> Result<ClusterBootstrapState, CliError> {
