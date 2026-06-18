@@ -28,6 +28,7 @@ mod network_info;
 mod object;
 mod paths;
 mod peer;
+mod records;
 mod roaming;
 mod route;
 mod rpc;
@@ -166,6 +167,7 @@ pub use peer::{
     AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions, InProcessNetwork,
     InProcessObjectRpcMessage, InProcessTransport, InboundObjectRpcMessage,
 };
+pub use records::{ClusterIdentityRecord, ClusterInvitationStateRecord};
 pub(crate) use roaming::read_iroh_endpoint_record_async;
 #[cfg(test)]
 pub(crate) use roaming::send_daemon_rpc_to_cluster_endpoint_async;
@@ -201,17 +203,17 @@ pub use rpc::{
 };
 pub use storage::{
     ClusterAuthenticatedPeer, ClusterControlPlaneDriver, ClusterControlPlaneTimeouts,
-    ClusterControlPlaneTransport, ClusterIdentityRecord, ClusterInvitationStateRecord,
-    ClusterInvitePublishHost, ClusterJoinRegistrationAsyncHost, ClusterJoinRegistrationDriver,
-    ClusterJoinRegistrationHost, ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse,
-    ClusterKvSnapshotRefreshHost, ClusterKvSnapshotRefreshOptions, ClusterKvTxnForwardAsyncHost,
-    ClusterKvTxnForwardHost, ClusterKvTxnForwardOptions, ClusterKvTxnForwardResult,
-    ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost, ClusterKvTxnQuorumOptions,
-    ClusterLocalDaemonMembershipAsyncObserver, ClusterLocalDaemonMembershipObservation,
-    ClusterLocalDaemonMembershipObserver, ClusterLocalDaemonMembershipRefresh,
-    ClusterLocalMemberPublishAsyncHost, ClusterLocalMemberPublishHost,
-    ClusterLocalMemberPublishOptions, ClusterMemberMutationAsyncHost, ClusterMemberMutationDriver,
-    ClusterMemberMutationHost, ClusterMemberPublishRequest, ClusterMemberPublishResponse,
+    ClusterControlPlaneTransport, ClusterInvitePublishHost, ClusterJoinRegistrationAsyncHost,
+    ClusterJoinRegistrationDriver, ClusterJoinRegistrationHost, ClusterJoinRegistrationRequest,
+    ClusterJoinRegistrationResponse, ClusterKvSnapshotRefreshHost, ClusterKvSnapshotRefreshOptions,
+    ClusterKvTxnForwardAsyncHost, ClusterKvTxnForwardHost, ClusterKvTxnForwardOptions,
+    ClusterKvTxnForwardResult, ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost,
+    ClusterKvTxnQuorumOptions, ClusterLocalDaemonMembershipAsyncObserver,
+    ClusterLocalDaemonMembershipObservation, ClusterLocalDaemonMembershipObserver,
+    ClusterLocalDaemonMembershipRefresh, ClusterLocalMemberPublishAsyncHost,
+    ClusterLocalMemberPublishHost, ClusterLocalMemberPublishOptions,
+    ClusterMemberMutationAsyncHost, ClusterMemberMutationDriver, ClusterMemberMutationHost,
+    ClusterMemberPublishRequest, ClusterMemberPublishResponse,
     ClusterMembershipRpcAsyncForwardHost, ClusterMembershipRpcForwardHost,
     ClusterMembershipRpcFuture, ClusterNetworkInfoPublishAsyncHost, ClusterNetworkRecordExpiryHost,
     ClusterNodeRoleUpdate, ClusterNodeStatusPublishAsyncHost,
