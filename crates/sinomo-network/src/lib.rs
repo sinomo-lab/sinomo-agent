@@ -13,6 +13,7 @@
 //! here.
 
 mod endpoint_advertisement;
+mod endpoint_records;
 mod endpoint_selector;
 mod error;
 mod health;
@@ -37,6 +38,14 @@ pub(crate) use endpoint_advertisement::{
 pub use endpoint_advertisement::{
     daemon_advertised_endpoints_from_addresses_with_public_discovery_and_advertise_host_async,
     daemon_advertised_endpoints_from_static_addresses, daemon_lan_endpoint,
+};
+#[cfg(test)]
+pub(crate) use endpoint_records::cleanup_member_iroh_endpoints;
+pub(crate) use endpoint_records::iroh_endpoint_public_key;
+pub use endpoint_records::{
+    apply_cluster_iroh_endpoint_advertisement, cleanup_cluster_iroh_endpoints,
+    cluster_endpoint_stable_eq, refresh_local_iroh_endpoints_from_disk,
+    refresh_local_iroh_endpoints_from_disk_async, upsert_member_endpoint,
 };
 pub use endpoint_selector::{
     ClusterEndpointSelectionPurpose, ClusterEndpointSelector, advertised_peer_route_targets,
@@ -182,9 +191,8 @@ pub use storage::{
     DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT, IoObserver,
     MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, accepted_cluster_join_state_from_kv_snapshot,
-    apply_cluster_connectivity_probe_results, apply_cluster_iroh_endpoint_advertisement,
-    apply_cluster_node_role, assign_local_daemon_member_public_keys,
-    build_cluster_network_info_record, cleanup_cluster_iroh_endpoints,
+    apply_cluster_connectivity_probe_results, apply_cluster_node_role,
+    assign_local_daemon_member_public_keys, build_cluster_network_info_record,
     cleanup_legacy_shadow_daemon_members_with_host, cluster_bootstrap_state_stable_eq,
     cluster_connectivity_full_sync_ops, cluster_connectivity_key,
     cluster_connectivity_probe_due_with_graph, cluster_connectivity_probe_due_with_startup_settle,
@@ -226,16 +234,16 @@ pub use storage::{
     record_forwarded_join_registration_acceptance_with_host,
     refresh_current_cluster_kv_store_with_host,
     refresh_current_cluster_kv_store_with_local_storage_and_transport,
-    refresh_local_daemon_membership_from_disk, refresh_local_iroh_endpoints_from_disk,
-    remove_cluster_members_with_host, replicate_cluster_raft_to_endpoint_with_host,
-    select_cluster_connectivity_probe_batch, send_cluster_join_registration_over_membership_rpc,
-    set_io_observer, spawn_cluster_raft_committed_fanout_worker_on_runtime,
-    stored_cluster_network_info_matches, stored_cluster_node_status_matches,
-    sync_cluster_connectivity_records_to_kv, sync_cluster_connectivity_records_to_quorum_with_host,
-    sync_cluster_invitation_to_kv, sync_cluster_network_info_to_kv, sync_cluster_node_status_to_kv,
+    refresh_local_daemon_membership_from_disk, remove_cluster_members_with_host,
+    replicate_cluster_raft_to_endpoint_with_host, select_cluster_connectivity_probe_batch,
+    send_cluster_join_registration_over_membership_rpc, set_io_observer,
+    spawn_cluster_raft_committed_fanout_worker_on_runtime, stored_cluster_network_info_matches,
+    stored_cluster_node_status_matches, sync_cluster_connectivity_records_to_kv,
+    sync_cluster_connectivity_records_to_quorum_with_host, sync_cluster_invitation_to_kv,
+    sync_cluster_network_info_to_kv, sync_cluster_node_status_to_kv,
     sync_cluster_state_to_kv_with_host, sync_cluster_state_to_local_raft_unchecked,
-    update_cluster_node_role_with_host, update_cluster_raft_role_with_host, upsert_member_endpoint,
-    upsert_member_record, write_cluster_state, write_local_cluster_connectivity_records,
+    update_cluster_node_role_with_host, update_cluster_raft_role_with_host, upsert_member_record,
+    write_cluster_state, write_local_cluster_connectivity_records,
 };
 pub use storage::{
     ClusterConnectivityPublishAsyncHost,

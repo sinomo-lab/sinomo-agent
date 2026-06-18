@@ -1022,7 +1022,7 @@ pub fn apply_lan_discovery_advertisements(
                 .iter_mut()
                 .find(|member| member.node_id == record.endpoint.node_id)
             {
-                changed |= crate::storage::upsert_member_endpoint(member, record.endpoint);
+                changed |= crate::upsert_member_endpoint(member, record.endpoint);
             }
         }
     }

@@ -1,3 +1,4 @@
+use crate::iroh_endpoint_public_key;
 use crate::is_loopback_connect_address;
 use crate::lan::{
     discover_local_ip_candidates_for_targets, discover_local_ip_candidates_for_targets_async,
@@ -5,7 +6,7 @@ use crate::lan::{
 };
 use crate::membership::{cluster_member_is_local_process, locally_learned_bridge_route_endpoint};
 use crate::storage::{
-    ClusterConnectivityGraph, ClusterConnectivityState, ClusterPaths, iroh_endpoint_public_key,
+    ClusterConnectivityGraph, ClusterConnectivityState, ClusterPaths,
     read_cluster_endpoints_from_kv, read_cluster_node_statuses_from_kv,
 };
 use sinomo_core::{
