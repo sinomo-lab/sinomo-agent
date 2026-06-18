@@ -5802,7 +5802,8 @@ pub fn select_cluster_connectivity_probe_batch(
 ) -> ClusterConnectivityProbeBatch {
     let refresh_deadline =
         now + time::Duration::seconds(CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS);
-    let targets = cluster_network_probe_targets(state);
+    let targets = ClusterEndpointSelector::new(paths, state)
+        .select(ClusterEndpointSelectionPurpose::NetworkProbe);
     let active_keys = targets
         .iter()
         .map(|endpoint| cluster_connectivity_probe_key(&state.local_node_id, endpoint))
@@ -12284,7 +12285,9 @@ fn cluster_raft_route_order_key(
     )
 }
 
-pub fn cluster_network_probe_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpointRecord> {
+pub(crate) fn cluster_network_probe_targets_impl(
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
     let mut endpoint_ids = BTreeSet::new();
     let mut endpoints = Vec::new();
     for member in &state.members {

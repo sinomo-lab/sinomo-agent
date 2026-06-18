@@ -6210,6 +6210,9 @@ fn rollout_target_selection_uses_command_route_context_for_shadow_fallbacks() {
 
 #[test]
 fn cluster_network_probe_targets_include_remote_shadow_endpoints() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-probe-shadow-targets");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
     let now = OffsetDateTime::now_utc();
     let cluster_id = ClusterId::from_legacy_named("cluster_network_probe_shadow").expect("cluster");
     let local = NodeId::from_legacy_named("node_network_probe_shadow_local").expect("local");
@@ -6242,7 +6245,8 @@ fn cluster_network_probe_targets_include_remote_shadow_endpoints() {
     state.members.push(main_member);
     state.members.push(shadow_member);
 
-    let targets = cluster_network_probe_targets(&state);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::NetworkProbe);
     let endpoint_ids = targets
         .into_iter()
         .map(|endpoint| endpoint.endpoint_id)
@@ -14097,7 +14101,8 @@ fn advertised_hostname_outranks_opportunistic_private_ip_for_docker_routes() {
     write_cluster_state(&paths, &state).expect("write state");
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
 
-    let probe_targets = cluster_network_probe_targets(&state);
+    let probe_targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::NetworkProbe);
     assert_eq!(
         probe_targets
             .iter()

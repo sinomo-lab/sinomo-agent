@@ -3,8 +3,9 @@ use crate::storage::{
     cluster_invite_publish_targets_impl, cluster_main_daemon_command_endpoint_candidates_impl,
     cluster_main_daemon_command_targets_impl,
     cluster_member_daemon_status_targets_with_connectivity, cluster_member_publish_targets_impl,
-    cluster_member_publish_targets_voter_first_impl, cluster_raft_command_targets_impl,
-    cluster_raft_live_voter_targets, cluster_rollout_endpoint_targets_impl,
+    cluster_member_publish_targets_voter_first_impl, cluster_network_probe_targets_impl,
+    cluster_raft_command_targets_impl, cluster_raft_live_voter_targets,
+    cluster_rollout_endpoint_targets_impl,
     cluster_rollout_target_endpoints_for_main_with_command_endpoint_impl,
     cluster_voter_command_targets_impl,
 };
@@ -23,6 +24,7 @@ pub enum ClusterEndpointSelectionPurpose {
     MemberDaemonStatus,
     MemberPublish,
     MemberPublishVoterFirst,
+    NetworkProbe,
     RaftCommand,
     RelayHop,
     Rollout,
@@ -65,6 +67,9 @@ impl<'a> ClusterEndpointSelector<'a> {
             }
             ClusterEndpointSelectionPurpose::MemberPublishVoterFirst => {
                 cluster_member_publish_targets_voter_first_impl(self.paths, self.state)
+            }
+            ClusterEndpointSelectionPurpose::NetworkProbe => {
+                cluster_network_probe_targets_impl(self.state)
             }
             ClusterEndpointSelectionPurpose::RaftCommand => {
                 cluster_raft_command_targets_impl(self.paths, self.state)
