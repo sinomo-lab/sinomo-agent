@@ -9,10 +9,9 @@
 //! either apply locally (journal batch) or reject gracefully (snapshot install), the
 //! same way the daemon's handlers do.
 //!
-//! Covers the host-agnostic DFS control-plane routes. Smoke, typed message, and
-//! legacy protocol-frame data-plane routes bind to a [`DfsDataPlaneHost`], so
-//! `sinomo-dfs` still owns the route contract while an embedding process supplies
-//! cluster transport.
+//! Covers the host-agnostic DFS control-plane routes. Smoke and typed message
+//! data-plane routes bind to a [`DfsDataPlaneHost`], so `sinomo-dfs` still owns
+//! the route contract while an embedding process supplies cluster transport.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -719,6 +718,6 @@ mod tests {
                 .as_slice(),
             ["message-route-1"]
         );
-        assert!(!registry.owns(crate::DFS_PROTOCOL_FRAME_ROUTE));
+        assert!(!registry.owns("/dfs/protocol/frame"));
     }
 }

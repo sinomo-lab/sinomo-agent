@@ -90,6 +90,25 @@ fn test_dfs_lookup_frame(
     .expect("test DFS lookup frame")
 }
 
+fn test_dfs_frame_from_message_command(command: &DfsMessageCommand) -> NetworkFrame {
+    protocol::dfs_protocol_frame_from_routed_message(&command.routed_message)
+        .expect("message command frame")
+}
+
+fn test_dfs_message_response_from_frames(
+    request_id: impl Into<String>,
+    frames: Vec<NetworkFrame>,
+) -> DfsMessageResponse {
+    DfsMessageResponse {
+        request_id: request_id.into(),
+        outbound_messages: frames
+            .iter()
+            .map(dfs_routed_message_from_network_frame)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("message response frames"),
+    }
+}
+
 fn test_dfs_message_command(
     request_id: impl Into<String>,
     frame: NetworkFrame,
@@ -1200,7 +1219,7 @@ fn endpoint_transport_transfer_profile_tracks_best_endpoint_kind() {
     let local = NodeId::from_legacy_named("node_dfs_transfer_profile_local").expect("local");
     let remote = NodeId::from_legacy_named("node_dfs_transfer_profile_remote").expect("remote");
     let unknown = NodeId::from_legacy_named("node_dfs_transfer_profile_unknown").expect("unknown");
-    let sender: DfsProtocolFrameSender =
+    let sender: DfsMessageSender =
         Arc::new(|_endpoint, _command, _timeout| Err(DfsPeerTransportError::new("test sender")));
 
     let lan = test_endpoint(&remote, "192.0.2.80:21353");
@@ -1321,8 +1340,7 @@ fn recording_async_peer_transport(
 fn dfs_peer_transport_adapters_delegate_all_routes() {
     let peer = Arc::new(RecordingPeerTransport::default());
     let peer_transport: Arc<dyn DfsPeerTransport> = peer.clone();
-    let protocol_sender =
-        dfs_protocol_frame_sender_from_peer_transport(Arc::clone(&peer_transport));
+    let message_sender = dfs_message_sender_from_peer_transport(Arc::clone(&peer_transport));
     let journal_sender =
         dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport));
     let snapshot_sender = dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport);
@@ -1348,15 +1366,15 @@ fn dfs_peer_transport_adapters_delegate_all_routes() {
     )
     .expect("DFS frame");
 
-    protocol_sender(
+    message_sender(
         &endpoint,
-        &DfsProtocolFrameCommand {
+        &DfsMessageCommand {
             request_id: "protocol-1".to_string(),
-            frame,
+            routed_message: dfs_routed_message_from_network_frame(&frame).expect("routed frame"),
         },
         Duration::from_secs(1),
     )
-    .expect("protocol send");
+    .expect("message send");
 
     let shard_id = DfsMetadataShardId::new("root");
     journal_sender(
@@ -1628,11 +1646,10 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
             .expect("message body"),
         message_command
     );
-    let frame_command =
-        dfs_message_command_to_protocol_frame_command(message_command.clone()).expect("frame");
+    let frame = test_dfs_frame_from_message_command(&message_command);
     assert_eq!(
-        dfs_protocol_frame_command_to_message_command(&frame_command).expect("message"),
-        message_command
+        dfs_routed_message_from_network_frame(&frame).expect("frame"),
+        message_command.routed_message
     );
     let message_response = DfsMessageResponse {
         request_id: "message-request".to_string(),
@@ -1655,74 +1672,21 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         decode_dfs_message_rpc_response(&message_rpc_response).expect("message response body"),
         message_response
     );
-    let frame_response =
-        protocol::dfs_message_response_to_protocol_frame_response(message_response.clone())
-            .expect("frames");
+    let frame_response = message_response
+        .outbound_messages
+        .iter()
+        .map(protocol::dfs_protocol_frame_from_routed_message)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("frames");
     assert_eq!(
-        dfs_protocol_frame_response_to_message_response(frame_response).expect("messages"),
+        test_dfs_message_response_from_frames("message-request", frame_response),
         message_response
-    );
-
-    let frame = NetworkFrame {
-        frame_id: NetworkFrameId(1),
-        source_node_id: local.clone(),
-        target_node_id: remote.clone(),
-        message: MeshMessage {
-            message_id: MeshMessageId(1),
-            origin_node_id: local.clone(),
-            target_node_id: remote.clone(),
-            body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                node_id: local,
-                tick: 1,
-            }),
-        },
-    };
-    let protocol_command = DfsProtocolFrameCommand {
-        request_id: "frame-request".to_string(),
-        frame: frame.clone(),
-    };
-    let protocol_request =
-        dfs_protocol_frame_rpc_request(&protocol_command).expect("protocol request");
-    assert_eq!(protocol_request.route, DFS_PROTOCOL_FRAME_ROUTE);
-    assert_eq!(protocol_request.category, DFS_RPC_CATEGORY);
-    assert_eq!(
-        protocol_request
-            .metadata
-            .get(sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY)
-            .map(String::as_str),
-        Some(sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE)
-    );
-    assert_eq!(
-        protocol_request
-            .metadata
-            .get(sinomo_network::ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY),
-        None
-    );
-    assert_eq!(
-        protocol_request
-            .decode_body::<DfsProtocolFrameCommand>()
-            .expect("protocol body"),
-        protocol_command
-    );
-    let protocol_response = DfsProtocolFrameResponse {
-        request_id: "frame-request".to_string(),
-        outbound_frames: vec![frame],
-    };
-    let protocol_rpc_response = sinomo_network::ObjectRpcResponse::encode_body(
-        DFS_PROTOCOL_FRAME_ROUTE,
-        &protocol_response,
-    )
-    .expect("protocol response");
-    assert_eq!(
-        decode_dfs_protocol_frame_rpc_response(&protocol_rpc_response)
-            .expect("protocol response body"),
-        protocol_response
     );
     std::fs::remove_dir_all(snapshot_root).ok();
 }
 
 #[test]
-fn direct_read_rpc_uses_raw_body_and_reconstructs_protocol_response() {
+fn direct_read_rpc_uses_raw_body_and_reconstructs_message_response() {
     let root = temp_root("direct-read-rpc-raw-body");
     let data_dir = SinomoDataDir::new(&root);
     data_dir.ensure_root_layout().expect("root layout");
@@ -1748,19 +1712,18 @@ fn direct_read_rpc_uses_raw_body_and_reconstructs_protocol_response() {
         start_chunk_index: 0,
         max_chunks: 0,
     };
-    let command = DfsProtocolFrameCommand {
+    let command = DfsMessageCommand {
         request_id: "direct-read-protocol-frame".to_string(),
-        frame: build_dfs_network_frame(
-            &local,
-            &remote,
-            10,
-            11,
-            DfsNetworkMessage::ReadRequest(read_request),
-        )
-        .expect("read request frame"),
+        routed_message: DfsRoutedMessage {
+            source_node_id: local.clone(),
+            target_node_id: remote.clone(),
+            frame_id: 10,
+            message_id: 11,
+            message: DfsNetworkMessage::ReadRequest(read_request),
+        },
     };
 
-    let direct_request = dfs_direct_read_rpc_request_from_protocol_frame_command(&command)
+    let direct_request = dfs_direct_read_rpc_request_from_message_command(&command)
         .expect("direct read request")
         .expect("direct read eligible");
     assert_eq!(direct_request.route, DFS_DIRECT_READ_ROUTE);
@@ -1804,24 +1767,18 @@ fn direct_read_rpc_uses_raw_body_and_reconstructs_protocol_response() {
     );
     assert_eq!(direct_response.body, bytes);
 
-    let protocol_response =
-        dfs_protocol_frame_response_from_direct_read_rpc_response(&command, direct_response)
-            .expect("protocol response");
-    assert_eq!(protocol_response.request_id, command.request_id);
-    assert_eq!(protocol_response.outbound_frames.len(), 1);
-    let returned_frame = &protocol_response.outbound_frames[0];
-    assert_eq!(returned_frame.source_node_id, remote);
-    assert_eq!(returned_frame.target_node_id, local);
-    let MeshMessageBody::Protocol(protocol_message) = &returned_frame.message.body else {
-        panic!("expected protocol response frame");
-    };
-    let message = protocol_message
-        .decode::<DfsNetworkMessage>()
-        .expect("decode read response");
-    let DfsNetworkMessage::ReadResponse(response) = message else {
+    let message_response =
+        dfs_message_response_from_direct_read_rpc_response(&command, direct_response)
+            .expect("message response");
+    assert_eq!(message_response.request_id, command.request_id);
+    assert_eq!(message_response.outbound_messages.len(), 1);
+    let returned_message = &message_response.outbound_messages[0];
+    assert_eq!(returned_message.source_node_id, remote);
+    assert_eq!(returned_message.target_node_id, local);
+    let DfsNetworkMessage::ReadResponse(response) = &returned_message.message else {
         panic!("expected read response");
     };
-    let DfsReadResult::Found(data) = response.result else {
+    let DfsReadResult::Found(data) = &response.result else {
         panic!("expected found response");
     };
     assert_eq!(data.object_id, decoded_direct_request.object_id);
@@ -1908,20 +1865,20 @@ fn endpoint_transport_sends_rpc_and_queues_returned_frames() {
     let calls_for_sender = Arc::clone(&calls);
     let local_for_sender = local.clone();
     let remote_for_sender = remote.clone();
-    let sender: DfsProtocolFrameSender = Arc::new(move |endpoint, command, _timeout| {
-        calls_for_sender
-            .lock()
-            .expect("calls lock")
-            .push((endpoint.node_id.clone(), command.frame.clone()));
-        Ok(DfsProtocolFrameResponse {
-            request_id: command.request_id.clone(),
-            outbound_frames: vec![test_dfs_lookup_frame(
+    let sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
+        calls_for_sender.lock().expect("calls lock").push((
+            endpoint.node_id.clone(),
+            test_dfs_frame_from_message_command(command),
+        ));
+        Ok(test_dfs_message_response_from_frames(
+            command.request_id.clone(),
+            vec![test_dfs_lookup_frame(
                 &remote_for_sender,
                 &local_for_sender,
                 100,
                 "/endpoint/send-return",
             )],
-        })
+        ))
     });
     let mut transport = DfsEndpointTransport::with_connect_timeout(
         local.clone(),
@@ -1969,12 +1926,12 @@ fn endpoint_transport_direct_read_uses_direct_sender_without_queuing_frame() {
             }),
         })
     });
-    let protocol_sender: DfsProtocolFrameSender = Arc::new(|_endpoint, _command, _timeout| {
+    let message_sender: DfsMessageSender = Arc::new(|_endpoint, _command, _timeout| {
         Err(DfsPeerTransportError::new(
             "protocol sender should not be used by direct read",
         ))
     });
-    let async_sender: AsyncDfsProtocolFrameSender = Arc::new(|_endpoint, _command, _timeout| {
+    let async_sender: AsyncDfsMessageSender = Arc::new(|_endpoint, _command, _timeout| {
         Box::pin(async {
             Err(DfsPeerTransportError::new(
                 "async sender should not be used by direct read",
@@ -1984,7 +1941,7 @@ fn endpoint_transport_direct_read_uses_direct_sender_without_queuing_frame() {
     let mut transport = DfsEndpointTransport::new_with_peer_senders(
         local.clone(),
         vec![endpoint],
-        protocol_sender,
+        message_sender,
         async_sender,
         direct_sender,
     );
@@ -2046,20 +2003,20 @@ fn endpoint_transport_async_send_requires_async_sender() {
         let calls_for_sender = Arc::clone(&calls);
         let local_for_sender = local.clone();
         let remote_for_sender = remote.clone();
-        let sender: DfsProtocolFrameSender = Arc::new(move |endpoint, command, _timeout| {
-            calls_for_sender
-                .lock()
-                .expect("calls lock")
-                .push((endpoint.node_id.clone(), command.frame.clone()));
-            Ok(DfsProtocolFrameResponse {
-                request_id: command.request_id.clone(),
-                outbound_frames: vec![test_dfs_lookup_frame(
+        let sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
+            calls_for_sender.lock().expect("calls lock").push((
+                endpoint.node_id.clone(),
+                test_dfs_frame_from_message_command(command),
+            ));
+            Ok(test_dfs_message_response_from_frames(
+                command.request_id.clone(),
+                vec![test_dfs_lookup_frame(
                     &remote_for_sender,
                     &local_for_sender,
                     100,
                     "/endpoint/async-missing-return",
                 )],
-            })
+            ))
         });
         let mut transport = DfsEndpointTransport::with_connect_timeout(
             local.clone(),
@@ -2098,11 +2055,11 @@ fn endpoint_transport_async_sender_does_not_require_sync_sender() {
         let calls_for_sender = Arc::clone(&calls);
         let local_for_sender = local.clone();
         let remote_for_sender = remote.clone();
-        let sender: AsyncDfsProtocolFrameSender = Arc::new(move |endpoint, command, _timeout| {
+        let sender: AsyncDfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
             let calls_for_sender = Arc::clone(&calls_for_sender);
             let endpoint_node_id = endpoint.node_id.clone();
             let request_id = command.request_id.clone();
-            let frame = command.frame.clone();
+            let frame = test_dfs_frame_from_message_command(command);
             let local_for_sender = local_for_sender.clone();
             let remote_for_sender = remote_for_sender.clone();
             Box::pin(async move {
@@ -2110,15 +2067,15 @@ fn endpoint_transport_async_sender_does_not_require_sync_sender() {
                     .lock()
                     .expect("calls lock")
                     .push((endpoint_node_id, frame));
-                Ok(DfsProtocolFrameResponse {
+                Ok(test_dfs_message_response_from_frames(
                     request_id,
-                    outbound_frames: vec![test_dfs_lookup_frame(
+                    vec![test_dfs_lookup_frame(
                         &remote_for_sender,
                         &local_for_sender,
                         101,
                         "/endpoint/async-only-return",
                     )],
-                })
+                ))
             })
         });
         let mut transport = DfsEndpointTransport::with_connect_timeout_async(
@@ -2167,49 +2124,51 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
         let sync_calls_for_sender = Arc::clone(&sync_calls);
         let local_for_sync = local.clone();
         let remote_for_sync = remote.clone();
-        let sync_sender: DfsProtocolFrameSender = Arc::new(move |endpoint, command, _timeout| {
+        let sync_sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
             sync_calls_for_sender
                 .lock()
                 .expect("sync calls lock")
-                .push((endpoint.node_id.clone(), command.frame.frame_id));
-            Ok(DfsProtocolFrameResponse {
-                request_id: command.request_id.clone(),
-                outbound_frames: vec![test_dfs_lookup_frame(
+                .push((
+                    endpoint.node_id.clone(),
+                    NetworkFrameId(command.routed_message.frame_id),
+                ));
+            Ok(test_dfs_message_response_from_frames(
+                command.request_id.clone(),
+                vec![test_dfs_lookup_frame(
                     &remote_for_sync,
                     &local_for_sync,
                     201,
                     "/endpoint/dual-sync-return",
                 )],
-            })
+            ))
         });
 
         let async_calls_for_sender = Arc::clone(&async_calls);
         let local_for_async = local.clone();
         let remote_for_async = remote.clone();
-        let async_sender: AsyncDfsProtocolFrameSender =
-            Arc::new(move |endpoint, command, _timeout| {
-                let async_calls_for_sender = Arc::clone(&async_calls_for_sender);
-                let endpoint_node_id = endpoint.node_id.clone();
-                let request_id = command.request_id.clone();
-                let frame_id = command.frame.frame_id;
-                let local_for_async = local_for_async.clone();
-                let remote_for_async = remote_for_async.clone();
-                Box::pin(async move {
-                    async_calls_for_sender
-                        .lock()
-                        .expect("async calls lock")
-                        .push((endpoint_node_id, frame_id));
-                    Ok(DfsProtocolFrameResponse {
-                        request_id,
-                        outbound_frames: vec![test_dfs_lookup_frame(
-                            &remote_for_async,
-                            &local_for_async,
-                            301,
-                            "/endpoint/dual-async-return",
-                        )],
-                    })
-                })
-            });
+        let async_sender: AsyncDfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
+            let async_calls_for_sender = Arc::clone(&async_calls_for_sender);
+            let endpoint_node_id = endpoint.node_id.clone();
+            let request_id = command.request_id.clone();
+            let frame_id = NetworkFrameId(command.routed_message.frame_id);
+            let local_for_async = local_for_async.clone();
+            let remote_for_async = remote_for_async.clone();
+            Box::pin(async move {
+                async_calls_for_sender
+                    .lock()
+                    .expect("async calls lock")
+                    .push((endpoint_node_id, frame_id));
+                Ok(test_dfs_message_response_from_frames(
+                    request_id,
+                    vec![test_dfs_lookup_frame(
+                        &remote_for_async,
+                        &local_for_async,
+                        301,
+                        "/endpoint/dual-async-return",
+                    )],
+                ))
+            })
+        });
 
         let mut transport = DfsEndpointTransport::with_connect_timeout_and_senders(
             local.clone(),
@@ -2261,37 +2220,37 @@ fn endpoint_transport_relays_remote_returned_frames_preserving_source() {
     let local_for_sender = local.clone();
     let primary_for_sender = primary.clone();
     let replica_for_sender = replica.clone();
-    let sender: DfsProtocolFrameSender = Arc::new(move |endpoint, command, _timeout| {
+    let sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
         calls_for_sender.lock().expect("calls lock").push((
             endpoint.node_id.clone(),
-            command.frame.source_node_id.clone(),
-            command.frame.target_node_id.clone(),
+            command.routed_message.source_node_id.clone(),
+            command.routed_message.target_node_id.clone(),
         ));
-        if command.frame.target_node_id == primary_for_sender {
-            return Ok(DfsProtocolFrameResponse {
-                request_id: command.request_id.clone(),
-                outbound_frames: vec![test_dfs_lookup_frame(
+        if command.routed_message.target_node_id == primary_for_sender {
+            return Ok(test_dfs_message_response_from_frames(
+                command.request_id.clone(),
+                vec![test_dfs_lookup_frame(
                     &primary_for_sender,
                     &replica_for_sender,
                     101,
                     "/endpoint/relay-primary",
                 )],
-            });
+            ));
         }
-        if command.frame.target_node_id == replica_for_sender {
-            return Ok(DfsProtocolFrameResponse {
-                request_id: command.request_id.clone(),
-                outbound_frames: vec![test_dfs_lookup_frame(
+        if command.routed_message.target_node_id == replica_for_sender {
+            return Ok(test_dfs_message_response_from_frames(
+                command.request_id.clone(),
+                vec![test_dfs_lookup_frame(
                     &replica_for_sender,
                     &local_for_sender,
                     102,
                     "/endpoint/relay-replica",
                 )],
-            });
+            ));
         }
-        Ok(DfsProtocolFrameResponse {
+        Ok(DfsMessageResponse {
             request_id: command.request_id.clone(),
-            outbound_frames: Vec::new(),
+            outbound_messages: Vec::new(),
         })
     });
     let mut transport = DfsEndpointTransport::with_connect_timeout(
@@ -2325,15 +2284,11 @@ fn endpoint_transport_completes_synchronous_replica_write() {
     let endpoint = test_endpoint(&remote, "192.0.2.11:21353");
     let calls = Arc::new(Mutex::new(Vec::new()));
     let calls_for_sender = Arc::clone(&calls);
-    let sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, command, _timeout| {
-        let MeshMessageBody::Protocol(protocol) = &command.frame.message.body else {
-            panic!("expected protocol frame");
-        };
-        let message: DfsNetworkMessage = protocol.decode().expect("decode dfs message");
-        let DfsNetworkMessage::StageBlob(stage) = message else {
-            return Ok(DfsProtocolFrameResponse {
+    let sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+        let DfsNetworkMessage::StageBlob(stage) = &command.routed_message.message else {
+            return Ok(DfsMessageResponse {
                 request_id: command.request_id.clone(),
-                outbound_frames: Vec::new(),
+                outbound_messages: Vec::new(),
             });
         };
         calls_for_sender
@@ -2341,30 +2296,24 @@ fn endpoint_transport_completes_synchronous_replica_write() {
             .expect("calls lock")
             .push(stage.request_id.clone());
         let response = DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
-            request_id: stage.request_id,
-            intent_id: stage.intent_id,
-            file_system_id: stage.file_system_id,
-            object_id: stage.object_id,
-            version: stage.version,
-            replica_node_id: command.frame.target_node_id.clone(),
+            request_id: stage.request_id.clone(),
+            intent_id: stage.intent_id.clone(),
+            file_system_id: stage.file_system_id.clone(),
+            object_id: stage.object_id.clone(),
+            version: stage.version.clone(),
+            replica_node_id: command.routed_message.target_node_id.clone(),
             result: DfsBlobTransferResult::Durable {
-                content_hash: stage.content_hash,
+                content_hash: stage.content_hash.clone(),
             },
         });
-        Ok(DfsProtocolFrameResponse {
+        Ok(DfsMessageResponse {
             request_id: command.request_id.clone(),
-            outbound_frames: vec![NetworkFrame {
-                frame_id: NetworkFrameId(100),
-                source_node_id: command.frame.target_node_id.clone(),
-                target_node_id: command.frame.source_node_id.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(100),
-                    origin_node_id: command.frame.target_node_id.clone(),
-                    target_node_id: command.frame.source_node_id.clone(),
-                    body: MeshMessageBody::Protocol(
-                        ProtocolMessage::encode(DFS_PROTOCOL, &response).expect("encode response"),
-                    ),
-                },
+            outbound_messages: vec![DfsRoutedMessage {
+                source_node_id: command.routed_message.target_node_id.clone(),
+                target_node_id: command.routed_message.source_node_id.clone(),
+                frame_id: 100,
+                message_id: 100,
+                message: response,
             }],
         })
     });
@@ -2407,15 +2356,11 @@ fn posix_wait_for_commit_reports_repair_retry_failure_without_failing_write() {
     let endpoint = test_endpoint(&remote, "192.0.2.12:21353");
     let stage_calls = Arc::new(Mutex::new(Vec::new()));
     let stage_calls_for_sender = Arc::clone(&stage_calls);
-    let sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, command, _timeout| {
-        let MeshMessageBody::Protocol(protocol) = &command.frame.message.body else {
-            panic!("expected protocol frame");
-        };
-        let message: DfsNetworkMessage = protocol.decode().expect("decode dfs message");
-        let DfsNetworkMessage::StageBlob(stage) = message else {
-            return Ok(DfsProtocolFrameResponse {
+    let sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+        let DfsNetworkMessage::StageBlob(stage) = &command.routed_message.message else {
+            return Ok(DfsMessageResponse {
                 request_id: command.request_id.clone(),
-                outbound_frames: Vec::new(),
+                outbound_messages: Vec::new(),
             });
         };
         stage_calls_for_sender
@@ -2423,30 +2368,24 @@ fn posix_wait_for_commit_reports_repair_retry_failure_without_failing_write() {
             .expect("stage calls lock")
             .push(stage.request_id.clone());
         let response = DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
-            request_id: stage.request_id,
-            intent_id: stage.intent_id,
-            file_system_id: stage.file_system_id,
-            object_id: stage.object_id,
-            version: stage.version,
-            replica_node_id: command.frame.target_node_id.clone(),
+            request_id: stage.request_id.clone(),
+            intent_id: stage.intent_id.clone(),
+            file_system_id: stage.file_system_id.clone(),
+            object_id: stage.object_id.clone(),
+            version: stage.version.clone(),
+            replica_node_id: command.routed_message.target_node_id.clone(),
             result: DfsBlobTransferResult::Durable {
-                content_hash: stage.content_hash,
+                content_hash: stage.content_hash.clone(),
             },
         });
-        Ok(DfsProtocolFrameResponse {
+        Ok(DfsMessageResponse {
             request_id: command.request_id.clone(),
-            outbound_frames: vec![NetworkFrame {
-                frame_id: NetworkFrameId(100),
-                source_node_id: command.frame.target_node_id.clone(),
-                target_node_id: command.frame.source_node_id.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(100),
-                    origin_node_id: command.frame.target_node_id.clone(),
-                    target_node_id: command.frame.source_node_id.clone(),
-                    body: MeshMessageBody::Protocol(
-                        ProtocolMessage::encode(DFS_PROTOCOL, &response).expect("encode response"),
-                    ),
-                },
+            outbound_messages: vec![DfsRoutedMessage {
+                source_node_id: command.routed_message.target_node_id.clone(),
+                target_node_id: command.routed_message.source_node_id.clone(),
+                frame_id: 100,
+                message_id: 100,
+                message: response,
             }],
         })
     });
@@ -3564,75 +3503,75 @@ fn cluster_protocol_frame_processor_returns_none_without_cluster_state() {
 }
 
 #[test]
-fn cluster_protocol_frame_command_processor_returns_none_without_cluster_state() {
-    let root = temp_root("cluster_protocol_frame_command_orphan");
+fn cluster_dfs_message_command_processor_returns_none_without_cluster_state() {
+    let root = temp_root("cluster_dfs_message_command_orphan");
     let data_dir = SinomoDataDir::new(&root);
     data_dir.ensure_root_layout().expect("root layout");
     let cluster_paths = ClusterPaths::new(&data_dir);
     let local =
-        NodeId::from_legacy_named("node_cluster_protocol_command_orphan_local").expect("local");
-    let frame = NetworkFrame {
-        frame_id: NetworkFrameId(1),
-        source_node_id: local.clone(),
-        target_node_id: local.clone(),
-        message: MeshMessage {
-            message_id: MeshMessageId(1),
-            origin_node_id: local.clone(),
+        NodeId::from_legacy_named("node_cluster_message_command_orphan_local").expect("local");
+    let command = DfsMessageCommand {
+        request_id: "dfs_message_command_orphan".to_string(),
+        routed_message: DfsRoutedMessage {
+            source_node_id: local.clone(),
             target_node_id: local.clone(),
-            body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                node_id: local,
-                tick: 1,
+            frame_id: 1,
+            message_id: 1,
+            message: DfsNetworkMessage::ReadRequest(DfsReadRequest {
+                request_id: "orphan-read".to_string(),
+                object_id: DfsObjectId::generate(),
+                version: None,
+                content_hash: None,
+                content_size_bytes: None,
+                range_offset: None,
+                range_max_bytes: None,
+                start_chunk_index: 0,
+                max_chunks: 0,
             }),
         },
     };
 
-    let result = process_cluster_dfs_protocol_frame_command(
-        &data_dir,
-        &cluster_paths,
-        DfsProtocolFrameCommand {
-            request_id: "dfs_protocol_frame_command_orphan".to_string(),
-            frame,
-        },
-        None,
-    )
-    .expect("cluster protocol frame command");
+    let result = process_cluster_dfs_message_command(&data_dir, &cluster_paths, command, None)
+        .expect("cluster DFS message command");
 
     assert!(result.is_none());
     std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
-fn cluster_protocol_frame_handler_returns_none_without_cluster_state() {
-    let root = temp_root("cluster_protocol_frame_handler_orphan");
+fn cluster_dfs_message_handler_returns_none_without_cluster_state() {
+    let root = temp_root("cluster_dfs_message_handler_orphan");
     let data_dir = SinomoDataDir::new(&root);
     data_dir.ensure_root_layout().expect("root layout");
     let cluster_paths = ClusterPaths::new(&data_dir);
     let local =
-        NodeId::from_legacy_named("node_cluster_protocol_handler_orphan_local").expect("local");
-    let frame = NetworkFrame {
-        frame_id: NetworkFrameId(1),
-        source_node_id: local.clone(),
-        target_node_id: local.clone(),
-        message: MeshMessage {
-            message_id: MeshMessageId(1),
-            origin_node_id: local.clone(),
+        NodeId::from_legacy_named("node_cluster_message_handler_orphan_local").expect("local");
+    let command = DfsMessageCommand {
+        request_id: "dfs_message_handler_orphan".to_string(),
+        routed_message: DfsRoutedMessage {
+            source_node_id: local.clone(),
             target_node_id: local.clone(),
-            body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                node_id: local,
-                tick: 1,
+            frame_id: 1,
+            message_id: 1,
+            message: DfsNetworkMessage::ReadRequest(DfsReadRequest {
+                request_id: "orphan-handler-read".to_string(),
+                object_id: DfsObjectId::generate(),
+                version: None,
+                content_hash: None,
+                content_size_bytes: None,
+                range_offset: None,
+                range_max_bytes: None,
+                start_chunk_index: 0,
+                max_chunks: 0,
             }),
         },
-    };
-    let command = DfsProtocolFrameCommand {
-        request_id: "dfs_protocol_frame_handler_orphan".to_string(),
-        frame,
     };
     let peer = Arc::new(RecordingPeerTransport::default());
     let peer_transport: Arc<dyn DfsPeerTransport> = peer.clone();
     let mut reports = Vec::new();
     let mut errors = Vec::new();
 
-    let result = run_cluster_dfs_protocol_frame_command_with_metadata_publish(
+    let result = run_cluster_dfs_message_command_with_metadata_publish(
         &data_dir,
         &cluster_paths,
         command.clone(),
@@ -4287,9 +4226,9 @@ fn cluster_maintenance_tick_opens_service_and_publishes_metadata() {
     backend.put_object(&object).expect("object");
     drop(backend);
 
-    let protocol_sender: DfsProtocolFrameSender = Arc::new(|_endpoint, _command, _timeout| {
+    let message_sender: DfsMessageSender = Arc::new(|_endpoint, _command, _timeout| {
         Err(DfsPeerTransportError::new(
-            "protocol frame sender should not be needed",
+            "message sender should not be needed",
         ))
     });
     let sender: DfsMetadataJournalBatchSender = Arc::new(|_endpoint, command, _timeout| {
@@ -4311,7 +4250,7 @@ fn cluster_maintenance_tick_opens_service_and_publishes_metadata() {
     let report = run_cluster_dfs_maintenance_tick(
         &data_dir,
         &cluster_paths,
-        protocol_sender,
+        message_sender,
         sender,
         snapshot_sender,
         None,
@@ -4401,9 +4340,9 @@ fn cluster_smoke_opens_service_and_publishes_metadata() {
     )
     .expect("write shard config");
 
-    let protocol_sender: DfsProtocolFrameSender = Arc::new(|_endpoint, _command, _timeout| {
+    let message_sender: DfsMessageSender = Arc::new(|_endpoint, _command, _timeout| {
         Err(DfsPeerTransportError::new(
-            "protocol frame sender should not be needed",
+            "message sender should not be needed",
         ))
     });
     let sent = Arc::new(Mutex::new(Vec::new()));
@@ -4431,7 +4370,7 @@ fn cluster_smoke_opens_service_and_publishes_metadata() {
     let report = run_cluster_dfs_smoke(
         &data_dir,
         &cluster_paths,
-        protocol_sender,
+        message_sender,
         sender,
         snapshot_sender,
         None,
@@ -4494,9 +4433,9 @@ fn default_cluster_smoke_bootstraps_dfs_before_running_smoke() {
     sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
         .expect("cluster raft state");
 
-    let protocol_sender: DfsProtocolFrameSender = Arc::new(|_endpoint, _command, _timeout| {
+    let message_sender: DfsMessageSender = Arc::new(|_endpoint, _command, _timeout| {
         Err(DfsPeerTransportError::new(
-            "single-node default smoke should not send protocol frames",
+            "single-node default smoke should not send DFS messages",
         ))
     });
     let sender: DfsMetadataJournalBatchSender = Arc::new(|_endpoint, _command, _timeout| {
@@ -4514,7 +4453,7 @@ fn default_cluster_smoke_bootstraps_dfs_before_running_smoke() {
     let report = run_default_cluster_dfs_smoke(
         &data_dir,
         &cluster_paths,
-        protocol_sender,
+        message_sender,
         sender,
         snapshot_sender,
         Box::new(ClusterPathDfsControlPlaneKvClient::new(&cluster_paths)),
@@ -8125,16 +8064,11 @@ fn stateless_endpoint_reader_write_commits_after_primary_fetch_receipt() {
     let primary_metadata_for_sender = primary_metadata_root.clone();
     let control_plane_for_sender = control_plane.clone();
     let trace_for_sender = Arc::clone(&trace);
-    let sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, command, _timeout| {
-        if let MeshMessageBody::Protocol(protocol) = &command.frame.message.body
-            && protocol.protocol == DFS_PROTOCOL
-            && let Ok(message) = protocol.decode::<DfsNetworkMessage>()
-        {
-            trace_for_sender
-                .lock()
-                .expect("trace")
-                .push(format!("in:{message:?}"));
-        }
+    let sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+        trace_for_sender
+            .lock()
+            .expect("trace")
+            .push(format!("in:{:?}", command.routed_message.message));
         let content = LocalContentStore::new(&primary_content_for_sender).expect("content");
         let metadata = LocalSobjMetadataBackend::new(
             DfsMetadataShardId::new("services"),
@@ -8143,7 +8077,7 @@ fn stateless_endpoint_reader_write_commits_after_primary_fetch_receipt() {
         .expect("metadata");
         let result = process_dfs_protocol_frame(
             primary_for_sender.clone(),
-            command.frame.clone(),
+            test_dfs_frame_from_message_command(command),
             content,
             Box::new(metadata),
             Some(Box::new(control_plane_for_sender.clone())),
@@ -8166,10 +8100,10 @@ fn stateless_endpoint_reader_write_commits_after_primary_fetch_receipt() {
                     .push(format!("out:{message:?}"));
             }
         }
-        Ok(DfsProtocolFrameResponse {
-            request_id: command.request_id.clone(),
-            outbound_frames: result.outbound_frames,
-        })
+        Ok(test_dfs_message_response_from_frames(
+            command.request_id.clone(),
+            result.outbound_frames,
+        ))
     });
     let transport = DfsEndpointTransport::with_connect_timeout(
         writer.clone(),
@@ -8276,18 +8210,15 @@ fn posix_routed_strict_write_prefers_metadata_primary_replica() {
 
     let captured_desired = Arc::new(Mutex::new(None::<Vec<NodeId>>));
     let captured_desired_for_sender = Arc::clone(&captured_desired);
-    let sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, command, _timeout| {
-        if let MeshMessageBody::Protocol(protocol) = &command.frame.message.body
-            && protocol.protocol == DFS_PROTOCOL
-            && let Ok(DfsNetworkMessage::DistributedWriteRequest(command)) =
-                protocol.decode::<DfsNetworkMessage>()
+    let sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+        if let DfsNetworkMessage::DistributedWriteRequest(command) = &command.routed_message.message
         {
             *captured_desired_for_sender.lock().expect("capture") =
-                Some(command.desired_replica_nodes);
+                Some(command.desired_replica_nodes.clone());
         }
-        Ok(DfsProtocolFrameResponse {
+        Ok(DfsMessageResponse {
             request_id: command.request_id.clone(),
-            outbound_frames: Vec::new(),
+            outbound_messages: Vec::new(),
         })
     });
     let transport = DfsEndpointTransport::with_connect_timeout(
@@ -8360,17 +8291,15 @@ fn posix_routed_large_write_sends_manifest_only_request() {
 
     let captured_command = Arc::new(Mutex::new(None::<DfsDistributedWriteCommand>));
     let captured_command_for_sender = Arc::clone(&captured_command);
-    let sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, command, _timeout| {
-        if let MeshMessageBody::Protocol(protocol) = &command.frame.message.body
-            && protocol.protocol == DFS_PROTOCOL
-            && let Ok(DfsNetworkMessage::DistributedWriteRequest(write_command)) =
-                protocol.decode::<DfsNetworkMessage>()
+    let sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+        if let DfsNetworkMessage::DistributedWriteRequest(write_command) =
+            &command.routed_message.message
         {
-            *captured_command_for_sender.lock().expect("capture") = Some(write_command);
+            *captured_command_for_sender.lock().expect("capture") = Some(write_command.clone());
         }
-        Ok(DfsProtocolFrameResponse {
+        Ok(DfsMessageResponse {
             request_id: command.request_id.clone(),
-            outbound_frames: Vec::new(),
+            outbound_messages: Vec::new(),
         })
     });
     let transport = DfsEndpointTransport::with_connect_timeout(
@@ -8462,11 +8391,11 @@ fn posix_local_primary_detached_manifest_write_persists_visible_metadata_without
 
     let send_count = Arc::new(AtomicUsize::new(0));
     let send_count_for_sender = Arc::clone(&send_count);
-    let sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, command, _timeout| {
+    let sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
         send_count_for_sender.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(DfsProtocolFrameResponse {
+        Ok(DfsMessageResponse {
             request_id: command.request_id.clone(),
-            outbound_frames: Vec::new(),
+            outbound_messages: Vec::new(),
         })
     });
     let transport = DfsEndpointTransport::with_connect_timeout(
@@ -8510,10 +8439,10 @@ fn posix_local_primary_detached_manifest_write_persists_visible_metadata_without
     assert_eq!(stat.content_hash.as_deref(), Some(expected_hash.as_str()));
     assert_eq!(dfs.posix_read_file(path).expect("read local"), bytes);
 
-    let reload_sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, command, _timeout| {
-        Ok(DfsProtocolFrameResponse {
+    let reload_sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+        Ok(DfsMessageResponse {
             request_id: command.request_id.clone(),
-            outbound_frames: Vec::new(),
+            outbound_messages: Vec::new(),
         })
     });
     let reload_transport = DfsEndpointTransport::with_connect_timeout(
@@ -8576,20 +8505,18 @@ fn routed_manifest_write_controls_response_journal_replay() {
 
     let captured_commands = Arc::new(Mutex::new(Vec::<DfsDistributedWriteCommand>::new()));
     let captured_commands_for_sender = Arc::clone(&captured_commands);
-    let sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, command, _timeout| {
-        if let MeshMessageBody::Protocol(protocol) = &command.frame.message.body
-            && protocol.protocol == DFS_PROTOCOL
-            && let Ok(DfsNetworkMessage::DistributedWriteRequest(write_command)) =
-                protocol.decode::<DfsNetworkMessage>()
+    let sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+        if let DfsNetworkMessage::DistributedWriteRequest(write_command) =
+            &command.routed_message.message
         {
             captured_commands_for_sender
                 .lock()
                 .expect("capture")
-                .push(write_command);
+                .push(write_command.clone());
         }
-        Ok(DfsProtocolFrameResponse {
+        Ok(DfsMessageResponse {
             request_id: command.request_id.clone(),
-            outbound_frames: Vec::new(),
+            outbound_messages: Vec::new(),
         })
     });
     let transport = DfsEndpointTransport::with_connect_timeout(
@@ -8962,12 +8889,11 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
         }
         Ok(result.response)
     });
-    let primary_sender = dfs_protocol_frame_sender_from_message_sender(primary_message_sender);
     let transport = DfsEndpointTransport::with_connect_timeout(
         writer.clone(),
         vec![test_endpoint(&primary, "192.0.2.44:21353")],
         Duration::from_millis(1),
-        primary_sender,
+        primary_message_sender,
     );
     let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
     let mut dfs =

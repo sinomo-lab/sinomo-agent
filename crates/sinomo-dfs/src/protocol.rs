@@ -12,14 +12,6 @@ use sinomo_network::{
 };
 use sinomo_node::NodeId;
 
-/// Legacy object-RPC route for DFS payloads carried as generic network frames.
-///
-/// This route is retained only for compatibility tests and explicit frame
-/// adapters. The registered DFS data plane uses typed object-RPC routes such as
-/// `/dfs/message` and `/dfs/object/read`.
-#[cfg(test)]
-pub const DFS_PROTOCOL_FRAME_ROUTE: &str = "/dfs/protocol/frame";
-
 fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
@@ -721,20 +713,6 @@ pub struct DfsMetadataSnapshotInstallResponse {
     pub result: DfsMetadataSnapshotInstallResult,
 }
 
-#[cfg(test)]
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct DfsProtocolFrameCommand {
-    pub request_id: String,
-    pub frame: NetworkFrame,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct DfsProtocolFrameResponse {
-    pub request_id: String,
-    pub outbound_frames: Vec<NetworkFrame>,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsRoutedMessage {
     pub source_node_id: NodeId,
@@ -773,21 +751,6 @@ pub fn dfs_protocol_frame_from_routed_message(
     message: &DfsRoutedMessage,
 ) -> Result<NetworkFrame, NetworkError> {
     dfs_network_frame_from_routed_message(message)
-}
-
-#[cfg(test)]
-pub fn dfs_message_response_to_protocol_frame_response(
-    response: DfsMessageResponse,
-) -> Result<DfsProtocolFrameResponse, NetworkError> {
-    let outbound_frames = response
-        .outbound_messages
-        .iter()
-        .map(dfs_network_frame_from_routed_message)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(DfsProtocolFrameResponse {
-        request_id: response.request_id,
-        outbound_frames,
-    })
 }
 
 fn dfs_network_message_from_frame(frame: &NetworkFrame) -> Result<DfsNetworkMessage, NetworkError> {
