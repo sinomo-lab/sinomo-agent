@@ -11,6 +11,8 @@ use crate::storage::{read_object_file, write_object_file};
 use crate::storage::{read_optional_object_file, write_object_file_create_new_serialized};
 #[cfg(feature = "iroh-transport")]
 use fs2::FileExt;
+#[cfg(test)]
+use sinomo_kv::KvEntry;
 
 #[cfg(feature = "iroh-transport")]
 const IROH_ROAMING_PROTOCOL: &str = "sinomo.iroh-roaming.v1";

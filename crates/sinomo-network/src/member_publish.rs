@@ -8,6 +8,7 @@ use crate::keyspace::{
     cluster_capability_policy_key, cluster_endpoint_key, cluster_endpoint_prefix,
     cluster_member_key,
 };
+use crate::kv_txn_ops::push_bounded_txn_success_op;
 use crate::membership::cluster_local_process_members;
 use crate::membership_rpc::{ClusterMemberPublishRequest, ClusterMemberPublishResponse};
 use crate::prelude::*;
@@ -16,7 +17,7 @@ use crate::storage::{
     ClusterMemberMutationAsyncHost, ClusterMembershipRpcFuture,
     MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS, cluster_member_stable_eq,
     imported_snapshot_advances_local_kv, local_cluster_kv_snapshot_revision,
-    push_bounded_txn_success_op, read_cluster_kv_cached_snapshot, read_cluster_kv_current_snapshot,
+    read_cluster_kv_cached_snapshot, read_cluster_kv_current_snapshot,
     read_cluster_kv_current_snapshot_arc, read_cluster_state,
     write_imported_cluster_kv_snapshot_if_changed,
 };

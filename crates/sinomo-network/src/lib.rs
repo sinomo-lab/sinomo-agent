@@ -30,6 +30,7 @@ mod kv_local_store;
 mod kv_read_model;
 mod kv_semantics;
 mod kv_snapshot;
+mod kv_txn_ops;
 mod kv_watch_store;
 mod lan;
 mod local_membership;
@@ -138,7 +139,10 @@ pub(crate) use invite_publish::{
 pub(crate) use io_observer::io_observer;
 pub use io_observer::{IoObserver, set_io_observer};
 #[cfg(test)]
-pub(crate) use keyspace::cluster_node_status_key_for_record;
+pub(crate) use keyspace::{
+    cluster_capability_policy_key, cluster_node_status_key, cluster_node_status_key_for_process,
+    cluster_node_status_key_for_record,
+};
 pub use keyspace::{
     cluster_connectivity_key, cluster_connectivity_source_prefix, cluster_endpoint_key,
     cluster_endpoint_prefix, cluster_identity_key, cluster_invitation_key,
@@ -545,7 +549,7 @@ pub(crate) mod prelude {
     pub(crate) use sinomo_kv::WatchId;
     pub(crate) use sinomo_kv::{
         ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, InProcessKvStore, KvCommand,
-        KvCompare, KvEntry, KvError, KvEvent, KvOp, KvSnapshot, KvTxn, KvTxnResponse,
+        KvCompare, KvError, KvEvent, KvOp, KvSnapshot, KvTxn, KvTxnResponse,
         RaftRequestVoteRequest, RaftRequestVoteResponse,
     };
     #[cfg(test)]
