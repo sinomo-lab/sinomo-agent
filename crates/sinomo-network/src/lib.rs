@@ -50,7 +50,26 @@ pub use lan::{
     discover_default_lan_ip_candidates_async, format_ip_port, iroh_disabled_by_env,
     lan_discovery_advertisement_for_state,
 };
-pub use object::*;
+pub use object::{
+    AsyncDaemonControlListener, AsyncDaemonControlStream,
+    DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY, DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE,
+    DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY, DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE,
+    DAEMON_CONTROL_RPC_MAX_FRAME_BYTES, DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY,
+    DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE, DaemonControlRequest,
+    DaemonControlResponse, DaemonRpcTimeouts, ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY,
+    ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE, OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL,
+    OBJECT_STREAM_DEFAULT_CHUNK_BYTES, OBJECT_STREAM_MAX_CHUNK_BYTES, ObjectFrameIoOptions,
+    ObjectStreamChunk, ObjectStreamChunkOptions, RawByteStreamChunkOptions,
+    SINOMO_NETWORK_OBJECT_VERSION, SinomoObjectCodec,
+    daemon_control_request_expects_raw_rpc_response, decode_single_object_frame_from_slice,
+    encode_object_frame_to_vec, forward_raw_byte_stream_chunks_async,
+    object_rpc_request_accepts_streamed_daemon_response,
+    object_rpc_request_expects_raw_daemon_response, object_rpc_response_has_streamed_daemon_body,
+    read_object_frame_async, read_object_stream_chunks_async,
+    read_object_stream_chunks_to_vec_async, read_raw_byte_stream_chunks_to_vec_async,
+    send_daemon_control_request_async, send_daemon_control_rpc_request_raw_response_async,
+    write_object_frame_async, write_object_stream_chunks_async,
+};
 pub use peer::{
     AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions,
     AsyncNetworkServiceCommands, AsyncNetworkServiceHandle, AsyncNetworkTransport,
