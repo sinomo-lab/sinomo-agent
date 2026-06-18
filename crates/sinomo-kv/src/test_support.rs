@@ -4467,11 +4467,11 @@ mod tests {
     }
 
     #[test]
-    fn tick_leases_partially_drains_oversized_legacy_lease() {
+    fn tick_leases_partially_drains_restored_oversized_lease() {
         let lease_id = LeaseId(9);
         let entries = (0..=MAX_KV_MUTATION_EVENTS_PER_COMMAND)
             .map(|index| KvEntry {
-                key: format!("/lease/legacy/{index:05}"),
+                key: format!("/lease/restored/{index:05}"),
                 value: vec![index as u8],
                 create_revision: KvRevision((index + 1) as u64),
                 modify_revision: KvRevision((index + 1) as u64),
@@ -4502,7 +4502,7 @@ mod tests {
             store
                 .lease_keys
                 .get(&lease_id)
-                .expect("remaining legacy lease keys")
+                .expect("remaining restored lease keys")
                 .len(),
             1
         );
@@ -4513,7 +4513,7 @@ mod tests {
 
         assert_eq!(store.tick_leases(0).expect("finish expiry"), vec![lease_id]);
         assert!(!store.leases.contains_key(&lease_id));
-        assert!(store.range_prefix("/lease/legacy/").is_empty());
+        assert!(store.range_prefix("/lease/restored/").is_empty());
         assert_eq!(
             store.revision(),
             KvRevision(revision_before.0 + MAX_KV_MUTATION_EVENTS_PER_COMMAND as u64 + 1)
