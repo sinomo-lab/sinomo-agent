@@ -26,6 +26,7 @@ mod keyspace;
 mod kv_forward;
 mod kv_snapshot;
 mod lan;
+mod local_membership;
 mod maintenance;
 mod member_publish;
 mod membership;
@@ -146,6 +147,15 @@ pub use lan::{
     apply_lan_discovery_advertisements, discover_default_lan_ip_candidates,
     discover_default_lan_ip_candidates_async, format_ip_port, iroh_disabled_by_env,
     lan_discovery_advertisement_for_state,
+};
+pub use local_membership::{
+    ClusterLocalDaemonMembershipObservation, ClusterLocalDaemonMembershipRefresh,
+    apply_cluster_node_role, assign_local_daemon_member_public_keys,
+    cluster_state_needs_join_registration, cluster_status_summary_label,
+    ensure_daemon_cluster_members, merge_cluster_join_registration,
+    prepare_cluster_join_retry_state, prepare_pending_cluster_join_state,
+    refresh_cluster_connectivity_environment, refresh_cluster_connectivity_environment_async,
+    refresh_local_daemon_membership_from_disk, refresh_local_daemon_membership_from_disk_async,
 };
 pub use maintenance::{
     CLUSTER_CONNECTIVITY_MOBILE_PROBE_MAX_ENDPOINTS_PER_TICK,
@@ -279,8 +289,7 @@ pub use storage::{
     ClusterControlPlaneDriver, ClusterControlPlaneTimeouts, ClusterControlPlaneTransport,
     ClusterJoinRegistrationAsyncHost, ClusterJoinRegistrationDriver, ClusterJoinRegistrationHost,
     ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost, ClusterKvTxnQuorumOptions,
-    ClusterLocalDaemonMembershipAsyncObserver, ClusterLocalDaemonMembershipObservation,
-    ClusterLocalDaemonMembershipObserver, ClusterLocalDaemonMembershipRefresh,
+    ClusterLocalDaemonMembershipAsyncObserver, ClusterLocalDaemonMembershipObserver,
     ClusterMemberMutationAsyncHost, ClusterMemberMutationDriver, ClusterMemberMutationHost,
     ClusterMembershipRpcFuture, ClusterNodeRoleUpdate, ClusterRaftAppendReplicationAsyncHost,
     ClusterRaftAppendReplicationHost, ClusterRaftAppendReplicationOptions,
@@ -295,25 +304,20 @@ pub use storage::{
     DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
-    accepted_cluster_join_state_from_kv_snapshot, apply_cluster_node_role,
-    assign_local_daemon_member_public_keys, cleanup_legacy_shadow_daemon_members_with_host,
+    accepted_cluster_join_state_from_kv_snapshot, cleanup_legacy_shadow_daemon_members_with_host,
     cluster_bootstrap_state_stable_eq, cluster_has_local_quorum_with_host,
     cluster_join_challenge_rpc_request, cluster_network_publish_interval_for_node,
     cluster_node_blocks_leader_preference, cluster_reachable_voter_count_with_host,
-    cluster_state_needs_join_registration, cluster_state_sync_txn, cluster_status_summary_label,
-    commit_cluster_kv_txn_with_quorum_response_with_host,
+    cluster_state_sync_txn, commit_cluster_kv_txn_with_quorum_response_with_host,
     commit_cluster_raft_command_with_quorum_driver, elect_cluster_raft_leader_with_host,
-    ensure_daemon_cluster_members, handle_cluster_join_registration_request_with_host,
-    handle_cluster_kv_watch_events, handle_cluster_membership_rpc_request_with_hosts,
-    handle_cluster_raft_rpc_request, join_channel_endpoint_for_accepted_state,
-    merge_cluster_join_registration, prepare_cluster_join_retry_state,
-    prepare_pending_cluster_join_state, read_cluster_connectivity_graph_from_kv,
+    handle_cluster_join_registration_request_with_host, handle_cluster_kv_watch_events,
+    handle_cluster_membership_rpc_request_with_hosts, handle_cluster_raft_rpc_request,
+    join_channel_endpoint_for_accepted_state, read_cluster_connectivity_graph_from_kv,
     read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_state,
     read_cluster_state_cached, read_cluster_state_without_kv,
     read_local_cluster_connectivity_records, reconcile_accepted_cluster_join_response,
     reconcile_cluster_join_with_introducers_with_host,
-    record_forwarded_join_registration_acceptance_with_host,
-    refresh_local_daemon_membership_from_disk, remove_cluster_members_with_host,
+    record_forwarded_join_registration_acceptance_with_host, remove_cluster_members_with_host,
     replicate_cluster_raft_to_endpoint_with_host, select_cluster_connectivity_probe_batch,
     send_cluster_join_registration_over_membership_rpc,
     spawn_cluster_raft_committed_fanout_worker_on_runtime, sync_cluster_state_to_kv_with_host,
@@ -329,8 +333,6 @@ pub use storage::{
     handle_cluster_join_registration_request_async_with_host,
     handle_cluster_kv_txn_request_async_with_host, handle_cluster_raft_rpc_request_async,
     read_cluster_state_async, read_cluster_state_without_kv_async,
-    refresh_cluster_connectivity_environment, refresh_cluster_connectivity_environment_async,
-    refresh_local_daemon_membership_from_disk_async,
     replicate_cluster_raft_to_endpoint_async_with_host, sync_cluster_state_to_kv_async_with_host,
     write_cluster_state_async,
 };
@@ -531,8 +533,10 @@ pub(crate) mod prelude {
     #[cfg(test)]
     pub(crate) use sinomo_local::SinomoDataDir;
     #[cfg(test)]
+    pub(crate) use sinomo_node::main_daemon_capabilities;
+    #[cfg(test)]
     pub(crate) use sinomo_node::{NodeAvailability, NodeHealth, NodeProfile};
-    pub(crate) use sinomo_node::{NodeId, main_daemon_capabilities, shadow_daemon_node_id};
+    pub(crate) use sinomo_node::{NodeId, shadow_daemon_node_id};
     #[cfg(test)]
     pub(crate) use std::collections::HashSet;
     pub(crate) use std::collections::{BTreeMap, BTreeSet, VecDeque};
