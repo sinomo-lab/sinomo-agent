@@ -29,7 +29,6 @@ pub(crate) const DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY: &str =
 pub(crate) const DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE: &str = "raw-byte-chunks-v1";
 pub(crate) const ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY: &str = "sinomo.endpoint-rpc.raw-direct";
 pub(crate) const ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE: &str = "1";
-const OBJECT_STREAM_CHUNK_FRAME_OVERHEAD_BYTES: usize = 4096;
 const DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES: usize = 8;
 
 /// Timeout policy for daemon object-RPC transport.
@@ -317,21 +316,6 @@ impl AsyncDaemonControlStream {
         options: ObjectFrameIoOptions,
     ) -> Result<(), NetworkError> {
         self.write_response(address, response, options).await
-    }
-
-    pub async fn write_object_stream_chunk(
-        &mut self,
-        address: &str,
-        chunk: &ObjectStreamChunk,
-        options: ObjectFrameIoOptions,
-    ) -> Result<(), NetworkError> {
-        let result = write_object_frame_async(&mut self.stream, chunk, options).await;
-        result.map_err(|error| {
-            map_daemon_control_frame_error(
-                error,
-                format!("write async daemon control stream {address}"),
-            )
-        })
     }
 
     pub async fn write_raw_byte_stream_chunk(
@@ -703,6 +687,7 @@ pub fn object_rpc_response_has_streamed_daemon_body(response: &crate::ObjectRpcR
         .is_some_and(|value| value == DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE)
 }
 
+#[cfg(test)]
 pub fn daemon_control_request_expects_raw_rpc_response(request: &DaemonControlRequest) -> bool {
     object_rpc_request_expects_raw_daemon_response(request)
 }
@@ -823,6 +808,7 @@ pub(crate) fn object_frame_total_bytes(
         })
 }
 
+#[cfg(any(feature = "iroh-transport", test))]
 pub fn encode_object_frame_to_vec<T>(value: &T) -> Result<Vec<u8>, NetworkError>
 where
     T: serde::Serialize + ?Sized,
@@ -843,6 +829,7 @@ where
     Ok(frame)
 }
 
+#[cfg(any(feature = "iroh-transport", test))]
 pub fn decode_single_object_frame_from_slice<T>(
     frame: &[u8],
     max_bytes: usize,
@@ -1126,153 +1113,6 @@ async fn read_object_frame_len_async<R: AsyncRead + Unpin>(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ObjectStreamChunkOptions {
-    pub chunk_bytes: usize,
-    pub max_total_bytes: Option<u64>,
-    pub idle_timeout: Option<Duration>,
-}
-
-impl Default for ObjectStreamChunkOptions {
-    fn default() -> Self {
-        Self {
-            chunk_bytes: OBJECT_STREAM_DEFAULT_CHUNK_BYTES,
-            max_total_bytes: None,
-            idle_timeout: None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ObjectStreamChunk {
-    pub sequence: u64,
-    pub final_chunk: bool,
-    #[serde(with = "serde_bytes")]
-    pub bytes: Vec<u8>,
-}
-
-pub async fn write_object_stream_chunks_async<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    options: ObjectStreamChunkOptions,
-) -> Result<u64, NetworkError>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let chunk_bytes = validate_object_stream_chunk_options(options)?;
-    let mut buffer = vec![0_u8; chunk_bytes];
-    let mut sequence = 0_u64;
-    let mut total = 0_u64;
-    loop {
-        let read =
-            read_object_stream_source_chunk(reader, &mut buffer, options.idle_timeout).await?;
-        if read == 0 {
-            write_object_stream_chunk(
-                writer,
-                &ObjectStreamChunk {
-                    sequence,
-                    final_chunk: true,
-                    bytes: Vec::new(),
-                },
-                options.idle_timeout,
-            )
-            .await?;
-            return Ok(total);
-        }
-        total = checked_object_stream_total(total, read, options.max_total_bytes)?;
-        write_object_stream_chunk(
-            writer,
-            &ObjectStreamChunk {
-                sequence,
-                final_chunk: false,
-                bytes: buffer[..read].to_vec(),
-            },
-            options.idle_timeout,
-        )
-        .await?;
-        sequence = sequence.saturating_add(1);
-    }
-}
-
-pub async fn read_object_stream_chunks_async<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    options: ObjectStreamChunkOptions,
-) -> Result<u64, NetworkError>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let chunk_bytes = validate_object_stream_chunk_options(options)?;
-    let max_frame_bytes = chunk_bytes.saturating_add(OBJECT_STREAM_CHUNK_FRAME_OVERHEAD_BYTES);
-    let mut expected_sequence = 0_u64;
-    let mut total = 0_u64;
-    loop {
-        let chunk: ObjectStreamChunk =
-            read_object_stream_chunk(reader, max_frame_bytes, options.idle_timeout).await?;
-        if chunk.sequence != expected_sequence {
-            return Err(NetworkError::Serialization {
-                detail: format!(
-                    "object stream chunk sequence mismatch: expected {expected_sequence}, got {}",
-                    chunk.sequence
-                ),
-            });
-        }
-        if chunk.bytes.len() > chunk_bytes {
-            return Err(NetworkError::FrameTooLarge {
-                actual_bytes: chunk.bytes.len(),
-                max_bytes: chunk_bytes,
-            });
-        }
-        total = checked_object_stream_total(total, chunk.bytes.len(), options.max_total_bytes)?;
-        write_object_stream_sink_chunk(writer, &chunk.bytes, options.idle_timeout).await?;
-        if chunk.final_chunk {
-            flush_object_stream_sink(writer, options.idle_timeout).await?;
-            return Ok(total);
-        }
-        expected_sequence = expected_sequence.saturating_add(1);
-    }
-}
-
-pub async fn read_object_stream_chunks_to_vec_async<R>(
-    reader: &mut R,
-    output: &mut Vec<u8>,
-    options: ObjectStreamChunkOptions,
-) -> Result<u64, NetworkError>
-where
-    R: AsyncRead + Unpin,
-{
-    let chunk_bytes = validate_object_stream_chunk_options(options)?;
-    let max_frame_bytes = chunk_bytes.saturating_add(OBJECT_STREAM_CHUNK_FRAME_OVERHEAD_BYTES);
-    let mut expected_sequence = 0_u64;
-    let mut total = 0_u64;
-    loop {
-        let chunk: ObjectStreamChunk =
-            read_object_stream_chunk(reader, max_frame_bytes, options.idle_timeout).await?;
-        if chunk.sequence != expected_sequence {
-            return Err(NetworkError::Serialization {
-                detail: format!(
-                    "object stream chunk sequence mismatch: expected {expected_sequence}, got {}",
-                    chunk.sequence
-                ),
-            });
-        }
-        if chunk.bytes.len() > chunk_bytes {
-            return Err(NetworkError::FrameTooLarge {
-                actual_bytes: chunk.bytes.len(),
-                max_bytes: chunk_bytes,
-            });
-        }
-        total = checked_object_stream_total(total, chunk.bytes.len(), options.max_total_bytes)?;
-        output.extend_from_slice(&chunk.bytes);
-        if chunk.final_chunk {
-            return Ok(total);
-        }
-        expected_sequence = expected_sequence.saturating_add(1);
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RawByteStreamChunkOptions {
     pub chunk_bytes: usize,
     pub max_total_bytes: Option<u64>,
@@ -1504,23 +1344,6 @@ fn validate_raw_byte_stream_chunk_options(
     Ok(options.chunk_bytes)
 }
 
-fn validate_object_stream_chunk_options(
-    options: ObjectStreamChunkOptions,
-) -> Result<usize, NetworkError> {
-    if options.chunk_bytes == 0 {
-        return Err(NetworkError::Serialization {
-            detail: "object stream chunk size must be greater than zero".to_string(),
-        });
-    }
-    if options.chunk_bytes > OBJECT_STREAM_MAX_CHUNK_BYTES {
-        return Err(NetworkError::FrameTooLarge {
-            actual_bytes: options.chunk_bytes,
-            max_bytes: OBJECT_STREAM_MAX_CHUNK_BYTES,
-        });
-    }
-    Ok(options.chunk_bytes)
-}
-
 fn checked_object_stream_total(
     current: u64,
     next_chunk_bytes: usize,
@@ -1541,92 +1364,6 @@ fn checked_object_stream_total(
         });
     }
     Ok(total)
-}
-
-async fn read_object_stream_source_chunk<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    buffer: &mut [u8],
-    idle_timeout: Option<Duration>,
-) -> Result<usize, NetworkError> {
-    let read = if let Some(timeout) = idle_timeout {
-        tokio::time::timeout(timeout, reader.read(buffer))
-            .await
-            .map_err(|_| NetworkError::Io {
-                operation: "read object stream source chunk".to_string(),
-                detail: format!("timed out after {}ms", timeout.as_millis()),
-            })?
-    } else {
-        reader.read(buffer).await
-    }
-    .map_err(|source| NetworkError::Io {
-        operation: "read object stream source chunk".to_string(),
-        detail: source.to_string(),
-    })?;
-    Ok(read)
-}
-
-async fn write_object_stream_chunk<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    chunk: &ObjectStreamChunk,
-    idle_timeout: Option<Duration>,
-) -> Result<(), NetworkError> {
-    write_object_frame_async(
-        writer,
-        chunk,
-        ObjectFrameIoOptions::none().with_idle_timeout(idle_timeout),
-    )
-    .await
-}
-
-async fn read_object_stream_chunk<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    max_frame_bytes: usize,
-    idle_timeout: Option<Duration>,
-) -> Result<ObjectStreamChunk, NetworkError> {
-    read_object_frame_async(
-        reader,
-        max_frame_bytes,
-        ObjectFrameIoOptions::none().with_idle_timeout(idle_timeout),
-    )
-    .await
-}
-
-async fn write_object_stream_sink_chunk<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    bytes: &[u8],
-    idle_timeout: Option<Duration>,
-) -> Result<(), NetworkError> {
-    if bytes.is_empty() {
-        return Ok(());
-    }
-    write_all_async_frame(
-        writer,
-        bytes,
-        idle_timeout,
-        "write object stream sink chunk",
-        "body",
-    )
-    .await
-}
-
-async fn flush_object_stream_sink<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    idle_timeout: Option<Duration>,
-) -> Result<(), NetworkError> {
-    if let Some(timeout) = idle_timeout {
-        tokio::time::timeout(timeout, writer.flush())
-            .await
-            .map_err(|_| NetworkError::Io {
-                operation: "flush object stream sink".to_string(),
-                detail: format!("timed out after {}ms", timeout.as_millis()),
-            })?
-    } else {
-        writer.flush().await
-    }
-    .map_err(|source| NetworkError::Io {
-        operation: "flush object stream sink".to_string(),
-        detail: source.to_string(),
-    })
 }
 
 pub(crate) async fn write_all_async_frame<W: AsyncWrite + Unpin>(
@@ -1774,13 +1511,11 @@ fn object_frame_eof_detail(part: &str, read: usize, expected: usize) -> String {
 #[cfg(test)]
 mod serde_bytes_tests {
     use super::{
-        AsyncDaemonControlListener, DaemonRpcTimeouts, ObjectFrameIoOptions, ObjectStreamChunk,
-        ObjectStreamChunkOptions, RawByteStreamChunkOptions, SinomoObjectCodec,
-        decode_single_object_frame_from_slice, encode_object_frame_to_vec,
-        forward_raw_byte_stream_chunks_async, read_object_frame_async, read_object_frame_blocking,
-        read_object_stream_chunks_async, read_raw_byte_stream_chunks_to_vec_async,
-        send_daemon_control_request_async, write_all_async_frame, write_object_frame_async,
-        write_object_frame_blocking, write_object_stream_chunks_async,
+        AsyncDaemonControlListener, DaemonRpcTimeouts, ObjectFrameIoOptions,
+        RawByteStreamChunkOptions, SinomoObjectCodec, decode_single_object_frame_from_slice,
+        encode_object_frame_to_vec, forward_raw_byte_stream_chunks_async, read_object_frame_async,
+        read_object_frame_blocking, read_raw_byte_stream_chunks_to_vec_async,
+        send_daemon_control_request_async, write_all_async_frame, write_object_frame_blocking,
         write_raw_byte_stream_chunk_async,
     };
     use crate::error::NetworkError;
@@ -2112,94 +1847,6 @@ mod serde_bytes_tests {
                 detail: "timed out after 5ms without flush progress".to_string(),
             }
         );
-    }
-
-    #[tokio::test]
-    async fn async_object_stream_chunks_round_trip_without_single_large_frame() {
-        let payload: Vec<u8> = (0..=255u8).cycle().take(4099).collect();
-        let options = ObjectStreamChunkOptions {
-            chunk_bytes: 257,
-            max_total_bytes: Some(payload.len() as u64),
-            idle_timeout: None,
-        };
-        let mut source = Cursor::new(payload.clone());
-        let mut wire = Vec::new();
-
-        let written = write_object_stream_chunks_async(&mut source, &mut wire, options)
-            .await
-            .expect("write chunks");
-
-        let mut received = Vec::new();
-        let mut wire_reader = Cursor::new(wire);
-        let read = read_object_stream_chunks_async(&mut wire_reader, &mut received, options)
-            .await
-            .expect("read chunks");
-
-        assert_eq!(written, payload.len() as u64);
-        assert_eq!(read, payload.len() as u64);
-        assert_eq!(received, payload);
-    }
-
-    #[tokio::test]
-    async fn async_object_stream_chunks_enforce_total_limit() {
-        let payload: Vec<u8> = (0..32_u8).collect();
-        let options = ObjectStreamChunkOptions {
-            chunk_bytes: 8,
-            max_total_bytes: Some(16),
-            idle_timeout: None,
-        };
-        let mut source = Cursor::new(payload);
-        let mut wire = Vec::new();
-
-        let error = write_object_stream_chunks_async(&mut source, &mut wire, options)
-            .await
-            .expect_err("stream should exceed total limit");
-
-        assert_eq!(
-            error,
-            NetworkError::FrameTooLarge {
-                actual_bytes: 24,
-                max_bytes: 16,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn async_object_stream_chunks_reject_sequence_gap() {
-        let mut wire = Vec::new();
-        write_object_frame_async(
-            &mut wire,
-            &ObjectStreamChunk {
-                sequence: 1,
-                final_chunk: true,
-                bytes: b"bad".to_vec(),
-            },
-            ObjectFrameIoOptions::none(),
-        )
-        .await
-        .expect("write chunk");
-        let mut wire_reader = Cursor::new(wire);
-        let mut received = Vec::new();
-
-        let error = read_object_stream_chunks_async(
-            &mut wire_reader,
-            &mut received,
-            ObjectStreamChunkOptions {
-                chunk_bytes: 64,
-                max_total_bytes: None,
-                idle_timeout: None,
-            },
-        )
-        .await
-        .expect_err("sequence gap");
-
-        assert_eq!(
-            error,
-            NetworkError::Serialization {
-                detail: "object stream chunk sequence mismatch: expected 0, got 1".to_string(),
-            }
-        );
-        assert!(received.is_empty());
     }
 
     #[tokio::test]

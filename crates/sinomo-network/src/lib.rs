@@ -54,29 +54,26 @@ pub use lan::{
 };
 pub use object::{
     AsyncDaemonControlListener, AsyncDaemonControlStream, DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
-    DaemonControlRequest, DaemonControlResponse, DaemonRpcTimeouts,
-    OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL, OBJECT_STREAM_DEFAULT_CHUNK_BYTES,
-    OBJECT_STREAM_MAX_CHUNK_BYTES, ObjectFrameIoOptions, ObjectStreamChunk,
-    ObjectStreamChunkOptions, RawByteStreamChunkOptions, SINOMO_NETWORK_OBJECT_VERSION,
-    SinomoObjectCodec, daemon_control_request_expects_raw_rpc_response,
-    decode_single_object_frame_from_slice, encode_object_frame_to_vec,
-    forward_raw_byte_stream_chunks_async,
+    DaemonControlRequest, DaemonControlResponse, DaemonRpcTimeouts, OBJECT_STREAM_MAX_CHUNK_BYTES,
+    ObjectFrameIoOptions, RawByteStreamChunkOptions, SinomoObjectCodec,
     mark_object_rpc_request_accepts_raw_streamed_daemon_response,
     mark_object_rpc_request_reuses_daemon_stream,
     mark_object_rpc_response_has_streamed_daemon_body,
     object_rpc_request_accepts_streamed_daemon_response,
     object_rpc_request_expects_raw_daemon_response, object_rpc_request_reuses_daemon_stream,
-    object_rpc_response_has_streamed_daemon_body, read_object_frame_async,
-    read_object_stream_chunks_async, read_object_stream_chunks_to_vec_async,
-    read_raw_byte_stream_chunks_to_vec_async, send_daemon_control_request_async,
-    send_daemon_control_rpc_request_raw_response_async, write_object_frame_async,
-    write_object_stream_chunks_async,
+    object_rpc_response_has_streamed_daemon_body, send_daemon_control_request_async,
 };
 pub(crate) use object::{
     DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY, DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE,
     DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY,
     DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE, ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY,
-    ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE,
+    ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE, read_object_frame_async,
+    send_daemon_control_rpc_request_raw_response_async, write_object_frame_async,
+};
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) use object::{
+    OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL, decode_single_object_frame_from_slice,
+    encode_object_frame_to_vec,
 };
 pub use peer::{
     AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions, InProcessNetwork,
@@ -195,11 +192,11 @@ pub use storage::{
     publish_cluster_network_info_to_quorum_with_host,
     publish_cluster_node_status_to_quorum_with_host,
     publish_local_members_to_quorum_if_needed_with_host, publish_local_members_via_voter_with_host,
-    read_cluster_connectivity_graph_from_kv, read_cluster_endpoints_from_kv,
-    read_cluster_invitation_from_kv, read_cluster_members_from_kv,
-    read_cluster_node_statuses_from_kv, read_cluster_state, read_cluster_state_cached,
-    read_cluster_state_without_kv, read_local_cluster_connectivity_records,
-    reconcile_accepted_cluster_join_response, reconcile_cluster_join_with_introducers_with_host,
+    read_cluster_connectivity_graph_from_kv, read_cluster_invitation_from_kv,
+    read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_state,
+    read_cluster_state_cached, read_cluster_state_without_kv,
+    read_local_cluster_connectivity_records, reconcile_accepted_cluster_join_response,
+    reconcile_cluster_join_with_introducers_with_host,
     record_forwarded_join_registration_acceptance_with_host,
     refresh_current_cluster_kv_store_with_host,
     refresh_current_cluster_kv_store_with_local_storage_and_transport,
