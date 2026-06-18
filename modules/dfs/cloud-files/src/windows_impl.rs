@@ -857,6 +857,12 @@ impl DfsMessageTransport for DfsCloudFilesEndpointTransport {
             })
             .collect()
     }
+
+    fn drain_incoming_messages(
+        &mut self,
+    ) -> std::result::Result<Vec<DfsRoutedMessage>, NetworkError> {
+        Ok(self.incoming_messages.drain(..).collect())
+    }
 }
 
 fn send_dfs_message(

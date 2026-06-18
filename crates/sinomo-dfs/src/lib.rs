@@ -112,11 +112,11 @@ use sinomo_events::EventId;
 use sinomo_kv::KvError;
 use sinomo_local::{LocalDataError, SinomoDataDir};
 use sinomo_network::{
-    ClusterPaths, InboundFrame, MeshMessageBody, NetworkError, ObjectRpcRequest, ObjectRpcResponse,
-    ProtocolMessage,
+    ClusterPaths, InboundFrame, MeshMessageBody, NetworkError, NetworkFrame, ObjectRpcRequest,
+    ObjectRpcResponse, ProtocolMessage,
 };
 #[cfg(test)]
-use sinomo_network::{MeshMessage, MeshMessageId, NetworkFrame, NetworkFrameId};
+use sinomo_network::{MeshMessage, MeshMessageId, NetworkFrameId};
 use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -182,6 +182,13 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         self.send_routed_message(target_node_id, message)
     }
     fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError>;
+    fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
+        Ok(self
+            .drain_incoming()?
+            .into_iter()
+            .filter_map(|inbound| dfs_routed_message_from_network_frame(&inbound.frame).ok())
+            .collect())
+    }
     fn flush_detached_sends(&mut self) -> Result<(), NetworkError> {
         Ok(())
     }
@@ -410,7 +417,6 @@ fn dfs_network_message_from_frame(frame: &NetworkFrame) -> Result<DfsNetworkMess
     protocol::dfs_routed_message_from_protocol_frame(frame).map(|message| message.message)
 }
 
-#[cfg(test)]
 fn dfs_routed_message_from_network_frame(
     frame: &NetworkFrame,
 ) -> Result<DfsRoutedMessage, NetworkError> {
@@ -8923,6 +8929,10 @@ impl DfsMessageTransport for DfsEndpointTransport {
         self.drain_incoming_frames()
     }
 
+    fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
+        Ok(self.incoming_messages.drain(..).collect())
+    }
+
     fn flush_detached_sends(&mut self) -> Result<(), NetworkError> {
         self.flush_detached_endpoint_sends()
     }
@@ -9055,6 +9065,12 @@ impl DfsMessageTransport for DfsEndpointServedMessageTransport {
             .collect::<Result<Vec<_>, _>>()?;
         frames.extend(self.endpoint_transport.drain_incoming()?);
         Ok(frames)
+    }
+
+    fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
+        let mut messages = self.inbound_messages.drain(..).collect::<Vec<_>>();
+        messages.extend(self.endpoint_transport.drain_incoming_messages()?);
+        Ok(messages)
     }
 
     fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
@@ -15348,12 +15364,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.last_events = events.clone();
             return Ok(events);
         }
-        let inbound_frames = self
+        let inbound_messages = self
             .transport
-            .drain_incoming()
+            .drain_incoming_messages()
             .map_err(DfsError::from_network)?;
-        let mut events = self
-            .process_inbound_frames_with_options(inbound_frames, drain_deferred_parent_touches)?;
+        let mut events = self.process_routed_messages_with_options(
+            inbound_messages,
+            drain_deferred_parent_touches,
+        )?;
         if !direct_events.is_empty() {
             direct_events.extend(events);
             events = direct_events;
@@ -15373,21 +15391,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         inbound_frames: Vec<InboundFrame>,
         drain_deferred_parent_touches: bool,
     ) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
+        let inbound_messages = inbound_frames
+            .into_iter()
+            .filter_map(|inbound| dfs_routed_message_from_network_frame(&inbound.frame).ok())
+            .collect::<Vec<_>>();
+        self.process_routed_messages_with_options(inbound_messages, drain_deferred_parent_touches)
+    }
+
+    fn process_routed_messages_with_options(
+        &mut self,
+        routed_messages: Vec<DfsRoutedMessage>,
+        drain_deferred_parent_touches: bool,
+    ) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
         let mut events = Vec::new();
 
-        for inbound in inbound_frames {
-            let source_node_id = inbound.frame.source_node_id.clone();
-            let MeshMessageBody::Protocol(protocol_message) = inbound.frame.message.body else {
-                continue;
-            };
-            if protocol_message.protocol != DFS_PROTOCOL {
-                continue;
-            }
-            let Ok(message) = protocol_message.decode::<DfsNetworkMessage>() else {
-                continue;
-            };
-            self.process_network_message_with_options(
-                source_node_id,
+        for message in routed_messages {
+            self.process_routed_message_with_options(
                 message,
                 drain_deferred_parent_touches,
                 &mut events,
