@@ -401,7 +401,6 @@ mod tests {
     fn runtime_daemon_facade_exports_async_rpc_clients() {
         let _ = daemon::send_daemon_rpc_async;
         let _ = daemon::send_daemon_rpc_to_endpoint_async;
-        let _ = daemon::send_daemon_rpc_direct_to_endpoint_async;
         let _ = daemon::fetch_daemon_status_from_endpoint_async;
         let _ = daemon::send_dfs_object_rpc_to_endpoint_async;
         let _ = daemon::send_dfs_metadata_journal_batch_to_endpoint_async;

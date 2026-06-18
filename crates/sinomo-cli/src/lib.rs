@@ -129,7 +129,6 @@ use sinomo_runtime::daemon::{
     send_daemon_rollout_native_dylib_module as daemon_send_daemon_rollout_native_dylib_module,
     send_daemon_rollout_native_dylib_module_to_endpoint as daemon_send_daemon_rollout_native_dylib_module_to_endpoint,
     send_daemon_rpc as daemon_send_daemon_rpc,
-    send_daemon_rpc_direct_to_endpoint as daemon_send_daemon_rpc_direct_to_endpoint,
     send_daemon_rpc_to_endpoint as daemon_send_daemon_rpc_to_endpoint,
     send_daemon_rpc_with_timeouts as daemon_send_daemon_rpc_with_timeouts,
     send_daemon_shutdown_request,

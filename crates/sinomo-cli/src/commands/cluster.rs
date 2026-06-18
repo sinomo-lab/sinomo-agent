@@ -1884,10 +1884,7 @@ fn send_join_rpc(
     timeout: Duration,
 ) -> Result<network::ObjectRpcResponse, CliError> {
     match endpoint.transport {
-        ClusterTransportKind::Iroh => {
-            daemon_send_daemon_rpc_direct_to_endpoint(endpoint, request, timeout)
-                .map_err(Into::into)
-        }
+        ClusterTransportKind::Iroh => send_join_endpoint_rpc(endpoint, request, timeout),
         // Join RPCs must carry an idle deadline, not just a connect timeout:
         // an introducer that accepts the stream and never answers otherwise
         // hangs the join forever, and the caller's bounded retry loop (the
@@ -1903,6 +1900,106 @@ fn send_join_rpc(
             },
         )
         .map_err(Into::into),
+    }
+}
+
+fn send_join_endpoint_rpc(
+    endpoint: &ClusterEndpointRecord,
+    request: &network::ObjectRpcRequest,
+    timeout: Duration,
+) -> Result<network::ObjectRpcResponse, CliError> {
+    let timeouts = network::DaemonRpcTimeouts::connect_and_idle(timeout);
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return if matches!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            let runtime = handle.clone();
+            tokio::task::block_in_place(|| {
+                runtime.block_on(send_join_endpoint_rpc_async(endpoint, request, timeouts))
+            })
+            .map_err(CliError::from)
+        } else {
+            Err(CliError::Network {
+                address: "cluster join membership rpc".to_string(),
+                detail: "cluster join endpoint RPC sync client cannot run inside a current-thread Tokio runtime".to_string(),
+            })
+        };
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| CliError::Network {
+            address: "cluster join membership rpc".to_string(),
+            detail: source.to_string(),
+        })?;
+    let output = runtime
+        .block_on(send_join_endpoint_rpc_async(endpoint, request, timeouts))
+        .map_err(CliError::from);
+    runtime.shutdown_timeout(Duration::from_millis(250));
+    output
+}
+
+async fn send_join_endpoint_rpc_async(
+    endpoint: &ClusterEndpointRecord,
+    request: &network::ObjectRpcRequest,
+    timeouts: network::DaemonRpcTimeouts,
+) -> Result<network::ObjectRpcResponse, network::NetworkError> {
+    let mut host = CliJoinEndpointRpcHost;
+    let mut client = network::ClusterObjectRpcClient::new(&mut host);
+    client
+        .call_endpoint(
+            endpoint,
+            request,
+            network::ClusterObjectRpcOptions::new(timeouts),
+        )
+        .await
+}
+
+struct CliJoinEndpointRpcHost;
+
+impl network::ClusterSignedEndpointRpcAsyncHost for CliJoinEndpointRpcHost {
+    fn sign_endpoint_rpc_request_async<'a>(
+        &'a mut self,
+        request: &'a network::ObjectRpcRequest,
+    ) -> network::ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
+        let request = request.clone();
+        Box::pin(async move {
+            crate::daemon_sign_daemon_rpc_request_for_local_node(&request).map_err(|error| {
+                network::NetworkError::Io {
+                    operation: "cluster join endpoint rpc signing".to_string(),
+                    detail: error.to_string(),
+                }
+            })
+        })
+    }
+
+    fn try_gateway_signed_rpc_async<'a>(
+        &'a mut self,
+        _endpoint: &'a ClusterEndpointRecord,
+        _request: &'a network::ObjectRpcRequest,
+        _request_auth: &'a [u8],
+        _timeouts: network::DaemonRpcTimeouts,
+    ) -> network::ClusterSignedEndpointRpcFuture<'a, Option<network::ObjectRpcResponse>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn send_signed_endpoint_rpc_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        auth: &'a [u8],
+        request: &'a network::ObjectRpcRequest,
+        timeouts: network::DaemonRpcTimeouts,
+    ) -> network::ClusterSignedEndpointRpcFuture<'a, network::ObjectRpcResponse> {
+        Box::pin(async move {
+            network::send_daemon_rpc_to_cluster_endpoint_async(
+                endpoint,
+                Some(auth),
+                request,
+                timeouts,
+            )
+            .await
+        })
     }
 }
 
