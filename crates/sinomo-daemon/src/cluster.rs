@@ -10018,7 +10018,11 @@ mod tests {
         )
         .expect("connectivity records");
 
-        let targets = sinomo_network::cluster_member_publish_targets(&paths, &state);
+        let targets = sinomo_network::cluster_endpoint_targets(
+            &paths,
+            &state,
+            sinomo_network::ClusterEndpointSelectionPurpose::MemberPublish,
+        );
 
         assert_eq!(
             targets
@@ -10175,7 +10179,11 @@ mod tests {
             .expect("write local learned route");
 
         let merged_state = sinomo_network::read_cluster_state(&paths).expect("read merged state");
-        let targets = sinomo_network::cluster_member_publish_targets(&paths, &merged_state);
+        let targets = sinomo_network::cluster_endpoint_targets(
+            &paths,
+            &merged_state,
+            sinomo_network::ClusterEndpointSelectionPurpose::MemberPublish,
+        );
 
         assert_eq!(
             targets
@@ -10697,9 +10705,13 @@ mod tests {
             "ordinary live-voter routing should honor explicit offline status"
         );
         assert_eq!(
-            sinomo_network::cluster_join_voter_targets(&paths, &state)
-                .first()
-                .map(|endpoint| &endpoint.endpoint_id),
+            sinomo_network::cluster_endpoint_targets(
+                &paths,
+                &state,
+                sinomo_network::ClusterEndpointSelectionPurpose::VoterCommand,
+            )
+            .first()
+            .map(|endpoint| &endpoint.endpoint_id),
             Some(&voter_endpoint.endpoint_id),
             "join bootstrap must still try voter command targets even when local health is stale/offline"
         );

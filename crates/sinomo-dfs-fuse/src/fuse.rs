@@ -994,7 +994,13 @@ fn open_sifs_service(data_dir: Option<PathBuf>) -> Result<OpenedSifsService> {
         .unwrap_or_else(dfs::fallback_dfs_node_id);
     let endpoints = cluster_state
         .as_ref()
-        .map(|state| network::cluster_dfs_protocol_targets(&cluster_paths, state))
+        .map(|state| {
+            network::cluster_endpoint_targets(
+                &cluster_paths,
+                state,
+                network::ClusterEndpointSelectionPurpose::DfsData,
+            )
+        })
         .unwrap_or_default();
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
         .map_err(|source| DfsFuseError::Dfs(source.to_string()))?;
@@ -1552,7 +1558,11 @@ impl network::ClusterKvTxnForwardHost for DfsFuseClusterKvTxnForwardHost {
         paths: &network::ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Vec<ClusterEndpointRecord> {
-        network::cluster_member_publish_targets(paths, state)
+        network::cluster_endpoint_targets(
+            paths,
+            state,
+            network::ClusterEndpointSelectionPurpose::MemberPublish,
+        )
     }
 
     fn relay_rpc_to_node(
@@ -1714,11 +1724,11 @@ fn send_dfs_protocol_frame(
     request: &DfsProtocolFrameCommand,
     timeout: Duration,
 ) -> std::result::Result<DfsProtocolFrameResponse, DfsFuseError> {
-    let rpc_request = dfs::dfs_protocol_frame_rpc_request(request)
+    let rpc_request = dfs::dfs_message_rpc_request_from_protocol_frame_command(request)
         .map_err(|source| DfsFuseError::Daemon(source.to_string()))?;
     let response = daemon::send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)
         .map_err(|source| DfsFuseError::Daemon(source.to_string()))?;
-    dfs::decode_dfs_protocol_frame_rpc_response(&response)
+    dfs::dfs_protocol_frame_response_from_message_rpc_response(&response)
         .map_err(|source| DfsFuseError::Daemon(source.to_string()))
 }
 

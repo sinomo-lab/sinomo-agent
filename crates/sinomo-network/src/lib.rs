@@ -28,9 +28,33 @@ pub use health::*;
 pub use invite::*;
 pub use lan::*;
 pub use object::*;
-pub use peer::*;
+pub use peer::{
+    AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions,
+    AsyncNetworkServiceCommands, AsyncNetworkServiceHandle, AsyncNetworkTransport,
+    AsyncNetworkTransportFuture, DeliveryAck, DeliveryLedger, DeliveryRecord, DeliveryStatus,
+    EndpointCandidateStatus, Heartbeat, HeartbeatPolicy, InProcessNetwork, InProcessRouter,
+    InProcessTransport, InboundFrame, InboundOutcome, LinkState, MeshMessage, MeshMessageBody,
+    MeshMessageId, NetworkFrame, NetworkFrameId, NetworkService, NetworkServiceActorOptions,
+    NetworkServiceCommandBackpressure, NetworkServiceCommandOptions, NetworkStreamChunkId,
+    NetworkStreamFrame, NetworkStreamId, NetworkStreamOpen, NodeEndpoint, PeerEndpointCandidate,
+    PeerRegistry, PeerState, PeerStatus, ProtocolMessage, RetryPolicy, RouteDelivery,
+    RouteDeliveryId, TransportKind,
+};
 pub use roaming::*;
-pub use route::*;
+pub(crate) use route::cluster_route_next_hop;
+pub use route::{
+    CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY, CLUSTER_ROUTING_RPC_ROUTE_METADATA,
+    ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterRelayAsyncHost, ClusterRelayFuture,
+    ClusterRelayOptions, ClusterSignedEndpointRpcAsyncHost, ClusterSignedEndpointRpcFuture,
+    ClusterSignedRelayRpcAsyncHost, ClusterSignedRelayRpcFuture, ClusterSignedRelayRpcOptions,
+    RelayEnvelope, call_object_rpc_endpoint_async_with_host,
+    call_object_rpc_endpoint_from_paths_async_with_host, cluster_endpoint_prefers_relay,
+    cluster_endpoint_prefers_relay_with_graph, cluster_relay_forward_plan,
+    cluster_relay_next_hop_endpoints, cluster_relay_next_hops_with_direct_target_fallback,
+    handle_cluster_relay_async_with_host, relay_envelope_hop_transport_timeouts,
+    relay_request_for_signed_rpc, relay_response_is_routing_error,
+    relay_rpc_to_node_via_peer_async_with_host,
+};
 pub use rpc::*;
 pub use storage::*;
 

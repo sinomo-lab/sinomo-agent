@@ -5,14 +5,14 @@ use crate::file_manager::{
 };
 use sinomo_runtime::core::ClusterEndpointRecord;
 use sinomo_runtime::dfs::{
-    AsyncDfsProtocolFrameSender, DfsControlPlaneKvClient, DfsDirectReadRequest,
-    DfsDirectReadSender, DfsEndpointTransport, DfsMetadataJournalBatchSender,
-    DfsMetadataJournalReplicationOptions, DfsMetadataPeerTransportError, DfsMetadataShardConfig,
-    DfsMetadataSnapshotInstallSender, DfsNodeAdvertisement, DfsObjectKind, DfsPeerTransportError,
-    DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsProtocolFrameSender, DfsReadResponse,
-    DfsStat, DfsWriteOptions, LocalContentStore, NetworkedDfsService, content_services_prefix,
-    default_dfs_metadata_root, default_dfs_metadata_shards_root, fallback_dfs_node_id,
-    metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
+    AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsDirectReadRequest, DfsDirectReadSender,
+    DfsEndpointTransport, DfsMetadataJournalBatchSender, DfsMetadataJournalReplicationOptions,
+    DfsMetadataPeerTransportError, DfsMetadataShardConfig, DfsMetadataSnapshotInstallSender,
+    DfsNodeAdvertisement, DfsObjectKind, DfsObjectRpcSendOptions, DfsPeerTransport,
+    DfsPeerTransportError, DfsPeerTransportFuture, DfsReadResponse, DfsStat, DfsWriteOptions,
+    LocalContentStore, NetworkedDfsService, content_services_prefix, default_dfs_metadata_root,
+    default_dfs_metadata_shards_root, fallback_dfs_node_id, metadata_shards_prefix,
+    open_local_sharded_metadata_backend, open_root_local_metadata_backend,
     publish_cluster_dfs_metadata_journal, sifs_file_system_id,
 };
 use sinomo_runtime::kv::{self, KvError, KvOp, KvTxn, KvTxnResponse};
@@ -88,9 +88,10 @@ impl SifsFileManagerBackend {
         let Ok(state) = network::read_cluster_state_without_kv(&cluster_paths) else {
             return;
         };
-        service.refresh_endpoint_targets(network::cluster_dfs_protocol_targets(
+        service.refresh_endpoint_targets(network::cluster_endpoint_targets(
             &cluster_paths,
             &state,
+            network::ClusterEndpointSelectionPurpose::DfsData,
         ));
     }
 
@@ -656,19 +657,28 @@ fn open_sifs_service_with_hydration(
     let (local_node_id, endpoints) = if cluster_paths.state.exists() {
         let state = network::read_cluster_state_without_kv(&cluster_paths)
             .map_err(|error| format!("cannot read local cluster state: {error}"))?;
-        let endpoints = network::cluster_dfs_protocol_targets(&cluster_paths, &state);
+        let endpoints = network::cluster_endpoint_targets(
+            &cluster_paths,
+            &state,
+            network::ClusterEndpointSelectionPurpose::DfsData,
+        );
         (state.local_node_id, endpoints)
     } else {
         (fallback_dfs_node_id(), Vec::new())
     };
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
         .map_err(|error| format!("cannot open DFS content store: {error}"))?;
+    let peer_transport = Arc::new(SifsDfsPeerTransport::new(rpc_runtime.clone()));
+    let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
+    let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer_transport;
     let mut service = NetworkedDfsService::new(
         DfsEndpointTransport::new_with_peer_senders(
             local_node_id,
             endpoints,
-            sifs_protocol_frame_sender(rpc_runtime.clone()),
-            async_sifs_protocol_frame_sender(rpc_runtime.clone()),
+            sinomo_runtime::dfs::dfs_protocol_frame_sender_from_peer_transport(sync_peer_transport),
+            sinomo_runtime::dfs::async_dfs_protocol_frame_sender_from_peer_transport(
+                async_peer_transport,
+            ),
             sifs_direct_read_sender(rpc_runtime.clone()),
         ),
         content,
@@ -806,10 +816,14 @@ fn sifs_replica_candidates(data_dir: &SinomoDataDir, local_node_id: &NodeId) -> 
     let Ok(state) = network::read_cluster_state_without_kv(&cluster_paths) else {
         return candidates;
     };
-    let routable_node_ids = network::cluster_dfs_protocol_targets(&cluster_paths, &state)
-        .into_iter()
-        .map(|endpoint| endpoint.node_id)
-        .collect::<BTreeSet<_>>();
+    let routable_node_ids = network::cluster_endpoint_targets(
+        &cluster_paths,
+        &state,
+        network::ClusterEndpointSelectionPurpose::DfsData,
+    )
+    .into_iter()
+    .map(|endpoint| endpoint.node_id)
+    .collect::<BTreeSet<_>>();
     let graph = network::ClusterConnectivityGraph::read_for_local(&cluster_paths, &state);
     let Ok(entries) =
         kv::read_cluster_kv_prefix_entries(&cluster_paths.kv_paths(), content_services_prefix())
@@ -875,37 +889,62 @@ fn sifs_replica_candidate_rank(
     (3, u64::MAX, node_id.to_string())
 }
 
-fn sifs_protocol_frame_sender(rpc_runtime: SifsRpcRuntime) -> DfsProtocolFrameSender {
-    Arc::new(move |endpoint, command, timeout| {
-        sifs_send_dfs_protocol_frame(&rpc_runtime, endpoint, command, timeout)
-    })
-}
-
-fn async_sifs_protocol_frame_sender(rpc_runtime: SifsRpcRuntime) -> AsyncDfsProtocolFrameSender {
-    Arc::new(move |endpoint, command, timeout| {
-        let handle = rpc_runtime.runtime.handle().clone();
-        Box::pin(async move {
-            sinomo_runtime::daemon::send_dfs_protocol_frame_to_endpoint_async(
-                endpoint, command, timeout, &handle,
-            )
-            .await
-            .map_err(|error| DfsPeerTransportError::new(error.to_string()))
-        })
-    })
-}
-
 fn sifs_direct_read_sender(rpc_runtime: SifsRpcRuntime) -> DfsDirectReadSender {
     Arc::new(move |endpoint, request, timeout| {
         sifs_send_dfs_direct_read(&rpc_runtime, endpoint, request, timeout)
     })
 }
 
-fn sifs_send_dfs_protocol_frame(
+#[derive(Clone, Debug)]
+struct SifsDfsPeerTransport {
+    rpc_runtime: SifsRpcRuntime,
+}
+
+impl SifsDfsPeerTransport {
+    fn new(rpc_runtime: SifsRpcRuntime) -> Self {
+        Self { rpc_runtime }
+    }
+}
+
+impl DfsPeerTransport for SifsDfsPeerTransport {
+    fn call_object_rpc(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+        request: &network::ObjectRpcRequest,
+        options: DfsObjectRpcSendOptions,
+    ) -> Result<network::ObjectRpcResponse, DfsPeerTransportError> {
+        sifs_send_dfs_object_rpc(&self.rpc_runtime, endpoint, request, options)
+    }
+}
+
+impl AsyncDfsPeerTransport for SifsDfsPeerTransport {
+    fn call_object_rpc_async<'a>(
+        &'a self,
+        endpoint: &'a ClusterEndpointRecord,
+        request: &'a network::ObjectRpcRequest,
+        options: DfsObjectRpcSendOptions,
+    ) -> DfsPeerTransportFuture<'a, Result<network::ObjectRpcResponse, DfsPeerTransportError>> {
+        let handle = self.rpc_runtime.runtime.handle().clone();
+        Box::pin(async move {
+            sinomo_runtime::daemon::send_dfs_object_rpc_to_endpoint_async(
+                endpoint,
+                request,
+                options.connect_timeout,
+                &handle,
+                options.observe_connectivity,
+            )
+            .await
+            .map_err(|error| DfsPeerTransportError::new(error.to_string()))
+        })
+    }
+}
+
+fn sifs_send_dfs_object_rpc(
     rpc_runtime: &SifsRpcRuntime,
     endpoint: &ClusterEndpointRecord,
-    command: &DfsProtocolFrameCommand,
-    timeout: std::time::Duration,
-) -> Result<DfsProtocolFrameResponse, DfsPeerTransportError> {
+    request: &network::ObjectRpcRequest,
+    options: DfsObjectRpcSendOptions,
+) -> Result<network::ObjectRpcResponse, DfsPeerTransportError> {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         if matches!(
             handle.runtime_flavor(),
@@ -913,8 +952,12 @@ fn sifs_send_dfs_protocol_frame(
         ) {
             return tokio::task::block_in_place(|| {
                 handle.block_on(async {
-                    sinomo_runtime::daemon::send_dfs_protocol_frame_to_endpoint_async(
-                        endpoint, command, timeout, &handle,
+                    sinomo_runtime::daemon::send_dfs_object_rpc_to_endpoint_async(
+                        endpoint,
+                        request,
+                        options.connect_timeout,
+                        &handle,
+                        options.observe_connectivity,
                     )
                     .await
                     .map_err(|error| DfsPeerTransportError::new(error.to_string()))
@@ -922,17 +965,18 @@ fn sifs_send_dfs_protocol_frame(
             });
         }
         return Err(DfsPeerTransportError::new(
-            "SIFS protocol frame sync sender cannot run inside a current-thread Tokio runtime",
+            "SIFS DFS object RPC sync sender cannot run inside a current-thread Tokio runtime",
         ));
     }
     rpc_runtime
         .runtime
         .block_on(async {
-            sinomo_runtime::daemon::send_dfs_protocol_frame_to_endpoint_async(
+            sinomo_runtime::daemon::send_dfs_object_rpc_to_endpoint_async(
                 endpoint,
-                command,
-                timeout,
+                request,
+                options.connect_timeout,
                 rpc_runtime.runtime.handle(),
+                options.observe_connectivity,
             )
             .await
         })

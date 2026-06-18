@@ -942,7 +942,11 @@ impl network::ClusterKvTxnForwardHost for CliClusterKvTxnForwardHost {
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Vec<ClusterEndpointRecord> {
-        network::cluster_member_publish_targets(paths, state)
+        network::cluster_endpoint_targets(
+            paths,
+            state,
+            network::ClusterEndpointSelectionPurpose::MemberPublish,
+        )
     }
 
     fn relay_rpc_to_node(

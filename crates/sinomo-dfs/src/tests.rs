@@ -1192,94 +1192,86 @@ struct RecordingPeerTransport {
 }
 
 impl DfsPeerTransport for RecordingPeerTransport {
-    fn send_protocol_frame(
+    fn call_object_rpc(
         &self,
         endpoint: &ClusterEndpointRecord,
-        command: &DfsProtocolFrameCommand,
-        _timeout: Duration,
-    ) -> Result<DfsProtocolFrameResponse, DfsPeerTransportError> {
-        self.calls.lock().expect("calls").push(format!(
-            "protocol:{}:{}",
-            endpoint.address, command.request_id
-        ));
-        Ok(DfsProtocolFrameResponse {
-            request_id: command.request_id.clone(),
-            outbound_frames: Vec::new(),
-        })
-    }
-
-    fn send_metadata_journal_batch(
-        &self,
-        endpoint: &ClusterEndpointRecord,
-        command: &DfsMetadataJournalBatchCommand,
-        _timeout: Duration,
-    ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataPeerTransportError> {
-        self.calls.lock().expect("calls").push(format!(
-            "journal:{}:{}",
-            endpoint.address, command.request_id
-        ));
-        Ok(DfsMetadataJournalBatchResponse {
-            request_id: command.request_id.clone(),
-            shard_id: command.batch.shard_id.clone(),
-            next_after_sequence: command.batch.next_after_sequence,
-            applied_entries: command.batch.entries.len(),
-            result: DfsMetadataJournalBatchResult::Applied,
-        })
-    }
-
-    fn send_metadata_snapshot_install(
-        &self,
-        endpoint: &ClusterEndpointRecord,
-        command: &DfsMetadataSnapshotInstallCommand,
-        _timeout: Duration,
-    ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataPeerTransportError> {
-        self.calls.lock().expect("calls").push(format!(
-            "snapshot:{}:{}",
-            endpoint.address, command.request_id
-        ));
-        Ok(DfsMetadataSnapshotInstallResponse {
-            request_id: command.request_id.clone(),
-            shard_id: command.shard_id.clone(),
-            next_after_sequence: command.next_after_sequence,
-            result: DfsMetadataSnapshotInstallResult::Installed {
-                archived_existing: false,
-            },
-        })
+        request: &ObjectRpcRequest,
+        _options: DfsObjectRpcSendOptions,
+    ) -> Result<ObjectRpcResponse, DfsPeerTransportError> {
+        match request.route.as_str() {
+            DFS_MESSAGE_ROUTE => {
+                let command: DfsMessageCommand = request
+                    .decode_body()
+                    .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+                self.calls.lock().expect("calls").push(format!(
+                    "rpc:{}:{}:{}",
+                    request.route, endpoint.address, command.request_id
+                ));
+                ObjectRpcResponse::encode_body(
+                    DFS_MESSAGE_ROUTE,
+                    &DfsMessageResponse {
+                        request_id: command.request_id,
+                        outbound_messages: Vec::new(),
+                    },
+                )
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+            }
+            DFS_METADATA_JOURNAL_BATCH_ROUTE => {
+                let command: DfsMetadataJournalBatchCommand = request
+                    .decode_body()
+                    .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+                self.calls.lock().expect("calls").push(format!(
+                    "rpc:{}:{}:{}",
+                    request.route, endpoint.address, command.request_id
+                ));
+                ObjectRpcResponse::encode_body(
+                    DFS_METADATA_JOURNAL_BATCH_ROUTE,
+                    &DfsMetadataJournalBatchResponse {
+                        request_id: command.request_id,
+                        shard_id: command.batch.shard_id,
+                        next_after_sequence: command.batch.next_after_sequence,
+                        applied_entries: command.batch.entries.len(),
+                        result: DfsMetadataJournalBatchResult::Applied,
+                    },
+                )
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+            }
+            DFS_METADATA_SNAPSHOT_INSTALL_ROUTE => {
+                let command: DfsMetadataSnapshotInstallCommand = request
+                    .decode_body()
+                    .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+                self.calls.lock().expect("calls").push(format!(
+                    "rpc:{}:{}:{}",
+                    request.route, endpoint.address, command.request_id
+                ));
+                ObjectRpcResponse::encode_body(
+                    DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
+                    &DfsMetadataSnapshotInstallResponse {
+                        request_id: command.request_id,
+                        shard_id: command.shard_id,
+                        next_after_sequence: command.next_after_sequence,
+                        result: DfsMetadataSnapshotInstallResult::Installed {
+                            archived_existing: false,
+                        },
+                    },
+                )
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+            }
+            other => Err(DfsPeerTransportError::new(format!(
+                "unexpected DFS object RPC route {other}"
+            ))),
+        }
     }
 }
 
 impl AsyncDfsPeerTransport for RecordingPeerTransport {
-    fn send_protocol_frame_async<'a>(
+    fn call_object_rpc_async<'a>(
         &'a self,
         endpoint: &'a ClusterEndpointRecord,
-        command: &'a DfsProtocolFrameCommand,
-        timeout: Duration,
-    ) -> DfsPeerTransportFuture<'a, Result<DfsProtocolFrameResponse, DfsPeerTransportError>> {
-        Box::pin(async move { self.send_protocol_frame(endpoint, command, timeout) })
-    }
-
-    fn send_metadata_journal_batch_async<'a>(
-        &'a self,
-        endpoint: &'a ClusterEndpointRecord,
-        command: &'a DfsMetadataJournalBatchCommand,
-        timeout: Duration,
-    ) -> DfsPeerTransportFuture<
-        'a,
-        Result<DfsMetadataJournalBatchResponse, DfsMetadataPeerTransportError>,
-    > {
-        Box::pin(async move { self.send_metadata_journal_batch(endpoint, command, timeout) })
-    }
-
-    fn send_metadata_snapshot_install_async<'a>(
-        &'a self,
-        endpoint: &'a ClusterEndpointRecord,
-        command: &'a DfsMetadataSnapshotInstallCommand,
-        timeout: Duration,
-    ) -> DfsPeerTransportFuture<
-        'a,
-        Result<DfsMetadataSnapshotInstallResponse, DfsMetadataPeerTransportError>,
-    > {
-        Box::pin(async move { self.send_metadata_snapshot_install(endpoint, command, timeout) })
+        request: &'a ObjectRpcRequest,
+        options: DfsObjectRpcSendOptions,
+    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResponse, DfsPeerTransportError>> {
+        Box::pin(async move { self.call_object_rpc(endpoint, request, options) })
     }
 }
 
@@ -1301,20 +1293,24 @@ fn dfs_peer_transport_adapters_delegate_all_routes() {
     let local = NodeId::from_legacy_named("node_dfs_peer_transport_local").expect("local");
     let remote = NodeId::from_legacy_named("node_dfs_peer_transport_remote").expect("remote");
     let endpoint = test_endpoint(&remote, "10.95.0.2:21353");
-    let frame = NetworkFrame {
-        frame_id: NetworkFrameId(42),
-        source_node_id: local.clone(),
-        target_node_id: remote.clone(),
-        message: MeshMessage {
-            message_id: MeshMessageId(42),
-            origin_node_id: local.clone(),
-            target_node_id: remote.clone(),
-            body: MeshMessageBody::Protocol(ProtocolMessage {
-                protocol: DFS_PROTOCOL.to_string(),
-                payload: Vec::new(),
-            }),
-        },
-    };
+    let frame = build_dfs_network_frame(
+        &local,
+        &remote,
+        42,
+        42,
+        DfsNetworkMessage::ReadRequest(DfsReadRequest {
+            request_id: "read-1".to_string(),
+            object_id: DfsObjectId::generate(),
+            version: None,
+            content_hash: None,
+            content_size_bytes: None,
+            range_offset: None,
+            range_max_bytes: None,
+            start_chunk_index: 0,
+            max_chunks: 0,
+        }),
+    )
+    .expect("DFS frame");
 
     protocol_sender(
         &endpoint,
@@ -1363,9 +1359,9 @@ fn dfs_peer_transport_adapters_delegate_all_routes() {
     assert_eq!(
         peer.calls.lock().expect("calls").as_slice(),
         &[
-            "protocol:10.95.0.2:21353:protocol-1".to_string(),
-            "journal:10.95.0.2:21353:journal-1".to_string(),
-            "snapshot:10.95.0.2:21353:snapshot-1".to_string(),
+            "rpc:/dfs/message:10.95.0.2:21353:protocol-1".to_string(),
+            "rpc:/dfs/metadata/journal-batch:10.95.0.2:21353:journal-1".to_string(),
+            "rpc:/dfs/metadata/snapshot-install:10.95.0.2:21353:snapshot-1".to_string(),
         ]
     );
     std::fs::remove_dir_all(snapshot_root).ok();
@@ -1558,6 +1554,76 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         decode_dfs_metadata_snapshot_install_rpc_response(&snapshot_rpc_response)
             .expect("snapshot response body"),
         snapshot_response
+    );
+
+    let message_command = DfsMessageCommand {
+        request_id: "message-request".to_string(),
+        routed_message: DfsRoutedMessage {
+            source_node_id: local.clone(),
+            target_node_id: remote.clone(),
+            frame_id: 2,
+            message_id: 3,
+            message: DfsNetworkMessage::ReadRequest(DfsReadRequest {
+                request_id: "message-read".to_string(),
+                object_id: DfsObjectId::generate(),
+                version: None,
+                content_hash: None,
+                content_size_bytes: None,
+                range_offset: None,
+                range_max_bytes: None,
+                start_chunk_index: 0,
+                max_chunks: 0,
+            }),
+        },
+    };
+    let message_request = dfs_message_rpc_request(&message_command).expect("message request");
+    assert_eq!(message_request.route, DFS_MESSAGE_ROUTE);
+    assert_eq!(message_request.category, DFS_RPC_CATEGORY);
+    assert_eq!(
+        message_request
+            .metadata
+            .get(sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY)
+            .map(String::as_str),
+        Some(sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE)
+    );
+    assert_eq!(
+        message_request
+            .decode_body::<DfsMessageCommand>()
+            .expect("message body"),
+        message_command
+    );
+    let frame_command =
+        dfs_message_command_to_protocol_frame_command(message_command.clone()).expect("frame");
+    assert_eq!(
+        dfs_protocol_frame_command_to_message_command(&frame_command).expect("message"),
+        message_command
+    );
+    let message_response = DfsMessageResponse {
+        request_id: "message-request".to_string(),
+        outbound_messages: vec![DfsRoutedMessage {
+            source_node_id: remote.clone(),
+            target_node_id: local.clone(),
+            frame_id: 4,
+            message_id: 5,
+            message: DfsNetworkMessage::ReadResponse(DfsReadResponse {
+                request_id: "message-read".to_string(),
+                object_id: DfsObjectId::generate(),
+                result: DfsReadResult::NotFound,
+            }),
+        }],
+    };
+    let message_rpc_response =
+        sinomo_network::ObjectRpcResponse::encode_body(DFS_MESSAGE_ROUTE, &message_response)
+            .expect("message response");
+    assert_eq!(
+        decode_dfs_message_rpc_response(&message_rpc_response).expect("message response body"),
+        message_response
+    );
+    let frame_response =
+        dfs_message_response_to_protocol_frame_response(message_response.clone()).expect("frames");
+    assert_eq!(
+        dfs_protocol_frame_response_to_message_response(frame_response).expect("messages"),
+        message_response
     );
 
     let frame = NetworkFrame {
@@ -6344,7 +6410,7 @@ fn scheduled_cluster_metadata_publish_uses_async_peer_transport() {
     assert!(errors.lock().expect("errors").is_empty());
     let calls = peer.calls.lock().expect("calls");
     assert_eq!(calls.len(), 1);
-    assert!(calls[0].starts_with("journal:10.77.0.3:21353:dfs_meta_"));
+    assert!(calls[0].starts_with("rpc:/dfs/metadata/journal-batch:10.77.0.3:21353:dfs_meta_"));
     assert!(calls[0].ends_with("_2"));
     drop(calls);
     assert_eq!(

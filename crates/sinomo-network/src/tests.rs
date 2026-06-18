@@ -2868,9 +2868,7 @@ fn iroh_daemon_response_retry_is_limited_to_idempotent_routes() {
     let retry_safe = ObjectRpcRequest::encode_body("/test/retry-safe", "test", &())
         .expect("retry-safe request")
         .with_response_retry_safe();
-    assert!(
-        crate::roaming::iroh_daemon_control_request_allows_response_retry(&retry_safe)
-    );
+    assert!(crate::roaming::iroh_daemon_control_request_allows_response_retry(&retry_safe));
 
     let range = object_rpc_request_from_kv_payload(
         sinomo_kv::cluster_kv_range_prefix_rpc_payload("/").expect("range request"),
@@ -5679,6 +5677,11 @@ fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
     let dfs_targets = cluster_dfs_protocol_targets(&paths, &state);
 
     assert_eq!(
+        dfs_targets,
+        cluster_endpoint_targets(&paths, &state, ClusterEndpointSelectionPurpose::DfsData),
+        "DFS target wrapper should stay aligned with the canonical endpoint selector"
+    );
+    assert_eq!(
         candidates
             .iter()
             .map(|endpoint| endpoint.endpoint_id.clone())
@@ -5878,6 +5881,15 @@ fn member_publish_targets_prefer_locally_learned_bridge_endpoint() {
 
     let targets = cluster_member_publish_targets(&paths, &state);
 
+    assert_eq!(
+        targets,
+        cluster_endpoint_targets(
+            &paths,
+            &state,
+            ClusterEndpointSelectionPurpose::MemberPublish
+        ),
+        "member-publish wrapper should stay aligned with the canonical endpoint selector"
+    );
     assert_eq!(
         targets
             .first()

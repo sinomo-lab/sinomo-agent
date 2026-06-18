@@ -360,7 +360,10 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        route if route == sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE => {
+        route
+            if route == sinomo_dfs::DFS_MESSAGE_ROUTE
+                || route == sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE =>
+        {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -1420,6 +1423,7 @@ mod tests {
     #[test]
     fn dfs_object_transfer_routes_authorize_cluster_members() {
         for route in [
+            sinomo_dfs::DFS_MESSAGE_ROUTE,
             sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE,
             sinomo_dfs::DFS_DIRECT_READ_ROUTE,
         ] {
