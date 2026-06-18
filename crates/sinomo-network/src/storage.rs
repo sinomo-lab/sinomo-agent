@@ -47,6 +47,10 @@ use crate::membership::{
     cluster_local_process_members, cluster_member_is_legacy_shadow_daemon,
     cluster_member_is_local_process, cluster_node_is_local_process,
 };
+use crate::membership_forward::{
+    ClusterMembershipRpcForwardHost, forward_cluster_membership_rpc_to_voter_async_with_host,
+    forward_cluster_membership_rpc_to_voter_with_host,
+};
 use crate::membership_rpc::{
     ClusterAuthenticatedPeer, ClusterInvitePublishRequest, ClusterInvitePublishResponse,
     ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse, ClusterMemberPublishRequest,
@@ -56,17 +60,14 @@ use crate::network_info::{
     CLUSTER_NETWORK_INFO_TTL_SECONDS, ClusterNetworkInfoRecord, build_cluster_network_info_record,
     cluster_network_info_stable_eq,
 };
-use crate::object::{DaemonRpcTimeouts, SinomoObjectCodec};
+use crate::object::SinomoObjectCodec;
 use crate::prelude::*;
 pub(crate) use crate::records::ClusterCapabilityPolicyRecord;
 use crate::records::{
     ClusterIdentityRecord, ClusterInvitationStateRecord, cluster_capability_policy_stable_eq,
     cluster_identity_record_stable_eq, cluster_invitation_state_stable_eq,
 };
-use crate::route::{
-    ClusterObjectRpcClient, ClusterObjectRpcNodeOptions, ClusterObjectRpcRouteContext,
-    ClusterSignedEndpointRpcAsyncHost,
-};
+use crate::route::ClusterSignedEndpointRpcAsyncHost;
 use crate::rpc::{
     CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_CHALLENGE_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE,
     CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY, ObjectRpcRequest,
@@ -2275,107 +2276,6 @@ fn cluster_endpoint_address_host(address: &str) -> Option<&str> {
     (!host.is_empty()).then_some(host)
 }
 
-pub fn forward_cluster_membership_rpc_to_voter_with_host(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    request: &ObjectRpcRequest,
-    failure_detail: &str,
-    host: &mut impl ClusterMembershipRpcForwardHost,
-) -> Result<ObjectRpcResponse, NetworkError> {
-    let mut failures = Vec::new();
-    let mut seen_voters = BTreeSet::new();
-    for target_node_id in ClusterEndpointSelector::new(paths, state)
-        .select(ClusterEndpointSelectionPurpose::VoterCommand)
-        .into_iter()
-        .filter_map(|endpoint| {
-            seen_voters
-                .insert(endpoint.node_id.clone())
-                .then_some(endpoint.node_id)
-        })
-    {
-        match host.send_membership_rpc_to_node(state, &target_node_id, request) {
-            Ok(response) => return Ok(response),
-            Err(error) => {
-                failures.push(format!("node {target_node_id}: {error}"));
-            }
-        }
-    }
-    Err(NetworkError::ClusterReadOnly {
-        detail: format!(
-            "{failure_detail}{}",
-            if failures.is_empty() {
-                String::new()
-            } else {
-                format!(": {}", failures.join("; "))
-            }
-        ),
-    })
-}
-
-pub async fn forward_cluster_membership_rpc_to_voter_async_with_host(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    request: &ObjectRpcRequest,
-    failure_detail: &str,
-    host: &mut (impl ClusterSignedEndpointRpcAsyncHost + Send),
-) -> Result<ObjectRpcResponse, NetworkError> {
-    let paths_for_targets = paths.clone();
-    let state_for_targets = state.clone();
-    let voter_node_ids = runtime
-        .spawn_blocking(move || {
-            let mut seen_voters = BTreeSet::new();
-            ClusterEndpointSelector::new(&paths_for_targets, &state_for_targets)
-                .select(ClusterEndpointSelectionPurpose::VoterCommand)
-                .into_iter()
-                .filter_map(|endpoint| {
-                    seen_voters
-                        .insert(endpoint.node_id.clone())
-                        .then_some(endpoint.node_id)
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster membership voter target selection".to_string(),
-            detail: format!("voter target selection task failed: {source}"),
-        })?;
-    let mut failures = Vec::new();
-    let mut client =
-        ClusterObjectRpcClient::routed(host, ClusterObjectRpcRouteContext::new(runtime, paths));
-    for target_node_id in &voter_node_ids {
-        match client
-            .call_node(
-                state,
-                target_node_id,
-                request,
-                ClusterObjectRpcNodeOptions::new(
-                    ClusterEndpointSelectionPurpose::VoterCommand,
-                    DaemonRpcTimeouts::connect_and_idle(
-                        DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
-                    ),
-                ),
-            )
-            .await
-        {
-            Ok(response) => return Ok(response),
-            Err(error) => {
-                failures.push(format!("node {target_node_id}: {error}"));
-            }
-        }
-    }
-    Err(NetworkError::ClusterReadOnly {
-        detail: format!(
-            "{failure_detail}{}",
-            if failures.is_empty() {
-                String::new()
-            } else {
-                format!(": {}", failures.join("; "))
-            }
-        ),
-    })
-}
-
 pub fn cluster_join_challenge_rpc_request<T: Serialize + ?Sized>(
     challenge: &T,
 ) -> Result<ObjectRpcRequest, NetworkError> {
@@ -2384,51 +2284,6 @@ pub fn cluster_join_challenge_rpc_request<T: Serialize + ?Sized>(
         CLUSTER_MEMBERSHIP_RPC_CATEGORY,
         challenge,
     )
-}
-
-/// A bridge introducer named in an invite minted before it joined is not itself a
-/// proof-capable channel/issuer, so it cannot answer a join challenge. Relay the challenge to
-/// a reachable voter (the invite issuer can produce an issuer-signed proof). The routing-aware
-/// send routes the challenge across segments when no voter is directly reachable.
-#[cfg(test)]
-pub fn forward_cluster_join_challenge_rpc_to_voter_with_host(
-    paths: &ClusterPaths,
-    request: &ObjectRpcRequest,
-    host: &mut impl ClusterMembershipRpcForwardHost,
-) -> Result<ObjectRpcResponse, NetworkError> {
-    let state = read_cluster_state(paths)?;
-    forward_cluster_membership_rpc_to_voter_with_host(
-        paths,
-        &state,
-        request,
-        "join challenge introducer is not a channel/issuer and could not relay the challenge to any voter",
-        host,
-    )
-}
-
-pub async fn forward_cluster_join_challenge_rpc_to_voter_async_with_host(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    request: &ObjectRpcRequest,
-    host: &mut (impl ClusterSignedEndpointRpcAsyncHost + Send),
-) -> Result<ObjectRpcResponse, NetworkError> {
-    let state_paths = paths.clone();
-    let state = runtime
-        .spawn_blocking(move || read_cluster_state(&state_paths))
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "read cluster state".to_string(),
-            detail: format!("cluster state read task failed: {source}"),
-        })??;
-    forward_cluster_membership_rpc_to_voter_async_with_host(
-        runtime,
-        paths,
-        &state,
-        request,
-        "join challenge introducer is not a channel/issuer and could not relay the challenge to any voter",
-        host,
-    )
-    .await
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4366,15 +4221,6 @@ where
         }
         Ok(())
     }
-}
-
-pub trait ClusterMembershipRpcForwardHost {
-    fn send_membership_rpc_to_node(
-        &mut self,
-        state: &ClusterBootstrapState,
-        target_node_id: &NodeId,
-        request: &ObjectRpcRequest,
-    ) -> Result<ObjectRpcResponse, NetworkError>;
 }
 
 pub type ClusterMembershipRpcFuture<'a, T> =

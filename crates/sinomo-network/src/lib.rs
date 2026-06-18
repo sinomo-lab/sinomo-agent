@@ -26,6 +26,7 @@ mod kv_snapshot;
 mod lan;
 mod maintenance;
 mod membership;
+mod membership_forward;
 mod membership_rpc;
 mod network_info;
 mod object;
@@ -148,6 +149,13 @@ pub use membership::{
 };
 #[cfg(test)]
 pub(crate) use membership::{cluster_has_remote_peers, cluster_local_process_members};
+#[cfg(test)]
+pub(crate) use membership_forward::forward_cluster_join_challenge_rpc_to_voter_with_host;
+#[cfg(test)]
+pub(crate) use membership_forward::forward_cluster_membership_rpc_to_voter_with_host;
+pub use membership_forward::{
+    ClusterMembershipRpcForwardHost, forward_cluster_join_challenge_rpc_to_voter_async_with_host,
+};
 pub use membership_rpc::{
     ClusterAuthenticatedPeer, ClusterInvitePublishRequest, ClusterInvitePublishResponse,
     ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse, ClusterMemberPublishRequest,
@@ -225,7 +233,6 @@ pub use storage::{
     commit_cluster_kv_txn_with_quorum_response_async_with_host,
     commit_cluster_raft_index_with_events_async,
     discard_cluster_raft_uncommitted_tail_and_clear_leader_async,
-    forward_cluster_join_challenge_rpc_to_voter_async_with_host,
     handle_cluster_invite_publish_request_async_with_host,
     handle_cluster_join_registration_request_async_with_host,
     handle_cluster_kv_txn_request_async_with_host,
@@ -250,15 +257,15 @@ pub use storage::{
     ClusterLocalDaemonMembershipRefresh, ClusterLocalMemberPublishAsyncHost,
     ClusterLocalMemberPublishHost, ClusterLocalMemberPublishOptions,
     ClusterMemberMutationAsyncHost, ClusterMemberMutationDriver, ClusterMemberMutationHost,
-    ClusterMembershipRpcForwardHost, ClusterMembershipRpcFuture,
-    ClusterNetworkInfoPublishAsyncHost, ClusterNetworkRecordExpiryHost, ClusterNodeRoleUpdate,
-    ClusterNodeStatusPublishAsyncHost, ClusterRaftAppendReplicationAsyncHost,
-    ClusterRaftAppendReplicationHost, ClusterRaftAppendReplicationOptions,
-    ClusterRaftAppendReplicationOutcome, ClusterRaftCommittedFanoutAsyncHost,
-    ClusterRaftCommittedFanoutOptions, ClusterRaftLeaderElectionOptions,
-    ClusterRaftQuorumAsyncHost, ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult,
-    ClusterRaftQuorumTransportHost, ClusterRaftVoteTransportAsyncHost,
-    ClusterRaftVoteTransportHost, ClusterVoterReachabilityAsyncHost, ClusterVoterReachabilityHost,
+    ClusterMembershipRpcFuture, ClusterNetworkInfoPublishAsyncHost, ClusterNetworkRecordExpiryHost,
+    ClusterNodeRoleUpdate, ClusterNodeStatusPublishAsyncHost,
+    ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
+    ClusterRaftAppendReplicationOptions, ClusterRaftAppendReplicationOutcome,
+    ClusterRaftCommittedFanoutAsyncHost, ClusterRaftCommittedFanoutOptions,
+    ClusterRaftLeaderElectionOptions, ClusterRaftQuorumAsyncHost, ClusterRaftQuorumCommitOptions,
+    ClusterRaftQuorumCommitResult, ClusterRaftQuorumTransportHost,
+    ClusterRaftVoteTransportAsyncHost, ClusterRaftVoteTransportHost,
+    ClusterVoterReachabilityAsyncHost, ClusterVoterReachabilityHost,
     ClusterVoterReachabilityOptions, DAEMON_MAIN_RUN_CAPABILITY,
     DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_IROH_FOREGROUND_ATTEMPT_TIMEOUT,
