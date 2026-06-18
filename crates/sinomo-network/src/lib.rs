@@ -37,6 +37,7 @@ mod records;
 mod roaming;
 mod route;
 mod rpc;
+mod status_publish;
 mod storage;
 
 pub use connectivity::{
@@ -103,6 +104,8 @@ pub use invite::{
 };
 pub(crate) use io_observer::io_observer;
 pub use io_observer::{IoObserver, set_io_observer};
+#[cfg(test)]
+pub(crate) use keyspace::cluster_node_status_key_for_record;
 pub use keyspace::{
     cluster_connectivity_key, cluster_connectivity_source_prefix, cluster_endpoint_key,
     cluster_endpoint_prefix, cluster_identity_key, cluster_invitation_key,
@@ -242,6 +245,16 @@ pub use rpc::{
     ServiceCategory, call_object_rpc_frame_async, call_object_rpc_service_async,
     serve_object_rpc_frame_async,
 };
+pub use status_publish::{
+    ClusterNetworkInfoPublishAsyncHost, ClusterNetworkInfoPublishHost,
+    ClusterNodeStatusPublishAsyncHost, ClusterNodeStatusPublishHost, cluster_node_status_stable_eq,
+    publish_cluster_network_info_to_quorum_async_with_host,
+    publish_cluster_network_info_to_quorum_with_host,
+    publish_cluster_node_status_to_quorum_async_with_host,
+    publish_cluster_node_status_to_quorum_with_host, stored_cluster_network_info_matches,
+    stored_cluster_node_status_matches, sync_cluster_network_info_to_kv,
+    sync_cluster_node_status_to_kv,
+};
 pub use storage::{
     ClusterConnectivityPublishAsyncHost, cluster_has_local_quorum_async_with_host,
     cluster_kv_key_can_defer_materialized_snapshot,
@@ -251,10 +264,8 @@ pub use storage::{
     handle_cluster_invite_publish_request_async_with_host,
     handle_cluster_join_registration_request_async_with_host,
     handle_cluster_kv_txn_request_async_with_host, handle_cluster_raft_rpc_request_async,
-    publish_cluster_network_info_to_quorum_async_with_host,
-    publish_cluster_node_status_to_quorum_async_with_host, read_cluster_state_async,
-    read_cluster_state_without_kv_async, refresh_cluster_connectivity_environment,
-    refresh_cluster_connectivity_environment_async,
+    read_cluster_state_async, read_cluster_state_without_kv_async,
+    refresh_cluster_connectivity_environment, refresh_cluster_connectivity_environment_async,
     refresh_local_daemon_membership_from_disk_async,
     replicate_cluster_raft_to_endpoint_async_with_host,
     sync_cluster_connectivity_records_to_quorum_async_with_host,
@@ -268,8 +279,7 @@ pub use storage::{
     ClusterLocalDaemonMembershipObservation, ClusterLocalDaemonMembershipObserver,
     ClusterLocalDaemonMembershipRefresh, ClusterMemberMutationAsyncHost,
     ClusterMemberMutationDriver, ClusterMemberMutationHost, ClusterMembershipRpcFuture,
-    ClusterNetworkInfoPublishAsyncHost, ClusterNetworkRecordExpiryHost, ClusterNodeRoleUpdate,
-    ClusterNodeStatusPublishAsyncHost, ClusterRaftAppendReplicationAsyncHost,
+    ClusterNetworkRecordExpiryHost, ClusterNodeRoleUpdate, ClusterRaftAppendReplicationAsyncHost,
     ClusterRaftAppendReplicationHost, ClusterRaftAppendReplicationOptions,
     ClusterRaftAppendReplicationOutcome, ClusterRaftCommittedFanoutAsyncHost,
     ClusterRaftCommittedFanoutOptions, ClusterRaftLeaderElectionOptions,
@@ -289,8 +299,8 @@ pub use storage::{
     cluster_connectivity_sync_ops, cluster_has_local_quorum_with_host,
     cluster_join_challenge_rpc_request, cluster_network_publish_interval_for_node,
     cluster_network_record_should_refresh, cluster_node_blocks_leader_preference,
-    cluster_node_status_stable_eq, cluster_reachable_voter_count_with_host,
-    cluster_state_needs_join_registration, cluster_state_sync_txn, cluster_status_summary_label,
+    cluster_reachable_voter_count_with_host, cluster_state_needs_join_registration,
+    cluster_state_sync_txn, cluster_status_summary_label,
     commit_cluster_kv_txn_with_quorum_response_with_host,
     commit_cluster_raft_command_with_quorum_driver, elect_cluster_raft_leader_with_host,
     ensure_daemon_cluster_members, expire_cluster_network_records_with_host,
@@ -298,9 +308,7 @@ pub use storage::{
     handle_cluster_membership_rpc_request_with_hosts, handle_cluster_raft_rpc_request,
     join_channel_endpoint_for_accepted_state, merge_cluster_join_registration,
     prepare_cluster_join_retry_state, prepare_pending_cluster_join_state,
-    publish_cluster_invitation_to_quorum_with_host,
-    publish_cluster_network_info_to_quorum_with_host,
-    publish_cluster_node_status_to_quorum_with_host, read_cluster_connectivity_graph_from_kv,
+    publish_cluster_invitation_to_quorum_with_host, read_cluster_connectivity_graph_from_kv,
     read_cluster_invitation_from_kv, read_cluster_members_from_kv,
     read_cluster_node_statuses_from_kv, read_cluster_state, read_cluster_state_cached,
     read_cluster_state_without_kv, read_local_cluster_connectivity_records,
@@ -309,10 +317,8 @@ pub use storage::{
     refresh_local_daemon_membership_from_disk, remove_cluster_members_with_host,
     replicate_cluster_raft_to_endpoint_with_host, select_cluster_connectivity_probe_batch,
     send_cluster_join_registration_over_membership_rpc,
-    spawn_cluster_raft_committed_fanout_worker_on_runtime, stored_cluster_network_info_matches,
-    stored_cluster_node_status_matches, sync_cluster_connectivity_records_to_kv,
+    spawn_cluster_raft_committed_fanout_worker_on_runtime, sync_cluster_connectivity_records_to_kv,
     sync_cluster_connectivity_records_to_quorum_with_host, sync_cluster_invitation_to_kv,
-    sync_cluster_network_info_to_kv, sync_cluster_node_status_to_kv,
     sync_cluster_state_to_kv_with_host, sync_cluster_state_to_local_raft_unchecked,
     update_cluster_node_role_with_host, update_cluster_raft_role_with_host, upsert_member_record,
     write_cluster_state, write_local_cluster_connectivity_records,
