@@ -7,10 +7,10 @@ use crate::kv_local_store::{
 };
 use crate::kv_txn_ops::push_bounded_txn_success_op;
 use crate::local_state_store::{read_cluster_state, read_cluster_state_without_kv};
+use crate::member_mutation::ClusterMemberMutationAsyncHost;
 use crate::membership_rpc::{ClusterInvitePublishRequest, ClusterInvitePublishResponse};
 use crate::prelude::*;
 use crate::records::{ClusterInvitationStateRecord, cluster_invitation_state_stable_eq};
-use crate::storage::ClusterMemberMutationAsyncHost;
 
 pub trait ClusterInvitePublishHost {
     type Error: From<NetworkError> + ToString;

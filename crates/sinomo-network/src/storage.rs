@@ -137,6 +137,7 @@ pub use crate::local_state_store::{
     read_cluster_state, read_cluster_state_without_kv, read_cluster_state_without_kv_async,
     write_cluster_state,
 };
+use crate::member_mutation::{ClusterMemberMutationAsyncHost, ClusterMemberMutationHost};
 use crate::member_publish::{
     ClusterLocalMemberPublishHost, ClusterMemberPublishHost,
     handle_cluster_member_publish_request_with_host,
@@ -224,46 +225,6 @@ pub struct ClusterRaftRoleUpdate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterMemberRemoval {
     pub removed: Vec<ClusterMemberRecord>,
-}
-
-pub trait ClusterMemberMutationHost {
-    fn prepare_cluster_state_for_kv_sync(
-        &mut self,
-        _paths: &ClusterPaths,
-        _state: &mut ClusterBootstrapState,
-    ) -> Result<(), NetworkError> {
-        Ok(())
-    }
-
-    fn current_cluster_kv_store(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Result<InProcessKvStore, NetworkError>;
-
-    fn commit_cluster_kv_txn_with_quorum(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, NetworkError>;
-}
-
-pub trait ClusterMemberMutationAsyncHost {
-    fn prepare_cluster_state_for_kv_sync_async<'a>(
-        &'a mut self,
-        _paths: &'a ClusterPaths,
-        _state: &'a mut ClusterBootstrapState,
-    ) -> ClusterMembershipRpcFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn commit_cluster_kv_txn_with_quorum_async<'a>(
-        &'a mut self,
-        paths: &'a ClusterPaths,
-        state: &'a mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> ClusterMembershipRpcFuture<'a, KvSnapshot>;
 }
 
 pub fn prepare_cluster_join_registration_response(

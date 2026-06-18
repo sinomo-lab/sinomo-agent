@@ -37,6 +37,7 @@ mod lan;
 mod local_membership;
 mod local_state_store;
 mod maintenance;
+mod member_mutation;
 mod member_publish;
 mod member_store;
 mod membership;
@@ -226,6 +227,7 @@ pub use maintenance::{
     cluster_network_maintenance_next_due_duration, cluster_network_probe_interval_for_role,
     cluster_network_publish_interval_for_role, cluster_network_stable_discovery_announcement_due,
 };
+pub use member_mutation::{ClusterMemberMutationAsyncHost, ClusterMemberMutationHost};
 pub use member_publish::{
     ClusterLocalMemberPublishAsyncHost, ClusterLocalMemberPublishHost,
     ClusterLocalMemberPublishOptions, ClusterMemberPublishHost, cluster_member_publish_txn_from_kv,
@@ -346,8 +348,7 @@ pub use storage::{
     ClusterControlPlaneDriver, ClusterControlPlaneTransport, ClusterJoinRegistrationAsyncHost,
     ClusterJoinRegistrationDriver, ClusterJoinRegistrationHost, ClusterKvTxnQuorumAsyncHost,
     ClusterKvTxnQuorumHost, ClusterLocalDaemonMembershipAsyncObserver,
-    ClusterLocalDaemonMembershipObserver, ClusterMemberMutationAsyncHost,
-    ClusterMemberMutationDriver, ClusterMemberMutationHost, ClusterNodeRoleUpdate,
+    ClusterLocalDaemonMembershipObserver, ClusterMemberMutationDriver, ClusterNodeRoleUpdate,
     ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
     ClusterRaftCommittedFanoutAsyncHost, ClusterRaftQuorumAsyncHost,
     ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult, ClusterRaftQuorumTransportHost,

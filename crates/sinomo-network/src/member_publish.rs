@@ -15,13 +15,13 @@ use crate::kv_local_store::{
 };
 use crate::kv_txn_ops::push_bounded_txn_success_op;
 use crate::local_state_store::read_cluster_state;
+use crate::member_mutation::ClusterMemberMutationAsyncHost;
 use crate::member_store::{MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS, cluster_member_stable_eq};
 use crate::membership::cluster_local_process_members;
 use crate::membership_rpc::{ClusterMemberPublishRequest, ClusterMemberPublishResponse};
 use crate::prelude::*;
 use crate::records::{ClusterCapabilityPolicyRecord, cluster_capability_policy_stable_eq};
 use crate::rpc_future::ClusterMembershipRpcFuture;
-use crate::storage::ClusterMemberMutationAsyncHost;
 use sinomo_kv::KvRevision;
 
 pub trait ClusterMemberPublishHost {
