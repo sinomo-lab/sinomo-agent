@@ -42,6 +42,7 @@ mod peer;
 mod records;
 mod roaming;
 mod route;
+mod route_graph_read_model;
 mod rpc;
 mod status_publish;
 mod storage;
