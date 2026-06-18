@@ -15,6 +15,7 @@
 mod connectivity;
 mod connectivity_publish;
 mod connectivity_store;
+mod control_plane_options;
 mod endpoint_advertisement;
 mod endpoint_records;
 mod endpoint_selector;
@@ -81,6 +82,18 @@ pub use connectivity_publish::{
 };
 pub use connectivity_store::{
     read_local_cluster_connectivity_records, write_local_cluster_connectivity_records,
+};
+pub use control_plane_options::{
+    ClusterControlPlaneTimeouts, ClusterKvTxnQuorumOptions, ClusterRaftAppendReplicationOptions,
+    ClusterRaftAppendReplicationOutcome, ClusterRaftCommittedFanoutOptions,
+    ClusterRaftLeaderElectionOptions, DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT,
+    DEFAULT_CLUSTER_CONTROL_PLANE_IROH_FOREGROUND_ATTEMPT_TIMEOUT,
+    DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
+    DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,
+    DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_MAX_ATTEMPTS,
+    DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT, DEFAULT_CLUSTER_CONTROL_PLANE_RPC_TIMEOUT,
+    DEFAULT_CLUSTER_CONTROL_PLANE_TCP_COMMAND_TIMEOUT,
+    DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
 };
 #[cfg(test)]
 pub(crate) use endpoint_advertisement::{
@@ -330,22 +343,15 @@ pub use status_publish::{
     sync_cluster_node_status_to_kv,
 };
 pub use storage::{
-    ClusterControlPlaneDriver, ClusterControlPlaneTimeouts, ClusterControlPlaneTransport,
-    ClusterJoinRegistrationAsyncHost, ClusterJoinRegistrationDriver, ClusterJoinRegistrationHost,
-    ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost, ClusterKvTxnQuorumOptions,
-    ClusterLocalDaemonMembershipAsyncObserver, ClusterLocalDaemonMembershipObserver,
-    ClusterMemberMutationAsyncHost, ClusterMemberMutationDriver, ClusterMemberMutationHost,
-    ClusterNodeRoleUpdate, ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
-    ClusterRaftAppendReplicationOptions, ClusterRaftAppendReplicationOutcome,
-    ClusterRaftCommittedFanoutAsyncHost, ClusterRaftCommittedFanoutOptions,
-    ClusterRaftLeaderElectionOptions, ClusterRaftQuorumAsyncHost, ClusterRaftQuorumCommitOptions,
-    ClusterRaftQuorumCommitResult, ClusterRaftQuorumTransportHost,
+    ClusterControlPlaneDriver, ClusterControlPlaneTransport, ClusterJoinRegistrationAsyncHost,
+    ClusterJoinRegistrationDriver, ClusterJoinRegistrationHost, ClusterKvTxnQuorumAsyncHost,
+    ClusterKvTxnQuorumHost, ClusterLocalDaemonMembershipAsyncObserver,
+    ClusterLocalDaemonMembershipObserver, ClusterMemberMutationAsyncHost,
+    ClusterMemberMutationDriver, ClusterMemberMutationHost, ClusterNodeRoleUpdate,
+    ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
+    ClusterRaftCommittedFanoutAsyncHost, ClusterRaftQuorumAsyncHost,
+    ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult, ClusterRaftQuorumTransportHost,
     ClusterRaftVoteTransportAsyncHost, ClusterRaftVoteTransportHost,
-    DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT,
-    DEFAULT_CLUSTER_CONTROL_PLANE_IROH_FOREGROUND_ATTEMPT_TIMEOUT,
-    DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,
-    DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT,
-    DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
     accepted_cluster_join_state_from_kv_snapshot, cleanup_legacy_shadow_daemon_members_with_host,
     cluster_join_challenge_rpc_request, cluster_state_sync_txn,
     commit_cluster_kv_txn_with_quorum_response_with_host,
