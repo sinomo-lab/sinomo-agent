@@ -19,7 +19,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::{
-    DFS_CONTROL_PLANE_ROUTES, DFS_DATA_PLANE_ROUTES, DFS_DIRECT_READ_ROUTE,
+    DFS_CONTROL_PLANE_ROUTES, DFS_DATA_PLANE_SERVICE_ROUTES, DFS_DIRECT_READ_ROUTE,
     DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE, DFS_MESSAGE_ROUTE,
     DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
     DFS_PROTOCOL_FRAME_ROUTE, DFS_RPC_CATEGORY, DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE,
@@ -227,11 +227,11 @@ impl Service for DfsDataPlaneService {
     }
 
     fn routes(&self) -> &'static [&'static str] {
-        DFS_DATA_PLANE_ROUTES
+        DFS_DATA_PLANE_SERVICE_ROUTES
     }
 
     fn route_categories(&self) -> Vec<ServiceRoute> {
-        dfs_service_routes(DFS_DATA_PLANE_ROUTES)
+        dfs_service_routes(DFS_DATA_PLANE_SERVICE_ROUTES)
     }
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {

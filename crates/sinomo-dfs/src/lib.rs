@@ -343,11 +343,19 @@ pub const DFS_CONTROL_PLANE_ROUTES: &[&str] = &[
     DFS_METADATA_JOURNAL_BATCH_ROUTE,
     DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
 ];
-pub const DFS_DATA_PLANE_ROUTES: &[&str] = &[
+/// Canonical DFS data-plane object-RPC routes.
+pub const DFS_DATA_PLANE_ROUTES: &[&str] =
+    &[DFS_SMOKE_ROUTE, DFS_MESSAGE_ROUTE, DFS_DIRECT_READ_ROUTE];
+/// Temporary compatibility shim for callers that still carry DFS messages as
+/// network protocol frames. New data-plane callers should use `DFS_MESSAGE_ROUTE`
+/// or a typed DFS route instead.
+pub const DFS_LEGACY_DATA_PLANE_COMPATIBILITY_ROUTES: &[&str] = &[DFS_PROTOCOL_FRAME_ROUTE];
+/// Routes registered by the DFS data-plane service while the compatibility shim exists.
+pub const DFS_DATA_PLANE_SERVICE_ROUTES: &[&str] = &[
     DFS_SMOKE_ROUTE,
     DFS_MESSAGE_ROUTE,
-    DFS_PROTOCOL_FRAME_ROUTE,
     DFS_DIRECT_READ_ROUTE,
+    DFS_PROTOCOL_FRAME_ROUTE,
 ];
 pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
     DFS_STATUS_ROUTE,
