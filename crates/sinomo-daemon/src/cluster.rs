@@ -10402,6 +10402,23 @@ mod tests {
         );
     }
 
+    fn test_relay_envelope(
+        state: &ClusterBootstrapState,
+        target_node: &NodeId,
+    ) -> sinomo_network::RelayEnvelope {
+        sinomo_network::RelayEnvelope::new(
+            state.cluster_id.clone(),
+            target_node.clone(),
+            sinomo_network::ObjectRpcRequest {
+                route: "/test/relay".to_string(),
+                category: "test".to_string(),
+                metadata: BTreeMap::new(),
+                auth: None,
+                body: Vec::new(),
+            },
+        )
+    }
+
     #[test]
     fn relay_next_hops_fall_back_to_direct_target_endpoint_before_graph_converges() {
         let root = unique_cluster_test_root("sinomo-daemon-relay-direct-target-fallback");
@@ -10439,32 +10456,29 @@ mod tests {
         state.members.push(target_member);
 
         sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
-        let graph = sinomo_network::ClusterConnectivityGraph::from_records(local_node.clone(), []);
-
-        let next_hops = sinomo_network::cluster_relay_next_hops_with_direct_target_fallback(
-            &paths,
-            &graph,
-            &state,
-            &local_node,
-            &target_node,
-            &[],
-        );
-
-        assert_eq!(
-            next_hops,
-            vec![target_node],
-            "relay should deliver directly to a known command endpoint while connectivity publication is still empty"
-        );
-        assert_eq!(
-            sinomo_network::cluster_relay_next_hop_endpoints(
+        let runtime = daemon_cluster_test_runtime();
+        let envelope = test_relay_envelope(&state, &target_node);
+        let plan = runtime
+            .block_on(sinomo_network::cluster_relay_forward_plan(
+                runtime.handle(),
                 &paths,
                 &state,
                 &local_node,
-                &next_hops[0],
-            )
-            .into_iter()
-            .next()
-            .map(|endpoint| endpoint.endpoint_id),
+                &envelope,
+            ))
+            .expect("relay plan");
+
+        assert_eq!(
+            plan.iter()
+                .map(|(node_id, _endpoints)| node_id.clone())
+                .collect::<Vec<_>>(),
+            vec![target_node.clone()],
+            "relay should deliver directly to a known command endpoint while connectivity publication is still empty"
+        );
+        assert_eq!(
+            plan.first()
+                .and_then(|(_node_id, endpoints)| endpoints.first())
+                .map(|endpoint| endpoint.endpoint_id.clone()),
             Some(target_endpoint.endpoint_id)
         );
     }
@@ -10528,12 +10542,21 @@ mod tests {
             Some(1),
             None,
         );
-        let endpoints = sinomo_network::cluster_relay_next_hop_endpoints(
-            &paths,
-            &state,
-            &local_node,
-            &target_node,
-        );
+        let runtime = daemon_cluster_test_runtime();
+        let envelope = test_relay_envelope(&state, &target_node);
+        let plan = runtime
+            .block_on(sinomo_network::cluster_relay_forward_plan(
+                runtime.handle(),
+                &paths,
+                &state,
+                &local_node,
+                &envelope,
+            ))
+            .expect("relay plan");
+        let endpoints = plan
+            .first()
+            .map(|(_node_id, endpoints)| endpoints.as_slice())
+            .unwrap_or(&[]);
 
         assert_eq!(
             endpoints.first().map(|endpoint| &endpoint.address),

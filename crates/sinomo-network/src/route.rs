@@ -160,7 +160,7 @@ pub fn cluster_route_first_hop_best_effort(
 /// graph only knows directly-reachable neighbors, return all usable neighbors so
 /// the daemon relay layer can retry another bridge if the first one reports a
 /// loop or dead end.
-pub fn cluster_route_next_hops_best_effort(
+pub(crate) fn cluster_route_next_hops_best_effort(
     graph: &ClusterConnectivityGraph,
     local: &NodeId,
     target: &NodeId,
@@ -1457,7 +1457,7 @@ pub fn relay_response_is_routing_error(response: &ObjectRpcResponse) -> bool {
     response.route == CLUSTER_RELAY_ROUTE && response.error_detail().is_err()
 }
 
-pub fn cluster_relay_next_hops(
+pub(crate) fn cluster_relay_next_hops(
     graph: &ClusterConnectivityGraph,
     state: &ClusterBootstrapState,
     local_node_id: &NodeId,
@@ -1671,7 +1671,7 @@ fn cluster_graph_has_reachable_main_daemon_route_targets(
         })
 }
 
-pub fn cluster_relay_next_hops_with_direct_target_fallback(
+pub(crate) fn cluster_relay_next_hops_with_direct_target_fallback(
     paths: &ClusterPaths,
     graph: &ClusterConnectivityGraph,
     state: &ClusterBootstrapState,
@@ -1789,17 +1789,8 @@ fn cluster_relay_target_has_locally_learned_endpoint(
         })
 }
 
-pub fn cluster_relay_next_hop_endpoints(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    source_node_id: &NodeId,
-    node_id: &NodeId,
-) -> Vec<ClusterEndpointRecord> {
-    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
-    cluster_relay_next_hop_endpoints_with_graph(paths, &graph, state, source_node_id, node_id)
-}
-
-pub fn cluster_relay_next_hop_endpoints_with_graph(
+#[cfg(test)]
+pub(crate) fn cluster_relay_next_hop_endpoints_with_graph(
     paths: &ClusterPaths,
     graph: &ClusterConnectivityGraph,
     state: &ClusterBootstrapState,
