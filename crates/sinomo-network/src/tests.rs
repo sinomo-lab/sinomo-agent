@@ -1,4 +1,12 @@
 use crate::prelude::*;
+use crate::roaming::{
+    ClusterAuthMaterial, ClusterAuthVerifier, IceCandidateRecord, IceCandidateType, IrohKvExchange,
+    LanConnectionPlanner, RoamingConnectionPlanner, RoamingPathSelection, WebRtcKvExchange,
+    WebRtcSignalMessage, WebRtcSignalingEnvelope, default_sinomo_iroh_relay_urls,
+    iroh_endpoint_record_from_cluster_endpoint, write_iroh_endpoint_record_async,
+};
+#[cfg(feature = "iroh-transport")]
+use crate::roaming::{iroh_public_key_for_node_async, load_or_create_iroh_secret_key};
 use crate::storage::*;
 use crate::storage::{
     LocalClusterRaftCommandStorage, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,

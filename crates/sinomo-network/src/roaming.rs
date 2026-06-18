@@ -1,5 +1,6 @@
 use crate::error::NetworkError;
 use crate::object::DaemonRpcTimeouts;
+#[cfg(test)]
 use crate::peer::{EndpointCandidateStatus, PeerEndpointCandidate};
 use crate::prelude::*;
 #[cfg(any(feature = "iroh-transport", test))]
@@ -10,11 +11,13 @@ use crate::storage::{read_optional_object_file, write_object_file_create_new_ser
 #[cfg(feature = "iroh-transport")]
 use fs2::FileExt;
 
-pub const WEBRTC_SIGNALING_PROTOCOL: &str = "sinomo.webrtc-signaling.v1";
-pub const IROH_ROAMING_PROTOCOL: &str = "sinomo.iroh-roaming.v1";
+#[cfg(feature = "iroh-transport")]
+const IROH_ROAMING_PROTOCOL: &str = "sinomo.iroh-roaming.v1";
 pub const IROH_DAEMON_COMMAND_MAX_BYTES: usize = crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES;
-pub const IROH_DAEMON_ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
-pub const SINOMO_IROH_RELAY_URLS_ENV: &str = "SINOMO_IROH_RELAY_URLS";
+#[cfg(feature = "iroh-transport")]
+const IROH_DAEMON_ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(any(feature = "iroh-transport", test))]
+const SINOMO_IROH_RELAY_URLS_ENV: &str = "SINOMO_IROH_RELAY_URLS";
 #[cfg(any(feature = "iroh-transport", test))]
 pub(crate) const IROH_DAEMON_PROXY_RESTART_BACKOFF_MIN: Duration = Duration::from_secs(5);
 #[cfg(any(feature = "iroh-transport", test))]
@@ -48,6 +51,7 @@ pub(crate) const IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES: usize =
 pub(crate) const IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(any(feature = "iroh-transport", test))]
 pub(crate) const IROH_DAEMON_PROXY_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(any(feature = "iroh-transport", test))]
 const SINOMO_DEFAULT_IROH_RELAY_URLS: &[&str] = &[
     "https://use1-1.relay.n0.iroh-canary.iroh.link./",
     "https://usw1-1.relay.n0.iroh-canary.iroh.link./",
@@ -55,8 +59,9 @@ const SINOMO_DEFAULT_IROH_RELAY_URLS: &[&str] = &[
     "https://aps1-1.relay.n0.iroh-canary.iroh.link./",
 ];
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct WebRtcSignalingEnvelope {
+pub(crate) struct WebRtcSignalingEnvelope {
     pub cluster_id: ClusterId,
     pub exchange_id: String,
     pub source_node_id: NodeId,
@@ -66,6 +71,7 @@ pub struct WebRtcSignalingEnvelope {
     pub message: WebRtcSignalMessage,
 }
 
+#[cfg(test)]
 impl WebRtcSignalingEnvelope {
     pub fn offer(
         cluster_id: ClusterId,
@@ -106,17 +112,19 @@ impl WebRtcSignalingEnvelope {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-pub enum WebRtcSignalMessage {
+pub(crate) enum WebRtcSignalMessage {
     Offer { sdp: String },
     Answer { sdp: String },
     IceCandidate(IceCandidateRecord),
     EndOfCandidates,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct IceCandidateRecord {
+pub(crate) struct IceCandidateRecord {
     pub cluster_id: ClusterId,
     pub exchange_id: String,
     pub node_id: NodeId,
@@ -128,6 +136,7 @@ pub struct IceCandidateRecord {
     pub expires_after_tick: u64,
 }
 
+#[cfg(test)]
 impl IceCandidateRecord {
     pub fn endpoint(&self) -> ClusterEndpointRecord {
         let (transport, privacy, source_priority) = match self.candidate_type {
@@ -165,17 +174,20 @@ impl IceCandidateRecord {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-pub enum IceCandidateType {
+pub(crate) enum IceCandidateType {
     Host,
     ServerReflexive,
     PeerReflexive,
     Relay,
 }
 
-pub struct WebRtcKvExchange;
+#[cfg(test)]
+pub(crate) struct WebRtcKvExchange;
 
+#[cfg(test)]
 impl WebRtcKvExchange {
     pub fn signal_key(cluster_id: &ClusterId, exchange_id: &str, sequence: u64) -> String {
         format!("/webrtc/signals/{cluster_id}/{exchange_id}/{sequence:020}")
@@ -335,10 +347,12 @@ pub enum IrohRelayMode {
     Custom { relay_url: String },
 }
 
-pub fn default_sinomo_iroh_relay_urls() -> Vec<String> {
+#[cfg(test)]
+pub(crate) fn default_sinomo_iroh_relay_urls() -> Vec<String> {
     sinomo_iroh_relay_url_strings_from_env(std::env::var(SINOMO_IROH_RELAY_URLS_ENV).ok())
 }
 
+#[cfg(any(feature = "iroh-transport", test))]
 pub(crate) fn sinomo_iroh_relay_url_strings_from_env(value: Option<String>) -> Vec<String> {
     let Some(value) = value else {
         return SINOMO_DEFAULT_IROH_RELAY_URLS
@@ -389,36 +403,10 @@ fn sinomo_iroh_endpoint_builder() -> Result<iroh::endpoint::Builder, NetworkErro
     Ok(iroh::Endpoint::builder(iroh::endpoint::presets::N0).relay_mode(sinomo_iroh_relay_mode()?))
 }
 
-#[cfg(feature = "iroh-transport")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IrohEndpointDialConfig {
-    pub endpoint_public_key: iroh::PublicKey,
-    pub alpn: Vec<u8>,
-    pub relay_url: Option<String>,
-    pub direct_addresses: Vec<String>,
-}
+#[cfg(test)]
+pub(crate) struct IrohKvExchange;
 
-#[cfg(feature = "iroh-transport")]
-impl IrohEndpointDialConfig {
-    pub fn from_record(record: &IrohEndpointRecord) -> Result<Self, NetworkError> {
-        let endpoint_public_key =
-            record
-                .endpoint_public_key
-                .parse()
-                .map_err(|source| NetworkError::Serialization {
-                    detail: format!("invalid iroh public key: {source}"),
-                })?;
-        Ok(Self {
-            endpoint_public_key,
-            alpn: IROH_ROAMING_PROTOCOL.as_bytes().to_vec(),
-            relay_url: record.relay_url.clone(),
-            direct_addresses: record.direct_addresses.clone(),
-        })
-    }
-}
-
-pub struct IrohKvExchange;
-
+#[cfg(test)]
 impl IrohKvExchange {
     pub fn endpoint_key(cluster_id: &ClusterId, node_id: &NodeId) -> String {
         format!("/iroh/endpoints/{cluster_id}/{node_id}")
@@ -441,7 +429,8 @@ impl IrohKvExchange {
     }
 }
 
-pub fn iroh_endpoint_key_path(paths: &ClusterPaths, node_id: &NodeId) -> PathBuf {
+#[cfg(feature = "iroh-transport")]
+pub(crate) fn iroh_endpoint_key_path(paths: &ClusterPaths, node_id: &NodeId) -> PathBuf {
     paths.iroh.join(format!("{}.secret.sobj", node_id.as_str()))
 }
 
@@ -450,7 +439,7 @@ fn iroh_endpoint_key_lock_path(paths: &ClusterPaths, node_id: &NodeId) -> PathBu
     paths.iroh.join(format!("{}.secret.lock", node_id.as_str()))
 }
 
-pub fn iroh_endpoint_record_path(paths: &ClusterPaths, node_id: &NodeId) -> PathBuf {
+fn iroh_endpoint_record_path(paths: &ClusterPaths, node_id: &NodeId) -> PathBuf {
     paths
         .iroh
         .join(format!("{}.endpoint.sobj", node_id.as_str()))
@@ -529,7 +518,7 @@ fn file_lock_is_busy(source: &std::io::Error) -> bool {
 }
 
 #[cfg(feature = "iroh-transport")]
-pub fn load_or_create_iroh_secret_key(
+pub(crate) fn load_or_create_iroh_secret_key(
     paths: &ClusterPaths,
     node_id: &NodeId,
 ) -> Result<iroh::SecretKey, NetworkError> {
@@ -555,17 +544,6 @@ pub fn load_or_create_iroh_secret_key(
     }
 }
 
-#[cfg(not(feature = "iroh-transport"))]
-pub fn load_or_create_iroh_secret_key(
-    _paths: &ClusterPaths,
-    _node_id: &NodeId,
-) -> Result<(), NetworkError> {
-    Err(NetworkError::Io {
-        operation: "iroh secret key".to_string(),
-        detail: "sinomo-network was built without iroh-transport".to_string(),
-    })
-}
-
 async fn spawn_roaming_disk_task_on_runtime<T, F>(
     runtime: &tokio::runtime::Handle,
     operation: &'static str,
@@ -585,7 +563,7 @@ where
 }
 
 #[cfg(feature = "iroh-transport")]
-pub async fn load_or_create_iroh_secret_key_async(
+pub(crate) async fn load_or_create_iroh_secret_key_async(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     node_id: &NodeId,
@@ -598,55 +576,18 @@ pub async fn load_or_create_iroh_secret_key_async(
     .await
 }
 
-#[cfg(not(feature = "iroh-transport"))]
-pub async fn load_or_create_iroh_secret_key_async(
-    _runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    node_id: &NodeId,
-) -> Result<(), NetworkError> {
-    load_or_create_iroh_secret_key(paths, node_id)
-}
-
-#[cfg(feature = "iroh-transport")]
-pub fn iroh_public_key_for_node(
+#[cfg(all(feature = "iroh-transport", test))]
+pub(crate) async fn iroh_public_key_for_node_async(
+    runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     node_id: &NodeId,
 ) -> Result<String, NetworkError> {
-    Ok(load_or_create_iroh_secret_key(paths, node_id)?
-        .public()
-        .to_string())
-}
-
-#[cfg(not(feature = "iroh-transport"))]
-pub fn iroh_public_key_for_node(
-    _paths: &ClusterPaths,
-    _node_id: &NodeId,
-) -> Result<String, NetworkError> {
-    Err(NetworkError::Io {
-        operation: "iroh public key".to_string(),
-        detail: "sinomo-network was built without iroh-transport".to_string(),
-    })
-}
-
-pub async fn iroh_public_key_for_node_async(
-    _runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    node_id: &NodeId,
-) -> Result<String, NetworkError> {
-    #[cfg(feature = "iroh-transport")]
-    {
-        return Ok(
-            load_or_create_iroh_secret_key_async(_runtime, paths, node_id)
-                .await?
-                .public()
-                .to_string(),
-        );
-    }
-
-    #[cfg(not(feature = "iroh-transport"))]
-    {
-        iroh_public_key_for_node(paths, node_id)
-    }
+    Ok(
+        load_or_create_iroh_secret_key_async(runtime, paths, node_id)
+            .await?
+            .public()
+            .to_string(),
+    )
 }
 
 pub fn read_iroh_endpoint_record(
@@ -677,7 +618,8 @@ pub fn write_iroh_endpoint_record(
     write_object_file(&iroh_endpoint_record_path(paths, &record.node_id), record)
 }
 
-pub async fn write_iroh_endpoint_record_async(
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) async fn write_iroh_endpoint_record_async(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     record: &IrohEndpointRecord,
@@ -1455,7 +1397,8 @@ pub fn iroh_endpoint_record_from_addr(
     }
 }
 
-pub fn iroh_endpoint_record_from_cluster_endpoint(
+#[cfg(test)]
+pub(crate) fn iroh_endpoint_record_from_cluster_endpoint(
     endpoint: &ClusterEndpointRecord,
     cluster_id: &ClusterId,
 ) -> Result<IrohEndpointRecord, NetworkError> {
@@ -1468,7 +1411,8 @@ pub fn iroh_endpoint_record_from_cluster_endpoint(
     iroh_endpoint_record_from_address(&endpoint.address, cluster_id, &endpoint.node_id)
 }
 
-pub fn iroh_endpoint_record_from_address(
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) fn iroh_endpoint_record_from_address(
     address: &str,
     cluster_id: &ClusterId,
     node_id: &NodeId,
@@ -2279,19 +2223,22 @@ async fn forward_daemon_control_payload_async(
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ClusterAuthMaterial {
+pub(crate) struct ClusterAuthMaterial {
     pub cluster_id: ClusterId,
     pub node_id: NodeId,
     pub node_public_key: String,
     pub certificate: ClusterCertificate,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
-pub struct ClusterAuthVerifier {
+pub(crate) struct ClusterAuthVerifier {
     members: BTreeMap<NodeId, ClusterMemberRecord>,
 }
 
+#[cfg(test)]
 impl ClusterAuthVerifier {
     pub fn new(members: impl IntoIterator<Item = ClusterMemberRecord>) -> Self {
         Self {
@@ -2378,8 +2325,9 @@ impl ClusterAuthVerifier {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct AuthenticatedClusterSession {
+pub(crate) struct AuthenticatedClusterSession {
     pub cluster_id: ClusterId,
     pub local_node_id: NodeId,
     pub remote_node_id: NodeId,
@@ -2387,9 +2335,11 @@ pub struct AuthenticatedClusterSession {
     pub established_at: OffsetDateTime,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
-pub struct LanConnectionPlanner;
+pub(crate) struct LanConnectionPlanner;
 
+#[cfg(test)]
 impl LanConnectionPlanner {
     pub fn select_direct_candidate<'a>(
         candidates: &'a [PeerEndpointCandidate],
@@ -2416,17 +2366,20 @@ impl LanConnectionPlanner {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub enum RoamingPathSelection {
+pub(crate) enum RoamingPathSelection {
     Direct(PeerEndpointCandidate),
     Iroh(PeerEndpointCandidate),
     WebRtc(PeerEndpointCandidate),
     Relay(PeerEndpointCandidate),
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
-pub struct RoamingConnectionPlanner;
+pub(crate) struct RoamingConnectionPlanner;
 
+#[cfg(test)]
 impl RoamingConnectionPlanner {
     pub fn select_path(candidates: &[PeerEndpointCandidate]) -> Option<RoamingPathSelection> {
         if let Some(candidate) = LanConnectionPlanner::select_direct_candidate(candidates) {

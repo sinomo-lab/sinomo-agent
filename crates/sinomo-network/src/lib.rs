@@ -39,7 +39,13 @@ pub use peer::{
     PeerEndpointCandidate, PeerRegistry, PeerState, PeerStatus, ProtocolMessage, RetryPolicy,
     RouteDelivery, RouteDeliveryId, TransportKind,
 };
-pub use roaming::*;
+pub(crate) use roaming::read_iroh_endpoint_record_async;
+pub use roaming::{
+    IROH_DAEMON_COMMAND_MAX_BYTES, IrohDaemonProxyHandle, IrohEndpointRecord, IrohRelayMode,
+    read_iroh_endpoint_record, send_daemon_rpc_to_address_async,
+    send_daemon_rpc_to_cluster_endpoint_async, stable_iroh_endpoint_id, start_iroh_daemon_proxy,
+    write_iroh_endpoint_record,
+};
 pub(crate) use route::cluster_route_next_hop;
 pub use route::{
     CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY, CLUSTER_ROUTING_RPC_ROUTE_METADATA,
@@ -347,23 +353,27 @@ pub fn register_storage_paths(
 pub(crate) mod prelude {
     pub(crate) use crate::{ClusterEndpointId, ClusterId, ClusterInviteId};
     pub(crate) use serde::{Deserialize, Serialize};
+    #[cfg(test)]
+    pub(crate) use sinomo_core::ClusterCertificate;
     pub(crate) use sinomo_core::{
-        CapabilityName, ClusterBootstrapState, ClusterCertificate, ClusterEndpointPrivacy,
-        ClusterEndpointRecord, ClusterEndpointSource, ClusterInvitationChannel, ClusterJoinInvite,
-        ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability,
-        ClusterNodeRole, ClusterNodeStatusRecord, ClusterTransportKind, EventEnvelope,
-        LatencyClass, RoutingScope, TrustDomain,
+        CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
+        ClusterEndpointSource, ClusterInvitationChannel, ClusterJoinInvite, ClusterMemberRecord,
+        ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability, ClusterNodeRole,
+        ClusterNodeStatusRecord, ClusterTransportKind, EventEnvelope, LatencyClass, RoutingScope,
+        TrustDomain,
     };
     pub(crate) use sinomo_events::{
         EventId, EventSequence, EventStore, EventStoreError, SessionId, StoredEvent,
     };
     #[cfg(test)]
     pub(crate) use sinomo_kv::KvLogEntry;
+    #[cfg(test)]
+    pub(crate) use sinomo_kv::LeaseId;
     pub(crate) use sinomo_kv::{
         ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, DurableRaftKvNode,
         InProcessKvStore, KvCommand, KvCompare, KvEntry, KvError, KvEvent, KvLocalCache, KvOp,
-        KvSnapshot, KvTxn, KvTxnResponse, LeaseId, RaftAppendEntriesRequest,
-        RaftAppendEntriesResponse, RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot,
+        KvSnapshot, KvTxn, KvTxnResponse, RaftAppendEntriesRequest, RaftAppendEntriesResponse,
+        RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot,
     };
     #[cfg(test)]
     pub(crate) use sinomo_kv::{KvWalPaths, WatchId};
