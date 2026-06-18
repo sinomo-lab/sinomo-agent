@@ -12164,16 +12164,12 @@ impl ClusterJoinRegistrationHost for RecordingJoinRegistrationHost {
     }
 }
 
-impl ClusterMembershipRpcAsyncForwardHost for RecordingJoinRegistrationHost {
-    fn send_membership_rpc_to_node_async<'a>(
+impl ClusterSignedEndpointRpcAsyncHost for RecordingJoinRegistrationHost {
+    fn sign_endpoint_rpc_request_async<'a>(
         &'a mut self,
-        _state: &'a ClusterBootstrapState,
-        _target_node_id: &'a NodeId,
         _request: &'a ObjectRpcRequest,
-    ) -> ClusterMembershipRpcFuture<'a, ObjectRpcResponse> {
-        Box::pin(async {
-            panic!("voter-local join registration should not forward membership node RPCs")
-        })
+    ) -> ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
+        Box::pin(async { panic!("voter-local join registration should not forward object RPCs") })
     }
 }
 
@@ -13356,16 +13352,26 @@ fn join_challenge_forwarding_uses_membership_voter_policy() {
         }
     }
 
-    impl ClusterMembershipRpcAsyncForwardHost for RecordingForwardHost {
-        fn send_membership_rpc_to_node_async<'a>(
+    impl ClusterSignedEndpointRpcAsyncHost for RecordingForwardHost {
+        fn sign_endpoint_rpc_request_async<'a>(
             &'a mut self,
-            _state: &'a ClusterBootstrapState,
-            target_node_id: &'a NodeId,
             request: &'a ObjectRpcRequest,
-        ) -> ClusterMembershipRpcFuture<'a, ObjectRpcResponse> {
+        ) -> ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
             assert_eq!(request.route, CLUSTER_JOIN_CHALLENGE_ROUTE);
             assert_eq!(request.category, CLUSTER_MEMBERSHIP_RPC_CATEGORY);
-            self.node_rpcs.push(target_node_id.clone());
+            Box::pin(async { Ok(b"test-signature".to_vec()) })
+        }
+
+        fn send_signed_endpoint_rpc_async<'a>(
+            &'a mut self,
+            endpoint: &'a ClusterEndpointRecord,
+            _auth: &'a [u8],
+            request: &'a ObjectRpcRequest,
+            _timeouts: DaemonRpcTimeouts,
+        ) -> ClusterSignedEndpointRpcFuture<'a, ObjectRpcResponse> {
+            assert_eq!(request.route, CLUSTER_JOIN_CHALLENGE_ROUTE);
+            assert_eq!(request.category, CLUSTER_MEMBERSHIP_RPC_CATEGORY);
+            self.node_rpcs.push(endpoint.node_id.clone());
             Box::pin(async {
                 ObjectRpcResponse::encode_body(CLUSTER_JOIN_CHALLENGE_ROUTE, &"proof".to_string())
             })

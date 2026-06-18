@@ -45,12 +45,16 @@ use crate::network_info::{
     CLUSTER_NETWORK_INFO_TTL_SECONDS, ClusterNetworkInfoRecord, build_cluster_network_info_record,
     cluster_network_info_stable_eq,
 };
-use crate::object::SinomoObjectCodec;
+use crate::object::{DaemonRpcTimeouts, SinomoObjectCodec};
 use crate::prelude::*;
 pub(crate) use crate::records::ClusterCapabilityPolicyRecord;
 use crate::records::{
     ClusterIdentityRecord, ClusterInvitationStateRecord, cluster_capability_policy_stable_eq,
     cluster_identity_record_stable_eq, cluster_invitation_state_stable_eq,
+};
+use crate::route::{
+    ClusterObjectRpcClient, ClusterObjectRpcNodeOptions, ClusterObjectRpcRouteContext,
+    ClusterSignedEndpointRpcAsyncHost,
 };
 use crate::rpc::{
     CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_CHALLENGE_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE,
@@ -2303,7 +2307,7 @@ pub async fn forward_cluster_membership_rpc_to_voter_async_with_host(
     state: &ClusterBootstrapState,
     request: &ObjectRpcRequest,
     failure_detail: &str,
-    host: &mut impl ClusterMembershipRpcAsyncForwardHost,
+    host: &mut (impl ClusterSignedEndpointRpcAsyncHost + Send),
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let paths_for_targets = paths.clone();
     let state_for_targets = state.clone();
@@ -2326,9 +2330,21 @@ pub async fn forward_cluster_membership_rpc_to_voter_async_with_host(
             detail: format!("voter target selection task failed: {source}"),
         })?;
     let mut failures = Vec::new();
+    let mut client =
+        ClusterObjectRpcClient::routed(host, ClusterObjectRpcRouteContext::new(runtime, paths));
     for target_node_id in &voter_node_ids {
-        match host
-            .send_membership_rpc_to_node_async(state, target_node_id, request)
+        match client
+            .call_node(
+                state,
+                target_node_id,
+                request,
+                ClusterObjectRpcNodeOptions::new(
+                    ClusterEndpointSelectionPurpose::VoterCommand,
+                    DaemonRpcTimeouts::connect_and_idle(
+                        DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
+                    ),
+                ),
+            )
             .await
         {
             Ok(response) => return Ok(response),
@@ -2383,7 +2399,7 @@ pub async fn forward_cluster_join_challenge_rpc_to_voter_async_with_host(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     request: &ObjectRpcRequest,
-    host: &mut impl ClusterMembershipRpcAsyncForwardHost,
+    host: &mut (impl ClusterSignedEndpointRpcAsyncHost + Send),
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let state_paths = paths.clone();
     let state = runtime
@@ -4539,15 +4555,6 @@ pub trait ClusterMembershipRpcForwardHost {
 pub type ClusterMembershipRpcFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, NetworkError>> + Send + 'a>>;
 
-pub trait ClusterMembershipRpcAsyncForwardHost {
-    fn send_membership_rpc_to_node_async<'a>(
-        &'a mut self,
-        state: &'a ClusterBootstrapState,
-        target_node_id: &'a NodeId,
-        request: &'a ObjectRpcRequest,
-    ) -> ClusterMembershipRpcFuture<'a, ObjectRpcResponse>;
-}
-
 pub trait ClusterJoinRegistrationHost: ClusterMembershipRpcForwardHost {
     fn local_daemon_membership_observation(
         &mut self,
@@ -4593,7 +4600,7 @@ pub trait ClusterJoinRegistrationHost: ClusterMembershipRpcForwardHost {
     }
 }
 
-pub trait ClusterJoinRegistrationAsyncHost: ClusterMembershipRpcAsyncForwardHost {
+pub trait ClusterJoinRegistrationAsyncHost: ClusterSignedEndpointRpcAsyncHost {
     fn local_daemon_membership_observation_async<'a>(
         &'a mut self,
         _paths: &'a ClusterPaths,
