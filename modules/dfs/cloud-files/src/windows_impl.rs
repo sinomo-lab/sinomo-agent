@@ -23,10 +23,7 @@ use sinomo_runtime::kv::{
     read_cluster_kv_prefix_entries,
 };
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::network::{
-    self, InboundFrame, MeshMessage, MeshMessageBody, MeshMessageId, NetworkError, NetworkFrame,
-    NetworkFrameId, ProtocolMessage,
-};
+use sinomo_runtime::network::{self, NetworkError};
 use sinomo_runtime::node::NodeId;
 use windows::Win32::Foundation::{
     NTSTATUS, STATUS_FILE_IS_A_DIRECTORY, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
@@ -846,18 +843,6 @@ impl DfsMessageTransport for DfsCloudFilesEndpointTransport {
         self.send_routed_message_to_endpoint(target_node_id, message, true)
     }
 
-    fn drain_incoming(&mut self) -> std::result::Result<Vec<InboundFrame>, NetworkError> {
-        self.incoming_messages
-            .drain(..)
-            .map(|message| {
-                dfs_network_frame_from_routed_message(message).map(|frame| InboundFrame {
-                    received_by: self.local_node_id.clone(),
-                    frame,
-                })
-            })
-            .collect()
-    }
-
     fn drain_incoming_messages(
         &mut self,
     ) -> std::result::Result<Vec<DfsRoutedMessage>, NetworkError> {
@@ -874,23 +859,6 @@ fn send_dfs_message(
     let response = daemon::send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)
         .map_err(error("daemon"))?;
     dfs::decode_dfs_message_rpc_response(&response).map_err(error("dfs-message"))
-}
-
-fn dfs_network_frame_from_routed_message(
-    message: DfsRoutedMessage,
-) -> std::result::Result<NetworkFrame, NetworkError> {
-    let protocol_message = ProtocolMessage::encode(dfs::DFS_PROTOCOL, &message.message)?;
-    Ok(NetworkFrame {
-        frame_id: NetworkFrameId(message.frame_id),
-        source_node_id: message.source_node_id.clone(),
-        target_node_id: message.target_node_id.clone(),
-        message: MeshMessage {
-            message_id: MeshMessageId(message.message_id),
-            origin_node_id: message.source_node_id,
-            target_node_id: message.target_node_id,
-            body: MeshMessageBody::Protocol(protocol_message),
-        },
-    })
 }
 
 fn normalize_sifs_root(path: &str) -> Result<String, CloudFilesModuleError> {

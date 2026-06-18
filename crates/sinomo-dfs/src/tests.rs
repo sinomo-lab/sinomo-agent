@@ -64,8 +64,12 @@ impl DfsMessageTransport for ReceiveOnlyTransport {
         })
     }
 
-    fn drain_incoming(&mut self) -> Result<Vec<sinomo_network::InboundFrame>, NetworkError> {
-        Ok(self.incoming.drain(..).collect())
+    fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
+        Ok(self
+            .incoming
+            .drain(..)
+            .filter_map(|inbound| dfs_routed_message_from_network_frame(&inbound.frame).ok())
+            .collect())
     }
 }
 
@@ -834,7 +838,7 @@ impl DfsMessageTransport for FailingSendTransport {
         })
     }
 
-    fn drain_incoming(&mut self) -> Result<Vec<sinomo_network::InboundFrame>, NetworkError> {
+    fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
         Ok(Vec::new())
     }
 }
@@ -858,7 +862,7 @@ impl DfsMessageTransport for DroppingSendTransport {
         Ok(())
     }
 
-    fn drain_incoming(&mut self) -> Result<Vec<sinomo_network::InboundFrame>, NetworkError> {
+    fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
         Ok(Vec::new())
     }
 }
@@ -952,7 +956,7 @@ impl DfsMessageTransport for DirectReadTransport {
         }))
     }
 
-    fn drain_incoming(&mut self) -> Result<Vec<sinomo_network::InboundFrame>, NetworkError> {
+    fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
         Ok(Vec::new())
     }
 
@@ -1457,7 +1461,7 @@ impl DfsMessageTransport for CountingEmptyTransport {
         })
     }
 
-    fn drain_incoming(&mut self) -> Result<Vec<sinomo_network::InboundFrame>, NetworkError> {
+    fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
         *self.drain_calls.lock().expect("drain calls") += 1;
         Ok(Vec::new())
     }
