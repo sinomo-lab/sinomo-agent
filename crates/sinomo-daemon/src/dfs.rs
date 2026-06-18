@@ -623,10 +623,11 @@ fn process_daemon_dfs_message_command_on_runtime(
     let cache_key = data_dir.root();
     let use_read_lane = sinomo_dfs::dfs_message_is_read_only_request(&command);
     let requires_fresh_metadata = sinomo_dfs::dfs_message_requires_fresh_metadata(&command);
-    let frame = sinomo_dfs::dfs_protocol_frame_from_routed_message(&command.routed_message)
-        .map_err(|source| sinomo_dfs::DfsError::Network {
-            message: source.to_string(),
-        })?;
+    let frame =
+        sinomo_dfs::protocol::dfs_protocol_frame_from_routed_message(&command.routed_message)
+            .map_err(|source| sinomo_dfs::DfsError::Network {
+                message: source.to_string(),
+            })?;
     let request_id = command.request_id;
     let route_started = Instant::now();
     let cached_route_snapshot = cached_daemon_dfs_protocol_frame_route_snapshot(&cache_key)?;
@@ -748,7 +749,7 @@ fn process_daemon_dfs_message_command_on_runtime(
     let outbound_messages = result
         .outbound_frames
         .iter()
-        .map(sinomo_dfs::dfs_routed_message_from_protocol_frame)
+        .map(sinomo_dfs::protocol::dfs_routed_message_from_protocol_frame)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source| sinomo_dfs::DfsError::Network {
             message: source.to_string(),
@@ -835,7 +836,9 @@ fn handle_daemon_dfs_protocol_frame_on_runtime(
     let cluster_paths = ClusterPaths::new(&data_dir);
     let message_command = DfsMessageCommand {
         request_id: command.request_id,
-        routed_message: sinomo_dfs::dfs_routed_message_from_protocol_frame(&command.frame)?,
+        routed_message: sinomo_dfs::protocol::dfs_routed_message_from_protocol_frame(
+            &command.frame,
+        )?,
     };
     let result = process_daemon_dfs_message_command_on_runtime(
         &data_dir,
@@ -861,7 +864,7 @@ fn handle_daemon_dfs_protocol_frame_on_runtime(
             eprintln!("sinomo daemon DFS metadata publish after protocol mutation failed: {error}");
         },
     );
-    sinomo_dfs::dfs_message_response_to_protocol_frame_response(message_response)
+    sinomo_dfs::protocol::dfs_message_response_to_protocol_frame_response(message_response)
         .map_err(DaemonError::from)
 }
 

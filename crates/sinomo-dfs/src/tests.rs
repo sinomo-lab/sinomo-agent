@@ -1645,7 +1645,8 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         message_response
     );
     let frame_response =
-        dfs_message_response_to_protocol_frame_response(message_response.clone()).expect("frames");
+        protocol::dfs_message_response_to_protocol_frame_response(message_response.clone())
+            .expect("frames");
     assert_eq!(
         dfs_protocol_frame_response_to_message_response(frame_response).expect("messages"),
         message_response

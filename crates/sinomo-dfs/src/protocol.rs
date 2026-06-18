@@ -6,7 +6,10 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::{DfsWriteReceipt, DfsWriteRequest};
-use sinomo_network::NetworkFrame;
+use sinomo_network::{
+    MeshMessage, MeshMessageBody, MeshMessageId, NetworkError, NetworkFrame, NetworkFrameId,
+    ProtocolMessage,
+};
 use sinomo_node::NodeId;
 
 /// Legacy object-RPC route for DFS payloads carried as generic network frames.
@@ -748,6 +751,78 @@ pub struct DfsMessageCommand {
 pub struct DfsMessageResponse {
     pub request_id: String,
     pub outbound_messages: Vec<DfsRoutedMessage>,
+}
+
+pub fn dfs_routed_message_from_protocol_frame(
+    frame: &NetworkFrame,
+) -> Result<DfsRoutedMessage, NetworkError> {
+    let message = dfs_network_message_from_frame(frame)?;
+    Ok(DfsRoutedMessage {
+        source_node_id: frame.source_node_id.clone(),
+        target_node_id: frame.target_node_id.clone(),
+        frame_id: frame.frame_id.0,
+        message_id: frame.message.message_id.0,
+        message,
+    })
+}
+
+pub fn dfs_protocol_frame_from_routed_message(
+    message: &DfsRoutedMessage,
+) -> Result<NetworkFrame, NetworkError> {
+    dfs_network_frame_from_routed_message(message)
+}
+
+pub fn dfs_message_response_to_protocol_frame_response(
+    response: DfsMessageResponse,
+) -> Result<DfsProtocolFrameResponse, NetworkError> {
+    let outbound_frames = response
+        .outbound_messages
+        .iter()
+        .map(dfs_network_frame_from_routed_message)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(DfsProtocolFrameResponse {
+        request_id: response.request_id,
+        outbound_frames,
+    })
+}
+
+fn dfs_network_message_from_frame(frame: &NetworkFrame) -> Result<DfsNetworkMessage, NetworkError> {
+    let MeshMessageBody::Protocol(protocol_message) = &frame.message.body else {
+        return Err(dfs_protocol_serialization_error(
+            "DFS message route requires a protocol frame",
+        ));
+    };
+    if protocol_message.protocol != crate::DFS_PROTOCOL {
+        return Err(dfs_protocol_serialization_error(format!(
+            "DFS message route requires protocol {}, got {}",
+            crate::DFS_PROTOCOL,
+            protocol_message.protocol
+        )));
+    }
+    protocol_message.decode::<DfsNetworkMessage>()
+}
+
+fn dfs_network_frame_from_routed_message(
+    message: &DfsRoutedMessage,
+) -> Result<NetworkFrame, NetworkError> {
+    let protocol_message = ProtocolMessage::encode(crate::DFS_PROTOCOL, &message.message)?;
+    Ok(NetworkFrame {
+        frame_id: NetworkFrameId(message.frame_id),
+        source_node_id: message.source_node_id.clone(),
+        target_node_id: message.target_node_id.clone(),
+        message: MeshMessage {
+            message_id: MeshMessageId(message.message_id),
+            origin_node_id: message.source_node_id.clone(),
+            target_node_id: message.target_node_id.clone(),
+            body: MeshMessageBody::Protocol(protocol_message),
+        },
+    })
+}
+
+fn dfs_protocol_serialization_error(detail: impl Into<String>) -> NetworkError {
+    NetworkError::Serialization {
+        detail: detail.into(),
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

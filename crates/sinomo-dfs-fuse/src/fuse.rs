@@ -1773,7 +1773,7 @@ impl DfsFuseEndpointTransport {
             })?;
         let request = DfsMessageCommand {
             request_id: format!("fuse_dfs_message_{}", frame.frame_id.0),
-            routed_message: dfs::dfs_routed_message_from_protocol_frame(&frame).map_err(
+            routed_message: dfs::protocol::dfs_routed_message_from_protocol_frame(&frame).map_err(
                 |source| NetworkError::Serialization {
                     detail: source.to_string(),
                 },
@@ -1783,10 +1783,11 @@ impl DfsFuseEndpointTransport {
         for endpoint in &endpoints {
             match send_dfs_message(endpoint, &request, self.timeout) {
                 Ok(response) => {
-                    let response = dfs::dfs_message_response_to_protocol_frame_response(response)
-                        .map_err(|source| NetworkError::Serialization {
-                        detail: source.to_string(),
-                    })?;
+                    let response =
+                        dfs::protocol::dfs_message_response_to_protocol_frame_response(response)
+                            .map_err(|source| NetworkError::Serialization {
+                                detail: source.to_string(),
+                            })?;
                     for returned_frame in response.outbound_frames {
                         self.deliver_returned_frame(returned_frame)?;
                     }

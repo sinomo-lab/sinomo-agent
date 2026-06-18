@@ -79,6 +79,7 @@ pub use posix::{
 use protocol::DFS_PROTOCOL_FRAME_ROUTE;
 #[cfg(test)]
 use protocol::DfsProtocolFrameCommand;
+#[cfg(test)]
 use protocol::DfsProtocolFrameResponse;
 pub use protocol::{
     DfsBlobTransferResult, DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest,
@@ -387,56 +388,13 @@ pub(crate) fn build_dfs_network_frame(
 }
 
 fn dfs_network_message_from_frame(frame: &NetworkFrame) -> Result<DfsNetworkMessage, NetworkError> {
-    let MeshMessageBody::Protocol(protocol_message) = &frame.message.body else {
-        return Err(dfs_network_serialization_error(
-            "DFS message route requires a protocol frame",
-        ));
-    };
-    if protocol_message.protocol != DFS_PROTOCOL {
-        return Err(dfs_network_serialization_error(format!(
-            "DFS message route requires protocol {DFS_PROTOCOL}, got {}",
-            protocol_message.protocol
-        )));
-    }
-    protocol_message.decode::<DfsNetworkMessage>()
+    protocol::dfs_routed_message_from_protocol_frame(frame).map(|message| message.message)
 }
 
 fn dfs_routed_message_from_network_frame(
     frame: &NetworkFrame,
 ) -> Result<DfsRoutedMessage, NetworkError> {
-    let message = dfs_network_message_from_frame(frame)?;
-    Ok(DfsRoutedMessage {
-        source_node_id: frame.source_node_id.clone(),
-        target_node_id: frame.target_node_id.clone(),
-        frame_id: frame.frame_id.0,
-        message_id: frame.message.message_id.0,
-        message,
-    })
-}
-
-pub fn dfs_routed_message_from_protocol_frame(
-    frame: &NetworkFrame,
-) -> Result<DfsRoutedMessage, NetworkError> {
-    dfs_routed_message_from_network_frame(frame)
-}
-
-pub fn dfs_protocol_frame_from_routed_message(
-    message: &DfsRoutedMessage,
-) -> Result<NetworkFrame, NetworkError> {
-    dfs_network_frame_from_routed_message(message)
-}
-
-fn dfs_network_frame_from_routed_message(
-    message: &DfsRoutedMessage,
-) -> Result<NetworkFrame, NetworkError> {
-    build_dfs_network_frame(
-        &message.source_node_id,
-        &message.target_node_id,
-        message.frame_id,
-        message.message_id,
-        message.message.clone(),
-    )
-    .map_err(|source| dfs_network_serialization_error(source.to_string()))
+    protocol::dfs_routed_message_from_protocol_frame(frame)
 }
 
 #[cfg(test)]
@@ -455,7 +413,7 @@ fn dfs_message_command_to_protocol_frame_command(
 ) -> Result<DfsProtocolFrameCommand, NetworkError> {
     Ok(DfsProtocolFrameCommand {
         request_id: command.request_id,
-        frame: dfs_network_frame_from_routed_message(&command.routed_message)?,
+        frame: protocol::dfs_protocol_frame_from_routed_message(&command.routed_message)?,
     })
 }
 
@@ -471,20 +429,6 @@ fn dfs_protocol_frame_response_to_message_response(
     Ok(DfsMessageResponse {
         request_id: response.request_id,
         outbound_messages,
-    })
-}
-
-pub fn dfs_message_response_to_protocol_frame_response(
-    response: DfsMessageResponse,
-) -> Result<DfsProtocolFrameResponse, NetworkError> {
-    let outbound_frames = response
-        .outbound_messages
-        .iter()
-        .map(dfs_network_frame_from_routed_message)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(DfsProtocolFrameResponse {
-        request_id: response.request_id,
-        outbound_frames,
     })
 }
 
@@ -8332,7 +8276,7 @@ pub(crate) fn dfs_protocol_frame_sender_from_message_sender(
         let message_command = dfs_protocol_frame_command_to_message_command(command)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
         let message_response = sender(endpoint, &message_command, connect_timeout)?;
-        dfs_message_response_to_protocol_frame_response(message_response)
+        protocol::dfs_message_response_to_protocol_frame_response(message_response)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))
     })
 }
@@ -8869,11 +8813,10 @@ fn send_dfs_frame_to_endpoint(
         let send_started = Instant::now();
         match sender(endpoint, &command, connect_timeout) {
             Ok(response) => {
-                let response = dfs_message_response_to_protocol_frame_response(response).map_err(
-                    |source| NetworkError::Serialization {
+                let response = protocol::dfs_message_response_to_protocol_frame_response(response)
+                    .map_err(|source| NetworkError::Serialization {
                         detail: source.to_string(),
-                    },
-                )?;
+                    })?;
                 let outbound_payload_bytes =
                     dfs_network_frames_protocol_payload_bytes(&response.outbound_frames);
                 dfs_perf_trace(format_args!(
@@ -8972,11 +8915,10 @@ async fn send_dfs_frame_to_endpoint_async(
         let send_started = Instant::now();
         match sender(endpoint, &command, connect_timeout).await {
             Ok(response) => {
-                let response = dfs_message_response_to_protocol_frame_response(response).map_err(
-                    |source| NetworkError::Serialization {
+                let response = protocol::dfs_message_response_to_protocol_frame_response(response)
+                    .map_err(|source| NetworkError::Serialization {
                         detail: source.to_string(),
-                    },
-                )?;
+                    })?;
                 let outbound_payload_bytes =
                     dfs_network_frames_protocol_payload_bytes(&response.outbound_frames);
                 dfs_perf_trace(format_args!(
