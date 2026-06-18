@@ -30,6 +30,7 @@ mod kv_semantics;
 mod kv_snapshot;
 mod lan;
 mod local_membership;
+mod local_state_store;
 mod maintenance;
 mod member_publish;
 mod membership;
