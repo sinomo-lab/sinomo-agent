@@ -1,6 +1,8 @@
 use crate::error::NetworkError;
 use crate::object::SinomoObjectCodec;
-use crate::peer::{NetworkFrame, PeerEndpointCandidate};
+#[cfg(test)]
+use crate::peer::NetworkFrame;
+use crate::peer::PeerEndpointCandidate;
 use crate::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -183,12 +185,14 @@ pub(crate) enum PublicIpDiscoveryResult {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct LanQuicEndpointConfig {
+#[cfg(test)]
+pub(crate) struct LanQuicEndpointConfig {
     pub bind_address: String,
     pub alpn: String,
     pub max_frame_bytes: usize,
 }
 
+#[cfg(test)]
 impl Default for LanQuicEndpointConfig {
     fn default() -> Self {
         Self {
@@ -200,10 +204,12 @@ impl Default for LanQuicEndpointConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct LanQuicFrameCodec {
+#[cfg(test)]
+pub(crate) struct LanQuicFrameCodec {
     pub max_frame_bytes: usize,
 }
 
+#[cfg(test)]
 impl Default for LanQuicFrameCodec {
     fn default() -> Self {
         Self {
@@ -212,6 +218,7 @@ impl Default for LanQuicFrameCodec {
     }
 }
 
+#[cfg(test)]
 impl LanQuicFrameCodec {
     pub fn encode(&self, frame: &NetworkFrame) -> Result<Vec<u8>, NetworkError> {
         let bytes = SinomoObjectCodec::default().encode(frame)?;
@@ -343,24 +350,6 @@ pub fn discover_interface_ip_candidates() -> Vec<IpAddr> {
 /// e.g. the segmented network test cluster -- without starting or advertising iroh.
 pub fn iroh_disabled_by_env() -> bool {
     std::env::var("SINOMO_DISABLE_IROH").ok().as_deref() == Some("1")
-}
-
-pub async fn discover_default_public_ip_candidates_async() -> Vec<IpAddr> {
-    if std::env::var("SINOMO_DISABLE_PUBLIC_IP_DISCOVERY")
-        .ok()
-        .as_deref()
-        == Some("1")
-    {
-        return Vec::new();
-    }
-    cached_default_public_ip_candidates_for_key_with_async(Vec::new(), || async {
-        discover_public_ip_candidates_from_hosts_with_status_async(&[
-            ("api.ipify.org", "/"),
-            ("ifconfig.me", "/ip"),
-        ])
-        .await
-    })
-    .await
 }
 
 pub(crate) async fn discover_default_public_ip_candidates_for_local_ips_async(
@@ -497,13 +486,6 @@ pub(crate) fn clear_public_ip_discovery_cache() {
 pub(crate) fn age_public_ip_discovery_cache_for_test(age: Duration) {
     if let Ok(mut cache) = PUBLIC_IP_DISCOVERY_CACHE.lock() {
         cache.age_for_test(age);
-    }
-}
-
-pub async fn discover_public_ip_candidates_from_hosts_async(hosts: &[(&str, &str)]) -> Vec<IpAddr> {
-    match discover_public_ip_candidates_from_hosts_with_status_async(hosts).await {
-        PublicIpDiscoveryResult::Complete(candidates)
-        | PublicIpDiscoveryResult::Deferred(candidates) => candidates,
     }
 }
 

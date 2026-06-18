@@ -1,16 +1,16 @@
 use crate::error::NetworkError;
-use crate::lan::local_network_cache_key;
+use crate::is_loopback_connect_address;
+use crate::lan::{
+    discover_default_public_ip_candidates_for_local_ips_async,
+    discover_local_ip_candidates_for_targets, discover_local_ip_candidates_for_targets_async,
+    format_ip_port, is_invitable_ip, is_private_or_link_local_ip, local_network_cache_key,
+};
 use crate::object::SinomoObjectCodec;
 use crate::prelude::*;
 use crate::rpc::{
     CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_CHALLENGE_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE,
     CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY, ObjectRpcRequest,
     ObjectRpcResponse,
-};
-use crate::{
-    discover_default_public_ip_candidates_for_local_ips_async,
-    discover_local_ip_candidates_for_targets, discover_local_ip_candidates_for_targets_async,
-    format_ip_port, is_invitable_ip, is_loopback_connect_address,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
@@ -12801,8 +12801,7 @@ fn daemon_advertised_endpoints_from_addresses_with_verified_public_ips(
     let mut lan_addresses = Vec::new();
     if matches!(host, "0.0.0.0" | "::") {
         for ip in lan_ips.iter().chain(route_ips.iter()).copied() {
-            if is_invitable_ip(ip)
-                && (allow_public_ip_discovery || crate::is_private_or_link_local_ip(ip))
+            if is_invitable_ip(ip) && (allow_public_ip_discovery || is_private_or_link_local_ip(ip))
             {
                 push_unique_address(&mut lan_addresses, format_ip_port(ip, port));
             }
@@ -12811,7 +12810,7 @@ fn daemon_advertised_endpoints_from_addresses_with_verified_public_ips(
             .iter()
             .chain(route_ips.iter())
             .copied()
-            .any(|ip| is_invitable_ip(ip) && !crate::is_private_or_link_local_ip(ip));
+            .any(|ip| is_invitable_ip(ip) && !is_private_or_link_local_ip(ip));
         if allow_public_ip_discovery && !has_public_candidate {
             for ip in verified_public_ips {
                 // Only advertise a discovered public IP when it is actually reachable on the
@@ -12861,7 +12860,7 @@ fn should_discover_public_endpoint_candidates(
         .iter()
         .chain(route_ips.iter())
         .copied()
-        .any(|ip| is_invitable_ip(ip) && !crate::is_private_or_link_local_ip(ip))
+        .any(|ip| is_invitable_ip(ip) && !is_private_or_link_local_ip(ip))
 }
 
 async fn verified_public_endpoint_ips_async(
@@ -12956,7 +12955,7 @@ pub fn daemon_lan_endpoint(
         .parse::<SocketAddr>()
         .ok()
         .map(|address| address.ip())
-        .filter(|ip| !crate::is_private_or_link_local_ip(*ip))
+        .filter(|ip| !is_private_or_link_local_ip(*ip))
         .map(|_| ClusterEndpointPrivacy::InternetDirect)
         .unwrap_or(ClusterEndpointPrivacy::Lan);
     ClusterEndpointRecord {

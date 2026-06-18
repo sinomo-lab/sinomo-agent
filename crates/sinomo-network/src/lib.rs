@@ -26,7 +26,12 @@ mod storage;
 pub use error::*;
 pub use health::*;
 pub use invite::*;
-pub use lan::*;
+pub use lan::{
+    AsyncMdnsDiscoverySocket, MdnsDiscoveryAdvertisement, MdnsDiscoveryCache, MdnsDiscoveryRecord,
+    apply_lan_discovery_advertisements, discover_default_lan_ip_candidates,
+    discover_default_lan_ip_candidates_async, format_ip_port, iroh_disabled_by_env,
+    lan_discovery_advertisement_for_state,
+};
 pub use object::*;
 pub use peer::{
     AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions,

@@ -1,3 +1,8 @@
+use crate::lan::{
+    AsyncMdnsDiscoverySocket, LanQuicFrameCodec, MdnsDiscoveryAdvertisement, MdnsDiscoveryCache,
+    MdnsDiscoveryRecord, apply_lan_discovery_advertisements, is_advertisable_interface_ip,
+    is_invitable_ip, lan_discovery_advertisement_for_state,
+};
 use crate::prelude::*;
 use crate::roaming::{
     ClusterAuthMaterial, ClusterAuthVerifier, IceCandidateRecord, IceCandidateType, IrohKvExchange,
