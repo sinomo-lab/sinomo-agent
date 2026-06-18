@@ -24,6 +24,7 @@ mod invite_publish;
 mod io_observer;
 mod keyspace;
 mod kv_forward;
+mod kv_semantics;
 mod kv_snapshot;
 mod lan;
 mod local_membership;
@@ -137,6 +138,8 @@ pub use kv_forward::{
     ClusterKvTxnForwardResult, forward_cluster_kv_txn_to_voter_async_with_host,
     forward_cluster_kv_txn_to_voter_with_host,
 };
+#[cfg(test)]
+pub(crate) use kv_semantics::cluster_semantic_txn_no_effect_response;
 pub use kv_snapshot::{
     ClusterKvSnapshotRefreshHost, ClusterKvSnapshotRefreshOptions,
     refresh_current_cluster_kv_store_with_host,
