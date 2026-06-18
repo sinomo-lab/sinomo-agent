@@ -408,11 +408,6 @@ pub(crate) fn build_dfs_network_frame(
     .map_err(DfsError::from_network)
 }
 
-#[cfg(test)]
-fn dfs_network_message_from_frame(frame: &NetworkFrame) -> Result<DfsNetworkMessage, NetworkError> {
-    protocol::dfs_routed_message_from_protocol_frame(frame).map(|message| message.message)
-}
-
 fn dfs_routed_message_from_network_frame(
     frame: &NetworkFrame,
 ) -> Result<DfsRoutedMessage, NetworkError> {
@@ -436,12 +431,6 @@ pub fn dfs_message_is_read_only_request(command: &DfsMessageCommand) -> bool {
     dfs_network_message_is_read_only_request(&command.routed_message.message)
 }
 
-#[cfg(test)]
-fn dfs_protocol_frame_is_read_only_request(frame: &NetworkFrame) -> bool {
-    dfs_network_message_from_frame(frame)
-        .is_ok_and(|message| dfs_network_message_is_read_only_request(&message))
-}
-
 fn dfs_network_message_requires_fresh_metadata(message: &DfsNetworkMessage) -> bool {
     matches!(
         message,
@@ -449,12 +438,6 @@ fn dfs_network_message_requires_fresh_metadata(message: &DfsNetworkMessage) -> b
             | DfsNetworkMessage::BulkReadRequest(_)
             | DfsNetworkMessage::NamespaceRequest(_)
     )
-}
-
-#[cfg(test)]
-fn dfs_protocol_frame_requires_fresh_metadata(frame: &NetworkFrame) -> bool {
-    dfs_network_message_from_frame(frame)
-        .is_ok_and(|message| dfs_network_message_requires_fresh_metadata(&message))
 }
 
 pub fn dfs_message_requires_fresh_metadata(command: &DfsMessageCommand) -> bool {
@@ -472,10 +455,8 @@ fn dfs_network_message_allows_write_repair_progress(message: &DfsNetworkMessage)
     }
 }
 
-#[cfg(test)]
-fn dfs_protocol_frame_allows_write_repair_progress(frame: &NetworkFrame) -> bool {
-    dfs_network_message_from_frame(frame)
-        .is_ok_and(|message| dfs_network_message_allows_write_repair_progress(&message))
+pub fn dfs_message_allows_write_repair_progress(command: &DfsMessageCommand) -> bool {
+    dfs_network_message_allows_write_repair_progress(&command.routed_message.message)
 }
 
 pub fn dfs_status_rpc_request() -> Result<ObjectRpcRequest, NetworkError> {

@@ -143,6 +143,24 @@ fn test_dfs_message_command(
     }
 }
 
+fn test_dfs_message_command_from_message(
+    source_node_id: &NodeId,
+    target_node_id: &NodeId,
+    frame_id: u64,
+    message: DfsNetworkMessage,
+) -> DfsMessageCommand {
+    DfsMessageCommand {
+        request_id: format!("dfs_message_test_{frame_id}"),
+        routed_message: build_dfs_routed_message(
+            source_node_id,
+            target_node_id,
+            frame_id,
+            frame_id,
+            message,
+        ),
+    }
+}
+
 fn process_dfs_message_command_for_test(
     local_node_id: NodeId,
     command: DfsMessageCommand,
@@ -237,15 +255,14 @@ fn content_hash_range_fallback_validates_returned_window_not_full_blob_size() {
 }
 
 #[test]
-fn protocol_frame_read_requests_require_fresh_metadata() {
+fn dfs_message_read_requests_require_fresh_metadata() {
     let source = NodeId::from_legacy_named("node_protocol_fresh_source").expect("source");
     let target = NodeId::from_legacy_named("node_protocol_fresh_target").expect("target");
     let object_id = DfsObjectId::from_legacy_named("obj_protocol_fresh").expect("object");
     let version = DfsVersion::from_legacy_named("version_protocol_fresh").expect("version");
-    let read = build_dfs_network_frame(
+    let read = test_dfs_message_command_from_message(
         &source,
         &target,
-        1,
         1,
         DfsNetworkMessage::ReadRequest(DfsReadRequest {
             request_id: "dfs_read_fresh_metadata".to_string(),
@@ -258,12 +275,10 @@ fn protocol_frame_read_requests_require_fresh_metadata() {
             start_chunk_index: 0,
             max_chunks: 0,
         }),
-    )
-    .expect("read frame");
-    let bulk = build_dfs_network_frame(
+    );
+    let bulk = test_dfs_message_command_from_message(
         &source,
         &target,
-        2,
         2,
         DfsNetworkMessage::BulkReadRequest(DfsBulkReadRequest {
             request_id: "dfs_bulk_read_fresh_metadata".to_string(),
@@ -275,15 +290,14 @@ fn protocol_frame_read_requests_require_fresh_metadata() {
                 content_size_bytes: 12,
             }],
         }),
-    )
-    .expect("bulk read frame");
+    );
 
-    assert!(dfs_protocol_frame_requires_fresh_metadata(&read));
-    assert!(dfs_protocol_frame_requires_fresh_metadata(&bulk));
+    assert!(dfs_message_requires_fresh_metadata(&read));
+    assert!(dfs_message_requires_fresh_metadata(&bulk));
 }
 
 #[test]
-fn protocol_frame_repair_progress_is_only_inline_for_explicit_foreground_repair_writes() {
+fn dfs_message_repair_progress_is_only_inline_for_explicit_foreground_repair_writes() {
     let source = NodeId::from_legacy_named("node_protocol_repair_source").expect("source");
     let target = NodeId::from_legacy_named("node_protocol_repair_target").expect("target");
     let file_system_id = sifs_file_system_id();
@@ -297,10 +311,9 @@ fn protocol_frame_repair_progress_is_only_inline_for_explicit_foreground_repair_
             operation,
         })
     };
-    let lookup = build_dfs_network_frame(
+    let lookup = test_dfs_message_command_from_message(
         &source,
         &target,
-        1,
         1,
         namespace_command(
             "dfs_lookup_no_inline_repair",
@@ -308,12 +321,10 @@ fn protocol_frame_repair_progress_is_only_inline_for_explicit_foreground_repair_
                 path: "/services/no-inline-repair".to_string(),
             },
         ),
-    )
-    .expect("lookup frame");
-    let mkdir = build_dfs_network_frame(
+    );
+    let mkdir = test_dfs_message_command_from_message(
         &source,
         &target,
-        2,
         2,
         namespace_command(
             "dfs_mkdir_no_inline_repair",
@@ -321,12 +332,10 @@ fn protocol_frame_repair_progress_is_only_inline_for_explicit_foreground_repair_
                 path: "/services/no-inline-repair".to_string(),
             },
         ),
-    )
-    .expect("mkdir frame");
-    let read = build_dfs_network_frame(
+    );
+    let read = test_dfs_message_command_from_message(
         &source,
         &target,
-        3,
         3,
         DfsNetworkMessage::ReadRequest(DfsReadRequest {
             request_id: "dfs_read_no_inline_repair".to_string(),
@@ -339,40 +348,33 @@ fn protocol_frame_repair_progress_is_only_inline_for_explicit_foreground_repair_
             start_chunk_index: 0,
             max_chunks: 0,
         }),
-    )
-    .expect("read frame");
+    );
     let object_id = DfsObjectId::from_legacy_named("obj_foreground_repair_write").expect("object");
     let mut background_write =
         test_routed_write_command("dfs_background_write_no_inline_repair", &source, &object_id);
     background_write.foreground_replica_repair = false;
-    let background_write = build_dfs_network_frame(
+    let background_write = test_dfs_message_command_from_message(
         &source,
         &target,
-        4,
         4,
         DfsNetworkMessage::DistributedWriteRequest(background_write),
-    )
-    .expect("background write frame");
-    let foreground_repair_write = build_dfs_network_frame(
+    );
+    let foreground_repair_write = test_dfs_message_command_from_message(
         &source,
         &target,
-        5,
         5,
         DfsNetworkMessage::DistributedWriteRequest(test_routed_write_command(
             "dfs_foreground_repair_write",
             &source,
             &object_id,
         )),
-    )
-    .expect("foreground repair write frame");
+    );
 
-    assert!(!dfs_protocol_frame_allows_write_repair_progress(&lookup));
-    assert!(!dfs_protocol_frame_allows_write_repair_progress(&mkdir));
-    assert!(!dfs_protocol_frame_allows_write_repair_progress(&read));
-    assert!(!dfs_protocol_frame_allows_write_repair_progress(
-        &background_write
-    ));
-    assert!(dfs_protocol_frame_allows_write_repair_progress(
+    assert!(!dfs_message_allows_write_repair_progress(&lookup));
+    assert!(!dfs_message_allows_write_repair_progress(&mkdir));
+    assert!(!dfs_message_allows_write_repair_progress(&read));
+    assert!(!dfs_message_allows_write_repair_progress(&background_write));
+    assert!(dfs_message_allows_write_repair_progress(
         &foreground_repair_write
     ));
 }
@@ -722,14 +724,13 @@ fn dfs_protocol_binary_payloads_use_native_bytes_codec() {
 }
 
 #[test]
-fn dfs_protocol_frame_read_only_classifier_routes_lookup_path_to_read_lane() {
+fn dfs_message_read_only_classifier_routes_lookup_path_to_read_lane() {
     let local = NodeId::from_legacy_named("node_read_classifier_local").expect("local");
     let remote = NodeId::from_legacy_named("node_read_classifier_remote").expect("remote");
     let file_system_id = sifs_file_system_id();
-    let read_frame = build_dfs_network_frame(
+    let read = test_dfs_message_command_from_message(
         &local,
         &remote,
-        1,
         1,
         DfsNetworkMessage::ReadRequest(DfsReadRequest {
             request_id: "read-request".to_string(),
@@ -742,15 +743,13 @@ fn dfs_protocol_frame_read_only_classifier_routes_lookup_path_to_read_lane() {
             start_chunk_index: 0,
             max_chunks: 0,
         }),
-    )
-    .expect("read frame");
-    assert!(dfs_protocol_frame_is_read_only_request(&read_frame));
-    assert!(dfs_protocol_frame_requires_fresh_metadata(&read_frame));
+    );
+    assert!(dfs_message_is_read_only_request(&read));
+    assert!(dfs_message_requires_fresh_metadata(&read));
 
-    let lookup_frame = build_dfs_network_frame(
+    let lookup = test_dfs_message_command_from_message(
         &local,
         &remote,
-        2,
         2,
         DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
             request_id: "lookup-request".to_string(),
@@ -762,18 +761,16 @@ fn dfs_protocol_frame_read_only_classifier_routes_lookup_path_to_read_lane() {
                 path: "/services/example.txt".to_string(),
             },
         }),
-    )
-    .expect("lookup frame");
-    assert!(dfs_protocol_frame_is_read_only_request(&lookup_frame));
+    );
+    assert!(dfs_message_is_read_only_request(&lookup));
     assert!(
-        dfs_protocol_frame_requires_fresh_metadata(&lookup_frame),
+        dfs_message_requires_fresh_metadata(&lookup),
         "lookup requests must hydrate daemon read lanes before answering primary path checks"
     );
 
-    let lookup_paths_frame = build_dfs_network_frame(
+    let lookup_paths = test_dfs_message_command_from_message(
         &local,
         &remote,
-        4,
         4,
         DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
             request_id: "lookup-paths-request".to_string(),
@@ -788,18 +785,16 @@ fn dfs_protocol_frame_read_only_classifier_routes_lookup_path_to_read_lane() {
                 ],
             },
         }),
-    )
-    .expect("lookup paths frame");
-    assert!(dfs_protocol_frame_is_read_only_request(&lookup_paths_frame));
+    );
+    assert!(dfs_message_is_read_only_request(&lookup_paths));
     assert!(
-        dfs_protocol_frame_requires_fresh_metadata(&lookup_paths_frame),
+        dfs_message_requires_fresh_metadata(&lookup_paths),
         "batched lookup requests must hydrate daemon read lanes before answering primary path checks"
     );
 
-    let sync_frame = build_dfs_network_frame(
+    let sync = test_dfs_message_command_from_message(
         &local,
         &remote,
-        3,
         3,
         DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
             request_id: "sync-request".to_string(),
@@ -811,16 +806,14 @@ fn dfs_protocol_frame_read_only_classifier_routes_lookup_path_to_read_lane() {
                 path: "/services/example.txt".to_string(),
             },
         }),
-    )
-    .expect("sync frame");
-    assert!(!dfs_protocol_frame_is_read_only_request(&sync_frame));
-    assert!(dfs_protocol_frame_requires_fresh_metadata(&sync_frame));
+    );
+    assert!(!dfs_message_is_read_only_request(&sync));
+    assert!(dfs_message_requires_fresh_metadata(&sync));
 
-    let apply_frame = build_dfs_network_frame(
+    let apply = test_dfs_message_command_from_message(
         &local,
         &remote,
-        4,
-        4,
+        5,
         DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
             request_id: "apply-request".to_string(),
             file_system_id: file_system_id.clone(),
@@ -837,10 +830,9 @@ fn dfs_protocol_frame_read_only_classifier_routes_lookup_path_to_read_lane() {
                 },
             },
         }),
-    )
-    .expect("apply frame");
-    assert!(!dfs_protocol_frame_is_read_only_request(&apply_frame));
-    assert!(dfs_protocol_frame_requires_fresh_metadata(&apply_frame));
+    );
+    assert!(!dfs_message_is_read_only_request(&apply));
+    assert!(dfs_message_requires_fresh_metadata(&apply));
 }
 
 struct FailingSendTransport {
