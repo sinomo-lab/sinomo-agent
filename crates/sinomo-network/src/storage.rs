@@ -1,3 +1,4 @@
+use crate::ClusterPaths;
 use crate::endpoint_records::{
     cleanup_cluster_iroh_endpoints, cleanup_member_iroh_endpoints, cluster_endpoint_stable_eq,
     refresh_local_iroh_endpoints_from_disk, refresh_local_iroh_endpoints_from_disk_async,
@@ -5,6 +6,7 @@ use crate::endpoint_records::{
 };
 use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
 use crate::error::NetworkError;
+use crate::io_observer;
 use crate::membership::{
     DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE,
     cluster_capabilities_are_legacy_shadow_only, cluster_local_process_members,
@@ -1291,96 +1293,6 @@ pub(crate) fn remove_local_cluster_connectivity_record_cache_entries_under_root_
 ) {
     if let Ok(mut cache) = LOCAL_CLUSTER_CONNECTIVITY_RECORDS.lock() {
         cache.retain(|path, _| !path.starts_with(root));
-    }
-}
-
-/// Receives notifications about disk and network I/O performed by the network
-/// layer: object-file and KV-snapshot writes (op counts), the byte volume of
-/// those reads/writes, and the byte volume of framed RPC traffic. Used by
-/// sinomo-daemon to feed idle-stats counters. All methods default to no-ops so
-/// implementors opt into only the signals they care about.
-pub trait IoObserver: Send + Sync {
-    /// Bytes read from disk (object-file reads, including the read-compare in
-    /// `write_object_file`).
-    fn on_disk_read(&self, _bytes: u64) {}
-    /// Bytes written to disk (object-file and KV-snapshot writes).
-    fn on_disk_write(&self, _bytes: u64) {}
-    fn on_object_file_actual_write(&self) {}
-    fn on_object_file_skipped_write(&self) {}
-    fn on_kv_snapshot_actual_write(&self) {}
-    fn on_kv_snapshot_skipped_write(&self) {}
-    /// Bytes sent over a framed RPC stream (4-byte length prefix + body).
-    fn on_net_sent(&self, _bytes: u64) {}
-    /// Bytes received over a framed RPC stream (4-byte length prefix + body).
-    fn on_net_recv(&self, _bytes: u64) {}
-}
-
-static IO_OBSERVER: Mutex<Option<Arc<dyn IoObserver>>> = Mutex::new(None);
-
-/// Install a process-wide I/O observer. The daemon installs exactly one
-/// observer at startup; tests may swap in their own. The previous observer is
-/// returned so callers can restore it after a scoped change.
-pub fn set_io_observer(observer: Option<Arc<dyn IoObserver>>) -> Option<Arc<dyn IoObserver>> {
-    let mut guard = IO_OBSERVER.lock().ok()?;
-    std::mem::replace(&mut *guard, observer)
-}
-
-pub(crate) fn io_observer() -> Option<Arc<dyn IoObserver>> {
-    IO_OBSERVER.lock().ok().and_then(|guard| guard.clone())
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClusterPaths {
-    pub root: PathBuf,
-    pub state: PathBuf,
-    pub iroh: PathBuf,
-    pub connectivity_local: PathBuf,
-    pub kv_snapshot: PathBuf,
-    pub kv_raft: PathBuf,
-    pub kv_watches: PathBuf,
-    pub kv_watches_lock: PathBuf,
-    pub kv_watches_next_id: PathBuf,
-    pub kv_watch_events: PathBuf,
-    pub kv_watch_events_log: PathBuf,
-}
-
-impl ClusterPaths {
-    pub fn new(data_dir: &SinomoDataDir) -> Self {
-        let root = data_dir.root().join("cluster");
-        let kv = sinomo_kv::ClusterKvPaths::new(&root);
-        Self {
-            state: root.join("state.sobj"),
-            iroh: root.join("iroh"),
-            connectivity_local: root.join("connectivity-local.sobj"),
-            kv_snapshot: kv.snapshot,
-            kv_raft: kv.raft,
-            kv_watches: kv.watches,
-            kv_watches_lock: kv.watches_lock,
-            kv_watches_next_id: kv.watches_next_id,
-            kv_watch_events: kv.watch_events,
-            kv_watch_events_log: kv.watch_events_log,
-            root,
-        }
-    }
-
-    pub fn ensure(&self) -> Result<(), NetworkError> {
-        fs::create_dir_all(&self.root).map_err(|source| NetworkError::StorageIo {
-            path: self.root.display().to_string(),
-            detail: source.to_string(),
-        })
-    }
-
-    pub fn kv_paths(&self) -> sinomo_kv::ClusterKvPaths {
-        sinomo_kv::ClusterKvPaths {
-            root: self.root.clone(),
-            snapshot: self.kv_snapshot.clone(),
-            raft: self.kv_raft.clone(),
-            watches: self.kv_watches.clone(),
-            watches_lock: self.kv_watches_lock.clone(),
-            watches_next_id: self.kv_watches_next_id.clone(),
-            watch_events: self.kv_watch_events.clone(),
-            watch_events_log: self.kv_watch_events_log.clone(),
-        }
     }
 }
 

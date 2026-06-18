@@ -1,5 +1,5 @@
 use crate::error::NetworkError;
-use crate::storage::io_observer;
+use crate::io_observer;
 use sinomo_object::{LengthMode, serde_ext};
 use std::collections::HashMap;
 #[cfg(test)]

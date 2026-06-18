@@ -1,11 +1,12 @@
+use crate::ClusterPaths;
 use crate::error::NetworkError;
+#[cfg(any(feature = "iroh-transport", test))]
+use crate::io_observer;
 use crate::object::DaemonRpcTimeouts;
 #[cfg(test)]
 use crate::peer::{EndpointCandidateStatus, PeerEndpointCandidate};
 use crate::prelude::*;
-#[cfg(any(feature = "iroh-transport", test))]
-use crate::storage::io_observer;
-use crate::storage::{ClusterPaths, read_object_file, write_object_file};
+use crate::storage::{read_object_file, write_object_file};
 #[cfg(feature = "iroh-transport")]
 use crate::storage::{read_optional_object_file, write_object_file_create_new_serialized};
 #[cfg(feature = "iroh-transport")]

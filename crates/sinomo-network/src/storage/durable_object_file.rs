@@ -16,7 +16,8 @@ use std::sync::Mutex;
 #[cfg(test)]
 use std::time::SystemTime;
 
-use super::{FILE_CACHE_CAPACITY, io_observer};
+use super::FILE_CACHE_CAPACITY;
+use crate::io_observer;
 
 pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = durable_file::DEFAULT_OBJECT_FILE_MAX_READ_BYTES;
 

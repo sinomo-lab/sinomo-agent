@@ -18,9 +18,11 @@ mod endpoint_selector;
 mod error;
 mod health;
 mod invite;
+mod io_observer;
 mod lan;
 mod membership;
 mod object;
+mod paths;
 mod peer;
 mod roaming;
 mod route;
@@ -77,6 +79,8 @@ pub use invite::{
     is_remote_usable_invite_endpoint, push_unique_introducer, sign_cluster_join_invite,
     sort_default_invite_introducers, verify_cluster_join_invite_signature,
 };
+pub(crate) use io_observer::io_observer;
+pub use io_observer::{IoObserver, set_io_observer};
 pub use lan::{
     AsyncMdnsDiscoverySocket, MdnsDiscoveryAdvertisement, MdnsDiscoveryCache, MdnsDiscoveryRecord,
     apply_lan_discovery_advertisements, discover_default_lan_ip_candidates,
@@ -114,6 +118,7 @@ pub(crate) use object::{
     OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL, decode_single_object_frame_from_slice,
     encode_object_frame_to_vec,
 };
+pub use paths::ClusterPaths;
 pub use peer::{
     AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions, InProcessNetwork,
     InProcessObjectRpcMessage, InProcessTransport, InboundObjectRpcMessage,
@@ -177,7 +182,7 @@ pub use storage::{
     ClusterMembershipRpcAsyncForwardHost, ClusterMembershipRpcForwardHost,
     ClusterMembershipRpcFuture, ClusterNetworkInfoPublishAsyncHost, ClusterNetworkInfoRecord,
     ClusterNetworkMaintenanceSchedule, ClusterNetworkRecordExpiryHost, ClusterNodeRoleUpdate,
-    ClusterNodeStatusPublishAsyncHost, ClusterPaths, ClusterRaftAppendReplicationAsyncHost,
+    ClusterNodeStatusPublishAsyncHost, ClusterRaftAppendReplicationAsyncHost,
     ClusterRaftAppendReplicationHost, ClusterRaftAppendReplicationOptions,
     ClusterRaftAppendReplicationOutcome, ClusterRaftCommittedFanoutAsyncHost,
     ClusterRaftCommittedFanoutOptions, ClusterRaftLeaderElectionOptions,
@@ -189,7 +194,7 @@ pub use storage::{
     DEFAULT_CLUSTER_CONTROL_PLANE_IROH_FOREGROUND_ATTEMPT_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT,
-    DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT, IoObserver,
+    DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
     MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, accepted_cluster_join_state_from_kv_snapshot,
     apply_cluster_connectivity_probe_results, apply_cluster_node_role,
     assign_local_daemon_member_public_keys, build_cluster_network_info_record,
@@ -236,7 +241,7 @@ pub use storage::{
     refresh_current_cluster_kv_store_with_local_storage_and_transport,
     refresh_local_daemon_membership_from_disk, remove_cluster_members_with_host,
     replicate_cluster_raft_to_endpoint_with_host, select_cluster_connectivity_probe_batch,
-    send_cluster_join_registration_over_membership_rpc, set_io_observer,
+    send_cluster_join_registration_over_membership_rpc,
     spawn_cluster_raft_committed_fanout_worker_on_runtime, stored_cluster_network_info_matches,
     stored_cluster_node_status_matches, sync_cluster_connectivity_records_to_kv,
     sync_cluster_connectivity_records_to_quorum_with_host, sync_cluster_invitation_to_kv,
@@ -463,6 +468,7 @@ pub(crate) mod prelude {
     };
     #[cfg(test)]
     pub(crate) use sinomo_kv::{KvWalPaths, WatchId};
+    #[cfg(test)]
     pub(crate) use sinomo_local::SinomoDataDir;
     #[cfg(test)]
     pub(crate) use sinomo_node::{NodeAvailability, NodeHealth, NodeProfile};
