@@ -13978,7 +13978,7 @@ fn cluster_sync_targets_keep_lan_public_iroh_order_before_connectivity() {
     member_b.endpoints = vec![iroh.clone(), public.clone(), lan.clone()];
     state.members.push(member_b);
 
-    let targets = cluster_sync_targets(&state);
+    let targets = crate::storage::cluster_sync_targets(&state);
     let ordered_endpoint_ids = targets
         .iter()
         .map(|endpoint| endpoint.endpoint_id.clone())

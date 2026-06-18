@@ -15807,7 +15807,7 @@ pub fn iroh_endpoint_public_key(endpoint: &ClusterEndpointRecord) -> Option<Stri
     }
 }
 
-pub fn cluster_sync_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpointRecord> {
+pub(crate) fn cluster_sync_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpointRecord> {
     let mut targets = Vec::new();
     for member in &state.members {
         if member.node_id == state.local_node_id || !member.state.is_authorized() {

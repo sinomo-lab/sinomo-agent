@@ -25,7 +25,7 @@ use super::{
     cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_with_paths,
     cluster_join_with_paths, cluster_leave_with_paths, cluster_migration_plan_with_paths,
     cluster_node_status_from_daemon_status, cluster_peer_members, cluster_raft_known_leader_id,
-    cluster_state_sync_txn, cluster_sync_targets, compact_default_invite_introducers,
+    cluster_state_sync_txn, compact_default_invite_introducers,
     daemon_advertised_endpoints_for_state, daemon_handle_daemon_sandbox_http_fetch,
     daemon_package_version, data_dir_storage_contract_findings, decode_cluster_join_invite,
     encode_cluster_join_invite, ensure_rollout_layout, expire_cluster_network_records_in_kv,
@@ -5792,7 +5792,14 @@ fn cluster_sync_targets_skip_remote_local_only_endpoints() {
     remote.endpoints.push(lan_endpoint);
     state.members.push(remote);
 
-    let targets = cluster_sync_targets(&state);
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-sync-targets");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    paths.ensure().expect("cluster paths");
+    let targets = network::cluster_endpoint_targets(
+        &paths,
+        &state,
+        network::ClusterEndpointSelectionPurpose::DaemonCommand,
+    );
 
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].address, "192.168.1.10:21353");

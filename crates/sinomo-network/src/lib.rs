@@ -129,7 +129,7 @@ pub use storage::{
     cluster_rollout_endpoint_candidates, cluster_rollout_target_endpoint_for_main,
     cluster_rollout_target_endpoints_for_main_with_command_endpoint,
     cluster_state_needs_join_registration, cluster_state_sync_txn, cluster_status_summary_label,
-    cluster_sync_targets, commit_cluster_kv_txn_with_quorum_response_with_host,
+    commit_cluster_kv_txn_with_quorum_response_with_host,
     commit_cluster_raft_command_with_quorum_driver, discover_peer_route_ip_candidates,
     elect_cluster_raft_leader_with_host, ensure_daemon_cluster_members,
     expire_cluster_network_records_with_host, forward_cluster_kv_txn_to_voter_with_host,

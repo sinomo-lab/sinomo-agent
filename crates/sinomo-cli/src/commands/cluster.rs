@@ -9,8 +9,6 @@ pub(crate) use network::cluster_connectivity_sync_ops;
 #[cfg(test)]
 pub(crate) use network::cluster_state_sync_txn;
 #[cfg(test)]
-pub(crate) use network::cluster_sync_targets;
-#[cfg(test)]
 pub(crate) use network::invite_channels_for_join_registration;
 #[cfg(test)]
 pub(crate) use network::invite_communication_channels;
