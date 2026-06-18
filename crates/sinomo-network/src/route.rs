@@ -33,7 +33,7 @@ pub const CLUSTER_ROUTING_RPC_ROUTE_METADATA: &[(&str, &str)] =
     &[(CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY)];
 /// Default hop budget for a relayed RPC (roughly the cluster diameter). Each forward
 /// decrements it; a relay is dropped when it reaches zero.
-pub const CLUSTER_RELAY_DEFAULT_TTL: u8 = 8;
+const CLUSTER_RELAY_DEFAULT_TTL: u8 = 8;
 const CLUSTER_RELAY_MAX_FAILURE_DETAILS: usize = 8;
 const CLUSTER_RELAY_FAILURE_DETAIL_MAX_CHARS: usize = 512;
 const CLUSTER_RELAY_ROUTE_PLAN_CACHE_MAX_AGE: Duration = Duration::from_secs(1);
@@ -66,7 +66,7 @@ struct ClusterRelayRoutePlanCacheEntry {
 /// A discovered route to a target node: the immediate next hop to send to, and the full
 /// node path (`local` … `target`, inclusive) for diagnostics.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClusterRoute {
+pub(crate) struct ClusterRoute {
     pub next_hop: NodeId,
     pub path: Vec<NodeId>,
 }
@@ -74,7 +74,7 @@ pub struct ClusterRoute {
 /// Breadth-first search the connectivity graph for a shortest path from `local` to
 /// `target` over reachable edges (records whose state is not `Unreachable`), returning the
 /// first hop along it. Returns `None` when `target == local` or no reachable path exists.
-pub fn cluster_route_next_hop(
+pub(crate) fn cluster_route_next_hop(
     graph: &ClusterConnectivityGraph,
     local: &NodeId,
     target: &NodeId,
@@ -143,7 +143,7 @@ fn route_from_predecessors(
 /// local node itself) so the fallback never bounces back along the path; the TTL bounds any
 /// remaining flailing toward a genuinely unreachable target.
 #[cfg(test)]
-pub fn cluster_route_first_hop_best_effort(
+fn cluster_route_first_hop_best_effort(
     graph: &ClusterConnectivityGraph,
     local: &NodeId,
     target: &NodeId,
@@ -333,7 +333,7 @@ impl RelayEnvelope {
 /// What a node should do with a [`RelayEnvelope`] it received.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg(test)]
-pub enum RelayDecision {
+enum RelayDecision {
     /// This node is the target: unwrap `inner` and dispatch it into local handling.
     DeliverLocal,
     /// Forward `envelope` (already TTL-decremented and visit-stamped) to `next_hop`.
@@ -349,7 +349,7 @@ pub enum RelayDecision {
 /// caller performs the local dispatch (on [`RelayDecision::DeliverLocal`]) or the dial to
 /// `next_hop` (on [`RelayDecision::Forward`]).
 #[cfg(test)]
-pub fn relay_decision(
+fn relay_decision(
     envelope: &RelayEnvelope,
     local: &NodeId,
     graph: &ClusterConnectivityGraph,
