@@ -1,5 +1,6 @@
 use crate::ClusterPaths;
 use crate::connectivity::ClusterConnectivityRecord;
+use crate::connectivity_store::write_local_cluster_connectivity_record_set;
 use crate::error::NetworkError;
 use crate::keyspace::{cluster_connectivity_key, cluster_connectivity_source_prefix};
 use crate::maintenance::CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS;
@@ -10,7 +11,6 @@ use crate::storage::{
     ClusterMembershipRpcFuture, append_cluster_raft_ops_in_batches,
     read_cluster_kv_current_or_empty_snapshot_arc, read_cluster_kv_current_snapshot_arc,
     read_cluster_kv_snapshot, read_cluster_state, read_cluster_state_without_kv,
-    write_local_cluster_connectivity_record_set,
 };
 use sinomo_kv::{CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, KvCompare, KvOp, KvSnapshot, KvTxn};
 use std::collections::BTreeMap;

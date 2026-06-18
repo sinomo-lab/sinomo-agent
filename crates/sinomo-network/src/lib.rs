@@ -14,6 +14,7 @@
 
 mod connectivity;
 mod connectivity_publish;
+mod connectivity_store;
 mod endpoint_advertisement;
 mod endpoint_records;
 mod endpoint_selector;
@@ -64,6 +65,9 @@ pub use connectivity_publish::{
     expire_cluster_network_records_with_host, sync_cluster_connectivity_records_to_kv,
     sync_cluster_connectivity_records_to_quorum_async_with_host,
     sync_cluster_connectivity_records_to_quorum_with_host,
+};
+pub use connectivity_store::{
+    read_local_cluster_connectivity_records, write_local_cluster_connectivity_records,
 };
 #[cfg(test)]
 pub(crate) use endpoint_advertisement::{
@@ -318,15 +322,13 @@ pub use storage::{
     join_channel_endpoint_for_accepted_state, read_cluster_connectivity_graph_from_kv,
     read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_state,
     read_cluster_state_cached, read_cluster_state_without_kv,
-    read_local_cluster_connectivity_records, reconcile_accepted_cluster_join_response,
-    reconcile_cluster_join_with_introducers_with_host,
+    reconcile_accepted_cluster_join_response, reconcile_cluster_join_with_introducers_with_host,
     record_forwarded_join_registration_acceptance_with_host, remove_cluster_members_with_host,
     replicate_cluster_raft_to_endpoint_with_host, select_cluster_connectivity_probe_batch,
     send_cluster_join_registration_over_membership_rpc,
     spawn_cluster_raft_committed_fanout_worker_on_runtime, sync_cluster_state_to_kv_with_host,
     sync_cluster_state_to_local_raft_unchecked, update_cluster_node_role_with_host,
     update_cluster_raft_role_with_host, upsert_member_record, write_cluster_state,
-    write_local_cluster_connectivity_records,
 };
 pub use storage::{
     cluster_has_local_quorum_async_with_host, cluster_kv_key_can_defer_materialized_snapshot,

@@ -1,4 +1,5 @@
 use crate::ClusterPaths;
+use crate::connectivity_publish::cluster_network_record_should_refresh;
 use crate::error::NetworkError;
 use crate::keyspace::{
     cluster_network_info_key, cluster_node_status_key_for_record,
@@ -7,7 +8,7 @@ use crate::keyspace::{
 use crate::network_info::{ClusterNetworkInfoRecord, cluster_network_info_stable_eq};
 use crate::prelude::*;
 use crate::storage::{
-    ClusterMembershipRpcFuture, append_cluster_raft_command, cluster_network_record_should_refresh,
+    ClusterMembershipRpcFuture, append_cluster_raft_command,
     read_cluster_kv_current_or_cached_snapshot_arc_if_present, read_cluster_kv_snapshot,
     read_cluster_state, read_cluster_state_without_kv,
 };

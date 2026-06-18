@@ -1,5 +1,8 @@
 use crate::ClusterPaths;
 use crate::connectivity::ClusterConnectivityProbeState;
+use crate::connectivity_store::{
+    write_local_cluster_connectivity_record_set, write_local_cluster_connectivity_record_set_async,
+};
 use crate::endpoint_records::{
     refresh_local_iroh_endpoints_from_disk, refresh_local_iroh_endpoints_from_disk_async,
     upsert_member_endpoint,
@@ -32,11 +35,7 @@ pub fn refresh_cluster_connectivity_environment(
         .is_some_and(|known| known != &local_environment_id);
     if changed {
         connectivity.clear();
-        crate::storage::write_local_cluster_connectivity_record_set(
-            paths,
-            &state.local_node_id,
-            &[],
-        )?;
+        write_local_cluster_connectivity_record_set(paths, &state.local_node_id, &[])?;
     }
     *environment_id = Some(local_environment_id);
     Ok(changed)
@@ -62,7 +61,7 @@ pub async fn refresh_cluster_connectivity_environment_async(
         .is_some_and(|known| known != &local_environment_id);
     if changed {
         connectivity.clear();
-        crate::storage::write_local_cluster_connectivity_record_set_async(
+        write_local_cluster_connectivity_record_set_async(
             runtime,
             paths,
             &state.local_node_id,

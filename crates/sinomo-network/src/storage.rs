@@ -5,19 +5,29 @@ use crate::connectivity::{
     ClusterConnectivityState, cluster_connectivity_probe_due_with_graph,
     cluster_connectivity_probe_key,
 };
+use crate::connectivity_publish::cluster_network_record_live;
 pub(crate) use crate::connectivity_publish::{
     ClusterConnectivityPublishHost, ClusterNetworkRecordExpiryHost,
-    MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, cluster_connectivity_stable_eq,
-    cluster_network_record_should_refresh,
 };
 #[cfg(test)]
 pub(crate) use crate::connectivity_publish::{
-    cluster_connectivity_full_sync_batch_ops, cluster_connectivity_sync_is_noop,
+    MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, cluster_connectivity_full_sync_batch_ops,
+    cluster_connectivity_stable_eq, cluster_connectivity_sync_is_noop,
     cluster_network_expiry_delete_ops, expire_cluster_network_record_ops,
     expire_cluster_network_records,
 };
-use crate::connectivity_publish::{
-    cluster_network_record_live, validate_cluster_connectivity_records_for_source,
+use crate::connectivity_store::{
+    local_cluster_connectivity_content_generation, read_local_cluster_connectivity_records,
+    sort_cluster_connectivity_records,
+};
+#[cfg(test)]
+pub(crate) use crate::connectivity_store::{
+    local_cluster_connectivity_prune_passes_for_test,
+    local_cluster_connectivity_record_cache_capacity_for_test,
+    local_cluster_connectivity_record_cache_contains_for_test,
+    remove_local_cluster_connectivity_record_cache_entries_under_root_for_test,
+    reset_local_cluster_connectivity_prune_passes_for_test,
+    write_local_cluster_connectivity_record_set,
 };
 use crate::endpoint_records::{
     cleanup_cluster_iroh_endpoints, cleanup_member_iroh_endpoints, cluster_endpoint_list_stable_eq,
@@ -149,7 +159,6 @@ const MAX_CLUSTER_KV_WATCH_REGISTRATION_CACHE_ENTRIES: usize =
     sinomo_kv::MAX_CLUSTER_KV_ACTIVE_WATCHES;
 pub use sinomo_node::DAEMON_MAIN_RUN_CAPABILITY;
 const FILE_CACHE_CAPACITY: usize = 4096;
-const MAX_LOCAL_CLUSTER_CONNECTIVITY_CACHE_ENTRIES: usize = 128;
 const MAX_CLUSTER_ROUTE_GRAPH_CACHE_ENTRIES: usize = 128;
 const MAX_CLUSTER_STATE_CACHE_ENTRIES: usize = 128;
 const CLUSTER_ROUTE_GRAPH_CACHE_MAX_AGE: Duration = Duration::from_secs(1);
@@ -157,15 +166,10 @@ const CLUSTER_STATE_CACHE_MAX_AGE: Duration = Duration::from_secs(1);
 #[cfg(test)]
 static CLUSTER_KV_WATCH_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
 static CLUSTER_KV_METADATA_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
-static LOCAL_CLUSTER_CONNECTIVITY_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
-static LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static CLUSTER_ROUTE_GRAPH_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
 static CLUSTER_STATE_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
 static CLUSTER_RAFT_FANOUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CLUSTER_RAFT_FANOUT_PENDING: AtomicBool = AtomicBool::new(false);
-static LOCAL_CLUSTER_CONNECTIVITY_RECORDS: LazyLock<
-    Mutex<HashMap<PathBuf, LocalClusterConnectivityRecordCacheEntry>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static CLUSTER_ROUTE_GRAPHS: LazyLock<Mutex<HashMap<PathBuf, ClusterRouteGraphCacheEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static CLUSTER_STATES: LazyLock<Mutex<HashMap<PathBuf, ClusterStateCacheEntry>>> =
@@ -210,9 +214,6 @@ static CLUSTER_KV_CACHED_SNAPSHOT_READS_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf
 #[cfg(test)]
 static CLUSTER_KV_CURRENT_SNAPSHOT_READS_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-#[cfg(test)]
-static LOCAL_CLUSTER_CONNECTIVITY_PRUNE_PASSES_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ClusterFileMark {
     exists: bool,
@@ -251,13 +252,6 @@ struct ClusterKvWatchEmptyDrainMark {
     raft_hard_state: ClusterFileMark,
     raft_wal: ClusterFileMark,
     raft_snapshot: ClusterFileMark,
-}
-
-#[derive(Clone)]
-struct LocalClusterConnectivityRecordCacheEntry {
-    records: Vec<ClusterConnectivityRecord>,
-    earliest_expires_at: Option<OffsetDateTime>,
-    last_used: u64,
 }
 
 #[derive(Clone)]
@@ -1087,32 +1081,6 @@ pub(crate) fn cached_cluster_kv_reader_node_id_for_test(paths: &ClusterPaths) ->
 }
 
 #[cfg(test)]
-pub(crate) fn local_cluster_connectivity_record_cache_contains_for_test(
-    paths: &ClusterPaths,
-) -> bool {
-    LOCAL_CLUSTER_CONNECTIVITY_RECORDS
-        .lock()
-        .map(|cache| cache.contains_key(&paths.root))
-        .unwrap_or(false)
-}
-
-#[cfg(test)]
-pub(crate) fn reset_local_cluster_connectivity_prune_passes_for_test(paths: &ClusterPaths) {
-    if let Ok(mut passes) = LOCAL_CLUSTER_CONNECTIVITY_PRUNE_PASSES_FOR_TEST.lock() {
-        passes.remove(&paths.root);
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn local_cluster_connectivity_prune_passes_for_test(paths: &ClusterPaths) -> u64 {
-    LOCAL_CLUSTER_CONNECTIVITY_PRUNE_PASSES_FOR_TEST
-        .lock()
-        .ok()
-        .and_then(|passes| passes.get(&paths.root).copied())
-        .unwrap_or(0)
-}
-
-#[cfg(test)]
 pub(crate) fn cluster_kv_watch_event_cache_capacity_for_test() -> usize {
     MAX_CLUSTER_KV_WATCH_EVENT_CACHE_ENTRIES
 }
@@ -1342,20 +1310,6 @@ pub(crate) fn remove_cluster_kv_reader_node_id_cache_entries_under_root_for_test
 }
 
 #[cfg(test)]
-pub(crate) fn local_cluster_connectivity_record_cache_capacity_for_test() -> usize {
-    MAX_LOCAL_CLUSTER_CONNECTIVITY_CACHE_ENTRIES
-}
-
-#[cfg(test)]
-pub(crate) fn remove_local_cluster_connectivity_record_cache_entries_under_root_for_test(
-    root: &std::path::Path,
-) {
-    if let Ok(mut cache) = LOCAL_CLUSTER_CONNECTIVITY_RECORDS.lock() {
-        cache.retain(|path, _| !path.starts_with(root));
-    }
-}
-
-#[cfg(test)]
 fn cluster_kv_watch_notify_key(paths: &ClusterPaths) -> PathBuf {
     paths.root.clone()
 }
@@ -1462,7 +1416,7 @@ pub fn remove_local_cluster_state(paths: &ClusterPaths) -> Result<(), NetworkErr
     Ok(())
 }
 
-fn remove_optional_file(path: &PathBuf) -> Result<bool, NetworkError> {
+pub(crate) fn remove_optional_file(path: &PathBuf) -> Result<bool, NetworkError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -4812,14 +4766,6 @@ fn cluster_route_graph_cache_tick() -> u64 {
     CLUSTER_ROUTE_GRAPH_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed)
 }
 
-fn local_cluster_connectivity_content_generation() -> u64 {
-    LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATION.load(Ordering::Acquire)
-}
-
-fn bump_local_cluster_connectivity_content_generation() {
-    LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATION.fetch_add(1, Ordering::AcqRel);
-}
-
 fn cluster_route_graph_cache_mark(paths: &ClusterPaths) -> Option<ClusterRouteGraphCacheMark> {
     Some(ClusterRouteGraphCacheMark {
         state: cluster_file_mark(&paths.state)?,
@@ -6482,300 +6428,6 @@ where
     let mut records = records_by_key.into_values().collect::<Vec<_>>();
     sort_cluster_connectivity_records(&mut records);
     Ok(records)
-}
-
-pub fn read_local_cluster_connectivity_records(
-    paths: &ClusterPaths,
-) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
-    let now = OffsetDateTime::now_utc();
-    if let Some(records) = read_local_cluster_connectivity_records_from_cache(paths, now)? {
-        return Ok(records);
-    }
-
-    let Some(mut records) =
-        read_optional_object_file::<Vec<ClusterConnectivityRecord>>(&paths.connectivity_local)?
-    else {
-        return Ok(Vec::new());
-    };
-    records.retain(|record| cluster_network_record_live(record.expires_at, now));
-    sort_cluster_connectivity_records(&mut records);
-    if records.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut cache =
-        LOCAL_CLUSTER_CONNECTIVITY_RECORDS
-            .lock()
-            .map_err(|error| NetworkError::Io {
-                operation: "lock local cluster connectivity cache".to_string(),
-                detail: error.to_string(),
-            })?;
-    if let Some(entry) = cache.get_mut(&paths.root) {
-        prune_expired_local_cluster_connectivity_cache_entry(&paths.root, entry, now);
-        if entry.records.is_empty() {
-            cache.remove(&paths.root);
-        } else {
-            entry.last_used = local_cluster_connectivity_cache_tick();
-            let mut cached_records = entry.records.clone();
-            sort_cluster_connectivity_records(&mut cached_records);
-            return Ok(cached_records);
-        }
-    }
-    store_local_cluster_connectivity_cache_entry(
-        &mut cache,
-        paths.root.clone(),
-        records.clone(),
-        now,
-    );
-    Ok(records)
-}
-
-pub fn write_local_cluster_connectivity_records(
-    paths: &ClusterPaths,
-    source_node_id: &NodeId,
-    records: &[ClusterConnectivityRecord],
-) -> Result<(), NetworkError> {
-    write_local_cluster_connectivity_records_inner(paths, source_node_id, records, false)
-}
-
-pub fn write_local_cluster_connectivity_record_set(
-    paths: &ClusterPaths,
-    source_node_id: &NodeId,
-    records: &[ClusterConnectivityRecord],
-) -> Result<(), NetworkError> {
-    write_local_cluster_connectivity_records_inner(paths, source_node_id, records, true)
-}
-
-pub async fn write_local_cluster_connectivity_record_set_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    source_node_id: &NodeId,
-    records: &[ClusterConnectivityRecord],
-) -> Result<(), NetworkError> {
-    let paths = paths.clone();
-    let source_node_id = source_node_id.clone();
-    let records = records.to_vec();
-    runtime
-        .spawn_blocking(move || {
-            write_local_cluster_connectivity_record_set(&paths, &source_node_id, &records)
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "write local cluster connectivity records".to_string(),
-            detail: format!("local cluster connectivity write task failed: {source}"),
-        })?
-}
-
-fn local_cluster_connectivity_cache_tick() -> u64 {
-    LOCAL_CLUSTER_CONNECTIVITY_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed)
-}
-
-fn read_local_cluster_connectivity_records_from_cache(
-    paths: &ClusterPaths,
-    now: OffsetDateTime,
-) -> Result<Option<Vec<ClusterConnectivityRecord>>, NetworkError> {
-    let mut cache =
-        LOCAL_CLUSTER_CONNECTIVITY_RECORDS
-            .lock()
-            .map_err(|error| NetworkError::Io {
-                operation: "lock local cluster connectivity cache".to_string(),
-                detail: error.to_string(),
-            })?;
-    let Some(entry) = cache.get_mut(&paths.root) else {
-        return Ok(None);
-    };
-    prune_expired_local_cluster_connectivity_cache_entry(&paths.root, entry, now);
-    if entry.records.is_empty() {
-        cache.remove(&paths.root);
-        return Ok(Some(Vec::new()));
-    }
-    entry.last_used = local_cluster_connectivity_cache_tick();
-    let mut records = entry.records.clone();
-    sort_cluster_connectivity_records(&mut records);
-    Ok(Some(records))
-}
-
-fn earliest_cluster_connectivity_expiry(
-    records: &[ClusterConnectivityRecord],
-) -> Option<OffsetDateTime> {
-    records.iter().map(|record| record.expires_at).min()
-}
-
-#[cfg(test)]
-fn record_local_cluster_connectivity_prune_pass_for_test(path: &PathBuf) {
-    if let Ok(mut passes) = LOCAL_CLUSTER_CONNECTIVITY_PRUNE_PASSES_FOR_TEST.lock() {
-        *passes.entry(path.clone()).or_default() += 1;
-    }
-}
-
-fn prune_expired_local_cluster_connectivity_cache_entry(
-    _path: &PathBuf,
-    entry: &mut LocalClusterConnectivityRecordCacheEntry,
-    now: OffsetDateTime,
-) {
-    if !entry
-        .earliest_expires_at
-        .is_some_and(|expires_at| expires_at <= now)
-    {
-        return;
-    }
-    #[cfg(test)]
-    record_local_cluster_connectivity_prune_pass_for_test(_path);
-    entry
-        .records
-        .retain(|record| cluster_network_record_live(record.expires_at, now));
-    entry.earliest_expires_at = earliest_cluster_connectivity_expiry(&entry.records);
-}
-
-fn prune_expired_local_cluster_connectivity_cache_entries(
-    cache: &mut HashMap<PathBuf, LocalClusterConnectivityRecordCacheEntry>,
-    now: OffsetDateTime,
-) {
-    cache.retain(|path, entry| {
-        prune_expired_local_cluster_connectivity_cache_entry(path, entry, now);
-        !entry.records.is_empty()
-    });
-}
-
-fn evict_local_cluster_connectivity_cache_entry_if_needed(
-    cache: &mut HashMap<PathBuf, LocalClusterConnectivityRecordCacheEntry>,
-    protected: &PathBuf,
-) {
-    if cache.contains_key(protected) || cache.len() < MAX_LOCAL_CLUSTER_CONNECTIVITY_CACHE_ENTRIES {
-        return;
-    }
-    let eviction_candidate = cache
-        .iter()
-        .filter(|(path, _)| *path != protected)
-        .min_by_key(|(_, entry)| entry.last_used)
-        .map(|(path, _)| path.clone());
-    if let Some(path) = eviction_candidate {
-        cache.remove(&path);
-    }
-}
-
-fn store_local_cluster_connectivity_cache_entry(
-    cache: &mut HashMap<PathBuf, LocalClusterConnectivityRecordCacheEntry>,
-    key: PathBuf,
-    records: Vec<ClusterConnectivityRecord>,
-    now: OffsetDateTime,
-) {
-    prune_expired_local_cluster_connectivity_cache_entries(cache, now);
-    evict_local_cluster_connectivity_cache_entry_if_needed(cache, &key);
-    cache.insert(
-        key,
-        LocalClusterConnectivityRecordCacheEntry {
-            earliest_expires_at: earliest_cluster_connectivity_expiry(&records),
-            records,
-            last_used: local_cluster_connectivity_cache_tick(),
-        },
-    );
-}
-
-fn local_cluster_connectivity_persisted_records_stable(
-    existing_records: &[ClusterConnectivityRecord],
-    merged_records: &[ClusterConnectivityRecord],
-    now: OffsetDateTime,
-) -> bool {
-    existing_records.len() == merged_records.len()
-        && existing_records
-            .iter()
-            .zip(merged_records)
-            .all(|(existing, merged)| {
-                cluster_connectivity_stable_eq(existing, merged)
-                    && !cluster_network_record_should_refresh(existing.expires_at, now)
-            })
-}
-
-fn write_local_cluster_connectivity_records_inner(
-    paths: &ClusterPaths,
-    source_node_id: &NodeId,
-    records: &[ClusterConnectivityRecord],
-    replace_source_records: bool,
-) -> Result<(), NetworkError> {
-    validate_cluster_connectivity_records_for_source(source_node_id, records)?;
-    let now = OffsetDateTime::now_utc();
-    let existing_records = read_local_cluster_connectivity_records(paths)?;
-    let mut merged = existing_records
-        .iter()
-        .filter(|record| {
-            cluster_network_record_live(record.expires_at, now)
-                && (!replace_source_records || record.source_node_id != *source_node_id)
-        })
-        .map(|record| {
-            (
-                (
-                    record.source_node_id.clone(),
-                    record.target_node_id.clone(),
-                    record.endpoint_id.clone(),
-                ),
-                record.clone(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    for record in records {
-        if record.source_node_id == *source_node_id
-            && cluster_network_record_live(record.expires_at, now)
-        {
-            merged.insert(
-                (
-                    record.source_node_id.clone(),
-                    record.target_node_id.clone(),
-                    record.endpoint_id.clone(),
-                ),
-                record.clone(),
-            );
-        }
-    }
-    let retained_source_records = merged
-        .values()
-        .filter(|record| record.source_node_id == *source_node_id)
-        .count();
-    if retained_source_records > MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS {
-        return Err(NetworkError::ClusterConnectivityRecordLimit {
-            source_node_id: source_node_id.clone(),
-            observed_records: retained_source_records,
-            max_records: MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
-        });
-    }
-    let mut merged = merged.into_values().collect::<Vec<_>>();
-    sort_cluster_connectivity_records(&mut merged);
-    if !local_cluster_connectivity_persisted_records_stable(&existing_records, &merged, now) {
-        if merged.is_empty() {
-            remove_optional_file(&paths.connectivity_local)?;
-        } else {
-            write_object_file(&paths.connectivity_local, &merged)?;
-        }
-    }
-    let mut cache =
-        LOCAL_CLUSTER_CONNECTIVITY_RECORDS
-            .lock()
-            .map_err(|error| NetworkError::Io {
-                operation: "lock local cluster connectivity cache".to_string(),
-                detail: error.to_string(),
-            })?;
-    if merged.is_empty() {
-        cache.remove(&paths.root);
-    } else {
-        store_local_cluster_connectivity_cache_entry(&mut cache, paths.root.clone(), merged, now);
-    }
-    bump_local_cluster_connectivity_content_generation();
-    Ok(())
-}
-
-fn sort_cluster_connectivity_records(records: &mut [ClusterConnectivityRecord]) {
-    records.sort_by(|left, right| {
-        (
-            left.source_node_id.as_str(),
-            left.target_node_id.as_str(),
-            left.endpoint_id.as_str(),
-        )
-            .cmp(&(
-                right.source_node_id.as_str(),
-                right.target_node_id.as_str(),
-                right.endpoint_id.as_str(),
-            ))
-    });
 }
 
 /// Mirrors a cluster state into the local durable Raft store without proving
