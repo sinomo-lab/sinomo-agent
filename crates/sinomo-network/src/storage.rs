@@ -12454,34 +12454,6 @@ pub fn prefer_bounded_daemon_command_targets(
     selected
 }
 
-pub fn cluster_daemon_command_transport_rank(endpoint: &ClusterEndpointRecord) -> u8 {
-    match endpoint.transport {
-        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => 0,
-        ClusterTransportKind::Iroh => 1,
-        _ => 2,
-    }
-}
-
-pub fn cluster_daemon_command_address_rank(endpoint: &ClusterEndpointRecord) -> u8 {
-    if !matches!(
-        endpoint.transport,
-        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
-    ) {
-        return 1;
-    }
-    let Ok(address) = endpoint.address.parse::<SocketAddr>() else {
-        return 1;
-    };
-    match address.ip() {
-        IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() => 0,
-        IpAddr::V6(ip) if ip.is_unique_local() || ip.is_unicast_link_local() => 0,
-        _ if matches!(endpoint.privacy, ClusterEndpointPrivacy::Lan) => 0,
-        _ if matches!(endpoint.privacy, ClusterEndpointPrivacy::InternetDirect) => 1,
-        ip if ip.is_loopback() || ip.is_unspecified() => 3,
-        _ => 1,
-    }
-}
-
 pub fn cluster_member_is_local_process(
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,

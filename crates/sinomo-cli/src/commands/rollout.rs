@@ -1599,47 +1599,6 @@ fn local_rollout_target(options: &RolloutOptions) -> Result<Option<RolloutTarget
 }
 
 #[cfg(test)]
-pub(crate) fn rollout_target_endpoint_for_main(
-    main_node_id: &NodeId,
-    candidates: &[ClusterEndpointRecord],
-) -> Option<ClusterEndpointRecord> {
-    let shadow_node_id = shadow_daemon_node_id(main_node_id);
-    let mut candidates = candidates
-        .iter()
-        .filter(|endpoint| {
-            (endpoint.node_id == *main_node_id || endpoint.node_id == shadow_node_id)
-                && endpoint.privacy != sinomo_runtime::core::ClusterEndpointPrivacy::LocalOnly
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|endpoint| {
-        (
-            endpoint.node_id != *main_node_id,
-            sinomo_runtime::network::cluster_daemon_command_transport_rank(endpoint),
-            sinomo_runtime::network::cluster_daemon_command_address_rank(endpoint),
-            endpoint.priority,
-            endpoint.address.clone(),
-        )
-    });
-    candidates.into_iter().next()
-}
-
-#[cfg(test)]
-pub(crate) fn rollout_target_endpoint_for_main_in_order(
-    main_node_id: &NodeId,
-    candidates: &[ClusterEndpointRecord],
-) -> Option<ClusterEndpointRecord> {
-    let shadow_node_id = shadow_daemon_node_id(main_node_id);
-    candidates
-        .iter()
-        .find(|endpoint| {
-            endpoint.node_id == shadow_node_id
-                && endpoint.privacy != sinomo_runtime::core::ClusterEndpointPrivacy::LocalOnly
-        })
-        .cloned()
-}
-
-#[cfg(test)]
 pub(crate) fn rollout_target_endpoint_for_main_with_connectivity(
     paths: &ClusterPaths,
     state: &sinomo_runtime::core::ClusterBootstrapState,

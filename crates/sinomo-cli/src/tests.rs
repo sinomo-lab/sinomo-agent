@@ -46,7 +46,6 @@ use super::{
     read_cluster_state, require_cluster_runtime_quorum_with_paths_and_daemon,
     rollout_advance_with_data_dir, rollout_cluster_targets, rollout_cluster_targets_from_state,
     rollout_pending_error_grace, rollout_progress_bar, rollout_status_matches_expectation,
-    rollout_target_endpoint_for_main, rollout_target_endpoint_for_main_in_order,
     rollout_target_endpoint_for_main_with_connectivity, rollout_telemetry_gates_set_with_data_dir,
     rollout_terminal_response, run_tui_with_handler_io, run_tui_with_handler_io_and_daemon,
     send_cluster_join_registration_over_iroh, shadow_daemon_node_id, sign_cluster_join_invite,
@@ -134,6 +133,33 @@ fn append_cluster_raft_command(
             network::cluster_kv_key_can_defer_materialized_snapshot,
         )
         .map_err(Into::into)
+}
+
+fn rollout_target_endpoint_for_main(
+    main_node_id: &NodeId,
+    candidates: &[ClusterEndpointRecord],
+) -> Option<ClusterEndpointRecord> {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-target-helper");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let state = ClusterBootstrapState::initialized_locally(
+        ClusterId::from_legacy_named("cluster_rollout_target_helper").expect("cluster"),
+        "rollout target helper",
+        NodeId::from_legacy_named("node_rollout_target_helper_local").expect("local node"),
+        "local",
+        "local-public-key",
+        OffsetDateTime::now_utc(),
+    );
+    network::cluster_rollout_target_endpoints_for_main_with_command_endpoint(
+        &paths,
+        &state,
+        main_node_id,
+        None,
+        candidates,
+    )
+    .into_iter()
+    .next()
 }
 
 fn append_cluster_raft_command_with_response(
@@ -11119,25 +11145,6 @@ fn rollout_cluster_target_prefers_direct_shadow_endpoint_before_iroh() {
 
     assert_eq!(selected.node_id, shadow_node_id);
     assert_eq!(selected.transport, ClusterTransportKind::LanTcp);
-}
-
-#[test]
-fn rollout_cluster_target_can_preserve_connectivity_order() {
-    let main_node_id =
-        NodeId::from_legacy_named("node_rollout_shadow_connectivity_main").expect("main node");
-    let shadow_node_id = shadow_daemon_node_id(&main_node_id);
-    let lan_endpoint = invite_introducer_endpoint(&shadow_node_id, "192.0.2.42:21354".to_string());
-    let iroh_endpoint = invite_introducer_endpoint(
-        &shadow_node_id,
-        "iroh://shadow_connectivity_rollout?relay=https://relay.example./".to_string(),
-    );
-
-    let selected =
-        rollout_target_endpoint_for_main_in_order(&main_node_id, &[iroh_endpoint, lan_endpoint])
-            .expect("shadow target");
-
-    assert_eq!(selected.node_id, shadow_node_id);
-    assert_eq!(selected.transport, ClusterTransportKind::Iroh);
 }
 
 #[test]
