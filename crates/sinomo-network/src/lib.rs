@@ -48,7 +48,7 @@ pub use route::{
     ClusterSignedEndpointRpcAsyncHost, ClusterSignedEndpointRpcFuture, RelayEnvelope,
     cluster_endpoint_prefers_relay_with_graph, cluster_relay_forward_plan,
     handle_cluster_relay_async_with_host, relay_envelope_hop_transport_timeouts,
-    relay_request_for_signed_rpc, relay_response_is_routing_error,
+    relay_response_is_routing_error,
 };
 pub use rpc::*;
 pub use storage::{

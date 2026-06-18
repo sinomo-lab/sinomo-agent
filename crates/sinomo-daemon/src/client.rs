@@ -963,15 +963,16 @@ async fn route_endpoint_request_via_local_daemon_async(
     }
 
     let cluster = status.cluster.as_ref()?;
-    let outer = match sinomo_network::relay_request_for_signed_rpc(
-        &cluster.cluster_id,
-        &endpoint.node_id,
-        request,
-        request_auth.to_vec(),
-        std::iter::empty::<sinomo_node::NodeId>(),
-    ) {
+    let outer = sinomo_network::RelayEnvelope::new(
+        cluster.cluster_id.clone(),
+        endpoint.node_id.clone(),
+        request.clone().with_auth(request_auth.to_vec()),
+    )
+    .into_request()
+    .map_err(DaemonError::from);
+    let outer = match outer {
         Ok(outer) => outer,
-        Err(error) => return Some(Err(DaemonError::from(error))),
+        Err(error) => return Some(Err(error)),
     };
     match send_daemon_rpc_async(
         &status.address,

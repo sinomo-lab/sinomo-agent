@@ -922,7 +922,7 @@ impl ClusterEndpointRpcDeadline {
 }
 
 /// Wrap an already-signed object RPC in a relay request for hop-by-hop delivery.
-pub fn relay_request_for_signed_rpc(
+pub(crate) fn relay_request_for_signed_rpc(
     cluster_id: &ClusterId,
     target_node_id: &NodeId,
     request: &ObjectRpcRequest,
