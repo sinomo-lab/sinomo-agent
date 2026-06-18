@@ -723,7 +723,7 @@ impl DfsControlPlaneKvClient for DfsCloudFilesControlPlaneKvClient {
 struct DfsCloudFilesEndpointTransport {
     local_node_id: NodeId,
     endpoints_by_node_id: BTreeMap<NodeId, Vec<ClusterEndpointRecord>>,
-    incoming_frames: VecDeque<InboundFrame>,
+    incoming_messages: VecDeque<DfsRoutedMessage>,
     timeout: Duration,
 }
 
@@ -733,7 +733,7 @@ impl std::fmt::Debug for DfsCloudFilesEndpointTransport {
             .debug_struct("DfsCloudFilesEndpointTransport")
             .field("local_node_id", &self.local_node_id)
             .field("endpoints_by_node_id", &self.endpoints_by_node_id)
-            .field("incoming_frames", &self.incoming_frames)
+            .field("incoming_messages", &self.incoming_messages)
             .field("timeout", &self.timeout)
             .finish()
     }
@@ -756,7 +756,7 @@ impl DfsCloudFilesEndpointTransport {
         Self {
             local_node_id,
             endpoints_by_node_id,
-            incoming_frames: VecDeque::new(),
+            incoming_messages: VecDeque::new(),
             timeout: DEFAULT_CLOUD_FILES_TIMEOUT,
         }
     }
@@ -767,11 +767,7 @@ impl DfsCloudFilesEndpointTransport {
     ) -> std::result::Result<(), NetworkError> {
         let target_node_id = message.target_node_id.clone();
         if target_node_id == self.local_node_id {
-            let frame = dfs_network_frame_from_routed_message(message)?;
-            self.incoming_frames.push_back(InboundFrame {
-                received_by: self.local_node_id.clone(),
-                frame,
-            });
+            self.incoming_messages.push_back(message);
             return Ok(());
         }
         self.send_routed_message_to_endpoint(&target_node_id, message, false)
@@ -851,7 +847,15 @@ impl DfsMessageTransport for DfsCloudFilesEndpointTransport {
     }
 
     fn drain_incoming(&mut self) -> std::result::Result<Vec<InboundFrame>, NetworkError> {
-        Ok(self.incoming_frames.drain(..).collect())
+        self.incoming_messages
+            .drain(..)
+            .map(|message| {
+                dfs_network_frame_from_routed_message(message).map(|frame| InboundFrame {
+                    received_by: self.local_node_id.clone(),
+                    frame,
+                })
+            })
+            .collect()
     }
 }
 
