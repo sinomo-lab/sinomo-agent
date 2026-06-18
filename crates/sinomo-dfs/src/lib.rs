@@ -8977,19 +8977,14 @@ impl DfsEndpointServedMessageTransport {
         }
     }
 
-    pub fn enqueue_message(&mut self, message: DfsRoutedMessage) -> Result<(), NetworkError> {
+    pub fn begin_message(&mut self, message: &DfsRoutedMessage) -> Result<(), NetworkError> {
         if message.target_node_id != self.local_node_id {
             return Err(NetworkError::FrameTargetMismatch {
                 requested_target_node_id: self.local_node_id.clone(),
-                frame_target_node_id: message.target_node_id,
+                frame_target_node_id: message.target_node_id.clone(),
             });
         }
         self.return_node_id = Some(message.source_node_id.clone());
-        let frame = protocol::dfs_protocol_frame_from_routed_message(&message)?;
-        self.inbound_frames.push_back(InboundFrame {
-            received_by: self.local_node_id.clone(),
-            frame,
-        });
         Ok(())
     }
 
@@ -9129,30 +9124,41 @@ impl NetworkedDfsService<DfsEndpointServedMessageTransport> {
         &mut self,
         command: DfsMessageCommand,
     ) -> Result<DfsMessageProcessResult, DfsError> {
-        if command.routed_message.target_node_id != self.node_id {
-            return Err(DfsError::Network {
-                message: format!(
-                    "dfs message target {} does not match local node {}",
-                    command.routed_message.target_node_id, self.node_id
-                ),
-            });
-        }
         let request_id = command.request_id;
         let allow_write_repair_progress =
             dfs_network_message_allows_write_repair_progress(&command.routed_message.message);
         self.transport
-            .enqueue_message(command.routed_message)
+            .begin_message(&command.routed_message)
             .map_err(DfsError::from_network)?;
         let mut events = Vec::new();
+        if let Err(error) =
+            self.process_routed_message_with_options(command.routed_message, false, &mut events)
+        {
+            self.transport.finish_message();
+            return Err(error);
+        }
         for _ in 0..DFS_PROTOCOL_FRAME_DRAIN_MAX_PASSES {
-            let batch = match self.process_incoming_with_options(false) {
-                Ok(batch) => batch,
+            let pending = match self
+                .transport
+                .pending_incoming_count()
+                .map_err(DfsError::from_network)
+            {
+                Ok(pending) => pending,
                 Err(error) => {
                     self.transport.finish_message();
                     return Err(error);
                 }
             };
-            events.extend(batch);
+            if pending != Some(0) {
+                let batch = match self.process_incoming_with_options(false) {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        self.transport.finish_message();
+                        return Err(error);
+                    }
+                };
+                events.extend(batch);
+            }
             let scheduled = if allow_write_repair_progress {
                 let (scheduled, repair_events) = self.retry_pending_repairs_best_effort();
                 events.extend(repair_events);
@@ -9290,27 +9296,38 @@ pub(crate) fn process_cluster_dfs_message_command(
     command: DfsMessageCommand,
     control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
 ) -> Result<Option<DfsMessageCommandProcessResult>, DfsError> {
-    let request_id = command.request_id;
-    let frame = protocol::dfs_protocol_frame_from_routed_message(&command.routed_message)
-        .map_err(DfsError::from_network)?;
-    let Some(result) =
-        process_cluster_dfs_protocol_frame(data_dir, cluster_paths, frame, control_plane)?
-    else {
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| DfsError::Metadata {
+            message: source.to_string(),
+        })?;
+    if !cluster_paths.state.exists() {
         return Ok(None);
     };
-    let outbound_messages = result
-        .outbound_frames
-        .iter()
-        .map(dfs_routed_message_from_network_frame)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(DfsError::from_network)?;
-    Ok(Some(DfsMessageCommandProcessResult {
-        response: DfsMessageResponse {
-            request_id,
-            outbound_messages,
-        },
-        events: result.events,
-    }))
+    let local_node_id = (sinomo_network::read_cluster_state_without_kv(cluster_paths)
+        .map_err(DfsError::from_network)?)
+    .local_node_id;
+    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+    let metadata_backend = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
+    let message_sender: DfsMessageSender = Arc::new(|endpoint, command, _timeout| {
+        Err(DfsPeerTransportError::new(format!(
+            "unexpected DFS message hop to {} while processing test command {}",
+            endpoint.node_id, command.request_id
+        )))
+    });
+    let transport = DfsEndpointServedMessageTransport::new_with_message_sender(
+        local_node_id,
+        Vec::new(),
+        message_sender,
+        DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+    );
+    let mut service = NetworkedDfsService::new(transport, content);
+    if let Some(control_plane) = control_plane {
+        service = service.with_boxed_control_plane(control_plane);
+    }
+    let mut service = service.with_boxed_metadata_backend(metadata_backend)?;
+    let DfsMessageProcessResult { response, events } = service.process_message_command(command)?;
+    Ok(Some(DfsMessageCommandProcessResult { response, events }))
 }
 
 #[cfg(test)]
@@ -15323,141 +15340,170 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let Ok(message) = protocol_message.decode::<DfsNetworkMessage>() else {
                 continue;
             };
-            let trace_message_label = dfs_network_message_trace_label(&message);
-
-            match message {
-                DfsNetworkMessage::StageBlob(command) => {
-                    events.push(self.handle_stage_blob(source_node_id, command)?);
-                }
-                DfsNetworkMessage::StageBlobChunk(command) => {
-                    if let Some(event) = self.handle_stage_blob_chunk(source_node_id, command)? {
-                        events.push(event);
-                    }
-                }
-                DfsNetworkMessage::StagePatch(command) => {
-                    events.push(self.handle_stage_patch(source_node_id, command)?);
-                }
-                DfsNetworkMessage::StagePatchChunk(command) => {
-                    if let Some(event) = self.handle_stage_patch_chunk(source_node_id, command)? {
-                        events.push(event);
-                    }
-                }
-                DfsNetworkMessage::StageBlobResponse(response) => {
-                    if let Some(event) =
-                        self.handle_stage_blob_response(source_node_id, response)?
-                    {
-                        events.push(event);
-                    }
-                }
-                DfsNetworkMessage::CommitVersion(command) => {
-                    events.push(self.handle_commit_version(source_node_id, command)?);
-                }
-                DfsNetworkMessage::RepairReplica(command) => {
-                    events.push(self.handle_repair_replica(source_node_id, command)?);
-                }
-                DfsNetworkMessage::RepairReplicaChunk(command) => {
-                    if let Some(event) =
-                        self.handle_repair_replica_chunk(source_node_id, command)?
-                    {
-                        events.push(event);
-                    }
-                }
-                DfsNetworkMessage::RepairReplicaResponse(response) => {
-                    events.push(self.handle_repair_replica_response(source_node_id, response)?);
-                }
-                DfsNetworkMessage::FetchBlob(command) => {
-                    events.push(self.handle_fetch_blob(source_node_id, command)?);
-                }
-                DfsNetworkMessage::FetchBlobResponse(response) => {
-                    events.push(self.handle_fetch_blob_response(source_node_id.clone(), response)?);
-                }
-                DfsNetworkMessage::FetchBlobResponseChunk(chunk) => {
-                    if let Some(event) =
-                        self.handle_fetch_blob_response_chunk(source_node_id.clone(), chunk)?
-                    {
-                        events.push(event);
-                    }
-                }
-                DfsNetworkMessage::ReadRequest(request) => {
-                    events.push(self.handle_networked_read_request(source_node_id, request)?);
-                }
-                DfsNetworkMessage::ReadResponse(response) => {
-                    events.push(self.handle_networked_read_response(source_node_id, response)?);
-                }
-                DfsNetworkMessage::BulkReadRequest(request) => {
-                    events.push(self.handle_networked_bulk_read_request(source_node_id, request)?);
-                }
-                DfsNetworkMessage::BulkReadResponse(response) => {
-                    events
-                        .push(self.handle_networked_bulk_read_response(source_node_id, response)?);
-                }
-                DfsNetworkMessage::ReadResponseChunk(chunk) => {
-                    if let Some(event) =
-                        self.handle_networked_read_response_chunk(source_node_id, chunk)?
-                    {
-                        events.push(event);
-                    }
-                }
-                DfsNetworkMessage::DistributedWriteRequest(command) => {
-                    events.push(self.handle_distributed_write_request(source_node_id, command)?);
-                }
-                DfsNetworkMessage::DistributedWriteResponse(response) => {
-                    events.push(self.handle_distributed_write_response(source_node_id, response)?);
-                }
-                DfsNetworkMessage::NamespaceRequest(command) => {
-                    events.push(self.handle_namespace_request(source_node_id, command)?);
-                }
-                DfsNetworkMessage::NamespaceResponse(response) => {
-                    events.push(self.handle_namespace_response(source_node_id, response)?);
-                }
-                DfsNetworkMessage::MetadataJournalBatch(command) => {
-                    events.push(self.handle_metadata_journal_batch(source_node_id, command)?);
-                }
-                DfsNetworkMessage::MetadataJournalBatchResponse(response) => {
-                    if let Some(event) =
-                        self.handle_metadata_journal_batch_response(source_node_id, response)?
-                    {
-                        events.push(event);
-                    }
-                }
-                DfsNetworkMessage::MetadataSnapshotInstall(command) => {
-                    events.push(self.handle_metadata_snapshot_install(source_node_id, command)?);
-                }
-                DfsNetworkMessage::MetadataSnapshotInstallResponse(response) => {
-                    if let Some(event) =
-                        self.handle_metadata_snapshot_install_response(source_node_id, response)?
-                    {
-                        events.push(event);
-                    }
-                }
-                DfsNetworkMessage::CommitVersionResponse(_)
-                | DfsNetworkMessage::WriteRequest(_)
-                | DfsNetworkMessage::WriteResponse(_) => {}
-            }
-            let flush_started = Instant::now();
-            self.flush_completed_pending_remote_write_responses(&mut events)?;
-            let flush_ms = flush_started.elapsed().as_millis();
-            if drain_deferred_parent_touches {
-                let drain_started = Instant::now();
-                let deferred_parent_touches = self.deferred_routed_create_parent_touches.len();
-                self.drain_deferred_routed_create_parent_touches();
-                let drain_ms = drain_started.elapsed().as_millis();
-                if flush_ms > 0 || drain_ms > 0 || deferred_parent_touches > 0 {
-                    dfs_perf_trace(format_args!(
-                        "inbound-post-message node={} message={} flush_ms={} deferred_parent_touches={} drain_ms={}",
-                        self.node_id,
-                        trace_message_label,
-                        flush_ms,
-                        deferred_parent_touches,
-                        drain_ms
-                    ));
-                }
-            }
+            self.process_network_message_with_options(
+                source_node_id,
+                message,
+                drain_deferred_parent_touches,
+                &mut events,
+            )?;
         }
 
         self.prune_expired_pending_remote_reads();
         self.last_events = events.clone();
         Ok(events)
+    }
+
+    fn process_routed_message_with_options(
+        &mut self,
+        routed_message: DfsRoutedMessage,
+        drain_deferred_parent_touches: bool,
+        events: &mut Vec<NetworkedDfsServiceEvent>,
+    ) -> Result<(), DfsError> {
+        if routed_message.target_node_id != self.node_id {
+            return Err(DfsError::Network {
+                message: format!(
+                    "dfs message target {} does not match local node {}",
+                    routed_message.target_node_id, self.node_id
+                ),
+            });
+        }
+        self.process_network_message_with_options(
+            routed_message.source_node_id,
+            routed_message.message,
+            drain_deferred_parent_touches,
+            events,
+        )
+    }
+
+    fn process_network_message_with_options(
+        &mut self,
+        source_node_id: NodeId,
+        message: DfsNetworkMessage,
+        drain_deferred_parent_touches: bool,
+        events: &mut Vec<NetworkedDfsServiceEvent>,
+    ) -> Result<(), DfsError> {
+        let trace_message_label = dfs_network_message_trace_label(&message);
+
+        match message {
+            DfsNetworkMessage::StageBlob(command) => {
+                events.push(self.handle_stage_blob(source_node_id, command)?);
+            }
+            DfsNetworkMessage::StageBlobChunk(command) => {
+                if let Some(event) = self.handle_stage_blob_chunk(source_node_id, command)? {
+                    events.push(event);
+                }
+            }
+            DfsNetworkMessage::StagePatch(command) => {
+                events.push(self.handle_stage_patch(source_node_id, command)?);
+            }
+            DfsNetworkMessage::StagePatchChunk(command) => {
+                if let Some(event) = self.handle_stage_patch_chunk(source_node_id, command)? {
+                    events.push(event);
+                }
+            }
+            DfsNetworkMessage::StageBlobResponse(response) => {
+                if let Some(event) = self.handle_stage_blob_response(source_node_id, response)? {
+                    events.push(event);
+                }
+            }
+            DfsNetworkMessage::CommitVersion(command) => {
+                events.push(self.handle_commit_version(source_node_id, command)?);
+            }
+            DfsNetworkMessage::RepairReplica(command) => {
+                events.push(self.handle_repair_replica(source_node_id, command)?);
+            }
+            DfsNetworkMessage::RepairReplicaChunk(command) => {
+                if let Some(event) = self.handle_repair_replica_chunk(source_node_id, command)? {
+                    events.push(event);
+                }
+            }
+            DfsNetworkMessage::RepairReplicaResponse(response) => {
+                events.push(self.handle_repair_replica_response(source_node_id, response)?);
+            }
+            DfsNetworkMessage::FetchBlob(command) => {
+                events.push(self.handle_fetch_blob(source_node_id, command)?);
+            }
+            DfsNetworkMessage::FetchBlobResponse(response) => {
+                events.push(self.handle_fetch_blob_response(source_node_id.clone(), response)?);
+            }
+            DfsNetworkMessage::FetchBlobResponseChunk(chunk) => {
+                if let Some(event) =
+                    self.handle_fetch_blob_response_chunk(source_node_id.clone(), chunk)?
+                {
+                    events.push(event);
+                }
+            }
+            DfsNetworkMessage::ReadRequest(request) => {
+                events.push(self.handle_networked_read_request(source_node_id, request)?);
+            }
+            DfsNetworkMessage::ReadResponse(response) => {
+                events.push(self.handle_networked_read_response(source_node_id, response)?);
+            }
+            DfsNetworkMessage::BulkReadRequest(request) => {
+                events.push(self.handle_networked_bulk_read_request(source_node_id, request)?);
+            }
+            DfsNetworkMessage::BulkReadResponse(response) => {
+                events.push(self.handle_networked_bulk_read_response(source_node_id, response)?);
+            }
+            DfsNetworkMessage::ReadResponseChunk(chunk) => {
+                if let Some(event) =
+                    self.handle_networked_read_response_chunk(source_node_id, chunk)?
+                {
+                    events.push(event);
+                }
+            }
+            DfsNetworkMessage::DistributedWriteRequest(command) => {
+                events.push(self.handle_distributed_write_request(source_node_id, command)?);
+            }
+            DfsNetworkMessage::DistributedWriteResponse(response) => {
+                events.push(self.handle_distributed_write_response(source_node_id, response)?);
+            }
+            DfsNetworkMessage::NamespaceRequest(command) => {
+                events.push(self.handle_namespace_request(source_node_id, command)?);
+            }
+            DfsNetworkMessage::NamespaceResponse(response) => {
+                events.push(self.handle_namespace_response(source_node_id, response)?);
+            }
+            DfsNetworkMessage::MetadataJournalBatch(command) => {
+                events.push(self.handle_metadata_journal_batch(source_node_id, command)?);
+            }
+            DfsNetworkMessage::MetadataJournalBatchResponse(response) => {
+                if let Some(event) =
+                    self.handle_metadata_journal_batch_response(source_node_id, response)?
+                {
+                    events.push(event);
+                }
+            }
+            DfsNetworkMessage::MetadataSnapshotInstall(command) => {
+                events.push(self.handle_metadata_snapshot_install(source_node_id, command)?);
+            }
+            DfsNetworkMessage::MetadataSnapshotInstallResponse(response) => {
+                if let Some(event) =
+                    self.handle_metadata_snapshot_install_response(source_node_id, response)?
+                {
+                    events.push(event);
+                }
+            }
+            DfsNetworkMessage::CommitVersionResponse(_)
+            | DfsNetworkMessage::WriteRequest(_)
+            | DfsNetworkMessage::WriteResponse(_) => {}
+        }
+        let flush_started = Instant::now();
+        self.flush_completed_pending_remote_write_responses(events)?;
+        let flush_ms = flush_started.elapsed().as_millis();
+        if drain_deferred_parent_touches {
+            let drain_started = Instant::now();
+            let deferred_parent_touches = self.deferred_routed_create_parent_touches.len();
+            self.drain_deferred_routed_create_parent_touches();
+            let drain_ms = drain_started.elapsed().as_millis();
+            if flush_ms > 0 || drain_ms > 0 || deferred_parent_touches > 0 {
+                dfs_perf_trace(format_args!(
+                    "inbound-post-message node={} message={} flush_ms={} deferred_parent_touches={} drain_ms={}",
+                    self.node_id, trace_message_label, flush_ms, deferred_parent_touches, drain_ms
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn prune_expired_pending_remote_reads(&mut self) {
