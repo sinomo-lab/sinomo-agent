@@ -3312,7 +3312,7 @@ fn temp_root(name: &str) -> sinomo_testdir::TestDir {
 }
 
 #[test]
-fn networked_dfs_builds_protocol_frames_without_transport_send() {
+fn networked_dfs_builds_routed_messages_without_transport_send() {
     let root = temp_root("networked-dfs-builds-protocol-frames");
     let local = NodeId::from_legacy_named("node_build_frame_local").expect("local");
     let remote = NodeId::from_legacy_named("node_build_frame_remote").expect("remote");
@@ -3320,21 +3320,21 @@ fn networked_dfs_builds_protocol_frames_without_transport_send() {
     let content = LocalContentStore::new(root.join("content")).expect("content");
     let mut dfs = NetworkedDfsService::new(ReceiveOnlyTransport::new(local.clone()), content);
 
-    let first = dfs
-        .next_dfs_network_frame(
-            &remote,
-            DfsNetworkMessage::ReadRequest(DfsReadRequest {
-                request_id: "read-1".to_string(),
-                object_id: object_id.clone(),
-                version: None,
-                content_hash: None,
-                content_size_bytes: None,
-                range_offset: None,
-                range_max_bytes: None,
-                start_chunk_index: 0,
-                max_chunks: 0,
-            }),
-        )
+    let first_routed_message = dfs.next_dfs_routed_message(
+        &remote,
+        DfsNetworkMessage::ReadRequest(DfsReadRequest {
+            request_id: "read-1".to_string(),
+            object_id: object_id.clone(),
+            version: None,
+            content_hash: None,
+            content_size_bytes: None,
+            range_offset: None,
+            range_max_bytes: None,
+            start_chunk_index: 0,
+            max_chunks: 0,
+        }),
+    );
+    let first = protocol::dfs_protocol_frame_from_routed_message(&first_routed_message)
         .expect("first frame");
 
     assert_eq!(first.frame_id, NetworkFrameId(1));
@@ -3358,22 +3358,21 @@ fn networked_dfs_builds_protocol_frames_without_transport_send() {
         other => panic!("unexpected DFS payload: {other:?}"),
     }
 
-    let second = dfs
-        .next_dfs_network_frame(
-            &first.target_node_id.clone(),
-            DfsNetworkMessage::ReadRequest(DfsReadRequest {
-                request_id: "read-2".to_string(),
-                object_id: DfsObjectId::from_legacy_named("obj_build_frame_second")
-                    .expect("object"),
-                version: None,
-                content_hash: None,
-                content_size_bytes: None,
-                range_offset: None,
-                range_max_bytes: None,
-                start_chunk_index: 0,
-                max_chunks: 0,
-            }),
-        )
+    let second_routed_message = dfs.next_dfs_routed_message(
+        &first.target_node_id.clone(),
+        DfsNetworkMessage::ReadRequest(DfsReadRequest {
+            request_id: "read-2".to_string(),
+            object_id: DfsObjectId::from_legacy_named("obj_build_frame_second").expect("object"),
+            version: None,
+            content_hash: None,
+            content_size_bytes: None,
+            range_offset: None,
+            range_max_bytes: None,
+            start_chunk_index: 0,
+            max_chunks: 0,
+        }),
+    );
+    let second = protocol::dfs_protocol_frame_from_routed_message(&second_routed_message)
         .expect("second frame");
     assert_eq!(second.frame_id, NetworkFrameId(2));
     assert_eq!(second.message.message_id, MeshMessageId(2));
