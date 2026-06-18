@@ -4938,23 +4938,17 @@ async fn send_cluster_relay_request_to_next_hop_async(
     request: &sinomo_network::ObjectRpcRequest,
     timeouts: sinomo_network::DaemonRpcTimeouts,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
-    let request_for_signing = request.clone();
-    let request_auth = tokio::task::spawn_blocking(move || {
-        crate::sign_daemon_rpc_request_for_local_node(&request_for_signing)
-    })
-    .await
-    .map_err(|source| DaemonError::Network {
-        address: format!("cluster relay {}", endpoint.address),
-        detail: format!("cluster relay signing task failed: {source}"),
-    })??;
-    sinomo_network::send_daemon_rpc_to_cluster_endpoint_async(
-        endpoint,
-        Some(&request_auth),
-        request,
-        timeouts,
-    )
-    .await
-    .map_err(DaemonError::from)
+    let runtime = tokio::runtime::Handle::current();
+    let mut host = DaemonSignedEndpointRpcAsyncHost::direct_only(&runtime);
+    let mut client = sinomo_network::ClusterObjectRpcClient::new(&mut host);
+    client
+        .call_endpoint(
+            endpoint,
+            request,
+            sinomo_network::ClusterObjectRpcOptions::new(timeouts),
+        )
+        .await
+        .map_err(DaemonError::from)
 }
 
 fn relay_envelope_inner_expects_streamed_response(
