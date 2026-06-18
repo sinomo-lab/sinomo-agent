@@ -894,102 +894,58 @@ impl DfsMessageTransport for DroppingSendTransport {
     }
 }
 
-struct DirectReadTransport {
+fn endpoint_transport_with_direct_read_sender(
     local_node_id: NodeId,
+    remote_node_id: NodeId,
     bytes: Vec<u8>,
     direct_error: Option<String>,
     direct_calls: Arc<Mutex<Vec<DfsDirectReadRequest>>>,
-    protocol_send_calls: Arc<Mutex<usize>>,
-}
-
-impl DirectReadTransport {
-    fn new(
-        local_node_id: NodeId,
-        bytes: Vec<u8>,
-        direct_calls: Arc<Mutex<Vec<DfsDirectReadRequest>>>,
-        protocol_send_calls: Arc<Mutex<usize>>,
-    ) -> Self {
-        Self {
-            local_node_id,
-            bytes,
-            direct_error: None,
-            direct_calls,
-            protocol_send_calls,
-        }
-    }
-
-    fn with_direct_error(
-        local_node_id: NodeId,
-        direct_error: impl Into<String>,
-        direct_calls: Arc<Mutex<Vec<DfsDirectReadRequest>>>,
-        protocol_send_calls: Arc<Mutex<usize>>,
-    ) -> Self {
-        Self {
-            local_node_id,
-            bytes: Vec::new(),
-            direct_error: Some(direct_error.into()),
-            direct_calls,
-            protocol_send_calls,
-        }
-    }
-}
-
-impl DfsTransportIdentity for DirectReadTransport {
-    fn local_node_id(&self) -> &NodeId {
-        &self.local_node_id
-    }
-}
-
-impl DfsMessageTransport for DirectReadTransport {
-    fn send_routed_message(
-        &mut self,
-        _target_node_id: &NodeId,
-        _message: DfsRoutedMessage,
-    ) -> Result<(), NetworkError> {
-        *self
-            .protocol_send_calls
-            .lock()
-            .expect("protocol send calls") += 1;
-        Err(NetworkError::Io {
-            operation: "test protocol send".to_string(),
-            detail: "direct read test should not use protocol send".to_string(),
-        })
-    }
-
-    fn send_direct_read(
-        &mut self,
-        _target_node_id: &NodeId,
-        request: &DfsDirectReadRequest,
-    ) -> Result<Option<DfsReadResponse>, NetworkError> {
-        self.direct_calls
+    message_send_calls: Arc<Mutex<usize>>,
+) -> DfsEndpointTransport {
+    let direct_calls_for_sender = Arc::clone(&direct_calls);
+    let bytes_for_sender = bytes.clone();
+    let direct_sender: DfsDirectReadSender = Arc::new(move |_endpoint, request, _timeout| {
+        direct_calls_for_sender
             .lock()
             .expect("direct calls")
             .push(request.clone());
-        if let Some(detail) = &self.direct_error {
-            return Err(NetworkError::Io {
-                operation: "test direct read".to_string(),
-                detail: detail.clone(),
-            });
+        if let Some(detail) = &direct_error {
+            return Err(DfsPeerTransportError::new(detail.clone()));
         }
-        Ok(Some(DfsReadResponse {
+        Ok(DfsReadResponse {
             request_id: request.request_id.clone(),
             object_id: request.object_id.clone(),
             result: DfsReadResult::Found(DfsReadData {
                 object_id: request.object_id.clone(),
                 version: request.version.clone(),
                 content_hash: Some(request.content_hash.clone()),
-                bytes: self.bytes.clone(),
+                bytes: bytes_for_sender.clone(),
             }),
-        }))
-    }
-
-    fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
-        Ok(Vec::new())
-    }
-
-    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
-        Ok(Some(0))
-    }
+        })
+    });
+    let message_send_calls_for_sender = Arc::clone(&message_send_calls);
+    let message_sender: DfsMessageSender = Arc::new(move |_endpoint, _command, _timeout| {
+        *message_send_calls_for_sender
+            .lock()
+            .expect("message send calls") += 1;
+        Err(DfsPeerTransportError::new(
+            "message sender should not be used by direct-read-eligible messages",
+        ))
+    });
+    let async_sender: AsyncDfsMessageSender = Arc::new(|_endpoint, _command, _timeout| {
+        Box::pin(async {
+            Err(DfsPeerTransportError::new(
+                "async sender should not be used by direct-read tests",
+            ))
+        })
+    });
+    DfsEndpointTransport::new_with_peer_senders(
+        local_node_id,
+        vec![test_endpoint(&remote_node_id, "192.0.2.17:21353")],
+        message_sender,
+        async_sender,
+        direct_sender,
+    )
 }
 
 fn test_routed_write_command(
@@ -1956,92 +1912,73 @@ fn endpoint_transport_sends_rpc_and_queues_returned_frames() {
 }
 
 #[test]
-fn endpoint_transport_direct_read_uses_direct_sender_without_queuing_frame() {
+fn endpoint_transport_read_message_uses_direct_sender_and_queues_response() {
     let local = NodeId::from_legacy_named("node_dfs_endpoint_direct_local").expect("local");
     let remote = NodeId::from_legacy_named("node_dfs_endpoint_direct_remote").expect("remote");
-    let endpoint = test_endpoint(&remote, "192.0.2.17:21353");
     let object_id = DfsObjectId::generate();
     let version = DfsVersion::generate();
     let bytes = b"direct endpoint read bytes".to_vec();
     let direct_calls = Arc::new(Mutex::new(Vec::new()));
-    let direct_calls_for_sender = Arc::clone(&direct_calls);
-    let bytes_for_sender = bytes.clone();
-    let direct_sender: DfsDirectReadSender = Arc::new(move |endpoint, request, timeout| {
-        direct_calls_for_sender.lock().expect("direct calls").push((
-            endpoint.node_id.clone(),
-            request.clone(),
-            timeout,
-        ));
-        Ok(DfsReadResponse {
-            request_id: request.request_id.clone(),
-            object_id: request.object_id.clone(),
-            result: DfsReadResult::Found(DfsReadData {
-                object_id: request.object_id.clone(),
-                version: request.version.clone(),
-                content_hash: Some(request.content_hash.clone()),
-                bytes: bytes_for_sender.clone(),
-            }),
-        })
-    });
-    let message_sender: DfsMessageSender = Arc::new(|_endpoint, _command, _timeout| {
-        Err(DfsPeerTransportError::new(
-            "protocol sender should not be used by direct read",
-        ))
-    });
-    let async_sender: AsyncDfsMessageSender = Arc::new(|_endpoint, _command, _timeout| {
-        Box::pin(async {
-            Err(DfsPeerTransportError::new(
-                "async sender should not be used by direct read",
-            ))
-        })
-    });
-    let mut transport = DfsEndpointTransport::new_with_peer_senders(
+    let message_send_calls = Arc::new(Mutex::new(0));
+    let mut transport = endpoint_transport_with_direct_read_sender(
         local.clone(),
-        vec![endpoint],
-        message_sender,
-        async_sender,
-        direct_sender,
+        remote.clone(),
+        bytes.clone(),
+        None,
+        Arc::clone(&direct_calls),
+        Arc::clone(&message_send_calls),
     );
-    let request = DfsDirectReadRequest {
-        request_id: "endpoint-direct-read".to_string(),
-        object_id: object_id.clone(),
-        version: version.clone(),
-        content_hash: "blake3:endpoint-direct".to_string(),
-        content_size_bytes: bytes.len() as u64,
+    let message = DfsRoutedMessage {
+        source_node_id: local.clone(),
+        target_node_id: remote.clone(),
+        frame_id: 7,
+        message_id: 9,
+        message: DfsNetworkMessage::ReadRequest(DfsReadRequest {
+            request_id: "endpoint-direct-read".to_string(),
+            object_id: object_id.clone(),
+            version: Some(version.clone()),
+            content_hash: Some("blake3:endpoint-direct".to_string()),
+            content_size_bytes: Some(bytes.len() as u64),
+            range_offset: None,
+            range_max_bytes: None,
+            start_chunk_index: 0,
+            max_chunks: 0,
+        }),
     };
 
-    let response = DfsMessageTransport::send_direct_read(&mut transport, &remote, &request)
-        .expect("send direct read")
-        .expect("direct response");
+    transport
+        .send_routed_message(&remote, message)
+        .expect("send routed read message");
 
-    assert_eq!(
-        direct_calls.lock().expect("direct calls").as_slice(),
-        &[(
-            remote.clone(),
-            request.clone(),
-            DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT
-        )]
-    );
+    let calls = direct_calls.lock().expect("direct calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].object_id, object_id);
+    assert_eq!(calls[0].version, version);
+    assert_eq!(calls[0].content_hash, "blake3:endpoint-direct");
+    assert_eq!(calls[0].content_size_bytes, bytes.len() as u64);
+    drop(calls);
+    assert_eq!(*message_send_calls.lock().expect("message send calls"), 0);
     assert_eq!(
         transport
             .pending_incoming_count()
             .expect("pending incoming frames"),
-        Some(0)
+        Some(1)
     );
-    assert!(
-        transport
-            .drain_incoming()
-            .expect("incoming frames")
-            .is_empty()
-    );
+    let messages = transport
+        .drain_incoming_messages()
+        .expect("incoming messages");
+    assert_eq!(messages.len(), 1);
     assert!(matches!(
-        response.result,
-        DfsReadResult::Found(DfsReadData {
-            object_id: response_object_id,
-            version: response_version,
-            bytes: response_bytes,
+        &messages[0].message,
+        DfsNetworkMessage::ReadResponse(DfsReadResponse {
+            result: DfsReadResult::Found(DfsReadData {
+                object_id: response_object_id,
+                version: response_version,
+                bytes: response_bytes,
+                ..
+            }),
             ..
-        }) if response_object_id == object_id && response_version == version && response_bytes == bytes
+        }) if response_object_id == &object_id && response_version == &version && response_bytes == &bytes
     ));
 }
 
@@ -12345,12 +12282,14 @@ fn uncached_remote_read_direct_transport_completes_without_protocol_frame() {
         .put_object_version(object_id.as_str(), version.as_str(), &bytes)
         .expect("owner content blob");
     let direct_calls = Arc::new(Mutex::new(Vec::new()));
-    let protocol_send_calls = Arc::new(Mutex::new(0));
-    let transport = DirectReadTransport::new(
+    let message_send_calls = Arc::new(Mutex::new(0));
+    let transport = endpoint_transport_with_direct_read_sender(
         reader.clone(),
+        owner.clone(),
         bytes.clone(),
+        None,
         Arc::clone(&direct_calls),
-        Arc::clone(&protocol_send_calls),
+        Arc::clone(&message_send_calls),
     );
     let mut reader_dfs = NetworkedDfsService::new(
         transport,
@@ -12377,9 +12316,9 @@ fn uncached_remote_read_direct_transport_completes_without_protocol_frame() {
         vec![owner.clone()]
     );
     assert_eq!(
-        *protocol_send_calls.lock().expect("protocol send calls"),
+        *message_send_calls.lock().expect("message send calls"),
         0,
-        "direct transport should avoid the normal protocol-frame send path"
+        "direct-read-eligible message should avoid the normal DFS message RPC path"
     );
     let calls = direct_calls.lock().expect("direct calls");
     assert_eq!(calls.len(), 1);
@@ -12389,8 +12328,8 @@ fn uncached_remote_read_direct_transport_completes_without_protocol_frame() {
     assert_eq!(calls[0].content_size_bytes, manifest.size_bytes);
     drop(calls);
     assert!(
-        reader_dfs.pending_reads.is_empty(),
-        "synchronous direct read completion should clear pending state immediately"
+        !reader_dfs.pending_reads.is_empty(),
+        "direct read responses now re-enter through the normal incoming message path"
     );
 
     let events = reader_dfs
@@ -12417,12 +12356,14 @@ fn failed_uncached_remote_direct_read_cleans_pending_state() {
     let object_id = DfsObjectId::from_legacy_named("obj_uncached_error").expect("object");
     let version = DfsVersion::from_legacy_named("version_uncached_error").expect("version");
     let direct_calls = Arc::new(Mutex::new(Vec::new()));
-    let protocol_send_calls = Arc::new(Mutex::new(0));
-    let transport = DirectReadTransport::with_direct_error(
+    let message_send_calls = Arc::new(Mutex::new(0));
+    let transport = endpoint_transport_with_direct_read_sender(
         reader.clone(),
-        "direct read failed",
+        owner.clone(),
+        Vec::new(),
+        Some("direct read failed".to_string()),
         Arc::clone(&direct_calls),
-        Arc::clone(&protocol_send_calls),
+        Arc::clone(&message_send_calls),
     );
     let mut reader_dfs = NetworkedDfsService::new(
         transport,
@@ -12452,9 +12393,9 @@ fn failed_uncached_remote_direct_read_cleans_pending_state() {
     );
     assert_eq!(direct_calls.lock().expect("direct calls").len(), 1);
     assert_eq!(
-        *protocol_send_calls.lock().expect("protocol send calls"),
+        *message_send_calls.lock().expect("message send calls"),
         0,
-        "direct-read errors should not fall through to a duplicate protocol send"
+        "direct-read errors should not fall through to a duplicate DFS message send"
     );
     assert!(
         reader_dfs.pending_reads.is_empty(),

@@ -167,13 +167,6 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         target_node_id: &NodeId,
         message: DfsRoutedMessage,
     ) -> Result<(), NetworkError>;
-    fn send_direct_read(
-        &mut self,
-        _target_node_id: &NodeId,
-        _request: &DfsDirectReadRequest,
-    ) -> Result<Option<DfsReadResponse>, NetworkError> {
-        Ok(None)
-    }
     fn send_detached_routed_message(
         &mut self,
         target_node_id: &NodeId,
@@ -651,7 +644,6 @@ pub(crate) fn dfs_direct_read_rpc_request_from_message_command(
     dfs_direct_read_rpc_request(&request).map(Some)
 }
 
-#[cfg(test)]
 fn dfs_direct_read_request_from_read_request(
     request: &DfsReadRequest,
 ) -> Option<DfsDirectReadRequest> {
@@ -5440,7 +5432,6 @@ pub struct NetworkedDfsService<T> {
     active_replica_stages: BTreeMap<DfsObjectId, ActiveReplicaStage>,
     pending_writes: BTreeMap<String, PendingNetworkedWrite>,
     pending_reads: BTreeMap<String, PendingNetworkedRead>,
-    completed_direct_read_events: VecDeque<NetworkedDfsServiceEvent>,
     transient_remote_read_pruned_locations:
         BTreeMap<(DfsObjectId, DfsVersion, Option<String>), BTreeSet<NodeId>>,
     incoming_read_transfers: BTreeMap<String, InProgressReadTransfer>,
@@ -8123,17 +8114,6 @@ pub type AsyncDfsMessageSender = Arc<
         + Sync,
 >;
 
-pub type AsyncDfsDirectReadSender = Arc<
-    dyn for<'a> Fn(
-            &'a ClusterEndpointRecord,
-            &'a DfsDirectReadRequest,
-            Duration,
-        )
-            -> DfsPeerTransportFuture<'a, Result<DfsReadResponse, DfsPeerTransportError>>
-        + Send
-        + Sync,
->;
-
 pub type AsyncDfsMetadataJournalBatchSender = Arc<
     dyn for<'a> Fn(
             &'a ClusterEndpointRecord,
@@ -8513,6 +8493,20 @@ impl DfsEndpointTransport {
                 &routed_message,
                 require_local_source,
             )?;
+            if let Some(returned_messages) = self.try_send_direct_read_message_to_endpoint(
+                endpoints.clone(),
+                &target_node_id,
+                &routed_message,
+            )? {
+                for returned_message in returned_messages {
+                    pending.push_back((
+                        returned_message.target_node_id.clone(),
+                        returned_message,
+                        false,
+                    ));
+                }
+                continue;
+            }
             let Some(sender) = self.sender.as_ref().cloned() else {
                 return Err(NetworkError::Io {
                     operation: format!("send DFS message to {target_node_id}"),
@@ -8538,32 +8532,35 @@ impl DfsEndpointTransport {
         Ok(())
     }
 
-    fn send_direct_read_to_endpoint(
-        &mut self,
+    fn try_send_direct_read_message_to_endpoint(
+        &self,
+        endpoints: Vec<ClusterEndpointRecord>,
         target_node_id: &NodeId,
-        request: &DfsDirectReadRequest,
-    ) -> Result<Option<DfsReadResponse>, NetworkError> {
-        if target_node_id == &self.local_node_id {
-            return Ok(None);
-        }
-        let endpoints = self
-            .endpoints_by_node_id
-            .get(target_node_id)
-            .cloned()
-            .ok_or_else(|| NetworkError::UnknownNode {
-                node_id: target_node_id.clone(),
-            })?;
+        routed_message: &DfsRoutedMessage,
+    ) -> Result<Option<Vec<DfsRoutedMessage>>, NetworkError> {
         let Some(sender) = self.direct_read_sender.as_ref().cloned() else {
             return Ok(None);
         };
-        send_dfs_direct_read_to_endpoint(
+        let DfsNetworkMessage::ReadRequest(read_request) = &routed_message.message else {
+            return Ok(None);
+        };
+        let Some(request) = dfs_direct_read_request_from_read_request(read_request) else {
+            return Ok(None);
+        };
+        let response = send_dfs_direct_read_to_endpoint(
             endpoints,
             sender,
             self.connect_timeout,
             target_node_id.clone(),
-            request,
-        )
-        .map(Some)
+            &request,
+        )?;
+        Ok(Some(vec![DfsRoutedMessage {
+            source_node_id: target_node_id.clone(),
+            target_node_id: routed_message.source_node_id.clone(),
+            frame_id: routed_message.frame_id,
+            message_id: routed_message.message_id,
+            message: DfsNetworkMessage::ReadResponse(response),
+        }]))
     }
 
     fn send_routed_message_to_endpoint_detached(
@@ -8924,14 +8921,6 @@ impl DfsMessageTransport for DfsEndpointTransport {
         self.send_routed_message_to_endpoint(target_node_id, message, true)
     }
 
-    fn send_direct_read(
-        &mut self,
-        target_node_id: &NodeId,
-        request: &DfsDirectReadRequest,
-    ) -> Result<Option<DfsReadResponse>, NetworkError> {
-        self.send_direct_read_to_endpoint(target_node_id, request)
-    }
-
     fn send_detached_routed_message(
         &mut self,
         target_node_id: &NodeId,
@@ -9186,17 +9175,9 @@ impl NetworkedDfsService<DfsEndpointServedMessageTransport> {
         messages: Vec<DfsRoutedMessage>,
     ) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
         self.prune_idle_chunk_transfers();
-        let mut direct_events = self
-            .completed_direct_read_events
-            .drain(..)
-            .collect::<Vec<_>>();
         let mut events = Vec::new();
         for message in messages {
             self.process_routed_message_with_options(message, false, &mut events)?;
-        }
-        if !direct_events.is_empty() {
-            direct_events.extend(events);
-            events = direct_events;
         }
         self.prune_expired_pending_remote_reads();
         self.last_events = events.clone();
@@ -9350,7 +9331,6 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             active_replica_stages: BTreeMap::new(),
             pending_writes: BTreeMap::new(),
             pending_reads: BTreeMap::new(),
-            completed_direct_read_events: VecDeque::new(),
             transient_remote_read_pruned_locations: BTreeMap::new(),
             incoming_read_transfers: BTreeMap::new(),
             incoming_read_memory_transfers: BTreeMap::new(),
@@ -9530,10 +9510,6 @@ where
         &mut self,
     ) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
         self.prune_idle_chunk_transfers();
-        let mut direct_events = self
-            .completed_direct_read_events
-            .drain(..)
-            .collect::<Vec<_>>();
         if self
             .transport
             .pending_incoming_count_async()
@@ -9543,18 +9519,14 @@ where
         {
             self.flush_deferred_untracked_routed_write_responses_async()
                 .await?;
-            return Ok(direct_events);
+            return Ok(Vec::new());
         }
         let inbound_messages = self
             .transport
             .drain_incoming_messages_async()
             .await
             .map_err(DfsError::from_network)?;
-        let mut events = self.process_routed_messages_with_options(inbound_messages, true)?;
-        if !direct_events.is_empty() {
-            direct_events.extend(events);
-            events = direct_events;
-        }
+        let events = self.process_routed_messages_with_options(inbound_messages, true)?;
         self.flush_deferred_untracked_routed_write_responses_async()
             .await?;
         Ok(events)
@@ -12427,41 +12399,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             next_retry_at: now + DFS_REMOTE_READ_RETRY_DELAY,
             cache_response,
         };
-        if direct_uncached_full_read
-            && let (Some(version), Some(content_hash), Some(content_size_bytes)) = (
-                read_request.version.clone(),
-                read_request.content_hash.clone(),
-                read_request.content_size_bytes,
-            )
-        {
-            let direct_request = DfsDirectReadRequest {
-                request_id: request_id.clone(),
-                object_id: read_request.object_id.clone(),
-                version,
-                content_hash,
-                content_size_bytes,
-            };
-            self.pending_reads
-                .insert(request_id.clone(), pending.clone());
-            match self
-                .transport
-                .send_direct_read(target_node_id, &direct_request)
-            {
-                Ok(Some(response)) => {
-                    let event =
-                        self.handle_networked_read_response(target_node_id.clone(), response)?;
-                    self.completed_direct_read_events.push_back(event);
-                    return Ok(true);
-                }
-                Ok(None) => {
-                    self.pending_reads.remove(&request_id);
-                }
-                Err(error) => {
-                    self.pending_reads.remove(&request_id);
-                    return Err(DfsError::from_network(error));
-                }
-            }
-        }
         let sent = self.send_dfs_message_if_routable(
             target_node_id,
             DfsNetworkMessage::ReadRequest(read_request),
@@ -15225,10 +15162,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         drain_deferred_parent_touches: bool,
     ) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
         self.prune_idle_chunk_transfers();
-        let mut direct_events = self
-            .completed_direct_read_events
-            .drain(..)
-            .collect::<Vec<_>>();
         if self
             .transport
             .pending_incoming_count()
@@ -15237,10 +15170,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         {
             let mut events = Vec::new();
             self.flush_completed_pending_remote_write_responses(&mut events)?;
-            if !direct_events.is_empty() {
-                direct_events.extend(events);
-                events = direct_events;
-            }
             if drain_deferred_parent_touches {
                 self.drain_deferred_routed_create_parent_touches();
             }
@@ -15252,14 +15181,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .transport
             .drain_incoming_messages()
             .map_err(DfsError::from_network)?;
-        let mut events = self.process_routed_messages_with_options(
+        let events = self.process_routed_messages_with_options(
             inbound_messages,
             drain_deferred_parent_touches,
         )?;
-        if !direct_events.is_empty() {
-            direct_events.extend(events);
-            events = direct_events;
-        }
         Ok(events)
     }
 
