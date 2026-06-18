@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,11 @@ static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
 pub enum DurableFileError {
     #[error("storage I/O error at {path}: {detail}")]
-    Io { path: String, detail: String },
+    Io {
+        path: String,
+        kind: io::ErrorKind,
+        detail: String,
+    },
 }
 
 impl DurableFileError {
@@ -30,6 +34,12 @@ impl DurableFileError {
     pub fn detail(&self) -> &str {
         match self {
             DurableFileError::Io { detail, .. } => detail,
+        }
+    }
+
+    pub fn kind(&self) -> io::ErrorKind {
+        match self {
+            DurableFileError::Io { kind, .. } => *kind,
         }
     }
 }
@@ -51,6 +61,91 @@ pub struct DurableObjectFileOptions<'a> {
 pub enum DurableFileSync {
     Data,
     All,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableReadChunk {
+    Complete,
+    CleanEof,
+    Truncated,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableLengthEndian {
+    Big,
+    Little,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableRecordReadOptions {
+    pub length_endian: DurableLengthEndian,
+    pub max_record_bytes: Option<usize>,
+}
+
+impl DurableRecordReadOptions {
+    pub const fn new(length_endian: DurableLengthEndian) -> Self {
+        Self {
+            length_endian,
+            max_record_bytes: None,
+        }
+    }
+
+    pub const fn max_record_bytes(mut self, max_record_bytes: usize) -> Self {
+        self.max_record_bytes = Some(max_record_bytes);
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableRecordAppendOptions {
+    pub length_endian: DurableLengthEndian,
+    pub sync: Option<DurableFileSync>,
+}
+
+impl DurableRecordAppendOptions {
+    pub const fn new(length_endian: DurableLengthEndian) -> Self {
+        Self {
+            length_endian,
+            sync: None,
+        }
+    }
+
+    pub const fn sync(mut self, sync: DurableFileSync) -> Self {
+        self.sync = Some(sync);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DurableRecord {
+    pub bytes: Vec<u8>,
+    pub record_start: u64,
+    pub record_end: u64,
+    pub file_len: u64,
+}
+
+#[derive(Debug)]
+pub struct DurableAppendFile {
+    pub file: File,
+    pub created: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableAppendFileOptions {
+    pub sync_parent_on_create: bool,
+}
+
+impl DurableAppendFileOptions {
+    pub const fn new() -> Self {
+        Self {
+            sync_parent_on_create: true,
+        }
+    }
+
+    pub const fn without_parent_sync(mut self) -> Self {
+        self.sync_parent_on_create = false;
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,6 +178,324 @@ impl<'a> DurableObjectFileOptions<'a> {
             temp_label,
         }
     }
+}
+
+pub fn read_full_chunk<R: Read>(
+    reader: &mut R,
+    buf: &mut [u8],
+) -> Result<DurableReadChunk, DurableFileError> {
+    read_full_chunk_with_observer("stream", reader, buf, |_| {})
+}
+
+pub fn read_full_chunk_with_observer<R, F>(
+    path: impl std::fmt::Display,
+    reader: &mut R,
+    buf: &mut [u8],
+    mut on_read: F,
+) -> Result<DurableReadChunk, DurableFileError>
+where
+    R: Read,
+    F: FnMut(u64),
+{
+    let mut offset = 0;
+    while offset < buf.len() {
+        match reader.read(&mut buf[offset..]) {
+            Ok(0) if offset == 0 => return Ok(DurableReadChunk::CleanEof),
+            Ok(0) => return Ok(DurableReadChunk::Truncated),
+            Ok(read) => {
+                offset += read;
+                on_read(read as u64);
+            }
+            Err(source) => return Err(io_error(&path, source)),
+        }
+    }
+    Ok(DurableReadChunk::Complete)
+}
+
+pub fn read_length_prefixed_record(
+    file: &mut File,
+    path: &Path,
+    options: DurableRecordReadOptions,
+) -> Result<Option<DurableRecord>, DurableFileError> {
+    read_length_prefixed_record_with_observer(file, path, options, |_| {})
+}
+
+pub fn read_length_prefixed_record_with_observer<F>(
+    file: &mut File,
+    path: &Path,
+    options: DurableRecordReadOptions,
+    mut on_read: F,
+) -> Result<Option<DurableRecord>, DurableFileError>
+where
+    F: FnMut(u64),
+{
+    let record_start = file
+        .stream_position()
+        .map_err(|source| io_error(path.display(), source))?;
+    let file_len = file
+        .metadata()
+        .map_err(|source| io_error(path.display(), source))?
+        .len();
+    let mut length_bytes = [0_u8; 4];
+    match read_full_chunk_with_observer(path.display(), file, &mut length_bytes, &mut on_read)? {
+        DurableReadChunk::Complete => {}
+        DurableReadChunk::CleanEof | DurableReadChunk::Truncated => {
+            seek_to_record_start(file, path, record_start)?;
+            return Ok(None);
+        }
+    }
+    let length_u32 = match options.length_endian {
+        DurableLengthEndian::Big => u32::from_be_bytes(length_bytes),
+        DurableLengthEndian::Little => u32::from_le_bytes(length_bytes),
+    };
+    let length = length_u32 as usize;
+    if let Some(max_record_bytes) = options.max_record_bytes
+        && length > max_record_bytes
+    {
+        return Err(DurableFileError::Io {
+            path: path.display().to_string(),
+            kind: io::ErrorKind::InvalidData,
+            detail: format!("length-prefixed record is {length} bytes; max is {max_record_bytes}"),
+        });
+    }
+    let record_end = record_start
+        .saturating_add(4)
+        .saturating_add(u64::from(length_u32));
+    if record_end > file_len {
+        seek_to_record_start(file, path, record_start)?;
+        return Ok(None);
+    }
+    let mut bytes = vec![0_u8; length];
+    match read_full_chunk_with_observer(path.display(), file, &mut bytes, &mut on_read)? {
+        DurableReadChunk::Complete => {}
+        DurableReadChunk::CleanEof | DurableReadChunk::Truncated => {
+            seek_to_record_start(file, path, record_start)?;
+            return Ok(None);
+        }
+    }
+    Ok(Some(DurableRecord {
+        bytes,
+        record_start,
+        record_end,
+        file_len,
+    }))
+}
+
+pub fn append_length_prefixed_records<I, B>(
+    file: &mut File,
+    path: &Path,
+    records: I,
+    options: DurableRecordAppendOptions,
+) -> Result<u64, DurableFileError>
+where
+    I: IntoIterator<Item = B>,
+    B: AsRef<[u8]>,
+{
+    let mut written = 0_u64;
+    for record in records {
+        let record = record.as_ref();
+        let len = u32::try_from(record.len()).map_err(|_| DurableFileError::Io {
+            path: path.display().to_string(),
+            kind: io::ErrorKind::InvalidData,
+            detail: format!(
+                "length-prefixed record exceeds u32 length: {}",
+                record.len()
+            ),
+        })?;
+        let length_bytes = match options.length_endian {
+            DurableLengthEndian::Big => len.to_be_bytes(),
+            DurableLengthEndian::Little => len.to_le_bytes(),
+        };
+        file.write_all(&length_bytes)
+            .and_then(|()| file.write_all(record))
+            .map_err(|source| io_error(path.display(), source))?;
+        written = written.saturating_add(4).saturating_add(u64::from(len));
+    }
+    if let Some(sync) = options.sync {
+        sync_file(file, path, sync)?;
+    }
+    Ok(written)
+}
+
+pub fn open_file_for_append(path: &Path) -> Result<DurableAppendFile, DurableFileError> {
+    open_file_for_append_with_options(path, DurableAppendFileOptions::new())
+}
+
+pub fn open_file_for_append_with_options(
+    path: &Path,
+    options: DurableAppendFileOptions,
+) -> Result<DurableAppendFile, DurableFileError> {
+    create_parent_dir(path)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    match OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(file) => {
+            if options.sync_parent_on_create {
+                sync_directory(parent)?;
+            }
+            Ok(DurableAppendFile {
+                file,
+                created: true,
+            })
+        }
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(path)
+            .map(|file| DurableAppendFile {
+                file,
+                created: false,
+            })
+            .map_err(|source| io_error(path.display(), source)),
+        Err(source) => Err(io_error(path.display(), source)),
+    }
+}
+
+pub fn truncate_open_file_and_sync(
+    file: &mut File,
+    path: &Path,
+    offset: u64,
+    sync: DurableFileSync,
+) -> Result<(), DurableFileError> {
+    file.set_len(offset)
+        .and_then(|()| file.seek(SeekFrom::Start(offset)).map(|_| ()))
+        .map_err(|source| io_error(path.display(), source))?;
+    sync_file(file, path, sync)
+}
+
+pub fn truncate_file_and_sync(
+    path: &Path,
+    offset: u64,
+    sync: DurableFileSync,
+) -> Result<bool, DurableFileError> {
+    let len = fs::metadata(path)
+        .map_err(|source| io_error(path.display(), source))?
+        .len();
+    if offset >= len {
+        return Ok(false);
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|source| io_error(path.display(), source))?;
+    truncate_open_file_and_sync(&mut file, path, offset, sync)?;
+    Ok(true)
+}
+
+pub fn remove_file_if_exists_and_sync_parent(path: &Path) -> Result<bool, DurableFileError> {
+    match fs::remove_file(path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                sync_directory(parent)?;
+            }
+            Ok(true)
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(io_error(path.display(), source)),
+    }
+}
+
+pub fn remove_empty_dir_if_exists_and_sync_parent(path: &Path) -> Result<bool, DurableFileError> {
+    match fs::remove_dir(path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                sync_directory(parent)?;
+            }
+            Ok(true)
+        }
+        Err(source)
+            if source.kind() == io::ErrorKind::NotFound
+                || source.kind() == io::ErrorKind::DirectoryNotEmpty =>
+        {
+            Ok(false)
+        }
+        Err(source) => Err(io_error(path.display(), source)),
+    }
+}
+
+pub fn file_blake3_hash_and_size(path: &Path) -> Result<(blake3::Hash, u64), DurableFileError> {
+    let mut file = File::open(path).map_err(|source| io_error(path.display(), source))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut size_bytes = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| io_error(path.display(), source))?;
+        if read == 0 {
+            break;
+        }
+        size_bytes = size_bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| DurableFileError::Io {
+                path: path.display().to_string(),
+                kind: io::ErrorKind::InvalidData,
+                detail: "content size overflow".to_string(),
+            })?;
+        hasher.update(&buffer[..read]);
+    }
+    Ok((hasher.finalize(), size_bytes))
+}
+
+pub fn write_file_create_new_atomic(
+    path: &Path,
+    content: &[u8],
+    options: DurableAtomicFileOptions<'_>,
+) -> Result<(), DurableFileError> {
+    create_parent_dir(path)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let temp_path = temp_path(parent, path, options.fallback_file_name, options.temp_label);
+    let write_temp_result = write_temp_file(&temp_path, content, false, options.sync);
+    if let Err(error) = write_temp_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    if let Err(source) = fs::hard_link(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(io_error(path.display(), source));
+    }
+    fs::remove_file(&temp_path).map_err(|source| io_error(temp_path.display(), source))?;
+    sync_directory(parent)
+}
+
+pub fn write_files_create_new_relaxed<I, P, B>(
+    files: I,
+    options: DurableAtomicFileOptions<'_>,
+) -> Result<(), DurableFileError>
+where
+    I: IntoIterator<Item = (P, B)>,
+    P: AsRef<Path>,
+    B: AsRef<[u8]>,
+{
+    for (path, content) in files {
+        let path = path.as_ref();
+        let content = content.as_ref();
+        if path.is_file() {
+            continue;
+        }
+        create_parent_dir(path)?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let temp_path = temp_path(parent, path, options.fallback_file_name, options.temp_label);
+        let write_temp_result = write_temp_file_without_sync(&temp_path, content, false);
+        if let Err(error) = write_temp_result {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+        match fs::hard_link(&temp_path, path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                let _ = fs::remove_file(&temp_path);
+                return Err(io_error(path.display(), source));
+            }
+        }
+        fs::remove_file(&temp_path).map_err(|source| io_error(temp_path.display(), source))?;
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -257,6 +670,7 @@ pub fn read_object_file_bytes_from_open_file(
     if len > max_read_bytes {
         return Err(DurableFileError::Io {
             path: path.display().to_string(),
+            kind: io::ErrorKind::InvalidData,
             detail: format!("object file is {len} bytes; max is {max_read_bytes}"),
         });
     }
@@ -269,6 +683,7 @@ pub fn read_object_file_bytes_from_open_file(
     if bytes.len() as u64 > max_read_bytes {
         return Err(DurableFileError::Io {
             path: path.display().to_string(),
+            kind: io::ErrorKind::InvalidData,
             detail: format!("object file read exceeded max of {max_read_bytes} bytes"),
         });
     }
@@ -433,6 +848,7 @@ pub fn replace_file(temp_path: &Path, path: &Path) -> Result<(), DurableFileErro
         {
             fs::remove_file(path).map_err(|remove_source| DurableFileError::Io {
                 path: path.display().to_string(),
+                kind: remove_source.kind(),
                 detail: format!(
                     "replace failed with {}; additionally failed to remove existing file: {}",
                     source, remove_source
@@ -440,6 +856,7 @@ pub fn replace_file(temp_path: &Path, path: &Path) -> Result<(), DurableFileErro
             })?;
             fs::rename(temp_path, path).map_err(|rename_source| DurableFileError::Io {
                 path: format!("{} -> {}", temp_path.display(), path.display()),
+                kind: rename_source.kind(),
                 detail: format!(
                     "replace after removing existing file failed: {}",
                     rename_source
@@ -518,6 +935,23 @@ fn write_temp_file(
     create_new: bool,
     sync: DurableFileSync,
 ) -> Result<(), DurableFileError> {
+    let mut file = write_temp_file_opened(temp_path, content, create_new)?;
+    sync_file(&mut file, temp_path, sync)
+}
+
+fn write_temp_file_without_sync(
+    temp_path: &Path,
+    content: &[u8],
+    create_new: bool,
+) -> Result<(), DurableFileError> {
+    write_temp_file_opened(temp_path, content, create_new).map(|_| ())
+}
+
+fn write_temp_file_opened(
+    temp_path: &Path,
+    content: &[u8],
+    create_new: bool,
+) -> Result<File, DurableFileError> {
     let mut options = OpenOptions::new();
     options.write(true);
     if create_new {
@@ -530,12 +964,25 @@ fn write_temp_file(
         .map_err(|source| io_error(temp_path.display(), source))?;
     file.write_all(content)
         .map_err(|source| io_error(temp_path.display(), source))?;
+    Ok(file)
+}
+
+fn sync_file(file: &mut File, path: &Path, sync: DurableFileSync) -> Result<(), DurableFileError> {
     match sync {
         DurableFileSync::Data => file.sync_data(),
         DurableFileSync::All => file.sync_all(),
     }
-    .map_err(|source| io_error(temp_path.display(), source))?;
-    Ok(())
+    .map_err(|source| io_error(path.display(), source))
+}
+
+fn seek_to_record_start(
+    file: &mut File,
+    path: &Path,
+    record_start: u64,
+) -> Result<(), DurableFileError> {
+    file.seek(SeekFrom::Start(record_start))
+        .map(|_| ())
+        .map_err(|source| io_error(path.display(), source))
 }
 
 fn temp_path(parent: &Path, path: &Path, fallback_file_name: &str, temp_label: &str) -> PathBuf {
@@ -557,9 +1004,131 @@ fn file_modified_and_ino(path: &Path) -> (Option<SystemTime>, u64) {
     }
 }
 
-fn io_error(path: impl std::fmt::Display, source: impl ToString) -> DurableFileError {
+fn io_error(path: impl std::fmt::Display, source: io::Error) -> DurableFileError {
     DurableFileError::Io {
         path: path.to_string(),
+        kind: source.kind(),
         detail: source.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn length_prefixed_records_stop_at_torn_tail_and_rewind() {
+        let root = sinomo_testdir::TestDir::new("storage-length-prefixed-torn-tail");
+        let path = root.join("records.slog");
+        let mut append = open_file_for_append(&path).expect("open append");
+        append_length_prefixed_records(
+            &mut append.file,
+            &path,
+            [b"alpha".as_slice(), b"beta".as_slice()],
+            DurableRecordAppendOptions::new(DurableLengthEndian::Little)
+                .sync(DurableFileSync::Data),
+        )
+        .expect("append records");
+        append
+            .file
+            .write_all(&10_u32.to_le_bytes())
+            .expect("length");
+        append.file.write_all(b"short").expect("torn body");
+        append.file.sync_all().expect("sync");
+        drop(append);
+
+        let mut file = File::open(&path).expect("open read");
+        let first = read_length_prefixed_record(
+            &mut file,
+            &path,
+            DurableRecordReadOptions::new(DurableLengthEndian::Little),
+        )
+        .expect("read first")
+        .expect("first record");
+        assert_eq!(first.bytes, b"alpha");
+        let second = read_length_prefixed_record(
+            &mut file,
+            &path,
+            DurableRecordReadOptions::new(DurableLengthEndian::Little),
+        )
+        .expect("read second")
+        .expect("second record");
+        assert_eq!(second.bytes, b"beta");
+        let torn_start = file.stream_position().expect("position before torn");
+        assert!(
+            read_length_prefixed_record(
+                &mut file,
+                &path,
+                DurableRecordReadOptions::new(DurableLengthEndian::Little),
+            )
+            .expect("read torn")
+            .is_none()
+        );
+        assert_eq!(
+            file.stream_position().expect("position after torn"),
+            torn_start
+        );
+    }
+
+    #[test]
+    fn create_new_atomic_rejects_existing_and_relaxed_batch_skips_existing() {
+        let root = sinomo_testdir::TestDir::new("storage-create-new-helpers");
+        let path = root.join("nested/object.bin");
+        write_file_create_new_atomic(
+            &path,
+            b"first",
+            DurableAtomicFileOptions::new("tmp", "tmp").sync_all(),
+        )
+        .expect("create first");
+        let error = write_file_create_new_atomic(
+            &path,
+            b"second",
+            DurableAtomicFileOptions::new("tmp", "tmp").sync_all(),
+        )
+        .expect_err("existing target should fail");
+        assert!(error.detail().contains("File exists") || error.detail().contains("exists"));
+        assert_eq!(fs::read(&path).expect("read existing"), b"first");
+
+        let new_path = root.join("batch/new.bin");
+        write_files_create_new_relaxed(
+            [
+                (path.as_path(), b"ignored".as_slice()),
+                (new_path.as_path(), b"created".as_slice()),
+            ],
+            DurableAtomicFileOptions::new("tmp", "tmp"),
+        )
+        .expect("relaxed batch");
+        assert_eq!(fs::read(&path).expect("read skipped"), b"first");
+        assert_eq!(fs::read(&new_path).expect("read created"), b"created");
+    }
+
+    #[test]
+    fn remove_helpers_report_whether_anything_was_removed() {
+        let root = sinomo_testdir::TestDir::new("storage-remove-sync-helpers");
+        let file_path = root.join("dir/file.bin");
+        fs::create_dir_all(file_path.parent().expect("parent")).expect("mkdir");
+        fs::write(&file_path, b"content").expect("write file");
+        assert!(remove_file_if_exists_and_sync_parent(&file_path).expect("remove file"));
+        assert!(!remove_file_if_exists_and_sync_parent(&file_path).expect("missing file"));
+
+        let empty_dir = root.join("empty");
+        fs::create_dir_all(&empty_dir).expect("mkdir empty");
+        assert!(remove_empty_dir_if_exists_and_sync_parent(&empty_dir).expect("remove empty"));
+        assert!(!remove_empty_dir_if_exists_and_sync_parent(&empty_dir).expect("missing dir"));
+
+        let non_empty = root.join("non-empty");
+        fs::create_dir_all(&non_empty).expect("mkdir non-empty");
+        fs::write(non_empty.join("child"), b"content").expect("write child");
+        assert!(!remove_empty_dir_if_exists_and_sync_parent(&non_empty).expect("non-empty dir"));
+    }
+
+    #[test]
+    fn file_blake3_hash_and_size_streams_file_content() {
+        let root = sinomo_testdir::TestDir::new("storage-blake3-file-hash");
+        let path = root.join("content.bin");
+        fs::write(&path, b"abcdef").expect("write");
+        let (hash, size) = file_blake3_hash_and_size(&path).expect("hash");
+        assert_eq!(hash, blake3::hash(b"abcdef"));
+        assert_eq!(size, 6);
     }
 }

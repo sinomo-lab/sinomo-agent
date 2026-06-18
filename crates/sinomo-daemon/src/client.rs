@@ -2058,8 +2058,8 @@ mod tests {
 
     #[test]
     fn daemon_rpc_connectivity_observation_classifies_endpoint_failures() {
-        let response = ObjectRpcResponse::encode_body(crate::DAEMON_STATUS_ROUTE, &())
-            .expect("response");
+        let response =
+            ObjectRpcResponse::encode_body(crate::DAEMON_STATUS_ROUTE, &()).expect("response");
         let started = Instant::now() - Duration::from_millis(5);
 
         let healthy = super::daemon_rpc_connectivity_observation(Ok(&response), started)

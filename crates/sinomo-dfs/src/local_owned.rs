@@ -653,14 +653,14 @@ fn write_local_owned_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), LocalO
 fn expose_durable_file_error(error: durable_file::DurableFileError) -> DfsExposeStoreError {
     DfsExposeStoreError::Io {
         path: PathBuf::from(error.path()),
-        source: io::Error::new(io::ErrorKind::Other, error.detail().to_string()),
+        source: io::Error::new(error.kind(), error.detail().to_string()),
     }
 }
 
 fn local_owned_durable_file_error(error: durable_file::DurableFileError) -> LocalOwnedDfsError {
     LocalOwnedDfsError::Io {
         path: PathBuf::from(error.path()),
-        source: io::Error::new(io::ErrorKind::Other, error.detail().to_string()),
+        source: io::Error::new(error.kind(), error.detail().to_string()),
     }
 }
 

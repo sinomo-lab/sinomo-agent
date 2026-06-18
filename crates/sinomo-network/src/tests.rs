@@ -2868,9 +2868,7 @@ fn iroh_daemon_response_retry_is_limited_to_idempotent_routes() {
     let retry_safe = ObjectRpcRequest::encode_body("/test/retry-safe", "test", &())
         .expect("retry-safe request")
         .with_response_retry_safe();
-    assert!(
-        crate::roaming::iroh_daemon_control_request_allows_response_retry(&retry_safe)
-    );
+    assert!(crate::roaming::iroh_daemon_control_request_allows_response_retry(&retry_safe));
 
     let range = object_rpc_request_from_kv_payload(
         sinomo_kv::cluster_kv_range_prefix_rpc_payload("/").expect("range request"),
