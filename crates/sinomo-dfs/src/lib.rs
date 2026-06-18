@@ -619,20 +619,6 @@ pub fn decode_dfs_message_rpc_response(
     response.decode_body()
 }
 
-pub fn dfs_message_rpc_request_from_protocol_frame_command(
-    command: &DfsProtocolFrameCommand,
-) -> Result<ObjectRpcRequest, NetworkError> {
-    let message_command = dfs_protocol_frame_command_to_message_command(command)?;
-    dfs_message_rpc_request(&message_command)
-}
-
-pub fn dfs_protocol_frame_response_from_message_rpc_response(
-    response: &ObjectRpcResponse,
-) -> Result<DfsProtocolFrameResponse, NetworkError> {
-    let message_response = decode_dfs_message_rpc_response(response)?;
-    dfs_message_response_to_protocol_frame_response(message_response)
-}
-
 #[cfg(test)]
 pub(crate) fn dfs_protocol_frame_rpc_request(
     command: &DfsProtocolFrameCommand,
