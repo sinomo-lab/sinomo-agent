@@ -9,9 +9,8 @@ use fuser::{
 use sinomo_runtime::core::{ClusterBootstrapState, ClusterEndpointRecord};
 use sinomo_runtime::daemon;
 use sinomo_runtime::dfs::{
-    self, DfsControlPlaneKvClient, DfsError, DfsFrameTransport, DfsMessageCommand,
-    DfsMessageResponse, DfsObjectKind, DfsPosixError, DfsTransportIdentity, DfsWriteOptions,
-    LocalContentStore, NetworkedDfsService,
+    self, DfsControlPlaneKvClient, DfsEndpointTransport, DfsError, DfsMessageSender, DfsObjectKind,
+    DfsPeerTransportError, DfsPosixError, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
 };
 use sinomo_runtime::kv::{
     ClusterKvRaftCommandStorage, ClusterKvRaftCommitResult, ClusterKvRaftStore,
@@ -21,9 +20,9 @@ use sinomo_runtime::kv::{
     read_cluster_kv_prefix_entries,
 };
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::network::{self, InboundFrame, NetworkError, NetworkFrame};
+use sinomo_runtime::network::{self, NetworkError};
 use sinomo_runtime::node::NodeId;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -40,7 +39,7 @@ const FUSE_CLUSTER_IROH_FOREGROUND_ATTEMPT_TIMEOUT: Duration = Duration::from_mi
 const FUSE_CLUSTER_RAFT_APPEND_TIMEOUT: Duration = Duration::from_secs(5);
 const FUSE_CLUSTER_RAFT_APPEND_MAX_ATTEMPTS: usize = 32;
 
-type SifsService = NetworkedDfsService<DfsFuseEndpointTransport>;
+type SifsService = NetworkedDfsService<DfsEndpointTransport>;
 
 fn object_rpc_request_from_kv_payload(
     payload: sinomo_runtime::kv::ClusterKvRpcPayload,
@@ -1005,7 +1004,12 @@ fn open_sifs_service(data_dir: Option<PathBuf>) -> Result<OpenedSifsService> {
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
         .map_err(|source| DfsFuseError::Dfs(source.to_string()))?;
     let mut service = NetworkedDfsService::new(
-        DfsFuseEndpointTransport::new(local_node_id.clone(), endpoints),
+        DfsEndpointTransport::with_message_sender(
+            local_node_id.clone(),
+            endpoints,
+            DEFAULT_FUSE_TIMEOUT,
+            dfs_fuse_message_sender(),
+        ),
         content,
     );
     if cluster_paths.kv_snapshot.exists() {
@@ -1649,164 +1653,15 @@ impl network::ClusterSignedEndpointRpcAsyncHost for DfsFuseSignedObjectRpcHost {
     }
 }
 
-#[derive(Clone)]
-struct DfsFuseEndpointTransport {
-    local_node_id: NodeId,
-    endpoints_by_node_id: BTreeMap<NodeId, Vec<ClusterEndpointRecord>>,
-    incoming_frames: VecDeque<InboundFrame>,
-    timeout: Duration,
-}
-
-impl std::fmt::Debug for DfsFuseEndpointTransport {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("DfsFuseEndpointTransport")
-            .field("local_node_id", &self.local_node_id)
-            .field("endpoints_by_node_id", &self.endpoints_by_node_id)
-            .field("incoming_frames", &self.incoming_frames)
-            .field("timeout", &self.timeout)
-            .finish()
-    }
-}
-
-impl DfsFuseEndpointTransport {
-    fn new(
-        local_node_id: NodeId,
-        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
-    ) -> Self {
-        let mut endpoints_by_node_id = BTreeMap::<NodeId, Vec<ClusterEndpointRecord>>::new();
-        for endpoint in endpoints {
-            if endpoint.node_id != local_node_id {
-                endpoints_by_node_id
-                    .entry(endpoint.node_id.clone())
-                    .or_default()
-                    .push(endpoint);
-            }
-        }
-        Self {
-            local_node_id,
-            endpoints_by_node_id,
-            incoming_frames: VecDeque::new(),
-            timeout: DEFAULT_FUSE_TIMEOUT,
-        }
-    }
-
-    fn deliver_returned_frame(
-        &mut self,
-        frame: NetworkFrame,
-    ) -> std::result::Result<(), NetworkError> {
-        let target_node_id = frame.target_node_id.clone();
-        if target_node_id == self.local_node_id {
-            self.incoming_frames.push_back(InboundFrame {
-                received_by: self.local_node_id.clone(),
-                frame,
-            });
-            return Ok(());
-        }
-        self.send_frame_to_endpoint(&target_node_id, frame, false)
-    }
-
-    fn send_frame_to_endpoint(
-        &mut self,
-        target_node_id: &NodeId,
-        frame: NetworkFrame,
-        require_local_source: bool,
-    ) -> std::result::Result<(), NetworkError> {
-        if require_local_source && frame.source_node_id != self.local_node_id {
-            return Err(NetworkError::FrameSourceMismatch {
-                local_node_id: self.local_node_id.clone(),
-                source_node_id: frame.source_node_id,
-            });
-        }
-        if !require_local_source
-            && frame.source_node_id != self.local_node_id
-            && !self
-                .endpoints_by_node_id
-                .contains_key(&frame.source_node_id)
-        {
-            return Err(NetworkError::UnknownNode {
-                node_id: frame.source_node_id,
-            });
-        }
-        if &frame.target_node_id != target_node_id {
-            return Err(NetworkError::FrameTargetMismatch {
-                requested_target_node_id: target_node_id.clone(),
-                frame_target_node_id: frame.target_node_id,
-            });
-        }
-        let endpoints = self
-            .endpoints_by_node_id
-            .get(target_node_id)
-            .cloned()
-            .ok_or_else(|| NetworkError::UnknownNode {
-                node_id: target_node_id.clone(),
-            })?;
-        let request = DfsMessageCommand {
-            request_id: format!("fuse_dfs_message_{}", frame.frame_id.0),
-            routed_message: dfs::protocol::dfs_routed_message_from_protocol_frame(&frame).map_err(
-                |source| NetworkError::Serialization {
-                    detail: source.to_string(),
-                },
-            )?,
-        };
-        let mut failures = Vec::new();
-        for endpoint in &endpoints {
-            match send_dfs_message(endpoint, &request, self.timeout) {
-                Ok(response) => {
-                    let outbound_frames = response
-                        .outbound_messages
-                        .iter()
-                        .map(dfs::protocol::dfs_protocol_frame_from_routed_message)
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                        .map_err(|source| NetworkError::Serialization {
-                            detail: source.to_string(),
-                        })?;
-                    for returned_frame in outbound_frames {
-                        self.deliver_returned_frame(returned_frame)?;
-                    }
-                    return Ok(());
-                }
-                Err(error) => failures.push(format!("{} failed: {error}", endpoint.address)),
-            }
-        }
-        Err(NetworkError::Io {
-            operation: format!("send DFS message to {target_node_id}"),
-            detail: failures.join("; "),
-        })
-    }
-}
-
-impl DfsTransportIdentity for DfsFuseEndpointTransport {
-    fn local_node_id(&self) -> &NodeId {
-        &self.local_node_id
-    }
-}
-
-impl DfsFrameTransport for DfsFuseEndpointTransport {
-    fn send(
-        &mut self,
-        target_node_id: &NodeId,
-        frame: NetworkFrame,
-    ) -> std::result::Result<(), NetworkError> {
-        self.send_frame_to_endpoint(target_node_id, frame, true)
-    }
-
-    fn drain_incoming(&mut self) -> std::result::Result<Vec<InboundFrame>, NetworkError> {
-        Ok(self.incoming_frames.drain(..).collect())
-    }
-}
-
-fn send_dfs_message(
-    endpoint: &ClusterEndpointRecord,
-    request: &DfsMessageCommand,
-    timeout: Duration,
-) -> std::result::Result<DfsMessageResponse, DfsFuseError> {
-    let rpc_request = dfs::dfs_message_rpc_request(request)
-        .map_err(|source| DfsFuseError::Daemon(source.to_string()))?;
-    let response = daemon::send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)
-        .map_err(|source| DfsFuseError::Daemon(source.to_string()))?;
-    dfs::decode_dfs_message_rpc_response(&response)
-        .map_err(|source| DfsFuseError::Daemon(source.to_string()))
+fn dfs_fuse_message_sender() -> DfsMessageSender {
+    Arc::new(|endpoint, request, timeout| {
+        let rpc_request = dfs::dfs_message_rpc_request(request)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+        let response = daemon::send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+        dfs::decode_dfs_message_rpc_response(&response)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+    })
 }
 
 fn file_attr(ino: u64, stat: &dfs::DfsStat) -> FileAttr {
