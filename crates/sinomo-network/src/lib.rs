@@ -549,8 +549,8 @@ pub(crate) mod prelude {
     pub(crate) use sinomo_kv::WatchId;
     pub(crate) use sinomo_kv::{
         ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, InProcessKvStore, KvCommand,
-        KvCompare, KvError, KvEvent, KvOp, KvSnapshot, KvTxn, KvTxnResponse,
-        RaftRequestVoteRequest, RaftRequestVoteResponse,
+        KvError, KvEvent, KvOp, KvSnapshot, KvTxn, KvTxnResponse, RaftRequestVoteRequest,
+        RaftRequestVoteResponse,
     };
     #[cfg(test)]
     pub(crate) use sinomo_local::SinomoDataDir;

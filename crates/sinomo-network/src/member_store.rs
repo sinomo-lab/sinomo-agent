@@ -1,17 +1,21 @@
 use crate::connectivity::ClusterConnectivityRecord;
 use crate::endpoint_records::{
-    cleanup_member_iroh_endpoints, cluster_endpoint_list_stable_eq, cluster_endpoint_stable_eq,
-    upsert_member_endpoint,
+    cleanup_cluster_iroh_endpoints, cleanup_member_iroh_endpoints, cluster_endpoint_list_stable_eq,
+    cluster_endpoint_stable_eq, upsert_member_endpoint,
 };
 use crate::error::NetworkError;
 use crate::keyspace::{
     cluster_capability_policy_key, cluster_connectivity_source_prefix, cluster_endpoint_key,
-    cluster_endpoint_prefix, cluster_member_key, cluster_node_status_key,
+    cluster_endpoint_prefix, cluster_identity_key, cluster_member_key, cluster_node_status_key,
     cluster_node_status_key_for_process,
 };
 use crate::kv_txn_ops::push_bounded_txn_success_op;
 use crate::membership::{DAEMON_SHADOW_CLUSTER_ROLE, cluster_capabilities_are_legacy_shadow_only};
-use crate::records::{ClusterCapabilityPolicyRecord, cluster_capability_policy_stable_eq};
+use crate::object::SinomoObjectCodec;
+use crate::records::{
+    ClusterCapabilityPolicyRecord, ClusterIdentityRecord, cluster_capability_policy_stable_eq,
+    cluster_identity_record_stable_eq,
+};
 use sinomo_core::{
     ClusterBootstrapState, ClusterEndpointRecord, ClusterMemberRecord, ClusterMemberRole,
     ClusterMemberState, ClusterNodeStatusRecord,
@@ -149,6 +153,151 @@ pub fn upsert_member_record(state: &mut ClusterBootstrapState, member: ClusterMe
     } else {
         state.members.push(member);
     }
+}
+
+pub(crate) fn cluster_state_sync_txn_from_store(
+    store: &InProcessKvStore,
+    state: &ClusterBootstrapState,
+    validate_config_transition: bool,
+) -> Result<KvTxn, NetworkError> {
+    let mut state = state.clone();
+    cleanup_cluster_iroh_endpoints(&mut state);
+    let new_config = ClusterKvRaftConfigRecord::from(&state);
+    let current_config_entry = store.get(&sinomo_kv::cluster_kv_raft_config_key()).cloned();
+    let mut compares = Vec::new();
+    if let Some(current_config_entry) = &current_config_entry {
+        let current_config: ClusterKvRaftConfigRecord = current_config_entry.decode()?;
+        if validate_config_transition {
+            sinomo_kv::validate_cluster_kv_raft_config_transition(&current_config, &new_config)?;
+        }
+        compares.push(KvCompare::ValueEquals {
+            key: sinomo_kv::cluster_kv_raft_config_key(),
+            value: current_config_entry.value.clone(),
+        });
+    } else {
+        compares.push(KvCompare::Missing {
+            key: sinomo_kv::cluster_kv_raft_config_key(),
+        });
+    }
+
+    let mut success = Vec::new();
+
+    let new_identity = ClusterIdentityRecord::from(&state);
+    let identity_unchanged = store
+        .get(&cluster_identity_key())
+        .and_then(|entry| entry.decode::<ClusterIdentityRecord>().ok())
+        .is_some_and(|stored| cluster_identity_record_stable_eq(&stored, &new_identity));
+    if !identity_unchanged {
+        success.push(KvOp::put_serde(
+            cluster_identity_key(),
+            &new_identity,
+            None,
+        )?);
+    }
+
+    let config_unchanged = current_config_entry
+        .as_ref()
+        .and_then(|entry| entry.decode::<ClusterKvRaftConfigRecord>().ok())
+        .is_some_and(|stored| {
+            sinomo_kv::cluster_kv_raft_config_record_stable_eq(&stored, &new_config)
+        });
+    if !config_unchanged {
+        success.push(KvOp::put_serde(
+            sinomo_kv::cluster_kv_raft_config_key(),
+            &new_config,
+            None,
+        )?);
+    }
+
+    push_stale_member_identity_replacement_deletes(store, &state, &mut success)?;
+
+    for member in &state.members {
+        let member_op = KvOp::put_serde(cluster_member_key(&member.node_id), member, None)?;
+        if cluster_member_put_changes_store(store, &member_op, member) {
+            success.push(member_op);
+        }
+        let policy = ClusterCapabilityPolicyRecord::from(member);
+        let policy_op = KvOp::put_serde(
+            cluster_capability_policy_key(&member.node_id),
+            &policy,
+            None,
+        )?;
+        if cluster_capability_policy_put_changes_store(store, &policy_op, &policy) {
+            success.push(policy_op);
+        }
+
+        let endpoint_prefix = cluster_endpoint_prefix(&member.node_id);
+        let stored_endpoints: BTreeMap<String, (Vec<u8>, Option<ClusterEndpointRecord>)> = store
+            .range_prefix_limited(&endpoint_prefix, MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS)?
+            .into_iter()
+            .map(|entry| {
+                let endpoint =
+                    sinomo_kv::decode_kv_value::<ClusterEndpointRecord>(&entry.value).ok();
+                (entry.key, (entry.value, endpoint))
+            })
+            .collect();
+        let mut desired_endpoints: BTreeMap<String, (Vec<u8>, ClusterEndpointRecord)> =
+            BTreeMap::new();
+        for endpoint in &member.endpoints {
+            let key = cluster_endpoint_key(&member.node_id, endpoint);
+            desired_endpoints.insert(
+                key,
+                (
+                    SinomoObjectCodec::default().encode(endpoint)?,
+                    endpoint.clone(),
+                ),
+            );
+        }
+        if !cluster_endpoint_maps_stable_eq(&stored_endpoints, &desired_endpoints) {
+            for key in stored_endpoints
+                .keys()
+                .filter(|key| !desired_endpoints.contains_key(*key))
+            {
+                success.push(KvOp::Delete { key: key.clone() });
+            }
+            for (key, (value, endpoint)) in desired_endpoints {
+                if !stored_endpoints
+                    .get(&key)
+                    .is_some_and(|(stored_value, stored)| {
+                        stored_value == &value
+                            || stored
+                                .as_ref()
+                                .is_some_and(|stored| cluster_endpoint_stable_eq(stored, &endpoint))
+                    })
+                {
+                    success.push(KvOp::Put {
+                        key,
+                        value,
+                        lease_id: None,
+                    });
+                }
+            }
+        }
+    }
+
+    if success.is_empty() {
+        compares.clear();
+    }
+    Ok(KvTxn {
+        compares,
+        success,
+        failure: Vec::new(),
+    })
+}
+
+fn cluster_endpoint_maps_stable_eq(
+    stored: &BTreeMap<String, (Vec<u8>, Option<ClusterEndpointRecord>)>,
+    desired: &BTreeMap<String, (Vec<u8>, ClusterEndpointRecord)>,
+) -> bool {
+    stored.len() == desired.len()
+        && desired.iter().all(|(key, (desired_value, desired))| {
+            stored.get(key).is_some_and(|(stored_value, stored)| {
+                stored_value == desired_value
+                    || stored
+                        .as_ref()
+                        .is_some_and(|stored| cluster_endpoint_stable_eq(stored, desired))
+            })
+        })
 }
 
 pub(crate) fn cluster_member_update_txn_from_store(
@@ -508,7 +657,7 @@ pub(crate) fn cluster_legacy_shadow_orphan_artifact_cleanup_txns_from_store(
     Ok(txns)
 }
 
-pub(crate) fn cluster_member_put_changes_store(
+fn cluster_member_put_changes_store(
     store: &InProcessKvStore,
     op: &KvOp,
     member: &ClusterMemberRecord,
@@ -528,7 +677,7 @@ pub(crate) fn cluster_member_put_changes_store(
     }
 }
 
-pub(crate) fn push_stale_member_identity_replacement_deletes(
+fn push_stale_member_identity_replacement_deletes(
     store: &InProcessKvStore,
     state: &ClusterBootstrapState,
     ops: &mut Vec<KvOp>,
@@ -576,7 +725,7 @@ pub(crate) fn push_stale_member_identity_replacement_deletes(
     Ok(())
 }
 
-pub(crate) fn cluster_capability_policy_put_changes_store(
+fn cluster_capability_policy_put_changes_store(
     store: &InProcessKvStore,
     op: &KvOp,
     policy: &ClusterCapabilityPolicyRecord,
