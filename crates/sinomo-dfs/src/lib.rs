@@ -112,11 +112,11 @@ use sinomo_events::EventId;
 use sinomo_kv::KvError;
 use sinomo_local::{LocalDataError, SinomoDataDir};
 use sinomo_network::{
-    ClusterPaths, InboundFrame, MeshMessageBody, NetworkError, NetworkFrame, ObjectRpcRequest,
-    ObjectRpcResponse, ProtocolMessage,
+    ClusterPaths, InboundFrame, MeshMessageBody, NetworkError, ObjectRpcRequest, ObjectRpcResponse,
+    ProtocolMessage,
 };
 #[cfg(test)]
-use sinomo_network::{MeshMessage, MeshMessageId, NetworkFrameId};
+use sinomo_network::{MeshMessage, MeshMessageId, NetworkFrame, NetworkFrameId};
 use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -167,24 +167,12 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         target_node_id: &NodeId,
         message: DfsRoutedMessage,
     ) -> Result<(), NetworkError>;
-    fn send(&mut self, target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError> {
-        let message = protocol::dfs_routed_message_from_protocol_frame(&frame)?;
-        self.send_routed_message(target_node_id, message)
-    }
     fn send_direct_read(
         &mut self,
         _target_node_id: &NodeId,
         _request: &DfsDirectReadRequest,
     ) -> Result<Option<DfsReadResponse>, NetworkError> {
         Ok(None)
-    }
-    fn send_detached(
-        &mut self,
-        target_node_id: &NodeId,
-        frame: NetworkFrame,
-    ) -> Result<(), NetworkError> {
-        let message = protocol::dfs_routed_message_from_protocol_frame(&frame)?;
-        self.send_detached_routed_message(target_node_id, message)
     }
     fn send_detached_routed_message(
         &mut self,
@@ -232,18 +220,6 @@ pub trait AsyncDfsMessageTransport: Send {
         target_node_id: &'a NodeId,
         message: DfsRoutedMessage,
     ) -> DfsMessageTransportFuture<'a, Result<(), NetworkError>>;
-
-    fn send_async<'a>(
-        &'a mut self,
-        target_node_id: &'a NodeId,
-        frame: NetworkFrame,
-    ) -> DfsMessageTransportFuture<'a, Result<(), NetworkError>> {
-        Box::pin(async move {
-            let message = protocol::dfs_routed_message_from_protocol_frame(&frame)?;
-            self.send_routed_message_async(target_node_id, message)
-                .await
-        })
-    }
 
     fn drain_incoming_async<'a>(
         &'a mut self,

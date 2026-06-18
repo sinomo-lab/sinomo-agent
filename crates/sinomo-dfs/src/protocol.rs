@@ -734,6 +734,7 @@ pub struct DfsMessageResponse {
     pub outbound_messages: Vec<DfsRoutedMessage>,
 }
 
+#[cfg(test)]
 pub(crate) fn dfs_routed_message_from_protocol_frame(
     frame: &NetworkFrame,
 ) -> Result<DfsRoutedMessage, NetworkError> {
@@ -753,6 +754,7 @@ pub(crate) fn dfs_protocol_frame_from_routed_message(
     dfs_network_frame_from_routed_message(message)
 }
 
+#[cfg(test)]
 fn dfs_network_message_from_frame(frame: &NetworkFrame) -> Result<DfsNetworkMessage, NetworkError> {
     let MeshMessageBody::Protocol(protocol_message) = &frame.message.body else {
         return Err(dfs_protocol_serialization_error(
@@ -786,6 +788,7 @@ fn dfs_network_frame_from_routed_message(
     })
 }
 
+#[cfg(test)]
 fn dfs_protocol_serialization_error(detail: impl Into<String>) -> NetworkError {
     NetworkError::Serialization {
         detail: detail.into(),

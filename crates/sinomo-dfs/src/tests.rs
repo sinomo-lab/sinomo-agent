@@ -94,6 +94,21 @@ fn test_dfs_lookup_frame(
     .expect("test DFS lookup frame")
 }
 
+fn test_dfs_lookup_routed_message(
+    source_node_id: &NodeId,
+    target_node_id: &NodeId,
+    frame_id: u64,
+    path: &str,
+) -> DfsRoutedMessage {
+    dfs_routed_message_from_network_frame(&test_dfs_lookup_frame(
+        source_node_id,
+        target_node_id,
+        frame_id,
+        path,
+    ))
+    .expect("test DFS lookup routed message")
+}
+
 fn test_dfs_frame_from_message_command(command: &DfsMessageCommand) -> NetworkFrame {
     protocol::dfs_protocol_frame_from_routed_message(&command.routed_message)
         .expect("message command frame")
@@ -974,7 +989,7 @@ fn test_routed_write_command(
 }
 
 #[test]
-fn async_dfs_frame_transport_in_process_sends_waits_and_drains() {
+fn async_dfs_message_transport_in_process_sends_waits_and_drains() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -985,22 +1000,10 @@ fn async_dfs_frame_transport_in_process_sends_waits_and_drains() {
         let node_b = NodeId::from_legacy_named("node_dfs_async_frame_b").expect("node b");
         let mut transport_a = network.add_node(node_a.clone());
         let mut transport_b = network.add_node(node_b.clone());
-        let frame = NetworkFrame {
-            frame_id: NetworkFrameId(7),
-            source_node_id: node_a.clone(),
-            target_node_id: node_b.clone(),
-            message: MeshMessage {
-                message_id: MeshMessageId(11),
-                origin_node_id: node_a.clone(),
-                target_node_id: node_b.clone(),
-                body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                    node_id: node_a,
-                    tick: 1,
-                }),
-            },
-        };
+        let message =
+            test_dfs_lookup_routed_message(&node_a, &node_b, 7, "/async/message-transport");
 
-        AsyncDfsMessageTransport::send_async(&mut transport_a, &node_b, frame)
+        AsyncDfsMessageTransport::send_routed_message_async(&mut transport_a, &node_b, message)
             .await
             .expect("send");
         assert!(
@@ -1907,8 +1910,11 @@ fn endpoint_transport_sends_rpc_and_queues_returned_frames() {
         sender,
     );
     let frame = test_dfs_lookup_frame(&local, &remote, 7, "/endpoint/send");
+    let message = dfs_routed_message_from_network_frame(&frame).expect("routed message");
 
-    transport.send(&remote, frame.clone()).expect("send frame");
+    transport
+        .send_routed_message(&remote, message)
+        .expect("send message");
     let recorded = calls.lock().expect("calls lock");
     assert_eq!(recorded.as_slice(), &[(remote.clone(), frame)]);
     drop(recorded);
@@ -2044,11 +2050,12 @@ fn endpoint_transport_async_send_requires_async_sender() {
             Duration::from_millis(1),
             sender,
         );
-        let frame = test_dfs_lookup_frame(&local, &remote, 7, "/endpoint/async-missing");
+        let message = test_dfs_lookup_routed_message(&local, &remote, 7, "/endpoint/async-missing");
 
-        let error = AsyncDfsMessageTransport::send_async(&mut transport, &remote, frame.clone())
-            .await
-            .expect_err("async send should require async sender");
+        let error =
+            AsyncDfsMessageTransport::send_routed_message_async(&mut transport, &remote, message)
+                .await
+                .expect_err("async send should require async sender");
         assert!(error.to_string().contains("without an async sender"));
         assert!(calls.lock().expect("calls lock").is_empty());
         assert_eq!(
@@ -2105,15 +2112,16 @@ fn endpoint_transport_async_sender_does_not_require_sync_sender() {
             sender,
         );
         let frame = test_dfs_lookup_frame(&local, &remote, 7, "/endpoint/async-only");
+        let message = dfs_routed_message_from_network_frame(&frame).expect("routed message");
 
         assert!(
             transport
-                .send(&remote, frame.clone())
+                .send_routed_message(&remote, message.clone())
                 .expect_err("sync send should be unavailable")
                 .to_string()
                 .contains("without a sync sender")
         );
-        AsyncDfsMessageTransport::send_async(&mut transport, &remote, frame.clone())
+        AsyncDfsMessageTransport::send_routed_message_async(&mut transport, &remote, message)
             .await
             .expect("async send frame");
         let recorded = calls.lock().expect("calls lock");
@@ -2197,10 +2205,11 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
             sync_sender,
             async_sender,
         );
-        let sync_frame = test_dfs_lookup_frame(&local, &remote, 11, "/endpoint/dual-sync");
+        let sync_message =
+            test_dfs_lookup_routed_message(&local, &remote, 11, "/endpoint/dual-sync");
         transport
-            .send(&remote, sync_frame)
-            .expect("sync send frame");
+            .send_routed_message(&remote, sync_message)
+            .expect("sync send message");
         assert_eq!(
             sync_calls.lock().expect("sync calls lock").as_slice(),
             &[(remote.clone(), NetworkFrameId(11))]
@@ -2211,10 +2220,11 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
         assert_eq!(incoming[0].received_by, local);
         assert_eq!(incoming[0].frame.source_node_id, remote);
 
-        let async_frame = test_dfs_lookup_frame(&local, &remote, 12, "/endpoint/dual-async");
-        AsyncDfsMessageTransport::send_async(&mut transport, &remote, async_frame)
+        let async_message =
+            test_dfs_lookup_routed_message(&local, &remote, 12, "/endpoint/dual-async");
+        AsyncDfsMessageTransport::send_routed_message_async(&mut transport, &remote, async_message)
             .await
-            .expect("async send frame");
+            .expect("async send message");
         assert_eq!(
             async_calls.lock().expect("async calls lock").as_slice(),
             &[(remote.clone(), NetworkFrameId(12))]
@@ -2280,8 +2290,11 @@ fn endpoint_transport_relays_remote_returned_frames_preserving_source() {
         sender,
     );
     let frame = test_dfs_lookup_frame(&local, &primary, 9, "/endpoint/relay");
+    let message = dfs_routed_message_from_network_frame(&frame).expect("routed message");
 
-    transport.send(&primary, frame).expect("send through relay");
+    transport
+        .send_routed_message(&primary, message)
+        .expect("send through relay");
 
     assert_eq!(
         calls.lock().expect("calls lock").as_slice(),

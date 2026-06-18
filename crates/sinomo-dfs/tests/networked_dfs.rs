@@ -9,11 +9,12 @@ use sinomo_dfs::{
     DfsNodeAdvertisement, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsObjectVersionRecord,
     DfsOwnerHandoffOutcome, DfsReadData, DfsReadResponse, DfsReadResponseChunk, DfsReadResult,
     DfsRepairReplicaChunkCommand, DfsRepairReplicaCommand, DfsRepairReplicaResponse,
-    DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsStageBlobChunkCommand, DfsStageBlobCommand,
-    DfsStageBlobResponse, DfsVersion, DfsWriteIntentState, DfsWriteIntentStatus,
-    LocalSobjMetadataBackend, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
-    NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
-    SharedDfsControlPlaneKvClient, file_system_config_key, sifs_node_files_path,
+    DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsRoutedMessage, DfsStageBlobChunkCommand,
+    DfsStageBlobCommand, DfsStageBlobResponse, DfsVersion, DfsWriteIntentState,
+    DfsWriteIntentStatus, LocalSobjMetadataBackend, NetworkedDfsReadFreshness,
+    NetworkedDfsReadOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
+    NetworkedDfsWriteOutcome, SharedDfsControlPlaneKvClient, file_system_config_key,
+    sifs_node_files_path,
 };
 use sinomo_events::EventId;
 use sinomo_kv::InProcessRaftKvCluster;
@@ -12770,20 +12771,15 @@ fn send_dfs_test_message<T: DfsMessageTransport>(
     target: &NodeId,
     message: DfsNetworkMessage,
 ) {
-    let protocol_message = ProtocolMessage::encode(DFS_PROTOCOL, &message).expect("protocol");
     transport
-        .send(
+        .send_routed_message(
             target,
-            NetworkFrame {
-                frame_id: NetworkFrameId(1),
+            DfsRoutedMessage {
                 source_node_id: source.clone(),
                 target_node_id: target.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(1),
-                    origin_node_id: source.clone(),
-                    target_node_id: target.clone(),
-                    body: MeshMessageBody::Protocol(protocol_message),
-                },
+                frame_id: 1,
+                message_id: 1,
+                message,
             },
         )
         .expect("send DFS test message");
