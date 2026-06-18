@@ -77,6 +77,9 @@ pub use posix::{
 };
 #[cfg(test)]
 use protocol::DFS_PROTOCOL_FRAME_ROUTE;
+#[cfg(test)]
+use protocol::DfsProtocolFrameCommand;
+use protocol::DfsProtocolFrameResponse;
 pub use protocol::{
     DfsBlobTransferResult, DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest,
     DfsBulkReadResponse, DfsCommitVersionCommand, DfsCommitVersionResponse, DfsDirectReadRequest,
@@ -93,7 +96,6 @@ pub use protocol::{
     DfsStageBlobResponse, DfsStagePatchChunkCommand, DfsStagePatchCommand, DfsWriteCommand,
     DfsWriteResponse, DfsWriteResult,
 };
-use protocol::{DfsProtocolFrameCommand, DfsProtocolFrameResponse};
 
 pub type DfsFileSystemId = sinomo_core::Id;
 pub type DfsObjectId = sinomo_core::Id;
@@ -437,7 +439,8 @@ fn dfs_network_frame_from_routed_message(
     .map_err(|source| dfs_network_serialization_error(source.to_string()))
 }
 
-pub fn dfs_protocol_frame_command_to_message_command(
+#[cfg(test)]
+fn dfs_protocol_frame_command_to_message_command(
     command: &DfsProtocolFrameCommand,
 ) -> Result<DfsMessageCommand, NetworkError> {
     Ok(DfsMessageCommand {
@@ -446,7 +449,8 @@ pub fn dfs_protocol_frame_command_to_message_command(
     })
 }
 
-pub fn dfs_message_command_to_protocol_frame_command(
+#[cfg(test)]
+fn dfs_message_command_to_protocol_frame_command(
     command: DfsMessageCommand,
 ) -> Result<DfsProtocolFrameCommand, NetworkError> {
     Ok(DfsProtocolFrameCommand {
@@ -455,7 +459,8 @@ pub fn dfs_message_command_to_protocol_frame_command(
     })
 }
 
-pub fn dfs_protocol_frame_response_to_message_response(
+#[cfg(test)]
+fn dfs_protocol_frame_response_to_message_response(
     response: DfsProtocolFrameResponse,
 ) -> Result<DfsMessageResponse, NetworkError> {
     let outbound_messages = response

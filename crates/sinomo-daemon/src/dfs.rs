@@ -833,7 +833,10 @@ fn handle_daemon_dfs_protocol_frame_on_runtime(
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
-    let message_command = sinomo_dfs::dfs_protocol_frame_command_to_message_command(&command)?;
+    let message_command = DfsMessageCommand {
+        request_id: command.request_id,
+        routed_message: sinomo_dfs::dfs_routed_message_from_protocol_frame(&command.frame)?,
+    };
     let result = process_daemon_dfs_message_command_on_runtime(
         &data_dir,
         &cluster_paths,
