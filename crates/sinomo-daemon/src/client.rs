@@ -416,6 +416,7 @@ where
 pub(crate) struct DaemonSignedEndpointRpcAsyncHost {
     runtime: tokio::runtime::Handle,
     observe_connectivity: bool,
+    allow_local_route_policy: bool,
 }
 
 impl DaemonSignedEndpointRpcAsyncHost {
@@ -423,6 +424,15 @@ impl DaemonSignedEndpointRpcAsyncHost {
         Self {
             runtime: runtime.clone(),
             observe_connectivity,
+            allow_local_route_policy: true,
+        }
+    }
+
+    pub(crate) fn direct_only(runtime: &tokio::runtime::Handle) -> Self {
+        Self {
+            runtime: runtime.clone(),
+            observe_connectivity: false,
+            allow_local_route_policy: false,
         }
     }
 }
@@ -628,6 +638,9 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
         timeouts: sinomo_network::DaemonRpcTimeouts,
     ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_network::ObjectRpcResponse>>
     {
+        if !self.allow_local_route_policy {
+            return Box::pin(async { Ok(None) });
+        }
         let endpoint = endpoint.clone();
         let request = request.clone();
         let request_auth = request_auth.to_vec();
@@ -657,6 +670,9 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
         &'a mut self,
         _endpoint: &'a ClusterEndpointRecord,
     ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_network::ClusterId>> {
+        if !self.allow_local_route_policy {
+            return Box::pin(async { Ok(None) });
+        }
         let runtime = self.runtime.clone();
         Box::pin(async move {
             let Some(paths) = cluster_paths_from_env() else {

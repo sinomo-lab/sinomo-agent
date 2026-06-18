@@ -2535,24 +2535,18 @@ async fn fetch_daemon_status_from_endpoint_direct_async(
         crate::DAEMON_RPC_CATEGORY,
         &(),
     )?;
-    let request_for_signing = request.clone();
-    let signed = tokio::task::spawn_blocking(move || {
-        crate::sign_daemon_rpc_request_for_local_node(&request_for_signing)
-    })
-    .await
-    .map_err(|source| DaemonError::Network {
-        address: endpoint.address.clone(),
-        detail: format!("cluster connectivity probe signing task failed: {source}"),
-    })??;
     let timeouts = sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout);
-    let response = sinomo_network::send_daemon_rpc_to_cluster_endpoint_async(
-        endpoint,
-        Some(&signed),
-        &request,
-        timeouts,
-    )
-    .await
-    .map_err(DaemonError::from)?;
+    let runtime = tokio::runtime::Handle::current();
+    let mut host = DaemonSignedEndpointRpcAsyncHost::direct_only(&runtime);
+    let mut client = sinomo_network::ClusterObjectRpcClient::new(&mut host);
+    let response = client
+        .call_endpoint(
+            endpoint,
+            &request,
+            sinomo_network::ClusterObjectRpcOptions::new(timeouts),
+        )
+        .await
+        .map_err(DaemonError::from)?;
     response.decode_body().map_err(DaemonError::from)
 }
 
