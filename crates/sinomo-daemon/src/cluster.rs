@@ -1197,7 +1197,8 @@ pub(crate) fn prune_local_cluster_raft_uncommitted_tail(
     let Ok(state) = sinomo_network::read_cluster_state_without_kv(&cluster_paths) else {
         return Ok(());
     };
-    let _raft_guard = sinomo_kv::lock_cluster_kv_raft_operation()?;
+    let _raft_guard =
+        sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&cluster_paths.kv_paths())?;
     daemon_cluster_kv_raft_store(&cluster_paths)
         .discard_uncommitted_tail(&state.local_node_id)
         .map(|_| ())?;
@@ -7477,7 +7478,8 @@ mod tests {
         let local_for_holder = local.clone();
         let holder = std::thread::spawn(move || {
             let _raft_guard =
-                sinomo_kv::lock_cluster_kv_raft_operation().expect("raft operation lock");
+                sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&paths_for_holder.kv_paths())
+                    .expect("raft operation lock");
             let _node = paths_for_holder
                 .kv_paths()
                 .raft_store()

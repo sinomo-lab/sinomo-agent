@@ -7848,7 +7848,7 @@ pub(crate) fn handle_locked_cluster_raft_append_request(
     request: ClusterRaftAppendRequest,
     authenticated_peer: &ClusterAuthenticatedPeer,
 ) -> Result<ClusterRaftAppendResponse, NetworkError> {
-    let _raft_guard = sinomo_kv::lock_cluster_kv_raft_operation()?;
+    let _raft_guard = sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths())?;
     handle_cluster_raft_append_request(paths, request, authenticated_peer)
 }
 
@@ -7916,7 +7916,7 @@ pub(crate) fn handle_locked_cluster_raft_vote_request(
     request: ClusterRaftVoteRequest,
     authenticated_peer: &ClusterAuthenticatedPeer,
 ) -> Result<ClusterRaftVoteResponse, NetworkError> {
-    let _raft_guard = sinomo_kv::lock_cluster_kv_raft_operation()?;
+    let _raft_guard = sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths())?;
     handle_cluster_raft_vote_request(paths, request, authenticated_peer)
 }
 

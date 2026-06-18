@@ -17,7 +17,7 @@ use sinomo_runtime::kv::{
     ClusterKvRaftCommandStorage, ClusterKvRaftCommitResult, ClusterKvRaftStore,
     ClusterKvRaftUncommittedAppend, KvCommand, KvEntry, KvError, KvEvent, KvOp, KvRevision,
     KvSnapshot, KvTxn, KvTxnResponse, cluster_kv_raft_local_is_voter,
-    cluster_kv_raft_node_is_voter, lock_cluster_kv_raft_operation, read_cluster_kv_entry,
+    cluster_kv_raft_node_is_voter, lock_cluster_kv_raft_operation_for_paths, read_cluster_kv_entry,
     read_cluster_kv_prefix_entries,
 };
 use sinomo_runtime::local::SinomoDataDir;
@@ -1158,10 +1158,11 @@ fn dfs_fuse_send_daemon_rpc_to_endpoint(
 }
 
 fn with_dfs_fuse_cluster_raft_operation<T>(
+    paths: &network::ClusterPaths,
     operation: &str,
     f: impl FnOnce() -> std::result::Result<T, NetworkError>,
 ) -> std::result::Result<T, NetworkError> {
-    let _guard = lock_cluster_kv_raft_operation()
+    let _guard = lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths())
         .map_err(NetworkError::from)
         .map_err(|error| dfs_fuse_network_error(operation, error))?;
     f()
@@ -1289,7 +1290,7 @@ impl network::ClusterKvTxnQuorumHost for DfsFuseClusterKvTxnQuorumHost {
         paths: &network::ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> std::result::Result<bool, NetworkError> {
-        with_dfs_fuse_cluster_raft_operation("cluster raft leader check", || {
+        with_dfs_fuse_cluster_raft_operation(paths, "cluster raft leader check", || {
             dfs_fuse_cluster_raft_local_is_leader(paths, state)
         })
     }
@@ -1363,7 +1364,7 @@ impl network::ClusterRaftAppendReplicationHost for DfsFuseClusterRaftAppendRepli
         paths: &network::ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> std::result::Result<u64, NetworkError> {
-        with_dfs_fuse_cluster_raft_operation("cluster raft last-log read", || {
+        with_dfs_fuse_cluster_raft_operation(paths, "cluster raft last-log read", || {
             paths
                 .kv_paths()
                 .raft_store()
@@ -1378,7 +1379,7 @@ impl network::ClusterRaftAppendReplicationHost for DfsFuseClusterRaftAppendRepli
         state: &ClusterBootstrapState,
         next_index: u64,
     ) -> std::result::Result<sinomo_runtime::kv::ClusterRaftAppendRequest, NetworkError> {
-        with_dfs_fuse_cluster_raft_operation("cluster raft append request build", || {
+        with_dfs_fuse_cluster_raft_operation(paths, "cluster raft append request build", || {
             dfs_fuse_cluster_kv_raft_store(paths)
                 .build_cluster_raft_append_request_from_next_index(state, next_index)
                 .map_err(Into::into)
@@ -1418,7 +1419,7 @@ impl ClusterKvRaftCommandStorage for DfsFuseClusterRaftQuorumCommitHost<'_> {
         &mut self,
         command: KvCommand,
     ) -> std::result::Result<ClusterKvRaftUncommittedAppend, NetworkError> {
-        with_dfs_fuse_cluster_raft_operation("cluster raft uncommitted append", || {
+        with_dfs_fuse_cluster_raft_operation(self.paths, "cluster raft uncommitted append", || {
             dfs_fuse_cluster_kv_raft_store(self.paths)
                 .append_command_uncommitted_or_no_effect(&self.local_node_id, command)
                 .map_err(Into::into)
@@ -1428,22 +1429,26 @@ impl ClusterKvRaftCommandStorage for DfsFuseClusterRaftQuorumCommitHost<'_> {
     fn discard_cluster_raft_uncommitted_tail_and_clear_leader(
         &mut self,
     ) -> std::result::Result<(), NetworkError> {
-        with_dfs_fuse_cluster_raft_operation("cluster raft discard uncommitted tail", || {
-            let snapshot = dfs_fuse_cluster_kv_raft_store(self.paths)
-                .discard_uncommitted_tail_and_clear_leader(&self.local_node_id)?;
-            sinomo_runtime::kv::write_cluster_kv_snapshot_if_changed(
-                &self.paths.kv_paths(),
-                &snapshot,
-            )?;
-            Ok(())
-        })
+        with_dfs_fuse_cluster_raft_operation(
+            self.paths,
+            "cluster raft discard uncommitted tail",
+            || {
+                let snapshot = dfs_fuse_cluster_kv_raft_store(self.paths)
+                    .discard_uncommitted_tail_and_clear_leader(&self.local_node_id)?;
+                sinomo_runtime::kv::write_cluster_kv_snapshot_if_changed(
+                    &self.paths.kv_paths(),
+                    &snapshot,
+                )?;
+                Ok(())
+            },
+        )
     }
 
     fn commit_cluster_raft_index_with_events(
         &mut self,
         index: u64,
     ) -> std::result::Result<ClusterKvRaftCommitResult, NetworkError> {
-        with_dfs_fuse_cluster_raft_operation("cluster raft index commit", || {
+        with_dfs_fuse_cluster_raft_operation(self.paths, "cluster raft index commit", || {
             let store = dfs_fuse_cluster_kv_raft_store(self.paths);
             let result = store.commit_index_with_events(&self.local_node_id, index)?;
             store.publish_commit_result(&result, |_| false)?;
@@ -1511,7 +1516,7 @@ impl network::ClusterKvTxnForwardHost for DfsFuseClusterKvTxnForwardHost {
         paths: &network::ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> std::result::Result<Option<NodeId>, NetworkError> {
-        with_dfs_fuse_cluster_raft_operation("cluster raft leader lookup", || {
+        with_dfs_fuse_cluster_raft_operation(paths, "cluster raft leader lookup", || {
             dfs_fuse_cluster_raft_known_leader_id(paths, state)
         })
     }

@@ -2536,8 +2536,9 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
             local_node_id: &NodeId,
             snapshot: KvSnapshot,
         ) -> Result<bool, network::NetworkError> {
-            let _raft_guard = sinomo_runtime::kv::lock_cluster_kv_raft_operation()
-                .map_err(network::NetworkError::from)?;
+            let _raft_guard =
+                sinomo_runtime::kv::lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths())
+                    .map_err(network::NetworkError::from)?;
             paths
                 .kv_paths()
                 .local_cache()

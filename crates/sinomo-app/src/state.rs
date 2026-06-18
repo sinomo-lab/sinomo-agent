@@ -72,8 +72,8 @@ impl Tab {
 pub enum ConnectEvent {
     /// Human-readable progress for the status indicator.
     Status(String),
-    /// The connection resolved; the app can become interactive.
-    Connected(Box<Backend>),
+    /// The connection resolved and tab state has been built off the UI thread.
+    Connected(Box<ReadyState>),
 }
 
 /// Everything that requires a resolved backend — populated once connected.
@@ -277,9 +277,9 @@ impl Shared {
     }
 
     /// Drain pending connect events (called by the shell when the UI is woken). Updates the
-    /// status line and, on `Connected`, builds the ready state. Returns `true` if anything
-    /// changed, and `Some(true)` of that when the app *became* ready (so the caller can build the
-    /// tab content). The tuple is `(changed, became_ready)`.
+    /// status line and, on `Connected`, installs the ready state that was built off the UI thread.
+    /// Returns `true` if anything changed, and `Some(true)` of that when the app *became* ready
+    /// (so the caller can build the tab content). The tuple is `(changed, became_ready)`.
     pub fn pump_connect(&self) -> (bool, bool) {
         // Drain without holding the borrow across ReadyState construction (which itself borrows).
         let events: Vec<ConnectEvent> = {
@@ -301,16 +301,14 @@ impl Shared {
                     self.0.borrow_mut().status = status;
                     changed = true;
                 }
-                ConnectEvent::Connected(backend) => {
-                    // Build the tab sub-states off the borrow (a one-time hitch), then commit.
-                    let ready = ReadyState::build(*backend);
+                ConnectEvent::Connected(ready) => {
                     let data_dir = ready.backend.data_dir.clone();
                     let theme_mode = app_config::load_theme(&data_dir);
                     let mut state = self.0.borrow_mut();
                     state.theme_mode = theme_mode;
                     state.data_dir = data_dir;
                     state.status = ready.backend.mode_label();
-                    state.ready = Some(ready);
+                    state.ready = Some(*ready);
                     state.connect_rx = None;
                     changed = true;
                     became_ready = true;

@@ -732,7 +732,7 @@ fn capture_advanced_settings() {
 #[test]
 fn capture_connecting_then_ready() {
     use sinomo_app::backend::Backend;
-    use sinomo_app::state::{AppState, ConnectEvent, Shared};
+    use sinomo_app::state::{AppState, ConnectEvent, ReadyState, Shared};
     use sui::{CustomEvent, Event};
 
     let dir = shots_dir();
@@ -757,8 +757,10 @@ fn capture_connecting_then_ready() {
     // thread would send. The shell drains it, builds the tabs, and becomes interactive.
     let (tx, rx) = std::sync::mpsc::channel();
     shared.borrow_mut().connect_rx = Some(rx);
-    tx.send(ConnectEvent::Connected(Box::new(Backend::local_fallback())))
-        .expect("queue connected");
+    tx.send(ConnectEvent::Connected(Box::new(ReadyState::build(
+        Backend::local_fallback(),
+    ))))
+    .expect("queue connected");
     window
         .root()
         .dispatch_event(Event::Custom(CustomEvent::new(sui::EXTERNAL_WAKE_KIND)))
