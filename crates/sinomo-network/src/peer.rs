@@ -1,5 +1,6 @@
 use crate::error::NetworkError;
 use crate::prelude::*;
+use crate::rpc::ObjectRpcRequest;
 use arc_swap::ArcSwap;
 use std::future::Future;
 use std::pin::Pin;
@@ -573,6 +574,19 @@ pub struct InboundFrame {
     pub frame: NetworkFrame,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct InProcessObjectRpcMessage {
+    pub source_node_id: NodeId,
+    pub target_node_id: NodeId,
+    pub request: ObjectRpcRequest,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct InboundObjectRpcMessage {
+    pub received_by: NodeId,
+    pub message: InProcessObjectRpcMessage,
+}
+
 pub type AsyncNetworkTransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -752,13 +766,13 @@ impl InProcessNetwork {
     }
 
     pub fn add_node(&self, node_id: NodeId) -> InProcessTransport {
-        self.inner
-            .state
-            .lock()
-            .expect("in-process network lock")
-            .mailboxes
+        let mut state = self.inner.state.lock().expect("in-process network lock");
+        state.mailboxes.entry(node_id.clone()).or_default();
+        state
+            .object_rpc_mailboxes
             .entry(node_id.clone())
             .or_default();
+        drop(state);
 
         InProcessTransport {
             local_node_id: node_id,
@@ -776,6 +790,7 @@ struct InProcessNetworkInner {
 #[derive(Clone, Debug, Default)]
 struct InProcessNetworkState {
     mailboxes: BTreeMap<NodeId, VecDeque<InboundFrame>>,
+    object_rpc_mailboxes: BTreeMap<NodeId, VecDeque<InboundObjectRpcMessage>>,
 }
 
 #[derive(Clone, Debug)]
@@ -838,6 +853,44 @@ impl InProcessTransport {
         Ok(())
     }
 
+    pub fn send_object_rpc_request(
+        &mut self,
+        target_node_id: &NodeId,
+        request: ObjectRpcRequest,
+    ) -> Result<(), NetworkError> {
+        let mut inner = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| NetworkError::Serialization {
+                detail: "in-process network lock poisoned".to_string(),
+            })?;
+        let mailbox = inner
+            .object_rpc_mailboxes
+            .get_mut(target_node_id)
+            .ok_or_else(|| NetworkError::UnknownNode {
+                node_id: target_node_id.clone(),
+            })?;
+        if mailbox.len() >= IN_PROCESS_MAILBOX_CAPACITY {
+            return Err(NetworkError::MailboxFull {
+                node_id: target_node_id.clone(),
+                max_frames: IN_PROCESS_MAILBOX_CAPACITY,
+            });
+        }
+
+        mailbox.push_back(InboundObjectRpcMessage {
+            received_by: target_node_id.clone(),
+            message: InProcessObjectRpcMessage {
+                source_node_id: self.local_node_id.clone(),
+                target_node_id: target_node_id.clone(),
+                request,
+            },
+        });
+        drop(inner);
+        self.inner.incoming.notify_all();
+        Ok(())
+    }
+
     pub fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
         let mut inner = self
             .inner
@@ -848,6 +901,26 @@ impl InProcessTransport {
             })?;
         let mailbox = inner
             .mailboxes
+            .get_mut(&self.local_node_id)
+            .ok_or_else(|| NetworkError::UnknownNode {
+                node_id: self.local_node_id.clone(),
+            })?;
+
+        Ok(mailbox.drain(..).collect())
+    }
+
+    pub fn drain_incoming_object_rpc_requests(
+        &mut self,
+    ) -> Result<Vec<InboundObjectRpcMessage>, NetworkError> {
+        let mut inner = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| NetworkError::Serialization {
+                detail: "in-process network lock poisoned".to_string(),
+            })?;
+        let mailbox = inner
+            .object_rpc_mailboxes
             .get_mut(&self.local_node_id)
             .ok_or_else(|| NetworkError::UnknownNode {
                 node_id: self.local_node_id.clone(),
@@ -871,6 +944,23 @@ impl InProcessTransport {
                 .ok_or_else(|| NetworkError::UnknownNode {
                     node_id: self.local_node_id.clone(),
                 })?;
+        Ok(Some(mailbox.len()))
+    }
+
+    pub fn pending_incoming_object_rpc_request_count(&self) -> Result<Option<usize>, NetworkError> {
+        let inner = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| NetworkError::Serialization {
+                detail: "in-process network lock poisoned".to_string(),
+            })?;
+        let mailbox = inner
+            .object_rpc_mailboxes
+            .get(&self.local_node_id)
+            .ok_or_else(|| NetworkError::UnknownNode {
+                node_id: self.local_node_id.clone(),
+            })?;
         Ok(Some(mailbox.len()))
     }
 
@@ -919,6 +1009,56 @@ impl InProcessTransport {
                 .ok_or_else(|| NetworkError::UnknownNode {
                     node_id: self.local_node_id.clone(),
                 })?;
+        Ok(!mailbox.is_empty())
+    }
+
+    pub fn wait_for_incoming_object_rpc_request(
+        &self,
+        timeout: Duration,
+    ) -> Result<bool, NetworkError> {
+        let mut inner = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| NetworkError::Serialization {
+                detail: "in-process network lock poisoned".to_string(),
+            })?;
+        if !inner.object_rpc_mailboxes.contains_key(&self.local_node_id) {
+            return Err(NetworkError::UnknownNode {
+                node_id: self.local_node_id.clone(),
+            });
+        }
+        if inner
+            .object_rpc_mailboxes
+            .get(&self.local_node_id)
+            .is_some_and(|mailbox| !mailbox.is_empty())
+            || timeout.is_zero()
+        {
+            return Ok(inner
+                .object_rpc_mailboxes
+                .get(&self.local_node_id)
+                .is_some_and(|mailbox| !mailbox.is_empty()));
+        }
+        let local_node_id = self.local_node_id.clone();
+        let (guard, _timeout) = self
+            .inner
+            .incoming
+            .wait_timeout_while(inner, timeout, |state| {
+                state
+                    .object_rpc_mailboxes
+                    .get(&local_node_id)
+                    .is_some_and(|mailbox| mailbox.is_empty())
+            })
+            .map_err(|_| NetworkError::Serialization {
+                detail: "in-process network lock poisoned".to_string(),
+            })?;
+        inner = guard;
+        let mailbox = inner
+            .object_rpc_mailboxes
+            .get(&self.local_node_id)
+            .ok_or_else(|| NetworkError::UnknownNode {
+                node_id: self.local_node_id.clone(),
+            })?;
         Ok(!mailbox.is_empty())
     }
 
@@ -981,10 +1121,16 @@ impl AsyncInProcessNetwork {
 
     pub fn add_node(&self, node_id: NodeId) -> AsyncInProcessTransport {
         let (sender, incoming) = tokio::sync::mpsc::channel(self.inner.mailbox_capacity);
+        let (object_rpc_sender, object_rpc_incoming) =
+            tokio::sync::mpsc::channel(self.inner.mailbox_capacity);
         let target = AsyncInProcessTarget {
             sender,
+            object_rpc_sender,
             mailbox_capacity: self.inner.mailbox_capacity,
             send_limiter: Arc::new(tokio::sync::Semaphore::new(
+                self.inner.per_target_send_limit,
+            )),
+            object_rpc_send_limiter: Arc::new(tokio::sync::Semaphore::new(
                 self.inner.per_target_send_limit,
             )),
         };
@@ -1002,6 +1148,8 @@ impl AsyncInProcessNetwork {
             inner: Arc::clone(&self.inner),
             incoming,
             pending: VecDeque::new(),
+            object_rpc_incoming,
+            object_rpc_pending: VecDeque::new(),
         }
     }
 }
@@ -1016,8 +1164,10 @@ struct AsyncInProcessNetworkInner {
 #[derive(Clone)]
 struct AsyncInProcessTarget {
     sender: tokio::sync::mpsc::Sender<InboundFrame>,
+    object_rpc_sender: tokio::sync::mpsc::Sender<InboundObjectRpcMessage>,
     mailbox_capacity: usize,
     send_limiter: Arc<tokio::sync::Semaphore>,
+    object_rpc_send_limiter: Arc<tokio::sync::Semaphore>,
 }
 
 pub struct AsyncInProcessTransport {
@@ -1025,6 +1175,8 @@ pub struct AsyncInProcessTransport {
     inner: Arc<AsyncInProcessNetworkInner>,
     incoming: tokio::sync::mpsc::Receiver<InboundFrame>,
     pending: VecDeque<InboundFrame>,
+    object_rpc_incoming: tokio::sync::mpsc::Receiver<InboundObjectRpcMessage>,
+    object_rpc_pending: VecDeque<InboundObjectRpcMessage>,
 }
 
 impl AsyncInProcessTransport {
@@ -1066,6 +1218,76 @@ impl AsyncInProcessTransport {
 
     fn pending_count(&self) -> usize {
         self.pending.len() + self.incoming.len()
+    }
+
+    fn pending_object_rpc_count(&self) -> usize {
+        self.object_rpc_pending.len() + self.object_rpc_incoming.len()
+    }
+
+    pub async fn send_object_rpc_request_async(
+        &mut self,
+        target_node_id: &NodeId,
+        request: ObjectRpcRequest,
+        options: AsyncNetworkSendOptions,
+    ) -> Result<(), NetworkError> {
+        let target = self.target_channel(target_node_id)?;
+        send_async_in_process_object_rpc_message(
+            target,
+            &self.local_node_id,
+            target_node_id,
+            request,
+            options,
+        )
+        .await
+    }
+
+    pub async fn drain_incoming_object_rpc_requests(
+        &mut self,
+        max_messages: usize,
+    ) -> Result<Vec<InboundObjectRpcMessage>, NetworkError> {
+        let take = max_messages.max(1);
+        let mut messages = self.object_rpc_pending.drain(..).collect::<Vec<_>>();
+        if messages.len() > take {
+            let retained = messages.split_off(take);
+            self.object_rpc_pending.extend(retained);
+            return Ok(messages);
+        }
+        while messages.len() < take {
+            let Ok(message) = self.object_rpc_incoming.try_recv() else {
+                break;
+            };
+            messages.push(message);
+        }
+        Ok(messages)
+    }
+
+    pub async fn pending_incoming_object_rpc_request_count(
+        &mut self,
+    ) -> Result<Option<usize>, NetworkError> {
+        Ok(Some(self.pending_object_rpc_count()))
+    }
+
+    pub async fn wait_for_incoming_object_rpc_request(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<bool, NetworkError> {
+        if self.pending_object_rpc_count() > 0 {
+            return Ok(true);
+        }
+        if timeout.is_zero() {
+            return Ok(false);
+        }
+        match tokio::time::timeout(timeout, self.object_rpc_incoming.recv()).await {
+            Ok(Some(message)) => {
+                self.object_rpc_pending.push_back(message);
+                Ok(true)
+            }
+            Ok(None) => Err(NetworkError::Io {
+                operation: "async in-process object rpc receive".to_string(),
+                detail: format!("object rpc mailbox for {} is closed", self.local_node_id),
+            }),
+            Err(_) => Ok(false),
+        }
     }
 }
 
@@ -1197,6 +1419,74 @@ async fn send_async_in_process_frame(
                     detail: format!("send limiter closed: {source}"),
                 })?;
             target.sender.send(inbound).await
+        }
+    }
+    .map_err(|_| NetworkError::UnknownNode {
+        node_id: target_node_id.clone(),
+    })
+}
+
+async fn send_async_in_process_object_rpc_message(
+    target: AsyncInProcessTarget,
+    source_node_id: &NodeId,
+    target_node_id: &NodeId,
+    request: ObjectRpcRequest,
+    options: AsyncNetworkSendOptions,
+) -> Result<(), NetworkError> {
+    let inbound = InboundObjectRpcMessage {
+        received_by: target_node_id.clone(),
+        message: InProcessObjectRpcMessage {
+            source_node_id: source_node_id.clone(),
+            target_node_id: target_node_id.clone(),
+            request,
+        },
+    };
+    if options.is_nonblocking() {
+        let _permit = target
+            .object_rpc_send_limiter
+            .try_acquire_owned()
+            .map_err(|_| NetworkError::MailboxFull {
+                node_id: target_node_id.clone(),
+                max_frames: target.mailbox_capacity,
+            })?;
+        return target
+            .object_rpc_sender
+            .try_send(inbound)
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => NetworkError::MailboxFull {
+                    node_id: target_node_id.clone(),
+                    max_frames: target.mailbox_capacity,
+                },
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => NetworkError::UnknownNode {
+                    node_id: target_node_id.clone(),
+                },
+            });
+    }
+    match options.timeout_duration() {
+        Some(timeout) => {
+            let deadline = tokio::time::Instant::now() + timeout;
+            let _permit =
+                tokio::time::timeout_at(deadline, target.object_rpc_send_limiter.acquire_owned())
+                    .await
+                    .map_err(|_| async_transport_send_timed_out(target_node_id, timeout))?
+                    .map_err(|source| NetworkError::Io {
+                        operation: format!("async object rpc transport send to {target_node_id}"),
+                        detail: format!("send limiter closed: {source}"),
+                    })?;
+            tokio::time::timeout_at(deadline, target.object_rpc_sender.send(inbound))
+                .await
+                .map_err(|_| async_transport_send_timed_out(target_node_id, timeout))?
+        }
+        None => {
+            let _permit = target
+                .object_rpc_send_limiter
+                .acquire_owned()
+                .await
+                .map_err(|source| NetworkError::Io {
+                    operation: format!("async object rpc transport send to {target_node_id}"),
+                    detail: format!("send limiter closed: {source}"),
+                })?;
+            target.object_rpc_sender.send(inbound).await
         }
     }
     .map_err(|_| NetworkError::UnknownNode {

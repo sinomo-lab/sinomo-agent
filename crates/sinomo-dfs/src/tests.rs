@@ -3381,13 +3381,13 @@ fn networked_dfs_builds_routed_messages_without_transport_send() {
 }
 
 #[test]
-fn networked_dfs_async_send_uses_shared_protocol_frame_path() {
+fn networked_dfs_async_send_uses_typed_object_message_path() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("runtime");
     runtime.block_on(async {
-        let root = temp_root("networked-dfs-async-send-shared-frame");
+        let root = temp_root("networked-dfs-async-send-typed-object-message");
         let network = AsyncInProcessNetwork::new();
         let local = NodeId::from_legacy_named("node_async_frame_local").expect("local");
         let remote = NodeId::from_legacy_named("node_async_frame_remote").expect("remote");

@@ -24498,6 +24498,47 @@ fn in_process_transport_delivers_typed_frames() {
 }
 
 #[test]
+fn in_process_transport_delivers_object_rpc_requests_without_frames() {
+    let node_a = NodeId::from_legacy_named("node_object_rpc_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_object_rpc_b").expect("node");
+    let network = InProcessNetwork::new();
+    let mut transport_a = network.add_node(node_a.clone());
+    let mut transport_b = network.add_node(node_b.clone());
+    let request = ObjectRpcRequest::encode_body("/test/object-message", "test.object", &42_u64)
+        .expect("request");
+
+    transport_a
+        .send_object_rpc_request(&node_b, request.clone())
+        .expect("send object rpc request");
+
+    assert_eq!(
+        transport_b.pending_incoming_count().expect("frame count"),
+        Some(0),
+        "object-RPC delivery must not populate the legacy frame mailbox"
+    );
+    assert!(
+        transport_b
+            .wait_for_incoming_object_rpc_request(Duration::ZERO)
+            .expect("wait for object rpc request")
+    );
+    let inbound = transport_b
+        .drain_incoming_object_rpc_requests()
+        .expect("drain object rpc requests");
+
+    assert_eq!(inbound.len(), 1);
+    assert_eq!(inbound[0].received_by, node_b);
+    assert_eq!(inbound[0].message.source_node_id, node_a);
+    assert_eq!(inbound[0].message.target_node_id, node_b);
+    assert_eq!(inbound[0].message.request, request);
+    assert!(
+        transport_b
+            .drain_incoming()
+            .expect("drain frames after object rpc")
+            .is_empty()
+    );
+}
+
+#[test]
 fn in_process_transport_wait_for_incoming_wakes_on_send() {
     let node_a = NodeId::from_legacy_named("node_wait_sender").expect("node");
     let node_b = NodeId::from_legacy_named("node_wait_receiver").expect("node");
@@ -24621,6 +24662,55 @@ async fn drain_async_test_frames<T: AsyncNetworkTransport>(
     transport: &mut T,
 ) -> Result<Vec<InboundFrame>, NetworkError> {
     transport.drain_incoming_async(usize::MAX).await
+}
+
+#[tokio::test]
+async fn async_in_process_transport_delivers_object_rpc_requests_without_frames() {
+    let node_a = NodeId::from_legacy_named("node_async_object_rpc_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_async_object_rpc_b").expect("node");
+    let network = AsyncInProcessNetwork::new();
+    let mut transport_a = network.add_node(node_a.clone());
+    let mut transport_b = network.add_node(node_b.clone());
+    let request =
+        ObjectRpcRequest::encode_body("/test/async-object-message", "test.object", &7_u64)
+            .expect("request");
+
+    transport_a
+        .send_object_rpc_request_async(&node_b, request.clone(), AsyncNetworkSendOptions::default())
+        .await
+        .expect("send object rpc request");
+
+    assert_eq!(
+        transport_b
+            .pending_incoming_count_async()
+            .await
+            .expect("frame count"),
+        Some(0),
+        "object-RPC delivery must not populate the legacy async frame mailbox"
+    );
+    assert!(
+        transport_b
+            .wait_for_incoming_object_rpc_request(Duration::ZERO)
+            .await
+            .expect("wait for object rpc request")
+    );
+    let inbound = transport_b
+        .drain_incoming_object_rpc_requests(usize::MAX)
+        .await
+        .expect("drain object rpc requests");
+
+    assert_eq!(inbound.len(), 1);
+    assert_eq!(inbound[0].received_by, node_b);
+    assert_eq!(inbound[0].message.source_node_id, node_a);
+    assert_eq!(inbound[0].message.target_node_id, node_b);
+    assert_eq!(inbound[0].message.request, request);
+    assert!(
+        transport_b
+            .drain_incoming_async(usize::MAX)
+            .await
+            .expect("drain frames after object rpc")
+            .is_empty()
+    );
 }
 
 #[tokio::test]

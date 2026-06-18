@@ -112,12 +112,11 @@ use sinomo_events::EventId;
 use sinomo_kv::KvError;
 use sinomo_local::{LocalDataError, SinomoDataDir};
 use sinomo_network::{
-    ClusterPaths, NetworkError, NetworkFrame, ObjectRpcRequest, ObjectRpcResponse,
-    SinomoObjectCodec,
+    ClusterPaths, NetworkError, ObjectRpcRequest, ObjectRpcResponse, SinomoObjectCodec,
 };
 #[cfg(test)]
 use sinomo_network::{
-    MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrameId, ProtocolMessage,
+    MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrame, NetworkFrameId, ProtocolMessage,
 };
 use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
@@ -255,23 +254,26 @@ impl DfsMessageTransport for sinomo_network::InProcessTransport {
         target_node_id: &NodeId,
         message: DfsRoutedMessage,
     ) -> Result<(), NetworkError> {
-        let frame = protocol::dfs_protocol_frame_from_routed_message(&message)?;
-        self.send(target_node_id, frame)
+        let request = dfs_message_rpc_request(&dfs_message_command_from_routed_message(message))?;
+        self.send_object_rpc_request(target_node_id, request)
     }
 
     fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
-        Ok(sinomo_network::InProcessTransport::drain_incoming(self)?
+        Ok(self
+            .drain_incoming_object_rpc_requests()?
             .into_iter()
-            .filter_map(|inbound| dfs_routed_message_from_network_frame(&inbound.frame).ok())
+            .filter_map(|inbound| {
+                dfs_routed_message_from_object_rpc_request(&inbound.message.request).ok()
+            })
             .collect())
     }
 
     fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
-        self.pending_incoming_count()
+        self.pending_incoming_object_rpc_request_count()
     }
 
     fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {
-        self.wait_for_incoming(timeout)
+        self.wait_for_incoming_object_rpc_request(timeout)
     }
 
     fn transfer_profile(&self, _target_node_id: &NodeId) -> DfsTransferProfile {
@@ -279,10 +281,7 @@ impl DfsMessageTransport for sinomo_network::InProcessTransport {
     }
 }
 
-impl<T> AsyncDfsMessageTransport for T
-where
-    T: sinomo_network::AsyncNetworkTransport + Send,
-{
+impl AsyncDfsMessageTransport for sinomo_network::AsyncInProcessTransport {
     fn local_node_id(&self) -> &NodeId {
         sinomo_network::AsyncNetworkTransport::local_node_id(self)
     }
@@ -293,11 +292,11 @@ where
         message: DfsRoutedMessage,
     ) -> DfsMessageTransportFuture<'a, Result<(), NetworkError>> {
         Box::pin(async move {
-            let frame = protocol::dfs_protocol_frame_from_routed_message(&message)?;
-            sinomo_network::AsyncNetworkTransport::send_async(
-                self,
+            let request =
+                dfs_message_rpc_request(&dfs_message_command_from_routed_message(message))?;
+            self.send_object_rpc_request_async(
                 target_node_id,
-                frame,
+                request,
                 sinomo_network::AsyncNetworkSendOptions::default(),
             )
             .await
@@ -308,33 +307,28 @@ where
         &'a mut self,
     ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedMessage>, NetworkError>> {
         Box::pin(async move {
-            Ok(
-                sinomo_network::AsyncNetworkTransport::drain_incoming_async(self, usize::MAX)
-                    .await?
-                    .into_iter()
-                    .filter_map(|inbound| {
-                        dfs_routed_message_from_network_frame(&inbound.frame).ok()
-                    })
-                    .collect(),
-            )
+            Ok(self
+                .drain_incoming_object_rpc_requests(usize::MAX)
+                .await?
+                .into_iter()
+                .filter_map(|inbound| {
+                    dfs_routed_message_from_object_rpc_request(&inbound.message.request).ok()
+                })
+                .collect())
         })
     }
 
     fn pending_incoming_count_async<'a>(
         &'a mut self,
     ) -> DfsMessageTransportFuture<'a, Result<Option<usize>, NetworkError>> {
-        Box::pin(async move {
-            sinomo_network::AsyncNetworkTransport::pending_incoming_count_async(self).await
-        })
+        Box::pin(async move { self.pending_incoming_object_rpc_request_count().await })
     }
 
     fn wait_for_incoming_async<'a>(
         &'a mut self,
         timeout: Duration,
     ) -> DfsMessageTransportFuture<'a, Result<bool, NetworkError>> {
-        Box::pin(async move {
-            sinomo_network::AsyncNetworkTransport::wait_for_incoming_async(self, timeout).await
-        })
+        Box::pin(async move { self.wait_for_incoming_object_rpc_request(timeout).await })
     }
 }
 
@@ -393,6 +387,28 @@ fn build_dfs_routed_message(
     }
 }
 
+fn dfs_message_command_from_routed_message(message: DfsRoutedMessage) -> DfsMessageCommand {
+    DfsMessageCommand {
+        request_id: format!("dfs-message-{}-{}", message.frame_id, message.message_id),
+        routed_message: message,
+    }
+}
+
+fn dfs_routed_message_from_object_rpc_request(
+    request: &ObjectRpcRequest,
+) -> Result<DfsRoutedMessage, NetworkError> {
+    if request.route != DFS_MESSAGE_ROUTE {
+        return Err(NetworkError::Serialization {
+            detail: format!(
+                "DFS in-process message transport requires route {}, got {}",
+                DFS_MESSAGE_ROUTE, request.route
+            ),
+        });
+    }
+    let command: DfsMessageCommand = request.decode_body()?;
+    Ok(command.routed_message)
+}
+
 #[cfg(test)]
 pub(crate) fn build_dfs_network_frame(
     source_node_id: &NodeId,
@@ -411,6 +427,7 @@ pub(crate) fn build_dfs_network_frame(
     .map_err(DfsError::from_network)
 }
 
+#[cfg(test)]
 fn dfs_routed_message_from_network_frame(
     frame: &NetworkFrame,
 ) -> Result<DfsRoutedMessage, NetworkError> {

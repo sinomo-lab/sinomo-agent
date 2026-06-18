@@ -6,6 +6,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::{DfsWriteReceipt, DfsWriteRequest};
+#[cfg(test)]
 use sinomo_network::{
     MeshMessage, MeshMessageBody, MeshMessageId, NetworkError, NetworkFrame, NetworkFrameId,
     ProtocolMessage,
@@ -734,6 +735,7 @@ pub struct DfsMessageResponse {
     pub outbound_messages: Vec<DfsRoutedMessage>,
 }
 
+#[cfg(test)]
 pub(crate) fn dfs_routed_message_from_protocol_frame(
     frame: &NetworkFrame,
 ) -> Result<DfsRoutedMessage, NetworkError> {
@@ -747,12 +749,14 @@ pub(crate) fn dfs_routed_message_from_protocol_frame(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn dfs_protocol_frame_from_routed_message(
     message: &DfsRoutedMessage,
 ) -> Result<NetworkFrame, NetworkError> {
     dfs_network_frame_from_routed_message(message)
 }
 
+#[cfg(test)]
 fn dfs_network_message_from_frame(frame: &NetworkFrame) -> Result<DfsNetworkMessage, NetworkError> {
     let MeshMessageBody::Protocol(protocol_message) = &frame.message.body else {
         return Err(dfs_protocol_serialization_error(
@@ -769,6 +773,7 @@ fn dfs_network_message_from_frame(frame: &NetworkFrame) -> Result<DfsNetworkMess
     protocol_message.decode::<DfsNetworkMessage>()
 }
 
+#[cfg(test)]
 fn dfs_network_frame_from_routed_message(
     message: &DfsRoutedMessage,
 ) -> Result<NetworkFrame, NetworkError> {
@@ -786,6 +791,7 @@ fn dfs_network_frame_from_routed_message(
     })
 }
 
+#[cfg(test)]
 fn dfs_protocol_serialization_error(detail: impl Into<String>) -> NetworkError {
     NetworkError::Serialization {
         detail: detail.into(),
