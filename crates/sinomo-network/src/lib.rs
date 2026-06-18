@@ -79,7 +79,20 @@ pub use route::{
     handle_cluster_relay_async_with_host, relay_envelope_hop_transport_timeouts,
     relay_response_is_routing_error,
 };
-pub use rpc::*;
+pub use rpc::{
+    CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_HEALTH_RPC_ROUTE_METADATA,
+    CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_CHALLENGE_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE,
+    CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+    CLUSTER_MEMBERSHIP_RPC_ROUTE_METADATA, CLUSTER_NETWORK_PING_ROUTE,
+    CLUSTER_NETWORK_RPC_CATEGORY, CLUSTER_NETWORK_RPC_ROUTE_METADATA,
+    OBJECT_RPC_ERROR_DETAIL_METADATA_KEY, ObjectRouteDescriptor, ObjectRpcAuthorizationContext,
+    ObjectRpcAuthorizationLayer, ObjectRpcCancelRequest, ObjectRpcCancelResponse,
+    ObjectRpcCategoryDefinition, ObjectRpcRequest, ObjectRpcResponse, ObjectRpcRouteCatalog,
+    ObjectRpcRoutePolicyLayer, ObjectRpcRouteReadiness, ObjectRpcRouteRegistry,
+    ObjectRpcRouteRegistryBuilder, ObjectRpcRouter, ServiceCatalog, ServiceCatalogSnapshot,
+    ServiceCategory, call_object_rpc_frame_async, call_object_rpc_service_async,
+    serve_object_rpc_frame_async,
+};
 pub use storage::{
     CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD,
     CLUSTER_CONNECTIVITY_MOBILE_PROBE_MAX_ENDPOINTS_PER_TICK,

@@ -21,6 +21,7 @@ use crate::roaming::{
 };
 #[cfg(feature = "iroh-transport")]
 use crate::roaming::{iroh_public_key_for_node_async, load_or_create_iroh_secret_key};
+use crate::rpc::ObjectRpcFuture;
 use crate::storage::*;
 use crate::storage::{
     LocalClusterRaftCommandStorage, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
@@ -1342,7 +1343,6 @@ fn object_rpc_authorization_layer_enforces_descriptor_policy_before_handler() {
         }
         Ok(())
     });
-    let router = ServiceCategoryLayer::new("test", "test routes").layer(router);
     let mut router = layer.layer(router);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1405,7 +1405,6 @@ fn object_rpc_authorization_layer_preserves_route_readiness() {
     let service = ObjectRpcRoutePolicyLayer::new(router.catalog())
         .expect("policy layer")
         .layer(router);
-    let service = ServiceCategoryLayer::new("test", "test routes").layer(service);
     let service = ObjectRpcAuthorizationLayer::new(|_, _| async { Ok(()) }).layer(service);
 
     let initial = service
