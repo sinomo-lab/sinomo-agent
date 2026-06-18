@@ -7964,23 +7964,6 @@ pub trait DfsPeerTransport: Send + Sync {
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))
     }
 
-    fn send_direct_read(
-        &self,
-        endpoint: &ClusterEndpointRecord,
-        request: &DfsDirectReadRequest,
-        connect_timeout: Duration,
-    ) -> Result<DfsReadResponse, DfsPeerTransportError> {
-        let rpc_request = dfs_direct_read_rpc_request(request)
-            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-        let response = self.call_object_rpc(
-            endpoint,
-            &rpc_request,
-            DfsObjectRpcSendOptions::new(connect_timeout).with_observe_connectivity(false),
-        )?;
-        dfs_direct_read_response_from_rpc_response(response)
-            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
-    }
-
     fn send_metadata_journal_batch(
         &self,
         endpoint: &ClusterEndpointRecord,
@@ -8189,7 +8172,15 @@ pub fn dfs_direct_read_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsDirectReadSender {
     Arc::new(move |endpoint, request, connect_timeout| {
-        peer_transport.send_direct_read(endpoint, request, connect_timeout)
+        let rpc_request = dfs_direct_read_rpc_request(request)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+        let response = peer_transport.call_object_rpc(
+            endpoint,
+            &rpc_request,
+            DfsObjectRpcSendOptions::new(connect_timeout).with_observe_connectivity(false),
+        )?;
+        dfs_direct_read_response_from_rpc_response(response)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
     })
 }
 
