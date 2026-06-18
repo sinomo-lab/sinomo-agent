@@ -997,8 +997,8 @@ pub fn fetch_daemon_status_from_endpoint(
 ) -> Result<DaemonStatus, DaemonError> {
     send_daemon_rpc_body_to_endpoint(
         endpoint,
-        sinomo_network::DAEMON_STATUS_ROUTE,
-        sinomo_network::DAEMON_RPC_CATEGORY,
+        crate::DAEMON_STATUS_ROUTE,
+        crate::DAEMON_RPC_CATEGORY,
         &(),
         timeout,
     )
@@ -1011,8 +1011,8 @@ pub(crate) fn fetch_daemon_status_from_endpoint_on_runtime(
 ) -> Result<DaemonStatus, DaemonError> {
     send_daemon_rpc_body_to_endpoint_on_runtime(
         endpoint,
-        sinomo_network::DAEMON_STATUS_ROUTE,
-        sinomo_network::DAEMON_RPC_CATEGORY,
+        crate::DAEMON_STATUS_ROUTE,
+        crate::DAEMON_RPC_CATEGORY,
         &(),
         timeout,
         runtime,
@@ -1024,11 +1024,8 @@ pub async fn fetch_daemon_status_from_endpoint_async(
     timeout: Duration,
     runtime: &tokio::runtime::Handle,
 ) -> Result<DaemonStatus, DaemonError> {
-    let request = ObjectRpcRequest::encode_body(
-        sinomo_network::DAEMON_STATUS_ROUTE,
-        sinomo_network::DAEMON_RPC_CATEGORY,
-        &(),
-    )?;
+    let request =
+        ObjectRpcRequest::encode_body(crate::DAEMON_STATUS_ROUTE, crate::DAEMON_RPC_CATEGORY, &())?;
     send_daemon_rpc_request_to_endpoint_with_decoder_async(
         endpoint,
         &request,
@@ -1164,8 +1161,8 @@ pub fn fetch_daemon_status_from_address(
 ) -> Result<DaemonStatus, DaemonError> {
     send_daemon_rpc_body(
         address,
-        sinomo_network::DAEMON_STATUS_ROUTE,
-        sinomo_network::DAEMON_RPC_CATEGORY,
+        crate::DAEMON_STATUS_ROUTE,
+        crate::DAEMON_RPC_CATEGORY,
         &(),
         timeout,
     )
@@ -1177,8 +1174,8 @@ pub fn send_daemon_shutdown_request(
 ) -> Result<String, DaemonError> {
     send_daemon_rpc_body(
         address,
-        sinomo_network::DAEMON_SHUTDOWN_ROUTE,
-        sinomo_network::DAEMON_RPC_CATEGORY,
+        crate::DAEMON_SHUTDOWN_ROUTE,
+        crate::DAEMON_RPC_CATEGORY,
         &(),
         timeout,
     )
@@ -1463,13 +1460,15 @@ pub fn send_daemon_rollout_binary_upload_chunk(
     request: &ClusterRolloutBinaryUploadChunkRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryUploadChunkResponse, DaemonError> {
-    send_daemon_rpc_body(
-        address,
+    let request = ObjectRpcRequest::encode_body(
         ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
         ROLLOUT_RPC_CATEGORY,
         request,
-        timeout,
-    )
+    )?
+    .with_response_retry_safe();
+    send_daemon_rpc_request_with_decoder(address, &request, timeout, |response| {
+        response.decode_body()
+    })
 }
 
 pub fn send_daemon_rollout_binary_upload_chunk_to_endpoint(
@@ -1477,13 +1476,15 @@ pub fn send_daemon_rollout_binary_upload_chunk_to_endpoint(
     request: &ClusterRolloutBinaryUploadChunkRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryUploadChunkResponse, DaemonError> {
-    send_daemon_rpc_body_to_endpoint(
-        endpoint,
+    let request = ObjectRpcRequest::encode_body(
         ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
         ROLLOUT_RPC_CATEGORY,
         request,
-        timeout,
-    )
+    )?
+    .with_response_retry_safe();
+    send_daemon_rpc_request_to_endpoint_with_decoder(endpoint, &request, timeout, |response| {
+        response.decode_body()
+    })
 }
 
 pub fn send_daemon_rollout_binary_upload_finalize(
@@ -1587,13 +1588,12 @@ pub fn send_daemon_rollout_diagnostics(
     address: &str,
     timeout: Duration,
 ) -> Result<String, DaemonError> {
-    send_daemon_rpc_body(
-        address,
-        ROLLOUT_DIAGNOSTICS_ROUTE,
-        ROLLOUT_RPC_CATEGORY,
-        &(),
-        timeout,
-    )
+    let request =
+        ObjectRpcRequest::encode_body(ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_RPC_CATEGORY, &())?
+            .with_response_retry_safe();
+    send_daemon_rpc_request_with_decoder(address, &request, timeout, |response| {
+        response.decode_body()
+    })
 }
 
 #[cfg(test)]
@@ -1643,8 +1643,8 @@ mod tests {
             .build()
             .expect("runtime");
         let request = ObjectRpcRequest::encode_body(
-            sinomo_network::DAEMON_STATUS_ROUTE,
-            sinomo_network::DAEMON_RPC_CATEGORY,
+            crate::DAEMON_STATUS_ROUTE,
+            crate::DAEMON_RPC_CATEGORY,
             &(),
         )
         .expect("request");
@@ -1802,8 +1802,8 @@ mod tests {
 
     #[test]
     fn daemon_rpc_connectivity_observation_ignores_non_transport_errors() {
-        let response = ObjectRpcResponse::encode_body(sinomo_network::DAEMON_STATUS_ROUTE, &())
-            .expect("response");
+        let response =
+            ObjectRpcResponse::encode_body(crate::DAEMON_STATUS_ROUTE, &()).expect("response");
         let started = Instant::now() - Duration::from_millis(5);
 
         let healthy = super::daemon_rpc_connectivity_observation(Ok(&response), started)

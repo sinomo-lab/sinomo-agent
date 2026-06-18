@@ -3424,8 +3424,8 @@ pub fn sandbox_fetch_with_daemon(options: SandboxFetchOptions) -> Result<(), Cli
         output_path: options.output_path,
     };
     let rpc = network::ObjectRpcRequest::encode_body(
-        network::SANDBOX_HTTP_FETCH_TO_FILE_ROUTE,
-        network::SANDBOX_RPC_CATEGORY,
+        crate::SANDBOX_HTTP_FETCH_TO_FILE_ROUTE,
+        crate::SANDBOX_RPC_CATEGORY,
         &request,
     )
     .map_err(CliError::from)?;
@@ -5303,8 +5303,8 @@ fn daemon_run_toolchain_command(
 ) -> Result<crate::SandboxLocalCommandOutcome, CliError> {
     let request = daemon_run_toolchain_request(sandbox_id, command_name, argv, stdin, timeout_ms);
     let rpc = network::ObjectRpcRequest::encode_body(
-        network::SANDBOX_RUN_TOOLCHAIN_ROUTE,
-        network::SANDBOX_RPC_CATEGORY,
+        crate::SANDBOX_RUN_TOOLCHAIN_ROUTE,
+        crate::SANDBOX_RPC_CATEGORY,
         &request,
     )
     .map_err(CliError::from)?;
@@ -5684,8 +5684,8 @@ pub fn sandbox_toolchain_import_busybox_with_daemon(
         module_bytes,
     };
     let rpc = network::ObjectRpcRequest::encode_body(
-        network::SANDBOX_IMPORT_BUSYBOX_ROUTE,
-        network::SANDBOX_RPC_CATEGORY,
+        crate::SANDBOX_IMPORT_BUSYBOX_ROUTE,
+        crate::SANDBOX_RPC_CATEGORY,
         &request,
     )
     .map_err(CliError::from)?;
@@ -5766,8 +5766,8 @@ pub fn sandbox_toolchain_add_command_with_daemon(
         default_limits: options.default_limits,
     };
     let rpc = network::ObjectRpcRequest::encode_body(
-        network::SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE,
-        network::SANDBOX_RPC_CATEGORY,
+        crate::SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE,
+        crate::SANDBOX_RPC_CATEGORY,
         &request,
     )
     .map_err(CliError::from)?;
@@ -5862,8 +5862,8 @@ pub fn sandbox_toolchain_add_artifact_with_daemon(
         bytes,
     };
     let rpc = network::ObjectRpcRequest::encode_body(
-        network::SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE,
-        network::SANDBOX_RPC_CATEGORY,
+        crate::SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE,
+        crate::SANDBOX_RPC_CATEGORY,
         &request,
     )
     .map_err(CliError::from)?;
@@ -6013,8 +6013,8 @@ pub fn sandbox_toolchain_import_package_with_daemon(
         toolchain_id: options.target_toolchain_id,
     };
     let rpc = network::ObjectRpcRequest::encode_body(
-        network::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE,
-        network::SANDBOX_RPC_CATEGORY,
+        crate::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE,
+        crate::SANDBOX_RPC_CATEGORY,
         &request,
     )
     .map_err(CliError::from)?;
@@ -6347,8 +6347,8 @@ pub fn sandbox_create_with_daemon(options: SandboxCreateOptions) -> Result<(), C
         mounts: options.mounts,
     };
     let rpc = network::ObjectRpcRequest::encode_body(
-        network::SANDBOX_CREATE_ROUTE,
-        network::SANDBOX_RPC_CATEGORY,
+        crate::SANDBOX_CREATE_ROUTE,
+        crate::SANDBOX_RPC_CATEGORY,
         &request,
     )
     .map_err(CliError::from)?;
@@ -6437,15 +6437,15 @@ pub fn sandbox_process_plan_with_daemon(
         timeout_ms: options.timeout_ms,
     };
     let rpc = network::ObjectRpcRequest::encode_body(
-        network::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
-        network::SANDBOX_RPC_CATEGORY,
+        crate::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
+        crate::SANDBOX_RPC_CATEGORY,
         &request,
     )
     .map_err(CliError::from)?;
     let timeout = sandbox_daemon_execution_rpc_timeout(options.timeout_ms);
     let mut final_outcome = None;
     send_daemon_rpc_stream(&address, &rpc, timeout, |response| {
-        if response.route != network::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE {
+        if response.route != crate::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE {
             return Err(CliError::Parse {
                 detail: format!(
                     "unexpected sandbox process-plan stream route {}",
@@ -6691,15 +6691,15 @@ pub fn sandbox_run_with_daemon_and_stdin(
         timeout_ms: options.timeout_ms,
     };
     let rpc = network::ObjectRpcRequest::encode_body(
-        network::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
-        network::SANDBOX_RPC_CATEGORY,
+        crate::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
+        crate::SANDBOX_RPC_CATEGORY,
         &request,
     )
     .map_err(CliError::from)?;
     let timeout = sandbox_daemon_execution_rpc_timeout(options.timeout_ms);
     let mut final_outcome = None;
     send_daemon_rpc_stream(&address, &rpc, timeout, |response| {
-        if response.route != network::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE {
+        if response.route != crate::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE {
             return Err(CliError::Parse {
                 detail: format!("unexpected sandbox stream route {}", response.route),
             });
@@ -6837,8 +6837,8 @@ pub fn sandbox_status_with_daemon(options: SandboxStatusOptions) -> Result<(), C
         sandbox_id: options.sandbox_id,
     };
     let rpc = network::ObjectRpcRequest::encode_body(
-        network::SANDBOX_STATUS_ROUTE,
-        network::SANDBOX_RPC_CATEGORY,
+        crate::SANDBOX_STATUS_ROUTE,
+        crate::SANDBOX_RPC_CATEGORY,
         &request,
     )
     .map_err(CliError::from)?;
@@ -6881,8 +6881,8 @@ pub fn sandbox_config_with_daemon(options: SandboxConfigOptions) -> Result<(), C
         env_unset: options.env_unset,
     };
     let rpc = network::ObjectRpcRequest::encode_body(
-        network::SANDBOX_UPDATE_ROUTE,
-        network::SANDBOX_RPC_CATEGORY,
+        crate::SANDBOX_UPDATE_ROUTE,
+        crate::SANDBOX_RPC_CATEGORY,
         &request,
     )
     .map_err(CliError::from)?;
@@ -7214,8 +7214,8 @@ fn daemon_sandbox_list(
         path,
     };
     let rpc = network::ObjectRpcRequest::encode_body(
-        network::SANDBOX_LIST_ROUTE,
-        network::SANDBOX_RPC_CATEGORY,
+        crate::SANDBOX_LIST_ROUTE,
+        crate::SANDBOX_RPC_CATEGORY,
         &request,
     )
     .map_err(CliError::from)?;
@@ -7236,8 +7236,8 @@ fn daemon_sandbox_status(
         sandbox_id: sandbox_id.clone(),
     };
     let rpc = network::ObjectRpcRequest::encode_body(
-        network::SANDBOX_STATUS_ROUTE,
-        network::SANDBOX_RPC_CATEGORY,
+        crate::SANDBOX_STATUS_ROUTE,
+        crate::SANDBOX_RPC_CATEGORY,
         &request,
     )
     .map_err(CliError::from)?;
@@ -7262,8 +7262,8 @@ fn daemon_sandbox_read_file(
         range,
     };
     let rpc = network::ObjectRpcRequest::encode_body(
-        network::SANDBOX_READ_ROUTE,
-        network::SANDBOX_RPC_CATEGORY,
+        crate::SANDBOX_READ_ROUTE,
+        crate::SANDBOX_RPC_CATEGORY,
         &request,
     )
     .map_err(CliError::from)?;
@@ -7297,8 +7297,8 @@ fn daemon_sandbox_write_file_to_address(
         bytes,
     };
     let rpc = network::ObjectRpcRequest::encode_body(
-        network::SANDBOX_WRITE_ROUTE,
-        network::SANDBOX_RPC_CATEGORY,
+        crate::SANDBOX_WRITE_ROUTE,
+        crate::SANDBOX_RPC_CATEGORY,
         &request,
     )
     .map_err(CliError::from)?;
@@ -7454,8 +7454,8 @@ impl crate::SandboxHttpTransport for DaemonMediatedSandboxHttpTransport {
         request: &crate::SandboxHttpRequest,
     ) -> Result<crate::SandboxHttpResponse, crate::SandboxNetworkError> {
         let rpc = network::ObjectRpcRequest::encode_body(
-            network::SANDBOX_HTTP_FETCH_ROUTE,
-            network::SANDBOX_RPC_CATEGORY,
+            crate::SANDBOX_HTTP_FETCH_ROUTE,
+            crate::SANDBOX_RPC_CATEGORY,
             request,
         )
         .map_err(|source| crate::SandboxNetworkError::Transport {
@@ -7540,8 +7540,8 @@ pub fn sandbox_checkpoint_with_daemon(options: SandboxCheckpointOptions) -> Resu
         sandbox_id: options.sandbox_id,
     };
     let rpc = network::ObjectRpcRequest::encode_body(
-        network::SANDBOX_CHECKPOINT_ROUTE,
-        network::SANDBOX_RPC_CATEGORY,
+        crate::SANDBOX_CHECKPOINT_ROUTE,
+        crate::SANDBOX_RPC_CATEGORY,
         &request,
     )
     .map_err(CliError::from)?;
@@ -7585,8 +7585,8 @@ pub fn sandbox_resume_with_daemon(options: SandboxResumeOptions) -> Result<(), C
         checkpoint_id: options.checkpoint_id,
     };
     let rpc = network::ObjectRpcRequest::encode_body(
-        network::SANDBOX_RESUME_ROUTE,
-        network::SANDBOX_RPC_CATEGORY,
+        crate::SANDBOX_RESUME_ROUTE,
+        crate::SANDBOX_RPC_CATEGORY,
         &request,
     )
     .map_err(CliError::from)?;
@@ -7626,8 +7626,8 @@ pub fn sandbox_reboot_with_daemon(options: SandboxRebootOptions) -> Result<(), C
         sandbox_id: options.sandbox_id,
     };
     let rpc = network::ObjectRpcRequest::encode_body(
-        network::SANDBOX_REBOOT_ROUTE,
-        network::SANDBOX_RPC_CATEGORY,
+        crate::SANDBOX_REBOOT_ROUTE,
+        crate::SANDBOX_RPC_CATEGORY,
         &request,
     )
     .map_err(CliError::from)?;
@@ -7661,8 +7661,8 @@ pub fn sandbox_destroy_with_daemon(options: SandboxDestroyOptions) -> Result<(),
         sandbox_id: options.sandbox_id,
     };
     let rpc = network::ObjectRpcRequest::encode_body(
-        network::SANDBOX_DESTROY_ROUTE,
-        network::SANDBOX_RPC_CATEGORY,
+        crate::SANDBOX_DESTROY_ROUTE,
+        crate::SANDBOX_RPC_CATEGORY,
         &request,
     )
     .map_err(CliError::from)?;

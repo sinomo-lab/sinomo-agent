@@ -13,6 +13,10 @@ mod rollout;
 mod service_adapter;
 mod status;
 
+pub const DAEMON_RPC_CATEGORY: &str = "daemon";
+pub const DAEMON_STATUS_ROUTE: &str = "/daemon/status";
+pub const DAEMON_SHUTDOWN_ROUTE: &str = "/daemon/shutdown";
+
 #[derive(Clone)]
 pub struct DaemonServiceRegistryHook {
     register: std::sync::Arc<

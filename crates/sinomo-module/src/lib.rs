@@ -54,6 +54,8 @@ pub const MODULE_CRASH_EVENT_KIND: &str = "module.crash";
 pub const MODULE_TIMEOUT_EVENT_KIND: &str = "module.timeout";
 pub const MODULE_POLICY_BLOCKED_EVENT_KIND: &str = "module.policy.blocked";
 pub const DECLARATIVE_MODULE_API_VERSION: &str = "sinomo.declarative.module.v1";
+pub const MODULE_RPC_CATEGORY: &str = "module";
+pub const MODULE_NATIVE_DYLIB_CANCEL_ROUTE: &str = "/module/native-dylib/cancel";
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SinomoModuleV1Context {

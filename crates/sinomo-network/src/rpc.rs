@@ -31,12 +31,8 @@ pub const OBJECT_RPC_ERROR_METADATA_KEY: &str = "sinomo-error";
 pub const OBJECT_RPC_ERROR_DETAIL_METADATA_KEY: &str = "sinomo-error-detail";
 pub const OBJECT_RPC_OPERATION_ID_METADATA_KEY: &str = "sinomo-operation-id";
 pub const OBJECT_RPC_CANCELS_OPERATION_ID_METADATA_KEY: &str = "sinomo-cancels-operation-id";
+pub const OBJECT_RPC_RESPONSE_RETRY_SAFE_METADATA_KEY: &str = "sinomo-response-retry-safe";
 
-pub const DAEMON_RPC_CATEGORY: &str = "daemon";
-pub const DAEMON_STATUS_ROUTE: &str = "/daemon/status";
-pub const DAEMON_SHUTDOWN_ROUTE: &str = "/daemon/shutdown";
-pub const MODULE_RPC_CATEGORY: &str = "module";
-pub const MODULE_NATIVE_DYLIB_CANCEL_ROUTE: &str = "/module/native-dylib/cancel";
 pub const CLUSTER_HEALTH_RPC_CATEGORY: &str = "cluster.health";
 pub const CLUSTER_HEALTH_ROUTE: &str = "/cluster/health";
 pub const CLUSTER_HEALTH_SCOPE_METADATA_KEY: &str = "sinomo-health-scope";
@@ -67,39 +63,6 @@ pub const CLUSTER_MEMBERSHIP_RPC_ROUTE_METADATA: &[(&str, &str)] = &[
         CLUSTER_MEMBERSHIP_RPC_CATEGORY,
     ),
 ];
-pub const SANDBOX_RPC_CATEGORY: &str = "sandbox";
-pub const SANDBOX_CREATE_ROUTE: &str = "/sandbox/create";
-pub const SANDBOX_STATUS_ROUTE: &str = "/sandbox/status";
-pub const SANDBOX_UPDATE_ROUTE: &str = "/sandbox/update";
-pub const SANDBOX_CHECKPOINT_ROUTE: &str = "/sandbox/checkpoint";
-pub const SANDBOX_RESUME_ROUTE: &str = "/sandbox/resume";
-pub const SANDBOX_REBOOT_ROUTE: &str = "/sandbox/reboot";
-pub const SANDBOX_DESTROY_ROUTE: &str = "/sandbox/destroy";
-pub const SANDBOX_LIST_ROUTE: &str = "/sandbox/list";
-pub const SANDBOX_READ_ROUTE: &str = "/sandbox/read";
-pub const SANDBOX_WRITE_ROUTE: &str = "/sandbox/write";
-pub const SANDBOX_IMPORT_BUSYBOX_ROUTE: &str = "/sandbox/toolchain/import-busybox";
-pub const SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE: &str = "/sandbox/toolchain/import-package";
-pub const SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE: &str =
-    "/sandbox/toolchain/import-package-from-path";
-pub const SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE: &str = "/sandbox/toolchain/add-command";
-pub const SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE: &str = "/sandbox/toolchain/add-artifact";
-pub const SANDBOX_HTTP_FETCH_ROUTE: &str = "/sandbox/http/fetch";
-pub const SANDBOX_HTTP_FETCH_TO_FILE_ROUTE: &str = "/sandbox/http/fetch-to-file";
-pub const SANDBOX_RUN_TOOLCHAIN_ROUTE: &str = "/sandbox/run/toolchain";
-pub const SANDBOX_RUN_PROCESS_PLAN_ROUTE: &str = "/sandbox/run/process-plan";
-pub const SANDBOX_RUN_CANCEL_ROUTE: &str = "/sandbox/run/cancel";
-pub const SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE: &str = "/sandbox/run/toolchain/stream";
-pub const SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE: &str = "/sandbox/run/process-plan/stream";
-pub const ROLLOUT_RPC_CATEGORY: &str = "rollout";
-pub const ROLLOUT_DIAGNOSTICS_ROUTE: &str = "/rollout/diagnostics";
-pub const ROLLOUT_BINARY_ROUTE: &str = "/rollout/binary";
-pub const ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE: &str = "/rollout/binary-upload-chunk";
-pub const ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE: &str = "/rollout/binary-upload-finalize";
-pub const ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE: &str = "/rollout/native-dylib-module";
-pub const ROLLOUT_BUILD_ROUTE: &str = "/rollout/build";
-pub const ROLLOUT_FINALIZE_SHADOW_ROUTE: &str = "/rollout/finalize-shadow";
-pub const ROLLOUT_CLEAR_STATUS_ROUTE: &str = "/rollout/clear-status";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ObjectRpcRequest {
@@ -155,6 +118,10 @@ impl ObjectRpcRequest {
         self.with_metadata(OBJECT_RPC_CANCELS_OPERATION_ID_METADATA_KEY, operation_id)
     }
 
+    pub fn with_response_retry_safe(self) -> Self {
+        self.with_metadata(OBJECT_RPC_RESPONSE_RETRY_SAFE_METADATA_KEY, "true")
+    }
+
     pub fn operation_id(&self) -> Option<&str> {
         self.metadata
             .get(OBJECT_RPC_OPERATION_ID_METADATA_KEY)
@@ -165,6 +132,12 @@ impl ObjectRpcRequest {
         self.metadata
             .get(OBJECT_RPC_CANCELS_OPERATION_ID_METADATA_KEY)
             .map(String::as_str)
+    }
+
+    pub fn is_response_retry_safe(&self) -> bool {
+        self.metadata
+            .get(OBJECT_RPC_RESPONSE_RETRY_SAFE_METADATA_KEY)
+            .is_some_and(|value| value == "true")
     }
 }
 

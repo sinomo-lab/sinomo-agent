@@ -1793,13 +1793,14 @@ pub(crate) fn iroh_daemon_control_request_allows_response_retry(
     let Some(rpc) = request.rpc.as_ref() else {
         return false;
     };
+    if rpc.is_response_retry_safe() {
+        return true;
+    }
     matches!(
         rpc.route.as_str(),
         crate::CLUSTER_HEALTH_ROUTE
             | sinomo_kv::CLUSTER_KV_RANGE_PREFIX_ROUTE
             | sinomo_kv::CLUSTER_KV_SNAPSHOT_ROUTE
-            | crate::ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE
-            | crate::ROLLOUT_DIAGNOSTICS_ROUTE
     )
 }
 

@@ -322,9 +322,9 @@ pub fn authorize_authenticated_daemon_command(
 ) -> Result<(), DaemonError> {
     let command = authenticated.command.as_str();
     let allowed = match command {
-        command if command == daemon_rpc_command(sinomo_network::DAEMON_STATUS_ROUTE) => true,
+        command if command == daemon_rpc_command(crate::DAEMON_STATUS_ROUTE) => true,
         command if command == daemon_rpc_command(CLUSTER_KV_SNAPSHOT_ROUTE) => true,
-        command if command == daemon_rpc_command(sinomo_network::DAEMON_SHUTDOWN_ROUTE) => {
+        command if command == daemon_rpc_command(crate::DAEMON_SHUTDOWN_ROUTE) => {
             authenticated.signer.can_run_local_command()
         }
         command if command == daemon_rpc_command(ROLLOUT_FINALIZE_SHADOW_ROUTE) => {
@@ -397,7 +397,7 @@ pub fn authorize_authenticated_daemon_command(
             )
         }
         command
-            if command == daemon_rpc_command(sinomo_network::MODULE_NATIVE_DYLIB_CANCEL_ROUTE) =>
+            if command == daemon_rpc_command(sinomo_module::MODULE_NATIVE_DYLIB_CANCEL_ROUTE) =>
         {
             matches!(
                 authenticated.signer,
@@ -521,29 +521,29 @@ fn is_agent_session_rpc_command(command: &str) -> bool {
 }
 
 fn is_local_sandbox_rpc_command(command: &str) -> bool {
-    command == daemon_rpc_command(sinomo_network::SANDBOX_CREATE_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_STATUS_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_UPDATE_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_CHECKPOINT_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_RESUME_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_REBOOT_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_DESTROY_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_LIST_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_READ_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_WRITE_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_HTTP_FETCH_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_HTTP_FETCH_TO_FILE_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_RUN_TOOLCHAIN_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_RUN_PROCESS_PLAN_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_RUN_CANCEL_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_IMPORT_BUSYBOX_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE)
+    command == daemon_rpc_command(sinomo_sandbox::SANDBOX_CREATE_ROUTE)
+        || command == daemon_rpc_command(sinomo_sandbox::SANDBOX_STATUS_ROUTE)
+        || command == daemon_rpc_command(sinomo_sandbox::SANDBOX_UPDATE_ROUTE)
+        || command == daemon_rpc_command(sinomo_sandbox::SANDBOX_CHECKPOINT_ROUTE)
+        || command == daemon_rpc_command(sinomo_sandbox::SANDBOX_RESUME_ROUTE)
+        || command == daemon_rpc_command(sinomo_sandbox::SANDBOX_REBOOT_ROUTE)
+        || command == daemon_rpc_command(sinomo_sandbox::SANDBOX_DESTROY_ROUTE)
+        || command == daemon_rpc_command(sinomo_sandbox::SANDBOX_LIST_ROUTE)
+        || command == daemon_rpc_command(sinomo_sandbox::SANDBOX_READ_ROUTE)
+        || command == daemon_rpc_command(sinomo_sandbox::SANDBOX_WRITE_ROUTE)
+        || command == daemon_rpc_command(sinomo_sandbox::SANDBOX_HTTP_FETCH_ROUTE)
+        || command == daemon_rpc_command(sinomo_sandbox::SANDBOX_HTTP_FETCH_TO_FILE_ROUTE)
+        || command == daemon_rpc_command(sinomo_sandbox::SANDBOX_RUN_TOOLCHAIN_ROUTE)
+        || command == daemon_rpc_command(sinomo_sandbox::SANDBOX_RUN_PROCESS_PLAN_ROUTE)
+        || command == daemon_rpc_command(sinomo_sandbox::SANDBOX_RUN_CANCEL_ROUTE)
+        || command == daemon_rpc_command(sinomo_sandbox::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE)
+        || command == daemon_rpc_command(sinomo_sandbox::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE)
+        || command == daemon_rpc_command(sinomo_sandbox::SANDBOX_IMPORT_BUSYBOX_ROUTE)
+        || command == daemon_rpc_command(sinomo_sandbox::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE)
         || command
-            == daemon_rpc_command(sinomo_network::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE)
-        || command == daemon_rpc_command(sinomo_network::SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE)
+            == daemon_rpc_command(sinomo_sandbox::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE)
+        || command == daemon_rpc_command(sinomo_sandbox::SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE)
+        || command == daemon_rpc_command(sinomo_sandbox::SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE)
 }
 
 fn verify_signed_daemon_command(
@@ -639,7 +639,7 @@ fn authorize_daemon_signer(
         authorize_cluster_join_rpc_signer(paths, rpc_request, &envelope_public_key)?;
         return Ok(DaemonSignerAuthority::JoinCandidate);
     }
-    if envelope.command == daemon_rpc_command(sinomo_network::DAEMON_STATUS_ROUTE) {
+    if envelope.command == daemon_rpc_command(crate::DAEMON_STATUS_ROUTE) {
         return Ok(DaemonSignerAuthority::StatusProbe);
     }
     if let Some(authority) =
@@ -1056,7 +1056,7 @@ mod tests {
                 .format(&Rfc3339)
                 .expect("timestamp"),
             nonce: nonce.to_string(),
-            command: daemon_rpc_command(sinomo_network::DAEMON_STATUS_ROUTE),
+            command: daemon_rpc_command(crate::DAEMON_STATUS_ROUTE),
             rpc_body_sha256: None,
             signature: b"signature".to_vec(),
         }
@@ -1083,8 +1083,8 @@ mod tests {
         let data_root = unique_auth_test_root("sinomo-daemon-auth-binary");
         let data_dir = SinomoDataDir::new(&data_root);
         let request = sinomo_network::ObjectRpcRequest::encode_body(
-            sinomo_network::DAEMON_STATUS_ROUTE,
-            sinomo_network::DAEMON_RPC_CATEGORY,
+            crate::DAEMON_STATUS_ROUTE,
+            crate::DAEMON_RPC_CATEGORY,
             &(),
         )
         .expect("rpc request");
@@ -1182,7 +1182,7 @@ mod tests {
     #[test]
     fn status_probe_authority_is_limited_to_daemon_status() {
         let status = authenticated_command(
-            daemon_rpc_command(sinomo_network::DAEMON_STATUS_ROUTE),
+            daemon_rpc_command(crate::DAEMON_STATUS_ROUTE),
             DaemonSignerAuthority::StatusProbe,
         );
         authorize_authenticated_daemon_command(&status)
@@ -1429,7 +1429,7 @@ mod tests {
 
     #[test]
     fn native_dylib_cancel_route_authorizes_cluster_members() {
-        let command = daemon_rpc_command(sinomo_network::MODULE_NATIVE_DYLIB_CANCEL_ROUTE);
+        let command = daemon_rpc_command(sinomo_module::MODULE_NATIVE_DYLIB_CANCEL_ROUTE);
         for signer in [
             DaemonSignerAuthority::Local,
             DaemonSignerAuthority::Voter,

@@ -651,8 +651,8 @@ pub(crate) async fn probe_daemon_status_with_timeouts_async(
 
 pub fn probe_daemon_status_at_address(address: &str, timeout: Duration) -> Option<DaemonStatus> {
     let request = sinomo_network::ObjectRpcRequest::encode_body(
-        sinomo_network::DAEMON_STATUS_ROUTE,
-        sinomo_network::DAEMON_RPC_CATEGORY,
+        crate::DAEMON_STATUS_ROUTE,
+        crate::DAEMON_RPC_CATEGORY,
         &(),
     )
     .ok()?;
@@ -668,8 +668,8 @@ pub(crate) fn probe_daemon_status_at_address_on_runtime(
     runtime: &tokio::runtime::Handle,
 ) -> Option<DaemonStatus> {
     let request = sinomo_network::ObjectRpcRequest::encode_body(
-        sinomo_network::DAEMON_STATUS_ROUTE,
-        sinomo_network::DAEMON_RPC_CATEGORY,
+        crate::DAEMON_STATUS_ROUTE,
+        crate::DAEMON_RPC_CATEGORY,
         &(),
     )
     .ok()?;
@@ -685,8 +685,8 @@ pub(crate) async fn probe_daemon_status_at_address_with_timeouts_async(
     runtime: &tokio::runtime::Handle,
 ) -> Option<DaemonStatus> {
     let request = sinomo_network::ObjectRpcRequest::encode_body(
-        sinomo_network::DAEMON_STATUS_ROUTE,
-        sinomo_network::DAEMON_RPC_CATEGORY,
+        crate::DAEMON_STATUS_ROUTE,
+        crate::DAEMON_RPC_CATEGORY,
         &(),
     )
     .ok()?;
