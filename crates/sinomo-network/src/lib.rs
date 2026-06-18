@@ -12,6 +12,7 @@
 //! host filesystem and transport adapters while cluster-aware validation remains
 //! here.
 
+mod connectivity;
 mod endpoint_advertisement;
 mod endpoint_records;
 mod endpoint_selector;
@@ -30,6 +31,10 @@ mod route;
 mod rpc;
 mod storage;
 
+pub use connectivity::{
+    ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityRecordQuery,
+    ClusterConnectivityState,
+};
 #[cfg(test)]
 pub(crate) use endpoint_advertisement::{
     MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES,
@@ -178,8 +183,7 @@ pub use rpc::{
 pub use storage::{
     CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD, CLUSTER_CONNECTIVITY_TTL_SECONDS,
     CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS, CLUSTER_NETWORK_INFO_TTL_SECONDS,
-    ClusterAuthenticatedPeer, ClusterConnectivityGraph, ClusterConnectivityProbeBatchEntry,
-    ClusterConnectivityProbeState, ClusterConnectivityRecord, ClusterConnectivityState,
+    ClusterAuthenticatedPeer, ClusterConnectivityProbeBatchEntry, ClusterConnectivityProbeState,
     ClusterControlPlaneDriver, ClusterControlPlaneTimeouts, ClusterControlPlaneTransport,
     ClusterIdentityRecord, ClusterInvitationStateRecord, ClusterInvitePublishHost,
     ClusterJoinRegistrationAsyncHost, ClusterJoinRegistrationDriver, ClusterJoinRegistrationHost,

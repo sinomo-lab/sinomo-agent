@@ -4,10 +4,8 @@ use crate::lan::{
     is_invitable_ip,
 };
 use crate::membership::{cluster_member_is_local_process, locally_learned_bridge_route_endpoint};
-use crate::storage::{
-    ClusterConnectivityGraph, ClusterConnectivityState, read_cluster_endpoints_from_kv,
-    read_cluster_node_statuses_from_kv,
-};
+use crate::storage::{read_cluster_endpoints_from_kv, read_cluster_node_statuses_from_kv};
+use crate::{ClusterConnectivityGraph, ClusterConnectivityState};
 use crate::{ClusterPaths, iroh_endpoint_public_key};
 use sinomo_core::{
     ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
