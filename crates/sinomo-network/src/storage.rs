@@ -13,6 +13,18 @@ use crate::endpoint_records::{
 use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
 use crate::error::NetworkError;
 use crate::io_observer;
+#[cfg(test)]
+pub(crate) use crate::keyspace::cluster_certificate_key;
+pub(crate) use crate::keyspace::{
+    cluster_capability_policy_key, cluster_node_status_key, cluster_node_status_key_for_process,
+    cluster_node_status_key_for_record,
+};
+use crate::keyspace::{
+    cluster_connectivity_key, cluster_connectivity_source_prefix, cluster_endpoint_key,
+    cluster_endpoint_prefix, cluster_identity_key, cluster_invitation_key,
+    cluster_invitation_state_key, cluster_member_key, cluster_network_info_key,
+    cluster_node_status_key_matches_record, cluster_node_status_snapshot_record,
+};
 use crate::maintenance::{
     CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS, CLUSTER_NETWORK_PUBLISH_INTERVAL,
     CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS,
@@ -20,10 +32,9 @@ use crate::maintenance::{
     cluster_network_publish_interval_for_role,
 };
 use crate::membership::{
-    DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE,
-    cluster_capabilities_are_legacy_shadow_only, cluster_local_process_members,
-    cluster_member_is_legacy_shadow_daemon, cluster_member_is_local_process,
-    cluster_node_is_local_process,
+    DAEMON_SHADOW_CLUSTER_ROLE, cluster_capabilities_are_legacy_shadow_only,
+    cluster_local_process_members, cluster_member_is_legacy_shadow_daemon,
+    cluster_member_is_local_process, cluster_node_is_local_process,
 };
 use crate::network_info::{
     CLUSTER_NETWORK_INFO_TTL_SECONDS, ClusterNetworkInfoRecord, build_cluster_network_info_record,
@@ -12566,95 +12577,6 @@ fn append_cluster_raft_ops_in_batches(
         path: paths.kv_snapshot.display().to_string(),
         detail: "cannot append an empty batch of cluster kv operations".to_string(),
     })
-}
-
-pub fn cluster_node_status_key(node_id: &NodeId) -> String {
-    format!("/cluster/node-status/{node_id}")
-}
-
-pub fn cluster_node_status_key_for_record(status: &ClusterNodeStatusRecord) -> String {
-    if status.process == DAEMON_MAIN_CLUSTER_ROLE {
-        cluster_node_status_key(&status.node_id)
-    } else {
-        cluster_node_status_key_for_process(&status.node_id, &status.process)
-    }
-}
-
-pub fn cluster_node_status_key_for_process(node_id: &NodeId, process: &str) -> String {
-    if process == DAEMON_MAIN_CLUSTER_ROLE {
-        cluster_node_status_key(node_id)
-    } else {
-        format!("/cluster/node-status/{node_id}/{process}")
-    }
-}
-
-fn cluster_node_status_key_matches_record(key: &str, status: &ClusterNodeStatusRecord) -> bool {
-    key == cluster_node_status_key_for_record(status)
-        || (status.process == DAEMON_MAIN_CLUSTER_ROLE
-            && key == cluster_node_status_key(&status.node_id))
-}
-
-fn cluster_node_status_snapshot_record(
-    snapshot: &KvSnapshot,
-    status: &ClusterNodeStatusRecord,
-) -> Option<ClusterNodeStatusRecord> {
-    let key = cluster_node_status_key_for_record(status);
-    snapshot
-        .get(&key)
-        .and_then(|entry| entry.decode::<ClusterNodeStatusRecord>().ok())
-}
-
-pub fn cluster_network_info_key(node_id: &NodeId) -> String {
-    format!("/cluster/network/info/{node_id}")
-}
-
-pub fn cluster_connectivity_source_prefix(source_node_id: &NodeId) -> String {
-    format!("/cluster/network/connectivity/{source_node_id}/")
-}
-
-pub fn cluster_connectivity_key(
-    source_node_id: &NodeId,
-    target_node_id: &NodeId,
-    endpoint_id: &ClusterEndpointId,
-) -> String {
-    format!("/cluster/network/connectivity/{source_node_id}/{target_node_id}/{endpoint_id}")
-}
-
-pub fn cluster_identity_key() -> String {
-    "/cluster/config/identity".to_string()
-}
-
-pub fn cluster_member_key(node_id: &NodeId) -> String {
-    format!("/cluster/members/{node_id}")
-}
-
-pub fn cluster_endpoint_key(node_id: &NodeId, endpoint: &ClusterEndpointRecord) -> String {
-    format!(
-        "{}{}",
-        cluster_endpoint_prefix(node_id),
-        endpoint.endpoint_id
-    )
-}
-
-pub fn cluster_endpoint_prefix(node_id: &NodeId) -> String {
-    format!("/cluster/endpoints/{node_id}/")
-}
-
-pub fn cluster_capability_policy_key(node_id: &NodeId) -> String {
-    format!("/cluster/policy/capabilities/{node_id}")
-}
-
-#[cfg(test)]
-pub fn cluster_certificate_key(certificate: &ClusterCertificate) -> String {
-    format!("/cluster/certificates/{}", certificate.certificate_id)
-}
-
-pub fn cluster_invitation_key(invite_id: &ClusterInviteId) -> String {
-    format!("/cluster/invitations/{invite_id}")
-}
-
-pub fn cluster_invitation_state_key(invite_id: &ClusterInviteId) -> String {
-    format!("/cluster/invitations/{invite_id}/state")
 }
 
 pub fn read_cluster_invitation_from_kv(

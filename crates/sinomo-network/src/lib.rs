@@ -20,6 +20,7 @@ mod error;
 mod health;
 mod invite;
 mod io_observer;
+mod keyspace;
 mod lan;
 mod maintenance;
 mod membership;
@@ -96,6 +97,11 @@ pub use invite::{
 };
 pub(crate) use io_observer::io_observer;
 pub use io_observer::{IoObserver, set_io_observer};
+pub use keyspace::{
+    cluster_connectivity_key, cluster_connectivity_source_prefix, cluster_endpoint_key,
+    cluster_endpoint_prefix, cluster_identity_key, cluster_invitation_key,
+    cluster_invitation_state_key, cluster_member_key, cluster_network_info_key,
+};
 pub use lan::{
     AsyncMdnsDiscoverySocket, MdnsDiscoveryAdvertisement, MdnsDiscoveryCache, MdnsDiscoveryRecord,
     apply_lan_discovery_advertisements, discover_default_lan_ip_candidates,
@@ -225,12 +231,9 @@ pub use storage::{
     MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, accepted_cluster_join_state_from_kv_snapshot,
     apply_cluster_node_role, assign_local_daemon_member_public_keys,
     cleanup_legacy_shadow_daemon_members_with_host, cluster_bootstrap_state_stable_eq,
-    cluster_connectivity_full_sync_ops, cluster_connectivity_key,
-    cluster_connectivity_source_prefix, cluster_connectivity_stable_eq,
-    cluster_connectivity_sync_ops, cluster_endpoint_key, cluster_endpoint_prefix,
-    cluster_has_local_quorum_with_host, cluster_identity_key, cluster_invitation_key,
-    cluster_invitation_state_key, cluster_join_challenge_rpc_request, cluster_member_key,
-    cluster_member_publish_txn_from_kv, cluster_network_info_key,
+    cluster_connectivity_full_sync_ops, cluster_connectivity_stable_eq,
+    cluster_connectivity_sync_ops, cluster_has_local_quorum_with_host,
+    cluster_join_challenge_rpc_request, cluster_member_publish_txn_from_kv,
     cluster_network_publish_interval_for_node, cluster_network_record_should_refresh,
     cluster_node_blocks_leader_preference, cluster_node_status_stable_eq,
     cluster_reachable_voter_count_with_host, cluster_state_needs_join_registration,
