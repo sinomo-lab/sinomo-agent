@@ -1,3 +1,7 @@
+use crate::invite::{
+    CLUSTER_INVITE_CHALLENGE_PROTOCOL, cluster_invite_challenge_signing_payload,
+    verify_cluster_invite_challenge_proof,
+};
 use crate::lan::{
     AsyncMdnsDiscoverySocket, LanQuicFrameCodec, MdnsDiscoveryAdvertisement, MdnsDiscoveryCache,
     MdnsDiscoveryRecord, apply_lan_discovery_advertisements, is_advertisable_interface_ip,

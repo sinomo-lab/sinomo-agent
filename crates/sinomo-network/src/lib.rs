@@ -25,7 +25,17 @@ mod storage;
 
 pub use error::*;
 pub use health::*;
-pub use invite::*;
+pub use invite::{
+    ClusterInviteChallengeProof, ClusterInviteChallengeRequest, PENDING_INVITE_CLUSTER_ID,
+    SINOMO_JOIN_URI_PREFIX, build_cluster_join_invite, cluster_join_command,
+    compact_default_invite_introducers, create_cluster_invite_challenge_proof,
+    decode_cluster_join_invite, encode_cluster_join_invite, extract_invite_from_join_command,
+    invite_channels_for_join_registration, invite_communication_channels,
+    invite_has_embedded_cluster_identity, invite_has_embedded_signature,
+    invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_loopback_connect_address,
+    is_remote_usable_invite_endpoint, push_unique_introducer, sign_cluster_join_invite,
+    sort_default_invite_introducers, verify_cluster_join_invite_signature,
+};
 pub use lan::{
     AsyncMdnsDiscoverySocket, MdnsDiscoveryAdvertisement, MdnsDiscoveryCache, MdnsDiscoveryRecord,
     apply_lan_discovery_advertisements, discover_default_lan_ip_candidates,
