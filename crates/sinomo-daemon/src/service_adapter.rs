@@ -2599,14 +2599,14 @@ async fn dispatch_dfs_direct_read_stream_via_registry_async(
             write_dfs_direct_read_stream_chunks(stream, stream_address, reader).await
         {
             if let Some(key) = replay_key.as_ref() {
-                crate::control::abandon_daemon_dfs_frame_replay(paths, key);
+                crate::control::abandon_daemon_dfs_message_replay(paths, key);
             }
             let _ = stream.shutdown_write(stream_address).await;
             return Err(error);
         }
     }
     if let Some(key) = replay_key.as_ref() {
-        crate::control::complete_daemon_dfs_frame_replay(paths, key, &stream_response.response);
+        crate::control::complete_daemon_dfs_message_replay(paths, key, &stream_response.response);
     }
     Ok(false)
 }
@@ -2760,7 +2760,7 @@ pub(crate) async fn dispatch_rpc_via_registry_to_response_async(
             Ok(response) => response,
             Err(error) => {
                 if let (Some(paths), Some(key)) = (paths, replay_key.as_ref()) {
-                    crate::control::abandon_daemon_dfs_frame_replay(paths, key);
+                    crate::control::abandon_daemon_dfs_message_replay(paths, key);
                 }
                 return Err(error.into());
             }
@@ -2770,7 +2770,7 @@ pub(crate) async fn dispatch_rpc_via_registry_to_response_async(
         .remove(DAEMON_SERVICE_DISPOSITION_METADATA_KEY)
         .is_some_and(|value| value == "stop");
     if let (Some(paths), Some(key)) = (paths, replay_key.as_ref()) {
-        crate::control::complete_daemon_dfs_frame_replay(paths, key, &response);
+        crate::control::complete_daemon_dfs_message_replay(paths, key, &response);
     }
     Ok((response, stop))
 }
