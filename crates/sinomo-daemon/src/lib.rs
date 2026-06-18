@@ -24,6 +24,15 @@ pub struct DaemonServiceRegistryHook {
             + Send
             + Sync,
     >,
+    register_config_definitions: Option<
+        std::sync::Arc<
+            dyn Fn(
+                    sinomo_config::ConfigRegistryBuilder,
+                ) -> Result<sinomo_config::ConfigRegistryBuilder, String>
+                + Send
+                + Sync,
+        >,
+    >,
 }
 
 impl DaemonServiceRegistryHook {
@@ -37,6 +46,30 @@ impl DaemonServiceRegistryHook {
     ) -> Self {
         Self {
             register: std::sync::Arc::new(register),
+            register_config_definitions: None,
+        }
+    }
+
+    pub fn with_config_definitions(
+        mut self,
+        register: impl Fn(
+            sinomo_config::ConfigRegistryBuilder,
+        ) -> Result<sinomo_config::ConfigRegistryBuilder, String>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.register_config_definitions = Some(std::sync::Arc::new(register));
+        self
+    }
+
+    pub fn register_config_definitions(
+        &self,
+        builder: sinomo_config::ConfigRegistryBuilder,
+    ) -> Result<sinomo_config::ConfigRegistryBuilder, String> {
+        match &self.register_config_definitions {
+            Some(register) => register(builder),
+            None => Ok(builder),
         }
     }
 

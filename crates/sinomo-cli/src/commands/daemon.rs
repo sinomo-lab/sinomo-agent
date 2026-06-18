@@ -253,9 +253,13 @@ pub(crate) fn run_daemon_with_paths(
         paths,
         label,
         cluster,
-        vec![sinomo_runtime::daemon::DaemonServiceRegistryHook::new(
-            sinomo_agent::register_services,
-        )],
+        vec![
+            sinomo_runtime::daemon::DaemonServiceRegistryHook::new(sinomo_agent::register_services)
+                .with_config_definitions(|builder| {
+                    sinomo_lm::register_config_definitions(builder)
+                        .map_err(|error| error.to_string())
+                }),
+        ],
     )
     .map_err(Into::into)
 }

@@ -1317,7 +1317,7 @@ fn daemon_service_registry(
     if observe_module_should_register(paths) {
         builder = sinomo_observe::register_services(builder);
     }
-    let config_registry = daemon_config_registry();
+    let config_registry = daemon_config_registry(service_hooks);
     let builder = register_config_services(builder, config_registry);
     let builder = register_rollout_services(builder)
         .register(DaemonControlService {
@@ -1550,10 +1550,15 @@ fn observe_module_should_register(paths: &DaemonPaths) -> bool {
         .unwrap_or(true)
 }
 
-fn daemon_config_registry() -> ConfigRegistry {
-    register_daemon_config_definitions(ConfigRegistry::builder())
-        .expect("daemon config definitions must be valid")
-        .build()
+fn daemon_config_registry(service_hooks: &[crate::DaemonServiceRegistryHook]) -> ConfigRegistry {
+    let mut builder = register_daemon_config_definitions(ConfigRegistry::builder())
+        .expect("daemon config definitions must be valid");
+    for hook in service_hooks {
+        builder = hook
+            .register_config_definitions(builder)
+            .expect("daemon config hook definitions must be valid");
+    }
+    builder.build()
 }
 
 fn register_daemon_config_definitions(
@@ -3365,6 +3370,36 @@ mod tests {
                 .map(String::as_str),
             Some("true")
         );
+    }
+
+    #[test]
+    fn daemon_config_registry_accepts_application_config_hooks() {
+        let hook = crate::DaemonServiceRegistryHook::new(|builder| builder)
+            .with_config_definitions(|builder| {
+                let definition = sinomo_config::ConfigDefinition::new(
+                    "test.config",
+                    "test",
+                    sinomo_config::ConfigValueType::String {
+                        choices: Vec::new(),
+                    },
+                    "test hook config",
+                    sinomo_config::ConfigClusterMode::ClusterOverrideLocal,
+                )
+                .map_err(|error| error.to_string())?
+                .with_default(&"hooked")
+                .map_err(|error| error.to_string())?;
+                builder
+                    .register(definition)
+                    .map_err(|error| error.to_string())
+            });
+
+        let registry = daemon_config_registry(&[hook]);
+        let definition = registry
+            .get("test.config")
+            .expect("hooked config definition");
+
+        assert_eq!(definition.owner, "test");
+        assert_eq!(definition.description, "test hook config");
     }
 
     #[test]
