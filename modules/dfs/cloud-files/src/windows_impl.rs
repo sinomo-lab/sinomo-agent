@@ -14,8 +14,8 @@ use sinomo_dfs_cloud_files_api::{
 use sinomo_runtime::core::ClusterEndpointRecord;
 use sinomo_runtime::daemon;
 use sinomo_runtime::dfs::{
-    self, DfsControlPlaneKvClient, DfsMessageTransport, DfsObjectKind, DfsPosixError,
-    DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsTransportIdentity, LocalContentStore,
+    self, DfsControlPlaneKvClient, DfsMessageCommand, DfsMessageResponse, DfsMessageTransport,
+    DfsObjectKind, DfsPosixError, DfsRoutedMessage, DfsTransportIdentity, LocalContentStore,
     NetworkedDfsService,
 };
 use sinomo_runtime::kv::{
@@ -23,7 +23,10 @@ use sinomo_runtime::kv::{
     read_cluster_kv_prefix_entries,
 };
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::network::{self, InboundFrame, NetworkError, NetworkFrame};
+use sinomo_runtime::network::{
+    self, InboundFrame, MeshMessage, MeshMessageBody, MeshMessageId, NetworkError, NetworkFrame,
+    NetworkFrameId, ProtocolMessage,
+};
 use sinomo_runtime::node::NodeId;
 use windows::Win32::Foundation::{
     NTSTATUS, STATUS_FILE_IS_A_DIRECTORY, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
@@ -758,47 +761,48 @@ impl DfsCloudFilesEndpointTransport {
         }
     }
 
-    fn deliver_returned_frame(
+    fn deliver_returned_message(
         &mut self,
-        frame: NetworkFrame,
+        message: DfsRoutedMessage,
     ) -> std::result::Result<(), NetworkError> {
-        let target_node_id = frame.target_node_id.clone();
+        let target_node_id = message.target_node_id.clone();
         if target_node_id == self.local_node_id {
+            let frame = dfs_network_frame_from_routed_message(message)?;
             self.incoming_frames.push_back(InboundFrame {
                 received_by: self.local_node_id.clone(),
                 frame,
             });
             return Ok(());
         }
-        self.send_frame_to_endpoint(&target_node_id, frame, false)
+        self.send_routed_message_to_endpoint(&target_node_id, message, false)
     }
 
-    fn send_frame_to_endpoint(
+    fn send_routed_message_to_endpoint(
         &mut self,
         target_node_id: &NodeId,
-        frame: NetworkFrame,
+        message: DfsRoutedMessage,
         require_local_source: bool,
     ) -> std::result::Result<(), NetworkError> {
-        if require_local_source && frame.source_node_id != self.local_node_id {
+        if require_local_source && message.source_node_id != self.local_node_id {
             return Err(NetworkError::FrameSourceMismatch {
                 local_node_id: self.local_node_id.clone(),
-                source_node_id: frame.source_node_id,
+                source_node_id: message.source_node_id,
             });
         }
         if !require_local_source
-            && frame.source_node_id != self.local_node_id
+            && message.source_node_id != self.local_node_id
             && !self
                 .endpoints_by_node_id
-                .contains_key(&frame.source_node_id)
+                .contains_key(&message.source_node_id)
         {
             return Err(NetworkError::UnknownNode {
-                node_id: frame.source_node_id,
+                node_id: message.source_node_id,
             });
         }
-        if &frame.target_node_id != target_node_id {
+        if &message.target_node_id != target_node_id {
             return Err(NetworkError::FrameTargetMismatch {
                 requested_target_node_id: target_node_id.clone(),
-                frame_target_node_id: frame.target_node_id,
+                frame_target_node_id: message.target_node_id,
             });
         }
         let endpoints = self
@@ -808,16 +812,16 @@ impl DfsCloudFilesEndpointTransport {
             .ok_or_else(|| NetworkError::UnknownNode {
                 node_id: target_node_id.clone(),
             })?;
-        let request = DfsProtocolFrameCommand {
-            request_id: format!("cloud_files_dfs_protocol_frame_{}", frame.frame_id.0),
-            frame,
+        let request = DfsMessageCommand {
+            request_id: format!("cloud_files_dfs_message_{}", message.frame_id),
+            routed_message: message,
         };
         let mut failures = Vec::new();
         for endpoint in &endpoints {
-            match send_dfs_protocol_frame(endpoint, &request, self.timeout) {
+            match send_dfs_message(endpoint, &request, self.timeout) {
                 Ok(response) => {
-                    for returned_frame in response.outbound_frames {
-                        self.deliver_returned_frame(returned_frame)?;
+                    for returned_message in response.outbound_messages {
+                        self.deliver_returned_message(returned_message)?;
                     }
                     return Ok(());
                 }
@@ -825,7 +829,7 @@ impl DfsCloudFilesEndpointTransport {
             }
         }
         Err(NetworkError::Io {
-            operation: format!("send DFS protocol frame to {target_node_id}"),
+            operation: format!("send DFS message to {target_node_id}"),
             detail: failures.join("; "),
         })
     }
@@ -838,12 +842,12 @@ impl DfsTransportIdentity for DfsCloudFilesEndpointTransport {
 }
 
 impl DfsMessageTransport for DfsCloudFilesEndpointTransport {
-    fn send(
+    fn send_routed_message(
         &mut self,
         target_node_id: &NodeId,
-        frame: NetworkFrame,
+        message: DfsRoutedMessage,
     ) -> std::result::Result<(), NetworkError> {
-        self.send_frame_to_endpoint(target_node_id, frame, true)
+        self.send_routed_message_to_endpoint(target_node_id, message, true)
     }
 
     fn drain_incoming(&mut self) -> std::result::Result<Vec<InboundFrame>, NetworkError> {
@@ -851,12 +855,32 @@ impl DfsMessageTransport for DfsCloudFilesEndpointTransport {
     }
 }
 
-fn send_dfs_protocol_frame(
+fn send_dfs_message(
     endpoint: &ClusterEndpointRecord,
-    request: &DfsProtocolFrameCommand,
+    request: &DfsMessageCommand,
     timeout: Duration,
-) -> std::result::Result<DfsProtocolFrameResponse, CloudFilesModuleError> {
-    daemon::send_dfs_protocol_frame_to_endpoint(endpoint, request, timeout).map_err(error("daemon"))
+) -> std::result::Result<DfsMessageResponse, CloudFilesModuleError> {
+    let rpc_request = dfs::dfs_message_rpc_request(request).map_err(error("dfs-message"))?;
+    let response = daemon::send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)
+        .map_err(error("daemon"))?;
+    dfs::decode_dfs_message_rpc_response(&response).map_err(error("dfs-message"))
+}
+
+fn dfs_network_frame_from_routed_message(
+    message: DfsRoutedMessage,
+) -> std::result::Result<NetworkFrame, NetworkError> {
+    let protocol_message = ProtocolMessage::encode(dfs::DFS_PROTOCOL, &message.message)?;
+    Ok(NetworkFrame {
+        frame_id: NetworkFrameId(message.frame_id),
+        source_node_id: message.source_node_id.clone(),
+        target_node_id: message.target_node_id.clone(),
+        message: MeshMessage {
+            message_id: MeshMessageId(message.message_id),
+            origin_node_id: message.source_node_id,
+            target_node_id: message.target_node_id,
+            body: MeshMessageBody::Protocol(protocol_message),
+        },
+    })
 }
 
 fn normalize_sifs_root(path: &str) -> Result<String, CloudFilesModuleError> {
