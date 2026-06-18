@@ -1,4 +1,5 @@
 use crate::error::NetworkError;
+use crate::storage::io_observer;
 use sinomo_object::{LengthMode, serde_ext};
 use std::collections::HashMap;
 #[cfg(test)]
@@ -922,7 +923,7 @@ where
             operation: "write object frame".to_string(),
             detail: source.to_string(),
         })?;
-    if let Some(observer) = crate::io_observer() {
+    if let Some(observer) = io_observer() {
         observer.on_net_sent(len_prefix.len() as u64 + bytes.len() as u64);
     }
     Ok(())
@@ -940,7 +941,7 @@ where
     let (len, prefix_bytes) = read_object_frame_len_blocking(reader, max_bytes)?;
     let mut bytes = vec![0_u8; len];
     read_exact_blocking_frame(reader, &mut bytes, "read object frame body", "body")?;
-    if let Some(observer) = crate::io_observer() {
+    if let Some(observer) = io_observer() {
         observer.on_net_recv(prefix_bytes as u64 + bytes.len() as u64);
     }
     SinomoObjectCodec::network_frame().decode(&bytes)
@@ -1027,7 +1028,7 @@ where
         "body",
     )
     .await?;
-    if let Some(observer) = crate::io_observer() {
+    if let Some(observer) = io_observer() {
         observer.on_net_sent(len_prefix.len() as u64 + bytes.len() as u64);
     }
     Ok(())
@@ -1053,7 +1054,7 @@ where
         "body",
     )
     .await?;
-    if let Some(observer) = crate::io_observer() {
+    if let Some(observer) = io_observer() {
         observer.on_net_recv(prefix_bytes as u64 + bytes.len() as u64);
     }
     SinomoObjectCodec::network_frame().decode(&bytes)
@@ -1288,7 +1289,7 @@ where
         .await?;
     }
     flush_async_frame(writer, options.idle_timeout, "write raw byte stream chunk").await?;
-    if let Some(observer) = crate::io_observer() {
+    if let Some(observer) = io_observer() {
         observer.on_net_sent(
             DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64 + bytes.len() as u64,
         );
@@ -1318,7 +1319,7 @@ where
         .await?;
         let len = u64::from_be_bytes(len_bytes);
         if len == 0 {
-            if let Some(observer) = crate::io_observer() {
+            if let Some(observer) = io_observer() {
                 observer.on_net_recv(DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64);
             }
             return Ok(total);
@@ -1350,7 +1351,7 @@ where
             "body",
         )
         .await?;
-        if let Some(observer) = crate::io_observer() {
+        if let Some(observer) = io_observer() {
             observer.on_net_recv(
                 DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64 + len_usize as u64,
             );
@@ -1391,7 +1392,7 @@ where
                 "length",
             )
             .await?;
-            if let Some(observer) = crate::io_observer() {
+            if let Some(observer) = io_observer() {
                 observer.on_net_recv(DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64);
                 observer.on_net_sent(DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64);
             }
@@ -1443,7 +1444,7 @@ where
             "forward raw byte stream chunk body",
         )
         .await?;
-        if let Some(observer) = crate::io_observer() {
+        if let Some(observer) = io_observer() {
             observer.on_net_recv(
                 DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64 + len_usize as u64,
             );

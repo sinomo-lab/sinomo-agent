@@ -13,6 +13,7 @@
 //! coupling the network crate to daemon identity storage.
 
 use crate::prelude::*;
+use crate::storage::{DAEMON_SHADOW_SUPERVISE_CAPABILITY, locally_learned_bridge_route_endpoint};
 use crate::{
     ClusterConnectivityGraph, ClusterEndpointSelectionPurpose, ClusterPaths, DaemonControlRequest,
     DaemonRpcTimeouts, NetworkError, ObjectRpcRequest, ObjectRpcResponse, cluster_endpoint_targets,
@@ -1654,7 +1655,7 @@ fn relay_member_has_usable_bridge_endpoint(
     member
         .endpoints
         .iter()
-        .filter(|endpoint| crate::locally_learned_bridge_route_endpoint(endpoint))
+        .filter(|endpoint| locally_learned_bridge_route_endpoint(endpoint))
         .any(|endpoint| {
             cluster_relay_next_hop_endpoint_is_usable(
                 graph,
@@ -1771,7 +1772,7 @@ fn relay_candidate_is_known_shadow_daemon(
             member
                 .capabilities
                 .iter()
-                .any(|capability| capability.as_str() == crate::DAEMON_SHADOW_SUPERVISE_CAPABILITY)
+                .any(|capability| capability.as_str() == DAEMON_SHADOW_SUPERVISE_CAPABILITY)
         })
 }
 
@@ -1804,7 +1805,7 @@ fn cluster_relay_target_has_locally_learned_endpoint(
             member
                 .endpoints
                 .iter()
-                .any(crate::locally_learned_bridge_route_endpoint)
+                .any(locally_learned_bridge_route_endpoint)
         })
 }
 
@@ -1878,7 +1879,7 @@ fn cluster_relay_next_hop_endpoints_with_graph_and_policy(
         for endpoint in member
             .endpoints
             .iter()
-            .filter(|endpoint| crate::locally_learned_bridge_route_endpoint(endpoint))
+            .filter(|endpoint| locally_learned_bridge_route_endpoint(endpoint))
             .filter(|endpoint| cluster_relay_endpoint_can_carry_main_daemon_rpc(endpoint))
             .filter(|endpoint| {
                 cluster_relay_next_hop_endpoint_is_usable(
@@ -1937,7 +1938,7 @@ fn cluster_relay_next_hop_endpoint_is_usable(
             (!has_healthy_next_hop_endpoint && !local_graph_has_reachable_targets)
                 || (allow_unknown_locally_learned_endpoint
                     && !has_reachable_next_hop_endpoint
-                    && crate::locally_learned_bridge_route_endpoint(endpoint))
+                    && locally_learned_bridge_route_endpoint(endpoint))
         }
     }
 }

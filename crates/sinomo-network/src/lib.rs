@@ -56,7 +56,6 @@ pub use route::{
     relay_request_for_signed_rpc, relay_response_is_routing_error,
 };
 pub use rpc::*;
-pub(crate) use storage::*;
 pub use storage::{
     CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD,
     CLUSTER_CONNECTIVITY_MOBILE_PROBE_MAX_ENDPOINTS_PER_TICK,

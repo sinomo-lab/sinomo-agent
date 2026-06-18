@@ -2,6 +2,8 @@ use crate::error::NetworkError;
 use crate::object::DaemonRpcTimeouts;
 use crate::peer::{EndpointCandidateStatus, PeerEndpointCandidate};
 use crate::prelude::*;
+#[cfg(any(feature = "iroh-transport", test))]
+use crate::storage::io_observer;
 use crate::storage::{ClusterPaths, read_object_file, write_object_file};
 #[cfg(feature = "iroh-transport")]
 use crate::storage::{read_optional_object_file, write_object_file_create_new_serialized};
@@ -935,7 +937,7 @@ where
         "body",
     )
     .await?;
-    if let Some(observer) = crate::io_observer() {
+    if let Some(observer) = io_observer() {
         observer.on_net_recv(frame.len() as u64);
     }
     Ok((frame, permit))
@@ -992,7 +994,7 @@ where
         "body",
     )
     .await?;
-    if let Some(observer) = crate::io_observer() {
+    if let Some(observer) = io_observer() {
         observer.on_net_recv(frame.len() as u64);
     }
     Ok((frame, permit))
