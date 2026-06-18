@@ -615,7 +615,10 @@ fn open_sifs_service(
         .unwrap_or_else(dfs::fallback_dfs_node_id);
     let endpoints = cluster_state
         .as_ref()
-        .map(|state| network::cluster_dfs_protocol_targets(&cluster_paths, state))
+        .map(|state| {
+            network::ClusterEndpointSelector::new(&cluster_paths, state)
+                .select(network::ClusterEndpointSelectionPurpose::DfsData)
+        })
         .unwrap_or_default();
     let content =
         LocalContentStore::new(data_dir.dfs_dir().join("content")).map_err(error("dfs"))?;
