@@ -50,6 +50,7 @@ mod roaming;
 mod route;
 mod route_graph_read_model;
 mod rpc;
+mod rpc_future;
 mod status_publish;
 mod storage;
 mod voter_reachability;
@@ -306,6 +307,7 @@ pub use rpc::{
 };
 #[cfg(test)]
 pub(crate) use rpc::{call_object_rpc_frame_async, serve_object_rpc_frame_async};
+pub use rpc_future::ClusterMembershipRpcFuture;
 pub use status_publish::{
     ClusterNetworkInfoPublishAsyncHost, ClusterNetworkInfoPublishHost,
     ClusterNodeStatusPublishAsyncHost, ClusterNodeStatusPublishHost, cluster_node_status_stable_eq,
@@ -322,13 +324,12 @@ pub use storage::{
     ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost, ClusterKvTxnQuorumOptions,
     ClusterLocalDaemonMembershipAsyncObserver, ClusterLocalDaemonMembershipObserver,
     ClusterMemberMutationAsyncHost, ClusterMemberMutationDriver, ClusterMemberMutationHost,
-    ClusterMembershipRpcFuture, ClusterNodeRoleUpdate, ClusterRaftAppendReplicationAsyncHost,
-    ClusterRaftAppendReplicationHost, ClusterRaftAppendReplicationOptions,
-    ClusterRaftAppendReplicationOutcome, ClusterRaftCommittedFanoutAsyncHost,
-    ClusterRaftCommittedFanoutOptions, ClusterRaftLeaderElectionOptions,
-    ClusterRaftQuorumAsyncHost, ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult,
-    ClusterRaftQuorumTransportHost, ClusterRaftVoteTransportAsyncHost,
-    ClusterRaftVoteTransportHost, DAEMON_MAIN_RUN_CAPABILITY,
+    ClusterNodeRoleUpdate, ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
+    ClusterRaftAppendReplicationOptions, ClusterRaftAppendReplicationOutcome,
+    ClusterRaftCommittedFanoutAsyncHost, ClusterRaftCommittedFanoutOptions,
+    ClusterRaftLeaderElectionOptions, ClusterRaftQuorumAsyncHost, ClusterRaftQuorumCommitOptions,
+    ClusterRaftQuorumCommitResult, ClusterRaftQuorumTransportHost,
+    ClusterRaftVoteTransportAsyncHost, ClusterRaftVoteTransportHost, DAEMON_MAIN_RUN_CAPABILITY,
     DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_IROH_FOREGROUND_ATTEMPT_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,

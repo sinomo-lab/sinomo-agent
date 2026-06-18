@@ -11,7 +11,8 @@ use crate::route::{
     ClusterSignedEndpointRpcAsyncHost,
 };
 use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
-use crate::storage::{ClusterMembershipRpcFuture, locked_cluster_raft_known_leader_id_async};
+use crate::rpc_future::ClusterMembershipRpcFuture;
+use crate::storage::locked_cluster_raft_known_leader_id_async;
 use sinomo_core::{ClusterBootstrapState, ClusterEndpointRecord, ClusterTransportKind};
 use sinomo_kv::{KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_node::NodeId;

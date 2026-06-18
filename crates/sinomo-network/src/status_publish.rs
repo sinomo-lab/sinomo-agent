@@ -7,10 +7,10 @@ use crate::keyspace::{
 };
 use crate::network_info::{ClusterNetworkInfoRecord, cluster_network_info_stable_eq};
 use crate::prelude::*;
+use crate::rpc_future::ClusterMembershipRpcFuture;
 use crate::storage::{
-    ClusterMembershipRpcFuture, append_cluster_raft_command,
-    read_cluster_kv_current_or_cached_snapshot_arc_if_present, read_cluster_kv_snapshot,
-    read_cluster_state, read_cluster_state_without_kv,
+    append_cluster_raft_command, read_cluster_kv_current_or_cached_snapshot_arc_if_present,
+    read_cluster_kv_snapshot, read_cluster_state, read_cluster_state_without_kv,
 };
 
 pub trait ClusterNetworkInfoPublishHost {

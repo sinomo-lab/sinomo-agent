@@ -10,10 +10,11 @@ use crate::maintenance::{
 use crate::membership::cluster_node_is_local_process;
 use crate::network_info::ClusterNetworkInfoRecord;
 use crate::prelude::*;
+use crate::rpc_future::ClusterMembershipRpcFuture;
 use crate::storage::{
-    ClusterMembershipRpcFuture, append_cluster_raft_ops_in_batches,
-    read_cluster_kv_current_or_empty_snapshot_arc, read_cluster_kv_current_snapshot_arc,
-    read_cluster_kv_snapshot, read_cluster_state, read_cluster_state_without_kv,
+    append_cluster_raft_ops_in_batches, read_cluster_kv_current_or_empty_snapshot_arc,
+    read_cluster_kv_current_snapshot_arc, read_cluster_kv_snapshot, read_cluster_state,
+    read_cluster_state_without_kv,
 };
 use sinomo_kv::{CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, KvCompare, KvOp, KvSnapshot, KvTxn};
 use std::collections::BTreeMap;

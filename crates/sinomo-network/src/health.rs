@@ -5,11 +5,11 @@ use crate::rpc::{
     CLUSTER_HEALTH_SCOPE_METADATA_KEY, CLUSTER_NETWORK_PING_ROUTE, CLUSTER_NETWORK_RPC_CATEGORY,
     ObjectRpcRequest, ObjectRpcResponse,
 };
+use crate::rpc_future::ClusterMembershipRpcFuture;
 #[cfg(test)]
 use crate::storage::read_cluster_state;
 use crate::storage::{
-    ClusterMembershipRpcFuture, DAEMON_MAIN_RUN_CAPABILITY, read_cluster_node_statuses_from_kv,
-    read_cluster_state_async,
+    DAEMON_MAIN_RUN_CAPABILITY, read_cluster_node_statuses_from_kv, read_cluster_state_async,
 };
 use crate::{
     ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityState, ClusterPaths,

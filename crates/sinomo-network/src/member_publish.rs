@@ -13,9 +13,9 @@ use crate::membership::cluster_local_process_members;
 use crate::membership_rpc::{ClusterMemberPublishRequest, ClusterMemberPublishResponse};
 use crate::prelude::*;
 use crate::records::{ClusterCapabilityPolicyRecord, cluster_capability_policy_stable_eq};
+use crate::rpc_future::ClusterMembershipRpcFuture;
 use crate::storage::{
-    ClusterMemberMutationAsyncHost, ClusterMembershipRpcFuture,
-    MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS, cluster_member_stable_eq,
+    ClusterMemberMutationAsyncHost, MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS, cluster_member_stable_eq,
     imported_snapshot_advances_local_kv, local_cluster_kv_snapshot_revision,
     read_cluster_kv_cached_snapshot, read_cluster_kv_current_snapshot,
     read_cluster_kv_current_snapshot_arc, read_cluster_state,

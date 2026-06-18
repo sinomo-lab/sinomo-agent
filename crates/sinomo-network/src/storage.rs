@@ -181,6 +181,7 @@ use crate::rpc::{
     CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY, ObjectRpcRequest,
     ObjectRpcResponse,
 };
+use crate::rpc_future::ClusterMembershipRpcFuture;
 use crate::status_publish::{ClusterNetworkInfoPublishHost, ClusterNodeStatusPublishHost};
 use crate::voter_reachability::{
     ClusterVoterReachabilityAsyncHost, ClusterVoterReachabilityHost,
@@ -188,8 +189,6 @@ use crate::voter_reachability::{
     cluster_reachable_voter_count_async_with_host, cluster_reachable_voter_count_with_host,
 };
 use std::collections::BTreeSet;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -2885,9 +2884,6 @@ where
         Ok(())
     }
 }
-
-pub type ClusterMembershipRpcFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, NetworkError>> + Send + 'a>>;
 
 pub trait ClusterJoinRegistrationHost: ClusterMembershipRpcForwardHost {
     fn local_daemon_membership_observation(
