@@ -23992,23 +23992,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     fn expire_stale_fetch_requests(&mut self) {
         let tick = self.repair_retry_tick;
-        let active_fetch_request_ids = self
-            .incoming_fetch_transfers
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>();
         for pending in self.pending_writes.values_mut() {
             let expired_sources = pending
                 .fetch_inflight_started_ticks
                 .iter()
                 .filter_map(|(source_node_id, started_tick)| {
-                    if pending
-                        .fetch_inflight_request_ids
-                        .get(source_node_id)
-                        .is_some_and(|request_id| active_fetch_request_ids.contains(request_id))
-                    {
-                        return None;
-                    }
                     let expires_at = started_tick.saturating_add(fetch_inflight_timeout_ticks());
                     (expires_at <= tick).then_some(source_node_id.clone())
                 })
@@ -24018,9 +24006,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             for source_node_id in expired_sources {
                 pending.fetch_inflight_from.remove(&source_node_id);
-                pending.fetch_inflight_request_ids.remove(&source_node_id);
                 pending.fetch_inflight_started_ticks.remove(&source_node_id);
-                pending.fetch_next_chunk_indexes.remove(&source_node_id);
                 pending
                     .fetch_window_end_chunk_indexes
                     .remove(&source_node_id);

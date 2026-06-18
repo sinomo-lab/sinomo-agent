@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Debug)]
 struct ReceiveOnlyTransport {
     local_node_id: NodeId,
-    incoming: VecDeque<sinomo_network::InboundFrame>,
+    incoming: VecDeque<DfsRoutedMessage>,
 }
 
 impl ReceiveOnlyTransport {
@@ -28,22 +28,13 @@ impl ReceiveOnlyTransport {
         target_node_id: NodeId,
         message: DfsNetworkMessage,
     ) {
-        let protocol_message =
-            ProtocolMessage::encode(DFS_PROTOCOL, &message).expect("protocol message");
-        self.incoming.push_back(sinomo_network::InboundFrame {
-            received_by: target_node_id.clone(),
-            frame: NetworkFrame {
-                frame_id: NetworkFrameId(1),
-                source_node_id: source_node_id.clone(),
-                target_node_id: target_node_id.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(1),
-                    origin_node_id: source_node_id,
-                    target_node_id,
-                    body: MeshMessageBody::Protocol(protocol_message),
-                },
-            },
-        });
+        self.incoming.push_back(build_dfs_routed_message(
+            &source_node_id,
+            &target_node_id,
+            1,
+            1,
+            message,
+        ));
     }
 }
 
@@ -65,11 +56,7 @@ impl DfsMessageTransport for ReceiveOnlyTransport {
     }
 
     fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
-        Ok(self
-            .incoming
-            .drain(..)
-            .filter_map(|inbound| dfs_routed_message_from_network_frame(&inbound.frame).ok())
-            .collect())
+        Ok(self.incoming.drain(..).collect())
     }
 }
 
@@ -104,13 +91,22 @@ fn test_dfs_lookup_routed_message(
     frame_id: u64,
     path: &str,
 ) -> DfsRoutedMessage {
-    dfs_routed_message_from_network_frame(&test_dfs_lookup_frame(
+    build_dfs_routed_message(
         source_node_id,
         target_node_id,
         frame_id,
-        path,
-    ))
-    .expect("test DFS lookup routed message")
+        frame_id,
+        DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+            request_id: format!("dfs_test_lookup_{frame_id}"),
+            file_system_id: sifs_file_system_id(),
+            requesting_node_id: source_node_id.clone(),
+            include_metadata_journal_batches: false,
+            metadata_journal_after_sequences: Vec::new(),
+            operation: DfsNamespaceOperation::LookupPath {
+                path: path.to_string(),
+            },
+        }),
+    )
 }
 
 fn test_dfs_frame_from_message_command(command: &DfsMessageCommand) -> NetworkFrame {
@@ -3313,7 +3309,7 @@ fn temp_root(name: &str) -> sinomo_testdir::TestDir {
 
 #[test]
 fn networked_dfs_builds_routed_messages_without_transport_send() {
-    let root = temp_root("networked-dfs-builds-protocol-frames");
+    let root = temp_root("networked-dfs-builds-routed-messages");
     let local = NodeId::from_legacy_named("node_build_frame_local").expect("local");
     let remote = NodeId::from_legacy_named("node_build_frame_remote").expect("remote");
     let object_id = DfsObjectId::from_legacy_named("obj_build_frame").expect("object");
@@ -3334,23 +3330,12 @@ fn networked_dfs_builds_routed_messages_without_transport_send() {
             max_chunks: 0,
         }),
     );
-    let first = protocol::dfs_protocol_frame_from_routed_message(&first_routed_message)
-        .expect("first frame");
 
-    assert_eq!(first.frame_id, NetworkFrameId(1));
-    assert_eq!(first.source_node_id, local);
-    assert_eq!(first.target_node_id, remote);
-    assert_eq!(first.message.message_id, MeshMessageId(1));
-    assert_eq!(first.message.origin_node_id, first.source_node_id);
-    assert_eq!(first.message.target_node_id, first.target_node_id);
-    let MeshMessageBody::Protocol(protocol) = &first.message.body else {
-        panic!("expected DFS protocol frame");
-    };
-    assert_eq!(protocol.protocol, DFS_PROTOCOL);
-    match protocol
-        .decode::<DfsNetworkMessage>()
-        .expect("decode DFS payload")
-    {
+    assert_eq!(first_routed_message.frame_id, 1);
+    assert_eq!(first_routed_message.source_node_id, local);
+    assert_eq!(first_routed_message.target_node_id, remote);
+    assert_eq!(first_routed_message.message_id, 1);
+    match &first_routed_message.message {
         DfsNetworkMessage::ReadRequest(request) => {
             assert_eq!(request.request_id, "read-1");
             assert_eq!(request.object_id, object_id);
@@ -3359,7 +3344,7 @@ fn networked_dfs_builds_routed_messages_without_transport_send() {
     }
 
     let second_routed_message = dfs.next_dfs_routed_message(
-        &first.target_node_id.clone(),
+        &first_routed_message.target_node_id.clone(),
         DfsNetworkMessage::ReadRequest(DfsReadRequest {
             request_id: "read-2".to_string(),
             object_id: DfsObjectId::from_legacy_named("obj_build_frame_second").expect("object"),
@@ -3372,10 +3357,8 @@ fn networked_dfs_builds_routed_messages_without_transport_send() {
             max_chunks: 0,
         }),
     );
-    let second = protocol::dfs_protocol_frame_from_routed_message(&second_routed_message)
-        .expect("second frame");
-    assert_eq!(second.frame_id, NetworkFrameId(2));
-    assert_eq!(second.message.message_id, MeshMessageId(2));
+    assert_eq!(second_routed_message.frame_id, 2);
+    assert_eq!(second_routed_message.message_id, 2);
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -3637,16 +3620,10 @@ fn networked_sifs_with_backend(
 fn drain_dfs_messages(
     transport: &mut sinomo_network::InProcessTransport,
 ) -> Vec<DfsNetworkMessage> {
-    transport
-        .drain_incoming()
-        .expect("drain DFS frames")
+    DfsMessageTransport::drain_incoming_messages(transport)
+        .expect("drain DFS messages")
         .into_iter()
-        .filter_map(|frame| {
-            let MeshMessageBody::Protocol(protocol) = frame.frame.message.body else {
-                return None;
-            };
-            Some(protocol.decode::<DfsNetworkMessage>().expect("decode DFS"))
-        })
+        .map(|message| message.message)
         .collect()
 }
 
@@ -16896,7 +16873,9 @@ fn chunked_fetch_retry_resumes_from_received_prefix() {
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
     let base_version = DfsVersion::from_legacy_named("version_1").expect("version");
     let version = DfsVersion::from_legacy_named("version_2").expect("version");
-    let total_chunks = DFS_LOCAL_CHUNK_WINDOW_SIZE + 1;
+    let fetch_window_chunks =
+        (DFS_ADAPTIVE_TRANSFER_WINDOW_MAX_BYTES / DFS_BLOB_CHUNK_BYTES as u64) as u32;
+    let total_chunks = fetch_window_chunks + 1;
     let bytes_len = DFS_BLOB_CHUNK_BYTES * (total_chunks as usize - 1) + 17;
     let bytes = (0..bytes_len)
         .map(|index| (index % 251) as u8)
@@ -16914,6 +16893,7 @@ fn chunked_fetch_retry_resumes_from_received_prefix() {
         .content
         .put_object_version(object_id.as_str(), version.as_str(), &bytes)
         .expect("source content");
+    let expected_fetch_window = owner_dfs.adaptive_fetch_chunk_window(&source, manifest.size_bytes);
 
     let intent = owner_dfs
         .coordinator
@@ -16969,40 +16949,24 @@ fn chunked_fetch_retry_resumes_from_received_prefix() {
             .request_stage_blob_from_alternate(&intent_snapshot, &pending_snapshot)
             .expect("initial fetch request")
     );
-    let first_request = source_dfs
-        .transport
-        .drain_incoming()
-        .expect("source fetch request")
+    let first_request = drain_dfs_messages(&mut source_dfs.transport)
         .into_iter()
-        .find_map(|frame| {
-            let MeshMessageBody::Protocol(protocol) = frame.frame.message.body else {
-                return None;
-            };
-            match protocol.decode::<DfsNetworkMessage>().expect("decode DFS") {
-                DfsNetworkMessage::FetchBlob(command) => Some(command),
-                _ => None,
-            }
+        .find_map(|message| match message {
+            DfsNetworkMessage::FetchBlob(command) => Some(command),
+            _ => None,
         })
         .expect("fetch command");
     assert_eq!(first_request.start_chunk_index, 0);
-    assert_eq!(first_request.max_chunks, DFS_LOCAL_CHUNK_WINDOW_SIZE);
+    assert_eq!(first_request.max_chunks, expected_fetch_window);
 
     source_dfs
         .handle_fetch_blob(owner.clone(), first_request.clone())
         .expect("source sends first chunk stream");
-    let mut first_responses = owner_dfs
-        .transport
-        .drain_incoming()
-        .expect("owner first fetch chunks")
+    let mut first_responses = drain_dfs_messages(&mut owner_dfs.transport)
         .into_iter()
-        .filter_map(|frame| {
-            let MeshMessageBody::Protocol(protocol) = frame.frame.message.body else {
-                return None;
-            };
-            match protocol.decode::<DfsNetworkMessage>().expect("decode DFS") {
-                DfsNetworkMessage::FetchBlobResponseChunk(chunk) => Some(chunk),
-                _ => None,
-            }
+        .filter_map(|message| match message {
+            DfsNetworkMessage::FetchBlobResponseChunk(chunk) => Some(chunk),
+            _ => None,
         });
     let first_chunk = first_responses.next().expect("first chunk");
     assert_eq!(first_chunk.chunk_index, 0);
@@ -17055,19 +17019,11 @@ fn chunked_fetch_retry_resumes_from_received_prefix() {
             .request_stage_blob_from_alternate(&intent_snapshot, &pending_snapshot)
             .expect("second retry sends resumed fetch")
     );
-    let retry_request = source_dfs
-        .transport
-        .drain_incoming()
-        .expect("source retry fetch request")
+    let retry_request = drain_dfs_messages(&mut source_dfs.transport)
         .into_iter()
-        .find_map(|frame| {
-            let MeshMessageBody::Protocol(protocol) = frame.frame.message.body else {
-                return None;
-            };
-            match protocol.decode::<DfsNetworkMessage>().expect("decode DFS") {
-                DfsNetworkMessage::FetchBlob(command) => Some(command),
-                _ => None,
-            }
+        .find_map(|message| match message {
+            DfsNetworkMessage::FetchBlob(command) => Some(command),
+            _ => None,
         })
         .expect("retry fetch command");
     assert_eq!(
@@ -17075,24 +17031,16 @@ fn chunked_fetch_retry_resumes_from_received_prefix() {
         "fetch retry should preserve the request id so the partial assembler can continue"
     );
     assert_eq!(retry_request.start_chunk_index, 1);
-    assert_eq!(retry_request.max_chunks, DFS_LOCAL_CHUNK_WINDOW_SIZE);
+    assert_eq!(retry_request.max_chunks, expected_fetch_window);
 
     source_dfs
         .handle_fetch_blob(owner.clone(), retry_request)
         .expect("source sends resumed chunks");
-    let resumed_chunks = owner_dfs
-        .transport
-        .drain_incoming()
-        .expect("owner resumed fetch chunks")
+    let resumed_chunks = drain_dfs_messages(&mut owner_dfs.transport)
         .into_iter()
-        .filter_map(|frame| {
-            let MeshMessageBody::Protocol(protocol) = frame.frame.message.body else {
-                return None;
-            };
-            match protocol.decode::<DfsNetworkMessage>().expect("decode DFS") {
-                DfsNetworkMessage::FetchBlobResponseChunk(chunk) => Some(chunk),
-                _ => None,
-            }
+        .filter_map(|message| match message {
+            DfsNetworkMessage::FetchBlobResponseChunk(chunk) => Some(chunk),
+            _ => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(resumed_chunks.len(), (total_chunks - 1) as usize);
@@ -17144,7 +17092,9 @@ fn chunked_fetch_response_windows_and_continues() {
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
     let base_version = DfsVersion::from_legacy_named("version_1").expect("version");
     let version = DfsVersion::from_legacy_named("version_2").expect("version");
-    let total_chunks = DFS_LOCAL_CHUNK_WINDOW_SIZE + 2;
+    let fetch_window_chunks =
+        (DFS_ADAPTIVE_TRANSFER_WINDOW_MAX_BYTES / DFS_BLOB_CHUNK_BYTES as u64) as u32;
+    let total_chunks = fetch_window_chunks + 2;
     let bytes_len = DFS_BLOB_CHUNK_BYTES * (total_chunks as usize - 1) + 17;
     let bytes = (0..bytes_len)
         .map(|index| (index % 251) as u8)
@@ -17162,6 +17112,7 @@ fn chunked_fetch_response_windows_and_continues() {
         .content
         .put_object_version(object_id.as_str(), version.as_str(), &bytes)
         .expect("source content");
+    let expected_fetch_window = owner_dfs.adaptive_fetch_chunk_window(&source, manifest.size_bytes);
     let intent = owner_dfs
         .coordinator
         .create_intent(
@@ -17224,7 +17175,7 @@ fn chunked_fetch_response_windows_and_continues() {
         })
         .expect("first fetch request");
     assert_eq!(first_request.start_chunk_index, 0);
-    assert_eq!(first_request.max_chunks, DFS_LOCAL_CHUNK_WINDOW_SIZE);
+    assert_eq!(first_request.max_chunks, expected_fetch_window);
 
     source_dfs
         .handle_fetch_blob(owner.clone(), first_request)
@@ -17236,14 +17187,14 @@ fn chunked_fetch_response_windows_and_continues() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(first_window.len(), DFS_LOCAL_CHUNK_WINDOW_SIZE as usize);
+    assert_eq!(first_window.len(), expected_fetch_window as usize);
     assert_eq!(first_window.first().expect("first chunk").chunk_index, 0);
     assert_eq!(
         first_window
             .last()
             .expect("last first-window chunk")
             .chunk_index,
-        DFS_LOCAL_CHUNK_WINDOW_SIZE - 1
+        expected_fetch_window - 1
     );
     for chunk in first_window {
         owner_dfs
@@ -17265,8 +17216,8 @@ fn chunked_fetch_response_windows_and_continues() {
             _ => None,
         })
         .expect("continuation fetch request");
-    assert_eq!(next_request.start_chunk_index, DFS_LOCAL_CHUNK_WINDOW_SIZE);
-    assert_eq!(next_request.max_chunks, DFS_LOCAL_CHUNK_WINDOW_SIZE);
+    assert_eq!(next_request.start_chunk_index, expected_fetch_window);
+    assert_eq!(next_request.max_chunks, expected_fetch_window);
     source_dfs
         .handle_fetch_blob(owner.clone(), next_request)
         .expect("source sends second fetch window");
@@ -17283,7 +17234,7 @@ fn chunked_fetch_response_windows_and_continues() {
             .first()
             .expect("first resumed chunk")
             .chunk_index,
-        DFS_LOCAL_CHUNK_WINDOW_SIZE
+        expected_fetch_window
     );
     assert_eq!(
         second_window
