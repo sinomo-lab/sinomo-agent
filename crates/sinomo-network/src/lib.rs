@@ -17,6 +17,7 @@ mod error;
 mod health;
 mod invite;
 mod lan;
+mod membership;
 mod object;
 mod peer;
 mod roaming;
@@ -60,6 +61,14 @@ pub use lan::{
     discover_default_lan_ip_candidates_async, format_ip_port, iroh_disabled_by_env,
     lan_discovery_advertisement_for_state,
 };
+pub use membership::{
+    DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, DAEMON_SHADOW_SUPERVISE_CAPABILITY,
+    cluster_is_settled_solo, cluster_member_expected_daemon_process,
+    cluster_member_is_legacy_shadow_daemon, cluster_member_is_local_process,
+    cluster_node_is_local_process, live_cluster_member_probe_possible,
+};
+#[cfg(test)]
+pub(crate) use membership::{cluster_has_remote_peers, cluster_local_process_members};
 pub use object::{
     AsyncDaemonControlListener, AsyncDaemonControlStream, DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
     DaemonControlRequest, DaemonControlResponse, DaemonRpcTimeouts, OBJECT_STREAM_MAX_CHUNK_BYTES,
@@ -154,8 +163,8 @@ pub use storage::{
     ClusterRaftQuorumAsyncHost, ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult,
     ClusterRaftQuorumTransportHost, ClusterRaftVoteTransportAsyncHost,
     ClusterRaftVoteTransportHost, ClusterVoterReachabilityAsyncHost, ClusterVoterReachabilityHost,
-    ClusterVoterReachabilityOptions, DAEMON_MAIN_CLUSTER_ROLE, DAEMON_MAIN_RUN_CAPABILITY,
-    DAEMON_SHADOW_CLUSTER_ROLE, DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT,
+    ClusterVoterReachabilityOptions, DAEMON_MAIN_RUN_CAPABILITY,
+    DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_IROH_FOREGROUND_ATTEMPT_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT,
@@ -176,8 +185,7 @@ pub use storage::{
     cluster_endpoint_prefix, cluster_has_local_quorum_with_host, cluster_identity_key,
     cluster_invitation_key, cluster_invitation_state_key,
     cluster_iroh_proxy_republish_sleep_duration, cluster_iroh_proxy_start_retry_sleep_duration,
-    cluster_is_settled_solo, cluster_join_challenge_rpc_request, cluster_local_node_role,
-    cluster_member_expected_daemon_process, cluster_member_is_local_process, cluster_member_key,
+    cluster_join_challenge_rpc_request, cluster_local_node_role, cluster_member_key,
     cluster_member_publish_txn_from_kv, cluster_network_discovery_interval_for_role,
     cluster_network_info_key, cluster_network_info_stable_eq, cluster_network_maintenance_due,
     cluster_network_maintenance_interval_due,
@@ -185,9 +193,8 @@ pub use storage::{
     cluster_network_maintenance_next_due_duration, cluster_network_probe_interval_for_role,
     cluster_network_publish_interval_for_node, cluster_network_publish_interval_for_role,
     cluster_network_record_should_refresh, cluster_node_blocks_leader_preference,
-    cluster_node_is_local_process, cluster_node_status_stable_eq,
-    cluster_reachable_voter_count_with_host, cluster_state_needs_join_registration,
-    cluster_state_sync_txn, cluster_status_summary_label,
+    cluster_node_status_stable_eq, cluster_reachable_voter_count_with_host,
+    cluster_state_needs_join_registration, cluster_state_sync_txn, cluster_status_summary_label,
     commit_cluster_kv_txn_with_quorum_response_with_host,
     commit_cluster_raft_command_with_quorum_driver, elect_cluster_raft_leader_with_host,
     ensure_daemon_cluster_members, expire_cluster_network_records_with_host,

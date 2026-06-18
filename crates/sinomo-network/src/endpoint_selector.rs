@@ -3,11 +3,10 @@ use crate::lan::{
     discover_local_ip_candidates_for_targets, discover_local_ip_candidates_for_targets_async,
     is_invitable_ip,
 };
+use crate::membership::{cluster_member_is_local_process, locally_learned_bridge_route_endpoint};
 use crate::storage::{
-    ClusterConnectivityGraph, ClusterConnectivityState, ClusterPaths,
-    cluster_member_is_local_process, iroh_endpoint_public_key,
-    locally_learned_bridge_route_endpoint, read_cluster_endpoints_from_kv,
-    read_cluster_node_statuses_from_kv,
+    ClusterConnectivityGraph, ClusterConnectivityState, ClusterPaths, iroh_endpoint_public_key,
+    read_cluster_endpoints_from_kv, read_cluster_node_statuses_from_kv,
 };
 use sinomo_core::{
     ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,

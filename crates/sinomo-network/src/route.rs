@@ -12,8 +12,10 @@
 //! are supplied by daemon-host callbacks so route construction stays here without
 //! coupling the network crate to daemon identity storage.
 
+use crate::membership::{
+    DAEMON_SHADOW_SUPERVISE_CAPABILITY, locally_learned_bridge_route_endpoint,
+};
 use crate::prelude::*;
-use crate::storage::{DAEMON_SHADOW_SUPERVISE_CAPABILITY, locally_learned_bridge_route_endpoint};
 use crate::{
     ClusterConnectivityGraph, ClusterEndpointSelectionPurpose, ClusterEndpointSelector,
     ClusterPaths, DaemonControlRequest, DaemonRpcTimeouts, NetworkError, ObjectRpcRequest,
