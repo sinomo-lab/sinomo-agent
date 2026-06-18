@@ -9,7 +9,7 @@ use crate::kv_local_store::{
     cluster_raft_wal_paths, read_cluster_kv_cached_snapshot_if_present,
     read_cluster_kv_current_snapshot_arc, read_cluster_kv_reader_node_id,
 };
-use crate::storage::read_cluster_state;
+use crate::local_state_store::read_cluster_state;
 
 #[cfg(test)]
 use sinomo_kv::{

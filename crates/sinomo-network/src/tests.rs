@@ -12,6 +12,7 @@ use crate::lan::{
     MdnsDiscoveryRecord, apply_lan_discovery_advertisements, is_advertisable_interface_ip,
     is_invitable_ip, lan_discovery_advertisement_for_state,
 };
+use crate::member_store::MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS;
 use crate::object::{DaemonControlStream, read_object_frame_blocking, write_object_frame_blocking};
 use crate::peer::{
     AsyncNetworkServiceHandle, AsyncNetworkTransport, AsyncNetworkTransportFuture, DeliveryAck,
@@ -34,8 +35,8 @@ use crate::rpc::ObjectRpcFuture;
 use crate::storage::*;
 use crate::storage::{
     LocalClusterRaftCommandStorage, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
-    MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS, cluster_member_removal_txns_from_store,
-    cluster_member_update_ops_from_store, cluster_raft_config_from_store,
+    cluster_member_removal_txns_from_store, cluster_member_update_ops_from_store,
+    cluster_raft_config_from_store,
 };
 use crate::*;
 use sinomo_kv::ClusterKvRaftConfigRecord;

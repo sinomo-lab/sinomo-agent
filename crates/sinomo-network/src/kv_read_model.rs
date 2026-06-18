@@ -4,13 +4,13 @@ use crate::connectivity_publish::cluster_network_record_live;
 use crate::endpoint_records::cleanup_member_iroh_endpoints;
 use crate::error::NetworkError;
 use crate::keyspace::cluster_endpoint_prefix;
-#[cfg(test)]
-use crate::network_info::ClusterNetworkInfoRecord;
-use crate::records::ClusterCapabilityPolicyRecord;
-use crate::storage::{
+use crate::kv_local_store::{
     read_cluster_kv_cached_snapshot_if_present,
     read_cluster_kv_latest_observed_snapshot_arc_if_present,
 };
+#[cfg(test)]
+use crate::network_info::ClusterNetworkInfoRecord;
+use crate::records::ClusterCapabilityPolicyRecord;
 use sinomo_core::{ClusterEndpointRecord, ClusterMemberRecord, ClusterNodeStatusRecord};
 use sinomo_kv::{CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, KvSnapshot};
 use sinomo_node::NodeId;

@@ -1,3 +1,7 @@
+use crate::kv_read_model::read_cluster_node_statuses_from_kv;
+#[cfg(test)]
+use crate::local_state_store::read_cluster_state;
+use crate::local_state_store::read_cluster_state_async;
 use crate::prelude::*;
 use crate::route::cluster_route_next_hop;
 use crate::rpc::{
@@ -6,11 +10,7 @@ use crate::rpc::{
     ObjectRpcRequest, ObjectRpcResponse,
 };
 use crate::rpc_future::ClusterMembershipRpcFuture;
-#[cfg(test)]
-use crate::storage::read_cluster_state;
-use crate::storage::{
-    DAEMON_MAIN_RUN_CAPABILITY, read_cluster_node_statuses_from_kv, read_cluster_state_async,
-};
+use crate::storage::DAEMON_MAIN_RUN_CAPABILITY;
 use crate::{
     ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityState, ClusterPaths,
     NetworkError, cluster_member_expected_daemon_process, cluster_member_is_legacy_shadow_daemon,

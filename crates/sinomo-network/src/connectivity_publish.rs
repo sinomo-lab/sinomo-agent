@@ -3,6 +3,11 @@ use crate::connectivity::ClusterConnectivityRecord;
 use crate::connectivity_store::write_local_cluster_connectivity_record_set;
 use crate::error::NetworkError;
 use crate::keyspace::{cluster_connectivity_key, cluster_connectivity_source_prefix};
+use crate::kv_local_store::{
+    read_cluster_kv_current_or_empty_snapshot_arc, read_cluster_kv_current_snapshot_arc,
+    read_cluster_kv_snapshot,
+};
+use crate::local_state_store::{read_cluster_state, read_cluster_state_without_kv};
 use crate::maintenance::{
     CLUSTER_NETWORK_PUBLISH_INTERVAL, CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS,
     cluster_network_publish_interval_for_role,
@@ -11,11 +16,7 @@ use crate::membership::cluster_node_is_local_process;
 use crate::network_info::ClusterNetworkInfoRecord;
 use crate::prelude::*;
 use crate::rpc_future::ClusterMembershipRpcFuture;
-use crate::storage::{
-    append_cluster_raft_ops_in_batches, read_cluster_kv_current_or_empty_snapshot_arc,
-    read_cluster_kv_current_snapshot_arc, read_cluster_kv_snapshot, read_cluster_state,
-    read_cluster_state_without_kv,
-};
+use crate::storage::append_cluster_raft_ops_in_batches;
 use sinomo_kv::{CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, KvCompare, KvOp, KvSnapshot, KvTxn};
 use std::collections::BTreeMap;
 #[cfg(test)]

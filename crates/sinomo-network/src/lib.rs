@@ -158,7 +158,10 @@ pub use kv_forward::{
     ClusterKvTxnForwardResult, forward_cluster_kv_txn_to_voter_async_with_host,
     forward_cluster_kv_txn_to_voter_with_host,
 };
-pub use kv_local_store::cluster_kv_key_can_defer_materialized_snapshot;
+pub use kv_local_store::{
+    cluster_kv_key_can_defer_materialized_snapshot, commit_cluster_raft_index_with_events_async,
+    discard_cluster_raft_uncommitted_tail_and_clear_leader_async,
+};
 pub use kv_read_model::{
     read_cluster_connectivity_graph_from_kv, read_cluster_members_from_kv,
     read_cluster_node_statuses_from_kv,
@@ -185,6 +188,11 @@ pub use local_membership::{
     prepare_cluster_join_retry_state, prepare_pending_cluster_join_state,
     refresh_cluster_connectivity_environment, refresh_cluster_connectivity_environment_async,
     refresh_local_daemon_membership_from_disk, refresh_local_daemon_membership_from_disk_async,
+};
+pub use local_state_store::{
+    read_cluster_state, read_cluster_state_async, read_cluster_state_cached,
+    read_cluster_state_without_kv, read_cluster_state_without_kv_async, write_cluster_state,
+    write_cluster_state_async,
 };
 pub use maintenance::{
     CLUSTER_CONNECTIVITY_MOBILE_PROBE_MAX_ENDPOINTS_PER_TICK,
@@ -218,6 +226,7 @@ pub(crate) use member_publish::{
     cluster_member_publish_txn, cluster_member_publish_txn_from_snapshot,
     handle_cluster_member_publish_request_with_host,
 };
+pub use member_store::{cluster_bootstrap_state_stable_eq, upsert_member_record};
 pub use membership::{
     DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, DAEMON_SHADOW_SUPERVISE_CAPABILITY,
     cluster_is_settled_solo, cluster_member_expected_daemon_process,
@@ -336,30 +345,25 @@ pub use storage::{
     DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
     accepted_cluster_join_state_from_kv_snapshot, cleanup_legacy_shadow_daemon_members_with_host,
-    cluster_bootstrap_state_stable_eq, cluster_join_challenge_rpc_request, cluster_state_sync_txn,
+    cluster_join_challenge_rpc_request, cluster_state_sync_txn,
     commit_cluster_kv_txn_with_quorum_response_with_host,
     commit_cluster_raft_command_with_quorum_driver, elect_cluster_raft_leader_with_host,
     handle_cluster_join_registration_request_with_host,
     handle_cluster_membership_rpc_request_with_hosts, handle_cluster_raft_rpc_request,
-    join_channel_endpoint_for_accepted_state, read_cluster_state, read_cluster_state_cached,
-    read_cluster_state_without_kv, reconcile_accepted_cluster_join_response,
+    join_channel_endpoint_for_accepted_state, reconcile_accepted_cluster_join_response,
     reconcile_cluster_join_with_introducers_with_host,
     record_forwarded_join_registration_acceptance_with_host, remove_cluster_members_with_host,
     replicate_cluster_raft_to_endpoint_with_host,
     send_cluster_join_registration_over_membership_rpc,
     spawn_cluster_raft_committed_fanout_worker_on_runtime, sync_cluster_state_to_kv_with_host,
     sync_cluster_state_to_local_raft_unchecked, update_cluster_node_role_with_host,
-    update_cluster_raft_role_with_host, upsert_member_record, write_cluster_state,
+    update_cluster_raft_role_with_host,
 };
 pub use storage::{
     commit_cluster_kv_txn_with_quorum_response_async_with_host,
-    commit_cluster_raft_index_with_events_async,
-    discard_cluster_raft_uncommitted_tail_and_clear_leader_async,
     handle_cluster_join_registration_request_async_with_host,
     handle_cluster_kv_txn_request_async_with_host, handle_cluster_raft_rpc_request_async,
-    read_cluster_state_async, read_cluster_state_without_kv_async,
     replicate_cluster_raft_to_endpoint_async_with_host, sync_cluster_state_to_kv_async_with_host,
-    write_cluster_state_async,
 };
 pub use voter_reachability::{
     ClusterVoterReachabilityAsyncHost, ClusterVoterReachabilityHost,

@@ -45,12 +45,8 @@ pub(crate) use crate::kv_local_store::{
     append_cluster_raft_command_uncommitted_or_no_effect_async, apply_cluster_raft_append,
     cluster_kv_raft_store, locked_apply_cluster_raft_vote,
     locked_restore_cluster_raft_from_snapshot_if_newer, open_cluster_raft_kv_node,
-    read_cluster_kv_cached_snapshot, read_cluster_kv_cached_snapshot_if_present,
-    read_cluster_kv_current_or_cached_snapshot_arc_if_present,
-    read_cluster_kv_current_or_empty_snapshot_arc, read_cluster_kv_current_snapshot,
-    read_cluster_kv_current_snapshot_arc, read_cluster_kv_entry,
-    read_cluster_kv_latest_observed_snapshot_arc_if_present, read_cluster_kv_snapshot,
-    write_cluster_kv_snapshot, write_imported_cluster_kv_snapshot_if_changed,
+    read_cluster_kv_current_snapshot, read_cluster_kv_snapshot, write_cluster_kv_snapshot,
+    write_imported_cluster_kv_snapshot_if_changed,
 };
 #[cfg(test)]
 pub(crate) use crate::kv_local_store::{
@@ -58,8 +54,8 @@ pub(crate) use crate::kv_local_store::{
     cached_cluster_kv_reader_node_id_for_test, cluster_kv_cached_snapshot_reads_for_test,
     cluster_kv_current_snapshot_reads_for_test, cluster_kv_metadata_cache_capacity_for_test,
     cluster_kv_reader_node_id_cache_contains_for_test, cluster_raft_wal_paths,
-    open_cluster_raft_kv_node_async, read_cluster_kv_prefix_entries,
-    read_cluster_kv_prefix_entries_limited,
+    open_cluster_raft_kv_node_async, read_cluster_kv_cached_snapshot_if_present,
+    read_cluster_kv_prefix_entries, read_cluster_kv_prefix_entries_limited,
     read_cluster_kv_prefix_entries_limited_by_payload_bytes, read_cluster_kv_store,
     record_cluster_kv_reader_node_id_cache_for_test,
     refresh_cluster_kv_reader_node_id_cache_for_test,
@@ -71,9 +67,7 @@ pub use crate::kv_local_store::{
     commit_cluster_raft_index_with_events_async,
     discard_cluster_raft_uncommitted_tail_and_clear_leader_async,
 };
-pub(crate) use crate::kv_read_model::{
-    read_cluster_capability_policies_from_snapshot, read_cluster_node_statuses_from_kv,
-};
+pub(crate) use crate::kv_read_model::read_cluster_capability_policies_from_snapshot;
 #[cfg(test)]
 pub(crate) use crate::kv_read_model::{
     read_cluster_endpoints_from_kv, read_cluster_network_info_from_kv,
@@ -133,31 +127,26 @@ pub(crate) use crate::local_membership::{
 #[cfg(test)]
 pub use crate::local_state_store::remove_local_cluster_state;
 pub use crate::local_state_store::{
-    read_cluster_state, read_cluster_state_async, read_cluster_state_cached,
-    read_cluster_state_without_kv, read_cluster_state_without_kv_async, write_cluster_state,
-    write_cluster_state_async,
+    read_cluster_state, read_cluster_state_without_kv, read_cluster_state_without_kv_async,
+    write_cluster_state,
 };
 use crate::member_publish::{
     ClusterLocalMemberPublishHost, ClusterMemberPublishHost,
     handle_cluster_member_publish_request_with_host,
 };
 pub(crate) use crate::member_store::{
-    MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS, apply_cluster_raft_role,
-    cluster_legacy_shadow_orphan_artifact_cleanup_txns_from_store,
+    apply_cluster_raft_role, cluster_legacy_shadow_orphan_artifact_cleanup_txns_from_store,
     cluster_legacy_shadow_orphan_artifact_node_ids_from_store,
     cluster_member_raft_update_txn_from_store, cluster_member_removal_txns_from_store,
     cluster_member_update_txn_from_store, cluster_raft_state_for_role,
     cluster_state_sync_txn_from_store, merge_cluster_state_from_peer,
-};
-pub use crate::member_store::{
-    cluster_bootstrap_state_stable_eq, cluster_member_stable_eq, merge_member_record,
-    upsert_member_record,
 };
 #[cfg(test)]
 pub(crate) use crate::member_store::{
     cluster_member_put_command, cluster_member_update_ops_from_store,
     cluster_raft_config_from_store,
 };
+pub use crate::member_store::{merge_member_record, upsert_member_record};
 use crate::membership::{cluster_member_is_legacy_shadow_daemon, cluster_member_is_local_process};
 use crate::membership_forward::{
     ClusterMembershipRpcForwardHost, forward_cluster_membership_rpc_to_voter_async_with_host,

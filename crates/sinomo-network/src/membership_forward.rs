@@ -1,13 +1,14 @@
 use crate::ClusterPaths;
 use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
 use crate::error::NetworkError;
+use crate::local_state_store::read_cluster_state;
 use crate::object::DaemonRpcTimeouts;
 use crate::route::{
     ClusterObjectRpcClient, ClusterObjectRpcNodeOptions, ClusterObjectRpcRouteContext,
     ClusterSignedEndpointRpcAsyncHost,
 };
 use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
-use crate::storage::{DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT, read_cluster_state};
+use crate::storage::DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT;
 use sinomo_core::ClusterBootstrapState;
 use sinomo_node::NodeId;
 use std::collections::BTreeSet;
