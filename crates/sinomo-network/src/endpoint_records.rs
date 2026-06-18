@@ -28,6 +28,32 @@ fn cluster_endpoint_source_stable_eq(
         )
 }
 
+pub(crate) fn cluster_endpoint_list_stable_eq(
+    left: &[ClusterEndpointRecord],
+    right: &[ClusterEndpointRecord],
+) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut left = left.iter().collect::<Vec<_>>();
+    let mut right = right.iter().collect::<Vec<_>>();
+    left.sort_by(cluster_endpoint_record_order);
+    right.sort_by(cluster_endpoint_record_order);
+    left.into_iter()
+        .zip(right)
+        .all(|(left, right)| cluster_endpoint_stable_eq(left, right))
+}
+
+fn cluster_endpoint_record_order(
+    left: &&ClusterEndpointRecord,
+    right: &&ClusterEndpointRecord,
+) -> std::cmp::Ordering {
+    left.endpoint_id
+        .cmp(&right.endpoint_id)
+        .then_with(|| left.node_id.cmp(&right.node_id))
+        .then_with(|| left.address.cmp(&right.address))
+}
+
 pub fn cleanup_cluster_iroh_endpoints(state: &mut ClusterBootstrapState) -> bool {
     state.members.iter_mut().fold(false, |changed, member| {
         cleanup_member_iroh_endpoints(member) || changed

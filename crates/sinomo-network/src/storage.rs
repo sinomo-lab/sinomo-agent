@@ -6,9 +6,9 @@ use crate::connectivity::{
     cluster_connectivity_probe_key,
 };
 use crate::endpoint_records::{
-    cleanup_cluster_iroh_endpoints, cleanup_member_iroh_endpoints, cluster_endpoint_stable_eq,
-    refresh_local_iroh_endpoints_from_disk, refresh_local_iroh_endpoints_from_disk_async,
-    upsert_member_endpoint,
+    cleanup_cluster_iroh_endpoints, cleanup_member_iroh_endpoints, cluster_endpoint_list_stable_eq,
+    cluster_endpoint_stable_eq, refresh_local_iroh_endpoints_from_disk,
+    refresh_local_iroh_endpoints_from_disk_async, upsert_member_endpoint,
 };
 use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
 use crate::error::NetworkError;
@@ -24,6 +24,10 @@ use crate::membership::{
     cluster_capabilities_are_legacy_shadow_only, cluster_local_process_members,
     cluster_member_is_legacy_shadow_daemon, cluster_member_is_local_process,
     cluster_node_is_local_process,
+};
+use crate::network_info::{
+    CLUSTER_NETWORK_INFO_TTL_SECONDS, ClusterNetworkInfoRecord, build_cluster_network_info_record,
+    cluster_network_info_stable_eq,
 };
 use crate::object::SinomoObjectCodec;
 use crate::prelude::*;
@@ -81,7 +85,6 @@ const MAX_CLUSTER_KV_WATCH_EVENT_CACHE_ENTRIES: usize = 128;
 const MAX_CLUSTER_KV_WATCH_REGISTRATION_CACHE_ENTRIES: usize =
     sinomo_kv::MAX_CLUSTER_KV_ACTIVE_WATCHES;
 const CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS: i64 = 600;
-pub const CLUSTER_NETWORK_INFO_TTL_SECONDS: i64 = 3600;
 pub use sinomo_node::DAEMON_MAIN_RUN_CAPABILITY;
 const FILE_CACHE_CAPACITY: usize = 4096;
 const MAX_LOCAL_CLUSTER_CONNECTIVITY_CACHE_ENTRIES: usize = 128;
@@ -5245,21 +5248,6 @@ pub struct ClusterInvitationStateRecord {
     pub updated_at: OffsetDateTime,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ClusterNetworkInfoRecord {
-    pub cluster_id: ClusterId,
-    pub node_id: NodeId,
-    pub environment_id: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub observed_addresses: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub endpoints: Vec<ClusterEndpointRecord>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub observed_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub expires_at: OffsetDateTime,
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KvBackedClusterConnectivityRecordQuery;
 
@@ -5528,62 +5516,6 @@ fn evict_cluster_route_graph_cache_entry_if_needed(
     if let Some(path) = eviction_candidate {
         cache.remove(&path);
     }
-}
-
-pub fn build_cluster_network_info_record(
-    state: &ClusterBootstrapState,
-    node_id: &NodeId,
-    observed_at: OffsetDateTime,
-    ttl_seconds: i64,
-) -> ClusterNetworkInfoRecord {
-    let endpoints = state
-        .members
-        .iter()
-        .find(|member| member.node_id == *node_id)
-        .map(|member| member.endpoints.clone())
-        .unwrap_or_default();
-    let observed_addresses = cluster_network_observed_addresses(&endpoints);
-    ClusterNetworkInfoRecord {
-        cluster_id: state.cluster_id.clone(),
-        node_id: node_id.clone(),
-        environment_id: cluster_network_environment_id(&observed_addresses),
-        observed_addresses,
-        endpoints,
-        observed_at,
-        expires_at: observed_at + time::Duration::seconds(ttl_seconds),
-    }
-}
-
-pub fn cluster_network_observed_addresses(endpoints: &[ClusterEndpointRecord]) -> Vec<String> {
-    let mut observed_addresses = endpoints
-        .iter()
-        .filter(|endpoint| {
-            matches!(
-                endpoint.transport,
-                ClusterTransportKind::LanTcp
-                    | ClusterTransportKind::LanQuic
-                    | ClusterTransportKind::Iroh
-                    | ClusterTransportKind::WebRtc
-                    | ClusterTransportKind::TurnRelay
-                    | ClusterTransportKind::HttpsRelay
-            )
-        })
-        .map(|endpoint| endpoint.address.clone())
-        .collect::<Vec<_>>();
-    observed_addresses.sort();
-    observed_addresses.dedup();
-    observed_addresses
-}
-
-pub fn cluster_network_environment_id(values: &[String]) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for value in values {
-        for byte in value.as_bytes().iter().chain(std::iter::once(&0)) {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-    format!("env_{hash:016x}")
 }
 
 pub fn refresh_cluster_connectivity_environment(
@@ -11432,17 +11364,6 @@ pub fn stored_cluster_network_info_matches(
         && !cluster_network_record_should_refresh(existing.expires_at, now))
 }
 
-pub fn cluster_network_info_stable_eq(
-    left: &ClusterNetworkInfoRecord,
-    right: &ClusterNetworkInfoRecord,
-) -> bool {
-    left.cluster_id == right.cluster_id
-        && left.node_id == right.node_id
-        && left.environment_id == right.environment_id
-        && left.observed_addresses == right.observed_addresses
-        && cluster_endpoint_list_stable_eq(&left.endpoints, &right.endpoints)
-}
-
 pub fn cluster_capability_policy_stable_eq(
     left: &ClusterCapabilityPolicyRecord,
     right: &ClusterCapabilityPolicyRecord,
@@ -11819,32 +11740,6 @@ pub fn cluster_member_stable_eq(left: &ClusterMemberRecord, right: &ClusterMembe
         && left.allowed_capabilities == right.allowed_capabilities
         && cluster_endpoint_list_stable_eq(&left.endpoints, &right.endpoints)
         && left.joined_at == right.joined_at
-}
-
-pub fn cluster_endpoint_list_stable_eq(
-    left: &[ClusterEndpointRecord],
-    right: &[ClusterEndpointRecord],
-) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut left = left.iter().collect::<Vec<_>>();
-    let mut right = right.iter().collect::<Vec<_>>();
-    left.sort_by(cluster_endpoint_record_order);
-    right.sort_by(cluster_endpoint_record_order);
-    left.into_iter()
-        .zip(right)
-        .all(|(left, right)| cluster_endpoint_stable_eq(left, right))
-}
-
-fn cluster_endpoint_record_order(
-    left: &&ClusterEndpointRecord,
-    right: &&ClusterEndpointRecord,
-) -> std::cmp::Ordering {
-    left.endpoint_id
-        .cmp(&right.endpoint_id)
-        .then_with(|| left.node_id.cmp(&right.node_id))
-        .then_with(|| left.address.cmp(&right.address))
 }
 
 pub fn cluster_member_publish_matches_kv(

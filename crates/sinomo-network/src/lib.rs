@@ -23,6 +23,7 @@ mod io_observer;
 mod lan;
 mod maintenance;
 mod membership;
+mod network_info;
 mod object;
 mod paths;
 mod peer;
@@ -127,6 +128,10 @@ pub use membership::{
 };
 #[cfg(test)]
 pub(crate) use membership::{cluster_has_remote_peers, cluster_local_process_members};
+pub use network_info::{
+    CLUSTER_NETWORK_INFO_TTL_SECONDS, ClusterNetworkInfoRecord, build_cluster_network_info_record,
+    cluster_network_info_stable_eq,
+};
 pub use object::{
     AsyncDaemonControlListener, AsyncDaemonControlStream, DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
     DaemonControlRequest, DaemonControlResponse, DaemonRpcTimeouts, OBJECT_STREAM_MAX_CHUNK_BYTES,
@@ -189,22 +194,21 @@ pub use rpc::{
     serve_object_rpc_frame_async,
 };
 pub use storage::{
-    CLUSTER_NETWORK_INFO_TTL_SECONDS, ClusterAuthenticatedPeer, ClusterControlPlaneDriver,
-    ClusterControlPlaneTimeouts, ClusterControlPlaneTransport, ClusterIdentityRecord,
-    ClusterInvitationStateRecord, ClusterInvitePublishHost, ClusterJoinRegistrationAsyncHost,
-    ClusterJoinRegistrationDriver, ClusterJoinRegistrationHost, ClusterJoinRegistrationRequest,
-    ClusterJoinRegistrationResponse, ClusterKvSnapshotRefreshHost, ClusterKvSnapshotRefreshOptions,
-    ClusterKvTxnForwardAsyncHost, ClusterKvTxnForwardHost, ClusterKvTxnForwardOptions,
-    ClusterKvTxnForwardResult, ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost,
-    ClusterKvTxnQuorumOptions, ClusterLocalDaemonMembershipAsyncObserver,
-    ClusterLocalDaemonMembershipObservation, ClusterLocalDaemonMembershipObserver,
-    ClusterLocalDaemonMembershipRefresh, ClusterLocalMemberPublishAsyncHost,
-    ClusterLocalMemberPublishHost, ClusterLocalMemberPublishOptions,
-    ClusterMemberMutationAsyncHost, ClusterMemberMutationDriver, ClusterMemberMutationHost,
-    ClusterMemberPublishRequest, ClusterMemberPublishResponse,
+    ClusterAuthenticatedPeer, ClusterControlPlaneDriver, ClusterControlPlaneTimeouts,
+    ClusterControlPlaneTransport, ClusterIdentityRecord, ClusterInvitationStateRecord,
+    ClusterInvitePublishHost, ClusterJoinRegistrationAsyncHost, ClusterJoinRegistrationDriver,
+    ClusterJoinRegistrationHost, ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse,
+    ClusterKvSnapshotRefreshHost, ClusterKvSnapshotRefreshOptions, ClusterKvTxnForwardAsyncHost,
+    ClusterKvTxnForwardHost, ClusterKvTxnForwardOptions, ClusterKvTxnForwardResult,
+    ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost, ClusterKvTxnQuorumOptions,
+    ClusterLocalDaemonMembershipAsyncObserver, ClusterLocalDaemonMembershipObservation,
+    ClusterLocalDaemonMembershipObserver, ClusterLocalDaemonMembershipRefresh,
+    ClusterLocalMemberPublishAsyncHost, ClusterLocalMemberPublishHost,
+    ClusterLocalMemberPublishOptions, ClusterMemberMutationAsyncHost, ClusterMemberMutationDriver,
+    ClusterMemberMutationHost, ClusterMemberPublishRequest, ClusterMemberPublishResponse,
     ClusterMembershipRpcAsyncForwardHost, ClusterMembershipRpcForwardHost,
-    ClusterMembershipRpcFuture, ClusterNetworkInfoPublishAsyncHost, ClusterNetworkInfoRecord,
-    ClusterNetworkRecordExpiryHost, ClusterNodeRoleUpdate, ClusterNodeStatusPublishAsyncHost,
+    ClusterMembershipRpcFuture, ClusterNetworkInfoPublishAsyncHost, ClusterNetworkRecordExpiryHost,
+    ClusterNodeRoleUpdate, ClusterNodeStatusPublishAsyncHost,
     ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
     ClusterRaftAppendReplicationOptions, ClusterRaftAppendReplicationOutcome,
     ClusterRaftCommittedFanoutAsyncHost, ClusterRaftCommittedFanoutOptions,
@@ -220,13 +224,13 @@ pub use storage::{
     DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
     MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, accepted_cluster_join_state_from_kv_snapshot,
     apply_cluster_node_role, assign_local_daemon_member_public_keys,
-    build_cluster_network_info_record, cleanup_legacy_shadow_daemon_members_with_host,
-    cluster_bootstrap_state_stable_eq, cluster_connectivity_full_sync_ops,
-    cluster_connectivity_key, cluster_connectivity_source_prefix, cluster_connectivity_stable_eq,
+    cleanup_legacy_shadow_daemon_members_with_host, cluster_bootstrap_state_stable_eq,
+    cluster_connectivity_full_sync_ops, cluster_connectivity_key,
+    cluster_connectivity_source_prefix, cluster_connectivity_stable_eq,
     cluster_connectivity_sync_ops, cluster_endpoint_key, cluster_endpoint_prefix,
     cluster_has_local_quorum_with_host, cluster_identity_key, cluster_invitation_key,
     cluster_invitation_state_key, cluster_join_challenge_rpc_request, cluster_member_key,
-    cluster_member_publish_txn_from_kv, cluster_network_info_key, cluster_network_info_stable_eq,
+    cluster_member_publish_txn_from_kv, cluster_network_info_key,
     cluster_network_publish_interval_for_node, cluster_network_record_should_refresh,
     cluster_node_blocks_leader_preference, cluster_node_status_stable_eq,
     cluster_reachable_voter_count_with_host, cluster_state_needs_join_registration,
