@@ -54,7 +54,11 @@ impl DfsTransportIdentity for ReceiveOnlyTransport {
 }
 
 impl DfsFrameTransport for ReceiveOnlyTransport {
-    fn send(&mut self, target_node_id: &NodeId, _frame: NetworkFrame) -> Result<(), NetworkError> {
+    fn send_routed_message(
+        &mut self,
+        target_node_id: &NodeId,
+        _message: DfsRoutedMessage,
+    ) -> Result<(), NetworkError> {
         Err(NetworkError::UnknownNode {
             node_id: target_node_id.clone(),
         })
@@ -804,7 +808,11 @@ impl DfsTransportIdentity for FailingSendTransport {
 }
 
 impl DfsFrameTransport for FailingSendTransport {
-    fn send(&mut self, _target_node_id: &NodeId, _frame: NetworkFrame) -> Result<(), NetworkError> {
+    fn send_routed_message(
+        &mut self,
+        _target_node_id: &NodeId,
+        _message: DfsRoutedMessage,
+    ) -> Result<(), NetworkError> {
         Err(NetworkError::Io {
             operation: "test send".to_string(),
             detail: "unreachable".to_string(),
@@ -827,7 +835,11 @@ impl DfsTransportIdentity for DroppingSendTransport {
 }
 
 impl DfsFrameTransport for DroppingSendTransport {
-    fn send(&mut self, _target_node_id: &NodeId, _frame: NetworkFrame) -> Result<(), NetworkError> {
+    fn send_routed_message(
+        &mut self,
+        _target_node_id: &NodeId,
+        _message: DfsRoutedMessage,
+    ) -> Result<(), NetworkError> {
         Ok(())
     }
 
@@ -883,7 +895,11 @@ impl DfsTransportIdentity for DirectReadTransport {
 }
 
 impl DfsFrameTransport for DirectReadTransport {
-    fn send(&mut self, _target_node_id: &NodeId, _frame: NetworkFrame) -> Result<(), NetworkError> {
+    fn send_routed_message(
+        &mut self,
+        _target_node_id: &NodeId,
+        _message: DfsRoutedMessage,
+    ) -> Result<(), NetworkError> {
         *self
             .protocol_send_calls
             .lock()
@@ -1428,7 +1444,11 @@ impl DfsTransportIdentity for CountingEmptyTransport {
 }
 
 impl DfsFrameTransport for CountingEmptyTransport {
-    fn send(&mut self, target_node_id: &NodeId, _frame: NetworkFrame) -> Result<(), NetworkError> {
+    fn send_routed_message(
+        &mut self,
+        target_node_id: &NodeId,
+        _message: DfsRoutedMessage,
+    ) -> Result<(), NetworkError> {
         Err(NetworkError::UnknownNode {
             node_id: target_node_id.clone(),
         })

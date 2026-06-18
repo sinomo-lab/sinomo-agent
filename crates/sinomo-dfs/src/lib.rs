@@ -112,9 +112,11 @@ use sinomo_events::EventId;
 use sinomo_kv::KvError;
 use sinomo_local::{LocalDataError, SinomoDataDir};
 use sinomo_network::{
-    ClusterPaths, InboundFrame, MeshMessage, MeshMessageBody, MeshMessageId, NetworkError,
-    NetworkFrame, NetworkFrameId, ObjectRpcRequest, ObjectRpcResponse, ProtocolMessage,
+    ClusterPaths, InboundFrame, MeshMessageBody, NetworkError, NetworkFrame, ObjectRpcRequest,
+    ObjectRpcResponse, ProtocolMessage,
 };
+#[cfg(test)]
+use sinomo_network::{MeshMessage, MeshMessageId, NetworkFrameId};
 use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -160,14 +162,14 @@ pub enum DfsTransferProfile {
 }
 
 pub trait DfsFrameTransport: DfsTransportIdentity {
-    fn send(&mut self, target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError>;
     fn send_routed_message(
         &mut self,
         target_node_id: &NodeId,
         message: DfsRoutedMessage,
-    ) -> Result<(), NetworkError> {
-        let frame = protocol::dfs_protocol_frame_from_routed_message(&message)?;
-        self.send(target_node_id, frame)
+    ) -> Result<(), NetworkError>;
+    fn send(&mut self, target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError> {
+        let message = protocol::dfs_routed_message_from_protocol_frame(&frame)?;
+        self.send_routed_message(target_node_id, message)
     }
     fn send_direct_read(
         &mut self,
@@ -181,15 +183,15 @@ pub trait DfsFrameTransport: DfsTransportIdentity {
         target_node_id: &NodeId,
         frame: NetworkFrame,
     ) -> Result<(), NetworkError> {
-        self.send(target_node_id, frame)
+        let message = protocol::dfs_routed_message_from_protocol_frame(&frame)?;
+        self.send_detached_routed_message(target_node_id, message)
     }
     fn send_detached_routed_message(
         &mut self,
         target_node_id: &NodeId,
         message: DfsRoutedMessage,
     ) -> Result<(), NetworkError> {
-        let frame = protocol::dfs_protocol_frame_from_routed_message(&message)?;
-        self.send_detached(target_node_id, frame)
+        self.send_routed_message(target_node_id, message)
     }
     fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError>;
     fn flush_detached_sends(&mut self) -> Result<(), NetworkError> {
@@ -225,20 +227,21 @@ pub type DfsFrameTransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send 
 pub trait AsyncDfsFrameTransport: Send {
     fn local_node_id(&self) -> &NodeId;
 
-    fn send_async<'a>(
-        &'a mut self,
-        target_node_id: &'a NodeId,
-        frame: NetworkFrame,
-    ) -> DfsFrameTransportFuture<'a, Result<(), NetworkError>>;
-
     fn send_routed_message_async<'a>(
         &'a mut self,
         target_node_id: &'a NodeId,
         message: DfsRoutedMessage,
+    ) -> DfsFrameTransportFuture<'a, Result<(), NetworkError>>;
+
+    fn send_async<'a>(
+        &'a mut self,
+        target_node_id: &'a NodeId,
+        frame: NetworkFrame,
     ) -> DfsFrameTransportFuture<'a, Result<(), NetworkError>> {
         Box::pin(async move {
-            let frame = protocol::dfs_protocol_frame_from_routed_message(&message)?;
-            self.send_async(target_node_id, frame).await
+            let message = protocol::dfs_routed_message_from_protocol_frame(&frame)?;
+            self.send_routed_message_async(target_node_id, message)
+                .await
         })
     }
 
@@ -276,7 +279,12 @@ pub trait AsyncDfsFrameTransport: Send {
 }
 
 impl DfsFrameTransport for sinomo_network::InProcessTransport {
-    fn send(&mut self, target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError> {
+    fn send_routed_message(
+        &mut self,
+        target_node_id: &NodeId,
+        message: DfsRoutedMessage,
+    ) -> Result<(), NetworkError> {
+        let frame = protocol::dfs_protocol_frame_from_routed_message(&message)?;
         self.send(target_node_id, frame)
     }
 
@@ -305,12 +313,13 @@ where
         sinomo_network::AsyncNetworkTransport::local_node_id(self)
     }
 
-    fn send_async<'a>(
+    fn send_routed_message_async<'a>(
         &'a mut self,
         target_node_id: &'a NodeId,
-        frame: NetworkFrame,
+        message: DfsRoutedMessage,
     ) -> DfsFrameTransportFuture<'a, Result<(), NetworkError>> {
         Box::pin(async move {
+            let frame = protocol::dfs_protocol_frame_from_routed_message(&message)?;
             sinomo_network::AsyncNetworkTransport::send_async(
                 self,
                 target_node_id,
@@ -386,6 +395,23 @@ pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
 pub const DEFAULT_DFS_NODE_ID: &str = "node_local";
 pub const SIFS_FILE_SYSTEM_ID: &str = "sifs";
 
+fn build_dfs_routed_message(
+    source_node_id: &NodeId,
+    target_node_id: &NodeId,
+    frame_id: u64,
+    message_id: u64,
+    message: DfsNetworkMessage,
+) -> DfsRoutedMessage {
+    DfsRoutedMessage {
+        source_node_id: source_node_id.clone(),
+        target_node_id: target_node_id.clone(),
+        frame_id,
+        message_id,
+        message,
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn build_dfs_network_frame(
     source_node_id: &NodeId,
     target_node_id: &NodeId,
@@ -393,19 +419,14 @@ pub(crate) fn build_dfs_network_frame(
     message_id: u64,
     message: DfsNetworkMessage,
 ) -> Result<NetworkFrame, DfsError> {
-    let protocol_message =
-        ProtocolMessage::encode(DFS_PROTOCOL, &message).map_err(DfsError::from_network)?;
-    Ok(NetworkFrame {
-        frame_id: NetworkFrameId(frame_id),
-        source_node_id: source_node_id.clone(),
-        target_node_id: target_node_id.clone(),
-        message: MeshMessage {
-            message_id: MeshMessageId(message_id),
-            origin_node_id: source_node_id.clone(),
-            target_node_id: target_node_id.clone(),
-            body: MeshMessageBody::Protocol(protocol_message),
-        },
-    })
+    protocol::dfs_protocol_frame_from_routed_message(&build_dfs_routed_message(
+        source_node_id,
+        target_node_id,
+        frame_id,
+        message_id,
+        message,
+    ))
+    .map_err(DfsError::from_network)
 }
 
 #[cfg(test)]
@@ -413,6 +434,7 @@ fn dfs_network_message_from_frame(frame: &NetworkFrame) -> Result<DfsNetworkMess
     protocol::dfs_routed_message_from_protocol_frame(frame).map(|message| message.message)
 }
 
+#[cfg(test)]
 fn dfs_routed_message_from_network_frame(
     frame: &NetworkFrame,
 ) -> Result<DfsRoutedMessage, NetworkError> {
@@ -4953,18 +4975,18 @@ impl<T: DfsFrameTransport> LocalOwnedDfsService<T> {
         target_node_id: &NodeId,
         message: DfsNetworkMessage,
     ) -> Result<(), DfsError> {
-        let frame = build_dfs_network_frame(
+        let routed_message = build_dfs_routed_message(
             &self.node_id,
             target_node_id,
             self.next_frame_id,
             self.next_message_id,
             message,
-        )?;
+        );
         self.next_frame_id += 1;
         self.next_message_id += 1;
 
         self.transport
-            .send(target_node_id, frame)
+            .send_routed_message(target_node_id, routed_message)
             .map_err(DfsError::from_network)
     }
 
@@ -8461,16 +8483,6 @@ impl DfsEndpointTransport {
             .unwrap_or(DfsTransferProfile::Conservative)
     }
 
-    fn send_frame_to_endpoint(
-        &mut self,
-        target_node_id: &NodeId,
-        frame: NetworkFrame,
-        require_local_source: bool,
-    ) -> Result<(), NetworkError> {
-        let routed_message = dfs_routed_message_from_network_frame(&frame)?;
-        self.send_routed_message_to_endpoint(target_node_id, routed_message, require_local_source)
-    }
-
     fn send_routed_message_to_endpoint(
         &mut self,
         target_node_id: &NodeId,
@@ -8545,20 +8557,6 @@ impl DfsEndpointTransport {
             request,
         )
         .map(Some)
-    }
-
-    fn send_frame_to_endpoint_detached(
-        &mut self,
-        target_node_id: &NodeId,
-        frame: NetworkFrame,
-        require_local_source: bool,
-    ) -> Result<(), NetworkError> {
-        let routed_message = dfs_routed_message_from_network_frame(&frame)?;
-        self.send_routed_message_to_endpoint_detached(
-            target_node_id,
-            routed_message,
-            require_local_source,
-        )
     }
 
     fn send_routed_message_to_endpoint_detached(
@@ -8660,21 +8658,6 @@ impl DfsEndpointTransport {
             .ok_or_else(|| NetworkError::UnknownNode {
                 node_id: target_node_id.clone(),
             })
-    }
-
-    async fn send_frame_to_endpoint_async(
-        &mut self,
-        target_node_id: &NodeId,
-        frame: NetworkFrame,
-        require_local_source: bool,
-    ) -> Result<(), NetworkError> {
-        let routed_message = dfs_routed_message_from_network_frame(&frame)?;
-        self.send_routed_message_to_endpoint_async(
-            target_node_id,
-            routed_message,
-            require_local_source,
-        )
-        .await
     }
 
     async fn send_routed_message_to_endpoint_async(
@@ -8909,17 +8892,6 @@ impl AsyncDfsFrameTransport for DfsEndpointTransport {
         DfsTransportIdentity::local_node_id(self)
     }
 
-    fn send_async<'a>(
-        &'a mut self,
-        target_node_id: &'a NodeId,
-        frame: NetworkFrame,
-    ) -> DfsFrameTransportFuture<'a, Result<(), NetworkError>> {
-        Box::pin(async move {
-            self.send_frame_to_endpoint_async(target_node_id, frame, true)
-                .await
-        })
-    }
-
     fn send_routed_message_async<'a>(
         &'a mut self,
         target_node_id: &'a NodeId,
@@ -8945,10 +8917,6 @@ impl AsyncDfsFrameTransport for DfsEndpointTransport {
 }
 
 impl DfsFrameTransport for DfsEndpointTransport {
-    fn send(&mut self, target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError> {
-        self.send_frame_to_endpoint(target_node_id, frame, true)
-    }
-
     fn send_routed_message(
         &mut self,
         target_node_id: &NodeId,
@@ -8963,14 +8931,6 @@ impl DfsFrameTransport for DfsEndpointTransport {
         request: &DfsDirectReadRequest,
     ) -> Result<Option<DfsReadResponse>, NetworkError> {
         self.send_direct_read_to_endpoint(target_node_id, request)
-    }
-
-    fn send_detached(
-        &mut self,
-        target_node_id: &NodeId,
-        frame: NetworkFrame,
-    ) -> Result<(), NetworkError> {
-        self.send_frame_to_endpoint_detached(target_node_id, frame, true)
     }
 
     fn send_detached_routed_message(
@@ -9076,11 +9036,6 @@ impl DfsTransportIdentity for DfsEndpointServedMessageTransport {
 }
 
 impl DfsFrameTransport for DfsEndpointServedMessageTransport {
-    fn send(&mut self, target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError> {
-        let message = protocol::dfs_routed_message_from_protocol_frame(&frame)?;
-        self.send_routed_message(target_node_id, message)
-    }
-
     fn send_routed_message(
         &mut self,
         target_node_id: &NodeId,
@@ -9166,7 +9121,12 @@ impl DfsTransportIdentity for SingleDfsProtocolFrameTransport {
 
 #[cfg(test)]
 impl DfsFrameTransport for SingleDfsProtocolFrameTransport {
-    fn send(&mut self, _target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError> {
+    fn send_routed_message(
+        &mut self,
+        _target_node_id: &NodeId,
+        message: DfsRoutedMessage,
+    ) -> Result<(), NetworkError> {
+        let frame = protocol::dfs_protocol_frame_from_routed_message(&message)?;
         self.outbound_frames.push(frame);
         Ok(())
     }
@@ -9421,13 +9381,13 @@ impl<T> NetworkedDfsService<T> {
         target_node_id: &NodeId,
         message: DfsNetworkMessage,
     ) -> DfsRoutedMessage {
-        let routed_message = DfsRoutedMessage {
-            source_node_id: self.node_id.clone(),
-            target_node_id: target_node_id.clone(),
-            frame_id: self.next_frame_id,
-            message_id: self.next_message_id,
+        let routed_message = build_dfs_routed_message(
+            &self.node_id,
+            target_node_id,
+            self.next_frame_id,
+            self.next_message_id,
             message,
-        };
+        );
         self.next_frame_id += 1;
         self.next_message_id += 1;
         routed_message
