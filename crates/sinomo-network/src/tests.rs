@@ -89,6 +89,7 @@ fn object_rpc_requests_carry_operation_cancellation_metadata() {
         .with_operation_id("op_1");
     assert_eq!(request.operation_id(), Some("op_1"));
     assert_eq!(request.cancels_operation_id(), None);
+    assert!(!request.is_response_retry_safe());
 
     let cancel = ObjectRpcRequest::encode_body(
         "/test/cancel",
@@ -107,6 +108,11 @@ fn object_rpc_requests_carry_operation_cancellation_metadata() {
             reason: "turn cancelled".to_string(),
         }
     );
+
+    let retry_safe = ObjectRpcRequest::encode_body("/test/retry-safe", "test", &())
+        .expect("retry-safe request")
+        .with_response_retry_safe();
+    assert!(retry_safe.is_response_retry_safe());
 }
 
 #[test]
@@ -2070,8 +2076,7 @@ fn iroh_daemon_rpc_async_reports_missing_transport_feature() {
         .enable_all()
         .build()
         .expect("current-thread runtime");
-    let request = ObjectRpcRequest::encode_body(DAEMON_STATUS_ROUTE, DAEMON_RPC_CATEGORY, &())
-        .expect("request");
+    let request = ObjectRpcRequest::encode_body("/test/status", "test", &()).expect("request");
 
     let error = runtime
         .block_on(send_daemon_rpc_to_address_async(
@@ -2860,25 +2865,20 @@ fn iroh_daemon_response_decode_rejects_trailing_bytes() {
 
 #[test]
 fn iroh_daemon_response_retry_is_limited_to_idempotent_routes() {
-    let upload_chunk =
-        ObjectRpcRequest::encode_body(ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE, ROLLOUT_RPC_CATEGORY, &())
-            .expect("upload chunk request");
-    assert!(crate::roaming::iroh_daemon_control_request_allows_response_retry(&upload_chunk));
+    let retry_safe = ObjectRpcRequest::encode_body("/test/retry-safe", "test", &())
+        .expect("retry-safe request")
+        .with_response_retry_safe();
+    assert!(
+        crate::roaming::iroh_daemon_control_request_allows_response_retry(&retry_safe)
+    );
 
     let range = object_rpc_request_from_kv_payload(
         sinomo_kv::cluster_kv_range_prefix_rpc_payload("/").expect("range request"),
     );
     assert!(crate::roaming::iroh_daemon_control_request_allows_response_retry(&range));
 
-    for route in [
-        ROLLOUT_BINARY_ROUTE,
-        ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
-        ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
-        ROLLOUT_BUILD_ROUTE,
-        ROLLOUT_FINALIZE_SHADOW_ROUTE,
-    ] {
-        let request =
-            ObjectRpcRequest::encode_body(route, ROLLOUT_RPC_CATEGORY, &()).expect("rpc request");
+    for route in ["/test/mutate", "/test/finalize", "/test/build"] {
+        let request = ObjectRpcRequest::encode_body(route, "test", &()).expect("rpc request");
         assert!(
             !crate::roaming::iroh_daemon_control_request_allows_response_retry(&request),
             "{route} should not be retried after the remote may have accepted the request"

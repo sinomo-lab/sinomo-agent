@@ -2605,8 +2605,8 @@ async fn fetch_daemon_status_from_endpoint_direct_async(
     timeout: Duration,
 ) -> Result<crate::DaemonStatus, DaemonError> {
     let request = sinomo_network::ObjectRpcRequest::encode_body(
-        sinomo_network::DAEMON_STATUS_ROUTE,
-        sinomo_network::DAEMON_RPC_CATEGORY,
+        crate::DAEMON_STATUS_ROUTE,
+        crate::DAEMON_RPC_CATEGORY,
         &(),
     )?;
     let request_for_signing = request.clone();

@@ -447,35 +447,4 @@ mod module_registration_tests {
                     && route.auth == ModuleRouteAuth::LocalCommand)
         );
     }
-
-    #[test]
-    fn rollout_route_constants_match_network_rpc_mirrors() {
-        assert_eq!(ROLLOUT_RPC_CATEGORY, sinomo_network::ROLLOUT_RPC_CATEGORY);
-        assert_eq!(
-            ROLLOUT_DIAGNOSTICS_ROUTE,
-            sinomo_network::ROLLOUT_DIAGNOSTICS_ROUTE
-        );
-        assert_eq!(ROLLOUT_BINARY_ROUTE, sinomo_network::ROLLOUT_BINARY_ROUTE);
-        assert_eq!(
-            ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
-            sinomo_network::ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE
-        );
-        assert_eq!(
-            ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
-            sinomo_network::ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE
-        );
-        assert_eq!(
-            ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
-            sinomo_network::ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE
-        );
-        assert_eq!(ROLLOUT_BUILD_ROUTE, sinomo_network::ROLLOUT_BUILD_ROUTE);
-        assert_eq!(
-            ROLLOUT_FINALIZE_SHADOW_ROUTE,
-            sinomo_network::ROLLOUT_FINALIZE_SHADOW_ROUTE
-        );
-        assert_eq!(
-            ROLLOUT_CLEAR_STATUS_ROUTE,
-            sinomo_network::ROLLOUT_CLEAR_STATUS_ROUTE
-        );
-    }
 }

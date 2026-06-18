@@ -3286,7 +3286,7 @@ async fn write_daemon_sandbox_stream_frame_async(
     frame: &sinomo_sandbox::SandboxRunToolchainStreamFrame,
 ) -> Result<(), DaemonError> {
     let response = sinomo_network::ObjectRpcResponse::encode_body(
-        sinomo_network::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
+        sinomo_sandbox::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
         frame,
     )
     .map_err(DaemonError::from)?;
@@ -3299,7 +3299,7 @@ async fn write_daemon_sandbox_process_plan_stream_frame_async(
     frame: &sinomo_sandbox::SandboxRunProcessPlanStreamFrame,
 ) -> Result<(), DaemonError> {
     let response = sinomo_network::ObjectRpcResponse::encode_body(
-        sinomo_network::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
+        sinomo_sandbox::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
         frame,
     )
     .map_err(DaemonError::from)?;
@@ -5177,8 +5177,8 @@ mod tests {
         timeout: Duration,
     ) -> Result<crate::DaemonStatus, DaemonError> {
         let request = sinomo_network::ObjectRpcRequest::encode_body(
-            sinomo_network::DAEMON_STATUS_ROUTE,
-            sinomo_network::DAEMON_RPC_CATEGORY,
+            crate::DAEMON_STATUS_ROUTE,
+            crate::DAEMON_RPC_CATEGORY,
             &(),
         )?;
         let response = send_test_rpc(data_dir, address, &request, timeout)?;
@@ -5191,8 +5191,8 @@ mod tests {
         timeout: Duration,
     ) -> Result<String, DaemonError> {
         let request = sinomo_network::ObjectRpcRequest::encode_body(
-            sinomo_network::DAEMON_SHUTDOWN_ROUTE,
-            sinomo_network::DAEMON_RPC_CATEGORY,
+            crate::DAEMON_SHUTDOWN_ROUTE,
+            crate::DAEMON_RPC_CATEGORY,
             &(),
         )?;
         let response = send_test_rpc(data_dir, address, &request, timeout)?;

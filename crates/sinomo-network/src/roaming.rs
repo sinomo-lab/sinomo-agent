@@ -1778,13 +1778,14 @@ fn iroh_daemon_control_attempt_should_retry(
 pub(crate) fn iroh_daemon_control_request_allows_response_retry(
     request: &crate::DaemonControlRequest,
 ) -> bool {
+    if request.is_response_retry_safe() {
+        return true;
+    }
     matches!(
         request.route.as_str(),
         crate::CLUSTER_HEALTH_ROUTE
             | sinomo_kv::CLUSTER_KV_RANGE_PREFIX_ROUTE
             | sinomo_kv::CLUSTER_KV_SNAPSHOT_ROUTE
-            | crate::ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE
-            | crate::ROLLOUT_DIAGNOSTICS_ROUTE
     )
 }
 

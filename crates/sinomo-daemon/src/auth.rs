@@ -305,9 +305,9 @@ pub fn authorize_authenticated_daemon_command(
 ) -> Result<(), DaemonError> {
     let route = authenticated.route.as_str();
     let allowed = match route {
-        route if route == sinomo_network::DAEMON_STATUS_ROUTE => true,
+        route if route == crate::DAEMON_STATUS_ROUTE => true,
         route if route == CLUSTER_KV_SNAPSHOT_ROUTE => true,
-        route if route == sinomo_network::DAEMON_SHUTDOWN_ROUTE => {
+        route if route == crate::DAEMON_SHUTDOWN_ROUTE => {
             authenticated.signer.can_run_local_command()
         }
         route if route == ROLLOUT_FINALIZE_SHADOW_ROUTE => {
@@ -384,7 +384,7 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        route if route == sinomo_network::MODULE_NATIVE_DYLIB_CANCEL_ROUTE => {
+        route if route == sinomo_module::MODULE_NATIVE_DYLIB_CANCEL_ROUTE => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -509,28 +509,28 @@ fn is_config_rpc_route(route: &str) -> bool {
 }
 
 fn is_local_sandbox_rpc_route(route: &str) -> bool {
-    route == sinomo_network::SANDBOX_CREATE_ROUTE
-        || route == sinomo_network::SANDBOX_STATUS_ROUTE
-        || route == sinomo_network::SANDBOX_UPDATE_ROUTE
-        || route == sinomo_network::SANDBOX_CHECKPOINT_ROUTE
-        || route == sinomo_network::SANDBOX_RESUME_ROUTE
-        || route == sinomo_network::SANDBOX_REBOOT_ROUTE
-        || route == sinomo_network::SANDBOX_DESTROY_ROUTE
-        || route == sinomo_network::SANDBOX_LIST_ROUTE
-        || route == sinomo_network::SANDBOX_READ_ROUTE
-        || route == sinomo_network::SANDBOX_WRITE_ROUTE
-        || route == sinomo_network::SANDBOX_HTTP_FETCH_ROUTE
-        || route == sinomo_network::SANDBOX_HTTP_FETCH_TO_FILE_ROUTE
-        || route == sinomo_network::SANDBOX_RUN_TOOLCHAIN_ROUTE
-        || route == sinomo_network::SANDBOX_RUN_PROCESS_PLAN_ROUTE
-        || route == sinomo_network::SANDBOX_RUN_CANCEL_ROUTE
-        || route == sinomo_network::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE
-        || route == sinomo_network::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE
-        || route == sinomo_network::SANDBOX_IMPORT_BUSYBOX_ROUTE
-        || route == sinomo_network::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE
-        || route == sinomo_network::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE
-        || route == sinomo_network::SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE
-        || route == sinomo_network::SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE
+    route == sinomo_sandbox::SANDBOX_CREATE_ROUTE
+        || route == sinomo_sandbox::SANDBOX_STATUS_ROUTE
+        || route == sinomo_sandbox::SANDBOX_UPDATE_ROUTE
+        || route == sinomo_sandbox::SANDBOX_CHECKPOINT_ROUTE
+        || route == sinomo_sandbox::SANDBOX_RESUME_ROUTE
+        || route == sinomo_sandbox::SANDBOX_REBOOT_ROUTE
+        || route == sinomo_sandbox::SANDBOX_DESTROY_ROUTE
+        || route == sinomo_sandbox::SANDBOX_LIST_ROUTE
+        || route == sinomo_sandbox::SANDBOX_READ_ROUTE
+        || route == sinomo_sandbox::SANDBOX_WRITE_ROUTE
+        || route == sinomo_sandbox::SANDBOX_HTTP_FETCH_ROUTE
+        || route == sinomo_sandbox::SANDBOX_HTTP_FETCH_TO_FILE_ROUTE
+        || route == sinomo_sandbox::SANDBOX_RUN_TOOLCHAIN_ROUTE
+        || route == sinomo_sandbox::SANDBOX_RUN_PROCESS_PLAN_ROUTE
+        || route == sinomo_sandbox::SANDBOX_RUN_CANCEL_ROUTE
+        || route == sinomo_sandbox::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE
+        || route == sinomo_sandbox::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE
+        || route == sinomo_sandbox::SANDBOX_IMPORT_BUSYBOX_ROUTE
+        || route == sinomo_sandbox::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE
+        || route == sinomo_sandbox::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE
+        || route == sinomo_sandbox::SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE
+        || route == sinomo_sandbox::SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE
 }
 
 fn verify_signed_daemon_command(
@@ -630,7 +630,7 @@ fn authorize_daemon_signer(
         authorize_cluster_join_rpc_signer(paths, Some(request), &envelope_public_key)?;
         return Ok(DaemonSignerAuthority::JoinCandidate);
     }
-    if request.route == sinomo_network::DAEMON_STATUS_ROUTE {
+    if request.route == crate::DAEMON_STATUS_ROUTE {
         return Ok(DaemonSignerAuthority::StatusProbe);
     }
     if let Some(authority) =
@@ -1069,8 +1069,8 @@ mod tests {
         let data_root = unique_auth_test_root("sinomo-daemon-auth-binary");
         let data_dir = SinomoDataDir::new(&data_root);
         let request = sinomo_network::ObjectRpcRequest::encode_body(
-            sinomo_network::DAEMON_STATUS_ROUTE,
-            sinomo_network::DAEMON_RPC_CATEGORY,
+            crate::DAEMON_STATUS_ROUTE,
+            crate::DAEMON_RPC_CATEGORY,
             &(),
         )
         .expect("rpc request");
@@ -1169,7 +1169,7 @@ mod tests {
     #[test]
     fn status_probe_authority_is_limited_to_daemon_status() {
         let status = authenticated_command(
-            sinomo_network::DAEMON_STATUS_ROUTE.to_string(),
+            crate::DAEMON_STATUS_ROUTE.to_string(),
             DaemonSignerAuthority::StatusProbe,
         );
         authorize_authenticated_daemon_command(&status)
@@ -1459,14 +1459,14 @@ mod tests {
             DaemonSignerAuthority::Member,
         ] {
             let authenticated = authenticated_command(
-                sinomo_network::MODULE_NATIVE_DYLIB_CANCEL_ROUTE.to_string(),
+                sinomo_module::MODULE_NATIVE_DYLIB_CANCEL_ROUTE.to_string(),
                 signer,
             );
             authorize_authenticated_daemon_command(&authenticated)
                 .expect("cluster members must be able to cancel native dylib module operations");
         }
         let authenticated = authenticated_command(
-            sinomo_network::MODULE_NATIVE_DYLIB_CANCEL_ROUTE.to_string(),
+            sinomo_module::MODULE_NATIVE_DYLIB_CANCEL_ROUTE.to_string(),
             DaemonSignerAuthority::JoinCandidate,
         );
         assert!(authorize_authenticated_daemon_command(&authenticated).is_err());

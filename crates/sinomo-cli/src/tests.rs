@@ -7788,8 +7788,8 @@ fn daemon_auth_accepts_signed_local_command_and_rejects_tampering() {
     let identity = super::load_or_create_main_node_identity(&root).expect("identity");
 
     let rpc_request = sinomo_runtime::network::ObjectRpcRequest::encode_body(
-        sinomo_runtime::network::DAEMON_STATUS_ROUTE,
-        sinomo_runtime::network::DAEMON_RPC_CATEGORY,
+        sinomo_runtime::daemon::DAEMON_STATUS_ROUTE,
+        sinomo_runtime::daemon::DAEMON_RPC_CATEGORY,
         &(),
     )
     .expect("rpc request");
@@ -7802,7 +7802,7 @@ fn daemon_auth_accepts_signed_local_command_and_rejects_tampering() {
         )
         .expect("auth rpc command"),
         authenticated_test_command(
-            sinomo_runtime::network::DAEMON_STATUS_ROUTE,
+            sinomo_runtime::daemon::DAEMON_STATUS_ROUTE,
             super::DaemonSignerAuthority::Local,
             NodeId::from_legacy_named("node_auth")
                 .expect("node")
@@ -7815,8 +7815,8 @@ fn daemon_auth_accepts_signed_local_command_and_rejects_tampering() {
         Err(super::DaemonError::AuthDenied)
     ));
     let tampered_rpc_request = sinomo_runtime::network::ObjectRpcRequest::encode_body(
-        sinomo_runtime::network::DAEMON_STATUS_ROUTE,
-        sinomo_runtime::network::DAEMON_RPC_CATEGORY,
+        sinomo_runtime::daemon::DAEMON_STATUS_ROUTE,
+        sinomo_runtime::daemon::DAEMON_RPC_CATEGORY,
         &"tampered",
     )
     .expect("tampered rpc request");
@@ -7911,7 +7911,7 @@ fn daemon_auth_only_accepts_active_signed_join_invites() {
 fn daemon_authorization_restricts_admin_and_local_commands() {
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            sinomo_runtime::network::DAEMON_STATUS_ROUTE,
+            sinomo_runtime::daemon::DAEMON_STATUS_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -8046,7 +8046,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            sinomo_runtime::network::SANDBOX_HTTP_FETCH_ROUTE,
+            sinomo_runtime::sandbox::SANDBOX_HTTP_FETCH_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -8055,7 +8055,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            sinomo_runtime::network::SANDBOX_HTTP_FETCH_ROUTE,
+            sinomo_runtime::sandbox::SANDBOX_HTTP_FETCH_ROUTE,
             super::DaemonSignerAuthority::Local,
             "node_local",
             "pk_local"
@@ -8063,27 +8063,27 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
         .is_ok()
     );
     for route in [
-        sinomo_runtime::network::SANDBOX_CREATE_ROUTE,
-        sinomo_runtime::network::SANDBOX_STATUS_ROUTE,
-        sinomo_runtime::network::SANDBOX_UPDATE_ROUTE,
-        sinomo_runtime::network::SANDBOX_CHECKPOINT_ROUTE,
-        sinomo_runtime::network::SANDBOX_RESUME_ROUTE,
-        sinomo_runtime::network::SANDBOX_REBOOT_ROUTE,
-        sinomo_runtime::network::SANDBOX_DESTROY_ROUTE,
-        sinomo_runtime::network::SANDBOX_LIST_ROUTE,
-        sinomo_runtime::network::SANDBOX_READ_ROUTE,
-        sinomo_runtime::network::SANDBOX_WRITE_ROUTE,
-        sinomo_runtime::network::SANDBOX_HTTP_FETCH_ROUTE,
-        sinomo_runtime::network::SANDBOX_HTTP_FETCH_TO_FILE_ROUTE,
-        sinomo_runtime::network::SANDBOX_RUN_TOOLCHAIN_ROUTE,
-        sinomo_runtime::network::SANDBOX_RUN_PROCESS_PLAN_ROUTE,
-        sinomo_runtime::network::SANDBOX_RUN_CANCEL_ROUTE,
-        sinomo_runtime::network::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
-        sinomo_runtime::network::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
-        sinomo_runtime::network::SANDBOX_IMPORT_BUSYBOX_ROUTE,
-        sinomo_runtime::network::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE,
-        sinomo_runtime::network::SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE,
-        sinomo_runtime::network::SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_CREATE_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_STATUS_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_UPDATE_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_CHECKPOINT_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_RESUME_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_REBOOT_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_DESTROY_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_LIST_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_READ_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_WRITE_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_HTTP_FETCH_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_HTTP_FETCH_TO_FILE_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_RUN_TOOLCHAIN_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_RUN_PROCESS_PLAN_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_RUN_CANCEL_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_IMPORT_BUSYBOX_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE,
+        sinomo_runtime::sandbox::SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE,
     ] {
         assert!(
             super::authorize_authenticated_daemon_command(&authenticated_test_command(
@@ -8108,7 +8108,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     }
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            sinomo_runtime::network::SANDBOX_RUN_TOOLCHAIN_ROUTE,
+            sinomo_runtime::sandbox::SANDBOX_RUN_TOOLCHAIN_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -8117,7 +8117,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            sinomo_runtime::network::SANDBOX_RUN_TOOLCHAIN_ROUTE,
+            sinomo_runtime::sandbox::SANDBOX_RUN_TOOLCHAIN_ROUTE,
             super::DaemonSignerAuthority::Local,
             "node_local",
             "pk_local"
@@ -8126,7 +8126,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            sinomo_runtime::network::SANDBOX_WRITE_ROUTE,
+            sinomo_runtime::sandbox::SANDBOX_WRITE_ROUTE,
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -8135,7 +8135,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            sinomo_runtime::network::SANDBOX_WRITE_ROUTE,
+            sinomo_runtime::sandbox::SANDBOX_WRITE_ROUTE,
             super::DaemonSignerAuthority::Local,
             "node_local",
             "pk_local"
@@ -8189,7 +8189,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            sinomo_runtime::network::DAEMON_SHUTDOWN_ROUTE,
+            sinomo_runtime::daemon::DAEMON_SHUTDOWN_ROUTE,
             super::DaemonSignerAuthority::Voter,
             "node_voter",
             "pk_voter"
