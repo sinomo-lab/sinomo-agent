@@ -1,10 +1,10 @@
 use crate::is_loopback_connect_address;
+use crate::kv_read_model::{cluster_node_status_map_from_kv, read_cluster_endpoints_from_kv};
 use crate::lan::{
     discover_local_ip_candidates_for_targets, discover_local_ip_candidates_for_targets_async,
     is_invitable_ip,
 };
 use crate::membership::{cluster_member_is_local_process, locally_learned_bridge_route_endpoint};
-use crate::storage::{read_cluster_endpoints_from_kv, read_cluster_node_statuses_from_kv};
 use crate::{ClusterConnectivityGraph, ClusterConnectivityState};
 use crate::{ClusterPaths, iroh_endpoint_public_key};
 use sinomo_core::{
@@ -153,16 +153,6 @@ pub fn cluster_sync_targets_with_connectivity(
     let graph = ClusterConnectivityGraph::read_for_local(paths, state);
     let node_statuses = cluster_node_status_map_from_kv(paths);
     cluster_sync_targets_with_connectivity_context(state, &graph, &node_statuses)
-}
-
-fn cluster_node_status_map_from_kv(
-    paths: &ClusterPaths,
-) -> BTreeMap<NodeId, ClusterNodeStatusRecord> {
-    read_cluster_node_statuses_from_kv(paths)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|status| (status.node_id.clone(), status))
-        .collect()
 }
 
 fn cluster_sync_targets_with_connectivity_context(

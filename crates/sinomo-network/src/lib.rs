@@ -25,6 +25,7 @@ mod invite_publish;
 mod io_observer;
 mod keyspace;
 mod kv_forward;
+mod kv_read_model;
 mod kv_semantics;
 mod kv_snapshot;
 mod lan;
@@ -141,6 +142,10 @@ pub use kv_forward::{
     ClusterKvTxnForwardAsyncHost, ClusterKvTxnForwardHost, ClusterKvTxnForwardOptions,
     ClusterKvTxnForwardResult, forward_cluster_kv_txn_to_voter_async_with_host,
     forward_cluster_kv_txn_to_voter_with_host,
+};
+pub use kv_read_model::{
+    read_cluster_connectivity_graph_from_kv, read_cluster_members_from_kv,
+    read_cluster_node_statuses_from_kv,
 };
 #[cfg(test)]
 pub(crate) use kv_semantics::cluster_semantic_txn_no_effect_response;
@@ -323,10 +328,9 @@ pub use storage::{
     commit_cluster_raft_command_with_quorum_driver, elect_cluster_raft_leader_with_host,
     handle_cluster_join_registration_request_with_host, handle_cluster_kv_watch_events,
     handle_cluster_membership_rpc_request_with_hosts, handle_cluster_raft_rpc_request,
-    join_channel_endpoint_for_accepted_state, read_cluster_connectivity_graph_from_kv,
-    read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_state,
-    read_cluster_state_cached, read_cluster_state_without_kv,
-    reconcile_accepted_cluster_join_response, reconcile_cluster_join_with_introducers_with_host,
+    join_channel_endpoint_for_accepted_state, read_cluster_state, read_cluster_state_cached,
+    read_cluster_state_without_kv, reconcile_accepted_cluster_join_response,
+    reconcile_cluster_join_with_introducers_with_host,
     record_forwarded_join_registration_acceptance_with_host, remove_cluster_members_with_host,
     replicate_cluster_raft_to_endpoint_with_host, select_cluster_connectivity_probe_batch,
     send_cluster_join_registration_over_membership_rpc,
