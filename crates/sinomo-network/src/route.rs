@@ -417,11 +417,13 @@ pub(crate) struct ClusterSignedRelayRpcOptions {
 pub type ClusterSignedRelayRpcFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, NetworkError>> + Send + 'a>>;
 
-pub trait ClusterSignedRelayRpcAsyncHost {
+pub trait ClusterSignedRelayRpcAsyncHost: ClusterSignedEndpointRpcAsyncHost {
     fn sign_relay_rpc_request_async<'a>(
         &'a mut self,
         request: &'a ObjectRpcRequest,
-    ) -> ClusterSignedRelayRpcFuture<'a, Vec<u8>>;
+    ) -> ClusterSignedRelayRpcFuture<'a, Vec<u8>> {
+        self.sign_endpoint_rpc_request_async(request)
+    }
 
     fn send_signed_relay_rpc_async<'a>(
         &'a mut self,
@@ -429,7 +431,9 @@ pub trait ClusterSignedRelayRpcAsyncHost {
         auth: &'a [u8],
         request: &'a ObjectRpcRequest,
         timeouts: DaemonRpcTimeouts,
-    ) -> ClusterSignedRelayRpcFuture<'a, ObjectRpcResponse>;
+    ) -> ClusterSignedRelayRpcFuture<'a, ObjectRpcResponse> {
+        self.send_signed_endpoint_rpc_async(endpoint, auth, request, timeouts)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -509,6 +513,8 @@ pub trait ClusterSignedEndpointRpcAsyncHost {
     }
 }
 
+impl<H> ClusterSignedRelayRpcAsyncHost for H where H: ClusterSignedEndpointRpcAsyncHost {}
+
 struct ClusterObjectRpcPathRelayHost<'a, H> {
     runtime: tokio::runtime::Handle,
     paths: ClusterPaths,
@@ -517,7 +523,7 @@ struct ClusterObjectRpcPathRelayHost<'a, H> {
 
 impl<H> ClusterSignedEndpointRpcAsyncHost for ClusterObjectRpcPathRelayHost<'_, H>
 where
-    H: ClusterSignedEndpointRpcAsyncHost + ClusterSignedRelayRpcAsyncHost + Send,
+    H: ClusterSignedEndpointRpcAsyncHost + Send,
 {
     fn sign_endpoint_rpc_request_async<'a>(
         &'a mut self,
@@ -626,7 +632,7 @@ impl<'a, H: ClusterSignedEndpointRpcAsyncHost> ClusterObjectRpcClient<'a, H> {
 
 impl<'a, H> ClusterObjectRpcClient<'a, H>
 where
-    H: ClusterSignedEndpointRpcAsyncHost + ClusterSignedRelayRpcAsyncHost + Send,
+    H: ClusterSignedEndpointRpcAsyncHost + Send,
 {
     pub async fn call_endpoint_from_paths(
         &mut self,
@@ -3870,24 +3876,34 @@ mod tests {
             .expect("route helpers should pass an explicit routing timeout budget")
     }
 
-    impl ClusterSignedRelayRpcAsyncHost for RecordingSignedRelayRpcHost {
-        fn sign_relay_rpc_request_async<'a>(
+    impl ClusterSignedEndpointRpcAsyncHost for RecordingSignedRelayRpcHost {
+        fn sign_endpoint_rpc_request_async<'a>(
             &'a mut self,
             request: &'a ObjectRpcRequest,
-        ) -> ClusterSignedRelayRpcFuture<'a, Vec<u8>> {
+        ) -> ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
             Box::pin(async move {
                 self.signed_routes.push(request.route.clone());
                 Ok(format!("sig:{}", request.route).into_bytes())
             })
         }
 
-        fn send_signed_relay_rpc_async<'a>(
+        fn try_gateway_signed_rpc_async<'a>(
+            &'a mut self,
+            _endpoint: &'a ClusterEndpointRecord,
+            _request: &'a ObjectRpcRequest,
+            _request_auth: &'a [u8],
+            _timeouts: DaemonRpcTimeouts,
+        ) -> ClusterSignedEndpointRpcFuture<'a, Option<ObjectRpcResponse>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn send_signed_endpoint_rpc_async<'a>(
             &'a mut self,
             endpoint: &'a ClusterEndpointRecord,
             auth: &'a [u8],
             request: &'a ObjectRpcRequest,
             timeouts: DaemonRpcTimeouts,
-        ) -> ClusterSignedRelayRpcFuture<'a, ObjectRpcResponse> {
+        ) -> ClusterSignedEndpointRpcFuture<'a, ObjectRpcResponse> {
             Box::pin(async move {
                 self.sent_timeouts.push(timeouts);
                 self.sent.push((
@@ -4512,39 +4528,6 @@ mod tests {
                 self.relay_auth.push(request_auth.to_vec());
                 self.relay_timeout_policies.push(timeouts);
                 self.relay_result.clone()
-            })
-        }
-    }
-
-    impl ClusterSignedRelayRpcAsyncHost for RecordingSignedEndpointRpcHost {
-        fn sign_relay_rpc_request_async<'a>(
-            &'a mut self,
-            request: &'a ObjectRpcRequest,
-        ) -> ClusterSignedRelayRpcFuture<'a, Vec<u8>> {
-            Box::pin(async move {
-                self.signed_routes.push(request.route.clone());
-                Ok(format!("fresh-relay-auth-{}", self.signed_routes.len()).into_bytes())
-            })
-        }
-
-        fn send_signed_relay_rpc_async<'a>(
-            &'a mut self,
-            _endpoint: &'a ClusterEndpointRecord,
-            auth: &'a [u8],
-            _request: &'a ObjectRpcRequest,
-            timeouts: DaemonRpcTimeouts,
-        ) -> ClusterSignedRelayRpcFuture<'a, ObjectRpcResponse> {
-            Box::pin(async move {
-                self.calls.push("send_relay");
-                self.relay_auth.push(auth.to_vec());
-                self.relay_timeout_policies.push(timeouts);
-                match self.relay_result.clone()? {
-                    Some(response) => Ok(response),
-                    None => Err(NetworkError::Io {
-                        operation: "recording relay rpc".to_string(),
-                        detail: "no relay response configured".to_string(),
-                    }),
-                }
             })
         }
     }

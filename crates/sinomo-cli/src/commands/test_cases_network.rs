@@ -692,37 +692,6 @@ impl network::ClusterSignedEndpointRpcAsyncHost for NetworkPingEndpointRpcHost {
     }
 }
 
-impl network::ClusterSignedRelayRpcAsyncHost for NetworkPingEndpointRpcHost {
-    fn sign_relay_rpc_request_async<'a>(
-        &'a mut self,
-        request: &'a network::ObjectRpcRequest,
-    ) -> network::ClusterSignedRelayRpcFuture<'a, Vec<u8>> {
-        let request = request.clone();
-        Box::pin(async move {
-            sign_daemon_rpc_request_for_local_node(&request)
-                .map_err(|error| network_ping_network_error("cluster relay signing", error))
-        })
-    }
-
-    fn send_signed_relay_rpc_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        auth: &'a [u8],
-        request: &'a network::ObjectRpcRequest,
-        timeouts: network::DaemonRpcTimeouts,
-    ) -> network::ClusterSignedRelayRpcFuture<'a, network::ObjectRpcResponse> {
-        Box::pin(async move {
-            network::send_daemon_rpc_to_cluster_endpoint_async(
-                endpoint,
-                Some(auth),
-                request,
-                timeouts,
-            )
-            .await
-        })
-    }
-}
-
 fn network_ping_network_error(operation: &str, error: impl ToString) -> network::NetworkError {
     network::NetworkError::Io {
         operation: operation.to_string(),

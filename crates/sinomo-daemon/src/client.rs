@@ -776,60 +776,6 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
     }
 }
 
-impl sinomo_network::ClusterSignedRelayRpcAsyncHost for DaemonSignedEndpointRpcAsyncHost {
-    fn sign_relay_rpc_request_async<'a>(
-        &'a mut self,
-        request: &'a sinomo_network::ObjectRpcRequest,
-    ) -> sinomo_network::ClusterSignedRelayRpcFuture<'a, Vec<u8>> {
-        let request = request.clone();
-        let runtime = self.runtime.clone();
-        Box::pin(async move {
-            runtime
-                .spawn_blocking(move || sign_daemon_rpc_request_for_local_node(&request))
-                .await
-                .map_err(|source| sinomo_network::NetworkError::Io {
-                    operation: "cluster relay signing".to_string(),
-                    detail: format!("relay signing task failed: {source}"),
-                })?
-                .map_err(|error| daemon_client_network_error("cluster relay signing", error))
-        })
-    }
-
-    fn send_signed_relay_rpc_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        auth: &'a [u8],
-        request: &'a sinomo_network::ObjectRpcRequest,
-        timeouts: sinomo_network::DaemonRpcTimeouts,
-    ) -> sinomo_network::ClusterSignedRelayRpcFuture<'a, sinomo_network::ObjectRpcResponse> {
-        let runtime = self.runtime.clone();
-        Box::pin(async move {
-            let started = Instant::now();
-            let result = sinomo_network::send_daemon_rpc_to_cluster_endpoint_async(
-                endpoint,
-                Some(auth),
-                request,
-                timeouts,
-            )
-            .await;
-            if self.observe_connectivity
-                && let Some((connectivity_state, latency_ms, bypass_failure_grace)) =
-                    daemon_rpc_connectivity_observation(result.as_ref(), started)
-            {
-                remember_endpoint_command_connectivity_from_env_async(
-                    runtime,
-                    endpoint.clone(),
-                    connectivity_state,
-                    latency_ms,
-                    bypass_failure_grace,
-                )
-                .await;
-            }
-            result
-        })
-    }
-}
-
 fn daemon_rpc_connectivity_observation(
     result: Result<&sinomo_network::ObjectRpcResponse, &sinomo_network::NetworkError>,
     started: Instant,

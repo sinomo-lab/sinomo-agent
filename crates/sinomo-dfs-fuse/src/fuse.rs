@@ -1649,36 +1649,6 @@ impl network::ClusterSignedEndpointRpcAsyncHost for DfsFuseSignedObjectRpcHost {
     }
 }
 
-impl network::ClusterSignedRelayRpcAsyncHost for DfsFuseSignedObjectRpcHost {
-    fn sign_relay_rpc_request_async<'a>(
-        &'a mut self,
-        request: &'a network::ObjectRpcRequest,
-    ) -> network::ClusterSignedRelayRpcFuture<'a, Vec<u8>> {
-        Box::pin(async move {
-            daemon::sign_daemon_rpc_request_for_local_node(request)
-                .map_err(|error| dfs_fuse_network_error("dfs fuse relay rpc signing", error))
-        })
-    }
-
-    fn send_signed_relay_rpc_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        auth: &'a [u8],
-        request: &'a network::ObjectRpcRequest,
-        timeouts: network::DaemonRpcTimeouts,
-    ) -> network::ClusterSignedRelayRpcFuture<'a, network::ObjectRpcResponse> {
-        Box::pin(async move {
-            network::send_daemon_rpc_to_cluster_endpoint_async(
-                endpoint,
-                Some(auth),
-                request,
-                timeouts,
-            )
-            .await
-        })
-    }
-}
-
 #[derive(Clone)]
 struct DfsFuseEndpointTransport {
     local_node_id: NodeId,
