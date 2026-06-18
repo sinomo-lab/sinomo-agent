@@ -1525,11 +1525,13 @@ fn send_object_rpc_to_node(
         detail: "cluster paths are unavailable for node object RPC".to_string(),
     })?;
     let mut host = DaemonSignedEndpointRpcAsyncHost::new(runtime, true);
+    let mut client = sinomo_network::ClusterObjectRpcClient::routed(
+        &mut host,
+        sinomo_network::ClusterObjectRpcRouteContext::new(runtime, &paths),
+    );
     block_on_cluster_network_future_on_owner_runtime(
         runtime,
-        sinomo_network::call_cluster_node_rpc_async(
-            &mut host,
-            sinomo_network::ClusterObjectRpcRouteContext::new(runtime, &paths),
+        client.call_node(
             state,
             target_node_id,
             rpc_request,
@@ -1554,19 +1556,22 @@ async fn send_object_rpc_to_node_async(
         detail: "cluster paths are unavailable for node object RPC".to_string(),
     })?;
     let mut host = DaemonSignedEndpointRpcAsyncHost::new(runtime, true);
-    sinomo_network::call_cluster_node_rpc_async(
+    let mut client = sinomo_network::ClusterObjectRpcClient::routed(
         &mut host,
         sinomo_network::ClusterObjectRpcRouteContext::new(runtime, &paths),
-        state,
-        target_node_id,
-        rpc_request,
-        sinomo_network::ClusterObjectRpcNodeOptions::new(
-            sinomo_network::ClusterEndpointSelectionPurpose::VoterCommand,
-            sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
-        ),
-    )
-    .await
-    .map_err(DaemonError::from)
+    );
+    client
+        .call_node(
+            state,
+            target_node_id,
+            rpc_request,
+            sinomo_network::ClusterObjectRpcNodeOptions::new(
+                sinomo_network::ClusterEndpointSelectionPurpose::VoterCommand,
+                sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
+            ),
+        )
+        .await
+        .map_err(DaemonError::from)
 }
 
 #[cfg(test)]
@@ -2535,15 +2540,15 @@ async fn fetch_daemon_status_from_endpoint_direct_async(
     let timeouts = sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout);
     let runtime = tokio::runtime::Handle::current();
     let mut host = DaemonSignedEndpointRpcAsyncHost::direct_only(&runtime);
-    let response = sinomo_network::call_cluster_endpoint_rpc_async(
-        &mut host,
-        None,
-        endpoint,
-        &request,
-        sinomo_network::ClusterObjectRpcOptions::new(timeouts),
-    )
-    .await
-    .map_err(DaemonError::from)?;
+    let mut client = sinomo_network::ClusterObjectRpcClient::new(&mut host);
+    let response = client
+        .call_endpoint(
+            endpoint,
+            &request,
+            sinomo_network::ClusterObjectRpcOptions::new(timeouts),
+        )
+        .await
+        .map_err(DaemonError::from)?;
     response.decode_body().map_err(DaemonError::from)
 }
 
@@ -4937,15 +4942,15 @@ async fn send_cluster_relay_request_to_next_hop_async(
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     let runtime = tokio::runtime::Handle::current();
     let mut host = DaemonSignedEndpointRpcAsyncHost::direct_only(&runtime);
-    sinomo_network::call_cluster_endpoint_rpc_async(
-        &mut host,
-        None,
-        endpoint,
-        request,
-        sinomo_network::ClusterObjectRpcOptions::new(timeouts),
-    )
-    .await
-    .map_err(DaemonError::from)
+    let mut client = sinomo_network::ClusterObjectRpcClient::new(&mut host);
+    client
+        .call_endpoint(
+            endpoint,
+            request,
+            sinomo_network::ClusterObjectRpcOptions::new(timeouts),
+        )
+        .await
+        .map_err(DaemonError::from)
 }
 
 fn relay_envelope_inner_expects_streamed_response(

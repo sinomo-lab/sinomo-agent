@@ -329,15 +329,14 @@ async fn send_daemon_rpc_to_endpoint_async_with_connectivity_observation(
     let route_context = paths
         .as_ref()
         .map(|paths| sinomo_network::ClusterObjectRpcRouteContext::new(runtime, paths));
-    sinomo_network::call_cluster_endpoint_rpc_async(
-        &mut host,
-        route_context,
-        endpoint,
-        request,
-        options,
-    )
-    .await
-    .map_err(DaemonError::from)
+    let mut client = match route_context {
+        Some(context) => sinomo_network::ClusterObjectRpcClient::routed(&mut host, context),
+        None => sinomo_network::ClusterObjectRpcClient::new(&mut host),
+    };
+    client
+        .call_endpoint(endpoint, request, options)
+        .await
+        .map_err(DaemonError::from)
 }
 
 fn block_on_daemon_client<F, T>(future: F) -> Result<T, DaemonError>

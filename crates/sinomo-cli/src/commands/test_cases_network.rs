@@ -472,19 +472,19 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
     let mut host = NetworkPingEndpointRpcHost {
         cluster_state: Arc::clone(&job.cluster_state),
     };
-    let response = match network::call_cluster_endpoint_rpc_async(
+    let mut client = network::ClusterObjectRpcClient::routed(
         &mut host,
-        Some(network::ClusterObjectRpcRouteContext::new(
-            &job.runtime,
-            &job.paths,
-        )),
-        &job.endpoint,
-        &job.request,
-        network::ClusterObjectRpcOptions::new(network::DaemonRpcTimeouts::connect_and_idle(
-            job.timeout,
-        )),
-    )
-    .await
+        network::ClusterObjectRpcRouteContext::new(&job.runtime, &job.paths),
+    );
+    let response = match client
+        .call_endpoint(
+            &job.endpoint,
+            &job.request,
+            network::ClusterObjectRpcOptions::new(network::DaemonRpcTimeouts::connect_and_idle(
+                job.timeout,
+            )),
+        )
+        .await
     {
         Ok(response) => response,
         Err(error) => return NetworkPingOutcome::Failure(error.to_string()),

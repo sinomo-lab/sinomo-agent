@@ -1604,14 +1604,11 @@ impl network::ClusterKvTxnForwardHost for DfsFuseClusterKvTxnForwardHost {
             network::ClusterEndpointSelectionPurpose::VoterCommand,
             network::DaemonRpcTimeouts::connect_and_idle(timeout),
         );
-        let result = runtime.block_on(network::call_cluster_node_rpc_async(
+        let mut client = network::ClusterObjectRpcClient::routed(
             &mut host,
             network::ClusterObjectRpcRouteContext::new(runtime.handle(), &paths),
-            state,
-            target_node_id,
-            request,
-            options,
-        ));
+        );
+        let result = runtime.block_on(client.call_node(state, target_node_id, request, options));
         runtime.shutdown_timeout(Duration::from_millis(250));
         result
     }
