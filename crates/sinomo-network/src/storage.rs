@@ -1,3 +1,4 @@
+use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, cluster_endpoint_targets};
 use crate::error::NetworkError;
 use crate::is_loopback_connect_address;
 use crate::lan::{
@@ -11612,7 +11613,7 @@ fn cluster_sync_targets_with_connectivity_context(
     endpoints
 }
 
-fn cluster_raft_command_targets_impl(
+pub(crate) fn cluster_raft_command_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -11668,7 +11669,7 @@ fn cluster_raft_command_targets_impl(
     targets
 }
 
-fn cluster_raft_live_voter_targets(
+pub(crate) fn cluster_raft_live_voter_targets(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -11766,64 +11767,7 @@ pub fn cluster_node_blocks_leader_preference(
         .is_some_and(|member| cluster_member_unreachable_via_connectivity(paths, state, member))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ClusterEndpointSelectionPurpose {
-    DaemonCommand,
-    DfsData,
-    InvitePublish,
-    LiveVoterCommand,
-    MainDaemonCommand,
-    MainDaemonCommandCandidates,
-    MemberDaemonStatus,
-    MemberPublish,
-    MemberPublishVoterFirst,
-    RaftCommand,
-    Rollout,
-    VoterCommand,
-}
-
-pub fn cluster_endpoint_targets(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    purpose: ClusterEndpointSelectionPurpose,
-) -> Vec<ClusterEndpointRecord> {
-    match purpose {
-        ClusterEndpointSelectionPurpose::DaemonCommand => {
-            cluster_daemon_command_targets_impl(paths, state)
-        }
-        ClusterEndpointSelectionPurpose::DfsData => cluster_dfs_protocol_targets_impl(paths, state),
-        ClusterEndpointSelectionPurpose::InvitePublish => {
-            cluster_invite_publish_targets_impl(paths, state)
-        }
-        ClusterEndpointSelectionPurpose::LiveVoterCommand => {
-            cluster_raft_live_voter_targets(paths, state)
-        }
-        ClusterEndpointSelectionPurpose::MainDaemonCommand => {
-            cluster_main_daemon_command_targets_impl(paths, state)
-        }
-        ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates => {
-            cluster_main_daemon_command_endpoint_candidates_impl(paths, state)
-        }
-        ClusterEndpointSelectionPurpose::MemberDaemonStatus => Vec::new(),
-        ClusterEndpointSelectionPurpose::MemberPublish => {
-            cluster_member_publish_targets_impl(paths, state)
-        }
-        ClusterEndpointSelectionPurpose::MemberPublishVoterFirst => {
-            cluster_member_publish_targets_voter_first_impl(paths, state)
-        }
-        ClusterEndpointSelectionPurpose::RaftCommand => {
-            cluster_raft_command_targets_impl(paths, state)
-        }
-        ClusterEndpointSelectionPurpose::Rollout => {
-            cluster_rollout_endpoint_targets_impl(paths, state)
-        }
-        ClusterEndpointSelectionPurpose::VoterCommand => {
-            cluster_voter_command_targets_impl(paths, state)
-        }
-    }
-}
-
-fn cluster_daemon_command_targets_impl(
+pub(crate) fn cluster_daemon_command_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -11847,15 +11791,7 @@ fn cluster_daemon_command_endpoint_is_usable(
     }
 }
 
-#[cfg(test)]
-pub fn cluster_dfs_protocol_targets(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Vec<ClusterEndpointRecord> {
-    cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::DfsData)
-}
-
-fn cluster_dfs_protocol_targets_impl(
+pub(crate) fn cluster_dfs_data_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -11880,7 +11816,7 @@ pub fn cluster_main_daemon_command_targets(
     )
 }
 
-fn cluster_main_daemon_command_targets_impl(
+pub(crate) fn cluster_main_daemon_command_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -11891,7 +11827,7 @@ fn cluster_main_daemon_command_targets_impl(
         .collect()
 }
 
-fn cluster_main_daemon_command_endpoint_candidates_impl(
+pub(crate) fn cluster_main_daemon_command_endpoint_candidates_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -11959,7 +11895,7 @@ fn cluster_endpoint_address_port(address: &str) -> Option<u16> {
 /// sibling learner with an equally stale snapshot answers "current" and the
 /// sync silently stalls. Preferring voters (then bridges, whose own snapshots
 /// converge the same way) forms a convergence chain rooted at the voter.
-fn cluster_member_publish_targets_voter_first_impl(
+pub(crate) fn cluster_member_publish_targets_voter_first_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -11978,7 +11914,7 @@ pub fn cluster_member_publish_targets(
     cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::MemberPublish)
 }
 
-fn cluster_member_publish_targets_impl(
+pub(crate) fn cluster_member_publish_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -12069,7 +12005,7 @@ fn push_unique_cluster_endpoint(
     }
 }
 
-fn cluster_voter_command_targets_impl(
+pub(crate) fn cluster_voter_command_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -12087,7 +12023,7 @@ pub fn cluster_invite_publish_targets(
     cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::InvitePublish)
 }
 
-fn cluster_invite_publish_targets_impl(
+pub(crate) fn cluster_invite_publish_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -12102,21 +12038,7 @@ fn cluster_invite_publish_targets_impl(
     targets
 }
 
-pub fn cluster_member_endpoint_targets(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    member: &ClusterMemberRecord,
-    purpose: ClusterEndpointSelectionPurpose,
-) -> Vec<ClusterEndpointRecord> {
-    match purpose {
-        ClusterEndpointSelectionPurpose::MemberDaemonStatus => {
-            cluster_member_daemon_status_targets_with_connectivity(paths, state, member)
-        }
-        _ => Vec::new(),
-    }
-}
-
-fn cluster_member_daemon_status_targets_with_connectivity(
+pub(crate) fn cluster_member_daemon_status_targets_with_connectivity(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,
@@ -12184,7 +12106,7 @@ pub fn cluster_member_expected_daemon_process(
         })
 }
 
-fn cluster_rollout_endpoint_targets_impl(
+pub(crate) fn cluster_rollout_endpoint_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -12231,7 +12153,7 @@ fn cluster_rollout_endpoint_targets_impl(
     endpoints
 }
 
-pub fn cluster_rollout_target_endpoints_for_main_with_command_endpoint(
+pub(crate) fn cluster_rollout_target_endpoints_for_main_with_command_endpoint_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     main_node_id: &NodeId,

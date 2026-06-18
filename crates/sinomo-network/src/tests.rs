@@ -5739,7 +5739,7 @@ fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
         &state,
         ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates,
     );
-    let dfs_targets = cluster_dfs_protocol_targets(&paths, &state);
+    let dfs_targets = cluster_dfs_data_targets(&paths, &state);
 
     assert_eq!(
         dfs_targets,
@@ -5758,7 +5758,7 @@ fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
         dfs_targets.iter().all(|endpoint| endpoint.endpoint_id
             != folded_shadow_endpoint.endpoint_id
             && endpoint.endpoint_id != port_only_shadow_endpoint.endpoint_id),
-        "DFS protocol routing uses the same main-daemon target surface"
+        "DFS data routing uses the same main-daemon target surface"
     );
     let remote_member = state
         .members
@@ -5834,14 +5834,14 @@ fn main_daemon_command_targets_filter_known_unreachable_endpoints() {
         targets.is_empty(),
         "known-unreachable direct endpoints should not remain daemon command targets"
     );
-    let dfs_targets = cluster_dfs_protocol_targets(&paths, &state);
+    let dfs_targets = cluster_dfs_data_targets(&paths, &state);
     assert_eq!(
         dfs_targets
             .iter()
             .map(|endpoint| &endpoint.endpoint_id)
             .collect::<Vec<_>>(),
         vec![&stale_tcp.endpoint_id],
-        "DFS frame routing should keep the target record so relay can handle known-bad direct paths"
+        "DFS data routing should keep the target record so relay can handle known-bad direct paths"
     );
 }
 
@@ -14161,7 +14161,7 @@ fn advertised_hostname_outranks_opportunistic_private_ip_for_docker_routes() {
 }
 
 #[test]
-fn dfs_protocol_targets_prefer_healthy_bridge_ip_over_degraded_hostname() {
+fn dfs_data_targets_prefer_healthy_bridge_ip_over_degraded_hostname() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-dfs-healthy-bridge-before-hostname");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -14220,7 +14220,7 @@ fn dfs_protocol_targets_prefer_healthy_bridge_ip_over_degraded_hostname() {
     )
     .expect("connectivity records");
 
-    let dfs_targets = cluster_dfs_protocol_targets(&paths, &state);
+    let dfs_targets = cluster_dfs_data_targets(&paths, &state);
     let ordered_endpoint_ids = dfs_targets
         .iter()
         .filter(|endpoint| endpoint.node_id == bridge_ip.node_id)

@@ -12,6 +12,7 @@
 //! host filesystem and transport adapters while cluster-aware validation remains
 //! here.
 
+mod endpoint_selector;
 mod error;
 mod health;
 mod invite;
@@ -23,6 +24,13 @@ mod route;
 mod rpc;
 mod storage;
 
+#[cfg(test)]
+pub use endpoint_selector::cluster_dfs_data_targets;
+pub use endpoint_selector::{
+    ClusterEndpointSelectionPurpose, ClusterEndpointSelector, cluster_endpoint_targets,
+    cluster_member_endpoint_targets,
+    cluster_rollout_target_endpoints_for_main_with_command_endpoint,
+};
 pub use error::*;
 pub use health::{
     ClusterDoctorFinding, ClusterHealthRow, ClusterNetworkPingRequest, ClusterNetworkPingResponse,
@@ -125,13 +133,13 @@ pub use storage::{
     CLUSTER_NETWORK_STABLE_DISCOVERY_ANNOUNCE_TICK_STRIDE, ClusterAuthenticatedPeer,
     ClusterConnectivityGraph, ClusterConnectivityProbeBatchEntry, ClusterConnectivityProbeState,
     ClusterConnectivityRecord, ClusterConnectivityState, ClusterControlPlaneDriver,
-    ClusterControlPlaneTimeouts, ClusterControlPlaneTransport, ClusterEndpointSelectionPurpose,
-    ClusterIdentityRecord, ClusterInvitationStateRecord, ClusterInvitePublishHost,
-    ClusterJoinRegistrationAsyncHost, ClusterJoinRegistrationDriver, ClusterJoinRegistrationHost,
-    ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse, ClusterKvSnapshotRefreshHost,
-    ClusterKvSnapshotRefreshOptions, ClusterKvTxnForwardAsyncHost, ClusterKvTxnForwardHost,
-    ClusterKvTxnForwardOptions, ClusterKvTxnForwardResult, ClusterKvTxnQuorumAsyncHost,
-    ClusterKvTxnQuorumHost, ClusterKvTxnQuorumOptions, ClusterLocalDaemonMembershipAsyncObserver,
+    ClusterControlPlaneTimeouts, ClusterControlPlaneTransport, ClusterIdentityRecord,
+    ClusterInvitationStateRecord, ClusterInvitePublishHost, ClusterJoinRegistrationAsyncHost,
+    ClusterJoinRegistrationDriver, ClusterJoinRegistrationHost, ClusterJoinRegistrationRequest,
+    ClusterJoinRegistrationResponse, ClusterKvSnapshotRefreshHost, ClusterKvSnapshotRefreshOptions,
+    ClusterKvTxnForwardAsyncHost, ClusterKvTxnForwardHost, ClusterKvTxnForwardOptions,
+    ClusterKvTxnForwardResult, ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost,
+    ClusterKvTxnQuorumOptions, ClusterLocalDaemonMembershipAsyncObserver,
     ClusterLocalDaemonMembershipObservation, ClusterLocalDaemonMembershipObserver,
     ClusterLocalDaemonMembershipRefresh, ClusterLocalMemberPublishAsyncHost,
     ClusterLocalMemberPublishHost, ClusterLocalMemberPublishOptions,
@@ -166,23 +174,21 @@ pub use storage::{
     cluster_connectivity_record_for_probe_outcome,
     cluster_connectivity_record_for_startup_probe_failure, cluster_connectivity_source_prefix,
     cluster_connectivity_stable_eq, cluster_connectivity_sync_ops, cluster_endpoint_key,
-    cluster_endpoint_prefix, cluster_endpoint_targets, cluster_has_local_quorum_with_host,
-    cluster_identity_key, cluster_invitation_key, cluster_invitation_state_key,
+    cluster_endpoint_prefix, cluster_has_local_quorum_with_host, cluster_identity_key,
+    cluster_invitation_key, cluster_invitation_state_key,
     cluster_iroh_proxy_republish_sleep_duration, cluster_iroh_proxy_start_retry_sleep_duration,
     cluster_is_settled_solo, cluster_join_challenge_rpc_request, cluster_local_node_role,
-    cluster_member_endpoint_targets, cluster_member_expected_daemon_process,
-    cluster_member_is_local_process, cluster_member_key, cluster_member_publish_txn_from_kv,
-    cluster_network_discovery_interval_for_role, cluster_network_info_key,
-    cluster_network_info_stable_eq, cluster_network_maintenance_due,
+    cluster_member_expected_daemon_process, cluster_member_is_local_process, cluster_member_key,
+    cluster_member_publish_txn_from_kv, cluster_network_discovery_interval_for_role,
+    cluster_network_info_key, cluster_network_info_stable_eq, cluster_network_maintenance_due,
     cluster_network_maintenance_interval_due,
     cluster_network_maintenance_last_timestamp_for_next_due,
     cluster_network_maintenance_next_due_duration, cluster_network_probe_interval_for_role,
     cluster_network_publish_interval_for_node, cluster_network_publish_interval_for_role,
     cluster_network_record_should_refresh, cluster_node_blocks_leader_preference,
     cluster_node_is_local_process, cluster_node_status_stable_eq,
-    cluster_reachable_voter_count_with_host,
-    cluster_rollout_target_endpoints_for_main_with_command_endpoint,
-    cluster_state_needs_join_registration, cluster_state_sync_txn, cluster_status_summary_label,
+    cluster_reachable_voter_count_with_host, cluster_state_needs_join_registration,
+    cluster_state_sync_txn, cluster_status_summary_label,
     commit_cluster_kv_txn_with_quorum_response_with_host,
     commit_cluster_raft_command_with_quorum_driver, discover_peer_route_ip_candidates,
     elect_cluster_raft_leader_with_host, ensure_daemon_cluster_members,
