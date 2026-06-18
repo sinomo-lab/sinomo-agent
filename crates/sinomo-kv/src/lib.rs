@@ -25,7 +25,9 @@ use sinomo_storage::durable_file::{self, file_ino};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
-use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(test)]
+use std::io::Write;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};

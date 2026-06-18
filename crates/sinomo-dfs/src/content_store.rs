@@ -3434,49 +3434,40 @@ impl LocalContentStore {
             return Ok(());
         }
         let path = self.packed_blob_index_log_path();
-        let existed = path.exists();
-        if let Some(parent) = path.parent() {
-            create_dir_all(parent.to_owned())?;
-        }
-        let mut record = Vec::new();
+        let mut records = Vec::with_capacity(entries.len());
         for entry in entries {
             let bytes = encode_packed_blob_index_log_entry(entry)?;
-            let length = u32::try_from(bytes.len()).map_err(|_| {
+            u32::try_from(bytes.len()).map_err(|_| {
                 ContentStoreError::Serde(format!(
                     "packed blob index entry for {} is too large: {} bytes",
                     entry.content_hash,
                     bytes.len()
                 ))
             })?;
-            record.extend_from_slice(&length.to_le_bytes());
-            record.extend_from_slice(&bytes);
+            records.push(bytes);
         }
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|source| ContentStoreError::Io {
-                path: path.clone(),
-                source,
-            })?;
-        file.write_all(&record)
-            .map_err(|source| ContentStoreError::Io {
-                path: path.clone(),
-                source,
-            })?;
-        if sync_writes {
-            file.sync_all().map_err(|source| ContentStoreError::Io {
-                path: path.clone(),
-                source,
-            })?;
-        }
-        drop(file);
-        if sync_writes
-            && !existed
-            && let Some(parent) = path.parent()
-        {
-            sync_dir(parent)?;
-        }
+        let open_options = if sync_writes {
+            durable_file::DurableAppendFileOptions::new()
+        } else {
+            durable_file::DurableAppendFileOptions::new().without_parent_sync()
+        };
+        let mut append = durable_file::open_file_for_append_with_options(&path, open_options)
+            .map_err(content_durable_file_error)?;
+        let append_options = durable_file::DurableRecordAppendOptions::new(
+            durable_file::DurableLengthEndian::Little,
+        );
+        let append_options = if sync_writes {
+            append_options.sync(durable_file::DurableFileSync::All)
+        } else {
+            append_options
+        };
+        durable_file::append_length_prefixed_records(
+            &mut append.file,
+            &path,
+            records.iter().map(Vec::as_slice),
+            append_options,
+        )
+        .map_err(content_durable_file_error)?;
         Ok(())
     }
 
@@ -4260,71 +4251,19 @@ fn read_next_packed_blob_index_log_entry(
     file: &mut fs::File,
     path: &Path,
 ) -> Result<Option<(PackedBlobIndexLogEntry, u64)>> {
-    let record_start = file
-        .stream_position()
-        .map_err(|source| ContentStoreError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-    let mut length_bytes = [0_u8; 4];
-    match file.read_exact(&mut length_bytes) {
-        Ok(()) => {}
-        Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => {
-            file.seek(SeekFrom::Start(record_start))
-                .map_err(|source| ContentStoreError::Io {
-                    path: path.to_owned(),
-                    source,
-                })?;
-            return Ok(None);
-        }
-        Err(source) => {
-            return Err(ContentStoreError::Io {
-                path: path.to_owned(),
-                source,
-            });
-        }
-    }
-    let length = u32::from_le_bytes(length_bytes) as usize;
-    let record_end = record_start
-        .saturating_add(4)
-        .saturating_add(u64::from(u32::from_le_bytes(length_bytes)));
-    let file_len = file
-        .metadata()
-        .map_err(|source| ContentStoreError::Io {
-            path: path.to_owned(),
-            source,
-        })?
-        .len();
-    if record_end > file_len {
-        file.seek(SeekFrom::Start(record_start))
-            .map_err(|source| ContentStoreError::Io {
-                path: path.to_owned(),
-                source,
-            })?;
+    let Some(record) = durable_file::read_length_prefixed_record(
+        file,
+        path,
+        durable_file::DurableRecordReadOptions::new(durable_file::DurableLengthEndian::Little),
+    )
+    .map_err(content_durable_file_error)?
+    else {
         return Ok(None);
-    }
-    let mut bytes = vec![0_u8; length];
-    match file.read_exact(&mut bytes) {
-        Ok(()) => {}
-        Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => {
-            file.seek(SeekFrom::Start(record_start))
-                .map_err(|source| ContentStoreError::Io {
-                    path: path.to_owned(),
-                    source,
-                })?;
-            return Ok(None);
-        }
-        Err(source) => {
-            return Err(ContentStoreError::Io {
-                path: path.to_owned(),
-                source,
-            });
-        }
-    }
-    let entry = match sinomo_object_serde::from_bytes(&bytes) {
+    };
+    let entry = match sinomo_object_serde::from_bytes(&record.bytes) {
         Ok(entry) => entry,
-        Err(_) if record_end >= file_len => {
-            file.seek(SeekFrom::Start(record_start))
+        Err(_) if record.record_end >= record.file_len => {
+            file.seek(SeekFrom::Start(record.record_start))
                 .map_err(|source| ContentStoreError::Io {
                     path: path.to_owned(),
                     source,
@@ -4333,32 +4272,12 @@ fn read_next_packed_blob_index_log_entry(
         }
         Err(source) => return Err(ContentStoreError::Serde(source.to_string())),
     };
-    Ok(Some((entry, record_end)))
+    Ok(Some((entry, record.record_end)))
 }
 
 fn truncate_torn_packed_blob_index_log_tail(path: &Path, offset: u64) -> Result<()> {
-    let len = fs::metadata(path)
-        .map_err(|source| ContentStoreError::Io {
-            path: path.to_owned(),
-            source,
-        })?
-        .len();
-    if offset >= len {
-        return Ok(());
-    }
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .map_err(|source| ContentStoreError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-    file.set_len(offset)
-        .and_then(|()| file.sync_all())
-        .map_err(|source| ContentStoreError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
+    durable_file::truncate_file_and_sync(path, offset, durable_file::DurableFileSync::All)
+        .map_err(content_durable_file_error)?;
     Ok(())
 }
 
@@ -4533,35 +4452,9 @@ fn file_content_hash(path: &Path) -> Result<String> {
 }
 
 fn file_content_hash_and_size(path: &Path) -> Result<(String, u64)> {
-    let mut file = fs::File::open(path).map_err(|source| ContentStoreError::Io {
-        path: path.to_owned(),
-        source,
-    })?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut size_bytes = 0u64;
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|source| ContentStoreError::Io {
-                path: path.to_owned(),
-                source,
-            })?;
-        if read == 0 {
-            break;
-        }
-        size_bytes = size_bytes
-            .checked_add(read as u64)
-            .ok_or_else(|| ContentStoreError::Io {
-                path: path.to_owned(),
-                source: io::Error::new(io::ErrorKind::InvalidData, "content size overflow"),
-            })?;
-        hasher.update(&buffer[..read]);
-    }
-    Ok((
-        format!("{HASH_PREFIX}{}", hasher.finalize().to_hex()),
-        size_bytes,
-    ))
+    let (hash, size_bytes) =
+        durable_file::file_blake3_hash_and_size(path).map_err(content_durable_file_error)?;
+    Ok((format!("{HASH_PREFIX}{}", hash.to_hex()), size_bytes))
 }
 
 fn hash_hex(hash: &str) -> Result<&str> {
@@ -4734,40 +4627,12 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
 }
 
 fn remove_file_if_exists_and_sync_parent(path: &Path) -> Result<bool> {
-    match fs::remove_file(path) {
-        Ok(()) => {
-            if let Some(parent) = path.parent() {
-                sync_dir(parent)?;
-            }
-            Ok(true)
-        }
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(source) => Err(ContentStoreError::Io {
-            path: path.to_owned(),
-            source,
-        }),
-    }
+    durable_file::remove_file_if_exists_and_sync_parent(path).map_err(content_durable_file_error)
 }
 
 fn remove_empty_dir_if_exists_and_sync_parent(path: &Path) -> Result<bool> {
-    match fs::remove_dir(path) {
-        Ok(()) => {
-            if let Some(parent) = path.parent() {
-                sync_dir(parent)?;
-            }
-            Ok(true)
-        }
-        Err(source)
-            if source.kind() == io::ErrorKind::NotFound
-                || source.kind() == io::ErrorKind::DirectoryNotEmpty =>
-        {
-            Ok(false)
-        }
-        Err(source) => Err(ContentStoreError::Io {
-            path: path.to_owned(),
-            source,
-        }),
-    }
+    durable_file::remove_empty_dir_if_exists_and_sync_parent(path)
+        .map_err(content_durable_file_error)
 }
 
 fn file_age_nanos(path: &Path, now: SystemTime) -> Result<u64> {
@@ -5117,76 +4982,23 @@ fn write_content_addressed_blob_bytes_prehashed_defer_dir_sync_inner(
 }
 
 fn write_file_create_new_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        create_dir_all(parent.to_owned())?;
-    }
-
-    let tmp_path = temporary_path_for(path);
-    let mut file = fs::File::create(&tmp_path).map_err(|source| ContentStoreError::Io {
-        path: tmp_path.clone(),
-        source,
-    })?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|source| ContentStoreError::Io {
-            path: tmp_path.clone(),
-            source,
-        })?;
-    drop(file);
-    if let Err(source) = fs::hard_link(&tmp_path, path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(ContentStoreError::Io {
-            path: path.to_owned(),
-            source,
-        });
-    }
-    fs::remove_file(&tmp_path).map_err(|source| ContentStoreError::Io {
-        path: tmp_path,
-        source,
-    })?;
-    if let Some(parent) = path.parent() {
-        sync_dir(parent)?;
-    }
-    Ok(())
+    durable_file::write_file_create_new_atomic(
+        path,
+        bytes,
+        durable_file::DurableAtomicFileOptions::new("tmp", "tmp").sync_all(),
+    )
+    .map_err(content_durable_file_error)
 }
 
 fn write_files_create_new_relaxed<'a, I>(files: I) -> Result<()>
 where
     I: IntoIterator<Item = (PathBuf, &'a [u8])>,
 {
-    for (path, bytes) in files {
-        if path.is_file() {
-            continue;
-        }
-        if let Some(parent) = path.parent() {
-            create_dir_all(parent.to_owned())?;
-        }
-
-        let tmp_path = temporary_path_for(&path);
-        let mut file = fs::File::create(&tmp_path).map_err(|source| ContentStoreError::Io {
-            path: tmp_path.clone(),
-            source,
-        })?;
-        file.write_all(bytes)
-            .map_err(|source| ContentStoreError::Io {
-                path: tmp_path.clone(),
-                source,
-            })?;
-        drop(file);
-        match fs::hard_link(&tmp_path, &path) {
-            Ok(()) => {}
-            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(source) => {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(ContentStoreError::Io { path, source });
-            }
-        }
-        fs::remove_file(&tmp_path).map_err(|source| ContentStoreError::Io {
-            path: tmp_path,
-            source,
-        })?;
-    }
-    Ok(())
+    durable_file::write_files_create_new_relaxed(
+        files,
+        durable_file::DurableAtomicFileOptions::new("tmp", "tmp"),
+    )
+    .map_err(content_durable_file_error)
 }
 
 fn sync_dir(path: &Path) -> Result<()> {
@@ -5196,7 +5008,7 @@ fn sync_dir(path: &Path) -> Result<()> {
 fn content_durable_file_error(error: durable_file::DurableFileError) -> ContentStoreError {
     ContentStoreError::Io {
         path: PathBuf::from(error.path()),
-        source: io::Error::new(io::ErrorKind::Other, error.detail().to_string()),
+        source: io::Error::new(error.kind(), error.detail().to_string()),
     }
 }
 

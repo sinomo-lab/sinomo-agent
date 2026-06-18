@@ -868,37 +868,9 @@ pub struct EncodedClusterKvWatchEventLogBatch {
 }
 
 pub fn open_cluster_kv_watch_event_log_for_append(paths: &ClusterKvPaths) -> Result<File, KvError> {
-    let parent = paths
-        .watch_events_log
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|source| KvError::Io {
-        path: parent.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    match OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .append(true)
-        .open(&paths.watch_events_log)
-    {
-        Ok(file) => {
-            sync_directory(parent)?;
-            Ok(file)
-        }
-        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&paths.watch_events_log)
-            .map_err(|source| KvError::Io {
-                path: paths.watch_events_log.display().to_string(),
-                detail: source.to_string(),
-            }),
-        Err(source) => Err(KvError::Io {
-            path: paths.watch_events_log.display().to_string(),
-            detail: source.to_string(),
-        }),
-    }
+    durable_file::open_file_for_append(&paths.watch_events_log)
+        .map(|append| append.file)
+        .map_err(kv_durable_file_error)
 }
 
 pub fn lock_cluster_kv_watch_event_log_for_append(
@@ -938,44 +910,27 @@ pub fn append_cluster_kv_watch_event_log_batch_to_file(
     if batch.records.is_empty() {
         return Ok(0);
     }
-    for record in &batch.records {
-        let len = u32::try_from(record.len()).map_err(|_| KvError::Serialization {
-            detail: format!(
-                "cluster kv watch-event log record for {} exceeds u32 length",
-                paths.watch_events_log.display()
-            ),
-        })?;
-        file.write_all(&len.to_be_bytes())
-            .and_then(|()| file.write_all(record))
-            .map_err(|source| KvError::Io {
-                path: paths.watch_events_log.display().to_string(),
-                detail: source.to_string(),
-            })?;
-    }
-    file.sync_data().map_err(|source| KvError::Io {
-        path: paths.watch_events_log.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    Ok(batch.bytes)
+    durable_file::append_length_prefixed_records(
+        file,
+        &paths.watch_events_log,
+        batch.records.iter().map(Vec::as_slice),
+        durable_file::DurableRecordAppendOptions::new(durable_file::DurableLengthEndian::Big)
+            .sync(durable_file::DurableFileSync::Data),
+    )
+    .map_err(kv_durable_file_error)
 }
 
 pub fn truncate_cluster_kv_watch_event_log_file(
     paths: &ClusterKvPaths,
     file: &mut File,
 ) -> Result<(), KvError> {
-    file.set_len(0).map_err(|source| KvError::Io {
-        path: paths.watch_events_log.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|source| KvError::Io {
-            path: paths.watch_events_log.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    file.sync_data().map_err(|source| KvError::Io {
-        path: paths.watch_events_log.display().to_string(),
-        detail: source.to_string(),
-    })
+    durable_file::truncate_open_file_and_sync(
+        file,
+        &paths.watch_events_log,
+        0,
+        durable_file::DurableFileSync::Data,
+    )
+    .map_err(kv_durable_file_error)
 }
 
 pub fn decode_cluster_kv_watch_event_log_record(record: &[u8]) -> Result<KvEvent, KvError> {
@@ -1891,32 +1846,60 @@ where
     let mut read_bytes = 0_u64;
     let mut needs_repair = false;
     loop {
-        record_number += 1;
-        let mut len_buf = [0_u8; 4];
-        match read_cluster_kv_watch_event_log_chunk(
-            &paths.watch_events_log,
+        let next_record_number = record_number.saturating_add(1);
+        let record_start = file.stream_position().map_err(|source| KvError::Io {
+            path: paths.watch_events_log.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let file_len = file
+            .metadata()
+            .map_err(|source| KvError::Io {
+                path: paths.watch_events_log.display().to_string(),
+                detail: source.to_string(),
+            })?
+            .len();
+        let record = match durable_file::read_length_prefixed_record_with_observer(
             file,
-            &mut len_buf,
-            &mut on_log_read,
-        )? {
-            WatchEventLogReadChunk::Complete => {}
-            WatchEventLogReadChunk::CleanEof => break,
-            WatchEventLogReadChunk::Truncated => {
+            &paths.watch_events_log,
+            durable_file::DurableRecordReadOptions::new(durable_file::DurableLengthEndian::Big)
+                .max_record_bytes(MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES),
+            |bytes| {
+                read_bytes = read_bytes.saturating_add(bytes);
+                on_log_read(bytes);
+            },
+        ) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                if record_start < file_len {
+                    eprintln!(
+                        "warning: ignoring partial cluster kv watch-event log record {} in {}",
+                        next_record_number,
+                        paths.watch_events_log.display()
+                    );
+                    return Ok(ClusterKvWatchEventLogRead {
+                        events,
+                        records: record_number,
+                        truncated: true,
+                    });
+                }
+                break;
+            }
+            Err(error) if error.detail().contains("length-prefixed record is") => {
                 eprintln!(
-                    "warning: ignoring partial cluster kv watch-event log record {} in {}",
-                    record_number,
+                    "warning: ignoring corrupt cluster kv watch-event log record {} in {}",
+                    next_record_number,
                     paths.watch_events_log.display()
                 );
                 return Ok(ClusterKvWatchEventLogRead {
                     events,
-                    records: record_number.saturating_sub(1),
+                    records: record_number,
                     truncated: true,
                 });
             }
-        }
-        let len = u32::from_be_bytes(len_buf) as usize;
-        read_bytes = read_bytes.saturating_add(4).saturating_add(len as u64);
-        if len == 0 || len > MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES {
+            Err(error) => return Err(kv_durable_file_error(error)),
+        };
+        record_number = next_record_number;
+        if record.bytes.is_empty() {
             eprintln!(
                 "warning: ignoring corrupt cluster kv watch-event log record {} in {}",
                 record_number,
@@ -1928,26 +1911,7 @@ where
                 truncated: true,
             });
         }
-        let mut record = vec![0_u8; len];
-        if read_cluster_kv_watch_event_log_chunk(
-            &paths.watch_events_log,
-            file,
-            &mut record,
-            &mut on_log_read,
-        )? != WatchEventLogReadChunk::Complete
-        {
-            eprintln!(
-                "warning: ignoring corrupt cluster kv watch-event log record {} in {}",
-                record_number,
-                paths.watch_events_log.display()
-            );
-            return Ok(ClusterKvWatchEventLogRead {
-                events,
-                records: record_number.saturating_sub(1),
-                truncated: true,
-            });
-        }
-        match decode_cluster_kv_watch_event_log_record(&record) {
+        match decode_cluster_kv_watch_event_log_record(&record.bytes) {
             Ok(event) => events.push(event),
             Err(source) => {
                 eprintln!(
@@ -1976,51 +1940,15 @@ where
         eprintln!(
             "warning: repairing overgrown cluster kv watch-event log {} after reading {} records / {} bytes",
             paths.watch_events_log.display(),
-            record_number.saturating_sub(1),
+            record_number,
             read_bytes
         );
     }
     Ok(ClusterKvWatchEventLogRead {
         events,
-        records: record_number.saturating_sub(1),
+        records: record_number,
         truncated: needs_repair,
     })
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WatchEventLogReadChunk {
-    Complete,
-    CleanEof,
-    Truncated,
-}
-
-pub(crate) fn read_cluster_kv_watch_event_log_chunk<F>(
-    log_path: &Path,
-    file: &mut File,
-    buf: &mut [u8],
-    on_log_read: &mut F,
-) -> Result<WatchEventLogReadChunk, KvError>
-where
-    F: FnMut(u64),
-{
-    let mut offset = 0;
-    while offset < buf.len() {
-        match file.read(&mut buf[offset..]) {
-            Ok(0) if offset == 0 => return Ok(WatchEventLogReadChunk::CleanEof),
-            Ok(0) => return Ok(WatchEventLogReadChunk::Truncated),
-            Ok(read) => {
-                offset += read;
-                on_log_read(read as u64);
-            }
-            Err(source) => {
-                return Err(KvError::Io {
-                    path: log_path.display().to_string(),
-                    detail: source.to_string(),
-                });
-            }
-        }
-    }
-    Ok(WatchEventLogReadChunk::Complete)
 }
 
 pub fn cluster_kv_watch_event_payload_bytes(event: &KvEvent) -> usize {

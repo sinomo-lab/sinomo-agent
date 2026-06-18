@@ -18,10 +18,11 @@ use sinomo_storage::durable_file;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(test)]
+use std::io::Write;
+use std::io::{self, Seek, SeekFrom};
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use thiserror::Error;
@@ -9933,19 +9934,8 @@ fn truncate_torn_metadata_table_log_tail(path: &Path, offset: u64) -> Result<()>
         offset,
         len
     );
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .map_err(|source| MetadataBackendError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-    file.set_len(offset)
-        .and_then(|()| file.sync_all())
-        .map_err(|source| MetadataBackendError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
+    durable_file::truncate_file_and_sync(path, offset, durable_file::DurableFileSync::All)
+        .map_err(metadata_durable_file_error)?;
     Ok(())
 }
 
@@ -10062,46 +10052,25 @@ fn replay_metadata_table_batches(
         })?;
     let mut materialized_through_sequence = None;
     loop {
-        let mut length_bytes = [0_u8; 4];
-        match file.read_exact(&mut length_bytes) {
-            Ok(()) => {}
-            Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(source) => {
-                return Err(MetadataBackendError::Io {
-                    path: path.to_owned(),
-                    source,
-                });
-            }
-        }
-        let length = u32::from_le_bytes(length_bytes) as usize;
-        let record_start = offset;
-        let record_end = record_start
-            .saturating_add(4)
-            .saturating_add(u64::from(u32::from_le_bytes(length_bytes)));
-        let file_len = file
-            .metadata()
-            .map_err(|source| MetadataBackendError::Io {
-                path: path.to_owned(),
-                source,
-            })?
-            .len();
-        if record_end > file_len {
+        let Some(record) = durable_file::read_length_prefixed_record(
+            file,
+            path,
+            durable_file::DurableRecordReadOptions::new(durable_file::DurableLengthEndian::Little),
+        )
+        .map_err(metadata_durable_file_error)?
+        else {
             break;
-        }
-        let mut bytes = vec![0_u8; length];
-        match file.read_exact(&mut bytes) {
-            Ok(()) => {}
-            Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(source) => {
-                return Err(MetadataBackendError::Io {
-                    path: path.to_owned(),
-                    source,
-                });
-            }
-        }
-        let batch: DfsMetadataTableBatch = match sinomo_object_serde::from_bytes(&bytes) {
+        };
+        let batch: DfsMetadataTableBatch = match sinomo_object_serde::from_bytes(&record.bytes) {
             Ok(batch) => batch,
-            Err(_) if record_end >= file_len => break,
+            Err(_) if record.record_end >= record.file_len => {
+                file.seek(SeekFrom::Start(record.record_start))
+                    .map_err(|source| MetadataBackendError::Io {
+                        path: path.to_owned(),
+                        source,
+                    })?;
+                break;
+            }
             Err(source) => return Err(MetadataBackendError::Serde(source.to_string())),
         };
         materialized_through_sequence =
@@ -10114,9 +10083,7 @@ fn replay_metadata_table_batches(
         // cursor at the last complete-record boundary so the next replay
         // re-reads it from the start instead of treating torn bytes as a
         // length prefix.
-        offset = offset
-            .saturating_add(4)
-            .saturating_add(u64::try_from(length).unwrap_or(u64::MAX));
+        offset = record.record_end;
     }
     Ok(MetadataTableReplay {
         offset,
@@ -10136,33 +10103,28 @@ fn append_metadata_table_batch(root: &Path, batch: &DfsMetadataTableBatch) -> Re
     let encode_started = Instant::now();
     let bytes = sinomo_object_serde::to_bytes(batch, 1, LengthMode::U32)
         .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
-    let length = u32::try_from(bytes.len()).map_err(|_| {
+    u32::try_from(bytes.len()).map_err(|_| {
         MetadataBackendError::Serde(format!(
             "DFS metadata table batch {} is too large: {} bytes",
             batch.sequence,
             bytes.len()
         ))
     })?;
-    let mut record = Vec::with_capacity(4 + bytes.len());
-    record.extend_from_slice(&length.to_le_bytes());
-    record.extend_from_slice(&bytes);
     let encode_ms = encode_started.elapsed().as_millis();
     let write_sync_started = Instant::now();
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|source| MetadataBackendError::Io {
-            path: path.clone(),
-            source,
-        })?;
-    file.write_all(&record)
-        .and_then(|()| file.sync_all())
-        .map_err(|source| MetadataBackendError::Io {
-            path: path.clone(),
-            source,
-        })?;
-    drop(file);
+    let mut append = durable_file::open_file_for_append_with_options(
+        &path,
+        durable_file::DurableAppendFileOptions::new().without_parent_sync(),
+    )
+    .map_err(metadata_durable_file_error)?;
+    let record_bytes = durable_file::append_length_prefixed_records(
+        &mut append.file,
+        &path,
+        [bytes.as_slice()],
+        durable_file::DurableRecordAppendOptions::new(durable_file::DurableLengthEndian::Little)
+            .sync(durable_file::DurableFileSync::All),
+    )
+    .map_err(metadata_durable_file_error)?;
     let write_sync_ms = write_sync_started.elapsed().as_millis();
     let sync_dir_started = Instant::now();
     if !existed && let Some(parent) = path.parent() {
@@ -10173,7 +10135,7 @@ fn append_metadata_table_batch(root: &Path, batch: &DfsMetadataTableBatch) -> Re
         "metadata-table-batch sequence={} ops={} bytes={} existed={} create_dir_ms={} encode_ms={} write_sync_ms={} sync_dir_ms={} total_ms={}",
         batch.sequence,
         batch.ops.len(),
-        record.len(),
+        record_bytes,
         existed,
         create_dir_ms,
         encode_ms,
@@ -10181,7 +10143,7 @@ fn append_metadata_table_batch(root: &Path, batch: &DfsMetadataTableBatch) -> Re
         sync_dir_ms,
         trace_started.elapsed().as_millis()
     ));
-    Ok(u64::try_from(record.len()).unwrap_or(u64::MAX))
+    Ok(record_bytes)
 }
 
 fn persist_metadata_table_snapshot(
@@ -10671,7 +10633,7 @@ fn max_segmented_journal_sequence(root: &Path) -> Result<u64> {
 fn append_segmented_journal_entry(root: &Path, entry: &DfsMetadataJournalEntry) -> Result<()> {
     let bytes = sinomo_object_serde::to_bytes(entry, 1, LengthMode::U32)
         .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
-    let length = u32::try_from(bytes.len()).map_err(|_| {
+    u32::try_from(bytes.len()).map_err(|_| {
         MetadataBackendError::Serde(format!(
             "metadata journal entry {} is too large: {} bytes",
             entry.sequence,
@@ -10687,24 +10649,19 @@ fn append_segmented_journal_entry(root: &Path, entry: &DfsMetadataJournalEntry) 
     if let Some(parent) = path.parent() {
         create_dir_all(parent.to_owned())?;
     }
-    let mut record = Vec::with_capacity(4 + bytes.len());
-    record.extend_from_slice(&length.to_le_bytes());
-    record.extend_from_slice(&bytes);
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|source| MetadataBackendError::Io {
-            path: path.clone(),
-            source,
-        })?;
-    file.write_all(&record)
-        .and_then(|()| file.sync_all())
-        .map_err(|source| MetadataBackendError::Io {
-            path: path.clone(),
-            source,
-        })?;
-    drop(file);
+    let mut append = durable_file::open_file_for_append_with_options(
+        &path,
+        durable_file::DurableAppendFileOptions::new().without_parent_sync(),
+    )
+    .map_err(metadata_durable_file_error)?;
+    durable_file::append_length_prefixed_records(
+        &mut append.file,
+        &path,
+        [bytes.as_slice()],
+        durable_file::DurableRecordAppendOptions::new(durable_file::DurableLengthEndian::Little)
+            .sync(durable_file::DurableFileSync::All),
+    )
+    .map_err(metadata_durable_file_error)?;
     if !existed && let Some(parent) = path.parent() {
         sync_dir(parent)?;
     }
@@ -10731,7 +10688,8 @@ fn append_segmented_journal_entries(
     }
     let create_dir_ms = create_dir_started.elapsed().as_millis();
     let encode_started = Instant::now();
-    let mut records = Vec::new();
+    let mut records = Vec::with_capacity(entries.len());
+    let mut records_len = 0_u64;
     for entry in entries {
         if journal_segment_id(entry.sequence) != segment_id {
             return Err(MetadataBackendError::Serde(format!(
@@ -10748,26 +10706,26 @@ fn append_segmented_journal_entries(
                 bytes.len()
             ))
         })?;
-        records.extend_from_slice(&length.to_le_bytes());
-        records.extend_from_slice(&bytes);
+        records_len = records_len
+            .saturating_add(4)
+            .saturating_add(u64::from(length));
+        records.push(bytes);
     }
     let encode_ms = encode_started.elapsed().as_millis();
     let write_sync_started = Instant::now();
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|source| MetadataBackendError::Io {
-            path: path.clone(),
-            source,
-        })?;
-    file.write_all(&records)
-        .and_then(|()| file.sync_all())
-        .map_err(|source| MetadataBackendError::Io {
-            path: path.clone(),
-            source,
-        })?;
-    drop(file);
+    let mut append = durable_file::open_file_for_append_with_options(
+        &path,
+        durable_file::DurableAppendFileOptions::new().without_parent_sync(),
+    )
+    .map_err(metadata_durable_file_error)?;
+    durable_file::append_length_prefixed_records(
+        &mut append.file,
+        &path,
+        records.iter().map(Vec::as_slice),
+        durable_file::DurableRecordAppendOptions::new(durable_file::DurableLengthEndian::Little)
+            .sync(durable_file::DurableFileSync::All),
+    )
+    .map_err(metadata_durable_file_error)?;
     let write_sync_ms = write_sync_started.elapsed().as_millis();
     let sync_dir_started = Instant::now();
     if !existed && let Some(parent) = path.parent() {
@@ -10777,7 +10735,7 @@ fn append_segmented_journal_entries(
     metadata_backend_perf_trace(format_args!(
         "metadata-journal-segment entries={} bytes={} segment={} existed={} create_dir_ms={} encode_ms={} write_sync_ms={} sync_dir_ms={} total_ms={}",
         entries.len(),
-        records.len(),
+        records_len,
         segment_id,
         existed,
         create_dir_ms,
@@ -11025,51 +10983,25 @@ fn read_next_segmented_journal_entry(
     file: &mut fs::File,
     path: &Path,
 ) -> Result<Option<DfsMetadataJournalEntry>> {
-    let record_start = file
-        .stream_position()
-        .map_err(|source| MetadataBackendError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-    let mut length_bytes = [0_u8; 4];
-    match file.read_exact(&mut length_bytes) {
-        Ok(()) => {}
-        Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(source) => {
-            return Err(MetadataBackendError::Io {
-                path: path.to_owned(),
-                source,
-            });
-        }
-    }
-    let length = u32::from_le_bytes(length_bytes) as usize;
-    let record_end = record_start
-        .saturating_add(4)
-        .saturating_add(u64::from(u32::from_le_bytes(length_bytes)));
-    let file_len = file
-        .metadata()
-        .map_err(|source| MetadataBackendError::Io {
-            path: path.to_owned(),
-            source,
-        })?
-        .len();
-    if record_end > file_len {
+    let Some(record) = durable_file::read_length_prefixed_record(
+        file,
+        path,
+        durable_file::DurableRecordReadOptions::new(durable_file::DurableLengthEndian::Little),
+    )
+    .map_err(metadata_durable_file_error)?
+    else {
         return Ok(None);
-    }
-    let mut bytes = vec![0_u8; length];
-    match file.read_exact(&mut bytes) {
-        Ok(()) => {}
-        Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(source) => {
-            return Err(MetadataBackendError::Io {
-                path: path.to_owned(),
-                source,
-            });
-        }
-    }
-    let entry = match sinomo_object_serde::from_bytes(&bytes) {
+    };
+    let entry = match sinomo_object_serde::from_bytes(&record.bytes) {
         Ok(entry) => entry,
-        Err(_) if record_end >= file_len => return Ok(None),
+        Err(_) if record.record_end >= record.file_len => {
+            file.seek(SeekFrom::Start(record.record_start))
+                .map_err(|source| MetadataBackendError::Io {
+                    path: path.to_owned(),
+                    source,
+                })?;
+            return Ok(None);
+        }
         Err(source) => return Err(MetadataBackendError::Serde(source.to_string())),
     };
     Ok(Some(entry))
@@ -11088,19 +11020,9 @@ fn create_dir_all(path: PathBuf) -> Result<()> {
 }
 
 fn remove_file_if_exists(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => {
-            if let Some(parent) = path.parent() {
-                sync_dir(parent)?;
-            }
-            Ok(())
-        }
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(MetadataBackendError::Io {
-            path: path.to_owned(),
-            source,
-        }),
-    }
+    durable_file::remove_file_if_exists_and_sync_parent(path)
+        .map(|_| ())
+        .map_err(metadata_durable_file_error)
 }
 
 fn duration_nanos_saturating(duration: Duration) -> u64 {
@@ -11243,52 +11165,11 @@ where
 }
 
 fn write_sobj_files_create_new_relaxed(files: Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
-    for (path, bytes) in files {
-        if path.is_file() {
-            continue;
-        }
-        if let Some(parent) = path.parent() {
-            create_dir_all(parent.to_owned())?;
-        }
-        let tmp_path = temporary_path_for(&path);
-        let mut file = fs::File::create(&tmp_path).map_err(|source| MetadataBackendError::Io {
-            path: tmp_path.clone(),
-            source,
-        })?;
-        file.write_all(&bytes)
-            .map_err(|source| MetadataBackendError::Io {
-                path: tmp_path.clone(),
-                source,
-            })?;
-        drop(file);
-        match fs::hard_link(&tmp_path, &path) {
-            Ok(()) => {}
-            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(source) => {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(MetadataBackendError::Io { path, source });
-            }
-        }
-        fs::remove_file(&tmp_path).map_err(|source| MetadataBackendError::Io {
-            path: tmp_path,
-            source,
-        })?;
-    }
-    Ok(())
-}
-
-fn temporary_path_for(path: &Path) -> PathBuf {
-    static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
-    let counter = TMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("tmp");
-    path.with_file_name(format!(
-        ".{file_name}.{}.{}.tmp",
-        std::process::id(),
-        counter
-    ))
+    durable_file::write_files_create_new_relaxed(
+        files,
+        durable_file::DurableAtomicFileOptions::new("tmp", "tmp"),
+    )
+    .map_err(metadata_durable_file_error)
 }
 
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -11307,7 +11188,7 @@ fn sync_dir(path: &Path) -> Result<()> {
 fn metadata_durable_file_error(error: durable_file::DurableFileError) -> MetadataBackendError {
     MetadataBackendError::Io {
         path: PathBuf::from(error.path()),
-        source: io::Error::new(io::ErrorKind::Other, error.detail().to_string()),
+        source: io::Error::new(error.kind(), error.detail().to_string()),
     }
 }
 

@@ -504,27 +504,42 @@ pub(crate) fn read_wal_entries(
     let mut truncated = false;
     let mut record_number = 0;
     loop {
-        let mut len_buf = [0_u8; 4];
-        match read_wal_chunk(&mut file, &mut len_buf, path)? {
-            WalReadChunk::Complete => {}
-            WalReadChunk::CleanEof => break,
-            WalReadChunk::Truncated => {
+        let record_start = file.stream_position().map_err(|source| KvError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let file_len = file
+            .metadata()
+            .map_err(|source| KvError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?
+            .len();
+        let record = match durable_file::read_length_prefixed_record(
+            &mut file,
+            path,
+            durable_file::DurableRecordReadOptions::new(durable_file::DurableLengthEndian::Big)
+                .max_record_bytes(MAX_WAL_RECORD_BYTES),
+        ) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                if record_start < file_len {
+                    truncated = true;
+                }
+                break;
+            }
+            Err(error) if error.detail().contains("length-prefixed record is") => {
                 truncated = true;
                 break;
             }
-        }
+            Err(error) => return Err(kv_durable_file_error(error)),
+        };
         record_number += 1;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        if len == 0 || len > MAX_WAL_RECORD_BYTES {
+        if record.bytes.is_empty() {
             truncated = true;
             break;
         }
-        let mut record = vec![0_u8; len];
-        if read_wal_chunk(&mut file, &mut record, path)? != WalReadChunk::Complete {
-            truncated = true;
-            break;
-        }
-        match sinomo_object_serde::from_bytes(&record) {
+        match sinomo_object_serde::from_bytes(&record.bytes) {
             Ok(entry) => {
                 let entry: KvLogEntry = entry;
                 if entry.index <= retain_after_index {
@@ -551,35 +566,6 @@ pub(crate) fn read_wal_entries(
     Ok(WalRead { entries, truncated })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WalReadChunk {
-    Complete,
-    CleanEof,
-    Truncated,
-}
-
-pub(crate) fn read_wal_chunk(
-    file: &mut File,
-    buf: &mut [u8],
-    path: &Path,
-) -> Result<WalReadChunk, KvError> {
-    let mut offset = 0;
-    while offset < buf.len() {
-        match file.read(&mut buf[offset..]) {
-            Ok(0) if offset == 0 => return Ok(WalReadChunk::CleanEof),
-            Ok(0) => return Ok(WalReadChunk::Truncated),
-            Ok(read) => offset += read,
-            Err(source) => {
-                return Err(KvError::Io {
-                    path: path.display().to_string(),
-                    detail: source.to_string(),
-                });
-            }
-        }
-    }
-    Ok(WalReadChunk::Complete)
-}
-
 pub(crate) fn append_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvError> {
     if entries.is_empty() {
         return Ok(());
@@ -589,51 +575,40 @@ pub(crate) fn append_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;
+    let mut records = Vec::with_capacity(entries.len());
     for entry in entries {
-        write_wal_record(&mut file, entry, path)?;
+        records.push(encode_wal_record_payload(entry, path)?);
     }
-    file.sync_data().map_err(|source| KvError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })
+    durable_file::append_length_prefixed_records(
+        &mut file,
+        path,
+        records.iter().map(Vec::as_slice),
+        durable_file::DurableRecordAppendOptions::new(durable_file::DurableLengthEndian::Big)
+            .sync(durable_file::DurableFileSync::Data),
+    )
+    .map(|_| ())
+    .map_err(kv_durable_file_error)
 }
 
 pub(crate) fn open_wal_file_for_append(path: &Path) -> Result<File, KvError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|source| KvError::Io {
-        path: parent.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    match OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .append(true)
-        .open(path)
-    {
-        Ok(file) => {
-            sync_directory(parent)?;
-            Ok(file)
-        }
-        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(path)
-            .map_err(|source| KvError::Io {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            }),
-        Err(source) => Err(KvError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        }),
-    }
+    durable_file::open_file_for_append(path)
+        .map(|append| append.file)
+        .map_err(kv_durable_file_error)
 }
 
-pub(crate) fn encode_wal_record(entry: &KvLogEntry, path: &Path) -> Result<Vec<u8>, KvError> {
+fn encode_wal_record_payload(entry: &KvLogEntry, path: &Path) -> Result<Vec<u8>, KvError> {
     let record = sinomo_object_serde::to_bytes(entry, KV_WAL_OBJECT_VERSION_ID, LengthMode::U32)
         .map_err(|source| KvError::Serialization {
             detail: source.to_string(),
         })?;
+    u32::try_from(record.len()).map_err(|_| KvError::Serialization {
+        detail: format!("wal record for {} exceeds u32 length", path.display()),
+    })?;
+    Ok(record)
+}
+
+pub(crate) fn encode_wal_record(entry: &KvLogEntry, path: &Path) -> Result<Vec<u8>, KvError> {
+    let record = encode_wal_record_payload(entry, path)?;
     let record_len = u32::try_from(record.len()).map_err(|_| KvError::Serialization {
         detail: format!("wal record for {} exceeds u32 length", path.display()),
     })?;
@@ -648,11 +623,15 @@ pub(crate) fn write_wal_record(
     entry: &KvLogEntry,
     path: &Path,
 ) -> Result<(), KvError> {
-    let record = encode_wal_record(entry, path)?;
-    file.write_all(&record).map_err(|source| KvError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })
+    let record = encode_wal_record_payload(entry, path)?;
+    durable_file::append_length_prefixed_records(
+        file,
+        path,
+        [record.as_slice()],
+        durable_file::DurableRecordAppendOptions::new(durable_file::DurableLengthEndian::Big),
+    )
+    .map(|_| ())
+    .map_err(kv_durable_file_error)
 }
 
 pub(crate) fn wal_file_matches_entries(
