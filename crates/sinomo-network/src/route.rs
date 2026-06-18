@@ -414,10 +414,10 @@ pub(crate) struct ClusterSignedRelayRpcOptions {
     pub timeouts: DaemonRpcTimeouts,
 }
 
-pub type ClusterSignedRelayRpcFuture<'a, T> =
+pub(crate) type ClusterSignedRelayRpcFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, NetworkError>> + Send + 'a>>;
 
-pub trait ClusterSignedRelayRpcAsyncHost: ClusterSignedEndpointRpcAsyncHost {
+pub(crate) trait ClusterSignedRelayRpcAsyncHost: ClusterSignedEndpointRpcAsyncHost {
     fn sign_relay_rpc_request_async<'a>(
         &'a mut self,
         request: &'a ObjectRpcRequest,
