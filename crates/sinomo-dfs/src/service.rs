@@ -135,20 +135,20 @@ pub trait DfsDataPlaneHost: Send + Sync {
     fn handle_message<'a>(
         &'a self,
         command: DfsMessageCommand,
-    ) -> DfsDataPlaneHostFuture<'a, DfsMessageResponse> {
-        Box::pin(async move {
-            let frame_command = crate::dfs_message_command_to_protocol_frame_command(command)
-                .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))?;
-            let frame_response = self.handle_protocol_frame(frame_command).await?;
-            crate::dfs_protocol_frame_response_to_message_response(frame_response)
-                .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))
-        })
-    }
+    ) -> DfsDataPlaneHostFuture<'a, DfsMessageResponse>;
 
     fn handle_protocol_frame<'a>(
         &'a self,
         command: DfsProtocolFrameCommand,
-    ) -> DfsDataPlaneHostFuture<'a, DfsProtocolFrameResponse>;
+    ) -> DfsDataPlaneHostFuture<'a, DfsProtocolFrameResponse> {
+        Box::pin(async move {
+            let message_command = crate::dfs_protocol_frame_command_to_message_command(&command)
+                .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))?;
+            let message_response = self.handle_message(message_command).await?;
+            crate::dfs_message_response_to_protocol_frame_response(message_response)
+                .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))
+        })
+    }
 }
 
 pub type DfsDataPlaneHostFuture<'a, T> =
@@ -459,7 +459,6 @@ mod tests {
     struct StubDfsDataPlaneHost {
         smoke_calls: Mutex<usize>,
         message_request_ids: Mutex<Vec<String>>,
-        frame_request_ids: Mutex<Vec<String>>,
     }
 
     impl DfsDataPlaneHost for StubDfsDataPlaneHost {
@@ -506,22 +505,6 @@ mod tests {
                 Ok(DfsMessageResponse {
                     request_id: command.request_id,
                     outbound_messages: Vec::new(),
-                })
-            })
-        }
-
-        fn handle_protocol_frame<'a>(
-            &'a self,
-            command: DfsProtocolFrameCommand,
-        ) -> DfsDataPlaneHostFuture<'a, DfsProtocolFrameResponse> {
-            Box::pin(async move {
-                self.frame_request_ids
-                    .lock()
-                    .expect("frame request ids")
-                    .push(command.request_id.clone());
-                Ok(DfsProtocolFrameResponse {
-                    request_id: command.request_id,
-                    outbound_frames: Vec::new(),
                 })
             })
         }
@@ -809,12 +792,6 @@ mod tests {
                 .expect("message request ids")
                 .as_slice(),
             ["message-route-1", "frame-route-1"]
-        );
-        assert!(
-            host.frame_request_ids
-                .lock()
-                .expect("frame request ids")
-                .is_empty()
         );
     }
 }

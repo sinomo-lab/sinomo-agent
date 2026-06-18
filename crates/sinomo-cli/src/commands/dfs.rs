@@ -1169,10 +1169,10 @@ fn run_local_dfs_smoke(
         Box::new(CliDfsControlPlaneKvClient::new(&cluster_paths))
             as Box<dyn sinomo_runtime::dfs::DfsControlPlaneKvClient>
     });
-    let Some(report) = sinomo_runtime::dfs::run_default_cluster_dfs_smoke(
+    let Some(report) = sinomo_runtime::dfs::run_default_cluster_dfs_smoke_with_message_sender(
         data_dir,
         &cluster_paths,
-        dfs_protocol_frame_sender(),
+        dfs_message_sender(),
         dfs_metadata_journal_batch_sender(),
         dfs_metadata_snapshot_install_sender(),
         Box::new(CliDfsControlPlaneKvClient::new(&cluster_paths)),
@@ -1191,7 +1191,7 @@ fn run_local_dfs_smoke(
     Ok(report)
 }
 
-fn dfs_protocol_frame_sender() -> sinomo_runtime::dfs::DfsProtocolFrameSender {
+fn dfs_message_sender() -> sinomo_runtime::dfs::DfsMessageSender {
     fn transport_error(
         error: impl std::fmt::Display,
     ) -> sinomo_runtime::dfs::DfsPeerTransportError {
@@ -1200,12 +1200,10 @@ fn dfs_protocol_frame_sender() -> sinomo_runtime::dfs::DfsProtocolFrameSender {
 
     std::sync::Arc::new(|endpoint, command, timeout| {
         let request =
-            sinomo_runtime::dfs::dfs_message_rpc_request_from_protocol_frame_command(command)
-                .map_err(transport_error)?;
+            sinomo_runtime::dfs::dfs_message_rpc_request(command).map_err(transport_error)?;
         let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
             .map_err(transport_error)?;
-        sinomo_runtime::dfs::dfs_protocol_frame_response_from_message_rpc_response(&response)
-            .map_err(transport_error)
+        sinomo_runtime::dfs::decode_dfs_message_rpc_response(&response).map_err(transport_error)
     })
 }
 

@@ -2540,16 +2540,13 @@ fn served_protocol_frame_drains_nested_stage_response_before_returning() {
     let stage_calls = Arc::new(Mutex::new(Vec::new()));
     let stage_calls_for_sender = Arc::clone(&stage_calls);
     let replica_for_sender = replica.clone();
-    let sender: DfsProtocolFrameSender = Arc::new(move |endpoint, command, _timeout| {
+    let sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
         assert_eq!(endpoint.node_id, replica_for_sender);
-        let MeshMessageBody::Protocol(protocol) = &command.frame.message.body else {
-            panic!("expected protocol frame");
-        };
-        let message: DfsNetworkMessage = protocol.decode().expect("decode dfs message");
+        let message = command.routed_message.message.clone();
         let DfsNetworkMessage::StageBlob(stage) = message else {
-            return Ok(DfsProtocolFrameResponse {
+            return Ok(DfsMessageResponse {
                 request_id: command.request_id.clone(),
-                outbound_frames: Vec::new(),
+                outbound_messages: Vec::new(),
             });
         };
         stage_calls_for_sender
@@ -2562,29 +2559,23 @@ fn served_protocol_frame_drains_nested_stage_response_before_returning() {
             file_system_id: stage.file_system_id,
             object_id: stage.object_id,
             version: stage.version,
-            replica_node_id: command.frame.target_node_id.clone(),
+            replica_node_id: command.routed_message.target_node_id.clone(),
             result: DfsBlobTransferResult::Durable {
                 content_hash: stage.content_hash,
             },
         });
-        Ok(DfsProtocolFrameResponse {
+        Ok(DfsMessageResponse {
             request_id: command.request_id.clone(),
-            outbound_frames: vec![NetworkFrame {
-                frame_id: NetworkFrameId(100),
-                source_node_id: command.frame.target_node_id.clone(),
-                target_node_id: command.frame.source_node_id.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(100),
-                    origin_node_id: command.frame.target_node_id.clone(),
-                    target_node_id: command.frame.source_node_id.clone(),
-                    body: MeshMessageBody::Protocol(
-                        ProtocolMessage::encode(DFS_PROTOCOL, &response).expect("encode response"),
-                    ),
-                },
+            outbound_messages: vec![DfsRoutedMessage {
+                source_node_id: command.routed_message.target_node_id.clone(),
+                target_node_id: command.routed_message.source_node_id.clone(),
+                frame_id: 100,
+                message_id: 100,
+                message: response,
             }],
         })
     });
-    let transport = DfsEndpointServedProtocolFrameTransport::new(
+    let transport = DfsEndpointServedProtocolFrameTransport::new_with_message_sender(
         primary.clone(),
         vec![endpoint],
         sender,
@@ -2666,7 +2657,8 @@ fn served_protocol_frame_drains_nested_stage_response_before_returning() {
                                 },
                         },
                     ..
-                }) if response_request_id == &request_id && response_object_id == &object_id
+                }) if response_request_id.as_str() == request_id.as_str()
+                    && response_object_id == &object_id
             )
         }),
         "served frame should return the initial pending response, got {responses:?}"
@@ -2687,7 +2679,7 @@ fn served_protocol_frame_drains_nested_stage_response_before_returning() {
                                 },
                         },
                     ..
-                }) if response_request_id == &request_id
+                }) if response_request_id.as_str() == request_id.as_str()
                     && response_object_id == &object_id
                     && version == &version_2
             )
@@ -2714,29 +2706,24 @@ fn served_non_foreground_write_does_not_retry_unrelated_repairs() {
     let repair_calls = Arc::new(Mutex::new(Vec::new()));
     let repair_calls_for_sender = Arc::clone(&repair_calls);
     let replica_for_sender = replica.clone();
-    let sender: DfsProtocolFrameSender = Arc::new(move |endpoint, command, _timeout| {
+    let sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
         assert_eq!(endpoint.node_id, replica_for_sender);
-        let MeshMessageBody::Protocol(protocol) = &command.frame.message.body else {
-            panic!("expected protocol frame");
-        };
-        if let Ok(
-            message @ (DfsNetworkMessage::RepairReplica(_)
-            | DfsNetworkMessage::RepairReplicaChunk(_)
-            | DfsNetworkMessage::StageBlob(_)
-            | DfsNetworkMessage::StageBlobChunk(_)),
-        ) = protocol.decode::<DfsNetworkMessage>()
+        if let message @ (DfsNetworkMessage::RepairReplica(_)
+        | DfsNetworkMessage::RepairReplicaChunk(_)
+        | DfsNetworkMessage::StageBlob(_)
+        | DfsNetworkMessage::StageBlobChunk(_)) = &command.routed_message.message
         {
             repair_calls_for_sender
                 .lock()
                 .expect("repair calls lock")
-                .push(dfs_message_trace_label(&message).to_string());
+                .push(dfs_message_trace_label(message).to_string());
         }
-        Ok(DfsProtocolFrameResponse {
+        Ok(DfsMessageResponse {
             request_id: command.request_id.clone(),
-            outbound_frames: Vec::new(),
+            outbound_messages: Vec::new(),
         })
     });
-    let transport = DfsEndpointServedProtocolFrameTransport::new(
+    let transport = DfsEndpointServedProtocolFrameTransport::new_with_message_sender(
         primary.clone(),
         vec![endpoint],
         sender,
@@ -2853,7 +2840,7 @@ fn served_non_foreground_write_does_not_retry_unrelated_repairs() {
                                 },
                         },
                     ..
-                }) if response_request_id == &request_id
+                }) if response_request_id.as_str() == request_id.as_str()
                     && response_object_id == &routed_object
                     && version == &version_2
             )
@@ -2874,14 +2861,14 @@ fn served_protocol_frame_reports_repair_retry_failure_without_failing_request() 
     let path = "/services/served-frame/repair-retry-patch.bin";
     let send_attempts = Arc::new(Mutex::new(0usize));
     let send_attempts_for_sender = Arc::clone(&send_attempts);
-    let sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, _command, _timeout| {
+    let sender: DfsMessageSender = Arc::new(move |_endpoint, _command, _timeout| {
         *send_attempts_for_sender.lock().expect("send attempts") += 1;
-        Ok(DfsProtocolFrameResponse {
+        Ok(DfsMessageResponse {
             request_id: "dropped-stage".to_string(),
-            outbound_frames: Vec::new(),
+            outbound_messages: Vec::new(),
         })
     });
-    let transport = DfsEndpointServedProtocolFrameTransport::new(
+    let transport = DfsEndpointServedProtocolFrameTransport::new_with_message_sender(
         primary.clone(),
         vec![test_endpoint(&replica, "192.0.2.31:21353")],
         sender,
@@ -8739,12 +8726,9 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
     let replica_for_sender = replica.clone();
     let trace_for_replica_sender = Arc::clone(&trace);
     let staged_chunks_for_replica_sender = Arc::clone(&staged_chunks);
-    let replica_sender: DfsProtocolFrameSender = Arc::new(move |endpoint, command, _timeout| {
+    let replica_sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
         assert_eq!(endpoint.node_id, replica_for_sender);
-        let MeshMessageBody::Protocol(protocol) = &command.frame.message.body else {
-            panic!("expected protocol frame");
-        };
-        let message: DfsNetworkMessage = protocol.decode().expect("decode dfs message");
+        let message = command.routed_message.message.clone();
         let response = match message {
             DfsNetworkMessage::StageBlob(stage) => {
                 trace_for_replica_sender
@@ -8757,7 +8741,7 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
                     file_system_id: stage.file_system_id,
                     object_id: stage.object_id,
                     version: stage.version,
-                    replica_node_id: command.frame.target_node_id.clone(),
+                    replica_node_id: command.routed_message.target_node_id.clone(),
                     result: DfsBlobTransferResult::Durable {
                         content_hash: stage.content_hash,
                     },
@@ -8801,7 +8785,7 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
                         file_system_id: chunk.file_system_id,
                         object_id: chunk.object_id,
                         version: chunk.version,
-                        replica_node_id: command.frame.target_node_id.clone(),
+                        replica_node_id: command.routed_message.target_node_id.clone(),
                         result: DfsBlobTransferResult::Durable {
                             content_hash: actual_hash,
                         },
@@ -8822,7 +8806,7 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
                         file_system_id: repair.file_system_id,
                         object_id: repair.object_id,
                         version: repair.version,
-                        replica_node_id: command.frame.target_node_id.clone(),
+                        replica_node_id: command.routed_message.target_node_id.clone(),
                         result: DfsBlobTransferResult::Committed {
                             content_hash: actual_hash,
                         },
@@ -8868,7 +8852,7 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
                             file_system_id: chunk.file_system_id,
                             object_id: chunk.object_id,
                             version: chunk.version,
-                            replica_node_id: command.frame.target_node_id.clone(),
+                            replica_node_id: command.routed_message.target_node_id.clone(),
                             result: DfsBlobTransferResult::Committed {
                                 content_hash: actual_hash,
                             },
@@ -8879,29 +8863,23 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
             _ => None,
         };
         let Some(response) = response else {
-            return Ok(DfsProtocolFrameResponse {
+            return Ok(DfsMessageResponse {
                 request_id: command.request_id.clone(),
-                outbound_frames: Vec::new(),
+                outbound_messages: Vec::new(),
             });
         };
-        Ok(DfsProtocolFrameResponse {
+        Ok(DfsMessageResponse {
             request_id: command.request_id.clone(),
-            outbound_frames: vec![NetworkFrame {
-                frame_id: NetworkFrameId(101),
-                source_node_id: command.frame.target_node_id.clone(),
-                target_node_id: command.frame.source_node_id.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(101),
-                    origin_node_id: command.frame.target_node_id.clone(),
-                    target_node_id: command.frame.source_node_id.clone(),
-                    body: MeshMessageBody::Protocol(
-                        ProtocolMessage::encode(DFS_PROTOCOL, &response).expect("encode response"),
-                    ),
-                },
+            outbound_messages: vec![DfsRoutedMessage {
+                source_node_id: command.routed_message.target_node_id.clone(),
+                target_node_id: command.routed_message.source_node_id.clone(),
+                frame_id: 101,
+                message_id: 101,
+                message: response,
             }],
         })
     });
-    let primary_transport = DfsEndpointServedProtocolFrameTransport::new(
+    let primary_transport = DfsEndpointServedProtocolFrameTransport::new_with_message_sender(
         primary.clone(),
         vec![test_endpoint(&replica, "192.0.2.45:21353")],
         replica_sender,

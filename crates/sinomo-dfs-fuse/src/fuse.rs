@@ -9,8 +9,8 @@ use fuser::{
 use sinomo_runtime::core::{ClusterBootstrapState, ClusterEndpointRecord};
 use sinomo_runtime::daemon;
 use sinomo_runtime::dfs::{
-    self, DfsControlPlaneKvClient, DfsError, DfsFrameTransport, DfsObjectKind, DfsPosixError,
-    DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsTransportIdentity, DfsWriteOptions,
+    self, DfsControlPlaneKvClient, DfsError, DfsFrameTransport, DfsMessageCommand,
+    DfsMessageResponse, DfsObjectKind, DfsPosixError, DfsTransportIdentity, DfsWriteOptions,
     LocalContentStore, NetworkedDfsService,
 };
 use sinomo_runtime::kv::{
@@ -1785,14 +1785,22 @@ impl DfsFuseEndpointTransport {
             .ok_or_else(|| NetworkError::UnknownNode {
                 node_id: target_node_id.clone(),
             })?;
-        let request = DfsProtocolFrameCommand {
-            request_id: format!("fuse_dfs_protocol_frame_{}", frame.frame_id.0),
-            frame,
+        let request = DfsMessageCommand {
+            request_id: format!("fuse_dfs_message_{}", frame.frame_id.0),
+            routed_message: dfs::dfs_routed_message_from_protocol_frame(&frame).map_err(
+                |source| NetworkError::Serialization {
+                    detail: source.to_string(),
+                },
+            )?,
         };
         let mut failures = Vec::new();
         for endpoint in &endpoints {
-            match send_dfs_protocol_frame(endpoint, &request, self.timeout) {
+            match send_dfs_message(endpoint, &request, self.timeout) {
                 Ok(response) => {
+                    let response = dfs::dfs_message_response_to_protocol_frame_response(response)
+                        .map_err(|source| NetworkError::Serialization {
+                        detail: source.to_string(),
+                    })?;
                     for returned_frame in response.outbound_frames {
                         self.deliver_returned_frame(returned_frame)?;
                     }
@@ -1802,7 +1810,7 @@ impl DfsFuseEndpointTransport {
             }
         }
         Err(NetworkError::Io {
-            operation: format!("send DFS protocol frame to {target_node_id}"),
+            operation: format!("send DFS message to {target_node_id}"),
             detail: failures.join("; "),
         })
     }
@@ -1828,16 +1836,16 @@ impl DfsFrameTransport for DfsFuseEndpointTransport {
     }
 }
 
-fn send_dfs_protocol_frame(
+fn send_dfs_message(
     endpoint: &ClusterEndpointRecord,
-    request: &DfsProtocolFrameCommand,
+    request: &DfsMessageCommand,
     timeout: Duration,
-) -> std::result::Result<DfsProtocolFrameResponse, DfsFuseError> {
-    let rpc_request = dfs::dfs_message_rpc_request_from_protocol_frame_command(request)
+) -> std::result::Result<DfsMessageResponse, DfsFuseError> {
+    let rpc_request = dfs::dfs_message_rpc_request(request)
         .map_err(|source| DfsFuseError::Daemon(source.to_string()))?;
     let response = daemon::send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)
         .map_err(|source| DfsFuseError::Daemon(source.to_string()))?;
-    dfs::dfs_protocol_frame_response_from_message_rpc_response(&response)
+    dfs::decode_dfs_message_rpc_response(&response)
         .map_err(|source| DfsFuseError::Daemon(source.to_string()))
 }
 

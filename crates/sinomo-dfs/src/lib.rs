@@ -412,6 +412,18 @@ fn dfs_routed_message_from_network_frame(
     })
 }
 
+pub fn dfs_routed_message_from_protocol_frame(
+    frame: &NetworkFrame,
+) -> Result<DfsRoutedMessage, NetworkError> {
+    dfs_routed_message_from_network_frame(frame)
+}
+
+pub fn dfs_protocol_frame_from_routed_message(
+    message: &DfsRoutedMessage,
+) -> Result<NetworkFrame, NetworkError> {
+    dfs_network_frame_from_routed_message(message)
+}
+
 fn dfs_network_frame_from_routed_message(
     message: &DfsRoutedMessage,
 ) -> Result<NetworkFrame, NetworkError> {
@@ -505,6 +517,10 @@ fn dfs_network_message_requires_fresh_metadata(message: &DfsNetworkMessage) -> b
 pub fn dfs_protocol_frame_requires_fresh_metadata(frame: &NetworkFrame) -> bool {
     dfs_network_message_from_frame(frame)
         .is_ok_and(|message| dfs_network_message_requires_fresh_metadata(&message))
+}
+
+pub fn dfs_message_requires_fresh_metadata(command: &DfsMessageCommand) -> bool {
+    dfs_network_message_requires_fresh_metadata(&command.routed_message.message)
 }
 
 fn dfs_network_message_allows_write_repair_progress(message: &DfsNetworkMessage) -> bool {
@@ -3002,62 +3018,21 @@ where
     })
 }
 
-pub fn open_cluster_dfs_service(
+pub fn open_cluster_dfs_service_with_message_sender(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     local_node_id: NodeId,
     endpoints: Vec<ClusterEndpointRecord>,
-    protocol_sender: DfsProtocolFrameSender,
+    message_sender: DfsMessageSender,
     control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
 ) -> Result<NetworkedDfsService<DfsEndpointTransport>, DfsError> {
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
     let mut service = NetworkedDfsService::new(
-        DfsEndpointTransport::new(local_node_id, endpoints, protocol_sender),
-        content,
-    );
-    if let Some(control_plane) = control_plane {
-        service = service.with_boxed_control_plane(control_plane);
-    }
-    let metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
-    service.with_boxed_metadata_backend(metadata)
-}
-
-pub fn open_cluster_dfs_service_with_async_protocol_sender(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    local_node_id: NodeId,
-    endpoints: Vec<ClusterEndpointRecord>,
-    protocol_sender: AsyncDfsProtocolFrameSender,
-    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
-) -> Result<NetworkedDfsService<DfsEndpointTransport>, DfsError> {
-    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
-    let mut service = NetworkedDfsService::new(
-        DfsEndpointTransport::new_async(local_node_id, endpoints, protocol_sender),
-        content,
-    );
-    if let Some(control_plane) = control_plane {
-        service = service.with_boxed_control_plane(control_plane);
-    }
-    let metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
-    service.with_boxed_metadata_backend(metadata)
-}
-
-pub fn open_cluster_dfs_service_with_protocol_senders(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    local_node_id: NodeId,
-    endpoints: Vec<ClusterEndpointRecord>,
-    protocol_sender: DfsProtocolFrameSender,
-    async_protocol_sender: AsyncDfsProtocolFrameSender,
-    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
-) -> Result<NetworkedDfsService<DfsEndpointTransport>, DfsError> {
-    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
-    let mut service = NetworkedDfsService::new(
-        DfsEndpointTransport::new_with_senders(
+        DfsEndpointTransport::with_message_sender(
             local_node_id,
             endpoints,
-            protocol_sender,
-            async_protocol_sender,
+            DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+            message_sender,
         ),
         content,
     );
@@ -3068,10 +3043,58 @@ pub fn open_cluster_dfs_service_with_protocol_senders(
     service.with_boxed_metadata_backend(metadata)
 }
 
-pub fn run_cluster_dfs_maintenance_tick(
+pub fn open_cluster_dfs_service_with_message_senders(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    local_node_id: NodeId,
+    endpoints: Vec<ClusterEndpointRecord>,
+    message_sender: DfsMessageSender,
+    async_message_sender: AsyncDfsMessageSender,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+) -> Result<NetworkedDfsService<DfsEndpointTransport>, DfsError> {
+    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+    let mut service = NetworkedDfsService::new(
+        DfsEndpointTransport::with_connect_timeout_and_message_senders(
+            local_node_id,
+            endpoints,
+            DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+            message_sender,
+            async_message_sender,
+        ),
+        content,
+    );
+    if let Some(control_plane) = control_plane {
+        service = service.with_boxed_control_plane(control_plane);
+    }
+    let metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
+    service.with_boxed_metadata_backend(metadata)
+}
+
+#[cfg(test)]
+pub(crate) fn run_cluster_dfs_maintenance_tick(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     protocol_sender: DfsProtocolFrameSender,
+    metadata_sender: DfsMetadataJournalBatchSender,
+    snapshot_sender: DfsMetadataSnapshotInstallSender,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    options: DfsMaintenanceTickOptions,
+) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
+    run_cluster_dfs_maintenance_tick_with_message_sender(
+        data_dir,
+        cluster_paths,
+        dfs_message_sender_from_protocol_frame_sender(protocol_sender),
+        metadata_sender,
+        snapshot_sender,
+        control_plane,
+        options,
+    )
+}
+
+pub fn run_cluster_dfs_maintenance_tick_with_message_sender(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    message_sender: DfsMessageSender,
     metadata_sender: DfsMetadataJournalBatchSender,
     snapshot_sender: DfsMetadataSnapshotInstallSender,
     control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
@@ -3096,12 +3119,12 @@ pub fn run_cluster_dfs_maintenance_tick(
         &state,
         sinomo_network::ClusterEndpointSelectionPurpose::DfsData,
     );
-    let mut service = open_cluster_dfs_service(
+    let mut service = open_cluster_dfs_service_with_message_sender(
         data_dir,
         cluster_paths,
         local_node_id.clone(),
         endpoints.clone(),
-        protocol_sender,
+        message_sender,
         control_plane,
     )?;
     let mut maintenance_host = LocalDfsMaintenanceHost::new(data_dir.clone());
@@ -3150,13 +3173,13 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport(
         &state,
         sinomo_network::ClusterEndpointSelectionPurpose::DfsData,
     );
-    let mut service = open_cluster_dfs_service_with_protocol_senders(
+    let mut service = open_cluster_dfs_service_with_message_senders(
         &data_dir,
         &cluster_paths,
         local_node_id.clone(),
         endpoints.clone(),
-        dfs_protocol_frame_sender_from_peer_transport(sync_peer_transport),
-        async_dfs_protocol_frame_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        dfs_message_sender_from_peer_transport(sync_peer_transport),
+        async_dfs_message_sender_from_peer_transport(Arc::clone(&peer_transport)),
         control_plane,
     )?;
     let mut maintenance_host = LocalDfsMaintenanceHost::new(data_dir.clone());
@@ -3188,10 +3211,10 @@ pub fn run_cluster_dfs_maintenance_tick_with_peer_transport(
     control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
     options: DfsMaintenanceTickOptions,
 ) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
-    run_cluster_dfs_maintenance_tick(
+    run_cluster_dfs_maintenance_tick_with_message_sender(
         data_dir,
         cluster_paths,
-        dfs_protocol_frame_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        dfs_message_sender_from_peer_transport(Arc::clone(&peer_transport)),
         dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
         dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
         control_plane,
@@ -3263,10 +3286,31 @@ impl DfsSmokeHost for LocalDfsSmokeHost {
     }
 }
 
-pub fn run_cluster_dfs_smoke(
+#[cfg(test)]
+pub(crate) fn run_cluster_dfs_smoke(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     protocol_sender: DfsProtocolFrameSender,
+    metadata_sender: DfsMetadataJournalBatchSender,
+    snapshot_sender: DfsMetadataSnapshotInstallSender,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    options: DfsSmokeOptions,
+) -> Result<Option<DfsSmokeReport>, DfsError> {
+    run_cluster_dfs_smoke_with_message_sender(
+        data_dir,
+        cluster_paths,
+        dfs_message_sender_from_protocol_frame_sender(protocol_sender),
+        metadata_sender,
+        snapshot_sender,
+        control_plane,
+        options,
+    )
+}
+
+pub fn run_cluster_dfs_smoke_with_message_sender(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    message_sender: DfsMessageSender,
     metadata_sender: DfsMetadataJournalBatchSender,
     snapshot_sender: DfsMetadataSnapshotInstallSender,
     control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
@@ -3308,12 +3352,12 @@ pub fn run_cluster_dfs_smoke(
         .iter()
         .map(|endpoint| endpoint.node_id.clone())
         .collect::<Vec<_>>();
-    let mut service = open_cluster_dfs_service(
+    let mut service = open_cluster_dfs_service_with_message_sender(
         data_dir,
         cluster_paths,
         local_node_id.clone(),
         endpoints.clone(),
-        protocol_sender,
+        message_sender,
         control_plane,
     )?;
     let mut smoke_host = LocalDfsSmokeHost::new(data_dir.clone(), cluster_paths.clone());
@@ -3676,7 +3720,7 @@ pub struct DfsControlPlaneDefaultClusterAsyncBootstrapHost {
 }
 
 impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
-    pub fn new(
+    pub(crate) fn new(
         data_dir: SinomoDataDir,
         cluster_paths: ClusterPaths,
         local_node_id: NodeId,
@@ -4127,10 +4171,33 @@ pub async fn ensure_default_cluster_dfs_async(
         .map(Some)
 }
 
-pub fn run_default_cluster_dfs_smoke(
+#[cfg(test)]
+pub(crate) fn run_default_cluster_dfs_smoke(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     protocol_sender: DfsProtocolFrameSender,
+    metadata_sender: DfsMetadataJournalBatchSender,
+    snapshot_sender: DfsMetadataSnapshotInstallSender,
+    bootstrap_control_plane: Box<dyn DfsControlPlaneKvClient>,
+    smoke_control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    options: DfsDefaultClusterSmokeOptions,
+) -> Result<Option<DfsSmokeReport>, DfsError> {
+    run_default_cluster_dfs_smoke_with_message_sender(
+        data_dir,
+        cluster_paths,
+        dfs_message_sender_from_protocol_frame_sender(protocol_sender),
+        metadata_sender,
+        snapshot_sender,
+        bootstrap_control_plane,
+        smoke_control_plane,
+        options,
+    )
+}
+
+pub fn run_default_cluster_dfs_smoke_with_message_sender(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    message_sender: DfsMessageSender,
     metadata_sender: DfsMetadataJournalBatchSender,
     snapshot_sender: DfsMetadataSnapshotInstallSender,
     bootstrap_control_plane: Box<dyn DfsControlPlaneKvClient>,
@@ -4147,10 +4214,10 @@ pub fn run_default_cluster_dfs_smoke(
     {
         return Ok(None);
     }
-    run_cluster_dfs_smoke(
+    run_cluster_dfs_smoke_with_message_sender(
         data_dir,
         cluster_paths,
-        protocol_sender,
+        message_sender,
         metadata_sender,
         snapshot_sender,
         smoke_control_plane,
@@ -4166,10 +4233,10 @@ pub fn run_default_cluster_dfs_smoke_with_peer_transport(
     smoke_control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
     options: DfsDefaultClusterSmokeOptions,
 ) -> Result<Option<DfsSmokeReport>, DfsError> {
-    run_default_cluster_dfs_smoke(
+    run_default_cluster_dfs_smoke_with_message_sender(
         data_dir,
         cluster_paths,
-        dfs_protocol_frame_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        dfs_message_sender_from_peer_transport(Arc::clone(&peer_transport)),
         dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
         dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
         bootstrap_control_plane,
@@ -7895,7 +7962,9 @@ fn metadata_journal_rejection_is_sequence_conflict(reason: &str) -> bool {
         && reason.contains("already exists with a different entry")
 }
 
-pub const DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+pub const DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+pub const DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT: Duration =
+    DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT;
 const DFS_PROTOCOL_FRAME_DRAIN_MAX_PASSES: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -7919,7 +7988,8 @@ impl std::fmt::Display for DfsPeerTransportError {
 
 impl std::error::Error for DfsPeerTransportError {}
 
-pub type DfsProtocolFrameSender = Arc<
+#[cfg(test)]
+pub(crate) type DfsProtocolFrameSender = Arc<
     dyn Fn(
             &ClusterEndpointRecord,
             &DfsProtocolFrameCommand,
@@ -7992,19 +8062,6 @@ pub trait DfsPeerTransport: Send + Sync {
                 .with_observe_connectivity(!dfs_message_is_read_only_request(command)),
         )?;
         decode_dfs_message_rpc_response(&response)
-            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
-    }
-
-    fn send_protocol_frame(
-        &self,
-        endpoint: &ClusterEndpointRecord,
-        command: &DfsProtocolFrameCommand,
-        connect_timeout: Duration,
-    ) -> Result<DfsProtocolFrameResponse, DfsPeerTransportError> {
-        let message_command = dfs_protocol_frame_command_to_message_command(command)
-            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-        let message_response = self.send_message(endpoint, &message_command, connect_timeout)?;
-        dfs_message_response_to_protocol_frame_response(message_response)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))
     }
 
@@ -8096,23 +8153,6 @@ pub trait AsyncDfsPeerTransport: Send + Sync {
         })
     }
 
-    fn send_protocol_frame_async<'a>(
-        &'a self,
-        endpoint: &'a ClusterEndpointRecord,
-        command: &'a DfsProtocolFrameCommand,
-        connect_timeout: Duration,
-    ) -> DfsPeerTransportFuture<'a, Result<DfsProtocolFrameResponse, DfsPeerTransportError>> {
-        Box::pin(async move {
-            let message_command = dfs_protocol_frame_command_to_message_command(command)
-                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-            let message_response = self
-                .send_message_async(endpoint, &message_command, connect_timeout)
-                .await?;
-            dfs_message_response_to_protocol_frame_response(message_response)
-                .map_err(|source| DfsPeerTransportError::new(source.to_string()))
-        })
-    }
-
     fn send_metadata_journal_batch_async<'a>(
         &'a self,
         endpoint: &'a ClusterEndpointRecord,
@@ -8164,7 +8204,8 @@ pub trait AsyncDfsPeerTransport: Send + Sync {
     }
 }
 
-pub type AsyncDfsProtocolFrameSender = Arc<
+#[cfg(test)]
+pub(crate) type AsyncDfsProtocolFrameSender = Arc<
     dyn for<'a> Fn(
             &'a ClusterEndpointRecord,
             &'a DfsProtocolFrameCommand,
@@ -8222,7 +8263,8 @@ pub type AsyncDfsMetadataSnapshotInstallSender = Arc<
         + Sync,
 >;
 
-pub fn async_dfs_message_sender_from_protocol_frame_sender(
+#[cfg(test)]
+pub(crate) fn async_dfs_message_sender_from_protocol_frame_sender(
     sender: AsyncDfsProtocolFrameSender,
 ) -> AsyncDfsMessageSender {
     Arc::new(move |endpoint, command, connect_timeout| {
@@ -8232,21 +8274,6 @@ pub fn async_dfs_message_sender_from_protocol_frame_sender(
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
             let frame_response = sender(endpoint, &frame_command, connect_timeout).await?;
             dfs_protocol_frame_response_to_message_response(frame_response)
-                .map_err(|source| DfsPeerTransportError::new(source.to_string()))
-        })
-    })
-}
-
-pub fn async_dfs_protocol_frame_sender_from_message_sender(
-    sender: AsyncDfsMessageSender,
-) -> AsyncDfsProtocolFrameSender {
-    Arc::new(move |endpoint, command, connect_timeout| {
-        let sender = Arc::clone(&sender);
-        Box::pin(async move {
-            let message_command = dfs_protocol_frame_command_to_message_command(command)
-                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-            let message_response = sender(endpoint, &message_command, connect_timeout).await?;
-            dfs_message_response_to_protocol_frame_response(message_response)
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))
         })
     })
@@ -8263,14 +8290,6 @@ pub fn async_dfs_message_sender_from_peer_transport(
                 .await
         })
     })
-}
-
-pub fn async_dfs_protocol_frame_sender_from_peer_transport(
-    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
-) -> AsyncDfsProtocolFrameSender {
-    async_dfs_protocol_frame_sender_from_message_sender(
-        async_dfs_message_sender_from_peer_transport(peer_transport),
-    )
 }
 
 pub fn async_dfs_metadata_journal_batch_sender_from_peer_transport(
@@ -8299,7 +8318,8 @@ pub fn async_dfs_metadata_snapshot_install_sender_from_peer_transport(
     })
 }
 
-pub fn dfs_message_sender_from_protocol_frame_sender(
+#[cfg(test)]
+pub(crate) fn dfs_message_sender_from_protocol_frame_sender(
     sender: DfsProtocolFrameSender,
 ) -> DfsMessageSender {
     Arc::new(move |endpoint, command, connect_timeout| {
@@ -8311,7 +8331,8 @@ pub fn dfs_message_sender_from_protocol_frame_sender(
     })
 }
 
-pub fn dfs_protocol_frame_sender_from_message_sender(
+#[cfg(test)]
+pub(crate) fn dfs_protocol_frame_sender_from_message_sender(
     sender: DfsMessageSender,
 ) -> DfsProtocolFrameSender {
     Arc::new(move |endpoint, command, connect_timeout| {
@@ -8331,7 +8352,8 @@ pub fn dfs_message_sender_from_peer_transport(
     })
 }
 
-pub fn dfs_protocol_frame_sender_from_peer_transport(
+#[cfg(test)]
+pub(crate) fn dfs_protocol_frame_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsProtocolFrameSender {
     dfs_protocol_frame_sender_from_message_sender(dfs_message_sender_from_peer_transport(
@@ -8424,7 +8446,8 @@ fn dfs_endpoint_transfer_profile_for_targets<'a>(
 }
 
 impl DfsEndpointTransport {
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
         local_node_id: NodeId,
         endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
         sender: DfsProtocolFrameSender,
@@ -8432,12 +8455,13 @@ impl DfsEndpointTransport {
         Self::with_connect_timeout(
             local_node_id,
             endpoints,
-            DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT,
+            DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
             sender,
         )
     }
 
-    pub fn with_connect_timeout(
+    #[cfg(test)]
+    pub(crate) fn with_connect_timeout(
         local_node_id: NodeId,
         endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
         connect_timeout: Duration,
@@ -8469,20 +8493,8 @@ impl DfsEndpointTransport {
         )
     }
 
-    pub fn new_async(
-        local_node_id: NodeId,
-        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
-        sender: AsyncDfsProtocolFrameSender,
-    ) -> Self {
-        Self::with_connect_timeout_async(
-            local_node_id,
-            endpoints,
-            DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT,
-            sender,
-        )
-    }
-
-    pub fn with_connect_timeout_async(
+    #[cfg(test)]
+    pub(crate) fn with_connect_timeout_async(
         local_node_id: NodeId,
         endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
         connect_timeout: Duration,
@@ -8514,22 +8526,8 @@ impl DfsEndpointTransport {
         )
     }
 
-    pub fn new_with_senders(
-        local_node_id: NodeId,
-        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
-        sender: DfsProtocolFrameSender,
-        async_sender: AsyncDfsProtocolFrameSender,
-    ) -> Self {
-        Self::with_connect_timeout_and_senders(
-            local_node_id,
-            endpoints,
-            DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT,
-            sender,
-            async_sender,
-        )
-    }
-
-    pub fn with_connect_timeout_and_senders(
+    #[cfg(test)]
+    pub(crate) fn with_connect_timeout_and_senders(
         local_node_id: NodeId,
         endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
         connect_timeout: Duration,
@@ -8565,7 +8563,8 @@ impl DfsEndpointTransport {
         )
     }
 
-    pub fn new_with_peer_senders(
+    #[cfg(test)]
+    pub(crate) fn new_with_peer_senders(
         local_node_id: NodeId,
         endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
         sender: DfsProtocolFrameSender,
@@ -8575,7 +8574,7 @@ impl DfsEndpointTransport {
         Self::with_senders(
             local_node_id,
             endpoints,
-            DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT,
+            DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
             Some(dfs_message_sender_from_protocol_frame_sender(sender)),
             Some(async_dfs_message_sender_from_protocol_frame_sender(
                 async_sender,
@@ -8594,7 +8593,7 @@ impl DfsEndpointTransport {
         Self::with_senders(
             local_node_id,
             endpoints,
-            DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT,
+            DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
             Some(sender),
             Some(async_sender),
             Some(direct_read_sender),
@@ -9118,6 +9117,7 @@ impl NetworkedDfsService<DfsEndpointTransport> {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct SingleDfsProtocolFrameTransport {
     local_node_id: NodeId,
@@ -9125,6 +9125,7 @@ struct SingleDfsProtocolFrameTransport {
     outbound_frames: Vec<NetworkFrame>,
 }
 
+#[cfg(test)]
 impl SingleDfsProtocolFrameTransport {
     fn new(local_node_id: NodeId, inbound_frame: NetworkFrame) -> Self {
         Self {
@@ -9138,12 +9139,14 @@ impl SingleDfsProtocolFrameTransport {
     }
 }
 
+#[cfg(test)]
 impl DfsTransportIdentity for SingleDfsProtocolFrameTransport {
     fn local_node_id(&self) -> &NodeId {
         &self.local_node_id
     }
 }
 
+#[cfg(test)]
 impl DfsFrameTransport for SingleDfsProtocolFrameTransport {
     fn send(&mut self, _target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError> {
         self.outbound_frames.push(frame);
@@ -9169,20 +9172,6 @@ pub struct DfsEndpointServedProtocolFrameTransport {
 }
 
 impl DfsEndpointServedProtocolFrameTransport {
-    pub fn new(
-        local_node_id: NodeId,
-        endpoints: Vec<ClusterEndpointRecord>,
-        sender: DfsProtocolFrameSender,
-        connect_timeout: Duration,
-    ) -> Self {
-        Self::new_with_message_sender(
-            local_node_id,
-            endpoints,
-            dfs_message_sender_from_protocol_frame_sender(sender),
-            connect_timeout,
-        )
-    }
-
     pub fn new_with_message_sender(
         local_node_id: NodeId,
         endpoints: Vec<ClusterEndpointRecord>,
@@ -9377,7 +9366,8 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 }
 
-pub fn process_dfs_protocol_frame(
+#[cfg(test)]
+pub(crate) fn process_dfs_protocol_frame(
     local_node_id: NodeId,
     inbound_frame: NetworkFrame,
     content: LocalContentStore,
@@ -9406,47 +9396,8 @@ pub fn process_dfs_protocol_frame(
     })
 }
 
-pub fn process_dfs_protocol_frame_with_endpoint_sender(
-    local_node_id: NodeId,
-    inbound_frame: NetworkFrame,
-    content: LocalContentStore,
-    metadata_backend: Box<dyn DfsMetadataBackend>,
-    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
-    endpoints: Vec<ClusterEndpointRecord>,
-    sender: DfsProtocolFrameSender,
-    connect_timeout: Duration,
-) -> Result<DfsProtocolFrameProcessResult, DfsError> {
-    if inbound_frame.target_node_id != local_node_id {
-        return Err(DfsError::Network {
-            message: format!(
-                "dfs protocol frame target {} does not match local node {}",
-                inbound_frame.target_node_id, local_node_id
-            ),
-        });
-    }
-    let mut transport = DfsEndpointServedProtocolFrameTransport::new(
-        local_node_id,
-        endpoints,
-        sender,
-        connect_timeout,
-    );
-    transport
-        .enqueue_protocol_frame(inbound_frame)
-        .map_err(DfsError::from_network)?;
-    let mut service = NetworkedDfsService::new(transport, content);
-    if let Some(control_plane) = control_plane {
-        service = service.with_boxed_control_plane(control_plane);
-    }
-    let mut service = service.with_boxed_metadata_backend(metadata_backend)?;
-    let events = service.process_incoming()?;
-    let outbound_frames = service.into_transport().finish_protocol_frame();
-    Ok(DfsProtocolFrameProcessResult {
-        outbound_frames,
-        events,
-    })
-}
-
-pub fn process_cluster_dfs_protocol_frame(
+#[cfg(test)]
+pub(crate) fn process_cluster_dfs_protocol_frame(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     inbound_frame: NetworkFrame,
@@ -9475,51 +9426,14 @@ pub fn process_cluster_dfs_protocol_frame(
     .map(Some)
 }
 
-pub fn process_cluster_dfs_protocol_frame_with_endpoint_sender(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    inbound_frame: NetworkFrame,
-    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
-    sender: DfsProtocolFrameSender,
-    connect_timeout: Duration,
-) -> Result<Option<DfsProtocolFrameProcessResult>, DfsError> {
-    data_dir
-        .ensure_root_layout()
-        .map_err(|source| DfsError::Metadata {
-            message: source.to_string(),
-        })?;
-    if !cluster_paths.state.exists() {
-        return Ok(None);
-    }
-    let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
-        .map_err(DfsError::from_network)?;
-    let local_node_id = state.local_node_id.clone();
-    let endpoints = sinomo_network::cluster_endpoint_targets(
-        cluster_paths,
-        &state,
-        sinomo_network::ClusterEndpointSelectionPurpose::DfsData,
-    );
-    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
-    let metadata_backend = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
-    process_dfs_protocol_frame_with_endpoint_sender(
-        local_node_id,
-        inbound_frame,
-        content,
-        metadata_backend,
-        control_plane,
-        endpoints,
-        sender,
-        connect_timeout,
-    )
-    .map(Some)
-}
-
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct DfsProtocolFrameCommandProcessResult {
     pub response: DfsProtocolFrameResponse,
     pub events: Vec<NetworkedDfsServiceEvent>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct DfsProtocolFrameCommandHandleResult {
     pub response: DfsProtocolFrameResponse,
@@ -9527,7 +9441,8 @@ pub struct DfsProtocolFrameCommandHandleResult {
     pub metadata_publish_schedule_error: Option<String>,
 }
 
-pub fn process_cluster_dfs_protocol_frame_command(
+#[cfg(test)]
+pub(crate) fn process_cluster_dfs_protocol_frame_command(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     command: DfsProtocolFrameCommand,
@@ -9548,36 +9463,8 @@ pub fn process_cluster_dfs_protocol_frame_command(
     }))
 }
 
-pub fn process_cluster_dfs_protocol_frame_command_with_endpoint_sender(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    command: DfsProtocolFrameCommand,
-    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
-    sender: DfsProtocolFrameSender,
-    connect_timeout: Duration,
-) -> Result<Option<DfsProtocolFrameCommandProcessResult>, DfsError> {
-    let request_id = command.request_id;
-    let Some(result) = process_cluster_dfs_protocol_frame_with_endpoint_sender(
-        data_dir,
-        cluster_paths,
-        command.frame,
-        control_plane,
-        sender,
-        connect_timeout,
-    )?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(DfsProtocolFrameCommandProcessResult {
-        response: DfsProtocolFrameResponse {
-            request_id,
-            outbound_frames: result.outbound_frames,
-        },
-        events: result.events,
-    }))
-}
-
-pub fn run_cluster_dfs_protocol_frame_command_with_metadata_publish<R, E>(
+#[cfg(test)]
+pub(crate) fn run_cluster_dfs_protocol_frame_command_with_metadata_publish<R, E>(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     command: DfsProtocolFrameCommand,
