@@ -8207,7 +8207,7 @@ struct DeferredDfsEndpointSend {
 pub struct DfsEndpointTransport {
     local_node_id: NodeId,
     endpoints_by_node_id: BTreeMap<NodeId, Vec<ClusterEndpointRecord>>,
-    incoming_frames: VecDeque<InboundFrame>,
+    incoming_messages: VecDeque<DfsRoutedMessage>,
     detached_sends: Arc<std::sync::Mutex<Vec<DeferredDfsEndpointSend>>>,
     connect_timeout: Duration,
     sender: Option<DfsMessageSender>,
@@ -8221,7 +8221,7 @@ impl std::fmt::Debug for DfsEndpointTransport {
             .debug_struct("DfsEndpointTransport")
             .field("local_node_id", &self.local_node_id)
             .field("endpoints_by_node_id", &self.endpoints_by_node_id)
-            .field("incoming_frames", &self.incoming_frames)
+            .field("incoming_messages", &self.incoming_messages)
             .field("connect_timeout", &self.connect_timeout)
             .finish_non_exhaustive()
     }
@@ -8426,7 +8426,7 @@ impl DfsEndpointTransport {
         Self {
             local_node_id,
             endpoints_by_node_id,
-            incoming_frames: VecDeque::new(),
+            incoming_messages: VecDeque::new(),
             detached_sends: Arc::new(std::sync::Mutex::new(Vec::new())),
             connect_timeout,
             sender,
@@ -8470,11 +8470,7 @@ impl DfsEndpointTransport {
         while let Some((target_node_id, routed_message, require_local_source)) = pending.pop_front()
         {
             if target_node_id == self.local_node_id {
-                let frame = protocol::dfs_protocol_frame_from_routed_message(&routed_message)?;
-                self.incoming_frames.push_back(InboundFrame {
-                    received_by: self.local_node_id.clone(),
-                    frame,
-                });
+                self.incoming_messages.push_back(routed_message);
                 continue;
             }
             let endpoints = self.routed_message_endpoint_send_plan(
@@ -8542,11 +8538,7 @@ impl DfsEndpointTransport {
         require_local_source: bool,
     ) -> Result<(), NetworkError> {
         if target_node_id == &self.local_node_id {
-            let frame = protocol::dfs_protocol_frame_from_routed_message(&routed_message)?;
-            self.incoming_frames.push_back(InboundFrame {
-                received_by: self.local_node_id.clone(),
-                frame,
-            });
+            self.incoming_messages.push_back(routed_message);
             return Ok(());
         }
         let endpoints = self.routed_message_endpoint_send_plan(
@@ -8647,11 +8639,7 @@ impl DfsEndpointTransport {
         while let Some((target_node_id, routed_message, require_local_source)) = pending.pop_front()
         {
             if target_node_id == self.local_node_id {
-                let frame = protocol::dfs_protocol_frame_from_routed_message(&routed_message)?;
-                self.incoming_frames.push_back(InboundFrame {
-                    received_by: self.local_node_id.clone(),
-                    frame,
-                });
+                self.incoming_messages.push_back(routed_message);
                 continue;
             }
             let endpoints = self.routed_message_endpoint_send_plan(
@@ -8684,6 +8672,20 @@ impl DfsEndpointTransport {
             }
         }
         Ok(())
+    }
+
+    fn drain_incoming_frames(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
+        self.incoming_messages
+            .drain(..)
+            .map(|message| {
+                protocol::dfs_protocol_frame_from_routed_message(&message).map(|frame| {
+                    InboundFrame {
+                        received_by: self.local_node_id.clone(),
+                        frame,
+                    }
+                })
+            })
+            .collect()
     }
 }
 
@@ -8882,13 +8884,13 @@ impl AsyncDfsMessageTransport for DfsEndpointTransport {
     fn drain_incoming_async<'a>(
         &'a mut self,
     ) -> DfsMessageTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
-        Box::pin(async move { Ok(self.incoming_frames.drain(..).collect()) })
+        Box::pin(async move { self.drain_incoming_frames() })
     }
 
     fn pending_incoming_count_async<'a>(
         &'a mut self,
     ) -> DfsMessageTransportFuture<'a, Result<Option<usize>, NetworkError>> {
-        Box::pin(async move { Ok(Some(self.incoming_frames.len())) })
+        Box::pin(async move { Ok(Some(self.incoming_messages.len())) })
     }
 }
 
@@ -8918,7 +8920,7 @@ impl DfsMessageTransport for DfsEndpointTransport {
     }
 
     fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
-        Ok(self.incoming_frames.drain(..).collect())
+        self.drain_incoming_frames()
     }
 
     fn flush_detached_sends(&mut self) -> Result<(), NetworkError> {
@@ -8930,7 +8932,7 @@ impl DfsMessageTransport for DfsEndpointTransport {
     }
 
     fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
-        Ok(Some(self.incoming_frames.len()))
+        Ok(Some(self.incoming_messages.len()))
     }
 
     fn transfer_profile(&self, target_node_id: &NodeId) -> DfsTransferProfile {
@@ -8991,7 +8993,7 @@ impl DfsEndpointServedMessageTransport {
     pub fn finish_message(&mut self) -> Vec<DfsRoutedMessage> {
         self.return_node_id = None;
         self.inbound_messages.clear();
-        self.endpoint_transport.incoming_frames.clear();
+        self.endpoint_transport.incoming_messages.clear();
         std::mem::take(&mut self.outbound_messages)
     }
 
