@@ -5467,13 +5467,6 @@ pub struct NetworkedDfsService<T> {
     next_request_id: u64,
 }
 
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub struct DfsProtocolFrameProcessResult {
-    pub outbound_frames: Vec<NetworkFrame>,
-    pub events: Vec<NetworkedDfsServiceEvent>,
-}
-
 #[derive(Clone, Debug)]
 pub struct DfsMessageProcessResult {
     pub response: DfsMessageResponse,
@@ -9091,59 +9084,6 @@ impl DfsMessageTransport for DfsEndpointServedMessageTransport {
     }
 }
 
-#[cfg(test)]
-#[derive(Debug)]
-struct SingleDfsProtocolFrameTransport {
-    local_node_id: NodeId,
-    inbound_frames: Vec<InboundFrame>,
-    outbound_frames: Vec<NetworkFrame>,
-}
-
-#[cfg(test)]
-impl SingleDfsProtocolFrameTransport {
-    fn new(local_node_id: NodeId, inbound_frame: NetworkFrame) -> Self {
-        Self {
-            local_node_id: local_node_id.clone(),
-            inbound_frames: vec![InboundFrame {
-                received_by: local_node_id,
-                frame: inbound_frame,
-            }],
-            outbound_frames: Vec::new(),
-        }
-    }
-}
-
-#[cfg(test)]
-impl DfsTransportIdentity for SingleDfsProtocolFrameTransport {
-    fn local_node_id(&self) -> &NodeId {
-        &self.local_node_id
-    }
-}
-
-#[cfg(test)]
-impl DfsMessageTransport for SingleDfsProtocolFrameTransport {
-    fn send_routed_message(
-        &mut self,
-        _target_node_id: &NodeId,
-        message: DfsRoutedMessage,
-    ) -> Result<(), NetworkError> {
-        let frame = protocol::dfs_protocol_frame_from_routed_message(&message)?;
-        self.outbound_frames.push(frame);
-        Ok(())
-    }
-
-    fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
-        Ok(std::mem::take(&mut self.inbound_frames)
-            .into_iter()
-            .filter_map(|inbound| dfs_routed_message_from_network_frame(&inbound.frame).ok())
-            .collect())
-    }
-
-    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
-        Ok(Some(self.inbound_frames.len()))
-    }
-}
-
 impl NetworkedDfsService<DfsEndpointServedMessageTransport> {
     pub fn refresh_message_endpoints(&mut self, endpoints: Vec<ClusterEndpointRecord>) {
         self.transport.replace_endpoints(endpoints);
@@ -9278,66 +9218,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ),
         }
     }
-}
-
-#[cfg(test)]
-pub(crate) fn process_dfs_protocol_frame(
-    local_node_id: NodeId,
-    inbound_frame: NetworkFrame,
-    content: LocalContentStore,
-    metadata_backend: Box<dyn DfsMetadataBackend>,
-    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
-) -> Result<DfsProtocolFrameProcessResult, DfsError> {
-    if inbound_frame.target_node_id != local_node_id {
-        return Err(DfsError::Network {
-            message: format!(
-                "dfs protocol frame target {} does not match local node {}",
-                inbound_frame.target_node_id, local_node_id
-            ),
-        });
-    }
-    let transport = SingleDfsProtocolFrameTransport::new(local_node_id, inbound_frame);
-    let mut service = NetworkedDfsService::new(transport, content);
-    if let Some(control_plane) = control_plane {
-        service = service.with_boxed_control_plane(control_plane);
-    }
-    let mut service = service.with_boxed_metadata_backend(metadata_backend)?;
-    let events = service.process_incoming()?;
-    let outbound_frames = service.into_transport().outbound_frames;
-    Ok(DfsProtocolFrameProcessResult {
-        outbound_frames,
-        events,
-    })
-}
-
-#[cfg(test)]
-pub(crate) fn process_cluster_dfs_protocol_frame(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    inbound_frame: NetworkFrame,
-    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
-) -> Result<Option<DfsProtocolFrameProcessResult>, DfsError> {
-    data_dir
-        .ensure_root_layout()
-        .map_err(|source| DfsError::Metadata {
-            message: source.to_string(),
-        })?;
-    if !cluster_paths.state.exists() {
-        return Ok(None);
-    }
-    let local_node_id = sinomo_network::read_cluster_state_without_kv(cluster_paths)
-        .map_err(DfsError::from_network)?
-        .local_node_id;
-    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
-    let metadata_backend = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
-    process_dfs_protocol_frame(
-        local_node_id,
-        inbound_frame,
-        content,
-        metadata_backend,
-        control_plane,
-    )
-    .map(Some)
 }
 
 #[cfg(test)]

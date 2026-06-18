@@ -143,6 +143,33 @@ fn test_dfs_message_command(
     }
 }
 
+fn process_dfs_message_command_for_test(
+    local_node_id: NodeId,
+    command: DfsMessageCommand,
+    content: LocalContentStore,
+    metadata_backend: Box<dyn DfsMetadataBackend>,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+) -> Result<DfsMessageProcessResult, DfsError> {
+    let message_sender: DfsMessageSender = Arc::new(|endpoint, command, _timeout| {
+        Err(DfsPeerTransportError::new(format!(
+            "unexpected DFS message hop to {} while processing test command {}",
+            endpoint.node_id, command.request_id
+        )))
+    });
+    let transport = DfsEndpointServedMessageTransport::new_with_message_sender(
+        local_node_id,
+        Vec::new(),
+        message_sender,
+        DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+    );
+    let mut service = NetworkedDfsService::new(transport, content);
+    if let Some(control_plane) = control_plane {
+        service = service.with_boxed_control_plane(control_plane);
+    }
+    let mut service = service.with_boxed_metadata_backend(metadata_backend)?;
+    service.process_message_command(command)
+}
+
 #[test]
 fn dfs_adaptive_transfer_windows_stay_byte_bounded() {
     assert_eq!(DFS_BLOB_CHUNK_BYTES, 4 * 1024 * 1024);
@@ -3481,60 +3508,45 @@ fn networked_dfs_async_send_uses_shared_protocol_frame_path() {
 }
 
 #[test]
-fn protocol_frame_processor_rejects_wrong_target_node() {
-    let root = temp_root("protocol_frame_wrong_target");
-    let local = NodeId::from_legacy_named("node_protocol_frame_local").expect("local");
-    let remote = NodeId::from_legacy_named("node_protocol_frame_remote").expect("remote");
-    let frame = NetworkFrame {
-        frame_id: NetworkFrameId(1),
-        source_node_id: remote.clone(),
-        target_node_id: remote.clone(),
-        message: MeshMessage {
-            message_id: MeshMessageId(1),
-            origin_node_id: remote.clone(),
+fn dfs_message_command_processor_rejects_wrong_target_node() {
+    let root = temp_root("message_command_wrong_target");
+    let local = NodeId::from_legacy_named("node_message_command_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_message_command_remote").expect("remote");
+    let command = DfsMessageCommand {
+        request_id: "message-command-wrong-target".to_string(),
+        routed_message: DfsRoutedMessage {
+            source_node_id: remote.clone(),
             target_node_id: remote.clone(),
-            body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                node_id: remote,
-                tick: 1,
+            frame_id: 1,
+            message_id: 1,
+            message: DfsNetworkMessage::ReadRequest(DfsReadRequest {
+                request_id: "wrong-target-read".to_string(),
+                object_id: DfsObjectId::generate(),
+                version: None,
+                content_hash: None,
+                content_size_bytes: None,
+                range_offset: None,
+                range_max_bytes: None,
+                start_chunk_index: 0,
+                max_chunks: 0,
             }),
         },
     };
     let content = LocalContentStore::new(root.join("content")).expect("content");
     let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
 
-    let error = process_dfs_protocol_frame(local, frame, content, Box::new(metadata), None)
-        .expect_err("wrong target rejected");
+    let error = process_dfs_message_command_for_test(
+        local.clone(),
+        command,
+        content,
+        Box::new(metadata),
+        None,
+    )
+    .expect_err("wrong target rejected");
 
-    assert!(error.to_string().contains("does not match local node"));
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn cluster_protocol_frame_processor_returns_none_without_cluster_state() {
-    let root = temp_root("cluster_protocol_frame_orphan");
-    let data_dir = SinomoDataDir::new(&root);
-    data_dir.ensure_root_layout().expect("root layout");
-    let cluster_paths = ClusterPaths::new(&data_dir);
-    let local = NodeId::from_legacy_named("node_cluster_protocol_orphan_local").expect("local");
-    let frame = NetworkFrame {
-        frame_id: NetworkFrameId(1),
-        source_node_id: local.clone(),
-        target_node_id: local.clone(),
-        message: MeshMessage {
-            message_id: MeshMessageId(1),
-            origin_node_id: local.clone(),
-            target_node_id: local.clone(),
-            body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                node_id: local,
-                tick: 1,
-            }),
-        },
-    };
-
-    let result = process_cluster_dfs_protocol_frame(&data_dir, &cluster_paths, frame, None)
-        .expect("cluster protocol frame");
-
-    assert!(result.is_none());
+    let error = error.to_string();
+    assert!(error.contains(local.as_str()));
+    assert!(error.contains(remote.as_str()));
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -3629,45 +3641,52 @@ fn cluster_dfs_message_handler_returns_none_without_cluster_state() {
 }
 
 #[test]
-fn cluster_protocol_frame_processor_uses_cluster_local_node_id() {
-    let root = temp_root("cluster_protocol_frame_wrong_target");
+fn cluster_dfs_message_command_processor_uses_cluster_local_node_id() {
+    let root = temp_root("cluster_message_command_wrong_target");
     let data_dir = SinomoDataDir::new(&root);
     data_dir.ensure_root_layout().expect("root layout");
     let cluster_paths = ClusterPaths::new(&data_dir);
     let now = OffsetDateTime::now_utc();
-    let cluster_id = sinomo_network::ClusterId::from_legacy_named("cluster_dfs_protocol_frame")
+    let cluster_id = sinomo_network::ClusterId::from_legacy_named("cluster_dfs_message_command")
         .expect("cluster");
-    let local = NodeId::from_legacy_named("node_cluster_protocol_local").expect("local");
-    let remote = NodeId::from_legacy_named("node_cluster_protocol_remote").expect("remote");
+    let local = NodeId::from_legacy_named("node_cluster_message_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_cluster_message_remote").expect("remote");
     let state = sinomo_core::ClusterBootstrapState::initialized_locally(
         cluster_id,
-        "dfs protocol frame",
+        "dfs message command",
         local.clone(),
         "local",
         "pk-local",
         now,
     );
     sinomo_network::write_cluster_state(&cluster_paths, &state).expect("cluster state");
-    let frame = NetworkFrame {
-        frame_id: NetworkFrameId(1),
-        source_node_id: remote.clone(),
-        target_node_id: remote.clone(),
-        message: MeshMessage {
-            message_id: MeshMessageId(1),
-            origin_node_id: remote.clone(),
+    let command = DfsMessageCommand {
+        request_id: "message-command-cluster-wrong-target".to_string(),
+        routed_message: DfsRoutedMessage {
+            source_node_id: remote.clone(),
             target_node_id: remote.clone(),
-            body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                node_id: remote,
-                tick: 1,
+            frame_id: 1,
+            message_id: 1,
+            message: DfsNetworkMessage::ReadRequest(DfsReadRequest {
+                request_id: "cluster-wrong-target-read".to_string(),
+                object_id: DfsObjectId::generate(),
+                version: None,
+                content_hash: None,
+                content_size_bytes: None,
+                range_offset: None,
+                range_max_bytes: None,
+                start_chunk_index: 0,
+                max_chunks: 0,
             }),
         },
     };
 
-    let error = process_cluster_dfs_protocol_frame(&data_dir, &cluster_paths, frame, None)
+    let error = process_cluster_dfs_message_command(&data_dir, &cluster_paths, command, None)
         .expect_err("wrong target rejected");
 
-    assert!(error.to_string().contains("does not match local node"));
-    assert!(error.to_string().contains(local.as_str()));
+    let error = error.to_string();
+    assert!(error.contains(local.as_str()));
+    assert!(error.contains(remote.as_str()));
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -8111,35 +8130,27 @@ fn stateless_endpoint_reader_write_commits_after_primary_fetch_receipt() {
             &primary_metadata_for_sender,
         )
         .expect("metadata");
-        let result = process_dfs_protocol_frame(
+        let result = process_dfs_message_command_for_test(
             primary_for_sender.clone(),
-            test_dfs_frame_from_message_command(command),
+            command.clone(),
             content,
             Box::new(metadata),
             Some(Box::new(control_plane_for_sender.clone())),
         )
-        .expect("process stateless primary frame");
+        .expect("process stateless primary message");
         for event in &result.events {
             trace_for_sender
                 .lock()
                 .expect("trace")
                 .push(format!("event:{event:?}"));
         }
-        for frame in &result.outbound_frames {
-            if let MeshMessageBody::Protocol(protocol) = &frame.message.body
-                && protocol.protocol == DFS_PROTOCOL
-                && let Ok(message) = protocol.decode::<DfsNetworkMessage>()
-            {
-                trace_for_sender
-                    .lock()
-                    .expect("trace")
-                    .push(format!("out:{message:?}"));
-            }
+        for message in &result.response.outbound_messages {
+            trace_for_sender
+                .lock()
+                .expect("trace")
+                .push(format!("out:{:?}", message.message));
         }
-        Ok(test_dfs_message_response_from_frames(
-            command.request_id.clone(),
-            result.outbound_frames,
-        ))
+        Ok(result.response)
     });
     let transport = DfsEndpointTransport::with_connect_timeout(
         writer.clone(),
