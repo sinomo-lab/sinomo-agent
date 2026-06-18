@@ -19,6 +19,7 @@ mod endpoint_selector;
 mod error;
 mod health;
 mod invite;
+mod invite_publish;
 mod io_observer;
 mod keyspace;
 mod kv_forward;
@@ -101,6 +102,15 @@ pub use invite::{
     invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_loopback_connect_address,
     is_remote_usable_invite_endpoint, push_unique_introducer, sign_cluster_join_invite,
     sort_default_invite_introducers, verify_cluster_join_invite_signature,
+};
+pub use invite_publish::{
+    ClusterInvitePublishHost, handle_cluster_invite_publish_request_async_with_host,
+    publish_cluster_invitation_to_quorum_with_host, read_cluster_invitation_from_kv,
+    sync_cluster_invitation_to_kv,
+};
+#[cfg(test)]
+pub(crate) use invite_publish::{
+    cluster_invitation_publish_txn_from_kv, handle_cluster_invite_publish_request_with_host,
 };
 pub(crate) use io_observer::io_observer;
 pub use io_observer::{IoObserver, set_io_observer};
@@ -261,7 +271,6 @@ pub use storage::{
     commit_cluster_kv_txn_with_quorum_response_async_with_host,
     commit_cluster_raft_index_with_events_async,
     discard_cluster_raft_uncommitted_tail_and_clear_leader_async,
-    handle_cluster_invite_publish_request_async_with_host,
     handle_cluster_join_registration_request_async_with_host,
     handle_cluster_kv_txn_request_async_with_host, handle_cluster_raft_rpc_request_async,
     read_cluster_state_async, read_cluster_state_without_kv_async,
@@ -273,19 +282,19 @@ pub use storage::{
 };
 pub use storage::{
     ClusterControlPlaneDriver, ClusterControlPlaneTimeouts, ClusterControlPlaneTransport,
-    ClusterInvitePublishHost, ClusterJoinRegistrationAsyncHost, ClusterJoinRegistrationDriver,
-    ClusterJoinRegistrationHost, ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost,
-    ClusterKvTxnQuorumOptions, ClusterLocalDaemonMembershipAsyncObserver,
-    ClusterLocalDaemonMembershipObservation, ClusterLocalDaemonMembershipObserver,
-    ClusterLocalDaemonMembershipRefresh, ClusterMemberMutationAsyncHost,
-    ClusterMemberMutationDriver, ClusterMemberMutationHost, ClusterMembershipRpcFuture,
-    ClusterNetworkRecordExpiryHost, ClusterNodeRoleUpdate, ClusterRaftAppendReplicationAsyncHost,
-    ClusterRaftAppendReplicationHost, ClusterRaftAppendReplicationOptions,
-    ClusterRaftAppendReplicationOutcome, ClusterRaftCommittedFanoutAsyncHost,
-    ClusterRaftCommittedFanoutOptions, ClusterRaftLeaderElectionOptions,
-    ClusterRaftQuorumAsyncHost, ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult,
-    ClusterRaftQuorumTransportHost, ClusterRaftVoteTransportAsyncHost,
-    ClusterRaftVoteTransportHost, ClusterVoterReachabilityAsyncHost, ClusterVoterReachabilityHost,
+    ClusterJoinRegistrationAsyncHost, ClusterJoinRegistrationDriver, ClusterJoinRegistrationHost,
+    ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost, ClusterKvTxnQuorumOptions,
+    ClusterLocalDaemonMembershipAsyncObserver, ClusterLocalDaemonMembershipObservation,
+    ClusterLocalDaemonMembershipObserver, ClusterLocalDaemonMembershipRefresh,
+    ClusterMemberMutationAsyncHost, ClusterMemberMutationDriver, ClusterMemberMutationHost,
+    ClusterMembershipRpcFuture, ClusterNetworkRecordExpiryHost, ClusterNodeRoleUpdate,
+    ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
+    ClusterRaftAppendReplicationOptions, ClusterRaftAppendReplicationOutcome,
+    ClusterRaftCommittedFanoutAsyncHost, ClusterRaftCommittedFanoutOptions,
+    ClusterRaftLeaderElectionOptions, ClusterRaftQuorumAsyncHost, ClusterRaftQuorumCommitOptions,
+    ClusterRaftQuorumCommitResult, ClusterRaftQuorumTransportHost,
+    ClusterRaftVoteTransportAsyncHost, ClusterRaftVoteTransportHost,
+    ClusterVoterReachabilityAsyncHost, ClusterVoterReachabilityHost,
     ClusterVoterReachabilityOptions, DAEMON_MAIN_RUN_CAPABILITY,
     DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_IROH_FOREGROUND_ATTEMPT_TIMEOUT,
@@ -308,8 +317,7 @@ pub use storage::{
     handle_cluster_membership_rpc_request_with_hosts, handle_cluster_raft_rpc_request,
     join_channel_endpoint_for_accepted_state, merge_cluster_join_registration,
     prepare_cluster_join_retry_state, prepare_pending_cluster_join_state,
-    publish_cluster_invitation_to_quorum_with_host, read_cluster_connectivity_graph_from_kv,
-    read_cluster_invitation_from_kv, read_cluster_members_from_kv,
+    read_cluster_connectivity_graph_from_kv, read_cluster_members_from_kv,
     read_cluster_node_statuses_from_kv, read_cluster_state, read_cluster_state_cached,
     read_cluster_state_without_kv, read_local_cluster_connectivity_records,
     reconcile_accepted_cluster_join_response, reconcile_cluster_join_with_introducers_with_host,
@@ -318,10 +326,10 @@ pub use storage::{
     replicate_cluster_raft_to_endpoint_with_host, select_cluster_connectivity_probe_batch,
     send_cluster_join_registration_over_membership_rpc,
     spawn_cluster_raft_committed_fanout_worker_on_runtime, sync_cluster_connectivity_records_to_kv,
-    sync_cluster_connectivity_records_to_quorum_with_host, sync_cluster_invitation_to_kv,
-    sync_cluster_state_to_kv_with_host, sync_cluster_state_to_local_raft_unchecked,
-    update_cluster_node_role_with_host, update_cluster_raft_role_with_host, upsert_member_record,
-    write_cluster_state, write_local_cluster_connectivity_records,
+    sync_cluster_connectivity_records_to_quorum_with_host, sync_cluster_state_to_kv_with_host,
+    sync_cluster_state_to_local_raft_unchecked, update_cluster_node_role_with_host,
+    update_cluster_raft_role_with_host, upsert_member_record, write_cluster_state,
+    write_local_cluster_connectivity_records,
 };
 
 pub type ClusterId = sinomo_core::Id;
