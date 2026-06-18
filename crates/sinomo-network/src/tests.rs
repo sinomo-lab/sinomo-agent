@@ -14,9 +14,12 @@ use crate::lan::{
 };
 use crate::object::{DaemonControlStream, read_object_frame_blocking, write_object_frame_blocking};
 use crate::peer::{
-    AsyncNetworkServiceHandle, AsyncNetworkTransport, AsyncNetworkTransportFuture, InboundFrame,
-    MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrame, NetworkFrameId, NetworkService,
-    NetworkServiceActorOptions, NetworkServiceCommandOptions, ProtocolMessage,
+    AsyncNetworkServiceHandle, AsyncNetworkTransport, AsyncNetworkTransportFuture, DeliveryAck,
+    DeliveryLedger, DeliveryStatus, Heartbeat, HeartbeatPolicy, InProcessRouter, InboundFrame,
+    InboundOutcome, MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrame, NetworkFrameId,
+    NetworkService, NetworkServiceActorOptions, NetworkServiceCommandOptions, NodeEndpoint,
+    PeerEndpointCandidate, PeerRegistry, PeerStatus, ProtocolMessage, RetryPolicy, RouteDelivery,
+    RouteDeliveryId, TransportKind,
 };
 use crate::prelude::*;
 use crate::roaming::{

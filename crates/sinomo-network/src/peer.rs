@@ -7,9 +7,11 @@ use std::future::Future;
 #[cfg(test)]
 use std::pin::Pin;
 use std::sync::Condvar;
+#[cfg(test)]
 use std::time::Instant;
 
 #[derive(Clone, Debug, Default)]
+#[cfg(test)]
 pub struct PeerRegistry {
     cluster_id: Option<ClusterId>,
     nodes: BTreeMap<NodeId, NodeProfile>,
@@ -22,6 +24,7 @@ pub struct PeerRegistry {
     routable_sessions: BTreeMap<SessionId, BTreeSet<NodeId>>,
 }
 
+#[cfg(test)]
 impl PeerRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -29,10 +32,6 @@ impl PeerRegistry {
 
     pub fn cluster_id(&self) -> Option<&ClusterId> {
         self.cluster_id.as_ref()
-    }
-
-    pub fn set_cluster_id(&mut self, cluster_id: ClusterId) {
-        self.cluster_id = Some(cluster_id);
     }
 
     pub fn register_node(&mut self, profile: NodeProfile) -> Option<NodeProfile> {
@@ -72,10 +71,6 @@ impl PeerRegistry {
 
     pub fn cluster_member(&self, node_id: &NodeId) -> Option<&ClusterMemberRecord> {
         self.cluster_members.get(node_id)
-    }
-
-    pub fn cluster_members(&self) -> Vec<&ClusterMemberRecord> {
-        self.cluster_members.values().collect()
     }
 
     pub fn replace_endpoint_candidates(
@@ -260,11 +255,13 @@ impl PeerRegistry {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg(test)]
 pub struct InProcessRouter {
     registry: PeerRegistry,
     next_delivery_id: u64,
 }
 
+#[cfg(test)]
 impl InProcessRouter {
     pub fn new(registry: PeerRegistry) -> Self {
         Self {
@@ -336,12 +333,14 @@ impl InProcessRouter {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[cfg(test)]
 pub struct NodeEndpoint {
     pub node_id: NodeId,
     pub transport: TransportKind,
     pub address: String,
 }
 
+#[cfg(test)]
 impl NodeEndpoint {
     pub fn in_process(node_id: NodeId) -> Self {
         Self {
@@ -362,6 +361,7 @@ impl NodeEndpoint {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
+#[cfg(test)]
 pub enum TransportKind {
     InProcess,
     Loopback,
@@ -373,6 +373,7 @@ pub enum TransportKind {
     HttpsRelay,
 }
 
+#[cfg(test)]
 impl TransportKind {
     pub fn from_cluster_transport(transport: &sinomo_core::ClusterTransportKind) -> Self {
         match transport {
@@ -436,12 +437,14 @@ pub enum EndpointCandidateStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[cfg(test)]
 pub struct PeerState {
     pub endpoint: NodeEndpoint,
     pub status: PeerStatus,
     pub link: LinkState,
 }
 
+#[cfg(test)]
 impl PeerState {
     pub fn new(endpoint: NodeEndpoint) -> Self {
         Self {
@@ -454,6 +457,7 @@ impl PeerState {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
+#[cfg(test)]
 pub enum PeerStatus {
     Healthy,
     Degraded,
@@ -462,6 +466,7 @@ pub enum PeerStatus {
     Unknown,
 }
 
+#[cfg(test)]
 impl PeerStatus {
     pub fn can_route_reactive(&self) -> bool {
         matches!(self, Self::Healthy | Self::Degraded | Self::Unknown)
@@ -469,12 +474,14 @@ impl PeerStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[cfg(test)]
 pub struct LinkState {
     pub peer_node_id: NodeId,
     pub last_seen_tick: Option<u64>,
     pub missed_heartbeats: u16,
 }
 
+#[cfg(test)]
 impl LinkState {
     pub fn new(peer_node_id: NodeId) -> Self {
         Self {
@@ -486,11 +493,13 @@ impl LinkState {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[cfg(test)]
 pub struct HeartbeatPolicy {
     pub suspect_after_missed: u16,
     pub offline_after_missed: u16,
 }
 
+#[cfg(test)]
 impl Default for HeartbeatPolicy {
     fn default() -> Self {
         Self {
@@ -765,8 +774,11 @@ pub struct InProcessNetwork {
 }
 
 pub(crate) const IN_PROCESS_MAILBOX_CAPACITY: usize = 4096;
+#[cfg(test)]
 pub(crate) const DELIVERY_LEDGER_CAPACITY: usize = 8192;
+#[cfg(test)]
 pub(crate) const DELIVERY_LEDGER_TERMINAL_RECORD_CAP: usize = 1024;
+#[cfg(test)]
 const LATENCY_CLASS_READY_PRIORITY_COUNT: usize = 4;
 
 impl InProcessNetwork {
@@ -2603,6 +2615,7 @@ pub struct DeliveryAck {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
+#[cfg(test)]
 pub enum InboundOutcome {
     EventAccepted {
         delivery_id: RouteDeliveryId,
@@ -2657,10 +2670,12 @@ pub enum InboundOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[cfg(test)]
 pub struct RetryPolicy {
     pub max_attempts: u16,
 }
 
+#[cfg(test)]
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self { max_attempts: 3 }
@@ -2668,6 +2683,7 @@ impl Default for RetryPolicy {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(test)]
 pub struct DeliveryLedger {
     retry_policy: RetryPolicy,
     capacity: usize,
@@ -2690,6 +2706,7 @@ pub struct DeliveryLedger {
     terminal_record_ids: BTreeSet<RouteDeliveryId>,
 }
 
+#[cfg(test)]
 impl DeliveryLedger {
     pub fn new(retry_policy: RetryPolicy) -> Self {
         Self::with_capacity(retry_policy, DELIVERY_LEDGER_CAPACITY)
@@ -3493,6 +3510,7 @@ impl DeliveryLedger {
     }
 }
 
+#[cfg(test)]
 fn remove_deadline_index_entry(
     index: &mut BTreeMap<Instant, BTreeSet<RouteDeliveryId>>,
     deadline: Instant,
@@ -3509,6 +3527,7 @@ fn remove_deadline_index_entry(
     }
 }
 
+#[cfg(test)]
 fn remove_target_index_entry(
     index: &mut BTreeMap<NodeId, BTreeSet<RouteDeliveryId>>,
     target_node_id: &NodeId,
@@ -3525,9 +3544,12 @@ fn remove_target_index_entry(
     }
 }
 
+#[cfg(test)]
 const MAX_DELIVERY_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+#[cfg(test)]
 const MAX_DELIVERY_RETRY_JITTER: Duration = Duration::from_secs(2);
 
+#[cfg(test)]
 fn latency_class_ready_priority(latency_class: &LatencyClass) -> u8 {
     match latency_class {
         LatencyClass::Reactive => 0,
@@ -3537,6 +3559,7 @@ fn latency_class_ready_priority(latency_class: &LatencyClass) -> u8 {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn ack_timeout_for_latency_class(latency_class: &LatencyClass) -> Duration {
     match latency_class {
         LatencyClass::Reactive => Duration::from_millis(250),
@@ -3546,10 +3569,12 @@ pub(crate) fn ack_timeout_for_latency_class(latency_class: &LatencyClass) -> Dur
     }
 }
 
+#[cfg(test)]
 fn ack_timeout_for_record(record: &DeliveryRecord) -> Duration {
     ack_timeout_for_latency_class(&record.delivery.latency_class)
 }
 
+#[cfg(test)]
 fn retry_delay_for_record(record: &DeliveryRecord) -> Duration {
     let base = match record.delivery.latency_class {
         LatencyClass::Reactive => Duration::from_millis(25),
@@ -3564,6 +3589,7 @@ fn retry_delay_for_record(record: &DeliveryRecord) -> Duration {
     backoff + retry_jitter_for_record(record, backoff)
 }
 
+#[cfg(test)]
 fn retry_jitter_for_record(record: &DeliveryRecord, backoff: Duration) -> Duration {
     if !matches!(
         record.delivery.latency_class,
@@ -3581,6 +3607,7 @@ fn retry_jitter_for_record(record: &DeliveryRecord, backoff: Duration) -> Durati
     Duration::from_millis(jitter_ms)
 }
 
+#[cfg(test)]
 impl Default for DeliveryLedger {
     fn default() -> Self {
         Self::new(RetryPolicy::default())
@@ -3588,6 +3615,7 @@ impl Default for DeliveryLedger {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[cfg(test)]
 pub struct DeliveryRecord {
     pub delivery: RouteDelivery,
     pub event: EventEnvelope,
@@ -3598,6 +3626,7 @@ pub struct DeliveryRecord {
 pub struct RouteDeliveryId(pub u64);
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[cfg(test)]
 pub struct RouteDelivery {
     pub delivery_id: RouteDeliveryId,
     pub event_sequence: EventSequence,
@@ -3609,6 +3638,7 @@ pub struct RouteDelivery {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
+#[cfg(test)]
 pub enum DeliveryStatus {
     Queued,
     Sent,
@@ -3618,6 +3648,7 @@ pub enum DeliveryStatus {
     Failed,
 }
 
+#[cfg(test)]
 impl DeliveryStatus {
     fn is_terminal(&self) -> bool {
         matches!(self, Self::Delivered | Self::Failed)

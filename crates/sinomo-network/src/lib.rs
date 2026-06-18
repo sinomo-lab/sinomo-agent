@@ -73,12 +73,8 @@ pub use object::{
     write_object_frame_async, write_object_stream_chunks_async,
 };
 pub use peer::{
-    AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions, DeliveryAck,
-    DeliveryLedger, DeliveryRecord, DeliveryStatus, EndpointCandidateStatus, Heartbeat,
-    HeartbeatPolicy, InProcessNetwork, InProcessObjectRpcMessage, InProcessRouter,
-    InProcessTransport, InboundObjectRpcMessage, InboundOutcome, LinkState, NodeEndpoint,
-    PeerEndpointCandidate, PeerRegistry, PeerState, PeerStatus, RetryPolicy, RouteDelivery,
-    RouteDeliveryId, TransportKind,
+    AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions, InProcessNetwork,
+    InProcessObjectRpcMessage, InProcessTransport, InboundObjectRpcMessage,
 };
 pub(crate) use roaming::read_iroh_endpoint_record_async;
 pub use roaming::{
@@ -412,14 +408,15 @@ pub(crate) mod prelude {
         CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
         ClusterEndpointSource, ClusterInvitationChannel, ClusterJoinInvite, ClusterMemberRecord,
         ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability, ClusterNodeRole,
-        ClusterNodeStatusRecord, ClusterTransportKind, EventEnvelope, LatencyClass, RoutingScope,
-        TrustDomain,
+        ClusterNodeStatusRecord, ClusterTransportKind, EventEnvelope, TrustDomain,
     };
     #[cfg(test)]
+    pub(crate) use sinomo_core::{LatencyClass, RoutingScope};
+    #[cfg(test)]
     pub(crate) use sinomo_events::EventStore;
-    pub(crate) use sinomo_events::{
-        EventId, EventSequence, EventStoreError, SessionId, StoredEvent,
-    };
+    pub(crate) use sinomo_events::{EventId, EventStoreError};
+    #[cfg(test)]
+    pub(crate) use sinomo_events::{EventSequence, SessionId, StoredEvent};
     #[cfg(test)]
     pub(crate) use sinomo_kv::KvLogEntry;
     #[cfg(test)]
@@ -433,9 +430,11 @@ pub(crate) mod prelude {
     #[cfg(test)]
     pub(crate) use sinomo_kv::{KvWalPaths, WatchId};
     pub(crate) use sinomo_local::SinomoDataDir;
+    #[cfg(test)]
+    pub(crate) use sinomo_node::{NodeAvailability, NodeHealth, NodeProfile};
     pub(crate) use sinomo_node::{
-        NodeAvailability, NodeHealth, NodeId, NodeProfile, daemon_lan_endpoint_id,
-        daemon_loopback_endpoint_id, main_daemon_capabilities, shadow_daemon_node_id,
+        NodeId, daemon_lan_endpoint_id, daemon_loopback_endpoint_id, main_daemon_capabilities,
+        shadow_daemon_node_id,
     };
     #[cfg(test)]
     pub(crate) use std::collections::HashSet;
