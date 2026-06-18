@@ -24,8 +24,8 @@ pub(crate) use crate::connectivity_store::{
     write_local_cluster_connectivity_record_set,
 };
 use crate::endpoint_records::{
-    cleanup_cluster_iroh_endpoints, cleanup_member_iroh_endpoints, cluster_endpoint_list_stable_eq,
-    cluster_endpoint_stable_eq, upsert_member_endpoint,
+    cleanup_cluster_iroh_endpoints, cleanup_member_iroh_endpoints, cluster_endpoint_stable_eq,
+    upsert_member_endpoint,
 };
 use crate::endpoint_selector::{
     ClusterEndpointSelectionPurpose, ClusterEndpointSelector, cluster_raft_live_voter_targets,
@@ -155,6 +155,13 @@ use crate::maintenance::{
 use crate::member_publish::{
     ClusterLocalMemberPublishHost, ClusterMemberPublishHost,
     handle_cluster_member_publish_request_with_host,
+};
+pub(crate) use crate::member_store::{
+    apply_cluster_raft_role, cluster_raft_state_for_role, merge_cluster_state_from_peer,
+};
+pub use crate::member_store::{
+    cluster_bootstrap_state_stable_eq, cluster_member_stable_eq, merge_member_record,
+    upsert_member_record,
 };
 use crate::membership::{
     DAEMON_SHADOW_CLUSTER_ROLE, cluster_capabilities_are_legacy_shadow_only,
@@ -3438,22 +3445,6 @@ fn cluster_connectivity_probe_state_rank(record: Option<&ClusterConnectivityReco
     }
 }
 
-pub(crate) fn apply_cluster_raft_role(
-    member: &mut ClusterMemberRecord,
-    role: ClusterMemberRole,
-    timestamp: OffsetDateTime,
-) {
-    sinomo_node::apply_cluster_raft_role(member, role, timestamp);
-}
-
-pub(crate) fn cluster_raft_state_for_role(role: &ClusterMemberRole) -> ClusterMemberState {
-    match role {
-        ClusterMemberRole::Voter => ClusterMemberState::Voter,
-        ClusterMemberRole::Learner => ClusterMemberState::Learner,
-        ClusterMemberRole::NonVoting => ClusterMemberState::NonVoting,
-    }
-}
-
 #[cfg(test)]
 fn cluster_member_put_op(member: &ClusterMemberRecord) -> Result<KvOp, NetworkError> {
     KvOp::put_serde(cluster_member_key(&member.node_id), member, None).map_err(NetworkError::from)
@@ -5964,40 +5955,6 @@ pub fn cluster_member_unreachable_via_connectivity(
     has_probeable_endpoint
 }
 
-pub fn cluster_bootstrap_state_stable_eq(
-    left: &ClusterBootstrapState,
-    right: &ClusterBootstrapState,
-) -> bool {
-    left.cluster_id == right.cluster_id
-        && left.cluster_name == right.cluster_name
-        && left.local_node_id == right.local_node_id
-        && left.local_node_display_name == right.local_node_display_name
-        && left.term == right.term
-        && left.initialized_at == right.initialized_at
-        && left.members.len() == right.members.len()
-        && left
-            .members
-            .iter()
-            .zip(right.members.iter())
-            .all(|(left, right)| cluster_member_stable_eq(left, right))
-}
-
-pub fn cluster_member_stable_eq(left: &ClusterMemberRecord, right: &ClusterMemberRecord) -> bool {
-    left.cluster_id == right.cluster_id
-        && left.node_id == right.node_id
-        && left.display_name == right.display_name
-        && left.node_role == right.node_role
-        && left.role == right.role
-        && left.state == right.state
-        && left.trust_domain == right.trust_domain
-        && left.node_public_key == right.node_public_key
-        && left.certificate_id == right.certificate_id
-        && left.capabilities == right.capabilities
-        && left.allowed_capabilities == right.allowed_capabilities
-        && cluster_endpoint_list_stable_eq(&left.endpoints, &right.endpoints)
-        && left.joined_at == right.joined_at
-}
-
 /// The local node's current cluster KV snapshot revision, if one is readable;
 /// `None` asks the voter to ship its full snapshot back.
 pub(crate) fn local_cluster_kv_snapshot_revision(paths: &ClusterPaths) -> Option<KvRevision> {
@@ -6113,67 +6070,4 @@ fn cluster_kv_put_value_is_noop(paths: &ClusterPaths, op: &KvOp) -> Result<bool,
         return Ok(false);
     };
     Ok(entry.value.as_slice() == value.as_slice() && entry.lease_id == *lease_id)
-}
-
-pub fn merge_cluster_state_from_peer(
-    local: &mut ClusterBootstrapState,
-    peer: ClusterBootstrapState,
-) -> bool {
-    if peer.cluster_id != local.cluster_id {
-        return false;
-    }
-    let mut changed = false;
-    for member in peer.members {
-        changed |= merge_member_record(local, member);
-    }
-    if peer.kv_revision > local.kv_revision {
-        local.kv_revision = peer.kv_revision;
-    }
-    if peer.updated_at > local.updated_at {
-        local.updated_at = peer.updated_at;
-    }
-    changed
-}
-
-pub fn merge_member_record(
-    local: &mut ClusterBootstrapState,
-    incoming: ClusterMemberRecord,
-) -> bool {
-    if incoming.cluster_id != local.cluster_id {
-        return false;
-    }
-    if let Some(existing) = local
-        .members
-        .iter_mut()
-        .find(|member| member.node_id == incoming.node_id)
-    {
-        let mut changed = false;
-        if incoming.updated_at > existing.updated_at {
-            *existing = incoming;
-            cleanup_member_iroh_endpoints(existing);
-            return true;
-        }
-        for endpoint in incoming.endpoints {
-            changed |= upsert_member_endpoint(existing, endpoint);
-        }
-        changed |= cleanup_member_iroh_endpoints(existing);
-        changed
-    } else {
-        let mut incoming = incoming;
-        cleanup_member_iroh_endpoints(&mut incoming);
-        local.members.push(incoming);
-        true
-    }
-}
-
-pub fn upsert_member_record(state: &mut ClusterBootstrapState, member: ClusterMemberRecord) {
-    if let Some(existing) = state
-        .members
-        .iter_mut()
-        .find(|existing| existing.node_id == member.node_id)
-    {
-        *existing = member;
-    } else {
-        state.members.push(member);
-    }
 }

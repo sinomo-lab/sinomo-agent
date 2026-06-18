@@ -36,6 +36,7 @@ mod local_membership;
 mod local_state_store;
 mod maintenance;
 mod member_publish;
+mod member_store;
 mod membership;
 mod membership_forward;
 mod membership_rpc;
