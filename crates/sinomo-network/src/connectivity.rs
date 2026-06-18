@@ -1,5 +1,11 @@
-use crate::maintenance::cluster_network_probe_interval_for_role;
+use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
+use crate::maintenance::{
+    CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS,
+    cluster_connectivity_probe_max_endpoints_per_tick_for_role,
+    cluster_network_probe_interval_for_role,
+};
 use crate::prelude::*;
+use crate::route_graph_read_model::read_cluster_connectivity_graph;
 use crate::{ClusterPaths, NetworkError};
 
 pub const CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD: u16 = 3;
@@ -75,6 +81,113 @@ pub struct ClusterConnectivityProbeBatch {
     pub active_keys: BTreeSet<String>,
     pub entries: Vec<ClusterConnectivityProbeBatchEntry>,
     pub next_cursor: usize,
+}
+
+pub fn select_cluster_connectivity_probe_batch(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    connectivity: &mut BTreeMap<String, ClusterConnectivityProbeState>,
+    connectivity_cursor: usize,
+    local_node_role: &ClusterNodeRole,
+    startup_settle_active: bool,
+    now: OffsetDateTime,
+) -> ClusterConnectivityProbeBatch {
+    let refresh_deadline =
+        now + time::Duration::seconds(CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS);
+    let targets = ClusterEndpointSelector::new(paths, state)
+        .select(ClusterEndpointSelectionPurpose::NetworkProbe);
+    let active_keys = targets
+        .iter()
+        .map(|endpoint| cluster_connectivity_probe_key(&state.local_node_id, endpoint))
+        .collect::<BTreeSet<_>>();
+
+    // Seed the in-memory probe cache from the merged graph (KV + the local probe store,
+    // local-authoritative for our own edges). A learner cannot commit its connectivity
+    // edges to KV, so seeding from KV alone would discard its last-known reachability.
+    if connectivity.is_empty() {
+        for record in read_cluster_connectivity_graph(paths)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|record| record.source_node_id == state.local_node_id)
+        {
+            // Must match `cluster_connectivity_probe_key` ("src:tgt:endpoint"),
+            // not the KV key, or the seed never lands in the probe cache.
+            let key = format!(
+                "{}:{}:{}",
+                record.source_node_id, record.target_node_id, record.endpoint_id
+            );
+            if active_keys.contains(&key) {
+                connectivity.insert(key, ClusterConnectivityProbeState { record });
+            }
+        }
+    }
+
+    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
+    let mut probe_entries = targets
+        .iter()
+        .filter_map(|endpoint| {
+            let key = cluster_connectivity_probe_key(&state.local_node_id, endpoint);
+            let previous = connectivity.get(&key).map(|probe| probe.record.clone());
+            let due = previous.as_ref().is_none_or(|record| {
+                cluster_connectivity_probe_due_with_graph(
+                    record,
+                    endpoint,
+                    now,
+                    refresh_deadline,
+                    local_node_role,
+                    &graph,
+                    &state.local_node_id,
+                    startup_settle_active,
+                )
+            });
+            due.then(|| ClusterConnectivityProbeBatchEntry {
+                key,
+                endpoint: endpoint.clone(),
+                previous,
+            })
+        })
+        .collect::<Vec<_>>();
+    probe_entries.sort_by_key(|entry| {
+        (
+            cluster_connectivity_probe_expiry_rank(entry.previous.as_ref()),
+            cluster_connectivity_probe_state_rank(entry.previous.as_ref()),
+            entry.endpoint.node_id.clone(),
+            entry.endpoint.priority,
+            entry.endpoint.address.clone(),
+        )
+    });
+    let probe_count =
+        probe_entries
+            .len()
+            .min(cluster_connectivity_probe_max_endpoints_per_tick_for_role(
+                local_node_role,
+            ));
+    let _ = connectivity_cursor;
+    let next_cursor = 0;
+    let entries = probe_entries.into_iter().take(probe_count).collect();
+
+    ClusterConnectivityProbeBatch {
+        active_keys,
+        entries,
+        next_cursor,
+    }
+}
+
+fn cluster_connectivity_probe_expiry_rank(
+    record: Option<&ClusterConnectivityRecord>,
+) -> OffsetDateTime {
+    record
+        .map(|record| record.expires_at)
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+}
+
+fn cluster_connectivity_probe_state_rank(record: Option<&ClusterConnectivityRecord>) -> u8 {
+    match record.map(|record| &record.state) {
+        None => 0,
+        Some(ClusterConnectivityState::Healthy) => 1,
+        Some(ClusterConnectivityState::Degraded) => 2,
+        Some(ClusterConnectivityState::Unreachable) => 3,
+    }
 }
 
 pub fn cluster_connectivity_record_for_probe_outcome(

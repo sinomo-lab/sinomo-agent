@@ -1,9 +1,5 @@
 use crate::ClusterPaths;
-use crate::connectivity::{
-    ClusterConnectivityGraph, ClusterConnectivityProbeBatch, ClusterConnectivityProbeBatchEntry,
-    ClusterConnectivityProbeState, ClusterConnectivityRecord, ClusterConnectivityState,
-    cluster_connectivity_probe_due_with_graph, cluster_connectivity_probe_key,
-};
+use crate::connectivity::{ClusterConnectivityRecord, ClusterConnectivityState};
 pub(crate) use crate::connectivity_publish::{
     ClusterConnectivityPublishHost, ClusterNetworkRecordExpiryHost,
 };
@@ -27,8 +23,8 @@ use crate::endpoint_records::{
     cleanup_cluster_iroh_endpoints, cleanup_member_iroh_endpoints, upsert_member_endpoint,
 };
 use crate::endpoint_selector::{
-    ClusterEndpointSelectionPurpose, ClusterEndpointSelector, cluster_raft_live_voter_targets,
-    cluster_raft_live_voter_targets_async, cluster_raft_member_replication_targets_async,
+    cluster_raft_live_voter_targets, cluster_raft_live_voter_targets_async,
+    cluster_raft_member_replication_targets_async,
 };
 use crate::error::NetworkError;
 use crate::invite_publish::{
@@ -141,11 +137,6 @@ pub use crate::local_state_store::{
     read_cluster_state_without_kv, read_cluster_state_without_kv_async, write_cluster_state,
     write_cluster_state_async,
 };
-use crate::maintenance::{
-    CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS, CLUSTER_NETWORK_PUBLISH_INTERVAL,
-    cluster_connectivity_probe_max_endpoints_per_tick_for_role,
-    cluster_network_publish_interval_for_role,
-};
 use crate::member_publish::{
     ClusterLocalMemberPublishHost, ClusterMemberPublishHost,
     handle_cluster_member_publish_request_with_host,
@@ -181,6 +172,7 @@ use crate::prelude::*;
 pub(crate) use crate::records::ClusterCapabilityPolicyRecord;
 use crate::records::ClusterIdentityRecord;
 use crate::route::ClusterSignedEndpointRpcAsyncHost;
+#[cfg(test)]
 pub(crate) use crate::route_graph_read_model::read_cluster_connectivity_graph;
 #[cfg(test)]
 pub(crate) use crate::route_graph_read_model::read_cluster_connectivity_graph_with_query;
@@ -195,7 +187,7 @@ use crate::voter_reachability::{
     ClusterVoterReachabilityOptions, cluster_has_local_quorum_with_host,
     cluster_reachable_voter_count_async_with_host, cluster_reachable_voter_count_with_host,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3271,129 +3263,6 @@ where
         other => Err(E::from(NetworkError::UnknownRoute {
             route: other.to_string(),
         })),
-    }
-}
-
-pub fn cluster_network_publish_interval_for_node(
-    paths: &ClusterPaths,
-    node_id: &NodeId,
-) -> Duration {
-    read_cluster_state_without_kv(paths)
-        .ok()
-        .and_then(|state| {
-            state
-                .members
-                .iter()
-                .find(|member| member.node_id == *node_id)
-                .map(|member| cluster_network_publish_interval_for_role(&member.node_role))
-        })
-        .unwrap_or(CLUSTER_NETWORK_PUBLISH_INTERVAL)
-}
-
-pub fn select_cluster_connectivity_probe_batch(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    connectivity: &mut BTreeMap<String, ClusterConnectivityProbeState>,
-    connectivity_cursor: usize,
-    local_node_role: &ClusterNodeRole,
-    startup_settle_active: bool,
-    now: OffsetDateTime,
-) -> ClusterConnectivityProbeBatch {
-    let refresh_deadline =
-        now + time::Duration::seconds(CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS);
-    let targets = ClusterEndpointSelector::new(paths, state)
-        .select(ClusterEndpointSelectionPurpose::NetworkProbe);
-    let active_keys = targets
-        .iter()
-        .map(|endpoint| cluster_connectivity_probe_key(&state.local_node_id, endpoint))
-        .collect::<BTreeSet<_>>();
-
-    // Seed the in-memory probe cache from the merged graph (KV + the local probe store,
-    // local-authoritative for our own edges). A learner cannot commit its connectivity
-    // edges to KV, so seeding from KV alone would discard its last-known reachability.
-    if connectivity.is_empty() {
-        for record in read_cluster_connectivity_graph(paths)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|record| record.source_node_id == state.local_node_id)
-        {
-            // Must match `cluster_connectivity_probe_key` ("src:tgt:endpoint"),
-            // not the KV key, or the seed never lands in the probe cache.
-            let key = format!(
-                "{}:{}:{}",
-                record.source_node_id, record.target_node_id, record.endpoint_id
-            );
-            if active_keys.contains(&key) {
-                connectivity.insert(key, ClusterConnectivityProbeState { record });
-            }
-        }
-    }
-
-    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
-    let mut probe_entries = targets
-        .iter()
-        .filter_map(|endpoint| {
-            let key = cluster_connectivity_probe_key(&state.local_node_id, endpoint);
-            let previous = connectivity.get(&key).map(|probe| probe.record.clone());
-            let due = previous.as_ref().is_none_or(|record| {
-                cluster_connectivity_probe_due_with_graph(
-                    record,
-                    endpoint,
-                    now,
-                    refresh_deadline,
-                    local_node_role,
-                    &graph,
-                    &state.local_node_id,
-                    startup_settle_active,
-                )
-            });
-            due.then(|| ClusterConnectivityProbeBatchEntry {
-                key,
-                endpoint: endpoint.clone(),
-                previous,
-            })
-        })
-        .collect::<Vec<_>>();
-    probe_entries.sort_by_key(|entry| {
-        (
-            cluster_connectivity_probe_expiry_rank(entry.previous.as_ref()),
-            cluster_connectivity_probe_state_rank(entry.previous.as_ref()),
-            entry.endpoint.node_id.clone(),
-            entry.endpoint.priority,
-            entry.endpoint.address.clone(),
-        )
-    });
-    let probe_count =
-        probe_entries
-            .len()
-            .min(cluster_connectivity_probe_max_endpoints_per_tick_for_role(
-                local_node_role,
-            ));
-    let _ = connectivity_cursor;
-    let next_cursor = 0;
-    let entries = probe_entries.into_iter().take(probe_count).collect();
-
-    ClusterConnectivityProbeBatch {
-        active_keys,
-        entries,
-        next_cursor,
-    }
-}
-
-fn cluster_connectivity_probe_expiry_rank(
-    record: Option<&ClusterConnectivityRecord>,
-) -> OffsetDateTime {
-    record
-        .map(|record| record.expires_at)
-        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
-}
-
-fn cluster_connectivity_probe_state_rank(record: Option<&ClusterConnectivityRecord>) -> u8 {
-    match record.map(|record| &record.state) {
-        None => 0,
-        Some(ClusterConnectivityState::Healthy) => 1,
-        Some(ClusterConnectivityState::Degraded) => 2,
-        Some(ClusterConnectivityState::Unreachable) => 3,
     }
 }
 

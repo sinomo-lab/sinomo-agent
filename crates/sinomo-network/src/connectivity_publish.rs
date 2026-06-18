@@ -3,7 +3,10 @@ use crate::connectivity::ClusterConnectivityRecord;
 use crate::connectivity_store::write_local_cluster_connectivity_record_set;
 use crate::error::NetworkError;
 use crate::keyspace::{cluster_connectivity_key, cluster_connectivity_source_prefix};
-use crate::maintenance::CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS;
+use crate::maintenance::{
+    CLUSTER_NETWORK_PUBLISH_INTERVAL, CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS,
+    cluster_network_publish_interval_for_role,
+};
 use crate::membership::cluster_node_is_local_process;
 use crate::network_info::ClusterNetworkInfoRecord;
 use crate::prelude::*;
@@ -17,6 +20,7 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 use time::OffsetDateTime;
 
 pub const MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS: usize = CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
@@ -88,6 +92,22 @@ pub trait ClusterConnectivityPublishAsyncHost {
         state: &'a mut ClusterBootstrapState,
         txn: KvTxn,
     ) -> ClusterMembershipRpcFuture<'a, KvSnapshot>;
+}
+
+pub fn cluster_network_publish_interval_for_node(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+) -> Duration {
+    read_cluster_state_without_kv(paths)
+        .ok()
+        .and_then(|state| {
+            state
+                .members
+                .iter()
+                .find(|member| member.node_id == *node_id)
+                .map(|member| cluster_network_publish_interval_for_role(&member.node_role))
+        })
+        .unwrap_or(CLUSTER_NETWORK_PUBLISH_INTERVAL)
 }
 
 pub(crate) fn validate_cluster_connectivity_records_for_source(
