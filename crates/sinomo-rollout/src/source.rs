@@ -13,12 +13,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const ROLLOUT_BUILD_EXCLUDED_WORKSPACE_MEMBER: &str = "crates/sinomo-app";
 
+#[cfg(windows)]
+fn rollout_child_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+#[cfg(not(windows))]
+fn rollout_child_command(program: &str) -> Command {
+    Command::new(program)
+}
+
 pub fn discover_current_git_repo() -> Result<Option<PathBuf>, RolloutError> {
     let current_dir = std::env::current_dir().map_err(|source| RolloutError::Io {
         path: ".".to_string(),
         detail: source.to_string(),
     })?;
-    let output = Command::new("git")
+    let output = rollout_child_command("git")
         .args(["-C"])
         .arg(&current_dir)
         .args(["rev-parse", "--show-toplevel"])
@@ -53,7 +68,7 @@ pub fn rollout_artifact_suffix() -> String {
 }
 
 pub fn rollout_source_head(repo: &Path) -> Result<String, RolloutError> {
-    let output = Command::new("git")
+    let output = rollout_child_command("git")
         .arg("-C")
         .arg(repo)
         .args(["rev-parse", "--short=8", "HEAD"])
@@ -115,7 +130,7 @@ pub fn rollout_build_dev_artifacts(
     let modules = discover_default_native_dylib_module_builds(repo)?;
     let build_args = rollout_build_args(&modules);
     let _workspace_manifest = prepare_rollout_build_workspace_manifest(repo)?;
-    let build = Command::new("cargo")
+    let build = rollout_child_command("cargo")
         .args(&build_args)
         .current_dir(repo)
         .output()
@@ -171,7 +186,7 @@ fn rollout_build_dev_native_dylib_modules(
     let modules = discover_default_native_dylib_module_builds(repo)?;
     let build_args = rollout_module_build_args(&modules);
     let _workspace_manifest = prepare_rollout_build_workspace_manifest(repo)?;
-    let build = Command::new("cargo")
+    let build = rollout_child_command("cargo")
         .args(&build_args)
         .current_dir(repo)
         .output()
@@ -239,7 +254,7 @@ pub fn rollout_build_dev_native_dylib_module(
     };
     let build_args = rollout_single_module_build_args(&module);
     let _workspace_manifest = prepare_rollout_build_workspace_manifest(repo)?;
-    let build = Command::new("cargo")
+    let build = rollout_child_command("cargo")
         .args(&build_args)
         .current_dir(repo)
         .output()
@@ -601,7 +616,7 @@ pub fn deploy_managed_source_repo_with_options(
     let next = paths.source_repo.with_extension("next");
     let previous = paths.source_repo.with_extension("previous");
     remove_dir_if_exists(&next)?;
-    let output = Command::new("git")
+    let output = rollout_child_command("git")
         .arg("clone")
         .arg("--no-hardlinks")
         .arg(source_repo)
@@ -699,7 +714,7 @@ pub fn create_source_repo_bundle(
         })?;
     }
     let _ = fs::remove_file(bundle_path);
-    let output = Command::new("git")
+    let output = rollout_child_command("git")
         .arg("-C")
         .arg(source_repo)
         .args(["bundle", "create"])
@@ -765,7 +780,7 @@ pub fn deploy_managed_source_bundle_with_options(
     let next = paths.source_repo.with_extension("next");
     let previous = paths.source_repo.with_extension("previous");
     remove_dir_if_exists(&next)?;
-    let output = Command::new("git")
+    let output = rollout_child_command("git")
         .arg("clone")
         .arg(bundle_path)
         .arg(&next)
@@ -874,7 +889,7 @@ fn merge_bundle_head_into_managed(
     options: ManagedSourceDeployOptions,
 ) -> Result<(), RolloutError> {
     require_git_repo(&paths.source_repo, "managed source repo")?;
-    let fetch = Command::new("git")
+    let fetch = rollout_child_command("git")
         .arg("-C")
         .arg(&paths.source_repo)
         .arg("fetch")
@@ -1017,7 +1032,7 @@ fn git_lines(repo: &Path, args: &[&str]) -> Result<Vec<String>, RolloutError> {
 }
 
 fn run_git(repo: &Path, args: &[&str]) -> Result<String, RolloutError> {
-    let output = Command::new("git")
+    let output = rollout_child_command("git")
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -1037,7 +1052,7 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<String, RolloutError> {
 }
 
 fn run_git_paths(repo: &Path, args: &[&str], paths: &[&Path]) -> Result<String, RolloutError> {
-    let mut command = Command::new("git");
+    let mut command = rollout_child_command("git");
     command.arg("-C").arg(repo).args(args);
     for path in paths {
         command.arg(path);
@@ -1470,7 +1485,7 @@ default-members = [
     }
 
     fn run_git_for_test(repo: &Path, args: &[&str]) {
-        let output = Command::new("git")
+        let output = rollout_child_command("git")
             .arg("-C")
             .arg(repo)
             .args(args)
