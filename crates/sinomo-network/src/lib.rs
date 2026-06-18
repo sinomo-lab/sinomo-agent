@@ -12,6 +12,7 @@
 //! host filesystem and transport adapters while cluster-aware validation remains
 //! here.
 
+mod endpoint_advertisement;
 mod endpoint_selector;
 mod error;
 mod health;
@@ -25,6 +26,18 @@ mod route;
 mod rpc;
 mod storage;
 
+#[cfg(test)]
+pub(crate) use endpoint_advertisement::{
+    MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES,
+    PUBLIC_ENDPOINT_REACHABILITY_NEGATIVE_CACHE_TTL, clear_public_endpoint_reachability_cache,
+    daemon_loopback_endpoint, public_endpoint_is_reachable_for_local_ips_async,
+    public_endpoint_is_reachable_for_local_ips_with_probe_at,
+    public_endpoint_is_reachable_with_probe, public_endpoint_is_reachable_with_probe_at,
+};
+pub use endpoint_advertisement::{
+    daemon_advertised_endpoints_from_addresses_with_public_discovery_and_advertise_host_async,
+    daemon_advertised_endpoints_from_static_addresses, daemon_lan_endpoint,
+};
 pub use endpoint_selector::{
     ClusterEndpointSelectionPurpose, ClusterEndpointSelector, advertised_peer_route_targets,
     discover_peer_route_ip_candidates, discover_peer_route_ip_candidates_async,
@@ -232,8 +245,6 @@ pub use storage::{
     cluster_network_stable_discovery_announcement_due,
     commit_cluster_kv_txn_with_quorum_response_async_with_host,
     commit_cluster_raft_index_with_events_async,
-    daemon_advertised_endpoints_from_addresses_with_public_discovery_and_advertise_host_async,
-    daemon_advertised_endpoints_from_static_addresses, daemon_lan_endpoint,
     discard_cluster_raft_uncommitted_tail_and_clear_leader_async,
     forward_cluster_join_challenge_rpc_to_voter_async_with_host,
     handle_cluster_invite_publish_request_async_with_host,
@@ -448,10 +459,7 @@ pub(crate) mod prelude {
     pub(crate) use sinomo_local::SinomoDataDir;
     #[cfg(test)]
     pub(crate) use sinomo_node::{NodeAvailability, NodeHealth, NodeProfile};
-    pub(crate) use sinomo_node::{
-        NodeId, daemon_lan_endpoint_id, daemon_loopback_endpoint_id, main_daemon_capabilities,
-        shadow_daemon_node_id,
-    };
+    pub(crate) use sinomo_node::{NodeId, main_daemon_capabilities, shadow_daemon_node_id};
     #[cfg(test)]
     pub(crate) use std::collections::HashSet;
     pub(crate) use std::collections::{BTreeMap, BTreeSet, VecDeque};

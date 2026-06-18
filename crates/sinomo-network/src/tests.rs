@@ -34,9 +34,8 @@ use crate::rpc::ObjectRpcFuture;
 use crate::storage::*;
 use crate::storage::{
     LocalClusterRaftCommandStorage, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
-    MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS, MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES,
-    cluster_member_removal_txns_from_store, cluster_member_update_ops_from_store,
-    cluster_raft_config_from_store,
+    MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS, cluster_member_removal_txns_from_store,
+    cluster_member_update_ops_from_store, cluster_raft_config_from_store,
 };
 use crate::*;
 use sinomo_kv::ClusterKvRaftConfigRecord;
