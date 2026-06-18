@@ -14,7 +14,7 @@ use sinomo_dfs_cloud_files_api::{
 use sinomo_runtime::core::ClusterEndpointRecord;
 use sinomo_runtime::daemon;
 use sinomo_runtime::dfs::{
-    self, DfsControlPlaneKvClient, DfsFrameTransport, DfsObjectKind, DfsPosixError,
+    self, DfsControlPlaneKvClient, DfsMessageTransport, DfsObjectKind, DfsPosixError,
     DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsTransportIdentity, LocalContentStore,
     NetworkedDfsService,
 };
@@ -837,7 +837,7 @@ impl DfsTransportIdentity for DfsCloudFilesEndpointTransport {
     }
 }
 
-impl DfsFrameTransport for DfsCloudFilesEndpointTransport {
+impl DfsMessageTransport for DfsCloudFilesEndpointTransport {
     fn send(
         &mut self,
         target_node_id: &NodeId,
