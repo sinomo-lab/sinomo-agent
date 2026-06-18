@@ -7945,62 +7945,6 @@ pub trait DfsPeerTransport: Send + Sync {
         request: &ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> Result<ObjectRpcResponse, DfsPeerTransportError>;
-
-    fn send_message(
-        &self,
-        endpoint: &ClusterEndpointRecord,
-        command: &DfsMessageCommand,
-        connect_timeout: Duration,
-    ) -> Result<DfsMessageResponse, DfsPeerTransportError> {
-        let request = dfs_message_rpc_request(command)
-            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-        let response = self.call_object_rpc(
-            endpoint,
-            &request,
-            DfsObjectRpcSendOptions::new(connect_timeout)
-                .with_observe_connectivity(!dfs_message_is_read_only_request(command)),
-        )?;
-        decode_dfs_message_rpc_response(&response)
-            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
-    }
-
-    fn send_metadata_journal_batch(
-        &self,
-        endpoint: &ClusterEndpointRecord,
-        command: &DfsMetadataJournalBatchCommand,
-        connect_timeout: Duration,
-    ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataPeerTransportError> {
-        let request = dfs_metadata_journal_batch_rpc_request(command)
-            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
-        let response = self
-            .call_object_rpc(
-                endpoint,
-                &request,
-                DfsObjectRpcSendOptions::new(connect_timeout),
-            )
-            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
-        decode_dfs_metadata_journal_batch_rpc_response(&response)
-            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
-    }
-
-    fn send_metadata_snapshot_install(
-        &self,
-        endpoint: &ClusterEndpointRecord,
-        command: &DfsMetadataSnapshotInstallCommand,
-        connect_timeout: Duration,
-    ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataPeerTransportError> {
-        let request = dfs_metadata_snapshot_install_rpc_request(command)
-            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
-        let response = self
-            .call_object_rpc(
-                endpoint,
-                &request,
-                DfsObjectRpcSendOptions::new(connect_timeout),
-            )
-            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
-        decode_dfs_metadata_snapshot_install_rpc_response(&response)
-            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
-    }
 }
 
 pub type DfsPeerTransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -8012,78 +7956,6 @@ pub trait AsyncDfsPeerTransport: Send + Sync {
         request: &'a ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResponse, DfsPeerTransportError>>;
-
-    fn send_message_async<'a>(
-        &'a self,
-        endpoint: &'a ClusterEndpointRecord,
-        command: &'a DfsMessageCommand,
-        connect_timeout: Duration,
-    ) -> DfsPeerTransportFuture<'a, Result<DfsMessageResponse, DfsPeerTransportError>> {
-        Box::pin(async move {
-            let request = dfs_message_rpc_request(command)
-                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-            let response = self
-                .call_object_rpc_async(
-                    endpoint,
-                    &request,
-                    DfsObjectRpcSendOptions::new(connect_timeout)
-                        .with_observe_connectivity(!dfs_message_is_read_only_request(command)),
-                )
-                .await?;
-            decode_dfs_message_rpc_response(&response)
-                .map_err(|source| DfsPeerTransportError::new(source.to_string()))
-        })
-    }
-
-    fn send_metadata_journal_batch_async<'a>(
-        &'a self,
-        endpoint: &'a ClusterEndpointRecord,
-        command: &'a DfsMetadataJournalBatchCommand,
-        connect_timeout: Duration,
-    ) -> DfsPeerTransportFuture<
-        'a,
-        Result<DfsMetadataJournalBatchResponse, DfsMetadataPeerTransportError>,
-    > {
-        Box::pin(async move {
-            let request = dfs_metadata_journal_batch_rpc_request(command)
-                .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
-            let response = self
-                .call_object_rpc_async(
-                    endpoint,
-                    &request,
-                    DfsObjectRpcSendOptions::new(connect_timeout),
-                )
-                .await
-                .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
-            decode_dfs_metadata_journal_batch_rpc_response(&response)
-                .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
-        })
-    }
-
-    fn send_metadata_snapshot_install_async<'a>(
-        &'a self,
-        endpoint: &'a ClusterEndpointRecord,
-        command: &'a DfsMetadataSnapshotInstallCommand,
-        connect_timeout: Duration,
-    ) -> DfsPeerTransportFuture<
-        'a,
-        Result<DfsMetadataSnapshotInstallResponse, DfsMetadataPeerTransportError>,
-    > {
-        Box::pin(async move {
-            let request = dfs_metadata_snapshot_install_rpc_request(command)
-                .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
-            let response = self
-                .call_object_rpc_async(
-                    endpoint,
-                    &request,
-                    DfsObjectRpcSendOptions::new(connect_timeout),
-                )
-                .await
-                .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
-            decode_dfs_metadata_snapshot_install_rpc_response(&response)
-                .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
-        })
-    }
 }
 
 pub type AsyncDfsMessageSender = Arc<
@@ -8127,9 +7999,18 @@ pub fn async_dfs_message_sender_from_peer_transport(
     Arc::new(move |endpoint, command, connect_timeout| {
         let peer_transport = Arc::clone(&peer_transport);
         Box::pin(async move {
-            peer_transport
-                .send_message_async(endpoint, command, connect_timeout)
-                .await
+            let request = dfs_message_rpc_request(command)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            let response = peer_transport
+                .call_object_rpc_async(
+                    endpoint,
+                    &request,
+                    DfsObjectRpcSendOptions::new(connect_timeout)
+                        .with_observe_connectivity(!dfs_message_is_read_only_request(command)),
+                )
+                .await?;
+            decode_dfs_message_rpc_response(&response)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))
         })
     })
 }
@@ -8140,9 +8021,18 @@ pub fn async_dfs_metadata_journal_batch_sender_from_peer_transport(
     Arc::new(move |endpoint, command, connect_timeout| {
         let peer_transport = Arc::clone(&peer_transport);
         Box::pin(async move {
-            peer_transport
-                .send_metadata_journal_batch_async(endpoint, command, connect_timeout)
+            let request = dfs_metadata_journal_batch_rpc_request(command)
+                .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
+            let response = peer_transport
+                .call_object_rpc_async(
+                    endpoint,
+                    &request,
+                    DfsObjectRpcSendOptions::new(connect_timeout),
+                )
                 .await
+                .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
+            decode_dfs_metadata_journal_batch_rpc_response(&response)
+                .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
         })
     })
 }
@@ -8153,9 +8043,18 @@ pub fn async_dfs_metadata_snapshot_install_sender_from_peer_transport(
     Arc::new(move |endpoint, command, connect_timeout| {
         let peer_transport = Arc::clone(&peer_transport);
         Box::pin(async move {
-            peer_transport
-                .send_metadata_snapshot_install_async(endpoint, command, connect_timeout)
+            let request = dfs_metadata_snapshot_install_rpc_request(command)
+                .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
+            let response = peer_transport
+                .call_object_rpc_async(
+                    endpoint,
+                    &request,
+                    DfsObjectRpcSendOptions::new(connect_timeout),
+                )
                 .await
+                .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
+            decode_dfs_metadata_snapshot_install_rpc_response(&response)
+                .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
         })
     })
 }
@@ -8164,7 +8063,16 @@ pub fn dfs_message_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsMessageSender {
     Arc::new(move |endpoint, command, connect_timeout| {
-        peer_transport.send_message(endpoint, command, connect_timeout)
+        let request = dfs_message_rpc_request(command)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+        let response = peer_transport.call_object_rpc(
+            endpoint,
+            &request,
+            DfsObjectRpcSendOptions::new(connect_timeout)
+                .with_observe_connectivity(!dfs_message_is_read_only_request(command)),
+        )?;
+        decode_dfs_message_rpc_response(&response)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
     })
 }
 
@@ -8188,7 +8096,17 @@ pub fn dfs_metadata_journal_batch_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsMetadataJournalBatchSender {
     Arc::new(move |endpoint, command, connect_timeout| {
-        peer_transport.send_metadata_journal_batch(endpoint, command, connect_timeout)
+        let request = dfs_metadata_journal_batch_rpc_request(command)
+            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
+        let response = peer_transport
+            .call_object_rpc(
+                endpoint,
+                &request,
+                DfsObjectRpcSendOptions::new(connect_timeout),
+            )
+            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
+        decode_dfs_metadata_journal_batch_rpc_response(&response)
+            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
     })
 }
 
@@ -8196,7 +8114,17 @@ pub fn dfs_metadata_snapshot_install_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsMetadataSnapshotInstallSender {
     Arc::new(move |endpoint, command, connect_timeout| {
-        peer_transport.send_metadata_snapshot_install(endpoint, command, connect_timeout)
+        let request = dfs_metadata_snapshot_install_rpc_request(command)
+            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
+        let response = peer_transport
+            .call_object_rpc(
+                endpoint,
+                &request,
+                DfsObjectRpcSendOptions::new(connect_timeout),
+            )
+            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
+        decode_dfs_metadata_snapshot_install_rpc_response(&response)
+            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
     })
 }
 
