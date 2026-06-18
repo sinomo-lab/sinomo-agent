@@ -112,10 +112,13 @@ use sinomo_events::EventId;
 use sinomo_kv::KvError;
 use sinomo_local::{LocalDataError, SinomoDataDir};
 use sinomo_network::{
-    ClusterPaths, NetworkError, NetworkFrame, ObjectRpcRequest, ObjectRpcResponse, ProtocolMessage,
+    ClusterPaths, NetworkError, NetworkFrame, ObjectRpcRequest, ObjectRpcResponse,
+    SinomoObjectCodec,
 };
 #[cfg(test)]
-use sinomo_network::{MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrameId};
+use sinomo_network::{
+    MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrameId, ProtocolMessage,
+};
 use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -8572,40 +8575,40 @@ fn send_dfs_routed_message_to_endpoint(
 ) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
     let request_id = format!("dfs_message_{}", routed_message.frame_id);
     let source_node_id = routed_message.source_node_id.clone();
-    let payload_bytes = dfs_routed_message_protocol_payload_bytes(&routed_message)?;
     let command = DfsMessageCommand {
         request_id,
         routed_message,
     };
+    let request_body_bytes = dfs_message_request_body_bytes(&command)?;
     let mut failures = Vec::new();
     for endpoint in &endpoints {
         let send_started = Instant::now();
         match sender(endpoint, &command, connect_timeout) {
             Ok(response) => {
                 let outbound_messages = response.outbound_messages;
-                let outbound_payload_bytes =
-                    dfs_routed_messages_protocol_payload_bytes(&outbound_messages)?;
+                let outbound_body_bytes =
+                    dfs_message_response_body_bytes(&command.request_id, &outbound_messages)?;
                 dfs_perf_trace(format_args!(
-                    "dfs-message-send local={} target={} endpoint={} request={} payload_bytes={} outbound_frames={} outbound_payload_bytes={} elapsed_ms={}",
+                    "dfs-message-send local={} target={} endpoint={} request={} request_body_bytes={} outbound_messages={} outbound_body_bytes={} elapsed_ms={}",
                     source_node_id,
                     target_node_id,
                     endpoint.address,
                     command.request_id,
-                    payload_bytes,
+                    request_body_bytes,
                     outbound_messages.len(),
-                    outbound_payload_bytes,
+                    outbound_body_bytes,
                     send_started.elapsed().as_millis()
                 ));
                 return Ok(outbound_messages);
             }
             Err(error) => {
                 dfs_perf_trace(format_args!(
-                    "dfs-message-send-error local={} target={} endpoint={} request={} payload_bytes={} elapsed_ms={} error={}",
+                    "dfs-message-send-error local={} target={} endpoint={} request={} request_body_bytes={} elapsed_ms={} error={}",
                     source_node_id,
                     target_node_id,
                     endpoint.address,
                     command.request_id,
-                    payload_bytes,
+                    request_body_bytes,
                     send_started.elapsed().as_millis(),
                     error
                 ));
@@ -8671,40 +8674,40 @@ async fn send_dfs_routed_message_to_endpoint_async(
 ) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
     let request_id = format!("dfs_message_{}", routed_message.frame_id);
     let source_node_id = routed_message.source_node_id.clone();
-    let payload_bytes = dfs_routed_message_protocol_payload_bytes(&routed_message)?;
     let command = DfsMessageCommand {
         request_id,
         routed_message,
     };
+    let request_body_bytes = dfs_message_request_body_bytes(&command)?;
     let mut failures = Vec::new();
     for endpoint in &endpoints {
         let send_started = Instant::now();
         match sender(endpoint, &command, connect_timeout).await {
             Ok(response) => {
                 let outbound_messages = response.outbound_messages;
-                let outbound_payload_bytes =
-                    dfs_routed_messages_protocol_payload_bytes(&outbound_messages)?;
+                let outbound_body_bytes =
+                    dfs_message_response_body_bytes(&command.request_id, &outbound_messages)?;
                 dfs_perf_trace(format_args!(
-                    "dfs-message-send-async local={} target={} endpoint={} request={} payload_bytes={} outbound_frames={} outbound_payload_bytes={} elapsed_ms={}",
+                    "dfs-message-send-async local={} target={} endpoint={} request={} request_body_bytes={} outbound_messages={} outbound_body_bytes={} elapsed_ms={}",
                     source_node_id,
                     target_node_id,
                     endpoint.address,
                     command.request_id,
-                    payload_bytes,
+                    request_body_bytes,
                     outbound_messages.len(),
-                    outbound_payload_bytes,
+                    outbound_body_bytes,
                     send_started.elapsed().as_millis()
                 ));
                 return Ok(outbound_messages);
             }
             Err(error) => {
                 dfs_perf_trace(format_args!(
-                    "dfs-message-send-async-error local={} target={} endpoint={} request={} payload_bytes={} elapsed_ms={} error={}",
+                    "dfs-message-send-async-error local={} target={} endpoint={} request={} request_body_bytes={} elapsed_ms={} error={}",
                     source_node_id,
                     target_node_id,
                     endpoint.address,
                     command.request_id,
-                    payload_bytes,
+                    request_body_bytes,
                     send_started.elapsed().as_millis(),
                     error
                 ));
@@ -8718,19 +8721,29 @@ async fn send_dfs_routed_message_to_endpoint_async(
     })
 }
 
-fn dfs_routed_message_protocol_payload_bytes(
-    message: &DfsRoutedMessage,
-) -> Result<usize, NetworkError> {
-    ProtocolMessage::encode(DFS_PROTOCOL, &message.message).map(|protocol| protocol.payload.len())
+fn dfs_message_request_body_bytes(command: &DfsMessageCommand) -> Result<usize, NetworkError> {
+    SinomoObjectCodec::default()
+        .encode(command)
+        .map(|body| body.len())
 }
 
-fn dfs_routed_messages_protocol_payload_bytes(
-    messages: &[DfsRoutedMessage],
+#[derive(Serialize)]
+struct DfsMessageResponseTraceBody<'a> {
+    request_id: &'a str,
+    outbound_messages: &'a [DfsRoutedMessage],
+}
+
+fn dfs_message_response_body_bytes(
+    request_id: &str,
+    outbound_messages: &[DfsRoutedMessage],
 ) -> Result<usize, NetworkError> {
-    messages.iter().try_fold(0_usize, |total, message| {
-        dfs_routed_message_protocol_payload_bytes(message)
-            .map(|payload_bytes| total.saturating_add(payload_bytes))
-    })
+    let body = DfsMessageResponseTraceBody {
+        request_id,
+        outbound_messages,
+    };
+    SinomoObjectCodec::default()
+        .encode(&body)
+        .map(|body| body.len())
 }
 
 impl DfsTransportIdentity for DfsEndpointTransport {
