@@ -5712,7 +5712,11 @@ fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
     write_cluster_state(&paths, &state).expect("write state");
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
 
-    let candidates = cluster_main_daemon_command_endpoint_candidates(&paths, &state);
+    let candidates = cluster_endpoint_targets(
+        &paths,
+        &state,
+        ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates,
+    );
     let dfs_targets = cluster_dfs_protocol_targets(&paths, &state);
 
     assert_eq!(
@@ -5865,7 +5869,11 @@ fn main_daemon_endpoint_candidates_keep_static_fallback_order() {
     write_cluster_state(&paths, &state).expect("write state");
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
 
-    let candidates = cluster_main_daemon_command_endpoint_candidates(&paths, &state);
+    let candidates = cluster_endpoint_targets(
+        &paths,
+        &state,
+        ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates,
+    );
     let ordered_endpoint_ids = candidates
         .iter()
         .map(|endpoint| endpoint.endpoint_id.clone())

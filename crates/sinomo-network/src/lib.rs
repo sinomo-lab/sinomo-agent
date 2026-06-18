@@ -113,7 +113,6 @@ pub use storage::{
     cluster_invitation_state_key, cluster_iroh_proxy_republish_sleep_duration,
     cluster_iroh_proxy_start_retry_sleep_duration, cluster_is_settled_solo,
     cluster_join_challenge_rpc_request, cluster_local_node_role,
-    cluster_main_daemon_command_endpoint_candidates,
     cluster_member_daemon_status_targets_with_connectivity, cluster_member_expected_daemon_process,
     cluster_member_is_local_process, cluster_member_key, cluster_member_publish_txn_from_kv,
     cluster_network_discovery_interval_for_role, cluster_network_info_key,

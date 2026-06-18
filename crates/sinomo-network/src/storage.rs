@@ -11773,6 +11773,7 @@ pub enum ClusterEndpointSelectionPurpose {
     InvitePublish,
     LiveVoterCommand,
     MainDaemonCommand,
+    MainDaemonCommandCandidates,
     MemberPublish,
     MemberPublishVoterFirst,
     RaftCommand,
@@ -11798,6 +11799,9 @@ pub fn cluster_endpoint_targets(
         }
         ClusterEndpointSelectionPurpose::MainDaemonCommand => {
             cluster_main_daemon_command_targets_impl(paths, state)
+        }
+        ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates => {
+            cluster_main_daemon_command_endpoint_candidates_impl(paths, state)
         }
         ClusterEndpointSelectionPurpose::MemberPublish => {
             cluster_member_publish_targets_impl(paths, state)
@@ -11879,13 +11883,13 @@ fn cluster_main_daemon_command_targets_impl(
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
     let mut selected_remote_nodes = BTreeSet::new();
-    cluster_main_daemon_command_endpoint_candidates(paths, state)
+    cluster_main_daemon_command_endpoint_candidates_impl(paths, state)
         .into_iter()
         .filter(|endpoint| selected_remote_nodes.insert(endpoint.node_id.clone()))
         .collect()
 }
 
-pub fn cluster_main_daemon_command_endpoint_candidates(
+fn cluster_main_daemon_command_endpoint_candidates_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {

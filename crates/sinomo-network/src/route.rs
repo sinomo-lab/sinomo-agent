@@ -1867,21 +1867,24 @@ fn cluster_relay_next_hop_endpoints_with_graph_and_policy(
             push_unique_cluster_endpoint(&mut endpoints, &mut seen, endpoint.clone());
         }
     }
-    for endpoint in crate::cluster_main_daemon_command_endpoint_candidates(paths, state)
-        .into_iter()
-        .filter(|endpoint| endpoint.node_id == *node_id)
-        .filter(|endpoint| {
-            cluster_relay_next_hop_endpoint_is_usable(
-                graph,
-                source_node_id,
-                endpoint,
-                has_healthy_next_hop_endpoint,
-                has_reachable_next_hop_endpoint,
-                local_graph_has_reachable_targets,
-                allow_unknown_locally_learned_endpoint,
-            )
-        })
-    {
+    for endpoint in cluster_endpoint_targets(
+        paths,
+        state,
+        ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates,
+    )
+    .into_iter()
+    .filter(|endpoint| endpoint.node_id == *node_id)
+    .filter(|endpoint| {
+        cluster_relay_next_hop_endpoint_is_usable(
+            graph,
+            source_node_id,
+            endpoint,
+            has_healthy_next_hop_endpoint,
+            has_reachable_next_hop_endpoint,
+            local_graph_has_reachable_targets,
+            allow_unknown_locally_learned_endpoint,
+        )
+    }) {
         push_unique_cluster_endpoint(&mut endpoints, &mut seen, endpoint);
     }
     endpoints
