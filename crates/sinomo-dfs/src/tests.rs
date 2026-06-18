@@ -53,7 +53,7 @@ impl DfsTransportIdentity for ReceiveOnlyTransport {
     }
 }
 
-impl DfsFrameTransport for ReceiveOnlyTransport {
+impl DfsMessageTransport for ReceiveOnlyTransport {
     fn send_routed_message(
         &mut self,
         target_node_id: &NodeId,
@@ -807,7 +807,7 @@ impl DfsTransportIdentity for FailingSendTransport {
     }
 }
 
-impl DfsFrameTransport for FailingSendTransport {
+impl DfsMessageTransport for FailingSendTransport {
     fn send_routed_message(
         &mut self,
         _target_node_id: &NodeId,
@@ -834,7 +834,7 @@ impl DfsTransportIdentity for DroppingSendTransport {
     }
 }
 
-impl DfsFrameTransport for DroppingSendTransport {
+impl DfsMessageTransport for DroppingSendTransport {
     fn send_routed_message(
         &mut self,
         _target_node_id: &NodeId,
@@ -894,7 +894,7 @@ impl DfsTransportIdentity for DirectReadTransport {
     }
 }
 
-impl DfsFrameTransport for DirectReadTransport {
+impl DfsMessageTransport for DirectReadTransport {
     fn send_routed_message(
         &mut self,
         _target_node_id: &NodeId,
@@ -1000,15 +1000,15 @@ fn async_dfs_frame_transport_in_process_sends_waits_and_drains() {
             },
         };
 
-        AsyncDfsFrameTransport::send_async(&mut transport_a, &node_b, frame)
+        AsyncDfsMessageTransport::send_async(&mut transport_a, &node_b, frame)
             .await
             .expect("send");
         assert!(
-            AsyncDfsFrameTransport::wait_for_incoming_async(&mut transport_b, Duration::ZERO)
+            AsyncDfsMessageTransport::wait_for_incoming_async(&mut transport_b, Duration::ZERO)
                 .await
                 .expect("wait")
         );
-        let inbound = AsyncDfsFrameTransport::drain_incoming_async(&mut transport_b)
+        let inbound = AsyncDfsMessageTransport::drain_incoming_async(&mut transport_b)
             .await
             .expect("drain");
 
@@ -1443,7 +1443,7 @@ impl DfsTransportIdentity for CountingEmptyTransport {
     }
 }
 
-impl DfsFrameTransport for CountingEmptyTransport {
+impl DfsMessageTransport for CountingEmptyTransport {
     fn send_routed_message(
         &mut self,
         target_node_id: &NodeId,
@@ -1973,7 +1973,7 @@ fn endpoint_transport_direct_read_uses_direct_sender_without_queuing_frame() {
         content_size_bytes: bytes.len() as u64,
     };
 
-    let response = DfsFrameTransport::send_direct_read(&mut transport, &remote, &request)
+    let response = DfsMessageTransport::send_direct_read(&mut transport, &remote, &request)
         .expect("send direct read")
         .expect("direct response");
 
@@ -2046,13 +2046,13 @@ fn endpoint_transport_async_send_requires_async_sender() {
         );
         let frame = test_dfs_lookup_frame(&local, &remote, 7, "/endpoint/async-missing");
 
-        let error = AsyncDfsFrameTransport::send_async(&mut transport, &remote, frame.clone())
+        let error = AsyncDfsMessageTransport::send_async(&mut transport, &remote, frame.clone())
             .await
             .expect_err("async send should require async sender");
         assert!(error.to_string().contains("without an async sender"));
         assert!(calls.lock().expect("calls lock").is_empty());
         assert_eq!(
-            AsyncDfsFrameTransport::pending_incoming_count_async(&mut transport)
+            AsyncDfsMessageTransport::pending_incoming_count_async(&mut transport)
                 .await
                 .expect("pending frames"),
             Some(0)
@@ -2113,13 +2113,13 @@ fn endpoint_transport_async_sender_does_not_require_sync_sender() {
                 .to_string()
                 .contains("without a sync sender")
         );
-        AsyncDfsFrameTransport::send_async(&mut transport, &remote, frame.clone())
+        AsyncDfsMessageTransport::send_async(&mut transport, &remote, frame.clone())
             .await
             .expect("async send frame");
         let recorded = calls.lock().expect("calls lock");
         assert_eq!(recorded.as_slice(), &[(remote.clone(), frame)]);
         drop(recorded);
-        let incoming = AsyncDfsFrameTransport::drain_incoming_async(&mut transport)
+        let incoming = AsyncDfsMessageTransport::drain_incoming_async(&mut transport)
             .await
             .expect("incoming frames");
         assert_eq!(incoming.len(), 1);
@@ -2212,14 +2212,14 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
         assert_eq!(incoming[0].frame.source_node_id, remote);
 
         let async_frame = test_dfs_lookup_frame(&local, &remote, 12, "/endpoint/dual-async");
-        AsyncDfsFrameTransport::send_async(&mut transport, &remote, async_frame)
+        AsyncDfsMessageTransport::send_async(&mut transport, &remote, async_frame)
             .await
             .expect("async send frame");
         assert_eq!(
             async_calls.lock().expect("async calls lock").as_slice(),
             &[(remote.clone(), NetworkFrameId(12))]
         );
-        let incoming = AsyncDfsFrameTransport::drain_incoming_async(&mut transport)
+        let incoming = AsyncDfsMessageTransport::drain_incoming_async(&mut transport)
             .await
             .expect("async incoming frames");
         assert_eq!(incoming.len(), 1);
@@ -3435,7 +3435,7 @@ fn networked_dfs_async_send_uses_shared_protocol_frame_path() {
             .expect("async send");
 
         assert!(sent);
-        let inbound = AsyncDfsFrameTransport::drain_incoming_async(&mut remote_transport)
+        let inbound = AsyncDfsMessageTransport::drain_incoming_async(&mut remote_transport)
             .await
             .expect("drain remote");
         assert_eq!(inbound.len(), 1);
@@ -5090,7 +5090,7 @@ fn metadata_replication_cursor_advances_only_after_replica_ack() {
     );
 
     assert_eq!(
-        DfsFrameTransport::drain_incoming(&mut drop_replica_mailbox)
+        DfsMessageTransport::drain_incoming(&mut drop_replica_mailbox)
             .expect("drop first batch")
             .len(),
         1,

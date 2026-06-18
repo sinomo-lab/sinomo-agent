@@ -4,7 +4,7 @@ use sinomo_dfs::{
     DfsCommitVersionCommand, DfsConfirmedTimeoutAction, DfsConfirmedTimeoutOutcome,
     DfsConflictStatus, DfsControlPlaneStore, DfsDistributedWriteResult, DfsFetchBlobResponse,
     DfsFetchBlobResponseChunk, DfsFetchBlobResult, DfsFileSystem, DfsFileSystemId,
-    DfsFrameTransport, DfsMetadataBackend, DfsMetadataMutation, DfsMetadataReplicationOutcome,
+    DfsMessageTransport, DfsMetadataBackend, DfsMetadataMutation, DfsMetadataReplicationOutcome,
     DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardId, DfsNetworkMessage,
     DfsNodeAdvertisement, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsObjectVersionRecord,
     DfsOwnerHandoffOutcome, DfsReadData, DfsReadResponse, DfsReadResponseChunk, DfsReadResult,
@@ -12764,7 +12764,7 @@ fn blob_path_for_hash(root: &Path, hash: &str) -> PathBuf {
     root.join("blobs").join(&hex[..2]).join(hex)
 }
 
-fn send_dfs_test_message<T: DfsFrameTransport>(
+fn send_dfs_test_message<T: DfsMessageTransport>(
     transport: &mut T,
     source: &NodeId,
     target: &NodeId,

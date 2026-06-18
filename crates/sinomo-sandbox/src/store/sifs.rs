@@ -3,12 +3,12 @@ use crate::internal::*;
 use super::{decode_instance_manifest, encode_instance_manifest};
 
 #[derive(Debug)]
-pub struct SifsSandboxInstanceStore<T: DfsFrameTransport> {
+pub struct SifsSandboxInstanceStore<T: DfsMessageTransport> {
     pub dfs: NetworkedDfsService<T>,
     replica_candidates: Vec<NodeId>,
 }
 
-impl<T: DfsFrameTransport> SifsSandboxInstanceStore<T> {
+impl<T: DfsMessageTransport> SifsSandboxInstanceStore<T> {
     pub fn new(dfs: NetworkedDfsService<T>) -> Self {
         let replica_candidates = vec![dfs.node_id().clone()];
         Self {

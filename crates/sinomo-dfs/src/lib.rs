@@ -161,7 +161,7 @@ pub enum DfsTransferProfile {
     Local,
 }
 
-pub trait DfsFrameTransport: DfsTransportIdentity {
+pub trait DfsMessageTransport: DfsTransportIdentity {
     fn send_routed_message(
         &mut self,
         target_node_id: &NodeId,
@@ -222,22 +222,22 @@ pub trait DfsFrameTransport: DfsTransportIdentity {
     }
 }
 
-pub type DfsFrameTransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub type DfsMessageTransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-pub trait AsyncDfsFrameTransport: Send {
+pub trait AsyncDfsMessageTransport: Send {
     fn local_node_id(&self) -> &NodeId;
 
     fn send_routed_message_async<'a>(
         &'a mut self,
         target_node_id: &'a NodeId,
         message: DfsRoutedMessage,
-    ) -> DfsFrameTransportFuture<'a, Result<(), NetworkError>>;
+    ) -> DfsMessageTransportFuture<'a, Result<(), NetworkError>>;
 
     fn send_async<'a>(
         &'a mut self,
         target_node_id: &'a NodeId,
         frame: NetworkFrame,
-    ) -> DfsFrameTransportFuture<'a, Result<(), NetworkError>> {
+    ) -> DfsMessageTransportFuture<'a, Result<(), NetworkError>> {
         Box::pin(async move {
             let message = protocol::dfs_routed_message_from_protocol_frame(&frame)?;
             self.send_routed_message_async(target_node_id, message)
@@ -247,18 +247,18 @@ pub trait AsyncDfsFrameTransport: Send {
 
     fn drain_incoming_async<'a>(
         &'a mut self,
-    ) -> DfsFrameTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>>;
+    ) -> DfsMessageTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>>;
 
     fn pending_incoming_count_async<'a>(
         &'a mut self,
-    ) -> DfsFrameTransportFuture<'a, Result<Option<usize>, NetworkError>> {
+    ) -> DfsMessageTransportFuture<'a, Result<Option<usize>, NetworkError>> {
         Box::pin(async { Ok(None) })
     }
 
     fn wait_for_incoming_async<'a>(
         &'a mut self,
         timeout: Duration,
-    ) -> DfsFrameTransportFuture<'a, Result<bool, NetworkError>> {
+    ) -> DfsMessageTransportFuture<'a, Result<bool, NetworkError>> {
         Box::pin(async move {
             if self
                 .pending_incoming_count_async()
@@ -278,7 +278,7 @@ pub trait AsyncDfsFrameTransport: Send {
     }
 }
 
-impl DfsFrameTransport for sinomo_network::InProcessTransport {
+impl DfsMessageTransport for sinomo_network::InProcessTransport {
     fn send_routed_message(
         &mut self,
         target_node_id: &NodeId,
@@ -305,7 +305,7 @@ impl DfsFrameTransport for sinomo_network::InProcessTransport {
     }
 }
 
-impl<T> AsyncDfsFrameTransport for T
+impl<T> AsyncDfsMessageTransport for T
 where
     T: sinomo_network::AsyncNetworkTransport + Send,
 {
@@ -317,7 +317,7 @@ where
         &'a mut self,
         target_node_id: &'a NodeId,
         message: DfsRoutedMessage,
-    ) -> DfsFrameTransportFuture<'a, Result<(), NetworkError>> {
+    ) -> DfsMessageTransportFuture<'a, Result<(), NetworkError>> {
         Box::pin(async move {
             let frame = protocol::dfs_protocol_frame_from_routed_message(&message)?;
             sinomo_network::AsyncNetworkTransport::send_async(
@@ -332,7 +332,7 @@ where
 
     fn drain_incoming_async<'a>(
         &'a mut self,
-    ) -> DfsFrameTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
+    ) -> DfsMessageTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
         Box::pin(async move {
             sinomo_network::AsyncNetworkTransport::drain_incoming_async(self, usize::MAX).await
         })
@@ -340,7 +340,7 @@ where
 
     fn pending_incoming_count_async<'a>(
         &'a mut self,
-    ) -> DfsFrameTransportFuture<'a, Result<Option<usize>, NetworkError>> {
+    ) -> DfsMessageTransportFuture<'a, Result<Option<usize>, NetworkError>> {
         Box::pin(async move {
             sinomo_network::AsyncNetworkTransport::pending_incoming_count_async(self).await
         })
@@ -349,7 +349,7 @@ where
     fn wait_for_incoming_async<'a>(
         &'a mut self,
         timeout: Duration,
-    ) -> DfsFrameTransportFuture<'a, Result<bool, NetworkError>> {
+    ) -> DfsMessageTransportFuture<'a, Result<bool, NetworkError>> {
         Box::pin(async move {
             sinomo_network::AsyncNetworkTransport::wait_for_incoming_async(self, timeout).await
         })
@@ -2594,7 +2594,7 @@ pub trait DfsMaintenanceHost: Send {
     ) -> Result<(), DfsError>;
 }
 
-pub fn run_dfs_lifecycle_maintenance_with_host<T: DfsFrameTransport>(
+pub fn run_dfs_lifecycle_maintenance_with_host<T: DfsMessageTransport>(
     service: &mut NetworkedDfsService<T>,
     host: &mut dyn DfsMaintenanceHost,
     options: DfsMaintenanceRunOptions,
@@ -2845,7 +2845,7 @@ pub fn dfs_repair_maintenance_notice_lines(
     lines
 }
 
-pub fn run_dfs_maintenance_tick_with_host<T: DfsFrameTransport>(
+pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
     service: &mut NetworkedDfsService<T>,
     maintenance_host: &mut dyn DfsMaintenanceHost,
     file_system_id: DfsFileSystemId,
@@ -2897,7 +2897,7 @@ pub async fn run_dfs_maintenance_tick_with_async_host<T>(
     options: DfsMaintenanceTickOptions,
 ) -> Result<DfsMaintenanceTickReport, DfsError>
 where
-    T: AsyncDfsFrameTransport + DfsTransportIdentity + DfsFrameTransport,
+    T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
 {
     let namespace_jobs = service
         .posix_resume_namespace_jobs_bounded(
@@ -3285,7 +3285,7 @@ pub fn run_cluster_dfs_smoke_with_message_sender(
     .map(Some)
 }
 
-pub fn run_dfs_smoke_with_host<T: DfsFrameTransport>(
+pub fn run_dfs_smoke_with_host<T: DfsMessageTransport>(
     service: &mut NetworkedDfsService<T>,
     local_node_id: &NodeId,
     content_node_ids: Vec<NodeId>,
@@ -4589,7 +4589,7 @@ pub struct LocalOwnedDfsService<T> {
     next_request_id: u64,
 }
 
-impl<T: DfsFrameTransport> LocalOwnedDfsService<T> {
+impl<T: DfsMessageTransport> LocalOwnedDfsService<T> {
     pub fn new(transport: T) -> Self {
         let node_id = transport.local_node_id().clone();
         let mut metadata = DfsMetadataStore::new();
@@ -8887,7 +8887,7 @@ impl DfsTransportIdentity for DfsEndpointTransport {
     }
 }
 
-impl AsyncDfsFrameTransport for DfsEndpointTransport {
+impl AsyncDfsMessageTransport for DfsEndpointTransport {
     fn local_node_id(&self) -> &NodeId {
         DfsTransportIdentity::local_node_id(self)
     }
@@ -8896,7 +8896,7 @@ impl AsyncDfsFrameTransport for DfsEndpointTransport {
         &'a mut self,
         target_node_id: &'a NodeId,
         message: DfsRoutedMessage,
-    ) -> DfsFrameTransportFuture<'a, Result<(), NetworkError>> {
+    ) -> DfsMessageTransportFuture<'a, Result<(), NetworkError>> {
         Box::pin(async move {
             self.send_routed_message_to_endpoint_async(target_node_id, message, true)
                 .await
@@ -8905,18 +8905,18 @@ impl AsyncDfsFrameTransport for DfsEndpointTransport {
 
     fn drain_incoming_async<'a>(
         &'a mut self,
-    ) -> DfsFrameTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
+    ) -> DfsMessageTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
         Box::pin(async move { Ok(self.incoming_frames.drain(..).collect()) })
     }
 
     fn pending_incoming_count_async<'a>(
         &'a mut self,
-    ) -> DfsFrameTransportFuture<'a, Result<Option<usize>, NetworkError>> {
+    ) -> DfsMessageTransportFuture<'a, Result<Option<usize>, NetworkError>> {
         Box::pin(async move { Ok(Some(self.incoming_frames.len())) })
     }
 }
 
-impl DfsFrameTransport for DfsEndpointTransport {
+impl DfsMessageTransport for DfsEndpointTransport {
     fn send_routed_message(
         &mut self,
         target_node_id: &NodeId,
@@ -9035,7 +9035,7 @@ impl DfsTransportIdentity for DfsEndpointServedMessageTransport {
     }
 }
 
-impl DfsFrameTransport for DfsEndpointServedMessageTransport {
+impl DfsMessageTransport for DfsEndpointServedMessageTransport {
     fn send_routed_message(
         &mut self,
         target_node_id: &NodeId,
@@ -9120,7 +9120,7 @@ impl DfsTransportIdentity for SingleDfsProtocolFrameTransport {
 }
 
 #[cfg(test)]
-impl DfsFrameTransport for SingleDfsProtocolFrameTransport {
+impl DfsMessageTransport for SingleDfsProtocolFrameTransport {
     fn send_routed_message(
         &mut self,
         _target_node_id: &NodeId,
@@ -9216,7 +9216,7 @@ impl NetworkedDfsService<DfsEndpointServedMessageTransport> {
     }
 }
 
-impl<T: DfsFrameTransport> NetworkedDfsService<T> {
+impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn retry_pending_repairs_best_effort(
         &mut self,
     ) -> (Vec<DistributedRepairJob>, Vec<NetworkedDfsServiceEvent>) {
@@ -9440,7 +9440,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
 
 impl<T> NetworkedDfsService<T>
 where
-    T: AsyncDfsFrameTransport + DfsTransportIdentity,
+    T: AsyncDfsMessageTransport + DfsTransportIdentity,
 {
     pub async fn send_dfs_message_if_routable_async(
         &mut self,
@@ -9462,7 +9462,7 @@ where
 
 impl<T> NetworkedDfsService<T>
 where
-    T: AsyncDfsFrameTransport + DfsTransportIdentity + DfsFrameTransport,
+    T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
 {
     async fn retry_pending_repairs_async_bounded(
         &mut self,
@@ -10298,7 +10298,7 @@ where
     }
 }
 
-impl<T: DfsFrameTransport> NetworkedDfsService<T> {
+impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn adaptive_stage_chunk_window(&self, target_node_id: &NodeId, total_size_bytes: u64) -> u32 {
         dfs_adaptive_chunk_window_size(
             self.transport.transfer_profile(target_node_id),

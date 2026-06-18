@@ -265,7 +265,7 @@ fn daemon_dfs_data_plane_error(source: DaemonError) -> DfsDataPlaneHostError {
     DfsDataPlaneHostError::new(source.to_string())
 }
 
-pub(crate) fn with_daemon_dfs_control_plane_on_runtime<T: sinomo_dfs::DfsFrameTransport>(
+pub(crate) fn with_daemon_dfs_control_plane_on_runtime<T: sinomo_dfs::DfsMessageTransport>(
     service: NetworkedDfsService<T>,
     cluster_paths: &ClusterPaths,
     runtime: Option<&tokio::runtime::Handle>,

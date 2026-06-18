@@ -9,7 +9,7 @@
 use crate::namespace::{initial_version, metadata_path, next_version, object_id_for_path};
 use crate::{
     DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest, DfsControlPlaneStore,
-    DfsDirectoryPage, DfsDirectoryPageCursor, DfsError, DfsFileSystem, DfsFrameTransport,
+    DfsDirectoryPage, DfsDirectoryPageCursor, DfsError, DfsFileSystem, DfsMessageTransport,
     DfsMetadataShardConfig, DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobRecord,
     DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNamespacePosixError, DfsNamespaceResult,
     DfsNamespaceTransaction, DfsNetworkMessage, DfsObjectKind, DfsObjectMetadata,
@@ -241,7 +241,7 @@ impl DfsWriteOptions {
     }
 }
 
-impl<T: DfsFrameTransport> NetworkedDfsService<T> {
+impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn settle_ready_write_outcome(
         &mut self,
         outcome: NetworkedDfsWriteOutcome,

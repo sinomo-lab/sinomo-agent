@@ -2820,7 +2820,7 @@ fn handle_daemon_sandbox_run_process_plan_with_output_sink_on_runtime(
 }
 
 #[cfg(feature = "sandbox")]
-fn append_daemon_sandbox_new_command_record_events<T: sinomo_dfs::DfsFrameTransport>(
+fn append_daemon_sandbox_new_command_record_events<T: sinomo_dfs::DfsMessageTransport>(
     event_store: &mut sinomo_events::JsonlEventStore,
     node_id: sinomo_node::NodeId,
     manifest: &sinomo_sandbox::SandboxInstanceManifest,
@@ -3009,7 +3009,7 @@ fn handle_daemon_sandbox_run_toolchain_with_output_sink_on_runtime(
 }
 
 #[cfg(feature = "sandbox")]
-fn append_daemon_sandbox_command_events<T: sinomo_dfs::DfsFrameTransport>(
+fn append_daemon_sandbox_command_events<T: sinomo_dfs::DfsMessageTransport>(
     event_store: &mut sinomo_events::JsonlEventStore,
     node_id: sinomo_node::NodeId,
     manifest: &sinomo_sandbox::SandboxInstanceManifest,
