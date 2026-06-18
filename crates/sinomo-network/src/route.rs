@@ -1858,7 +1858,7 @@ fn relay_member_has_usable_bridge_endpoint(
 }
 
 fn cluster_relay_endpoint_can_carry_main_daemon_rpc(endpoint: &ClusterEndpointRecord) -> bool {
-    !crate::storage::cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
+    !crate::endpoint_selector::cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
 }
 
 fn cluster_graph_has_reachable_main_daemon_route_targets(

@@ -24,7 +24,15 @@ mod route;
 mod rpc;
 mod storage;
 
-pub use endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
+pub use endpoint_selector::{
+    ClusterEndpointSelectionPurpose, ClusterEndpointSelector, advertised_peer_route_targets,
+    discover_peer_route_ip_candidates, discover_peer_route_ip_candidates_async,
+};
+#[cfg(test)]
+pub(crate) use endpoint_selector::{
+    cluster_sync_targets, cluster_sync_targets_with_connectivity,
+    prefer_bounded_daemon_command_targets,
+};
 pub use error::*;
 pub use health::{
     ClusterDoctorFinding, ClusterHealthRow, ClusterNetworkPingRequest, ClusterNetworkPingResponse,
@@ -153,14 +161,14 @@ pub use storage::{
     DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT, IoObserver,
     MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, accepted_cluster_join_state_from_kv_snapshot,
-    advertised_peer_route_targets, apply_cluster_connectivity_probe_results,
-    apply_cluster_iroh_endpoint_advertisement, apply_cluster_node_role,
-    assign_local_daemon_member_public_keys, build_cluster_network_info_record,
-    cleanup_cluster_iroh_endpoints, cleanup_legacy_shadow_daemon_members_with_host,
-    cluster_bootstrap_state_stable_eq, cluster_connectivity_full_sync_ops,
-    cluster_connectivity_key, cluster_connectivity_probe_due_with_graph,
-    cluster_connectivity_probe_due_with_startup_settle, cluster_connectivity_probe_key,
-    cluster_connectivity_record, cluster_connectivity_record_for_hard_failure,
+    apply_cluster_connectivity_probe_results, apply_cluster_iroh_endpoint_advertisement,
+    apply_cluster_node_role, assign_local_daemon_member_public_keys,
+    build_cluster_network_info_record, cleanup_cluster_iroh_endpoints,
+    cleanup_legacy_shadow_daemon_members_with_host, cluster_bootstrap_state_stable_eq,
+    cluster_connectivity_full_sync_ops, cluster_connectivity_key,
+    cluster_connectivity_probe_due_with_graph, cluster_connectivity_probe_due_with_startup_settle,
+    cluster_connectivity_probe_key, cluster_connectivity_record,
+    cluster_connectivity_record_for_hard_failure,
     cluster_connectivity_record_for_identity_mismatch,
     cluster_connectivity_record_for_probe_outcome,
     cluster_connectivity_record_for_startup_probe_failure, cluster_connectivity_source_prefix,
@@ -181,14 +189,13 @@ pub use storage::{
     cluster_reachable_voter_count_with_host, cluster_state_needs_join_registration,
     cluster_state_sync_txn, cluster_status_summary_label,
     commit_cluster_kv_txn_with_quorum_response_with_host,
-    commit_cluster_raft_command_with_quorum_driver, discover_peer_route_ip_candidates,
-    elect_cluster_raft_leader_with_host, ensure_daemon_cluster_members,
-    expire_cluster_network_records_with_host, forward_cluster_kv_txn_to_voter_with_host,
-    handle_cluster_join_registration_request_with_host, handle_cluster_kv_watch_events,
-    handle_cluster_membership_rpc_request_with_hosts, handle_cluster_raft_rpc_request,
-    join_channel_endpoint_for_accepted_state, merge_cluster_join_registration,
-    prepare_cluster_join_retry_state, prepare_pending_cluster_join_state,
-    publish_cluster_invitation_to_quorum_with_host,
+    commit_cluster_raft_command_with_quorum_driver, elect_cluster_raft_leader_with_host,
+    ensure_daemon_cluster_members, expire_cluster_network_records_with_host,
+    forward_cluster_kv_txn_to_voter_with_host, handle_cluster_join_registration_request_with_host,
+    handle_cluster_kv_watch_events, handle_cluster_membership_rpc_request_with_hosts,
+    handle_cluster_raft_rpc_request, join_channel_endpoint_for_accepted_state,
+    merge_cluster_join_registration, prepare_cluster_join_retry_state,
+    prepare_pending_cluster_join_state, publish_cluster_invitation_to_quorum_with_host,
     publish_cluster_network_info_to_quorum_with_host,
     publish_cluster_node_status_to_quorum_with_host,
     publish_local_members_to_quorum_if_needed_with_host, publish_local_members_via_voter_with_host,
@@ -221,7 +228,6 @@ pub use storage::{
     daemon_advertised_endpoints_from_addresses_with_public_discovery_and_advertise_host_async,
     daemon_advertised_endpoints_from_static_addresses, daemon_lan_endpoint,
     discard_cluster_raft_uncommitted_tail_and_clear_leader_async,
-    discover_peer_route_ip_candidates_async,
     forward_cluster_join_challenge_rpc_to_voter_async_with_host,
     handle_cluster_invite_publish_request_async_with_host,
     handle_cluster_join_registration_request_async_with_host,
