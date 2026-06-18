@@ -9,6 +9,13 @@ use sinomo_core::{DfsWriteReceipt, DfsWriteRequest};
 use sinomo_network::NetworkFrame;
 use sinomo_node::NodeId;
 
+/// Legacy object-RPC route for DFS payloads carried as generic network frames.
+///
+/// This route is retained only for compatibility tests and explicit frame
+/// adapters. The registered DFS data plane uses typed object-RPC routes such as
+/// `/dfs/message` and `/dfs/object/read`.
+pub const DFS_PROTOCOL_FRAME_ROUTE: &str = "/dfs/protocol/frame";
+
 fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }

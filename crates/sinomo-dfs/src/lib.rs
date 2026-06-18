@@ -75,6 +75,8 @@ pub use posix::{
     DfsDirEntry, DfsDirEntryPage, DfsNamespaceJobFailure, DfsNamespaceJobMaintenanceReport,
     DfsPosixError, DfsPosixFileRangeReadStream, DfsPosixFileReadStream, DfsStat, DfsWriteOptions,
 };
+#[cfg(test)]
+use protocol::DFS_PROTOCOL_FRAME_ROUTE;
 pub use protocol::{
     DfsBlobTransferResult, DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest,
     DfsBulkReadResponse, DfsCommitVersionCommand, DfsCommitVersionResponse, DfsDirectReadRequest,
@@ -333,7 +335,6 @@ pub const DFS_EXPOSE_CONFIG_ROUTE: &str = "/dfs/expose/config";
 pub const DFS_METADATA_JOURNAL_BATCH_ROUTE: &str = "/dfs/metadata/journal-batch";
 pub const DFS_METADATA_SNAPSHOT_INSTALL_ROUTE: &str = "/dfs/metadata/snapshot-install";
 pub const DFS_MESSAGE_ROUTE: &str = "/dfs/message";
-pub const DFS_PROTOCOL_FRAME_ROUTE: &str = "/dfs/protocol/frame";
 pub const DFS_DIRECT_READ_ROUTE: &str = "/dfs/object/read";
 pub const DFS_POLICY_VIOLATION_EVENT_KIND: &str = "dfs.policy.violation";
 pub const DFS_CONTROL_PLANE_ROUTES: &[&str] = &[
@@ -346,10 +347,6 @@ pub const DFS_CONTROL_PLANE_ROUTES: &[&str] = &[
 /// Canonical DFS data-plane object-RPC routes.
 pub const DFS_DATA_PLANE_ROUTES: &[&str] =
     &[DFS_SMOKE_ROUTE, DFS_MESSAGE_ROUTE, DFS_DIRECT_READ_ROUTE];
-/// Temporary compatibility shim for callers that still carry DFS messages as
-/// network protocol frames. New data-plane callers should use `DFS_MESSAGE_ROUTE`
-/// or a typed DFS route instead.
-pub const DFS_LEGACY_DATA_PLANE_COMPATIBILITY_ROUTES: &[&str] = &[DFS_PROTOCOL_FRAME_ROUTE];
 /// Routes registered by the DFS data-plane service.
 pub const DFS_DATA_PLANE_SERVICE_ROUTES: &[&str] = DFS_DATA_PLANE_ROUTES;
 pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[

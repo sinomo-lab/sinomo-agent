@@ -3719,9 +3719,9 @@ mod tests {
             registry.category_for_route(sinomo_dfs::DFS_DIRECT_READ_ROUTE),
             Some(sinomo_dfs::DFS_RPC_CATEGORY)
         );
-        assert!(!registry.owns(sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE));
+        assert!(!registry.owns(sinomo_dfs::protocol::DFS_PROTOCOL_FRAME_ROUTE));
         assert_eq!(
-            registry.category_for_route(sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE),
+            registry.category_for_route(sinomo_dfs::protocol::DFS_PROTOCOL_FRAME_ROUTE),
             None
         );
         let route_metadata = registry.route_categories();
