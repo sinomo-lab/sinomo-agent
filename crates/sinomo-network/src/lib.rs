@@ -28,6 +28,7 @@ mod kv_forward;
 mod kv_read_model;
 mod kv_semantics;
 mod kv_snapshot;
+mod kv_watch_store;
 mod lan;
 mod local_membership;
 mod local_state_store;
@@ -156,6 +157,7 @@ pub use kv_snapshot::{
     refresh_current_cluster_kv_store_with_host,
     refresh_current_cluster_kv_store_with_local_storage_and_transport,
 };
+pub use kv_watch_store::handle_cluster_kv_watch_events;
 pub use lan::{
     AsyncMdnsDiscoverySocket, MdnsDiscoveryAdvertisement, MdnsDiscoveryCache, MdnsDiscoveryRecord,
     apply_lan_discovery_advertisements, discover_default_lan_ip_candidates,
@@ -328,7 +330,7 @@ pub use storage::{
     cluster_node_blocks_leader_preference, cluster_reachable_voter_count_with_host,
     cluster_state_sync_txn, commit_cluster_kv_txn_with_quorum_response_with_host,
     commit_cluster_raft_command_with_quorum_driver, elect_cluster_raft_leader_with_host,
-    handle_cluster_join_registration_request_with_host, handle_cluster_kv_watch_events,
+    handle_cluster_join_registration_request_with_host,
     handle_cluster_membership_rpc_request_with_hosts, handle_cluster_raft_rpc_request,
     join_channel_endpoint_for_accepted_state, read_cluster_state, read_cluster_state_cached,
     read_cluster_state_without_kv, reconcile_accepted_cluster_join_response,
