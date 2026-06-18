@@ -5,6 +5,7 @@ use crate::endpoint_selector::{
     cluster_raft_live_voter_targets_async,
 };
 use crate::error::NetworkError;
+use crate::kv_local_store::locked_cluster_raft_known_leader_id_async;
 use crate::object::DaemonRpcTimeouts;
 use crate::route::{
     ClusterObjectRpcClient, ClusterObjectRpcNodeOptions, ClusterObjectRpcRouteContext,
@@ -12,7 +13,6 @@ use crate::route::{
 };
 use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
 use crate::rpc_future::ClusterMembershipRpcFuture;
-use crate::storage::locked_cluster_raft_known_leader_id_async;
 use sinomo_core::{ClusterBootstrapState, ClusterEndpointRecord, ClusterTransportKind};
 use sinomo_kv::{KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_node::NodeId;

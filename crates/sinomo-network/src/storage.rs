@@ -40,7 +40,6 @@ use crate::kv_forward::{
     ClusterKvTxnForwardResult, forward_cluster_kv_txn_to_voter_async_with_host,
     forward_cluster_kv_txn_to_voter_with_host,
 };
-use crate::kv_local_store::imported_snapshot_advances_local_kv;
 pub(crate) use crate::kv_local_store::{
     LocalClusterRaftCommandStorage, append_cluster_raft_command,
     append_cluster_raft_command_uncommitted_or_no_effect_async, apply_cluster_raft_append,
@@ -67,6 +66,9 @@ pub(crate) use crate::kv_local_store::{
 pub use crate::kv_local_store::{
     commit_cluster_raft_index_with_events_async,
     discard_cluster_raft_uncommitted_tail_and_clear_leader_async,
+};
+use crate::kv_local_store::{
+    imported_snapshot_advances_local_kv, locked_cluster_raft_known_leader_id,
 };
 pub(crate) use crate::kv_read_model::read_cluster_capability_policies_from_snapshot;
 #[cfg(test)]
@@ -3400,15 +3402,6 @@ pub(crate) fn locked_cluster_raft_local_vote_metadata(
         .map_err(Into::into)
 }
 
-pub(crate) fn locked_cluster_raft_known_leader_id(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Result<Option<NodeId>, NetworkError> {
-    cluster_kv_raft_store(paths)
-        .locked_known_voter_leader_id(state)
-        .map_err(Into::into)
-}
-
 pub(crate) fn locked_cluster_raft_local_is_leader(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -4595,22 +4588,6 @@ pub fn handle_cluster_kv_txn_request_with_host(
         revision: result.snapshot.revision,
         responses: Vec::new(),
     }))
-}
-
-pub(crate) async fn locked_cluster_raft_known_leader_id_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Result<Option<NodeId>, NetworkError> {
-    let paths = paths.clone();
-    let state = state.clone();
-    runtime
-        .spawn_blocking(move || locked_cluster_raft_known_leader_id(&paths, &state))
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster raft known leader".to_string(),
-            detail: format!("known leader task failed: {source}"),
-        })?
 }
 
 async fn locked_cluster_raft_local_is_leader_async(

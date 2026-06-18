@@ -4,6 +4,7 @@ use crate::file_mark::{ClusterFileMark, cluster_file_mark};
 use crate::io_observer::io_observer;
 use crate::local_state_store::read_cluster_state_without_kv;
 
+use sinomo_core::ClusterBootstrapState;
 #[cfg(test)]
 use sinomo_kv::{CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, KvLogEntry, KvWalPaths};
 use sinomo_kv::{
@@ -450,6 +451,31 @@ pub(crate) fn locked_restore_cluster_raft_from_snapshot_if_newer(
     cluster_kv_raft_store(paths)
         .locked_restore_from_snapshot_if_newer_and_notify(node_id, snapshot)
         .map_err(NetworkError::from)
+}
+
+pub(crate) fn locked_cluster_raft_known_leader_id(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<Option<NodeId>, NetworkError> {
+    cluster_kv_raft_store(paths)
+        .locked_known_voter_leader_id(state)
+        .map_err(Into::into)
+}
+
+pub(crate) async fn locked_cluster_raft_known_leader_id_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<Option<NodeId>, NetworkError> {
+    let paths = paths.clone();
+    let state = state.clone();
+    runtime
+        .spawn_blocking(move || locked_cluster_raft_known_leader_id(&paths, &state))
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "cluster raft known leader".to_string(),
+            detail: format!("known leader task failed: {source}"),
+        })?
 }
 
 #[cfg(test)]
