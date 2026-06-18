@@ -11774,6 +11774,7 @@ pub enum ClusterEndpointSelectionPurpose {
     LiveVoterCommand,
     MainDaemonCommand,
     MainDaemonCommandCandidates,
+    MemberDaemonStatus,
     MemberPublish,
     MemberPublishVoterFirst,
     RaftCommand,
@@ -11803,6 +11804,7 @@ pub fn cluster_endpoint_targets(
         ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates => {
             cluster_main_daemon_command_endpoint_candidates_impl(paths, state)
         }
+        ClusterEndpointSelectionPurpose::MemberDaemonStatus => Vec::new(),
         ClusterEndpointSelectionPurpose::MemberPublish => {
             cluster_member_publish_targets_impl(paths, state)
         }
@@ -12100,21 +12102,17 @@ fn cluster_invite_publish_targets_impl(
     targets
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ClusterMemberEndpointSelectionPurpose {
-    DaemonStatus,
-}
-
 pub fn cluster_member_endpoint_targets(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,
-    purpose: ClusterMemberEndpointSelectionPurpose,
+    purpose: ClusterEndpointSelectionPurpose,
 ) -> Vec<ClusterEndpointRecord> {
     match purpose {
-        ClusterMemberEndpointSelectionPurpose::DaemonStatus => {
+        ClusterEndpointSelectionPurpose::MemberDaemonStatus => {
             cluster_member_daemon_status_targets_with_connectivity(paths, state, member)
         }
+        _ => Vec::new(),
     }
 }
 

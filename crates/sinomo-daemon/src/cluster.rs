@@ -2925,7 +2925,7 @@ async fn fetch_local_cluster_health_rows_from_member_async(
                 &paths_for_targets,
                 &state_for_targets,
                 &member_for_targets,
-                sinomo_network::ClusterMemberEndpointSelectionPurpose::DaemonStatus,
+                sinomo_network::ClusterEndpointSelectionPurpose::MemberDaemonStatus,
             )
         })
         .await
@@ -3019,7 +3019,7 @@ async fn probe_member_daemon_status_async(
             &paths_for_targets,
             &state_for_targets,
             &member_for_targets,
-            sinomo_network::ClusterMemberEndpointSelectionPurpose::DaemonStatus,
+            sinomo_network::ClusterEndpointSelectionPurpose::MemberDaemonStatus,
         )
     })
     .await

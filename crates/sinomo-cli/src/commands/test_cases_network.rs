@@ -491,7 +491,7 @@ fn network_ping_targets_from_state(
             &paths,
             &state,
             member,
-            network::ClusterMemberEndpointSelectionPurpose::DaemonStatus,
+            network::ClusterEndpointSelectionPurpose::MemberDaemonStatus,
         )
         .into_iter()
         .find(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly) else {

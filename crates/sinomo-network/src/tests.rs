@@ -5747,7 +5747,7 @@ fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
         &paths,
         &state,
         remote_member,
-        ClusterMemberEndpointSelectionPurpose::DaemonStatus,
+        ClusterEndpointSelectionPurpose::MemberDaemonStatus,
     );
     assert_eq!(
         status_targets
@@ -14129,7 +14129,7 @@ fn advertised_hostname_outranks_opportunistic_private_ip_for_docker_routes() {
         &paths,
         &state,
         &member,
-        ClusterMemberEndpointSelectionPurpose::DaemonStatus,
+        ClusterEndpointSelectionPurpose::MemberDaemonStatus,
     );
     assert_eq!(
         status_targets.first().map(|endpoint| &endpoint.endpoint_id),
@@ -14577,7 +14577,7 @@ fn member_daemon_status_targets_use_connectivity_without_promoting_iroh() {
         &paths,
         &state,
         &member,
-        ClusterMemberEndpointSelectionPurpose::DaemonStatus,
+        ClusterEndpointSelectionPurpose::MemberDaemonStatus,
     );
     assert_eq!(
         targets
@@ -14636,7 +14636,7 @@ fn member_daemon_status_targets_use_connectivity_without_promoting_iroh() {
         &paths,
         &state,
         &member,
-        ClusterMemberEndpointSelectionPurpose::DaemonStatus,
+        ClusterEndpointSelectionPurpose::MemberDaemonStatus,
     );
     assert_eq!(targets[0].endpoint_id, public.endpoint_id);
     assert_eq!(targets[1].endpoint_id, iroh.endpoint_id);
@@ -14685,7 +14685,7 @@ fn member_daemon_status_targets_use_connectivity_without_promoting_iroh() {
         &paths,
         &state,
         &member,
-        ClusterMemberEndpointSelectionPurpose::DaemonStatus,
+        ClusterEndpointSelectionPurpose::MemberDaemonStatus,
     );
     assert_eq!(targets[0].endpoint_id, iroh.endpoint_id);
 }
