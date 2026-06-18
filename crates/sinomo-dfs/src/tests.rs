@@ -1994,7 +1994,7 @@ fn endpoint_transport_direct_read_uses_direct_sender_without_queuing_frame() {
         &[(
             remote.clone(),
             request.clone(),
-            DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT
+            DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT
         )]
     );
     assert_eq!(

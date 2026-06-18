@@ -7900,8 +7900,6 @@ fn metadata_journal_rejection_is_sequence_conflict(reason: &str) -> bool {
 }
 
 pub const DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-pub const DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT: Duration =
-    DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT;
 const DFS_PROTOCOL_FRAME_DRAIN_MAX_PASSES: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

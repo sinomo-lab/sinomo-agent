@@ -2577,7 +2577,7 @@ fn open_evolution_sifs_service(
         DfsEndpointTransport::with_message_sender(
             local_node_id,
             endpoints,
-            sinomo_runtime::dfs::DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT,
+            sinomo_runtime::dfs::DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
             evolution_sifs_message_sender(),
         ),
         content,
