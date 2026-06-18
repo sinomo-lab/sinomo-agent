@@ -220,6 +220,10 @@ pub use network_info::{
     CLUSTER_NETWORK_INFO_TTL_SECONDS, ClusterNetworkInfoRecord, build_cluster_network_info_record,
     cluster_network_info_stable_eq,
 };
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) use object::read_object_frame_async;
+#[cfg(test)]
+pub(crate) use object::write_object_frame_async;
 pub use object::{
     AsyncDaemonControlListener, AsyncDaemonControlStream, DAEMON_CONTROL_RPC_MAX_FRAME_BYTES,
     DaemonControlRequest, DaemonControlResponse, DaemonRpcTimeouts, OBJECT_STREAM_MAX_CHUNK_BYTES,
@@ -235,8 +239,7 @@ pub(crate) use object::{
     DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY, DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE,
     DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY,
     DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE, ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY,
-    ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE, read_object_frame_async,
-    send_daemon_control_rpc_request_raw_response_async, write_object_frame_async,
+    ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE, send_daemon_control_rpc_request_raw_response_async,
 };
 #[cfg(any(feature = "iroh-transport", test))]
 pub(crate) use object::{
@@ -279,9 +282,10 @@ pub use rpc::{
     ObjectRpcCategoryDefinition, ObjectRpcRequest, ObjectRpcResponse, ObjectRpcRouteCatalog,
     ObjectRpcRoutePolicyLayer, ObjectRpcRouteReadiness, ObjectRpcRouteRegistry,
     ObjectRpcRouteRegistryBuilder, ObjectRpcRouter, ServiceCatalog, ServiceCatalogSnapshot,
-    ServiceCategory, call_object_rpc_frame_async, call_object_rpc_service_async,
-    serve_object_rpc_frame_async,
+    ServiceCategory, call_object_rpc_service_async,
 };
+#[cfg(test)]
+pub(crate) use rpc::{call_object_rpc_frame_async, serve_object_rpc_frame_async};
 pub use status_publish::{
     ClusterNetworkInfoPublishAsyncHost, ClusterNetworkInfoPublishHost,
     ClusterNodeStatusPublishAsyncHost, ClusterNodeStatusPublishHost, cluster_node_status_stable_eq,

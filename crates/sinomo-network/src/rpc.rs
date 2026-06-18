@@ -1,5 +1,7 @@
 use crate::error::NetworkError;
-use crate::object::{ObjectFrameIoOptions, SinomoObjectCodec};
+#[cfg(test)]
+use crate::object::ObjectFrameIoOptions;
+use crate::object::SinomoObjectCodec;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use sinomo_core::CapabilityName;
@@ -10,6 +12,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use time::OffsetDateTime;
+#[cfg(test)]
 use tokio::io::{AsyncRead, AsyncWrite};
 use tower_layer::Layer;
 use tower_service::Service;
@@ -1217,7 +1220,8 @@ where
     }
 }
 
-pub async fn call_object_rpc_frame_async<IO>(
+#[cfg(test)]
+pub(crate) async fn call_object_rpc_frame_async<IO>(
     stream: &mut IO,
     request: &ObjectRpcRequest,
     max_response_bytes: usize,
@@ -1241,7 +1245,8 @@ where
     service.call(request).await
 }
 
-pub async fn serve_object_rpc_frame_async<IO, S>(
+#[cfg(test)]
+pub(crate) async fn serve_object_rpc_frame_async<IO, S>(
     stream: &mut IO,
     service: &mut S,
     max_request_bytes: usize,
