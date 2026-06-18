@@ -9,7 +9,7 @@ use fuser::{
 use sinomo_runtime::core::{ClusterBootstrapState, ClusterEndpointRecord};
 use sinomo_runtime::daemon;
 use sinomo_runtime::dfs::{
-    self, DfsControlPlaneKvClient, DfsEndpointTransport, DfsError, DfsMessageSender, DfsObjectKind,
+    self, DfsControlPlaneKvClient, DfsEndpointTransport, DfsError, DfsObjectKind,
     DfsPeerTransportError, DfsPosixError, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
 };
 use sinomo_runtime::kv::{
@@ -1008,7 +1008,7 @@ fn open_sifs_service(data_dir: Option<PathBuf>) -> Result<OpenedSifsService> {
             local_node_id.clone(),
             endpoints,
             DEFAULT_FUSE_TIMEOUT,
-            dfs_fuse_message_sender(),
+            dfs::dfs_message_sender_from_peer_transport(Arc::new(DfsFusePeerTransport)),
         ),
         content,
     );
@@ -1159,6 +1159,25 @@ fn dfs_fuse_send_daemon_rpc_to_endpoint(
 ) -> std::result::Result<network::ObjectRpcResponse, NetworkError> {
     daemon::send_daemon_rpc_to_endpoint(endpoint, request, timeout)
         .map_err(|error| dfs_fuse_network_error(operation, error))
+}
+
+struct DfsFusePeerTransport;
+
+impl dfs::DfsPeerTransport for DfsFusePeerTransport {
+    fn call_object_rpc(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+        request: &network::ObjectRpcRequest,
+        options: dfs::DfsObjectRpcSendOptions,
+    ) -> std::result::Result<network::ObjectRpcResponse, DfsPeerTransportError> {
+        dfs_fuse_send_daemon_rpc_to_endpoint(
+            endpoint,
+            request,
+            options.connect_timeout,
+            "dfs fuse object rpc",
+        )
+        .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+    }
 }
 
 fn with_dfs_fuse_cluster_raft_operation<T>(
@@ -1651,17 +1670,6 @@ impl network::ClusterSignedEndpointRpcAsyncHost for DfsFuseSignedObjectRpcHost {
             .await
         })
     }
-}
-
-fn dfs_fuse_message_sender() -> DfsMessageSender {
-    Arc::new(|endpoint, request, timeout| {
-        let rpc_request = dfs::dfs_message_rpc_request(request)
-            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-        let response = daemon::send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)
-            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-        dfs::decode_dfs_message_rpc_response(&response)
-            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
-    })
 }
 
 fn file_attr(ino: u64, stat: &dfs::DfsStat) -> FileAttr {
