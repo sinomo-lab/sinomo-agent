@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use crate::route::cluster_route_next_hop;
 use crate::rpc::{
     CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_HEALTH_SCOPE_LOCAL,
     CLUSTER_HEALTH_SCOPE_METADATA_KEY, CLUSTER_NETWORK_PING_ROUTE, CLUSTER_NETWORK_RPC_CATEGORY,
@@ -13,7 +14,7 @@ use crate::storage::{
 use crate::{
     ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityState, ClusterPaths,
     NetworkError, cluster_member_expected_daemon_process, cluster_member_is_legacy_shadow_daemon,
-    cluster_route_next_hop, iroh_endpoint_public_key, live_cluster_member_probe_possible,
+    iroh_endpoint_public_key, live_cluster_member_probe_possible,
 };
 use crate::{advertised_peer_route_targets, discover_peer_route_ip_candidates};
 

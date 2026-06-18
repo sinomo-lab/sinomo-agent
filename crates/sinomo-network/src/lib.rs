@@ -52,6 +52,7 @@ mod route_graph_read_model;
 mod rpc;
 mod status_publish;
 mod storage;
+mod voter_reachability;
 
 pub use connectivity::{
     CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD, CLUSTER_CONNECTIVITY_TTL_SECONDS,
@@ -288,7 +289,6 @@ pub use route::{
     ClusterSignedEndpointRpcObservationKind, RelayEnvelope, handle_cluster_relay_async_with_host,
     handle_cluster_relay_stream_forward_async_with_host, relay_response_is_routing_error,
 };
-pub(crate) use route::{cluster_endpoint_prefers_relay_with_graph, cluster_route_next_hop};
 pub use rpc::{
     CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_HEALTH_RPC_ROUTE_METADATA,
     CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_CHALLENGE_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE,
@@ -326,17 +326,15 @@ pub use storage::{
     ClusterRaftCommittedFanoutOptions, ClusterRaftLeaderElectionOptions,
     ClusterRaftQuorumAsyncHost, ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult,
     ClusterRaftQuorumTransportHost, ClusterRaftVoteTransportAsyncHost,
-    ClusterRaftVoteTransportHost, ClusterVoterReachabilityAsyncHost, ClusterVoterReachabilityHost,
-    ClusterVoterReachabilityOptions, DAEMON_MAIN_RUN_CAPABILITY,
+    ClusterRaftVoteTransportHost, DAEMON_MAIN_RUN_CAPABILITY,
     DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_IROH_FOREGROUND_ATTEMPT_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
     accepted_cluster_join_state_from_kv_snapshot, cleanup_legacy_shadow_daemon_members_with_host,
-    cluster_bootstrap_state_stable_eq, cluster_has_local_quorum_with_host,
-    cluster_join_challenge_rpc_request, cluster_network_publish_interval_for_node,
-    cluster_reachable_voter_count_with_host, cluster_state_sync_txn,
+    cluster_bootstrap_state_stable_eq, cluster_join_challenge_rpc_request,
+    cluster_network_publish_interval_for_node, cluster_state_sync_txn,
     commit_cluster_kv_txn_with_quorum_response_with_host,
     commit_cluster_raft_command_with_quorum_driver, elect_cluster_raft_leader_with_host,
     handle_cluster_join_registration_request_with_host,
@@ -352,7 +350,6 @@ pub use storage::{
     update_cluster_raft_role_with_host, upsert_member_record, write_cluster_state,
 };
 pub use storage::{
-    cluster_has_local_quorum_async_with_host,
     commit_cluster_kv_txn_with_quorum_response_async_with_host,
     commit_cluster_raft_index_with_events_async,
     discard_cluster_raft_uncommitted_tail_and_clear_leader_async,
@@ -361,6 +358,12 @@ pub use storage::{
     read_cluster_state_async, read_cluster_state_without_kv_async,
     replicate_cluster_raft_to_endpoint_async_with_host, sync_cluster_state_to_kv_async_with_host,
     write_cluster_state_async,
+};
+pub use voter_reachability::{
+    ClusterVoterReachabilityAsyncHost, ClusterVoterReachabilityHost,
+    ClusterVoterReachabilityOptions, cluster_has_local_quorum_async_with_host,
+    cluster_has_local_quorum_with_host, cluster_reachable_voter_count_async_with_host,
+    cluster_reachable_voter_count_with_host,
 };
 
 pub type ClusterId = sinomo_core::Id;
