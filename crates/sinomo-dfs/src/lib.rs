@@ -500,7 +500,8 @@ pub fn dfs_message_is_read_only_request(command: &DfsMessageCommand) -> bool {
     dfs_network_message_is_read_only_request(&command.routed_message.message)
 }
 
-pub fn dfs_protocol_frame_is_read_only_request(frame: &NetworkFrame) -> bool {
+#[cfg(test)]
+fn dfs_protocol_frame_is_read_only_request(frame: &NetworkFrame) -> bool {
     dfs_network_message_from_frame(frame)
         .is_ok_and(|message| dfs_network_message_is_read_only_request(&message))
 }
@@ -514,7 +515,8 @@ fn dfs_network_message_requires_fresh_metadata(message: &DfsNetworkMessage) -> b
     )
 }
 
-pub fn dfs_protocol_frame_requires_fresh_metadata(frame: &NetworkFrame) -> bool {
+#[cfg(test)]
+fn dfs_protocol_frame_requires_fresh_metadata(frame: &NetworkFrame) -> bool {
     dfs_network_message_from_frame(frame)
         .is_ok_and(|message| dfs_network_message_requires_fresh_metadata(&message))
 }
