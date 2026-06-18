@@ -35,10 +35,9 @@ pub use peer::{
     EndpointCandidateStatus, Heartbeat, HeartbeatPolicy, InProcessNetwork, InProcessRouter,
     InProcessTransport, InboundFrame, InboundOutcome, LinkState, MeshMessage, MeshMessageBody,
     MeshMessageId, NetworkFrame, NetworkFrameId, NetworkService, NetworkServiceActorOptions,
-    NetworkServiceCommandBackpressure, NetworkServiceCommandOptions, NetworkStreamChunkId,
-    NetworkStreamFrame, NetworkStreamId, NetworkStreamOpen, NodeEndpoint, PeerEndpointCandidate,
-    PeerRegistry, PeerState, PeerStatus, ProtocolMessage, RetryPolicy, RouteDelivery,
-    RouteDeliveryId, TransportKind,
+    NetworkServiceCommandBackpressure, NetworkServiceCommandOptions, NodeEndpoint,
+    PeerEndpointCandidate, PeerRegistry, PeerState, PeerStatus, ProtocolMessage, RetryPolicy,
+    RouteDelivery, RouteDeliveryId, TransportKind,
 };
 pub use roaming::*;
 pub(crate) use route::cluster_route_next_hop;

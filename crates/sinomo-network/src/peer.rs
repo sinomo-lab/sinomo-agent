@@ -731,57 +731,6 @@ fn ingest_event<S: EventStore>(
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct NetworkStreamId(pub u64);
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct NetworkStreamChunkId(pub u64);
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct NetworkStreamOpen {
-    pub stream_id: NetworkStreamId,
-    pub protocol: String,
-    #[serde(default, with = "serde_bytes")]
-    pub metadata: Vec<u8>,
-}
-
-impl NetworkStreamOpen {
-    pub fn encode_metadata<T: serde::Serialize + ?Sized>(
-        stream_id: NetworkStreamId,
-        protocol: impl Into<String>,
-        metadata: &T,
-    ) -> Result<Self, NetworkError> {
-        Ok(Self {
-            stream_id,
-            protocol: protocol.into(),
-            metadata: crate::object::SinomoObjectCodec::default().encode(metadata)?,
-        })
-    }
-
-    pub fn decode_metadata<T: serde::de::DeserializeOwned>(&self) -> Result<T, NetworkError> {
-        crate::object::SinomoObjectCodec::default().decode(&self.metadata)
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum NetworkStreamFrame {
-    Open(NetworkStreamOpen),
-    Data {
-        stream_id: NetworkStreamId,
-        chunk_id: NetworkStreamChunkId,
-        #[serde(with = "serde_bytes")]
-        bytes: Vec<u8>,
-    },
-    End {
-        stream_id: NetworkStreamId,
-    },
-    Reset {
-        stream_id: NetworkStreamId,
-        reason: String,
-    },
-}
-
 /// Synchronous in-memory frame harness.
 ///
 /// This remains available for DFS and tests that drive frames manually. It is

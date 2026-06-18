@@ -23120,7 +23120,7 @@ struct FixtureProtocolPayload {
 }
 
 #[test]
-fn protocol_and_stream_metadata_use_sinomo_object_payloads() {
+fn protocol_metadata_uses_sinomo_object_payloads() {
     let payload = FixtureProtocolPayload {
         path: "/users/alice/readme.txt".to_string(),
         bytes: vec![1, 2, 3, 4],
@@ -23133,17 +23133,6 @@ fn protocol_and_stream_metadata_use_sinomo_object_payloads() {
         message
             .decode::<FixtureProtocolPayload>()
             .expect("decode payload"),
-        payload
-    );
-
-    let open =
-        NetworkStreamOpen::encode_metadata(NetworkStreamId(42), "fixture.stream.v1", &payload)
-            .expect("metadata");
-    assert_eq!(open.stream_id, NetworkStreamId(42));
-    assert_eq!(&open.metadata[..4], sinomo_object::MAGIC);
-    assert_eq!(
-        open.decode_metadata::<FixtureProtocolPayload>()
-            .expect("decode metadata"),
         payload
     );
 }
