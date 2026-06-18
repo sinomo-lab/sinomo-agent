@@ -8948,7 +8948,7 @@ impl NetworkedDfsService<DfsEndpointTransport> {
 pub struct DfsEndpointServedMessageTransport {
     local_node_id: NodeId,
     return_node_id: Option<NodeId>,
-    inbound_frames: VecDeque<InboundFrame>,
+    inbound_messages: VecDeque<DfsRoutedMessage>,
     outbound_messages: Vec<DfsRoutedMessage>,
     endpoint_transport: DfsEndpointTransport,
 }
@@ -8971,7 +8971,7 @@ impl DfsEndpointServedMessageTransport {
         Self {
             local_node_id,
             return_node_id: None,
-            inbound_frames: VecDeque::new(),
+            inbound_messages: VecDeque::new(),
             outbound_messages: Vec::new(),
             endpoint_transport,
         }
@@ -8990,13 +8990,17 @@ impl DfsEndpointServedMessageTransport {
 
     pub fn finish_message(&mut self) -> Vec<DfsRoutedMessage> {
         self.return_node_id = None;
-        self.inbound_frames.clear();
+        self.inbound_messages.clear();
         self.endpoint_transport.incoming_frames.clear();
         std::mem::take(&mut self.outbound_messages)
     }
 
     pub fn replace_endpoints(&mut self, endpoints: Vec<ClusterEndpointRecord>) {
         self.endpoint_transport.replace_endpoints(endpoints);
+    }
+
+    fn drain_queued_messages(&mut self) -> Vec<DfsRoutedMessage> {
+        self.inbound_messages.drain(..).collect()
     }
 }
 
@@ -9019,11 +9023,7 @@ impl DfsMessageTransport for DfsEndpointServedMessageTransport {
             });
         }
         if target_node_id == &self.local_node_id {
-            let frame = protocol::dfs_protocol_frame_from_routed_message(&message)?;
-            self.inbound_frames.push_back(InboundFrame {
-                received_by: self.local_node_id.clone(),
-                frame,
-            });
+            self.inbound_messages.push_back(message);
             return Ok(());
         }
         if self
@@ -9039,7 +9039,18 @@ impl DfsMessageTransport for DfsEndpointServedMessageTransport {
     }
 
     fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
-        let mut frames = self.inbound_frames.drain(..).collect::<Vec<_>>();
+        let mut frames = self
+            .inbound_messages
+            .drain(..)
+            .map(|message| {
+                protocol::dfs_protocol_frame_from_routed_message(&message).map(|frame| {
+                    InboundFrame {
+                        received_by: self.local_node_id.clone(),
+                        frame,
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         frames.extend(self.endpoint_transport.drain_incoming()?);
         Ok(frames)
     }
@@ -9049,7 +9060,7 @@ impl DfsMessageTransport for DfsEndpointServedMessageTransport {
             .endpoint_transport
             .pending_incoming_count()?
             .unwrap_or_default();
-        Ok(Some(self.inbound_frames.len().saturating_add(nested)))
+        Ok(Some(self.inbound_messages.len().saturating_add(nested)))
     }
 
     fn transfer_profile(&self, target_node_id: &NodeId) -> DfsTransferProfile {
@@ -9130,13 +9141,13 @@ impl NetworkedDfsService<DfsEndpointServedMessageTransport> {
         self.transport
             .begin_message(&command.routed_message)
             .map_err(DfsError::from_network)?;
-        let mut events = Vec::new();
-        if let Err(error) =
-            self.process_routed_message_with_options(command.routed_message, false, &mut events)
-        {
-            self.transport.finish_message();
-            return Err(error);
-        }
+        let mut events = match self.process_served_routed_messages(vec![command.routed_message]) {
+            Ok(events) => events,
+            Err(error) => {
+                self.transport.finish_message();
+                return Err(error);
+            }
+        };
         for _ in 0..DFS_PROTOCOL_FRAME_DRAIN_MAX_PASSES {
             let pending = match self
                 .transport
@@ -9150,11 +9161,22 @@ impl NetworkedDfsService<DfsEndpointServedMessageTransport> {
                 }
             };
             if pending != Some(0) {
-                let batch = match self.process_incoming_with_options(false) {
-                    Ok(batch) => batch,
-                    Err(error) => {
-                        self.transport.finish_message();
-                        return Err(error);
+                let queued_messages = self.transport.drain_queued_messages();
+                let batch = if queued_messages.is_empty() {
+                    match self.process_incoming_with_options(false) {
+                        Ok(batch) => batch,
+                        Err(error) => {
+                            self.transport.finish_message();
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    match self.process_served_routed_messages(queued_messages) {
+                        Ok(batch) => batch,
+                        Err(error) => {
+                            self.transport.finish_message();
+                            return Err(error);
+                        }
                     }
                 };
                 events.extend(batch);
@@ -9195,6 +9217,28 @@ impl NetworkedDfsService<DfsEndpointServedMessageTransport> {
                 outbound_messages.len()
             ),
         })
+    }
+
+    fn process_served_routed_messages(
+        &mut self,
+        messages: Vec<DfsRoutedMessage>,
+    ) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
+        self.prune_idle_chunk_transfers();
+        let mut direct_events = self
+            .completed_direct_read_events
+            .drain(..)
+            .collect::<Vec<_>>();
+        let mut events = Vec::new();
+        for message in messages {
+            self.process_routed_message_with_options(message, false, &mut events)?;
+        }
+        if !direct_events.is_empty() {
+            direct_events.extend(events);
+            events = direct_events;
+        }
+        self.prune_expired_pending_remote_reads();
+        self.last_events = events.clone();
+        Ok(events)
     }
 }
 
