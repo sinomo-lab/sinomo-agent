@@ -5,12 +5,12 @@ use crate::file_manager::{
 };
 use sinomo_runtime::core::ClusterEndpointRecord;
 use sinomo_runtime::dfs::{
-    AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsDirectReadRequest, DfsDirectReadSender,
-    DfsEndpointTransport, DfsMetadataJournalBatchSender, DfsMetadataJournalReplicationOptions,
+    AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsEndpointTransport,
+    DfsMetadataJournalBatchSender, DfsMetadataJournalReplicationOptions,
     DfsMetadataPeerTransportError, DfsMetadataShardConfig, DfsMetadataSnapshotInstallSender,
     DfsNodeAdvertisement, DfsObjectKind, DfsObjectRpcSendOptions, DfsPeerTransport,
-    DfsPeerTransportError, DfsPeerTransportFuture, DfsReadResponse, DfsStat, DfsWriteOptions,
-    LocalContentStore, NetworkedDfsService, content_services_prefix, default_dfs_metadata_root,
+    DfsPeerTransportError, DfsPeerTransportFuture, DfsStat, DfsWriteOptions, LocalContentStore,
+    NetworkedDfsService, content_services_prefix, default_dfs_metadata_root,
     default_dfs_metadata_shards_root, fallback_dfs_node_id, metadata_shards_prefix,
     open_local_sharded_metadata_backend, open_root_local_metadata_backend,
     publish_cluster_dfs_metadata_journal, sifs_file_system_id,
@@ -670,6 +670,7 @@ fn open_sifs_service_with_hydration(
         .map_err(|error| format!("cannot open DFS content store: {error}"))?;
     let peer_transport = Arc::new(SifsDfsPeerTransport::new(rpc_runtime.clone()));
     let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
+    let direct_read_peer_transport = Arc::clone(&sync_peer_transport);
     let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer_transport;
     let mut service = NetworkedDfsService::new(
         DfsEndpointTransport::new_with_message_peer_senders(
@@ -677,7 +678,9 @@ fn open_sifs_service_with_hydration(
             endpoints,
             sinomo_runtime::dfs::dfs_message_sender_from_peer_transport(sync_peer_transport),
             sinomo_runtime::dfs::async_dfs_message_sender_from_peer_transport(async_peer_transport),
-            sifs_direct_read_sender(rpc_runtime.clone()),
+            sinomo_runtime::dfs::dfs_direct_read_sender_from_peer_transport(
+                direct_read_peer_transport,
+            ),
         ),
         content,
     );
@@ -887,12 +890,6 @@ fn sifs_replica_candidate_rank(
     (3, u64::MAX, node_id.to_string())
 }
 
-fn sifs_direct_read_sender(rpc_runtime: SifsRpcRuntime) -> DfsDirectReadSender {
-    Arc::new(move |endpoint, request, timeout| {
-        sifs_send_dfs_direct_read(&rpc_runtime, endpoint, request, timeout)
-    })
-}
-
 #[derive(Clone, Debug)]
 struct SifsDfsPeerTransport {
     rpc_runtime: SifsRpcRuntime,
@@ -975,45 +972,6 @@ fn sifs_send_dfs_object_rpc(
                 options.connect_timeout,
                 rpc_runtime.runtime.handle(),
                 options.observe_connectivity,
-            )
-            .await
-        })
-        .map_err(|error| DfsPeerTransportError::new(error.to_string()))
-}
-
-fn sifs_send_dfs_direct_read(
-    rpc_runtime: &SifsRpcRuntime,
-    endpoint: &ClusterEndpointRecord,
-    request: &DfsDirectReadRequest,
-    timeout: std::time::Duration,
-) -> Result<DfsReadResponse, DfsPeerTransportError> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        if matches!(
-            handle.runtime_flavor(),
-            tokio::runtime::RuntimeFlavor::MultiThread
-        ) {
-            return tokio::task::block_in_place(|| {
-                handle.block_on(async {
-                    sinomo_runtime::daemon::send_dfs_direct_read_to_endpoint_async(
-                        endpoint, request, timeout, &handle,
-                    )
-                    .await
-                    .map_err(|error| DfsPeerTransportError::new(error.to_string()))
-                })
-            });
-        }
-        return Err(DfsPeerTransportError::new(
-            "SIFS direct read sync sender cannot run inside a current-thread Tokio runtime",
-        ));
-    }
-    rpc_runtime
-        .runtime
-        .block_on(async {
-            sinomo_runtime::daemon::send_dfs_direct_read_to_endpoint_async(
-                endpoint,
-                request,
-                timeout,
-                rpc_runtime.runtime.handle(),
             )
             .await
         })
