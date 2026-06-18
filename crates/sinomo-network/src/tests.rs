@@ -9218,6 +9218,70 @@ impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
     }
 }
 
+impl ClusterKvTxnForwardAsyncHost for RecordingKvTxnForwardHost {
+    fn send_cluster_kv_txn_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        _txn: &'a KvTxn,
+        _timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, KvTxnResponse> {
+        self.direct_sends.push(endpoint.node_id.clone());
+        let result = if self.direct_error {
+            Err(NetworkError::Io {
+                operation: "test async direct txn".to_string(),
+                detail: "unreachable".to_string(),
+            })
+        } else {
+            Ok(self.txn_response.clone())
+        };
+        Box::pin(async move { result })
+    }
+
+    fn fetch_cluster_kv_snapshot_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        _timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, KvSnapshot> {
+        self.snapshot_fetches.push(endpoint.node_id.clone());
+        let snapshot = self.snapshot.clone();
+        Box::pin(async move { Ok(snapshot) })
+    }
+}
+
+impl ClusterSignedEndpointRpcAsyncHost for RecordingKvTxnForwardHost {
+    fn sign_endpoint_rpc_request_async<'a>(
+        &'a mut self,
+        _request: &'a ObjectRpcRequest,
+    ) -> ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
+        Box::pin(async { Ok(b"test-signature".to_vec()) })
+    }
+
+    fn send_signed_endpoint_rpc_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        _auth: &'a [u8],
+        request: &'a ObjectRpcRequest,
+        _timeouts: DaemonRpcTimeouts,
+    ) -> ClusterSignedEndpointRpcFuture<'a, ObjectRpcResponse> {
+        self.node_rpcs
+            .push((endpoint.node_id.clone(), request.route.clone()));
+        let response: Result<ObjectRpcResponse, NetworkError> = match request.route.as_str() {
+            CLUSTER_KV_TXN_ROUTE => {
+                sinomo_kv::cluster_kv_txn_response_rpc_payload(&self.txn_response)
+                    .map(object_rpc_response_from_kv_payload)
+                    .map_err(NetworkError::from)
+            }
+            CLUSTER_KV_SNAPSHOT_ROUTE => {
+                sinomo_kv::cluster_kv_snapshot_response_rpc_payload(&self.snapshot)
+                    .map(object_rpc_response_from_kv_payload)
+                    .map_err(NetworkError::from)
+            }
+            route => ObjectRpcResponse::encode_error(route, "unexpected route"),
+        };
+        Box::pin(async move { response })
+    }
+}
+
 struct RecordingKvSnapshotRefreshHost {
     known_leader: Option<NodeId>,
     snapshots: BTreeMap<NodeId, KvSnapshot>,
@@ -10996,6 +11060,96 @@ fn cluster_kv_txn_forward_driver_uses_node_rpc_after_direct_voter_failure() {
     )
     .expect("forward")
     .expect("targeted voter");
+
+    assert_eq!(result.snapshot, snapshot);
+    assert_eq!(result.txn_response, Some(txn_response));
+    assert_eq!(host.direct_sends, vec![peer_node_id.clone()]);
+    assert!(host.snapshot_fetches.is_empty());
+    assert_eq!(
+        host.node_rpcs,
+        vec![
+            (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
+            (peer_node_id, CLUSTER_KV_SNAPSHOT_ROUTE.to_string())
+        ]
+    );
+}
+
+#[test]
+fn cluster_kv_txn_async_forward_driver_uses_object_rpc_client_after_direct_voter_failure() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-async-forward-node-rpc");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, local_node_id, peer_node_id) = cluster_raft_handler_test_state(
+        "cluster_kv_async_forward_node_rpc",
+        "node_kv_async_forward_node_rpc_local",
+        "node_kv_async_forward_node_rpc_voter",
+    );
+    let peer_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.86:21353".to_string(), 10);
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == peer_node_id)
+        .expect("peer member")
+        .endpoints
+        .push(peer_endpoint.clone());
+    write_cluster_state(&paths, &state).expect("write state");
+    let now = OffsetDateTime::now_utc();
+    write_local_cluster_connectivity_records(
+        &paths,
+        &local_node_id,
+        &[ClusterConnectivityRecord {
+            cluster_id: state.cluster_id.clone(),
+            source_node_id: local_node_id.clone(),
+            target_node_id: peer_node_id.clone(),
+            endpoint_id: peer_endpoint.endpoint_id.clone(),
+            transport: peer_endpoint.transport,
+            address: peer_endpoint.address.clone(),
+            state: ClusterConnectivityState::Healthy,
+            latency_ms: Some(3),
+            consecutive_failures: 0,
+            last_success_at: Some("ok".to_string()),
+            last_failure_at: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(600),
+        }],
+    )
+    .expect("write healthy direct connectivity");
+    let snapshot = forward_test_snapshot("/forward/async-node-rpc", b"async-node-rpc");
+    let txn_response = forward_test_txn_response(snapshot.revision);
+    let mut host = RecordingKvTxnForwardHost {
+        known_leader: None,
+        direct_error: true,
+        snapshot: snapshot.clone(),
+        txn_response: txn_response.clone(),
+        direct_sends: Vec::new(),
+        snapshot_fetches: Vec::new(),
+        node_rpcs: Vec::new(),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    let result = runtime
+        .block_on(forward_cluster_kv_txn_to_voter_async_with_host(
+            runtime.handle(),
+            &paths,
+            &state,
+            &KvTxn {
+                compares: Vec::new(),
+                success: Vec::new(),
+                failure: Vec::new(),
+            },
+            ClusterKvTxnForwardOptions {
+                timeout: Duration::from_secs(5),
+                tcp_command_timeout: Duration::from_secs(5),
+                iroh_command_timeout: Duration::from_secs(3),
+            },
+            &mut host,
+        ))
+        .expect("async forward")
+        .expect("targeted voter");
 
     assert_eq!(result.snapshot, snapshot);
     assert_eq!(result.txn_response, Some(txn_response));

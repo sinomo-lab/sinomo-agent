@@ -3403,14 +3403,6 @@ pub trait ClusterKvTxnForwardAsyncHost {
         endpoint: &'a ClusterEndpointRecord,
         timeout: Duration,
     ) -> ClusterMembershipRpcFuture<'a, KvSnapshot>;
-
-    fn send_object_rpc_to_node_async<'a>(
-        &'a mut self,
-        state: &'a ClusterBootstrapState,
-        target_node_id: &'a NodeId,
-        request: &'a ObjectRpcRequest,
-        timeout: Duration,
-    ) -> ClusterMembershipRpcFuture<'a, ObjectRpcResponse>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3709,6 +3701,7 @@ pub trait ClusterKvTxnQuorumHost {
 
 pub trait ClusterKvTxnQuorumAsyncHost:
     ClusterKvTxnForwardAsyncHost
+    + ClusterSignedEndpointRpcAsyncHost
     + ClusterRaftQuorumAsyncHost
     + ClusterRaftVoteTransportAsyncHost
     + ClusterVoterReachabilityAsyncHost
@@ -3718,6 +3711,7 @@ pub trait ClusterKvTxnQuorumAsyncHost:
 
 impl<T> ClusterKvTxnQuorumAsyncHost for T where
     T: ClusterKvTxnForwardAsyncHost
+        + ClusterSignedEndpointRpcAsyncHost
         + ClusterRaftQuorumAsyncHost
         + ClusterRaftVoteTransportAsyncHost
         + ClusterVoterReachabilityAsyncHost
@@ -10237,7 +10231,7 @@ pub async fn forward_cluster_kv_txn_to_voter_async_with_host<H>(
     host: &mut H,
 ) -> Result<Option<ClusterKvTxnForwardResult>, NetworkError>
 where
-    H: ClusterKvTxnForwardAsyncHost,
+    H: ClusterKvTxnForwardAsyncHost + ClusterSignedEndpointRpcAsyncHost + Send,
 {
     let mut targets = cluster_raft_live_voter_targets_async(runtime, paths, state).await?;
     if targets.is_empty() {
@@ -10313,6 +10307,8 @@ where
             &voter.node_id,
             txn,
             remaining,
+            runtime,
+            paths,
             host,
         )
         .await
@@ -10339,10 +10335,12 @@ async fn forward_cluster_kv_txn_to_voter_node_async_with_host<H>(
     voter_node_id: &NodeId,
     txn: &KvTxn,
     timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
     host: &mut H,
 ) -> Result<ClusterKvTxnForwardResult, NetworkError>
 where
-    H: ClusterKvTxnForwardAsyncHost,
+    H: ClusterSignedEndpointRpcAsyncHost + Send,
 {
     let started = Instant::now();
     let txn_payload = sinomo_kv::cluster_kv_txn_rpc_payload(txn)?;
@@ -10351,8 +10349,18 @@ where
         txn_payload.category,
         txn_payload.body,
     );
-    let txn_response = host
-        .send_object_rpc_to_node_async(state, voter_node_id, &txn_request, timeout)
+    let mut client =
+        ClusterObjectRpcClient::routed(host, ClusterObjectRpcRouteContext::new(runtime, paths));
+    let txn_response = client
+        .call_node(
+            state,
+            voter_node_id,
+            &txn_request,
+            ClusterObjectRpcNodeOptions::new(
+                ClusterEndpointSelectionPurpose::VoterCommand,
+                DaemonRpcTimeouts::connect_and_idle(timeout),
+            ),
+        )
         .await?;
     txn_response.error_detail()?;
     let txn_response = sinomo_kv::decode_cluster_kv_txn_rpc_body(&txn_response.body)?;
@@ -10366,8 +10374,16 @@ where
         snapshot_payload.category,
         snapshot_payload.body,
     );
-    let snapshot_response = host
-        .send_object_rpc_to_node_async(state, voter_node_id, &snapshot_request, snapshot_timeout)
+    let snapshot_response = client
+        .call_node(
+            state,
+            voter_node_id,
+            &snapshot_request,
+            ClusterObjectRpcNodeOptions::new(
+                ClusterEndpointSelectionPurpose::VoterCommand,
+                DaemonRpcTimeouts::connect_and_idle(snapshot_timeout),
+            ),
+        )
         .await?;
     snapshot_response.error_detail()?;
     let snapshot = sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&snapshot_response.body)?;
