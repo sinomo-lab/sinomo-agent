@@ -5732,6 +5732,11 @@ fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
 
     let selector = ClusterEndpointSelector::new(&paths, &state);
     let candidates = selector.select(ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates);
+    let relay_hop_candidates = selector.select(ClusterEndpointSelectionPurpose::RelayHop);
+    let relay_hop_for_remote = selector.select_node(
+        ClusterEndpointSelectionPurpose::RelayHop,
+        &main_endpoint.node_id,
+    );
     let dfs_targets = selector.select(ClusterEndpointSelectionPurpose::DfsData);
     assert_eq!(
         candidates
@@ -5740,6 +5745,22 @@ fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
             .collect::<Vec<_>>(),
         vec![main_endpoint.endpoint_id.clone()],
         "main daemon command candidates must not include shadow supervision endpoints folded under the main member"
+    );
+    assert_eq!(
+        relay_hop_candidates
+            .iter()
+            .map(|endpoint| endpoint.endpoint_id.clone())
+            .collect::<Vec<_>>(),
+        vec![main_endpoint.endpoint_id.clone()],
+        "relay-hop endpoint selection must use the same main-daemon surface instead of a bespoke shadow-prone path"
+    );
+    assert_eq!(
+        relay_hop_for_remote
+            .iter()
+            .map(|endpoint| endpoint.endpoint_id.clone())
+            .collect::<Vec<_>>(),
+        vec![main_endpoint.endpoint_id.clone()],
+        "node-scoped relay-hop selection should return only the target main endpoint"
     );
     assert!(
         dfs_targets.iter().all(|endpoint| endpoint.endpoint_id

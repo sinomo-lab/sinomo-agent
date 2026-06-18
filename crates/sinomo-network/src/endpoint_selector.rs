@@ -10,6 +10,7 @@ use crate::storage::{
 };
 use sinomo_core::{ClusterBootstrapState, ClusterEndpointRecord, ClusterMemberRecord};
 use sinomo_node::NodeId;
+use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClusterEndpointSelectionPurpose {
@@ -23,6 +24,7 @@ pub enum ClusterEndpointSelectionPurpose {
     MemberPublish,
     MemberPublishVoterFirst,
     RaftCommand,
+    RelayHop,
     Rollout,
     VoterCommand,
 }
@@ -67,6 +69,9 @@ impl<'a> ClusterEndpointSelector<'a> {
             ClusterEndpointSelectionPurpose::RaftCommand => {
                 cluster_raft_command_targets_impl(self.paths, self.state)
             }
+            ClusterEndpointSelectionPurpose::RelayHop => {
+                cluster_main_daemon_command_endpoint_candidates_impl(self.paths, self.state)
+            }
             ClusterEndpointSelectionPurpose::Rollout => {
                 cluster_rollout_endpoint_targets_impl(self.paths, self.state)
             }
@@ -74,6 +79,24 @@ impl<'a> ClusterEndpointSelector<'a> {
                 cluster_voter_command_targets_impl(self.paths, self.state)
             }
         }
+    }
+
+    pub fn select_node(
+        &self,
+        purpose: ClusterEndpointSelectionPurpose,
+        node_id: &NodeId,
+    ) -> Vec<ClusterEndpointRecord> {
+        let mut seen = BTreeSet::new();
+        self.select(purpose)
+            .into_iter()
+            .filter(|endpoint| endpoint.node_id == *node_id)
+            .filter(|endpoint| {
+                seen.insert((
+                    format!("{:?}", endpoint.transport),
+                    endpoint.address.clone(),
+                ))
+            })
+            .collect()
     }
 
     pub fn select_member(

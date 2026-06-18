@@ -760,18 +760,8 @@ async fn cluster_object_rpc_node_targets(
     let target_node_id = target_node_id.clone();
     runtime
         .spawn_blocking(move || {
-            let mut seen = BTreeSet::new();
             ClusterEndpointSelector::new(&paths, &state)
-                .select(endpoint_selection)
-                .into_iter()
-                .filter(|endpoint| endpoint.node_id == target_node_id)
-                .filter(|endpoint| {
-                    seen.insert((
-                        format!("{:?}", endpoint.transport),
-                        endpoint.address.clone(),
-                    ))
-                })
-                .collect::<Vec<_>>()
+                .select_node(endpoint_selection, &target_node_id)
         })
         .await
         .map_err(|source| NetworkError::Io {
@@ -2024,9 +2014,8 @@ fn cluster_relay_next_hop_endpoints_with_graph_and_policy(
         }
     }
     for endpoint in ClusterEndpointSelector::new(paths, state)
-        .select(ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates)
+        .select_node(ClusterEndpointSelectionPurpose::RelayHop, node_id)
         .into_iter()
-        .filter(|endpoint| endpoint.node_id == *node_id)
         .filter(|endpoint| {
             cluster_relay_next_hop_endpoint_is_usable(
                 graph,
