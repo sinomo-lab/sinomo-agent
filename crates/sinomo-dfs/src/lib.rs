@@ -112,11 +112,11 @@ use sinomo_events::EventId;
 use sinomo_kv::KvError;
 use sinomo_local::{LocalDataError, SinomoDataDir};
 use sinomo_network::{
-    ClusterPaths, InboundFrame, MeshMessageBody, NetworkError, NetworkFrame, ObjectRpcRequest,
-    ObjectRpcResponse, ProtocolMessage,
+    ClusterPaths, InboundFrame, NetworkError, NetworkFrame, ObjectRpcRequest, ObjectRpcResponse,
+    ProtocolMessage,
 };
 #[cfg(test)]
-use sinomo_network::{MeshMessage, MeshMessageId, NetworkFrameId};
+use sinomo_network::{MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrameId};
 use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -4745,26 +4745,15 @@ impl<T: DfsMessageTransport> LocalOwnedDfsService<T> {
         {
             return Ok(Vec::new());
         }
-        let inbound_frames = self
+        let inbound_messages = self
             .transport
-            .drain_incoming()
+            .drain_incoming_messages()
             .map_err(DfsError::from_network)?;
         let mut events = Vec::new();
 
-        for inbound in inbound_frames {
-            let source_node_id = inbound.frame.source_node_id.clone();
-            let MeshMessageBody::Protocol(protocol_message) = inbound.frame.message.body else {
-                continue;
-            };
-
-            if protocol_message.protocol != DFS_PROTOCOL {
-                continue;
-            }
-
-            let Ok(message) = protocol_message.decode::<DfsNetworkMessage>() else {
-                continue;
-            };
-            match message {
+        for inbound in inbound_messages {
+            let source_node_id = inbound.source_node_id;
+            match inbound.message {
                 DfsNetworkMessage::ReadRequest(request) => {
                     let event = self.handle_read_request(source_node_id, request)?;
                     events.push(event);
