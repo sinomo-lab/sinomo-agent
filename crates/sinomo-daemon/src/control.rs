@@ -1013,13 +1013,7 @@ async fn dispatch_streamed_cluster_relay_local_request_async(
 }
 
 fn daemon_rpc_request_allows_reusable_stream(request: &sinomo_network::ObjectRpcRequest) -> bool {
-    request
-        .metadata
-        .get(sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY)
-        .is_some_and(|value| {
-            value == sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE
-                || value.eq_ignore_ascii_case("true")
-        })
+    sinomo_network::object_rpc_request_reuses_daemon_stream(request)
 }
 
 pub(crate) fn daemon_dfs_frame_replay_key(

@@ -18,16 +18,17 @@ pub const OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL: u32 = u32::MAX;
 pub const DAEMON_CONTROL_RPC_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024 * 1024;
 #[cfg(not(target_pointer_width = "64"))]
 pub const DAEMON_CONTROL_RPC_MAX_FRAME_BYTES: usize = usize::MAX;
-pub const DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY: &str = "sinomo.daemon-control.reuse-stream";
-pub const DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE: &str = "1";
-pub const DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY: &str =
+pub(crate) const DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY: &str =
+    "sinomo.daemon-control.reuse-stream";
+pub(crate) const DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE: &str = "1";
+pub(crate) const DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY: &str =
     "sinomo.daemon-control.raw-rpc-response";
-pub const DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE: &str = "1";
-pub const DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY: &str =
+pub(crate) const DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE: &str = "1";
+pub(crate) const DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY: &str =
     "sinomo.daemon-control.streamed-rpc-response";
-pub const DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE: &str = "raw-byte-chunks-v1";
-pub const ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY: &str = "sinomo.endpoint-rpc.raw-direct";
-pub const ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE: &str = "1";
+pub(crate) const DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE: &str = "raw-byte-chunks-v1";
+pub(crate) const ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY: &str = "sinomo.endpoint-rpc.raw-direct";
+pub(crate) const ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE: &str = "1";
 const OBJECT_STREAM_CHUNK_FRAME_OVERHEAD_BYTES: usize = 4096;
 const DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES: usize = 8;
 
@@ -658,6 +659,43 @@ pub fn object_rpc_request_accepts_streamed_daemon_response(
         })
 }
 
+pub fn mark_object_rpc_request_reuses_daemon_stream(request: &mut crate::ObjectRpcRequest) {
+    request.metadata.insert(
+        DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY.to_string(),
+        DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE.to_string(),
+    );
+}
+
+pub fn object_rpc_request_reuses_daemon_stream(request: &crate::ObjectRpcRequest) -> bool {
+    request
+        .metadata
+        .get(DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY)
+        .is_some_and(|value| {
+            value == DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE
+                || value.eq_ignore_ascii_case("true")
+        })
+}
+
+pub fn mark_object_rpc_request_accepts_raw_streamed_daemon_response(
+    request: &mut crate::ObjectRpcRequest,
+) {
+    request.metadata.insert(
+        DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY.to_string(),
+        DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE.to_string(),
+    );
+    request.metadata.insert(
+        DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY.to_string(),
+        DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE.to_string(),
+    );
+}
+
+pub fn mark_object_rpc_response_has_streamed_daemon_body(response: &mut crate::ObjectRpcResponse) {
+    response.metadata.insert(
+        DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY.to_string(),
+        DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE.to_string(),
+    );
+}
+
 pub fn object_rpc_response_has_streamed_daemon_body(response: &crate::ObjectRpcResponse) -> bool {
     response
         .metadata
@@ -672,13 +710,7 @@ pub fn daemon_control_request_expects_raw_rpc_response(request: &DaemonControlRe
 fn daemon_control_request_allows_stream_reuse(request: &DaemonControlRequest) -> bool {
     request.route == crate::CLUSTER_NETWORK_PING_ROUTE
         || request.route == crate::CLUSTER_RELAY_ROUTE
-        || request
-            .metadata
-            .get(DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY)
-            .is_some_and(|value| {
-                value == DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE
-                    || value.eq_ignore_ascii_case("true")
-            })
+        || object_rpc_request_reuses_daemon_stream(request)
 }
 
 fn take_pooled_daemon_control_stream(address: &str) -> Option<AsyncDaemonControlStream> {

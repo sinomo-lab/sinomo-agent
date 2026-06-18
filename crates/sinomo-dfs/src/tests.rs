@@ -1596,13 +1596,9 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
     let message_request = dfs_message_rpc_request(&message_command).expect("message request");
     assert_eq!(message_request.route, DFS_MESSAGE_ROUTE);
     assert_eq!(message_request.category, DFS_RPC_CATEGORY);
-    assert_eq!(
-        message_request
-            .metadata
-            .get(sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY)
-            .map(String::as_str),
-        Some(sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE)
-    );
+    assert!(sinomo_network::object_rpc_request_reuses_daemon_stream(
+        &message_request
+    ));
     assert_eq!(
         message_request
             .decode_body::<DfsMessageCommand>()
@@ -1682,27 +1678,8 @@ fn direct_read_rpc_uses_raw_body_and_reconstructs_message_response() {
         .expect("direct read request")
         .expect("direct read eligible");
     assert_eq!(direct_request.route, DFS_DIRECT_READ_ROUTE);
-    assert_eq!(
-        direct_request
-            .metadata
-            .get(sinomo_network::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY)
-            .map(String::as_str),
-        Some(sinomo_network::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE)
-    );
-    assert_eq!(
-        direct_request
-            .metadata
-            .get(sinomo_network::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY)
-            .map(String::as_str),
-        Some(sinomo_network::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE)
-    );
-    assert_eq!(
-        direct_request
-            .metadata
-            .get(sinomo_network::ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY)
-            .map(String::as_str),
-        None
-    );
+    assert!(sinomo_network::object_rpc_request_expects_raw_daemon_response(&direct_request));
+    assert!(sinomo_network::object_rpc_request_accepts_streamed_daemon_response(&direct_request));
     let decoded_direct_request = direct_request
         .decode_body::<DfsDirectReadRequest>()
         .expect("decode direct request");
@@ -1783,13 +1760,8 @@ fn direct_read_stream_rpc_keeps_blob_out_of_initial_response() {
             .map(String::as_str),
         Some(DFS_DIRECT_READ_STATUS_FOUND)
     );
-    assert_eq!(
-        stream_response
-            .response
-            .metadata
-            .get(sinomo_network::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY)
-            .map(String::as_str),
-        Some(sinomo_network::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE)
+    assert!(
+        sinomo_network::object_rpc_response_has_streamed_daemon_body(&stream_response.response)
     );
     assert!(stream_response.response.body.is_empty());
     let mut streamed = Vec::new();

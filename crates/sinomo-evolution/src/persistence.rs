@@ -2558,11 +2558,8 @@ fn open_evolution_sifs_service(
                 detail: source.to_string(),
             }
         })?;
-        let endpoints = network::cluster_endpoint_targets(
-            &cluster_paths,
-            &state,
-            network::ClusterEndpointSelectionPurpose::DfsData,
-        );
+        let endpoints = network::ClusterEndpointSelector::new(&cluster_paths, &state)
+            .select(network::ClusterEndpointSelectionPurpose::DfsData);
         (state.local_node_id, endpoints)
     } else {
         (fallback_dfs_node_id(), Vec::new())

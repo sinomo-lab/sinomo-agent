@@ -514,10 +514,7 @@ pub fn dfs_message_rpc_request(
     command: &DfsMessageCommand,
 ) -> Result<ObjectRpcRequest, NetworkError> {
     let mut request = ObjectRpcRequest::encode_body(DFS_MESSAGE_ROUTE, DFS_RPC_CATEGORY, command)?;
-    request.metadata.insert(
-        sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY.to_string(),
-        sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE.to_string(),
-    );
+    sinomo_network::mark_object_rpc_request_reuses_daemon_stream(&mut request);
     Ok(request)
 }
 
@@ -550,18 +547,8 @@ pub fn dfs_direct_read_rpc_request(
 ) -> Result<ObjectRpcRequest, NetworkError> {
     let mut rpc_request =
         ObjectRpcRequest::encode_body(DFS_DIRECT_READ_ROUTE, DFS_RPC_CATEGORY, request)?;
-    rpc_request.metadata.insert(
-        sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY.to_string(),
-        sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE.to_string(),
-    );
-    rpc_request.metadata.insert(
-        sinomo_network::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY.to_string(),
-        sinomo_network::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE.to_string(),
-    );
-    rpc_request.metadata.insert(
-        sinomo_network::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY.to_string(),
-        sinomo_network::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE.to_string(),
-    );
+    sinomo_network::mark_object_rpc_request_reuses_daemon_stream(&mut rpc_request);
+    sinomo_network::mark_object_rpc_request_accepts_raw_streamed_daemon_response(&mut rpc_request);
     Ok(rpc_request)
 }
 
@@ -742,10 +729,7 @@ fn serve_dfs_direct_read_stream_request(
         DFS_DIRECT_READ_CONTENT_SIZE_METADATA_KEY.to_string(),
         request.content_size_bytes.to_string(),
     );
-    response.metadata.insert(
-        sinomo_network::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY.to_string(),
-        sinomo_network::DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE.to_string(),
-    );
+    sinomo_network::mark_object_rpc_response_has_streamed_daemon_body(&mut response);
     Ok(DfsDirectReadStreamResponse {
         response,
         reader: Some(reader),
