@@ -2921,10 +2921,11 @@ async fn fetch_local_cluster_health_rows_from_member_async(
     let member_node_id = member.node_id.as_str().to_string();
     let endpoints = runtime
         .spawn_blocking(move || {
-            sinomo_network::cluster_member_daemon_status_targets_with_connectivity(
+            sinomo_network::cluster_member_endpoint_targets(
                 &paths_for_targets,
                 &state_for_targets,
                 &member_for_targets,
+                sinomo_network::ClusterMemberEndpointSelectionPurpose::DaemonStatus,
             )
         })
         .await
@@ -3014,10 +3015,11 @@ async fn probe_member_daemon_status_async(
     let member_for_targets = member.clone();
     let member_node_id = member.node_id.as_str().to_string();
     let endpoints = tokio::task::spawn_blocking(move || {
-        sinomo_network::cluster_member_daemon_status_targets_with_connectivity(
+        sinomo_network::cluster_member_endpoint_targets(
             &paths_for_targets,
             &state_for_targets,
             &member_for_targets,
+            sinomo_network::ClusterMemberEndpointSelectionPurpose::DaemonStatus,
         )
     })
     .await

@@ -5743,8 +5743,12 @@ fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
         .iter()
         .find(|member| member.node_id == main_endpoint.node_id)
         .expect("remote main member");
-    let status_targets =
-        cluster_member_daemon_status_targets_with_connectivity(&paths, &state, remote_member);
+    let status_targets = cluster_member_endpoint_targets(
+        &paths,
+        &state,
+        remote_member,
+        ClusterMemberEndpointSelectionPurpose::DaemonStatus,
+    );
     assert_eq!(
         status_targets
             .iter()
@@ -14121,8 +14125,12 @@ fn advertised_hostname_outranks_opportunistic_private_ip_for_docker_routes() {
         "KV/Raft command routing should not fall back to the stale private IP when the hostname is healthy"
     );
 
-    let status_targets =
-        cluster_member_daemon_status_targets_with_connectivity(&paths, &state, &member);
+    let status_targets = cluster_member_endpoint_targets(
+        &paths,
+        &state,
+        &member,
+        ClusterMemberEndpointSelectionPurpose::DaemonStatus,
+    );
     assert_eq!(
         status_targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&stable_hostname.endpoint_id),
@@ -14565,7 +14573,12 @@ fn member_daemon_status_targets_use_connectivity_without_promoting_iroh() {
         ],
     )
     .expect("connectivity records");
-    let targets = cluster_member_daemon_status_targets_with_connectivity(&paths, &state, &member);
+    let targets = cluster_member_endpoint_targets(
+        &paths,
+        &state,
+        &member,
+        ClusterMemberEndpointSelectionPurpose::DaemonStatus,
+    );
     assert_eq!(
         targets
             .iter()
@@ -14619,7 +14632,12 @@ fn member_daemon_status_targets_use_connectivity_without_promoting_iroh() {
         ],
     )
     .expect("connectivity records");
-    let targets = cluster_member_daemon_status_targets_with_connectivity(&paths, &state, &member);
+    let targets = cluster_member_endpoint_targets(
+        &paths,
+        &state,
+        &member,
+        ClusterMemberEndpointSelectionPurpose::DaemonStatus,
+    );
     assert_eq!(targets[0].endpoint_id, public.endpoint_id);
     assert_eq!(targets[1].endpoint_id, iroh.endpoint_id);
 
@@ -14663,7 +14681,12 @@ fn member_daemon_status_targets_use_connectivity_without_promoting_iroh() {
         ],
     )
     .expect("connectivity records");
-    let targets = cluster_member_daemon_status_targets_with_connectivity(&paths, &state, &member);
+    let targets = cluster_member_endpoint_targets(
+        &paths,
+        &state,
+        &member,
+        ClusterMemberEndpointSelectionPurpose::DaemonStatus,
+    );
     assert_eq!(targets[0].endpoint_id, iroh.endpoint_id);
 }
 

@@ -12100,7 +12100,25 @@ fn cluster_invite_publish_targets_impl(
     targets
 }
 
-pub fn cluster_member_daemon_status_targets_with_connectivity(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClusterMemberEndpointSelectionPurpose {
+    DaemonStatus,
+}
+
+pub fn cluster_member_endpoint_targets(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+    purpose: ClusterMemberEndpointSelectionPurpose,
+) -> Vec<ClusterEndpointRecord> {
+    match purpose {
+        ClusterMemberEndpointSelectionPurpose::DaemonStatus => {
+            cluster_member_daemon_status_targets_with_connectivity(paths, state, member)
+        }
+    }
+}
+
+fn cluster_member_daemon_status_targets_with_connectivity(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,

@@ -335,9 +335,12 @@ fn cli_probe_member_daemon_status(
     {
         return Some(status);
     }
-    for endpoint in
-        network::cluster_member_daemon_status_targets_with_connectivity(paths, state, member)
-    {
+    for endpoint in network::cluster_member_endpoint_targets(
+        paths,
+        state,
+        member,
+        network::ClusterMemberEndpointSelectionPurpose::DaemonStatus,
+    ) {
         let Ok(status) =
             daemon_fetch_daemon_status_from_endpoint(&endpoint, CLUSTER_HEALTH_PROBE_TIMEOUT)
         else {
@@ -404,9 +407,12 @@ fn cli_fetch_local_cluster_health_rows_from_member(
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,
 ) -> Option<Vec<ClusterHealthRow>> {
-    for endpoint in
-        network::cluster_member_daemon_status_targets_with_connectivity(paths, state, member)
-    {
+    for endpoint in network::cluster_member_endpoint_targets(
+        paths,
+        state,
+        member,
+        network::ClusterMemberEndpointSelectionPurpose::DaemonStatus,
+    ) {
         let Ok(request) = network::cluster_local_health_rpc_request() else {
             return None;
         };

@@ -487,11 +487,14 @@ fn network_ping_targets_from_state(
         {
             continue;
         }
-        let Some(endpoint) =
-            network::cluster_member_daemon_status_targets_with_connectivity(&paths, &state, member)
-                .into_iter()
-                .find(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly)
-        else {
+        let Some(endpoint) = network::cluster_member_endpoint_targets(
+            &paths,
+            &state,
+            member,
+            network::ClusterMemberEndpointSelectionPurpose::DaemonStatus,
+        )
+        .into_iter()
+        .find(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly) else {
             continue;
         };
         targets.insert(member.node_id.clone(), endpoint);
