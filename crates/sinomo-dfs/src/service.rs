@@ -21,16 +21,15 @@ use std::sync::Arc;
 use crate::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_PLANE_SERVICE_ROUTES, DFS_DIRECT_READ_ROUTE,
     DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE, DFS_MESSAGE_ROUTE,
-    DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
-    DFS_PROTOCOL_FRAME_ROUTE, DFS_RPC_CATEGORY, DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE,
-    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMessageCommand, DfsMessageResponse,
-    DfsMetadataBackend, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
-    DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
-    DfsOperatorInspector, DfsOperatorStatus, DfsProtocolFrameCommand, DfsProtocolFrameResponse,
-    DfsSmokeReport, default_dfs_metadata_root, default_dfs_metadata_shards_root,
-    dfs_module_surfaces, ensure_default_cluster_aware_dfs_expose_config,
-    handle_dfs_direct_read_rpc_request, metadata_shards_prefix,
-    open_local_sharded_metadata_backend, open_root_local_metadata_backend, sifs_file_system_id,
+    DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_SMOKE_ROUTE,
+    DFS_STATUS_ROUTE, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMessageCommand,
+    DfsMessageResponse, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
+    DfsMetadataJournalBatchResponse, DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand,
+    DfsMetadataSnapshotInstallResponse, DfsOperatorInspector, DfsOperatorStatus, DfsSmokeReport,
+    default_dfs_metadata_root, default_dfs_metadata_shards_root, dfs_module_surfaces,
+    ensure_default_cluster_aware_dfs_expose_config, handle_dfs_direct_read_rpc_request,
+    metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
+    sifs_file_system_id,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
@@ -43,7 +42,7 @@ use sinomo_service::{
 };
 
 const DFS_DEFAULT_ROUTE_CONCURRENCY_LIMIT: usize = 8;
-const DFS_PROTOCOL_FRAME_ROUTE_CONCURRENCY_LIMIT: usize = 64;
+const DFS_DATA_PLANE_ROUTE_CONCURRENCY_LIMIT: usize = 64;
 
 /// DFS control-plane service. Host-agnostic: it derives everything from the request's
 /// [`ServiceContext::data_dir`], so it runs with or without a daemon/cluster.
@@ -68,15 +67,6 @@ pub fn register_data_plane_services(
 }
 
 fn dfs_service_route(route: &'static str) -> ServiceRoute {
-    if route == DFS_PROTOCOL_FRAME_ROUTE {
-        return ServiceRoute::from_route_metadata(
-            route,
-            DFS_RPC_CATEGORY,
-            sinomo_module::ModuleRouteAuth::LocalOrClusterMember.as_scope(),
-            ["dfs.object.transfer"],
-        )
-        .with_concurrency_limit(dfs_service_route_concurrency_limit(route));
-    }
     let descriptor = dfs_module_surfaces()
         .object_rpc_route_descriptor(route)
         .expect("DFS module surfaces should be valid")
@@ -94,11 +84,8 @@ fn dfs_service_route(route: &'static str) -> ServiceRoute {
 }
 
 fn dfs_service_route_concurrency_limit(route: &str) -> usize {
-    if route == DFS_MESSAGE_ROUTE
-        || route == DFS_PROTOCOL_FRAME_ROUTE
-        || route == DFS_DIRECT_READ_ROUTE
-    {
-        DFS_PROTOCOL_FRAME_ROUTE_CONCURRENCY_LIMIT
+    if route == DFS_MESSAGE_ROUTE || route == DFS_DIRECT_READ_ROUTE {
+        DFS_DATA_PLANE_ROUTE_CONCURRENCY_LIMIT
     } else {
         DFS_DEFAULT_ROUTE_CONCURRENCY_LIMIT
     }
@@ -136,19 +123,6 @@ pub trait DfsDataPlaneHost: Send + Sync {
         &'a self,
         command: DfsMessageCommand,
     ) -> DfsDataPlaneHostFuture<'a, DfsMessageResponse>;
-
-    fn handle_protocol_frame<'a>(
-        &'a self,
-        command: DfsProtocolFrameCommand,
-    ) -> DfsDataPlaneHostFuture<'a, DfsProtocolFrameResponse> {
-        Box::pin(async move {
-            let message_command = crate::dfs_protocol_frame_command_to_message_command(&command)
-                .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))?;
-            let message_response = self.handle_message(message_command).await?;
-            crate::dfs_message_response_to_protocol_frame_response(message_response)
-                .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))
-        })
-    }
 }
 
 pub type DfsDataPlaneHostFuture<'a, T> =
@@ -248,20 +222,6 @@ impl Service for DfsDataPlaneService {
                     let message_response =
                         host.handle_message(command).await.map_err(service_error)?;
                     ObjectRpcResponse::encode_body(DFS_MESSAGE_ROUTE, &message_response)?
-                }
-                DFS_PROTOCOL_FRAME_ROUTE => {
-                    let command: DfsProtocolFrameCommand = request.decode_body()?;
-                    let message_command =
-                        crate::dfs_protocol_frame_command_to_message_command(&command)
-                            .map_err(service_error)?;
-                    let message_response = host
-                        .handle_message(message_command)
-                        .await
-                        .map_err(service_error)?;
-                    let frame_response =
-                        crate::dfs_message_response_to_protocol_frame_response(message_response)
-                            .map_err(service_error)?;
-                    ObjectRpcResponse::encode_body(DFS_PROTOCOL_FRAME_ROUTE, &frame_response)?
                 }
                 DFS_DIRECT_READ_ROUTE => handle_dfs_direct_read_rpc_request(&ctx.data_dir, request)
                     .map_err(service_error)?,
@@ -704,7 +664,6 @@ mod tests {
             register_data_plane_services(ServiceRegistry::builder(), host.clone()).build();
         assert!(registry.owns(DFS_SMOKE_ROUTE));
         assert!(registry.owns(DFS_MESSAGE_ROUTE));
-        assert!(registry.owns(DFS_PROTOCOL_FRAME_ROUTE));
         assert!(registry.owns(DFS_DIRECT_READ_ROUTE));
 
         let (disposition, smoke_response) = {
@@ -753,45 +712,13 @@ mod tests {
         assert_eq!(message.request_id, "message-route-1");
         assert!(message.outbound_messages.is_empty());
 
-        let command = DfsProtocolFrameCommand {
-            request_id: "frame-route-1".to_string(),
-            frame: crate::build_dfs_network_frame(
-                &local,
-                &local,
-                1,
-                1,
-                crate::DfsNetworkMessage::ReadRequest(crate::DfsReadRequest {
-                    request_id: "frame-read-1".to_string(),
-                    object_id: DfsObjectId::generate(),
-                    version: None,
-                    content_hash: None,
-                    content_size_bytes: None,
-                    range_offset: None,
-                    range_max_bytes: None,
-                    start_chunk_index: 0,
-                    max_chunks: 0,
-                }),
-            )
-            .expect("dfs protocol frame"),
-        };
-        let (_test_root, test_data_dir) = temp_data_dir();
-        let (disposition, frame_response) = dispatch_local(
-            &registry,
-            test_data_dir.clone(),
-            DFS_PROTOCOL_FRAME_ROUTE,
-            &command,
-        )
-        .await;
-        assert_eq!(disposition, ServiceDisposition::Continue);
-        let frame: DfsProtocolFrameResponse = frame_response.decode_body().expect("decode frame");
-        assert_eq!(frame.request_id, "frame-route-1");
-        assert!(frame.outbound_frames.is_empty());
         assert_eq!(
             host.message_request_ids
                 .lock()
                 .expect("message request ids")
                 .as_slice(),
-            ["message-route-1", "frame-route-1"]
+            ["message-route-1"]
         );
+        assert!(!registry.owns(crate::DFS_PROTOCOL_FRAME_ROUTE));
     }
 }

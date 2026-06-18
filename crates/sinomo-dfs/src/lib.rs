@@ -350,13 +350,8 @@ pub const DFS_DATA_PLANE_ROUTES: &[&str] =
 /// network protocol frames. New data-plane callers should use `DFS_MESSAGE_ROUTE`
 /// or a typed DFS route instead.
 pub const DFS_LEGACY_DATA_PLANE_COMPATIBILITY_ROUTES: &[&str] = &[DFS_PROTOCOL_FRAME_ROUTE];
-/// Routes registered by the DFS data-plane service while the compatibility shim exists.
-pub const DFS_DATA_PLANE_SERVICE_ROUTES: &[&str] = &[
-    DFS_SMOKE_ROUTE,
-    DFS_MESSAGE_ROUTE,
-    DFS_DIRECT_READ_ROUTE,
-    DFS_PROTOCOL_FRAME_ROUTE,
-];
+/// Routes registered by the DFS data-plane service.
+pub const DFS_DATA_PLANE_SERVICE_ROUTES: &[&str] = DFS_DATA_PLANE_ROUTES;
 pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
     DFS_STATUS_ROUTE,
     DFS_EXPOSE_CONFIG_ROUTE,

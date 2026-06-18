@@ -3678,7 +3678,6 @@ mod tests {
                 CLUSTER_RELAY_ROUTE,
                 sinomo_dfs::DFS_SMOKE_ROUTE,
                 sinomo_dfs::DFS_MESSAGE_ROUTE,
-                sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE,
                 sinomo_dfs::DFS_DIRECT_READ_ROUTE,
                 CLUSTER_JOIN_CHALLENGE_ROUTE,
                 CLUSTER_JOIN_REGISTER_ROUTE,
@@ -3717,12 +3716,13 @@ mod tests {
             Some(sinomo_dfs::DFS_RPC_CATEGORY)
         );
         assert_eq!(
-            registry.category_for_route(sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE),
-            Some(sinomo_dfs::DFS_RPC_CATEGORY)
-        );
-        assert_eq!(
             registry.category_for_route(sinomo_dfs::DFS_DIRECT_READ_ROUTE),
             Some(sinomo_dfs::DFS_RPC_CATEGORY)
+        );
+        assert!(!registry.owns(sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE));
+        assert_eq!(
+            registry.category_for_route(sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE),
+            None
         );
         let route_metadata = registry.route_categories();
         let snapshot = route_metadata
@@ -3817,18 +3817,6 @@ mod tests {
         );
         assert_eq!(
             dfs_message.required_capabilities,
-            vec!["dfs.object.transfer".to_string()]
-        );
-        let dfs_frame = route_metadata
-            .iter()
-            .find(|route| route.route == sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE)
-            .expect("dfs frame route metadata");
-        assert_eq!(
-            dfs_frame.auth_scope.as_deref(),
-            Some(sinomo_module::ModuleRouteAuth::LocalOrClusterMember.as_scope())
-        );
-        assert_eq!(
-            dfs_frame.required_capabilities,
             vec!["dfs.object.transfer".to_string()]
         );
         let dfs_direct_read = route_metadata
