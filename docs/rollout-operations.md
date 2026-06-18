@@ -67,7 +67,7 @@ Run install from the current source checkout to create or refresh the local inst
 cargo run --bin sinomo -- install
 ```
 
-`install` copies the current executable to the installed main and shadow binary paths, updates boot entries, starts both daemons by default, and imports the current git checkout into the managed source repo. For a LAN-reachable node, the default install bind is `0.0.0.0`.
+`install` copies the current executable to the installed main and shadow binary paths, exposes the main binary as `~/.local/bin/sinomo` on Unix-like systems, updates boot entries, starts both daemons by default, and imports the current git checkout into the managed source repo. For a LAN-reachable node, the default install bind is `0.0.0.0`.
 
 Useful variants:
 
