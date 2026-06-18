@@ -8,8 +8,9 @@ use crate::local_state_store::read_cluster_state_without_kv;
 use sinomo_kv::{CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, KvLogEntry, KvWalPaths};
 use sinomo_kv::{
     ClusterKvRaftCommitResult, ClusterKvRaftUncommittedAppend, DurableRaftKvNode, InProcessKvStore,
-    KvCommand, KvEntry, KvLocalCache, KvSnapshot, KvTxnResponse, RaftAppendEntriesRequest,
-    RaftAppendEntriesResponse, RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot,
+    KvCommand, KvEntry, KvLocalCache, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse,
+    RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftRequestVoteRequest,
+    RaftRequestVoteResponse, RaftSnapshot,
 };
 use sinomo_node::NodeId;
 use std::collections::HashMap;
@@ -468,6 +469,59 @@ pub(crate) fn append_cluster_raft_command(
     command: KvCommand,
 ) -> Result<KvSnapshot, NetworkError> {
     append_cluster_raft_command_with_response(paths, node_id, command).map(|(snapshot, _)| snapshot)
+}
+
+/// The local node's current cluster KV snapshot revision, if one is readable;
+/// `None` asks the voter to ship its full snapshot back.
+pub(crate) fn local_cluster_kv_snapshot_revision(paths: &ClusterPaths) -> Option<KvRevision> {
+    read_cluster_kv_current_snapshot(paths)
+        .ok()
+        .map(|snapshot| snapshot.revision)
+}
+
+/// Direction guard for snapshot imports: under raft's lag-only invariant an
+/// imported snapshot must move local history FORWARD. A responder that lags
+/// the local node (a stale bridge answering a fresher publisher) must never
+/// roll the local KV back.
+pub(crate) fn imported_snapshot_advances_local_kv(
+    paths: &ClusterPaths,
+    snapshot: &KvSnapshot,
+) -> bool {
+    match local_cluster_kv_snapshot_revision(paths) {
+        Some(local) => snapshot.revision > local,
+        None => true,
+    }
+}
+
+pub(crate) fn append_cluster_raft_ops_in_batches(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    ops: Vec<KvOp>,
+) -> Result<KvSnapshot, NetworkError> {
+    let mut ops = ops.into_iter();
+    let mut latest = None;
+    loop {
+        let chunk = ops
+            .by_ref()
+            .take(sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND)
+            .collect::<Vec<_>>();
+        if chunk.is_empty() {
+            break;
+        }
+        latest = Some(append_cluster_raft_command(
+            paths,
+            node_id,
+            KvCommand::Txn(KvTxn {
+                compares: Vec::new(),
+                success: chunk,
+                failure: Vec::new(),
+            }),
+        )?);
+    }
+    latest.ok_or_else(|| NetworkError::StorageIo {
+        path: paths.kv_snapshot.display().to_string(),
+        detail: "cannot append an empty batch of cluster kv operations".to_string(),
+    })
 }
 
 pub(crate) fn append_cluster_raft_command_with_response(

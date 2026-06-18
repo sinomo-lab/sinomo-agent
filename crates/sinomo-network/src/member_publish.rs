@@ -9,6 +9,7 @@ use crate::keyspace::{
     cluster_member_key,
 };
 use crate::kv_local_store::{
+    imported_snapshot_advances_local_kv, local_cluster_kv_snapshot_revision,
     read_cluster_kv_cached_snapshot, read_cluster_kv_current_snapshot,
     read_cluster_kv_current_snapshot_arc, write_imported_cluster_kv_snapshot_if_changed,
 };
@@ -20,10 +21,7 @@ use crate::membership_rpc::{ClusterMemberPublishRequest, ClusterMemberPublishRes
 use crate::prelude::*;
 use crate::records::{ClusterCapabilityPolicyRecord, cluster_capability_policy_stable_eq};
 use crate::rpc_future::ClusterMembershipRpcFuture;
-use crate::storage::{
-    ClusterMemberMutationAsyncHost, imported_snapshot_advances_local_kv,
-    local_cluster_kv_snapshot_revision,
-};
+use crate::storage::ClusterMemberMutationAsyncHost;
 use sinomo_kv::KvRevision;
 
 pub trait ClusterMemberPublishHost {
