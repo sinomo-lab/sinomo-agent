@@ -65,6 +65,31 @@ impl DfsFrameTransport for ReceiveOnlyTransport {
     }
 }
 
+fn test_dfs_lookup_frame(
+    source_node_id: &NodeId,
+    target_node_id: &NodeId,
+    frame_id: u64,
+    path: &str,
+) -> NetworkFrame {
+    build_dfs_network_frame(
+        source_node_id,
+        target_node_id,
+        frame_id,
+        frame_id,
+        DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+            request_id: format!("dfs_test_lookup_{frame_id}"),
+            file_system_id: sifs_file_system_id(),
+            requesting_node_id: source_node_id.clone(),
+            include_metadata_journal_batches: false,
+            metadata_journal_after_sequences: Vec::new(),
+            operation: DfsNamespaceOperation::LookupPath {
+                path: path.to_string(),
+            },
+        }),
+    )
+    .expect("test DFS lookup frame")
+}
+
 #[test]
 fn dfs_adaptive_transfer_windows_stay_byte_bounded() {
     assert_eq!(DFS_BLOB_CHUNK_BYTES, 4 * 1024 * 1024);
@@ -1878,20 +1903,12 @@ fn endpoint_transport_sends_rpc_and_queues_returned_frames() {
             .push((endpoint.node_id.clone(), command.frame.clone()));
         Ok(DfsProtocolFrameResponse {
             request_id: command.request_id.clone(),
-            outbound_frames: vec![NetworkFrame {
-                frame_id: NetworkFrameId(100),
-                source_node_id: remote_for_sender.clone(),
-                target_node_id: local_for_sender.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(100),
-                    origin_node_id: remote_for_sender.clone(),
-                    target_node_id: local_for_sender.clone(),
-                    body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                        node_id: remote_for_sender.clone(),
-                        tick: 1,
-                    }),
-                },
-            }],
+            outbound_frames: vec![test_dfs_lookup_frame(
+                &remote_for_sender,
+                &local_for_sender,
+                100,
+                "/endpoint/send-return",
+            )],
         })
     });
     let mut transport = DfsEndpointTransport::with_connect_timeout(
@@ -1900,20 +1917,7 @@ fn endpoint_transport_sends_rpc_and_queues_returned_frames() {
         Duration::from_millis(1),
         sender,
     );
-    let frame = NetworkFrame {
-        frame_id: NetworkFrameId(7),
-        source_node_id: local.clone(),
-        target_node_id: remote.clone(),
-        message: MeshMessage {
-            message_id: MeshMessageId(7),
-            origin_node_id: local.clone(),
-            target_node_id: remote.clone(),
-            body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                node_id: local.clone(),
-                tick: 7,
-            }),
-        },
-    };
+    let frame = test_dfs_lookup_frame(&local, &remote, 7, "/endpoint/send");
 
     transport.send(&remote, frame.clone()).expect("send frame");
     let recorded = calls.lock().expect("calls lock");
@@ -2037,20 +2041,12 @@ fn endpoint_transport_async_send_requires_async_sender() {
                 .push((endpoint.node_id.clone(), command.frame.clone()));
             Ok(DfsProtocolFrameResponse {
                 request_id: command.request_id.clone(),
-                outbound_frames: vec![NetworkFrame {
-                    frame_id: NetworkFrameId(100),
-                    source_node_id: remote_for_sender.clone(),
-                    target_node_id: local_for_sender.clone(),
-                    message: MeshMessage {
-                        message_id: MeshMessageId(100),
-                        origin_node_id: remote_for_sender.clone(),
-                        target_node_id: local_for_sender.clone(),
-                        body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                            node_id: remote_for_sender.clone(),
-                            tick: 1,
-                        }),
-                    },
-                }],
+                outbound_frames: vec![test_dfs_lookup_frame(
+                    &remote_for_sender,
+                    &local_for_sender,
+                    100,
+                    "/endpoint/async-missing-return",
+                )],
             })
         });
         let mut transport = DfsEndpointTransport::with_connect_timeout(
@@ -2059,20 +2055,7 @@ fn endpoint_transport_async_send_requires_async_sender() {
             Duration::from_millis(1),
             sender,
         );
-        let frame = NetworkFrame {
-            frame_id: NetworkFrameId(7),
-            source_node_id: local.clone(),
-            target_node_id: remote.clone(),
-            message: MeshMessage {
-                message_id: MeshMessageId(7),
-                origin_node_id: local.clone(),
-                target_node_id: remote.clone(),
-                body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                    node_id: local.clone(),
-                    tick: 7,
-                }),
-            },
-        };
+        let frame = test_dfs_lookup_frame(&local, &remote, 7, "/endpoint/async-missing");
 
         let error = AsyncDfsFrameTransport::send_async(&mut transport, &remote, frame.clone())
             .await
@@ -2117,20 +2100,12 @@ fn endpoint_transport_async_sender_does_not_require_sync_sender() {
                     .push((endpoint_node_id, frame));
                 Ok(DfsProtocolFrameResponse {
                     request_id,
-                    outbound_frames: vec![NetworkFrame {
-                        frame_id: NetworkFrameId(101),
-                        source_node_id: remote_for_sender.clone(),
-                        target_node_id: local_for_sender.clone(),
-                        message: MeshMessage {
-                            message_id: MeshMessageId(101),
-                            origin_node_id: remote_for_sender.clone(),
-                            target_node_id: local_for_sender.clone(),
-                            body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                                node_id: remote_for_sender,
-                                tick: 1,
-                            }),
-                        },
-                    }],
+                    outbound_frames: vec![test_dfs_lookup_frame(
+                        &remote_for_sender,
+                        &local_for_sender,
+                        101,
+                        "/endpoint/async-only-return",
+                    )],
                 })
             })
         });
@@ -2140,20 +2115,7 @@ fn endpoint_transport_async_sender_does_not_require_sync_sender() {
             Duration::from_millis(1),
             sender,
         );
-        let frame = NetworkFrame {
-            frame_id: NetworkFrameId(7),
-            source_node_id: local.clone(),
-            target_node_id: remote.clone(),
-            message: MeshMessage {
-                message_id: MeshMessageId(7),
-                origin_node_id: local.clone(),
-                target_node_id: remote.clone(),
-                body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                    node_id: local.clone(),
-                    tick: 7,
-                }),
-            },
-        };
+        let frame = test_dfs_lookup_frame(&local, &remote, 7, "/endpoint/async-only");
 
         assert!(
             transport
@@ -2200,20 +2162,12 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
                 .push((endpoint.node_id.clone(), command.frame.frame_id));
             Ok(DfsProtocolFrameResponse {
                 request_id: command.request_id.clone(),
-                outbound_frames: vec![NetworkFrame {
-                    frame_id: NetworkFrameId(201),
-                    source_node_id: remote_for_sync.clone(),
-                    target_node_id: local_for_sync.clone(),
-                    message: MeshMessage {
-                        message_id: MeshMessageId(201),
-                        origin_node_id: remote_for_sync.clone(),
-                        target_node_id: local_for_sync.clone(),
-                        body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                            node_id: remote_for_sync.clone(),
-                            tick: 201,
-                        }),
-                    },
-                }],
+                outbound_frames: vec![test_dfs_lookup_frame(
+                    &remote_for_sync,
+                    &local_for_sync,
+                    201,
+                    "/endpoint/dual-sync-return",
+                )],
             })
         });
 
@@ -2235,20 +2189,12 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
                         .push((endpoint_node_id, frame_id));
                     Ok(DfsProtocolFrameResponse {
                         request_id,
-                        outbound_frames: vec![NetworkFrame {
-                            frame_id: NetworkFrameId(301),
-                            source_node_id: remote_for_async.clone(),
-                            target_node_id: local_for_async.clone(),
-                            message: MeshMessage {
-                                message_id: MeshMessageId(301),
-                                origin_node_id: remote_for_async.clone(),
-                                target_node_id: local_for_async.clone(),
-                                body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                                    node_id: remote_for_async.clone(),
-                                    tick: 301,
-                                }),
-                            },
-                        }],
+                        outbound_frames: vec![test_dfs_lookup_frame(
+                            &remote_for_async,
+                            &local_for_async,
+                            301,
+                            "/endpoint/dual-async-return",
+                        )],
                     })
                 })
             });
@@ -2260,20 +2206,7 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
             sync_sender,
             async_sender,
         );
-        let sync_frame = NetworkFrame {
-            frame_id: NetworkFrameId(11),
-            source_node_id: local.clone(),
-            target_node_id: remote.clone(),
-            message: MeshMessage {
-                message_id: MeshMessageId(11),
-                origin_node_id: local.clone(),
-                target_node_id: remote.clone(),
-                body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                    node_id: local.clone(),
-                    tick: 11,
-                }),
-            },
-        };
+        let sync_frame = test_dfs_lookup_frame(&local, &remote, 11, "/endpoint/dual-sync");
         transport
             .send(&remote, sync_frame)
             .expect("sync send frame");
@@ -2287,20 +2220,7 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
         assert_eq!(incoming[0].received_by, local);
         assert_eq!(incoming[0].frame.source_node_id, remote);
 
-        let async_frame = NetworkFrame {
-            frame_id: NetworkFrameId(12),
-            source_node_id: local.clone(),
-            target_node_id: remote.clone(),
-            message: MeshMessage {
-                message_id: MeshMessageId(12),
-                origin_node_id: local.clone(),
-                target_node_id: remote.clone(),
-                body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                    node_id: local.clone(),
-                    tick: 12,
-                }),
-            },
-        };
+        let async_frame = test_dfs_lookup_frame(&local, &remote, 12, "/endpoint/dual-async");
         AsyncDfsFrameTransport::send_async(&mut transport, &remote, async_frame)
             .await
             .expect("async send frame");
@@ -2338,39 +2258,23 @@ fn endpoint_transport_relays_remote_returned_frames_preserving_source() {
         if command.frame.target_node_id == primary_for_sender {
             return Ok(DfsProtocolFrameResponse {
                 request_id: command.request_id.clone(),
-                outbound_frames: vec![NetworkFrame {
-                    frame_id: NetworkFrameId(101),
-                    source_node_id: primary_for_sender.clone(),
-                    target_node_id: replica_for_sender.clone(),
-                    message: MeshMessage {
-                        message_id: MeshMessageId(101),
-                        origin_node_id: primary_for_sender.clone(),
-                        target_node_id: replica_for_sender.clone(),
-                        body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                            node_id: primary_for_sender.clone(),
-                            tick: 1,
-                        }),
-                    },
-                }],
+                outbound_frames: vec![test_dfs_lookup_frame(
+                    &primary_for_sender,
+                    &replica_for_sender,
+                    101,
+                    "/endpoint/relay-primary",
+                )],
             });
         }
         if command.frame.target_node_id == replica_for_sender {
             return Ok(DfsProtocolFrameResponse {
                 request_id: command.request_id.clone(),
-                outbound_frames: vec![NetworkFrame {
-                    frame_id: NetworkFrameId(102),
-                    source_node_id: replica_for_sender.clone(),
-                    target_node_id: local_for_sender.clone(),
-                    message: MeshMessage {
-                        message_id: MeshMessageId(102),
-                        origin_node_id: replica_for_sender.clone(),
-                        target_node_id: local_for_sender.clone(),
-                        body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                            node_id: replica_for_sender.clone(),
-                            tick: 2,
-                        }),
-                    },
-                }],
+                outbound_frames: vec![test_dfs_lookup_frame(
+                    &replica_for_sender,
+                    &local_for_sender,
+                    102,
+                    "/endpoint/relay-replica",
+                )],
             });
         }
         Ok(DfsProtocolFrameResponse {
@@ -2384,20 +2288,7 @@ fn endpoint_transport_relays_remote_returned_frames_preserving_source() {
         Duration::from_millis(1),
         sender,
     );
-    let frame = NetworkFrame {
-        frame_id: NetworkFrameId(9),
-        source_node_id: local.clone(),
-        target_node_id: primary.clone(),
-        message: MeshMessage {
-            message_id: MeshMessageId(9),
-            origin_node_id: local.clone(),
-            target_node_id: primary.clone(),
-            body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                node_id: local.clone(),
-                tick: 9,
-            }),
-        },
-    };
+    let frame = test_dfs_lookup_frame(&local, &primary, 9, "/endpoint/relay");
 
     transport.send(&primary, frame).expect("send through relay");
 

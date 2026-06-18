@@ -388,10 +388,7 @@ async fn send_daemon_rpc_to_endpoint_async_with_connectivity_observation(
     runtime: &tokio::runtime::Handle,
     observe_connectivity: bool,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
-    let mut host = DaemonSignedEndpointRpcAsyncHost {
-        runtime: runtime.clone(),
-        observe_connectivity,
-    };
+    let mut host = DaemonSignedEndpointRpcAsyncHost::new(runtime, observe_connectivity);
     let options = sinomo_network::ClusterObjectRpcOptions::new(timeouts);
     if let Some(paths) = cluster_paths_from_env() {
         sinomo_network::call_object_rpc_endpoint_from_paths_async_with_host(
@@ -482,9 +479,18 @@ where
     output
 }
 
-struct DaemonSignedEndpointRpcAsyncHost {
+pub(crate) struct DaemonSignedEndpointRpcAsyncHost {
     runtime: tokio::runtime::Handle,
     observe_connectivity: bool,
+}
+
+impl DaemonSignedEndpointRpcAsyncHost {
+    pub(crate) fn new(runtime: &tokio::runtime::Handle, observe_connectivity: bool) -> Self {
+        Self {
+            runtime: runtime.clone(),
+            observe_connectivity,
+        }
+    }
 }
 
 fn send_daemon_rpc_body<Req, Resp>(
@@ -916,7 +922,7 @@ async fn remember_endpoint_command_connectivity_from_env_async(
         .await;
 }
 
-fn cluster_paths_from_env() -> Option<sinomo_network::ClusterPaths> {
+pub(crate) fn cluster_paths_from_env() -> Option<sinomo_network::ClusterPaths> {
     let data_dir = sinomo_local::SinomoDataDir::from_env_or_home().ok()?;
     Some(sinomo_network::ClusterPaths::new(&data_dir))
 }

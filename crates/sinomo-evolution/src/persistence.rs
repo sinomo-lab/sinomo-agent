@@ -20,10 +20,10 @@ use sinomo_runtime::config::{
 use sinomo_runtime::core::ClusterEndpointRecord;
 use sinomo_runtime::core::{EvaluationOutcome, EvaluationScorecard};
 use sinomo_runtime::dfs::{
-    DfsEndpointTransport, DfsMetadataJournalBatchSender, DfsMetadataJournalReplicationOptions,
+    DfsEndpointTransport, DfsMessageCommand, DfsMessageResponse, DfsMessageSender,
+    DfsMetadataJournalBatchSender, DfsMetadataJournalReplicationOptions,
     DfsMetadataPeerTransportError, DfsMetadataShardConfig, DfsMetadataSnapshotInstallSender,
-    DfsPeerTransportError, DfsProtocolFrameCommand, DfsProtocolFrameResponse,
-    DfsProtocolFrameSender, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
+    DfsPeerTransportError, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
     default_dfs_metadata_root, default_dfs_metadata_shards_root, fallback_dfs_node_id,
     metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
     publish_cluster_dfs_metadata_journal, sifs_file_system_id,
@@ -2574,10 +2574,11 @@ fn open_evolution_sifs_service(
         }
     })?;
     let service = NetworkedDfsService::new(
-        DfsEndpointTransport::new(
+        DfsEndpointTransport::with_message_sender(
             local_node_id,
             endpoints,
-            evolution_sifs_protocol_frame_sender(),
+            sinomo_runtime::dfs::DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT,
+            evolution_sifs_message_sender(),
         ),
         content,
     );
@@ -2615,20 +2616,20 @@ fn open_evolution_sifs_service(
     Ok(service)
 }
 
-fn evolution_sifs_protocol_frame_sender() -> DfsProtocolFrameSender {
-    Arc::new(evolution_send_dfs_protocol_frame)
+fn evolution_sifs_message_sender() -> DfsMessageSender {
+    Arc::new(evolution_send_dfs_message)
 }
 
-fn evolution_send_dfs_protocol_frame(
+fn evolution_send_dfs_message(
     endpoint: &ClusterEndpointRecord,
-    command: &DfsProtocolFrameCommand,
+    command: &DfsMessageCommand,
     timeout: std::time::Duration,
-) -> Result<DfsProtocolFrameResponse, DfsPeerTransportError> {
-    let request = sinomo_runtime::dfs::dfs_message_rpc_request_from_protocol_frame_command(command)
+) -> Result<DfsMessageResponse, DfsPeerTransportError> {
+    let request = sinomo_runtime::dfs::dfs_message_rpc_request(command)
         .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
     let response = sinomo_runtime::daemon::send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
         .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
-    sinomo_runtime::dfs::dfs_protocol_frame_response_from_message_rpc_response(&response)
+    sinomo_runtime::dfs::decode_dfs_message_rpc_response(&response)
         .map_err(|error| DfsPeerTransportError::new(error.to_string()))
 }
 

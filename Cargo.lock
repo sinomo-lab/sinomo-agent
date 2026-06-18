@@ -5940,6 +5940,7 @@ dependencies = [
  "libc",
  "sinomo-runtime",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

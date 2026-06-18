@@ -2571,31 +2571,20 @@ pub fn forward_cluster_membership_rpc_to_voter_with_host(
     host: &mut impl ClusterMembershipRpcForwardHost,
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let mut failures = Vec::new();
-    for voter in
+    let mut seen_voters = BTreeSet::new();
+    for target_node_id in
         cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::VoterCommand)
+            .into_iter()
+            .filter_map(|endpoint| {
+                seen_voters
+                    .insert(endpoint.node_id.clone())
+                    .then_some(endpoint.node_id)
+            })
     {
-        match host.send_membership_rpc(&voter, request) {
+        match host.send_membership_rpc_to_node(state, &target_node_id, request) {
             Ok(response) => return Ok(response),
-            Err(error) => failures.push(format!(
-                "{} ({:?}): {error}",
-                voter.address, voter.transport
-            )),
-        }
-    }
-    for voter in
-        cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::VoterCommand)
-    {
-        for peer in
-            cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::MemberPublish)
-                .into_iter()
-                .filter(|peer| peer.node_id != voter.node_id)
-        {
-            match host.relay_membership_rpc_to_voter_via_peer(state, &voter, &peer, request) {
-                Ok(response) => return Ok(response),
-                Err(error) => failures.push(format!(
-                    "relay via {} ({:?}) to {} failed: {error}",
-                    peer.address, peer.transport, voter.node_id
-                )),
+            Err(error) => {
+                failures.push(format!("node {target_node_id}: {error}"));
             }
         }
     }
@@ -2621,20 +2610,21 @@ pub async fn forward_cluster_membership_rpc_to_voter_async_with_host(
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let paths_for_targets = paths.clone();
     let state_for_targets = state.clone();
-    let (voter_targets, publish_targets) = runtime
+    let voter_node_ids = runtime
         .spawn_blocking(move || {
-            (
-                cluster_endpoint_targets(
-                    &paths_for_targets,
-                    &state_for_targets,
-                    ClusterEndpointSelectionPurpose::VoterCommand,
-                ),
-                cluster_endpoint_targets(
-                    &paths_for_targets,
-                    &state_for_targets,
-                    ClusterEndpointSelectionPurpose::MemberPublish,
-                ),
+            let mut seen_voters = BTreeSet::new();
+            cluster_endpoint_targets(
+                &paths_for_targets,
+                &state_for_targets,
+                ClusterEndpointSelectionPurpose::VoterCommand,
             )
+            .into_iter()
+            .filter_map(|endpoint| {
+                seen_voters
+                    .insert(endpoint.node_id.clone())
+                    .then_some(endpoint.node_id)
+            })
+            .collect::<Vec<_>>()
         })
         .await
         .map_err(|source| NetworkError::Io {
@@ -2642,29 +2632,14 @@ pub async fn forward_cluster_membership_rpc_to_voter_async_with_host(
             detail: format!("voter target selection task failed: {source}"),
         })?;
     let mut failures = Vec::new();
-    for voter in &voter_targets {
-        match host.send_membership_rpc_async(voter, request).await {
-            Ok(response) => return Ok(response),
-            Err(error) => failures.push(format!(
-                "{} ({:?}): {error}",
-                voter.address, voter.transport
-            )),
-        }
-    }
-    for voter in &voter_targets {
-        for peer in publish_targets
-            .iter()
-            .filter(|peer| peer.node_id != voter.node_id)
+    for target_node_id in &voter_node_ids {
+        match host
+            .send_membership_rpc_to_node_async(state, target_node_id, request)
+            .await
         {
-            match host
-                .relay_membership_rpc_to_voter_via_peer_async(state, voter, peer, request)
-                .await
-            {
-                Ok(response) => return Ok(response),
-                Err(error) => failures.push(format!(
-                    "relay via {} ({:?}) to {} failed: {error}",
-                    peer.address, peer.transport, voter.node_id
-                )),
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                failures.push(format!("node {target_node_id}: {error}"));
             }
         }
     }
@@ -2693,7 +2668,7 @@ pub fn cluster_join_challenge_rpc_request<T: Serialize + ?Sized>(
 /// A bridge introducer named in an invite minted before it joined is not itself a
 /// proof-capable channel/issuer, so it cannot answer a join challenge. Relay the challenge to
 /// a reachable voter (the invite issuer can produce an issuer-signed proof). The routing-aware
-/// send relays the challenge across segments when no voter is directly reachable.
+/// send routes the challenge across segments when no voter is directly reachable.
 pub fn forward_cluster_join_challenge_rpc_to_voter_with_host(
     paths: &ClusterPaths,
     request: &ObjectRpcRequest,
@@ -3727,17 +3702,10 @@ pub trait ClusterKvTxnForwardHost {
         timeout: Duration,
     ) -> Result<KvSnapshot, NetworkError>;
 
-    fn relay_peers(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Vec<ClusterEndpointRecord>;
-
-    fn relay_rpc_to_node(
+    fn send_object_rpc_to_node(
         &mut self,
         state: &ClusterBootstrapState,
         target_node_id: &NodeId,
-        peer: &ClusterEndpointRecord,
         request: &ObjectRpcRequest,
         timeout: Duration,
     ) -> Result<ObjectRpcResponse, NetworkError>;
@@ -3757,11 +3725,10 @@ pub trait ClusterKvTxnForwardAsyncHost {
         timeout: Duration,
     ) -> ClusterMembershipRpcFuture<'a, KvSnapshot>;
 
-    fn relay_rpc_to_node_async<'a>(
+    fn send_object_rpc_to_node_async<'a>(
         &'a mut self,
         state: &'a ClusterBootstrapState,
         target_node_id: &'a NodeId,
-        peer: &'a ClusterEndpointRecord,
         request: &'a ObjectRpcRequest,
         timeout: Duration,
     ) -> ClusterMembershipRpcFuture<'a, ObjectRpcResponse>;
@@ -3834,28 +3801,15 @@ pub trait ClusterKvSnapshotRefreshHost {
         snapshot: KvSnapshot,
     ) -> Result<bool, NetworkError>;
 
-    /// Peers that can relay an RPC toward a voter when no voter is directly
-    /// dialable (cross-segment learners reach voters only through bridges).
-    /// Hosts without relay support keep the default and the refresh simply
-    /// skips the relay fallback.
-    fn relay_peers(
-        &mut self,
-        _paths: &ClusterPaths,
-        _state: &ClusterBootstrapState,
-    ) -> Vec<ClusterEndpointRecord> {
-        Vec::new()
-    }
-
-    fn relay_rpc_to_node(
+    fn send_object_rpc_to_node(
         &mut self,
         _state: &ClusterBootstrapState,
         _target_node_id: &NodeId,
-        _peer: &ClusterEndpointRecord,
         _request: &ObjectRpcRequest,
         _timeout: Duration,
     ) -> Result<ObjectRpcResponse, NetworkError> {
         Err(NetworkError::ClusterReadOnly {
-            detail: "cluster KV snapshot relay is not supported by this host".to_string(),
+            detail: "cluster KV snapshot node object RPC is not supported by this host".to_string(),
         })
     }
 }
@@ -4136,11 +4090,10 @@ pub trait ClusterControlPlaneTransport {
         timeout: Duration,
     ) -> Result<ObjectRpcResponse, NetworkError>;
 
-    fn relay_rpc_to_node(
+    fn send_object_rpc_to_node(
         &mut self,
         state: &ClusterBootstrapState,
         target_node_id: &NodeId,
-        peer: &ClusterEndpointRecord,
         request: &ObjectRpcRequest,
         timeout: Duration,
     ) -> Result<ObjectRpcResponse, NetworkError>;
@@ -4464,24 +4417,15 @@ where
         locked_restore_cluster_raft_from_snapshot_if_newer(paths, local_node_id, snapshot)
     }
 
-    fn relay_peers(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Vec<ClusterEndpointRecord> {
-        cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::MemberPublish)
-    }
-
-    fn relay_rpc_to_node(
+    fn send_object_rpc_to_node(
         &mut self,
         state: &ClusterBootstrapState,
         target_node_id: &NodeId,
-        peer: &ClusterEndpointRecord,
         request: &ObjectRpcRequest,
         timeout: Duration,
     ) -> Result<ObjectRpcResponse, NetworkError> {
         self.transport
-            .relay_rpc_to_node(state, target_node_id, peer, request, timeout)
+            .send_object_rpc_to_node(state, target_node_id, request, timeout)
     }
 }
 
@@ -4514,24 +4458,15 @@ where
         self.transport.fetch_cluster_kv_snapshot(endpoint, timeout)
     }
 
-    fn relay_peers(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Vec<ClusterEndpointRecord> {
-        cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::MemberPublish)
-    }
-
-    fn relay_rpc_to_node(
+    fn send_object_rpc_to_node(
         &mut self,
         state: &ClusterBootstrapState,
         target_node_id: &NodeId,
-        peer: &ClusterEndpointRecord,
         request: &ObjectRpcRequest,
         timeout: Duration,
     ) -> Result<ObjectRpcResponse, NetworkError> {
         self.transport
-            .relay_rpc_to_node(state, target_node_id, peer, request, timeout)
+            .send_object_rpc_to_node(state, target_node_id, request, timeout)
     }
 }
 
@@ -4832,29 +4767,15 @@ impl<T> ClusterMembershipRpcForwardHost for ClusterControlPlaneDriver<T>
 where
     T: ClusterControlPlaneTransport,
 {
-    fn send_membership_rpc(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        request: &ObjectRpcRequest,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        self.transport.send_cluster_membership_rpc(
-            endpoint,
-            request,
-            self.timeouts.membership_rpc_timeout,
-        )
-    }
-
-    fn relay_membership_rpc_to_voter_via_peer(
+    fn send_membership_rpc_to_node(
         &mut self,
         state: &ClusterBootstrapState,
-        voter: &ClusterEndpointRecord,
-        peer: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         request: &ObjectRpcRequest,
     ) -> Result<ObjectRpcResponse, NetworkError> {
-        self.transport.relay_rpc_to_node(
+        self.transport.send_object_rpc_to_node(
             state,
-            &voter.node_id,
-            peer,
+            target_node_id,
             request,
             self.timeouts.membership_rpc_timeout,
         )
@@ -4944,17 +4865,10 @@ where
 }
 
 pub trait ClusterMembershipRpcForwardHost {
-    fn send_membership_rpc(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        request: &ObjectRpcRequest,
-    ) -> Result<ObjectRpcResponse, NetworkError>;
-
-    fn relay_membership_rpc_to_voter_via_peer(
+    fn send_membership_rpc_to_node(
         &mut self,
         state: &ClusterBootstrapState,
-        voter: &ClusterEndpointRecord,
-        peer: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         request: &ObjectRpcRequest,
     ) -> Result<ObjectRpcResponse, NetworkError>;
 }
@@ -4963,17 +4877,10 @@ pub type ClusterMembershipRpcFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, NetworkError>> + Send + 'a>>;
 
 pub trait ClusterMembershipRpcAsyncForwardHost {
-    fn send_membership_rpc_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        request: &'a ObjectRpcRequest,
-    ) -> ClusterMembershipRpcFuture<'a, ObjectRpcResponse>;
-
-    fn relay_membership_rpc_to_voter_via_peer_async<'a>(
+    fn send_membership_rpc_to_node_async<'a>(
         &'a mut self,
         state: &'a ClusterBootstrapState,
-        voter: &'a ClusterEndpointRecord,
-        peer: &'a ClusterEndpointRecord,
+        target_node_id: &'a NodeId,
         request: &'a ObjectRpcRequest,
     ) -> ClusterMembershipRpcFuture<'a, ObjectRpcResponse>;
 }
@@ -5127,26 +5034,16 @@ impl<T, O> ClusterMembershipRpcForwardHost for ClusterJoinRegistrationDriver<T, 
 where
     T: ClusterControlPlaneTransport,
 {
-    fn send_membership_rpc(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        request: &ObjectRpcRequest,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        ClusterMembershipRpcForwardHost::send_membership_rpc(&mut self.driver, endpoint, request)
-    }
-
-    fn relay_membership_rpc_to_voter_via_peer(
+    fn send_membership_rpc_to_node(
         &mut self,
         state: &ClusterBootstrapState,
-        voter: &ClusterEndpointRecord,
-        peer: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         request: &ObjectRpcRequest,
     ) -> Result<ObjectRpcResponse, NetworkError> {
-        ClusterMembershipRpcForwardHost::relay_membership_rpc_to_voter_via_peer(
+        ClusterMembershipRpcForwardHost::send_membership_rpc_to_node(
             &mut self.driver,
             state,
-            voter,
-            peer,
+            target_node_id,
             request,
         )
     }
@@ -10901,32 +10798,23 @@ pub fn refresh_current_cluster_kv_store_with_host(
             fetched_remote = true;
         }
     }
-    // Cross-segment learners cannot dial any voter directly; fall back to
-    // relaying the snapshot fetch through a bridge peer, mirroring how KV txn
-    // forwarding relays toward a voter.
     if !fetched_remote {
-        'relay_targets: for voter in &targets {
-            for peer in host
-                .relay_peers(paths, state)
-                .into_iter()
-                .filter(|peer| peer.node_id != voter.node_id)
+        let mut seen_voters = BTreeSet::new();
+        'node_targets: for voter in targets
+            .iter()
+            .filter(|voter| seen_voters.insert(voter.node_id.clone()))
+        {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                break 'node_targets;
+            }
+            if let Ok(snapshot) =
+                fetch_cluster_kv_snapshot_from_voter_node(state, &voter.node_id, remaining, host)
             {
-                let remaining = deadline
-                    .checked_duration_since(Instant::now())
-                    .unwrap_or_default();
-                if remaining.is_zero() {
-                    break 'relay_targets;
-                }
-                if let Ok(snapshot) = relay_fetch_cluster_kv_snapshot_via_peer(
-                    state,
-                    voter,
-                    &peer,
-                    options.fair_command_timeout(&peer, remaining),
-                    host,
-                ) {
-                    snapshots.push(snapshot);
-                    break 'relay_targets;
-                }
+                snapshots.push(snapshot);
+                break 'node_targets;
             }
         }
     }
@@ -10945,17 +10833,16 @@ pub fn refresh_current_cluster_kv_store_with_host(
     Ok(InProcessKvStore::restore(snapshot))
 }
 
-fn relay_fetch_cluster_kv_snapshot_via_peer(
+fn fetch_cluster_kv_snapshot_from_voter_node(
     state: &ClusterBootstrapState,
-    voter: &ClusterEndpointRecord,
-    peer: &ClusterEndpointRecord,
+    voter_node_id: &NodeId,
     timeout: Duration,
     host: &mut impl ClusterKvSnapshotRefreshHost,
 ) -> Result<KvSnapshot, NetworkError> {
     let payload = sinomo_kv::cluster_kv_snapshot_rpc_payload()?;
     let request =
         ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
-    let response = host.relay_rpc_to_node(state, &voter.node_id, peer, &request, timeout)?;
+    let response = host.send_object_rpc_to_node(state, voter_node_id, &request, timeout)?;
     response.error_detail()?;
     sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&response.body).map_err(Into::into)
 }
@@ -11231,28 +11118,6 @@ async fn cluster_node_blocks_leader_preference_async(
         .map_err(|source| NetworkError::Io {
             operation: "cluster raft leader preference".to_string(),
             detail: format!("leader preference task failed: {source}"),
-        })?
-}
-
-async fn cluster_member_publish_targets_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
-    let paths = paths.clone();
-    let state = state.clone();
-    runtime
-        .spawn_blocking(move || {
-            Ok(cluster_endpoint_targets(
-                &paths,
-                &state,
-                ClusterEndpointSelectionPurpose::MemberPublish,
-            ))
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster relay peer target selection".to_string(),
-            detail: format!("cluster relay peer target selection task failed: {source}"),
         })?
 }
 
@@ -11556,31 +11421,30 @@ pub fn forward_cluster_kv_txn_to_voter_with_host(
         }
     }
 
-    'relay_targets: for voter in &targets {
-        for peer in host
-            .relay_peers(paths, state)
-            .into_iter()
-            .filter(|peer| peer.node_id != voter.node_id)
-        {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .unwrap_or_default();
-            if remaining.is_zero() {
-                failures.push(format!(
-                    "relay forwarding did not complete before {}ms command budget",
-                    options.timeout.as_millis()
-                ));
-                break 'relay_targets;
-            }
-            match relay_cluster_kv_txn_to_voter_via_peer_with_host(
-                state, voter, &peer, txn, remaining, host,
-            ) {
-                Ok(response) => return Ok(Some(response)),
-                Err(error) => failures.push(format!(
-                    "relay via {} ({:?}) to {} failed: {error}",
-                    peer.address, peer.transport, voter.node_id
-                )),
-            }
+    let mut seen_voters = BTreeSet::new();
+    for voter in targets
+        .iter()
+        .filter(|voter| seen_voters.insert(voter.node_id.clone()))
+    {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            failures.push(format!(
+                "node forwarding did not complete before {}ms command budget",
+                options.timeout.as_millis()
+            ));
+            break;
+        }
+        match forward_cluster_kv_txn_to_voter_node_with_host(
+            state,
+            &voter.node_id,
+            txn,
+            remaining,
+            host,
+        ) {
+            Ok(response) => return Ok(Some(response)),
+            Err(error) => failures.push(format!("node {} failed: {error}", voter.node_id)),
         }
     }
 
@@ -11596,10 +11460,9 @@ pub fn forward_cluster_kv_txn_to_voter_with_host(
     })
 }
 
-fn relay_cluster_kv_txn_to_voter_via_peer_with_host(
+fn forward_cluster_kv_txn_to_voter_node_with_host(
     state: &ClusterBootstrapState,
-    voter: &ClusterEndpointRecord,
-    peer: &ClusterEndpointRecord,
+    voter_node_id: &NodeId,
     txn: &KvTxn,
     timeout: Duration,
     host: &mut impl ClusterKvTxnForwardHost,
@@ -11611,8 +11474,7 @@ fn relay_cluster_kv_txn_to_voter_via_peer_with_host(
         txn_payload.category,
         txn_payload.body,
     );
-    let txn_response =
-        host.relay_rpc_to_node(state, &voter.node_id, peer, &txn_request, timeout)?;
+    let txn_response = host.send_object_rpc_to_node(state, voter_node_id, &txn_request, timeout)?;
     txn_response.error_detail()?;
     let txn_response = sinomo_kv::decode_cluster_kv_txn_rpc_body(&txn_response.body)?;
 
@@ -11625,13 +11487,8 @@ fn relay_cluster_kv_txn_to_voter_via_peer_with_host(
         snapshot_payload.category,
         snapshot_payload.body,
     );
-    let snapshot_response = host.relay_rpc_to_node(
-        state,
-        &voter.node_id,
-        peer,
-        &snapshot_request,
-        snapshot_timeout,
-    )?;
+    let snapshot_response =
+        host.send_object_rpc_to_node(state, voter_node_id, &snapshot_request, snapshot_timeout)?;
     snapshot_response.error_detail()?;
     let snapshot = sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&snapshot_response.body)?;
     Ok(ClusterKvTxnForwardResult {
@@ -11705,33 +11562,32 @@ where
         }
     }
 
-    let relay_peers = cluster_member_publish_targets_async(runtime, paths, state).await?;
-    'relay_targets: for voter in &targets {
-        for peer in relay_peers
-            .iter()
-            .filter(|peer| peer.node_id != voter.node_id)
+    let mut seen_voters = BTreeSet::new();
+    for voter in targets
+        .iter()
+        .filter(|voter| seen_voters.insert(voter.node_id.clone()))
+    {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            failures.push(format!(
+                "node forwarding did not complete before {}ms command budget",
+                options.timeout.as_millis()
+            ));
+            break;
+        }
+        match forward_cluster_kv_txn_to_voter_node_async_with_host(
+            state,
+            &voter.node_id,
+            txn,
+            remaining,
+            host,
+        )
+        .await
         {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .unwrap_or_default();
-            if remaining.is_zero() {
-                failures.push(format!(
-                    "relay forwarding did not complete before {}ms command budget",
-                    options.timeout.as_millis()
-                ));
-                break 'relay_targets;
-            }
-            match relay_cluster_kv_txn_to_voter_via_peer_async_with_host(
-                state, voter, peer, txn, remaining, host,
-            )
-            .await
-            {
-                Ok(response) => return Ok(Some(response)),
-                Err(error) => failures.push(format!(
-                    "relay via {} ({:?}) to {} failed: {error}",
-                    peer.address, peer.transport, voter.node_id
-                )),
-            }
+            Ok(response) => return Ok(Some(response)),
+            Err(error) => failures.push(format!("node {} failed: {error}", voter.node_id)),
         }
     }
 
@@ -11747,10 +11603,9 @@ where
     })
 }
 
-async fn relay_cluster_kv_txn_to_voter_via_peer_async_with_host<H>(
+async fn forward_cluster_kv_txn_to_voter_node_async_with_host<H>(
     state: &ClusterBootstrapState,
-    voter: &ClusterEndpointRecord,
-    peer: &ClusterEndpointRecord,
+    voter_node_id: &NodeId,
     txn: &KvTxn,
     timeout: Duration,
     host: &mut H,
@@ -11766,7 +11621,7 @@ where
         txn_payload.body,
     );
     let txn_response = host
-        .relay_rpc_to_node_async(state, &voter.node_id, peer, &txn_request, timeout)
+        .send_object_rpc_to_node_async(state, voter_node_id, &txn_request, timeout)
         .await?;
     txn_response.error_detail()?;
     let txn_response = sinomo_kv::decode_cluster_kv_txn_rpc_body(&txn_response.body)?;
@@ -11781,13 +11636,7 @@ where
         snapshot_payload.body,
     );
     let snapshot_response = host
-        .relay_rpc_to_node_async(
-            state,
-            &voter.node_id,
-            peer,
-            &snapshot_request,
-            snapshot_timeout,
-        )
+        .send_object_rpc_to_node_async(state, voter_node_id, &snapshot_request, snapshot_timeout)
         .await?;
     snapshot_response.error_detail()?;
     let snapshot = sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&snapshot_response.body)?;

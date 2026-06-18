@@ -88,6 +88,17 @@ pub use auth::{
 };
 #[cfg(test)]
 pub(crate) use client::send_daemon_rpc_raw;
+pub(crate) use client::{
+    DaemonSignedEndpointRpcAsyncHost, cluster_paths_from_env,
+    fetch_cluster_kv_snapshot_from_endpoint_async,
+    fetch_cluster_kv_snapshot_from_endpoint_on_runtime,
+    fetch_daemon_status_from_endpoint_on_runtime, send_cluster_kv_txn_async,
+    send_cluster_kv_txn_on_runtime, send_cluster_kv_watch_events_async,
+    send_cluster_member_publish_async, send_cluster_member_publish_on_runtime,
+    send_cluster_raft_append_async, send_cluster_raft_append_on_runtime,
+    send_cluster_raft_vote_async, send_cluster_raft_vote_on_runtime, send_daemon_rpc_on_runtime,
+    send_daemon_rpc_to_endpoint_on_runtime, send_dfs_object_rpc_to_endpoint_on_runtime,
+};
 pub use client::{
     RemoteConfigClient, fetch_daemon_status_from_address, fetch_daemon_status_from_endpoint,
     fetch_daemon_status_from_endpoint_async, send_daemon_rollout_binary,
@@ -104,16 +115,6 @@ pub use client::{
     send_dfs_direct_read_to_endpoint, send_dfs_direct_read_to_endpoint_async,
     send_dfs_metadata_journal_batch_to_endpoint_async,
     send_dfs_metadata_snapshot_install_to_endpoint_async, send_dfs_object_rpc_to_endpoint_async,
-};
-pub(crate) use client::{
-    fetch_cluster_kv_snapshot_from_endpoint_async,
-    fetch_cluster_kv_snapshot_from_endpoint_on_runtime,
-    fetch_daemon_status_from_endpoint_on_runtime, send_cluster_kv_txn_async,
-    send_cluster_kv_txn_on_runtime, send_cluster_kv_watch_events_async,
-    send_cluster_member_publish_async, send_cluster_member_publish_on_runtime,
-    send_cluster_raft_append_async, send_cluster_raft_append_on_runtime,
-    send_cluster_raft_vote_async, send_cluster_raft_vote_on_runtime, send_daemon_rpc_on_runtime,
-    send_daemon_rpc_to_endpoint_on_runtime, send_dfs_object_rpc_to_endpoint_on_runtime,
 };
 pub use cluster::commit_cluster_kv_txn_with_quorum;
 pub use control::{

@@ -18,6 +18,7 @@ fuse = ["dep:fuser", "dep:libc"]
 [dependencies]
 sinomo-runtime = { path = "../sinomo-runtime" }
 thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 fuser = { version = "0.15", optional = true, default-features = false }

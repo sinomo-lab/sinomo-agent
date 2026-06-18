@@ -22,15 +22,15 @@ use crate::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_PLANE_ROUTES, DFS_DIRECT_READ_ROUTE,
     DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE, DFS_MESSAGE_ROUTE,
     DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
-    DFS_PROTOCOL_FRAME_ROUTE, DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE, DaemonDfsInspectionRequest,
-    DaemonDfsInspectionResponse, DfsMessageCommand, DfsMetadataBackend,
-    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataShardConfig,
-    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse, DfsOperatorInspector,
-    DfsOperatorStatus, DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsSmokeReport,
-    default_dfs_metadata_root, default_dfs_metadata_shards_root, dfs_module_surfaces,
-    ensure_default_cluster_aware_dfs_expose_config, handle_dfs_direct_read_rpc_request,
-    metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
-    sifs_file_system_id,
+    DFS_PROTOCOL_FRAME_ROUTE, DFS_RPC_CATEGORY, DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE,
+    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMessageCommand, DfsMessageResponse,
+    DfsMetadataBackend, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
+    DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
+    DfsOperatorInspector, DfsOperatorStatus, DfsProtocolFrameCommand, DfsProtocolFrameResponse,
+    DfsSmokeReport, default_dfs_metadata_root, default_dfs_metadata_shards_root,
+    dfs_module_surfaces, ensure_default_cluster_aware_dfs_expose_config,
+    handle_dfs_direct_read_rpc_request, metadata_shards_prefix,
+    open_local_sharded_metadata_backend, open_root_local_metadata_backend, sifs_file_system_id,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
@@ -68,6 +68,15 @@ pub fn register_data_plane_services(
 }
 
 fn dfs_service_route(route: &'static str) -> ServiceRoute {
+    if route == DFS_PROTOCOL_FRAME_ROUTE {
+        return ServiceRoute::from_route_metadata(
+            route,
+            DFS_RPC_CATEGORY,
+            sinomo_module::ModuleRouteAuth::LocalOrClusterMember.as_scope(),
+            ["dfs.object.transfer"],
+        )
+        .with_concurrency_limit(dfs_service_route_concurrency_limit(route));
+    }
     let descriptor = dfs_module_surfaces()
         .object_rpc_route_descriptor(route)
         .expect("DFS module surfaces should be valid")
@@ -122,6 +131,19 @@ impl std::error::Error for DfsDataPlaneHostError {}
 
 pub trait DfsDataPlaneHost: Send + Sync {
     fn run_smoke<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, DfsSmokeReport>;
+
+    fn handle_message<'a>(
+        &'a self,
+        command: DfsMessageCommand,
+    ) -> DfsDataPlaneHostFuture<'a, DfsMessageResponse> {
+        Box::pin(async move {
+            let frame_command = crate::dfs_message_command_to_protocol_frame_command(command)
+                .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))?;
+            let frame_response = self.handle_protocol_frame(frame_command).await?;
+            crate::dfs_protocol_frame_response_to_message_response(frame_response)
+                .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))
+        })
+    }
 
     fn handle_protocol_frame<'a>(
         &'a self,
@@ -223,24 +245,22 @@ impl Service for DfsDataPlaneService {
                 }
                 DFS_MESSAGE_ROUTE => {
                     let command: DfsMessageCommand = request.decode_body()?;
-                    let frame_command =
-                        crate::dfs_message_command_to_protocol_frame_command(command)
-                            .map_err(service_error)?;
-                    let frame_response = host
-                        .handle_protocol_frame(frame_command)
-                        .await
-                        .map_err(service_error)?;
                     let message_response =
-                        crate::dfs_protocol_frame_response_to_message_response(frame_response)
-                            .map_err(service_error)?;
+                        host.handle_message(command).await.map_err(service_error)?;
                     ObjectRpcResponse::encode_body(DFS_MESSAGE_ROUTE, &message_response)?
                 }
                 DFS_PROTOCOL_FRAME_ROUTE => {
                     let command: DfsProtocolFrameCommand = request.decode_body()?;
-                    let frame_response = host
-                        .handle_protocol_frame(command)
+                    let message_command =
+                        crate::dfs_protocol_frame_command_to_message_command(&command)
+                            .map_err(service_error)?;
+                    let message_response = host
+                        .handle_message(message_command)
                         .await
                         .map_err(service_error)?;
+                    let frame_response =
+                        crate::dfs_message_response_to_protocol_frame_response(message_response)
+                            .map_err(service_error)?;
                     ObjectRpcResponse::encode_body(DFS_PROTOCOL_FRAME_ROUTE, &frame_response)?
                 }
                 DFS_DIRECT_READ_ROUTE => handle_dfs_direct_read_rpc_request(&ctx.data_dir, request)
@@ -420,9 +440,6 @@ mod tests {
         DfsMetadataSnapshotInstallResult, DfsObjectId, DfsSmokeAttempt, DfsVersion,
         LocalSobjMetadataBackend, sifs_file_system_id,
     };
-    use sinomo_network::{
-        Heartbeat, MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrame, NetworkFrameId,
-    };
     use sinomo_service::{ResponseSink, ServiceRegistry, ServiceSigner};
     use std::sync::{Arc, Mutex};
 
@@ -441,6 +458,7 @@ mod tests {
     #[derive(Default)]
     struct StubDfsDataPlaneHost {
         smoke_calls: Mutex<usize>,
+        message_request_ids: Mutex<Vec<String>>,
         frame_request_ids: Mutex<Vec<String>>,
     }
 
@@ -472,6 +490,22 @@ mod tests {
                         committed: true,
                         detail: "ok".to_string(),
                     }],
+                })
+            })
+        }
+
+        fn handle_message<'a>(
+            &'a self,
+            command: DfsMessageCommand,
+        ) -> DfsDataPlaneHostFuture<'a, DfsMessageResponse> {
+            Box::pin(async move {
+                self.message_request_ids
+                    .lock()
+                    .expect("message request ids")
+                    .push(command.request_id.clone());
+                Ok(DfsMessageResponse {
+                    request_id: command.request_id,
+                    outbound_messages: Vec::new(),
                 })
             })
         }
@@ -738,20 +772,24 @@ mod tests {
 
         let command = DfsProtocolFrameCommand {
             request_id: "frame-route-1".to_string(),
-            frame: NetworkFrame {
-                frame_id: NetworkFrameId(1),
-                source_node_id: local.clone(),
-                target_node_id: local.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(1),
-                    origin_node_id: local.clone(),
-                    target_node_id: local.clone(),
-                    body: MeshMessageBody::Heartbeat(Heartbeat {
-                        node_id: local,
-                        tick: 1,
-                    }),
-                },
-            },
+            frame: crate::build_dfs_network_frame(
+                &local,
+                &local,
+                1,
+                1,
+                crate::DfsNetworkMessage::ReadRequest(crate::DfsReadRequest {
+                    request_id: "frame-read-1".to_string(),
+                    object_id: DfsObjectId::generate(),
+                    version: None,
+                    content_hash: None,
+                    content_size_bytes: None,
+                    range_offset: None,
+                    range_max_bytes: None,
+                    start_chunk_index: 0,
+                    max_chunks: 0,
+                }),
+            )
+            .expect("dfs protocol frame"),
         };
         let (_test_root, test_data_dir) = temp_data_dir();
         let (disposition, frame_response) = dispatch_local(
@@ -766,11 +804,17 @@ mod tests {
         assert_eq!(frame.request_id, "frame-route-1");
         assert!(frame.outbound_frames.is_empty());
         assert_eq!(
+            host.message_request_ids
+                .lock()
+                .expect("message request ids")
+                .as_slice(),
+            ["message-route-1", "frame-route-1"]
+        );
+        assert!(
             host.frame_request_ids
                 .lock()
                 .expect("frame request ids")
-                .as_slice(),
-            ["message-route-1", "frame-route-1"]
+                .is_empty()
         );
     }
 }
