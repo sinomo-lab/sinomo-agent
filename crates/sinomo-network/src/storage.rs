@@ -1,7 +1,9 @@
 use crate::ClusterPaths;
 use crate::connectivity::{
-    ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityRecordQuery,
-    ClusterConnectivityState,
+    ClusterConnectivityGraph, ClusterConnectivityProbeBatch, ClusterConnectivityProbeBatchEntry,
+    ClusterConnectivityProbeState, ClusterConnectivityRecord, ClusterConnectivityRecordQuery,
+    ClusterConnectivityState, cluster_connectivity_probe_due_with_graph,
+    cluster_connectivity_probe_key,
 };
 use crate::endpoint_records::{
     cleanup_cluster_iroh_endpoints, cleanup_member_iroh_endpoints, cluster_endpoint_stable_eq,
@@ -15,7 +17,7 @@ use crate::maintenance::{
     CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS, CLUSTER_NETWORK_PUBLISH_INTERVAL,
     CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS,
     cluster_connectivity_probe_max_endpoints_per_tick_for_role,
-    cluster_network_probe_interval_for_role, cluster_network_publish_interval_for_role,
+    cluster_network_publish_interval_for_role,
 };
 use crate::membership::{
     DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE,
@@ -80,9 +82,6 @@ const MAX_CLUSTER_KV_WATCH_REGISTRATION_CACHE_ENTRIES: usize =
     sinomo_kv::MAX_CLUSTER_KV_ACTIVE_WATCHES;
 const CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS: i64 = 600;
 pub const CLUSTER_NETWORK_INFO_TTL_SECONDS: i64 = 3600;
-pub const CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD: u16 = 3;
-pub const CLUSTER_CONNECTIVITY_TTL_SECONDS: i64 = 900;
-pub const CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS: i64 = 7200;
 pub use sinomo_node::DAEMON_MAIN_RUN_CAPABILITY;
 const FILE_CACHE_CAPACITY: usize = 4096;
 const MAX_LOCAL_CLUSTER_CONNECTIVITY_CACHE_ENTRIES: usize = 128;
@@ -5289,25 +5288,6 @@ pub fn cluster_network_publish_interval_for_node(
         .unwrap_or(CLUSTER_NETWORK_PUBLISH_INTERVAL)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClusterConnectivityProbeState {
-    pub record: ClusterConnectivityRecord,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClusterConnectivityProbeBatchEntry {
-    pub key: String,
-    pub endpoint: ClusterEndpointRecord,
-    pub previous: Option<ClusterConnectivityRecord>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClusterConnectivityProbeBatch {
-    pub active_keys: BTreeSet<String>,
-    pub entries: Vec<ClusterConnectivityProbeBatchEntry>,
-    pub next_cursor: usize,
-}
-
 pub fn select_cluster_connectivity_probe_batch(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -5413,241 +5393,6 @@ fn cluster_connectivity_probe_state_rank(record: Option<&ClusterConnectivityReco
         Some(ClusterConnectivityState::Degraded) => 2,
         Some(ClusterConnectivityState::Unreachable) => 3,
     }
-}
-
-pub fn cluster_connectivity_record_for_probe_outcome(
-    state: &ClusterBootstrapState,
-    endpoint: &ClusterEndpointRecord,
-    previous: Option<&ClusterConnectivityRecord>,
-    healthy: bool,
-    latency_ms: u64,
-    timestamp: &str,
-    now: OffsetDateTime,
-) -> ClusterConnectivityRecord {
-    if healthy {
-        return cluster_connectivity_record(
-            state,
-            endpoint,
-            ClusterConnectivityState::Healthy,
-            Some(latency_ms),
-            0,
-            Some(timestamp.to_string()),
-            previous.and_then(|record| record.last_failure_at.clone()),
-            now,
-            CLUSTER_CONNECTIVITY_TTL_SECONDS,
-        );
-    }
-
-    let observed_failures = previous
-        .map(|record| record.consecutive_failures.saturating_add(1))
-        .unwrap_or(1);
-    let retained_success = previous.and_then(|record| {
-        if observed_failures < CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD {
-            record.last_success_at.clone()
-        } else {
-            None
-        }
-    });
-    let previously_healthy =
-        previous.is_some_and(|record| record.state == ClusterConnectivityState::Healthy);
-    let state_label = if previously_healthy && observed_failures == 1 {
-        // Single-failure grace: a confirmed-healthy link survives one transient
-        // probe failure as Healthy. A persistent outage still degrades on the next
-        // probe, while a never-confirmed link gets no grace.
-        ClusterConnectivityState::Healthy
-    } else if observed_failures >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD {
-        ClusterConnectivityState::Unreachable
-    } else {
-        ClusterConnectivityState::Degraded
-    };
-    let failures = observed_failures.min(CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD);
-    let ttl_seconds = if observed_failures >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD {
-        CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS
-    } else {
-        CLUSTER_CONNECTIVITY_TTL_SECONDS
-    };
-    cluster_connectivity_record(
-        state,
-        endpoint,
-        state_label,
-        previous.and_then(|record| record.latency_ms),
-        failures,
-        retained_success,
-        Some(timestamp.to_string()),
-        now,
-        ttl_seconds,
-    )
-}
-
-pub fn cluster_connectivity_record_for_startup_probe_failure(
-    state: &ClusterBootstrapState,
-    endpoint: &ClusterEndpointRecord,
-    previous: Option<&ClusterConnectivityRecord>,
-    latency_ms: u64,
-    timestamp: &str,
-    now: OffsetDateTime,
-) -> ClusterConnectivityRecord {
-    let mut record = cluster_connectivity_record_for_probe_outcome(
-        state, endpoint, previous, false, latency_ms, timestamp, now,
-    );
-    if record.state == ClusterConnectivityState::Unreachable {
-        record.state = ClusterConnectivityState::Degraded;
-        record.consecutive_failures = CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD
-            .saturating_sub(1)
-            .max(1);
-        record.expires_at = now + time::Duration::seconds(CLUSTER_CONNECTIVITY_TTL_SECONDS);
-    }
-    record
-}
-
-pub fn cluster_connectivity_record_for_identity_mismatch(
-    state: &ClusterBootstrapState,
-    endpoint: &ClusterEndpointRecord,
-    timestamp: &str,
-    now: OffsetDateTime,
-) -> ClusterConnectivityRecord {
-    cluster_connectivity_record(
-        state,
-        endpoint,
-        ClusterConnectivityState::Unreachable,
-        None,
-        CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD,
-        None,
-        Some(timestamp.to_string()),
-        now,
-        CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
-    )
-}
-
-pub fn cluster_connectivity_record_for_hard_failure(
-    state: &ClusterBootstrapState,
-    endpoint: &ClusterEndpointRecord,
-    previous: Option<&ClusterConnectivityRecord>,
-    timestamp: &str,
-    now: OffsetDateTime,
-) -> ClusterConnectivityRecord {
-    let observed_failures = previous
-        .map(|record| record.consecutive_failures.saturating_add(1))
-        .unwrap_or(1);
-    let failures = observed_failures.min(CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD);
-    let retained_success = previous.and_then(|record| {
-        if observed_failures < CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD {
-            record.last_success_at.clone()
-        } else {
-            None
-        }
-    });
-    let (state_label, ttl_seconds) = if observed_failures >= CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD
-    {
-        (
-            ClusterConnectivityState::Unreachable,
-            CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
-        )
-    } else {
-        (
-            ClusterConnectivityState::Degraded,
-            CLUSTER_CONNECTIVITY_TTL_SECONDS,
-        )
-    };
-    cluster_connectivity_record(
-        state,
-        endpoint,
-        state_label,
-        previous.and_then(|record| record.latency_ms),
-        failures,
-        retained_success,
-        Some(timestamp.to_string()),
-        now,
-        ttl_seconds,
-    )
-}
-
-pub fn apply_cluster_connectivity_probe_results(
-    connectivity: &mut BTreeMap<String, ClusterConnectivityProbeState>,
-    active_keys: &BTreeSet<String>,
-    probed: Vec<(String, ClusterConnectivityRecord)>,
-) -> Vec<ClusterConnectivityRecord> {
-    for (key, record) in probed {
-        connectivity.insert(key, ClusterConnectivityProbeState { record });
-    }
-
-    connectivity.retain(|key, _state| active_keys.contains(key));
-    connectivity
-        .values()
-        .map(|state| state.record.clone())
-        .collect()
-}
-
-pub fn cluster_connectivity_probe_due_with_startup_settle(
-    record: &ClusterConnectivityRecord,
-    now: OffsetDateTime,
-    refresh_deadline: OffsetDateTime,
-    local_node_role: &ClusterNodeRole,
-    startup_settle_active: bool,
-) -> bool {
-    if startup_settle_active && record.state != ClusterConnectivityState::Healthy {
-        return true;
-    }
-    if record.expires_at <= refresh_deadline {
-        return true;
-    }
-    let retry_interval = cluster_network_probe_interval_for_role(local_node_role);
-    let retry_seconds = retry_interval.as_secs().min(i64::MAX as u64) as i64;
-    let retry_due = record.observed_at + time::Duration::seconds(retry_seconds) <= now;
-    if record.state == ClusterConnectivityState::Unreachable {
-        return retry_due;
-    }
-    if record.state != ClusterConnectivityState::Healthy
-        && record.consecutive_failures < CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD
-    {
-        return retry_due;
-    }
-    if record.state != ClusterConnectivityState::Healthy {
-        // The failure budget is exhausted, but the endpoint must not freeze
-        // as degraded until record expiry: a peer that becomes reachable
-        // later — the canonical case is a cold-formation late joiner whose
-        // pre-join window burned the budget — has to be rediscovered. Retry
-        // at a slower cadence than healthy refreshes.
-        let degraded_retry_seconds = retry_seconds.saturating_mul(2);
-        return record.observed_at + time::Duration::seconds(degraded_retry_seconds) <= now;
-    }
-    record.consecutive_failures > 0 && retry_due
-}
-
-pub fn cluster_connectivity_probe_due_with_graph(
-    record: &ClusterConnectivityRecord,
-    endpoint: &ClusterEndpointRecord,
-    now: OffsetDateTime,
-    refresh_deadline: OffsetDateTime,
-    local_node_role: &ClusterNodeRole,
-    graph: &ClusterConnectivityGraph,
-    local_node_id: &NodeId,
-    startup_settle_active: bool,
-) -> bool {
-    if !cluster_connectivity_probe_due_with_startup_settle(
-        record,
-        now,
-        refresh_deadline,
-        local_node_role,
-        startup_settle_active,
-    ) {
-        return false;
-    }
-    if startup_settle_active && record.state != ClusterConnectivityState::Healthy {
-        return true;
-    }
-    if record.expires_at <= refresh_deadline {
-        return true;
-    }
-    if record.state == ClusterConnectivityState::Healthy {
-        return true;
-    }
-    // A due non-healthy record re-probes even when a relay route exists:
-    // a healed DIRECT endpoint always beats relaying, and the route may
-    // itself traverse stale edges. The slow degraded cadence in the base
-    // check keeps the probe volume negligible.
-    let _ = (graph, local_node_id, endpoint);
-    true
 }
 
 impl ClusterConnectivityGraph {
@@ -5896,47 +5641,6 @@ pub async fn refresh_cluster_connectivity_environment_async(
     }
     *environment_id = Some(local_environment_id);
     Ok(changed)
-}
-
-pub fn cluster_connectivity_probe_key(
-    source_node_id: &NodeId,
-    endpoint: &ClusterEndpointRecord,
-) -> String {
-    format!(
-        "{}:{}:{}",
-        source_node_id, endpoint.node_id, endpoint.endpoint_id
-    )
-}
-
-pub fn cluster_connectivity_record(
-    state: &ClusterBootstrapState,
-    endpoint: &ClusterEndpointRecord,
-    connectivity_state: ClusterConnectivityState,
-    latency_ms: Option<u64>,
-    consecutive_failures: u16,
-    last_success_at: Option<String>,
-    last_failure_at: Option<String>,
-    observed_at: OffsetDateTime,
-    ttl_seconds: i64,
-) -> ClusterConnectivityRecord {
-    // The caller passes an explicit per-state TTL (e.g. CLUSTER_CONNECTIVITY_TTL_SECONDS for
-    // healthy/degraded, CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS for unreachable); honor it
-    // directly rather than silently halving non-healthy lifetimes.
-    ClusterConnectivityRecord {
-        cluster_id: state.cluster_id.clone(),
-        source_node_id: state.local_node_id.clone(),
-        target_node_id: endpoint.node_id.clone(),
-        endpoint_id: endpoint.endpoint_id.clone(),
-        transport: endpoint.transport.clone(),
-        address: endpoint.address.clone(),
-        state: connectivity_state,
-        latency_ms,
-        consecutive_failures,
-        last_success_at,
-        last_failure_at,
-        observed_at,
-        expires_at: observed_at + time::Duration::seconds(ttl_seconds),
-    }
 }
 
 pub fn apply_cluster_node_role(
