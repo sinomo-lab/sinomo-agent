@@ -259,15 +259,7 @@ impl ChatState {
             })
             .collect();
         match sessions::save_with_report(&self.data_dir, &self.session_id, &title, &stored) {
-            Ok(report) => {
-                if let Err(error) = report.sifs {
-                    self.notice = Some(format!(
-                        "session saved locally; SIFS mirror failed: {}",
-                        compact_line(&error, 160)
-                    ));
-                    self.push_activity("session mirror", error, ActivityTone::Warn);
-                }
-            }
+            Ok(_) => {}
             Err(error) => {
                 let detail = error.to_string();
                 self.notice = Some(format!("session save failed: {detail}"));
@@ -2994,16 +2986,14 @@ mod tests {
     fn runtime_health_surfaces_degraded_cluster_and_persistence_state() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
-        state.notice = Some(
-            "session saved locally; SIFS mirror failed: DFS services shard replay delayed"
-                .to_string(),
-        );
+        state.notice =
+            Some("session save failed: DFS services shard replay delayed".to_string());
 
         let health = state.runtime_health();
         assert_eq!(health.label, "DEGRADED");
         assert_eq!(health.tone, ActivityTone::Warn);
         assert!(
-            health.detail.contains("SIFS mirror failed"),
+            health.detail.contains("session save failed"),
             "health detail should preserve the operator-relevant degraded signal"
         );
 
@@ -3219,14 +3209,14 @@ mod tests {
         );
 
         if let Some(notice) = state.notice.as_deref()
-            && notice.contains("SIFS mirror failed")
+            && notice.contains("session save failed")
         {
             assert!(
                 state
                     .activity
                     .iter()
-                    .any(|entry| entry.title == "session mirror" && entry.tone == ActivityTone::Warn),
-                "SIFS mirror failures should be visible as degraded app-layer activity"
+                    .any(|entry| entry.title == "session save" && entry.tone == ActivityTone::Warn),
+                "SIFS save failures should be visible as degraded app-layer activity"
             );
         }
     }
