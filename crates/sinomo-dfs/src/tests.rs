@@ -998,13 +998,14 @@ fn async_dfs_message_transport_in_process_sends_waits_and_drains() {
                 .await
                 .expect("wait")
         );
-        let inbound = AsyncDfsMessageTransport::drain_incoming_async(&mut transport_b)
+        let inbound = AsyncDfsMessageTransport::drain_incoming_messages_async(&mut transport_b)
             .await
             .expect("drain");
 
         assert_eq!(inbound.len(), 1);
-        assert_eq!(inbound[0].received_by, node_b);
-        assert_eq!(inbound[0].frame.frame_id, NetworkFrameId(7));
+        assert_eq!(inbound[0].target_node_id, node_b);
+        assert_eq!(inbound[0].source_node_id, node_a);
+        assert_eq!(inbound[0].frame_id, 7);
     });
 }
 
@@ -1905,10 +1906,12 @@ fn endpoint_transport_sends_rpc_and_queues_returned_frames() {
     let recorded = calls.lock().expect("calls lock");
     assert_eq!(recorded.as_slice(), &[(remote.clone(), frame)]);
     drop(recorded);
-    let incoming = transport.drain_incoming().expect("incoming frames");
+    let incoming = transport
+        .drain_incoming_messages()
+        .expect("incoming messages");
     assert_eq!(incoming.len(), 1);
-    assert_eq!(incoming[0].received_by, local);
-    assert_eq!(incoming[0].frame.source_node_id, remote);
+    assert_eq!(incoming[0].target_node_id, local);
+    assert_eq!(incoming[0].source_node_id, remote);
 }
 
 #[test]
@@ -2095,12 +2098,12 @@ fn endpoint_transport_async_sender_does_not_require_sync_sender() {
         let recorded = calls.lock().expect("calls lock");
         assert_eq!(recorded.as_slice(), &[(remote.clone(), frame)]);
         drop(recorded);
-        let incoming = AsyncDfsMessageTransport::drain_incoming_async(&mut transport)
+        let incoming = AsyncDfsMessageTransport::drain_incoming_messages_async(&mut transport)
             .await
-            .expect("incoming frames");
+            .expect("incoming messages");
         assert_eq!(incoming.len(), 1);
-        assert_eq!(incoming[0].received_by, local);
-        assert_eq!(incoming[0].frame.source_node_id, remote);
+        assert_eq!(incoming[0].target_node_id, local);
+        assert_eq!(incoming[0].source_node_id, remote);
     });
 }
 
@@ -2183,10 +2186,12 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
             &[(remote.clone(), NetworkFrameId(11))]
         );
         assert!(async_calls.lock().expect("async calls lock").is_empty());
-        let incoming = transport.drain_incoming().expect("sync incoming frames");
+        let incoming = transport
+            .drain_incoming_messages()
+            .expect("sync incoming messages");
         assert_eq!(incoming.len(), 1);
-        assert_eq!(incoming[0].received_by, local);
-        assert_eq!(incoming[0].frame.source_node_id, remote);
+        assert_eq!(incoming[0].target_node_id, local);
+        assert_eq!(incoming[0].source_node_id, remote);
 
         let async_message =
             test_dfs_lookup_routed_message(&local, &remote, 12, "/endpoint/dual-async");
@@ -2197,12 +2202,12 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
             async_calls.lock().expect("async calls lock").as_slice(),
             &[(remote.clone(), NetworkFrameId(12))]
         );
-        let incoming = AsyncDfsMessageTransport::drain_incoming_async(&mut transport)
+        let incoming = AsyncDfsMessageTransport::drain_incoming_messages_async(&mut transport)
             .await
-            .expect("async incoming frames");
+            .expect("async incoming messages");
         assert_eq!(incoming.len(), 1);
-        assert_eq!(incoming[0].received_by, local);
-        assert_eq!(incoming[0].frame.source_node_id, remote);
+        assert_eq!(incoming[0].target_node_id, local);
+        assert_eq!(incoming[0].source_node_id, remote);
     });
 }
 
@@ -2271,10 +2276,12 @@ fn endpoint_transport_relays_remote_returned_frames_preserving_source() {
             (replica.clone(), primary.clone(), replica.clone()),
         ]
     );
-    let incoming = transport.drain_incoming().expect("incoming frames");
+    let incoming = transport
+        .drain_incoming_messages()
+        .expect("incoming messages");
     assert_eq!(incoming.len(), 1);
-    assert_eq!(incoming[0].received_by, local);
-    assert_eq!(incoming[0].frame.source_node_id, replica);
+    assert_eq!(incoming[0].target_node_id, local);
+    assert_eq!(incoming[0].source_node_id, replica);
 }
 
 #[test]
@@ -3416,23 +3423,17 @@ fn networked_dfs_async_send_uses_shared_protocol_frame_path() {
             .expect("async send");
 
         assert!(sent);
-        let inbound = AsyncDfsMessageTransport::drain_incoming_async(&mut remote_transport)
-            .await
-            .expect("drain remote");
+        let inbound =
+            AsyncDfsMessageTransport::drain_incoming_messages_async(&mut remote_transport)
+                .await
+                .expect("drain remote");
         assert_eq!(inbound.len(), 1);
-        let frame = &inbound[0].frame;
-        assert_eq!(frame.frame_id, NetworkFrameId(1));
-        assert_eq!(frame.source_node_id, local);
-        assert_eq!(frame.target_node_id, remote);
-        assert_eq!(frame.message.message_id, MeshMessageId(1));
-        let MeshMessageBody::Protocol(protocol) = &frame.message.body else {
-            panic!("expected DFS protocol frame");
-        };
-        assert_eq!(protocol.protocol, DFS_PROTOCOL);
-        match protocol
-            .decode::<DfsNetworkMessage>()
-            .expect("decode DFS payload")
-        {
+        let message = &inbound[0];
+        assert_eq!(message.frame_id, 1);
+        assert_eq!(message.source_node_id, local);
+        assert_eq!(message.target_node_id, remote);
+        assert_eq!(message.message_id, 1);
+        match &message.message {
             DfsNetworkMessage::ReadRequest(request) => {
                 assert_eq!(request.request_id, "async-read-1");
                 assert_eq!(request.object_id, object_id);
@@ -5063,7 +5064,7 @@ fn metadata_replication_cursor_advances_only_after_replica_ack() {
     );
 
     assert_eq!(
-        DfsMessageTransport::drain_incoming(&mut drop_replica_mailbox)
+        DfsMessageTransport::drain_incoming_messages(&mut drop_replica_mailbox)
             .expect("drop first batch")
             .len(),
         1,

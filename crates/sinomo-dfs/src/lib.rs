@@ -112,8 +112,7 @@ use sinomo_events::EventId;
 use sinomo_kv::KvError;
 use sinomo_local::{LocalDataError, SinomoDataDir};
 use sinomo_network::{
-    ClusterPaths, InboundFrame, NetworkError, NetworkFrame, ObjectRpcRequest, ObjectRpcResponse,
-    ProtocolMessage,
+    ClusterPaths, NetworkError, NetworkFrame, ObjectRpcRequest, ObjectRpcResponse, ProtocolMessage,
 };
 #[cfg(test)]
 use sinomo_network::{MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrameId};
@@ -175,19 +174,6 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         self.send_routed_message(target_node_id, message)
     }
     fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError>;
-    fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
-        self.drain_incoming_messages()?
-            .into_iter()
-            .map(|message| {
-                protocol::dfs_protocol_frame_from_routed_message(&message).map(|frame| {
-                    InboundFrame {
-                        received_by: self.local_node_id().clone(),
-                        frame,
-                    }
-                })
-            })
-            .collect()
-    }
     fn flush_detached_sends(&mut self) -> Result<(), NetworkError> {
         Ok(())
     }
@@ -230,25 +216,6 @@ pub trait AsyncDfsMessageTransport: Send {
     fn drain_incoming_messages_async<'a>(
         &'a mut self,
     ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedMessage>, NetworkError>>;
-
-    fn drain_incoming_async<'a>(
-        &'a mut self,
-    ) -> DfsMessageTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
-        Box::pin(async move {
-            self.drain_incoming_messages_async()
-                .await?
-                .into_iter()
-                .map(|message| {
-                    protocol::dfs_protocol_frame_from_routed_message(&message).map(|frame| {
-                        InboundFrame {
-                            received_by: self.local_node_id().clone(),
-                            frame,
-                        }
-                    })
-                })
-                .collect()
-        })
-    }
 
     fn pending_incoming_count_async<'a>(
         &'a mut self,
