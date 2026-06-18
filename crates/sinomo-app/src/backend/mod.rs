@@ -134,7 +134,8 @@ impl Backend {
             }
         };
 
-        let connection = ensure_app_cluster(connection, &paths, data_dir.as_ref(), &node, &progress);
+        let connection =
+            ensure_app_cluster(connection, &paths, data_dir.as_ref(), &node, &progress);
         progress("Loading workspace…");
         let config = build_config_client(&connection, &data_dir);
 
@@ -329,9 +330,11 @@ fn agent_runtime_control_service_hook(
     control_host: sinomo_agent::AgentRuntimeControlRegistry,
 ) -> DaemonServiceRegistryHook {
     DaemonServiceRegistryHook::new(move |builder| {
-        let host: Arc<dyn sinomo_agent::AgentRuntimeControlHost> =
-            Arc::new(control_host.clone());
+        let host: Arc<dyn sinomo_agent::AgentRuntimeControlHost> = Arc::new(control_host.clone());
         sinomo_agent::register_services_with_runtime_control(builder, host)
+    })
+    .with_config_definitions(|builder| {
+        sinomo_lm::register_config_definitions(builder).map_err(|error| error.to_string())
     })
 }
 
@@ -344,6 +347,16 @@ mod tests {
     fn app_agent_runtime_control_hook_registers_read_and_control_routes() {
         let hook =
             agent_runtime_control_service_hook(sinomo_agent::AgentRuntimeControlRegistry::new());
+        let config_registry = hook
+            .register_config_definitions(sinomo_runtime::config::ConfigRegistry::builder())
+            .expect("register app config definitions")
+            .build();
+        assert!(
+            config_registry
+                .get(sinomo_lm::LM_PROVIDER_CONFIG_KEY)
+                .is_ok()
+        );
+
         let registry = hook.register(ServiceRegistry::builder()).build();
 
         for route in sinomo_agent::AGENT_OBJECT_RPC_ROUTES

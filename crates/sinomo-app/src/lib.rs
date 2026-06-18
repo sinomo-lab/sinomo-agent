@@ -14,7 +14,7 @@ pub mod ui;
 use sui::{App, Window, WindowRenderOptions, default_sui_logo_image};
 
 use crate::backend::Backend;
-use crate::state::{AppState, ConnectEvent, Shared, Tab};
+use crate::state::{AppState, ConnectEvent, ReadyState, Shared, Tab};
 use crate::ui::Shell;
 use crate::ui::shell::logo_image_handle;
 
@@ -78,7 +78,10 @@ pub fn run() -> sui::Result<()> {
                     ui.wake();
                 });
                 tracing::info!(mode = %backend.mode_label(), "sinomo-app connected");
-                let _ = tx.send(ConnectEvent::Connected(Box::new(backend)));
+                let _ = tx.send(ConnectEvent::Status("Loading workspace…".to_string()));
+                ui.wake();
+                let ready = ReadyState::build(backend);
+                let _ = tx.send(ConnectEvent::Connected(Box::new(ready)));
                 ui.wake();
             })
             .expect("spawn connect thread");
