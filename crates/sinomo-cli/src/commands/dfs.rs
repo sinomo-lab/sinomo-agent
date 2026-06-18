@@ -1435,54 +1435,82 @@ fn inspect_cluster_dfs_status() -> Result<DfsClusterStatusReport, CliError> {
         )?),
         error: None,
     }];
-    let mut endpoints_by_node =
-        std::collections::BTreeMap::<NodeId, Vec<ClusterEndpointRecord>>::new();
-    for endpoint in network::ClusterEndpointSelector::new(&cluster_paths, &state)
-        .select(network::ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates)
-    {
-        endpoints_by_node
-            .entry(endpoint.node_id.clone())
-            .or_default()
-            .push(endpoint);
-    }
-    for (node_id, endpoints) in endpoints_by_node {
-        let mut failures = Vec::new();
-        let mut successful = None;
-        for endpoint in endpoints {
-            match fetch_dfs_status_from_endpoint(&endpoint, std::time::Duration::from_secs(5)) {
-                Ok(status) => {
-                    successful = Some((endpoint.address, status));
-                    break;
-                }
-                Err(error) => failures.push(format!("{} failed: {error}", endpoint.address)),
-            }
-        }
-        nodes.push(match successful {
-            Some((endpoint, status)) => DfsClusterNodeStatus {
-                node_id,
-                local: false,
-                endpoint: Some(endpoint),
-                status: Some(status),
-                error: None,
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| CliError::Network {
+            address: "cluster dfs status".to_string(),
+            detail: source.to_string(),
+        })?;
+    let remote_node_ids = state
+        .members
+        .iter()
+        .filter(|member| {
+            member.node_id != state.local_node_id
+                && member.state.is_authorized()
+                && member
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.as_str() == network::DAEMON_MAIN_RUN_CAPABILITY)
+        })
+        .map(|member| member.node_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    for node_id in remote_node_ids {
+        nodes.push(
+            match fetch_dfs_status_from_node(
+                runtime.handle(),
+                &cluster_paths,
+                &state,
+                &node_id,
+                std::time::Duration::from_secs(5),
+            ) {
+                Ok(status) => DfsClusterNodeStatus {
+                    node_id,
+                    local: false,
+                    endpoint: Some("cluster-object-rpc".to_string()),
+                    status: Some(status),
+                    error: None,
+                },
+                Err(error) => DfsClusterNodeStatus {
+                    node_id,
+                    local: false,
+                    endpoint: None,
+                    status: None,
+                    error: Some(error.to_string()),
+                },
             },
-            None => DfsClusterNodeStatus {
-                node_id,
-                local: false,
-                endpoint: None,
-                status: None,
-                error: Some(failures.join("; ")),
-            },
-        });
+        );
     }
+    runtime.shutdown_timeout(std::time::Duration::from_millis(250));
     Ok(DfsClusterStatusReport { nodes })
 }
 
-fn fetch_dfs_status_from_endpoint(
-    endpoint: &ClusterEndpointRecord,
+fn fetch_dfs_status_from_node(
+    runtime: &tokio::runtime::Handle,
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+    node_id: &NodeId,
     timeout: std::time::Duration,
 ) -> Result<sinomo_runtime::dfs::DfsOperatorStatus, CliError> {
     let rpc_request = sinomo_runtime::dfs::dfs_status_rpc_request()?;
-    let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
+    let mut host = CliSignedEndpointRpcHost::new(
+        Some(state.cluster_id.clone()),
+        "dfs status object rpc signing",
+    );
+    let mut client = network::ClusterObjectRpcClient::new(&mut host);
+    let response = runtime
+        .block_on(client.call_node_from_paths(
+            runtime,
+            cluster_paths,
+            state,
+            node_id,
+            &rpc_request,
+            network::ClusterObjectRpcNodeOptions::new(
+                network::ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates,
+                network::DaemonRpcTimeouts::connect_and_idle(timeout),
+            ),
+        ))
+        .map_err(CliError::from)?;
     sinomo_runtime::dfs::decode_dfs_status_rpc_response(&response).map_err(Into::into)
 }
 

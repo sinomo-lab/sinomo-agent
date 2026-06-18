@@ -1945,7 +1945,7 @@ async fn send_join_endpoint_rpc_async(
     request: &network::ObjectRpcRequest,
     timeouts: network::DaemonRpcTimeouts,
 ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
-    let mut host = CliJoinEndpointRpcHost;
+    let mut host = CliSignedEndpointRpcHost::new(None, "cluster join endpoint rpc signing");
     let mut client = network::ClusterObjectRpcClient::new(&mut host);
     client
         .call_endpoint(
@@ -1954,53 +1954,6 @@ async fn send_join_endpoint_rpc_async(
             network::ClusterObjectRpcOptions::new(timeouts),
         )
         .await
-}
-
-struct CliJoinEndpointRpcHost;
-
-impl network::ClusterSignedEndpointRpcAsyncHost for CliJoinEndpointRpcHost {
-    fn sign_endpoint_rpc_request_async<'a>(
-        &'a mut self,
-        request: &'a network::ObjectRpcRequest,
-    ) -> network::ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
-        let request = request.clone();
-        Box::pin(async move {
-            crate::daemon_sign_daemon_rpc_request_for_local_node(&request).map_err(|error| {
-                network::NetworkError::Io {
-                    operation: "cluster join endpoint rpc signing".to_string(),
-                    detail: error.to_string(),
-                }
-            })
-        })
-    }
-
-    fn try_gateway_signed_rpc_async<'a>(
-        &'a mut self,
-        _endpoint: &'a ClusterEndpointRecord,
-        _request: &'a network::ObjectRpcRequest,
-        _request_auth: &'a [u8],
-        _timeouts: network::DaemonRpcTimeouts,
-    ) -> network::ClusterSignedEndpointRpcFuture<'a, Option<network::ObjectRpcResponse>> {
-        Box::pin(async { Ok(None) })
-    }
-
-    fn send_signed_endpoint_rpc_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        auth: &'a [u8],
-        request: &'a network::ObjectRpcRequest,
-        timeouts: network::DaemonRpcTimeouts,
-    ) -> network::ClusterSignedEndpointRpcFuture<'a, network::ObjectRpcResponse> {
-        Box::pin(async move {
-            network::send_daemon_rpc_to_cluster_endpoint_async(
-                endpoint,
-                Some(auth),
-                request,
-                timeouts,
-            )
-            .await
-        })
-    }
 }
 
 /// Idle deadline for join challenge/registration streams; covers a

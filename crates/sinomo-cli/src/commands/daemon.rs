@@ -965,9 +965,10 @@ impl network::ClusterKvTxnForwardHost for CliClusterKvTxnForwardHost {
                 operation: "cli daemon node object rpc runtime".to_string(),
                 detail: error.to_string(),
             })?;
-        let mut host = CliSignedObjectRpcHost {
-            cluster_id: state.cluster_id.clone(),
-        };
+        let mut host = CliSignedEndpointRpcHost::new(
+            Some(state.cluster_id.clone()),
+            "cli endpoint rpc signing",
+        );
         let mut client = network::ClusterObjectRpcClient::new(&mut host);
         let options = network::ClusterObjectRpcNodeOptions::new(
             network::ClusterEndpointSelectionPurpose::VoterCommand,
@@ -983,57 +984,6 @@ impl network::ClusterKvTxnForwardHost for CliClusterKvTxnForwardHost {
         ));
         runtime.shutdown_timeout(Duration::from_millis(250));
         result
-    }
-}
-
-struct CliSignedObjectRpcHost {
-    cluster_id: network::ClusterId,
-}
-
-impl network::ClusterSignedEndpointRpcAsyncHost for CliSignedObjectRpcHost {
-    fn sign_endpoint_rpc_request_async<'a>(
-        &'a mut self,
-        request: &'a network::ObjectRpcRequest,
-    ) -> network::ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
-        Box::pin(async move {
-            daemon_sign_daemon_rpc_request_for_local_node(request)
-                .map_err(|error| cli_daemon_rpc_network_error("cli endpoint rpc signing", error))
-        })
-    }
-
-    fn try_gateway_signed_rpc_async<'a>(
-        &'a mut self,
-        _endpoint: &'a ClusterEndpointRecord,
-        _request: &'a network::ObjectRpcRequest,
-        _request_auth: &'a [u8],
-        _timeouts: network::DaemonRpcTimeouts,
-    ) -> network::ClusterSignedEndpointRpcFuture<'a, Option<network::ObjectRpcResponse>> {
-        Box::pin(async { Ok(None) })
-    }
-
-    fn endpoint_rpc_cluster_id_async<'a>(
-        &'a mut self,
-        _endpoint: &'a ClusterEndpointRecord,
-    ) -> network::ClusterSignedEndpointRpcFuture<'a, Option<network::ClusterId>> {
-        Box::pin(async move { Ok(Some(self.cluster_id.clone())) })
-    }
-
-    fn send_signed_endpoint_rpc_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        auth: &'a [u8],
-        request: &'a network::ObjectRpcRequest,
-        timeouts: network::DaemonRpcTimeouts,
-    ) -> network::ClusterSignedEndpointRpcFuture<'a, network::ObjectRpcResponse> {
-        Box::pin(async move {
-            network::send_daemon_rpc_to_cluster_endpoint_async(
-                endpoint,
-                Some(auth),
-                request,
-                timeouts,
-            )
-            .await
-        })
     }
 }
 
