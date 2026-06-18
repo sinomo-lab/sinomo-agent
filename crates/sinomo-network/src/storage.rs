@@ -36,6 +36,11 @@ use crate::membership::{
     cluster_local_process_members, cluster_member_is_legacy_shadow_daemon,
     cluster_member_is_local_process, cluster_node_is_local_process,
 };
+use crate::membership_rpc::{
+    ClusterAuthenticatedPeer, ClusterInvitePublishRequest, ClusterInvitePublishResponse,
+    ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse, ClusterMemberPublishRequest,
+    ClusterMemberPublishResponse,
+};
 use crate::network_info::{
     CLUSTER_NETWORK_INFO_TTL_SECONDS, ClusterNetworkInfoRecord, build_cluster_network_info_record,
     cluster_network_info_stable_eq,
@@ -1427,22 +1432,6 @@ fn remove_optional_file(path: &PathBuf) -> Result<bool, NetworkError> {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ClusterJoinRegistrationRequest {
-    pub invite: sinomo_core::ClusterJoinInvite,
-    pub invitation_secret: String,
-    pub members: Vec<ClusterMemberRecord>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ClusterJoinRegistrationResponse {
-    pub accepted: bool,
-    pub detail: String,
-    pub state: ClusterBootstrapState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kv_snapshot: Option<KvSnapshot>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterJoinReconciliation {
     pub accepted_endpoint: Option<ClusterEndpointRecord>,
@@ -2413,45 +2402,6 @@ pub async fn forward_cluster_join_challenge_rpc_to_voter_async_with_host(
         host,
     )
     .await
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ClusterInvitePublishRequest {
-    pub invite: ClusterJoinInvite,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ClusterInvitePublishResponse {
-    pub accepted: bool,
-    pub detail: String,
-    pub state: ClusterBootstrapState,
-    pub kv_snapshot: Option<KvSnapshot>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ClusterMemberPublishRequest {
-    pub members: Vec<ClusterMemberRecord>,
-    /// The publisher's local cluster KV snapshot revision. When present, the
-    /// voter includes its current KV snapshot in the response only if the
-    /// publisher is behind — this is how learners (which cannot always dial a
-    /// voter directly; member publish is bridge-relayable) converge their
-    /// local KV snapshot without re-shipping it on every publish.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub local_kv_revision: Option<KvRevision>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ClusterMemberPublishResponse {
-    pub accepted: bool,
-    pub detail: String,
-    pub state: ClusterBootstrapState,
-    pub kv_snapshot: Option<KvSnapshot>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClusterAuthenticatedPeer {
-    pub node_id: String,
-    pub public_key: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
