@@ -25,12 +25,13 @@ use sinomo_config::{
 };
 use sinomo_dfs::register_services as register_dfs_services;
 use sinomo_kv::{
-    CLUSTER_KV_LOCAL_READ_WATCH_ROUTES, CLUSTER_KV_RPC_ROUTE_METADATA, CLUSTER_KV_RPC_ROUTES,
+    CLUSTER_KV_LOCAL_READ_WATCH_ROUTES, CLUSTER_KV_RPC_ROUTE_POLICIES, CLUSTER_KV_RPC_ROUTES,
     CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_SNAPSHOT_RPC_MAX_PAYLOAD_BYTES, CLUSTER_KV_TXN_ROUTE,
-    CLUSTER_KV_WATCH_EVENTS_ROUTE, CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_RPC_ROUTE_METADATA,
-    CLUSTER_RAFT_VOTE_ROUTE, ClusterKvWatchCancelRequest, ClusterKvWatchCancelResponse,
-    ClusterKvWatchDrainRequest, ClusterKvWatchDrainResponse, ClusterKvWatchPrefixRequest,
-    ClusterKvWatchRegistration, KvEntry, KvSnapshot, KvTxn, KvTxnResponse,
+    CLUSTER_KV_WATCH_EVENTS_ROUTE, CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_RPC_ROUTE_POLICIES,
+    CLUSTER_RAFT_RPC_ROUTES, ClusterKvRpcRoutePolicy, ClusterKvWatchCancelRequest,
+    ClusterKvWatchCancelResponse, ClusterKvWatchDrainRequest, ClusterKvWatchDrainResponse,
+    ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration, KvEntry, KvSnapshot, KvTxn,
+    KvTxnResponse,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_module::{MODULE_NATIVE_DYLIB_CANCEL_ROUTE, MODULE_RPC_CATEGORY};
@@ -324,6 +325,22 @@ fn service_routes_from_metadata(
         .collect()
 }
 
+fn service_routes_from_kv_policies(
+    policies: &'static [ClusterKvRpcRoutePolicy],
+) -> Vec<ServiceRoute> {
+    policies
+        .iter()
+        .map(|policy| {
+            ServiceRoute::from_route_metadata(
+                policy.route,
+                policy.category,
+                policy.auth.as_scope(),
+                policy.required_capabilities.iter().copied(),
+            )
+        })
+        .collect()
+}
+
 fn network_module_service_route(route: &'static str) -> ServiceRoute {
     let descriptor = network_module_surfaces()
         .object_rpc_route_descriptor(route)
@@ -438,7 +455,7 @@ impl Service for ClusterKvService {
     }
 
     fn route_categories(&self) -> Vec<ServiceRoute> {
-        service_routes_from_metadata(CLUSTER_KV_RPC_ROUTE_METADATA)
+        service_routes_from_kv_policies(CLUSTER_KV_RPC_ROUTE_POLICIES)
     }
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
@@ -652,11 +669,11 @@ impl Service for ClusterRaftService {
     }
 
     fn routes(&self) -> &'static [&'static str] {
-        &[CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_VOTE_ROUTE]
+        CLUSTER_RAFT_RPC_ROUTES
     }
 
     fn route_categories(&self) -> Vec<ServiceRoute> {
-        service_routes_from_metadata(CLUSTER_RAFT_RPC_ROUTE_METADATA)
+        service_routes_from_kv_policies(CLUSTER_RAFT_RPC_ROUTE_POLICIES)
     }
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
@@ -1636,12 +1653,17 @@ fn service_error_to_network_error(error: ServiceError) -> NetworkError {
 
 fn daemon_signer_authorizes_route_scope(authority: &DaemonSignerAuthority, scope: &str) -> bool {
     match scope {
+        "authenticated" => true,
         "local-command" => authority.can_run_local_command(),
         "local-or-cluster-member" | "cluster-member" => matches!(
             authority,
             DaemonSignerAuthority::Local
                 | DaemonSignerAuthority::Voter
                 | DaemonSignerAuthority::Member
+        ),
+        "local-or-cluster-voter" => matches!(
+            authority,
+            DaemonSignerAuthority::Local | DaemonSignerAuthority::Voter
         ),
         "admin" => authority.can_run_admin_command(),
         _ => false,
@@ -3611,23 +3633,32 @@ mod tests {
             .expect("runtime");
         let registry = daemon_service_registry(&paths, Some(runtime.handle()), &[]);
 
-        for route in CLUSTER_KV_RPC_ROUTES.iter().copied().chain([
-            sinomo_network::CLUSTER_HEALTH_ROUTE,
-            sinomo_network::CLUSTER_NETWORK_PING_ROUTE,
-            CLUSTER_RELAY_ROUTE,
-            sinomo_dfs::DFS_SMOKE_ROUTE,
-            sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE,
-            sinomo_dfs::DFS_DIRECT_READ_ROUTE,
-            CLUSTER_JOIN_CHALLENGE_ROUTE,
-            CLUSTER_JOIN_REGISTER_ROUTE,
-            CLUSTER_INVITE_PUBLISH_ROUTE,
-            CLUSTER_MEMBER_PUBLISH_ROUTE,
-        ]) {
+        for route in CLUSTER_KV_RPC_ROUTES
+            .iter()
+            .copied()
+            .chain(CLUSTER_RAFT_RPC_ROUTES.iter().copied())
+            .chain([
+                sinomo_network::CLUSTER_HEALTH_ROUTE,
+                sinomo_network::CLUSTER_NETWORK_PING_ROUTE,
+                CLUSTER_RELAY_ROUTE,
+                sinomo_dfs::DFS_SMOKE_ROUTE,
+                sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE,
+                sinomo_dfs::DFS_DIRECT_READ_ROUTE,
+                CLUSTER_JOIN_CHALLENGE_ROUTE,
+                CLUSTER_JOIN_REGISTER_ROUTE,
+                CLUSTER_INVITE_PUBLISH_ROUTE,
+                CLUSTER_MEMBER_PUBLISH_ROUTE,
+            ])
+        {
             assert!(registry.owns(route), "registry should own {route}");
         }
         assert_eq!(
             registry.category_for_route(CLUSTER_KV_TXN_ROUTE),
             Some(sinomo_kv::CLUSTER_KV_RPC_CATEGORY)
+        );
+        assert_eq!(
+            registry.category_for_route(CLUSTER_RAFT_APPEND_ROUTE),
+            Some(sinomo_kv::CLUSTER_RAFT_RPC_CATEGORY)
         );
         assert_eq!(
             registry.category_for_route(sinomo_network::CLUSTER_HEALTH_ROUTE),
@@ -3654,6 +3685,42 @@ mod tests {
             Some(sinomo_dfs::DFS_RPC_CATEGORY)
         );
         let route_metadata = registry.route_categories();
+        let snapshot = route_metadata
+            .iter()
+            .find(|route| route.route == CLUSTER_KV_SNAPSHOT_ROUTE)
+            .expect("cluster kv snapshot route metadata");
+        assert_eq!(
+            snapshot.auth_scope.as_deref(),
+            Some(sinomo_kv::ClusterKvRouteAuth::Authenticated.as_scope())
+        );
+        assert_eq!(
+            snapshot.required_capabilities,
+            vec![sinomo_kv::CLUSTER_KV_READ_CAPABILITY.to_string()]
+        );
+        let txn = route_metadata
+            .iter()
+            .find(|route| route.route == CLUSTER_KV_TXN_ROUTE)
+            .expect("cluster kv txn route metadata");
+        assert_eq!(
+            txn.auth_scope.as_deref(),
+            Some(sinomo_kv::ClusterKvRouteAuth::LocalOrClusterMember.as_scope())
+        );
+        assert_eq!(
+            txn.required_capabilities,
+            vec![sinomo_kv::CLUSTER_KV_WRITE_CAPABILITY.to_string()]
+        );
+        let raft_append = route_metadata
+            .iter()
+            .find(|route| route.route == CLUSTER_RAFT_APPEND_ROUTE)
+            .expect("cluster raft append route metadata");
+        assert_eq!(
+            raft_append.auth_scope.as_deref(),
+            Some(sinomo_kv::ClusterKvRouteAuth::LocalOrRaftVoter.as_scope())
+        );
+        assert_eq!(
+            raft_append.required_capabilities,
+            vec![sinomo_kv::CLUSTER_RAFT_APPEND_CAPABILITY.to_string()]
+        );
         let health = route_metadata
             .iter()
             .find(|route| route.route == sinomo_network::CLUSTER_HEALTH_ROUTE)

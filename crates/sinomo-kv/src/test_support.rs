@@ -30,12 +30,38 @@ mod tests {
             CLUSTER_KV_RPC_ROUTE_METADATA.len(),
             CLUSTER_KV_RPC_ROUTES.len()
         );
+        assert_eq!(
+            CLUSTER_KV_RPC_ROUTE_POLICIES.len(),
+            CLUSTER_KV_RPC_ROUTES.len()
+        );
         for (index, route) in CLUSTER_KV_RPC_ROUTES.iter().copied().enumerate() {
             assert_eq!(
                 CLUSTER_KV_RPC_ROUTE_METADATA[index],
                 (route, CLUSTER_KV_RPC_CATEGORY)
             );
+            let policy = CLUSTER_KV_RPC_ROUTE_POLICIES[index];
+            assert_eq!(policy.route, route);
+            assert_eq!(policy.category, CLUSTER_KV_RPC_CATEGORY);
+            assert_eq!(cluster_kv_rpc_route_policy(route).copied(), Some(policy));
         }
+        assert_eq!(
+            cluster_kv_rpc_route_policy(CLUSTER_KV_SNAPSHOT_ROUTE)
+                .expect("snapshot policy")
+                .auth,
+            ClusterKvRouteAuth::Authenticated
+        );
+        assert_eq!(
+            cluster_kv_rpc_route_policy(CLUSTER_KV_TXN_ROUTE)
+                .expect("txn policy")
+                .required_capabilities,
+            [CLUSTER_KV_WRITE_CAPABILITY]
+        );
+        assert_eq!(
+            cluster_kv_rpc_route_policy(CLUSTER_KV_RANGE_PREFIX_ROUTE)
+                .expect("range policy")
+                .required_capabilities,
+            [CLUSTER_KV_READ_CAPABILITY]
+        );
         assert!(!CLUSTER_KV_LOCAL_READ_WATCH_ROUTES.contains(&CLUSTER_KV_TXN_ROUTE));
     }
 
@@ -236,6 +262,33 @@ mod tests {
                 (CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_RPC_CATEGORY),
                 (CLUSTER_RAFT_VOTE_ROUTE, CLUSTER_RAFT_RPC_CATEGORY)
             ]
+        );
+        assert_eq!(
+            CLUSTER_RAFT_RPC_ROUTES,
+            [CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_VOTE_ROUTE]
+        );
+        assert_eq!(
+            CLUSTER_RAFT_RPC_ROUTE_POLICIES,
+            [
+                ClusterKvRpcRoutePolicy {
+                    route: CLUSTER_RAFT_APPEND_ROUTE,
+                    category: CLUSTER_RAFT_RPC_CATEGORY,
+                    auth: ClusterKvRouteAuth::LocalOrRaftVoter,
+                    required_capabilities: &[CLUSTER_RAFT_APPEND_CAPABILITY],
+                },
+                ClusterKvRpcRoutePolicy {
+                    route: CLUSTER_RAFT_VOTE_ROUTE,
+                    category: CLUSTER_RAFT_RPC_CATEGORY,
+                    auth: ClusterKvRouteAuth::LocalOrRaftVoter,
+                    required_capabilities: &[CLUSTER_RAFT_VOTE_CAPABILITY],
+                }
+            ]
+        );
+        assert_eq!(
+            cluster_kv_rpc_route_policy(CLUSTER_RAFT_APPEND_ROUTE)
+                .expect("raft append policy")
+                .auth,
+            ClusterKvRouteAuth::LocalOrRaftVoter
         );
 
         let dispatched_append = handle_cluster_raft_rpc_payload::<_, _, KvError>(

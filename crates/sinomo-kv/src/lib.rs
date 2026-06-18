@@ -59,6 +59,10 @@ pub const CLUSTER_KV_WATCH_EVENTS_ROUTE: &str = "/cluster/kv/watch-events";
 pub const CLUSTER_RAFT_RPC_CATEGORY: &str = "cluster.raft";
 pub const CLUSTER_RAFT_APPEND_ROUTE: &str = "/cluster/raft/append";
 pub const CLUSTER_RAFT_VOTE_ROUTE: &str = "/cluster/raft/vote";
+pub const CLUSTER_KV_READ_CAPABILITY: &str = "cluster.kv.read";
+pub const CLUSTER_KV_WRITE_CAPABILITY: &str = "cluster.kv.write";
+pub const CLUSTER_RAFT_APPEND_CAPABILITY: &str = "cluster.raft.append";
+pub const CLUSTER_RAFT_VOTE_CAPABILITY: &str = "cluster.raft.vote";
 pub const CLUSTER_KV_LOCAL_READ_WATCH_ROUTES: &[&str] = &[
     CLUSTER_KV_RANGE_PREFIX_ROUTE,
     CLUSTER_KV_WATCH_PREFIX_ROUTE,
@@ -74,6 +78,7 @@ pub const CLUSTER_KV_RPC_ROUTES: &[&str] = &[
     CLUSTER_KV_WATCH_CANCEL_ROUTE,
     CLUSTER_KV_WATCH_EVENTS_ROUTE,
 ];
+pub const CLUSTER_RAFT_RPC_ROUTES: &[&str] = &[CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_VOTE_ROUTE];
 pub const CLUSTER_KV_RPC_ROUTE_METADATA: &[(&str, &str)] = &[
     (CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_RPC_CATEGORY),
     (CLUSTER_KV_TXN_ROUTE, CLUSTER_KV_RPC_CATEGORY),
@@ -87,6 +92,98 @@ pub const CLUSTER_RAFT_RPC_ROUTE_METADATA: &[(&str, &str)] = &[
     (CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_RPC_CATEGORY),
     (CLUSTER_RAFT_VOTE_ROUTE, CLUSTER_RAFT_RPC_CATEGORY),
 ];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClusterKvRouteAuth {
+    Authenticated,
+    LocalOrClusterMember,
+    LocalOrRaftVoter,
+}
+
+impl ClusterKvRouteAuth {
+    pub fn as_scope(self) -> &'static str {
+        match self {
+            Self::Authenticated => "authenticated",
+            Self::LocalOrClusterMember => "local-or-cluster-member",
+            Self::LocalOrRaftVoter => "local-or-cluster-voter",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClusterKvRpcRoutePolicy {
+    pub route: &'static str,
+    pub category: &'static str,
+    pub auth: ClusterKvRouteAuth,
+    pub required_capabilities: &'static [&'static str],
+}
+
+pub const CLUSTER_KV_RPC_ROUTE_POLICIES: &[ClusterKvRpcRoutePolicy] = &[
+    ClusterKvRpcRoutePolicy {
+        route: CLUSTER_KV_SNAPSHOT_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        auth: ClusterKvRouteAuth::Authenticated,
+        required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
+    },
+    ClusterKvRpcRoutePolicy {
+        route: CLUSTER_KV_TXN_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        auth: ClusterKvRouteAuth::LocalOrClusterMember,
+        required_capabilities: &[CLUSTER_KV_WRITE_CAPABILITY],
+    },
+    ClusterKvRpcRoutePolicy {
+        route: CLUSTER_KV_RANGE_PREFIX_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        auth: ClusterKvRouteAuth::LocalOrClusterMember,
+        required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
+    },
+    ClusterKvRpcRoutePolicy {
+        route: CLUSTER_KV_WATCH_PREFIX_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        auth: ClusterKvRouteAuth::LocalOrClusterMember,
+        required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
+    },
+    ClusterKvRpcRoutePolicy {
+        route: CLUSTER_KV_WATCH_DRAIN_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        auth: ClusterKvRouteAuth::LocalOrClusterMember,
+        required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
+    },
+    ClusterKvRpcRoutePolicy {
+        route: CLUSTER_KV_WATCH_CANCEL_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        auth: ClusterKvRouteAuth::LocalOrClusterMember,
+        required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
+    },
+    ClusterKvRpcRoutePolicy {
+        route: CLUSTER_KV_WATCH_EVENTS_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        auth: ClusterKvRouteAuth::LocalOrClusterMember,
+        required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
+    },
+];
+
+pub const CLUSTER_RAFT_RPC_ROUTE_POLICIES: &[ClusterKvRpcRoutePolicy] = &[
+    ClusterKvRpcRoutePolicy {
+        route: CLUSTER_RAFT_APPEND_ROUTE,
+        category: CLUSTER_RAFT_RPC_CATEGORY,
+        auth: ClusterKvRouteAuth::LocalOrRaftVoter,
+        required_capabilities: &[CLUSTER_RAFT_APPEND_CAPABILITY],
+    },
+    ClusterKvRpcRoutePolicy {
+        route: CLUSTER_RAFT_VOTE_ROUTE,
+        category: CLUSTER_RAFT_RPC_CATEGORY,
+        auth: ClusterKvRouteAuth::LocalOrRaftVoter,
+        required_capabilities: &[CLUSTER_RAFT_VOTE_CAPABILITY],
+    },
+];
+
+pub fn cluster_kv_rpc_route_policy(route: &str) -> Option<&'static ClusterKvRpcRoutePolicy> {
+    CLUSTER_KV_RPC_ROUTE_POLICIES
+        .iter()
+        .chain(CLUSTER_RAFT_RPC_ROUTE_POLICIES)
+        .find(|policy| policy.route == route)
+}
 pub const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 256;
 pub const CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_EVENTS: usize = MAX_CLUSTER_KV_WATCH_EVENTS;
 pub const CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_PAYLOAD_BYTES: usize = MAX_KV_COMMAND_PAYLOAD_BYTES;

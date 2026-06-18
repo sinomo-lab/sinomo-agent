@@ -7,11 +7,7 @@ use sinomo_config::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_SEARCH_ROUTE, CONFIG_SET_ROUTE,
 };
 use sinomo_core::{ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState};
-use sinomo_kv::{
-    CLUSTER_KV_RANGE_PREFIX_ROUTE, CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_TXN_ROUTE,
-    CLUSTER_KV_WATCH_CANCEL_ROUTE, CLUSTER_KV_WATCH_DRAIN_ROUTE, CLUSTER_KV_WATCH_EVENTS_ROUTE,
-    CLUSTER_KV_WATCH_PREFIX_ROUTE, CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_VOTE_ROUTE,
-};
+use sinomo_kv::{ClusterKvRouteAuth, cluster_kv_rpc_route_policy};
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
     ClusterControlPlaneTimeouts, ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
@@ -304,9 +300,14 @@ pub fn authorize_authenticated_daemon_command(
     authenticated: &AuthenticatedDaemonCommand,
 ) -> Result<(), DaemonError> {
     let route = authenticated.route.as_str();
+    if let Some(policy) = cluster_kv_rpc_route_policy(route) {
+        if daemon_signer_authorizes_cluster_kv_route(&authenticated.signer, policy.auth) {
+            return Ok(());
+        }
+        return Err(DaemonError::AuthDenied);
+    }
     let allowed = match route {
         route if route == crate::DAEMON_STATUS_ROUTE => true,
-        route if route == CLUSTER_KV_SNAPSHOT_ROUTE => true,
         route if route == crate::DAEMON_SHUTDOWN_ROUTE => {
             authenticated.signer.can_run_local_command()
         }
@@ -421,36 +422,9 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        route if route == CLUSTER_RAFT_APPEND_ROUTE || route == CLUSTER_RAFT_VOTE_ROUTE => {
-            matches!(
-                authenticated.signer,
-                DaemonSignerAuthority::Local | DaemonSignerAuthority::Voter
-            )
-        }
-        route if route == CLUSTER_KV_RANGE_PREFIX_ROUTE => {
-            matches!(
-                authenticated.signer,
-                DaemonSignerAuthority::Local
-                    | DaemonSignerAuthority::Voter
-                    | DaemonSignerAuthority::Member
-            )
-        }
         route
             if route == sinomo_network::CLUSTER_HEALTH_ROUTE
                 || route == sinomo_network::CLUSTER_NETWORK_PING_ROUTE =>
-        {
-            matches!(
-                authenticated.signer,
-                DaemonSignerAuthority::Local
-                    | DaemonSignerAuthority::Voter
-                    | DaemonSignerAuthority::Member
-            )
-        }
-        route
-            if route == CLUSTER_KV_WATCH_PREFIX_ROUTE
-                || route == CLUSTER_KV_WATCH_DRAIN_ROUTE
-                || route == CLUSTER_KV_WATCH_CANCEL_ROUTE
-                || route == CLUSTER_KV_WATCH_EVENTS_ROUTE =>
         {
             matches!(
                 authenticated.signer,
@@ -467,14 +441,6 @@ pub fn authorize_authenticated_daemon_command(
                 || route == ROLLOUT_BUILD_ROUTE =>
         {
             authenticated.signer.can_run_admin_command()
-        }
-        route if route == CLUSTER_KV_TXN_ROUTE => {
-            matches!(
-                authenticated.signer,
-                DaemonSignerAuthority::Local
-                    | DaemonSignerAuthority::Voter
-                    | DaemonSignerAuthority::Member
-            )
         }
         route if route == sinomo_network::CLUSTER_RELAY_ROUTE => {
             // A relay envelope is forwarded on behalf of another node by any authenticated
@@ -494,6 +460,27 @@ pub fn authorize_authenticated_daemon_command(
         Ok(())
     } else {
         Err(DaemonError::AuthDenied)
+    }
+}
+
+fn daemon_signer_authorizes_cluster_kv_route(
+    signer: &DaemonSignerAuthority,
+    auth: ClusterKvRouteAuth,
+) -> bool {
+    match auth {
+        ClusterKvRouteAuth::Authenticated => true,
+        ClusterKvRouteAuth::LocalOrClusterMember => matches!(
+            signer,
+            DaemonSignerAuthority::Local
+                | DaemonSignerAuthority::Voter
+                | DaemonSignerAuthority::Member
+        ),
+        ClusterKvRouteAuth::LocalOrRaftVoter => {
+            matches!(
+                signer,
+                DaemonSignerAuthority::Local | DaemonSignerAuthority::Voter
+            )
+        }
     }
 }
 
@@ -1021,6 +1008,10 @@ fn auth_nonce_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_kv::{
+        CLUSTER_KV_TXN_ROUTE, CLUSTER_KV_WATCH_CANCEL_ROUTE, CLUSTER_KV_WATCH_DRAIN_ROUTE,
+        CLUSTER_KV_WATCH_EVENTS_ROUTE, CLUSTER_KV_WATCH_PREFIX_ROUTE,
+    };
 
     fn authenticated_command(
         route: String,
