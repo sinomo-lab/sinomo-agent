@@ -90,17 +90,16 @@ pub use roaming::{
     send_daemon_rpc_to_cluster_endpoint_async, stable_iroh_endpoint_id, start_iroh_daemon_proxy,
     write_iroh_endpoint_record,
 };
-pub(crate) use route::cluster_route_next_hop;
 pub use route::{
     CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY, CLUSTER_ROUTING_RPC_ROUTE_METADATA,
     ClusterObjectRpcClient, ClusterObjectRpcNodeOptions, ClusterObjectRpcOptions,
     ClusterRelayAsyncHost, ClusterRelayFuture, ClusterRelayOptions,
     ClusterRelayStreamForwardAsyncHost, ClusterRelayStreamForwardOutcome,
     ClusterRelayStreamSendOutcome, ClusterSignedEndpointRpcAsyncHost,
-    ClusterSignedEndpointRpcFuture, RelayEnvelope, cluster_endpoint_prefers_relay_with_graph,
-    handle_cluster_relay_async_with_host, handle_cluster_relay_stream_forward_async_with_host,
-    relay_response_is_routing_error,
+    ClusterSignedEndpointRpcFuture, RelayEnvelope, handle_cluster_relay_async_with_host,
+    handle_cluster_relay_stream_forward_async_with_host, relay_response_is_routing_error,
 };
+pub(crate) use route::{cluster_endpoint_prefers_relay_with_graph, cluster_route_next_hop};
 pub use rpc::{
     CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_HEALTH_RPC_ROUTE_METADATA,
     CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_CHALLENGE_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE,

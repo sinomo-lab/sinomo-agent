@@ -75,7 +75,6 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         "min-payload-bytes-per-second",
         DEFAULT_MIN_PAYLOAD_BYTES_PER_SECOND,
     )?;
-    let require_direct = optional_bool_parameter(ctx, "require-direct", false)?;
     require_positive("requests-per-target", requests_per_target)?;
     require_positive("concurrency", concurrency)?;
     require_positive("timeout-ms", timeout_ms as usize)?;
@@ -86,10 +85,6 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         network::read_cluster_state(&cluster_paths)
             .map_err(|error| SinomoTestError::failed(error.to_string()))?,
     );
-    let route_graph = Arc::new(network::ClusterConnectivityGraph::read_for_local(
-        &cluster_paths,
-        &cluster_state,
-    ));
     let targets = network_ping_targets_from_state(&cluster_paths, &cluster_state)?;
     let target_count = targets.len();
     ctx.record("target_count", target_count);
@@ -104,20 +99,6 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 )
             })
             .collect::<Vec<_>>(),
-    );
-    let (target_routes, route_by_target) =
-        network_ping_target_route_descriptions(&cluster_state, &route_graph, &targets);
-    ctx.record("target_routes", target_routes.clone());
-    ctx.record(
-        "target_route_modes",
-        route_by_target
-            .iter()
-            .map(|(node_id, route)| (node_id.to_string(), route.clone()))
-            .collect::<BTreeMap<_, _>>(),
-    );
-    ctx.record(
-        "target_route_counts",
-        route_counts(route_by_target.values().map(String::as_str)),
     );
     if target_count < expected_targets {
         return Ok(SinomoTestOutcome::failed(format!(
@@ -147,10 +128,6 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
      -> Result<Vec<NetworkPingJob>, SinomoTestError> {
         let mut jobs = Vec::with_capacity(target_count.saturating_mul(requests_per_target));
         for endpoint in &targets {
-            let route_mode = route_by_target
-                .get(&endpoint.node_id)
-                .cloned()
-                .unwrap_or_else(|| "unknown".to_string());
             for attempt in 0..requests_per_target {
                 let nonce = format!("ping-{phase}-{nonce_prefix}-{}-{attempt}", endpoint.node_id);
                 let request = network::cluster_network_ping_rpc_request_with_response_payload(
@@ -172,7 +149,6 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     response_payload_bytes,
                     nonce,
                     request,
-                    route_mode: route_mode.clone(),
                     runtime: runtime_handle.clone(),
                     paths: cluster_paths.clone(),
                     cluster_state: Arc::clone(&cluster_state),
@@ -201,7 +177,6 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("max_p95_us", max_p95_us);
     ctx.record("min_requests_per_second", min_requests_per_second);
     ctx.record("min_payload_bytes_per_second", min_payload_bytes_per_second);
-    ctx.record("require_direct", require_direct);
     ctx.record(
         "request_prepare_elapsed_ms",
         prepare_elapsed.as_millis() as u64,
@@ -262,21 +237,11 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let mut failures_by_target = BTreeMap::<String, usize>::new();
     let mut latencies_by_target = BTreeMap::<String, Vec<u64>>::new();
     let mut latencies_by_target_us = BTreeMap::<String, Vec<u64>>::new();
-    let mut latencies_by_route = BTreeMap::<String, Vec<u64>>::new();
-    let mut latencies_by_route_us = BTreeMap::<String, Vec<u64>>::new();
     for result in &results {
         match &result.outcome {
             NetworkPingOutcome::Success => {
                 latencies_ms.push(result.latency_ms);
                 latencies_us.push(result.latency_us);
-                latencies_by_route
-                    .entry(result.route_mode.clone())
-                    .or_default()
-                    .push(result.latency_ms);
-                latencies_by_route_us
-                    .entry(result.route_mode.clone())
-                    .or_default()
-                    .push(result.latency_us);
                 latencies_by_target
                     .entry(result.target_node_id.to_string())
                     .or_default()
@@ -350,40 +315,6 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let latency_by_route_ms = latencies_by_route
-        .into_iter()
-        .map(|(route, mut route_latencies)| {
-            route_latencies.sort_unstable();
-            let min = route_latencies.iter().copied().min().unwrap_or(0);
-            let p50 = percentile_value(&route_latencies, 50);
-            let p95 = percentile_value(&route_latencies, 95);
-            let max = route_latencies.iter().copied().max().unwrap_or(0);
-            (
-                route,
-                format!(
-                    "count={} min={min} p50={p50} p95={p95} max={max}",
-                    route_latencies.len()
-                ),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let latency_by_route_us = latencies_by_route_us
-        .into_iter()
-        .map(|(route, mut route_latencies)| {
-            route_latencies.sort_unstable();
-            let min = route_latencies.iter().copied().min().unwrap_or(0);
-            let p50 = percentile_value(&route_latencies, 50);
-            let p95 = percentile_value(&route_latencies, 95);
-            let max = route_latencies.iter().copied().max().unwrap_or(0);
-            (
-                route,
-                format!(
-                    "count={} min={min} p50={p50} p95={p95} max={max}",
-                    route_latencies.len()
-                ),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
     ctx.record("success_count", success_count);
     ctx.record("failure_count", failure_count);
     ctx.record("elapsed_ms", elapsed.as_millis() as u64);
@@ -406,8 +337,6 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("failures_by_target", failures_by_target);
     ctx.record("latency_by_target_ms", latency_by_target_ms);
     ctx.record("latency_by_target_us", latency_by_target_us);
-    ctx.record("latency_by_route_ms", latency_by_route_ms);
-    ctx.record("latency_by_route_us", latency_by_route_us);
     if !failures.is_empty() {
         ctx.record(
             "failure_samples",
@@ -424,18 +353,6 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         return Ok(SinomoTestOutcome::failed(
             "network ping had no successful RPCs".to_string(),
         ));
-    }
-    if require_direct {
-        let relayed_targets = route_by_target
-            .iter()
-            .filter_map(|(target, route)| (route == "relay").then(|| target.to_string()))
-            .collect::<Vec<_>>();
-        if !relayed_targets.is_empty() {
-            return Ok(SinomoTestOutcome::failed(format!(
-                "network ping used relay routes for direct-required targets: {}",
-                relayed_targets.join(", ")
-            )));
-        }
     }
     if max_p50_ms > 0 && p50_ms > max_p50_ms {
         return Ok(SinomoTestOutcome::failed(format!(
@@ -502,39 +419,6 @@ fn network_ping_targets_from_state(
     Ok(targets.into_values().collect())
 }
 
-fn network_ping_target_route_descriptions(
-    state: &ClusterBootstrapState,
-    graph: &network::ClusterConnectivityGraph,
-    targets: &[ClusterEndpointRecord],
-) -> (Vec<String>, BTreeMap<NodeId, String>) {
-    let mut route_by_target = BTreeMap::new();
-    let routes = targets
-        .iter()
-        .map(|target| {
-            let route =
-                if network::cluster_endpoint_prefers_relay_with_graph(&graph, &state, target) {
-                    "relay"
-                } else {
-                    "direct"
-                };
-            route_by_target.insert(target.node_id.clone(), route.to_string());
-            format!(
-                "{} {} {:?} route={route}",
-                target.node_id, target.address, target.transport
-            )
-        })
-        .collect();
-    (routes, route_by_target)
-}
-
-fn route_counts<'a>(routes: impl IntoIterator<Item = &'a str>) -> BTreeMap<String, usize> {
-    let mut counts = BTreeMap::new();
-    for route in routes {
-        *counts.entry(route.to_string()).or_default() += 1;
-    }
-    counts
-}
-
 fn member_has_main_daemon(member: &ClusterMemberRecord) -> bool {
     member
         .capabilities
@@ -551,7 +435,6 @@ struct NetworkPingJob {
     request_payload_bytes: usize,
     response_payload_bytes: usize,
     request: network::ObjectRpcRequest,
-    route_mode: String,
     runtime: tokio::runtime::Handle,
     paths: ClusterPaths,
     cluster_state: Arc<ClusterBootstrapState>,
@@ -561,7 +444,6 @@ struct NetworkPingJob {
 struct NetworkPingResult {
     target_node_id: NodeId,
     endpoint_address: String,
-    route_mode: String,
     latency_ms: u64,
     latency_us: u64,
     outcome: NetworkPingOutcome,
@@ -580,7 +462,6 @@ async fn run_network_ping_job(job: NetworkPingJob) -> NetworkPingResult {
     NetworkPingResult {
         target_node_id: job.target_node_id,
         endpoint_address: job.endpoint.address,
-        route_mode: job.route_mode,
         latency_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
         latency_us: elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
         outcome,
@@ -749,24 +630,6 @@ fn optional_f64_parameter(
                     detail: source.to_string(),
                 })
         }
-        None => Ok(default),
-    }
-}
-
-fn optional_bool_parameter(
-    ctx: &SinomoTestContext,
-    key: &str,
-    default: bool,
-) -> Result<bool, SinomoTestError> {
-    match ctx.parameter(key) {
-        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Ok(true),
-            "0" | "false" | "no" | "off" => Ok(false),
-            other => Err(SinomoTestError::InvalidParameter {
-                name: key.to_string(),
-                detail: format!("expected boolean, got {other}"),
-            }),
-        },
         None => Ok(default),
     }
 }

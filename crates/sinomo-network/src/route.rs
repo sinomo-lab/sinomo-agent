@@ -2073,7 +2073,7 @@ fn push_unique_cluster_endpoint(
     }
 }
 
-pub fn cluster_endpoint_prefers_relay_with_graph(
+pub(crate) fn cluster_endpoint_prefers_relay_with_graph(
     graph: &ClusterConnectivityGraph,
     state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
@@ -2363,6 +2363,56 @@ mod tests {
         assert!(
             cluster_endpoint_prefers_relay_with_graph(&graph, &state, &endpoint),
             "known-unreachable endpoints should skip stale direct dials even when no relay route is currently available"
+        );
+    }
+
+    #[test]
+    fn endpoint_prefers_relay_for_degraded_direct_endpoint_when_route_is_healthy() {
+        let now = OffsetDateTime::now_utc();
+        let local = nid("node_prefers_relay_degraded_local");
+        let bridge = nid("node_prefers_relay_degraded_bridge");
+        let target = nid("node_prefers_relay_degraded_target");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_prefers_relay_degraded").expect("cluster"),
+            "prefers relay degraded",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        for node in [&bridge, &target] {
+            let mut member = ClusterMemberRecord::local_non_voting(
+                state.cluster_id.clone(),
+                node.clone(),
+                node.as_str(),
+                format!("pk-{node}"),
+                now,
+            );
+            member.capabilities = main_daemon_capabilities(&member.role);
+            member.allowed_capabilities = member.capabilities.clone();
+            state.members.push(member);
+        }
+        let endpoint = crate::daemon_lan_endpoint(&target, "10.90.9.9:21353".to_string(), 5);
+        let graph = ClusterConnectivityGraph::from_records(
+            local.clone(),
+            [
+                ClusterConnectivityRecord {
+                    endpoint_id: endpoint.endpoint_id.clone(),
+                    target_node_id: endpoint.node_id.clone(),
+                    transport: endpoint.transport.clone(),
+                    address: endpoint.address.clone(),
+                    consecutive_failures: 1,
+                    last_failure_at: Some("timeout".to_string()),
+                    ..edge(&local, &target, ClusterConnectivityState::Degraded)
+                },
+                edge(&local, &bridge, ClusterConnectivityState::Healthy),
+                edge(&bridge, &target, ClusterConnectivityState::Healthy),
+            ],
+        );
+
+        assert!(
+            cluster_endpoint_prefers_relay_with_graph(&graph, &state, &endpoint),
+            "degraded direct endpoints should relay immediately when a healthy route exists"
         );
     }
 
