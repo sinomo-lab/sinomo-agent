@@ -1,5 +1,9 @@
 use crate::ClusterPaths;
-use crate::endpoint_selector::ClusterEndpointSelectionPurpose;
+use crate::endpoint_selector::{
+    ClusterEndpointSelectionPurpose, cluster_node_blocks_leader_preference,
+    cluster_node_blocks_leader_preference_async, cluster_raft_live_voter_targets,
+    cluster_raft_live_voter_targets_async,
+};
 use crate::error::NetworkError;
 use crate::object::DaemonRpcTimeouts;
 use crate::route::{
@@ -7,11 +11,7 @@ use crate::route::{
     ClusterSignedEndpointRpcAsyncHost,
 };
 use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
-use crate::storage::{
-    ClusterMembershipRpcFuture, cluster_node_blocks_leader_preference,
-    cluster_node_blocks_leader_preference_async, cluster_raft_live_voter_targets_async,
-    locked_cluster_raft_known_leader_id_async,
-};
+use crate::storage::{ClusterMembershipRpcFuture, locked_cluster_raft_known_leader_id_async};
 use sinomo_core::{ClusterBootstrapState, ClusterEndpointRecord, ClusterTransportKind};
 use sinomo_kv::{KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_node::NodeId;
@@ -91,7 +91,7 @@ pub fn forward_cluster_kv_txn_to_voter_with_host(
     options: ClusterKvTxnForwardOptions,
     host: &mut impl ClusterKvTxnForwardHost,
 ) -> Result<Option<ClusterKvTxnForwardResult>, NetworkError> {
-    let mut targets = crate::endpoint_selector::cluster_raft_live_voter_targets(paths, state);
+    let mut targets = cluster_raft_live_voter_targets(paths, state);
     if targets.is_empty() {
         return Ok(None);
     }

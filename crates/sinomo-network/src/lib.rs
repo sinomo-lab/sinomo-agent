@@ -99,7 +99,8 @@ pub use endpoint_records::{
 };
 pub use endpoint_selector::{
     ClusterEndpointSelectionPurpose, ClusterEndpointSelector, advertised_peer_route_targets,
-    discover_peer_route_ip_candidates, discover_peer_route_ip_candidates_async,
+    cluster_node_blocks_leader_preference, discover_peer_route_ip_candidates,
+    discover_peer_route_ip_candidates_async,
 };
 #[cfg(test)]
 pub(crate) use endpoint_selector::{
@@ -335,8 +336,8 @@ pub use storage::{
     accepted_cluster_join_state_from_kv_snapshot, cleanup_legacy_shadow_daemon_members_with_host,
     cluster_bootstrap_state_stable_eq, cluster_has_local_quorum_with_host,
     cluster_join_challenge_rpc_request, cluster_network_publish_interval_for_node,
-    cluster_node_blocks_leader_preference, cluster_reachable_voter_count_with_host,
-    cluster_state_sync_txn, commit_cluster_kv_txn_with_quorum_response_with_host,
+    cluster_reachable_voter_count_with_host, cluster_state_sync_txn,
+    commit_cluster_kv_txn_with_quorum_response_with_host,
     commit_cluster_raft_command_with_quorum_driver, elect_cluster_raft_leader_with_host,
     handle_cluster_join_registration_request_with_host,
     handle_cluster_membership_rpc_request_with_hosts, handle_cluster_raft_rpc_request,

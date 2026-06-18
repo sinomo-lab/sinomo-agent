@@ -1,11 +1,12 @@
 use crate::ClusterPaths;
-use crate::endpoint_selector::cluster_raft_live_voter_targets;
+use crate::endpoint_selector::{
+    cluster_node_blocks_leader_preference, cluster_raft_live_voter_targets,
+};
 use crate::error::NetworkError;
 use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
 use crate::storage::{
-    cluster_node_blocks_leader_preference, locked_cluster_raft_known_leader_id,
-    locked_restore_cluster_raft_from_snapshot_if_newer, read_cluster_kv_snapshot,
-    write_imported_cluster_kv_snapshot_if_changed,
+    locked_cluster_raft_known_leader_id, locked_restore_cluster_raft_from_snapshot_if_newer,
+    read_cluster_kv_snapshot, write_imported_cluster_kv_snapshot_if_changed,
 };
 use sinomo_core::{
     ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterTransportKind,

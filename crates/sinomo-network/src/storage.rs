@@ -28,6 +28,7 @@ use crate::endpoint_records::{
 };
 use crate::endpoint_selector::{
     ClusterEndpointSelectionPurpose, ClusterEndpointSelector, cluster_raft_live_voter_targets,
+    cluster_raft_live_voter_targets_async, cluster_raft_member_replication_targets_async,
 };
 use crate::error::NetworkError;
 use crate::invite_publish::{
@@ -75,8 +76,7 @@ pub use crate::kv_local_store::{
     discard_cluster_raft_uncommitted_tail_and_clear_leader_async,
 };
 pub(crate) use crate::kv_read_model::{
-    cluster_node_status_map_from_kv, read_cluster_capability_policies_from_snapshot,
-    read_cluster_node_statuses_from_kv,
+    read_cluster_capability_policies_from_snapshot, read_cluster_node_statuses_from_kv,
 };
 #[cfg(test)]
 pub(crate) use crate::kv_read_model::{
@@ -4973,28 +4973,6 @@ async fn locked_cluster_raft_local_is_leader_async(
         })?
 }
 
-pub(crate) async fn cluster_node_blocks_leader_preference_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    node_id: &NodeId,
-) -> Result<bool, NetworkError> {
-    let paths = paths.clone();
-    let state = state.clone();
-    let node_id = node_id.clone();
-    runtime
-        .spawn_blocking(move || {
-            Ok(cluster_node_blocks_leader_preference(
-                &paths, &state, &node_id,
-            ))
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster raft leader preference".to_string(),
-            detail: format!("leader preference task failed: {source}"),
-        })?
-}
-
 async fn cluster_semantic_txn_no_effect_response_async(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
@@ -5237,113 +5215,6 @@ where
         revision: result.snapshot.revision,
         responses: Vec::new(),
     }))
-}
-
-/// Replication targets for the committed-command fan-out: every authorized
-/// main-daemon member (learners included), connectivity-aware. Learners are
-/// pure raft followers — pushing committed appends to them on commit is the
-/// event-driven convergence path; nothing is sent when nothing commits.
-pub fn cluster_raft_member_replication_targets(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Vec<ClusterEndpointRecord> {
-    ClusterEndpointSelector::new(paths, state)
-        .select(ClusterEndpointSelectionPurpose::RaftMemberReplication)
-}
-
-pub async fn cluster_raft_member_replication_targets_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
-    let paths = paths.clone();
-    let state = state.clone();
-    runtime
-        .spawn_blocking(move || cluster_raft_member_replication_targets(&paths, &state))
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster raft member replication target selection".to_string(),
-            detail: format!("member replication target selection task failed: {source}"),
-        })
-}
-
-pub(crate) async fn cluster_raft_live_voter_targets_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
-    let paths = paths.clone();
-    let state = state.clone();
-    runtime
-        .spawn_blocking(move || {
-            Ok(ClusterEndpointSelector::new(&paths, &state)
-                .select(ClusterEndpointSelectionPurpose::LiveVoterCommand))
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster raft voter target selection".to_string(),
-            detail: format!("cluster raft voter target selection task failed: {source}"),
-        })?
-}
-
-pub fn cluster_node_blocks_leader_preference(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    node_id: &NodeId,
-) -> bool {
-    // A node blocks leader preference if it has gracefully reported itself
-    // offline, or if active connectivity probes can no longer reach it. The
-    // self-reported `observed_at` is not consulted: it is no longer refreshed on
-    // a timer, so an idle-but-healthy node must not be deprioritized.
-    let node_statuses = cluster_node_status_map_from_kv(paths);
-    if node_statuses
-        .get(node_id)
-        .is_some_and(|status| status.availability == ClusterNodeAvailability::Offline)
-    {
-        return true;
-    }
-    state
-        .members
-        .iter()
-        .find(|member| member.node_id == *node_id)
-        .is_some_and(|member| cluster_member_unreachable_via_connectivity(paths, state, member))
-}
-
-/// True when `member` has probeable endpoints but the local node's active
-/// connectivity probes currently mark every one of them unreachable.
-///
-/// This is the probe-based liveness signal: unlike the self-reported node-status
-/// `observed_at` (which is no longer periodically refreshed), it reflects whether
-/// we can actually reach the peer right now. A member we have never probed (no
-/// connectivity record yet) is not reported unreachable.
-pub fn cluster_member_unreachable_via_connectivity(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    member: &ClusterMemberRecord,
-) -> bool {
-    if cluster_member_is_local_process(state, member) {
-        return false;
-    }
-    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
-    let mut has_probeable_endpoint = false;
-    for endpoint in &member.endpoints {
-        let probeable = endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
-            && matches!(
-                endpoint.transport,
-                ClusterTransportKind::LanTcp
-                    | ClusterTransportKind::Loopback
-                    | ClusterTransportKind::Iroh
-            );
-        if !probeable {
-            continue;
-        }
-        has_probeable_endpoint = true;
-        if graph.unavailability_rank(endpoint) == 0 {
-            // At least one probeable endpoint is not marked unreachable.
-            return false;
-        }
-    }
-    has_probeable_endpoint
 }
 
 /// The local node's current cluster KV snapshot revision, if one is readable;
