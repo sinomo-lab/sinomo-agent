@@ -625,16 +625,78 @@ where
 /// owns request signing and the direct-vs-relay routing policy. Lower-level
 /// signed endpoint helpers remain for transport adapters and migration shims,
 /// but ordinary control-plane callers should enter through this facade.
-pub struct ClusterObjectRpcClient<'a, H> {
+pub(crate) struct ClusterObjectRpcClient<'a, H> {
     host: &'a mut H,
 }
 
+#[derive(Clone, Copy)]
+pub struct ClusterObjectRpcRouteContext<'a> {
+    pub runtime: &'a tokio::runtime::Handle,
+    pub paths: &'a ClusterPaths,
+}
+
+impl<'a> ClusterObjectRpcRouteContext<'a> {
+    pub fn new(runtime: &'a tokio::runtime::Handle, paths: &'a ClusterPaths) -> Self {
+        Self { runtime, paths }
+    }
+}
+
+pub async fn call_cluster_endpoint_rpc_async<H>(
+    host: &mut H,
+    route_context: Option<ClusterObjectRpcRouteContext<'_>>,
+    endpoint: &ClusterEndpointRecord,
+    request: &ObjectRpcRequest,
+    options: ClusterObjectRpcOptions,
+) -> Result<ObjectRpcResponse, NetworkError>
+where
+    H: ClusterSignedEndpointRpcAsyncHost + Send,
+{
+    let mut client = ClusterObjectRpcClient::new(host);
+    match route_context {
+        Some(context) => {
+            client
+                .call_endpoint_from_paths(
+                    context.runtime,
+                    context.paths,
+                    endpoint,
+                    request,
+                    options,
+                )
+                .await
+        }
+        None => client.call_endpoint(endpoint, request, options).await,
+    }
+}
+
+pub async fn call_cluster_node_rpc_async<H>(
+    host: &mut H,
+    route_context: ClusterObjectRpcRouteContext<'_>,
+    state: &ClusterBootstrapState,
+    target_node_id: &NodeId,
+    request: &ObjectRpcRequest,
+    options: ClusterObjectRpcNodeOptions,
+) -> Result<ObjectRpcResponse, NetworkError>
+where
+    H: ClusterSignedEndpointRpcAsyncHost + Send,
+{
+    ClusterObjectRpcClient::new(host)
+        .call_node_from_paths(
+            route_context.runtime,
+            route_context.paths,
+            state,
+            target_node_id,
+            request,
+            options,
+        )
+        .await
+}
+
 impl<'a, H: ClusterSignedEndpointRpcAsyncHost> ClusterObjectRpcClient<'a, H> {
-    pub fn new(host: &'a mut H) -> Self {
+    pub(crate) fn new(host: &'a mut H) -> Self {
         Self { host }
     }
 
-    pub async fn call_endpoint(
+    pub(crate) async fn call_endpoint(
         &mut self,
         endpoint: &ClusterEndpointRecord,
         request: &ObjectRpcRequest,
@@ -670,7 +732,7 @@ impl<'a, H> ClusterObjectRpcClient<'a, H>
 where
     H: ClusterSignedEndpointRpcAsyncHost + Send,
 {
-    pub async fn call_endpoint_from_paths(
+    pub(crate) async fn call_endpoint_from_paths(
         &mut self,
         runtime: &tokio::runtime::Handle,
         paths: &ClusterPaths,
@@ -690,7 +752,7 @@ where
             .await
     }
 
-    pub async fn call_node_from_paths(
+    pub(crate) async fn call_node_from_paths(
         &mut self,
         runtime: &tokio::runtime::Handle,
         paths: &ClusterPaths,
@@ -4741,18 +4803,16 @@ mod tests {
         let direct_response =
             endpoint_rpc_response("/test/object-rpc-endpoint-client-ok", "direct");
         let mut host = RecordingSignedEndpointRpcHost::new(Ok(direct_response), Ok(None));
-        let mut client = ClusterObjectRpcClient::new(&mut host);
 
-        let response = client
-            .call_endpoint(
-                &endpoint,
-                &request,
-                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_only(Duration::from_secs(
-                    5,
-                ))),
-            )
-            .await
-            .expect("endpoint rpc");
+        let response = call_cluster_endpoint_rpc_async(
+            &mut host,
+            None,
+            &endpoint,
+            &request,
+            ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_only(Duration::from_secs(5))),
+        )
+        .await
+        .expect("endpoint rpc");
 
         assert_eq!(response.decode_body::<String>().expect("body"), "direct");
         assert_eq!(host.calls, vec!["gateway", "cluster_id", "direct"]);
@@ -4799,23 +4859,21 @@ mod tests {
         let request = endpoint_rpc_request();
         let direct_response = endpoint_rpc_response("/test/object-rpc-node-client-ok", "direct");
         let mut host = RecordingSignedEndpointRpcHost::new(Ok(direct_response), Ok(None));
-        let mut client = ClusterObjectRpcClient::new(&mut host);
         let runtime = tokio::runtime::Handle::current();
 
-        let response = client
-            .call_node_from_paths(
-                &runtime,
-                &paths,
-                &state,
-                &target,
-                &request,
-                ClusterObjectRpcNodeOptions::new(
-                    ClusterEndpointSelectionPurpose::VoterCommand,
-                    DaemonRpcTimeouts::connect_only(Duration::from_secs(5)),
-                ),
-            )
-            .await
-            .expect("node rpc");
+        let response = call_cluster_node_rpc_async(
+            &mut host,
+            ClusterObjectRpcRouteContext::new(&runtime, &paths),
+            &state,
+            &target,
+            &request,
+            ClusterObjectRpcNodeOptions::new(
+                ClusterEndpointSelectionPurpose::VoterCommand,
+                DaemonRpcTimeouts::connect_only(Duration::from_secs(5)),
+            ),
+        )
+        .await
+        .expect("node rpc");
 
         assert_eq!(response.decode_body::<String>().expect("body"), "direct");
         assert_eq!(host.calls, vec!["gateway", "cluster_id", "direct"]);

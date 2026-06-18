@@ -89,11 +89,12 @@ pub use roaming::{
 };
 pub use route::{
     CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY, CLUSTER_ROUTING_RPC_ROUTE_METADATA,
-    ClusterObjectRpcClient, ClusterObjectRpcNodeOptions, ClusterObjectRpcOptions,
+    ClusterObjectRpcNodeOptions, ClusterObjectRpcOptions, ClusterObjectRpcRouteContext,
     ClusterRelayAsyncHost, ClusterRelayFuture, ClusterRelayOptions,
     ClusterRelayStreamForwardAsyncHost, ClusterRelayStreamForwardOutcome,
     ClusterRelayStreamSendOutcome, ClusterSignedEndpointRpcAsyncHost,
-    ClusterSignedEndpointRpcFuture, RelayEnvelope, handle_cluster_relay_async_with_host,
+    ClusterSignedEndpointRpcFuture, RelayEnvelope, call_cluster_endpoint_rpc_async,
+    call_cluster_node_rpc_async, handle_cluster_relay_async_with_host,
     handle_cluster_relay_stream_forward_async_with_host, relay_response_is_routing_error,
 };
 pub(crate) use route::{cluster_endpoint_prefers_relay_with_graph, cluster_route_next_hop};

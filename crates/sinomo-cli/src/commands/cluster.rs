@@ -1946,14 +1946,14 @@ async fn send_join_endpoint_rpc_async(
     timeouts: network::DaemonRpcTimeouts,
 ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
     let mut host = CliSignedEndpointRpcHost::new(None, "cluster join endpoint rpc signing");
-    let mut client = network::ClusterObjectRpcClient::new(&mut host);
-    client
-        .call_endpoint(
-            endpoint,
-            request,
-            network::ClusterObjectRpcOptions::new(timeouts),
-        )
-        .await
+    network::call_cluster_endpoint_rpc_async(
+        &mut host,
+        None,
+        endpoint,
+        request,
+        network::ClusterObjectRpcOptions::new(timeouts),
+    )
+    .await
 }
 
 /// Idle deadline for join challenge/registration streams; covers a

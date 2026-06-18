@@ -1600,14 +1600,13 @@ impl network::ClusterKvTxnForwardHost for DfsFuseClusterKvTxnForwardHost {
         let mut host = DfsFuseSignedObjectRpcHost {
             cluster_id: state.cluster_id.clone(),
         };
-        let mut client = network::ClusterObjectRpcClient::new(&mut host);
         let options = network::ClusterObjectRpcNodeOptions::new(
             network::ClusterEndpointSelectionPurpose::VoterCommand,
             network::DaemonRpcTimeouts::connect_and_idle(timeout),
         );
-        let result = runtime.block_on(client.call_node_from_paths(
-            runtime.handle(),
-            &paths,
+        let result = runtime.block_on(network::call_cluster_node_rpc_async(
+            &mut host,
+            network::ClusterObjectRpcRouteContext::new(runtime.handle(), &paths),
             state,
             target_node_id,
             request,

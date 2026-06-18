@@ -324,19 +324,20 @@ async fn send_daemon_rpc_to_endpoint_async_with_connectivity_observation(
     observe_connectivity: bool,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     let mut host = DaemonSignedEndpointRpcAsyncHost::new(runtime, observe_connectivity);
-    let mut client = sinomo_network::ClusterObjectRpcClient::new(&mut host);
     let options = sinomo_network::ClusterObjectRpcOptions::new(timeouts);
-    if let Some(paths) = cluster_paths_from_env() {
-        client
-            .call_endpoint_from_paths(runtime, &paths, endpoint, request, options)
-            .await
-            .map_err(DaemonError::from)
-    } else {
-        client
-            .call_endpoint(endpoint, request, options)
-            .await
-            .map_err(DaemonError::from)
-    }
+    let paths = cluster_paths_from_env();
+    let route_context = paths
+        .as_ref()
+        .map(|paths| sinomo_network::ClusterObjectRpcRouteContext::new(runtime, paths));
+    sinomo_network::call_cluster_endpoint_rpc_async(
+        &mut host,
+        route_context,
+        endpoint,
+        request,
+        options,
+    )
+    .await
+    .map_err(DaemonError::from)
 }
 
 fn block_on_daemon_client<F, T>(future: F) -> Result<T, DaemonError>
