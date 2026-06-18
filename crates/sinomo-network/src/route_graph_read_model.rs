@@ -7,8 +7,8 @@ use crate::connectivity_store::{
     sort_cluster_connectivity_records,
 };
 use crate::error::NetworkError;
+use crate::file_mark::{ClusterFileMark, cluster_file_mark};
 use crate::kv_read_model::KvBackedClusterConnectivityRecordQuery;
-use crate::storage::{ClusterFileMark, cluster_file_mark};
 use crate::{ClusterEndpointId, ClusterPaths};
 use sinomo_core::ClusterBootstrapState;
 use sinomo_node::NodeId;

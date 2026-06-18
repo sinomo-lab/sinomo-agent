@@ -19,12 +19,14 @@ mod endpoint_advertisement;
 mod endpoint_records;
 mod endpoint_selector;
 mod error;
+mod file_mark;
 mod health;
 mod invite;
 mod invite_publish;
 mod io_observer;
 mod keyspace;
 mod kv_forward;
+mod kv_local_store;
 mod kv_read_model;
 mod kv_semantics;
 mod kv_snapshot;
@@ -146,6 +148,7 @@ pub use kv_forward::{
     ClusterKvTxnForwardResult, forward_cluster_kv_txn_to_voter_async_with_host,
     forward_cluster_kv_txn_to_voter_with_host,
 };
+pub use kv_local_store::cluster_kv_key_can_defer_materialized_snapshot;
 pub use kv_read_model::{
     read_cluster_connectivity_graph_from_kv, read_cluster_members_from_kv,
     read_cluster_node_statuses_from_kv,
@@ -343,7 +346,7 @@ pub use storage::{
     update_cluster_raft_role_with_host, upsert_member_record, write_cluster_state,
 };
 pub use storage::{
-    cluster_has_local_quorum_async_with_host, cluster_kv_key_can_defer_materialized_snapshot,
+    cluster_has_local_quorum_async_with_host,
     commit_cluster_kv_txn_with_quorum_response_async_with_host,
     commit_cluster_raft_index_with_events_async,
     discard_cluster_raft_uncommitted_tail_and_clear_leader_async,
@@ -536,17 +539,14 @@ pub(crate) mod prelude {
     #[cfg(test)]
     pub(crate) use sinomo_events::{EventSequence, SessionId, StoredEvent};
     #[cfg(test)]
-    pub(crate) use sinomo_kv::KvLogEntry;
-    #[cfg(test)]
     pub(crate) use sinomo_kv::LeaseId;
-    pub(crate) use sinomo_kv::{
-        ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, DurableRaftKvNode,
-        InProcessKvStore, KvCommand, KvCompare, KvEntry, KvError, KvEvent, KvLocalCache, KvOp,
-        KvSnapshot, KvTxn, KvTxnResponse, RaftAppendEntriesRequest, RaftAppendEntriesResponse,
-        RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot,
-    };
     #[cfg(test)]
-    pub(crate) use sinomo_kv::{KvWalPaths, WatchId};
+    pub(crate) use sinomo_kv::WatchId;
+    pub(crate) use sinomo_kv::{
+        ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, InProcessKvStore, KvCommand,
+        KvCompare, KvEntry, KvError, KvEvent, KvOp, KvSnapshot, KvTxn, KvTxnResponse,
+        RaftRequestVoteRequest, RaftRequestVoteResponse,
+    };
     #[cfg(test)]
     pub(crate) use sinomo_local::SinomoDataDir;
     #[cfg(test)]

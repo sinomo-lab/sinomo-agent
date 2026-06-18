@@ -1,14 +1,15 @@
 use crate::ClusterPaths;
 use crate::error::NetworkError;
 #[cfg(test)]
-use crate::io_observer::io_observer;
-use crate::storage::read_cluster_state;
+use crate::file_mark::{ClusterFileMark, cluster_file_mark};
 #[cfg(test)]
-use crate::storage::{
-    ClusterFileMark, cluster_file_mark, cluster_raft_wal_paths,
-    read_cluster_kv_cached_snapshot_if_present, read_cluster_kv_current_snapshot_arc,
-    read_cluster_kv_reader_node_id,
+use crate::io_observer::io_observer;
+#[cfg(test)]
+use crate::kv_local_store::{
+    cluster_raft_wal_paths, read_cluster_kv_cached_snapshot_if_present,
+    read_cluster_kv_current_snapshot_arc, read_cluster_kv_reader_node_id,
 };
+use crate::storage::read_cluster_state;
 
 #[cfg(test)]
 use sinomo_kv::{
