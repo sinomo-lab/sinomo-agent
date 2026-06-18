@@ -4655,149 +4655,42 @@ pub(crate) async fn handle_daemon_cluster_relay_stream_forward_on_runtime(
     let state =
         sinomo_network::read_cluster_state_without_kv(&cluster_paths).map_err(DaemonError::from)?;
     let local_node_id = state.local_node_id.clone();
-
-    if sinomo_network::cluster_node_is_local_process(&state, &envelope.target_node_id) {
-        return write_relay_stream_error_response(
-            stream,
-            stream_address,
-            "stream relay local delivery must be handled by the daemon control loop",
-        )
-        .await;
-    }
-    if envelope.visited.iter().any(|node| node == &local_node_id) {
-        return write_relay_stream_error_response(
-            stream,
-            stream_address,
-            format!("relay dropped: relay loop: {local_node_id} already on the path"),
-        )
-        .await;
-    }
-    if envelope.ttl == 0 {
-        return write_relay_stream_error_response(
-            stream,
-            stream_address,
-            "relay dropped: relay ttl exhausted",
-        )
-        .await;
-    }
-
-    let next_hops = sinomo_network::cluster_relay_forward_plan(
+    let mut host = DaemonClusterRelayStreamForwardHost {
+        paths,
+        runtime: runtime.clone(),
+        stream,
+        stream_address,
+    };
+    let outcome = sinomo_network::handle_cluster_relay_stream_forward_async_with_host(
         runtime,
         &cluster_paths,
         &state,
         &local_node_id,
-        &envelope,
+        envelope,
+        sinomo_network::ClusterRelayOptions {
+            timeouts: sinomo_network::DaemonRpcTimeouts::connect_and_idle(
+                DAEMON_CLUSTER_RELAY_CONNECT_TIMEOUT,
+            ),
+        },
+        &mut host,
     )
     .await
     .map_err(DaemonError::from)?;
-    if next_hops.is_empty() {
-        return write_relay_stream_error_response(
-            stream,
-            stream_address,
-            format!(
-                "relay dropped: no reachable route from {local_node_id} to {}",
-                envelope.target_node_id
-            ),
-        )
-        .await;
-    }
-
-    let mut failures = Vec::new();
-    for (_next_hop, endpoints) in next_hops {
-        if endpoints.is_empty() {
-            push_daemon_relay_stream_failure(
-                &mut failures,
-                "relay next hop has no reachable endpoint".to_string(),
-            );
-            continue;
-        }
-        for endpoint in endpoints {
-            let mut forwarded = envelope.clone();
-            forwarded.ttl = envelope.ttl.saturating_sub(1);
-            forwarded.visited.push(local_node_id.clone());
-            let outer = forwarded.into_request().map_err(DaemonError::from)?;
-            let hop_timeouts = sinomo_network::relay_envelope_hop_transport_timeouts(
-                sinomo_network::DaemonRpcTimeouts::connect_and_idle(
-                    DAEMON_CLUSTER_RELAY_CONNECT_TIMEOUT,
-                ),
-                &envelope,
-            );
-            let started = Instant::now();
-            let result = send_cluster_relay_request_to_next_hop_streaming_async(
-                &endpoint,
-                outer,
-                hop_timeouts,
-                stream,
+    match outcome {
+        sinomo_network::ClusterRelayStreamForwardOutcome::Forwarded => Ok(()),
+        sinomo_network::ClusterRelayStreamForwardOutcome::ErrorResponse(response) => stream
+            .write_rpc_response(
                 stream_address,
+                &response,
+                sinomo_network::ObjectFrameIoOptions::none(),
             )
-            .await;
-            match result {
-                Ok(ClusterRelayStreamForwardResult::Forwarded) => {
-                    let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-                    remember_relay_endpoint_command_connectivity_async(
-                        paths.clone(),
-                        runtime.clone(),
-                        endpoint,
-                        sinomo_network::ClusterConnectivityState::Healthy,
-                        Some(latency_ms),
-                    )
-                    .await;
-                    return Ok(());
-                }
-                Ok(ClusterRelayStreamForwardResult::RoutingError(response)) => {
-                    push_daemon_relay_stream_failure(
-                        &mut failures,
-                        format!(
-                            "{} ({:?}) returned routing error: {}",
-                            endpoint.address,
-                            endpoint.transport,
-                            response
-                                .metadata
-                                .get(sinomo_network::OBJECT_RPC_ERROR_DETAIL_METADATA_KEY)
-                                .cloned()
-                                .unwrap_or_else(|| "routing error".to_string())
-                        ),
-                    );
-                }
-                Ok(ClusterRelayStreamForwardResult::StreamStartedThenFailed(error)) => {
-                    let _ = stream.shutdown_write(stream_address).await;
-                    return Err(error);
-                }
-                Err(error) => {
-                    remember_relay_endpoint_command_connectivity_async(
-                        paths.clone(),
-                        runtime.clone(),
-                        endpoint.clone(),
-                        sinomo_network::ClusterConnectivityState::Degraded,
-                        None,
-                    )
-                    .await;
-                    push_daemon_relay_stream_failure(
-                        &mut failures,
-                        format!(
-                            "{} ({:?}) failed: {}",
-                            endpoint.address, endpoint.transport, error
-                        ),
-                    );
-                }
-            }
+            .await
+            .map_err(DaemonError::from),
+        sinomo_network::ClusterRelayStreamForwardOutcome::StreamStartedThenFailed(error) => {
+            let _ = stream.shutdown_write(stream_address).await;
+            Err(DaemonError::from(error))
         }
     }
-
-    write_relay_stream_error_response(
-        stream,
-        stream_address,
-        format!(
-            "relay dropped: no reachable route from {local_node_id} to {}{}",
-            envelope.target_node_id,
-            if failures.is_empty() {
-                String::new()
-            } else {
-                format!(": {}", failures.join("; "))
-            }
-        ),
-    )
-    .await
 }
 
 struct DaemonClusterRelayAsyncHost<'a> {
@@ -4919,6 +4812,75 @@ impl sinomo_network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost<'_> {
                 Err(_) => {}
             }
             result
+        })
+    }
+}
+
+struct DaemonClusterRelayStreamForwardHost<'a> {
+    paths: &'a DaemonPaths,
+    runtime: tokio::runtime::Handle,
+    stream: &'a mut sinomo_network::AsyncDaemonControlStream,
+    stream_address: &'a str,
+}
+
+impl sinomo_network::ClusterRelayStreamForwardAsyncHost
+    for DaemonClusterRelayStreamForwardHost<'_>
+{
+    fn send_relay_stream_forward_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        request: &'a sinomo_network::ObjectRpcRequest,
+        timeouts: sinomo_network::DaemonRpcTimeouts,
+    ) -> sinomo_network::ClusterRelayFuture<'a, sinomo_network::ClusterRelayStreamSendOutcome> {
+        let paths = self.paths.clone();
+        let runtime = self.runtime.clone();
+        let endpoint = endpoint.clone();
+        let request = request.clone();
+        let stream = &mut *self.stream;
+        let stream_address = self.stream_address;
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = send_cluster_relay_request_to_next_hop_streaming_async(
+                &endpoint,
+                request,
+                timeouts,
+                stream,
+                stream_address,
+            )
+            .await;
+            match result {
+                Ok(ClusterRelayStreamForwardResult::Forwarded) => {
+                    let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    remember_relay_endpoint_command_connectivity_async(
+                        paths,
+                        runtime,
+                        endpoint,
+                        sinomo_network::ClusterConnectivityState::Healthy,
+                        Some(latency_ms),
+                    )
+                    .await;
+                    Ok(sinomo_network::ClusterRelayStreamSendOutcome::Forwarded)
+                }
+                Ok(ClusterRelayStreamForwardResult::RoutingError(response)) => Ok(
+                    sinomo_network::ClusterRelayStreamSendOutcome::RoutingError(response),
+                ),
+                Ok(ClusterRelayStreamForwardResult::StreamStartedThenFailed(error)) => Ok(
+                    sinomo_network::ClusterRelayStreamSendOutcome::StreamStartedThenFailed(
+                        daemon_host_network_error("cluster relay stream", error),
+                    ),
+                ),
+                Err(error) => {
+                    remember_relay_endpoint_command_connectivity_async(
+                        paths,
+                        runtime,
+                        endpoint,
+                        sinomo_network::ClusterConnectivityState::Degraded,
+                        None,
+                    )
+                    .await;
+                    Err(daemon_host_network_error("cluster relay stream", error))
+                }
+            }
         })
     }
 }
@@ -5099,41 +5061,6 @@ async fn send_cluster_relay_request_to_next_hop_streaming_async(
     Ok(ClusterRelayStreamForwardResult::Forwarded)
 }
 
-async fn write_relay_stream_error_response(
-    stream: &mut sinomo_network::AsyncDaemonControlStream,
-    stream_address: &str,
-    detail: impl Into<String>,
-) -> Result<(), DaemonError> {
-    let response = sinomo_network::ObjectRpcResponse::encode_error(
-        sinomo_network::CLUSTER_RELAY_ROUTE,
-        detail,
-    )
-    .map_err(DaemonError::from)?;
-    stream
-        .write_rpc_response(
-            stream_address,
-            &response,
-            sinomo_network::ObjectFrameIoOptions::none(),
-        )
-        .await
-        .map_err(DaemonError::from)
-}
-
-fn push_daemon_relay_stream_failure(failures: &mut Vec<String>, failure: String) {
-    const MAX_FAILURES: usize = 8;
-    const MAX_CHARS: usize = 512;
-    if failures.len() >= MAX_FAILURES {
-        return;
-    }
-    let mut chars = failure.chars();
-    let truncated = chars.by_ref().take(MAX_CHARS).collect::<String>();
-    if chars.next().is_some() {
-        failures.push(format!("{truncated}..."));
-    } else {
-        failures.push(truncated);
-    }
-}
-
 fn relay_local_node_id(_paths: &DaemonPaths, state: &ClusterBootstrapState) -> NodeId {
     state.local_node_id.clone()
 }
@@ -5234,6 +5161,69 @@ fn cluster_raft_append_attempt_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum RecordingRelayStreamForwardMode {
+        Forward,
+        RoutingError,
+    }
+
+    struct RecordingRelayStreamForwardHost {
+        mode: RecordingRelayStreamForwardMode,
+        sent: Vec<(
+            ClusterEndpointRecord,
+            sinomo_network::RelayEnvelope,
+            sinomo_network::DaemonRpcTimeouts,
+        )>,
+    }
+
+    impl RecordingRelayStreamForwardHost {
+        fn forwarding() -> Self {
+            Self {
+                mode: RecordingRelayStreamForwardMode::Forward,
+                sent: Vec::new(),
+            }
+        }
+
+        fn routing_error() -> Self {
+            Self {
+                mode: RecordingRelayStreamForwardMode::RoutingError,
+                sent: Vec::new(),
+            }
+        }
+    }
+
+    impl sinomo_network::ClusterRelayStreamForwardAsyncHost for RecordingRelayStreamForwardHost {
+        fn send_relay_stream_forward_async<'a>(
+            &'a mut self,
+            endpoint: &'a ClusterEndpointRecord,
+            request: &'a sinomo_network::ObjectRpcRequest,
+            timeouts: sinomo_network::DaemonRpcTimeouts,
+        ) -> sinomo_network::ClusterRelayFuture<'a, sinomo_network::ClusterRelayStreamSendOutcome>
+        {
+            let endpoint = endpoint.clone();
+            let request = request.clone();
+            let mode = self.mode;
+            let sent = &mut self.sent;
+            Box::pin(async move {
+                let envelope = sinomo_network::RelayEnvelope::from_request(&request)?;
+                sent.push((endpoint, envelope, timeouts));
+                match mode {
+                    RecordingRelayStreamForwardMode::Forward => {
+                        Ok(sinomo_network::ClusterRelayStreamSendOutcome::Forwarded)
+                    }
+                    RecordingRelayStreamForwardMode::RoutingError => {
+                        Ok(sinomo_network::ClusterRelayStreamSendOutcome::RoutingError(
+                            sinomo_network::ObjectRpcResponse::encode_error(
+                                sinomo_network::CLUSTER_RELAY_ROUTE,
+                                "test routing miss",
+                            )?,
+                        ))
+                    }
+                }
+            })
+        }
+    }
 
     fn append_cluster_raft_command(
         paths: &ClusterPaths,
@@ -10459,29 +10449,43 @@ mod tests {
         sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
         let runtime = daemon_cluster_test_runtime();
         let envelope = test_relay_envelope(&state, &target_node);
-        let plan = runtime
-            .block_on(sinomo_network::cluster_relay_forward_plan(
-                runtime.handle(),
-                &paths,
-                &state,
-                &local_node,
-                &envelope,
-            ))
-            .expect("relay plan");
+        let initial_ttl = envelope.ttl;
+        let mut host = RecordingRelayStreamForwardHost::forwarding();
+        let outcome = runtime
+            .block_on(
+                sinomo_network::handle_cluster_relay_stream_forward_async_with_host(
+                    runtime.handle(),
+                    &paths,
+                    &state,
+                    &local_node,
+                    envelope,
+                    sinomo_network::ClusterRelayOptions {
+                        timeouts: sinomo_network::DaemonRpcTimeouts::connect_and_idle(
+                            Duration::from_secs(5),
+                        ),
+                    },
+                    &mut host,
+                ),
+            )
+            .expect("relay forward");
 
-        assert_eq!(
-            plan.iter()
-                .map(|(node_id, _endpoints)| node_id.clone())
-                .collect::<Vec<_>>(),
-            vec![target_node.clone()],
+        assert!(
+            matches!(
+                outcome,
+                sinomo_network::ClusterRelayStreamForwardOutcome::Forwarded
+            ),
             "relay should deliver directly to a known command endpoint while connectivity publication is still empty"
         );
+        assert_eq!(host.sent.len(), 1);
+        let (endpoint, forwarded, _timeouts) = host.sent.first().expect("sent relay");
+        assert_eq!(endpoint.node_id, target_node);
         assert_eq!(
-            plan.first()
-                .and_then(|(_node_id, endpoints)| endpoints.first())
-                .map(|endpoint| endpoint.endpoint_id.clone()),
-            Some(target_endpoint.endpoint_id)
+            endpoint.endpoint_id, target_endpoint.endpoint_id,
+            "relay should use the known target command endpoint"
         );
+        assert_eq!(forwarded.target_node_id, target_node);
+        assert_eq!(forwarded.ttl, initial_ttl.saturating_sub(1));
+        assert_eq!(forwarded.visited, vec![local_node]);
     }
 
     #[test]
@@ -10545,28 +10549,38 @@ mod tests {
         );
         let runtime = daemon_cluster_test_runtime();
         let envelope = test_relay_envelope(&state, &target_node);
-        let plan = runtime
-            .block_on(sinomo_network::cluster_relay_forward_plan(
-                runtime.handle(),
-                &paths,
-                &state,
-                &local_node,
-                &envelope,
-            ))
-            .expect("relay plan");
-        let endpoints = plan
-            .first()
-            .map(|(_node_id, endpoints)| endpoints.as_slice())
-            .unwrap_or(&[]);
+        let mut host = RecordingRelayStreamForwardHost::routing_error();
+        let outcome = runtime
+            .block_on(
+                sinomo_network::handle_cluster_relay_stream_forward_async_with_host(
+                    runtime.handle(),
+                    &paths,
+                    &state,
+                    &local_node,
+                    envelope,
+                    sinomo_network::ClusterRelayOptions {
+                        timeouts: sinomo_network::DaemonRpcTimeouts::connect_and_idle(
+                            Duration::from_secs(5),
+                        ),
+                    },
+                    &mut host,
+                ),
+            )
+            .expect("relay forward");
 
-        assert_eq!(
-            endpoints.first().map(|endpoint| &endpoint.address),
-            Some(&stale_endpoint.address)
+        assert!(matches!(
+            outcome,
+            sinomo_network::ClusterRelayStreamForwardOutcome::ErrorResponse(_)
+        ));
+        assert_eq!(host.sent.len(), 1);
+        assert!(
+            host.sent[0].0.address == stale_endpoint.address,
+            "healthy next-hop routing should try the known healthy endpoint first"
         );
         assert!(
-            endpoints
-                .iter()
-                .all(|endpoint| endpoint.address != learned_endpoint.address),
+            host.sent.iter().all(
+                |(endpoint, _envelope, _timeouts)| endpoint.address != learned_endpoint.address
+            ),
             "healthy next-hop routing suppresses unknown hostname fallbacks"
         );
     }

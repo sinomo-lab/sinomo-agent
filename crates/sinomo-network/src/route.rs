@@ -410,6 +410,29 @@ pub trait ClusterRelayAsyncHost {
     ) -> ClusterRelayFuture<'a, ObjectRpcResponse>;
 }
 
+#[derive(Debug)]
+pub enum ClusterRelayStreamSendOutcome {
+    Forwarded,
+    RoutingError(ObjectRpcResponse),
+    StreamStartedThenFailed(NetworkError),
+}
+
+#[derive(Debug)]
+pub enum ClusterRelayStreamForwardOutcome {
+    Forwarded,
+    ErrorResponse(ObjectRpcResponse),
+    StreamStartedThenFailed(NetworkError),
+}
+
+pub trait ClusterRelayStreamForwardAsyncHost {
+    fn send_relay_stream_forward_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        request: &'a ObjectRpcRequest,
+        timeouts: DaemonRpcTimeouts,
+    ) -> ClusterRelayFuture<'a, ClusterRelayStreamSendOutcome>;
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ClusterSignedRelayRpcOptions {
     pub timeouts: DaemonRpcTimeouts,
@@ -859,7 +882,7 @@ fn cluster_relay_hop_transport_timeouts(
     shaped.with_idle_timeout(Some(idle_timeout.min(CLUSTER_RELAY_MIN_RESPONSE_BUDGET)))
 }
 
-pub fn relay_envelope_hop_transport_timeouts(
+pub(crate) fn relay_envelope_hop_transport_timeouts(
     timeouts: DaemonRpcTimeouts,
     envelope: &RelayEnvelope,
 ) -> DaemonRpcTimeouts {
@@ -1413,7 +1436,120 @@ pub async fn handle_cluster_relay_async_with_host(
     )
 }
 
-pub async fn cluster_relay_forward_plan(
+pub async fn handle_cluster_relay_stream_forward_async_with_host(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    local_node_id: &NodeId,
+    envelope: RelayEnvelope,
+    options: ClusterRelayOptions,
+    host: &mut impl ClusterRelayStreamForwardAsyncHost,
+) -> Result<ClusterRelayStreamForwardOutcome, NetworkError> {
+    if crate::cluster_node_is_local_process(state, &envelope.target_node_id) {
+        return ObjectRpcResponse::encode_error(
+            CLUSTER_RELAY_ROUTE,
+            "stream relay local delivery must be handled by the daemon control loop",
+        )
+        .map(ClusterRelayStreamForwardOutcome::ErrorResponse);
+    }
+
+    if envelope.visited.iter().any(|node| node == local_node_id) {
+        return ObjectRpcResponse::encode_error(
+            CLUSTER_RELAY_ROUTE,
+            format!("relay dropped: relay loop: {local_node_id} already on the path"),
+        )
+        .map(ClusterRelayStreamForwardOutcome::ErrorResponse);
+    }
+    if envelope.ttl == 0 {
+        return ObjectRpcResponse::encode_error(
+            CLUSTER_RELAY_ROUTE,
+            "relay dropped: relay ttl exhausted",
+        )
+        .map(ClusterRelayStreamForwardOutcome::ErrorResponse);
+    }
+
+    let next_hops =
+        cluster_relay_forward_plan(runtime, paths, state, local_node_id, &envelope).await?;
+    if next_hops.is_empty() {
+        return ObjectRpcResponse::encode_error(
+            CLUSTER_RELAY_ROUTE,
+            format!(
+                "relay dropped: no reachable route from {local_node_id} to {}",
+                envelope.target_node_id
+            ),
+        )
+        .map(ClusterRelayStreamForwardOutcome::ErrorResponse);
+    }
+
+    let mut failures = Vec::new();
+    for (next_hop, endpoints) in next_hops {
+        if endpoints.is_empty() {
+            push_cluster_relay_failure(
+                &mut failures,
+                format!("{next_hop}: relay next hop has no reachable endpoint"),
+            );
+            continue;
+        }
+        for endpoint in endpoints {
+            let mut forwarded = envelope.clone();
+            forwarded.ttl = envelope.ttl.saturating_sub(1);
+            forwarded.visited.push(local_node_id.clone());
+            let outer = forwarded.into_request()?;
+            let hop_timeouts = relay_envelope_hop_transport_timeouts(options.timeouts, &envelope);
+            match host
+                .send_relay_stream_forward_async(&endpoint, &outer, hop_timeouts)
+                .await
+            {
+                Ok(ClusterRelayStreamSendOutcome::Forwarded) => {
+                    return Ok(ClusterRelayStreamForwardOutcome::Forwarded);
+                }
+                Ok(ClusterRelayStreamSendOutcome::RoutingError(response)) => {
+                    push_cluster_relay_failure(
+                        &mut failures,
+                        format!(
+                            "{} ({:?}) returned routing error: {}",
+                            endpoint.address,
+                            endpoint.transport,
+                            response
+                                .metadata
+                                .get(crate::OBJECT_RPC_ERROR_DETAIL_METADATA_KEY)
+                                .cloned()
+                                .unwrap_or_else(|| "routing error".to_string())
+                        ),
+                    );
+                }
+                Ok(ClusterRelayStreamSendOutcome::StreamStartedThenFailed(error)) => {
+                    return Ok(ClusterRelayStreamForwardOutcome::StreamStartedThenFailed(
+                        error,
+                    ));
+                }
+                Err(error) => push_cluster_relay_failure(
+                    &mut failures,
+                    format!(
+                        "{} ({:?}) failed: {}",
+                        endpoint.address, endpoint.transport, error
+                    ),
+                ),
+            }
+        }
+    }
+
+    ObjectRpcResponse::encode_error(
+        CLUSTER_RELAY_ROUTE,
+        format!(
+            "relay dropped: no reachable route from {local_node_id} to {}{}",
+            envelope.target_node_id,
+            if failures.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", failures.join("; "))
+            }
+        ),
+    )
+    .map(ClusterRelayStreamForwardOutcome::ErrorResponse)
+}
+
+pub(crate) async fn cluster_relay_forward_plan(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -5082,6 +5218,28 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingRelayStreamForwardHost {
+        sent: Vec<(ClusterEndpointRecord, RelayEnvelope)>,
+        sent_timeouts: Vec<DaemonRpcTimeouts>,
+    }
+
+    impl ClusterRelayStreamForwardAsyncHost for RecordingRelayStreamForwardHost {
+        fn send_relay_stream_forward_async<'a>(
+            &'a mut self,
+            endpoint: &'a ClusterEndpointRecord,
+            request: &'a ObjectRpcRequest,
+            timeouts: DaemonRpcTimeouts,
+        ) -> ClusterRelayFuture<'a, ClusterRelayStreamSendOutcome> {
+            Box::pin(async move {
+                self.sent
+                    .push((endpoint.clone(), RelayEnvelope::from_request(request)?));
+                self.sent_timeouts.push(timeouts);
+                Ok(ClusterRelayStreamSendOutcome::Forwarded)
+            })
+        }
+    }
+
     #[tokio::test]
     async fn relay_driver_forwards_to_next_hop_endpoint() {
         let root = sinomo_testdir::TestDir::new("sinomo-network-relay-driver");
@@ -5142,7 +5300,7 @@ mod tests {
             )],
         )
         .expect("connectivity");
-        let mut envelope = RelayEnvelope::new(cluster_id, target.clone(), inner_request());
+        let mut envelope = RelayEnvelope::new(cluster_id.clone(), target.clone(), inner_request());
         envelope.max_hop_timeout_ms = Some(1_500);
 
         let mut async_host = RecordingRelayHost::default();
@@ -5174,7 +5332,41 @@ mod tests {
         assert_eq!(async_host.sent[0].0.node_id, bridge);
         assert_eq!(async_host.sent[0].1.target_node_id, target);
         assert_eq!(async_host.sent[0].1.ttl, CLUSTER_RELAY_DEFAULT_TTL - 1);
-        assert_eq!(async_host.sent[0].1.visited, vec![local]);
+        assert_eq!(async_host.sent[0].1.visited, vec![local.clone()]);
         assert_eq!(async_host.sent[0].1.max_hop_timeout_ms, Some(1_500));
+
+        let mut stream_envelope = RelayEnvelope::new(cluster_id, target.clone(), inner_request());
+        stream_envelope.max_hop_timeout_ms = Some(1_500);
+        let mut stream_host = RecordingRelayStreamForwardHost::default();
+        let stream_outcome = handle_cluster_relay_stream_forward_async_with_host(
+            &runtime,
+            &paths,
+            &state,
+            &local,
+            stream_envelope,
+            ClusterRelayOptions {
+                timeouts: DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5)),
+            },
+            &mut stream_host,
+        )
+        .await
+        .expect("stream relay");
+
+        assert!(matches!(
+            stream_outcome,
+            ClusterRelayStreamForwardOutcome::Forwarded
+        ));
+        assert_eq!(
+            stream_host.sent_timeouts,
+            vec![DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(
+                1_500
+            ))]
+        );
+        assert_eq!(stream_host.sent.len(), 1);
+        assert_eq!(stream_host.sent[0].0.node_id, bridge);
+        assert_eq!(stream_host.sent[0].1.target_node_id, target);
+        assert_eq!(stream_host.sent[0].1.ttl, CLUSTER_RELAY_DEFAULT_TTL - 1);
+        assert_eq!(stream_host.sent[0].1.visited, vec![local]);
+        assert_eq!(stream_host.sent[0].1.max_hop_timeout_ms, Some(1_500));
     }
 }

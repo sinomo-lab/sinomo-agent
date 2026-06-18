@@ -95,9 +95,10 @@ pub use route::{
     CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY, CLUSTER_ROUTING_RPC_ROUTE_METADATA,
     ClusterObjectRpcClient, ClusterObjectRpcNodeOptions, ClusterObjectRpcOptions,
     ClusterRelayAsyncHost, ClusterRelayFuture, ClusterRelayOptions,
-    ClusterSignedEndpointRpcAsyncHost, ClusterSignedEndpointRpcFuture, RelayEnvelope,
-    cluster_endpoint_prefers_relay_with_graph, cluster_relay_forward_plan,
-    handle_cluster_relay_async_with_host, relay_envelope_hop_transport_timeouts,
+    ClusterRelayStreamForwardAsyncHost, ClusterRelayStreamForwardOutcome,
+    ClusterRelayStreamSendOutcome, ClusterSignedEndpointRpcAsyncHost,
+    ClusterSignedEndpointRpcFuture, RelayEnvelope, cluster_endpoint_prefers_relay_with_graph,
+    handle_cluster_relay_async_with_host, handle_cluster_relay_stream_forward_async_with_host,
     relay_response_is_routing_error,
 };
 pub use rpc::{
