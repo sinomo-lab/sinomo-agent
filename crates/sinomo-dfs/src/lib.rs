@@ -387,6 +387,7 @@ pub(crate) fn build_dfs_network_frame(
     })
 }
 
+#[cfg(test)]
 fn dfs_network_message_from_frame(frame: &NetworkFrame) -> Result<DfsNetworkMessage, NetworkError> {
     protocol::dfs_routed_message_from_protocol_frame(frame).map(|message| message.message)
 }
@@ -485,6 +486,7 @@ fn dfs_network_message_allows_write_repair_progress(message: &DfsNetworkMessage)
     }
 }
 
+#[cfg(test)]
 fn dfs_protocol_frame_allows_write_repair_progress(frame: &NetworkFrame) -> bool {
     dfs_network_message_from_frame(frame)
         .is_ok_and(|message| dfs_network_message_allows_write_repair_progress(&message))
@@ -5480,9 +5482,16 @@ pub struct NetworkedDfsService<T> {
     next_request_id: u64,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct DfsProtocolFrameProcessResult {
     pub outbound_frames: Vec<NetworkFrame>,
+    pub events: Vec<NetworkedDfsServiceEvent>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DfsMessageProcessResult {
+    pub response: DfsMessageResponse,
     pub events: Vec<NetworkedDfsServiceEvent>,
 }
 
@@ -9054,6 +9063,124 @@ impl NetworkedDfsService<DfsEndpointTransport> {
     }
 }
 
+#[derive(Debug)]
+pub struct DfsEndpointServedMessageTransport {
+    local_node_id: NodeId,
+    return_node_id: Option<NodeId>,
+    inbound_frames: VecDeque<InboundFrame>,
+    outbound_messages: Vec<DfsRoutedMessage>,
+    endpoint_transport: DfsEndpointTransport,
+}
+
+impl DfsEndpointServedMessageTransport {
+    pub fn new_with_message_sender(
+        local_node_id: NodeId,
+        endpoints: Vec<ClusterEndpointRecord>,
+        sender: DfsMessageSender,
+        connect_timeout: Duration,
+    ) -> Self {
+        let endpoint_transport = DfsEndpointTransport::with_senders(
+            local_node_id.clone(),
+            endpoints,
+            connect_timeout,
+            Some(sender),
+            None,
+            None,
+        );
+        Self {
+            local_node_id,
+            return_node_id: None,
+            inbound_frames: VecDeque::new(),
+            outbound_messages: Vec::new(),
+            endpoint_transport,
+        }
+    }
+
+    pub fn enqueue_message(&mut self, message: DfsRoutedMessage) -> Result<(), NetworkError> {
+        if message.target_node_id != self.local_node_id {
+            return Err(NetworkError::FrameTargetMismatch {
+                requested_target_node_id: self.local_node_id.clone(),
+                frame_target_node_id: message.target_node_id,
+            });
+        }
+        self.return_node_id = Some(message.source_node_id.clone());
+        let frame = protocol::dfs_protocol_frame_from_routed_message(&message)?;
+        self.inbound_frames.push_back(InboundFrame {
+            received_by: self.local_node_id.clone(),
+            frame,
+        });
+        Ok(())
+    }
+
+    pub fn finish_message(&mut self) -> Vec<DfsRoutedMessage> {
+        self.return_node_id = None;
+        self.inbound_frames.clear();
+        self.endpoint_transport.incoming_frames.clear();
+        std::mem::take(&mut self.outbound_messages)
+    }
+
+    pub fn replace_endpoints(&mut self, endpoints: Vec<ClusterEndpointRecord>) {
+        self.endpoint_transport.replace_endpoints(endpoints);
+    }
+}
+
+impl DfsTransportIdentity for DfsEndpointServedMessageTransport {
+    fn local_node_id(&self) -> &NodeId {
+        &self.local_node_id
+    }
+}
+
+impl DfsFrameTransport for DfsEndpointServedMessageTransport {
+    fn send(&mut self, target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError> {
+        if &frame.target_node_id != target_node_id {
+            return Err(NetworkError::FrameTargetMismatch {
+                requested_target_node_id: target_node_id.clone(),
+                frame_target_node_id: frame.target_node_id.clone(),
+            });
+        }
+        if target_node_id == &self.local_node_id {
+            self.inbound_frames.push_back(InboundFrame {
+                received_by: self.local_node_id.clone(),
+                frame,
+            });
+            return Ok(());
+        }
+        if self
+            .return_node_id
+            .as_ref()
+            .is_some_and(|return_node_id| target_node_id == return_node_id)
+        {
+            self.outbound_messages
+                .push(protocol::dfs_routed_message_from_protocol_frame(&frame)?);
+            return Ok(());
+        }
+        self.endpoint_transport
+            .send_frame_to_endpoint(target_node_id, frame, true)
+    }
+
+    fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
+        let mut frames = self.inbound_frames.drain(..).collect::<Vec<_>>();
+        frames.extend(self.endpoint_transport.drain_incoming()?);
+        Ok(frames)
+    }
+
+    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+        let nested = self
+            .endpoint_transport
+            .pending_incoming_count()?
+            .unwrap_or_default();
+        Ok(Some(self.inbound_frames.len().saturating_add(nested)))
+    }
+
+    fn transfer_profile(&self, target_node_id: &NodeId) -> DfsTransferProfile {
+        if target_node_id == &self.local_node_id {
+            return DfsTransferProfile::Local;
+        }
+        self.endpoint_transport
+            .transfer_profile_for_target(target_node_id)
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug)]
 struct SingleDfsProtocolFrameTransport {
@@ -9099,154 +9226,39 @@ impl DfsFrameTransport for SingleDfsProtocolFrameTransport {
     }
 }
 
-#[derive(Debug)]
-pub struct DfsEndpointServedProtocolFrameTransport {
-    local_node_id: NodeId,
-    return_node_id: Option<NodeId>,
-    inbound_frames: VecDeque<InboundFrame>,
-    outbound_frames: Vec<NetworkFrame>,
-    endpoint_transport: DfsEndpointTransport,
-}
-
-impl DfsEndpointServedProtocolFrameTransport {
-    pub fn new_with_message_sender(
-        local_node_id: NodeId,
-        endpoints: Vec<ClusterEndpointRecord>,
-        sender: DfsMessageSender,
-        connect_timeout: Duration,
-    ) -> Self {
-        let endpoint_transport = DfsEndpointTransport::with_senders(
-            local_node_id.clone(),
-            endpoints,
-            connect_timeout,
-            Some(sender),
-            None,
-            None,
-        );
-        Self {
-            local_node_id,
-            return_node_id: None,
-            inbound_frames: VecDeque::new(),
-            outbound_frames: Vec::new(),
-            endpoint_transport,
-        }
-    }
-
-    pub fn enqueue_protocol_frame(&mut self, frame: NetworkFrame) -> Result<(), NetworkError> {
-        if frame.target_node_id != self.local_node_id {
-            return Err(NetworkError::FrameTargetMismatch {
-                requested_target_node_id: self.local_node_id.clone(),
-                frame_target_node_id: frame.target_node_id,
-            });
-        }
-        self.return_node_id = Some(frame.source_node_id.clone());
-        self.inbound_frames.push_back(InboundFrame {
-            received_by: self.local_node_id.clone(),
-            frame,
-        });
-        Ok(())
-    }
-
-    pub fn finish_protocol_frame(&mut self) -> Vec<NetworkFrame> {
-        self.return_node_id = None;
-        self.inbound_frames.clear();
-        self.endpoint_transport.incoming_frames.clear();
-        std::mem::take(&mut self.outbound_frames)
-    }
-
-    pub fn replace_endpoints(&mut self, endpoints: Vec<ClusterEndpointRecord>) {
-        self.endpoint_transport.replace_endpoints(endpoints);
-    }
-}
-
-impl DfsTransportIdentity for DfsEndpointServedProtocolFrameTransport {
-    fn local_node_id(&self) -> &NodeId {
-        &self.local_node_id
-    }
-}
-
-impl DfsFrameTransport for DfsEndpointServedProtocolFrameTransport {
-    fn send(&mut self, target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError> {
-        if &frame.target_node_id != target_node_id {
-            return Err(NetworkError::FrameTargetMismatch {
-                requested_target_node_id: target_node_id.clone(),
-                frame_target_node_id: frame.target_node_id.clone(),
-            });
-        }
-        if target_node_id == &self.local_node_id {
-            self.inbound_frames.push_back(InboundFrame {
-                received_by: self.local_node_id.clone(),
-                frame,
-            });
-            return Ok(());
-        }
-        if self
-            .return_node_id
-            .as_ref()
-            .is_some_and(|return_node_id| target_node_id == return_node_id)
-        {
-            self.outbound_frames.push(frame);
-            return Ok(());
-        }
-        self.endpoint_transport
-            .send_frame_to_endpoint(target_node_id, frame, true)
-    }
-
-    fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
-        let mut frames = self.inbound_frames.drain(..).collect::<Vec<_>>();
-        frames.extend(self.endpoint_transport.drain_incoming()?);
-        Ok(frames)
-    }
-
-    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
-        let nested = self
-            .endpoint_transport
-            .pending_incoming_count()?
-            .unwrap_or_default();
-        Ok(Some(self.inbound_frames.len().saturating_add(nested)))
-    }
-
-    fn transfer_profile(&self, target_node_id: &NodeId) -> DfsTransferProfile {
-        if target_node_id == &self.local_node_id {
-            return DfsTransferProfile::Local;
-        }
-        self.endpoint_transport
-            .transfer_profile_for_target(target_node_id)
-    }
-}
-
-impl NetworkedDfsService<DfsEndpointServedProtocolFrameTransport> {
-    pub fn refresh_protocol_frame_endpoints(&mut self, endpoints: Vec<ClusterEndpointRecord>) {
+impl NetworkedDfsService<DfsEndpointServedMessageTransport> {
+    pub fn refresh_message_endpoints(&mut self, endpoints: Vec<ClusterEndpointRecord>) {
         self.transport.replace_endpoints(endpoints);
     }
 
-    pub fn drain_protocol_frame_deferred_work(&mut self) {
+    pub fn drain_message_deferred_work(&mut self) {
         self.drain_deferred_routed_create_parent_touches();
     }
 
-    pub fn process_protocol_frame(
+    pub fn process_message_command(
         &mut self,
-        inbound_frame: NetworkFrame,
-    ) -> Result<DfsProtocolFrameProcessResult, DfsError> {
-        if inbound_frame.target_node_id != self.node_id {
+        command: DfsMessageCommand,
+    ) -> Result<DfsMessageProcessResult, DfsError> {
+        if command.routed_message.target_node_id != self.node_id {
             return Err(DfsError::Network {
                 message: format!(
-                    "dfs protocol frame target {} does not match local node {}",
-                    inbound_frame.target_node_id, self.node_id
+                    "dfs message target {} does not match local node {}",
+                    command.routed_message.target_node_id, self.node_id
                 ),
             });
         }
+        let request_id = command.request_id;
         let allow_write_repair_progress =
-            dfs_protocol_frame_allows_write_repair_progress(&inbound_frame);
+            dfs_network_message_allows_write_repair_progress(&command.routed_message.message);
         self.transport
-            .enqueue_protocol_frame(inbound_frame)
+            .enqueue_message(command.routed_message)
             .map_err(DfsError::from_network)?;
         let mut events = Vec::new();
         for _ in 0..DFS_PROTOCOL_FRAME_DRAIN_MAX_PASSES {
             let batch = match self.process_incoming_with_options(false) {
                 Ok(batch) => batch,
                 Err(error) => {
-                    self.transport.finish_protocol_frame();
+                    self.transport.finish_message();
                     return Err(error);
                 }
             };
@@ -9265,23 +9277,26 @@ impl NetworkedDfsService<DfsEndpointServedProtocolFrameTransport> {
             {
                 Ok(pending) => pending,
                 Err(error) => {
-                    self.transport.finish_protocol_frame();
+                    self.transport.finish_message();
                     return Err(error);
                 }
             };
             if pending == Some(0) && scheduled.is_empty() {
-                let outbound_frames = self.transport.finish_protocol_frame();
-                return Ok(DfsProtocolFrameProcessResult {
-                    outbound_frames,
+                let outbound_messages = self.transport.finish_message();
+                return Ok(DfsMessageProcessResult {
+                    response: DfsMessageResponse {
+                        request_id,
+                        outbound_messages,
+                    },
                     events,
                 });
             }
         }
-        let outbound_frames = self.transport.finish_protocol_frame();
+        let outbound_messages = self.transport.finish_message();
         Err(DfsError::Network {
             message: format!(
-                "DFS protocol frame did not quiesce after {DFS_PROTOCOL_FRAME_DRAIN_MAX_PASSES} passes; returned {} frame(s) before aborting",
-                outbound_frames.len()
+                "DFS message did not quiesce after {DFS_PROTOCOL_FRAME_DRAIN_MAX_PASSES} passes; returned {} message(s) before aborting",
+                outbound_messages.len()
             ),
         })
     }

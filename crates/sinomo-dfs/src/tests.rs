@@ -90,6 +90,17 @@ fn test_dfs_lookup_frame(
     .expect("test DFS lookup frame")
 }
 
+fn test_dfs_message_command(
+    request_id: impl Into<String>,
+    frame: NetworkFrame,
+) -> DfsMessageCommand {
+    DfsMessageCommand {
+        request_id: request_id.into(),
+        routed_message: protocol::dfs_routed_message_from_protocol_frame(&frame)
+            .expect("DFS routed message"),
+    }
+}
+
 #[test]
 fn dfs_adaptive_transfer_windows_stay_byte_bounded() {
     assert_eq!(DFS_BLOB_CHUNK_BYTES, 4 * 1024 * 1024);
@@ -2529,7 +2540,7 @@ fn posix_wait_for_commit_reports_repair_retry_failure_without_failing_write() {
 }
 
 #[test]
-fn served_protocol_frame_drains_nested_stage_response_before_returning() {
+fn served_message_drains_nested_stage_response_before_returning() {
     let root = temp_root("served-protocol-frame-drains-nested-stage-response");
     let requester = NodeId::from_legacy_named("node_served_frame_requester").expect("requester");
     let primary = NodeId::from_legacy_named("node_served_frame_primary").expect("primary");
@@ -2576,7 +2587,7 @@ fn served_protocol_frame_drains_nested_stage_response_before_returning() {
             }],
         })
     });
-    let transport = DfsEndpointServedProtocolFrameTransport::new_with_message_sender(
+    let transport = DfsEndpointServedMessageTransport::new_with_message_sender(
         primary.clone(),
         vec![endpoint],
         sender,
@@ -2625,20 +2636,20 @@ fn served_protocol_frame_drains_nested_stage_response_before_returning() {
     )
     .expect("request frame");
 
-    let result = dfs.process_protocol_frame(frame).expect("process frame");
+    let result = dfs
+        .process_message_command(test_dfs_message_command("dfs_served_message_rpc", frame))
+        .expect("process DFS message");
 
     assert_eq!(stage_calls.lock().expect("stage calls lock").len(), 1);
     let responses = result
-        .outbound_frames
+        .response
+        .outbound_messages
         .iter()
-        .filter_map(|frame| {
-            if frame.source_node_id != primary || frame.target_node_id != requester {
+        .filter_map(|routed| {
+            if routed.source_node_id != primary || routed.target_node_id != requester {
                 return None;
             }
-            let MeshMessageBody::Protocol(protocol) = &frame.message.body else {
-                return None;
-            };
-            protocol.decode::<DfsNetworkMessage>().ok()
+            Some(routed.message.clone())
         })
         .collect::<Vec<_>>();
     assert!(
@@ -2662,7 +2673,7 @@ fn served_protocol_frame_drains_nested_stage_response_before_returning() {
                     && response_object_id == &object_id
             )
         }),
-        "served frame should return the initial pending response, got {responses:?}"
+        "served message should return the initial pending response, got {responses:?}"
     );
     assert!(
         responses.iter().any(|message| {
@@ -2685,7 +2696,7 @@ fn served_protocol_frame_drains_nested_stage_response_before_returning() {
                     && version == &version_2
             )
         }),
-        "served frame must drain nested replica response and return the committed response, got {responses:?}"
+        "served message must drain nested replica response and return the committed response, got {responses:?}"
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -2724,7 +2735,7 @@ fn served_non_foreground_write_does_not_retry_unrelated_repairs() {
             outbound_messages: Vec::new(),
         })
     });
-    let transport = DfsEndpointServedProtocolFrameTransport::new_with_message_sender(
+    let transport = DfsEndpointServedMessageTransport::new_with_message_sender(
         primary.clone(),
         vec![endpoint],
         sender,
@@ -2806,23 +2817,26 @@ fn served_non_foreground_write_does_not_retry_unrelated_repairs() {
     )
     .expect("request frame");
 
-    let result = dfs.process_protocol_frame(frame).expect("process frame");
+    let result = dfs
+        .process_message_command(test_dfs_message_command(
+            "dfs_served_deferred_message_rpc",
+            frame,
+        ))
+        .expect("process DFS message");
 
     assert!(
         repair_calls.lock().expect("repair calls lock").is_empty(),
         "non-foreground routed write must not retry unrelated repair backlog"
     );
     let responses = result
-        .outbound_frames
+        .response
+        .outbound_messages
         .iter()
-        .filter_map(|frame| {
-            if frame.source_node_id != primary || frame.target_node_id != requester {
+        .filter_map(|routed| {
+            if routed.source_node_id != primary || routed.target_node_id != requester {
                 return None;
             }
-            let MeshMessageBody::Protocol(protocol) = &frame.message.body else {
-                return None;
-            };
-            protocol.decode::<DfsNetworkMessage>().ok()
+            Some(routed.message.clone())
         })
         .collect::<Vec<_>>();
     assert!(
@@ -2846,15 +2860,15 @@ fn served_non_foreground_write_does_not_retry_unrelated_repairs() {
                     && version == &version_2
             )
         }),
-        "served frame should return committed deferred write response, got {responses:?}"
+        "served message should return committed deferred write response, got {responses:?}"
     );
 
     std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
-fn served_protocol_frame_reports_repair_retry_failure_without_failing_request() {
-    let root = temp_root("served-protocol-frame-repair-retry-best-effort");
+fn served_message_reports_repair_retry_failure_without_failing_request() {
+    let root = temp_root("served-message-repair-retry-best-effort");
     let requester =
         NodeId::from_legacy_named("node_served_frame_repair_requester").expect("requester");
     let primary = NodeId::from_legacy_named("node_served_frame_repair_primary").expect("primary");
@@ -2869,7 +2883,7 @@ fn served_protocol_frame_reports_repair_retry_failure_without_failing_request() 
             outbound_messages: Vec::new(),
         })
     });
-    let transport = DfsEndpointServedProtocolFrameTransport::new_with_message_sender(
+    let transport = DfsEndpointServedMessageTransport::new_with_message_sender(
         primary.clone(),
         vec![test_endpoint(&replica, "192.0.2.31:21353")],
         sender,
@@ -2964,8 +2978,11 @@ fn served_protocol_frame_reports_repair_retry_failure_without_failing_request() 
     .expect("foreground frame");
 
     let result = dfs
-        .process_protocol_frame(frame)
-        .expect("foreground frame should not fail on repair retry error");
+        .process_message_command(test_dfs_message_command(
+            "dfs_served_repair_retry_message_rpc",
+            frame,
+        ))
+        .expect("foreground message should not fail on repair retry error");
 
     assert_eq!(*send_attempts.lock().expect("send attempts"), 0);
     assert!(
@@ -8880,7 +8897,7 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
             }],
         })
     });
-    let primary_transport = DfsEndpointServedProtocolFrameTransport::new_with_message_sender(
+    let primary_transport = DfsEndpointServedMessageTransport::new_with_message_sender(
         primary.clone(),
         vec![test_endpoint(&replica, "192.0.2.45:21353")],
         replica_sender,
@@ -8912,21 +8929,19 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
     let primary_service = Arc::new(Mutex::new(primary_service));
     let primary_service_for_sender = Arc::clone(&primary_service);
     let trace_for_primary_sender = Arc::clone(&trace);
-    let primary_sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, command, _timeout| {
-        if let MeshMessageBody::Protocol(protocol) = &command.frame.message.body
-            && protocol.protocol == DFS_PROTOCOL
-            && let Ok(message) = protocol.decode::<DfsNetworkMessage>()
-        {
-            trace_for_primary_sender
-                .lock()
-                .expect("trace")
-                .push(format!("primary-in:{}", dfs_message_trace_label(&message)));
-        }
+    let primary_message_sender: DfsMessageSender = Arc::new(move |_endpoint, command, _timeout| {
+        trace_for_primary_sender
+            .lock()
+            .expect("trace")
+            .push(format!(
+                "primary-in:{}",
+                dfs_message_trace_label(&command.routed_message.message)
+            ));
         let result = primary_service_for_sender
             .lock()
             .expect("primary service")
-            .process_protocol_frame(command.frame.clone())
-            .expect("process primary frame");
+            .process_message_command(command.clone())
+            .expect("process primary message");
         for event in &result.events {
             trace_for_primary_sender
                 .lock()
@@ -8936,22 +8951,18 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
                     networked_dfs_event_trace_label(event)
                 ));
         }
-        for frame in &result.outbound_frames {
-            if let MeshMessageBody::Protocol(protocol) = &frame.message.body
-                && protocol.protocol == DFS_PROTOCOL
-                && let Ok(message) = protocol.decode::<DfsNetworkMessage>()
-            {
-                trace_for_primary_sender
-                    .lock()
-                    .expect("trace")
-                    .push(format!("primary-out:{}", dfs_message_trace_label(&message)));
-            }
+        for routed in &result.response.outbound_messages {
+            trace_for_primary_sender
+                .lock()
+                .expect("trace")
+                .push(format!(
+                    "primary-out:{}",
+                    dfs_message_trace_label(&routed.message)
+                ));
         }
-        Ok(DfsProtocolFrameResponse {
-            request_id: command.request_id.clone(),
-            outbound_frames: result.outbound_frames,
-        })
+        Ok(result.response)
     });
+    let primary_sender = dfs_protocol_frame_sender_from_message_sender(primary_message_sender);
     let transport = DfsEndpointTransport::with_connect_timeout(
         writer.clone(),
         vec![test_endpoint(&primary, "192.0.2.44:21353")],
