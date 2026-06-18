@@ -718,27 +718,6 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
         })
     }
 
-    fn endpoint_prefers_relay_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, bool> {
-        let endpoint = endpoint.clone();
-        let runtime = self.runtime.clone();
-        Box::pin(async move {
-            runtime
-                .spawn_blocking(move || {
-                    Ok(cluster_paths_from_env().as_ref().is_some_and(|paths| {
-                        sinomo_network::cluster_endpoint_prefers_relay(paths, &endpoint)
-                    }))
-                })
-                .await
-                .map_err(|source| sinomo_network::NetworkError::Io {
-                    operation: "cluster endpoint relay preference".to_string(),
-                    detail: format!("relay preference task failed: {source}"),
-                })?
-        })
-    }
-
     fn endpoint_rpc_cluster_id_async<'a>(
         &'a mut self,
         _endpoint: &'a ClusterEndpointRecord,

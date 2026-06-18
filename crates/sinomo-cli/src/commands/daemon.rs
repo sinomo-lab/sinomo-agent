@@ -966,7 +966,6 @@ impl network::ClusterKvTxnForwardHost for CliClusterKvTxnForwardHost {
                 detail: error.to_string(),
             })?;
         let mut host = CliSignedObjectRpcHost {
-            paths: paths.clone(),
             cluster_id: state.cluster_id.clone(),
         };
         let mut client = network::ClusterObjectRpcClient::new(&mut host);
@@ -988,7 +987,6 @@ impl network::ClusterKvTxnForwardHost for CliClusterKvTxnForwardHost {
 }
 
 struct CliSignedObjectRpcHost {
-    paths: ClusterPaths,
     cluster_id: network::ClusterId,
 }
 
@@ -1011,18 +1009,6 @@ impl network::ClusterSignedEndpointRpcAsyncHost for CliSignedObjectRpcHost {
         _timeouts: network::DaemonRpcTimeouts,
     ) -> network::ClusterSignedEndpointRpcFuture<'a, Option<network::ObjectRpcResponse>> {
         Box::pin(async { Ok(None) })
-    }
-
-    fn endpoint_prefers_relay_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-    ) -> network::ClusterSignedEndpointRpcFuture<'a, bool> {
-        Box::pin(async move {
-            Ok(network::cluster_endpoint_prefers_relay(
-                &self.paths,
-                endpoint,
-            ))
-        })
     }
 
     fn endpoint_rpc_cluster_id_async<'a>(

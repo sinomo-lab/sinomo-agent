@@ -176,7 +176,6 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     runtime: runtime_handle.clone(),
                     paths: cluster_paths.clone(),
                     cluster_state: Arc::clone(&cluster_state),
-                    route_graph: Arc::clone(&route_graph),
                 });
             }
         }
@@ -553,7 +552,6 @@ struct NetworkPingJob {
     runtime: tokio::runtime::Handle,
     paths: ClusterPaths,
     cluster_state: Arc<ClusterBootstrapState>,
-    route_graph: Arc<network::ClusterConnectivityGraph>,
 }
 
 #[derive(Debug)]
@@ -589,7 +587,6 @@ async fn run_network_ping_job(job: NetworkPingJob) -> NetworkPingResult {
 async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome {
     let mut host = NetworkPingEndpointRpcHost {
         cluster_state: Arc::clone(&job.cluster_state),
-        route_graph: Arc::clone(&job.route_graph),
     };
     let mut client = network::ClusterObjectRpcClient::new(&mut host);
     let response = match client
@@ -641,7 +638,6 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
 
 struct NetworkPingEndpointRpcHost {
     cluster_state: Arc<ClusterBootstrapState>,
-    route_graph: Arc<network::ClusterConnectivityGraph>,
 }
 
 impl network::ClusterSignedEndpointRpcAsyncHost for NetworkPingEndpointRpcHost {
@@ -664,20 +660,6 @@ impl network::ClusterSignedEndpointRpcAsyncHost for NetworkPingEndpointRpcHost {
         _timeouts: network::DaemonRpcTimeouts,
     ) -> network::ClusterSignedEndpointRpcFuture<'a, Option<network::ObjectRpcResponse>> {
         Box::pin(async { Ok(None) })
-    }
-
-    fn endpoint_prefers_relay_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-    ) -> network::ClusterSignedEndpointRpcFuture<'a, bool> {
-        let endpoint = endpoint.clone();
-        let state = Arc::clone(&self.cluster_state);
-        let graph = Arc::clone(&self.route_graph);
-        Box::pin(async move {
-            Ok(network::cluster_endpoint_prefers_relay_with_graph(
-                &graph, &state, &endpoint,
-            ))
-        })
     }
 
     fn endpoint_rpc_cluster_id_async<'a>(

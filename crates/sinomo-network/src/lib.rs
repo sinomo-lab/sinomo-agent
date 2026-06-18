@@ -48,11 +48,10 @@ pub use route::{
     ClusterRelayAsyncHost, ClusterRelayFuture, ClusterRelayOptions,
     ClusterSignedEndpointRpcAsyncHost, ClusterSignedEndpointRpcFuture,
     ClusterSignedRelayRpcAsyncHost, ClusterSignedRelayRpcFuture, RelayEnvelope,
-    cluster_endpoint_prefers_relay, cluster_endpoint_prefers_relay_with_graph,
-    cluster_relay_forward_plan, cluster_relay_next_hop_endpoints,
-    cluster_relay_next_hops_with_direct_target_fallback, handle_cluster_relay_async_with_host,
-    relay_envelope_hop_transport_timeouts, relay_request_for_signed_rpc,
-    relay_response_is_routing_error,
+    cluster_endpoint_prefers_relay_with_graph, cluster_relay_forward_plan,
+    cluster_relay_next_hop_endpoints, cluster_relay_next_hops_with_direct_target_fallback,
+    handle_cluster_relay_async_with_host, relay_envelope_hop_transport_timeouts,
+    relay_request_for_signed_rpc, relay_response_is_routing_error,
 };
 pub use rpc::*;
 pub use storage::{
