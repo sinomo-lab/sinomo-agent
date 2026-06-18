@@ -1688,7 +1688,15 @@ pub(crate) fn rollout_target_endpoint_for_main_with_connectivity(
     main_node_id: &NodeId,
     candidates: &[ClusterEndpointRecord],
 ) -> Option<ClusterEndpointRecord> {
-    network::cluster_rollout_target_endpoint_for_main(paths, state, main_node_id, candidates)
+    network::cluster_rollout_target_endpoints_for_main_with_command_endpoint(
+        paths,
+        state,
+        main_node_id,
+        None,
+        candidates,
+    )
+    .into_iter()
+    .next()
 }
 
 #[cfg(test)]

@@ -49,6 +49,39 @@ fn object_rpc_response_from_kv_payload(
     ObjectRpcResponse::from_encoded_body(payload.route, payload.body)
 }
 
+fn first_cluster_rollout_target_endpoint_for_main(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    main_node_id: &NodeId,
+    candidates: &[ClusterEndpointRecord],
+) -> Option<ClusterEndpointRecord> {
+    first_cluster_rollout_target_endpoint_for_main_with_command_endpoint(
+        paths,
+        state,
+        main_node_id,
+        None,
+        candidates,
+    )
+}
+
+fn first_cluster_rollout_target_endpoint_for_main_with_command_endpoint(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    main_node_id: &NodeId,
+    command_endpoint: Option<&ClusterEndpointRecord>,
+    candidates: &[ClusterEndpointRecord],
+) -> Option<ClusterEndpointRecord> {
+    cluster_rollout_target_endpoints_for_main_with_command_endpoint(
+        paths,
+        state,
+        main_node_id,
+        command_endpoint,
+        candidates,
+    )
+    .into_iter()
+    .next()
+}
+
 #[test]
 fn cluster_network_rpc_route_metadata_matches_owned_routes() {
     assert_eq!(
@@ -5932,7 +5965,7 @@ fn rollout_target_selection_prefers_main_route_before_shadow_backup() {
     let main_endpoint = daemon_lan_endpoint(&main, "10.0.0.41:21353".to_string(), 10);
     let shadow_endpoint = daemon_lan_endpoint(&shadow, "10.0.0.42:21354".to_string(), 10);
 
-    let selected = cluster_rollout_target_endpoint_for_main(
+    let selected = first_cluster_rollout_target_endpoint_for_main(
         &paths,
         &state,
         &main,
@@ -5987,7 +6020,7 @@ fn rollout_target_selection_applies_connectivity_to_equivalent_tcp_route() {
     )
     .expect("connectivity record");
 
-    let selected = cluster_rollout_target_endpoint_for_main(
+    let selected = first_cluster_rollout_target_endpoint_for_main(
         &paths,
         &state,
         &main,
@@ -6048,9 +6081,13 @@ fn rollout_target_selection_keeps_transient_public_tcp_before_iroh() {
     )
     .expect("connectivity record");
 
-    let selected =
-        cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &[iroh, public.clone()])
-            .expect("rollout endpoint");
+    let selected = first_cluster_rollout_target_endpoint_for_main(
+        &paths,
+        &state,
+        &main,
+        &[iroh, public.clone()],
+    )
+    .expect("rollout endpoint");
 
     assert_eq!(selected.endpoint_id, public.endpoint_id);
 }
@@ -6091,7 +6128,7 @@ fn rollout_target_selection_uses_command_route_context_for_shadow_fallbacks() {
         last_observed_latency_ms: None,
     };
 
-    let selected = cluster_rollout_target_endpoint_for_main_with_command_endpoint(
+    let selected = first_cluster_rollout_target_endpoint_for_main_with_command_endpoint(
         &paths,
         &state,
         &main,
@@ -6127,7 +6164,7 @@ fn rollout_target_selection_uses_command_route_context_for_shadow_fallbacks() {
     );
     assert_eq!(ordered[0].endpoint_id, public_main.endpoint_id);
 
-    let selected = cluster_rollout_target_endpoint_for_main_with_command_endpoint(
+    let selected = first_cluster_rollout_target_endpoint_for_main_with_command_endpoint(
         &paths,
         &state,
         &main,
@@ -14656,8 +14693,9 @@ fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
     };
     let candidates = vec![iroh.clone(), public.clone(), lan.clone()];
 
-    let selected = cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &candidates)
-        .expect("rollout endpoint");
+    let selected =
+        first_cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &candidates)
+            .expect("rollout endpoint");
     assert_eq!(selected.endpoint_id, lan.endpoint_id);
 
     // A route must fail CLUSTER_CONNECTIVITY_UNAVAILABLE_AFTER_FAILURES (3)
@@ -14679,8 +14717,9 @@ fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
         )],
     )
     .expect("connectivity records");
-    let selected = cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &candidates)
-        .expect("rollout endpoint");
+    let selected =
+        first_cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &candidates)
+            .expect("rollout endpoint");
     assert_eq!(selected.endpoint_id, public.endpoint_id);
 
     sync_cluster_connectivity_records_to_kv(
@@ -14712,8 +14751,9 @@ fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
         ],
     )
     .expect("connectivity records");
-    let selected = cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &candidates)
-        .expect("rollout endpoint");
+    let selected =
+        first_cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &candidates)
+            .expect("rollout endpoint");
     assert_eq!(selected.endpoint_id, iroh.endpoint_id);
 }
 
@@ -14751,9 +14791,13 @@ fn rollout_target_selection_treats_hostname_tcp_as_direct_before_iroh() {
         last_observed_latency_ms: None,
     };
 
-    let selected =
-        cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &[iroh, hostname.clone()])
-            .expect("rollout endpoint");
+    let selected = first_cluster_rollout_target_endpoint_for_main(
+        &paths,
+        &state,
+        &main,
+        &[iroh, hostname.clone()],
+    )
+    .expect("rollout endpoint");
     assert_eq!(selected.endpoint_id, hostname.endpoint_id);
 }
 

@@ -12199,39 +12199,6 @@ pub fn cluster_rollout_endpoint_candidates(
     endpoints
 }
 
-pub fn cluster_rollout_target_endpoint_for_main(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    main_node_id: &NodeId,
-    candidates: &[ClusterEndpointRecord],
-) -> Option<ClusterEndpointRecord> {
-    cluster_rollout_target_endpoint_for_main_with_command_endpoint(
-        paths,
-        state,
-        main_node_id,
-        None,
-        candidates,
-    )
-}
-
-pub fn cluster_rollout_target_endpoint_for_main_with_command_endpoint(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    main_node_id: &NodeId,
-    command_endpoint: Option<&ClusterEndpointRecord>,
-    candidates: &[ClusterEndpointRecord],
-) -> Option<ClusterEndpointRecord> {
-    cluster_rollout_target_endpoints_for_main_with_command_endpoint(
-        paths,
-        state,
-        main_node_id,
-        command_endpoint,
-        candidates,
-    )
-    .into_iter()
-    .next()
-}
-
 pub fn cluster_rollout_target_endpoints_for_main_with_command_endpoint(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,

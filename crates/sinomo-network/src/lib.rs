@@ -126,7 +126,7 @@ pub use storage::{
     cluster_network_record_should_refresh, cluster_node_blocks_leader_preference,
     cluster_node_is_local_process, cluster_node_status_stable_eq, cluster_raft_command_targets,
     cluster_raft_live_voter_targets, cluster_reachable_voter_count_with_host,
-    cluster_rollout_endpoint_candidates, cluster_rollout_target_endpoint_for_main,
+    cluster_rollout_endpoint_candidates,
     cluster_rollout_target_endpoints_for_main_with_command_endpoint,
     cluster_state_needs_join_registration, cluster_state_sync_txn, cluster_status_summary_label,
     commit_cluster_kv_txn_with_quorum_response_with_host,
