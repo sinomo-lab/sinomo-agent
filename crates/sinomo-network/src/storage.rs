@@ -137,7 +137,10 @@ pub use crate::local_state_store::{
     read_cluster_state, read_cluster_state_without_kv, read_cluster_state_without_kv_async,
     write_cluster_state,
 };
-use crate::member_mutation::{ClusterMemberMutationAsyncHost, ClusterMemberMutationHost};
+use crate::member_mutation::{
+    ClusterMemberMutationAsyncHost, ClusterMemberMutationHost, ClusterMemberRemoval,
+    ClusterNodeRoleUpdate, ClusterRaftRoleUpdate,
+};
 use crate::member_publish::{
     ClusterLocalMemberPublishHost, ClusterMemberPublishHost,
     handle_cluster_member_publish_request_with_host,
@@ -202,29 +205,6 @@ static CLUSTER_RAFT_FANOUT_PENDING: AtomicBool = AtomicBool::new(false);
 pub struct ClusterJoinReconciliation {
     pub accepted_endpoint: Option<ClusterEndpointRecord>,
     pub kv_snapshot: Option<KvSnapshot>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClusterNodeRoleUpdate {
-    pub node_id: NodeId,
-    pub previous_role: ClusterNodeRole,
-    pub role: ClusterNodeRole,
-    pub changed: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClusterRaftRoleUpdate {
-    pub node_id: NodeId,
-    pub previous_role: ClusterMemberRole,
-    pub previous_state: ClusterMemberState,
-    pub role: ClusterMemberRole,
-    pub state: ClusterMemberState,
-    pub changed: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClusterMemberRemoval {
-    pub removed: Vec<ClusterMemberRecord>,
 }
 
 pub fn prepare_cluster_join_registration_response(

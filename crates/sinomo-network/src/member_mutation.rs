@@ -1,8 +1,35 @@
 use crate::ClusterPaths;
 use crate::error::NetworkError;
 use crate::rpc_future::ClusterMembershipRpcFuture;
-use sinomo_core::ClusterBootstrapState;
+use sinomo_core::{
+    ClusterBootstrapState, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState,
+    ClusterNodeRole,
+};
 use sinomo_kv::{InProcessKvStore, KvSnapshot, KvTxn};
+use sinomo_node::NodeId;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterNodeRoleUpdate {
+    pub node_id: NodeId,
+    pub previous_role: ClusterNodeRole,
+    pub role: ClusterNodeRole,
+    pub changed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterRaftRoleUpdate {
+    pub node_id: NodeId,
+    pub previous_role: ClusterMemberRole,
+    pub previous_state: ClusterMemberState,
+    pub role: ClusterMemberRole,
+    pub state: ClusterMemberState,
+    pub changed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterMemberRemoval {
+    pub removed: Vec<ClusterMemberRecord>,
+}
 
 pub trait ClusterMemberMutationHost {
     fn prepare_cluster_state_for_kv_sync(
