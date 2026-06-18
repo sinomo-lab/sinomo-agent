@@ -14,8 +14,9 @@ use crate::lan::{
 };
 use crate::object::{DaemonControlStream, read_object_frame_blocking, write_object_frame_blocking};
 use crate::peer::{
-    InboundFrame, MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrame, NetworkFrameId,
-    ProtocolMessage,
+    AsyncNetworkServiceHandle, AsyncNetworkTransport, AsyncNetworkTransportFuture, InboundFrame,
+    MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrame, NetworkFrameId, NetworkService,
+    NetworkServiceActorOptions, NetworkServiceCommandOptions, ProtocolMessage,
 };
 use crate::prelude::*;
 use crate::roaming::{

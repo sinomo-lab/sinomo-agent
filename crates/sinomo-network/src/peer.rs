@@ -2,7 +2,9 @@ use crate::error::NetworkError;
 use crate::prelude::*;
 use crate::rpc::ObjectRpcRequest;
 use arc_swap::ArcSwap;
+#[cfg(test)]
 use std::future::Future;
+#[cfg(test)]
 use std::pin::Pin;
 use std::sync::Condvar;
 use std::time::Instant;
@@ -587,6 +589,7 @@ pub struct InboundObjectRpcMessage {
     pub message: InProcessObjectRpcMessage,
 }
 
+#[cfg(test)]
 pub type AsyncNetworkTransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -626,6 +629,7 @@ impl AsyncNetworkSendOptions {
     }
 }
 
+#[cfg(test)]
 pub trait AsyncNetworkTransport {
     fn local_node_id(&self) -> &NodeId;
 
@@ -651,15 +655,18 @@ pub trait AsyncNetworkTransport {
     ) -> AsyncNetworkTransportFuture<'a, Result<bool, NetworkError>>;
 }
 
+#[cfg(test)]
 pub(crate) const SEEN_EVENT_CACHE_CAPACITY: usize = 16_384;
 
 #[derive(Clone, Debug)]
+#[cfg(test)]
 pub(crate) struct SeenEventCache {
     capacity: usize,
     keys: HashSet<(NodeId, EventId)>,
     order: VecDeque<(NodeId, EventId)>,
 }
 
+#[cfg(test)]
 impl SeenEventCache {
     pub(crate) fn new() -> Self {
         Self::with_capacity(SEEN_EVENT_CACHE_CAPACITY)
@@ -699,6 +706,7 @@ impl SeenEventCache {
 /// Core event-ingest step used by the [`NetworkService`] actor's inbound dispatch:
 /// dedups on `(origin_node_id, event_id)` and, for a new event, appends it to `store`.
 /// A store-level `DuplicateEventId` is folded into the same idempotent dedup result.
+#[cfg(test)]
 fn event_addresses_local_node(event: &EventEnvelope, local_node_id: &NodeId) -> bool {
     if let Some(target_node_id) = &event.target_node_id {
         return target_node_id == local_node_id;
@@ -713,6 +721,7 @@ fn event_addresses_local_node(event: &EventEnvelope, local_node_id: &NodeId) -> 
     }
 }
 
+#[cfg(test)]
 fn ingest_event<S: EventStore>(
     seen_events: &mut SeenEventCache,
     store: &mut S,
@@ -1120,13 +1129,16 @@ impl AsyncInProcessNetwork {
     }
 
     pub fn add_node(&self, node_id: NodeId) -> AsyncInProcessTransport {
+        #[cfg(test)]
         let (sender, incoming) = tokio::sync::mpsc::channel(self.inner.mailbox_capacity);
         let (object_rpc_sender, object_rpc_incoming) =
             tokio::sync::mpsc::channel(self.inner.mailbox_capacity);
         let target = AsyncInProcessTarget {
+            #[cfg(test)]
             sender,
             object_rpc_sender,
             mailbox_capacity: self.inner.mailbox_capacity,
+            #[cfg(test)]
             send_limiter: Arc::new(tokio::sync::Semaphore::new(
                 self.inner.per_target_send_limit,
             )),
@@ -1146,7 +1158,9 @@ impl AsyncInProcessNetwork {
         AsyncInProcessTransport {
             local_node_id: node_id,
             inner: Arc::clone(&self.inner),
+            #[cfg(test)]
             incoming,
+            #[cfg(test)]
             pending: VecDeque::new(),
             object_rpc_incoming,
             object_rpc_pending: VecDeque::new(),
@@ -1163,9 +1177,11 @@ struct AsyncInProcessNetworkInner {
 
 #[derive(Clone)]
 struct AsyncInProcessTarget {
+    #[cfg(test)]
     sender: tokio::sync::mpsc::Sender<InboundFrame>,
     object_rpc_sender: tokio::sync::mpsc::Sender<InboundObjectRpcMessage>,
     mailbox_capacity: usize,
+    #[cfg(test)]
     send_limiter: Arc<tokio::sync::Semaphore>,
     object_rpc_send_limiter: Arc<tokio::sync::Semaphore>,
 }
@@ -1173,13 +1189,20 @@ struct AsyncInProcessTarget {
 pub struct AsyncInProcessTransport {
     local_node_id: NodeId,
     inner: Arc<AsyncInProcessNetworkInner>,
+    #[cfg(test)]
     incoming: tokio::sync::mpsc::Receiver<InboundFrame>,
+    #[cfg(test)]
     pending: VecDeque<InboundFrame>,
     object_rpc_incoming: tokio::sync::mpsc::Receiver<InboundObjectRpcMessage>,
     object_rpc_pending: VecDeque<InboundObjectRpcMessage>,
 }
 
 impl AsyncInProcessTransport {
+    pub fn local_node_id(&self) -> &NodeId {
+        &self.local_node_id
+    }
+
+    #[cfg(test)]
     fn validate_outbound_frame(
         &self,
         target_node_id: &NodeId,
@@ -1216,6 +1239,7 @@ impl AsyncInProcessTransport {
             })
     }
 
+    #[cfg(test)]
     fn pending_count(&self) -> usize {
         self.pending.len() + self.incoming.len()
     }
@@ -1291,6 +1315,7 @@ impl AsyncInProcessTransport {
     }
 }
 
+#[cfg(test)]
 impl AsyncNetworkTransport for AsyncInProcessTransport {
     fn local_node_id(&self) -> &NodeId {
         &self.local_node_id
@@ -1363,6 +1388,7 @@ impl AsyncNetworkTransport for AsyncInProcessTransport {
     }
 }
 
+#[cfg(test)]
 async fn send_async_in_process_frame(
     target: AsyncInProcessTarget,
     target_node_id: &NodeId,
@@ -1502,6 +1528,7 @@ fn async_transport_send_timed_out(target_node_id: &NodeId, timeout: Duration) ->
 }
 
 #[derive(Clone, Debug)]
+#[cfg(test)]
 pub struct NetworkService<T> {
     router: InProcessRouter,
     pub(crate) transport: T,
@@ -1511,6 +1538,7 @@ pub struct NetworkService<T> {
     next_message_id: u64,
 }
 
+#[cfg(test)]
 impl<T> NetworkService<T> {
     pub fn new(registry: PeerRegistry, transport: T) -> Self {
         Self {
@@ -1547,6 +1575,7 @@ impl<T> NetworkService<T> {
     }
 }
 
+#[cfg(test)]
 impl<T: AsyncNetworkTransport> NetworkService<T> {
     fn enqueue_event_async(
         &mut self,
@@ -1915,17 +1944,22 @@ impl<T: AsyncNetworkTransport> NetworkService<T> {
 
 /// Bounded command-queue depth for a spawned [`NetworkService`] actor. Once this many
 /// commands are in flight, [`AsyncNetworkServiceHandle`] methods await room (backpressure).
+#[cfg(test)]
 const NETWORK_SERVICE_QUEUE_CAPACITY: usize = 256;
+#[cfg(test)]
 pub(crate) const NETWORK_SERVICE_INBOUND_BATCH_LIMIT: usize = 256;
+#[cfg(test)]
 pub(crate) const NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub struct NetworkServiceActorOptions {
     pub command_queue_capacity: usize,
     pub inbound_batch_limit: usize,
     pub outbound_batch_limit: usize,
 }
 
+#[cfg(test)]
 impl NetworkServiceActorOptions {
     fn normalized(self) -> Self {
         Self {
@@ -1936,6 +1970,7 @@ impl NetworkServiceActorOptions {
     }
 }
 
+#[cfg(test)]
 impl Default for NetworkServiceActorOptions {
     fn default() -> Self {
         Self {
@@ -1947,11 +1982,13 @@ impl Default for NetworkServiceActorOptions {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub enum NetworkServiceCommandBackpressure {
     WaitForCapacity,
     FailIfFull,
 }
 
+#[cfg(test)]
 impl Default for NetworkServiceCommandBackpressure {
     fn default() -> Self {
         Self::WaitForCapacity
@@ -1959,11 +1996,13 @@ impl Default for NetworkServiceCommandBackpressure {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg(test)]
 pub struct NetworkServiceCommandOptions {
     timeout: Option<Duration>,
     backpressure: NetworkServiceCommandBackpressure,
 }
 
+#[cfg(test)]
 impl NetworkServiceCommandOptions {
     pub const fn timeout(timeout: Duration) -> Self {
         Self {
@@ -1979,13 +2018,6 @@ impl NetworkServiceCommandOptions {
         }
     }
 
-    pub const fn timeout_and_fail_if_queue_full(timeout: Duration) -> Self {
-        Self {
-            timeout: Some(timeout),
-            backpressure: NetworkServiceCommandBackpressure::FailIfFull,
-        }
-    }
-
     pub const fn timeout_duration(self) -> Option<Duration> {
         self.timeout
     }
@@ -1995,6 +2027,7 @@ impl NetworkServiceCommandOptions {
     }
 }
 
+#[cfg(test)]
 enum AsyncNetworkServiceCommand {
     EnqueueEvent {
         stored_event: StoredEvent,
@@ -2035,6 +2068,7 @@ enum AsyncNetworkServiceCommand {
     },
 }
 
+#[cfg(test)]
 impl AsyncNetworkServiceCommand {
     fn caller_is_waiting(&self) -> bool {
         match self {
@@ -2051,6 +2085,7 @@ impl AsyncNetworkServiceCommand {
     }
 }
 
+#[cfg(test)]
 fn remaining_async_command_timeout(deadline: Option<tokio::time::Instant>) -> Option<Duration> {
     deadline.map(|deadline| {
         deadline
@@ -2059,6 +2094,7 @@ fn remaining_async_command_timeout(deadline: Option<tokio::time::Instant>) -> Op
     })
 }
 
+#[cfg(test)]
 fn actor_send_options_for_deadline(
     deadline: Option<tokio::time::Instant>,
 ) -> AsyncNetworkSendOptions {
@@ -2068,6 +2104,7 @@ fn actor_send_options_for_deadline(
     }
 }
 
+#[cfg(test)]
 impl<T: AsyncNetworkTransport + Send + 'static> NetworkService<T> {
     /// Run the async transport actor on the caller-owned Tokio runtime.
     pub fn spawn_on_runtime<S: EventStore + Send + 'static>(
@@ -2210,11 +2247,13 @@ impl<T: AsyncNetworkTransport + Send + 'static> NetworkService<T> {
 /// Handle to a [`NetworkService`] running with an [`AsyncNetworkTransport`] actor
 /// (see [`NetworkService::spawn_on_runtime`]). Transport send/drain work is awaited inside
 /// the actor instead of running through synchronous transport calls.
+#[cfg(test)]
 pub struct AsyncNetworkServiceHandle<S> {
     commands: tokio::sync::mpsc::Sender<AsyncNetworkServiceCommand>,
     task: tokio::task::JoinHandle<S>,
 }
 
+#[cfg(test)]
 impl<S> AsyncNetworkServiceHandle<S>
 where
     S: Send + 'static,
@@ -2446,52 +2485,23 @@ where
             }
         }
     }
-
-    pub fn abort(self) {
-        let Self { commands, task } = self;
-        drop(commands);
-        task.abort();
-    }
 }
 
+#[cfg(test)]
 pub struct AsyncNetworkServiceCommands<'a, S> {
     handle: &'a AsyncNetworkServiceHandle<S>,
     options: NetworkServiceCommandOptions,
 }
 
+#[cfg(test)]
 impl<S> AsyncNetworkServiceCommands<'_, S>
 where
     S: Send + 'static,
 {
-    pub async fn enqueue_event(
-        &self,
-        stored_event: StoredEvent,
-    ) -> Result<Vec<RouteDelivery>, NetworkError> {
-        self.handle
-            .request_with_options("enqueue-event", self.options, |reply, _deadline| {
-                AsyncNetworkServiceCommand::EnqueueEvent {
-                    stored_event,
-                    reply,
-                }
-            })
-            .await
-    }
-
     pub async fn pump_outbound(&self) -> Result<usize, NetworkError> {
         self.handle
             .request_with_options("pump-outbound", self.options, |reply, deadline| {
                 AsyncNetworkServiceCommand::PumpOutbound {
-                    send_deadline: deadline,
-                    reply,
-                }
-            })
-            .await
-    }
-
-    pub async fn process_incoming(&self) -> Result<Vec<InboundOutcome>, NetworkError> {
-        self.handle
-            .request_with_options("process-incoming", self.options, |reply, deadline| {
-                AsyncNetworkServiceCommand::ProcessIncoming {
                     send_deadline: deadline,
                     reply,
                 }
@@ -2543,24 +2553,6 @@ where
             .await
     }
 
-    pub async fn record_missed_heartbeat(
-        &self,
-        target_node_id: NodeId,
-        policy: HeartbeatPolicy,
-    ) -> Result<(PeerStatus, usize), NetworkError> {
-        self.handle
-            .request_with_options(
-                "record-missed-heartbeat",
-                self.options,
-                |reply, _deadline| AsyncNetworkServiceCommand::RecordMissedHeartbeat {
-                    target_node_id,
-                    policy,
-                    reply,
-                },
-            )
-            .await
-    }
-
     pub async fn ledger_records(&self) -> Result<Vec<DeliveryRecord>, NetworkError> {
         self.handle
             .request_with_options("ledger-records", self.options, |reply, _deadline| {
@@ -2568,16 +2560,9 @@ where
             })
             .await
     }
-
-    pub async fn next_outbound_wake_at(&self) -> Result<Option<Instant>, NetworkError> {
-        self.handle
-            .request_with_options("next-outbound-wake-at", self.options, |reply, _deadline| {
-                AsyncNetworkServiceCommand::NextOutboundWakeAt { reply }
-            })
-            .await
-    }
 }
 
+#[cfg(test)]
 fn network_service_actor_join_error(source: tokio::task::JoinError) -> NetworkError {
     NetworkError::Io {
         operation: "network-service-actor".to_string(),
@@ -2585,6 +2570,7 @@ fn network_service_actor_join_error(source: tokio::task::JoinError) -> NetworkEr
     }
 }
 
+#[cfg(test)]
 fn network_service_stopped() -> NetworkError {
     NetworkError::Io {
         operation: "network-service-command".to_string(),
@@ -2592,6 +2578,7 @@ fn network_service_stopped() -> NetworkError {
     }
 }
 
+#[cfg(test)]
 fn network_service_command_queue_full(operation: &str, max_commands: usize) -> NetworkError {
     NetworkError::NetworkServiceCommandQueueFull {
         operation: operation.to_string(),
@@ -2599,6 +2586,7 @@ fn network_service_command_queue_full(operation: &str, max_commands: usize) -> N
     }
 }
 
+#[cfg(test)]
 fn network_service_command_timed_out(operation: &str, timeout: Duration) -> NetworkError {
     NetworkError::Io {
         operation: format!("network-service-command {operation}"),
@@ -2778,6 +2766,7 @@ impl DeliveryLedger {
         self.ready_delivery_ids_limited_at(now, usize::MAX)
     }
 
+    #[cfg(test)]
     pub(crate) fn ready_delivery_ids_limited(&self, max_deliveries: usize) -> Vec<RouteDeliveryId> {
         self.ready_delivery_ids_limited_at(Instant::now(), max_deliveries)
     }
@@ -3052,6 +3041,7 @@ impl DeliveryLedger {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn expire_ack_deadlines_at(&mut self, now: Instant) -> usize {
         let mut expired_count = 0;
         while let Some((deadline, _)) = self.ack_deadline_ids.first_key_value() {
@@ -3081,6 +3071,7 @@ impl DeliveryLedger {
         expired_count
     }
 
+    #[cfg(test)]
     fn expire_ack_deadline_delivery_at(
         &mut self,
         delivery_id: RouteDeliveryId,

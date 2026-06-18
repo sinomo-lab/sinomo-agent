@@ -73,13 +73,10 @@ pub use object::{
     write_object_frame_async, write_object_stream_chunks_async,
 };
 pub use peer::{
-    AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions,
-    AsyncNetworkServiceCommands, AsyncNetworkServiceHandle, AsyncNetworkTransport,
-    AsyncNetworkTransportFuture, DeliveryAck, DeliveryLedger, DeliveryRecord, DeliveryStatus,
-    EndpointCandidateStatus, Heartbeat, HeartbeatPolicy, InProcessNetwork,
-    InProcessObjectRpcMessage, InProcessRouter, InProcessTransport, InboundObjectRpcMessage,
-    InboundOutcome, LinkState, NetworkService, NetworkServiceActorOptions,
-    NetworkServiceCommandBackpressure, NetworkServiceCommandOptions, NodeEndpoint,
+    AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions, DeliveryAck,
+    DeliveryLedger, DeliveryRecord, DeliveryStatus, EndpointCandidateStatus, Heartbeat,
+    HeartbeatPolicy, InProcessNetwork, InProcessObjectRpcMessage, InProcessRouter,
+    InProcessTransport, InboundObjectRpcMessage, InboundOutcome, LinkState, NodeEndpoint,
     PeerEndpointCandidate, PeerRegistry, PeerState, PeerStatus, RetryPolicy, RouteDelivery,
     RouteDeliveryId, TransportKind,
 };
@@ -417,8 +414,10 @@ pub(crate) mod prelude {
         ClusterNodeStatusRecord, ClusterTransportKind, EventEnvelope, LatencyClass, RoutingScope,
         TrustDomain,
     };
+    #[cfg(test)]
+    pub(crate) use sinomo_events::EventStore;
     pub(crate) use sinomo_events::{
-        EventId, EventSequence, EventStore, EventStoreError, SessionId, StoredEvent,
+        EventId, EventSequence, EventStoreError, SessionId, StoredEvent,
     };
     #[cfg(test)]
     pub(crate) use sinomo_kv::KvLogEntry;
@@ -437,7 +436,9 @@ pub(crate) mod prelude {
         NodeAvailability, NodeHealth, NodeId, NodeProfile, daemon_lan_endpoint_id,
         daemon_loopback_endpoint_id, main_daemon_capabilities, shadow_daemon_node_id,
     };
-    pub(crate) use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+    #[cfg(test)]
+    pub(crate) use std::collections::HashSet;
+    pub(crate) use std::collections::{BTreeMap, BTreeSet, VecDeque};
     pub(crate) use std::fs;
     pub(crate) use std::io;
     pub(crate) use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};

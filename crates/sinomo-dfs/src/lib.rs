@@ -147,7 +147,7 @@ impl DfsTransportIdentity for sinomo_network::InProcessTransport {
 
 impl DfsTransportIdentity for sinomo_network::AsyncInProcessTransport {
     fn local_node_id(&self) -> &NodeId {
-        sinomo_network::AsyncNetworkTransport::local_node_id(self)
+        self.local_node_id()
     }
 }
 
@@ -279,7 +279,7 @@ impl DfsMessageTransport for sinomo_network::InProcessTransport {
 
 impl AsyncDfsMessageTransport for sinomo_network::AsyncInProcessTransport {
     fn local_node_id(&self) -> &NodeId {
-        sinomo_network::AsyncNetworkTransport::local_node_id(self)
+        self.local_node_id()
     }
 
     fn send_routed_message_async<'a>(
