@@ -8811,12 +8811,9 @@ fn send_dfs_frame_to_endpoint(
         let send_started = Instant::now();
         match sender(endpoint, &command, connect_timeout) {
             Ok(response) => {
-                let response = protocol::dfs_message_response_to_protocol_frame_response(response)
-                    .map_err(|source| NetworkError::Serialization {
-                        detail: source.to_string(),
-                    })?;
+                let outbound_frames = dfs_message_response_to_network_frames(response)?;
                 let outbound_payload_bytes =
-                    dfs_network_frames_protocol_payload_bytes(&response.outbound_frames);
+                    dfs_network_frames_protocol_payload_bytes(&outbound_frames);
                 dfs_perf_trace(format_args!(
                     "dfs-message-send local={} target={} endpoint={} request={} payload_bytes={} outbound_frames={} outbound_payload_bytes={} elapsed_ms={}",
                     source_node_id,
@@ -8824,11 +8821,11 @@ fn send_dfs_frame_to_endpoint(
                     endpoint.address,
                     command.request_id,
                     payload_bytes,
-                    response.outbound_frames.len(),
+                    outbound_frames.len(),
                     outbound_payload_bytes,
                     send_started.elapsed().as_millis()
                 ));
-                return Ok(response.outbound_frames);
+                return Ok(outbound_frames);
             }
             Err(error) => {
                 dfs_perf_trace(format_args!(
@@ -8913,12 +8910,9 @@ async fn send_dfs_frame_to_endpoint_async(
         let send_started = Instant::now();
         match sender(endpoint, &command, connect_timeout).await {
             Ok(response) => {
-                let response = protocol::dfs_message_response_to_protocol_frame_response(response)
-                    .map_err(|source| NetworkError::Serialization {
-                        detail: source.to_string(),
-                    })?;
+                let outbound_frames = dfs_message_response_to_network_frames(response)?;
                 let outbound_payload_bytes =
-                    dfs_network_frames_protocol_payload_bytes(&response.outbound_frames);
+                    dfs_network_frames_protocol_payload_bytes(&outbound_frames);
                 dfs_perf_trace(format_args!(
                     "dfs-message-send-async local={} target={} endpoint={} request={} payload_bytes={} outbound_frames={} outbound_payload_bytes={} elapsed_ms={}",
                     source_node_id,
@@ -8926,11 +8920,11 @@ async fn send_dfs_frame_to_endpoint_async(
                     endpoint.address,
                     command.request_id,
                     payload_bytes,
-                    response.outbound_frames.len(),
+                    outbound_frames.len(),
                     outbound_payload_bytes,
                     send_started.elapsed().as_millis()
                 ));
-                return Ok(response.outbound_frames);
+                return Ok(outbound_frames);
             }
             Err(error) => {
                 dfs_perf_trace(format_args!(
@@ -8951,6 +8945,16 @@ async fn send_dfs_frame_to_endpoint_async(
         operation: format!("send DFS message to {target_node_id}"),
         detail: failures.join("; "),
     })
+}
+
+fn dfs_message_response_to_network_frames(
+    response: DfsMessageResponse,
+) -> Result<Vec<NetworkFrame>, NetworkError> {
+    response
+        .outbound_messages
+        .iter()
+        .map(protocol::dfs_protocol_frame_from_routed_message)
+        .collect::<Result<Vec<_>, _>>()
 }
 
 fn dfs_network_frame_protocol_payload_bytes(frame: &NetworkFrame) -> usize {

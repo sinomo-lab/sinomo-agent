@@ -1783,12 +1783,15 @@ impl DfsFuseEndpointTransport {
         for endpoint in &endpoints {
             match send_dfs_message(endpoint, &request, self.timeout) {
                 Ok(response) => {
-                    let response =
-                        dfs::protocol::dfs_message_response_to_protocol_frame_response(response)
-                            .map_err(|source| NetworkError::Serialization {
-                                detail: source.to_string(),
-                            })?;
-                    for returned_frame in response.outbound_frames {
+                    let outbound_frames = response
+                        .outbound_messages
+                        .iter()
+                        .map(dfs::protocol::dfs_protocol_frame_from_routed_message)
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(|source| NetworkError::Serialization {
+                            detail: source.to_string(),
+                        })?;
+                    for returned_frame in outbound_frames {
                         self.deliver_returned_frame(returned_frame)?;
                     }
                     return Ok(());

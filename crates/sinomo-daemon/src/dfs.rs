@@ -7,8 +7,6 @@ use sinomo_core::ClusterEndpointRecord;
 #[cfg(test)]
 use sinomo_dfs::DfsFileSystemConfig;
 #[cfg(test)]
-use sinomo_dfs::protocol::{DfsProtocolFrameCommand, DfsProtocolFrameResponse};
-#[cfg(test)]
 use sinomo_dfs::{
     DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMetadataJournalBatchCommand,
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataJournalBatchSender,
@@ -826,26 +824,16 @@ async fn handle_daemon_dfs_message_async(
 }
 
 #[cfg(test)]
-fn handle_daemon_dfs_protocol_frame_on_runtime(
+fn handle_daemon_dfs_message_on_runtime(
     paths: &DaemonPaths,
-    command: DfsProtocolFrameCommand,
+    command: DfsMessageCommand,
     runtime: &tokio::runtime::Handle,
-) -> Result<DfsProtocolFrameResponse, DaemonError> {
+) -> Result<DfsMessageResponse, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
-    let message_command = DfsMessageCommand {
-        request_id: command.request_id,
-        routed_message: sinomo_dfs::protocol::dfs_routed_message_from_protocol_frame(
-            &command.frame,
-        )?,
-    };
-    let result = process_daemon_dfs_message_command_on_runtime(
-        &data_dir,
-        &cluster_paths,
-        message_command,
-        runtime,
-    )?;
+    let result =
+        process_daemon_dfs_message_command_on_runtime(&data_dir, &cluster_paths, command, runtime)?;
     let Some(result) = result else {
         return Err(DaemonError::ClusterOrphan);
     };
@@ -861,11 +849,10 @@ fn handle_daemon_dfs_protocol_frame_on_runtime(
         daemon_dfs_metadata_replication_options(),
         log_dfs_metadata_replication_report,
         |error| {
-            eprintln!("sinomo daemon DFS metadata publish after protocol mutation failed: {error}");
+            eprintln!("sinomo daemon DFS metadata publish after message mutation failed: {error}");
         },
     );
-    sinomo_dfs::protocol::dfs_message_response_to_protocol_frame_response(message_response)
-        .map_err(DaemonError::from)
+    Ok(message_response)
 }
 
 pub(crate) async fn ensure_default_distributed_dfs_async_on_runtime(
@@ -1046,7 +1033,6 @@ mod tests {
         ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterTransportKind,
         DfsObjectPolicy,
     };
-    use sinomo_dfs::protocol::DfsProtocolFrameCommand;
     use sinomo_dfs::{
         DfsBlobTransferResult, DfsMetadataJournalReplicationOutcome, DfsNamespaceCommand,
         DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNetworkMessage, DfsObjectId,
@@ -1089,6 +1075,17 @@ mod tests {
                         .expect("protocol message"),
                 ),
             },
+        }
+    }
+
+    fn test_dfs_message_command(
+        request_id: impl Into<String>,
+        frame: NetworkFrame,
+    ) -> DfsMessageCommand {
+        DfsMessageCommand {
+            request_id: request_id.into(),
+            routed_message: sinomo_dfs::protocol::dfs_routed_message_from_protocol_frame(&frame)
+                .expect("routed message"),
         }
     }
 
@@ -2840,22 +2837,16 @@ mod tests {
         };
 
         let runtime = daemon_test_runtime("daemon-dfs-protocol-frame-replica-stage");
-        let response = handle_daemon_dfs_protocol_frame_on_runtime(
+        let response = handle_daemon_dfs_message_on_runtime(
             &paths,
-            DfsProtocolFrameCommand {
-                request_id: "dfs_protocol_frame_rpc_1".to_string(),
-                frame,
-            },
+            test_dfs_message_command("dfs_message_rpc_1", frame),
             runtime.handle(),
         )
-        .expect("protocol frame");
+        .expect("DFS message");
 
-        assert_eq!(response.request_id, "dfs_protocol_frame_rpc_1");
-        assert_eq!(response.outbound_frames.len(), 1);
-        let MeshMessageBody::Protocol(protocol) = &response.outbound_frames[0].message.body else {
-            panic!("expected protocol response frame");
-        };
-        let response_message: DfsNetworkMessage = protocol.decode().expect("decode response");
+        assert_eq!(response.request_id, "dfs_message_rpc_1");
+        assert_eq!(response.outbound_messages.len(), 1);
+        let response_message = &response.outbound_messages[0].message;
         assert!(matches!(
             response_message,
             DfsNetworkMessage::StageBlobResponse(response)
@@ -2897,12 +2888,9 @@ mod tests {
         let frame = test_dfs_lookup_frame(&remote, &remote, 1, "/services/daemon-wrong-target.txt");
 
         let runtime = daemon_test_runtime("daemon-dfs-protocol-frame-wrong-target");
-        let error = handle_daemon_dfs_protocol_frame_on_runtime(
+        let error = handle_daemon_dfs_message_on_runtime(
             &paths,
-            DfsProtocolFrameCommand {
-                request_id: "dfs_protocol_frame_rpc_wrong_target".to_string(),
-                frame,
-            },
+            test_dfs_message_command("dfs_message_rpc_wrong_target", frame),
             runtime.handle(),
         )
         .expect_err("wrong target rejected");
@@ -2920,23 +2908,23 @@ mod tests {
         let runtime = daemon_test_runtime("daemon-dfs-protocol-frame-warm-cache");
 
         for frame_id in 1..=2 {
-            let response = handle_daemon_dfs_protocol_frame_on_runtime(
+            let response = handle_daemon_dfs_message_on_runtime(
                 &paths,
-                DfsProtocolFrameCommand {
-                    request_id: format!("dfs_protocol_frame_warm_cache_{frame_id}"),
-                    frame: test_dfs_lookup_frame(
+                test_dfs_message_command(
+                    format!("dfs_message_warm_cache_{frame_id}"),
+                    test_dfs_lookup_frame(
                         &remote,
                         &local,
                         frame_id,
                         &format!("/services/warm-cache-{frame_id}.txt"),
                     ),
-                },
+                ),
                 runtime.handle(),
             )
-            .expect("protocol frame");
+            .expect("DFS message");
             assert_eq!(
                 response.request_id,
-                format!("dfs_protocol_frame_warm_cache_{frame_id}")
+                format!("dfs_message_warm_cache_{frame_id}")
             );
         }
 
@@ -2957,16 +2945,16 @@ mod tests {
             &remote,
             "10.77.0.2:21353",
         );
-        let response = handle_daemon_dfs_protocol_frame_on_runtime(
+        let response = handle_daemon_dfs_message_on_runtime(
             &paths,
-            DfsProtocolFrameCommand {
-                request_id: "dfs_protocol_frame_warm_cache_3".to_string(),
-                frame: test_dfs_lookup_frame(&remote, &local, 3, "/services/warm-cache-3.txt"),
-            },
+            test_dfs_message_command(
+                "dfs_message_warm_cache_3",
+                test_dfs_lookup_frame(&remote, &local, 3, "/services/warm-cache-3.txt"),
+            ),
             runtime.handle(),
         )
-        .expect("third protocol frame");
-        assert_eq!(response.request_id, "dfs_protocol_frame_warm_cache_3");
+        .expect("third DFS message");
+        assert_eq!(response.request_id, "dfs_message_warm_cache_3");
         let second_refresh = primary_service
             .lock()
             .expect("primary service lock")
