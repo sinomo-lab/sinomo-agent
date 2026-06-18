@@ -1821,16 +1821,15 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
             })
         }
 
-        fn relay_rpc_to_node(
+        fn send_object_rpc_to_node(
             &mut self,
             _state: &ClusterBootstrapState,
             _target_node_id: &NodeId,
-            _peer: &ClusterEndpointRecord,
             _request: &network::ObjectRpcRequest,
             _timeout: Duration,
         ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
             Err(unsupported_join_reconciliation_transport(
-                "cluster join relay rpc",
+                "cluster join node rpc",
             ))
         }
     }

@@ -20,10 +20,10 @@ use sinomo_dfs::{
     DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture,
     DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions,
     DfsEndpointServedProtocolFrameTransport, DfsEndpointTransport, DfsMaintenanceTickOptions,
-    DfsMetadataBackend, DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
+    DfsMessageCommand, DfsMessageResponse, DfsMessageSender, DfsMetadataBackend,
+    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
     DfsMetadataPublishScheduleOptions, DfsObjectRpcSendOptions, DfsPeerTransport,
-    DfsPeerTransportError, DfsProtocolFrameCommand, DfsProtocolFrameResponse,
-    DfsProtocolFrameSender, NetworkedDfsService,
+    DfsPeerTransportError, DfsProtocolFrameCommand, DfsProtocolFrameResponse, NetworkedDfsService,
 };
 use sinomo_kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_local::SinomoDataDir;
@@ -241,6 +241,19 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
         })
     }
 
+    fn handle_message<'a>(
+        &'a self,
+        command: DfsMessageCommand,
+    ) -> DfsDataPlaneHostFuture<'a, DfsMessageResponse> {
+        let paths = self.paths.clone();
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            handle_daemon_dfs_message_async(&paths, command, &runtime)
+                .await
+                .map_err(daemon_dfs_data_plane_error)
+        })
+    }
+
     fn handle_protocol_frame<'a>(
         &'a self,
         command: DfsProtocolFrameCommand,
@@ -289,12 +302,13 @@ pub(crate) fn daemon_dfs_endpoint_transport(
     local_node_id: sinomo_node::NodeId,
     endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
 ) -> DfsEndpointTransport {
-    DfsEndpointTransport::new(
+    DfsEndpointTransport::with_message_sender(
         local_node_id,
         endpoints,
+        sinomo_dfs::DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT,
         Arc::new(|_endpoint, _command, _timeout| {
             Err(DfsPeerTransportError::new(
-                "local-only DFS endpoint transport cannot send without the daemon-owned Tokio runtime",
+                "local-only DFS message transport cannot send without the daemon-owned Tokio runtime",
             ))
         }),
     )
@@ -306,13 +320,13 @@ pub(crate) fn daemon_dfs_endpoint_transport_on_runtime(
     runtime: &tokio::runtime::Handle,
 ) -> DfsEndpointTransport {
     let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(runtime);
-    DfsEndpointTransport::new_with_peer_senders(
+    DfsEndpointTransport::new_with_message_peer_senders(
         local_node_id,
         endpoints,
-        sinomo_dfs::dfs_protocol_frame_sender_from_peer_transport(Arc::clone(&peer_transport)),
-        sinomo_dfs::async_dfs_protocol_frame_sender_from_peer_transport(
-            daemon_dfs_async_peer_transport(runtime),
-        ),
+        sinomo_dfs::dfs_message_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        sinomo_dfs::async_dfs_message_sender_from_peer_transport(daemon_dfs_async_peer_transport(
+            runtime,
+        )),
         sinomo_dfs::dfs_direct_read_sender_from_peer_transport(peer_transport),
     )
 }
@@ -386,10 +400,8 @@ fn daemon_dfs_async_peer_transport(
     })
 }
 
-fn daemon_dfs_protocol_frame_sender_on_runtime(
-    runtime: &tokio::runtime::Handle,
-) -> DfsProtocolFrameSender {
-    sinomo_dfs::dfs_protocol_frame_sender_from_peer_transport(
+fn daemon_dfs_message_sender_on_runtime(runtime: &tokio::runtime::Handle) -> DfsMessageSender {
+    sinomo_dfs::dfs_message_sender_from_peer_transport(
         daemon_dfs_blocking_peer_transport_on_runtime(runtime),
     )
 }
@@ -584,10 +596,10 @@ fn open_daemon_dfs_protocol_frame_service_lane(
     let content = sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
     let metadata_backend =
         sinomo_dfs::open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
-    let transport = DfsEndpointServedProtocolFrameTransport::new(
+    let transport = DfsEndpointServedProtocolFrameTransport::new_with_message_sender(
         local_node_id.clone(),
         endpoints,
-        daemon_dfs_protocol_frame_sender_on_runtime(runtime),
+        daemon_dfs_message_sender_on_runtime(runtime),
         sinomo_dfs::DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT,
     );
     let service = NetworkedDfsService::new(transport, content);
@@ -806,6 +818,19 @@ async fn handle_daemon_dfs_protocol_frame_async(
         trace_started.elapsed().as_millis()
     ));
     Ok(response)
+}
+
+async fn handle_daemon_dfs_message_async(
+    paths: &DaemonPaths,
+    command: DfsMessageCommand,
+    runtime: &tokio::runtime::Handle,
+) -> Result<DfsMessageResponse, DaemonError> {
+    let frame_command = sinomo_dfs::dfs_message_command_to_protocol_frame_command(command)
+        .map_err(DaemonError::from)?;
+    let frame_response =
+        handle_daemon_dfs_protocol_frame_async(paths, frame_command, runtime).await?;
+    sinomo_dfs::dfs_protocol_frame_response_to_message_response(frame_response)
+        .map_err(DaemonError::from)
 }
 
 #[cfg(test)]

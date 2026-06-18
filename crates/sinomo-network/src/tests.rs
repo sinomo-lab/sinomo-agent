@@ -9074,10 +9074,9 @@ struct RecordingKvTxnForwardHost {
     direct_error: bool,
     snapshot: KvSnapshot,
     txn_response: KvTxnResponse,
-    relay_peers: Vec<ClusterEndpointRecord>,
     direct_sends: Vec<NodeId>,
     snapshot_fetches: Vec<NodeId>,
-    relays: Vec<(NodeId, NodeId, String)>,
+    node_rpcs: Vec<(NodeId, String)>,
 }
 
 impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
@@ -9114,27 +9113,15 @@ impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
         Ok(self.snapshot.clone())
     }
 
-    fn relay_peers(
-        &mut self,
-        _paths: &ClusterPaths,
-        _state: &ClusterBootstrapState,
-    ) -> Vec<ClusterEndpointRecord> {
-        self.relay_peers.clone()
-    }
-
-    fn relay_rpc_to_node(
+    fn send_object_rpc_to_node(
         &mut self,
         _state: &ClusterBootstrapState,
         target_node_id: &NodeId,
-        peer: &ClusterEndpointRecord,
         request: &ObjectRpcRequest,
         _timeout: Duration,
     ) -> Result<ObjectRpcResponse, NetworkError> {
-        self.relays.push((
-            target_node_id.clone(),
-            peer.node_id.clone(),
-            request.route.clone(),
-        ));
+        self.node_rpcs
+            .push((target_node_id.clone(), request.route.clone()));
         match request.route.as_str() {
             CLUSTER_KV_TXN_ROUTE => {
                 let payload = sinomo_kv::cluster_kv_txn_response_rpc_payload(&self.txn_response)?;
@@ -9426,7 +9413,7 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
     #[derive(Default)]
     struct RecordingMembershipTransport {
         sent: Vec<(NodeId, Duration, String)>,
-        relayed: Vec<(NodeId, NodeId, Duration, String)>,
+        node_rpcs: Vec<(NodeId, Duration, String)>,
         connectivity: Vec<(NodeId, ClusterConnectivityState, Option<u64>)>,
     }
 
@@ -9490,20 +9477,15 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
             ObjectRpcResponse::encode_body(request.route.clone(), &())
         }
 
-        fn relay_rpc_to_node(
+        fn send_object_rpc_to_node(
             &mut self,
             _state: &ClusterBootstrapState,
             target_node_id: &NodeId,
-            peer: &ClusterEndpointRecord,
             request: &ObjectRpcRequest,
             timeout: Duration,
         ) -> Result<ObjectRpcResponse, NetworkError> {
-            self.relayed.push((
-                target_node_id.clone(),
-                peer.node_id.clone(),
-                timeout,
-                request.route.clone(),
-            ));
+            self.node_rpcs
+                .push((target_node_id.clone(), timeout, request.route.clone()));
             ObjectRpcResponse::encode_body(request.route.clone(), &())
         }
 
@@ -9539,7 +9521,7 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
     let root = sinomo_testdir::TestDir::new("sinomo-network-membership-driver");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
-    let voter_endpoint = daemon_lan_endpoint(&voter, "10.81.0.2:21353".to_string(), 10);
+    let _voter_endpoint = daemon_lan_endpoint(&voter, "10.81.0.2:21353".to_string(), 10);
     let peer_endpoint = daemon_lan_endpoint(&peer, "10.81.0.3:21353".to_string(), 20);
     let request = ObjectRpcRequest::encode_body(
         CLUSTER_JOIN_REGISTER_ROUTE,
@@ -9553,16 +9535,13 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
     let mut driver =
         ClusterControlPlaneDriver::with_timeouts(RecordingMembershipTransport::default(), timeouts);
 
-    ClusterMembershipRpcForwardHost::send_membership_rpc(&mut driver, &voter_endpoint, &request)
-        .expect("send membership rpc");
-    ClusterMembershipRpcForwardHost::relay_membership_rpc_to_voter_via_peer(
+    ClusterMembershipRpcForwardHost::send_membership_rpc_to_node(
         &mut driver,
         &state,
-        &voter_endpoint,
-        &peer_endpoint,
+        &voter,
         &request,
     )
-    .expect("relay membership rpc");
+    .expect("send membership node rpc");
     ClusterJoinRegistrationHost::remember_successful_join_endpoint(
         &mut driver,
         &paths,
@@ -9572,19 +9551,11 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
     .expect("remember endpoint");
 
     let transport = driver.into_transport();
+    assert!(transport.sent.is_empty());
     assert_eq!(
-        transport.sent,
-        vec![(
-            voter.clone(),
-            membership_timeout,
-            CLUSTER_JOIN_REGISTER_ROUTE.to_string(),
-        )]
-    );
-    assert_eq!(
-        transport.relayed,
+        transport.node_rpcs,
         vec![(
             voter,
-            peer.clone(),
             membership_timeout,
             CLUSTER_JOIN_REGISTER_ROUTE.to_string(),
         )]
@@ -9657,15 +9628,14 @@ fn cluster_join_registration_driver_uses_local_membership_observer() {
             panic!("local observation should not send membership rpc")
         }
 
-        fn relay_rpc_to_node(
+        fn send_object_rpc_to_node(
             &mut self,
             _state: &ClusterBootstrapState,
             _target_node_id: &NodeId,
-            _peer: &ClusterEndpointRecord,
             _request: &ObjectRpcRequest,
             _timeout: Duration,
         ) -> Result<ObjectRpcResponse, NetworkError> {
-            panic!("local observation should not relay membership rpc")
+            panic!("local observation should not send node rpc")
         }
     }
 
@@ -9788,15 +9758,14 @@ fn cluster_member_mutation_driver_prepares_state_from_local_membership_observer(
             panic!("membership preparation should not send membership rpc")
         }
 
-        fn relay_rpc_to_node(
+        fn send_object_rpc_to_node(
             &mut self,
             _state: &ClusterBootstrapState,
             _target_node_id: &NodeId,
-            _peer: &ClusterEndpointRecord,
             _request: &ObjectRpcRequest,
             _timeout: Duration,
         ) -> Result<ObjectRpcResponse, NetworkError> {
-            panic!("membership preparation should not relay membership rpc")
+            panic!("membership preparation should not send node rpc")
         }
     }
 
@@ -9953,15 +9922,14 @@ fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
             panic!("cache hook test should not send membership rpc")
         }
 
-        fn relay_rpc_to_node(
+        fn send_object_rpc_to_node(
             &mut self,
             _state: &ClusterBootstrapState,
             _target_node_id: &NodeId,
-            _peer: &ClusterEndpointRecord,
             _request: &ObjectRpcRequest,
             _timeout: Duration,
         ) -> Result<ObjectRpcResponse, NetworkError> {
-            panic!("cache hook test should not relay rpc")
+            panic!("cache hook test should not send node rpc")
         }
 
         fn published_network_info_matches(
@@ -10864,10 +10832,9 @@ fn cluster_kv_txn_forward_driver_prefers_known_leader_and_fetches_snapshot() {
         direct_error: false,
         snapshot: snapshot.clone(),
         txn_response: txn_response.clone(),
-        relay_peers: Vec::new(),
         direct_sends: Vec::new(),
         snapshot_fetches: Vec::new(),
-        relays: Vec::new(),
+        node_rpcs: Vec::new(),
     };
 
     let result = forward_cluster_kv_txn_to_voter_with_host(
@@ -10892,19 +10859,19 @@ fn cluster_kv_txn_forward_driver_prefers_known_leader_and_fetches_snapshot() {
     assert_eq!(result.txn_response, Some(txn_response));
     assert_eq!(host.direct_sends, vec![peer_node_id.clone()]);
     assert_eq!(host.snapshot_fetches, vec![peer_node_id]);
-    assert!(host.relays.is_empty());
+    assert!(host.node_rpcs.is_empty());
 }
 
 #[test]
-fn cluster_kv_txn_forward_driver_relays_after_direct_voter_failure() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-forward-relay");
+fn cluster_kv_txn_forward_driver_uses_node_rpc_after_direct_voter_failure() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-forward-node-rpc");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
     let (mut state, _local_node_id, peer_node_id) = cluster_raft_handler_test_state(
-        "cluster_kv_forward_relay",
-        "node_kv_forward_relay_local",
-        "node_kv_forward_relay_voter",
+        "cluster_kv_forward_node_rpc",
+        "node_kv_forward_node_rpc_local",
+        "node_kv_forward_node_rpc_voter",
     );
     state
         .members
@@ -10918,19 +10885,16 @@ fn cluster_kv_txn_forward_driver_relays_after_direct_voter_failure() {
             10,
         ));
     write_cluster_state(&paths, &state).expect("write state");
-    let bridge_node_id = NodeId::from_legacy_named("node_kv_forward_relay_bridge").expect("bridge");
-    let bridge = daemon_lan_endpoint(&bridge_node_id, "10.0.0.86:21353".to_string(), 20);
-    let snapshot = forward_test_snapshot("/forward/relay", b"relay");
+    let snapshot = forward_test_snapshot("/forward/node-rpc", b"node-rpc");
     let txn_response = forward_test_txn_response(snapshot.revision);
     let mut host = RecordingKvTxnForwardHost {
         known_leader: None,
         direct_error: true,
         snapshot: snapshot.clone(),
         txn_response: txn_response.clone(),
-        relay_peers: vec![bridge.clone()],
         direct_sends: Vec::new(),
         snapshot_fetches: Vec::new(),
-        relays: Vec::new(),
+        node_rpcs: Vec::new(),
     };
 
     let result = forward_cluster_kv_txn_to_voter_with_host(
@@ -10956,18 +10920,10 @@ fn cluster_kv_txn_forward_driver_relays_after_direct_voter_failure() {
     assert_eq!(host.direct_sends, vec![peer_node_id.clone()]);
     assert!(host.snapshot_fetches.is_empty());
     assert_eq!(
-        host.relays,
+        host.node_rpcs,
         vec![
-            (
-                peer_node_id.clone(),
-                bridge_node_id.clone(),
-                CLUSTER_KV_TXN_ROUTE.to_string()
-            ),
-            (
-                peer_node_id,
-                bridge_node_id,
-                CLUSTER_KV_SNAPSHOT_ROUTE.to_string()
-            )
+            (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
+            (peer_node_id, CLUSTER_KV_SNAPSHOT_ROUTE.to_string())
         ]
     );
 }
@@ -12086,22 +12042,13 @@ struct RecordingJoinRegistrationHost {
 }
 
 impl ClusterMembershipRpcForwardHost for RecordingJoinRegistrationHost {
-    fn send_membership_rpc(
-        &mut self,
-        _endpoint: &ClusterEndpointRecord,
-        _request: &ObjectRpcRequest,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        panic!("voter-local join registration should not forward membership RPCs")
-    }
-
-    fn relay_membership_rpc_to_voter_via_peer(
+    fn send_membership_rpc_to_node(
         &mut self,
         _state: &ClusterBootstrapState,
-        _voter: &ClusterEndpointRecord,
-        _peer: &ClusterEndpointRecord,
+        _target_node_id: &NodeId,
         _request: &ObjectRpcRequest,
     ) -> Result<ObjectRpcResponse, NetworkError> {
-        panic!("voter-local join registration should not relay membership RPCs")
+        panic!("voter-local join registration should not forward membership node RPCs")
     }
 }
 
@@ -12136,24 +12083,15 @@ impl ClusterJoinRegistrationHost for RecordingJoinRegistrationHost {
 }
 
 impl ClusterMembershipRpcAsyncForwardHost for RecordingJoinRegistrationHost {
-    fn send_membership_rpc_async<'a>(
+    fn send_membership_rpc_to_node_async<'a>(
         &'a mut self,
-        _endpoint: &'a ClusterEndpointRecord,
+        _state: &'a ClusterBootstrapState,
+        _target_node_id: &'a NodeId,
         _request: &'a ObjectRpcRequest,
     ) -> ClusterMembershipRpcFuture<'a, ObjectRpcResponse> {
         Box::pin(async {
-            panic!("voter-local join registration should not forward membership RPCs")
+            panic!("voter-local join registration should not forward membership node RPCs")
         })
-    }
-
-    fn relay_membership_rpc_to_voter_via_peer_async<'a>(
-        &'a mut self,
-        _state: &'a ClusterBootstrapState,
-        _voter: &'a ClusterEndpointRecord,
-        _peer: &'a ClusterEndpointRecord,
-        _request: &'a ObjectRpcRequest,
-    ) -> ClusterMembershipRpcFuture<'a, ObjectRpcResponse> {
-        Box::pin(async { panic!("voter-local join registration should not relay membership RPCs") })
     }
 }
 
@@ -12199,22 +12137,13 @@ struct RecordingJoinEndpointHost {
 }
 
 impl ClusterMembershipRpcForwardHost for RecordingJoinEndpointHost {
-    fn send_membership_rpc(
-        &mut self,
-        _endpoint: &ClusterEndpointRecord,
-        _request: &ObjectRpcRequest,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        panic!("default target remembering should not send membership RPCs")
-    }
-
-    fn relay_membership_rpc_to_voter_via_peer(
+    fn send_membership_rpc_to_node(
         &mut self,
         _state: &ClusterBootstrapState,
-        _voter: &ClusterEndpointRecord,
-        _peer: &ClusterEndpointRecord,
+        _target_node_id: &NodeId,
         _request: &ObjectRpcRequest,
     ) -> Result<ObjectRpcResponse, NetworkError> {
-        panic!("default target remembering should not relay membership RPCs")
+        panic!("default target remembering should not send membership node RPCs")
     }
 }
 
@@ -13037,15 +12966,14 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
             }
         }
 
-        fn relay_rpc_to_node(
+        fn send_object_rpc_to_node(
             &mut self,
             _state: &ClusterBootstrapState,
             _target_node_id: &NodeId,
-            _peer: &ClusterEndpointRecord,
             _request: &ObjectRpcRequest,
             _timeout: Duration,
         ) -> Result<ObjectRpcResponse, NetworkError> {
-            panic!("join reconciliation should not relay rpc")
+            panic!("join reconciliation should not send node rpc")
         }
 
         fn record_endpoint_command_connectivity(
@@ -13230,34 +13158,19 @@ fn join_voter_targets_do_not_filter_offline_status_during_bootstrap() {
 }
 
 #[test]
-fn membership_forwarding_tries_voter_then_peer_relay() {
+fn membership_forwarding_uses_single_voter_node_rpc() {
     struct RecordingForwardHost {
-        direct: Vec<NodeId>,
-        relays: Vec<(NodeId, NodeId)>,
+        node_rpcs: Vec<NodeId>,
     }
 
     impl ClusterMembershipRpcForwardHost for RecordingForwardHost {
-        fn send_membership_rpc(
-            &mut self,
-            endpoint: &ClusterEndpointRecord,
-            _request: &ObjectRpcRequest,
-        ) -> Result<ObjectRpcResponse, NetworkError> {
-            self.direct.push(endpoint.node_id.clone());
-            Err(NetworkError::Io {
-                operation: "test direct membership rpc".to_string(),
-                detail: "offline".to_string(),
-            })
-        }
-
-        fn relay_membership_rpc_to_voter_via_peer(
+        fn send_membership_rpc_to_node(
             &mut self,
             _state: &ClusterBootstrapState,
-            voter: &ClusterEndpointRecord,
-            peer: &ClusterEndpointRecord,
+            target_node_id: &NodeId,
             _request: &ObjectRpcRequest,
         ) -> Result<ObjectRpcResponse, NetworkError> {
-            self.relays
-                .push((voter.node_id.clone(), peer.node_id.clone()));
+            self.node_rpcs.push(target_node_id.clone());
             ObjectRpcResponse::encode_body(CLUSTER_JOIN_REGISTER_ROUTE, &())
         }
     }
@@ -13322,8 +13235,7 @@ fn membership_forwarding_tries_voter_then_peer_relay() {
     )
     .expect("encode request");
     let mut host = RecordingForwardHost {
-        direct: Vec::new(),
-        relays: Vec::new(),
+        node_rpcs: Vec::new(),
     };
 
     forward_cluster_membership_rpc_to_voter_with_host(
@@ -13335,75 +13247,40 @@ fn membership_forwarding_tries_voter_then_peer_relay() {
     )
     .expect("forward response");
 
-    assert_eq!(host.direct, vec![voter_node.clone()]);
-    assert_eq!(host.relays, vec![(voter_node, peer_node)]);
+    assert_eq!(host.node_rpcs, vec![voter_node]);
+    assert_ne!(peer_node, state.local_node_id);
 }
 
 #[test]
 fn join_challenge_forwarding_uses_membership_voter_policy() {
     struct RecordingForwardHost {
-        direct: Vec<NodeId>,
-        relays: Vec<(NodeId, NodeId)>,
+        node_rpcs: Vec<NodeId>,
     }
 
     impl ClusterMembershipRpcForwardHost for RecordingForwardHost {
-        fn send_membership_rpc(
-            &mut self,
-            endpoint: &ClusterEndpointRecord,
-            request: &ObjectRpcRequest,
-        ) -> Result<ObjectRpcResponse, NetworkError> {
-            assert_eq!(request.route, CLUSTER_JOIN_CHALLENGE_ROUTE);
-            assert_eq!(request.category, CLUSTER_MEMBERSHIP_RPC_CATEGORY);
-            self.direct.push(endpoint.node_id.clone());
-            Err(NetworkError::Io {
-                operation: "test join challenge direct rpc".to_string(),
-                detail: "offline".to_string(),
-            })
-        }
-
-        fn relay_membership_rpc_to_voter_via_peer(
+        fn send_membership_rpc_to_node(
             &mut self,
             _state: &ClusterBootstrapState,
-            voter: &ClusterEndpointRecord,
-            peer: &ClusterEndpointRecord,
+            target_node_id: &NodeId,
             request: &ObjectRpcRequest,
         ) -> Result<ObjectRpcResponse, NetworkError> {
             assert_eq!(request.route, CLUSTER_JOIN_CHALLENGE_ROUTE);
             assert_eq!(request.category, CLUSTER_MEMBERSHIP_RPC_CATEGORY);
-            self.relays
-                .push((voter.node_id.clone(), peer.node_id.clone()));
+            self.node_rpcs.push(target_node_id.clone());
             ObjectRpcResponse::encode_body(CLUSTER_JOIN_CHALLENGE_ROUTE, &"proof".to_string())
         }
     }
 
     impl ClusterMembershipRpcAsyncForwardHost for RecordingForwardHost {
-        fn send_membership_rpc_async<'a>(
-            &'a mut self,
-            endpoint: &'a ClusterEndpointRecord,
-            request: &'a ObjectRpcRequest,
-        ) -> ClusterMembershipRpcFuture<'a, ObjectRpcResponse> {
-            assert_eq!(request.route, CLUSTER_JOIN_CHALLENGE_ROUTE);
-            assert_eq!(request.category, CLUSTER_MEMBERSHIP_RPC_CATEGORY);
-            self.direct.push(endpoint.node_id.clone());
-            Box::pin(async {
-                Err(NetworkError::Io {
-                    operation: "test join challenge direct rpc".to_string(),
-                    detail: "offline".to_string(),
-                })
-            })
-        }
-
-        fn relay_membership_rpc_to_voter_via_peer_async<'a>(
+        fn send_membership_rpc_to_node_async<'a>(
             &'a mut self,
             _state: &'a ClusterBootstrapState,
-            voter: &'a ClusterEndpointRecord,
-            peer: &'a ClusterEndpointRecord,
+            target_node_id: &'a NodeId,
             request: &'a ObjectRpcRequest,
         ) -> ClusterMembershipRpcFuture<'a, ObjectRpcResponse> {
             assert_eq!(request.route, CLUSTER_JOIN_CHALLENGE_ROUTE);
             assert_eq!(request.category, CLUSTER_MEMBERSHIP_RPC_CATEGORY);
-            self.relays
-                .push((voter.node_id.clone(), peer.node_id.clone()));
+            self.node_rpcs.push(target_node_id.clone());
             Box::pin(async {
                 ObjectRpcResponse::encode_body(CLUSTER_JOIN_CHALLENGE_ROUTE, &"proof".to_string())
             })
@@ -13465,8 +13342,7 @@ fn join_challenge_forwarding_uses_membership_voter_policy() {
 
     let request = cluster_join_challenge_rpc_request(&"challenge").expect("join challenge request");
     let mut host = RecordingForwardHost {
-        direct: Vec::new(),
-        relays: Vec::new(),
+        node_rpcs: Vec::new(),
     };
 
     let response =
@@ -13475,16 +13351,14 @@ fn join_challenge_forwarding_uses_membership_voter_policy() {
     let proof: String = response.decode_body().expect("proof body");
 
     assert_eq!(proof, "proof");
-    assert_eq!(host.direct, vec![voter_node.clone()]);
-    assert_eq!(host.relays, vec![(voter_node.clone(), peer_node.clone())]);
+    assert_eq!(host.node_rpcs, vec![voter_node.clone()]);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("runtime");
     let mut async_host = RecordingForwardHost {
-        direct: Vec::new(),
-        relays: Vec::new(),
+        node_rpcs: Vec::new(),
     };
     let async_response = runtime
         .block_on(forward_cluster_join_challenge_rpc_to_voter_async_with_host(
@@ -13496,8 +13370,8 @@ fn join_challenge_forwarding_uses_membership_voter_policy() {
         .expect("async forward join challenge");
     let async_proof: String = async_response.decode_body().expect("async proof body");
     assert_eq!(async_proof, "proof");
-    assert_eq!(async_host.direct, vec![voter_node.clone()]);
-    assert_eq!(async_host.relays, vec![(voter_node, peer_node)]);
+    assert_eq!(async_host.node_rpcs, vec![voter_node]);
+    assert_ne!(peer_node, state.local_node_id);
 }
 
 #[test]
@@ -15899,25 +15773,14 @@ impl ClusterMemberMutationAsyncHost for RecordingClusterMemberPublishHost {
 struct UnusedClusterJoinRegistrationHost;
 
 impl ClusterMembershipRpcForwardHost for UnusedClusterJoinRegistrationHost {
-    fn send_membership_rpc(
+    fn send_membership_rpc_to_node(
         &mut self,
-        _endpoint: &ClusterEndpointRecord,
+        _state: &ClusterBootstrapState,
+        _target_node_id: &NodeId,
         _request: &ObjectRpcRequest,
     ) -> Result<ObjectRpcResponse, NetworkError> {
         Err(NetworkError::InvalidClusterCommand {
             detail: "unused membership forward host".to_string(),
-        })
-    }
-
-    fn relay_membership_rpc_to_voter_via_peer(
-        &mut self,
-        _state: &ClusterBootstrapState,
-        _voter: &ClusterEndpointRecord,
-        _peer: &ClusterEndpointRecord,
-        _request: &ObjectRpcRequest,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        Err(NetworkError::InvalidClusterCommand {
-            detail: "unused membership relay host".to_string(),
         })
     }
 }
@@ -30257,14 +30120,13 @@ fn local_member_publish_forced_sync_publishes_even_when_records_current() {
 }
 
 #[derive(Default)]
-struct RelayOnlySnapshotRefreshHost {
-    relay_peer: Option<ClusterEndpointRecord>,
-    relay_snapshot: Option<KvSnapshot>,
+struct NodeOnlySnapshotRefreshHost {
+    node_snapshot: Option<KvSnapshot>,
     direct_fetches: usize,
-    relay_calls: usize,
+    node_calls: usize,
 }
 
-impl ClusterKvSnapshotRefreshHost for RelayOnlySnapshotRefreshHost {
+impl ClusterKvSnapshotRefreshHost for NodeOnlySnapshotRefreshHost {
     fn known_raft_leader_id(
         &mut self,
         _paths: &ClusterPaths,
@@ -30294,26 +30156,18 @@ impl ClusterKvSnapshotRefreshHost for RelayOnlySnapshotRefreshHost {
         Ok(false)
     }
 
-    fn relay_peers(
-        &mut self,
-        _paths: &ClusterPaths,
-        _state: &ClusterBootstrapState,
-    ) -> Vec<ClusterEndpointRecord> {
-        self.relay_peer.iter().cloned().collect()
-    }
-
-    fn relay_rpc_to_node(
+    fn send_object_rpc_to_node(
         &mut self,
         _state: &ClusterBootstrapState,
-        _target_node_id: &NodeId,
-        _peer: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         request: &ObjectRpcRequest,
         _timeout: Duration,
     ) -> Result<ObjectRpcResponse, NetworkError> {
-        self.relay_calls += 1;
+        self.node_calls += 1;
+        assert!(!target_node_id.as_str().is_empty());
         assert_eq!(request.route, sinomo_kv::CLUSTER_KV_SNAPSHOT_ROUTE);
         let payload = sinomo_kv::cluster_kv_snapshot_response_rpc_payload(
-            self.relay_snapshot.as_ref().expect("relay snapshot"),
+            self.node_snapshot.as_ref().expect("node snapshot"),
         )?;
         Ok(ObjectRpcResponse::from_encoded_body(
             payload.route,
@@ -30323,8 +30177,8 @@ impl ClusterKvSnapshotRefreshHost for RelayOnlySnapshotRefreshHost {
 }
 
 #[test]
-fn refresh_current_cluster_kv_store_falls_back_to_relayed_snapshot_fetch() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-refresh-relay-fallback");
+fn refresh_current_cluster_kv_store_falls_back_to_node_snapshot_fetch() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-refresh-node-fallback");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -30333,7 +30187,6 @@ fn refresh_current_cluster_kv_store_falls_back_to_relayed_snapshot_fetch() {
         ClusterId::from_legacy_named("cluster_refresh_relay_fallback").expect("cluster");
     let local = NodeId::from_legacy_named("node_refresh_relay_fallback").expect("local");
     let voter = NodeId::from_legacy_named("node_refresh_relay_fallback_voter").expect("voter");
-    let bridge = NodeId::from_legacy_named("node_refresh_relay_fallback_bridge").expect("bridge");
     let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id.clone(),
         "refresh relay fallback",
@@ -30362,17 +30215,12 @@ fn refresh_current_cluster_kv_store_falls_back_to_relayed_snapshot_fetch() {
     write_cluster_state(&paths, &state).expect("write state");
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot()).expect("empty snapshot");
 
-    let mut relayed_store = InProcessKvStore::new();
-    relayed_store
+    let mut node_store = InProcessKvStore::new();
+    node_store
         .put("/kv/relay/imported", b"ok".to_vec(), None)
         .expect("relayed marker");
-    let mut host = RelayOnlySnapshotRefreshHost {
-        relay_peer: Some(daemon_lan_endpoint(
-            &bridge,
-            "10.49.2.8:21353".to_string(),
-            10,
-        )),
-        relay_snapshot: Some(relayed_store.snapshot()),
+    let mut host = NodeOnlySnapshotRefreshHost {
+        node_snapshot: Some(node_store.snapshot()),
         ..Default::default()
     };
 
@@ -30385,7 +30233,7 @@ fn refresh_current_cluster_kv_store_falls_back_to_relayed_snapshot_fetch() {
     .expect("refresh with relay fallback");
 
     assert!(host.direct_fetches > 0, "direct fetch must be attempted");
-    assert_eq!(host.relay_calls, 1, "relay fallback must run exactly once");
+    assert_eq!(host.node_calls, 1, "node fallback must run exactly once");
     assert!(store.snapshot().get("/kv/relay/imported").is_some());
     assert!(
         read_cluster_kv_current_snapshot(&paths)

@@ -1558,34 +1558,138 @@ impl network::ClusterKvTxnForwardHost for DfsFuseClusterKvTxnForwardHost {
         sinomo_runtime::kv::decode_cluster_kv_snapshot_rpc_body(&response.body).map_err(Into::into)
     }
 
-    fn relay_peers(
-        &mut self,
-        paths: &network::ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Vec<ClusterEndpointRecord> {
-        network::cluster_endpoint_targets(
-            paths,
-            state,
-            network::ClusterEndpointSelectionPurpose::MemberPublish,
-        )
-    }
-
-    fn relay_rpc_to_node(
+    fn send_object_rpc_to_node(
         &mut self,
         state: &ClusterBootstrapState,
         target_node_id: &NodeId,
-        peer: &ClusterEndpointRecord,
         request: &network::ObjectRpcRequest,
         timeout: Duration,
     ) -> std::result::Result<network::ObjectRpcResponse, NetworkError> {
-        let signed = daemon::sign_daemon_rpc_request_for_local_node(request)
-            .map_err(|error| dfs_fuse_network_error("cluster relay sign inner", error))?;
-        let inner = request.clone().with_auth(signed);
-        let outer =
-            network::RelayEnvelope::new(state.cluster_id.clone(), target_node_id.clone(), inner)
-                .into_request()?;
-        daemon::send_daemon_rpc_to_endpoint(peer, &outer, timeout)
-            .map_err(|error| dfs_fuse_network_error("cluster relay", error))
+        let data_dir = SinomoDataDir::from_env_or_home().map_err(|error| NetworkError::Io {
+            operation: "dfs fuse cluster paths".to_string(),
+            detail: error.to_string(),
+        })?;
+        let paths = network::ClusterPaths::new(&data_dir);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| NetworkError::Io {
+                operation: "dfs fuse node object rpc runtime".to_string(),
+                detail: error.to_string(),
+            })?;
+        let mut host = DfsFuseSignedObjectRpcHost {
+            paths: paths.clone(),
+            cluster_id: state.cluster_id.clone(),
+        };
+        let options = network::ClusterObjectRpcNodeOptions::new(
+            network::ClusterEndpointSelectionPurpose::VoterCommand,
+            network::DaemonRpcTimeouts::connect_and_idle(timeout),
+        );
+        let result = runtime.block_on(network::call_object_rpc_node_from_paths_async_with_host(
+            runtime.handle(),
+            &paths,
+            state,
+            target_node_id,
+            request,
+            options,
+            &mut host,
+        ));
+        runtime.shutdown_timeout(Duration::from_millis(250));
+        result
+    }
+}
+
+struct DfsFuseSignedObjectRpcHost {
+    paths: network::ClusterPaths,
+    cluster_id: network::ClusterId,
+}
+
+impl network::ClusterSignedEndpointRpcAsyncHost for DfsFuseSignedObjectRpcHost {
+    fn sign_endpoint_rpc_request_async<'a>(
+        &'a mut self,
+        request: &'a network::ObjectRpcRequest,
+    ) -> network::ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
+        Box::pin(async move {
+            daemon::sign_daemon_rpc_request_for_local_node(request)
+                .map_err(|error| dfs_fuse_network_error("dfs fuse endpoint rpc signing", error))
+        })
+    }
+
+    fn try_gateway_signed_rpc_async<'a>(
+        &'a mut self,
+        _endpoint: &'a ClusterEndpointRecord,
+        _request: &'a network::ObjectRpcRequest,
+        _request_auth: &'a [u8],
+        _timeouts: network::DaemonRpcTimeouts,
+    ) -> network::ClusterSignedEndpointRpcFuture<'a, Option<network::ObjectRpcResponse>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn endpoint_prefers_relay_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+    ) -> network::ClusterSignedEndpointRpcFuture<'a, bool> {
+        Box::pin(async move {
+            Ok(network::cluster_endpoint_prefers_relay(
+                &self.paths,
+                endpoint,
+            ))
+        })
+    }
+
+    fn endpoint_rpc_cluster_id_async<'a>(
+        &'a mut self,
+        _endpoint: &'a ClusterEndpointRecord,
+    ) -> network::ClusterSignedEndpointRpcFuture<'a, Option<network::ClusterId>> {
+        Box::pin(async move { Ok(Some(self.cluster_id.clone())) })
+    }
+
+    fn send_signed_endpoint_rpc_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        auth: &'a [u8],
+        request: &'a network::ObjectRpcRequest,
+        timeouts: network::DaemonRpcTimeouts,
+    ) -> network::ClusterSignedEndpointRpcFuture<'a, network::ObjectRpcResponse> {
+        Box::pin(async move {
+            network::send_daemon_rpc_to_cluster_endpoint_async(
+                endpoint,
+                Some(auth),
+                request,
+                timeouts,
+            )
+            .await
+        })
+    }
+}
+
+impl network::ClusterSignedRelayRpcAsyncHost for DfsFuseSignedObjectRpcHost {
+    fn sign_relay_rpc_request_async<'a>(
+        &'a mut self,
+        request: &'a network::ObjectRpcRequest,
+    ) -> network::ClusterSignedRelayRpcFuture<'a, Vec<u8>> {
+        Box::pin(async move {
+            daemon::sign_daemon_rpc_request_for_local_node(request)
+                .map_err(|error| dfs_fuse_network_error("dfs fuse relay rpc signing", error))
+        })
+    }
+
+    fn send_signed_relay_rpc_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        auth: &'a [u8],
+        request: &'a network::ObjectRpcRequest,
+        timeouts: network::DaemonRpcTimeouts,
+    ) -> network::ClusterSignedRelayRpcFuture<'a, network::ObjectRpcResponse> {
+        Box::pin(async move {
+            network::send_daemon_rpc_to_cluster_endpoint_async(
+                endpoint,
+                Some(auth),
+                request,
+                timeouts,
+            )
+            .await
+        })
     }
 }
 

@@ -5,12 +5,13 @@ use crate::status::ensure_daemon_cluster_members;
 use crate::{AuthenticatedDaemonCommand, DaemonClusterRegistration};
 use crate::{
     DaemonClusterStatus, DaemonError, DaemonPaths, DaemonProbeStatus, DaemonRunOptions,
-    IdleStatsAtomics, SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT,
-    SINOMO_SHADOW_DAEMON_DEFAULT_PORT, cluster_node_status_from_daemon_status,
-    current_daemon_cluster_options, current_shadow_daemon_options_on_runtime,
-    daemon_cluster_options_from_status, daemon_cluster_process_from_paths, daemon_cluster_status,
-    daemon_cluster_status_matches, daemon_connect_address, daemon_options_from_status,
-    daemon_paths_are_shadow, fetch_cluster_kv_snapshot_from_endpoint_async,
+    DaemonSignedEndpointRpcAsyncHost, IdleStatsAtomics, SINOMO_DAEMON_DEFAULT_HOST,
+    SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
+    cluster_node_status_from_daemon_status, cluster_paths_from_env, current_daemon_cluster_options,
+    current_shadow_daemon_options_on_runtime, daemon_cluster_options_from_status,
+    daemon_cluster_process_from_paths, daemon_cluster_status, daemon_cluster_status_matches,
+    daemon_connect_address, daemon_options_from_status, daemon_paths_are_shadow,
+    fetch_cluster_kv_snapshot_from_endpoint_async,
     fetch_cluster_kv_snapshot_from_endpoint_on_runtime, fetch_daemon_status_from_endpoint_async,
     fetch_daemon_status_from_endpoint_on_runtime, handle_daemon_rollout_build_request,
     read_daemon_status, send_cluster_kv_txn_async, send_cluster_kv_txn_on_runtime,
@@ -1357,30 +1358,16 @@ impl sinomo_network::ClusterLocalDaemonMembershipAsyncObserver
 }
 
 impl sinomo_network::ClusterMembershipRpcForwardHost for DaemonClusterJoinRegistrationHost<'_> {
-    fn send_membership_rpc(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        request: &sinomo_network::ObjectRpcRequest,
-    ) -> Result<sinomo_network::ObjectRpcResponse, sinomo_network::NetworkError> {
-        sinomo_network::ClusterMembershipRpcForwardHost::send_membership_rpc(
-            &mut self.driver,
-            endpoint,
-            request,
-        )
-    }
-
-    fn relay_membership_rpc_to_voter_via_peer(
+    fn send_membership_rpc_to_node(
         &mut self,
         state: &ClusterBootstrapState,
-        voter: &ClusterEndpointRecord,
-        peer: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         request: &sinomo_network::ObjectRpcRequest,
     ) -> Result<sinomo_network::ObjectRpcResponse, sinomo_network::NetworkError> {
-        sinomo_network::ClusterMembershipRpcForwardHost::relay_membership_rpc_to_voter_via_peer(
+        sinomo_network::ClusterMembershipRpcForwardHost::send_membership_rpc_to_node(
             &mut self.driver,
             state,
-            voter,
-            peer,
+            target_node_id,
             request,
         )
     }
@@ -1389,45 +1376,18 @@ impl sinomo_network::ClusterMembershipRpcForwardHost for DaemonClusterJoinRegist
 impl sinomo_network::ClusterMembershipRpcAsyncForwardHost
     for DaemonClusterJoinRegistrationHost<'_>
 {
-    fn send_membership_rpc_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        request: &'a sinomo_network::ObjectRpcRequest,
-    ) -> sinomo_network::ClusterMembershipRpcFuture<'a, sinomo_network::ObjectRpcResponse> {
-        let timeout = cluster_control_plane_timeouts().membership_rpc_timeout;
-        let runtime = self.runtime.clone();
-        Box::pin(async move {
-            send_daemon_rpc_to_endpoint_async(
-                endpoint,
-                request,
-                sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
-                &runtime,
-            )
-            .await
-            .map_err(|error| daemon_host_network_error("cluster membership rpc", error))
-        })
-    }
-
-    fn relay_membership_rpc_to_voter_via_peer_async<'a>(
+    fn send_membership_rpc_to_node_async<'a>(
         &'a mut self,
         state: &'a ClusterBootstrapState,
-        voter: &'a ClusterEndpointRecord,
-        peer: &'a ClusterEndpointRecord,
+        target_node_id: &'a NodeId,
         request: &'a sinomo_network::ObjectRpcRequest,
     ) -> sinomo_network::ClusterMembershipRpcFuture<'a, sinomo_network::ObjectRpcResponse> {
         let timeout = cluster_control_plane_timeouts().membership_rpc_timeout;
         let runtime = self.runtime.clone();
         Box::pin(async move {
-            relay_rpc_to_node_via_peer_async(
-                state,
-                &voter.node_id,
-                peer,
-                request,
-                timeout,
-                &runtime,
-            )
-            .await
-            .map_err(|error| daemon_host_network_error("cluster relay", error))
+            send_object_rpc_to_node_async(state, target_node_id, request, timeout, &runtime)
+                .await
+                .map_err(|error| daemon_host_network_error("cluster membership node rpc", error))
         })
     }
 }
@@ -1553,98 +1513,62 @@ pub(crate) async fn forward_cluster_invite_challenge_to_voter_async_on_runtime(
     response.decode_body().map_err(DaemonError::from)
 }
 
-fn relay_rpc_to_node_via_peer(
+fn send_object_rpc_to_node(
     state: &ClusterBootstrapState,
     target_node_id: &NodeId,
-    peer: &ClusterEndpointRecord,
     rpc_request: &sinomo_network::ObjectRpcRequest,
     timeout: Duration,
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
-    let mut host = DaemonSignedRelayRpcAsyncHost {
-        runtime: runtime.clone(),
-    };
+    let paths = cluster_paths_from_env().ok_or_else(|| DaemonError::Network {
+        address: target_node_id.to_string(),
+        detail: "cluster paths are unavailable for node object RPC".to_string(),
+    })?;
+    let mut host = DaemonSignedEndpointRpcAsyncHost::new(runtime, true);
     block_on_cluster_network_future_on_owner_runtime(
         runtime,
-        sinomo_network::relay_rpc_to_node_via_peer_async_with_host(
+        sinomo_network::call_object_rpc_node_from_paths_async_with_host(
+            runtime,
+            &paths,
             state,
             target_node_id,
-            peer,
             rpc_request,
-            sinomo_network::ClusterSignedRelayRpcOptions {
-                timeouts: sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
-            },
+            sinomo_network::ClusterObjectRpcNodeOptions::new(
+                sinomo_network::ClusterEndpointSelectionPurpose::VoterCommand,
+                sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
+            ),
             &mut host,
         ),
     )
     .map_err(DaemonError::from)
 }
 
-async fn relay_rpc_to_node_via_peer_async(
+async fn send_object_rpc_to_node_async(
     state: &ClusterBootstrapState,
     target_node_id: &NodeId,
-    peer: &ClusterEndpointRecord,
     rpc_request: &sinomo_network::ObjectRpcRequest,
     timeout: Duration,
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
-    let mut host = DaemonSignedRelayRpcAsyncHost {
-        runtime: runtime.clone(),
-    };
-    sinomo_network::relay_rpc_to_node_via_peer_async_with_host(
+    let paths = cluster_paths_from_env().ok_or_else(|| DaemonError::Network {
+        address: target_node_id.to_string(),
+        detail: "cluster paths are unavailable for node object RPC".to_string(),
+    })?;
+    let mut host = DaemonSignedEndpointRpcAsyncHost::new(runtime, true);
+    sinomo_network::call_object_rpc_node_from_paths_async_with_host(
+        runtime,
+        &paths,
         state,
         target_node_id,
-        peer,
         rpc_request,
-        sinomo_network::ClusterSignedRelayRpcOptions {
-            timeouts: sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
-        },
+        sinomo_network::ClusterObjectRpcNodeOptions::new(
+            sinomo_network::ClusterEndpointSelectionPurpose::VoterCommand,
+            sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
+        ),
         &mut host,
     )
     .await
     .map_err(DaemonError::from)
-}
-
-struct DaemonSignedRelayRpcAsyncHost {
-    runtime: tokio::runtime::Handle,
-}
-
-impl sinomo_network::ClusterSignedRelayRpcAsyncHost for DaemonSignedRelayRpcAsyncHost {
-    fn sign_relay_rpc_request_async<'a>(
-        &'a mut self,
-        request: &'a sinomo_network::ObjectRpcRequest,
-    ) -> sinomo_network::ClusterSignedRelayRpcFuture<'a, Vec<u8>> {
-        let request = request.clone();
-        let runtime = self.runtime.clone();
-        Box::pin(async move {
-            runtime
-                .spawn_blocking(move || crate::sign_daemon_rpc_request_for_local_node(&request))
-                .await
-                .map_err(|source| sinomo_network::NetworkError::Io {
-                    operation: "cluster relay signing".to_string(),
-                    detail: format!("relay signing task failed: {source}"),
-                })?
-                .map_err(|error| daemon_host_network_error("cluster relay signing", error))
-        })
-    }
-
-    fn send_signed_relay_rpc_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        auth: &'a [u8],
-        request: &'a sinomo_network::ObjectRpcRequest,
-        timeouts: sinomo_network::DaemonRpcTimeouts,
-    ) -> sinomo_network::ClusterSignedRelayRpcFuture<'a, sinomo_network::ObjectRpcResponse> {
-        Box::pin(async move {
-            sinomo_network::send_daemon_rpc_to_cluster_endpoint_async(
-                endpoint,
-                Some(auth),
-                request,
-                timeouts,
-            )
-            .await
-        })
-    }
 }
 
 #[cfg(test)]
@@ -3648,23 +3572,21 @@ impl sinomo_network::ClusterControlPlaneTransport for DaemonClusterControlPlaneT
         result.map_err(|error| daemon_host_network_error("cluster membership rpc", error))
     }
 
-    fn relay_rpc_to_node(
+    fn send_object_rpc_to_node(
         &mut self,
         state: &ClusterBootstrapState,
         target_node_id: &NodeId,
-        peer: &ClusterEndpointRecord,
         request: &ObjectRpcRequest,
         timeout: Duration,
     ) -> Result<ObjectRpcResponse, sinomo_network::NetworkError> {
-        relay_rpc_to_node_via_peer(
+        send_object_rpc_to_node(
             state,
             target_node_id,
-            peer,
             request,
             timeout,
             self.rpc_mode.runtime(),
         )
-        .map_err(|error| daemon_host_network_error("cluster relay", error))
+        .map_err(|error| daemon_host_network_error("cluster node rpc", error))
     }
 
     fn record_endpoint_command_connectivity(
@@ -3821,26 +3743,18 @@ impl sinomo_network::ClusterKvTxnForwardAsyncHost for DaemonClusterControlPlaneT
         })
     }
 
-    fn relay_rpc_to_node_async<'a>(
+    fn send_object_rpc_to_node_async<'a>(
         &'a mut self,
         state: &'a ClusterBootstrapState,
         target_node_id: &'a NodeId,
-        peer: &'a ClusterEndpointRecord,
         request: &'a ObjectRpcRequest,
         timeout: Duration,
     ) -> sinomo_network::ClusterMembershipRpcFuture<'a, ObjectRpcResponse> {
         let runtime = self.rpc_mode.runtime().clone();
         Box::pin(async move {
-            relay_rpc_to_node_via_peer_async(
-                state,
-                target_node_id,
-                peer,
-                request,
-                timeout,
-                &runtime,
-            )
-            .await
-            .map_err(|error| daemon_host_network_error("cluster relay", error))
+            send_object_rpc_to_node_async(state, target_node_id, request, timeout, &runtime)
+                .await
+                .map_err(|error| daemon_host_network_error("cluster node rpc", error))
         })
     }
 }
@@ -5758,22 +5672,13 @@ mod tests {
     struct TestClusterJoinRegistrationHost;
 
     impl sinomo_network::ClusterMembershipRpcForwardHost for TestClusterJoinRegistrationHost {
-        fn send_membership_rpc(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _request: &sinomo_network::ObjectRpcRequest,
-        ) -> Result<sinomo_network::ObjectRpcResponse, sinomo_network::NetworkError> {
-            panic!("forwarded acceptance recorder should not send direct membership RPCs")
-        }
-
-        fn relay_membership_rpc_to_voter_via_peer(
+        fn send_membership_rpc_to_node(
             &mut self,
             _state: &ClusterBootstrapState,
-            _voter: &ClusterEndpointRecord,
-            _peer: &ClusterEndpointRecord,
+            _target_node_id: &NodeId,
             _request: &sinomo_network::ObjectRpcRequest,
         ) -> Result<sinomo_network::ObjectRpcResponse, sinomo_network::NetworkError> {
-            panic!("forwarded acceptance recorder should not relay membership RPCs")
+            panic!("forwarded acceptance recorder should not send membership node RPCs")
         }
     }
 

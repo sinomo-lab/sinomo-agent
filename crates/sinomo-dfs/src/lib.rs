@@ -357,7 +357,6 @@ pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
     DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
     DFS_SMOKE_ROUTE,
     DFS_MESSAGE_ROUTE,
-    DFS_PROTOCOL_FRAME_ROUTE,
     DFS_DIRECT_READ_ROUTE,
 ];
 pub const DEFAULT_DFS_NODE_ID: &str = "node_local";
@@ -426,7 +425,7 @@ fn dfs_network_frame_from_routed_message(
     .map_err(|source| dfs_network_serialization_error(source.to_string()))
 }
 
-pub(crate) fn dfs_protocol_frame_command_to_message_command(
+pub fn dfs_protocol_frame_command_to_message_command(
     command: &DfsProtocolFrameCommand,
 ) -> Result<DfsMessageCommand, NetworkError> {
     Ok(DfsMessageCommand {
@@ -435,7 +434,7 @@ pub(crate) fn dfs_protocol_frame_command_to_message_command(
     })
 }
 
-pub(crate) fn dfs_message_command_to_protocol_frame_command(
+pub fn dfs_message_command_to_protocol_frame_command(
     command: DfsMessageCommand,
 ) -> Result<DfsProtocolFrameCommand, NetworkError> {
     Ok(DfsProtocolFrameCommand {
@@ -444,7 +443,7 @@ pub(crate) fn dfs_message_command_to_protocol_frame_command(
     })
 }
 
-pub(crate) fn dfs_protocol_frame_response_to_message_response(
+pub fn dfs_protocol_frame_response_to_message_response(
     response: DfsProtocolFrameResponse,
 ) -> Result<DfsMessageResponse, NetworkError> {
     let outbound_messages = response
@@ -458,7 +457,7 @@ pub(crate) fn dfs_protocol_frame_response_to_message_response(
     })
 }
 
-pub(crate) fn dfs_message_response_to_protocol_frame_response(
+pub fn dfs_message_response_to_protocol_frame_response(
     response: DfsMessageResponse,
 ) -> Result<DfsProtocolFrameResponse, NetworkError> {
     let outbound_frames = response
@@ -1232,12 +1231,6 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
             ModuleRouteAuth::LocalOrClusterMember,
         ))
         .with_object_rpc_route(ModuleObjectRpcRoute::new(
-            DFS_PROTOCOL_FRAME_ROUTE,
-            DFS_RPC_CATEGORY,
-            "dfs.object.transfer",
-            ModuleRouteAuth::LocalOrClusterMember,
-        ))
-        .with_object_rpc_route(ModuleObjectRpcRoute::new(
             DFS_DIRECT_READ_ROUTE,
             DFS_RPC_CATEGORY,
             "dfs.object.transfer",
@@ -1365,8 +1358,7 @@ mod module_registration_tests {
                 .surfaces
                 .object_rpc_routes
                 .iter()
-                .any(|route| route.route == DFS_PROTOCOL_FRAME_ROUTE
-                    && route.operation == "dfs.object.transfer")
+                .all(|route| route.route != DFS_PROTOCOL_FRAME_ROUTE)
         );
     }
 
@@ -7937,6 +7929,16 @@ pub type DfsProtocolFrameSender = Arc<
         + Sync,
 >;
 
+pub type DfsMessageSender = Arc<
+    dyn Fn(
+            &ClusterEndpointRecord,
+            &DfsMessageCommand,
+            Duration,
+        ) -> Result<DfsMessageResponse, DfsPeerTransportError>
+        + Send
+        + Sync,
+>;
+
 pub type DfsDirectReadSender = Arc<
     dyn Fn(
             &ClusterEndpointRecord,
@@ -7975,6 +7977,24 @@ pub trait DfsPeerTransport: Send + Sync {
         options: DfsObjectRpcSendOptions,
     ) -> Result<ObjectRpcResponse, DfsPeerTransportError>;
 
+    fn send_message(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+        command: &DfsMessageCommand,
+        connect_timeout: Duration,
+    ) -> Result<DfsMessageResponse, DfsPeerTransportError> {
+        let request = dfs_message_rpc_request(command)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+        let response = self.call_object_rpc(
+            endpoint,
+            &request,
+            DfsObjectRpcSendOptions::new(connect_timeout)
+                .with_observe_connectivity(!dfs_message_is_read_only_request(command)),
+        )?;
+        decode_dfs_message_rpc_response(&response)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+    }
+
     fn send_protocol_frame(
         &self,
         endpoint: &ClusterEndpointRecord,
@@ -7983,16 +8003,7 @@ pub trait DfsPeerTransport: Send + Sync {
     ) -> Result<DfsProtocolFrameResponse, DfsPeerTransportError> {
         let message_command = dfs_protocol_frame_command_to_message_command(command)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-        let request = dfs_message_rpc_request(&message_command)
-            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-        let response = self.call_object_rpc(
-            endpoint,
-            &request,
-            DfsObjectRpcSendOptions::new(connect_timeout)
-                .with_observe_connectivity(!dfs_message_is_read_only_request(&message_command)),
-        )?;
-        let message_response = decode_dfs_message_rpc_response(&response)
-            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+        let message_response = self.send_message(endpoint, &message_command, connect_timeout)?;
         dfs_message_response_to_protocol_frame_response(message_response)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))
     }
@@ -8063,6 +8074,28 @@ pub trait AsyncDfsPeerTransport: Send + Sync {
         options: DfsObjectRpcSendOptions,
     ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResponse, DfsPeerTransportError>>;
 
+    fn send_message_async<'a>(
+        &'a self,
+        endpoint: &'a ClusterEndpointRecord,
+        command: &'a DfsMessageCommand,
+        connect_timeout: Duration,
+    ) -> DfsPeerTransportFuture<'a, Result<DfsMessageResponse, DfsPeerTransportError>> {
+        Box::pin(async move {
+            let request = dfs_message_rpc_request(command)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            let response = self
+                .call_object_rpc_async(
+                    endpoint,
+                    &request,
+                    DfsObjectRpcSendOptions::new(connect_timeout)
+                        .with_observe_connectivity(!dfs_message_is_read_only_request(command)),
+                )
+                .await?;
+            decode_dfs_message_rpc_response(&response)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+        })
+    }
+
     fn send_protocol_frame_async<'a>(
         &'a self,
         endpoint: &'a ClusterEndpointRecord,
@@ -8072,19 +8105,9 @@ pub trait AsyncDfsPeerTransport: Send + Sync {
         Box::pin(async move {
             let message_command = dfs_protocol_frame_command_to_message_command(command)
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-            let request = dfs_message_rpc_request(&message_command)
-                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-            let response = self
-                .call_object_rpc_async(
-                    endpoint,
-                    &request,
-                    DfsObjectRpcSendOptions::new(connect_timeout).with_observe_connectivity(
-                        !dfs_message_is_read_only_request(&message_command),
-                    ),
-                )
+            let message_response = self
+                .send_message_async(endpoint, &message_command, connect_timeout)
                 .await?;
-            let message_response = decode_dfs_message_rpc_response(&response)
-                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
             dfs_message_response_to_protocol_frame_response(message_response)
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))
         })
@@ -8153,6 +8176,17 @@ pub type AsyncDfsProtocolFrameSender = Arc<
         + Sync,
 >;
 
+pub type AsyncDfsMessageSender = Arc<
+    dyn for<'a> Fn(
+            &'a ClusterEndpointRecord,
+            &'a DfsMessageCommand,
+            Duration,
+        )
+            -> DfsPeerTransportFuture<'a, Result<DfsMessageResponse, DfsPeerTransportError>>
+        + Send
+        + Sync,
+>;
+
 pub type AsyncDfsDirectReadSender = Arc<
     dyn for<'a> Fn(
             &'a ClusterEndpointRecord,
@@ -8188,17 +8222,55 @@ pub type AsyncDfsMetadataSnapshotInstallSender = Arc<
         + Sync,
 >;
 
-pub fn async_dfs_protocol_frame_sender_from_peer_transport(
-    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+pub fn async_dfs_message_sender_from_protocol_frame_sender(
+    sender: AsyncDfsProtocolFrameSender,
+) -> AsyncDfsMessageSender {
+    Arc::new(move |endpoint, command, connect_timeout| {
+        let sender = Arc::clone(&sender);
+        Box::pin(async move {
+            let frame_command = dfs_message_command_to_protocol_frame_command(command.clone())
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            let frame_response = sender(endpoint, &frame_command, connect_timeout).await?;
+            dfs_protocol_frame_response_to_message_response(frame_response)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+        })
+    })
+}
+
+pub fn async_dfs_protocol_frame_sender_from_message_sender(
+    sender: AsyncDfsMessageSender,
 ) -> AsyncDfsProtocolFrameSender {
+    Arc::new(move |endpoint, command, connect_timeout| {
+        let sender = Arc::clone(&sender);
+        Box::pin(async move {
+            let message_command = dfs_protocol_frame_command_to_message_command(command)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            let message_response = sender(endpoint, &message_command, connect_timeout).await?;
+            dfs_message_response_to_protocol_frame_response(message_response)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+        })
+    })
+}
+
+pub fn async_dfs_message_sender_from_peer_transport(
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+) -> AsyncDfsMessageSender {
     Arc::new(move |endpoint, command, connect_timeout| {
         let peer_transport = Arc::clone(&peer_transport);
         Box::pin(async move {
             peer_transport
-                .send_protocol_frame_async(endpoint, command, connect_timeout)
+                .send_message_async(endpoint, command, connect_timeout)
                 .await
         })
     })
+}
+
+pub fn async_dfs_protocol_frame_sender_from_peer_transport(
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+) -> AsyncDfsProtocolFrameSender {
+    async_dfs_protocol_frame_sender_from_message_sender(
+        async_dfs_message_sender_from_peer_transport(peer_transport),
+    )
 }
 
 pub fn async_dfs_metadata_journal_batch_sender_from_peer_transport(
@@ -8227,12 +8299,44 @@ pub fn async_dfs_metadata_snapshot_install_sender_from_peer_transport(
     })
 }
 
+pub fn dfs_message_sender_from_protocol_frame_sender(
+    sender: DfsProtocolFrameSender,
+) -> DfsMessageSender {
+    Arc::new(move |endpoint, command, connect_timeout| {
+        let frame_command = dfs_message_command_to_protocol_frame_command(command.clone())
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+        let frame_response = sender(endpoint, &frame_command, connect_timeout)?;
+        dfs_protocol_frame_response_to_message_response(frame_response)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+    })
+}
+
+pub fn dfs_protocol_frame_sender_from_message_sender(
+    sender: DfsMessageSender,
+) -> DfsProtocolFrameSender {
+    Arc::new(move |endpoint, command, connect_timeout| {
+        let message_command = dfs_protocol_frame_command_to_message_command(command)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+        let message_response = sender(endpoint, &message_command, connect_timeout)?;
+        dfs_message_response_to_protocol_frame_response(message_response)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+    })
+}
+
+pub fn dfs_message_sender_from_peer_transport(
+    peer_transport: Arc<dyn DfsPeerTransport>,
+) -> DfsMessageSender {
+    Arc::new(move |endpoint, command, connect_timeout| {
+        peer_transport.send_message(endpoint, command, connect_timeout)
+    })
+}
+
 pub fn dfs_protocol_frame_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsProtocolFrameSender {
-    Arc::new(move |endpoint, command, connect_timeout| {
-        peer_transport.send_protocol_frame(endpoint, command, connect_timeout)
-    })
+    dfs_protocol_frame_sender_from_message_sender(dfs_message_sender_from_peer_transport(
+        peer_transport,
+    ))
 }
 
 pub fn dfs_direct_read_sender_from_peer_transport(
@@ -8262,7 +8366,7 @@ pub fn dfs_metadata_snapshot_install_sender_from_peer_transport(
 #[derive(Clone)]
 struct DeferredDfsEndpointSend {
     endpoints: Vec<ClusterEndpointRecord>,
-    sender: DfsProtocolFrameSender,
+    sender: DfsMessageSender,
     connect_timeout: Duration,
     target_node_id: NodeId,
     frame: NetworkFrame,
@@ -8275,8 +8379,8 @@ pub struct DfsEndpointTransport {
     incoming_frames: VecDeque<InboundFrame>,
     detached_sends: Arc<std::sync::Mutex<Vec<DeferredDfsEndpointSend>>>,
     connect_timeout: Duration,
-    sender: Option<DfsProtocolFrameSender>,
-    async_sender: Option<AsyncDfsProtocolFrameSender>,
+    sender: Option<DfsMessageSender>,
+    async_sender: Option<AsyncDfsMessageSender>,
     direct_read_sender: Option<DfsDirectReadSender>,
 }
 
@@ -8343,6 +8447,22 @@ impl DfsEndpointTransport {
             local_node_id,
             endpoints,
             connect_timeout,
+            Some(dfs_message_sender_from_protocol_frame_sender(sender)),
+            None,
+            None,
+        )
+    }
+
+    pub fn with_message_sender(
+        local_node_id: NodeId,
+        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+        connect_timeout: Duration,
+        sender: DfsMessageSender,
+    ) -> Self {
+        Self::with_senders(
+            local_node_id,
+            endpoints,
+            connect_timeout,
             Some(sender),
             None,
             None,
@@ -8367,6 +8487,22 @@ impl DfsEndpointTransport {
         endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
         connect_timeout: Duration,
         sender: AsyncDfsProtocolFrameSender,
+    ) -> Self {
+        Self::with_senders(
+            local_node_id,
+            endpoints,
+            connect_timeout,
+            None,
+            Some(async_dfs_message_sender_from_protocol_frame_sender(sender)),
+            None,
+        )
+    }
+
+    pub fn with_async_message_sender(
+        local_node_id: NodeId,
+        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+        connect_timeout: Duration,
+        sender: AsyncDfsMessageSender,
     ) -> Self {
         Self::with_senders(
             local_node_id,
@@ -8404,6 +8540,25 @@ impl DfsEndpointTransport {
             local_node_id,
             endpoints,
             connect_timeout,
+            Some(dfs_message_sender_from_protocol_frame_sender(sender)),
+            Some(async_dfs_message_sender_from_protocol_frame_sender(
+                async_sender,
+            )),
+            None,
+        )
+    }
+
+    pub fn with_connect_timeout_and_message_senders(
+        local_node_id: NodeId,
+        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+        connect_timeout: Duration,
+        sender: DfsMessageSender,
+        async_sender: AsyncDfsMessageSender,
+    ) -> Self {
+        Self::with_senders(
+            local_node_id,
+            endpoints,
+            connect_timeout,
             Some(sender),
             Some(async_sender),
             None,
@@ -8421,6 +8576,25 @@ impl DfsEndpointTransport {
             local_node_id,
             endpoints,
             DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT,
+            Some(dfs_message_sender_from_protocol_frame_sender(sender)),
+            Some(async_dfs_message_sender_from_protocol_frame_sender(
+                async_sender,
+            )),
+            Some(direct_read_sender),
+        )
+    }
+
+    pub fn new_with_message_peer_senders(
+        local_node_id: NodeId,
+        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+        sender: DfsMessageSender,
+        async_sender: AsyncDfsMessageSender,
+        direct_read_sender: DfsDirectReadSender,
+    ) -> Self {
+        Self::with_senders(
+            local_node_id,
+            endpoints,
+            DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT,
             Some(sender),
             Some(async_sender),
             Some(direct_read_sender),
@@ -8431,8 +8605,8 @@ impl DfsEndpointTransport {
         local_node_id: NodeId,
         endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
         connect_timeout: Duration,
-        sender: Option<DfsProtocolFrameSender>,
-        async_sender: Option<AsyncDfsProtocolFrameSender>,
+        sender: Option<DfsMessageSender>,
+        async_sender: Option<AsyncDfsMessageSender>,
         direct_read_sender: Option<DfsDirectReadSender>,
     ) -> Self {
         let mut endpoints_by_node_id: BTreeMap<NodeId, Vec<ClusterEndpointRecord>> =
@@ -8500,7 +8674,7 @@ impl DfsEndpointTransport {
                 self.endpoint_send_plan(&target_node_id, &frame, require_local_source)?;
             let Some(sender) = self.sender.as_ref().cloned() else {
                 return Err(NetworkError::Io {
-                    operation: format!("send DFS protocol frame to {target_node_id}"),
+                    operation: format!("send DFS message to {target_node_id}"),
                     detail: "DFS endpoint transport was constructed without a sync sender"
                         .to_string(),
                 });
@@ -8563,14 +8737,14 @@ impl DfsEndpointTransport {
         let endpoints = self.endpoint_send_plan(target_node_id, &frame, require_local_source)?;
         let Some(sender) = self.sender.as_ref().cloned() else {
             return Err(NetworkError::Io {
-                operation: format!("send DFS protocol frame to {target_node_id}"),
+                operation: format!("send DFS message to {target_node_id}"),
                 detail: "DFS endpoint transport was constructed without a sync sender".to_string(),
             });
         };
         self.detached_sends
             .lock()
             .map_err(|_| NetworkError::Io {
-                operation: "track detached DFS protocol frame send".to_string(),
+                operation: "track detached DFS message send".to_string(),
                 detail: "detached send lock is poisoned".to_string(),
             })?
             .push(DeferredDfsEndpointSend {
@@ -8586,7 +8760,7 @@ impl DfsEndpointTransport {
     fn flush_detached_endpoint_sends(&mut self) -> Result<(), NetworkError> {
         let sends = {
             let mut sends = self.detached_sends.lock().map_err(|_| NetworkError::Io {
-                operation: "flush detached DFS protocol frame sends".to_string(),
+                operation: "flush detached DFS message sends".to_string(),
                 detail: "detached send lock is poisoned".to_string(),
             })?;
             std::mem::take(&mut *sends)
@@ -8663,7 +8837,7 @@ impl DfsEndpointTransport {
             let connect_timeout = self.connect_timeout;
             let Some(sender) = self.async_sender.as_ref().cloned() else {
                 return Err(NetworkError::Io {
-                    operation: format!("send DFS protocol frame to {target_node_id}"),
+                    operation: format!("send DFS message to {target_node_id}"),
                     detail: "DFS endpoint transport was constructed without an async sender"
                         .to_string(),
                 });
@@ -8686,26 +8860,33 @@ impl DfsEndpointTransport {
 
 fn send_dfs_frame_to_endpoint(
     endpoints: Vec<ClusterEndpointRecord>,
-    sender: DfsProtocolFrameSender,
+    sender: DfsMessageSender,
     connect_timeout: Duration,
     target_node_id: NodeId,
     frame: NetworkFrame,
 ) -> Result<Vec<NetworkFrame>, NetworkError> {
-    let command = DfsProtocolFrameCommand {
-        request_id: format!("dfs_protocol_frame_{}", frame.frame_id.0),
-        frame,
+    let request_id = format!("dfs_message_{}", frame.frame_id.0);
+    let source_node_id = frame.source_node_id.clone();
+    let payload_bytes = dfs_network_frame_protocol_payload_bytes(&frame);
+    let command = DfsMessageCommand {
+        request_id,
+        routed_message: dfs_routed_message_from_network_frame(&frame)?,
     };
-    let payload_bytes = dfs_network_frame_protocol_payload_bytes(&command.frame);
     let mut failures = Vec::new();
     for endpoint in &endpoints {
         let send_started = Instant::now();
         match sender(endpoint, &command, connect_timeout) {
             Ok(response) => {
+                let response = dfs_message_response_to_protocol_frame_response(response).map_err(
+                    |source| NetworkError::Serialization {
+                        detail: source.to_string(),
+                    },
+                )?;
                 let outbound_payload_bytes =
                     dfs_network_frames_protocol_payload_bytes(&response.outbound_frames);
                 dfs_perf_trace(format_args!(
-                    "protocol-frame-send local={} target={} endpoint={} request={} payload_bytes={} outbound_frames={} outbound_payload_bytes={} elapsed_ms={}",
-                    command.frame.source_node_id,
+                    "dfs-message-send local={} target={} endpoint={} request={} payload_bytes={} outbound_frames={} outbound_payload_bytes={} elapsed_ms={}",
+                    source_node_id,
                     target_node_id,
                     endpoint.address,
                     command.request_id,
@@ -8718,8 +8899,8 @@ fn send_dfs_frame_to_endpoint(
             }
             Err(error) => {
                 dfs_perf_trace(format_args!(
-                    "protocol-frame-send-error local={} target={} endpoint={} request={} payload_bytes={} elapsed_ms={} error={}",
-                    command.frame.source_node_id,
+                    "dfs-message-send-error local={} target={} endpoint={} request={} payload_bytes={} elapsed_ms={} error={}",
+                    source_node_id,
                     target_node_id,
                     endpoint.address,
                     command.request_id,
@@ -8732,7 +8913,7 @@ fn send_dfs_frame_to_endpoint(
         }
     }
     Err(NetworkError::Io {
-        operation: format!("send DFS protocol frame to {target_node_id}"),
+        operation: format!("send DFS message to {target_node_id}"),
         detail: failures.join("; "),
     })
 }
@@ -8782,26 +8963,33 @@ fn send_dfs_direct_read_to_endpoint(
 
 async fn send_dfs_frame_to_endpoint_async(
     endpoints: Vec<ClusterEndpointRecord>,
-    sender: AsyncDfsProtocolFrameSender,
+    sender: AsyncDfsMessageSender,
     connect_timeout: Duration,
     target_node_id: NodeId,
     frame: NetworkFrame,
 ) -> Result<Vec<NetworkFrame>, NetworkError> {
-    let command = DfsProtocolFrameCommand {
-        request_id: format!("dfs_protocol_frame_{}", frame.frame_id.0),
-        frame,
+    let request_id = format!("dfs_message_{}", frame.frame_id.0);
+    let source_node_id = frame.source_node_id.clone();
+    let payload_bytes = dfs_network_frame_protocol_payload_bytes(&frame);
+    let command = DfsMessageCommand {
+        request_id,
+        routed_message: dfs_routed_message_from_network_frame(&frame)?,
     };
-    let payload_bytes = dfs_network_frame_protocol_payload_bytes(&command.frame);
     let mut failures = Vec::new();
     for endpoint in &endpoints {
         let send_started = Instant::now();
         match sender(endpoint, &command, connect_timeout).await {
             Ok(response) => {
+                let response = dfs_message_response_to_protocol_frame_response(response).map_err(
+                    |source| NetworkError::Serialization {
+                        detail: source.to_string(),
+                    },
+                )?;
                 let outbound_payload_bytes =
                     dfs_network_frames_protocol_payload_bytes(&response.outbound_frames);
                 dfs_perf_trace(format_args!(
-                    "protocol-frame-send-async local={} target={} endpoint={} request={} payload_bytes={} outbound_frames={} outbound_payload_bytes={} elapsed_ms={}",
-                    command.frame.source_node_id,
+                    "dfs-message-send-async local={} target={} endpoint={} request={} payload_bytes={} outbound_frames={} outbound_payload_bytes={} elapsed_ms={}",
+                    source_node_id,
                     target_node_id,
                     endpoint.address,
                     command.request_id,
@@ -8814,8 +9002,8 @@ async fn send_dfs_frame_to_endpoint_async(
             }
             Err(error) => {
                 dfs_perf_trace(format_args!(
-                    "protocol-frame-send-async-error local={} target={} endpoint={} request={} payload_bytes={} elapsed_ms={} error={}",
-                    command.frame.source_node_id,
+                    "dfs-message-send-async-error local={} target={} endpoint={} request={} payload_bytes={} elapsed_ms={} error={}",
+                    source_node_id,
                     target_node_id,
                     endpoint.address,
                     command.request_id,
@@ -8828,7 +9016,7 @@ async fn send_dfs_frame_to_endpoint_async(
         }
     }
     Err(NetworkError::Io {
-        operation: format!("send DFS protocol frame to {target_node_id}"),
+        operation: format!("send DFS message to {target_node_id}"),
         detail: failures.join("; "),
     })
 }
@@ -8985,6 +9173,20 @@ impl DfsEndpointServedProtocolFrameTransport {
         local_node_id: NodeId,
         endpoints: Vec<ClusterEndpointRecord>,
         sender: DfsProtocolFrameSender,
+        connect_timeout: Duration,
+    ) -> Self {
+        Self::new_with_message_sender(
+            local_node_id,
+            endpoints,
+            dfs_message_sender_from_protocol_frame_sender(sender),
+            connect_timeout,
+        )
+    }
+
+    pub fn new_with_message_sender(
+        local_node_id: NodeId,
+        endpoints: Vec<ClusterEndpointRecord>,
+        sender: DfsMessageSender,
         connect_timeout: Duration,
     ) -> Self {
         let endpoint_transport = DfsEndpointTransport::with_senders(

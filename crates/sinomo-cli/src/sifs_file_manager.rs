@@ -672,13 +672,11 @@ fn open_sifs_service_with_hydration(
     let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
     let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer_transport;
     let mut service = NetworkedDfsService::new(
-        DfsEndpointTransport::new_with_peer_senders(
+        DfsEndpointTransport::new_with_message_peer_senders(
             local_node_id,
             endpoints,
-            sinomo_runtime::dfs::dfs_protocol_frame_sender_from_peer_transport(sync_peer_transport),
-            sinomo_runtime::dfs::async_dfs_protocol_frame_sender_from_peer_transport(
-                async_peer_transport,
-            ),
+            sinomo_runtime::dfs::dfs_message_sender_from_peer_transport(sync_peer_transport),
+            sinomo_runtime::dfs::async_dfs_message_sender_from_peer_transport(async_peer_transport),
             sifs_direct_read_sender(rpc_runtime.clone()),
         ),
         content,
