@@ -505,11 +505,13 @@ pub trait ClusterSignedEndpointRpcAsyncHost {
 
     fn try_gateway_signed_rpc_async<'a>(
         &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        request: &'a ObjectRpcRequest,
-        request_auth: &'a [u8],
-        timeouts: DaemonRpcTimeouts,
-    ) -> ClusterSignedEndpointRpcFuture<'a, Option<ObjectRpcResponse>>;
+        _endpoint: &'a ClusterEndpointRecord,
+        _request: &'a ObjectRpcRequest,
+        _request_auth: &'a [u8],
+        _timeouts: DaemonRpcTimeouts,
+    ) -> ClusterSignedEndpointRpcFuture<'a, Option<ObjectRpcResponse>> {
+        Box::pin(async { Ok(None) })
+    }
 
     fn endpoint_rpc_cluster_id_async<'a>(
         &'a mut self,
@@ -524,7 +526,17 @@ pub trait ClusterSignedEndpointRpcAsyncHost {
         auth: &'a [u8],
         request: &'a ObjectRpcRequest,
         timeouts: DaemonRpcTimeouts,
-    ) -> ClusterSignedEndpointRpcFuture<'a, ObjectRpcResponse>;
+    ) -> ClusterSignedEndpointRpcFuture<'a, ObjectRpcResponse> {
+        Box::pin(async move {
+            crate::roaming::send_daemon_rpc_to_cluster_endpoint_async(
+                endpoint,
+                Some(auth),
+                request,
+                timeouts,
+            )
+            .await
+        })
+    }
 
     fn relay_signed_endpoint_rpc_async<'a>(
         &'a mut self,
