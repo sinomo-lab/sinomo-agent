@@ -734,7 +734,7 @@ pub struct DfsMessageResponse {
     pub outbound_messages: Vec<DfsRoutedMessage>,
 }
 
-pub fn dfs_routed_message_from_protocol_frame(
+pub(crate) fn dfs_routed_message_from_protocol_frame(
     frame: &NetworkFrame,
 ) -> Result<DfsRoutedMessage, NetworkError> {
     let message = dfs_network_message_from_frame(frame)?;
@@ -747,7 +747,7 @@ pub fn dfs_routed_message_from_protocol_frame(
     })
 }
 
-pub fn dfs_protocol_frame_from_routed_message(
+pub(crate) fn dfs_protocol_frame_from_routed_message(
     message: &DfsRoutedMessage,
 ) -> Result<NetworkFrame, NetworkError> {
     dfs_network_frame_from_routed_message(message)

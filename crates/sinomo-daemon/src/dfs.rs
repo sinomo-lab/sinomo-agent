@@ -1012,22 +1012,20 @@ mod tests {
     use sinomo_dfs::{
         DfsBlobTransferResult, DfsMetadataJournalReplicationOutcome, DfsNamespaceCommand,
         DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNetworkMessage, DfsObjectId,
-        DfsObjectKind, DfsObjectMetadata, DfsStageBlobCommand, DfsVersion, DfsWriteOptions,
-    };
-    use sinomo_network::{
-        MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrame, NetworkFrameId, ProtocolMessage,
+        DfsObjectKind, DfsObjectMetadata, DfsRoutedMessage, DfsStageBlobCommand, DfsVersion,
+        DfsWriteOptions,
     };
     use sinomo_node::NodeId;
     use std::collections::BTreeMap;
     use std::fs;
     use std::sync::{Arc, Mutex};
 
-    fn test_dfs_lookup_frame(
+    fn test_dfs_lookup_routed_message(
         source_node_id: &NodeId,
         target_node_id: &NodeId,
         frame_id: u64,
         path: &str,
-    ) -> NetworkFrame {
+    ) -> DfsRoutedMessage {
         let message = DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
             request_id: format!("daemon_dfs_lookup_{frame_id}"),
             file_system_id: sinomo_dfs::sifs_file_system_id(),
@@ -1038,30 +1036,22 @@ mod tests {
                 path: path.to_string(),
             },
         });
-        NetworkFrame {
-            frame_id: NetworkFrameId(frame_id),
+        DfsRoutedMessage {
             source_node_id: source_node_id.clone(),
             target_node_id: target_node_id.clone(),
-            message: MeshMessage {
-                message_id: MeshMessageId(frame_id),
-                origin_node_id: source_node_id.clone(),
-                target_node_id: target_node_id.clone(),
-                body: MeshMessageBody::Protocol(
-                    ProtocolMessage::encode(sinomo_dfs::DFS_PROTOCOL, &message)
-                        .expect("protocol message"),
-                ),
-            },
+            frame_id,
+            message_id: frame_id,
+            message,
         }
     }
 
     fn test_dfs_message_command(
         request_id: impl Into<String>,
-        frame: NetworkFrame,
+        routed_message: DfsRoutedMessage,
     ) -> DfsMessageCommand {
         DfsMessageCommand {
             request_id: request_id.into(),
-            routed_message: sinomo_dfs::protocol::dfs_routed_message_from_protocol_frame(&frame)
-                .expect("routed message"),
+            routed_message,
         }
     }
 
@@ -2797,25 +2787,18 @@ mod tests {
             bytes: bytes.clone(),
             object_metadata: Some(object),
         });
-        let frame = NetworkFrame {
-            frame_id: NetworkFrameId(1),
+        let routed_message = DfsRoutedMessage {
             source_node_id: owner.clone(),
             target_node_id: replica.clone(),
-            message: MeshMessage {
-                message_id: MeshMessageId(1),
-                origin_node_id: owner.clone(),
-                target_node_id: replica.clone(),
-                body: MeshMessageBody::Protocol(
-                    ProtocolMessage::encode(sinomo_dfs::DFS_PROTOCOL, &message)
-                        .expect("protocol message"),
-                ),
-            },
+            frame_id: 1,
+            message_id: 1,
+            message,
         };
 
         let runtime = daemon_test_runtime("daemon-dfs-message-replica-stage");
         let response = handle_daemon_dfs_message_on_runtime(
             &paths,
-            test_dfs_message_command("dfs_message_rpc_1", frame),
+            test_dfs_message_command("dfs_message_rpc_1", routed_message),
             runtime.handle(),
         )
         .expect("DFS message");
@@ -2861,12 +2844,17 @@ mod tests {
         let local = NodeId::from_legacy_named("node_dfs_protocol_local").expect("local");
         let remote = NodeId::from_legacy_named("node_dfs_protocol_remote").expect("remote");
         write_test_cluster_state(&data_root, &local);
-        let frame = test_dfs_lookup_frame(&remote, &remote, 1, "/services/daemon-wrong-target.txt");
+        let routed_message = test_dfs_lookup_routed_message(
+            &remote,
+            &remote,
+            1,
+            "/services/daemon-wrong-target.txt",
+        );
 
         let runtime = daemon_test_runtime("daemon-dfs-message-wrong-target");
         let error = handle_daemon_dfs_message_on_runtime(
             &paths,
-            test_dfs_message_command("dfs_message_rpc_wrong_target", frame),
+            test_dfs_message_command("dfs_message_rpc_wrong_target", routed_message),
             runtime.handle(),
         )
         .expect_err("wrong target rejected");
@@ -2888,7 +2876,7 @@ mod tests {
                 &paths,
                 test_dfs_message_command(
                     format!("dfs_message_warm_cache_{frame_id}"),
-                    test_dfs_lookup_frame(
+                    test_dfs_lookup_routed_message(
                         &remote,
                         &local,
                         frame_id,
@@ -2925,7 +2913,7 @@ mod tests {
             &paths,
             test_dfs_message_command(
                 "dfs_message_warm_cache_3",
-                test_dfs_lookup_frame(&remote, &local, 3, "/services/warm-cache-3.txt"),
+                test_dfs_lookup_routed_message(&remote, &local, 3, "/services/warm-cache-3.txt"),
             ),
             runtime.handle(),
         )
