@@ -4,11 +4,13 @@ use crate::rpc::{
     CLUSTER_HEALTH_SCOPE_METADATA_KEY, CLUSTER_NETWORK_PING_ROUTE, CLUSTER_NETWORK_RPC_CATEGORY,
     ObjectRpcRequest, ObjectRpcResponse,
 };
+#[cfg(test)]
+use crate::storage::read_cluster_state;
 use crate::storage::{
     ClusterMembershipRpcFuture, DAEMON_MAIN_RUN_CAPABILITY, advertised_peer_route_targets,
     cluster_member_expected_daemon_process, cluster_member_is_legacy_shadow_daemon,
     discover_peer_route_ip_candidates, iroh_endpoint_public_key,
-    live_cluster_member_probe_possible, read_cluster_node_statuses_from_kv, read_cluster_state,
+    live_cluster_member_probe_possible, read_cluster_node_statuses_from_kv,
     read_cluster_state_async,
 };
 use crate::{
@@ -100,7 +102,8 @@ pub fn decode_cluster_network_ping_rpc_response(
     response.decode_body()
 }
 
-pub fn handle_cluster_health_rpc_request<P: ClusterStatusProbe + ?Sized>(
+#[cfg(test)]
+pub(crate) fn handle_cluster_health_rpc_request<P: ClusterStatusProbe + ?Sized>(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     probe: &P,
@@ -128,7 +131,8 @@ pub fn handle_cluster_health_rpc_request<P: ClusterStatusProbe + ?Sized>(
     }
 }
 
-pub fn handle_current_cluster_health_rpc_request<P: ClusterStatusProbe + ?Sized>(
+#[cfg(test)]
+pub(crate) fn handle_current_cluster_health_rpc_request<P: ClusterStatusProbe + ?Sized>(
     paths: &ClusterPaths,
     probe: &P,
     request: ObjectRpcRequest,

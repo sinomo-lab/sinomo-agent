@@ -24,7 +24,15 @@ mod rpc;
 mod storage;
 
 pub use error::*;
-pub use health::*;
+pub use health::{
+    ClusterDoctorFinding, ClusterHealthRow, ClusterNetworkPingRequest, ClusterNetworkPingResponse,
+    ClusterStatusAsyncProbe, ClusterStatusProbe, cluster_doctor_findings,
+    cluster_health_rows_with_probe, cluster_health_rpc_request, cluster_local_health_rpc_request,
+    cluster_network_ping_rpc_request, cluster_network_ping_rpc_request_with_response_payload,
+    decode_cluster_health_rpc_response, decode_cluster_network_ping_rpc_response,
+    handle_cluster_network_ping_rpc_request_for_node,
+    handle_current_cluster_health_rpc_request_async, unknown_cluster_node_status,
+};
 pub use invite::{
     ClusterInviteChallengeProof, ClusterInviteChallengeRequest, PENDING_INVITE_CLUSTER_ID,
     SINOMO_JOIN_URI_PREFIX, build_cluster_join_invite, cluster_join_command,
