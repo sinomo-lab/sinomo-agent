@@ -964,6 +964,7 @@ fn record_current_cluster_kv_reader_node_id_cache(paths: &ClusterPaths, node_id:
     }
 }
 
+#[cfg(test)]
 fn invalidate_cluster_kv_reader_node_id_cache(path: &PathBuf) {
     if let Ok(mut cache) = CLUSTER_KV_READER_NODE_ID_CACHE.lock() {
         cache.remove(path);
@@ -1699,6 +1700,7 @@ pub(crate) fn wait_for_cluster_kv_watch_change_for_test(
     wait_for_cluster_kv_watch_change(paths, observed_generation, timeout)
 }
 
+#[cfg(test)]
 pub fn remove_local_cluster_state(paths: &ClusterPaths) -> Result<(), NetworkError> {
     if !remove_optional_file(&paths.state)? {
         return Err(NetworkError::ClusterOrphan);
@@ -2669,6 +2671,7 @@ pub fn cluster_join_challenge_rpc_request<T: Serialize + ?Sized>(
 /// proof-capable channel/issuer, so it cannot answer a join challenge. Relay the challenge to
 /// a reachable voter (the invite issuer can produce an issuer-signed proof). The routing-aware
 /// send routes the challenge across segments when no voter is directly reachable.
+#[cfg(test)]
 pub fn forward_cluster_join_challenge_rpc_to_voter_with_host(
     paths: &ClusterPaths,
     request: &ObjectRpcRequest,
@@ -2880,11 +2883,13 @@ pub trait ClusterRaftQuorumAsyncHost: ClusterRaftAppendReplicationAsyncHost {
     }
 }
 
+#[cfg(test)]
 struct LocalClusterRaftAppendReplicationHost<S, O> {
     send_raft_append: S,
     on_raft_append_sent: O,
 }
 
+#[cfg(test)]
 impl<S, O> ClusterRaftAppendReplicationHost for LocalClusterRaftAppendReplicationHost<S, O>
 where
     S: FnMut(
@@ -2929,6 +2934,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub fn replicate_cluster_raft_to_endpoint_with_local_host<S, O>(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -3078,6 +3084,7 @@ impl sinomo_kv::ClusterKvRaftCommandStorage for LocalClusterRaftCommandStorage<'
     }
 }
 
+#[cfg(test)]
 struct LocalClusterRaftQuorumCommitHost<'a, S, R, F, O> {
     storage: LocalClusterRaftCommandStorage<'a>,
     control_plane_timeouts: ClusterControlPlaneTimeouts,
@@ -3087,6 +3094,7 @@ struct LocalClusterRaftQuorumCommitHost<'a, S, R, F, O> {
     on_raft_append_sent: O,
 }
 
+#[cfg(test)]
 impl<S, R, F, O> sinomo_kv::ClusterKvRaftCommandStorage
     for LocalClusterRaftQuorumCommitHost<'_, S, R, F, O>
 {
@@ -3121,6 +3129,7 @@ impl<S, R, F, O> sinomo_kv::ClusterKvRaftCommandStorage
     }
 }
 
+#[cfg(test)]
 impl<S, R, F, O> ClusterRaftQuorumTransportHost for LocalClusterRaftQuorumCommitHost<'_, S, R, F, O>
 where
     S: FnMut(
@@ -3188,6 +3197,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub fn commit_cluster_raft_command_with_local_storage_and_transport<S, R, F, O>(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
@@ -5000,12 +5010,6 @@ pub trait ClusterLocalDaemonMembershipAsyncObserver {
         Box::pin(async { Ok(None) })
     }
 }
-
-#[derive(Clone, Debug, Default)]
-pub struct NoopClusterLocalDaemonMembershipObserver;
-
-impl ClusterLocalDaemonMembershipObserver for NoopClusterLocalDaemonMembershipObserver {}
-impl ClusterLocalDaemonMembershipAsyncObserver for NoopClusterLocalDaemonMembershipObserver {}
 
 pub struct ClusterJoinRegistrationDriver<T, O> {
     driver: ClusterControlPlaneDriver<T>,
@@ -6828,6 +6832,7 @@ impl ClusterLocalDaemonMembershipRefresh {
     }
 }
 
+#[cfg(test)]
 pub fn prepare_cluster_join_registration_state_with_local_daemon_members(
     mut state: ClusterBootstrapState,
     main_endpoints: Vec<ClusterEndpointRecord>,
@@ -7605,10 +7610,12 @@ fn append_cluster_raft_command_uncommitted_entry(
         .map_err(Into::into)
 }
 
+#[cfg(test)]
 fn cluster_member_put_op(member: &ClusterMemberRecord) -> Result<KvOp, NetworkError> {
     KvOp::put_serde(cluster_member_key(&member.node_id), member, None).map_err(NetworkError::from)
 }
 
+#[cfg(test)]
 pub fn cluster_member_put_command(member: &ClusterMemberRecord) -> Result<KvCommand, NetworkError> {
     cluster_member_put_op(member).map(KvCommand::Op)
 }
@@ -7876,16 +7883,6 @@ pub(crate) fn locked_cluster_raft_local_is_leader(
     cluster_kv_raft_store(paths)
         .locked_local_is_leader(state)
         .map_err(Into::into)
-}
-
-pub fn cluster_raft_vote_targets(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Vec<ClusterEndpointRecord> {
-    cluster_sync_targets_with_connectivity(paths, state)
-        .into_iter()
-        .filter(|endpoint| sinomo_kv::cluster_kv_raft_node_is_voter(state, &endpoint.node_id))
-        .collect()
 }
 
 #[cfg(test)]
@@ -8617,6 +8614,7 @@ pub fn read_cluster_node_statuses_from_kv(
     Ok(statuses)
 }
 
+#[cfg(test)]
 pub fn read_cluster_network_info_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterNetworkInfoRecord>, NetworkError> {
@@ -11044,6 +11042,7 @@ pub fn commit_cluster_kv_txn_with_quorum_response_with_host(
     )
 }
 
+#[cfg(test)]
 pub fn handle_cluster_kv_txn_request_with_host(
     paths: &ClusterPaths,
     txn: KvTxn,
@@ -11879,14 +11878,6 @@ pub fn cluster_endpoint_targets(
     }
 }
 
-#[cfg(test)]
-pub fn cluster_daemon_command_targets(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Vec<ClusterEndpointRecord> {
-    cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::DaemonCommand)
-}
-
 fn cluster_daemon_command_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -12023,18 +12014,6 @@ fn cluster_endpoint_address_port(address: &str) -> Option<u16> {
 /// sibling learner with an equally stale snapshot answers "current" and the
 /// sync silently stalls. Preferring voters (then bridges, whose own snapshots
 /// converge the same way) forms a convergence chain rooted at the voter.
-#[cfg(test)]
-pub fn cluster_member_publish_targets_voter_first(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Vec<ClusterEndpointRecord> {
-    cluster_endpoint_targets(
-        paths,
-        state,
-        ClusterEndpointSelectionPurpose::MemberPublishVoterFirst,
-    )
-}
-
 fn cluster_member_publish_targets_voter_first_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -12145,14 +12124,6 @@ fn push_unique_cluster_endpoint(
     }
 }
 
-#[cfg(test)]
-pub fn cluster_voter_command_targets(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Vec<ClusterEndpointRecord> {
-    cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::VoterCommand)
-}
-
 fn cluster_voter_command_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -12184,14 +12155,6 @@ fn cluster_invite_publish_targets_impl(
         targets.push(endpoint);
     }
     targets
-}
-
-pub fn cluster_member_daemon_status_targets(
-    state: &ClusterBootstrapState,
-    member: &ClusterMemberRecord,
-) -> Vec<ClusterEndpointRecord> {
-    let graph = ClusterConnectivityGraph::from_records(state.local_node_id.clone(), []);
-    cluster_member_daemon_status_targets_with_graph(state, member, &graph)
 }
 
 pub fn cluster_member_daemon_status_targets_with_connectivity(
@@ -12756,28 +12719,6 @@ pub fn daemon_advertised_endpoints_from_static_addresses(
     )
 }
 
-pub async fn daemon_advertised_endpoints_from_addresses_async(
-    node_id: &NodeId,
-    loopback_address: String,
-    host: &str,
-    port: u16,
-    priority: u16,
-    lan_ips: &[IpAddr],
-    route_ips: &[IpAddr],
-) -> Vec<ClusterEndpointRecord> {
-    daemon_advertised_endpoints_from_addresses_with_public_discovery_async(
-        node_id,
-        loopback_address,
-        host,
-        port,
-        priority,
-        lan_ips,
-        route_ips,
-        true,
-    )
-    .await
-}
-
 /// How long to wait when probing this node's own public endpoint for reachability.
 const PUBLIC_ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 
@@ -12907,30 +12848,6 @@ pub(crate) fn clear_public_endpoint_reachability_cache() {
     if let Ok(mut cache) = PUBLIC_ENDPOINT_REACHABILITY_CACHE.lock() {
         cache.clear();
     }
-}
-
-pub async fn daemon_advertised_endpoints_from_addresses_with_public_discovery_async(
-    node_id: &NodeId,
-    loopback_address: String,
-    host: &str,
-    port: u16,
-    priority: u16,
-    lan_ips: &[IpAddr],
-    route_ips: &[IpAddr],
-    allow_public_ip_discovery: bool,
-) -> Vec<ClusterEndpointRecord> {
-    daemon_advertised_endpoints_from_addresses_with_public_discovery_and_advertise_host_async(
-        node_id,
-        loopback_address,
-        host,
-        port,
-        priority,
-        lan_ips,
-        route_ips,
-        allow_public_ip_discovery,
-        None,
-    )
-    .await
 }
 
 pub async fn daemon_advertised_endpoints_from_addresses_with_public_discovery_and_advertise_host_async(
@@ -14148,6 +14065,7 @@ fn cluster_connectivity_full_sync_batch_ops_from_snapshot(
 /// Returns true when publishing `records` for `source_node_id` would not change
 /// cluster KV: no records need adding/refreshing and none need deleting. Lets the
 /// caller skip the raft append (and its disk churn) when connectivity is stable.
+#[cfg(test)]
 pub fn cluster_connectivity_sync_is_noop(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
@@ -14899,6 +14817,7 @@ pub fn cluster_member_publish_authorized_for_signer(
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 pub fn cluster_member_publish_txn(members: &[ClusterMemberRecord]) -> Result<KvTxn, NetworkError> {
     cluster_member_publish_txn_with_snapshot(None, members)
 }
@@ -14911,6 +14830,7 @@ pub fn cluster_member_publish_txn_from_kv(
     cluster_member_publish_txn_with_snapshot(Some(snapshot.as_ref()), members)
 }
 
+#[cfg(test)]
 pub fn cluster_member_publish_txn_from_snapshot(
     snapshot: &KvSnapshot,
     members: &[ClusterMemberRecord],
@@ -15100,6 +15020,7 @@ fn push_cluster_member_endpoint_diff_ops(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn expire_cluster_network_records(
     paths: &ClusterPaths,
     now: OffsetDateTime,
@@ -15132,6 +15053,7 @@ pub fn expire_cluster_network_records(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn cluster_network_expiry_delete_ops(
     snapshot: &KvSnapshot,
     now: OffsetDateTime,
@@ -15274,6 +15196,7 @@ pub fn cluster_capability_policy_key(node_id: &NodeId) -> String {
     format!("/cluster/policy/capabilities/{node_id}")
 }
 
+#[cfg(test)]
 pub fn cluster_certificate_key(certificate: &ClusterCertificate) -> String {
     format!("/cluster/certificates/{}", certificate.certificate_id)
 }
@@ -15611,6 +15534,7 @@ pub fn sync_cluster_invitation_to_kv(
     append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
 }
 
+#[cfg(test)]
 pub fn sync_cluster_certificate_to_kv(
     paths: &ClusterPaths,
     certificate: &ClusterCertificate,
@@ -15624,6 +15548,7 @@ pub fn sync_cluster_certificate_to_kv(
     )
 }
 
+#[cfg(test)]
 fn put_cluster_kv_value<T: Serialize + ?Sized>(
     paths: &ClusterPaths,
     node_id: &NodeId,
@@ -15637,6 +15562,7 @@ fn put_cluster_kv_value<T: Serialize + ?Sized>(
     append_cluster_raft_command(paths, node_id, KvCommand::Op(op))
 }
 
+#[cfg(test)]
 fn cluster_kv_put_value_is_noop(paths: &ClusterPaths, op: &KvOp) -> Result<bool, NetworkError> {
     let KvOp::Put {
         key,
