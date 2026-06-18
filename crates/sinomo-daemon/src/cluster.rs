@@ -1525,9 +1525,10 @@ fn send_object_rpc_to_node(
         detail: "cluster paths are unavailable for node object RPC".to_string(),
     })?;
     let mut host = DaemonSignedEndpointRpcAsyncHost::new(runtime, true);
+    let mut client = sinomo_network::ClusterObjectRpcClient::new(&mut host);
     block_on_cluster_network_future_on_owner_runtime(
         runtime,
-        sinomo_network::call_object_rpc_node_from_paths_async_with_host(
+        client.call_node_from_paths(
             runtime,
             &paths,
             state,
@@ -1537,7 +1538,6 @@ fn send_object_rpc_to_node(
                 sinomo_network::ClusterEndpointSelectionPurpose::VoterCommand,
                 sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
             ),
-            &mut host,
         ),
     )
     .map_err(DaemonError::from)
@@ -1555,20 +1555,21 @@ async fn send_object_rpc_to_node_async(
         detail: "cluster paths are unavailable for node object RPC".to_string(),
     })?;
     let mut host = DaemonSignedEndpointRpcAsyncHost::new(runtime, true);
-    sinomo_network::call_object_rpc_node_from_paths_async_with_host(
-        runtime,
-        &paths,
-        state,
-        target_node_id,
-        rpc_request,
-        sinomo_network::ClusterObjectRpcNodeOptions::new(
-            sinomo_network::ClusterEndpointSelectionPurpose::VoterCommand,
-            sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
-        ),
-        &mut host,
-    )
-    .await
-    .map_err(DaemonError::from)
+    let mut client = sinomo_network::ClusterObjectRpcClient::new(&mut host);
+    client
+        .call_node_from_paths(
+            runtime,
+            &paths,
+            state,
+            target_node_id,
+            rpc_request,
+            sinomo_network::ClusterObjectRpcNodeOptions::new(
+                sinomo_network::ClusterEndpointSelectionPurpose::VoterCommand,
+                sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
+            ),
+        )
+        .await
+        .map_err(DaemonError::from)
 }
 
 #[cfg(test)]

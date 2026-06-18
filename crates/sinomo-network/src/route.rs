@@ -704,44 +704,6 @@ where
     }
 }
 
-pub async fn call_object_rpc_endpoint_async_with_host(
-    endpoint: &ClusterEndpointRecord,
-    request: &ObjectRpcRequest,
-    options: ClusterObjectRpcOptions,
-    host: &mut impl ClusterSignedEndpointRpcAsyncHost,
-) -> Result<ObjectRpcResponse, NetworkError> {
-    ClusterObjectRpcClient::new(host)
-        .call_endpoint(endpoint, request, options)
-        .await
-}
-
-pub async fn call_object_rpc_endpoint_from_paths_async_with_host(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    endpoint: &ClusterEndpointRecord,
-    request: &ObjectRpcRequest,
-    options: ClusterObjectRpcOptions,
-    host: &mut (impl ClusterSignedEndpointRpcAsyncHost + ClusterSignedRelayRpcAsyncHost + Send),
-) -> Result<ObjectRpcResponse, NetworkError> {
-    ClusterObjectRpcClient::new(host)
-        .call_endpoint_from_paths(runtime, paths, endpoint, request, options)
-        .await
-}
-
-pub async fn call_object_rpc_node_from_paths_async_with_host(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    target_node_id: &NodeId,
-    request: &ObjectRpcRequest,
-    options: ClusterObjectRpcNodeOptions,
-    host: &mut (impl ClusterSignedEndpointRpcAsyncHost + ClusterSignedRelayRpcAsyncHost + Send),
-) -> Result<ObjectRpcResponse, NetworkError> {
-    ClusterObjectRpcClient::new(host)
-        .call_node_from_paths(runtime, paths, state, target_node_id, request, options)
-        .await
-}
-
 async fn cluster_object_rpc_node_targets(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
@@ -4610,15 +4572,18 @@ mod tests {
         let direct_response =
             endpoint_rpc_response("/test/object-rpc-endpoint-client-ok", "direct");
         let mut host = RecordingSignedEndpointRpcHost::new(false, Ok(direct_response), Ok(None));
+        let mut client = ClusterObjectRpcClient::new(&mut host);
 
-        let response = call_object_rpc_endpoint_async_with_host(
-            &endpoint,
-            &request,
-            ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_only(Duration::from_secs(5))),
-            &mut host,
-        )
-        .await
-        .expect("endpoint rpc");
+        let response = client
+            .call_endpoint(
+                &endpoint,
+                &request,
+                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_only(Duration::from_secs(
+                    5,
+                ))),
+            )
+            .await
+            .expect("endpoint rpc");
 
         assert_eq!(response.decode_body::<String>().expect("body"), "direct");
         assert_eq!(
@@ -4668,22 +4633,23 @@ mod tests {
         let request = endpoint_rpc_request();
         let direct_response = endpoint_rpc_response("/test/object-rpc-node-client-ok", "direct");
         let mut host = RecordingSignedEndpointRpcHost::new(false, Ok(direct_response), Ok(None));
+        let mut client = ClusterObjectRpcClient::new(&mut host);
         let runtime = tokio::runtime::Handle::current();
 
-        let response = call_object_rpc_node_from_paths_async_with_host(
-            &runtime,
-            &paths,
-            &state,
-            &target,
-            &request,
-            ClusterObjectRpcNodeOptions::new(
-                ClusterEndpointSelectionPurpose::VoterCommand,
-                DaemonRpcTimeouts::connect_only(Duration::from_secs(5)),
-            ),
-            &mut host,
-        )
-        .await
-        .expect("node rpc");
+        let response = client
+            .call_node_from_paths(
+                &runtime,
+                &paths,
+                &state,
+                &target,
+                &request,
+                ClusterObjectRpcNodeOptions::new(
+                    ClusterEndpointSelectionPurpose::VoterCommand,
+                    DaemonRpcTimeouts::connect_only(Duration::from_secs(5)),
+                ),
+            )
+            .await
+            .expect("node rpc");
 
         assert_eq!(response.decode_body::<String>().expect("body"), "direct");
         assert_eq!(

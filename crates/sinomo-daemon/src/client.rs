@@ -389,19 +389,18 @@ async fn send_daemon_rpc_to_endpoint_async_with_connectivity_observation(
     observe_connectivity: bool,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     let mut host = DaemonSignedEndpointRpcAsyncHost::new(runtime, observe_connectivity);
+    let mut client = sinomo_network::ClusterObjectRpcClient::new(&mut host);
     let options = sinomo_network::ClusterObjectRpcOptions::new(timeouts);
     if let Some(paths) = cluster_paths_from_env() {
-        sinomo_network::call_object_rpc_endpoint_from_paths_async_with_host(
-            runtime, &paths, endpoint, request, options, &mut host,
-        )
-        .await
-        .map_err(DaemonError::from)
+        client
+            .call_endpoint_from_paths(runtime, &paths, endpoint, request, options)
+            .await
+            .map_err(DaemonError::from)
     } else {
-        sinomo_network::call_object_rpc_endpoint_async_with_host(
-            endpoint, request, options, &mut host,
-        )
-        .await
-        .map_err(DaemonError::from)
+        client
+            .call_endpoint(endpoint, request, options)
+            .await
+            .map_err(DaemonError::from)
     }
 }
 

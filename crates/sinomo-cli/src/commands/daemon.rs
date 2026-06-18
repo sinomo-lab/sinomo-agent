@@ -969,18 +969,18 @@ impl network::ClusterKvTxnForwardHost for CliClusterKvTxnForwardHost {
             paths: paths.clone(),
             cluster_id: state.cluster_id.clone(),
         };
+        let mut client = network::ClusterObjectRpcClient::new(&mut host);
         let options = network::ClusterObjectRpcNodeOptions::new(
             network::ClusterEndpointSelectionPurpose::VoterCommand,
             network::DaemonRpcTimeouts::connect_and_idle(timeout),
         );
-        let result = runtime.block_on(network::call_object_rpc_node_from_paths_async_with_host(
+        let result = runtime.block_on(client.call_node_from_paths(
             runtime.handle(),
             &paths,
             state,
             target_node_id,
             request,
             options,
-            &mut host,
         ));
         runtime.shutdown_timeout(Duration::from_millis(250));
         result
