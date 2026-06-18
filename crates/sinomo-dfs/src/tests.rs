@@ -60,31 +60,6 @@ impl DfsMessageTransport for ReceiveOnlyTransport {
     }
 }
 
-fn test_dfs_lookup_frame(
-    source_node_id: &NodeId,
-    target_node_id: &NodeId,
-    frame_id: u64,
-    path: &str,
-) -> NetworkFrame {
-    build_dfs_network_frame(
-        source_node_id,
-        target_node_id,
-        frame_id,
-        frame_id,
-        DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
-            request_id: format!("dfs_test_lookup_{frame_id}"),
-            file_system_id: sifs_file_system_id(),
-            requesting_node_id: source_node_id.clone(),
-            include_metadata_journal_batches: false,
-            metadata_journal_after_sequences: Vec::new(),
-            operation: DfsNamespaceOperation::LookupPath {
-                path: path.to_string(),
-            },
-        }),
-    )
-    .expect("test DFS lookup frame")
-}
-
 fn test_dfs_lookup_routed_message(
     source_node_id: &NodeId,
     target_node_id: &NodeId,
@@ -109,33 +84,23 @@ fn test_dfs_lookup_routed_message(
     )
 }
 
-fn test_dfs_frame_from_message_command(command: &DfsMessageCommand) -> NetworkFrame {
-    protocol::dfs_protocol_frame_from_routed_message(&command.routed_message)
-        .expect("message command frame")
-}
-
-fn test_dfs_message_response_from_frames(
+fn test_dfs_message_response_from_routed_messages(
     request_id: impl Into<String>,
-    frames: Vec<NetworkFrame>,
+    routed_messages: Vec<DfsRoutedMessage>,
 ) -> DfsMessageResponse {
     DfsMessageResponse {
         request_id: request_id.into(),
-        outbound_messages: frames
-            .iter()
-            .map(dfs_routed_message_from_network_frame)
-            .collect::<Result<Vec<_>, _>>()
-            .expect("message response frames"),
+        outbound_messages: routed_messages,
     }
 }
 
 fn test_dfs_message_command(
     request_id: impl Into<String>,
-    frame: NetworkFrame,
+    routed_message: DfsRoutedMessage,
 ) -> DfsMessageCommand {
     DfsMessageCommand {
         request_id: request_id.into(),
-        routed_message: protocol::dfs_routed_message_from_protocol_frame(&frame)
-            .expect("DFS routed message"),
+        routed_message,
     }
 }
 
@@ -1342,7 +1307,7 @@ fn dfs_peer_transport_adapters_delegate_all_routes() {
     let local = NodeId::from_legacy_named("node_dfs_peer_transport_local").expect("local");
     let remote = NodeId::from_legacy_named("node_dfs_peer_transport_remote").expect("remote");
     let endpoint = test_endpoint(&remote, "10.95.0.2:21353");
-    let frame = build_dfs_network_frame(
+    let routed_message = build_dfs_routed_message(
         &local,
         &remote,
         42,
@@ -1358,14 +1323,13 @@ fn dfs_peer_transport_adapters_delegate_all_routes() {
             start_chunk_index: 0,
             max_chunks: 0,
         }),
-    )
-    .expect("DFS frame");
+    );
 
     message_sender(
         &endpoint,
         &DfsMessageCommand {
             request_id: "protocol-1".to_string(),
-            routed_message: dfs_routed_message_from_network_frame(&frame).expect("routed frame"),
+            routed_message,
         },
         Duration::from_secs(1),
     )
@@ -1645,11 +1609,6 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
             .expect("message body"),
         message_command
     );
-    let frame = test_dfs_frame_from_message_command(&message_command);
-    assert_eq!(
-        dfs_routed_message_from_network_frame(&frame).expect("frame"),
-        message_command.routed_message
-    );
     let message_response = DfsMessageResponse {
         request_id: "message-request".to_string(),
         outbound_messages: vec![DfsRoutedMessage {
@@ -1671,14 +1630,11 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         decode_dfs_message_rpc_response(&message_rpc_response).expect("message response body"),
         message_response
     );
-    let frame_response = message_response
-        .outbound_messages
-        .iter()
-        .map(protocol::dfs_protocol_frame_from_routed_message)
-        .collect::<Result<Vec<_>, _>>()
-        .expect("frames");
     assert_eq!(
-        test_dfs_message_response_from_frames("message-request", frame_response),
+        test_dfs_message_response_from_routed_messages(
+            "message-request",
+            message_response.outbound_messages.clone()
+        ),
         message_response
     );
     std::fs::remove_dir_all(snapshot_root).ok();
@@ -1856,7 +1812,7 @@ fn direct_read_stream_rpc_keeps_blob_out_of_initial_response() {
 }
 
 #[test]
-fn endpoint_transport_sends_rpc_and_queues_returned_frames() {
+fn endpoint_transport_sends_rpc_and_queues_returned_messages() {
     let local = NodeId::from_legacy_named("node_dfs_endpoint_send_local").expect("local");
     let remote = NodeId::from_legacy_named("node_dfs_endpoint_send_remote").expect("remote");
     let endpoint = test_endpoint(&remote, "192.0.2.10:21353");
@@ -1865,13 +1821,13 @@ fn endpoint_transport_sends_rpc_and_queues_returned_frames() {
     let local_for_sender = local.clone();
     let remote_for_sender = remote.clone();
     let sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
-        calls_for_sender.lock().expect("calls lock").push((
-            endpoint.node_id.clone(),
-            test_dfs_frame_from_message_command(command),
-        ));
-        Ok(test_dfs_message_response_from_frames(
+        calls_for_sender
+            .lock()
+            .expect("calls lock")
+            .push((endpoint.node_id.clone(), command.routed_message.clone()));
+        Ok(test_dfs_message_response_from_routed_messages(
             command.request_id.clone(),
-            vec![test_dfs_lookup_frame(
+            vec![test_dfs_lookup_routed_message(
                 &remote_for_sender,
                 &local_for_sender,
                 100,
@@ -1885,14 +1841,13 @@ fn endpoint_transport_sends_rpc_and_queues_returned_frames() {
         Duration::from_millis(1),
         sender,
     );
-    let frame = test_dfs_lookup_frame(&local, &remote, 7, "/endpoint/send");
-    let message = dfs_routed_message_from_network_frame(&frame).expect("routed message");
+    let message = test_dfs_lookup_routed_message(&local, &remote, 7, "/endpoint/send");
 
     transport
-        .send_routed_message(&remote, message)
+        .send_routed_message(&remote, message.clone())
         .expect("send message");
     let recorded = calls.lock().expect("calls lock");
-    assert_eq!(recorded.as_slice(), &[(remote.clone(), frame)]);
+    assert_eq!(recorded.as_slice(), &[(remote.clone(), message)]);
     drop(recorded);
     let incoming = transport
         .drain_incoming_messages()
@@ -1952,7 +1907,7 @@ fn endpoint_transport_read_message_uses_direct_sender_and_queues_response() {
     assert_eq!(
         transport
             .pending_incoming_count()
-            .expect("pending incoming frames"),
+            .expect("pending incoming messages"),
         Some(1)
     );
     let messages = transport
@@ -1989,13 +1944,13 @@ fn endpoint_transport_async_send_requires_async_sender() {
         let local_for_sender = local.clone();
         let remote_for_sender = remote.clone();
         let sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
-            calls_for_sender.lock().expect("calls lock").push((
-                endpoint.node_id.clone(),
-                test_dfs_frame_from_message_command(command),
-            ));
-            Ok(test_dfs_message_response_from_frames(
+            calls_for_sender
+                .lock()
+                .expect("calls lock")
+                .push((endpoint.node_id.clone(), command.routed_message.clone()));
+            Ok(test_dfs_message_response_from_routed_messages(
                 command.request_id.clone(),
-                vec![test_dfs_lookup_frame(
+                vec![test_dfs_lookup_routed_message(
                     &remote_for_sender,
                     &local_for_sender,
                     100,
@@ -2020,7 +1975,7 @@ fn endpoint_transport_async_send_requires_async_sender() {
         assert_eq!(
             AsyncDfsMessageTransport::pending_incoming_count_async(&mut transport)
                 .await
-                .expect("pending frames"),
+                .expect("pending messages"),
             Some(0)
         );
     });
@@ -2045,17 +2000,17 @@ fn endpoint_transport_async_sender_does_not_require_sync_sender() {
             let calls_for_sender = Arc::clone(&calls_for_sender);
             let endpoint_node_id = endpoint.node_id.clone();
             let request_id = command.request_id.clone();
-            let frame = test_dfs_frame_from_message_command(command);
+            let routed_message = command.routed_message.clone();
             let local_for_sender = local_for_sender.clone();
             let remote_for_sender = remote_for_sender.clone();
             Box::pin(async move {
                 calls_for_sender
                     .lock()
                     .expect("calls lock")
-                    .push((endpoint_node_id, frame));
-                Ok(test_dfs_message_response_from_frames(
+                    .push((endpoint_node_id, routed_message));
+                Ok(test_dfs_message_response_from_routed_messages(
                     request_id,
-                    vec![test_dfs_lookup_frame(
+                    vec![test_dfs_lookup_routed_message(
                         &remote_for_sender,
                         &local_for_sender,
                         101,
@@ -2070,8 +2025,7 @@ fn endpoint_transport_async_sender_does_not_require_sync_sender() {
             Duration::from_millis(1),
             sender,
         );
-        let frame = test_dfs_lookup_frame(&local, &remote, 7, "/endpoint/async-only");
-        let message = dfs_routed_message_from_network_frame(&frame).expect("routed message");
+        let message = test_dfs_lookup_routed_message(&local, &remote, 7, "/endpoint/async-only");
 
         assert!(
             transport
@@ -2080,11 +2034,15 @@ fn endpoint_transport_async_sender_does_not_require_sync_sender() {
                 .to_string()
                 .contains("without a sync sender")
         );
-        AsyncDfsMessageTransport::send_routed_message_async(&mut transport, &remote, message)
-            .await
-            .expect("async send frame");
+        AsyncDfsMessageTransport::send_routed_message_async(
+            &mut transport,
+            &remote,
+            message.clone(),
+        )
+        .await
+        .expect("async send message");
         let recorded = calls.lock().expect("calls lock");
-        assert_eq!(recorded.as_slice(), &[(remote.clone(), frame)]);
+        assert_eq!(recorded.as_slice(), &[(remote.clone(), message)]);
         drop(recorded);
         let incoming = AsyncDfsMessageTransport::drain_incoming_messages_async(&mut transport)
             .await
@@ -2115,13 +2073,10 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
             sync_calls_for_sender
                 .lock()
                 .expect("sync calls lock")
-                .push((
-                    endpoint.node_id.clone(),
-                    NetworkFrameId(command.routed_message.frame_id),
-                ));
-            Ok(test_dfs_message_response_from_frames(
+                .push((endpoint.node_id.clone(), command.routed_message.frame_id));
+            Ok(test_dfs_message_response_from_routed_messages(
                 command.request_id.clone(),
-                vec![test_dfs_lookup_frame(
+                vec![test_dfs_lookup_routed_message(
                     &remote_for_sync,
                     &local_for_sync,
                     201,
@@ -2137,7 +2092,7 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
             let async_calls_for_sender = Arc::clone(&async_calls_for_sender);
             let endpoint_node_id = endpoint.node_id.clone();
             let request_id = command.request_id.clone();
-            let frame_id = NetworkFrameId(command.routed_message.frame_id);
+            let frame_id = command.routed_message.frame_id;
             let local_for_async = local_for_async.clone();
             let remote_for_async = remote_for_async.clone();
             Box::pin(async move {
@@ -2145,9 +2100,9 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
                     .lock()
                     .expect("async calls lock")
                     .push((endpoint_node_id, frame_id));
-                Ok(test_dfs_message_response_from_frames(
+                Ok(test_dfs_message_response_from_routed_messages(
                     request_id,
-                    vec![test_dfs_lookup_frame(
+                    vec![test_dfs_lookup_routed_message(
                         &remote_for_async,
                         &local_for_async,
                         301,
@@ -2171,7 +2126,7 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
             .expect("sync send message");
         assert_eq!(
             sync_calls.lock().expect("sync calls lock").as_slice(),
-            &[(remote.clone(), NetworkFrameId(11))]
+            &[(remote.clone(), 11)]
         );
         assert!(async_calls.lock().expect("async calls lock").is_empty());
         let incoming = transport
@@ -2188,7 +2143,7 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
             .expect("async send message");
         assert_eq!(
             async_calls.lock().expect("async calls lock").as_slice(),
-            &[(remote.clone(), NetworkFrameId(12))]
+            &[(remote.clone(), 12)]
         );
         let incoming = AsyncDfsMessageTransport::drain_incoming_messages_async(&mut transport)
             .await
@@ -2200,7 +2155,7 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
 }
 
 #[test]
-fn endpoint_transport_relays_remote_returned_frames_preserving_source() {
+fn endpoint_transport_relays_remote_returned_messages_preserving_source() {
     let local = NodeId::from_legacy_named("node_dfs_endpoint_relay_local").expect("local");
     let primary = NodeId::from_legacy_named("node_dfs_endpoint_relay_primary").expect("primary");
     let replica = NodeId::from_legacy_named("node_dfs_endpoint_relay_replica").expect("replica");
@@ -2218,9 +2173,9 @@ fn endpoint_transport_relays_remote_returned_frames_preserving_source() {
             command.routed_message.target_node_id.clone(),
         ));
         if command.routed_message.target_node_id == primary_for_sender {
-            return Ok(test_dfs_message_response_from_frames(
+            return Ok(test_dfs_message_response_from_routed_messages(
                 command.request_id.clone(),
-                vec![test_dfs_lookup_frame(
+                vec![test_dfs_lookup_routed_message(
                     &primary_for_sender,
                     &replica_for_sender,
                     101,
@@ -2229,9 +2184,9 @@ fn endpoint_transport_relays_remote_returned_frames_preserving_source() {
             ));
         }
         if command.routed_message.target_node_id == replica_for_sender {
-            return Ok(test_dfs_message_response_from_frames(
+            return Ok(test_dfs_message_response_from_routed_messages(
                 command.request_id.clone(),
-                vec![test_dfs_lookup_frame(
+                vec![test_dfs_lookup_routed_message(
                     &replica_for_sender,
                     &local_for_sender,
                     102,
@@ -2250,8 +2205,7 @@ fn endpoint_transport_relays_remote_returned_frames_preserving_source() {
         Duration::from_millis(1),
         sender,
     );
-    let frame = test_dfs_lookup_frame(&local, &primary, 9, "/endpoint/relay");
-    let message = dfs_routed_message_from_network_frame(&frame).expect("routed message");
+    let message = test_dfs_lookup_routed_message(&local, &primary, 9, "/endpoint/relay");
 
     transport
         .send_routed_message(&primary, message)
@@ -2476,7 +2430,7 @@ fn posix_wait_for_commit_reports_repair_retry_failure_without_failing_write() {
 
 #[test]
 fn served_message_drains_nested_stage_response_before_returning() {
-    let root = temp_root("served-protocol-frame-drains-nested-stage-response");
+    let root = temp_root("served-object-message-drains-nested-stage-response");
     let requester = NodeId::from_legacy_named("node_served_frame_requester").expect("requester");
     let primary = NodeId::from_legacy_named("node_served_frame_primary").expect("primary");
     let replica = NodeId::from_legacy_named("node_served_frame_replica").expect("replica");
@@ -2562,17 +2516,19 @@ fn served_message_drains_nested_stage_response_before_returning() {
         touch_parent_on_create: false,
         foreground_replica_repair: true,
     };
-    let frame = build_dfs_network_frame(
+    let routed_message = build_dfs_routed_message(
         &requester,
         &primary,
         10,
         11,
         DfsNetworkMessage::DistributedWriteRequest(command),
-    )
-    .expect("request frame");
+    );
 
     let result = dfs
-        .process_message_command(test_dfs_message_command("dfs_served_message_rpc", frame))
+        .process_message_command(test_dfs_message_command(
+            "dfs_served_message_rpc",
+            routed_message,
+        ))
         .expect("process DFS message");
 
     assert_eq!(stage_calls.lock().expect("stage calls lock").len(), 1);
@@ -2743,19 +2699,18 @@ fn served_non_foreground_write_does_not_retry_unrelated_repairs() {
         touch_parent_on_create: false,
         foreground_replica_repair: false,
     };
-    let frame = build_dfs_network_frame(
+    let routed_message = build_dfs_routed_message(
         &requester,
         &primary,
         12,
         13,
         DfsNetworkMessage::DistributedWriteRequest(command),
-    )
-    .expect("request frame");
+    );
 
     let result = dfs
         .process_message_command(test_dfs_message_command(
             "dfs_served_deferred_message_rpc",
-            frame,
+            routed_message,
         ))
         .expect("process DFS message");
 
@@ -2894,7 +2849,7 @@ fn served_message_reports_repair_retry_failure_without_failing_request() {
         }
     }
 
-    let frame = build_dfs_network_frame(
+    let routed_message = build_dfs_routed_message(
         &requester,
         &primary,
         77,
@@ -2909,13 +2864,12 @@ fn served_message_reports_repair_retry_failure_without_failing_request() {
                 path: "/services".to_string(),
             },
         }),
-    )
-    .expect("foreground frame");
+    );
 
     let result = dfs
         .process_message_command(test_dfs_message_command(
             "dfs_served_repair_retry_message_rpc",
-            frame,
+            routed_message,
         ))
         .expect("foreground message should not fail on repair retry error");
 
@@ -4049,7 +4003,7 @@ fn maintenance_tick_drains_inflight_repair_response_without_new_schedule() {
         .expect("repair retry state")
         .next_retry_tick = 100;
 
-    let response_frame = build_dfs_network_frame(
+    let response_message = build_dfs_routed_message(
         &replica,
         &owner,
         900,
@@ -4065,10 +4019,8 @@ fn maintenance_tick_drains_inflight_repair_response_without_new_schedule() {
                 content_hash: content_hash.clone(),
             },
         }),
-    )
-    .expect("repair response frame");
-    replica_transport
-        .send(&owner, response_frame)
+    );
+    DfsMessageTransport::send_routed_message(&mut replica_transport, &owner, response_message)
         .expect("queue repair response to owner");
 
     let mut maintenance_host = RecordingMaintenanceHost::default();
@@ -9489,17 +9441,7 @@ fn reader_write_can_defer_post_commit_replica_repair() {
     };
     assert_eq!(repair_jobs.len(), 1);
     assert_eq!(repair_jobs[0].missing_replica_node_id, replica);
-    let foreground_messages = replica_transport
-        .drain_incoming()
-        .expect("replica foreground frames")
-        .into_iter()
-        .filter_map(|frame| match frame.frame.message.body {
-            MeshMessageBody::Protocol(protocol) if protocol.protocol == DFS_PROTOCOL => {
-                protocol.decode::<DfsNetworkMessage>().ok()
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let foreground_messages = drain_dfs_messages(&mut replica_transport);
     assert!(
         foreground_messages.iter().all(|message| !matches!(
             message,
@@ -12008,12 +11950,12 @@ fn write_outcome_uses_backend_current_metadata_after_pending_state_is_removed() 
 }
 
 #[test]
-fn malformed_dfs_protocol_frame_does_not_block_following_valid_frame() {
-    let root = temp_root("malformed-dfs-frame-does-not-block-valid-frame");
+fn malformed_dfs_object_rpc_message_does_not_block_following_valid_message() {
+    let root = temp_root("malformed-dfs-object-message-does-not-block-valid-message");
     let requester = NodeId::from_legacy_named("node_bad_frame_requester").expect("node");
     let server = NodeId::from_legacy_named("node_bad_frame_server").expect("node");
     let object_id = DfsObjectId::from_legacy_named("obj_bad_frame_read").expect("object");
-    let bytes = b"valid frame after bad frame";
+    let bytes = b"valid message after bad message";
     let network = InProcessNetwork::new();
     let mut requester_transport = network.add_node(requester.clone());
     let mut dfs = NetworkedDfsService::new(
@@ -12030,60 +11972,45 @@ fn malformed_dfs_protocol_frame_does_not_block_following_valid_frame() {
         .expect("seed object");
 
     requester_transport
-        .send(
+        .send_object_rpc_request(
             &server,
-            NetworkFrame {
-                frame_id: NetworkFrameId(1),
-                source_node_id: requester.clone(),
-                target_node_id: server.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(1),
-                    origin_node_id: requester.clone(),
-                    target_node_id: server.clone(),
-                    body: MeshMessageBody::Protocol(ProtocolMessage::new(
-                        DFS_PROTOCOL,
-                        b"not a sinomo object payload".to_vec(),
-                    )),
-                },
-            },
+            ObjectRpcRequest::from_encoded_body(
+                DFS_MESSAGE_ROUTE,
+                DFS_RPC_CATEGORY,
+                b"not a sinomo object payload".to_vec(),
+            ),
         )
-        .expect("send malformed frame");
+        .expect("send malformed object RPC message");
+    let valid_command = test_dfs_message_command(
+        "dfs_valid_after_bad_object_message",
+        build_dfs_routed_message(
+            &requester,
+            &server,
+            2,
+            2,
+            DfsNetworkMessage::ReadRequest(DfsReadRequest {
+                request_id: "dfs_net_req_after_bad_message".to_string(),
+                object_id: object_id.clone(),
+                version: None,
+                content_hash: None,
+                content_size_bytes: None,
+                range_offset: None,
+                range_max_bytes: None,
+                start_chunk_index: 0,
+                max_chunks: 0,
+            }),
+        ),
+    );
     requester_transport
-        .send(
+        .send_object_rpc_request(
             &server,
-            NetworkFrame {
-                frame_id: NetworkFrameId(2),
-                source_node_id: requester.clone(),
-                target_node_id: server.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(2),
-                    origin_node_id: requester.clone(),
-                    target_node_id: server.clone(),
-                    body: MeshMessageBody::Protocol(
-                        ProtocolMessage::encode(
-                            DFS_PROTOCOL,
-                            &DfsNetworkMessage::ReadRequest(DfsReadRequest {
-                                request_id: "dfs_net_req_after_bad_frame".to_string(),
-                                object_id: object_id.clone(),
-                                version: None,
-                                content_hash: None,
-                                content_size_bytes: None,
-                                range_offset: None,
-                                range_max_bytes: None,
-                                start_chunk_index: 0,
-                                max_chunks: 0,
-                            }),
-                        )
-                        .expect("valid read request"),
-                    ),
-                },
-            },
+            dfs_message_rpc_request(&valid_command).expect("valid DFS message request"),
         )
-        .expect("send valid frame");
+        .expect("send valid object RPC message");
 
     let events = dfs
         .process_incoming()
-        .expect("malformed frame should be isolated");
+        .expect("malformed object RPC message should be isolated");
 
     assert!(events.iter().any(|event| {
         matches!(
@@ -12093,14 +12020,12 @@ fn malformed_dfs_protocol_frame_does_not_block_following_valid_frame() {
                 object_id: served_object_id,
                 result: DfsReadResult::Found(data),
                 ..
-            } if request_id == "dfs_net_req_after_bad_frame"
+            } if request_id == "dfs_net_req_after_bad_message"
                 && served_object_id == &object_id
                 && data.bytes == bytes
         )
     }));
-    let responses = requester_transport
-        .drain_incoming()
-        .expect("requester response mailbox");
+    let responses = drain_dfs_messages(&mut requester_transport);
     assert_eq!(responses.len(), 1);
     std::fs::remove_dir_all(root).ok();
 }
@@ -16737,18 +16662,11 @@ fn repair_replica_window_resumes_large_chunk_transfer() {
             next_chunk_index: DFS_STAGE_CHUNK_WINDOW_SIZE,
         }
     );
-    let first_chunks = replica_transport
-        .drain_incoming()
-        .expect("first repair frames")
+    let first_chunks = drain_dfs_messages(&mut replica_transport)
         .into_iter()
-        .filter_map(|frame| {
-            let MeshMessageBody::Protocol(protocol) = frame.frame.message.body else {
-                return None;
-            };
-            match protocol.decode::<DfsNetworkMessage>().expect("decode DFS") {
-                DfsNetworkMessage::RepairReplicaChunk(chunk) => Some(chunk),
-                _ => None,
-            }
+        .filter_map(|message| match message {
+            DfsNetworkMessage::RepairReplicaChunk(chunk) => Some(chunk),
+            _ => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(first_chunks.len(), DFS_STAGE_CHUNK_WINDOW_SIZE as usize);
@@ -16790,18 +16708,11 @@ fn repair_replica_window_resumes_large_chunk_transfer() {
             next_chunk_index: total_chunks,
         }
     );
-    let second_chunks = replica_transport
-        .drain_incoming()
-        .expect("second repair frames")
+    let second_chunks = drain_dfs_messages(&mut replica_transport)
         .into_iter()
-        .filter_map(|frame| {
-            let MeshMessageBody::Protocol(protocol) = frame.frame.message.body else {
-                return None;
-            };
-            match protocol.decode::<DfsNetworkMessage>().expect("decode DFS") {
-                DfsNetworkMessage::RepairReplicaChunk(chunk) => Some(chunk),
-                _ => None,
-            }
+        .filter_map(|message| match message {
+            DfsNetworkMessage::RepairReplicaChunk(chunk) => Some(chunk),
+            _ => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(

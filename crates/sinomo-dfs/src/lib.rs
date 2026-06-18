@@ -114,10 +114,6 @@ use sinomo_local::{LocalDataError, SinomoDataDir};
 use sinomo_network::{
     ClusterPaths, NetworkError, ObjectRpcRequest, ObjectRpcResponse, SinomoObjectCodec,
 };
-#[cfg(test)]
-use sinomo_network::{
-    MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrame, NetworkFrameId, ProtocolMessage,
-};
 use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -407,31 +403,6 @@ fn dfs_routed_message_from_object_rpc_request(
     }
     let command: DfsMessageCommand = request.decode_body()?;
     Ok(command.routed_message)
-}
-
-#[cfg(test)]
-pub(crate) fn build_dfs_network_frame(
-    source_node_id: &NodeId,
-    target_node_id: &NodeId,
-    frame_id: u64,
-    message_id: u64,
-    message: DfsNetworkMessage,
-) -> Result<NetworkFrame, DfsError> {
-    protocol::dfs_protocol_frame_from_routed_message(&build_dfs_routed_message(
-        source_node_id,
-        target_node_id,
-        frame_id,
-        message_id,
-        message,
-    ))
-    .map_err(DfsError::from_network)
-}
-
-#[cfg(test)]
-fn dfs_routed_message_from_network_frame(
-    frame: &NetworkFrame,
-) -> Result<DfsRoutedMessage, NetworkError> {
-    protocol::dfs_routed_message_from_protocol_frame(frame)
 }
 
 fn dfs_network_message_is_read_only_request(message: &DfsNetworkMessage) -> bool {
