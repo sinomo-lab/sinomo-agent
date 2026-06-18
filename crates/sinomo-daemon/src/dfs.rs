@@ -7,6 +7,8 @@ use sinomo_core::ClusterEndpointRecord;
 #[cfg(test)]
 use sinomo_dfs::DfsFileSystemConfig;
 #[cfg(test)]
+use sinomo_dfs::protocol::{DfsProtocolFrameCommand, DfsProtocolFrameResponse};
+#[cfg(test)]
 use sinomo_dfs::{
     DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMetadataJournalBatchCommand,
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataJournalBatchSender,
@@ -25,8 +27,6 @@ use sinomo_dfs::{
     DfsMetadataPublishScheduleOptions, DfsObjectRpcSendOptions, DfsPeerTransport,
     DfsPeerTransportError, NetworkedDfsService,
 };
-#[cfg(test)]
-use sinomo_dfs::{DfsProtocolFrameCommand, DfsProtocolFrameResponse};
 use sinomo_kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_local::SinomoDataDir;
 use sinomo_network::ClusterPaths;
@@ -1040,11 +1040,11 @@ mod tests {
         ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterTransportKind,
         DfsObjectPolicy,
     };
+    use sinomo_dfs::protocol::DfsProtocolFrameCommand;
     use sinomo_dfs::{
         DfsBlobTransferResult, DfsMetadataJournalReplicationOutcome, DfsNamespaceCommand,
         DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNetworkMessage, DfsObjectId,
-        DfsObjectKind, DfsObjectMetadata, DfsProtocolFrameCommand, DfsStageBlobCommand, DfsVersion,
-        DfsWriteOptions,
+        DfsObjectKind, DfsObjectMetadata, DfsStageBlobCommand, DfsVersion, DfsWriteOptions,
     };
     use sinomo_network::{
         MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrame, NetworkFrameId, ProtocolMessage,
