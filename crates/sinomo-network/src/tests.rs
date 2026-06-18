@@ -14,6 +14,7 @@ use crate::lan::{
 };
 use crate::member_store::MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS;
 use crate::object::{DaemonControlStream, read_object_frame_blocking, write_object_frame_blocking};
+use crate::object_file_store::*;
 use crate::peer::{
     AsyncNetworkServiceHandle, AsyncNetworkTransport, AsyncNetworkTransportFuture, DeliveryAck,
     DeliveryLedger, DeliveryStatus, Heartbeat, HeartbeatPolicy, InProcessRouter, InboundFrame,
@@ -433,7 +434,7 @@ fn iroh_secret_key_creation_is_atomic_under_concurrency() {
     let paths = ClusterPaths::new(&data_dir);
     let node_id = NodeId::from_legacy_named("node_iroh_secret_concurrent").expect("node");
     let key_path = crate::roaming::iroh_endpoint_key_path(&paths, &node_id);
-    crate::storage::reset_write_object_file_create_new_attempts_for_test(&key_path);
+    crate::object_file_store::reset_write_object_file_create_new_attempts_for_test(&key_path);
     let threads = 8;
     let barrier = Arc::new(Barrier::new(threads));
     let handles = (0..threads)
@@ -468,7 +469,7 @@ fn iroh_secret_key_creation_is_atomic_under_concurrency() {
         .to_string();
     assert_eq!(persisted_public_key, public_keys[0]);
     assert_eq!(
-        crate::storage::write_object_file_create_new_attempts_for_test(&key_path),
+        crate::object_file_store::write_object_file_create_new_attempts_for_test(&key_path),
         1,
         "concurrent Iroh secret initialization should serialize creation so only one temporary key is written"
     );
@@ -30045,17 +30046,17 @@ fn read_optional_object_file_treats_only_missing_file_as_absent() {
 
     let missing = root.join("missing.sobj");
     assert_eq!(
-        crate::storage::read_optional_object_file::<OptionalObjectFixture>(&missing)
+        crate::object_file_store::read_optional_object_file::<OptionalObjectFixture>(&missing)
             .expect("missing optional object"),
         None,
         "a missing optional object should be absent without a pre-open exists probe"
     );
 
     let object = root.join("present.sobj");
-    crate::storage::write_object_file(&object, &OptionalObjectFixture { value: 42 })
+    crate::object_file_store::write_object_file(&object, &OptionalObjectFixture { value: 42 })
         .expect("write object");
     assert_eq!(
-        crate::storage::read_optional_object_file::<OptionalObjectFixture>(&object)
+        crate::object_file_store::read_optional_object_file::<OptionalObjectFixture>(&object)
             .expect("present optional object"),
         Some(OptionalObjectFixture { value: 42 })
     );
@@ -30063,7 +30064,8 @@ fn read_optional_object_file_treats_only_missing_file_as_absent() {
     let directory = root.join("directory.sobj");
     std::fs::create_dir_all(&directory).expect("directory");
     assert!(
-        crate::storage::read_optional_object_file::<OptionalObjectFixture>(&directory).is_err(),
+        crate::object_file_store::read_optional_object_file::<OptionalObjectFixture>(&directory)
+            .is_err(),
         "a directory at an optional object path is a storage error, not absence"
     );
 }
@@ -30079,9 +30081,9 @@ fn write_object_file_create_new_falls_back_when_hard_links_are_unsupported() {
     std::fs::create_dir_all(&root).expect("root");
     let path = root.join("object.sobj");
 
-    crate::storage::force_write_object_file_create_new_unsupported_link_for_test(&path);
+    crate::object_file_store::force_write_object_file_create_new_unsupported_link_for_test(&path);
     assert!(
-        crate::storage::write_object_file_create_new_serialized(
+        crate::object_file_store::write_object_file_create_new_serialized(
             &path,
             &CreateNewFixture { value: 42 },
         )
@@ -30089,11 +30091,12 @@ fn write_object_file_create_new_falls_back_when_hard_links_are_unsupported() {
         "missing target should be created when hard links are unsupported"
     );
     assert_eq!(
-        crate::storage::read_object_file::<CreateNewFixture>(&path).expect("read created object"),
+        crate::object_file_store::read_object_file::<CreateNewFixture>(&path)
+            .expect("read created object"),
         CreateNewFixture { value: 42 }
     );
     assert!(
-        !crate::storage::write_object_file_create_new_serialized(
+        !crate::object_file_store::write_object_file_create_new_serialized(
             &path,
             &CreateNewFixture { value: 7 },
         )
@@ -30101,7 +30104,8 @@ fn write_object_file_create_new_falls_back_when_hard_links_are_unsupported() {
         "existing target should not be replaced in the hard-link fallback"
     );
     assert_eq!(
-        crate::storage::read_object_file::<CreateNewFixture>(&path).expect("read original object"),
+        crate::object_file_store::read_object_file::<CreateNewFixture>(&path)
+            .expect("read original object"),
         CreateNewFixture { value: 42 }
     );
     assert!(
@@ -30112,7 +30116,7 @@ fn write_object_file_create_new_falls_back_when_hard_links_are_unsupported() {
             .all(|name| !name.contains(".create-new-tmp-")),
         "create-new fallback should not leave staged temp files behind"
     );
-    crate::storage::clear_write_object_file_create_new_unsupported_link_for_test(&path);
+    crate::object_file_store::clear_write_object_file_create_new_unsupported_link_for_test(&path);
 }
 
 #[test]
@@ -30126,14 +30130,14 @@ fn write_object_file_skips_identical_and_rewrites_after_external_change() {
     let path = root.join("obj.sobj");
 
     let value = "alpha".to_string();
-    crate::storage::write_object_file(&path, &value).expect("initial write");
+    crate::object_file_store::write_object_file(&path, &value).expect("initial write");
     let mtime_after_write = std::fs::metadata(&path)
         .expect("metadata")
         .modified()
         .expect("mtime");
 
     // An identical re-write takes the fast path and leaves the file untouched.
-    crate::storage::write_object_file(&path, &value).expect("identical re-write");
+    crate::object_file_store::write_object_file(&path, &value).expect("identical re-write");
     assert_eq!(
         std::fs::metadata(&path)
             .expect("metadata")
@@ -30153,7 +30157,8 @@ fn write_object_file_skips_identical_and_rewrites_after_external_change() {
 
     // Writing our content again must detect the change via the stat guard, fall
     // back to read + compare, and actually rewrite -- never falsely skip.
-    crate::storage::write_object_file(&path, &value).expect("rewrite after external change");
+    crate::object_file_store::write_object_file(&path, &value)
+        .expect("rewrite after external change");
     let restored: String = SinomoObjectCodec::default()
         .decode(&std::fs::read(&path).expect("read"))
         .expect("decode");
@@ -30195,7 +30200,7 @@ fn write_object_file_cleans_temp_file_after_replace_failure() {
     let path = root.join("obj.sobj");
     std::fs::create_dir(&path).expect("target directory");
 
-    let error = crate::storage::write_object_file(&path, &"alpha".to_string())
+    let error = crate::object_file_store::write_object_file(&path, &"alpha".to_string())
         .expect_err("replacing a directory should fail");
     assert!(
         error.to_string().contains("obj.sobj"),

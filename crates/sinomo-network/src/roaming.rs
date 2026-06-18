@@ -3,16 +3,20 @@ use crate::error::NetworkError;
 #[cfg(any(feature = "iroh-transport", test))]
 use crate::io_observer;
 use crate::object::DaemonRpcTimeouts;
+use crate::object_file_store::{read_object_file, write_object_file};
+#[cfg(feature = "iroh-transport")]
+use crate::object_file_store::{
+    read_optional_object_file, write_object_file_create_new_serialized,
+};
 #[cfg(test)]
 use crate::peer::{EndpointCandidateStatus, PeerEndpointCandidate};
 use crate::prelude::*;
-use crate::storage::{read_object_file, write_object_file};
-#[cfg(feature = "iroh-transport")]
-use crate::storage::{read_optional_object_file, write_object_file_create_new_serialized};
 #[cfg(feature = "iroh-transport")]
 use fs2::FileExt;
 #[cfg(test)]
 use sinomo_kv::KvEntry;
+#[cfg(feature = "iroh-transport")]
+use std::fs;
 
 #[cfg(feature = "iroh-transport")]
 const IROH_ROAMING_PROTOCOL: &str = "sinomo.iroh-roaming.v1";

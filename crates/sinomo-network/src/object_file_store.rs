@@ -2,6 +2,7 @@ use crate::error::NetworkError;
 use crate::object::SinomoObjectCodec;
 use serde::Serialize;
 use sinomo_storage::durable_file;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
@@ -9,15 +10,14 @@ use std::sync::LazyLock;
 use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::HashSet;
-#[cfg(any(test, feature = "iroh-transport"))]
-use std::fs;
 #[cfg(test)]
 use std::sync::Mutex;
 #[cfg(test)]
 use std::time::SystemTime;
 
-use super::FILE_CACHE_CAPACITY;
 use crate::io_observer;
+
+const FILE_CACHE_CAPACITY: usize = 4096;
 
 pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = durable_file::DEFAULT_OBJECT_FILE_MAX_READ_BYTES;
 
@@ -59,6 +59,17 @@ fn read_optional_object_file_bytes(path: &PathBuf) -> Result<Option<Vec<u8>>, Ne
 fn read_object_file_bytes(path: &PathBuf) -> Result<Vec<u8>, NetworkError> {
     durable_file::read_object_file_bytes(path, MAX_OBJECT_FILE_READ_BYTES)
         .map_err(network_durable_file_error)
+}
+
+pub(crate) fn remove_optional_file(path: &PathBuf) -> Result<bool, NetworkError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(NetworkError::StorageIo {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }),
+    }
 }
 
 pub(crate) fn write_object_file<T: Serialize>(

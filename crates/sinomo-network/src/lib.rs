@@ -43,6 +43,7 @@ mod membership_forward;
 mod membership_rpc;
 mod network_info;
 mod object;
+mod object_file_store;
 mod paths;
 mod peer;
 mod records;
@@ -572,7 +573,6 @@ pub(crate) mod prelude {
     #[cfg(test)]
     pub(crate) use std::collections::HashSet;
     pub(crate) use std::collections::{BTreeMap, BTreeSet, VecDeque};
-    pub(crate) use std::fs;
     pub(crate) use std::io;
     pub(crate) use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
     pub(crate) use std::path::PathBuf;

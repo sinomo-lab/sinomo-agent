@@ -6,7 +6,9 @@ use crate::connectivity_publish::{
     validate_cluster_connectivity_records_for_source,
 };
 use crate::error::NetworkError;
-use crate::storage::{read_optional_object_file, remove_optional_file, write_object_file};
+use crate::object_file_store::{
+    read_optional_object_file, remove_optional_file, write_object_file,
+};
 use sinomo_node::NodeId;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;

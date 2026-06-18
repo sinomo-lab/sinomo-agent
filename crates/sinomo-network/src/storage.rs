@@ -134,6 +134,7 @@ use crate::member_publish::{
     ClusterLocalMemberPublishHost, ClusterMemberPublishHost,
     handle_cluster_member_publish_request_with_host,
 };
+pub use crate::member_store::upsert_member_record;
 pub(crate) use crate::member_store::{
     apply_cluster_raft_role, cluster_legacy_shadow_orphan_artifact_cleanup_txns_from_store,
     cluster_legacy_shadow_orphan_artifact_node_ids_from_store,
@@ -146,7 +147,6 @@ pub(crate) use crate::member_store::{
     cluster_member_put_command, cluster_member_update_ops_from_store,
     cluster_raft_config_from_store,
 };
-pub use crate::member_store::{merge_member_record, upsert_member_record};
 use crate::membership::{cluster_member_is_legacy_shadow_daemon, cluster_member_is_local_process};
 use crate::membership_forward::{
     ClusterMembershipRpcForwardHost, forward_cluster_membership_rpc_to_voter_async_with_host,
@@ -187,41 +187,9 @@ use sinomo_kv::{
     ClusterRaftAppendResponse, ClusterRaftVoteRequest, ClusterRaftVoteResponse, KvRevision,
 };
 
-mod durable_object_file;
-
-#[cfg(any(test, feature = "iroh-transport"))]
-pub(crate) use durable_object_file::write_object_file_create_new_serialized;
-#[cfg(test)]
-pub(crate) use durable_object_file::{
-    MAX_OBJECT_FILE_READ_BYTES, clear_write_object_file_create_new_unsupported_link_for_test,
-    force_write_object_file_create_new_unsupported_link_for_test,
-    object_file_write_mark_cache_capacity_for_test, object_file_write_mark_cache_contains_for_test,
-    record_object_file_write_mark_for_test, refresh_object_file_write_mark_for_test,
-    remove_object_file_write_mark_entries_under_root_for_test,
-};
-pub(crate) use durable_object_file::{
-    read_object_file, read_optional_object_file, write_object_file,
-};
-#[cfg(all(test, feature = "iroh-transport"))]
-pub(crate) use durable_object_file::{
-    reset_write_object_file_create_new_attempts_for_test,
-    write_object_file_create_new_attempts_for_test,
-};
-
 pub use sinomo_node::DAEMON_MAIN_RUN_CAPABILITY;
-const FILE_CACHE_CAPACITY: usize = 4096;
 static CLUSTER_RAFT_FANOUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CLUSTER_RAFT_FANOUT_PENDING: AtomicBool = AtomicBool::new(false);
-pub(crate) fn remove_optional_file(path: &PathBuf) -> Result<bool, NetworkError> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(source) => Err(NetworkError::StorageIo {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        }),
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterJoinReconciliation {
