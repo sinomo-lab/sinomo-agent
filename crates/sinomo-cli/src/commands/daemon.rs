@@ -639,8 +639,9 @@ impl network::ClusterKvSnapshotRefreshHost for CliClusterKvSnapshotRefreshHost {
         local_node_id: &NodeId,
         snapshot: KvSnapshot,
     ) -> Result<bool, network::NetworkError> {
-        let _raft_guard = sinomo_runtime::kv::lock_cluster_kv_raft_operation()
-            .map_err(network::NetworkError::from)?;
+        let _raft_guard =
+            sinomo_runtime::kv::lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths())
+                .map_err(network::NetworkError::from)?;
         paths
             .kv_paths()
             .local_cache()
@@ -762,8 +763,9 @@ impl sinomo_runtime::kv::ClusterKvRaftCommandStorage for CliClusterRaftCommandSt
         &mut self,
         command: sinomo_runtime::kv::KvCommand,
     ) -> Result<sinomo_runtime::kv::ClusterKvRaftUncommittedAppend, network::NetworkError> {
-        let _raft_guard = sinomo_runtime::kv::lock_cluster_kv_raft_operation()
-            .map_err(network::NetworkError::from)?;
+        let _raft_guard =
+            sinomo_runtime::kv::lock_cluster_kv_raft_operation_for_paths(&self.paths.kv_paths())
+                .map_err(network::NetworkError::from)?;
         self.raft_store()
             .append_command_uncommitted_or_no_effect(&self.local_node_id, command)
             .map_err(Into::into)
@@ -772,8 +774,9 @@ impl sinomo_runtime::kv::ClusterKvRaftCommandStorage for CliClusterRaftCommandSt
     fn discard_cluster_raft_uncommitted_tail_and_clear_leader(
         &mut self,
     ) -> Result<(), network::NetworkError> {
-        let _raft_guard = sinomo_runtime::kv::lock_cluster_kv_raft_operation()
-            .map_err(network::NetworkError::from)?;
+        let _raft_guard =
+            sinomo_runtime::kv::lock_cluster_kv_raft_operation_for_paths(&self.paths.kv_paths())
+                .map_err(network::NetworkError::from)?;
         let snapshot = self
             .raft_store()
             .discard_uncommitted_tail_and_clear_leader(&self.local_node_id)
@@ -787,8 +790,9 @@ impl sinomo_runtime::kv::ClusterKvRaftCommandStorage for CliClusterRaftCommandSt
         &mut self,
         index: u64,
     ) -> Result<sinomo_runtime::kv::ClusterKvRaftCommitResult, network::NetworkError> {
-        let _raft_guard = sinomo_runtime::kv::lock_cluster_kv_raft_operation()
-            .map_err(network::NetworkError::from)?;
+        let _raft_guard =
+            sinomo_runtime::kv::lock_cluster_kv_raft_operation_for_paths(&self.paths.kv_paths())
+                .map_err(network::NetworkError::from)?;
         let store = self.raft_store();
         let result = store
             .commit_index_with_events(&self.local_node_id, index)

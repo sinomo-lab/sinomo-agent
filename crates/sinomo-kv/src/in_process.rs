@@ -1,4 +1,4 @@
-use super::*;
+use crate::internal::*;
 
 #[derive(Clone, Copy)]
 pub(crate) struct SimulatedKeyState {

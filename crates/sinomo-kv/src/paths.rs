@@ -1,4 +1,4 @@
-use super::*;
+use crate::internal::*;
 
 pub const CLUSTER_KV_COMMIT_SEQUENCE_LOCK_WAIT: Duration = Duration::from_secs(30);
 

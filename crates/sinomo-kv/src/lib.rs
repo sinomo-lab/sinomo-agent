@@ -232,11 +232,133 @@ mod test_support;
 mod wal;
 mod watch;
 
-pub use in_process::*;
-pub use model::*;
-pub use paths::*;
-pub use raft::*;
-pub use rpc::*;
-pub use snapshot::*;
-pub use wal::*;
-pub use watch::*;
+mod internal {
+    pub(crate) use super::in_process::*;
+    pub(crate) use super::model::*;
+    pub(crate) use super::paths::*;
+    pub(crate) use super::raft::*;
+    pub(crate) use super::rpc::*;
+    pub(crate) use super::snapshot::*;
+    pub(crate) use super::wal::*;
+    pub(crate) use super::watch::*;
+    pub(crate) use super::*;
+}
+
+pub use in_process::{InProcessKvStore, InProcessRaftKvCluster};
+pub use model::{
+    KvCommand, KvCompare, KvEntry, KvError, KvEvent, KvEventKind, KvLease, KvOp, KvOpResponse,
+    KvRevision, KvSnapshot, KvTxn, KvTxnResponse, KvVersion, KvWatch, LeaseId, WatchId,
+    decode_kv_value, encode_kv_value,
+};
+pub use paths::{
+    CLUSTER_KV_COMMIT_SEQUENCE_LOCK_WAIT, ClusterKvPaths, lock_cluster_kv_commit_sequence,
+    register_storage_paths,
+};
+pub use raft::{
+    ClusterKvRaftAppendReplicationAsyncHost, ClusterKvRaftAppendReplicationHost,
+    ClusterKvRaftAppendReplicationOptions, ClusterKvRaftAppendReplicationOutcome,
+    ClusterKvRaftAppendRequest, ClusterKvRaftCommandStorage, ClusterKvRaftCommitResult,
+    ClusterKvRaftCompactionPolicy, ClusterKvRaftConfigRecord, ClusterKvRaftLeaderElectionAsyncHost,
+    ClusterKvRaftLeaderElectionHost, ClusterKvRaftLeaderElectionOptions,
+    ClusterKvRaftLocalCommandStorage, ClusterKvRaftLocalVoteMetadata, ClusterKvRaftOperationGuard,
+    ClusterKvRaftQuorumCommitAsyncHost, ClusterKvRaftQuorumCommitHost,
+    ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult, ClusterKvRaftQuorumFuture,
+    ClusterKvRaftStore, ClusterKvRaftTargetReplicationStatus, ClusterKvRaftUncommittedAppend,
+    ClusterKvTxnCommitResult, ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumDriverOptions,
+    ClusterKvTxnQuorumHost, DurableRaftKvNode, KvLogEntry, RaftAppendEntriesApplyOutcome,
+    RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftHardState, RaftRequestVoteRequest,
+    RaftRequestVoteResponse, RaftSnapshot, cluster_kv_member_has_raft_vote,
+    cluster_kv_raft_candidate_is_authorized_voter, cluster_kv_raft_config_key,
+    cluster_kv_raft_config_member_role, cluster_kv_raft_config_record_stable_eq,
+    cluster_kv_raft_local_is_voter, cluster_kv_raft_node_is_voter,
+    cluster_kv_raft_node_should_compact, cluster_kv_raft_quorum_size,
+    cluster_kv_raft_quorum_size_for_state, cluster_kv_raft_snapshot_byte_limit,
+    cluster_kv_raft_voter_ids, cluster_kv_store_member_is_raft_voter,
+    commit_cluster_kv_raft_command_with_quorum, commit_cluster_kv_raft_command_with_quorum_async,
+    commit_cluster_kv_txn_with_quorum_async_with_host, commit_cluster_kv_txn_with_quorum_with_host,
+    compact_cluster_kv_raft_node_if_needed, default_cluster_kv_raft_compaction_policy,
+    elect_cluster_kv_raft_leader_async_with_host, elect_cluster_kv_raft_leader_with_host,
+    lock_cluster_kv_raft_operation_for_paths, lock_cluster_kv_raft_operation_for_root,
+    lock_cluster_kv_raft_operation_for_wal_paths,
+    replicate_cluster_kv_raft_to_target_async_with_host,
+    replicate_cluster_kv_raft_to_target_with_host, validate_cluster_kv_raft_config_transition,
+};
+pub use rpc::{
+    ClusterKvLocalReadWatchHost, ClusterKvRpcPayload, ClusterKvWatchEventsRequest,
+    ClusterKvWatchEventsResponse, ClusterRaftAppendRequest, ClusterRaftAppendResponse,
+    ClusterRaftVoteRequest, ClusterRaftVoteResponse, cluster_kv_range_prefix_rpc_payload,
+    cluster_kv_snapshot_response_rpc_payload, cluster_kv_snapshot_rpc_payload,
+    cluster_kv_txn_response_rpc_payload, cluster_kv_txn_rpc_payload,
+    cluster_kv_watch_events_noop_response, cluster_kv_watch_events_response_rpc_payload,
+    cluster_kv_watch_events_rpc_payload, cluster_raft_append_response_rpc_payload,
+    cluster_raft_append_rpc_payload, cluster_raft_vote_response_rpc_payload,
+    cluster_raft_vote_rpc_payload, decode_cluster_kv_snapshot_rpc_body,
+    decode_cluster_kv_snapshot_rpc_request_body, decode_cluster_kv_txn_rpc_body,
+    decode_cluster_kv_txn_rpc_request_body, decode_cluster_kv_watch_events_rpc_request_body,
+    decode_cluster_kv_watch_events_rpc_response_body, decode_cluster_raft_append_rpc_request_body,
+    decode_cluster_raft_append_rpc_response_body, decode_cluster_raft_vote_rpc_request_body,
+    decode_cluster_raft_vote_rpc_response_body, handle_cluster_kv_local_read_watch_rpc_payload,
+    handle_cluster_kv_watch_events, handle_cluster_raft_rpc_payload,
+};
+pub use snapshot::{
+    KvLocalCache, KvMaterializedCache, compact_kv_snapshot_event_history, kv_snapshot_durable_eq,
+    read_cluster_kv_cached_snapshot, read_cluster_kv_current_snapshot_arc_for_node,
+    read_cluster_kv_current_snapshot_for_node, read_cluster_kv_entry,
+    read_cluster_kv_prefix_entries, read_cluster_kv_prefix_entries_limited,
+    read_cluster_kv_prefix_entries_limited_by_payload_bytes, read_cluster_kv_store_for_node,
+    write_cluster_kv_materialized_snapshot_if_changed, write_cluster_kv_snapshot,
+    write_cluster_kv_snapshot_if_changed, write_imported_cluster_kv_snapshot_if_changed,
+};
+pub use wal::KvWalPaths;
+pub use watch::{
+    ClusterKvActiveWatchRegistrationReport, ClusterKvWatchAllocatorState,
+    ClusterKvWatchCancelRequest, ClusterKvWatchCancelResponse, ClusterKvWatchDrainCursorAction,
+    ClusterKvWatchDrainCursorPersistence, ClusterKvWatchDrainRegistrationReport,
+    ClusterKvWatchDrainRequest, ClusterKvWatchDrainResponse, ClusterKvWatchEventAppendCacheView,
+    ClusterKvWatchEventAppendReport, ClusterKvWatchEventFanoutBatchLimit,
+    ClusterKvWatchEventLogRead, ClusterKvWatchEventsRead, ClusterKvWatchObservedGeneration,
+    ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration,
+    ClusterKvWatchRegistrationCreateReport, ClusterKvWatchRegistrationRemovalReport,
+    ClusterKvWatchScanRegistration, ClusterKvWatchScanResult, EncodedClusterKvWatchEventLogBatch,
+    append_cluster_kv_watch_events_for_active_watches_for_node,
+    append_cluster_kv_watch_events_to_storage,
+    append_cluster_kv_watch_events_to_storage_with_observers, cancel_cluster_kv_watch,
+    cluster_kv_active_watch_registration_report, cluster_kv_events_can_defer_materialized_snapshot,
+    cluster_kv_events_contain, cluster_kv_events_contain_all,
+    cluster_kv_materialized_snapshot_is_fresh_enough_against, cluster_kv_snapshot_compare,
+    cluster_kv_snapshot_delta_only_deferable,
+    cluster_kv_watch_allocator_after_registration_removed, cluster_kv_watch_allocator_after_scan,
+    cluster_kv_watch_allocator_needs_scan, cluster_kv_watch_event_append_should_checkpoint,
+    cluster_kv_watch_event_fanout_batches, cluster_kv_watch_event_fanout_batches_with_limits,
+    cluster_kv_watch_event_payload_bytes, cluster_kv_watch_events_matching_registrations,
+    cluster_kv_watch_events_payload_bytes, cluster_kv_watch_generation,
+    cluster_kv_watch_id_from_file_name, cluster_kv_watch_ids_matching_events,
+    cluster_kv_watch_observed_generation, cluster_kv_watch_registration_cursor_should_persist,
+    cluster_raft_append_request_needs_watch_event_fanout, collect_cluster_kv_watch_drain_events,
+    compact_cluster_kv_watch_events, compact_cluster_kv_watch_events_incremental,
+    create_cluster_kv_watch_for_node, create_cluster_kv_watch_registration,
+    drain_cluster_kv_watch_for_node, drain_cluster_kv_watch_registration,
+    list_cluster_kv_watch_registrations, lock_cluster_kv_watch_allocator,
+    notify_cluster_kv_watchers, notify_cluster_kv_watchers_for_events,
+    notify_cluster_kv_watchers_for_watch_ids, persist_cluster_kv_watch_drain_cursor,
+    read_cluster_kv_watch_allocator_state, read_cluster_kv_watch_event_checkpoint,
+    read_cluster_kv_watch_event_log, read_cluster_kv_watch_event_log_from_file_with_observer,
+    read_cluster_kv_watch_event_log_with_observer, read_cluster_kv_watch_events,
+    read_cluster_kv_watch_events_with_observer, read_cluster_kv_watch_registration_file,
+    remove_cluster_kv_watch_registration_file_if_exists,
+    remove_cluster_kv_watch_registration_with_allocator, scan_cluster_kv_watch_registrations,
+    validate_cluster_kv_watch_event_fanout_batch,
+    validate_cluster_kv_watch_event_fanout_batch_with_limits, wait_for_cluster_kv_watch_change,
+    wait_for_cluster_kv_watch_change_for_watch, write_cluster_kv_watch_allocator_state,
+    write_cluster_kv_watch_event_checkpoint, write_cluster_kv_watch_registration_file,
+    write_cluster_kv_watch_registration_file_create_new,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use watch::{
+    cluster_kv_watch_notifier_capacity_for_test, cluster_kv_watch_notifier_has_key_for_test,
+    cluster_kv_watch_notifier_has_raw_key_for_test,
+    cluster_kv_watch_notifier_waiter_count_for_test, cluster_kv_watch_unchanged_wakeups_for_test,
+    record_cluster_kv_watch_notifier_waiter_key_for_test,
+    remove_cluster_kv_watch_notifier_entries_under_root_for_test,
+    reset_cluster_kv_watch_unchanged_wakeups_for_test, touch_cluster_kv_watch_notifier_for_test,
+};

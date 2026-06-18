@@ -1,4 +1,4 @@
-use super::*;
+use crate::internal::*;
 
 #[cfg(test)]
 mod tests {
@@ -1513,7 +1513,7 @@ mod tests {
 
         assert_eq!(
             read_cluster_kv_watch_allocator_state(&paths).expect("default allocator"),
-            ClusterKvWatchAllocatorState::legacy(1)
+            ClusterKvWatchAllocatorState::initial_for_missing_state(1)
         );
 
         let persisted = ClusterKvWatchAllocatorState {

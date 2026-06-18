@@ -1,20 +1,46 @@
-use super::*;
+use crate::internal::*;
 
-pub(crate) static CLUSTER_KV_RAFT_OPERATION_LOCK: LazyLock<Mutex<()>> =
-    LazyLock::new(|| Mutex::new(()));
+pub(crate) static CLUSTER_KV_RAFT_OPERATION_LOCKS: LazyLock<
+    Mutex<HashMap<PathBuf, &'static Mutex<()>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 #[cfg(test)]
 pub(crate) static CLUSTER_KV_RAFT_SNAPSHOT_BYTES_LIMIT_FOR_TEST: AtomicU64 =
     AtomicU64::new(MAX_CLUSTER_KV_RAFT_SNAPSHOT_BYTES);
 
 pub type ClusterKvRaftOperationGuard = MutexGuard<'static, ()>;
 
-pub fn lock_cluster_kv_raft_operation() -> Result<ClusterKvRaftOperationGuard, KvError> {
-    CLUSTER_KV_RAFT_OPERATION_LOCK
-        .lock()
-        .map_err(|error| KvError::Io {
-            path: "cluster kv raft operation lock".to_string(),
-            detail: format!("cluster kv raft operation lock poisoned: {error}"),
+pub fn lock_cluster_kv_raft_operation_for_root(
+    root: impl AsRef<Path>,
+) -> Result<ClusterKvRaftOperationGuard, KvError> {
+    let root = root.as_ref().to_path_buf();
+    let lock = {
+        let mut guard = CLUSTER_KV_RAFT_OPERATION_LOCKS
+            .lock()
+            .map_err(|error| KvError::Io {
+                path: "cluster kv raft operation locks".to_string(),
+                detail: format!("cluster kv raft operation lock table poisoned: {error}"),
+            })?;
+        *guard.entry(root.clone()).or_insert_with(|| {
+            let lock: &'static Mutex<()> = Box::leak(Box::new(Mutex::new(())));
+            lock
         })
+    };
+    lock.lock().map_err(|error| KvError::Io {
+        path: root.display().to_string(),
+        detail: format!("cluster kv raft operation lock poisoned: {error}"),
+    })
+}
+
+pub fn lock_cluster_kv_raft_operation_for_paths(
+    paths: &ClusterKvPaths,
+) -> Result<ClusterKvRaftOperationGuard, KvError> {
+    lock_cluster_kv_raft_operation_for_root(&paths.root)
+}
+
+pub fn lock_cluster_kv_raft_operation_for_wal_paths(
+    paths: &KvWalPaths,
+) -> Result<ClusterKvRaftOperationGuard, KvError> {
+    lock_cluster_kv_raft_operation_for_root(&paths.root)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1464,6 +1490,10 @@ impl ClusterKvRaftStore {
         &self.paths
     }
 
+    pub fn lock_operation(&self) -> Result<ClusterKvRaftOperationGuard, KvError> {
+        lock_cluster_kv_raft_operation_for_paths(&self.paths)
+    }
+
     pub fn wal_paths(&self, node_id: &NodeId) -> KvWalPaths {
         self.paths.raft_wal_paths(node_id)
     }
@@ -1583,7 +1613,7 @@ impl ClusterKvRaftStore {
         state: &ClusterBootstrapState,
         next_index: u64,
     ) -> Result<ClusterRaftAppendRequest, KvError> {
-        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        let _raft_guard = self.lock_operation()?;
         self.build_cluster_raft_append_request_from_next_index(state, next_index)
     }
 
@@ -1600,7 +1630,7 @@ impl ClusterKvRaftStore {
             .display()
             .to_string();
         tokio::task::spawn_blocking(move || {
-            let _raft_guard = lock_cluster_kv_raft_operation()?;
+            let _raft_guard = store.lock_operation()?;
             store.build_cluster_raft_append_request_from_next_index(&state, next_index)
         })
         .await
@@ -1637,7 +1667,7 @@ impl ClusterKvRaftStore {
         node_id: &NodeId,
         snapshot: KvSnapshot,
     ) -> Result<bool, KvError> {
-        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        let _raft_guard = self.lock_operation()?;
         self.restore_from_snapshot_if_newer_and_notify(node_id, snapshot)
     }
 
@@ -1657,7 +1687,7 @@ impl ClusterKvRaftStore {
         &self,
         node_id: &NodeId,
     ) -> Result<ClusterKvRaftLocalVoteMetadata, KvError> {
-        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        let _raft_guard = self.lock_operation()?;
         self.local_vote_metadata(node_id)
     }
 
@@ -1666,7 +1696,7 @@ impl ClusterKvRaftStore {
     }
 
     pub fn locked_last_log_index(&self, node_id: &NodeId) -> Result<u64, KvError> {
-        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        let _raft_guard = self.lock_operation()?;
         self.last_log_index(node_id)
     }
 
@@ -1675,7 +1705,7 @@ impl ClusterKvRaftStore {
         let node_id = node_id.clone();
         let error_path = store.wal_paths(&node_id).root.display().to_string();
         tokio::task::spawn_blocking(move || {
-            let _raft_guard = lock_cluster_kv_raft_operation()?;
+            let _raft_guard = store.lock_operation()?;
             store.last_log_index(&node_id)
         })
         .await
@@ -1699,7 +1729,7 @@ impl ClusterKvRaftStore {
         node_id: &NodeId,
         vote: RaftRequestVoteRequest,
     ) -> Result<RaftRequestVoteResponse, KvError> {
-        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        let _raft_guard = self.lock_operation()?;
         self.apply_vote(node_id, vote)
     }
 
@@ -1796,7 +1826,7 @@ impl ClusterKvRaftStore {
     }
 
     pub fn locked_known_leader_id(&self, node_id: &NodeId) -> Result<Option<NodeId>, KvError> {
-        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        let _raft_guard = self.lock_operation()?;
         self.known_leader_id(node_id)
     }
 
@@ -1813,7 +1843,7 @@ impl ClusterKvRaftStore {
         &self,
         state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, KvError> {
-        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        let _raft_guard = self.lock_operation()?;
         self.known_voter_leader_id(state)
     }
 
@@ -1825,7 +1855,7 @@ impl ClusterKvRaftStore {
     }
 
     pub fn locked_local_is_leader(&self, state: &ClusterBootstrapState) -> Result<bool, KvError> {
-        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        let _raft_guard = self.lock_operation()?;
         self.local_is_leader(state)
     }
 
@@ -1857,7 +1887,7 @@ impl ClusterKvRaftStore {
         node_id: &NodeId,
         term: u64,
     ) -> Result<bool, KvError> {
-        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        let _raft_guard = self.lock_operation()?;
         self.observe_term_and_write_snapshot_if_changed(node_id, term)
     }
 
@@ -1885,7 +1915,7 @@ impl ClusterKvRaftStore {
         node_id: &NodeId,
         term: u64,
     ) -> Result<KvSnapshot, KvError> {
-        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        let _raft_guard = self.lock_operation()?;
         self.set_leader_and_write_snapshot_if_changed(node_id, term)
     }
 
@@ -1911,7 +1941,7 @@ impl ClusterKvRaftStore {
         &self,
         node_id: &NodeId,
     ) -> Result<KvSnapshot, KvError> {
-        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        let _raft_guard = self.lock_operation()?;
         self.clear_leader_and_write_snapshot_if_changed(node_id)
     }
 
@@ -2111,7 +2141,7 @@ impl ClusterKvRaftStore {
         node_id: &NodeId,
         command: KvCommand,
     ) -> Result<ClusterKvRaftUncommittedAppend, KvError> {
-        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        let _raft_guard = self.lock_operation()?;
         self.append_command_uncommitted_or_no_effect(node_id, command)
     }
 
@@ -2146,7 +2176,7 @@ impl ClusterKvRaftStore {
         &self,
         node_id: &NodeId,
     ) -> Result<(KvSnapshot, bool), KvError> {
-        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        let _raft_guard = self.lock_operation()?;
         self.discard_uncommitted_tail_and_clear_leader_and_publish_report(node_id)
     }
 
@@ -2192,7 +2222,7 @@ impl ClusterKvRaftStore {
     where
         F: FnMut(&str) -> bool,
     {
-        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        let _raft_guard = self.lock_operation()?;
         self.commit_index_with_events_and_publish_report(
             node_id,
             commit_index,

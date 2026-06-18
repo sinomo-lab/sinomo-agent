@@ -1,4 +1,4 @@
-use super::*;
+use crate::internal::*;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterKvRpcPayload {
