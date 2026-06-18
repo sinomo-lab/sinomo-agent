@@ -10,7 +10,9 @@ use crate::endpoint_records::{
     cluster_endpoint_stable_eq, refresh_local_iroh_endpoints_from_disk,
     refresh_local_iroh_endpoints_from_disk_async, upsert_member_endpoint,
 };
-use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
+use crate::endpoint_selector::{
+    ClusterEndpointSelectionPurpose, ClusterEndpointSelector, cluster_raft_live_voter_targets,
+};
 use crate::error::NetworkError;
 use crate::io_observer;
 #[cfg(test)]
@@ -29,6 +31,10 @@ use crate::kv_forward::{
     ClusterKvTxnForwardAsyncHost, ClusterKvTxnForwardHost, ClusterKvTxnForwardOptions,
     ClusterKvTxnForwardResult, forward_cluster_kv_txn_to_voter_async_with_host,
     forward_cluster_kv_txn_to_voter_with_host,
+};
+use crate::kv_snapshot::{
+    ClusterKvSnapshotRefreshHost, ClusterKvSnapshotRefreshOptions,
+    refresh_current_cluster_kv_store_with_host,
 };
 use crate::maintenance::{
     CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS, CLUSTER_NETWORK_PUBLISH_INTERVAL,
@@ -3341,120 +3347,6 @@ where
                 })?
                 .map(|_| ())
         })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ClusterKvSnapshotRefreshOptions {
-    pub without_local_snapshot_timeout: Duration,
-    pub with_local_snapshot_timeout: Duration,
-    pub tcp_command_timeout: Duration,
-    pub iroh_command_timeout: Duration,
-    pub tcp_foreground_attempt_timeout: Duration,
-    pub public_foreground_attempt_timeout: Duration,
-    pub iroh_foreground_attempt_timeout: Duration,
-}
-
-impl ClusterKvSnapshotRefreshOptions {
-    fn refresh_budget(&self, has_local_snapshot: bool) -> Duration {
-        if has_local_snapshot {
-            self.with_local_snapshot_timeout
-        } else {
-            self.without_local_snapshot_timeout
-        }
-    }
-
-    pub fn command_timeout(
-        &self,
-        endpoint: &ClusterEndpointRecord,
-        remaining: Duration,
-    ) -> Duration {
-        match endpoint.transport {
-            ClusterTransportKind::Iroh => remaining.min(self.iroh_command_timeout),
-            _ => remaining.min(self.tcp_command_timeout),
-        }
-    }
-
-    pub fn fair_command_timeout(
-        &self,
-        endpoint: &ClusterEndpointRecord,
-        remaining: Duration,
-    ) -> Duration {
-        let attempt_cap = match endpoint.transport {
-            ClusterTransportKind::Iroh => self.iroh_foreground_attempt_timeout,
-            _ if matches!(endpoint.privacy, ClusterEndpointPrivacy::InternetDirect) => {
-                self.public_foreground_attempt_timeout
-            }
-            _ => self.tcp_foreground_attempt_timeout,
-        };
-        self.command_timeout(endpoint, remaining.min(attempt_cap))
-    }
-}
-
-pub trait ClusterKvSnapshotRefreshHost {
-    fn known_raft_leader_id(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Result<Option<NodeId>, NetworkError>;
-
-    fn fetch_cluster_kv_snapshot(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        timeout: Duration,
-    ) -> Result<KvSnapshot, NetworkError>;
-
-    fn restore_cluster_raft_from_snapshot_if_newer(
-        &mut self,
-        paths: &ClusterPaths,
-        local_node_id: &NodeId,
-        snapshot: KvSnapshot,
-    ) -> Result<bool, NetworkError>;
-
-    fn send_object_rpc_to_node(
-        &mut self,
-        _state: &ClusterBootstrapState,
-        _target_node_id: &NodeId,
-        _request: &ObjectRpcRequest,
-        _timeout: Duration,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        Err(NetworkError::ClusterReadOnly {
-            detail: "cluster KV snapshot node object RPC is not supported by this host".to_string(),
-        })
-    }
-}
-
-struct LocalClusterKvSnapshotRefreshHost<F> {
-    fetch_cluster_kv_snapshot: F,
-}
-
-impl<F> ClusterKvSnapshotRefreshHost for LocalClusterKvSnapshotRefreshHost<F>
-where
-    F: FnMut(&ClusterEndpointRecord, Duration) -> Result<KvSnapshot, NetworkError>,
-{
-    fn known_raft_leader_id(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Result<Option<NodeId>, NetworkError> {
-        locked_cluster_raft_known_leader_id(paths, state)
-    }
-
-    fn fetch_cluster_kv_snapshot(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        timeout: Duration,
-    ) -> Result<KvSnapshot, NetworkError> {
-        (self.fetch_cluster_kv_snapshot)(endpoint, timeout)
-    }
-
-    fn restore_cluster_raft_from_snapshot_if_newer(
-        &mut self,
-        paths: &ClusterPaths,
-        local_node_id: &NodeId,
-        snapshot: KvSnapshot,
-    ) -> Result<bool, NetworkError> {
-        locked_restore_cluster_raft_from_snapshot_if_newer(paths, local_node_id, snapshot)
     }
 }
 
@@ -9424,107 +9316,6 @@ pub async fn cluster_has_local_quorum_async_with_host(
     )
 }
 
-pub fn refresh_current_cluster_kv_store_with_host(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    options: ClusterKvSnapshotRefreshOptions,
-    host: &mut impl ClusterKvSnapshotRefreshHost,
-) -> Result<InProcessKvStore, NetworkError> {
-    let mut snapshots = Vec::new();
-    if let Ok(snapshot) = read_cluster_kv_snapshot(paths) {
-        snapshots.push(snapshot);
-    }
-    let mut targets = cluster_raft_live_voter_targets(paths, state);
-    if let Ok(Some(leader_id)) = host.known_raft_leader_id(paths, state)
-        && !cluster_node_blocks_leader_preference(paths, state, &leader_id)
-        && let Some(position) = targets
-            .iter()
-            .position(|endpoint| endpoint.node_id == leader_id)
-    {
-        let leader = targets.remove(position);
-        targets.insert(0, leader);
-    }
-
-    let deadline = Instant::now() + options.refresh_budget(!snapshots.is_empty());
-    let mut fetched_remote = false;
-    for endpoint in &targets {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .unwrap_or_default();
-        if remaining.is_zero() {
-            break;
-        }
-        if let Ok(snapshot) = host
-            .fetch_cluster_kv_snapshot(endpoint, options.fair_command_timeout(endpoint, remaining))
-        {
-            snapshots.push(snapshot);
-            fetched_remote = true;
-        }
-    }
-    if !fetched_remote {
-        let mut seen_voters = BTreeSet::new();
-        'node_targets: for voter in targets
-            .iter()
-            .filter(|voter| seen_voters.insert(voter.node_id.clone()))
-        {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .unwrap_or_default();
-            if remaining.is_zero() {
-                break 'node_targets;
-            }
-            if let Ok(snapshot) =
-                fetch_cluster_kv_snapshot_from_voter_node(state, &voter.node_id, remaining, host)
-            {
-                snapshots.push(snapshot);
-                break 'node_targets;
-            }
-        }
-    }
-    let snapshot = snapshots
-        .into_iter()
-        .max_by_key(|snapshot| snapshot.revision)
-        .ok_or_else(|| NetworkError::ClusterReadOnly {
-            detail: "no local or reachable cluster KV snapshot is available".to_string(),
-        })?;
-    write_imported_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
-    host.restore_cluster_raft_from_snapshot_if_newer(
-        paths,
-        &state.local_node_id,
-        snapshot.clone(),
-    )?;
-    Ok(InProcessKvStore::restore(snapshot))
-}
-
-fn fetch_cluster_kv_snapshot_from_voter_node(
-    state: &ClusterBootstrapState,
-    voter_node_id: &NodeId,
-    timeout: Duration,
-    host: &mut impl ClusterKvSnapshotRefreshHost,
-) -> Result<KvSnapshot, NetworkError> {
-    let payload = sinomo_kv::cluster_kv_snapshot_rpc_payload()?;
-    let request =
-        ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
-    let response = host.send_object_rpc_to_node(state, voter_node_id, &request, timeout)?;
-    response.error_detail()?;
-    sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&response.body).map_err(Into::into)
-}
-
-pub fn refresh_current_cluster_kv_store_with_local_storage_and_transport<F>(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    options: ClusterKvSnapshotRefreshOptions,
-    fetch_cluster_kv_snapshot: F,
-) -> Result<InProcessKvStore, NetworkError>
-where
-    F: FnMut(&ClusterEndpointRecord, Duration) -> Result<KvSnapshot, NetworkError>,
-{
-    let mut host = LocalClusterKvSnapshotRefreshHost {
-        fetch_cluster_kv_snapshot,
-    };
-    refresh_current_cluster_kv_store_with_host(paths, state, options, &mut host)
-}
-
 pub fn elect_cluster_raft_leader_with_host(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -10084,14 +9875,6 @@ pub(crate) async fn cluster_raft_live_voter_targets_async(
             operation: "cluster raft voter target selection".to_string(),
             detail: format!("cluster raft voter target selection task failed: {source}"),
         })?
-}
-
-fn cluster_raft_live_voter_targets(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Vec<ClusterEndpointRecord> {
-    ClusterEndpointSelector::new(paths, state)
-        .select(ClusterEndpointSelectionPurpose::LiveVoterCommand)
 }
 
 pub fn cluster_node_blocks_leader_preference(

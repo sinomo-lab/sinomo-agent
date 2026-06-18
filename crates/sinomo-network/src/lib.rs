@@ -22,6 +22,7 @@ mod invite;
 mod io_observer;
 mod keyspace;
 mod kv_forward;
+mod kv_snapshot;
 mod lan;
 mod maintenance;
 mod membership;
@@ -109,6 +110,11 @@ pub use kv_forward::{
     ClusterKvTxnForwardAsyncHost, ClusterKvTxnForwardHost, ClusterKvTxnForwardOptions,
     ClusterKvTxnForwardResult, forward_cluster_kv_txn_to_voter_async_with_host,
     forward_cluster_kv_txn_to_voter_with_host,
+};
+pub use kv_snapshot::{
+    ClusterKvSnapshotRefreshHost, ClusterKvSnapshotRefreshOptions,
+    refresh_current_cluster_kv_store_with_host,
+    refresh_current_cluster_kv_store_with_local_storage_and_transport,
 };
 pub use lan::{
     AsyncMdnsDiscoverySocket, MdnsDiscoveryAdvertisement, MdnsDiscoveryCache, MdnsDiscoveryRecord,
@@ -238,13 +244,13 @@ pub use storage::{
 pub use storage::{
     ClusterControlPlaneDriver, ClusterControlPlaneTimeouts, ClusterControlPlaneTransport,
     ClusterInvitePublishHost, ClusterJoinRegistrationAsyncHost, ClusterJoinRegistrationDriver,
-    ClusterJoinRegistrationHost, ClusterKvSnapshotRefreshHost, ClusterKvSnapshotRefreshOptions,
-    ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost, ClusterKvTxnQuorumOptions,
-    ClusterLocalDaemonMembershipAsyncObserver, ClusterLocalDaemonMembershipObservation,
-    ClusterLocalDaemonMembershipObserver, ClusterLocalDaemonMembershipRefresh,
-    ClusterLocalMemberPublishAsyncHost, ClusterLocalMemberPublishHost,
-    ClusterLocalMemberPublishOptions, ClusterMemberMutationAsyncHost, ClusterMemberMutationDriver,
-    ClusterMemberMutationHost, ClusterMembershipRpcForwardHost, ClusterMembershipRpcFuture,
+    ClusterJoinRegistrationHost, ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost,
+    ClusterKvTxnQuorumOptions, ClusterLocalDaemonMembershipAsyncObserver,
+    ClusterLocalDaemonMembershipObservation, ClusterLocalDaemonMembershipObserver,
+    ClusterLocalDaemonMembershipRefresh, ClusterLocalMemberPublishAsyncHost,
+    ClusterLocalMemberPublishHost, ClusterLocalMemberPublishOptions,
+    ClusterMemberMutationAsyncHost, ClusterMemberMutationDriver, ClusterMemberMutationHost,
+    ClusterMembershipRpcForwardHost, ClusterMembershipRpcFuture,
     ClusterNetworkInfoPublishAsyncHost, ClusterNetworkRecordExpiryHost, ClusterNodeRoleUpdate,
     ClusterNodeStatusPublishAsyncHost, ClusterRaftAppendReplicationAsyncHost,
     ClusterRaftAppendReplicationHost, ClusterRaftAppendReplicationOptions,
@@ -286,8 +292,6 @@ pub use storage::{
     read_local_cluster_connectivity_records, reconcile_accepted_cluster_join_response,
     reconcile_cluster_join_with_introducers_with_host,
     record_forwarded_join_registration_acceptance_with_host,
-    refresh_current_cluster_kv_store_with_host,
-    refresh_current_cluster_kv_store_with_local_storage_and_transport,
     refresh_local_daemon_membership_from_disk, remove_cluster_members_with_host,
     replicate_cluster_raft_to_endpoint_with_host, select_cluster_connectivity_probe_batch,
     send_cluster_join_registration_over_membership_rpc,
