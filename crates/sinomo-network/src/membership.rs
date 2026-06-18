@@ -5,6 +5,8 @@ use sinomo_core::{
 use sinomo_node::{DAEMON_MAIN_RUN_CAPABILITY, NodeId, shadow_daemon_node_id};
 use std::net::SocketAddr;
 
+use crate::local_membership::cluster_state_needs_join_registration;
+
 pub const DAEMON_SHADOW_SUPERVISE_CAPABILITY: &str = "daemon.shadow.supervise";
 pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
@@ -66,8 +68,7 @@ pub fn cluster_has_remote_peers(state: &ClusterBootstrapState) -> bool {
 }
 
 pub fn cluster_is_settled_solo(state: &ClusterBootstrapState) -> bool {
-    !cluster_has_remote_peers(state)
-        && !crate::storage::cluster_state_needs_join_registration(state)
+    !cluster_has_remote_peers(state) && !cluster_state_needs_join_registration(state)
 }
 
 pub fn cluster_local_process_members(state: &ClusterBootstrapState) -> Vec<ClusterMemberRecord> {

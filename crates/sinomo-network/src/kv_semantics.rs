@@ -9,6 +9,8 @@ use crate::keyspace::{
     cluster_capability_policy_key, cluster_connectivity_key, cluster_endpoint_key,
     cluster_identity_key, cluster_network_info_key, cluster_node_status_key_matches_record,
 };
+use crate::kv_local_store::read_cluster_kv_current_snapshot;
+use crate::member_store::cluster_member_stable_eq;
 use crate::network_info::{ClusterNetworkInfoRecord, cluster_network_info_stable_eq};
 use crate::prelude::*;
 use crate::records::{
@@ -24,7 +26,7 @@ pub(crate) fn cluster_semantic_txn_no_effect_response(
     txn: &KvTxn,
     now: OffsetDateTime,
 ) -> Result<Option<(KvSnapshot, KvTxnResponse)>, NetworkError> {
-    let snapshot = crate::storage::read_cluster_kv_current_snapshot(paths)?;
+    let snapshot = read_cluster_kv_current_snapshot(paths)?;
     let succeeded = txn
         .compares
         .iter()
@@ -136,7 +138,7 @@ fn cluster_member_put_no_effect_response(
         key,
         value,
         |member: &ClusterMemberRecord| key == crate::keyspace::cluster_member_key(&member.node_id),
-        crate::storage::cluster_member_stable_eq,
+        cluster_member_stable_eq,
     ))
 }
 
