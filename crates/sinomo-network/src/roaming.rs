@@ -1936,7 +1936,7 @@ fn iroh_endpoint_addr_from_record(
     Ok(addr)
 }
 
-pub async fn send_daemon_rpc_to_cluster_endpoint_async(
+pub(crate) async fn send_daemon_rpc_to_cluster_endpoint_async(
     endpoint: &ClusterEndpointRecord,
     auth: Option<&[u8]>,
     request: &crate::ObjectRpcRequest,

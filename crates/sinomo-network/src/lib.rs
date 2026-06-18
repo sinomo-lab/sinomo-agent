@@ -143,11 +143,12 @@ pub use peer::{
     InProcessObjectRpcMessage, InProcessTransport, InboundObjectRpcMessage,
 };
 pub(crate) use roaming::read_iroh_endpoint_record_async;
+#[cfg(test)]
+pub(crate) use roaming::send_daemon_rpc_to_cluster_endpoint_async;
 pub use roaming::{
     IROH_DAEMON_COMMAND_MAX_BYTES, IrohDaemonProxyHandle, IrohEndpointRecord, IrohRelayMode,
-    read_iroh_endpoint_record, send_daemon_rpc_to_address_async,
-    send_daemon_rpc_to_cluster_endpoint_async, stable_iroh_endpoint_id, start_iroh_daemon_proxy,
-    write_iroh_endpoint_record,
+    read_iroh_endpoint_record, send_daemon_rpc_to_address_async, stable_iroh_endpoint_id,
+    start_iroh_daemon_proxy, write_iroh_endpoint_record,
 };
 pub use route::{
     CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY, CLUSTER_ROUTING_RPC_ROUTE_METADATA,
@@ -155,7 +156,8 @@ pub use route::{
     ClusterObjectRpcRouteContext, ClusterRelayAsyncHost, ClusterRelayFuture, ClusterRelayOptions,
     ClusterRelayStreamForwardAsyncHost, ClusterRelayStreamForwardOutcome,
     ClusterRelayStreamSendOutcome, ClusterSignedEndpointRpcAsyncHost,
-    ClusterSignedEndpointRpcFuture, RelayEnvelope, handle_cluster_relay_async_with_host,
+    ClusterSignedEndpointRpcFuture, ClusterSignedEndpointRpcObservation,
+    ClusterSignedEndpointRpcObservationKind, RelayEnvelope, handle_cluster_relay_async_with_host,
     handle_cluster_relay_stream_forward_async_with_host, relay_response_is_routing_error,
 };
 pub(crate) use route::{cluster_endpoint_prefers_relay_with_graph, cluster_route_next_hop};

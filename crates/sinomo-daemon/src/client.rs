@@ -692,71 +692,55 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
         })
     }
 
-    fn send_signed_endpoint_rpc_async<'a>(
+    fn observe_signed_endpoint_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
-        auth: &'a [u8],
-        request: &'a ObjectRpcRequest,
-        timeouts: sinomo_network::DaemonRpcTimeouts,
-    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, sinomo_network::ObjectRpcResponse> {
+        observation: sinomo_network::ClusterSignedEndpointRpcObservation,
+    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, ()> {
+        if !self.observe_connectivity {
+            return Box::pin(async { Ok(()) });
+        }
         let runtime = self.runtime.clone();
         Box::pin(async move {
-            let started = Instant::now();
-            let result = sinomo_network::send_daemon_rpc_to_cluster_endpoint_async(
-                endpoint,
-                Some(auth),
-                request,
-                timeouts,
+            let (connectivity_state, latency_ms, bypass_failure_grace) =
+                daemon_rpc_connectivity_observation(observation);
+            remember_endpoint_command_connectivity_from_env_async(
+                runtime,
+                endpoint.clone(),
+                connectivity_state,
+                latency_ms,
+                bypass_failure_grace,
             )
             .await;
-            if self.observe_connectivity
-                && let Some((connectivity_state, latency_ms, bypass_failure_grace)) =
-                    daemon_rpc_connectivity_observation(result.as_ref(), started)
-            {
-                remember_endpoint_command_connectivity_from_env_async(
-                    runtime,
-                    endpoint.clone(),
-                    connectivity_state,
-                    latency_ms,
-                    bypass_failure_grace,
-                )
-                .await;
-            }
-            result
+            Ok(())
         })
     }
 }
 
 fn daemon_rpc_connectivity_observation(
-    result: Result<&sinomo_network::ObjectRpcResponse, &sinomo_network::NetworkError>,
-    started: Instant,
-) -> Option<(sinomo_network::ClusterConnectivityState, Option<u64>, bool)> {
-    match result {
-        Ok(_) => Some((
+    observation: sinomo_network::ClusterSignedEndpointRpcObservation,
+) -> (sinomo_network::ClusterConnectivityState, Option<u64>, bool) {
+    match observation.kind {
+        sinomo_network::ClusterSignedEndpointRpcObservationKind::Success => (
             sinomo_network::ClusterConnectivityState::Healthy,
-            Some(daemon_rpc_elapsed_latency_ms(started)),
+            observation.latency_ms,
             false,
-        )),
-        Err(sinomo_network::NetworkError::Io { .. }) => Some((
+        ),
+        sinomo_network::ClusterSignedEndpointRpcObservationKind::IoFailure => (
             sinomo_network::ClusterConnectivityState::Degraded,
             None,
             false,
-        )),
-        Err(sinomo_network::NetworkError::AuthDenied) => Some((
+        ),
+        sinomo_network::ClusterSignedEndpointRpcObservationKind::AuthDenied => (
             sinomo_network::ClusterConnectivityState::Degraded,
             None,
             true,
-        )),
-        Err(_) => None,
+        ),
     }
 }
 
 fn daemon_rpc_timeout_from_policy(timeouts: sinomo_network::DaemonRpcTimeouts) -> Option<Duration> {
     timeouts.connect_timeout.or(timeouts.idle_timeout)
-}
-
-fn daemon_rpc_elapsed_latency_ms(started: Instant) -> u64 {
-    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 async fn remember_endpoint_command_connectivity_from_env_async(
@@ -1774,21 +1758,21 @@ mod tests {
 
     #[test]
     fn daemon_rpc_connectivity_observation_classifies_endpoint_failures() {
-        let response =
-            ObjectRpcResponse::encode_body(crate::DAEMON_STATUS_ROUTE, &()).expect("response");
-        let started = Instant::now() - Duration::from_millis(5);
-
-        let healthy = super::daemon_rpc_connectivity_observation(Ok(&response), started)
-            .expect("healthy observation");
+        let healthy = super::daemon_rpc_connectivity_observation(
+            sinomo_network::ClusterSignedEndpointRpcObservation {
+                kind: sinomo_network::ClusterSignedEndpointRpcObservationKind::Success,
+                latency_ms: Some(5),
+            },
+        );
         assert_eq!(healthy.0, sinomo_network::ClusterConnectivityState::Healthy);
-        assert!(healthy.1.is_some());
+        assert_eq!(healthy.1, Some(5));
 
-        let io_error = sinomo_network::NetworkError::Io {
-            operation: "read".to_string(),
-            detail: "timed out".to_string(),
-        };
-        let degraded = super::daemon_rpc_connectivity_observation(Err(&io_error), Instant::now())
-            .expect("transport failure observation");
+        let degraded = super::daemon_rpc_connectivity_observation(
+            sinomo_network::ClusterSignedEndpointRpcObservation {
+                kind: sinomo_network::ClusterSignedEndpointRpcObservationKind::IoFailure,
+                latency_ms: None,
+            },
+        );
         assert_eq!(
             degraded,
             (
@@ -1799,10 +1783,11 @@ mod tests {
         );
 
         let auth_denied = super::daemon_rpc_connectivity_observation(
-            Err(&sinomo_network::NetworkError::AuthDenied),
-            Instant::now(),
-        )
-        .expect("auth denied connectivity observation");
+            sinomo_network::ClusterSignedEndpointRpcObservation {
+                kind: sinomo_network::ClusterSignedEndpointRpcObservationKind::AuthDenied,
+                latency_ms: None,
+            },
+        );
         assert_eq!(
             auth_denied,
             (
@@ -1810,15 +1795,6 @@ mod tests {
                 None,
                 true
             )
-        );
-        assert_eq!(
-            super::daemon_rpc_connectivity_observation(
-                Err(&sinomo_network::NetworkError::ClusterReadOnly {
-                    detail: "quorum unavailable".to_string(),
-                }),
-                Instant::now()
-            ),
-            None
         );
     }
 

@@ -499,7 +499,20 @@ impl ClusterObjectRpcNodeOptions {
 pub type ClusterSignedEndpointRpcFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, NetworkError>> + Send + 'a>>;
 
-pub trait ClusterSignedEndpointRpcAsyncHost {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClusterSignedEndpointRpcObservationKind {
+    Success,
+    IoFailure,
+    AuthDenied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClusterSignedEndpointRpcObservation {
+    pub kind: ClusterSignedEndpointRpcObservationKind,
+    pub latency_ms: Option<u64>,
+}
+
+pub trait ClusterSignedEndpointRpcAsyncHost: Send {
     fn sign_endpoint_rpc_request_async<'a>(
         &'a mut self,
         request: &'a ObjectRpcRequest,
@@ -522,6 +535,14 @@ pub trait ClusterSignedEndpointRpcAsyncHost {
         Box::pin(async { Ok(None) })
     }
 
+    fn observe_signed_endpoint_rpc_async<'a>(
+        &'a mut self,
+        _endpoint: &'a ClusterEndpointRecord,
+        _observation: ClusterSignedEndpointRpcObservation,
+    ) -> ClusterSignedEndpointRpcFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn send_signed_endpoint_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
@@ -530,13 +551,22 @@ pub trait ClusterSignedEndpointRpcAsyncHost {
         timeouts: DaemonRpcTimeouts,
     ) -> ClusterSignedEndpointRpcFuture<'a, ObjectRpcResponse> {
         Box::pin(async move {
-            crate::roaming::send_daemon_rpc_to_cluster_endpoint_async(
+            let started = Instant::now();
+            let result = crate::roaming::send_daemon_rpc_to_cluster_endpoint_async(
                 endpoint,
                 Some(auth),
                 request,
                 timeouts,
             )
-            .await
+            .await;
+            if let Some(observation) =
+                cluster_signed_endpoint_rpc_observation(result.as_ref(), started)
+            {
+                let _ = self
+                    .observe_signed_endpoint_rpc_async(endpoint, observation)
+                    .await;
+            }
+            result
         })
     }
 
@@ -552,6 +582,31 @@ pub trait ClusterSignedEndpointRpcAsyncHost {
 }
 
 impl<H> ClusterSignedRelayRpcAsyncHost for H where H: ClusterSignedEndpointRpcAsyncHost {}
+
+fn cluster_signed_endpoint_rpc_observation(
+    result: Result<&ObjectRpcResponse, &NetworkError>,
+    started: Instant,
+) -> Option<ClusterSignedEndpointRpcObservation> {
+    match result {
+        Ok(_) => Some(ClusterSignedEndpointRpcObservation {
+            kind: ClusterSignedEndpointRpcObservationKind::Success,
+            latency_ms: Some(cluster_signed_endpoint_rpc_elapsed_latency_ms(started)),
+        }),
+        Err(NetworkError::Io { .. }) => Some(ClusterSignedEndpointRpcObservation {
+            kind: ClusterSignedEndpointRpcObservationKind::IoFailure,
+            latency_ms: None,
+        }),
+        Err(NetworkError::AuthDenied) => Some(ClusterSignedEndpointRpcObservation {
+            kind: ClusterSignedEndpointRpcObservationKind::AuthDenied,
+            latency_ms: None,
+        }),
+        Err(_) => None,
+    }
+}
+
+fn cluster_signed_endpoint_rpc_elapsed_latency_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
 
 struct ClusterObjectRpcPathRelayHost<'a, H> {
     runtime: tokio::runtime::Handle,
@@ -586,6 +641,15 @@ where
         endpoint: &'a ClusterEndpointRecord,
     ) -> ClusterSignedEndpointRpcFuture<'a, Option<ClusterId>> {
         self.inner.endpoint_rpc_cluster_id_async(endpoint)
+    }
+
+    fn observe_signed_endpoint_rpc_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        observation: ClusterSignedEndpointRpcObservation,
+    ) -> ClusterSignedEndpointRpcFuture<'a, ()> {
+        self.inner
+            .observe_signed_endpoint_rpc_async(endpoint, observation)
     }
 
     fn send_signed_endpoint_rpc_async<'a>(
