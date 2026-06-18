@@ -1548,7 +1548,11 @@ pub(crate) fn rollout_cluster_targets_from_state(
         }
     }
 
-    let rollout_endpoints = network::cluster_rollout_endpoint_candidates(paths, state);
+    let rollout_endpoints = network::cluster_endpoint_targets(
+        paths,
+        state,
+        network::ClusterEndpointSelectionPurpose::Rollout,
+    );
     for main_node_id in main_node_ids {
         let command_endpoint = command_endpoints_by_node.get(&main_node_id);
         let mut target_endpoints =
@@ -1592,52 +1596,6 @@ fn local_rollout_target(options: &RolloutOptions) -> Result<Option<RolloutTarget
         &options.host,
         options.port,
     ))))
-}
-
-#[cfg(test)]
-pub(crate) fn rollout_endpoint_candidates(
-    state: &sinomo_runtime::core::ClusterBootstrapState,
-) -> Vec<ClusterEndpointRecord> {
-    let mut endpoints = Vec::new();
-    for member in &state.members {
-        if member.node_id == state.local_node_id || !member.state.is_authorized() {
-            continue;
-        }
-        endpoints.extend(
-            member
-                .endpoints
-                .iter()
-                .filter(|endpoint| {
-                    endpoint.privacy != sinomo_runtime::core::ClusterEndpointPrivacy::LocalOnly
-                        && matches!(
-                            endpoint.transport,
-                            sinomo_runtime::core::ClusterTransportKind::LanTcp
-                                | sinomo_runtime::core::ClusterTransportKind::Loopback
-                                | sinomo_runtime::core::ClusterTransportKind::Iroh
-                        )
-                })
-                .cloned(),
-        );
-    }
-    endpoints
-}
-
-#[cfg(test)]
-pub(crate) fn extend_rollout_endpoints_from_kv(
-    paths: &ClusterPaths,
-    endpoints: &mut Vec<ClusterEndpointRecord>,
-) {
-    let Ok(kv_endpoints) = network::read_cluster_endpoints_from_kv(paths) else {
-        return;
-    };
-    for endpoint in kv_endpoints {
-        if !endpoints
-            .iter()
-            .any(|candidate| candidate.endpoint_id == endpoint.endpoint_id)
-        {
-            endpoints.push(endpoint);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1697,15 +1655,6 @@ pub(crate) fn rollout_target_endpoint_for_main_with_connectivity(
     )
     .into_iter()
     .next()
-}
-
-#[cfg(test)]
-pub(crate) fn sort_rollout_endpoints_by_connectivity(
-    paths: &ClusterPaths,
-    state: &sinomo_runtime::core::ClusterBootstrapState,
-    endpoints: &mut [ClusterEndpointRecord],
-) {
-    network::sort_cluster_rollout_endpoints(paths, state, endpoints);
 }
 
 fn push_unique_rollout_target(targets: &mut Vec<RolloutTarget>, target: RolloutTarget) {

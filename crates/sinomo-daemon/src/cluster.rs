@@ -9182,7 +9182,11 @@ mod tests {
             "sustained command-path failures should stop advertising a stale success"
         );
 
-        let targets = sinomo_network::cluster_raft_command_targets(&paths, &state);
+        let targets = sinomo_network::cluster_endpoint_targets(
+            &paths,
+            &state,
+            sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand,
+        );
         assert_eq!(
             targets.first().map(|endpoint| &endpoint.endpoint_id),
             Some(&iroh.endpoint_id),
@@ -9209,7 +9213,11 @@ mod tests {
             "healthy recovery keeps the last failure timestamp as diagnostic history"
         );
 
-        let targets = sinomo_network::cluster_raft_command_targets(&paths, &state);
+        let targets = sinomo_network::cluster_endpoint_targets(
+            &paths,
+            &state,
+            sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand,
+        );
         assert_eq!(
             targets.first().map(|endpoint| &endpoint.endpoint_id),
             Some(&tcp.endpoint_id),
@@ -9243,7 +9251,11 @@ mod tests {
             Some(13),
             None,
         );
-        let targets = sinomo_network::cluster_raft_command_targets(&paths, &state);
+        let targets = sinomo_network::cluster_endpoint_targets(
+            &paths,
+            &state,
+            sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand,
+        );
         assert_eq!(
             targets.first().map(|endpoint| &endpoint.endpoint_id),
             Some(&tcp.endpoint_id),
@@ -9272,7 +9284,11 @@ mod tests {
             record.last_success_at.is_none(),
             "identity failures must not retain stale successful reachability"
         );
-        let targets = sinomo_network::cluster_raft_command_targets(&paths, &state);
+        let targets = sinomo_network::cluster_endpoint_targets(
+            &paths,
+            &state,
+            sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand,
+        );
         assert_eq!(
             targets.first().map(|endpoint| &endpoint.endpoint_id),
             Some(&iroh.endpoint_id),
@@ -9287,7 +9303,11 @@ mod tests {
             Some(14),
             None,
         );
-        let targets = sinomo_network::cluster_raft_command_targets(&paths, &state);
+        let targets = sinomo_network::cluster_endpoint_targets(
+            &paths,
+            &state,
+            sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand,
+        );
         assert_eq!(
             targets.first().map(|endpoint| &endpoint.endpoint_id),
             Some(&tcp.endpoint_id),
@@ -9825,7 +9845,11 @@ mod tests {
         )
         .expect("connectivity records");
 
-        let targets = sinomo_network::cluster_raft_command_targets(&paths, &state);
+        let targets = sinomo_network::cluster_endpoint_targets(
+            &paths,
+            &state,
+            sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand,
+        );
 
         assert_eq!(
             targets.first().map(|endpoint| &endpoint.endpoint_id),
@@ -10189,7 +10213,11 @@ mod tests {
         sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
             .expect("sync state to raft kv");
 
-        let targets = sinomo_network::cluster_raft_command_targets(&paths, &state);
+        let targets = sinomo_network::cluster_endpoint_targets(
+            &paths,
+            &state,
+            sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand,
+        );
 
         assert_eq!(
             targets.first().map(|endpoint| &endpoint.endpoint_id),
@@ -10632,7 +10660,12 @@ mod tests {
         .expect("sync offline node status");
 
         assert!(
-            sinomo_network::cluster_raft_live_voter_targets(&paths, &state).is_empty(),
+            sinomo_network::cluster_endpoint_targets(
+                &paths,
+                &state,
+                sinomo_network::ClusterEndpointSelectionPurpose::LiveVoterCommand
+            )
+            .is_empty(),
             "ordinary live-voter routing should honor explicit offline status"
         );
         assert_eq!(
@@ -10722,7 +10755,11 @@ mod tests {
         sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
             .expect("sync state to raft kv");
 
-        let targets = sinomo_network::cluster_raft_command_targets(&paths, &state);
+        let targets = sinomo_network::cluster_endpoint_targets(
+            &paths,
+            &state,
+            sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand,
+        );
         let first_iroh_position = targets
             .iter()
             .position(|endpoint| endpoint.endpoint_id == first_iroh.endpoint_id)
@@ -10839,7 +10876,12 @@ mod tests {
             "an unreachable member that never self-declared Offline is not explicit offline"
         );
         assert_eq!(
-            sinomo_network::cluster_raft_live_voter_targets(&paths, &state).len(),
+            sinomo_network::cluster_endpoint_targets(
+                &paths,
+                &state,
+                sinomo_network::ClusterEndpointSelectionPurpose::LiveVoterCommand
+            )
+            .len(),
             1,
             "an unreachable member must remain a voter while connectivity is recovering"
         );

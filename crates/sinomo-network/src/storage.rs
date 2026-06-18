@@ -11612,7 +11612,7 @@ fn cluster_sync_targets_with_connectivity_context(
     endpoints
 }
 
-pub fn cluster_raft_command_targets(
+fn cluster_raft_command_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -11668,12 +11668,12 @@ pub fn cluster_raft_command_targets(
     targets
 }
 
-pub fn cluster_raft_live_voter_targets(
+fn cluster_raft_live_voter_targets(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
     let node_statuses = cluster_node_status_map_from_kv(paths);
-    cluster_raft_command_targets(paths, state)
+    cluster_raft_command_targets_impl(paths, state)
         .into_iter()
         .filter(|endpoint| sinomo_kv::cluster_kv_raft_node_is_voter(state, &endpoint.node_id))
         .filter(|endpoint| {
@@ -11693,7 +11693,7 @@ pub fn cluster_raft_member_replication_targets(
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
     let node_statuses = cluster_node_status_map_from_kv(paths);
-    cluster_raft_command_targets(paths, state)
+    cluster_raft_command_targets_impl(paths, state)
         .into_iter()
         .filter(|endpoint| endpoint.node_id != state.local_node_id)
         .filter(|endpoint| {
@@ -11727,7 +11727,7 @@ pub async fn cluster_raft_member_replication_targets_async(
         })
 }
 
-pub async fn cluster_raft_live_voter_targets_async(
+async fn cluster_raft_live_voter_targets_async(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -11771,9 +11771,12 @@ pub enum ClusterEndpointSelectionPurpose {
     DaemonCommand,
     DfsData,
     InvitePublish,
+    LiveVoterCommand,
     MainDaemonCommand,
     MemberPublish,
     MemberPublishVoterFirst,
+    RaftCommand,
+    Rollout,
     VoterCommand,
 }
 
@@ -11790,6 +11793,9 @@ pub fn cluster_endpoint_targets(
         ClusterEndpointSelectionPurpose::InvitePublish => {
             cluster_invite_publish_targets_impl(paths, state)
         }
+        ClusterEndpointSelectionPurpose::LiveVoterCommand => {
+            cluster_raft_live_voter_targets(paths, state)
+        }
         ClusterEndpointSelectionPurpose::MainDaemonCommand => {
             cluster_main_daemon_command_targets_impl(paths, state)
         }
@@ -11798,6 +11804,12 @@ pub fn cluster_endpoint_targets(
         }
         ClusterEndpointSelectionPurpose::MemberPublishVoterFirst => {
             cluster_member_publish_targets_voter_first_impl(paths, state)
+        }
+        ClusterEndpointSelectionPurpose::RaftCommand => {
+            cluster_raft_command_targets_impl(paths, state)
+        }
+        ClusterEndpointSelectionPurpose::Rollout => {
+            cluster_rollout_endpoint_targets_impl(paths, state)
         }
         ClusterEndpointSelectionPurpose::VoterCommand => {
             cluster_voter_command_targets_impl(paths, state)
@@ -12055,7 +12067,7 @@ fn cluster_voter_command_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
-    cluster_raft_command_targets(paths, state)
+    cluster_raft_command_targets_impl(paths, state)
         .into_iter()
         .filter(|endpoint| sinomo_kv::cluster_kv_raft_node_is_voter(state, &endpoint.node_id))
         .collect()
@@ -12152,7 +12164,7 @@ pub fn cluster_member_expected_daemon_process(
         })
 }
 
-pub fn cluster_rollout_endpoint_candidates(
+fn cluster_rollout_endpoint_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -12254,7 +12266,7 @@ fn cluster_rollout_route_process_rank(
     }
 }
 
-pub fn sort_cluster_rollout_endpoints(
+fn sort_cluster_rollout_endpoints(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     endpoints: &mut [ClusterEndpointRecord],

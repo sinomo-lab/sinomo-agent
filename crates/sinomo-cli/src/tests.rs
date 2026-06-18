@@ -29,33 +29,31 @@ use super::{
     daemon_advertised_endpoints_for_state, daemon_handle_daemon_sandbox_http_fetch,
     daemon_package_version, data_dir_storage_contract_findings, decode_cluster_join_invite,
     encode_cluster_join_invite, ensure_rollout_layout, expire_cluster_network_records_in_kv,
-    extend_rollout_endpoints_from_kv, format_rollout_progress_line,
-    handle_daemon_cluster_join_request, handle_daemon_cluster_kv_txn_request,
-    handle_daemon_rollout_build_request, install_should_update_binary, install_with_layout,
-    invite_channels_for_join_registration, invite_communication_channels,
-    invite_introducer_endpoint, invite_introducer_endpoint_from_state,
-    load_tui_model_runtime_config, main_agent_config_tool_registry,
-    main_agent_handler_for_tui_with_data_dir, managed_source_status, model_config_uses_cluster,
-    models_default_with_data_dir, normalize_model_provider,
-    open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
-    parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
-    parse_dfs_command, parse_install_options, parse_model_default_options,
+    format_rollout_progress_line, handle_daemon_cluster_join_request,
+    handle_daemon_cluster_kv_txn_request, handle_daemon_rollout_build_request,
+    install_should_update_binary, install_with_layout, invite_channels_for_join_registration,
+    invite_communication_channels, invite_introducer_endpoint,
+    invite_introducer_endpoint_from_state, load_tui_model_runtime_config,
+    main_agent_config_tool_registry, main_agent_handler_for_tui_with_data_dir,
+    managed_source_status, model_config_uses_cluster, models_default_with_data_dir,
+    normalize_model_provider, open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command,
+    parse_cli_invocation, parse_cluster_command, parse_cluster_join_invite_argument,
+    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
     parse_model_options_command, parse_models_list_options, parse_models_runtime_command,
     parse_provider_command, parse_rollout_command, parse_slash_command, parse_test_command,
     parse_uninstall_options, parse_usage_options, push_unique_introducer, read_cluster_kv_snapshot,
     read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
     read_cluster_state, require_cluster_runtime_quorum_with_paths_and_daemon,
     rollout_advance_with_data_dir, rollout_cluster_targets, rollout_cluster_targets_from_state,
-    rollout_endpoint_candidates, rollout_pending_error_grace, rollout_progress_bar,
-    rollout_status_matches_expectation, rollout_target_endpoint_for_main,
-    rollout_target_endpoint_for_main_in_order, rollout_target_endpoint_for_main_with_connectivity,
-    rollout_telemetry_gates_set_with_data_dir, rollout_terminal_response, run_tui_with_handler_io,
-    run_tui_with_handler_io_and_daemon, send_cluster_join_registration_over_iroh,
-    shadow_daemon_node_id, sign_cluster_join_invite, sign_daemon_rpc_request_from_data_dir,
-    sort_rollout_endpoints_by_connectivity, stage_rollout_main_activation,
-    sync_cluster_state_to_kv, test_command_requires_cluster_state, tui_default_daemon_status,
-    uninstall_with_layout, with_cli_force_local_mode, write_daemon_status,
-    write_imported_cluster_kv_snapshot, write_model_runtime_config_for_node, write_rollout_status,
+    rollout_pending_error_grace, rollout_progress_bar, rollout_status_matches_expectation,
+    rollout_target_endpoint_for_main, rollout_target_endpoint_for_main_in_order,
+    rollout_target_endpoint_for_main_with_connectivity, rollout_telemetry_gates_set_with_data_dir,
+    rollout_terminal_response, run_tui_with_handler_io, run_tui_with_handler_io_and_daemon,
+    send_cluster_join_registration_over_iroh, shadow_daemon_node_id, sign_cluster_join_invite,
+    sign_daemon_rpc_request_from_data_dir, stage_rollout_main_activation, sync_cluster_state_to_kv,
+    test_command_requires_cluster_state, tui_default_daemon_status, uninstall_with_layout,
+    with_cli_force_local_mode, write_daemon_status, write_imported_cluster_kv_snapshot,
+    write_model_runtime_config_for_node, write_rollout_status,
 };
 #[cfg(feature = "sandbox")]
 use super::{
@@ -11025,6 +11023,11 @@ fn rollout_cluster_targets_keep_one_route_per_main_node() {
 
 #[test]
 fn rollout_endpoint_candidates_include_remote_shadow_members() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-endpoint-candidates");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
     let cluster_id =
         ClusterId::from_legacy_named("cluster_rollout_endpoint_candidates").expect("cluster");
     let local_node_id =
@@ -11070,7 +11073,11 @@ fn rollout_endpoint_candidates_include_remote_shadow_members() {
     state.members.push(remote_main);
     state.members.push(remote_shadow);
 
-    let endpoints = rollout_endpoint_candidates(&state);
+    let endpoints = network::cluster_endpoint_targets(
+        &paths,
+        &state,
+        network::ClusterEndpointSelectionPurpose::Rollout,
+    );
 
     assert!(endpoints.iter().any(|endpoint| {
         endpoint.node_id == remote_shadow_id && endpoint.address == "10.0.0.42:21354"
@@ -11145,7 +11152,7 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
     let local_node_id = NodeId::from_legacy_named("node_rollout_connectivity_local").expect("node");
     let remote_node_id =
         NodeId::from_legacy_named("node_rollout_connectivity_remote").expect("node");
-    let state = ClusterBootstrapState::initialized_locally(
+    let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id.clone(),
         "rollout connectivity order",
         local_node_id.clone(),
@@ -11153,14 +11160,22 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
         "local-public-key",
         OffsetDateTime::now_utc(),
     );
-    sinomo_runtime::network::write_cluster_state(&paths, &state).expect("write state");
-    super::network::sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
-
     let lan_endpoint = invite_introducer_endpoint(&remote_node_id, "192.0.2.42:21354".to_string());
     let iroh_endpoint = invite_introducer_endpoint(
         &remote_node_id,
         "iroh://rollout_connectivity_remote?relay=https://relay.example./".to_string(),
     );
+    let mut remote = ClusterMemberRecord::local_non_voting(
+        cluster_id,
+        remote_node_id,
+        "remote",
+        "remote-public-key",
+        OffsetDateTime::now_utc(),
+    );
+    remote.endpoints = vec![lan_endpoint.clone(), iroh_endpoint.clone()];
+    state.members.push(remote);
+    sinomo_runtime::network::write_cluster_state(&paths, &state).expect("write state");
+    super::network::sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
 
     let now = OffsetDateTime::now_utc();
     let records = [
@@ -11203,8 +11218,11 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
     )
     .expect("connectivity records");
 
-    let mut endpoints = vec![lan_endpoint, iroh_endpoint.clone()];
-    sort_rollout_endpoints_by_connectivity(&paths, &state, &mut endpoints);
+    let endpoints = network::cluster_endpoint_targets(
+        &paths,
+        &state,
+        network::ClusterEndpointSelectionPurpose::Rollout,
+    );
 
     assert_eq!(
         endpoints.first().expect("endpoint").endpoint_id,
@@ -11449,6 +11467,16 @@ fn rollout_endpoint_candidates_include_kv_only_endpoint_records() {
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
 
+    let cluster_id = ClusterId::from_legacy_named("cluster_rollout_kv_endpoint").expect("cluster");
+    let local_node_id = NodeId::from_legacy_named("node_rollout_kv_endpoint_local").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "rollout kv endpoint",
+        local_node_id,
+        "local",
+        "local-public-key",
+        OffsetDateTime::now_utc(),
+    );
     let remote_node_id =
         NodeId::from_legacy_named("node_rollout_kv_endpoint_remote").expect("node");
     let iroh_endpoint = invite_introducer_endpoint(
@@ -11467,8 +11495,11 @@ fn rollout_endpoint_candidates_include_kv_only_endpoint_records() {
     sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot())
         .expect("cluster kv snapshot");
 
-    let mut endpoints = Vec::new();
-    extend_rollout_endpoints_from_kv(&paths, &mut endpoints);
+    let endpoints = network::cluster_endpoint_targets(
+        &paths,
+        &state,
+        network::ClusterEndpointSelectionPurpose::Rollout,
+    );
 
     assert!(
         endpoints

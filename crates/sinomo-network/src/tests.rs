@@ -4788,7 +4788,8 @@ fn local_route_graph_uses_persisted_self_connectivity_after_cache_loss() {
         "same-environment restart should retain the local fallback probe result"
     );
 
-    let targets = cluster_raft_command_targets(&paths, &state);
+    let targets =
+        cluster_endpoint_targets(&paths, &state, ClusterEndpointSelectionPurpose::RaftCommand);
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&iroh.endpoint_id),
@@ -5291,7 +5292,8 @@ fn raft_command_targets_try_unknown_tcp_before_unknown_iroh_fallbacks() {
     write_cluster_state(&paths, &state).expect("write state");
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
 
-    let targets = cluster_raft_command_targets(&paths, &state);
+    let targets =
+        cluster_endpoint_targets(&paths, &state, ClusterEndpointSelectionPurpose::RaftCommand);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
@@ -5378,7 +5380,8 @@ fn raft_command_targets_preserve_verified_connectivity_before_unknown_tcp() {
     )
     .expect("connectivity records");
 
-    let targets = cluster_raft_command_targets(&paths, &state);
+    let targets =
+        cluster_endpoint_targets(&paths, &state, ClusterEndpointSelectionPurpose::RaftCommand);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
@@ -5485,7 +5488,8 @@ fn raft_command_targets_keep_degraded_direct_before_iroh() {
     )
     .expect("connectivity records");
 
-    let targets = cluster_raft_command_targets(&paths, &state);
+    let targets =
+        cluster_endpoint_targets(&paths, &state, ClusterEndpointSelectionPurpose::RaftCommand);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
@@ -5597,7 +5601,8 @@ fn raft_command_targets_prefer_reachable_voter_over_unreachable_voter() {
     )
     .expect("sync connectivity");
 
-    let targets = cluster_raft_command_targets(&paths, &state);
+    let targets =
+        cluster_endpoint_targets(&paths, &state, ClusterEndpointSelectionPurpose::RaftCommand);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.node_id),
@@ -13183,7 +13188,12 @@ fn join_voter_targets_do_not_filter_offline_status_during_bootstrap() {
     .expect("sync offline node status");
 
     assert!(
-        cluster_raft_live_voter_targets(&paths, &state).is_empty(),
+        cluster_endpoint_targets(
+            &paths,
+            &state,
+            ClusterEndpointSelectionPurpose::LiveVoterCommand
+        )
+        .is_empty(),
         "ordinary live-voter routing should honor explicit offline status"
     );
     assert_eq!(
@@ -14095,7 +14105,8 @@ fn advertised_hostname_outranks_opportunistic_private_ip_for_docker_routes() {
     )
     .expect("connectivity records");
 
-    let raft_targets = cluster_raft_command_targets(&paths, &state);
+    let raft_targets =
+        cluster_endpoint_targets(&paths, &state, ClusterEndpointSelectionPurpose::RaftCommand);
     assert_eq!(
         raft_targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&stable_hostname.endpoint_id),
