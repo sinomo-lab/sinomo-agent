@@ -1007,11 +1007,8 @@ fn cluster_invite_requires_voter_error(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> CliError {
-    let targets = network::cluster_endpoint_targets(
-        paths,
-        state,
-        network::ClusterEndpointSelectionPurpose::InvitePublish,
-    );
+    let targets = network::ClusterEndpointSelector::new(paths, state)
+        .select(network::ClusterEndpointSelectionPurpose::InvitePublish);
     CliError::ClusterReadOnly {
         detail: format!(
             "local node is not a voter; create the invite on a voter node or restore voter connectivity{}",

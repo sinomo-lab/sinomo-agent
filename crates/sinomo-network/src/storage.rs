@@ -1,4 +1,4 @@
-use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, cluster_endpoint_targets};
+use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
 use crate::error::NetworkError;
 use crate::is_loopback_connect_address;
 use crate::lan::{
@@ -2502,14 +2502,14 @@ pub fn forward_cluster_membership_rpc_to_voter_with_host(
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let mut failures = Vec::new();
     let mut seen_voters = BTreeSet::new();
-    for target_node_id in
-        cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::VoterCommand)
-            .into_iter()
-            .filter_map(|endpoint| {
-                seen_voters
-                    .insert(endpoint.node_id.clone())
-                    .then_some(endpoint.node_id)
-            })
+    for target_node_id in ClusterEndpointSelector::new(paths, state)
+        .select(ClusterEndpointSelectionPurpose::VoterCommand)
+        .into_iter()
+        .filter_map(|endpoint| {
+            seen_voters
+                .insert(endpoint.node_id.clone())
+                .then_some(endpoint.node_id)
+        })
     {
         match host.send_membership_rpc_to_node(state, &target_node_id, request) {
             Ok(response) => return Ok(response),
@@ -2543,18 +2543,15 @@ pub async fn forward_cluster_membership_rpc_to_voter_async_with_host(
     let voter_node_ids = runtime
         .spawn_blocking(move || {
             let mut seen_voters = BTreeSet::new();
-            cluster_endpoint_targets(
-                &paths_for_targets,
-                &state_for_targets,
-                ClusterEndpointSelectionPurpose::VoterCommand,
-            )
-            .into_iter()
-            .filter_map(|endpoint| {
-                seen_voters
-                    .insert(endpoint.node_id.clone())
-                    .then_some(endpoint.node_id)
-            })
-            .collect::<Vec<_>>()
+            ClusterEndpointSelector::new(&paths_for_targets, &state_for_targets)
+                .select(ClusterEndpointSelectionPurpose::VoterCommand)
+                .into_iter()
+                .filter_map(|endpoint| {
+                    seen_voters
+                        .insert(endpoint.node_id.clone())
+                        .then_some(endpoint.node_id)
+                })
+                .collect::<Vec<_>>()
         })
         .await
         .map_err(|source| NetworkError::Io {
@@ -7814,17 +7811,6 @@ pub(crate) fn locked_cluster_raft_local_is_leader(
 }
 
 #[cfg(test)]
-pub fn cluster_join_voter_targets(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Vec<ClusterEndpointRecord> {
-    // Join bootstrap must not depend on this node's current health view of the voter.
-    // Bridges often need to ask a voter for invite proofs before their connectivity graph
-    // and status probes have converged, so try the ordered voter command targets directly.
-    cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::VoterCommand)
-}
-
-#[cfg(test)]
 pub fn create_cluster_kv_watch(
     paths: &ClusterPaths,
     request: ClusterKvWatchPrefixRequest,
@@ -11804,18 +11790,6 @@ pub(crate) fn cluster_dfs_data_targets_impl(
     ))
 }
 
-#[cfg(test)]
-pub fn cluster_main_daemon_command_targets(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Vec<ClusterEndpointRecord> {
-    cluster_endpoint_targets(
-        paths,
-        state,
-        ClusterEndpointSelectionPurpose::MainDaemonCommand,
-    )
-}
-
 pub(crate) fn cluster_main_daemon_command_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -11904,14 +11878,6 @@ pub(crate) fn cluster_member_publish_targets_voter_first_impl(
         !sinomo_kv::cluster_kv_raft_node_is_voter(state, &endpoint.node_id)
     });
     targets
-}
-
-#[cfg(test)]
-pub fn cluster_member_publish_targets(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Vec<ClusterEndpointRecord> {
-    cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::MemberPublish)
 }
 
 pub(crate) fn cluster_member_publish_targets_impl(
@@ -12013,14 +11979,6 @@ pub(crate) fn cluster_voter_command_targets_impl(
         .into_iter()
         .filter(|endpoint| sinomo_kv::cluster_kv_raft_node_is_voter(state, &endpoint.node_id))
         .collect()
-}
-
-#[cfg(test)]
-pub fn cluster_invite_publish_targets(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Vec<ClusterEndpointRecord> {
-    cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::InvitePublish)
 }
 
 pub(crate) fn cluster_invite_publish_targets_impl(

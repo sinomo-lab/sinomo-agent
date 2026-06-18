@@ -95,15 +95,10 @@ fn first_cluster_rollout_target_endpoint_for_main_with_command_endpoint(
     command_endpoint: Option<&ClusterEndpointRecord>,
     candidates: &[ClusterEndpointRecord],
 ) -> Option<ClusterEndpointRecord> {
-    cluster_rollout_target_endpoints_for_main_with_command_endpoint(
-        paths,
-        state,
-        main_node_id,
-        command_endpoint,
-        candidates,
-    )
-    .into_iter()
-    .next()
+    ClusterEndpointSelector::new(paths, state)
+        .rollout_targets_for_main_with_command_endpoint(main_node_id, command_endpoint, candidates)
+        .into_iter()
+        .next()
 }
 
 #[test]
@@ -4810,8 +4805,8 @@ fn local_route_graph_uses_persisted_self_connectivity_after_cache_loss() {
         "same-environment restart should retain the local fallback probe result"
     );
 
-    let targets =
-        cluster_endpoint_targets(&paths, &state, ClusterEndpointSelectionPurpose::RaftCommand);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::RaftCommand);
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&iroh.endpoint_id),
@@ -5314,8 +5309,8 @@ fn raft_command_targets_try_unknown_tcp_before_unknown_iroh_fallbacks() {
     write_cluster_state(&paths, &state).expect("write state");
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
 
-    let targets =
-        cluster_endpoint_targets(&paths, &state, ClusterEndpointSelectionPurpose::RaftCommand);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::RaftCommand);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
@@ -5402,8 +5397,8 @@ fn raft_command_targets_preserve_verified_connectivity_before_unknown_tcp() {
     )
     .expect("connectivity records");
 
-    let targets =
-        cluster_endpoint_targets(&paths, &state, ClusterEndpointSelectionPurpose::RaftCommand);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::RaftCommand);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
@@ -5510,8 +5505,8 @@ fn raft_command_targets_keep_degraded_direct_before_iroh() {
     )
     .expect("connectivity records");
 
-    let targets =
-        cluster_endpoint_targets(&paths, &state, ClusterEndpointSelectionPurpose::RaftCommand);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::RaftCommand);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
@@ -5623,8 +5618,8 @@ fn raft_command_targets_prefer_reachable_voter_over_unreachable_voter() {
     )
     .expect("sync connectivity");
 
-    let targets =
-        cluster_endpoint_targets(&paths, &state, ClusterEndpointSelectionPurpose::RaftCommand);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::RaftCommand);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.node_id),
@@ -5689,7 +5684,8 @@ fn main_daemon_command_targets_select_one_route_per_remote_main() {
     )
     .expect("connectivity records");
 
-    let targets = cluster_main_daemon_command_targets(&paths, &state);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::MainDaemonCommand);
 
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].endpoint_id, remote_tcp.endpoint_id);
@@ -5734,18 +5730,9 @@ fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
     write_cluster_state(&paths, &state).expect("write state");
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
 
-    let candidates = cluster_endpoint_targets(
-        &paths,
-        &state,
-        ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates,
-    );
-    let dfs_targets = cluster_dfs_data_targets(&paths, &state);
-
-    assert_eq!(
-        dfs_targets,
-        cluster_endpoint_targets(&paths, &state, ClusterEndpointSelectionPurpose::DfsData),
-        "DFS target wrapper should stay aligned with the canonical endpoint selector"
-    );
+    let selector = ClusterEndpointSelector::new(&paths, &state);
+    let candidates = selector.select(ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates);
+    let dfs_targets = selector.select(ClusterEndpointSelectionPurpose::DfsData);
     assert_eq!(
         candidates
             .iter()
@@ -5765,9 +5752,7 @@ fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
         .iter()
         .find(|member| member.node_id == main_endpoint.node_id)
         .expect("remote main member");
-    let status_targets = cluster_member_endpoint_targets(
-        &paths,
-        &state,
+    let status_targets = selector.select_member(
         remote_member,
         ClusterEndpointSelectionPurpose::MemberDaemonStatus,
     );
@@ -5828,13 +5813,15 @@ fn main_daemon_command_targets_filter_known_unreachable_endpoints() {
     )
     .expect("connectivity records");
 
-    let targets = cluster_main_daemon_command_targets(&paths, &state);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::MainDaemonCommand);
 
     assert!(
         targets.is_empty(),
         "known-unreachable direct endpoints should not remain daemon command targets"
     );
-    let dfs_targets = cluster_dfs_data_targets(&paths, &state);
+    let dfs_targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::DfsData);
     assert_eq!(
         dfs_targets
             .iter()
@@ -5895,11 +5882,8 @@ fn main_daemon_endpoint_candidates_keep_static_fallback_order() {
     write_cluster_state(&paths, &state).expect("write state");
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
 
-    let candidates = cluster_endpoint_targets(
-        &paths,
-        &state,
-        ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates,
-    );
+    let candidates = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates);
     let ordered_endpoint_ids = candidates
         .iter()
         .map(|endpoint| endpoint.endpoint_id.clone())
@@ -5952,17 +5936,8 @@ fn member_publish_targets_prefer_locally_learned_bridge_endpoint() {
     write_cluster_state(&paths, &state).expect("write state");
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
 
-    let targets = cluster_member_publish_targets(&paths, &state);
-
-    assert_eq!(
-        targets,
-        cluster_endpoint_targets(
-            &paths,
-            &state,
-            ClusterEndpointSelectionPurpose::MemberPublish
-        ),
-        "member-publish wrapper should stay aligned with the canonical endpoint selector"
-    );
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::MemberPublish);
     assert_eq!(
         targets
             .first()
@@ -6180,27 +6155,25 @@ fn rollout_target_selection_uses_command_route_context_for_shadow_fallbacks() {
     )
     .expect("public-context rollout endpoint");
     assert_eq!(selected.endpoint_id, public_main.endpoint_id);
-    let ordered = cluster_rollout_target_endpoints_for_main_with_command_endpoint(
-        &paths,
-        &state,
-        &main,
-        Some(&public_main),
-        &[
-            private_shadow.clone(),
-            shadow_iroh.clone(),
-            public_main.clone(),
-        ],
-    );
+    let ordered = ClusterEndpointSelector::new(&paths, &state)
+        .rollout_targets_for_main_with_command_endpoint(
+            &main,
+            Some(&public_main),
+            &[
+                private_shadow.clone(),
+                shadow_iroh.clone(),
+                public_main.clone(),
+            ],
+        );
     assert_eq!(ordered[0].endpoint_id, public_main.endpoint_id);
     assert_eq!(ordered[1].endpoint_id, private_shadow.endpoint_id);
     assert_eq!(ordered[2].endpoint_id, shadow_iroh.endpoint_id);
-    let ordered = cluster_rollout_target_endpoints_for_main_with_command_endpoint(
-        &paths,
-        &state,
-        &main,
-        Some(&public_main),
-        &[private_shadow.clone(), shadow_iroh.clone()],
-    );
+    let ordered = ClusterEndpointSelector::new(&paths, &state)
+        .rollout_targets_for_main_with_command_endpoint(
+            &main,
+            Some(&public_main),
+            &[private_shadow.clone(), shadow_iroh.clone()],
+        );
     assert_eq!(ordered[0].endpoint_id, public_main.endpoint_id);
 
     let selected = first_cluster_rollout_target_endpoint_for_main_with_command_endpoint(
@@ -13222,16 +13195,14 @@ fn join_voter_targets_do_not_filter_offline_status_during_bootstrap() {
     .expect("sync offline node status");
 
     assert!(
-        cluster_endpoint_targets(
-            &paths,
-            &state,
-            ClusterEndpointSelectionPurpose::LiveVoterCommand
-        )
-        .is_empty(),
+        ClusterEndpointSelector::new(&paths, &state)
+            .select(ClusterEndpointSelectionPurpose::LiveVoterCommand)
+            .is_empty(),
         "ordinary live-voter routing should honor explicit offline status"
     );
     assert_eq!(
-        cluster_join_voter_targets(&paths, &state)
+        ClusterEndpointSelector::new(&paths, &state)
+            .select(ClusterEndpointSelectionPurpose::VoterCommand)
             .first()
             .map(|endpoint| &endpoint.endpoint_id),
         Some(&voter_endpoint.endpoint_id),
@@ -14139,20 +14110,16 @@ fn advertised_hostname_outranks_opportunistic_private_ip_for_docker_routes() {
     )
     .expect("connectivity records");
 
-    let raft_targets =
-        cluster_endpoint_targets(&paths, &state, ClusterEndpointSelectionPurpose::RaftCommand);
+    let selector = ClusterEndpointSelector::new(&paths, &state);
+    let raft_targets = selector.select(ClusterEndpointSelectionPurpose::RaftCommand);
     assert_eq!(
         raft_targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&stable_hostname.endpoint_id),
         "KV/Raft command routing should not fall back to the stale private IP when the hostname is healthy"
     );
 
-    let status_targets = cluster_member_endpoint_targets(
-        &paths,
-        &state,
-        &member,
-        ClusterEndpointSelectionPurpose::MemberDaemonStatus,
-    );
+    let status_targets =
+        selector.select_member(&member, ClusterEndpointSelectionPurpose::MemberDaemonStatus);
     assert_eq!(
         status_targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&stable_hostname.endpoint_id),
@@ -14220,7 +14187,8 @@ fn dfs_data_targets_prefer_healthy_bridge_ip_over_degraded_hostname() {
     )
     .expect("connectivity records");
 
-    let dfs_targets = cluster_dfs_data_targets(&paths, &state);
+    let dfs_targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::DfsData);
     let ordered_endpoint_ids = dfs_targets
         .iter()
         .filter(|endpoint| endpoint.node_id == bridge_ip.node_id)
@@ -14378,7 +14346,8 @@ fn cluster_invite_publish_targets_prefer_tcp_voters_over_iroh_when_available() {
     ];
     state.members.push(voter);
 
-    let targets = cluster_invite_publish_targets(&paths, &state);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::InvitePublish);
 
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].transport, ClusterTransportKind::LanTcp);
@@ -14441,7 +14410,8 @@ fn cluster_invite_publish_targets_use_connectivity_graph_for_fallback() {
     write_cluster_state(&paths, &state).expect("write state");
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync kv");
 
-    let targets = cluster_invite_publish_targets(&paths, &state);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::InvitePublish);
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&lan.endpoint_id)
@@ -14463,7 +14433,8 @@ fn cluster_invite_publish_targets_use_connectivity_graph_for_fallback() {
         )],
     )
     .expect("connectivity records");
-    let targets = cluster_invite_publish_targets(&paths, &state);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::InvitePublish);
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&public.endpoint_id)
@@ -14498,7 +14469,8 @@ fn cluster_invite_publish_targets_use_connectivity_graph_for_fallback() {
         ],
     )
     .expect("connectivity records");
-    let targets = cluster_invite_publish_targets(&paths, &state);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::InvitePublish);
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&iroh.endpoint_id)
@@ -14595,12 +14567,9 @@ fn member_daemon_status_targets_use_connectivity_without_promoting_iroh() {
         ],
     )
     .expect("connectivity records");
-    let targets = cluster_member_endpoint_targets(
-        &paths,
-        &state,
-        &member,
-        ClusterEndpointSelectionPurpose::MemberDaemonStatus,
-    );
+    let selector = ClusterEndpointSelector::new(&paths, &state);
+    let targets =
+        selector.select_member(&member, ClusterEndpointSelectionPurpose::MemberDaemonStatus);
     assert_eq!(
         targets
             .iter()
@@ -14654,12 +14623,8 @@ fn member_daemon_status_targets_use_connectivity_without_promoting_iroh() {
         ],
     )
     .expect("connectivity records");
-    let targets = cluster_member_endpoint_targets(
-        &paths,
-        &state,
-        &member,
-        ClusterEndpointSelectionPurpose::MemberDaemonStatus,
-    );
+    let targets =
+        selector.select_member(&member, ClusterEndpointSelectionPurpose::MemberDaemonStatus);
     assert_eq!(targets[0].endpoint_id, public.endpoint_id);
     assert_eq!(targets[1].endpoint_id, iroh.endpoint_id);
 
@@ -14703,12 +14668,8 @@ fn member_daemon_status_targets_use_connectivity_without_promoting_iroh() {
         ],
     )
     .expect("connectivity records");
-    let targets = cluster_member_endpoint_targets(
-        &paths,
-        &state,
-        &member,
-        ClusterEndpointSelectionPurpose::MemberDaemonStatus,
-    );
+    let targets =
+        selector.select_member(&member, ClusterEndpointSelectionPurpose::MemberDaemonStatus);
     assert_eq!(targets[0].endpoint_id, iroh.endpoint_id);
 }
 

@@ -507,11 +507,8 @@ fn read_daemon_dfs_message_route_snapshot(
     }
     let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
         .map_err(daemon_dfs_network_error)?;
-    let endpoints = sinomo_network::cluster_endpoint_targets(
-        cluster_paths,
-        &state,
-        sinomo_network::ClusterEndpointSelectionPurpose::DfsData,
-    );
+    let endpoints = sinomo_network::ClusterEndpointSelector::new(cluster_paths, &state)
+        .select(sinomo_network::ClusterEndpointSelectionPurpose::DfsData);
     Ok(Some(DaemonDfsMessageRouteSnapshot {
         signature: DaemonDfsMessageServiceSignature {
             local_node_id: state.local_node_id,

@@ -994,11 +994,8 @@ fn open_sifs_service(data_dir: Option<PathBuf>) -> Result<OpenedSifsService> {
     let endpoints = cluster_state
         .as_ref()
         .map(|state| {
-            network::cluster_endpoint_targets(
-                &cluster_paths,
-                state,
-                network::ClusterEndpointSelectionPurpose::DfsData,
-            )
+            network::ClusterEndpointSelector::new(&cluster_paths, state)
+                .select(network::ClusterEndpointSelectionPurpose::DfsData)
         })
         .unwrap_or_default();
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))

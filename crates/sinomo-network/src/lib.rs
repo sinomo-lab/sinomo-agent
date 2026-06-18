@@ -24,13 +24,7 @@ mod route;
 mod rpc;
 mod storage;
 
-#[cfg(test)]
-pub use endpoint_selector::cluster_dfs_data_targets;
-pub use endpoint_selector::{
-    ClusterEndpointSelectionPurpose, ClusterEndpointSelector, cluster_endpoint_targets,
-    cluster_member_endpoint_targets,
-    cluster_rollout_target_endpoints_for_main_with_command_endpoint,
-};
+pub use endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
 pub use error::*;
 pub use health::{
     ClusterDoctorFinding, ClusterHealthRow, ClusterNetworkPingRequest, ClusterNetworkPingResponse,

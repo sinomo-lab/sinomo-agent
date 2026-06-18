@@ -1437,11 +1437,9 @@ fn inspect_cluster_dfs_status() -> Result<DfsClusterStatusReport, CliError> {
     }];
     let mut endpoints_by_node =
         std::collections::BTreeMap::<NodeId, Vec<ClusterEndpointRecord>>::new();
-    for endpoint in network::cluster_endpoint_targets(
-        &cluster_paths,
-        &state,
-        network::ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates,
-    ) {
+    for endpoint in network::ClusterEndpointSelector::new(&cluster_paths, &state)
+        .select(network::ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates)
+    {
         endpoints_by_node
             .entry(endpoint.node_id.clone())
             .or_default()

@@ -86,11 +86,10 @@ impl SifsFileManagerBackend {
         let Ok(state) = network::read_cluster_state_without_kv(&cluster_paths) else {
             return;
         };
-        service.refresh_endpoint_targets(network::cluster_endpoint_targets(
-            &cluster_paths,
-            &state,
-            network::ClusterEndpointSelectionPurpose::DfsData,
-        ));
+        service.refresh_endpoint_targets(
+            network::ClusterEndpointSelector::new(&cluster_paths, &state)
+                .select(network::ClusterEndpointSelectionPurpose::DfsData),
+        );
     }
 
     pub(crate) fn publish_metadata_after_mutation(&self) {
@@ -655,11 +654,8 @@ fn open_sifs_service_with_hydration(
     let (local_node_id, endpoints) = if cluster_paths.state.exists() {
         let state = network::read_cluster_state_without_kv(&cluster_paths)
             .map_err(|error| format!("cannot read local cluster state: {error}"))?;
-        let endpoints = network::cluster_endpoint_targets(
-            &cluster_paths,
-            &state,
-            network::ClusterEndpointSelectionPurpose::DfsData,
-        );
+        let endpoints = network::ClusterEndpointSelector::new(&cluster_paths, &state)
+            .select(network::ClusterEndpointSelectionPurpose::DfsData);
         (state.local_node_id, endpoints)
     } else {
         (fallback_dfs_node_id(), Vec::new())
@@ -815,14 +811,11 @@ fn sifs_replica_candidates(data_dir: &SinomoDataDir, local_node_id: &NodeId) -> 
     let Ok(state) = network::read_cluster_state_without_kv(&cluster_paths) else {
         return candidates;
     };
-    let routable_node_ids = network::cluster_endpoint_targets(
-        &cluster_paths,
-        &state,
-        network::ClusterEndpointSelectionPurpose::DfsData,
-    )
-    .into_iter()
-    .map(|endpoint| endpoint.node_id)
-    .collect::<BTreeSet<_>>();
+    let routable_node_ids = network::ClusterEndpointSelector::new(&cluster_paths, &state)
+        .select(network::ClusterEndpointSelectionPurpose::DfsData)
+        .into_iter()
+        .map(|endpoint| endpoint.node_id)
+        .collect::<BTreeSet<_>>();
     let graph = network::ClusterConnectivityGraph::read_for_local(&cluster_paths, &state);
     let Ok(entries) =
         kv::read_cluster_kv_prefix_entries(&cluster_paths.kv_paths(), content_services_prefix())

@@ -1519,11 +1519,9 @@ pub(crate) fn rollout_cluster_targets_from_state(
         push_unique_rollout_target(&mut targets, local_target);
     }
 
-    let command_endpoints = network::cluster_endpoint_targets(
-        paths,
-        state,
-        network::ClusterEndpointSelectionPurpose::MainDaemonCommand,
-    );
+    let selector = network::ClusterEndpointSelector::new(paths, state);
+    let command_endpoints =
+        selector.select(network::ClusterEndpointSelectionPurpose::MainDaemonCommand);
     let mut command_endpoints_by_node = std::collections::BTreeMap::new();
     let mut main_node_ids = Vec::new();
     let mut seen_main_node_ids = std::collections::BTreeSet::new();
@@ -1548,21 +1546,14 @@ pub(crate) fn rollout_cluster_targets_from_state(
         }
     }
 
-    let rollout_endpoints = network::cluster_endpoint_targets(
-        paths,
-        state,
-        network::ClusterEndpointSelectionPurpose::Rollout,
-    );
+    let rollout_endpoints = selector.select(network::ClusterEndpointSelectionPurpose::Rollout);
     for main_node_id in main_node_ids {
         let command_endpoint = command_endpoints_by_node.get(&main_node_id);
-        let mut target_endpoints =
-            network::cluster_rollout_target_endpoints_for_main_with_command_endpoint(
-                paths,
-                state,
-                &main_node_id,
-                command_endpoint,
-                &rollout_endpoints,
-            );
+        let mut target_endpoints = selector.rollout_targets_for_main_with_command_endpoint(
+            &main_node_id,
+            command_endpoint,
+            &rollout_endpoints,
+        );
         if target_endpoints.is_empty()
             && let Some(command_endpoint) = command_endpoint
         {
@@ -1605,15 +1596,10 @@ pub(crate) fn rollout_target_endpoint_for_main_with_connectivity(
     main_node_id: &NodeId,
     candidates: &[ClusterEndpointRecord],
 ) -> Option<ClusterEndpointRecord> {
-    network::cluster_rollout_target_endpoints_for_main_with_command_endpoint(
-        paths,
-        state,
-        main_node_id,
-        None,
-        candidates,
-    )
-    .into_iter()
-    .next()
+    network::ClusterEndpointSelector::new(paths, state)
+        .rollout_targets_for_main_with_command_endpoint(main_node_id, None, candidates)
+        .into_iter()
+        .next()
 }
 
 fn push_unique_rollout_target(targets: &mut Vec<RolloutTarget>, target: RolloutTarget) {

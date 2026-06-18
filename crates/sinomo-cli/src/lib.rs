@@ -335,9 +335,7 @@ fn cli_probe_member_daemon_status(
     {
         return Some(status);
     }
-    for endpoint in network::cluster_member_endpoint_targets(
-        paths,
-        state,
+    for endpoint in network::ClusterEndpointSelector::new(paths, state).select_member(
         member,
         network::ClusterEndpointSelectionPurpose::MemberDaemonStatus,
     ) {
@@ -407,9 +405,7 @@ fn cli_fetch_local_cluster_health_rows_from_member(
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,
 ) -> Option<Vec<ClusterHealthRow>> {
-    for endpoint in network::cluster_member_endpoint_targets(
-        paths,
-        state,
+    for endpoint in network::ClusterEndpointSelector::new(paths, state).select_member(
         member,
         network::ClusterEndpointSelectionPurpose::MemberDaemonStatus,
     ) {

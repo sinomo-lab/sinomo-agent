@@ -15,8 +15,9 @@
 use crate::prelude::*;
 use crate::storage::{DAEMON_SHADOW_SUPERVISE_CAPABILITY, locally_learned_bridge_route_endpoint};
 use crate::{
-    ClusterConnectivityGraph, ClusterEndpointSelectionPurpose, ClusterPaths, DaemonControlRequest,
-    DaemonRpcTimeouts, NetworkError, ObjectRpcRequest, ObjectRpcResponse, cluster_endpoint_targets,
+    ClusterConnectivityGraph, ClusterEndpointSelectionPurpose, ClusterEndpointSelector,
+    ClusterPaths, DaemonControlRequest, DaemonRpcTimeouts, NetworkError, ObjectRpcRequest,
+    ObjectRpcResponse,
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -725,7 +726,8 @@ async fn cluster_object_rpc_node_targets(
     runtime
         .spawn_blocking(move || {
             let mut seen = BTreeSet::new();
-            cluster_endpoint_targets(&paths, &state, endpoint_selection)
+            ClusterEndpointSelector::new(&paths, &state)
+                .select(endpoint_selection)
                 .into_iter()
                 .filter(|endpoint| endpoint.node_id == target_node_id)
                 .filter(|endpoint| {
@@ -1873,24 +1875,22 @@ fn cluster_relay_next_hop_endpoints_with_graph_and_policy(
             push_unique_cluster_endpoint(&mut endpoints, &mut seen, endpoint.clone());
         }
     }
-    for endpoint in cluster_endpoint_targets(
-        paths,
-        state,
-        ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates,
-    )
-    .into_iter()
-    .filter(|endpoint| endpoint.node_id == *node_id)
-    .filter(|endpoint| {
-        cluster_relay_next_hop_endpoint_is_usable(
-            graph,
-            source_node_id,
-            endpoint,
-            has_healthy_next_hop_endpoint,
-            has_reachable_next_hop_endpoint,
-            local_graph_has_reachable_targets,
-            allow_unknown_locally_learned_endpoint,
-        )
-    }) {
+    for endpoint in ClusterEndpointSelector::new(paths, state)
+        .select(ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates)
+        .into_iter()
+        .filter(|endpoint| endpoint.node_id == *node_id)
+        .filter(|endpoint| {
+            cluster_relay_next_hop_endpoint_is_usable(
+                graph,
+                source_node_id,
+                endpoint,
+                has_healthy_next_hop_endpoint,
+                has_reachable_next_hop_endpoint,
+                local_graph_has_reachable_targets,
+                allow_unknown_locally_learned_endpoint,
+            )
+        })
+    {
         push_unique_cluster_endpoint(&mut endpoints, &mut seen, endpoint);
     }
     endpoints

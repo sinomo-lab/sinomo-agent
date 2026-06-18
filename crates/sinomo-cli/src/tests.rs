@@ -151,15 +151,10 @@ fn rollout_target_endpoint_for_main(
         "local-public-key",
         OffsetDateTime::now_utc(),
     );
-    network::cluster_rollout_target_endpoints_for_main_with_command_endpoint(
-        &paths,
-        &state,
-        main_node_id,
-        None,
-        candidates,
-    )
-    .into_iter()
-    .next()
+    network::ClusterEndpointSelector::new(&paths, &state)
+        .rollout_targets_for_main_with_command_endpoint(main_node_id, None, candidates)
+        .into_iter()
+        .next()
 }
 
 fn append_cluster_raft_command_with_response(
@@ -5819,11 +5814,8 @@ fn cluster_sync_targets_skip_remote_local_only_endpoints() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-sync-targets");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     paths.ensure().expect("cluster paths");
-    let targets = network::cluster_endpoint_targets(
-        &paths,
-        &state,
-        network::ClusterEndpointSelectionPurpose::DaemonCommand,
-    );
+    let targets = network::ClusterEndpointSelector::new(&paths, &state)
+        .select(network::ClusterEndpointSelectionPurpose::DaemonCommand);
 
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].address, "192.168.1.10:21353");
@@ -11099,11 +11091,8 @@ fn rollout_endpoint_candidates_include_remote_shadow_members() {
     state.members.push(remote_main);
     state.members.push(remote_shadow);
 
-    let endpoints = network::cluster_endpoint_targets(
-        &paths,
-        &state,
-        network::ClusterEndpointSelectionPurpose::Rollout,
-    );
+    let endpoints = network::ClusterEndpointSelector::new(&paths, &state)
+        .select(network::ClusterEndpointSelectionPurpose::Rollout);
 
     assert!(endpoints.iter().any(|endpoint| {
         endpoint.node_id == remote_shadow_id && endpoint.address == "10.0.0.42:21354"
@@ -11225,11 +11214,8 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
     )
     .expect("connectivity records");
 
-    let endpoints = network::cluster_endpoint_targets(
-        &paths,
-        &state,
-        network::ClusterEndpointSelectionPurpose::Rollout,
-    );
+    let endpoints = network::ClusterEndpointSelector::new(&paths, &state)
+        .select(network::ClusterEndpointSelectionPurpose::Rollout);
 
     assert_eq!(
         endpoints.first().expect("endpoint").endpoint_id,
@@ -11502,11 +11488,8 @@ fn rollout_endpoint_candidates_include_kv_only_endpoint_records() {
     sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot())
         .expect("cluster kv snapshot");
 
-    let endpoints = network::cluster_endpoint_targets(
-        &paths,
-        &state,
-        network::ClusterEndpointSelectionPurpose::Rollout,
-    );
+    let endpoints = network::ClusterEndpointSelector::new(&paths, &state)
+        .select(network::ClusterEndpointSelectionPurpose::Rollout);
 
     assert!(
         endpoints

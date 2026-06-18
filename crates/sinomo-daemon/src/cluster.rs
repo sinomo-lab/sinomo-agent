@@ -2921,12 +2921,11 @@ async fn fetch_local_cluster_health_rows_from_member_async(
     let member_node_id = member.node_id.as_str().to_string();
     let endpoints = runtime
         .spawn_blocking(move || {
-            sinomo_network::cluster_member_endpoint_targets(
-                &paths_for_targets,
-                &state_for_targets,
-                &member_for_targets,
-                sinomo_network::ClusterEndpointSelectionPurpose::MemberDaemonStatus,
-            )
+            sinomo_network::ClusterEndpointSelector::new(&paths_for_targets, &state_for_targets)
+                .select_member(
+                    &member_for_targets,
+                    sinomo_network::ClusterEndpointSelectionPurpose::MemberDaemonStatus,
+                )
         })
         .await
         .map_err(|source| DaemonError::Network {
@@ -3015,12 +3014,11 @@ async fn probe_member_daemon_status_async(
     let member_for_targets = member.clone();
     let member_node_id = member.node_id.as_str().to_string();
     let endpoints = tokio::task::spawn_blocking(move || {
-        sinomo_network::cluster_member_endpoint_targets(
-            &paths_for_targets,
-            &state_for_targets,
-            &member_for_targets,
-            sinomo_network::ClusterEndpointSelectionPurpose::MemberDaemonStatus,
-        )
+        sinomo_network::ClusterEndpointSelector::new(&paths_for_targets, &state_for_targets)
+            .select_member(
+                &member_for_targets,
+                sinomo_network::ClusterEndpointSelectionPurpose::MemberDaemonStatus,
+            )
     })
     .await
     .map_err(|source| DaemonError::Network {
@@ -9184,11 +9182,8 @@ mod tests {
             "sustained command-path failures should stop advertising a stale success"
         );
 
-        let targets = sinomo_network::cluster_endpoint_targets(
-            &paths,
-            &state,
-            sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand,
-        );
+        let targets = sinomo_network::ClusterEndpointSelector::new(&paths, &state)
+            .select(sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand);
         assert_eq!(
             targets.first().map(|endpoint| &endpoint.endpoint_id),
             Some(&iroh.endpoint_id),
@@ -9215,11 +9210,8 @@ mod tests {
             "healthy recovery keeps the last failure timestamp as diagnostic history"
         );
 
-        let targets = sinomo_network::cluster_endpoint_targets(
-            &paths,
-            &state,
-            sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand,
-        );
+        let targets = sinomo_network::ClusterEndpointSelector::new(&paths, &state)
+            .select(sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand);
         assert_eq!(
             targets.first().map(|endpoint| &endpoint.endpoint_id),
             Some(&tcp.endpoint_id),
@@ -9253,11 +9245,8 @@ mod tests {
             Some(13),
             None,
         );
-        let targets = sinomo_network::cluster_endpoint_targets(
-            &paths,
-            &state,
-            sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand,
-        );
+        let targets = sinomo_network::ClusterEndpointSelector::new(&paths, &state)
+            .select(sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand);
         assert_eq!(
             targets.first().map(|endpoint| &endpoint.endpoint_id),
             Some(&tcp.endpoint_id),
@@ -9286,11 +9275,8 @@ mod tests {
             record.last_success_at.is_none(),
             "identity failures must not retain stale successful reachability"
         );
-        let targets = sinomo_network::cluster_endpoint_targets(
-            &paths,
-            &state,
-            sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand,
-        );
+        let targets = sinomo_network::ClusterEndpointSelector::new(&paths, &state)
+            .select(sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand);
         assert_eq!(
             targets.first().map(|endpoint| &endpoint.endpoint_id),
             Some(&iroh.endpoint_id),
@@ -9305,11 +9291,8 @@ mod tests {
             Some(14),
             None,
         );
-        let targets = sinomo_network::cluster_endpoint_targets(
-            &paths,
-            &state,
-            sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand,
-        );
+        let targets = sinomo_network::ClusterEndpointSelector::new(&paths, &state)
+            .select(sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand);
         assert_eq!(
             targets.first().map(|endpoint| &endpoint.endpoint_id),
             Some(&tcp.endpoint_id),
@@ -9847,11 +9830,8 @@ mod tests {
         )
         .expect("connectivity records");
 
-        let targets = sinomo_network::cluster_endpoint_targets(
-            &paths,
-            &state,
-            sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand,
-        );
+        let targets = sinomo_network::ClusterEndpointSelector::new(&paths, &state)
+            .select(sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand);
 
         assert_eq!(
             targets.first().map(|endpoint| &endpoint.endpoint_id),
@@ -9952,11 +9932,8 @@ mod tests {
         )
         .expect("connectivity records");
 
-        let targets = sinomo_network::cluster_endpoint_targets(
-            &paths,
-            &state,
-            sinomo_network::ClusterEndpointSelectionPurpose::MemberPublish,
-        );
+        let targets = sinomo_network::ClusterEndpointSelector::new(&paths, &state)
+            .select(sinomo_network::ClusterEndpointSelectionPurpose::MemberPublish);
 
         assert_eq!(
             targets
@@ -10113,11 +10090,8 @@ mod tests {
             .expect("write local learned route");
 
         let merged_state = sinomo_network::read_cluster_state(&paths).expect("read merged state");
-        let targets = sinomo_network::cluster_endpoint_targets(
-            &paths,
-            &merged_state,
-            sinomo_network::ClusterEndpointSelectionPurpose::MemberPublish,
-        );
+        let targets = sinomo_network::ClusterEndpointSelector::new(&paths, &merged_state)
+            .select(sinomo_network::ClusterEndpointSelectionPurpose::MemberPublish);
 
         assert_eq!(
             targets
@@ -10215,11 +10189,8 @@ mod tests {
         sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
             .expect("sync state to raft kv");
 
-        let targets = sinomo_network::cluster_endpoint_targets(
-            &paths,
-            &state,
-            sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand,
-        );
+        let targets = sinomo_network::ClusterEndpointSelector::new(&paths, &state)
+            .select(sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand);
 
         assert_eq!(
             targets.first().map(|endpoint| &endpoint.endpoint_id),
@@ -10662,22 +10633,16 @@ mod tests {
         .expect("sync offline node status");
 
         assert!(
-            sinomo_network::cluster_endpoint_targets(
-                &paths,
-                &state,
-                sinomo_network::ClusterEndpointSelectionPurpose::LiveVoterCommand
-            )
-            .is_empty(),
+            sinomo_network::ClusterEndpointSelector::new(&paths, &state)
+                .select(sinomo_network::ClusterEndpointSelectionPurpose::LiveVoterCommand)
+                .is_empty(),
             "ordinary live-voter routing should honor explicit offline status"
         );
         assert_eq!(
-            sinomo_network::cluster_endpoint_targets(
-                &paths,
-                &state,
-                sinomo_network::ClusterEndpointSelectionPurpose::VoterCommand,
-            )
-            .first()
-            .map(|endpoint| &endpoint.endpoint_id),
+            sinomo_network::ClusterEndpointSelector::new(&paths, &state)
+                .select(sinomo_network::ClusterEndpointSelectionPurpose::VoterCommand)
+                .first()
+                .map(|endpoint| &endpoint.endpoint_id),
             Some(&voter_endpoint.endpoint_id),
             "join bootstrap must still try voter command targets even when local health is stale/offline"
         );
@@ -10757,11 +10722,8 @@ mod tests {
         sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
             .expect("sync state to raft kv");
 
-        let targets = sinomo_network::cluster_endpoint_targets(
-            &paths,
-            &state,
-            sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand,
-        );
+        let targets = sinomo_network::ClusterEndpointSelector::new(&paths, &state)
+            .select(sinomo_network::ClusterEndpointSelectionPurpose::RaftCommand);
         let first_iroh_position = targets
             .iter()
             .position(|endpoint| endpoint.endpoint_id == first_iroh.endpoint_id)
@@ -10878,12 +10840,9 @@ mod tests {
             "an unreachable member that never self-declared Offline is not explicit offline"
         );
         assert_eq!(
-            sinomo_network::cluster_endpoint_targets(
-                &paths,
-                &state,
-                sinomo_network::ClusterEndpointSelectionPurpose::LiveVoterCommand
-            )
-            .len(),
+            sinomo_network::ClusterEndpointSelector::new(&paths, &state)
+                .select(sinomo_network::ClusterEndpointSelectionPurpose::LiveVoterCommand)
+                .len(),
             1,
             "an unreachable member must remain a voter while connectivity is recovering"
         );
