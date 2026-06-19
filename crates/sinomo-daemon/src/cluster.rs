@@ -13,11 +13,11 @@ use crate::{
     daemon_connect_address, daemon_options_from_status, daemon_paths_are_shadow,
     fetch_cluster_kv_snapshot_from_endpoint_on_runtime, fetch_daemon_status_from_endpoint_async,
     fetch_daemon_status_from_endpoint_on_runtime, handle_daemon_rollout_build_request,
-    read_daemon_status, send_cluster_kv_txn_on_runtime, send_cluster_kv_watch_events_async,
-    send_cluster_member_publish_async, send_cluster_member_publish_on_runtime,
-    send_cluster_raft_append_async, send_cluster_raft_append_on_runtime,
-    send_cluster_raft_vote_async, send_cluster_raft_vote_on_runtime,
-    send_daemon_rpc_to_endpoint_async, send_daemon_rpc_to_endpoint_on_runtime, write_daemon_status,
+    read_daemon_status, send_cluster_kv_watch_events_async, send_cluster_member_publish_async,
+    send_cluster_member_publish_on_runtime, send_cluster_raft_append_async,
+    send_cluster_raft_append_on_runtime, send_cluster_raft_vote_async,
+    send_cluster_raft_vote_on_runtime, send_daemon_rpc_to_endpoint_async,
+    send_daemon_rpc_to_endpoint_on_runtime, write_daemon_status,
 };
 use sinomo_core::{
     ClusterBootstrapState, ClusterEndpointRecord, ClusterMemberRecord, ClusterNodeRole,
@@ -3541,17 +3541,6 @@ impl sinomo_network::ClusterControlPlaneTransport for DaemonClusterControlPlaneT
     fn probe_voter(&mut self, endpoint: &ClusterEndpointRecord, timeout: Duration) -> bool {
         fetch_daemon_status_from_endpoint_on_runtime(endpoint, timeout, self.rpc_mode.runtime())
             .is_ok()
-    }
-
-    fn send_cluster_kv_txn(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        txn: &KvTxn,
-        timeout: Duration,
-    ) -> Result<KvTxnResponse, sinomo_network::NetworkError> {
-        let runtime = self.rpc_mode.runtime();
-        send_cluster_kv_txn_on_runtime(endpoint, txn, timeout, runtime)
-            .map_err(|error| daemon_host_network_error("cluster kv txn", error))
     }
 
     fn fetch_cluster_kv_snapshot(

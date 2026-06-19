@@ -1769,17 +1769,6 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
             false
         }
 
-        fn send_cluster_kv_txn(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _txn: &KvTxn,
-            _timeout: Duration,
-        ) -> Result<KvTxnResponse, network::NetworkError> {
-            Err(unsupported_join_reconciliation_transport(
-                "cluster join kv txn",
-            ))
-        }
-
         fn fetch_cluster_kv_snapshot(
             &mut self,
             endpoint: &ClusterEndpointRecord,

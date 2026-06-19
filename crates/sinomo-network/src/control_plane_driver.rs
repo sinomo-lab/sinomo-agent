@@ -29,13 +29,6 @@ pub trait ClusterControlPlaneTransport {
 
     fn probe_voter(&mut self, endpoint: &ClusterEndpointRecord, timeout: Duration) -> bool;
 
-    fn send_cluster_kv_txn(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        txn: &KvTxn,
-        timeout: Duration,
-    ) -> Result<KvTxnResponse, NetworkError>;
-
     fn fetch_cluster_kv_snapshot(
         &mut self,
         endpoint: &ClusterEndpointRecord,

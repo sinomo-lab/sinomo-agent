@@ -12,8 +12,7 @@ use sinomo_dfs::{
 };
 use sinomo_kv::{
     ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, ClusterRaftAppendRequest,
-    ClusterRaftAppendResponse, ClusterRaftVoteRequest, ClusterRaftVoteResponse, KvSnapshot, KvTxn,
-    KvTxnResponse,
+    ClusterRaftAppendResponse, ClusterRaftVoteRequest, ClusterRaftVoteResponse, KvSnapshot,
 };
 use sinomo_network::{
     AsyncDaemonControlStream, ClusterMemberPublishRequest, ClusterMemberPublishResponse,
@@ -1145,13 +1144,6 @@ fn decode_cluster_kv_snapshot_rpc_response(
     sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&response.body).map_err(Into::into)
 }
 
-fn decode_cluster_kv_txn_rpc_response(
-    response: &sinomo_network::ObjectRpcResponse,
-) -> Result<KvTxnResponse, DaemonError> {
-    response.error_detail()?;
-    sinomo_kv::decode_cluster_kv_txn_rpc_body(&response.body).map_err(Into::into)
-}
-
 fn decode_cluster_kv_watch_events_rpc_response(
     response: &sinomo_network::ObjectRpcResponse,
 ) -> Result<ClusterKvWatchEventsResponse, DaemonError> {
@@ -1200,23 +1192,6 @@ pub(crate) fn fetch_cluster_kv_snapshot_from_endpoint(
         &rpc_request,
         timeout,
         decode_cluster_kv_snapshot_rpc_response,
-    )
-}
-
-pub(crate) fn send_cluster_kv_txn_on_runtime(
-    endpoint: &ClusterEndpointRecord,
-    txn: &KvTxn,
-    timeout: Duration,
-    runtime: &tokio::runtime::Handle,
-) -> Result<KvTxnResponse, DaemonError> {
-    let rpc_request =
-        object_rpc_request_from_kv_payload(sinomo_kv::cluster_kv_txn_rpc_payload(txn)?);
-    send_daemon_rpc_request_to_endpoint_with_decoder_on_runtime(
-        endpoint,
-        &rpc_request,
-        timeout,
-        runtime,
-        decode_cluster_kv_txn_rpc_response,
     )
 }
 

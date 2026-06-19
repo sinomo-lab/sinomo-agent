@@ -9530,15 +9530,6 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
             panic!("membership forwarding should not probe voters")
         }
 
-        fn send_cluster_kv_txn(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _txn: &KvTxn,
-            _timeout: Duration,
-        ) -> Result<KvTxnResponse, NetworkError> {
-            panic!("membership forwarding should not send kv txn")
-        }
-
         fn fetch_cluster_kv_snapshot(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
@@ -9683,15 +9674,6 @@ fn cluster_join_registration_driver_uses_local_membership_observer() {
             panic!("local observation should not probe voters")
         }
 
-        fn send_cluster_kv_txn(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _txn: &KvTxn,
-            _timeout: Duration,
-        ) -> Result<KvTxnResponse, NetworkError> {
-            panic!("local observation should not send kv txn")
-        }
-
         fn fetch_cluster_kv_snapshot(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
@@ -9811,15 +9793,6 @@ fn cluster_member_mutation_driver_prepares_state_from_local_membership_observer(
 
         fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
             panic!("membership preparation should not probe voters")
-        }
-
-        fn send_cluster_kv_txn(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _txn: &KvTxn,
-            _timeout: Duration,
-        ) -> Result<KvTxnResponse, NetworkError> {
-            panic!("membership preparation should not send kv txn")
         }
 
         fn fetch_cluster_kv_snapshot(
@@ -9975,15 +9948,6 @@ fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
 
         fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
             panic!("cache hook test should not probe voters")
-        }
-
-        fn send_cluster_kv_txn(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _txn: &KvTxn,
-            _timeout: Duration,
-        ) -> Result<KvTxnResponse, NetworkError> {
-            panic!("cache hook test should not send kv txn")
         }
 
         fn fetch_cluster_kv_snapshot(
@@ -13064,15 +13028,6 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
 
         fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
             panic!("join reconciliation should not probe voters")
-        }
-
-        fn send_cluster_kv_txn(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _txn: &KvTxn,
-            _timeout: Duration,
-        ) -> Result<KvTxnResponse, NetworkError> {
-            panic!("join reconciliation should not send kv txn")
         }
 
         fn fetch_cluster_kv_snapshot(
