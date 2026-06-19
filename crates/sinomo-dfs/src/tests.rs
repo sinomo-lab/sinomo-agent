@@ -1901,6 +1901,127 @@ fn endpoint_transport_read_message_uses_direct_sender_and_queues_response() {
 }
 
 #[test]
+fn endpoint_transport_async_read_message_uses_direct_sender_and_queues_response() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let local = NodeId::from_legacy_named("node_dfs_endpoint_async_direct_local")
+            .expect("local");
+        let remote = NodeId::from_legacy_named("node_dfs_endpoint_async_direct_remote")
+            .expect("remote");
+        let object_id = DfsObjectId::from_legacy_named("object_async_endpoint_direct")
+            .expect("object");
+        let version = DfsVersion::from_legacy_named("version_async_endpoint_direct")
+            .expect("version");
+        let bytes = b"async direct endpoint read bytes".to_vec();
+        let direct_calls = Arc::new(Mutex::new(Vec::new()));
+        let direct_calls_for_sender = Arc::clone(&direct_calls);
+        let bytes_for_sender = bytes.clone();
+        let async_direct_sender: AsyncDfsDirectReadSender =
+            Arc::new(move |_endpoint, request, _timeout| {
+                let direct_calls_for_sender = Arc::clone(&direct_calls_for_sender);
+                let request = request.clone();
+                let bytes_for_sender = bytes_for_sender.clone();
+                Box::pin(async move {
+                    direct_calls_for_sender
+                        .lock()
+                        .expect("direct calls")
+                        .push(request.clone());
+                    Ok(DfsReadResponse {
+                        request_id: request.request_id.clone(),
+                        object_id: request.object_id.clone(),
+                        result: DfsReadResult::Found(DfsReadData {
+                            object_id: request.object_id.clone(),
+                            version: request.version.clone(),
+                            content_hash: Some(request.content_hash.clone()),
+                            bytes: bytes_for_sender,
+                        }),
+                    })
+                })
+            });
+        let message_send_calls = Arc::new(Mutex::new(0usize));
+        let message_send_calls_for_sender = Arc::clone(&message_send_calls);
+        let async_sender: AsyncDfsMessageSender = Arc::new(move |_endpoint, _command, _timeout| {
+            let message_send_calls_for_sender = Arc::clone(&message_send_calls_for_sender);
+            Box::pin(async move {
+                *message_send_calls_for_sender
+                    .lock()
+                    .expect("message send calls") += 1;
+                Err(DfsPeerTransportError::new(
+                    "async message sender should not be used by direct-read-eligible messages",
+                ))
+            })
+        });
+        let sync_sender: DfsMessageSender = Arc::new(|_endpoint, _command, _timeout| {
+            Err(DfsPeerTransportError::new(
+                "sync message sender should not be used by async direct-read tests",
+            ))
+        });
+        let sync_direct_sender: DfsDirectReadSender = Arc::new(|_endpoint, _request, _timeout| {
+            Err(DfsPeerTransportError::new(
+                "sync direct sender should not be used by async direct-read tests",
+            ))
+        });
+        let mut transport = DfsEndpointTransport::new_with_message_peer_senders(
+            local.clone(),
+            vec![test_endpoint(&remote, "192.0.2.18:21353")],
+            sync_sender,
+            async_sender,
+            sync_direct_sender,
+            async_direct_sender,
+        );
+        let message = DfsRoutedMessage {
+            source_node_id: local.clone(),
+            target_node_id: remote.clone(),
+            frame_id: 17,
+            message_id: 19,
+            message: DfsNetworkMessage::ReadRequest(DfsReadRequest {
+                request_id: "endpoint-async-direct-read".to_string(),
+                object_id: object_id.clone(),
+                version: Some(version.clone()),
+                content_hash: Some("blake3:async-endpoint-direct".to_string()),
+                content_size_bytes: Some(bytes.len() as u64),
+                range_offset: None,
+                range_max_bytes: None,
+                start_chunk_index: 0,
+                max_chunks: 0,
+            }),
+        };
+
+        AsyncDfsMessageTransport::send_routed_message_async(&mut transport, &remote, message)
+            .await
+            .expect("send async routed read message");
+
+        let calls = direct_calls.lock().expect("direct calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].object_id, object_id);
+        assert_eq!(calls[0].version, version);
+        assert_eq!(calls[0].content_hash, "blake3:async-endpoint-direct");
+        assert_eq!(calls[0].content_size_bytes, bytes.len() as u64);
+        drop(calls);
+        assert_eq!(*message_send_calls.lock().expect("message send calls"), 0);
+        let messages = AsyncDfsMessageTransport::drain_incoming_messages_async(&mut transport)
+            .await
+            .expect("incoming messages");
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            &messages[0].message,
+            DfsNetworkMessage::ReadResponse(DfsReadResponse {
+                result: DfsReadResult::Found(DfsReadData {
+                    object_id: response_object_id,
+                    version: response_version,
+                    bytes: response_bytes,
+                    ..
+                }),
+                ..
+            }) if response_object_id == &object_id && response_version == &version && response_bytes == &bytes
+        ));
+    });
+}
+
+#[test]
 fn endpoint_transport_async_send_requires_async_sender() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

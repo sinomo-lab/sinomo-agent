@@ -313,14 +313,17 @@ pub(crate) fn daemon_dfs_endpoint_transport_on_runtime(
     runtime: &tokio::runtime::Handle,
 ) -> DfsEndpointTransport {
     let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(runtime);
+    let async_peer_transport = daemon_dfs_async_peer_transport(runtime);
+    let async_direct_read_peer_transport = Arc::clone(&async_peer_transport);
     DfsEndpointTransport::new_with_message_peer_senders(
         local_node_id,
         endpoints,
         sinomo_dfs::dfs_message_sender_from_peer_transport(Arc::clone(&peer_transport)),
-        sinomo_dfs::async_dfs_message_sender_from_peer_transport(daemon_dfs_async_peer_transport(
-            runtime,
-        )),
+        sinomo_dfs::async_dfs_message_sender_from_peer_transport(async_peer_transport),
         sinomo_dfs::dfs_direct_read_sender_from_peer_transport(peer_transport),
+        sinomo_dfs::async_dfs_direct_read_sender_from_peer_transport(
+            async_direct_read_peer_transport,
+        ),
     )
 }
 
