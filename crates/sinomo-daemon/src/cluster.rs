@@ -4592,13 +4592,17 @@ struct DaemonClusterRelayAsyncHost<'a> {
     runtime: tokio::runtime::Handle,
 }
 
+type DaemonClusterRelayFuture<'a, T> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<T, sinomo_network::NetworkError>> + Send + 'a>,
+>;
+
 impl sinomo_network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost<'_> {
     fn try_deliver_local_async<'a>(
         &'a mut self,
         state: &'a ClusterBootstrapState,
         envelope: &'a sinomo_network::RelayEnvelope,
         timeouts: sinomo_network::DaemonRpcTimeouts,
-    ) -> sinomo_network::ClusterRelayFuture<'a, Option<sinomo_network::ObjectRpcResponse>> {
+    ) -> DaemonClusterRelayFuture<'a, Option<sinomo_network::ObjectRpcResponse>> {
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
         let state = state.clone();
@@ -4658,7 +4662,7 @@ impl sinomo_network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost<'_> {
         endpoint: &'a ClusterEndpointRecord,
         request: &'a sinomo_network::ObjectRpcRequest,
         timeouts: sinomo_network::DaemonRpcTimeouts,
-    ) -> sinomo_network::ClusterRelayFuture<'a, sinomo_network::ObjectRpcResponse> {
+    ) -> DaemonClusterRelayFuture<'a, sinomo_network::ObjectRpcResponse> {
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
         let endpoint = endpoint.clone();
@@ -4723,7 +4727,7 @@ impl sinomo_network::ClusterRelayStreamForwardAsyncHost
         endpoint: &'a ClusterEndpointRecord,
         request: &'a sinomo_network::ObjectRpcRequest,
         timeouts: sinomo_network::DaemonRpcTimeouts,
-    ) -> sinomo_network::ClusterRelayFuture<'a, sinomo_network::ClusterRelayStreamSendOutcome> {
+    ) -> DaemonClusterRelayFuture<'a, sinomo_network::ClusterRelayStreamSendOutcome> {
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
         let endpoint = endpoint.clone();
@@ -5086,8 +5090,7 @@ mod tests {
             endpoint: &'a ClusterEndpointRecord,
             request: &'a sinomo_network::ObjectRpcRequest,
             timeouts: sinomo_network::DaemonRpcTimeouts,
-        ) -> sinomo_network::ClusterRelayFuture<'a, sinomo_network::ClusterRelayStreamSendOutcome>
-        {
+        ) -> DaemonClusterRelayFuture<'a, sinomo_network::ClusterRelayStreamSendOutcome> {
             let endpoint = endpoint.clone();
             let request = request.clone();
             let mode = self.mode;

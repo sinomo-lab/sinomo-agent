@@ -7993,7 +7993,7 @@ fn metadata_journal_rejection_is_sequence_conflict(reason: &str) -> bool {
 }
 
 pub const DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const DFS_PROTOCOL_FRAME_DRAIN_MAX_PASSES: usize = 64;
+const DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsPeerTransportError {
@@ -9277,7 +9277,7 @@ impl NetworkedDfsService<DfsEndpointServedMessageTransport> {
                 return Err(error);
             }
         };
-        for _ in 0..DFS_PROTOCOL_FRAME_DRAIN_MAX_PASSES {
+        for _ in 0..DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES {
             let pending = match self
                 .transport
                 .pending_incoming_count()
@@ -9342,7 +9342,7 @@ impl NetworkedDfsService<DfsEndpointServedMessageTransport> {
         let outbound_messages = self.transport.finish_message();
         Err(DfsError::Network {
             message: format!(
-                "DFS message did not quiesce after {DFS_PROTOCOL_FRAME_DRAIN_MAX_PASSES} passes; returned {} message(s) before aborting",
+                "DFS data-plane message did not quiesce after {DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES} passes; returned {} message(s) before aborting",
                 outbound_messages.len()
             ),
         })

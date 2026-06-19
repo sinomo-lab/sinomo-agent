@@ -35,10 +35,11 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 use time::OffsetDateTime;
 
-// Protocol frames keep the cached service hot by applying inbound frames and
-// routed journal batches. A full backend hydrate is a defensive catch-up for
-// out-of-band metadata writes, and doing it every few seconds makes multi-node
-// DFS writes pay repeated disk scans while a request is still in flight.
+// Data-plane object-RPC messages keep the cached service hot by applying
+// inbound messages and routed journal batches. A full backend hydrate is a
+// defensive catch-up for out-of-band metadata writes, and doing it every few
+// seconds makes multi-node DFS writes pay repeated disk scans while a request is
+// still in flight.
 const DAEMON_DFS_MESSAGE_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const DAEMON_DFS_MESSAGE_ROUTE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DAEMON_DFS_REPAIR_MAX_JOBS_PER_TICK: usize = 8;
@@ -2775,14 +2776,15 @@ mod tests {
             }),
         )
         .expect("write dfs control plane");
-        let object_id = DfsObjectId::from_legacy_named("obj_dfs_protocol_stage").expect("object");
-        let version = DfsVersion::from_legacy_named("version_dfs_protocol_stage").expect("version");
-        let bytes = b"daemon dfs protocol frame bytes".to_vec();
+        let object_id = DfsObjectId::from_legacy_named("obj_dfs_data_plane_stage").expect("object");
+        let version =
+            DfsVersion::from_legacy_named("version_dfs_data_plane_stage").expect("version");
+        let bytes = b"daemon dfs data-plane message bytes".to_vec();
         let content_hash = format!("blake3:{}", blake3::hash(&bytes).to_hex());
         let object = DfsObjectMetadata {
             object_id: object_id.clone(),
             file_system_id: file_system_id.clone(),
-            path: "services/daemon-dfs-protocol.bin".to_string(),
+            path: "services/daemon-dfs-data-plane.bin".to_string(),
             kind: DfsObjectKind::File,
             owner_node_id: owner.clone(),
             current_locations: vec![owner.clone()],

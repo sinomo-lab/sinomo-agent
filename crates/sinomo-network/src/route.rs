@@ -434,8 +434,8 @@ impl ClusterRelayOptions {
     }
 }
 
-pub type ClusterRelayFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, NetworkError>> + Send + 'a>>;
+#[cfg(test)]
+type ClusterRelayFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, NetworkError>> + Send + 'a>>;
 
 pub trait ClusterRelayAsyncHost {
     fn try_deliver_local_async<'a>(
@@ -443,14 +443,14 @@ pub trait ClusterRelayAsyncHost {
         state: &'a ClusterBootstrapState,
         envelope: &'a RelayEnvelope,
         timeouts: DaemonRpcTimeouts,
-    ) -> ClusterRelayFuture<'a, Option<ObjectRpcResponse>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ObjectRpcResponse>, NetworkError>> + Send + 'a>>;
 
     fn send_relay_request_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
         request: &'a ObjectRpcRequest,
         timeouts: DaemonRpcTimeouts,
-    ) -> ClusterRelayFuture<'a, ObjectRpcResponse>;
+    ) -> Pin<Box<dyn Future<Output = Result<ObjectRpcResponse, NetworkError>> + Send + 'a>>;
 }
 
 #[derive(Debug)]
@@ -473,7 +473,9 @@ pub trait ClusterRelayStreamForwardAsyncHost {
         endpoint: &'a ClusterEndpointRecord,
         request: &'a ObjectRpcRequest,
         timeouts: DaemonRpcTimeouts,
-    ) -> ClusterRelayFuture<'a, ClusterRelayStreamSendOutcome>;
+    ) -> Pin<
+        Box<dyn Future<Output = Result<ClusterRelayStreamSendOutcome, NetworkError>> + Send + 'a>,
+    >;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

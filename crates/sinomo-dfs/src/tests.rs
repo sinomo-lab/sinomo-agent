@@ -1685,7 +1685,7 @@ fn direct_read_rpc_uses_raw_body_and_reconstructs_message_response() {
         max_chunks: 0,
     };
     let command = DfsMessageCommand {
-        request_id: "direct-read-protocol-frame".to_string(),
+        request_id: "direct-read-data-plane-message".to_string(),
         routed_message: DfsRoutedMessage {
             source_node_id: local.clone(),
             target_node_id: remote.clone(),

@@ -194,13 +194,13 @@ DFS route and data-plane behavior belongs to `sinomo-dfs`. The current boundary
 is:
 
 - `sinomo-dfs` owns DFS control-plane route constants, control-plane service
-  behavior, protocol-frame processing for a single inbound frame, endpoint
-  peer transport through `DfsEndpointTransport`, metadata replication endpoint
-  transport through `DfsMetadataEndpointTransport`, metadata publish retry
-  scheduling through `DfsMetadataPublishScheduler` and the default scheduler,
-  DFS peer RPC request/response codecs for protocol frames and metadata
-  replication, the post-mutation metadata publish event gate, cluster
-  protocol-frame service assembly through `process_cluster_dfs_protocol_frame`,
+  behavior, data-plane object-RPC message processing for a single inbound
+  message, endpoint peer transport through `DfsEndpointTransport`, metadata
+  replication endpoint transport through `DfsMetadataEndpointTransport`,
+  metadata publish retry scheduling through `DfsMetadataPublishScheduler` and
+  the default scheduler, DFS peer RPC request/response codecs for data-plane
+  messages and metadata replication, the post-mutation metadata publish event
+  gate, cluster data-plane service assembly through `DfsDataPlaneService`,
   cluster maintenance tick assembly through `run_cluster_dfs_maintenance_tick`,
   cluster smoke assembly through `run_cluster_dfs_smoke`, metadata shard
   primary-transfer readiness, metadata backend semantics,
