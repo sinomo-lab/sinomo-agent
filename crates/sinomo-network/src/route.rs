@@ -1628,6 +1628,34 @@ pub async fn handle_cluster_relay_async_with_host(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     local_node_id: &NodeId,
+    request: &ObjectRpcRequest,
+    options: ClusterRelayOptions,
+    host: &mut impl ClusterRelayAsyncHost,
+) -> Result<ObjectRpcResponse, NetworkError> {
+    let envelope = RelayEnvelope::from_request(request)?;
+    if relay_envelope_inner_expects_streamed_response(&envelope) {
+        return Err(NetworkError::Io {
+            operation: "cluster relay rpc".to_string(),
+            detail: "streamed raw relay responses require socket streaming dispatch".to_string(),
+        });
+    }
+    handle_cluster_relay_envelope_async_with_host(
+        runtime,
+        paths,
+        state,
+        local_node_id,
+        envelope,
+        options,
+        host,
+    )
+    .await
+}
+
+async fn handle_cluster_relay_envelope_async_with_host(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    local_node_id: &NodeId,
     envelope: RelayEnvelope,
     options: ClusterRelayOptions,
     host: &mut impl ClusterRelayAsyncHost,
@@ -1718,6 +1746,10 @@ pub async fn handle_cluster_relay_async_with_host(
             }
         ),
     )
+}
+
+fn relay_envelope_inner_expects_streamed_response(envelope: &RelayEnvelope) -> bool {
+    crate::object_rpc_request_stream_mode(envelope.inner()).expects_raw_streamed_response()
 }
 
 pub async fn handle_cluster_relay_stream_forward_async_with_host(
@@ -5516,6 +5548,7 @@ mod tests {
         .expect("connectivity");
         let mut envelope = RelayEnvelope::new(cluster_id.clone(), target.clone(), inner_request());
         envelope.max_hop_timeout_ms = Some(1_500);
+        let relay_request = envelope.into_request().expect("relay request");
 
         let mut async_host = RecordingRelayHost::default();
         let runtime = tokio::runtime::Handle::current();
@@ -5524,7 +5557,7 @@ mod tests {
             &paths,
             &state,
             &local,
-            envelope,
+            &relay_request,
             ClusterRelayOptions::new(DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5))),
             &mut async_host,
         )

@@ -4489,14 +4489,6 @@ pub(crate) async fn handle_daemon_cluster_relay_request_on_runtime(
     request: &sinomo_network::ObjectRpcRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
-    let envelope =
-        sinomo_network::RelayEnvelope::from_request(request).map_err(DaemonError::from)?;
-    if relay_envelope_inner_expects_streamed_response(&envelope) {
-        return Err(DaemonError::Network {
-            address: sinomo_network::CLUSTER_RELAY_ROUTE.to_string(),
-            detail: "streamed raw relay responses require socket streaming dispatch".to_string(),
-        });
-    }
     let runtime = runtime.ok_or_else(|| DaemonError::Network {
         address: sinomo_network::CLUSTER_RELAY_ROUTE.to_string(),
         detail: "cluster relay dispatch requires the daemon-owned Tokio runtime".to_string(),
@@ -4521,7 +4513,7 @@ pub(crate) async fn handle_daemon_cluster_relay_request_on_runtime(
         &cluster_paths,
         &state,
         &local_node_id,
-        envelope,
+        request,
         sinomo_network::ClusterRelayOptions::new(
             sinomo_network::DaemonRpcTimeouts::connect_and_idle(
                 DAEMON_CLUSTER_RELAY_CONNECT_TIMEOUT,
@@ -4846,12 +4838,6 @@ async fn send_cluster_relay_request_to_next_hop_async(
         )
         .await
         .map_err(DaemonError::from)
-}
-
-fn relay_envelope_inner_expects_streamed_response(
-    envelope: &sinomo_network::RelayEnvelope,
-) -> bool {
-    sinomo_network::object_rpc_request_stream_mode(envelope.inner()).expects_raw_streamed_response()
 }
 
 enum ClusterRelayStreamForwardResult {
