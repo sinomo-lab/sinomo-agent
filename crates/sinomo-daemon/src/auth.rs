@@ -361,7 +361,7 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        route if route == sinomo_dfs::DFS_MESSAGE_ROUTE => {
+        route if sinomo_dfs::dfs_route_is_message_data_plane(route) => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -1410,10 +1410,10 @@ mod tests {
 
     #[test]
     fn dfs_object_transfer_routes_authorize_cluster_members() {
-        for route in [
-            sinomo_dfs::DFS_MESSAGE_ROUTE,
-            sinomo_dfs::DFS_DIRECT_READ_ROUTE,
-        ] {
+        for route in std::iter::once(sinomo_dfs::DFS_DIRECT_READ_ROUTE)
+            .chain(std::iter::once(sinomo_dfs::DFS_MESSAGE_ROUTE))
+            .chain(sinomo_dfs::DFS_MESSAGE_DATA_PLANE_ROUTES.iter().copied())
+        {
             for signer in [
                 DaemonSignerAuthority::Local,
                 DaemonSignerAuthority::Voter,

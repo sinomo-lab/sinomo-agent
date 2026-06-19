@@ -1019,7 +1019,7 @@ fn daemon_rpc_request_allows_reusable_stream(request: &sinomo_network::ObjectRpc
 pub(crate) fn daemon_dfs_message_replay_key(
     request: &sinomo_network::DaemonControlRequest,
 ) -> Option<Vec<u8>> {
-    if request.route != sinomo_dfs::DFS_MESSAGE_ROUTE {
+    if !sinomo_dfs::dfs_route_is_message_data_plane(&request.route) {
         return None;
     }
     let auth = request.auth.as_ref()?;

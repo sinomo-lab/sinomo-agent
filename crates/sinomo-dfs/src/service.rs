@@ -19,16 +19,16 @@ use std::sync::Arc;
 
 use crate::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_PLANE_SERVICE_ROUTES, DFS_DIRECT_READ_ROUTE,
-    DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE, DFS_MESSAGE_ROUTE,
-    DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_SMOKE_ROUTE,
-    DFS_STATUS_ROUTE, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMessageCommand,
-    DfsMessageResponse, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
-    DfsMetadataJournalBatchResponse, DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand,
-    DfsMetadataSnapshotInstallResponse, DfsOperatorInspector, DfsOperatorStatus, DfsSmokeReport,
+    DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE, DFS_METADATA_JOURNAL_BATCH_ROUTE,
+    DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE,
+    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMessageCommand, DfsMessageResponse,
+    DfsMetadataBackend, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
+    DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
+    DfsOperatorInspector, DfsOperatorStatus, DfsSmokeReport, decode_dfs_message_rpc_request,
     default_dfs_metadata_root, default_dfs_metadata_shards_root, dfs_module_surfaces,
-    ensure_default_cluster_aware_dfs_expose_config, handle_dfs_direct_read_rpc_request,
-    metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
-    sifs_file_system_id,
+    dfs_route_is_message_data_plane, ensure_default_cluster_aware_dfs_expose_config,
+    handle_dfs_direct_read_rpc_request, metadata_shards_prefix,
+    open_local_sharded_metadata_backend, open_root_local_metadata_backend, sifs_file_system_id,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
@@ -83,7 +83,7 @@ fn dfs_service_route(route: &'static str) -> ServiceRoute {
 }
 
 fn dfs_service_route_concurrency_limit(route: &str) -> usize {
-    if route == DFS_MESSAGE_ROUTE || route == DFS_DIRECT_READ_ROUTE {
+    if dfs_route_is_message_data_plane(route) || route == DFS_DIRECT_READ_ROUTE {
         DFS_DATA_PLANE_ROUTE_CONCURRENCY_LIMIT
     } else {
         DFS_DEFAULT_ROUTE_CONCURRENCY_LIMIT
@@ -216,11 +216,11 @@ impl Service for DfsDataPlaneService {
                     let report = host.run_smoke().await.map_err(service_error)?;
                     ObjectRpcResponse::encode_body(DFS_SMOKE_ROUTE, &report)?
                 }
-                DFS_MESSAGE_ROUTE => {
-                    let command: DfsMessageCommand = request.decode_body()?;
+                route if dfs_route_is_message_data_plane(route) => {
+                    let command = decode_dfs_message_rpc_request(&request)?;
                     let message_response =
                         host.handle_message(command).await.map_err(service_error)?;
-                    ObjectRpcResponse::encode_body(DFS_MESSAGE_ROUTE, &message_response)?
+                    ObjectRpcResponse::encode_body(route, &message_response)?
                 }
                 DFS_DIRECT_READ_ROUTE => handle_dfs_direct_read_rpc_request(&ctx.data_dir, request)
                     .map_err(service_error)?,
@@ -662,7 +662,8 @@ mod tests {
         let registry =
             register_data_plane_services(ServiceRegistry::builder(), host.clone()).build();
         assert!(registry.owns(DFS_SMOKE_ROUTE));
-        assert!(registry.owns(DFS_MESSAGE_ROUTE));
+        assert!(registry.owns(crate::DFS_MESSAGE_ROUTE));
+        assert!(registry.owns(crate::DFS_DATA_READ_ROUTE));
         assert!(registry.owns(DFS_DIRECT_READ_ROUTE));
 
         let (disposition, smoke_response) = {
@@ -701,7 +702,7 @@ mod tests {
         let (disposition, message_response) = dispatch_local(
             &registry,
             test_data_dir.clone(),
-            DFS_MESSAGE_ROUTE,
+            crate::DFS_DATA_READ_ROUTE,
             &typed_command,
         )
         .await;

@@ -341,7 +341,67 @@ pub const DFS_METADATA_JOURNAL_BATCH_ROUTE: &str = "/dfs/metadata/journal-batch"
 pub const DFS_METADATA_SNAPSHOT_INSTALL_ROUTE: &str = "/dfs/metadata/snapshot-install";
 pub const DFS_MESSAGE_ROUTE: &str = "/dfs/message";
 pub const DFS_DIRECT_READ_ROUTE: &str = "/dfs/object/read";
+pub const DFS_DATA_READ_ROUTE: &str = "/dfs/data/read";
+pub const DFS_DATA_READ_RESPONSE_ROUTE: &str = "/dfs/data/read/response";
+pub const DFS_DATA_READ_RESPONSE_CHUNK_ROUTE: &str = "/dfs/data/read/response-chunk";
+pub const DFS_DATA_BULK_READ_ROUTE: &str = "/dfs/data/bulk-read";
+pub const DFS_DATA_BULK_READ_RESPONSE_ROUTE: &str = "/dfs/data/bulk-read/response";
+pub const DFS_DATA_WRITE_ROUTE: &str = "/dfs/data/write";
+pub const DFS_DATA_WRITE_RESPONSE_ROUTE: &str = "/dfs/data/write/response";
+pub const DFS_DATA_DISTRIBUTED_WRITE_ROUTE: &str = "/dfs/data/distributed-write";
+pub const DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE: &str = "/dfs/data/distributed-write/response";
+pub const DFS_DATA_NAMESPACE_ROUTE: &str = "/dfs/data/namespace";
+pub const DFS_DATA_NAMESPACE_RESPONSE_ROUTE: &str = "/dfs/data/namespace/response";
+pub const DFS_DATA_STAGE_BLOB_ROUTE: &str = "/dfs/data/stage-blob";
+pub const DFS_DATA_STAGE_BLOB_CHUNK_ROUTE: &str = "/dfs/data/stage-blob/chunk";
+pub const DFS_DATA_STAGE_PATCH_ROUTE: &str = "/dfs/data/stage-patch";
+pub const DFS_DATA_STAGE_PATCH_CHUNK_ROUTE: &str = "/dfs/data/stage-patch/chunk";
+pub const DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE: &str = "/dfs/data/stage-blob/response";
+pub const DFS_DATA_COMMIT_VERSION_ROUTE: &str = "/dfs/data/commit-version";
+pub const DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE: &str = "/dfs/data/commit-version/response";
+pub const DFS_DATA_REPAIR_REPLICA_ROUTE: &str = "/dfs/data/repair-replica";
+pub const DFS_DATA_REPAIR_REPLICA_CHUNK_ROUTE: &str = "/dfs/data/repair-replica/chunk";
+pub const DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE: &str = "/dfs/data/repair-replica/response";
+pub const DFS_DATA_FETCH_BLOB_ROUTE: &str = "/dfs/data/fetch-blob";
+pub const DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE: &str = "/dfs/data/fetch-blob/response";
+pub const DFS_DATA_FETCH_BLOB_RESPONSE_CHUNK_ROUTE: &str = "/dfs/data/fetch-blob/response-chunk";
+pub const DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE: &str = "/dfs/data/metadata/journal-batch";
+pub const DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE: &str =
+    "/dfs/data/metadata/journal-batch/response";
+pub const DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE: &str = "/dfs/data/metadata/snapshot-install";
+pub const DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE: &str =
+    "/dfs/data/metadata/snapshot-install/response";
 pub const DFS_POLICY_VIOLATION_EVENT_KIND: &str = "dfs.policy.violation";
+pub const DFS_MESSAGE_DATA_PLANE_ROUTES: &[&str] = &[
+    DFS_DATA_READ_ROUTE,
+    DFS_DATA_READ_RESPONSE_ROUTE,
+    DFS_DATA_READ_RESPONSE_CHUNK_ROUTE,
+    DFS_DATA_BULK_READ_ROUTE,
+    DFS_DATA_BULK_READ_RESPONSE_ROUTE,
+    DFS_DATA_WRITE_ROUTE,
+    DFS_DATA_WRITE_RESPONSE_ROUTE,
+    DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
+    DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE,
+    DFS_DATA_NAMESPACE_ROUTE,
+    DFS_DATA_NAMESPACE_RESPONSE_ROUTE,
+    DFS_DATA_STAGE_BLOB_ROUTE,
+    DFS_DATA_STAGE_BLOB_CHUNK_ROUTE,
+    DFS_DATA_STAGE_PATCH_ROUTE,
+    DFS_DATA_STAGE_PATCH_CHUNK_ROUTE,
+    DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE,
+    DFS_DATA_COMMIT_VERSION_ROUTE,
+    DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE,
+    DFS_DATA_REPAIR_REPLICA_ROUTE,
+    DFS_DATA_REPAIR_REPLICA_CHUNK_ROUTE,
+    DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE,
+    DFS_DATA_FETCH_BLOB_ROUTE,
+    DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE,
+    DFS_DATA_FETCH_BLOB_RESPONSE_CHUNK_ROUTE,
+    DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+    DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE,
+    DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE,
+    DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE,
+];
 pub const DFS_CONTROL_PLANE_ROUTES: &[&str] = &[
     DFS_STATUS_ROUTE,
     DFS_EXPOSE_CONFIG_ROUTE,
@@ -350,8 +410,39 @@ pub const DFS_CONTROL_PLANE_ROUTES: &[&str] = &[
     DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
 ];
 /// Canonical DFS data-plane object-RPC routes.
-pub const DFS_DATA_PLANE_ROUTES: &[&str] =
-    &[DFS_SMOKE_ROUTE, DFS_MESSAGE_ROUTE, DFS_DIRECT_READ_ROUTE];
+pub const DFS_DATA_PLANE_ROUTES: &[&str] = &[
+    DFS_SMOKE_ROUTE,
+    DFS_MESSAGE_ROUTE,
+    DFS_DIRECT_READ_ROUTE,
+    DFS_DATA_READ_ROUTE,
+    DFS_DATA_READ_RESPONSE_ROUTE,
+    DFS_DATA_READ_RESPONSE_CHUNK_ROUTE,
+    DFS_DATA_BULK_READ_ROUTE,
+    DFS_DATA_BULK_READ_RESPONSE_ROUTE,
+    DFS_DATA_WRITE_ROUTE,
+    DFS_DATA_WRITE_RESPONSE_ROUTE,
+    DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
+    DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE,
+    DFS_DATA_NAMESPACE_ROUTE,
+    DFS_DATA_NAMESPACE_RESPONSE_ROUTE,
+    DFS_DATA_STAGE_BLOB_ROUTE,
+    DFS_DATA_STAGE_BLOB_CHUNK_ROUTE,
+    DFS_DATA_STAGE_PATCH_ROUTE,
+    DFS_DATA_STAGE_PATCH_CHUNK_ROUTE,
+    DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE,
+    DFS_DATA_COMMIT_VERSION_ROUTE,
+    DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE,
+    DFS_DATA_REPAIR_REPLICA_ROUTE,
+    DFS_DATA_REPAIR_REPLICA_CHUNK_ROUTE,
+    DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE,
+    DFS_DATA_FETCH_BLOB_ROUTE,
+    DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE,
+    DFS_DATA_FETCH_BLOB_RESPONSE_CHUNK_ROUTE,
+    DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+    DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE,
+    DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE,
+    DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE,
+];
 /// Routes registered by the DFS data-plane service.
 pub const DFS_DATA_PLANE_SERVICE_ROUTES: &[&str] = DFS_DATA_PLANE_ROUTES;
 pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
@@ -363,6 +454,34 @@ pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
     DFS_SMOKE_ROUTE,
     DFS_MESSAGE_ROUTE,
     DFS_DIRECT_READ_ROUTE,
+    DFS_DATA_READ_ROUTE,
+    DFS_DATA_READ_RESPONSE_ROUTE,
+    DFS_DATA_READ_RESPONSE_CHUNK_ROUTE,
+    DFS_DATA_BULK_READ_ROUTE,
+    DFS_DATA_BULK_READ_RESPONSE_ROUTE,
+    DFS_DATA_WRITE_ROUTE,
+    DFS_DATA_WRITE_RESPONSE_ROUTE,
+    DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
+    DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE,
+    DFS_DATA_NAMESPACE_ROUTE,
+    DFS_DATA_NAMESPACE_RESPONSE_ROUTE,
+    DFS_DATA_STAGE_BLOB_ROUTE,
+    DFS_DATA_STAGE_BLOB_CHUNK_ROUTE,
+    DFS_DATA_STAGE_PATCH_ROUTE,
+    DFS_DATA_STAGE_PATCH_CHUNK_ROUTE,
+    DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE,
+    DFS_DATA_COMMIT_VERSION_ROUTE,
+    DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE,
+    DFS_DATA_REPAIR_REPLICA_ROUTE,
+    DFS_DATA_REPAIR_REPLICA_CHUNK_ROUTE,
+    DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE,
+    DFS_DATA_FETCH_BLOB_ROUTE,
+    DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE,
+    DFS_DATA_FETCH_BLOB_RESPONSE_CHUNK_ROUTE,
+    DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+    DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE,
+    DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE,
+    DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE,
 ];
 pub const DEFAULT_DFS_NODE_ID: &str = "node_local";
 pub const SIFS_FILE_SYSTEM_ID: &str = "sifs";
@@ -393,16 +512,76 @@ fn dfs_message_command_from_routed_message(message: DfsRoutedMessage) -> DfsMess
 fn dfs_routed_message_from_object_rpc_request(
     request: &ObjectRpcRequest,
 ) -> Result<DfsRoutedMessage, NetworkError> {
-    if request.route != DFS_MESSAGE_ROUTE {
+    Ok(decode_dfs_message_rpc_request(request)?.routed_message)
+}
+
+pub fn decode_dfs_message_rpc_request(
+    request: &ObjectRpcRequest,
+) -> Result<DfsMessageCommand, NetworkError> {
+    if !dfs_route_is_message_data_plane(&request.route) {
         return Err(NetworkError::Serialization {
             detail: format!(
-                "DFS in-process message transport requires route {}, got {}",
-                DFS_MESSAGE_ROUTE, request.route
+                "DFS message RPC requires a DFS data-plane route, got {} (legacy route is {})",
+                request.route, DFS_MESSAGE_ROUTE
             ),
         });
     }
     let command: DfsMessageCommand = request.decode_body()?;
-    Ok(command.routed_message)
+    let expected_route = dfs_message_route_for_network_message(&command.routed_message.message);
+    if request.route != DFS_MESSAGE_ROUTE && request.route != expected_route {
+        return Err(NetworkError::Serialization {
+            detail: format!(
+                "DFS data-plane route {} does not match message route {}",
+                request.route, expected_route
+            ),
+        });
+    }
+    Ok(command)
+}
+
+pub fn dfs_route_is_message_data_plane(route: &str) -> bool {
+    route == DFS_MESSAGE_ROUTE || DFS_MESSAGE_DATA_PLANE_ROUTES.contains(&route)
+}
+
+pub fn dfs_message_route(command: &DfsMessageCommand) -> &'static str {
+    dfs_message_route_for_network_message(&command.routed_message.message)
+}
+
+pub fn dfs_message_route_for_network_message(message: &DfsNetworkMessage) -> &'static str {
+    match message {
+        DfsNetworkMessage::ReadRequest(_) => DFS_DATA_READ_ROUTE,
+        DfsNetworkMessage::ReadResponse(_) => DFS_DATA_READ_RESPONSE_ROUTE,
+        DfsNetworkMessage::ReadResponseChunk(_) => DFS_DATA_READ_RESPONSE_CHUNK_ROUTE,
+        DfsNetworkMessage::BulkReadRequest(_) => DFS_DATA_BULK_READ_ROUTE,
+        DfsNetworkMessage::BulkReadResponse(_) => DFS_DATA_BULK_READ_RESPONSE_ROUTE,
+        DfsNetworkMessage::WriteRequest(_) => DFS_DATA_WRITE_ROUTE,
+        DfsNetworkMessage::WriteResponse(_) => DFS_DATA_WRITE_RESPONSE_ROUTE,
+        DfsNetworkMessage::DistributedWriteRequest(_) => DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
+        DfsNetworkMessage::DistributedWriteResponse(_) => DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE,
+        DfsNetworkMessage::NamespaceRequest(_) => DFS_DATA_NAMESPACE_ROUTE,
+        DfsNetworkMessage::NamespaceResponse(_) => DFS_DATA_NAMESPACE_RESPONSE_ROUTE,
+        DfsNetworkMessage::StageBlob(_) => DFS_DATA_STAGE_BLOB_ROUTE,
+        DfsNetworkMessage::StageBlobChunk(_) => DFS_DATA_STAGE_BLOB_CHUNK_ROUTE,
+        DfsNetworkMessage::StagePatch(_) => DFS_DATA_STAGE_PATCH_ROUTE,
+        DfsNetworkMessage::StagePatchChunk(_) => DFS_DATA_STAGE_PATCH_CHUNK_ROUTE,
+        DfsNetworkMessage::StageBlobResponse(_) => DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE,
+        DfsNetworkMessage::CommitVersion(_) => DFS_DATA_COMMIT_VERSION_ROUTE,
+        DfsNetworkMessage::CommitVersionResponse(_) => DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE,
+        DfsNetworkMessage::RepairReplica(_) => DFS_DATA_REPAIR_REPLICA_ROUTE,
+        DfsNetworkMessage::RepairReplicaChunk(_) => DFS_DATA_REPAIR_REPLICA_CHUNK_ROUTE,
+        DfsNetworkMessage::RepairReplicaResponse(_) => DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE,
+        DfsNetworkMessage::FetchBlob(_) => DFS_DATA_FETCH_BLOB_ROUTE,
+        DfsNetworkMessage::FetchBlobResponse(_) => DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE,
+        DfsNetworkMessage::FetchBlobResponseChunk(_) => DFS_DATA_FETCH_BLOB_RESPONSE_CHUNK_ROUTE,
+        DfsNetworkMessage::MetadataJournalBatch(_) => DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+        DfsNetworkMessage::MetadataJournalBatchResponse(_) => {
+            DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE
+        }
+        DfsNetworkMessage::MetadataSnapshotInstall(_) => DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE,
+        DfsNetworkMessage::MetadataSnapshotInstallResponse(_) => {
+            DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE
+        }
+    }
 }
 
 fn dfs_network_message_is_read_only_request(message: &DfsNetworkMessage) -> bool {
@@ -513,7 +692,8 @@ pub fn decode_dfs_metadata_snapshot_install_rpc_response(
 pub fn dfs_message_rpc_request(
     command: &DfsMessageCommand,
 ) -> Result<ObjectRpcRequest, NetworkError> {
-    let mut request = ObjectRpcRequest::encode_body(DFS_MESSAGE_ROUTE, DFS_RPC_CATEGORY, command)?;
+    let mut request =
+        ObjectRpcRequest::encode_body(dfs_message_route(command), DFS_RPC_CATEGORY, command)?;
     sinomo_network::mark_object_rpc_request_reuses_daemon_stream(&mut request);
     Ok(request)
 }
@@ -1092,12 +1272,6 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
             ModuleRouteAuth::LocalCommand,
         ))
         .with_object_rpc_route(ModuleObjectRpcRoute::new(
-            DFS_MESSAGE_ROUTE,
-            DFS_RPC_CATEGORY,
-            "dfs.object.transfer",
-            ModuleRouteAuth::LocalOrClusterMember,
-        ))
-        .with_object_rpc_route(ModuleObjectRpcRoute::new(
             DFS_DIRECT_READ_ROUTE,
             DFS_RPC_CATEGORY,
             "dfs.object.transfer",
@@ -1105,6 +1279,16 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
         ))
         .with_event_kind_name(DFS_POLICY_VIOLATION_EVENT_KIND)
         .with_storage_owner(SINOMO_DFS_MODULE_OWNER);
+    for route in
+        std::iter::once(DFS_MESSAGE_ROUTE).chain(DFS_MESSAGE_DATA_PLANE_ROUTES.iter().copied())
+    {
+        surfaces = surfaces.with_object_rpc_route(ModuleObjectRpcRoute::new(
+            route,
+            DFS_RPC_CATEGORY,
+            "dfs.object.transfer",
+            ModuleRouteAuth::LocalOrClusterMember,
+        ));
+    }
     surfaces.capabilities = dfs_module_capabilities();
     surfaces
 }
@@ -1218,6 +1402,14 @@ mod module_registration_tests {
                 .object_rpc_routes
                 .iter()
                 .any(|route| route.route == DFS_MESSAGE_ROUTE
+                    && route.operation == "dfs.object.transfer")
+        );
+        assert!(
+            registration
+                .surfaces
+                .object_rpc_routes
+                .iter()
+                .any(|route| route.route == DFS_DATA_READ_ROUTE
                     && route.operation == "dfs.object.transfer")
         );
         assert!(

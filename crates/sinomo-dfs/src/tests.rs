@@ -1214,7 +1214,7 @@ impl DfsPeerTransport for RecordingPeerTransport {
         _options: DfsObjectRpcSendOptions,
     ) -> Result<ObjectRpcResponse, DfsPeerTransportError> {
         match request.route.as_str() {
-            DFS_MESSAGE_ROUTE => {
+            route if dfs_route_is_message_data_plane(route) => {
                 let command: DfsMessageCommand = request
                     .decode_body()
                     .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
@@ -1223,7 +1223,7 @@ impl DfsPeerTransport for RecordingPeerTransport {
                     request.route, endpoint.address, command.request_id
                 ));
                 ObjectRpcResponse::encode_body(
-                    DFS_MESSAGE_ROUTE,
+                    route,
                     &DfsMessageResponse {
                         request_id: command.request_id,
                         outbound_messages: Vec::new(),
@@ -1372,7 +1372,7 @@ fn dfs_peer_transport_adapters_delegate_all_routes() {
     assert_eq!(
         peer.calls.lock().expect("calls").as_slice(),
         &[
-            "rpc:/dfs/message:10.95.0.2:21353:protocol-1".to_string(),
+            "rpc:/dfs/data/read:10.95.0.2:21353:protocol-1".to_string(),
             "rpc:/dfs/metadata/journal-batch:10.95.0.2:21353:journal-1".to_string(),
             "rpc:/dfs/metadata/snapshot-install:10.95.0.2:21353:snapshot-1".to_string(),
         ]
@@ -1594,7 +1594,7 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         },
     };
     let message_request = dfs_message_rpc_request(&message_command).expect("message request");
-    assert_eq!(message_request.route, DFS_MESSAGE_ROUTE);
+    assert_eq!(message_request.route, DFS_DATA_READ_ROUTE);
     assert_eq!(message_request.category, DFS_RPC_CATEGORY);
     assert!(sinomo_network::object_rpc_request_reuses_daemon_stream(
         &message_request
@@ -1604,6 +1604,24 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
             .decode_body::<DfsMessageCommand>()
             .expect("message body"),
         message_command
+    );
+    assert_eq!(
+        decode_dfs_message_rpc_request(&message_request).expect("validated message request"),
+        message_command
+    );
+    let mismatched_route_request = sinomo_network::ObjectRpcRequest::encode_body(
+        DFS_DATA_WRITE_ROUTE,
+        DFS_RPC_CATEGORY,
+        &message_command,
+    )
+    .expect("mismatched route request");
+    let mismatched = decode_dfs_message_rpc_request(&mismatched_route_request)
+        .expect_err("typed DFS route should match message body");
+    assert!(
+        mismatched
+            .to_string()
+            .contains("does not match message route"),
+        "unexpected mismatch error: {mismatched}"
     );
     let message_response = DfsMessageResponse {
         request_id: "message-request".to_string(),

@@ -3672,13 +3672,11 @@ mod tests {
             .iter()
             .copied()
             .chain(CLUSTER_RAFT_RPC_ROUTES.iter().copied())
+            .chain(sinomo_dfs::DFS_DATA_PLANE_ROUTES.iter().copied())
             .chain([
                 sinomo_network::CLUSTER_HEALTH_ROUTE,
                 sinomo_network::CLUSTER_NETWORK_PING_ROUTE,
                 CLUSTER_RELAY_ROUTE,
-                sinomo_dfs::DFS_SMOKE_ROUTE,
-                sinomo_dfs::DFS_MESSAGE_ROUTE,
-                sinomo_dfs::DFS_DIRECT_READ_ROUTE,
                 CLUSTER_JOIN_CHALLENGE_ROUTE,
                 CLUSTER_JOIN_REGISTER_ROUTE,
                 CLUSTER_INVITE_PUBLISH_ROUTE,
@@ -3713,6 +3711,10 @@ mod tests {
         );
         assert_eq!(
             registry.category_for_route(sinomo_dfs::DFS_MESSAGE_ROUTE),
+            Some(sinomo_dfs::DFS_RPC_CATEGORY)
+        );
+        assert_eq!(
+            registry.category_for_route(sinomo_dfs::DFS_DATA_READ_ROUTE),
             Some(sinomo_dfs::DFS_RPC_CATEGORY)
         );
         assert_eq!(
@@ -3814,6 +3816,18 @@ mod tests {
         );
         assert_eq!(
             dfs_message.required_capabilities,
+            vec!["dfs.object.transfer".to_string()]
+        );
+        let dfs_read = route_metadata
+            .iter()
+            .find(|route| route.route == sinomo_dfs::DFS_DATA_READ_ROUTE)
+            .expect("dfs typed read route metadata");
+        assert_eq!(
+            dfs_read.auth_scope.as_deref(),
+            Some(sinomo_module::ModuleRouteAuth::LocalOrClusterMember.as_scope())
+        );
+        assert_eq!(
+            dfs_read.required_capabilities,
             vec!["dfs.object.transfer".to_string()]
         );
         let dfs_direct_read = route_metadata
