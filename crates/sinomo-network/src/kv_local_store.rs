@@ -387,10 +387,6 @@ fn cluster_kv_local_cache(paths: &ClusterPaths) -> KvLocalCache {
     paths.kv_paths().local_cache()
 }
 
-pub(crate) fn cluster_kv_raft_store(paths: &ClusterPaths) -> sinomo_kv::ClusterKvRaftStore {
-    paths.kv_paths().raft_store()
-}
-
 pub(crate) fn read_cluster_kv_reader_node_id(paths: &ClusterPaths) -> Result<NodeId, NetworkError> {
     if let Some(mark) = cluster_file_mark(&paths.state)
         && mark.exists
@@ -552,8 +548,9 @@ pub(crate) fn append_cluster_raft_command_uncommitted(
     node_id: &NodeId,
     command: KvCommand,
 ) -> Result<KvLogEntry, NetworkError> {
-    cluster_kv_raft_store(paths)
-        .append_command_uncommitted(node_id, command)
+    paths
+        .kv_paths()
+        .append_raft_command_uncommitted(node_id, command)
         .map_err(Into::into)
 }
 
@@ -654,8 +651,7 @@ impl<'a> LocalClusterRaftCommandStorage<'a> {
     pub(crate) fn new(paths: &'a ClusterPaths, local_node_id: NodeId) -> Self {
         Self {
             paths,
-            inner: sinomo_kv::ClusterKvRaftLocalCommandStorage::new(
-                cluster_kv_raft_store(paths),
+            inner: paths.kv_paths().local_raft_command_storage(
                 local_node_id,
                 sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
             ),

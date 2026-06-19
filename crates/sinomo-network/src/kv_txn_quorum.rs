@@ -7,7 +7,7 @@ use crate::kv_forward::{
     forward_cluster_kv_txn_to_state_authority_with_host,
 };
 use crate::kv_local_store::{
-    cluster_kv_raft_store, imported_snapshot_advances_local_kv, locked_kv_state_authority_id,
+    imported_snapshot_advances_local_kv, locked_kv_state_authority_id,
     write_imported_cluster_kv_snapshot_if_changed,
 };
 use crate::kv_semantics::cluster_semantic_txn_no_effect_response;
@@ -400,8 +400,9 @@ pub(crate) fn locked_cluster_raft_local_is_leader(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<bool, NetworkError> {
-    cluster_kv_raft_store(paths)
-        .locked_local_is_leader(state)
+    paths
+        .kv_paths()
+        .locked_raft_local_is_leader(state)
         .map_err(Into::into)
 }
 
