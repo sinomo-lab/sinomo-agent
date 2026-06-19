@@ -34,6 +34,12 @@ pub fn read_cluster_members_from_kv(
     let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
         return Ok(Vec::new());
     };
+    read_cluster_members_from_snapshot(snapshot.as_ref())
+}
+
+pub fn read_cluster_members_from_snapshot(
+    snapshot: &KvSnapshot,
+) -> Result<Vec<ClusterMemberRecord>, NetworkError> {
     let mut members: Vec<ClusterMemberRecord> = Vec::new();
     for entry in
         snapshot.range_prefix_limited("/cluster/members/", CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)?

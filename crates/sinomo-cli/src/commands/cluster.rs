@@ -2260,25 +2260,11 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
     let mut state = read_cluster_state(&paths)?;
     let peer_status = daemon_fetch_daemon_status_from_address(&options.from, DAEMON_JOIN_TIMEOUT)?;
     let peer_snapshot = daemon_fetch_cluster_kv_snapshot(&options.from, DAEMON_JOIN_TIMEOUT)?;
-    let peer_store = InProcessKvStore::restore(peer_snapshot);
     let mut imported = Vec::new();
     let mut endpoint_updates = Vec::new();
-    for entry in peer_store.range_prefix("/cluster/members/") {
-        let mut member: ClusterMemberRecord = entry.decode()?;
+    for mut member in network::read_cluster_members_from_snapshot(&peer_snapshot)? {
         if member.cluster_id != state.cluster_id {
             continue;
-        }
-        for endpoint_entry in
-            peer_store.range_prefix(&network::cluster_endpoint_prefix(&member.node_id))
-        {
-            let endpoint: ClusterEndpointRecord = endpoint_entry.decode()?;
-            if !member
-                .endpoints
-                .iter()
-                .any(|candidate| candidate.endpoint_id == endpoint.endpoint_id)
-            {
-                member.endpoints.push(endpoint);
-            }
         }
         if let Some(existing) = state
             .members

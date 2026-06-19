@@ -40,7 +40,7 @@ pub fn cluster_endpoint_key(node_id: &NodeId, endpoint: &ClusterEndpointRecord) 
     )
 }
 
-pub fn cluster_endpoint_prefix(node_id: &NodeId) -> String {
+pub(crate) fn cluster_endpoint_prefix(node_id: &NodeId) -> String {
     format!("/cluster/endpoints/{node_id}/")
 }
 

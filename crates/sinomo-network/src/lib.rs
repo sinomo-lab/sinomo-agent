@@ -193,14 +193,14 @@ pub(crate) use keyspace::{
 };
 pub use keyspace::{
     cluster_connectivity_key, cluster_connectivity_source_prefix, cluster_endpoint_key,
-    cluster_endpoint_prefix, cluster_network_info_key,
+    cluster_network_info_key,
 };
 #[cfg(test)]
 pub(crate) use kv_forward::forward_cluster_kv_txn_to_voter_with_host;
 pub use kv_forward::{ClusterKvTxnForwardHost, ClusterKvTxnForwardOptions};
 pub use kv_read_model::{
     read_cluster_connectivity_graph_from_kv, read_cluster_members_from_kv,
-    read_cluster_node_statuses_from_kv,
+    read_cluster_members_from_snapshot, read_cluster_node_statuses_from_kv,
 };
 #[cfg(test)]
 pub(crate) use kv_semantics::cluster_semantic_txn_no_effect_response;
