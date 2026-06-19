@@ -7,8 +7,7 @@ use crate::error::NetworkError;
 use crate::kv_local_store::locked_cluster_raft_known_leader_id_async;
 use crate::object::DaemonRpcTimeouts;
 use crate::route::{
-    ClusterObjectRpcClient, ClusterObjectRpcNodeOptions, ClusterObjectRpcRouteContext,
-    ClusterSignedEndpointRpcAsyncHost,
+    ClusterObjectRpcClient, ClusterObjectRpcNodeOptions, ClusterSignedEndpointRpcAsyncHost,
 };
 use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_core::{ClusterBootstrapState, ClusterEndpointRecord, ClusterTransportKind};
@@ -249,8 +248,7 @@ where
         txn_payload.category,
         txn_payload.body,
     );
-    let mut client =
-        ClusterObjectRpcClient::routed(host, ClusterObjectRpcRouteContext::new(runtime, paths));
+    let mut client = ClusterObjectRpcClient::routed(host, runtime, paths);
     let txn_response = client
         .call_node(
             state,

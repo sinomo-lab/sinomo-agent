@@ -5,8 +5,7 @@ use crate::error::NetworkError;
 use crate::local_state_store::read_cluster_state;
 use crate::object::DaemonRpcTimeouts;
 use crate::route::{
-    ClusterObjectRpcClient, ClusterObjectRpcNodeOptions, ClusterObjectRpcRouteContext,
-    ClusterSignedEndpointRpcAsyncHost,
+    ClusterObjectRpcClient, ClusterObjectRpcNodeOptions, ClusterSignedEndpointRpcAsyncHost,
 };
 use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_core::ClusterBootstrapState;
@@ -88,8 +87,7 @@ pub async fn forward_cluster_membership_rpc_to_voter_async_with_host(
             detail: format!("voter target selection task failed: {source}"),
         })?;
     let mut failures = Vec::new();
-    let mut client =
-        ClusterObjectRpcClient::routed(host, ClusterObjectRpcRouteContext::new(runtime, paths));
+    let mut client = ClusterObjectRpcClient::routed(host, runtime, paths);
     for target_node_id in &voter_node_ids {
         match client
             .call_node(

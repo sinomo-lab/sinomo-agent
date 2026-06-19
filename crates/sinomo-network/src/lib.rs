@@ -347,7 +347,7 @@ pub use roaming::{
 pub use route::{
     CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY, CLUSTER_ROUTING_RPC_ROUTE_METADATA,
     ClusterObjectRpcClient, ClusterObjectRpcNodeOptions, ClusterObjectRpcOptions,
-    ClusterObjectRpcRouteContext, ClusterRelayAsyncHost, ClusterRelayFuture, ClusterRelayOptions,
+    ClusterRelayAsyncHost, ClusterRelayFuture, ClusterRelayOptions,
     ClusterRelayStreamForwardAsyncHost, ClusterRelayStreamForwardOutcome,
     ClusterRelayStreamSendOutcome, ClusterSignedEndpointRpcAsyncHost,
     ClusterSignedEndpointRpcFuture, ClusterSignedEndpointRpcObservation, RelayEnvelope,

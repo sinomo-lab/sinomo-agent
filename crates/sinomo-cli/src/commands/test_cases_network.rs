@@ -472,10 +472,7 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
     let mut host = NetworkPingEndpointRpcHost {
         cluster_state: Arc::clone(&job.cluster_state),
     };
-    let mut client = network::ClusterObjectRpcClient::routed(
-        &mut host,
-        network::ClusterObjectRpcRouteContext::new(&job.runtime, &job.paths),
-    );
+    let mut client = network::ClusterObjectRpcClient::routed(&mut host, &job.runtime, &job.paths);
     let response = match client
         .call_endpoint(
             &job.endpoint,

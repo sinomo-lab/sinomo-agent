@@ -799,15 +799,9 @@ where
 }
 
 #[derive(Clone, Copy)]
-pub struct ClusterObjectRpcRouteContext<'a> {
+struct ClusterObjectRpcRouteContext<'a> {
     runtime: &'a tokio::runtime::Handle,
     paths: &'a ClusterPaths,
-}
-
-impl<'a> ClusterObjectRpcRouteContext<'a> {
-    pub fn new(runtime: &'a tokio::runtime::Handle, paths: &'a ClusterPaths) -> Self {
-        Self { runtime, paths }
-    }
 }
 
 /// Canonical cluster object-RPC client facade.
@@ -836,10 +830,14 @@ impl<'a, H: ClusterSignedEndpointRpcAsyncHost> ClusterObjectRpcClient<'a, H> {
     }
 
     /// Build the canonical route-aware cluster object-RPC client.
-    pub fn routed(host: &'a mut H, route_context: ClusterObjectRpcRouteContext<'a>) -> Self {
+    pub fn routed(
+        host: &'a mut H,
+        runtime: &'a tokio::runtime::Handle,
+        paths: &'a ClusterPaths,
+    ) -> Self {
         Self {
             host,
-            route_context: Some(route_context),
+            route_context: Some(ClusterObjectRpcRouteContext { runtime, paths }),
         }
     }
 }
@@ -4925,10 +4923,7 @@ mod tests {
         let mut host = RecordingSignedEndpointRpcHost::new(Ok(direct_response), Ok(None));
         let runtime = tokio::runtime::Handle::current();
 
-        let mut client = ClusterObjectRpcClient::routed(
-            &mut host,
-            ClusterObjectRpcRouteContext::new(&runtime, &paths),
-        );
+        let mut client = ClusterObjectRpcClient::routed(&mut host, &runtime, &paths);
         let response = client
             .call_node(
                 &state,

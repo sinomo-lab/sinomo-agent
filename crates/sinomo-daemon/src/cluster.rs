@@ -1542,10 +1542,7 @@ fn send_object_rpc_to_node(
         detail: "cluster paths are unavailable for node object RPC".to_string(),
     })?;
     let mut host = DaemonSignedEndpointRpcAsyncHost::new(runtime, true);
-    let mut client = sinomo_network::ClusterObjectRpcClient::routed(
-        &mut host,
-        sinomo_network::ClusterObjectRpcRouteContext::new(runtime, &paths),
-    );
+    let mut client = sinomo_network::ClusterObjectRpcClient::routed(&mut host, runtime, &paths);
     block_on_cluster_network_future_on_owner_runtime(
         runtime,
         client.call_node(

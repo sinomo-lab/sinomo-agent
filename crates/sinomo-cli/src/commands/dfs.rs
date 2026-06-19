@@ -1467,10 +1467,7 @@ fn fetch_dfs_status_from_node(
         Some(state.cluster_id.clone()),
         "dfs status object rpc signing",
     );
-    let mut client = network::ClusterObjectRpcClient::routed(
-        &mut host,
-        network::ClusterObjectRpcRouteContext::new(runtime, cluster_paths),
-    );
+    let mut client = network::ClusterObjectRpcClient::routed(&mut host, runtime, cluster_paths);
     let response = runtime
         .block_on(client.call_node(
             state,
