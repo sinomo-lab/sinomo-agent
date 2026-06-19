@@ -562,16 +562,16 @@ pub(crate) struct InboundEventFrame {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct InProcessObjectRpcMessage {
-    pub source_node_id: NodeId,
-    pub target_node_id: NodeId,
-    pub request: ObjectRpcRequest,
+pub(crate) struct InProcessObjectRpcMessage {
+    pub(crate) source_node_id: NodeId,
+    pub(crate) target_node_id: NodeId,
+    pub(crate) request: ObjectRpcRequest,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct InboundObjectRpcMessage {
-    pub received_by: NodeId,
-    pub message: InProcessObjectRpcMessage,
+pub(crate) struct InboundObjectRpcMessage {
+    pub(crate) received_by: NodeId,
+    pub(crate) message: InProcessObjectRpcMessage,
 }
 
 #[cfg(test)]
@@ -909,7 +909,7 @@ impl InProcessTransport {
         Ok(mailbox.drain(..).collect())
     }
 
-    pub fn drain_incoming_object_rpc_requests(
+    pub(crate) fn drain_incoming_object_rpc_messages(
         &mut self,
     ) -> Result<Vec<InboundObjectRpcMessage>, NetworkError> {
         let mut inner = self
@@ -927,6 +927,16 @@ impl InProcessTransport {
             })?;
 
         Ok(mailbox.drain(..).collect())
+    }
+
+    pub fn drain_incoming_object_rpc_requests(
+        &mut self,
+    ) -> Result<Vec<ObjectRpcRequest>, NetworkError> {
+        Ok(self
+            .drain_incoming_object_rpc_messages()?
+            .into_iter()
+            .map(|inbound| inbound.message.request)
+            .collect())
     }
 
     #[cfg(test)]
@@ -1236,7 +1246,7 @@ impl AsyncInProcessTransport {
         .await
     }
 
-    pub async fn drain_incoming_object_rpc_requests(
+    pub(crate) async fn drain_incoming_object_rpc_messages(
         &mut self,
         max_messages: usize,
     ) -> Result<Vec<InboundObjectRpcMessage>, NetworkError> {
@@ -1254,6 +1264,18 @@ impl AsyncInProcessTransport {
             messages.push(message);
         }
         Ok(messages)
+    }
+
+    pub async fn drain_incoming_object_rpc_requests(
+        &mut self,
+        max_messages: usize,
+    ) -> Result<Vec<ObjectRpcRequest>, NetworkError> {
+        Ok(self
+            .drain_incoming_object_rpc_messages(max_messages)
+            .await?
+            .into_iter()
+            .map(|inbound| inbound.message.request)
+            .collect())
     }
 
     pub async fn pending_incoming_object_rpc_request_count(

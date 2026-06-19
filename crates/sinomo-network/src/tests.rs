@@ -24562,7 +24562,7 @@ fn in_process_transport_delivers_object_rpc_requests_without_frames() {
             .expect("wait for object rpc request")
     );
     let inbound = transport_b
-        .drain_incoming_object_rpc_requests()
+        .drain_incoming_object_rpc_messages()
         .expect("drain object rpc requests");
 
     assert_eq!(inbound.len(), 1);
@@ -24735,7 +24735,7 @@ async fn async_in_process_transport_delivers_object_rpc_requests_without_frames(
             .expect("wait for object rpc request")
     );
     let inbound = transport_b
-        .drain_incoming_object_rpc_requests(usize::MAX)
+        .drain_incoming_object_rpc_messages(usize::MAX)
         .await
         .expect("drain object rpc requests");
 

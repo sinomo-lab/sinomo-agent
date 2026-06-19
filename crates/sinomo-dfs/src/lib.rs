@@ -266,9 +266,7 @@ impl DfsMessageTransport for sinomo_network::InProcessTransport {
         Ok(self
             .drain_incoming_object_rpc_requests()?
             .into_iter()
-            .filter_map(|inbound| {
-                dfs_routed_message_from_object_rpc_request(&inbound.message.request).ok()
-            })
+            .filter_map(|request| dfs_routed_message_from_object_rpc_request(&request).ok())
             .collect())
     }
 
@@ -315,9 +313,7 @@ impl AsyncDfsMessageTransport for sinomo_network::AsyncInProcessTransport {
                 .drain_incoming_object_rpc_requests(usize::MAX)
                 .await?
                 .into_iter()
-                .filter_map(|inbound| {
-                    dfs_routed_message_from_object_rpc_request(&inbound.message.request).ok()
-                })
+                .filter_map(|request| dfs_routed_message_from_object_rpc_request(&request).ok())
                 .collect())
         })
     }

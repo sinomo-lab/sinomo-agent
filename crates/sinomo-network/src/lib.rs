@@ -316,7 +316,7 @@ pub(crate) use object::{
 pub use paths::ClusterPaths;
 pub use peer::{
     AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions, InProcessNetwork,
-    InProcessObjectRpcMessage, InProcessTransport, InboundObjectRpcMessage,
+    InProcessTransport,
 };
 pub use raft_election::{
     ClusterRaftVoteTransportAsyncHost, ClusterRaftVoteTransportHost,
