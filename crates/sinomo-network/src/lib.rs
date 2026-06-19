@@ -18,6 +18,7 @@ mod connectivity_store;
 mod control_plane_adapters;
 mod control_plane_driver;
 mod control_plane_options;
+mod daemon_auth;
 mod endpoint_advertisement;
 mod endpoint_records;
 mod endpoint_selector;
@@ -109,6 +110,11 @@ pub use control_plane_options::{
     DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT, DEFAULT_CLUSTER_CONTROL_PLANE_RPC_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_TCP_COMMAND_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
+};
+pub use daemon_auth::{
+    DAEMON_AUTH_PROTOCOL, SignedDaemonCommand, daemon_auth_decode_public_key,
+    daemon_auth_encode_public_key, daemon_auth_signing_payload, daemon_rpc_body_sha256,
+    sign_daemon_rpc_request_for_local_node, sign_daemon_rpc_request_from_data_dir,
 };
 #[cfg(test)]
 pub(crate) use endpoint_advertisement::{

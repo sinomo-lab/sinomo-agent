@@ -1,8 +1,7 @@
 use crate::{DaemonError, DaemonPaths};
+#[cfg(test)]
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use ring::digest;
-use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
-use serde::{Deserialize, Serialize};
+use ring::signature::{ED25519, UnparsedPublicKey};
 use sinomo_config::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_SEARCH_ROUTE, CONFIG_SET_ROUTE,
 };
@@ -13,10 +12,9 @@ use sinomo_network::{
     ClusterControlPlaneTimeouts, ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
     ClusterPaths,
 };
-use sinomo_node::{
-    ClusterInviteId, NodeIdentity, NodeIdentityPaths, load_or_create_main_node_identity,
-    load_or_create_node_identity,
-};
+#[cfg(test)]
+use sinomo_node::load_or_create_main_node_identity;
+use sinomo_node::{ClusterInviteId, NodeIdentity, NodeIdentityPaths, load_or_create_node_identity};
 use sinomo_rollout::{
     ROLLOUT_BINARY_ROUTE, ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE, ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
     ROLLOUT_BUILD_ROUTE, ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_DIAGNOSTICS_ROUTE,
@@ -26,17 +24,18 @@ use sinomo_storage::durable_file::file_ino;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-pub const DAEMON_AUTH_PROTOCOL: &str = "sinomo.daemon-auth.v1";
+pub const DAEMON_AUTH_PROTOCOL: &str = sinomo_network::DAEMON_AUTH_PROTOCOL;
 pub const DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS: i64 = 300;
 pub const DAEMON_AUTH_NONCE_RETENTION_SECONDS: i64 = DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS * 2;
 const DAEMON_AUTH_NONCE_PRUNE_INTERVAL_SECONDS: i64 = 1;
 const DAEMON_AUTH_NONCE_PRUNE_MAX_ENTRIES: usize = 8_192;
 const DAEMON_AUTH_VERIFIER_CONTEXT_MAX_AGE: Duration = Duration::from_secs(1);
+pub use sinomo_network::SignedDaemonCommand;
 /// In-memory replay-protection nonce sets, keyed by daemon data root. Replacing the
 /// previous per-RPC `auth-nonces.sobjlog` append (a disk read + write on *every*
 /// authenticated request, including idle cluster heartbeats) keeps idle disk I/O at
@@ -44,18 +43,9 @@ const DAEMON_AUTH_VERIFIER_CONTEXT_MAX_AGE: Duration = Duration::from_secs(1);
 /// check, so the only behavioral change is that a process restart forgets nonces
 /// from the trailing skew window — which the freshness check already constrains.
 static DAEMON_AUTH_NONCES: OnceLock<Mutex<HashMap<PathBuf, DaemonAuthNonceSet>>> = OnceLock::new();
-static DAEMON_SIGNING_IDENTITIES: OnceLock<Mutex<HashMap<PathBuf, CachedDaemonSigningIdentity>>> =
-    OnceLock::new();
 static DAEMON_AUTH_VERIFIER_CONTEXTS: OnceLock<
     Mutex<HashMap<PathBuf, CachedDaemonAuthVerifierContext>>,
 > = OnceLock::new();
-
-#[derive(Clone)]
-struct CachedDaemonSigningIdentity {
-    node_id: String,
-    public_key: Vec<u8>,
-    key_pair: Arc<Ed25519KeyPair>,
-}
 
 #[derive(Clone)]
 struct CachedDaemonAuthVerifierContext {
@@ -98,20 +88,6 @@ impl DaemonAuthNonceSet {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SignedDaemonCommand {
-    pub protocol: String,
-    pub node_id: String,
-    #[serde(with = "serde_bytes")]
-    pub public_key: Vec<u8>,
-    pub timestamp: String,
-    pub nonce: String,
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
-    pub rpc_body_sha256: Option<Vec<u8>>,
-    #[serde(with = "serde_bytes")]
-    pub signature: Vec<u8>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthenticatedDaemonCommand {
     pub route: String,
@@ -143,101 +119,19 @@ impl DaemonSignerAuthority {
 pub fn sign_daemon_rpc_request_for_local_node(
     request: &sinomo_network::ObjectRpcRequest,
 ) -> Result<Vec<u8>, DaemonError> {
-    let data_dir = SinomoDataDir::from_env_or_home()?;
-    sign_daemon_rpc_request_from_data_dir(&data_dir, request)
+    sinomo_network::sign_daemon_rpc_request_for_local_node(request).map_err(DaemonError::from)
 }
 
 pub fn sign_daemon_rpc_request_from_data_dir(
     data_dir: &SinomoDataDir,
     request: &sinomo_network::ObjectRpcRequest,
 ) -> Result<Vec<u8>, DaemonError> {
-    sign_daemon_rpc_request_from_data_dir_with_body_sha256(
-        data_dir,
-        &request.route,
-        &request.category,
-        Some(daemon_rpc_body_sha256(request)),
-    )
-}
-
-pub fn daemon_rpc_body_sha256(request: &sinomo_network::ObjectRpcRequest) -> Vec<u8> {
-    digest::digest(&digest::SHA256, &request.body)
-        .as_ref()
-        .to_vec()
-}
-
-fn sign_daemon_rpc_request_from_data_dir_with_body_sha256(
-    data_dir: &SinomoDataDir,
-    route: &str,
-    category: &str,
-    rpc_body_sha256: Option<Vec<u8>>,
-) -> Result<Vec<u8>, DaemonError> {
-    let identity = cached_daemon_signing_identity(data_dir)?;
-    let timestamp = OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "unknown".to_string());
-    let nonce = format!("{}-{}", std::process::id(), auth_nonce_suffix());
-    let signing_payload = daemon_auth_signing_payload(
-        &identity.node_id,
-        &identity.public_key,
-        &timestamp,
-        &nonce,
-        route,
-        category,
-        rpc_body_sha256.as_deref(),
-    );
-    let signature = identity.key_pair.sign(&signing_payload);
-    let envelope = SignedDaemonCommand {
-        protocol: DAEMON_AUTH_PROTOCOL.to_string(),
-        node_id: identity.node_id,
-        public_key: identity.public_key,
-        timestamp,
-        nonce,
-        rpc_body_sha256,
-        signature: signature.as_ref().to_vec(),
-    };
-    sinomo_network::SinomoObjectCodec::default()
-        .encode(&envelope)
+    sinomo_network::sign_daemon_rpc_request_from_data_dir(data_dir, request)
         .map_err(DaemonError::from)
 }
 
-fn cached_daemon_signing_identity(
-    data_dir: &SinomoDataDir,
-) -> Result<CachedDaemonSigningIdentity, DaemonError> {
-    let root = data_dir.root().to_path_buf();
-    if let Some(cached) = DAEMON_SIGNING_IDENTITIES
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .map_err(|source| DaemonError::Io {
-            path: root.display().to_string(),
-            detail: source.to_string(),
-        })?
-        .get(&root)
-        .cloned()
-    {
-        return Ok(cached);
-    }
-
-    data_dir.ensure_root_layout()?;
-    let identity = load_or_create_main_node_identity(&root)?;
-    let node_id = sinomo_network::read_cluster_state(&ClusterPaths::new(data_dir))
-        .map(|state| state.local_node_id.to_string())
-        .unwrap_or_else(|_| "node_local".to_string());
-    let public_key = daemon_auth_decode_public_key(&identity.public_key)?;
-    let key_pair = Arc::new(identity.key_pair()?);
-    let loaded = CachedDaemonSigningIdentity {
-        node_id,
-        public_key,
-        key_pair,
-    };
-
-    let mut guard = DAEMON_SIGNING_IDENTITIES
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .map_err(|source| DaemonError::Io {
-            path: root.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    Ok(guard.entry(root).or_insert_with(|| loaded).clone())
+pub fn daemon_rpc_body_sha256(request: &sinomo_network::ObjectRpcRequest) -> Vec<u8> {
+    sinomo_network::daemon_rpc_body_sha256(request)
 }
 
 pub fn authenticate_daemon_control_request(
@@ -250,7 +144,7 @@ pub fn authenticate_daemon_control_request(
     verify_daemon_rpc_body_binding(&envelope, request)?;
     let signer = verify_signed_daemon_command(paths, &envelope, request)?;
     remember_daemon_auth_nonce(paths, &envelope)?;
-    let signer_public_key = daemon_auth_encode_public_key(&envelope.public_key);
+    let signer_public_key = sinomo_network::daemon_auth_encode_public_key(&envelope.public_key);
     let authenticated = AuthenticatedDaemonCommand {
         route: request.route.clone(),
         signer,
@@ -538,7 +432,7 @@ fn verify_signed_daemon_command(
     if envelope.nonce.trim().is_empty() || request.route.trim().is_empty() {
         return Err(DaemonError::AuthDenied);
     }
-    let signing_payload = daemon_auth_signing_payload(
+    let signing_payload = sinomo_network::daemon_auth_signing_payload(
         &envelope.node_id,
         &envelope.public_key,
         &envelope.timestamp,
@@ -553,42 +447,12 @@ fn verify_signed_daemon_command(
     authorize_daemon_signer(paths, envelope, request)
 }
 
-fn daemon_auth_signing_payload(
-    node_id: &str,
-    public_key: &[u8],
-    timestamp: &str,
-    nonce: &str,
-    route: &str,
-    category: &str,
-    rpc_body_sha256: Option<&[u8]>,
-) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(DAEMON_AUTH_PROTOCOL.as_bytes());
-    payload.push(b'\n');
-    payload.extend_from_slice(node_id.as_bytes());
-    payload.push(b'\n');
-    payload.extend_from_slice(public_key);
-    payload.push(b'\n');
-    payload.extend_from_slice(timestamp.as_bytes());
-    payload.push(b'\n');
-    payload.extend_from_slice(nonce.as_bytes());
-    payload.push(b'\n');
-    payload.extend_from_slice(route.as_bytes());
-    payload.push(b'\n');
-    payload.extend_from_slice(category.as_bytes());
-    payload.push(b'\n');
-    if let Some(rpc_body_sha256) = rpc_body_sha256 {
-        payload.extend_from_slice(rpc_body_sha256);
-    }
-    payload
-}
-
 fn authorize_daemon_signer(
     paths: &DaemonPaths,
     envelope: &SignedDaemonCommand,
     request: &sinomo_network::ObjectRpcRequest,
 ) -> Result<DaemonSignerAuthority, DaemonError> {
-    let envelope_public_key = daemon_auth_encode_public_key(&envelope.public_key);
+    let envelope_public_key = sinomo_network::daemon_auth_encode_public_key(&envelope.public_key);
     let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon paths have no data directory parent".to_string(),
@@ -979,14 +843,9 @@ fn remember_daemon_auth_nonce(
     Ok(())
 }
 
+#[cfg(test)]
 fn daemon_auth_decode_public_key(public_key: &str) -> Result<Vec<u8>, DaemonError> {
-    URL_SAFE_NO_PAD
-        .decode(public_key.as_bytes())
-        .map_err(|_| DaemonError::AuthDenied)
-}
-
-fn daemon_auth_encode_public_key(public_key: &[u8]) -> String {
-    URL_SAFE_NO_PAD.encode(public_key)
+    sinomo_network::daemon_auth_decode_public_key(public_key).map_err(DaemonError::from)
 }
 
 fn daemon_auth_nonce_key(envelope: &SignedDaemonCommand) -> Vec<u8> {
@@ -995,14 +854,6 @@ fn daemon_auth_nonce_key(envelope: &SignedDaemonCommand) -> Vec<u8> {
     key.push(0);
     key.extend_from_slice(envelope.nonce.as_bytes());
     key
-}
-
-fn auth_nonce_suffix() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    format!("{nanos}")
 }
 
 #[cfg(test)]

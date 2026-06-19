@@ -61,12 +61,6 @@ pub enum DfsFuseError {
     LocalData(String),
     #[error("DFS error: {0}")]
     Dfs(String),
-    #[error("network error: {0}")]
-    Network(String),
-    #[error("daemon error: {0}")]
-    Daemon(String),
-    #[error("cluster KV error: {0}")]
-    Kv(String),
     #[error("FUSE mount error at {mount_point}: {detail}")]
     Mount { mount_point: String, detail: String },
 }
