@@ -360,14 +360,6 @@ impl RelayEnvelope {
     }
 }
 
-pub fn cluster_relay_rpc_request(
-    cluster_id: &ClusterId,
-    target_node_id: &NodeId,
-    inner: DaemonControlRequest,
-) -> Result<ObjectRpcRequest, NetworkError> {
-    RelayEnvelope::new(cluster_id.clone(), target_node_id.clone(), inner).into_request()
-}
-
 /// What a node should do with a [`RelayEnvelope`] it received.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg(test)]

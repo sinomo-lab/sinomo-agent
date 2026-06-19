@@ -10082,19 +10082,38 @@ mod tests {
         );
     }
 
+    #[derive(serde::Serialize)]
+    struct TestRelayEnvelope {
+        cluster_id: ClusterId,
+        target_node_id: NodeId,
+        ttl: u8,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        visited: Vec<NodeId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_hop_timeout_ms: Option<u64>,
+        inner: sinomo_network::DaemonControlRequest,
+    }
+
     fn test_relay_envelope(
         state: &ClusterBootstrapState,
         target_node: &NodeId,
     ) -> sinomo_network::RelayEnvelope {
-        let request = sinomo_network::cluster_relay_rpc_request(
-            &state.cluster_id,
-            target_node,
-            sinomo_network::ObjectRpcRequest {
-                route: "/test/relay".to_string(),
-                category: "test".to_string(),
-                metadata: BTreeMap::new(),
-                auth: None,
-                body: Vec::new(),
+        let request = sinomo_network::ObjectRpcRequest::encode_body(
+            sinomo_network::CLUSTER_RELAY_ROUTE,
+            sinomo_network::CLUSTER_ROUTING_RPC_CATEGORY,
+            &TestRelayEnvelope {
+                cluster_id: state.cluster_id.clone(),
+                target_node_id: target_node.clone(),
+                ttl: 8,
+                visited: Vec::new(),
+                max_hop_timeout_ms: None,
+                inner: sinomo_network::ObjectRpcRequest {
+                    route: "/test/relay".to_string(),
+                    category: "test".to_string(),
+                    metadata: BTreeMap::new(),
+                    auth: None,
+                    body: Vec::new(),
+                },
             },
         )
         .expect("relay rpc request");
