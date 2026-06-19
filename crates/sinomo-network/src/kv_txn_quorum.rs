@@ -3,7 +3,8 @@ use crate::control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlane
 use crate::control_plane_options::ClusterKvTxnQuorumOptions;
 use crate::error::NetworkError;
 use crate::kv_forward::{
-    forward_cluster_kv_txn_to_voter_async_with_host, forward_cluster_kv_txn_to_voter_with_host,
+    forward_cluster_kv_txn_to_state_authority_async_with_host,
+    forward_cluster_kv_txn_to_state_authority_with_host,
 };
 use crate::kv_local_store::{
     cluster_kv_raft_store, imported_snapshot_advances_local_kv,
@@ -84,7 +85,13 @@ pub trait ClusterKvTxnQuorumHost {
     where
         Self: Sized,
     {
-        forward_cluster_kv_txn_to_voter_with_host(paths, state, txn, options.forward_options, self)
+        forward_cluster_kv_txn_to_state_authority_with_host(
+            paths,
+            state,
+            txn,
+            options.forward_options,
+            self,
+        )
     }
 
     fn elect_kv_state_authority(
@@ -492,7 +499,7 @@ where
         let options = self.options.forward_options;
         let host = &mut *self.host;
         Box::pin(async move {
-            forward_cluster_kv_txn_to_voter_async_with_host(
+            forward_cluster_kv_txn_to_state_authority_async_with_host(
                 runtime, paths, state, txn, options, host,
             )
             .await

@@ -51,7 +51,7 @@ pub(crate) trait ClusterKvTxnForwardHost {
     ) -> Result<ObjectRpcResponse, NetworkError>;
 }
 
-pub(crate) fn forward_cluster_kv_txn_to_voter_with_host(
+pub(crate) fn forward_cluster_kv_txn_to_state_authority_with_host(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     txn: &KvTxn,
@@ -65,19 +65,19 @@ pub(crate) fn forward_cluster_kv_txn_to_voter_with_host(
     if targets.is_empty() {
         return Ok(None);
     }
-    if let Ok(Some(leader_id)) = host.known_kv_state_authority_id(paths, state)
-        && !cluster_node_blocks_leader_preference(paths, state, &leader_id)
+    if let Ok(Some(authority_id)) = host.known_kv_state_authority_id(paths, state)
+        && !cluster_node_blocks_leader_preference(paths, state, &authority_id)
         && let Some(position) = targets
             .iter()
-            .position(|endpoint| endpoint.node_id == leader_id)
+            .position(|endpoint| endpoint.node_id == authority_id)
     {
-        let leader = targets.remove(position);
-        targets.insert(0, leader);
+        let authority = targets.remove(position);
+        targets.insert(0, authority);
     }
 
     let mut failures = Vec::new();
     let deadline = Instant::now() + options.timeout;
-    for voter in &targets {
+    for target in &targets {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
@@ -88,21 +88,21 @@ pub(crate) fn forward_cluster_kv_txn_to_voter_with_host(
             ));
             break;
         }
-        match forward_cluster_kv_txn_to_voter_node_with_host(
+        match forward_cluster_kv_txn_to_state_authority_node_with_host(
             state,
-            &voter.node_id,
+            &target.node_id,
             txn,
-            options.command_timeout(voter, remaining),
+            options.command_timeout(target, remaining),
             host,
         ) {
             Ok(response) => return Ok(Some(response)),
-            Err(error) => failures.push(format!("node {} failed: {error}", voter.node_id)),
+            Err(error) => failures.push(format!("node {} failed: {error}", target.node_id)),
         }
     }
 
     Err(NetworkError::ClusterReadOnly {
         detail: format!(
-            "could not forward cluster KV transaction to any known voter{}",
+            "could not forward cluster KV transaction to any known state authority{}",
             if failures.is_empty() {
                 String::new()
             } else {
@@ -112,9 +112,9 @@ pub(crate) fn forward_cluster_kv_txn_to_voter_with_host(
     })
 }
 
-fn forward_cluster_kv_txn_to_voter_node_with_host(
+fn forward_cluster_kv_txn_to_state_authority_node_with_host(
     state: &ClusterBootstrapState,
-    voter_node_id: &NodeId,
+    authority_node_id: &NodeId,
     txn: &KvTxn,
     timeout: Duration,
     host: &mut impl ClusterKvTxnForwardHost,
@@ -126,7 +126,8 @@ fn forward_cluster_kv_txn_to_voter_node_with_host(
         txn_payload.category,
         txn_payload.body,
     );
-    let txn_response = host.send_object_rpc_to_node(state, voter_node_id, &txn_request, timeout)?;
+    let txn_response =
+        host.send_object_rpc_to_node(state, authority_node_id, &txn_request, timeout)?;
     txn_response.error_detail()?;
     let txn_response = sinomo_kv::decode_cluster_kv_txn_rpc_body(&txn_response.body)?;
 
@@ -139,8 +140,12 @@ fn forward_cluster_kv_txn_to_voter_node_with_host(
         snapshot_payload.category,
         snapshot_payload.body,
     );
-    let snapshot_response =
-        host.send_object_rpc_to_node(state, voter_node_id, &snapshot_request, snapshot_timeout)?;
+    let snapshot_response = host.send_object_rpc_to_node(
+        state,
+        authority_node_id,
+        &snapshot_request,
+        snapshot_timeout,
+    )?;
     snapshot_response.error_detail()?;
     let snapshot = sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&snapshot_response.body)?;
     Ok(ClusterKvTxnCommitResult {
@@ -149,7 +154,7 @@ fn forward_cluster_kv_txn_to_voter_node_with_host(
     })
 }
 
-pub(crate) async fn forward_cluster_kv_txn_to_voter_async_with_host<H>(
+pub(crate) async fn forward_cluster_kv_txn_to_state_authority_async_with_host<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -170,20 +175,21 @@ where
     if targets.is_empty() {
         return Ok(None);
     }
-    if let Ok(Some(leader_id)) =
+    if let Ok(Some(authority_id)) =
         locked_cluster_raft_known_leader_id_async(runtime, paths, state).await
-        && !cluster_node_blocks_leader_preference_async(runtime, paths, state, &leader_id).await?
+        && !cluster_node_blocks_leader_preference_async(runtime, paths, state, &authority_id)
+            .await?
         && let Some(position) = targets
             .iter()
-            .position(|endpoint| endpoint.node_id == leader_id)
+            .position(|endpoint| endpoint.node_id == authority_id)
     {
-        let leader = targets.remove(position);
-        targets.insert(0, leader);
+        let authority = targets.remove(position);
+        targets.insert(0, authority);
     }
 
     let mut failures = Vec::new();
     let deadline = Instant::now() + options.timeout;
-    for voter in &targets {
+    for target in &targets {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
@@ -194,11 +200,11 @@ where
             ));
             break;
         }
-        match forward_cluster_kv_txn_to_voter_node_async_with_host(
+        match forward_cluster_kv_txn_to_state_authority_node_async_with_host(
             state,
-            &voter.node_id,
+            &target.node_id,
             txn,
-            options.command_timeout(voter, remaining),
+            options.command_timeout(target, remaining),
             runtime,
             paths,
             host,
@@ -206,13 +212,13 @@ where
         .await
         {
             Ok(response) => return Ok(Some(response)),
-            Err(error) => failures.push(format!("node {} failed: {error}", voter.node_id)),
+            Err(error) => failures.push(format!("node {} failed: {error}", target.node_id)),
         }
     }
 
     Err(NetworkError::ClusterReadOnly {
         detail: format!(
-            "could not forward cluster KV transaction to any known voter{}",
+            "could not forward cluster KV transaction to any known state authority{}",
             if failures.is_empty() {
                 String::new()
             } else {
@@ -222,9 +228,9 @@ where
     })
 }
 
-async fn forward_cluster_kv_txn_to_voter_node_async_with_host<H>(
+async fn forward_cluster_kv_txn_to_state_authority_node_async_with_host<H>(
     state: &ClusterBootstrapState,
-    voter_node_id: &NodeId,
+    authority_node_id: &NodeId,
     txn: &KvTxn,
     timeout: Duration,
     runtime: &tokio::runtime::Handle,
@@ -245,7 +251,7 @@ where
     let txn_response = client
         .call_node(
             state,
-            voter_node_id,
+            authority_node_id,
             &txn_request,
             ClusterObjectRpcNodeOptions::internal(
                 ClusterEndpointInternalSelectionPurpose::VoterCommand,
@@ -268,7 +274,7 @@ where
     let snapshot_response = client
         .call_node(
             state,
-            voter_node_id,
+            authority_node_id,
             &snapshot_request,
             ClusterObjectRpcNodeOptions::internal(
                 ClusterEndpointInternalSelectionPurpose::VoterCommand,

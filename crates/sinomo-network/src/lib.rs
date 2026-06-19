@@ -203,7 +203,7 @@ pub(crate) use kv_forward::ClusterKvTxnForwardHost;
 #[cfg(test)]
 pub(crate) use kv_forward::ClusterKvTxnForwardOptions;
 #[cfg(test)]
-pub(crate) use kv_forward::forward_cluster_kv_txn_to_voter_with_host;
+pub(crate) use kv_forward::forward_cluster_kv_txn_to_state_authority_with_host;
 pub use kv_read_model::{
     read_cluster_connectivity_graph_from_kv, read_cluster_members_from_kv,
     read_cluster_members_from_snapshot, read_cluster_node_statuses_from_kv,
@@ -286,11 +286,11 @@ pub use membership::cluster_is_settled_solo;
 #[cfg(test)]
 pub(crate) use membership_forward::ClusterMembershipRpcForwardHost;
 #[cfg(test)]
-pub(crate) use membership_forward::forward_cluster_membership_rpc_to_voter_with_host;
+pub(crate) use membership_forward::forward_cluster_membership_rpc_to_state_authority_with_host;
 #[cfg(test)]
 pub(crate) use membership_forward::{
-    forward_cluster_join_challenge_rpc_to_voter_async_with_host,
-    forward_cluster_join_challenge_rpc_to_voter_with_host,
+    forward_cluster_join_challenge_rpc_to_state_authority_async_with_host,
+    forward_cluster_join_challenge_rpc_to_state_authority_with_host,
 };
 pub use membership_rpc::{
     ClusterAuthenticatedPeer, ClusterInvitePublishRequest, ClusterInvitePublishResponse,

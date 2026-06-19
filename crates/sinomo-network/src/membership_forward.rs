@@ -21,7 +21,7 @@ pub(crate) trait ClusterMembershipRpcForwardHost {
     ) -> Result<ObjectRpcResponse, NetworkError>;
 }
 
-pub(crate) fn forward_cluster_membership_rpc_to_voter_with_host(
+pub(crate) fn forward_cluster_membership_rpc_to_state_authority_with_host(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     request: &ObjectRpcRequest,
@@ -53,7 +53,7 @@ pub(crate) fn forward_cluster_membership_rpc_to_voter_with_host(
     })
 }
 
-pub async fn forward_cluster_membership_rpc_to_voter_async_with_host(
+pub async fn forward_cluster_membership_rpc_to_state_authority_async_with_host(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -61,16 +61,17 @@ pub async fn forward_cluster_membership_rpc_to_voter_async_with_host(
     failure_detail: &str,
     host: &mut (impl ClusterSignedEndpointRpcAsyncHost + Send),
 ) -> Result<ObjectRpcResponse, NetworkError> {
-    let voter_targets = ClusterEndpointSelector::select_internal_unique_node_targets_async(
-        runtime,
-        paths,
-        state,
-        ClusterEndpointInternalSelectionPurpose::VoterCommand,
-    )
-    .await?;
+    let state_authority_targets =
+        ClusterEndpointSelector::select_internal_unique_node_targets_async(
+            runtime,
+            paths,
+            state,
+            ClusterEndpointInternalSelectionPurpose::VoterCommand,
+        )
+        .await?;
     let mut failures = Vec::new();
     let mut client = ClusterObjectRpcClient::routed(host, runtime, paths);
-    for target in &voter_targets {
+    for target in &state_authority_targets {
         match client
             .call_node(
                 state,
@@ -109,23 +110,23 @@ pub async fn forward_cluster_membership_rpc_to_voter_async_with_host(
 /// The routing-aware send routes the challenge across segments when no authority is directly
 /// reachable.
 #[cfg(test)]
-pub(crate) fn forward_cluster_join_challenge_rpc_to_voter_with_host(
+pub(crate) fn forward_cluster_join_challenge_rpc_to_state_authority_with_host(
     paths: &ClusterPaths,
     request: &ObjectRpcRequest,
     host: &mut impl ClusterMembershipRpcForwardHost,
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let state = read_cluster_state(paths)?;
-    forward_cluster_membership_rpc_to_voter_with_host(
+    forward_cluster_membership_rpc_to_state_authority_with_host(
         paths,
         &state,
         request,
-        "join challenge introducer is not a channel/issuer and could not relay the challenge to any voter",
+        "join challenge introducer is not a channel/issuer and could not relay the challenge to any state authority",
         host,
     )
 }
 
 #[cfg(test)]
-pub(crate) async fn forward_cluster_join_challenge_rpc_to_voter_async_with_host(
+pub(crate) async fn forward_cluster_join_challenge_rpc_to_state_authority_async_with_host(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     request: &ObjectRpcRequest,
@@ -139,12 +140,12 @@ pub(crate) async fn forward_cluster_join_challenge_rpc_to_voter_async_with_host(
             operation: "read cluster state".to_string(),
             detail: format!("cluster state read task failed: {source}"),
         })??;
-    forward_cluster_membership_rpc_to_voter_async_with_host(
+    forward_cluster_membership_rpc_to_state_authority_async_with_host(
         runtime,
         paths,
         &state,
         request,
-        "join challenge introducer is not a channel/issuer and could not relay the challenge to any voter",
+        "join challenge introducer is not a channel/issuer and could not relay the challenge to any state authority",
         host,
     )
     .await

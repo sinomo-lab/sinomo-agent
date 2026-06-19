@@ -17,8 +17,9 @@ use crate::local_state_store::{
 };
 use crate::member_mutation::sync_cluster_state_to_kv_with_host;
 use crate::membership_forward::{
-    ClusterMembershipRpcForwardHost, forward_cluster_membership_rpc_to_voter_async_with_host,
-    forward_cluster_membership_rpc_to_voter_with_host,
+    ClusterMembershipRpcForwardHost,
+    forward_cluster_membership_rpc_to_state_authority_async_with_host,
+    forward_cluster_membership_rpc_to_state_authority_with_host,
 };
 use crate::membership_rpc::{ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse};
 use crate::prelude::*;
@@ -159,17 +160,17 @@ pub fn handle_cluster_join_registration_request_with_host(
         return Ok(prepared);
     }
 
-    if !sinomo_kv::cluster_kv_raft_local_is_voter(&state) {
+    if !cluster_kv_local_is_state_authority(&state) {
         let rpc_request = ObjectRpcRequest::encode_body(
             CLUSTER_JOIN_REGISTER_ROUTE,
             CLUSTER_MEMBERSHIP_RPC_CATEGORY,
             &request,
         )?;
-        let response = forward_cluster_membership_rpc_to_voter_with_host(
+        let response = forward_cluster_membership_rpc_to_state_authority_with_host(
             paths,
             &state,
             &rpc_request,
-            "join introducer is not a voter and could not forward the join to any voter",
+            "join introducer is not a state authority and could not forward the join to any state authority",
             host,
         )?;
         let response: ClusterJoinRegistrationResponse = response.decode_body()?;
@@ -233,18 +234,18 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
         return Ok(prepared);
     }
 
-    if !sinomo_kv::cluster_kv_raft_local_is_voter(&state) {
+    if !cluster_kv_local_is_state_authority(&state) {
         let rpc_request = ObjectRpcRequest::encode_body(
             CLUSTER_JOIN_REGISTER_ROUTE,
             CLUSTER_MEMBERSHIP_RPC_CATEGORY,
             &request,
         )?;
-        let response = forward_cluster_membership_rpc_to_voter_async_with_host(
+        let response = forward_cluster_membership_rpc_to_state_authority_async_with_host(
             runtime,
             paths,
             &state,
             &rpc_request,
-            "join introducer is not a voter and could not forward the join to any voter",
+            "join introducer is not a state authority and could not forward the join to any state authority",
             host,
         )
         .await?;
@@ -808,6 +809,10 @@ pub fn cluster_join_challenge_rpc_request<T: Serialize + ?Sized>(
         CLUSTER_MEMBERSHIP_RPC_CATEGORY,
         challenge,
     )
+}
+
+fn cluster_kv_local_is_state_authority(state: &ClusterBootstrapState) -> bool {
+    sinomo_kv::cluster_kv_raft_local_is_voter(state)
 }
 
 pub trait ClusterJoinRegistrationHost {

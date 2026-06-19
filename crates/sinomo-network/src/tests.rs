@@ -9123,7 +9123,7 @@ impl ClusterRaftVoteTransportHost for RecordingLeaderElectionHost {
 }
 
 struct RecordingKvTxnForwardHost {
-    known_leader: Option<NodeId>,
+    known_authority: Option<NodeId>,
     snapshot: KvSnapshot,
     txn_response: KvTxnResponse,
     node_rpcs: Vec<(NodeId, String)>,
@@ -9135,7 +9135,7 @@ impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError> {
-        Ok(self.known_leader.clone())
+        Ok(self.known_authority.clone())
     }
 
     fn send_object_rpc_to_node(
@@ -9196,7 +9196,7 @@ impl ClusterSignedEndpointRpcAsyncHost for RecordingKvTxnForwardHost {
 }
 
 struct RecordingKvSnapshotRefreshHost {
-    known_leader: Option<NodeId>,
+    known_authority: Option<NodeId>,
     snapshots: BTreeMap<NodeId, KvSnapshot>,
     fetches: Vec<(NodeId, Duration)>,
     restored: Option<(NodeId, KvRevision)>,
@@ -9208,7 +9208,7 @@ impl ClusterKvSnapshotRefreshHost for RecordingKvSnapshotRefreshHost {
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError> {
-        Ok(self.known_leader.clone())
+        Ok(self.known_authority.clone())
     }
 
     fn fetch_cluster_kv_snapshot(
@@ -10099,7 +10099,7 @@ fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
 }
 
 #[test]
-fn cluster_kv_snapshot_refresh_driver_prefers_known_leader_and_imports_newest_snapshot() {
+fn cluster_kv_snapshot_refresh_driver_prefers_known_state_authority_and_imports_newest_snapshot() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-kv-refresh-driver");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -10121,7 +10121,7 @@ fn cluster_kv_snapshot_refresh_driver_prefers_known_leader_and_imports_newest_sn
             20,
         ));
     let now = OffsetDateTime::now_utc();
-    let leader_id = NodeId::from_legacy_named("node_kv_refresh_known_leader").expect("leader");
+    let leader_id = NodeId::from_legacy_named("node_kv_refresh_known_authority").expect("leader");
     let mut leader_member = state.members[0].clone();
     leader_member.node_id = leader_id.clone();
     leader_member.display_name = "leader".to_string();
@@ -10154,7 +10154,7 @@ fn cluster_kv_snapshot_refresh_driver_prefers_known_leader_and_imports_newest_sn
     let leader_snapshot = leader_store.snapshot();
 
     let mut host = RecordingKvSnapshotRefreshHost {
-        known_leader: Some(leader_id.clone()),
+        known_authority: Some(leader_id.clone()),
         snapshots: BTreeMap::from([
             (first_peer_id.clone(), first_snapshot),
             (leader_id.clone(), leader_snapshot.clone()),
@@ -10823,7 +10823,7 @@ fn cluster_raft_leader_election_driver_sets_leader_after_remote_voter_grants() {
 }
 
 #[test]
-fn cluster_kv_txn_forward_driver_uses_node_rpc_for_known_leader() {
+fn cluster_kv_txn_forward_driver_uses_node_rpc_for_known_state_authority() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-kv-forward-direct");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -10848,13 +10848,13 @@ fn cluster_kv_txn_forward_driver_uses_node_rpc_for_known_leader() {
     let snapshot = forward_test_snapshot("/forward/direct", b"direct");
     let txn_response = forward_test_txn_response(snapshot.revision);
     let mut host = RecordingKvTxnForwardHost {
-        known_leader: Some(peer_node_id.clone()),
+        known_authority: Some(peer_node_id.clone()),
         snapshot: snapshot.clone(),
         txn_response: txn_response.clone(),
         node_rpcs: Vec::new(),
     };
 
-    let result = forward_cluster_kv_txn_to_voter_with_host(
+    let result = forward_cluster_kv_txn_to_state_authority_with_host(
         &paths,
         &state,
         &KvTxn {
@@ -10945,7 +10945,7 @@ fn cluster_node_blocks_leader_preference_when_local_probe_marks_member_unreachab
 }
 
 #[test]
-fn cluster_kv_txn_forward_driver_uses_node_rpc_without_known_leader() {
+fn cluster_kv_txn_forward_driver_uses_node_rpc_without_known_state_authority() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-kv-forward-node-rpc");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -10970,13 +10970,13 @@ fn cluster_kv_txn_forward_driver_uses_node_rpc_without_known_leader() {
     let snapshot = forward_test_snapshot("/forward/node-rpc", b"node-rpc");
     let txn_response = forward_test_txn_response(snapshot.revision);
     let mut host = RecordingKvTxnForwardHost {
-        known_leader: None,
+        known_authority: None,
         snapshot: snapshot.clone(),
         txn_response: txn_response.clone(),
         node_rpcs: Vec::new(),
     };
 
-    let result = forward_cluster_kv_txn_to_voter_with_host(
+    let result = forward_cluster_kv_txn_to_state_authority_with_host(
         &paths,
         &state,
         &KvTxn {
@@ -11049,7 +11049,7 @@ fn cluster_kv_txn_async_forward_driver_uses_object_rpc_client() {
     let snapshot = forward_test_snapshot("/forward/async-node-rpc", b"async-node-rpc");
     let txn_response = forward_test_txn_response(snapshot.revision);
     let mut host = RecordingKvTxnForwardHost {
-        known_leader: None,
+        known_authority: None,
         snapshot: snapshot.clone(),
         txn_response: txn_response.clone(),
         node_rpcs: Vec::new(),
@@ -11061,7 +11061,7 @@ fn cluster_kv_txn_async_forward_driver_uses_object_rpc_client() {
 
     let result = runtime
         .block_on(
-            crate::kv_forward::forward_cluster_kv_txn_to_voter_async_with_host(
+            crate::kv_forward::forward_cluster_kv_txn_to_state_authority_async_with_host(
                 runtime.handle(),
                 &paths,
                 &state,
@@ -13228,7 +13228,7 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
 }
 
 #[test]
-fn join_voter_targets_do_not_filter_offline_status_during_bootstrap() {
+fn join_state_authority_targets_do_not_filter_offline_status_during_bootstrap() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-join-targets-ignore-offline-status");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -13305,7 +13305,7 @@ fn join_voter_targets_do_not_filter_offline_status_during_bootstrap() {
 }
 
 #[test]
-fn membership_forwarding_uses_single_voter_node_rpc() {
+fn membership_forwarding_uses_single_state_authority_node_rpc() {
     struct RecordingForwardHost {
         node_rpcs: Vec<NodeId>,
     }
@@ -13385,7 +13385,7 @@ fn membership_forwarding_uses_single_voter_node_rpc() {
         node_rpcs: Vec::new(),
     };
 
-    forward_cluster_membership_rpc_to_voter_with_host(
+    forward_cluster_membership_rpc_to_state_authority_with_host(
         &paths,
         &state,
         &request,
@@ -13399,7 +13399,7 @@ fn membership_forwarding_uses_single_voter_node_rpc() {
 }
 
 #[test]
-fn join_challenge_forwarding_uses_membership_voter_policy() {
+fn join_challenge_forwarding_uses_membership_state_authority_policy() {
     struct RecordingForwardHost {
         node_rpcs: Vec<NodeId>,
     }
@@ -13502,9 +13502,10 @@ fn join_challenge_forwarding_uses_membership_voter_policy() {
         node_rpcs: Vec::new(),
     };
 
-    let response =
-        forward_cluster_join_challenge_rpc_to_voter_with_host(&paths, &request, &mut host)
-            .expect("forward join challenge");
+    let response = forward_cluster_join_challenge_rpc_to_state_authority_with_host(
+        &paths, &request, &mut host,
+    )
+    .expect("forward join challenge");
     let proof: String = response.decode_body().expect("proof body");
 
     assert_eq!(proof, "proof");
@@ -13518,12 +13519,14 @@ fn join_challenge_forwarding_uses_membership_voter_policy() {
         node_rpcs: Vec::new(),
     };
     let async_response = runtime
-        .block_on(forward_cluster_join_challenge_rpc_to_voter_async_with_host(
-            runtime.handle(),
-            &paths,
-            &request,
-            &mut async_host,
-        ))
+        .block_on(
+            forward_cluster_join_challenge_rpc_to_state_authority_async_with_host(
+                runtime.handle(),
+                &paths,
+                &request,
+                &mut async_host,
+            ),
+        )
         .expect("async forward join challenge");
     let async_proof: String = async_response.decode_body().expect("async proof body");
     assert_eq!(async_proof, "proof");
