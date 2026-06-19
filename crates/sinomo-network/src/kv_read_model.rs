@@ -10,10 +10,9 @@ use crate::kv_local_store::{
 };
 #[cfg(test)]
 use crate::network_info::ClusterNetworkInfoRecord;
-use crate::records::ClusterCapabilityPolicyRecord;
 use sinomo_core::{ClusterEndpointRecord, ClusterMemberRecord, ClusterNodeStatusRecord};
 use sinomo_kv::{CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, KvSnapshot};
-use sinomo_node::NodeId;
+use sinomo_node::{ClusterCapabilityPolicyRecord, NodeId};
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
 

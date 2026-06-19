@@ -303,6 +303,36 @@ mod tests {
     }
 
     #[test]
+    fn cluster_capability_policy_stable_eq_ignores_updated_at() {
+        let timestamp = time::OffsetDateTime::parse(
+            "2026-05-02T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("timestamp");
+        let cluster_id = Id::from_legacy_named("cluster_policy_stable").expect("cluster");
+        let node_id = Id::from_legacy_named("node_policy_stable").expect("node");
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            node_id,
+            "desktop",
+            "pk-policy",
+            timestamp,
+        );
+        member.capabilities = vec![CapabilityName::new("daemon.main.run").expect("capability")];
+        member.allowed_capabilities = member.capabilities.clone();
+        let left = ClusterCapabilityPolicyRecord::from(&member);
+        let mut right = left.clone();
+        right.updated_at = right.updated_at + time::Duration::minutes(1);
+
+        assert!(cluster_capability_policy_stable_eq(&left, &right));
+
+        right
+            .allowed_capabilities
+            .push(CapabilityName::new("cluster.kv.vote").expect("capability"));
+        assert!(!cluster_capability_policy_stable_eq(&left, &right));
+    }
+
+    #[test]
     fn upsert_member_record_replaces_by_node_id() {
         let timestamp = time::OffsetDateTime::parse(
             "2026-05-02T12:00:00Z",

@@ -144,8 +144,6 @@ pub(crate) use crate::raft_rpc::{
     handle_cluster_raft_append_request, handle_cluster_raft_vote_request,
 };
 #[cfg(test)]
-pub(crate) use crate::records::ClusterCapabilityPolicyRecord;
-#[cfg(test)]
 pub(crate) use crate::route_graph_read_model::read_cluster_connectivity_graph;
 #[cfg(test)]
 pub(crate) use crate::route_graph_read_model::read_cluster_connectivity_graph_with_query;

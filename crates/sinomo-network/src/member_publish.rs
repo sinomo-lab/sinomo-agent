@@ -16,10 +16,10 @@ use crate::member_mutation::ClusterMemberMutationAsyncHost;
 use crate::member_store::MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS;
 use crate::membership_rpc::{ClusterMemberPublishRequest, ClusterMemberPublishResponse};
 use crate::prelude::*;
-use crate::records::{ClusterCapabilityPolicyRecord, cluster_capability_policy_stable_eq};
 use crate::rpc_future::ClusterMembershipRpcFuture;
 use sinomo_kv::{KvRevision, push_bounded_txn_success_op};
 use sinomo_node::{
+    ClusterCapabilityPolicyRecord, cluster_capability_policy_stable_eq,
     cluster_endpoint_list_stable_eq, cluster_endpoint_stable_eq, cluster_local_process_members,
     cluster_member_stable_eq,
 };

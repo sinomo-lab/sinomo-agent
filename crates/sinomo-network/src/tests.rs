@@ -64,7 +64,7 @@ use sinomo_kv::{
     MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES, MAX_CLUSTER_KV_WATCH_EVENTS, RaftAppendEntriesRequest,
     RaftAppendEntriesResponse, RaftRequestVoteRequest, RaftSnapshot,
 };
-use sinomo_node::{ClusterIdentityRecord, NodeId};
+use sinomo_node::{ClusterCapabilityPolicyRecord, ClusterIdentityRecord, NodeId};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};

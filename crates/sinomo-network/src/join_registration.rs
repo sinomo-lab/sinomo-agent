@@ -22,7 +22,6 @@ use crate::membership_forward::{
 };
 use crate::membership_rpc::{ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse};
 use crate::prelude::*;
-use crate::records::ClusterCapabilityPolicyRecord;
 use crate::route::ClusterSignedEndpointRpcAsyncHost;
 use crate::rpc::{
     CLUSTER_JOIN_CHALLENGE_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY,
@@ -30,7 +29,10 @@ use crate::rpc::{
 };
 use crate::rpc_future::ClusterMembershipRpcFuture;
 use sinomo_kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
-use sinomo_node::{ClusterIdentityRecord, cluster_member_is_local_process, upsert_member_record};
+use sinomo_node::{
+    ClusterCapabilityPolicyRecord, ClusterIdentityRecord, cluster_member_is_local_process,
+    upsert_member_record,
+};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
