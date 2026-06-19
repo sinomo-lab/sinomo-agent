@@ -152,7 +152,7 @@ impl<'a> ClusterEndpointSelector<'a> {
             })
     }
 
-    pub fn select_node(
+    pub(crate) fn select_node(
         &self,
         purpose: ClusterEndpointSelectionPurpose,
         node_id: &NodeId,
