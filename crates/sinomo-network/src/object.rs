@@ -453,6 +453,27 @@ pub async fn send_daemon_control_request_async(
     .await
 }
 
+pub async fn send_daemon_control_rpc_request_async(
+    address: &str,
+    request: &DaemonControlRequest,
+    timeouts: DaemonRpcTimeouts,
+    max_response_bytes: usize,
+) -> Result<crate::ObjectRpcResponse, NetworkError> {
+    let response = if object_rpc_request_expects_raw_daemon_response(request) {
+        send_daemon_control_rpc_request_raw_response_async(
+            address,
+            request,
+            timeouts,
+            max_response_bytes,
+        )
+        .await?
+    } else {
+        send_daemon_control_request_async(address, request, timeouts, max_response_bytes).await?
+    };
+    response.error_detail()?;
+    Ok(response)
+}
+
 pub async fn send_daemon_control_rpc_request_raw_response_async(
     address: &str,
     request: &DaemonControlRequest,
@@ -2347,11 +2368,11 @@ mod serde_bytes_tests {
             body: Vec::new(),
         };
 
-        let response = crate::send_daemon_rpc_to_address_async(
+        let response = super::send_daemon_control_rpc_request_async(
             &address,
-            None,
             &request,
             DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(1)),
+            crate::IROH_DAEMON_COMMAND_MAX_BYTES,
         )
         .await
         .expect("streamed response");

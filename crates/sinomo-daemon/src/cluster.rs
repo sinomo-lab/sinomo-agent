@@ -4679,11 +4679,11 @@ impl sinomo_network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost<'_> {
                 }
                 RelayLocalDeliveryTarget::LoopbackAddress(local_address) => {
                     let inner = &envelope.inner;
-                    sinomo_network::send_daemon_rpc_to_address_async(
+                    sinomo_network::send_daemon_control_rpc_request_async(
                         &local_address,
-                        inner.auth.as_deref(),
                         inner,
                         timeouts,
+                        sinomo_network::IROH_DAEMON_COMMAND_MAX_BYTES,
                     )
                     .await
                     .map(Some)

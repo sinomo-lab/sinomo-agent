@@ -74,9 +74,14 @@ pub async fn send_daemon_rpc_async(
             address: address.to_string(),
             detail: format!("daemon RPC signing task failed: {source}"),
         })??;
-    let response =
-        sinomo_network::send_daemon_rpc_to_address_async(address, Some(&signed), request, timeouts)
-            .await?;
+    let control_request = request.clone().with_auth(signed);
+    let response = sinomo_network::send_daemon_control_rpc_request_async(
+        address,
+        &control_request,
+        timeouts,
+        sinomo_network::IROH_DAEMON_COMMAND_MAX_BYTES,
+    )
+    .await?;
     Ok(response)
 }
 
@@ -114,9 +119,18 @@ pub(crate) fn send_daemon_rpc_raw_with_timeouts(
     timeouts: sinomo_network::DaemonRpcTimeouts,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     block_on_daemon_client(async {
-        sinomo_network::send_daemon_rpc_to_address_async(address, auth, request, timeouts)
-            .await
-            .map_err(DaemonError::from)
+        let control_request = match auth {
+            Some(auth) => request.clone().with_auth(auth.to_vec()),
+            None => request.clone(),
+        };
+        sinomo_network::send_daemon_control_rpc_request_async(
+            address,
+            &control_request,
+            timeouts,
+            sinomo_network::IROH_DAEMON_COMMAND_MAX_BYTES,
+        )
+        .await
+        .map_err(DaemonError::from)
     })
 }
 

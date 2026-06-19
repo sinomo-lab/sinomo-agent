@@ -297,7 +297,8 @@ pub use object::{
     ObjectFrameIoOptions, ObjectRpcRequestStreamMode, ObjectRpcResponseStreamMode,
     RawByteStreamChunkOptions, SinomoObjectCodec, object_rpc_request_stream_mode,
     object_rpc_response_stream_mode, send_daemon_control_request_async,
-    set_object_rpc_request_stream_mode, set_object_rpc_response_stream_mode,
+    send_daemon_control_rpc_request_async, set_object_rpc_request_stream_mode,
+    set_object_rpc_response_stream_mode,
 };
 pub(crate) use object::{
     DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY, DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE,
@@ -340,7 +341,7 @@ pub(crate) use roaming::send_daemon_rpc_to_cluster_endpoint_async;
 pub(crate) use roaming::stable_iroh_endpoint_id;
 pub use roaming::{
     IROH_DAEMON_COMMAND_MAX_BYTES, IrohDaemonProxyHandle, IrohEndpointRecord, IrohRelayMode,
-    send_daemon_rpc_to_address_async, start_iroh_daemon_proxy,
+    start_iroh_daemon_proxy,
 };
 pub use route::{
     CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY, CLUSTER_ROUTING_RPC_ROUTE_METADATA,

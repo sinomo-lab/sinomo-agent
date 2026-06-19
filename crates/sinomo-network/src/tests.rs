@@ -1895,11 +1895,11 @@ fn async_daemon_control_client_round_trips_object_frames() {
         });
         let request =
             ObjectRpcRequest::encode_body("/test/status", "test", &()).expect("rpc request");
-        let response = send_daemon_rpc_to_address_async(
+        let response = crate::send_daemon_control_rpc_request_async(
             &address,
-            None,
             &request,
             DaemonRpcTimeouts::connect_only(Duration::from_secs(1)),
+            crate::IROH_DAEMON_COMMAND_MAX_BYTES,
         )
         .await
         .expect("response");
@@ -1992,11 +1992,11 @@ fn async_daemon_control_client_timeout_is_idle_not_total_transfer() {
         });
         let request =
             ObjectRpcRequest::encode_body("/test/slow", "test", &()).expect("rpc request");
-        let response = send_daemon_rpc_to_address_async(
+        let response = crate::send_daemon_control_rpc_request_async(
             &address,
-            None,
             &request,
             DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(25)),
+            crate::IROH_DAEMON_COMMAND_MAX_BYTES,
         )
         .await
         .expect("response");
@@ -2033,11 +2033,11 @@ fn async_daemon_control_client_without_idle_timeout_allows_response_gap() {
         });
         let request = ObjectRpcRequest::encode_body("/test/no-idle-timeout", "test", &())
             .expect("rpc request");
-        let response = send_daemon_rpc_to_address_async(
+        let response = crate::send_daemon_control_rpc_request_async(
             &address,
-            None,
             &request,
             DaemonRpcTimeouts::connect_only(Duration::from_millis(20)),
+            crate::IROH_DAEMON_COMMAND_MAX_BYTES,
         )
         .await
         .expect("response");
@@ -2068,11 +2068,11 @@ fn async_daemon_control_client_explicit_idle_timeout_still_fails_on_stall() {
         });
         let request =
             ObjectRpcRequest::encode_body("/test/idle-timeout", "test", &()).expect("rpc request");
-        let error = send_daemon_rpc_to_address_async(
+        let error = crate::send_daemon_control_rpc_request_async(
             &address,
-            None,
             &request,
             DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(20)),
+            crate::IROH_DAEMON_COMMAND_MAX_BYTES,
         )
         .await
         .expect_err("explicit idle timeout should fail");
@@ -2121,11 +2121,11 @@ fn async_daemon_rpc_client_rejects_legacy_wrapped_response() {
         });
         let request =
             ObjectRpcRequest::encode_body("/test/status", "test", &()).expect("rpc request");
-        let error = send_daemon_rpc_to_address_async(
+        let error = crate::send_daemon_control_rpc_request_async(
             &address,
-            None,
             &request,
             DaemonRpcTimeouts::connect_only(Duration::from_secs(1)),
+            crate::IROH_DAEMON_COMMAND_MAX_BYTES,
         )
         .await
         .expect_err("legacy wrapped response");
@@ -2143,9 +2143,20 @@ fn iroh_daemon_rpc_async_reports_missing_transport_feature() {
         .expect("current-thread runtime");
     let request = ObjectRpcRequest::encode_body("/test/status", "test", &()).expect("request");
 
+    let endpoint = ClusterEndpointRecord {
+        endpoint_id: sinomo_core::Id::generate(),
+        node_id: NodeId::from_legacy_named("node_iroh_missing_transport").expect("node"),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://example".to_string(),
+        source: ClusterEndpointSource::KvMembership,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 0,
+        last_observed_latency_ms: None,
+    };
+
     let error = runtime
-        .block_on(send_daemon_rpc_to_address_async(
-            "iroh://example",
+        .block_on(send_daemon_rpc_to_cluster_endpoint_async(
+            &endpoint,
             None,
             &request,
             DaemonRpcTimeouts::connect_only(Duration::from_millis(1)),
@@ -7024,12 +7035,12 @@ async fn iroh_daemon_proxy_round_trips_rpc_request() {
     let fixture = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept daemon fixture");
         let request: crate::DaemonControlRequest =
-            crate::read_object_frame_blocking(&mut stream, crate::IROH_DAEMON_COMMAND_MAX_BYTES)
+            read_object_frame_blocking(&mut stream, crate::IROH_DAEMON_COMMAND_MAX_BYTES)
                 .expect("read daemon fixture request");
         assert_eq!(request.route, "/test/ping");
         let rpc_response = crate::ObjectRpcResponse::encode_body("/test/ping", &"PONG".to_string())
             .expect("rpc response");
-        crate::write_object_frame_blocking(&mut stream, &rpc_response)
+        write_object_frame_blocking(&mut stream, &rpc_response)
             .expect("write daemon fixture response");
     });
 
