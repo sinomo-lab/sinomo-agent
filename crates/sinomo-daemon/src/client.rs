@@ -719,22 +719,30 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
 fn daemon_rpc_connectivity_observation(
     observation: sinomo_network::ClusterSignedEndpointRpcObservation,
 ) -> (sinomo_network::ClusterConnectivityState, Option<u64>, bool) {
-    match observation.kind() {
-        sinomo_network::ClusterSignedEndpointRpcObservationKind::Success => (
+    if observation.is_success() {
+        (
             sinomo_network::ClusterConnectivityState::Healthy,
             observation.latency_ms(),
             false,
-        ),
-        sinomo_network::ClusterSignedEndpointRpcObservationKind::IoFailure => (
+        )
+    } else if observation.is_io_failure() {
+        (
             sinomo_network::ClusterConnectivityState::Degraded,
             None,
             false,
-        ),
-        sinomo_network::ClusterSignedEndpointRpcObservationKind::AuthDenied => (
+        )
+    } else if observation.is_auth_denied() {
+        (
             sinomo_network::ClusterConnectivityState::Degraded,
             None,
             true,
-        ),
+        )
+    } else {
+        (
+            sinomo_network::ClusterConnectivityState::Degraded,
+            None,
+            false,
+        )
     }
 }
 

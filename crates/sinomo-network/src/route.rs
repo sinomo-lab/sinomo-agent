@@ -510,7 +510,7 @@ pub type ClusterSignedEndpointRpcFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, NetworkError>> + Send + 'a>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ClusterSignedEndpointRpcObservationKind {
+enum ClusterSignedEndpointRpcObservationKind {
     Success,
     IoFailure,
     AuthDenied,
@@ -544,8 +544,22 @@ impl ClusterSignedEndpointRpcObservation {
         }
     }
 
-    pub fn kind(&self) -> ClusterSignedEndpointRpcObservationKind {
-        self.kind
+    pub fn is_success(&self) -> bool {
+        matches!(self.kind, ClusterSignedEndpointRpcObservationKind::Success)
+    }
+
+    pub fn is_io_failure(&self) -> bool {
+        matches!(
+            self.kind,
+            ClusterSignedEndpointRpcObservationKind::IoFailure
+        )
+    }
+
+    pub fn is_auth_denied(&self) -> bool {
+        matches!(
+            self.kind,
+            ClusterSignedEndpointRpcObservationKind::AuthDenied
+        )
     }
 
     pub fn latency_ms(&self) -> Option<u64> {
