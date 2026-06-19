@@ -414,16 +414,14 @@ pub(crate) fn read_cluster_kv_reader_node_id(paths: &ClusterPaths) -> Result<Nod
 
 #[cfg(test)]
 pub(crate) fn cluster_raft_wal_paths(paths: &ClusterPaths, node_id: &NodeId) -> KvWalPaths {
-    cluster_kv_raft_store(paths).wal_paths(node_id)
+    paths.kv_paths().raft_wal_paths(node_id)
 }
 
 pub(crate) fn open_cluster_raft_kv_node(
     paths: &ClusterPaths,
     node_id: &NodeId,
 ) -> Result<DurableRaftKvNode, NetworkError> {
-    cluster_kv_raft_store(paths)
-        .open_node(node_id)
-        .map_err(Into::into)
+    paths.kv_paths().open_raft_node(node_id).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -432,8 +430,9 @@ pub(crate) fn restore_cluster_raft_from_snapshot_if_newer(
     node_id: &NodeId,
     snapshot: KvSnapshot,
 ) -> Result<bool, NetworkError> {
-    cluster_kv_raft_store(paths)
-        .restore_from_snapshot_if_newer_and_notify(node_id, snapshot)
+    paths
+        .kv_paths()
+        .restore_raft_from_snapshot_if_newer_and_notify(node_id, snapshot)
         .map_err(NetworkError::from)
 }
 
@@ -442,8 +441,9 @@ pub(crate) fn locked_restore_cluster_raft_from_snapshot_if_newer(
     node_id: &NodeId,
     snapshot: KvSnapshot,
 ) -> Result<bool, NetworkError> {
-    cluster_kv_raft_store(paths)
-        .locked_restore_from_snapshot_if_newer_and_notify(node_id, snapshot)
+    paths
+        .kv_paths()
+        .locked_restore_raft_from_snapshot_if_newer_and_notify(node_id, snapshot)
         .map_err(NetworkError::from)
 }
 
@@ -478,8 +478,9 @@ pub(crate) async fn open_cluster_raft_kv_node_async(
     paths: &ClusterPaths,
     node_id: &NodeId,
 ) -> Result<DurableRaftKvNode, NetworkError> {
-    cluster_kv_raft_store(paths)
-        .open_node_async(node_id)
+    paths
+        .kv_paths()
+        .open_raft_node_async(node_id)
         .await
         .map_err(Into::into)
 }
