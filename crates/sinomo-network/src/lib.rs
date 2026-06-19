@@ -290,7 +290,7 @@ pub use membership_forward::{
 pub use membership_rpc::{
     ClusterAuthenticatedPeer, ClusterInvitePublishRequest, ClusterInvitePublishResponse,
     ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse, ClusterMemberPublishRequest,
-    ClusterMemberPublishResponse,
+    ClusterMemberPublishResponse, handle_cluster_membership_rpc_request_with_hosts,
 };
 pub use network_info::{
     CLUSTER_NETWORK_INFO_TTL_SECONDS, ClusterNetworkInfoRecord, build_cluster_network_info_record,
@@ -394,11 +394,10 @@ pub use status_publish::{
 };
 pub use storage::{
     cleanup_legacy_shadow_daemon_members_with_host, cluster_state_sync_txn,
-    handle_cluster_membership_rpc_request_with_hosts, handle_cluster_raft_rpc_request,
-    handle_cluster_raft_rpc_request_async, remove_cluster_members_with_host,
-    sync_cluster_state_to_kv_async_with_host, sync_cluster_state_to_kv_with_host,
-    sync_cluster_state_to_local_raft_unchecked, update_cluster_node_role_with_host,
-    update_cluster_raft_role_with_host,
+    handle_cluster_raft_rpc_request, handle_cluster_raft_rpc_request_async,
+    remove_cluster_members_with_host, sync_cluster_state_to_kv_async_with_host,
+    sync_cluster_state_to_kv_with_host, sync_cluster_state_to_local_raft_unchecked,
+    update_cluster_node_role_with_host, update_cluster_raft_role_with_host,
 };
 pub use voter_reachability::{
     ClusterVoterReachabilityAsyncHost, ClusterVoterReachabilityHost,

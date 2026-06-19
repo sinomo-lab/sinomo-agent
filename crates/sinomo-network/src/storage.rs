@@ -22,12 +22,7 @@ pub(crate) use crate::connectivity_store::{
 use crate::control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlaneTransport};
 use crate::endpoint_records::cleanup_cluster_iroh_endpoints;
 use crate::error::NetworkError;
-use crate::invite_publish::{
-    ClusterInvitePublishHost, handle_cluster_invite_publish_request_with_host,
-};
-use crate::join_registration::{
-    ClusterJoinRegistrationHost, handle_cluster_join_registration_request_with_host,
-};
+use crate::invite_publish::ClusterInvitePublishHost;
 #[cfg(test)]
 pub(crate) use crate::keyspace::cluster_certificate_key;
 use crate::keyspace::cluster_member_key;
@@ -120,10 +115,7 @@ use crate::member_mutation::{
     ClusterMemberMutationAsyncHost, ClusterMemberMutationHost, ClusterMemberRemoval,
     ClusterNodeRoleUpdate, ClusterRaftRoleUpdate,
 };
-use crate::member_publish::{
-    ClusterLocalMemberPublishHost, ClusterMemberPublishHost,
-    handle_cluster_member_publish_request_with_host,
-};
+use crate::member_publish::{ClusterLocalMemberPublishHost, ClusterMemberPublishHost};
 pub(crate) use crate::member_store::{
     apply_cluster_raft_role, cluster_legacy_shadow_orphan_artifact_cleanup_txns_from_store,
     cluster_legacy_shadow_orphan_artifact_node_ids_from_store,
@@ -139,8 +131,7 @@ pub(crate) use crate::member_store::{
 use crate::membership::cluster_member_is_legacy_shadow_daemon;
 use crate::membership_forward::ClusterMembershipRpcForwardHost;
 use crate::membership_rpc::{
-    ClusterAuthenticatedPeer, ClusterInvitePublishRequest, ClusterJoinRegistrationRequest,
-    ClusterMemberPublishRequest, ClusterMemberPublishResponse,
+    ClusterAuthenticatedPeer, ClusterMemberPublishRequest, ClusterMemberPublishResponse,
 };
 use crate::network_info::ClusterNetworkInfoRecord;
 use crate::prelude::*;
@@ -166,8 +157,8 @@ pub(crate) use crate::route_graph_read_model::read_cluster_connectivity_graph;
 #[cfg(test)]
 pub(crate) use crate::route_graph_read_model::read_cluster_connectivity_graph_with_query;
 use crate::rpc::{
-    CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE, CLUSTER_MEMBER_PUBLISH_ROUTE,
-    CLUSTER_MEMBERSHIP_RPC_CATEGORY, ObjectRpcRequest, ObjectRpcResponse,
+    CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY, ObjectRpcRequest,
+    ObjectRpcResponse,
 };
 use crate::status_publish::{ClusterNetworkInfoPublishHost, ClusterNodeStatusPublishHost};
 use crate::voter_reachability::{ClusterVoterReachabilityHost, cluster_has_local_quorum_with_host};
@@ -554,58 +545,6 @@ pub async fn handle_cluster_raft_rpc_request_async(
             operation: "cluster raft rpc".to_string(),
             detail: format!("cluster raft rpc task failed: {source}"),
         })?
-}
-
-pub fn handle_cluster_membership_rpc_request_with_hosts<E, J, M, I>(
-    paths: &ClusterPaths,
-    request: ObjectRpcRequest,
-    signer_node_id: &str,
-    signer_public_key: &str,
-    now: OffsetDateTime,
-    join_host: &mut J,
-    member_host: &mut M,
-    invite_host: &mut I,
-) -> Result<ObjectRpcResponse, E>
-where
-    E: From<NetworkError> + ToString,
-    J: ClusterJoinRegistrationHost,
-    M: ClusterMemberPublishHost<Error = E>,
-    I: ClusterInvitePublishHost<Error = E>,
-{
-    match request.route.as_str() {
-        CLUSTER_JOIN_REGISTER_ROUTE => {
-            let payload: ClusterJoinRegistrationRequest = request.decode_body().map_err(E::from)?;
-            let response =
-                handle_cluster_join_registration_request_with_host(paths, payload, now, join_host)
-                    .map_err(E::from)?;
-            ObjectRpcResponse::encode_body(CLUSTER_JOIN_REGISTER_ROUTE, &response).map_err(E::from)
-        }
-        CLUSTER_INVITE_PUBLISH_ROUTE => {
-            let payload: ClusterInvitePublishRequest = request.decode_body().map_err(E::from)?;
-            let response = handle_cluster_invite_publish_request_with_host(
-                paths,
-                payload,
-                signer_node_id,
-                signer_public_key,
-                now,
-                invite_host,
-            )?;
-            ObjectRpcResponse::encode_body(CLUSTER_INVITE_PUBLISH_ROUTE, &response).map_err(E::from)
-        }
-        CLUSTER_MEMBER_PUBLISH_ROUTE => {
-            let payload: ClusterMemberPublishRequest = request.decode_body().map_err(E::from)?;
-            let response = handle_cluster_member_publish_request_with_host(
-                paths,
-                payload,
-                signer_node_id,
-                member_host,
-            )?;
-            ObjectRpcResponse::encode_body(CLUSTER_MEMBER_PUBLISH_ROUTE, &response).map_err(E::from)
-        }
-        other => Err(E::from(NetworkError::UnknownRoute {
-            route: other.to_string(),
-        })),
-    }
 }
 
 pub(crate) fn handle_cluster_raft_append_request(
