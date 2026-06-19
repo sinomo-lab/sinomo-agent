@@ -8,7 +8,7 @@ use crate::endpoint_selector::{ClusterEndpointInternalSelectionPurpose, ClusterE
 use crate::error::NetworkError;
 use crate::kv_local_store::{
     LocalClusterRaftCommandStorage, append_cluster_raft_command_uncommitted_or_no_effect_async,
-    cluster_kv_raft_store, commit_cluster_raft_index_with_events_async,
+    commit_cluster_raft_index_with_events_async,
     discard_cluster_raft_uncommitted_tail_and_clear_leader_async,
 };
 use crate::member_store::merge_cluster_state_from_peer;
@@ -309,8 +309,9 @@ where
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Result<u64, NetworkError> {
-        cluster_kv_raft_store(paths)
-            .locked_last_log_index(&state.local_node_id)
+        paths
+            .kv_paths()
+            .locked_last_raft_log_index(&state.local_node_id)
             .map_err(Into::into)
     }
 
@@ -320,8 +321,9 @@ where
         state: &ClusterBootstrapState,
         next_index: u64,
     ) -> Result<ClusterRaftAppendRequest, NetworkError> {
-        cluster_kv_raft_store(paths)
-            .locked_build_cluster_raft_append_request_from_next_index(state, next_index)
+        paths
+            .kv_paths()
+            .locked_build_raft_append_request_from_next_index(state, next_index)
             .map_err(Into::into)
     }
 

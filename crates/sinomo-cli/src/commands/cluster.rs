@@ -36,8 +36,7 @@ pub(crate) fn build_cluster_raft_append_request_from_next_index(
 ) -> Result<sinomo_runtime::kv::ClusterRaftAppendRequest, network::NetworkError> {
     paths
         .kv_paths()
-        .raft_store()
-        .build_cluster_raft_append_request_from_next_index(state, next_index)
+        .build_raft_append_request_from_next_index(state, next_index)
         .map_err(Into::into)
 }
 

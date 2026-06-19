@@ -3746,8 +3746,7 @@ impl sinomo_network::ClusterKvAppendReplicationAsyncHost for DaemonClusterContro
         Box::pin(async move {
             paths
                 .kv_paths()
-                .raft_store()
-                .locked_last_log_index_async(&state.local_node_id)
+                .locked_last_raft_log_index_async(&state.local_node_id)
                 .await
                 .map_err(Into::into)
         })
@@ -3762,8 +3761,7 @@ impl sinomo_network::ClusterKvAppendReplicationAsyncHost for DaemonClusterContro
         Box::pin(async move {
             paths
                 .kv_paths()
-                .raft_store()
-                .locked_build_cluster_raft_append_request_from_next_index_async(state, next_index)
+                .locked_build_raft_append_request_from_next_index_async(state, next_index)
                 .await
                 .map_err(Into::into)
         })
@@ -7327,8 +7325,7 @@ mod tests {
                     .expect("raft operation lock");
             let _node = paths_for_holder
                 .kv_paths()
-                .raft_store()
-                .open_node(&local_for_holder)
+                .open_raft_node(&local_for_holder)
                 .expect("hold raft node");
             held_tx.send(()).expect("notify lock held");
             std::thread::sleep(Duration::from_millis(100));

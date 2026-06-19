@@ -3,8 +3,6 @@ use crate::control_plane_options::{
     ClusterControlPlaneTimeouts, ClusterRaftAppendReplicationOptions,
 };
 use crate::error::NetworkError;
-#[cfg(test)]
-use crate::kv_local_store::cluster_kv_raft_store;
 use crate::prelude::*;
 use crate::rpc_future::ClusterMembershipRpcFuture;
 use sinomo_kv::{
@@ -341,8 +339,9 @@ where
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Result<u64, NetworkError> {
-        cluster_kv_raft_store(paths)
-            .locked_last_log_index(&state.local_node_id)
+        paths
+            .kv_paths()
+            .locked_last_raft_log_index(&state.local_node_id)
             .map_err(Into::into)
     }
 
@@ -352,8 +351,9 @@ where
         state: &ClusterBootstrapState,
         next_index: u64,
     ) -> Result<ClusterRaftAppendRequest, NetworkError> {
-        cluster_kv_raft_store(paths)
-            .locked_build_cluster_raft_append_request_from_next_index(state, next_index)
+        paths
+            .kv_paths()
+            .locked_build_raft_append_request_from_next_index(state, next_index)
             .map_err(Into::into)
     }
 

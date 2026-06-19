@@ -323,6 +323,46 @@ impl ClusterKvPaths {
         self.raft_store().locked_local_vote_metadata(node_id)
     }
 
+    pub fn locked_last_raft_log_index(&self, node_id: &NodeId) -> Result<u64, KvError> {
+        self.raft_store().locked_last_log_index(node_id)
+    }
+
+    pub fn open_raft_node(&self, node_id: &NodeId) -> Result<DurableRaftKvNode, KvError> {
+        self.raft_store().open_node(node_id)
+    }
+
+    pub async fn locked_last_raft_log_index_async(&self, node_id: &NodeId) -> Result<u64, KvError> {
+        self.raft_store().locked_last_log_index_async(node_id).await
+    }
+
+    pub fn build_raft_append_request_from_next_index(
+        &self,
+        state: &ClusterBootstrapState,
+        next_index: u64,
+    ) -> Result<ClusterRaftAppendRequest, KvError> {
+        self.raft_store()
+            .build_cluster_raft_append_request_from_next_index(state, next_index)
+    }
+
+    pub fn locked_build_raft_append_request_from_next_index(
+        &self,
+        state: &ClusterBootstrapState,
+        next_index: u64,
+    ) -> Result<ClusterRaftAppendRequest, KvError> {
+        self.raft_store()
+            .locked_build_cluster_raft_append_request_from_next_index(state, next_index)
+    }
+
+    pub async fn locked_build_raft_append_request_from_next_index_async(
+        &self,
+        state: &ClusterBootstrapState,
+        next_index: u64,
+    ) -> Result<ClusterRaftAppendRequest, KvError> {
+        self.raft_store()
+            .locked_build_cluster_raft_append_request_from_next_index_async(state, next_index)
+            .await
+    }
+
     pub fn append_kv_ops_in_batches_and_publish<F>(
         &self,
         node_id: &NodeId,
