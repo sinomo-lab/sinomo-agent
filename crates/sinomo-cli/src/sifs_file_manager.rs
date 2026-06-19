@@ -9,9 +9,10 @@ use sinomo_runtime::dfs::{
     DfsMetadataJournalReplicationOptions, DfsMetadataShardConfig, DfsNodeAdvertisement,
     DfsObjectKind, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
     DfsPeerTransportFuture, DfsStat, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
-    content_services_prefix, default_dfs_metadata_root, default_dfs_metadata_shards_root,
-    fallback_dfs_node_id, metadata_shards_prefix, open_local_sharded_metadata_backend,
-    open_root_local_metadata_backend, publish_cluster_dfs_metadata_journal, sifs_file_system_id,
+    cluster_dfs_data_endpoints, content_services_prefix, default_dfs_metadata_root,
+    default_dfs_metadata_shards_root, fallback_dfs_node_id, metadata_shards_prefix,
+    open_local_sharded_metadata_backend, open_root_local_metadata_backend,
+    publish_cluster_dfs_metadata_journal, sifs_file_system_id,
 };
 use sinomo_runtime::kv::{self, KvError, KvOp, KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;
@@ -86,10 +87,7 @@ impl SifsFileManagerBackend {
         let Ok(state) = network::read_cluster_state_without_kv(&cluster_paths) else {
             return;
         };
-        service.refresh_endpoint_targets(
-            network::ClusterEndpointSelector::new(&cluster_paths, &state)
-                .select(network::ClusterEndpointSelectionPurpose::DfsData),
-        );
+        service.refresh_endpoint_targets(cluster_dfs_data_endpoints(&cluster_paths, &state));
     }
 
     pub(crate) fn publish_metadata_after_mutation(&self) {
@@ -654,8 +652,7 @@ fn open_sifs_service_with_hydration(
     let (local_node_id, endpoints) = if cluster_paths.state.exists() {
         let state = network::read_cluster_state_without_kv(&cluster_paths)
             .map_err(|error| format!("cannot read local cluster state: {error}"))?;
-        let endpoints = network::ClusterEndpointSelector::new(&cluster_paths, &state)
-            .select(network::ClusterEndpointSelectionPurpose::DfsData);
+        let endpoints = cluster_dfs_data_endpoints(&cluster_paths, &state);
         (state.local_node_id, endpoints)
     } else {
         (fallback_dfs_node_id(), Vec::new())
@@ -815,8 +812,7 @@ fn sifs_replica_candidates(data_dir: &SinomoDataDir, local_node_id: &NodeId) -> 
     let Ok(state) = network::read_cluster_state_without_kv(&cluster_paths) else {
         return candidates;
     };
-    let routable_node_ids = network::ClusterEndpointSelector::new(&cluster_paths, &state)
-        .select(network::ClusterEndpointSelectionPurpose::DfsData)
+    let routable_node_ids = cluster_dfs_data_endpoints(&cluster_paths, &state)
         .into_iter()
         .map(|endpoint| endpoint.node_id)
         .collect::<BTreeSet<_>>();

@@ -96,6 +96,14 @@ pub type DfsFileSystemId = sinomo_core::Id;
 pub type DfsObjectId = sinomo_core::Id;
 pub type DfsVersion = sinomo_core::Id;
 
+pub fn cluster_dfs_data_endpoints(
+    cluster_paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    sinomo_network::ClusterEndpointSelector::new(cluster_paths, state)
+        .select(sinomo_network::ClusterEndpointSelectionPurpose::DfsData)
+}
+
 use serde::{Deserialize, Serialize};
 pub use service::{
     DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture, DfsDataPlaneService,
@@ -1784,8 +1792,7 @@ pub fn publish_cluster_dfs_metadata_journal(
     let file_system = distributed_sifs(state.local_node_id.clone());
     let shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
 
-    let endpoints = sinomo_network::ClusterEndpointSelector::new(cluster_paths, &state)
-        .select(sinomo_network::ClusterEndpointSelectionPurpose::DfsData);
+    let endpoints = cluster_dfs_data_endpoints(cluster_paths, &state);
     let mut transport = DfsMetadataEndpointTransport::new(endpoints, sender, snapshot_sender);
     let mut host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     publish_dfs_metadata_journal_with_host(
@@ -3156,8 +3163,7 @@ pub fn run_cluster_dfs_maintenance_tick_with_message_sender(
     let local_node_id = state.local_node_id.clone();
     let file_system = distributed_sifs(local_node_id.clone());
     let metadata_shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
-    let endpoints = sinomo_network::ClusterEndpointSelector::new(cluster_paths, &state)
-        .select(sinomo_network::ClusterEndpointSelectionPurpose::DfsData);
+    let endpoints = cluster_dfs_data_endpoints(cluster_paths, &state);
     let mut service = open_cluster_dfs_service_with_message_sender(
         data_dir,
         cluster_paths,
@@ -3207,8 +3213,7 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport(
     let local_node_id = state.local_node_id.clone();
     let file_system = distributed_sifs(local_node_id.clone());
     let metadata_shards = cluster_dfs_metadata_shards(&cluster_paths, &file_system.file_system_id)?;
-    let endpoints = sinomo_network::ClusterEndpointSelector::new(&cluster_paths, &state)
-        .select(sinomo_network::ClusterEndpointSelectionPurpose::DfsData);
+    let endpoints = cluster_dfs_data_endpoints(&cluster_paths, &state);
     let mut service = open_cluster_dfs_service_with_message_senders(
         &data_dir,
         &cluster_paths,
@@ -3379,8 +3384,7 @@ pub fn run_cluster_dfs_smoke_with_message_sender(
     let local_node_id = state.local_node_id.clone();
     let file_system = distributed_sifs(local_node_id.clone());
     let metadata_shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
-    let endpoints = sinomo_network::ClusterEndpointSelector::new(cluster_paths, &state)
-        .select(sinomo_network::ClusterEndpointSelectionPurpose::DfsData);
+    let endpoints = cluster_dfs_data_endpoints(cluster_paths, &state);
     let routable_node_ids = endpoints
         .iter()
         .map(|endpoint| endpoint.node_id.clone())
@@ -6810,8 +6814,7 @@ fn prepare_cluster_dfs_metadata_journal_publish(
         .map_err(DfsError::from_network)?;
     let file_system = distributed_sifs(state.local_node_id.clone());
     let shards = cluster_dfs_metadata_shards(&cluster_paths, &file_system.file_system_id)?;
-    let endpoints = sinomo_network::ClusterEndpointSelector::new(&cluster_paths, &state)
-        .select(sinomo_network::ClusterEndpointSelectionPurpose::DfsData);
+    let endpoints = cluster_dfs_data_endpoints(&cluster_paths, &state);
     let mut host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     let (outcomes, targets) = prepare_dfs_metadata_journal_publish_with_host(
         file_system.file_system_id,
