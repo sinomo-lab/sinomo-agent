@@ -584,24 +584,6 @@ pub(crate) fn cluster_raft_known_leader_id(
         .filter(|leader_id| sinomo_runtime::kv::cluster_kv_raft_node_is_voter(state, leader_id)))
 }
 
-pub(crate) fn locked_cluster_raft_known_leader_id(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Result<Option<NodeId>, network::NetworkError> {
-    Ok(cluster_kv_raft_store(paths)
-        .locked_known_leader_id(&state.local_node_id)?
-        .filter(|leader_id| sinomo_runtime::kv::cluster_kv_raft_node_is_voter(state, leader_id)))
-}
-
-pub(crate) fn locked_cluster_raft_local_is_leader(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Result<bool, network::NetworkError> {
-    Ok(sinomo_runtime::kv::cluster_kv_raft_local_is_voter(state)
-        && locked_cluster_raft_known_leader_id(paths, state)?.as_ref()
-            == Some(&state.local_node_id))
-}
-
 #[cfg(test)]
 pub(crate) fn set_cluster_raft_leader(
     paths: &ClusterPaths,
