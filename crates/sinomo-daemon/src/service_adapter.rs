@@ -8,10 +8,10 @@
 //!
 //! The registry mixes host-agnostic services from `sinomo-service` and native modules
 //! such as `sinomo-rollout` with **daemon-foundational** services defined here
-//! ([`DaemonControlService`], [`ClusterKvService`], [`ClusterHealthService`],
-//! [`ClusterRelayService`]) that own daemon state (their [`DaemonPaths`], which encode
-//! whether this is the main or shadow daemon) and call the daemon's own cluster/control
-//! handlers. Consuming services receive a real
+//! ([`DaemonControlService`], [`ClusterKvService`], [`ClusterKvConsensusService`],
+//! [`ClusterHealthService`], [`ClusterRelayService`]) that own daemon state
+//! (their [`DaemonPaths`], which encode whether this is the main or shadow daemon)
+//! and call the daemon's own cluster/control handlers. Consuming services receive a real
 //! [`DaemonClusterAccess`] via [`ServiceContext::cluster`] when the node is clustered.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -656,17 +656,17 @@ impl Service for ClusterRelayService {
     }
 }
 
-/// Daemon adapter for cluster raft consensus (append + vote). Request identity flows
-/// through `ServiceContext::signer`; `sinomo-network` validates that identity against
-/// cluster membership and applies the network-owned raft RPC policy.
-struct ClusterRaftService {
+/// Daemon adapter for the KV-owned consensus routes. Request identity flows through
+/// `ServiceContext::signer`; `sinomo-network` validates that identity against cluster
+/// membership and applies the transport policy.
+struct ClusterKvConsensusService {
     paths: DaemonPaths,
     runtime: Option<tokio::runtime::Handle>,
 }
 
-impl Service for ClusterRaftService {
+impl Service for ClusterKvConsensusService {
     fn name(&self) -> &'static str {
-        "cluster-raft"
+        "cluster-kv-consensus"
     }
 
     fn routes(&self) -> &'static [&'static str] {
@@ -689,8 +689,8 @@ impl Service for ClusterRaftService {
             }
             let cluster_paths = cluster_paths_from_daemon_paths(&paths).map_err(daemon_error)?;
             let authenticated_peer = cluster_authenticated_peer(&ctx.signer, &route)?;
-            let runtime = require_service_runtime(runtime.as_ref(), "cluster raft rpc")?;
-            let response = sinomo_network::handle_cluster_raft_rpc_request_async(
+            let runtime = require_service_runtime(runtime.as_ref(), "cluster kv consensus rpc")?;
+            let response = sinomo_network::handle_cluster_kv_consensus_rpc_request_async(
                 runtime,
                 &cluster_paths,
                 request,
@@ -1337,7 +1337,7 @@ fn daemon_service_registry(
             paths: paths.clone(),
             runtime: service_runtime.cloned(),
         })
-        .register(ClusterRaftService {
+        .register(ClusterKvConsensusService {
             paths: paths.clone(),
             runtime: service_runtime.cloned(),
         })

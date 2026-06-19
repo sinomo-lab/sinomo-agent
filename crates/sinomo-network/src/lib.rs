@@ -350,9 +350,9 @@ pub(crate) use raft_replication::{
     replicate_cluster_raft_to_endpoint_async_with_host,
     replicate_cluster_raft_to_endpoint_with_host,
 };
+pub use raft_rpc::handle_cluster_kv_consensus_rpc_request_async;
 #[cfg(test)]
 pub(crate) use raft_rpc::handle_cluster_raft_rpc_request;
-pub use raft_rpc::handle_cluster_raft_rpc_request_async;
 pub(crate) use roaming::read_iroh_endpoint_record_async;
 #[cfg(test)]
 pub(crate) use roaming::send_daemon_rpc_to_cluster_endpoint_async;

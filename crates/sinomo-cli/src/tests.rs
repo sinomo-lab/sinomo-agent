@@ -456,11 +456,11 @@ fn handle_cluster_raft_append_rpc(
         .enable_all()
         .build()
         .map_err(|error| network::NetworkError::Io {
-            operation: "cli test cluster raft rpc runtime".to_string(),
+            operation: "cli test cluster kv consensus rpc runtime".to_string(),
             detail: error.to_string(),
         })?;
     let peer = authenticated_cluster_peer(authenticated);
-    let response = runtime.block_on(network::handle_cluster_raft_rpc_request_async(
+    let response = runtime.block_on(network::handle_cluster_kv_consensus_rpc_request_async(
         runtime.handle(),
         paths,
         rpc,
@@ -484,11 +484,11 @@ fn handle_cluster_raft_vote_rpc(
         .enable_all()
         .build()
         .map_err(|error| network::NetworkError::Io {
-            operation: "cli test cluster raft rpc runtime".to_string(),
+            operation: "cli test cluster kv consensus rpc runtime".to_string(),
             detail: error.to_string(),
         })?;
     let peer = authenticated_cluster_peer(authenticated);
-    let response = runtime.block_on(network::handle_cluster_raft_rpc_request_async(
+    let response = runtime.block_on(network::handle_cluster_kv_consensus_rpc_request_async(
         runtime.handle(),
         paths,
         rpc,

@@ -8728,7 +8728,7 @@ fn cluster_raft_rpc_dispatch_decodes_and_encodes_append_and_vote() {
         .build()
         .expect("runtime");
     let vote_response = runtime
-        .block_on(handle_cluster_raft_rpc_request_async(
+        .block_on(handle_cluster_kv_consensus_rpc_request_async(
             runtime.handle(),
             &paths,
             vote_rpc,

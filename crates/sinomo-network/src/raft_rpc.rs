@@ -33,7 +33,7 @@ pub(crate) fn handle_cluster_raft_rpc_request(
     ))
 }
 
-pub async fn handle_cluster_raft_rpc_request_async(
+pub async fn handle_cluster_kv_consensus_rpc_request_async(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     request: ObjectRpcRequest,
@@ -47,8 +47,8 @@ pub async fn handle_cluster_raft_rpc_request_async(
         })
         .await
         .map_err(|source| NetworkError::Io {
-            operation: "cluster raft rpc".to_string(),
-            detail: format!("cluster raft rpc task failed: {source}"),
+            operation: "cluster kv consensus rpc".to_string(),
+            detail: format!("cluster kv consensus rpc task failed: {source}"),
         })?
 }
 
