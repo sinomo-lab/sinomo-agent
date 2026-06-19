@@ -56,15 +56,15 @@ use sinomo_kv::{
     CLUSTER_RAFT_RPC_CATEGORY, CLUSTER_RAFT_VOTE_ROUTE, ClusterKvRaftAppendReplicationOutcome,
     ClusterKvRaftCommandStorage, ClusterKvRaftLeaderElectionOptions,
     ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult,
-    ClusterKvRaftUncommittedAppend, ClusterKvTxnCommitResult, ClusterKvWatchAllocatorState,
-    ClusterKvWatchCancelRequest, ClusterKvWatchCancelResponse, ClusterKvWatchDrainRequest,
-    ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, ClusterKvWatchPrefixRequest,
-    ClusterKvWatchRegistration, ClusterRaftAppendRequest, ClusterRaftAppendResponse,
-    ClusterRaftVoteRequest, ClusterRaftVoteResponse, InProcessKvStore, KvCommand, KvCompare,
-    KvEntry, KvError, KvEventKind, KvOp, KvOpResponse, KvRevision, KvSnapshot, KvTxn, LeaseId,
-    MAX_CLUSTER_KV_ACTIVE_WATCHES, MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
-    MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES, MAX_CLUSTER_KV_WATCH_EVENTS, RaftAppendEntriesRequest,
-    RaftAppendEntriesResponse, RaftRequestVoteRequest, RaftSnapshot,
+    ClusterKvRaftUncommittedAppend, ClusterKvWatchAllocatorState, ClusterKvWatchCancelRequest,
+    ClusterKvWatchCancelResponse, ClusterKvWatchDrainRequest, ClusterKvWatchEventsRequest,
+    ClusterKvWatchEventsResponse, ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration,
+    ClusterRaftAppendRequest, ClusterRaftAppendResponse, ClusterRaftVoteRequest,
+    ClusterRaftVoteResponse, InProcessKvStore, KvCommand, KvCompare, KvEntry, KvError, KvEventKind,
+    KvOp, KvOpResponse, KvRevision, KvSnapshot, KvTxn, LeaseId, MAX_CLUSTER_KV_ACTIVE_WATCHES,
+    MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS, MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES,
+    MAX_CLUSTER_KV_WATCH_EVENTS, RaftAppendEntriesRequest, RaftAppendEntriesResponse,
+    RaftRequestVoteRequest, RaftSnapshot,
 };
 use sinomo_node::{
     ClusterCapabilityPolicyRecord, ClusterIdentityRecord, ClusterInvitationStateRecord, NodeId,
@@ -9223,6 +9223,26 @@ struct RecordingKvTxnQuorumHost {
     commit_calls: usize,
 }
 
+impl ClusterKvTxnForwardHost for RecordingKvTxnQuorumHost {
+    fn known_raft_leader_id(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, NetworkError> {
+        panic!("forwarded non-leader requests must not forward again")
+    }
+
+    fn send_object_rpc_to_node(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        _target_node_id: &NodeId,
+        _request: &ObjectRpcRequest,
+        _timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        panic!("forwarded non-leader requests must not forward again")
+    }
+}
+
 impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
     fn local_is_raft_leader(
         &mut self,
@@ -9231,16 +9251,6 @@ impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
     ) -> Result<bool, NetworkError> {
         self.leader_checks += 1;
         Ok(false)
-    }
-
-    fn forward_cluster_kv_txn_to_voter(
-        &mut self,
-        _paths: &ClusterPaths,
-        _state: &ClusterBootstrapState,
-        _txn: &KvTxn,
-        _options: ClusterKvTxnForwardOptions,
-    ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
-        panic!("forwarded non-leader requests must not forward again")
     }
 
     fn elect_cluster_raft_leader(

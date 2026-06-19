@@ -678,22 +678,6 @@ impl network::ClusterKvTxnQuorumHost for CliClusterKvTxnQuorumHost {
         locked_cluster_raft_local_is_leader(paths, state)
     }
 
-    fn forward_cluster_kv_txn_to_voter(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-        txn: &KvTxn,
-        options: network::ClusterKvTxnForwardOptions,
-    ) -> Result<Option<sinomo_runtime::kv::ClusterKvTxnCommitResult>, network::NetworkError> {
-        network::forward_cluster_kv_txn_to_voter_with_host(
-            paths,
-            state,
-            txn,
-            options,
-            &mut CliClusterKvTxnForwardHost,
-        )
-    }
-
     fn elect_cluster_raft_leader(
         &mut self,
         paths: &ClusterPaths,
@@ -914,9 +898,7 @@ impl network::ClusterRaftVoteTransportHost for CliClusterRaftLeaderElectionHost 
     }
 }
 
-struct CliClusterKvTxnForwardHost;
-
-impl network::ClusterKvTxnForwardHost for CliClusterKvTxnForwardHost {
+impl network::ClusterKvTxnForwardHost for CliClusterKvTxnQuorumHost {
     fn known_raft_leader_id(
         &mut self,
         paths: &ClusterPaths,

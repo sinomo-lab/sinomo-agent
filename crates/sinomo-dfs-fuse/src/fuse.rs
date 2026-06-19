@@ -15,9 +15,9 @@ use sinomo_runtime::dfs::{
 use sinomo_runtime::kv::{
     ClusterKvRaftAppendReplicationOutcome, ClusterKvRaftCommandStorage, ClusterKvRaftCommitResult,
     ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult, ClusterKvRaftStore,
-    ClusterKvRaftUncommittedAppend, ClusterKvTxnCommitResult, KvCommand, KvEntry, KvError, KvEvent,
-    KvOp, KvRevision, KvTxn, KvTxnResponse, cluster_kv_raft_local_is_voter,
-    cluster_kv_raft_node_is_voter, lock_cluster_kv_raft_operation_for_paths, read_cluster_kv_entry,
+    ClusterKvRaftUncommittedAppend, KvCommand, KvEntry, KvError, KvEvent, KvOp, KvRevision, KvTxn,
+    KvTxnResponse, cluster_kv_raft_local_is_voter, cluster_kv_raft_node_is_voter,
+    lock_cluster_kv_raft_operation_for_paths, read_cluster_kv_entry,
     read_cluster_kv_prefix_entries,
 };
 use sinomo_runtime::local::SinomoDataDir;
@@ -1313,22 +1313,6 @@ impl network::ClusterKvTxnQuorumHost for DfsFuseClusterKvTxnQuorumHost {
         })
     }
 
-    fn forward_cluster_kv_txn_to_voter(
-        &mut self,
-        paths: &network::ClusterPaths,
-        state: &ClusterBootstrapState,
-        txn: &KvTxn,
-        options: network::ClusterKvTxnForwardOptions,
-    ) -> std::result::Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
-        network::forward_cluster_kv_txn_to_voter_with_host(
-            paths,
-            state,
-            txn,
-            options,
-            &mut DfsFuseClusterKvTxnForwardHost,
-        )
-    }
-
     fn elect_cluster_raft_leader(
         &mut self,
         paths: &network::ClusterPaths,
@@ -1526,9 +1510,7 @@ impl network::ClusterRaftVoteTransportHost for DfsFuseClusterRaftLeaderElectionH
     }
 }
 
-struct DfsFuseClusterKvTxnForwardHost;
-
-impl network::ClusterKvTxnForwardHost for DfsFuseClusterKvTxnForwardHost {
+impl network::ClusterKvTxnForwardHost for DfsFuseClusterKvTxnQuorumHost {
     fn known_raft_leader_id(
         &mut self,
         paths: &network::ClusterPaths,

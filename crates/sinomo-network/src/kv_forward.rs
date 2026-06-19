@@ -54,7 +54,7 @@ pub trait ClusterKvTxnForwardHost {
     ) -> Result<ObjectRpcResponse, NetworkError>;
 }
 
-pub fn forward_cluster_kv_txn_to_voter_with_host(
+pub(crate) fn forward_cluster_kv_txn_to_voter_with_host(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     txn: &KvTxn,
@@ -153,7 +153,7 @@ fn forward_cluster_kv_txn_to_voter_node_with_host(
     })
 }
 
-pub async fn forward_cluster_kv_txn_to_voter_async_with_host<H>(
+pub(crate) async fn forward_cluster_kv_txn_to_voter_async_with_host<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,

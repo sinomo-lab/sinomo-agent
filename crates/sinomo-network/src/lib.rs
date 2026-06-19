@@ -189,9 +189,9 @@ pub use keyspace::{
     cluster_connectivity_key, cluster_connectivity_source_prefix, cluster_endpoint_key,
     cluster_endpoint_prefix, cluster_network_info_key,
 };
-pub use kv_forward::{
-    ClusterKvTxnForwardHost, ClusterKvTxnForwardOptions, forward_cluster_kv_txn_to_voter_with_host,
-};
+#[cfg(test)]
+pub(crate) use kv_forward::forward_cluster_kv_txn_to_voter_with_host;
+pub use kv_forward::{ClusterKvTxnForwardHost, ClusterKvTxnForwardOptions};
 pub use kv_read_model::{
     read_cluster_connectivity_graph_from_kv, read_cluster_members_from_kv,
     read_cluster_node_statuses_from_kv,

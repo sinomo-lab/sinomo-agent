@@ -33,7 +33,7 @@ use sinomo_kv::{
     ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult, ClusterKvTxnCommitResult,
 };
 
-pub trait ClusterKvTxnQuorumHost {
+pub trait ClusterKvTxnQuorumHost: crate::kv_forward::ClusterKvTxnForwardHost {
     fn refresh_current_cluster_kv_store(
         &mut self,
         _paths: &ClusterPaths,
@@ -54,7 +54,12 @@ pub trait ClusterKvTxnQuorumHost {
         state: &ClusterBootstrapState,
         txn: &KvTxn,
         options: ClusterKvTxnForwardOptions,
-    ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError>;
+    ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError>
+    where
+        Self: Sized,
+    {
+        forward_cluster_kv_txn_to_voter_with_host(paths, state, txn, options, self)
+    }
 
     fn elect_cluster_raft_leader(
         &mut self,
@@ -121,16 +126,6 @@ where
         state: &ClusterBootstrapState,
     ) -> Result<bool, NetworkError> {
         locked_cluster_raft_local_is_leader(paths, state)
-    }
-
-    fn forward_cluster_kv_txn_to_voter(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-        txn: &KvTxn,
-        options: ClusterKvTxnForwardOptions,
-    ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
-        forward_cluster_kv_txn_to_voter_with_host(paths, state, txn, options, self)
     }
 
     fn elect_cluster_raft_leader(
