@@ -4587,20 +4587,21 @@ impl sinomo_network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost<'_> {
     fn try_deliver_local_async<'a>(
         &'a mut self,
         state: &'a ClusterBootstrapState,
-        envelope: &'a sinomo_network::RelayEnvelope,
+        target_node_id: &'a NodeId,
+        inner_request: &'a sinomo_network::ObjectRpcRequest,
         timeouts: sinomo_network::DaemonRpcTimeouts,
     ) -> DaemonClusterRelayFuture<'a, Option<sinomo_network::ObjectRpcResponse>> {
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
         let state = state.clone();
-        let target_node_id = envelope.target_node_id().clone();
-        let envelope = envelope.clone();
+        let target_node_id = target_node_id.clone();
+        let inner_request = inner_request.clone();
         Box::pin(async move {
             if target_node_id == relay_local_node_id(&paths, &state) {
                 return crate::control::dispatch_daemon_control_request_in_process_async(
                     paths,
                     runtime,
-                    envelope.into_inner(),
+                    inner_request,
                 )
                 .await
                 .map(Some)
@@ -4618,11 +4619,12 @@ impl sinomo_network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost<'_> {
             let Some(delivery) = delivery else {
                 return Ok(None);
             };
-            let inner = envelope.into_inner();
             match delivery {
                 RelayLocalDeliveryTarget::CurrentProcess(paths) => {
                     crate::control::dispatch_daemon_control_request_in_process_async(
-                        paths, runtime, inner,
+                        paths,
+                        runtime,
+                        inner_request,
                     )
                     .await
                     .map(Some)
@@ -4633,7 +4635,7 @@ impl sinomo_network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost<'_> {
                 RelayLocalDeliveryTarget::LoopbackAddress(local_address) => {
                     sinomo_network::send_daemon_control_rpc_request_async(
                         &local_address,
-                        &inner,
+                        &inner_request,
                         timeouts,
                         sinomo_network::IROH_DAEMON_COMMAND_MAX_BYTES,
                     )

@@ -433,7 +433,8 @@ pub trait ClusterRelayAsyncHost {
     fn try_deliver_local_async<'a>(
         &'a mut self,
         state: &'a ClusterBootstrapState,
-        envelope: &'a RelayEnvelope,
+        target_node_id: &'a NodeId,
+        inner_request: &'a ObjectRpcRequest,
         timeouts: DaemonRpcTimeouts,
     ) -> Pin<Box<dyn Future<Output = Result<Option<ObjectRpcResponse>, NetworkError>> + Send + 'a>>;
 
@@ -1662,7 +1663,12 @@ async fn handle_cluster_relay_envelope_async_with_host(
 ) -> Result<ObjectRpcResponse, NetworkError> {
     if sinomo_node::cluster_node_is_local_process(state, &envelope.target_node_id) {
         if let Some(response) = host
-            .try_deliver_local_async(state, &envelope, options.timeouts)
+            .try_deliver_local_async(
+                state,
+                &envelope.target_node_id,
+                envelope.inner(),
+                options.timeouts,
+            )
             .await?
         {
             return Ok(response);
@@ -5477,7 +5483,8 @@ mod tests {
         fn try_deliver_local_async<'a>(
             &'a mut self,
             _state: &'a ClusterBootstrapState,
-            _envelope: &'a RelayEnvelope,
+            _target_node_id: &'a NodeId,
+            _inner_request: &'a ObjectRpcRequest,
             timeouts: DaemonRpcTimeouts,
         ) -> ClusterRelayFuture<'a, Option<ObjectRpcResponse>> {
             Box::pin(async move {
