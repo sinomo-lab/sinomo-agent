@@ -719,10 +719,10 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
 fn daemon_rpc_connectivity_observation(
     observation: sinomo_network::ClusterSignedEndpointRpcObservation,
 ) -> (sinomo_network::ClusterConnectivityState, Option<u64>, bool) {
-    match observation.kind {
+    match observation.kind() {
         sinomo_network::ClusterSignedEndpointRpcObservationKind::Success => (
             sinomo_network::ClusterConnectivityState::Healthy,
-            observation.latency_ms,
+            observation.latency_ms(),
             false,
         ),
         sinomo_network::ClusterSignedEndpointRpcObservationKind::IoFailure => (
@@ -1683,19 +1683,13 @@ mod tests {
     #[test]
     fn daemon_rpc_connectivity_observation_classifies_endpoint_failures() {
         let healthy = super::daemon_rpc_connectivity_observation(
-            sinomo_network::ClusterSignedEndpointRpcObservation {
-                kind: sinomo_network::ClusterSignedEndpointRpcObservationKind::Success,
-                latency_ms: Some(5),
-            },
+            sinomo_network::ClusterSignedEndpointRpcObservation::success(Some(5)),
         );
         assert_eq!(healthy.0, sinomo_network::ClusterConnectivityState::Healthy);
         assert_eq!(healthy.1, Some(5));
 
         let degraded = super::daemon_rpc_connectivity_observation(
-            sinomo_network::ClusterSignedEndpointRpcObservation {
-                kind: sinomo_network::ClusterSignedEndpointRpcObservationKind::IoFailure,
-                latency_ms: None,
-            },
+            sinomo_network::ClusterSignedEndpointRpcObservation::io_failure(),
         );
         assert_eq!(
             degraded,
@@ -1707,10 +1701,7 @@ mod tests {
         );
 
         let auth_denied = super::daemon_rpc_connectivity_observation(
-            sinomo_network::ClusterSignedEndpointRpcObservation {
-                kind: sinomo_network::ClusterSignedEndpointRpcObservationKind::AuthDenied,
-                latency_ms: None,
-            },
+            sinomo_network::ClusterSignedEndpointRpcObservation::auth_denied(),
         );
         assert_eq!(
             auth_denied,

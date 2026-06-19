@@ -518,8 +518,39 @@ pub enum ClusterSignedEndpointRpcObservationKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClusterSignedEndpointRpcObservation {
-    pub kind: ClusterSignedEndpointRpcObservationKind,
-    pub latency_ms: Option<u64>,
+    kind: ClusterSignedEndpointRpcObservationKind,
+    latency_ms: Option<u64>,
+}
+
+impl ClusterSignedEndpointRpcObservation {
+    pub fn success(latency_ms: Option<u64>) -> Self {
+        Self {
+            kind: ClusterSignedEndpointRpcObservationKind::Success,
+            latency_ms,
+        }
+    }
+
+    pub fn io_failure() -> Self {
+        Self {
+            kind: ClusterSignedEndpointRpcObservationKind::IoFailure,
+            latency_ms: None,
+        }
+    }
+
+    pub fn auth_denied() -> Self {
+        Self {
+            kind: ClusterSignedEndpointRpcObservationKind::AuthDenied,
+            latency_ms: None,
+        }
+    }
+
+    pub fn kind(&self) -> ClusterSignedEndpointRpcObservationKind {
+        self.kind
+    }
+
+    pub fn latency_ms(&self) -> Option<u64> {
+        self.latency_ms
+    }
 }
 
 pub trait ClusterSignedEndpointRpcAsyncHost: Send {
@@ -598,18 +629,11 @@ fn cluster_signed_endpoint_rpc_observation(
     started: Instant,
 ) -> Option<ClusterSignedEndpointRpcObservation> {
     match result {
-        Ok(_) => Some(ClusterSignedEndpointRpcObservation {
-            kind: ClusterSignedEndpointRpcObservationKind::Success,
-            latency_ms: Some(cluster_signed_endpoint_rpc_elapsed_latency_ms(started)),
-        }),
-        Err(NetworkError::Io { .. }) => Some(ClusterSignedEndpointRpcObservation {
-            kind: ClusterSignedEndpointRpcObservationKind::IoFailure,
-            latency_ms: None,
-        }),
-        Err(NetworkError::AuthDenied) => Some(ClusterSignedEndpointRpcObservation {
-            kind: ClusterSignedEndpointRpcObservationKind::AuthDenied,
-            latency_ms: None,
-        }),
+        Ok(_) => Some(ClusterSignedEndpointRpcObservation::success(Some(
+            cluster_signed_endpoint_rpc_elapsed_latency_ms(started),
+        ))),
+        Err(NetworkError::Io { .. }) => Some(ClusterSignedEndpointRpcObservation::io_failure()),
+        Err(NetworkError::AuthDenied) => Some(ClusterSignedEndpointRpcObservation::auth_denied()),
         Err(_) => None,
     }
 }
