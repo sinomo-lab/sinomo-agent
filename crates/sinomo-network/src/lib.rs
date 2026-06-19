@@ -50,6 +50,7 @@ mod object;
 mod object_file_store;
 mod paths;
 mod peer;
+mod raft_election;
 mod raft_replication;
 mod records;
 mod roaming;
@@ -318,6 +319,10 @@ pub use peer::{
     AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions, InProcessNetwork,
     InProcessObjectRpcMessage, InProcessTransport, InboundObjectRpcMessage,
 };
+pub use raft_election::{
+    ClusterRaftVoteTransportAsyncHost, ClusterRaftVoteTransportHost,
+    elect_cluster_raft_leader_async_with_host, elect_cluster_raft_leader_with_host,
+};
 pub use raft_replication::{
     ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
 };
@@ -370,10 +375,9 @@ pub use status_publish::{
 pub use storage::{
     ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost, ClusterRaftCommittedFanoutAsyncHost,
     ClusterRaftQuorumAsyncHost, ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult,
-    ClusterRaftQuorumTransportHost, ClusterRaftVoteTransportAsyncHost,
-    ClusterRaftVoteTransportHost, cleanup_legacy_shadow_daemon_members_with_host,
+    ClusterRaftQuorumTransportHost, cleanup_legacy_shadow_daemon_members_with_host,
     cluster_state_sync_txn, commit_cluster_kv_txn_with_quorum_response_with_host,
-    commit_cluster_raft_command_with_quorum_driver, elect_cluster_raft_leader_with_host,
+    commit_cluster_raft_command_with_quorum_driver,
     handle_cluster_membership_rpc_request_with_hosts, handle_cluster_raft_rpc_request,
     remove_cluster_members_with_host, replicate_cluster_raft_to_endpoint_with_host,
     spawn_cluster_raft_committed_fanout_worker_on_runtime, sync_cluster_state_to_kv_with_host,
