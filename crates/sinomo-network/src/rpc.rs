@@ -1,5 +1,7 @@
 use crate::error::NetworkError;
-use crate::object::{ObjectFrameIoOptions, SinomoObjectCodec};
+#[cfg(test)]
+use crate::object::ObjectFrameIoOptions;
+use crate::object::SinomoObjectCodec;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use sinomo_core::CapabilityName;
@@ -10,6 +12,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use time::OffsetDateTime;
+#[cfg(test)]
 use tokio::io::{AsyncRead, AsyncWrite};
 use tower_layer::Layer;
 use tower_service::Service;
@@ -1217,7 +1220,8 @@ where
     }
 }
 
-pub async fn call_object_rpc_frame_async<IO>(
+#[cfg(test)]
+pub(crate) async fn call_object_rpc_frame_async<IO>(
     stream: &mut IO,
     request: &ObjectRpcRequest,
     max_response_bytes: usize,
@@ -1241,7 +1245,8 @@ where
     service.call(request).await
 }
 
-pub async fn serve_object_rpc_frame_async<IO, S>(
+#[cfg(test)]
+pub(crate) async fn serve_object_rpc_frame_async<IO, S>(
     stream: &mut IO,
     service: &mut S,
     max_request_bytes: usize,
@@ -1255,72 +1260,6 @@ where
         crate::read_object_frame_async(stream, max_request_bytes, frame_options).await?;
     let response = call_object_rpc_service_async(service, request).await?;
     crate::write_object_frame_async(stream, &response, frame_options).await
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ServiceCategoryLayer {
-    pub category: ServiceCategory,
-}
-
-impl ServiceCategoryLayer {
-    pub fn new(name: impl Into<String>, summary: impl Into<String>) -> Self {
-        Self {
-            category: ServiceCategory::new(name, summary),
-        }
-    }
-}
-
-impl<S> Layer<S> for ServiceCategoryLayer {
-    type Service = CategorizedService<S>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        CategorizedService {
-            category: self.category.clone(),
-            inner,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct CategorizedService<S> {
-    category: ServiceCategory,
-    inner: S,
-}
-
-impl<S> CategorizedService<S> {
-    pub fn category(&self) -> &ServiceCategory {
-        &self.category
-    }
-}
-
-impl<S> ObjectRpcRouteCatalog for CategorizedService<S>
-where
-    S: ObjectRpcRouteCatalog,
-{
-    fn object_rpc_route_descriptor(&self, route: &str) -> Option<ObjectRouteDescriptor> {
-        self.inner.object_rpc_route_descriptor(route)
-    }
-
-    fn object_rpc_route_readiness(&self, route: &str) -> Option<ObjectRpcRouteReadiness> {
-        self.inner.object_rpc_route_readiness(route)
-    }
-}
-
-impl<S> Service<ObjectRpcRequest> for CategorizedService<S>
-where
-    S: Service<ObjectRpcRequest>,
-{
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = S::Future;
-
-    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(context)
-    }
-
-    fn call(&mut self, request: ObjectRpcRequest) -> Self::Future {
-        self.inner.call(request)
-    }
 }
 
 fn validate_rpc_route(route: &str) -> Result<(), NetworkError> {

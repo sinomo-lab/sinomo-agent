@@ -715,6 +715,25 @@ mod tests {
     }
 
     #[test]
+    fn cluster_kv_materialized_snapshot_default_defer_policy_covers_high_churn_status_keys() {
+        assert!(cluster_kv_key_can_defer_materialized_snapshot(
+            "/cluster/network/connectivity/node-a/node-b"
+        ));
+        assert!(cluster_kv_key_can_defer_materialized_snapshot(
+            "/cluster/network/info/node-a"
+        ));
+        assert!(cluster_kv_key_can_defer_materialized_snapshot(
+            "/cluster/node-status/node-a"
+        ));
+        assert!(!cluster_kv_key_can_defer_materialized_snapshot(
+            "/cluster/members/node-a"
+        ));
+        assert!(!cluster_kv_key_can_defer_materialized_snapshot(
+            "/config/models/default"
+        ));
+    }
+
+    #[test]
     fn cluster_kv_snapshot_delta_defers_only_predicate_matched_changes() {
         let entry = |key: &str, value: &[u8]| KvEntry {
             key: key.to_string(),
@@ -3740,6 +3759,35 @@ mod tests {
                 compares: 1,
                 success_ops: 0,
                 failure_ops: MAX_KV_TXN_OPS_PER_BRANCH + 1,
+                max_compares: MAX_KV_TXN_COMPARES,
+                max_ops_per_branch: MAX_KV_TXN_OPS_PER_BRANCH,
+            }
+        );
+    }
+
+    #[test]
+    fn bounded_txn_success_op_reports_success_branch_limit() {
+        let mut ops = (0..MAX_KV_TXN_OPS_PER_BRANCH)
+            .map(|index| KvOp::Delete {
+                key: format!("/success/{index}"),
+            })
+            .collect::<Vec<_>>();
+
+        let error = push_bounded_txn_success_op(
+            &mut ops,
+            KvOp::Delete {
+                key: "/success/overflow".to_string(),
+            },
+        )
+        .expect_err("success branch limit");
+
+        assert_eq!(ops.len(), MAX_KV_TXN_OPS_PER_BRANCH);
+        assert_eq!(
+            error,
+            KvError::TxnLimit {
+                compares: 0,
+                success_ops: MAX_KV_TXN_OPS_PER_BRANCH + 1,
+                failure_ops: 0,
                 max_compares: MAX_KV_TXN_COMPARES,
                 max_ops_per_branch: MAX_KV_TXN_OPS_PER_BRANCH,
             }

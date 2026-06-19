@@ -90,13 +90,11 @@ pub use auth::{
 pub(crate) use client::send_daemon_rpc_raw;
 pub(crate) use client::{
     DaemonSignedEndpointRpcAsyncHost, cluster_paths_from_env,
-    fetch_cluster_kv_snapshot_from_endpoint_async,
     fetch_cluster_kv_snapshot_from_endpoint_on_runtime,
-    fetch_daemon_status_from_endpoint_on_runtime, send_cluster_kv_txn_async,
-    send_cluster_kv_txn_on_runtime, send_cluster_kv_watch_events_async,
-    send_cluster_member_publish_async, send_cluster_member_publish_on_runtime,
-    send_cluster_raft_append_async, send_cluster_raft_append_on_runtime,
-    send_cluster_raft_vote_async, send_cluster_raft_vote_on_runtime, send_daemon_rpc_on_runtime,
+    fetch_daemon_status_from_endpoint_on_runtime, send_cluster_kv_watch_events_async,
+    send_cluster_member_publish_async, send_cluster_raft_append_async,
+    send_cluster_raft_append_on_runtime, send_cluster_raft_vote_async,
+    send_cluster_raft_vote_on_runtime, send_daemon_rpc_on_runtime,
     send_daemon_rpc_to_endpoint_on_runtime, send_dfs_object_rpc_to_endpoint_on_runtime,
 };
 pub use client::{
@@ -109,10 +107,8 @@ pub use client::{
     send_daemon_rollout_build_to_endpoint, send_daemon_rollout_clear_status,
     send_daemon_rollout_diagnostics, send_daemon_rollout_native_dylib_module,
     send_daemon_rollout_native_dylib_module_to_endpoint, send_daemon_rpc, send_daemon_rpc_async,
-    send_daemon_rpc_direct_to_endpoint, send_daemon_rpc_direct_to_endpoint_async,
     send_daemon_rpc_stream, send_daemon_rpc_stream_async, send_daemon_rpc_to_endpoint,
     send_daemon_rpc_to_endpoint_async, send_daemon_rpc_with_timeouts, send_daemon_shutdown_request,
-    send_dfs_direct_read_to_endpoint, send_dfs_direct_read_to_endpoint_async,
     send_dfs_metadata_journal_batch_to_endpoint_async,
     send_dfs_metadata_snapshot_install_to_endpoint_async, send_dfs_object_rpc_to_endpoint_async,
 };
@@ -172,9 +168,8 @@ pub(crate) use rollout::{
     handle_daemon_finalize_shadow_rollout,
 };
 pub use status::{
-    DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, DaemonClusterProcess,
-    DaemonClusterRegistration, DaemonClusterStatus, DaemonDataOwnerLock, DaemonLock,
-    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, SINOMO_DAEMON_DEFAULT_HOST,
+    DaemonClusterProcess, DaemonClusterRegistration, DaemonClusterStatus, DaemonDataOwnerLock,
+    DaemonLock, DaemonProbeStatus, DaemonRunOptions, DaemonStatus, SINOMO_DAEMON_DEFAULT_HOST,
     SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
     cluster_node_status_from_daemon_status, current_shadow_daemon_options,
     daemon_advertised_endpoints_for_state, daemon_advertised_endpoints_for_state_async,

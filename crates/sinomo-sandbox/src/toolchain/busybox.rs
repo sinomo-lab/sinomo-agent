@@ -78,7 +78,7 @@ pub fn install_busybox_toolchain_to_local_store(
     Ok(manifest)
 }
 
-pub fn install_busybox_toolchain_to_sifs_store<T: DfsFrameTransport>(
+pub fn install_busybox_toolchain_to_sifs_store<T: DfsMessageTransport>(
     store: &mut SifsSandboxToolchainStore<T>,
     spec: &SandboxBusyBoxToolchainSpec,
     module_bytes: &[u8],

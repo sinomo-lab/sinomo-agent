@@ -1,9 +1,7 @@
 use crate::error::NetworkError;
+use crate::invite_publish::read_cluster_invitation_from_kv;
 use crate::prelude::*;
-use crate::{
-    ClusterPaths, iroh_endpoint_public_key, read_cluster_invitation_from_kv, read_cluster_state,
-    stable_iroh_endpoint_id,
-};
+use crate::{ClusterPaths, iroh_endpoint_public_key, read_cluster_state, stable_iroh_endpoint_id};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, UnparsedPublicKey};

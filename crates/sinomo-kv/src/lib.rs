@@ -245,10 +245,11 @@ mod internal {
 }
 
 pub use in_process::{InProcessKvStore, InProcessRaftKvCluster};
+pub type InProcessKvCluster = InProcessRaftKvCluster;
 pub use model::{
     KvCommand, KvCompare, KvEntry, KvError, KvEvent, KvEventKind, KvLease, KvOp, KvOpResponse,
     KvRevision, KvSnapshot, KvTxn, KvTxnResponse, KvVersion, KvWatch, LeaseId, WatchId,
-    decode_kv_value, encode_kv_value,
+    decode_kv_value, encode_kv_value, push_bounded_txn_success_op,
 };
 pub use paths::{
     CLUSTER_KV_COMMIT_SEQUENCE_LOCK_WAIT, ClusterKvPaths, lock_cluster_kv_commit_sequence,
@@ -284,17 +285,19 @@ pub use raft::{
     replicate_cluster_kv_raft_to_target_with_host, validate_cluster_kv_raft_config_transition,
 };
 pub use rpc::{
-    ClusterKvLocalReadWatchHost, ClusterKvRpcPayload, ClusterKvWatchEventsRequest,
-    ClusterKvWatchEventsResponse, ClusterRaftAppendRequest, ClusterRaftAppendResponse,
-    ClusterRaftVoteRequest, ClusterRaftVoteResponse, cluster_kv_range_prefix_rpc_payload,
-    cluster_kv_snapshot_response_rpc_payload, cluster_kv_snapshot_rpc_payload,
-    cluster_kv_txn_response_rpc_payload, cluster_kv_txn_rpc_payload,
-    cluster_kv_watch_events_noop_response, cluster_kv_watch_events_response_rpc_payload,
-    cluster_kv_watch_events_rpc_payload, cluster_raft_append_response_rpc_payload,
-    cluster_raft_append_rpc_payload, cluster_raft_vote_response_rpc_payload,
-    cluster_raft_vote_rpc_payload, decode_cluster_kv_snapshot_rpc_body,
-    decode_cluster_kv_snapshot_rpc_request_body, decode_cluster_kv_txn_rpc_body,
-    decode_cluster_kv_txn_rpc_request_body, decode_cluster_kv_watch_events_rpc_request_body,
+    ClusterKvLocalReadWatchHost, ClusterKvReplicationRequest, ClusterKvReplicationResponse,
+    ClusterKvRpcPayload, ClusterKvStateAuthorityVoteRequest, ClusterKvStateAuthorityVoteResponse,
+    ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, ClusterRaftAppendRequest,
+    ClusterRaftAppendResponse, ClusterRaftVoteRequest, ClusterRaftVoteResponse,
+    cluster_kv_range_prefix_rpc_payload, cluster_kv_snapshot_response_rpc_payload,
+    cluster_kv_snapshot_rpc_payload, cluster_kv_txn_response_rpc_payload,
+    cluster_kv_txn_rpc_payload, cluster_kv_watch_events_noop_response,
+    cluster_kv_watch_events_response_rpc_payload, cluster_kv_watch_events_rpc_payload,
+    cluster_raft_append_response_rpc_payload, cluster_raft_append_rpc_payload,
+    cluster_raft_vote_response_rpc_payload, cluster_raft_vote_rpc_payload,
+    decode_cluster_kv_snapshot_rpc_body, decode_cluster_kv_snapshot_rpc_request_body,
+    decode_cluster_kv_txn_rpc_body, decode_cluster_kv_txn_rpc_request_body,
+    decode_cluster_kv_watch_events_rpc_request_body,
     decode_cluster_kv_watch_events_rpc_response_body, decode_cluster_raft_append_rpc_request_body,
     decode_cluster_raft_append_rpc_response_body, decode_cluster_raft_vote_rpc_request_body,
     decode_cluster_raft_vote_rpc_response_body, handle_cluster_kv_local_read_watch_rpc_payload,
@@ -325,6 +328,7 @@ pub use watch::{
     append_cluster_kv_watch_events_to_storage_with_observers, cancel_cluster_kv_watch,
     cluster_kv_active_watch_registration_report, cluster_kv_events_can_defer_materialized_snapshot,
     cluster_kv_events_contain, cluster_kv_events_contain_all,
+    cluster_kv_key_can_defer_materialized_snapshot,
     cluster_kv_materialized_snapshot_is_fresh_enough_against, cluster_kv_snapshot_compare,
     cluster_kv_snapshot_delta_only_deferable,
     cluster_kv_watch_allocator_after_registration_removed, cluster_kv_watch_allocator_after_scan,

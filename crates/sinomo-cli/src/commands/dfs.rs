@@ -1169,12 +1169,10 @@ fn run_local_dfs_smoke(
         Box::new(CliDfsControlPlaneKvClient::new(&cluster_paths))
             as Box<dyn sinomo_runtime::dfs::DfsControlPlaneKvClient>
     });
-    let Some(report) = sinomo_runtime::dfs::run_default_cluster_dfs_smoke(
+    let Some(report) = sinomo_runtime::dfs::run_default_cluster_dfs_smoke_with_peer_transport(
         data_dir,
         &cluster_paths,
-        dfs_protocol_frame_sender(),
-        dfs_metadata_journal_batch_sender(),
-        dfs_metadata_snapshot_install_sender(),
+        cli_dfs_peer_transport(),
         Box::new(CliDfsControlPlaneKvClient::new(&cluster_paths)),
         control_plane,
         sinomo_runtime::dfs::DfsDefaultClusterSmokeOptions {
@@ -1191,69 +1189,40 @@ fn run_local_dfs_smoke(
     Ok(report)
 }
 
-fn dfs_protocol_frame_sender() -> sinomo_runtime::dfs::DfsProtocolFrameSender {
-    fn transport_error(
-        error: impl std::fmt::Display,
-    ) -> sinomo_runtime::dfs::DfsPeerTransportError {
-        sinomo_runtime::dfs::DfsPeerTransportError::new(error.to_string())
-    }
-
-    std::sync::Arc::new(|endpoint, command, timeout| {
-        let request =
-            sinomo_runtime::dfs::dfs_message_rpc_request_from_protocol_frame_command(command)
-                .map_err(transport_error)?;
-        let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
-            .map_err(transport_error)?;
-        sinomo_runtime::dfs::dfs_protocol_frame_response_from_message_rpc_response(&response)
-            .map_err(transport_error)
-    })
+fn cli_dfs_peer_transport() -> std::sync::Arc<dyn sinomo_runtime::dfs::DfsPeerTransport> {
+    std::sync::Arc::new(CliDfsPeerTransport)
 }
 
-fn dfs_metadata_journal_batch_sender() -> sinomo_runtime::dfs::DfsMetadataJournalBatchSender {
-    fn metadata_peer_error(
-        error: impl std::fmt::Display,
-    ) -> sinomo_runtime::dfs::DfsMetadataPeerTransportError {
-        sinomo_runtime::dfs::DfsMetadataPeerTransportError::new(error.to_string())
+#[derive(Clone, Debug)]
+struct CliDfsPeerTransport;
+
+impl sinomo_runtime::dfs::DfsPeerTransport for CliDfsPeerTransport {
+    fn call_object_rpc(
+        &self,
+        endpoint: &sinomo_runtime::core::ClusterEndpointRecord,
+        request: &sinomo_runtime::network::ObjectRpcRequest,
+        options: sinomo_runtime::dfs::DfsObjectRpcSendOptions,
+    ) -> Result<
+        sinomo_runtime::network::ObjectRpcResponse,
+        sinomo_runtime::dfs::DfsPeerTransportError,
+    > {
+        daemon_send_daemon_rpc_to_endpoint(endpoint, request, options.connect_timeout)
+            .map_err(|error| sinomo_runtime::dfs::DfsPeerTransportError::new(error.to_string()))
     }
-
-    std::sync::Arc::new(|endpoint, command, timeout| {
-        let request = sinomo_runtime::dfs::dfs_metadata_journal_batch_rpc_request(command)
-            .map_err(metadata_peer_error)?;
-        let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
-            .map_err(metadata_peer_error)?;
-        sinomo_runtime::dfs::decode_dfs_metadata_journal_batch_rpc_response(&response)
-            .map_err(metadata_peer_error)
-    })
-}
-
-fn dfs_metadata_snapshot_install_sender() -> sinomo_runtime::dfs::DfsMetadataSnapshotInstallSender {
-    fn metadata_peer_error(
-        error: impl std::fmt::Display,
-    ) -> sinomo_runtime::dfs::DfsMetadataPeerTransportError {
-        sinomo_runtime::dfs::DfsMetadataPeerTransportError::new(error.to_string())
-    }
-
-    std::sync::Arc::new(|endpoint, command, timeout| {
-        let request = sinomo_runtime::dfs::dfs_metadata_snapshot_install_rpc_request(command)
-            .map_err(metadata_peer_error)?;
-        let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
-            .map_err(metadata_peer_error)?;
-        sinomo_runtime::dfs::decode_dfs_metadata_snapshot_install_rpc_response(&response)
-            .map_err(metadata_peer_error)
-    })
 }
 
 fn publish_dfs_metadata_journal_from_data_dir(
     data_dir: &SinomoDataDir,
 ) -> Result<sinomo_runtime::dfs::DfsMetadataJournalReplicationReport, CliError> {
     let cluster_paths = sinomo_runtime::network::ClusterPaths::new(data_dir);
-    Ok(sinomo_runtime::dfs::publish_cluster_dfs_metadata_journal(
-        data_dir,
-        &cluster_paths,
-        dfs_metadata_journal_batch_sender(),
-        dfs_metadata_snapshot_install_sender(),
-        sinomo_runtime::dfs::DfsMetadataJournalReplicationOptions::default(),
-    )?)
+    Ok(
+        sinomo_runtime::dfs::publish_cluster_dfs_metadata_journal_with_peer_transport(
+            data_dir,
+            &cluster_paths,
+            cli_dfs_peer_transport(),
+            sinomo_runtime::dfs::DfsMetadataJournalReplicationOptions::default(),
+        )?,
+    )
 }
 
 pub(crate) fn run_dfs_mount_command(options: DfsMountOptions) -> Result<(), CliError> {
@@ -1437,53 +1406,79 @@ fn inspect_cluster_dfs_status() -> Result<DfsClusterStatusReport, CliError> {
         )?),
         error: None,
     }];
-    let mut endpoints_by_node =
-        std::collections::BTreeMap::<NodeId, Vec<ClusterEndpointRecord>>::new();
-    for endpoint in network::cluster_main_daemon_command_endpoint_candidates(&cluster_paths, &state)
-    {
-        endpoints_by_node
-            .entry(endpoint.node_id.clone())
-            .or_default()
-            .push(endpoint);
-    }
-    for (node_id, endpoints) in endpoints_by_node {
-        let mut failures = Vec::new();
-        let mut successful = None;
-        for endpoint in endpoints {
-            match fetch_dfs_status_from_endpoint(&endpoint, std::time::Duration::from_secs(5)) {
-                Ok(status) => {
-                    successful = Some((endpoint.address, status));
-                    break;
-                }
-                Err(error) => failures.push(format!("{} failed: {error}", endpoint.address)),
-            }
-        }
-        nodes.push(match successful {
-            Some((endpoint, status)) => DfsClusterNodeStatus {
-                node_id,
-                local: false,
-                endpoint: Some(endpoint),
-                status: Some(status),
-                error: None,
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| CliError::Network {
+            address: "cluster dfs status".to_string(),
+            detail: source.to_string(),
+        })?;
+    let remote_node_ids = state
+        .members
+        .iter()
+        .filter(|member| {
+            member.node_id != state.local_node_id
+                && member.state.is_authorized()
+                && member.capabilities.iter().any(|capability| {
+                    capability.as_str() == sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY
+                })
+        })
+        .map(|member| member.node_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    for node_id in remote_node_ids {
+        nodes.push(
+            match fetch_dfs_status_from_node(
+                runtime.handle(),
+                &cluster_paths,
+                &state,
+                &node_id,
+                std::time::Duration::from_secs(5),
+            ) {
+                Ok(status) => DfsClusterNodeStatus {
+                    node_id,
+                    local: false,
+                    endpoint: Some("cluster-object-rpc".to_string()),
+                    status: Some(status),
+                    error: None,
+                },
+                Err(error) => DfsClusterNodeStatus {
+                    node_id,
+                    local: false,
+                    endpoint: None,
+                    status: None,
+                    error: Some(error.to_string()),
+                },
             },
-            None => DfsClusterNodeStatus {
-                node_id,
-                local: false,
-                endpoint: None,
-                status: None,
-                error: Some(failures.join("; ")),
-            },
-        });
+        );
     }
+    runtime.shutdown_timeout(std::time::Duration::from_millis(250));
     Ok(DfsClusterStatusReport { nodes })
 }
 
-fn fetch_dfs_status_from_endpoint(
-    endpoint: &ClusterEndpointRecord,
+fn fetch_dfs_status_from_node(
+    runtime: &tokio::runtime::Handle,
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+    node_id: &NodeId,
     timeout: std::time::Duration,
 ) -> Result<sinomo_runtime::dfs::DfsOperatorStatus, CliError> {
     let rpc_request = sinomo_runtime::dfs::dfs_status_rpc_request()?;
-    let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
+    let mut host = CliSignedEndpointRpcHost::new(
+        Some(state.cluster_id.clone()),
+        "dfs status object rpc signing",
+    );
+    let mut client = network::ClusterObjectRpcClient::routed(&mut host, runtime, cluster_paths);
+    let response = runtime
+        .block_on(client.call_node(
+            state,
+            node_id,
+            &rpc_request,
+            network::ClusterObjectRpcNodeOptions::new(
+                network::ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates,
+                network::DaemonRpcTimeouts::connect_and_idle(timeout),
+            ),
+        ))
+        .map_err(CliError::from)?;
     sinomo_runtime::dfs::decode_dfs_status_rpc_response(&response).map_err(Into::into)
 }
 

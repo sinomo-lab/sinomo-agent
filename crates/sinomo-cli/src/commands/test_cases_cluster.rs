@@ -87,8 +87,7 @@ fn run_cluster_migration_seed_source(ctx: &mut SinomoTestContext) -> SinomoTestR
 
     let snapshot = paths
         .kv_paths()
-        .raft_store()
-        .append_command_and_publish(
+        .append_kv_command_and_publish(
             &state.local_node_id,
             KvCommand::Txn(KvTxn {
                 compares: Vec::new(),
@@ -106,7 +105,7 @@ fn run_cluster_migration_seed_source(ctx: &mut SinomoTestContext) -> SinomoTestR
                 ],
                 failure: Vec::new(),
             }),
-            network::cluster_kv_key_can_defer_materialized_snapshot,
+            sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
         .map_err(|source| {
             SinomoTestError::failed(format!("cannot seed source cluster KV: {source}"))
@@ -290,7 +289,7 @@ fn migration_imported_dfs_marker_path(
 
 fn find_migration_record_for_target(
     paths: &ClusterPaths,
-    target_cluster_id: &sinomo_runtime::network::ClusterId,
+    target_cluster_id: &sinomo_runtime::node::ClusterId,
 ) -> Result<ClusterMigrationRecord, SinomoTestError> {
     let migrations_root = paths.root.join("migrations");
     let entries = fs::read_dir(&migrations_root).map_err(|source| {

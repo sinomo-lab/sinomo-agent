@@ -8,8 +8,11 @@ use sinomo_core::{
     ClusterNodeAvailability, ClusterNodeRolloutStatus, ClusterNodeStatusRecord,
 };
 use sinomo_local::SinomoDataDir;
-use sinomo_network::{ClusterId, DaemonRpcTimeouts};
-use sinomo_node::NodeId;
+use sinomo_network::DaemonRpcTimeouts;
+use sinomo_node::{
+    ClusterId, DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, NodeId,
+    cluster_node_is_local_process,
+};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::net::IpAddr;
@@ -21,8 +24,6 @@ use time::format_description::well_known::Rfc3339;
 pub const SINOMO_DAEMON_DEFAULT_HOST: &str = "127.0.0.1";
 pub const SINOMO_DAEMON_DEFAULT_PORT: u16 = 21_353;
 pub const SINOMO_SHADOW_DAEMON_DEFAULT_PORT: u16 = 21_354;
-pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
-pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 pub const SINOMO_DAEMON_ADVERTISE_HOST_ENV: &str = "SINOMO_DAEMON_ADVERTISE_HOST";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -121,7 +122,8 @@ pub(crate) fn ensure_daemon_cluster_members(
     let main_node_id = state.local_node_id.clone();
     let shadow_node_id = sinomo_node::shadow_daemon_node_id(&state.local_node_id);
     let lan_ips = sinomo_network::discover_default_lan_ip_candidates();
-    let route_ips = sinomo_network::discover_peer_route_ip_candidates(state);
+    let route_ips =
+        sinomo_network::ClusterEndpointSelector::discover_peer_route_ip_candidates_for_state(state);
     let main_endpoints = daemon_advertised_endpoints_for_state(
         state,
         &main_node_id,
@@ -154,7 +156,7 @@ pub fn daemon_advertised_endpoints_for_state(
     lan_ips: &[IpAddr],
     route_ips: &[IpAddr],
 ) -> Vec<ClusterEndpointRecord> {
-    let allow_public_ip_discovery = sinomo_network::cluster_node_is_local_process(state, node_id);
+    let allow_public_ip_discovery = cluster_node_is_local_process(state, node_id);
     daemon_advertised_endpoints_from_ips(
         node_id,
         options,
@@ -173,7 +175,7 @@ pub async fn daemon_advertised_endpoints_for_state_async(
     lan_ips: &[IpAddr],
     route_ips: &[IpAddr],
 ) -> Vec<ClusterEndpointRecord> {
-    let allow_public_ip_discovery = sinomo_network::cluster_node_is_local_process(state, node_id);
+    let allow_public_ip_discovery = cluster_node_is_local_process(state, node_id);
     daemon_advertised_endpoints_from_ips_async(
         node_id,
         options,

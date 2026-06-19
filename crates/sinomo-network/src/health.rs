@@ -1,19 +1,22 @@
+use crate::kv_read_model::read_cluster_node_statuses_from_kv;
+#[cfg(test)]
+use crate::local_state_store::read_cluster_state;
+use crate::local_state_store::read_cluster_state_async;
 use crate::prelude::*;
+use crate::route::cluster_route_next_hop;
 use crate::rpc::{
     CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_HEALTH_SCOPE_LOCAL,
     CLUSTER_HEALTH_SCOPE_METADATA_KEY, CLUSTER_NETWORK_PING_ROUTE, CLUSTER_NETWORK_RPC_CATEGORY,
     ObjectRpcRequest, ObjectRpcResponse,
 };
-use crate::storage::{
-    ClusterMembershipRpcFuture, DAEMON_MAIN_RUN_CAPABILITY, advertised_peer_route_targets,
-    cluster_member_expected_daemon_process, cluster_member_is_legacy_shadow_daemon,
-    discover_peer_route_ip_candidates, iroh_endpoint_public_key,
-    live_cluster_member_probe_possible, read_cluster_node_statuses_from_kv, read_cluster_state,
-    read_cluster_state_async,
-};
+use crate::rpc_future::ClusterMembershipRpcFuture;
 use crate::{
-    ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityState, ClusterPaths,
-    NetworkError, cluster_route_next_hop,
+    ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityState,
+    ClusterEndpointSelector, ClusterPaths, NetworkError, iroh_endpoint_public_key,
+};
+use sinomo_node::{
+    DAEMON_MAIN_RUN_CAPABILITY, cluster_member_expected_daemon_process,
+    cluster_member_is_legacy_shadow_daemon, live_cluster_member_probe_possible,
 };
 
 const CLUSTER_HEALTH_PEER_ROWS_MAX_PEERS: usize = 8;
@@ -100,7 +103,8 @@ pub fn decode_cluster_network_ping_rpc_response(
     response.decode_body()
 }
 
-pub fn handle_cluster_health_rpc_request<P: ClusterStatusProbe + ?Sized>(
+#[cfg(test)]
+pub(crate) fn handle_cluster_health_rpc_request<P: ClusterStatusProbe + ?Sized>(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     probe: &P,
@@ -128,7 +132,8 @@ pub fn handle_cluster_health_rpc_request<P: ClusterStatusProbe + ?Sized>(
     }
 }
 
-pub fn handle_current_cluster_health_rpc_request<P: ClusterStatusProbe + ?Sized>(
+#[cfg(test)]
+pub(crate) fn handle_current_cluster_health_rpc_request<P: ClusterStatusProbe + ?Sized>(
     paths: &ClusterPaths,
     probe: &P,
     request: ObjectRpcRequest,
@@ -472,9 +477,9 @@ pub fn cluster_doctor_findings(
         }
     }
 
-    let route_targets = advertised_peer_route_targets(state);
+    let route_targets = ClusterEndpointSelector::advertised_peer_route_targets_for_state(state);
     if !route_targets.is_empty() {
-        let route_ips = discover_peer_route_ip_candidates(state);
+        let route_ips = ClusterEndpointSelector::discover_peer_route_ip_candidates_for_state(state);
         if route_ips.is_empty() {
             findings.push(ClusterDoctorFinding::warning(
                 "peer-route-unadvertised",

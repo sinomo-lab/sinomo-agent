@@ -33,7 +33,7 @@ impl SifsStagedSandboxCommandRunner {
         self
     }
 
-    pub(super) fn sifs_instance_store<T: DfsFrameTransport>(
+    pub(super) fn sifs_instance_store<T: DfsMessageTransport>(
         &self,
         dfs: NetworkedDfsService<T>,
     ) -> SifsSandboxInstanceStore<T> {
@@ -45,7 +45,7 @@ impl SifsStagedSandboxCommandRunner {
         }
     }
 
-    pub(super) fn sifs_filesystem<T: DfsFrameTransport>(
+    pub(super) fn sifs_filesystem<T: DfsMessageTransport>(
         &self,
         dfs: NetworkedDfsService<T>,
         manifest: &SandboxInstanceManifest,
@@ -58,7 +58,7 @@ impl SifsStagedSandboxCommandRunner {
         }
     }
 
-    pub fn run_module<T: DfsFrameTransport + Send + 'static>(
+    pub fn run_module<T: DfsMessageTransport + Send + 'static>(
         &self,
         dfs: NetworkedDfsService<T>,
         local_store: &LocalSandboxInstanceStore,
@@ -70,7 +70,7 @@ impl SifsStagedSandboxCommandRunner {
         self.run_module_with_stdin(dfs, local_store, sandbox_id, wasm, argv, None, timeout_ms)
     }
 
-    pub fn run_module_with_stdin<T: DfsFrameTransport + Send + 'static>(
+    pub fn run_module_with_stdin<T: DfsMessageTransport + Send + 'static>(
         &self,
         dfs: NetworkedDfsService<T>,
         local_store: &LocalSandboxInstanceStore,
@@ -92,7 +92,7 @@ impl SifsStagedSandboxCommandRunner {
         )
     }
 
-    pub fn run_module_with_stdin_and_limits<T: DfsFrameTransport + Send + 'static>(
+    pub fn run_module_with_stdin_and_limits<T: DfsMessageTransport + Send + 'static>(
         &self,
         dfs: NetworkedDfsService<T>,
         local_store: &LocalSandboxInstanceStore,
@@ -116,7 +116,7 @@ impl SifsStagedSandboxCommandRunner {
         )
     }
 
-    pub fn run_module_with_stdin_limits_and_output_sink<T: DfsFrameTransport + Send + 'static>(
+    pub fn run_module_with_stdin_limits_and_output_sink<T: DfsMessageTransport + Send + 'static>(
         &self,
         dfs: NetworkedDfsService<T>,
         local_store: &LocalSandboxInstanceStore,
@@ -144,7 +144,7 @@ impl SifsStagedSandboxCommandRunner {
 
     #[allow(clippy::too_many_arguments)]
     pub fn run_module_with_stdin_limits_output_sink_and_abi<
-        T: DfsFrameTransport + Send + 'static,
+        T: DfsMessageTransport + Send + 'static,
     >(
         &self,
         dfs: NetworkedDfsService<T>,
@@ -184,7 +184,7 @@ impl SifsStagedSandboxCommandRunner {
 
     #[allow(clippy::too_many_arguments)]
     fn run_module_with_stdin_limits_output_sink_abi_and_artifacts<
-        T: DfsFrameTransport + Send + 'static,
+        T: DfsMessageTransport + Send + 'static,
     >(
         &self,
         dfs: NetworkedDfsService<T>,
@@ -242,7 +242,7 @@ impl SifsStagedSandboxCommandRunner {
 
     #[cfg(feature = "wasix-runtime")]
     #[allow(clippy::too_many_arguments)]
-    fn run_module_with_direct_sifs_wasix<T: DfsFrameTransport + Send + 'static>(
+    fn run_module_with_direct_sifs_wasix<T: DfsMessageTransport + Send + 'static>(
         &self,
         dfs: NetworkedDfsService<T>,
         _local_store: &LocalSandboxInstanceStore,
@@ -469,7 +469,7 @@ impl SifsStagedSandboxCommandRunner {
 
     #[cfg(not(feature = "wasix-runtime"))]
     #[allow(clippy::too_many_arguments)]
-    fn run_module_with_direct_sifs_wasix<T: DfsFrameTransport + Send + 'static>(
+    fn run_module_with_direct_sifs_wasix<T: DfsMessageTransport + Send + 'static>(
         &self,
         _dfs: NetworkedDfsService<T>,
         _local_store: &LocalSandboxInstanceStore,
@@ -497,7 +497,7 @@ impl SifsStagedSandboxCommandRunner {
         .into())
     }
 
-    pub fn run_module_with_policy<T: DfsFrameTransport + Send + 'static>(
+    pub fn run_module_with_policy<T: DfsMessageTransport + Send + 'static>(
         &self,
         dfs: NetworkedDfsService<T>,
         local_store: &LocalSandboxInstanceStore,
@@ -519,7 +519,7 @@ impl SifsStagedSandboxCommandRunner {
         )
     }
 
-    pub fn run_toolchain_command_with_stdin_and_policy<T: DfsFrameTransport + Send + 'static>(
+    pub fn run_toolchain_command_with_stdin_and_policy<T: DfsMessageTransport + Send + 'static>(
         &self,
         dfs: NetworkedDfsService<T>,
         local_store: &LocalSandboxInstanceStore,
@@ -544,7 +544,7 @@ impl SifsStagedSandboxCommandRunner {
     }
 
     pub fn run_toolchain_command_with_stdin_policy_and_output_sink<
-        T: DfsFrameTransport + Send + 'static,
+        T: DfsMessageTransport + Send + 'static,
     >(
         &self,
         dfs: NetworkedDfsService<T>,
@@ -574,7 +574,7 @@ impl SifsStagedSandboxCommandRunner {
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_toolchain_command_with_stdin_policy_output_sink_cwd_and_env<
-        T: DfsFrameTransport + Send + 'static,
+        T: DfsMessageTransport + Send + 'static,
     >(
         &self,
         dfs: NetworkedDfsService<T>,
@@ -653,7 +653,7 @@ impl SifsStagedSandboxCommandRunner {
         )
     }
 
-    pub fn run_module_with_stdin_and_policy<T: DfsFrameTransport + Send + 'static>(
+    pub fn run_module_with_stdin_and_policy<T: DfsMessageTransport + Send + 'static>(
         &self,
         dfs: NetworkedDfsService<T>,
         local_store: &LocalSandboxInstanceStore,

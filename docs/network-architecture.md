@@ -4,7 +4,7 @@
 
 ## Wire Format
 
-Cluster frames use Sinomo Object documents on the wire. `sinomo-network` owns the `sinomo-object` dependency and exposes typed helpers such as `ProtocolMessage::encode`, `ProtocolMessage::decode`, and `SinomoObjectCodec`. Callers should not build `sinomo-object` documents directly unless they are implementing a new low-level transport inside `sinomo-network`.
+Cluster frames use Sinomo Object documents on the wire. `sinomo-network` owns the `sinomo-object` dependency and exposes typed helpers such as `ObjectRpcRequest`, `ObjectRpcResponse`, object frame I/O, and `SinomoObjectCodec`. Callers should not build `sinomo-object` documents directly unless they are implementing a new low-level transport inside `sinomo-network`.
 
 This keeps higher-level crates protocol agnostic. Typed requests should normally be sent as object RPC routes; the LAN frame codec, discovery advertisements, and typed protocol payloads are encoded as `SOBJ` documents by the network layer.
 
@@ -18,9 +18,9 @@ Daemon control requests can carry an authenticated object RPC request alongside 
 
 - Object RPC routes, via `ClusterObjectRpcClient`, `ObjectRpcRouter`, `ObjectRpcRequest`, `ObjectRpcResponse`, `ObjectRouteDescriptor`, and `ServiceCatalog`. A route is an object in and an object out, intentionally REST-like in naming and documentation but without HTTP concepts. The router implements `tower_service::Service`, and `ServiceCategoryLayer` lets a node expose groups of related services for agent-readable discovery, measurement, and debugging. `object_rpc_category!` can declare a category and route descriptors with input/output Rust types and observability keys so service catalogs stay machine-readable. Callers give the client a target endpoint, request, and timeout policy; `sinomo-network` owns signing handoff, direct-vs-relay choice, and endpoint transport policy.
 
-Legacy message frames, via `NetworkTransport`, `NetworkFrame`, `MeshMessage`, and `ProtocolMessage`, remain only for event propagation, heartbeats, tests, and migration shims that have not yet moved to typed object RPC routes. They must not be used for new cluster request/response protocols.
+The old generic request/response frame path is gone. Event propagation and heartbeats still use the internal mesh transport, but DFS, KV, daemon control, membership, rollout, and other command-style protocols must use typed object RPC routes rather than a second request/response abstraction.
 
-DFS peer adapters follow the same rule. `DfsPeerTransport` implementations provide one object-RPC send primitive, while DFS-owned helpers build and decode route-specific requests for typed object messages (`/dfs/message`), direct reads, metadata batches, and snapshots. The older `/dfs/protocol/frame` route is a compatibility shim only; new DFS object transfer should use typed DFS messages over object RPC.
+DFS peer adapters follow the same rule. `DfsPeerTransport` implementations provide one object-RPC send primitive, while DFS-owned helpers build and decode route-specific requests for typed object messages, direct reads, metadata batches, and snapshots. `/dfs/protocol/frame` is no longer a registered route.
 
 Stream helpers are an extension of object RPC for realtime or large data flows where a route opens a typed byte stream, sends chunks, then ends or resets the stream. They are not a separate command path.
 
@@ -32,4 +32,4 @@ Tokio-native object frame helpers (`read_object_frame_async` and `write_object_f
 
 Cluster communication should flow through `sinomo-network` abstractions. Durable cluster storage may still use its own stable storage representation, but live peer discovery, peer routing, object RPC routes, and stream traffic should not reach around the network crate to open ad hoc sockets or choose a wire format in higher-level crates.
 
-Cluster daemon endpoint selection also belongs to `sinomo-network`. CLI and daemon code may sign or authorize commands, but choosing loopback, LAN TCP, or Iroh and opening the transport should happen through network helpers rather than inside higher-level command handlers. Callers that need endpoint candidates should use `cluster_endpoint_targets` with a `ClusterEndpointSelectionPurpose`; older purpose-specific selectors remain only as compatibility shims while call sites migrate.
+Cluster daemon endpoint selection also belongs to `sinomo-network`. CLI and daemon code may sign or authorize commands, but choosing loopback, LAN TCP, or Iroh and opening the transport should happen through network helpers rather than inside higher-level command handlers. Callers that need endpoint candidates should use `ClusterEndpointSelector` with a `ClusterEndpointSelectionPurpose`; older purpose-specific selectors remain only as crate-local compatibility shims while call sites migrate.

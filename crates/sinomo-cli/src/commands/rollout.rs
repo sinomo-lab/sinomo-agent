@@ -1519,11 +1519,9 @@ pub(crate) fn rollout_cluster_targets_from_state(
         push_unique_rollout_target(&mut targets, local_target);
     }
 
-    let command_endpoints = network::cluster_endpoint_targets(
-        paths,
-        state,
-        network::ClusterEndpointSelectionPurpose::MainDaemonCommand,
-    );
+    let selector = network::ClusterEndpointSelector::new(paths, state);
+    let command_endpoints =
+        selector.select(network::ClusterEndpointSelectionPurpose::MainDaemonCommand);
     let mut command_endpoints_by_node = std::collections::BTreeMap::new();
     let mut main_node_ids = Vec::new();
     let mut seen_main_node_ids = std::collections::BTreeSet::new();
@@ -1548,17 +1546,14 @@ pub(crate) fn rollout_cluster_targets_from_state(
         }
     }
 
-    let rollout_endpoints = network::cluster_rollout_endpoint_candidates(paths, state);
+    let rollout_endpoints = selector.select(network::ClusterEndpointSelectionPurpose::Rollout);
     for main_node_id in main_node_ids {
         let command_endpoint = command_endpoints_by_node.get(&main_node_id);
-        let mut target_endpoints =
-            network::cluster_rollout_target_endpoints_for_main_with_command_endpoint(
-                paths,
-                state,
-                &main_node_id,
-                command_endpoint,
-                &rollout_endpoints,
-            );
+        let mut target_endpoints = selector.rollout_targets_for_main_with_command_endpoint(
+            &main_node_id,
+            command_endpoint,
+            &rollout_endpoints,
+        );
         if target_endpoints.is_empty()
             && let Some(command_endpoint) = command_endpoint
         {
@@ -1595,109 +1590,16 @@ fn local_rollout_target(options: &RolloutOptions) -> Result<Option<RolloutTarget
 }
 
 #[cfg(test)]
-pub(crate) fn rollout_endpoint_candidates(
-    state: &sinomo_runtime::core::ClusterBootstrapState,
-) -> Vec<ClusterEndpointRecord> {
-    let mut endpoints = Vec::new();
-    for member in &state.members {
-        if member.node_id == state.local_node_id || !member.state.is_authorized() {
-            continue;
-        }
-        endpoints.extend(
-            member
-                .endpoints
-                .iter()
-                .filter(|endpoint| {
-                    endpoint.privacy != sinomo_runtime::core::ClusterEndpointPrivacy::LocalOnly
-                        && matches!(
-                            endpoint.transport,
-                            sinomo_runtime::core::ClusterTransportKind::LanTcp
-                                | sinomo_runtime::core::ClusterTransportKind::Loopback
-                                | sinomo_runtime::core::ClusterTransportKind::Iroh
-                        )
-                })
-                .cloned(),
-        );
-    }
-    endpoints
-}
-
-#[cfg(test)]
-pub(crate) fn extend_rollout_endpoints_from_kv(
-    paths: &ClusterPaths,
-    endpoints: &mut Vec<ClusterEndpointRecord>,
-) {
-    let Ok(kv_endpoints) = network::read_cluster_endpoints_from_kv(paths) else {
-        return;
-    };
-    for endpoint in kv_endpoints {
-        if !endpoints
-            .iter()
-            .any(|candidate| candidate.endpoint_id == endpoint.endpoint_id)
-        {
-            endpoints.push(endpoint);
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn rollout_target_endpoint_for_main(
-    main_node_id: &NodeId,
-    candidates: &[ClusterEndpointRecord],
-) -> Option<ClusterEndpointRecord> {
-    let shadow_node_id = shadow_daemon_node_id(main_node_id);
-    let mut candidates = candidates
-        .iter()
-        .filter(|endpoint| {
-            (endpoint.node_id == *main_node_id || endpoint.node_id == shadow_node_id)
-                && endpoint.privacy != sinomo_runtime::core::ClusterEndpointPrivacy::LocalOnly
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|endpoint| {
-        (
-            endpoint.node_id != *main_node_id,
-            sinomo_runtime::network::cluster_daemon_command_transport_rank(endpoint),
-            sinomo_runtime::network::cluster_daemon_command_address_rank(endpoint),
-            endpoint.priority,
-            endpoint.address.clone(),
-        )
-    });
-    candidates.into_iter().next()
-}
-
-#[cfg(test)]
-pub(crate) fn rollout_target_endpoint_for_main_in_order(
-    main_node_id: &NodeId,
-    candidates: &[ClusterEndpointRecord],
-) -> Option<ClusterEndpointRecord> {
-    let shadow_node_id = shadow_daemon_node_id(main_node_id);
-    candidates
-        .iter()
-        .find(|endpoint| {
-            endpoint.node_id == shadow_node_id
-                && endpoint.privacy != sinomo_runtime::core::ClusterEndpointPrivacy::LocalOnly
-        })
-        .cloned()
-}
-
-#[cfg(test)]
 pub(crate) fn rollout_target_endpoint_for_main_with_connectivity(
     paths: &ClusterPaths,
     state: &sinomo_runtime::core::ClusterBootstrapState,
     main_node_id: &NodeId,
     candidates: &[ClusterEndpointRecord],
 ) -> Option<ClusterEndpointRecord> {
-    network::cluster_rollout_target_endpoint_for_main(paths, state, main_node_id, candidates)
-}
-
-#[cfg(test)]
-pub(crate) fn sort_rollout_endpoints_by_connectivity(
-    paths: &ClusterPaths,
-    state: &sinomo_runtime::core::ClusterBootstrapState,
-    endpoints: &mut [ClusterEndpointRecord],
-) {
-    network::sort_cluster_rollout_endpoints(paths, state, endpoints);
+    network::ClusterEndpointSelector::new(paths, state)
+        .rollout_targets_for_main_with_command_endpoint(main_node_id, None, candidates)
+        .into_iter()
+        .next()
 }
 
 fn push_unique_rollout_target(targets: &mut Vec<RolloutTarget>, target: RolloutTarget) {

@@ -84,10 +84,9 @@ use sinomo_runtime::core::{
 };
 #[cfg(test)]
 use sinomo_runtime::daemon::{
-    AuthenticatedDaemonCommand, DAEMON_MAIN_CLUSTER_ROLE, DaemonError, DaemonSignerAuthority,
-    SignedDaemonCommand, authenticate_daemon_control_request,
-    authorize_authenticated_daemon_command, daemon_package_version,
-    sign_daemon_rpc_request_from_data_dir, write_daemon_status,
+    AuthenticatedDaemonCommand, DaemonError, DaemonSignerAuthority, SignedDaemonCommand,
+    authenticate_daemon_control_request, authorize_authenticated_daemon_command,
+    daemon_package_version, sign_daemon_rpc_request_from_data_dir, write_daemon_status,
 };
 use sinomo_runtime::daemon::{
     DaemonClusterProcess, DaemonClusterRegistration, DaemonClusterStatus, DaemonPaths,
@@ -129,7 +128,6 @@ use sinomo_runtime::daemon::{
     send_daemon_rollout_native_dylib_module as daemon_send_daemon_rollout_native_dylib_module,
     send_daemon_rollout_native_dylib_module_to_endpoint as daemon_send_daemon_rollout_native_dylib_module_to_endpoint,
     send_daemon_rpc as daemon_send_daemon_rpc,
-    send_daemon_rpc_direct_to_endpoint as daemon_send_daemon_rpc_direct_to_endpoint,
     send_daemon_rpc_to_endpoint as daemon_send_daemon_rpc_to_endpoint,
     send_daemon_rpc_with_timeouts as daemon_send_daemon_rpc_with_timeouts,
     send_daemon_shutdown_request,
@@ -192,12 +190,15 @@ use sinomo_runtime::network::ClusterJoinRegistrationRequest;
 #[cfg(test)]
 use sinomo_runtime::network::ClusterJoinRegistrationResponse;
 use sinomo_runtime::network::{self, ClusterPaths, cluster_doctor_findings};
-use sinomo_runtime::network::{ClusterDoctorFinding, ClusterHealthRow, ClusterId, ClusterInviteId};
+use sinomo_runtime::network::{ClusterDoctorFinding, ClusterHealthRow};
 #[cfg(test)]
 use sinomo_runtime::network::{ClusterInviteChallengeProof, ClusterInviteChallengeRequest};
+#[cfg(test)]
+use sinomo_runtime::node::DAEMON_MAIN_CLUSTER_ROLE;
 use sinomo_runtime::node::{
-    NodeId, load_or_create_main_node_identity, load_or_create_shadow_node_identity,
-    shadow_daemon_node_id,
+    ClusterId, ClusterInviteId, NodeId, cluster_member_expected_daemon_process,
+    cluster_member_is_local_process, load_or_create_main_node_identity,
+    load_or_create_shadow_node_identity, shadow_daemon_node_id,
 };
 #[cfg(test)]
 use sinomo_runtime::rollout::read_rollout_status;
@@ -266,16 +267,21 @@ use time::format_description::well_known::Rfc3339;
 pub use tui::*;
 pub(crate) use voice::*;
 
-struct CliClusterVoterReachabilityHost;
+struct CliClusterStateAuthorityReachabilityHost;
 
-impl network::ClusterVoterReachabilityHost for CliClusterVoterReachabilityHost {
-    fn probe_voter(&mut self, endpoint: &ClusterEndpointRecord, timeout: Duration) -> bool {
+impl network::ClusterStateAuthorityReachabilityHost for CliClusterStateAuthorityReachabilityHost {
+    fn probe_cluster_state_authority(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        timeout: Duration,
+    ) -> bool {
         daemon_fetch_daemon_status_from_endpoint(endpoint, timeout).is_ok()
     }
 }
 
-fn cli_cluster_voter_reachability_options() -> network::ClusterVoterReachabilityOptions {
-    network::ClusterVoterReachabilityOptions {
+fn cli_cluster_state_authority_reachability_options()
+-> network::ClusterStateAuthorityReachabilityOptions {
+    network::ClusterStateAuthorityReachabilityOptions {
         timeout: Duration::from_secs(5),
         tcp_command_timeout: Duration::from_secs(5),
         iroh_command_timeout: Duration::from_secs(3),
@@ -289,17 +295,20 @@ fn cluster_has_local_quorum(paths: &ClusterPaths, state: &ClusterBootstrapState)
     network::cluster_has_local_quorum_with_host(
         paths,
         state,
-        cli_cluster_voter_reachability_options(),
-        &mut CliClusterVoterReachabilityHost,
+        cli_cluster_state_authority_reachability_options(),
+        &mut CliClusterStateAuthorityReachabilityHost,
     )
 }
 
-fn cluster_reachable_voter_count(paths: &ClusterPaths, state: &ClusterBootstrapState) -> usize {
-    network::cluster_reachable_voter_count_with_host(
+fn cluster_reachable_state_authority_count(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> usize {
+    network::cluster_reachable_state_authority_count_with_host(
         paths,
         state,
-        cli_cluster_voter_reachability_options(),
-        &mut CliClusterVoterReachabilityHost,
+        cli_cluster_state_authority_reachability_options(),
+        &mut CliClusterStateAuthorityReachabilityHost,
     )
 }
 
@@ -330,13 +339,15 @@ fn cli_probe_member_daemon_status(
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,
 ) -> Option<ClusterNodeStatusRecord> {
-    if network::cluster_member_is_local_process(state, member)
+    if cluster_member_is_local_process(state, member)
         && let Some(status) = cli_probe_local_member_daemon_status(paths, state, member)
     {
         return Some(status);
     }
-    for endpoint in
-        network::cluster_member_daemon_status_targets_with_connectivity(paths, state, member)
+    for endpoint in network::ClusterEndpointSelector::new(paths, state)
+        .select(network::ClusterEndpointSelectionPurpose::MemberDaemonStatus)
+        .into_iter()
+        .filter(|endpoint| endpoint.node_id == member.node_id)
     {
         let Ok(status) =
             daemon_fetch_daemon_status_from_endpoint(&endpoint, CLUSTER_HEALTH_PROBE_TIMEOUT)
@@ -355,7 +366,7 @@ fn cli_probe_member_daemon_status(
             None,
             OffsetDateTime::now_utc(),
         );
-        if network::cluster_member_expected_daemon_process(member)
+        if cluster_member_expected_daemon_process(member)
             .is_some_and(|process| status.process != process)
         {
             continue;
@@ -391,7 +402,7 @@ fn cli_probe_local_member_daemon_status(
     }
     let status =
         cluster_node_status_from_daemon_status(&status, cluster, None, OffsetDateTime::now_utc());
-    if network::cluster_member_expected_daemon_process(member)
+    if cluster_member_expected_daemon_process(member)
         .is_some_and(|process| status.process != process)
     {
         return None;
@@ -404,8 +415,10 @@ fn cli_fetch_local_cluster_health_rows_from_member(
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,
 ) -> Option<Vec<ClusterHealthRow>> {
-    for endpoint in
-        network::cluster_member_daemon_status_targets_with_connectivity(paths, state, member)
+    for endpoint in network::ClusterEndpointSelector::new(paths, state)
+        .select(network::ClusterEndpointSelectionPurpose::MemberDaemonStatus)
+        .into_iter()
+        .filter(|endpoint| endpoint.node_id == member.node_id)
     {
         let Ok(request) = network::cluster_local_health_rpc_request() else {
             return None;
@@ -3143,25 +3156,9 @@ fn cluster_kv_snapshot_rpc_request() -> Result<network::ObjectRpcRequest, KvErro
     ))
 }
 
-fn cluster_kv_txn_rpc_request(txn: &KvTxn) -> Result<network::ObjectRpcRequest, KvError> {
-    let payload = sinomo_runtime::kv::cluster_kv_txn_rpc_payload(txn)?;
-    Ok(network::ObjectRpcRequest::from_encoded_body(
-        payload.route,
-        payload.category,
-        payload.body,
-    ))
-}
-
 fn decode_cluster_kv_snapshot_rpc_response(
     response: &network::ObjectRpcResponse,
 ) -> Result<KvSnapshot, network::NetworkError> {
     response.error_detail()?;
     sinomo_runtime::kv::decode_cluster_kv_snapshot_rpc_body(&response.body).map_err(Into::into)
-}
-
-fn decode_cluster_kv_txn_rpc_response(
-    response: &network::ObjectRpcResponse,
-) -> Result<KvTxnResponse, network::NetworkError> {
-    response.error_detail()?;
-    sinomo_runtime::kv::decode_cluster_kv_txn_rpc_body(&response.body).map_err(Into::into)
 }

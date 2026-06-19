@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use sinomo_dfs::{DfsFrameTransport, NetworkedDfsService};
+use sinomo_dfs::{DfsMessageTransport, NetworkedDfsService};
 use sinomo_module::{
     ModuleId, NativeDylibModuleLoaderState, NativeModuleUnloadReport, native_module_cache_path,
     read_native_dylib_module_loader_state,
@@ -793,7 +793,7 @@ impl SandboxWasixSifsCommandRunner {
         self
     }
 
-    fn sifs_instance_store<T: DfsFrameTransport>(
+    fn sifs_instance_store<T: DfsMessageTransport>(
         &self,
         dfs: NetworkedDfsService<T>,
     ) -> SifsSandboxInstanceStore<T> {
@@ -805,7 +805,7 @@ impl SandboxWasixSifsCommandRunner {
         }
     }
 
-    fn sifs_toolchain_store<T: DfsFrameTransport>(
+    fn sifs_toolchain_store<T: DfsMessageTransport>(
         &self,
         dfs: NetworkedDfsService<T>,
     ) -> SifsSandboxToolchainStore<T> {
@@ -817,7 +817,7 @@ impl SandboxWasixSifsCommandRunner {
         }
     }
 
-    fn sifs_filesystem<T: DfsFrameTransport>(
+    fn sifs_filesystem<T: DfsMessageTransport>(
         &self,
         dfs: NetworkedDfsService<T>,
         manifest: &SandboxInstanceManifest,
@@ -832,7 +832,7 @@ impl SandboxWasixSifsCommandRunner {
 
     #[allow(clippy::too_many_arguments)]
     pub fn run_toolchain_command_with_stdin_policy_and_output_sink<
-        T: DfsFrameTransport + Send + 'static,
+        T: DfsMessageTransport + Send + 'static,
     >(
         &self,
         dfs: NetworkedDfsService<T>,
@@ -861,7 +861,7 @@ impl SandboxWasixSifsCommandRunner {
 
     #[allow(clippy::too_many_arguments)]
     pub fn run_toolchain_command_with_stdin_policy_output_sink_and_cancellation<
-        T: DfsFrameTransport + Send + 'static,
+        T: DfsMessageTransport + Send + 'static,
     >(
         &self,
         dfs: NetworkedDfsService<T>,
@@ -897,7 +897,7 @@ impl SandboxWasixSifsCommandRunner {
     }
 
     pub fn run_toolchain_process_plan_with_policy_and_output_sink<
-        T: DfsFrameTransport + Send + 'static,
+        T: DfsMessageTransport + Send + 'static,
     >(
         &self,
         dfs: NetworkedDfsService<T>,
@@ -922,7 +922,7 @@ impl SandboxWasixSifsCommandRunner {
 
     #[allow(clippy::too_many_arguments)]
     pub fn run_toolchain_process_plan_with_policy_output_sink_and_cancellation<
-        T: DfsFrameTransport + Send + 'static,
+        T: DfsMessageTransport + Send + 'static,
     >(
         &self,
         dfs: NetworkedDfsService<T>,
@@ -953,7 +953,7 @@ impl SandboxWasixSifsCommandRunner {
         Ok(SandboxWasixSifsProcessPlanOutcome { dfs, process })
     }
 
-    fn materialize_sifs_execution<T: DfsFrameTransport + Send + 'static>(
+    fn materialize_sifs_execution<T: DfsMessageTransport + Send + 'static>(
         &self,
         dfs: NetworkedDfsService<T>,
         local_store: &LocalSandboxInstanceStore,
@@ -1006,7 +1006,7 @@ impl SandboxWasixSifsCommandRunner {
         Ok((dfs, execution_node_id, manifest, local_toolchain_store))
     }
 
-    fn reconcile_sifs_execution<T: DfsFrameTransport + Send + 'static>(
+    fn reconcile_sifs_execution<T: DfsMessageTransport + Send + 'static>(
         &self,
         dfs: NetworkedDfsService<T>,
         local_store: &LocalSandboxInstanceStore,

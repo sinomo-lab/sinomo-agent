@@ -8,10 +8,10 @@
 //!
 //! The registry mixes host-agnostic services from `sinomo-service` and native modules
 //! such as `sinomo-rollout` with **daemon-foundational** services defined here
-//! ([`DaemonControlService`], [`ClusterKvService`], [`ClusterHealthService`],
-//! [`ClusterRelayService`]) that own daemon state (their [`DaemonPaths`], which encode
-//! whether this is the main or shadow daemon) and call the daemon's own cluster/control
-//! handlers. Consuming services receive a real
+//! ([`DaemonControlService`], [`ClusterKvService`], [`ClusterKvConsensusService`],
+//! [`ClusterHealthService`], [`ClusterRelayService`]) that own daemon state
+//! (their [`DaemonPaths`], which encode whether this is the main or shadow daemon)
+//! and call the daemon's own cluster/control handlers. Consuming services receive a real
 //! [`DaemonClusterAccess`] via [`ServiceContext::cluster`] when the node is clustered.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -43,7 +43,7 @@ use sinomo_network::{
     NETWORK_OBJECT_RPC_ROUTES, NetworkError, ObjectRouteDescriptor, ObjectRpcAuthorizationLayer,
     ObjectRpcCancelRequest, ObjectRpcCancelResponse, ObjectRpcRequest, ObjectRpcResponse,
     ObjectRpcRouteCatalog, ObjectRpcRoutePolicyLayer, ObjectRpcRouteRegistry, ObjectRpcRouter,
-    RelayEnvelope, ServiceCatalog,
+    ServiceCatalog,
 };
 use sinomo_network_module::network_module_surfaces;
 use sinomo_rollout::{
@@ -78,7 +78,8 @@ use tower_layer::Layer;
 use crate::auth::{AuthenticatedDaemonCommand, DaemonSignerAuthority};
 use crate::cluster::{
     DaemonClusterJoinRegistrationHost, DaemonClusterMemberMutationHost, DaemonClusterStatusProbe,
-    cluster_paths_from_daemon_paths, forward_cluster_invite_challenge_to_voter_async_on_runtime,
+    cluster_paths_from_daemon_paths,
+    forward_cluster_invite_challenge_to_cluster_state_authority_async_on_runtime,
     handle_daemon_cluster_kv_snapshot_async, handle_daemon_cluster_kv_txn_request_async_on_runtime,
     handle_daemon_cluster_relay_request_on_runtime,
     handle_forwarded_daemon_cluster_kv_txn_request_async_on_runtime,
@@ -260,7 +261,8 @@ fn handle_cluster_kv_watch_events_request(
     request: &ObjectRpcRequest,
 ) -> Result<ObjectRpcResponse, ServiceError> {
     let payload = sinomo_kv::decode_cluster_kv_watch_events_rpc_request_body(&request.body)?;
-    let response = sinomo_network::handle_cluster_kv_watch_events(paths, payload)?;
+    let state = sinomo_network::read_cluster_state(paths)?;
+    let response = sinomo_kv::handle_cluster_kv_watch_events(&paths.kv_paths(), &state, payload)?;
     let payload = sinomo_kv::cluster_kv_watch_events_response_rpc_payload(&response)?;
     Ok(object_rpc_response_from_kv_payload(payload))
 }
@@ -644,9 +646,8 @@ impl Service for ClusterRelayService {
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
         Box::pin(async move {
-            let envelope = RelayEnvelope::from_request(&request)?;
             let response =
-                handle_daemon_cluster_relay_request_on_runtime(&paths, envelope, runtime.as_ref())
+                handle_daemon_cluster_relay_request_on_runtime(&paths, &request, runtime.as_ref())
                     .await
                     .map_err(daemon_error)?;
             ctx.respond(response)?;
@@ -655,17 +656,17 @@ impl Service for ClusterRelayService {
     }
 }
 
-/// Daemon adapter for cluster raft consensus (append + vote). Request identity flows
-/// through `ServiceContext::signer`; `sinomo-network` validates that identity against
-/// cluster membership and applies the network-owned raft RPC policy.
-struct ClusterRaftService {
+/// Daemon adapter for the KV-owned consensus routes. Request identity flows through
+/// `ServiceContext::signer`; `sinomo-network` validates that identity against cluster
+/// membership and applies the transport policy.
+struct ClusterKvConsensusService {
     paths: DaemonPaths,
     runtime: Option<tokio::runtime::Handle>,
 }
 
-impl Service for ClusterRaftService {
+impl Service for ClusterKvConsensusService {
     fn name(&self) -> &'static str {
-        "cluster-raft"
+        "cluster-kv-consensus"
     }
 
     fn routes(&self) -> &'static [&'static str] {
@@ -688,8 +689,8 @@ impl Service for ClusterRaftService {
             }
             let cluster_paths = cluster_paths_from_daemon_paths(&paths).map_err(daemon_error)?;
             let authenticated_peer = cluster_authenticated_peer(&ctx.signer, &route)?;
-            let runtime = require_service_runtime(runtime.as_ref(), "cluster raft rpc")?;
-            let response = sinomo_network::handle_cluster_raft_rpc_request_async(
+            let runtime = require_service_runtime(runtime.as_ref(), "cluster kv consensus rpc")?;
+            let response = sinomo_network::handle_cluster_kv_consensus_rpc_request_async(
                 runtime,
                 &cluster_paths,
                 request,
@@ -728,7 +729,7 @@ fn service_signer_cluster_identity(
 
 /// Daemon adapter for cluster membership object-RPC routes. The domain join decision
 /// lives in `sinomo-network`; the daemon handler still supplies host-local member refresh,
-/// voter forwarding, and quorum persistence.
+/// authority forwarding, and cluster state persistence.
 /// Server-side budgets for join handling, deliberately below the joiner's
 /// 30s idle deadline so a stuck step yields a structured error the retry
 /// loop can act on.
@@ -765,7 +766,7 @@ impl Service for ClusterMembershipService {
             if request.route == CLUSTER_JOIN_CHALLENGE_ROUTE {
                 let challenge: sinomo_network::ClusterInviteChallengeRequest =
                     request.decode_body()?;
-                // The whole proof acquisition (local attempt + voter forward)
+                // The whole proof acquisition (local attempt + authority forward)
                 // runs under a hard budget: a hung step must surface an error
                 // to the joiner — never hold its stream open silently, or the
                 // joiner's bounded retry loop can wedge for its whole window.
@@ -791,12 +792,12 @@ impl Service for ClusterMembershipService {
                         Ok(proof) => Ok(proof),
                         Err(local_error) => {
                             // A bridge introducer may hold the invite but not be proof-capable.
-                            // Relay to a voter that can produce an issuer-signed proof.
+                            // Relay to a cluster state authority that can produce an issuer-signed proof.
                             let runtime = require_service_runtime(
                                 proof_runtime.as_ref(),
                                 "cluster join challenge",
                             )?;
-                            match forward_cluster_invite_challenge_to_voter_async_on_runtime(
+                            match forward_cluster_invite_challenge_to_cluster_state_authority_async_on_runtime(
                                 &proof_paths,
                                 &proof_challenge,
                                 runtime,
@@ -806,7 +807,7 @@ impl Service for ClusterMembershipService {
                                 Ok(proof) => Ok(proof),
                                 Err(forward_error) => {
                                     eprintln!(
-                                        "sinomo daemon join challenge for invite {} failed (local: {local_error}; forward-to-voter: {forward_error})",
+                                        "sinomo daemon join challenge for invite {} failed (local: {local_error}; forward-to-authority: {forward_error})",
                                         proof_challenge.invite_id
                                     );
                                     Err(daemon_error(local_error))
@@ -1336,7 +1337,7 @@ fn daemon_service_registry(
             paths: paths.clone(),
             runtime: service_runtime.cloned(),
         })
-        .register(ClusterRaftService {
+        .register(ClusterKvConsensusService {
             paths: paths.clone(),
             runtime: service_runtime.cloned(),
         })
@@ -2599,14 +2600,14 @@ async fn dispatch_dfs_direct_read_stream_via_registry_async(
             write_dfs_direct_read_stream_chunks(stream, stream_address, reader).await
         {
             if let Some(key) = replay_key.as_ref() {
-                crate::control::abandon_daemon_dfs_frame_replay(paths, key);
+                crate::control::abandon_daemon_dfs_message_replay(paths, key);
             }
             let _ = stream.shutdown_write(stream_address).await;
             return Err(error);
         }
     }
     if let Some(key) = replay_key.as_ref() {
-        crate::control::complete_daemon_dfs_frame_replay(paths, key, &stream_response.response);
+        crate::control::complete_daemon_dfs_message_replay(paths, key, &stream_response.response);
     }
     Ok(false)
 }
@@ -2760,7 +2761,7 @@ pub(crate) async fn dispatch_rpc_via_registry_to_response_async(
             Ok(response) => response,
             Err(error) => {
                 if let (Some(paths), Some(key)) = (paths, replay_key.as_ref()) {
-                    crate::control::abandon_daemon_dfs_frame_replay(paths, key);
+                    crate::control::abandon_daemon_dfs_message_replay(paths, key);
                 }
                 return Err(error.into());
             }
@@ -2770,7 +2771,7 @@ pub(crate) async fn dispatch_rpc_via_registry_to_response_async(
         .remove(DAEMON_SERVICE_DISPOSITION_METADATA_KEY)
         .is_some_and(|value| value == "stop");
     if let (Some(paths), Some(key)) = (paths, replay_key.as_ref()) {
-        crate::control::complete_daemon_dfs_frame_replay(paths, key, &response);
+        crate::control::complete_daemon_dfs_message_replay(paths, key, &response);
     }
     Ok((response, stop))
 }
@@ -3259,7 +3260,7 @@ mod tests {
         let node_id =
             sinomo_node::NodeId::from_legacy_named("node_service_snapshot").expect("node id");
         let cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            sinomo_network::ClusterId::from_legacy_named("cluster_service_snapshot")
+            sinomo_node::ClusterId::from_legacy_named("cluster_service_snapshot")
                 .expect("cluster id"),
             "service snapshot test",
             node_id,
@@ -3672,14 +3673,11 @@ mod tests {
             .iter()
             .copied()
             .chain(CLUSTER_RAFT_RPC_ROUTES.iter().copied())
+            .chain(sinomo_dfs::DFS_DATA_PLANE_ROUTES.iter().copied())
             .chain([
                 sinomo_network::CLUSTER_HEALTH_ROUTE,
                 sinomo_network::CLUSTER_NETWORK_PING_ROUTE,
                 CLUSTER_RELAY_ROUTE,
-                sinomo_dfs::DFS_SMOKE_ROUTE,
-                sinomo_dfs::DFS_MESSAGE_ROUTE,
-                sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE,
-                sinomo_dfs::DFS_DIRECT_READ_ROUTE,
                 CLUSTER_JOIN_CHALLENGE_ROUTE,
                 CLUSTER_JOIN_REGISTER_ROUTE,
                 CLUSTER_INVITE_PUBLISH_ROUTE,
@@ -3712,18 +3710,18 @@ mod tests {
             registry.category_for_route(CLUSTER_JOIN_REGISTER_ROUTE),
             Some(CLUSTER_MEMBERSHIP_RPC_CATEGORY)
         );
+        assert!(!registry.owns("/dfs/message"));
+        assert_eq!(registry.category_for_route("/dfs/message"), None);
         assert_eq!(
-            registry.category_for_route(sinomo_dfs::DFS_MESSAGE_ROUTE),
-            Some(sinomo_dfs::DFS_RPC_CATEGORY)
-        );
-        assert_eq!(
-            registry.category_for_route(sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE),
+            registry.category_for_route(sinomo_dfs::DFS_DATA_READ_ROUTE),
             Some(sinomo_dfs::DFS_RPC_CATEGORY)
         );
         assert_eq!(
             registry.category_for_route(sinomo_dfs::DFS_DIRECT_READ_ROUTE),
             Some(sinomo_dfs::DFS_RPC_CATEGORY)
         );
+        assert!(!registry.owns("/dfs/protocol/frame"));
+        assert_eq!(registry.category_for_route("/dfs/protocol/frame"), None);
         let route_metadata = registry.route_categories();
         let snapshot = route_metadata
             .iter()
@@ -3807,28 +3805,28 @@ mod tests {
                 .map(|capability| capability.as_str().to_string())
                 .collect::<Vec<_>>()
         );
-        let dfs_message = route_metadata
+        let dfs_data_read = route_metadata
             .iter()
-            .find(|route| route.route == sinomo_dfs::DFS_MESSAGE_ROUTE)
-            .expect("dfs message route metadata");
+            .find(|route| route.route == sinomo_dfs::DFS_DATA_READ_ROUTE)
+            .expect("dfs data read route metadata");
         assert_eq!(
-            dfs_message.auth_scope.as_deref(),
+            dfs_data_read.auth_scope.as_deref(),
             Some(sinomo_module::ModuleRouteAuth::LocalOrClusterMember.as_scope())
         );
         assert_eq!(
-            dfs_message.required_capabilities,
+            dfs_data_read.required_capabilities,
             vec!["dfs.object.transfer".to_string()]
         );
-        let dfs_frame = route_metadata
+        let dfs_read = route_metadata
             .iter()
-            .find(|route| route.route == sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE)
-            .expect("dfs frame route metadata");
+            .find(|route| route.route == sinomo_dfs::DFS_DATA_READ_ROUTE)
+            .expect("dfs typed read route metadata");
         assert_eq!(
-            dfs_frame.auth_scope.as_deref(),
+            dfs_read.auth_scope.as_deref(),
             Some(sinomo_module::ModuleRouteAuth::LocalOrClusterMember.as_scope())
         );
         assert_eq!(
-            dfs_frame.required_capabilities,
+            dfs_read.required_capabilities,
             vec!["dfs.object.transfer".to_string()]
         );
         let dfs_direct_read = route_metadata

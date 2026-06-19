@@ -108,7 +108,7 @@ sinomo_runtime::test::sinomo_test_case! {
 sinomo_runtime::test::sinomo_test_case! {
     pub fn dfs_protocol_codec_baseline(ctx) {
         id: "cluster.dfs.protocol-codec-baseline",
-        summary: "Measure in-memory DFS protocol-frame object-RPC encode/decode throughput for chunk payloads",
+        summary: "Measure in-memory DFS data-plane object-RPC encode/decode throughput for chunk payloads",
         tags: ["cluster-dfs", "probe", "performance"],
         requirements: [],
         run: {
@@ -326,12 +326,13 @@ fn run_protocol_codec_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult 
     let encoded_samples = samples
         .iter()
         .map(|sample| {
-            let request = dfs::dfs_message_rpc_request(&sample.command).map_err(|error| {
-                SinomoTestError::failed(format!(
-                    "cannot encode {} DFS message request: {error}",
-                    sample.label
-                ))
-            })?;
+            let request = dfs::dfs_routed_message_rpc_request(&sample.command.routed_message)
+                .map_err(|error| {
+                    SinomoTestError::failed(format!(
+                        "cannot encode {} DFS message request: {error}",
+                        sample.label
+                    ))
+                })?;
             Ok(EncodedDfsProtocolCodecSample {
                 label: sample.label,
                 request_body_bytes: request.body.len(),
@@ -356,12 +357,13 @@ fn run_protocol_codec_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult 
     let mut encoded_request_body_bytes = 0_usize;
     for _ in 0..iterations {
         for sample in &samples {
-            let request = dfs::dfs_message_rpc_request(&sample.command).map_err(|error| {
-                SinomoTestError::failed(format!(
-                    "cannot encode {} DFS message request: {error}",
-                    sample.label
-                ))
-            })?;
+            let request = dfs::dfs_routed_message_rpc_request(&sample.command.routed_message)
+                .map_err(|error| {
+                    SinomoTestError::failed(format!(
+                        "cannot encode {} DFS message request: {error}",
+                        sample.label
+                    ))
+                })?;
             encoded_request_body_bytes =
                 encoded_request_body_bytes.saturating_add(request.body.len());
             std::hint::black_box(&request);
@@ -440,12 +442,12 @@ fn run_protocol_codec_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult 
 
     if min_encode_bytes_per_second > 0.0 && encode_bytes_per_second < min_encode_bytes_per_second {
         return Ok(SinomoTestOutcome::failed(format!(
-            "DFS protocol frame encode throughput {encode_bytes_per_second:.2} bytes/s is below required {min_encode_bytes_per_second:.2} bytes/s"
+            "DFS data-plane object-RPC encode throughput {encode_bytes_per_second:.2} bytes/s is below required {min_encode_bytes_per_second:.2} bytes/s"
         )));
     }
     if min_decode_bytes_per_second > 0.0 && decode_bytes_per_second < min_decode_bytes_per_second {
         return Ok(SinomoTestOutcome::failed(format!(
-            "DFS protocol frame decode throughput {decode_bytes_per_second:.2} bytes/s is below required {min_decode_bytes_per_second:.2} bytes/s"
+            "DFS data-plane object-RPC decode throughput {decode_bytes_per_second:.2} bytes/s is below required {min_decode_bytes_per_second:.2} bytes/s"
         )));
     }
 

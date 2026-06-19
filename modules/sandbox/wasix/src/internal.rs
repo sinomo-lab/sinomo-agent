@@ -17,7 +17,7 @@ pub(crate) use sinomo_core::{
     RoutingMetadata, RoutingScope, Salience, Source,
 };
 pub(crate) use sinomo_dfs::{
-    DfsFrameTransport, DfsObjectId, DfsObjectKind, DfsPosixError, DfsWriteOptions,
+    DfsMessageTransport, DfsObjectId, DfsObjectKind, DfsPosixError, DfsWriteOptions,
     NetworkedDfsService,
 };
 pub(crate) use sinomo_events::{AppendReceipt, EventId, EventStore, EventStoreError};

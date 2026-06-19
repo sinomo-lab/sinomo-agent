@@ -1,5 +1,6 @@
 use crate::{RolloutError, source::LocalRolloutNativeDylibModuleArtifact};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use sinomo_core::{ClusterBootstrapState, ClusterEndpointPrivacy};
 use std::path::{Path, PathBuf};
 
@@ -236,7 +237,8 @@ pub fn unique_rollout_targets(targets: Vec<String>) -> Vec<String> {
     unique
 }
 
-pub fn cluster_rollout_targets_from_state(state: &ClusterBootstrapState) -> Vec<String> {
+#[cfg(test)]
+fn cluster_rollout_targets_from_state(state: &ClusterBootstrapState) -> Vec<String> {
     let mut targets = Vec::new();
     for member in &state.members {
         if member.node_id == state.local_node_id {
@@ -259,7 +261,8 @@ pub fn cluster_rollout_targets_from_state(state: &ClusterBootstrapState) -> Vec<
     unique_rollout_targets(targets)
 }
 
-pub fn prepare_rollout_cluster_targets(
+#[cfg(test)]
+fn prepare_rollout_cluster_targets(
     explicit_targets: Vec<String>,
     local_target: Option<String>,
     cluster_state: Option<&ClusterBootstrapState>,
