@@ -334,14 +334,13 @@ pub(crate) use raft_election::ClusterRaftVoteTransportHost;
 pub use raft_fanout::{
     ClusterRaftCommittedFanoutAsyncHost, spawn_cluster_raft_committed_fanout_worker_on_runtime,
 };
-pub use raft_quorum::{
-    ClusterRaftQuorumAsyncHost, ClusterRaftQuorumTransportHost,
-    commit_cluster_raft_command_with_quorum_driver,
-};
+pub use raft_quorum::ClusterRaftQuorumAsyncHost;
 pub use raft_replication::{
-    ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
-    replicate_cluster_raft_to_endpoint_async_with_host,
-    replicate_cluster_raft_to_endpoint_with_host,
+    ClusterRaftAppendReplicationAsyncHost, replicate_cluster_raft_to_endpoint_async_with_host,
+};
+#[cfg(test)]
+pub(crate) use raft_replication::{
+    ClusterRaftAppendReplicationHost, replicate_cluster_raft_to_endpoint_with_host,
 };
 pub use raft_rpc::{handle_cluster_raft_rpc_request, handle_cluster_raft_rpc_request_async};
 pub(crate) use roaming::read_iroh_endpoint_record_async;
