@@ -83,6 +83,13 @@ pub struct ClusterConnectivityProbeBatch {
     pub next_cursor: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClusterConnectivityProbeObservation {
+    Healthy,
+    IdentityMismatch,
+    Failed,
+}
+
 pub fn select_cluster_connectivity_probe_batch(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -190,7 +197,60 @@ fn cluster_connectivity_probe_state_rank(record: Option<&ClusterConnectivityReco
     }
 }
 
-pub fn cluster_connectivity_record_for_probe_outcome(
+pub fn cluster_connectivity_record_for_probe_observation(
+    state: &ClusterBootstrapState,
+    entry: &ClusterConnectivityProbeBatchEntry,
+    observation: ClusterConnectivityProbeObservation,
+    latency_ms: u64,
+    timestamp: &str,
+    now: OffsetDateTime,
+    startup_settle_active: bool,
+) -> ClusterConnectivityRecord {
+    match observation {
+        ClusterConnectivityProbeObservation::Healthy => {
+            cluster_connectivity_record_for_probe_outcome(
+                state,
+                &entry.endpoint,
+                entry.previous.as_ref(),
+                true,
+                latency_ms,
+                timestamp,
+                now,
+            )
+        }
+        ClusterConnectivityProbeObservation::IdentityMismatch => {
+            cluster_connectivity_record_for_identity_mismatch(
+                state,
+                &entry.endpoint,
+                timestamp,
+                now,
+            )
+        }
+        ClusterConnectivityProbeObservation::Failed if startup_settle_active => {
+            cluster_connectivity_record_for_startup_probe_failure(
+                state,
+                &entry.endpoint,
+                entry.previous.as_ref(),
+                latency_ms,
+                timestamp,
+                now,
+            )
+        }
+        ClusterConnectivityProbeObservation::Failed => {
+            cluster_connectivity_record_for_probe_outcome(
+                state,
+                &entry.endpoint,
+                entry.previous.as_ref(),
+                false,
+                latency_ms,
+                timestamp,
+                now,
+            )
+        }
+    }
+}
+
+pub(crate) fn cluster_connectivity_record_for_probe_outcome(
     state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
     previous: Option<&ClusterConnectivityRecord>,
@@ -254,7 +314,7 @@ pub fn cluster_connectivity_record_for_probe_outcome(
     )
 }
 
-pub fn cluster_connectivity_record_for_startup_probe_failure(
+pub(crate) fn cluster_connectivity_record_for_startup_probe_failure(
     state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
     previous: Option<&ClusterConnectivityRecord>,
@@ -275,7 +335,7 @@ pub fn cluster_connectivity_record_for_startup_probe_failure(
     record
 }
 
-pub fn cluster_connectivity_record_for_identity_mismatch(
+pub(crate) fn cluster_connectivity_record_for_identity_mismatch(
     state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
     timestamp: &str,

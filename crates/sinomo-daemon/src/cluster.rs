@@ -2346,17 +2346,9 @@ fn connectivity_record_for_daemon_status_probe(
     now: time::OffsetDateTime,
     startup_settle_active: bool,
 ) -> (String, ClusterConnectivityRecord) {
-    let record = match &result {
+    let observation = match &result {
         Ok(status) if daemon_cluster_status_matches(state, &entry.endpoint, status) => {
-            sinomo_network::cluster_connectivity_record_for_probe_outcome(
-                state,
-                &entry.endpoint,
-                entry.previous.as_ref(),
-                true,
-                latency_ms,
-                timestamp,
-                now,
-            )
+            sinomo_network::ClusterConnectivityProbeObservation::Healthy
         }
         Ok(status) => {
             eprintln!(
@@ -2367,53 +2359,22 @@ fn connectivity_record_for_daemon_status_probe(
                 status.cluster.as_ref().map(|c| c.node_id.to_string()),
             );
             if status.cluster.is_some() {
-                sinomo_network::cluster_connectivity_record_for_identity_mismatch(
-                    state,
-                    &entry.endpoint,
-                    timestamp,
-                    now,
-                )
-            } else if startup_settle_active {
-                sinomo_network::cluster_connectivity_record_for_startup_probe_failure(
-                    state,
-                    &entry.endpoint,
-                    entry.previous.as_ref(),
-                    latency_ms,
-                    timestamp,
-                    now,
-                )
+                sinomo_network::ClusterConnectivityProbeObservation::IdentityMismatch
             } else {
-                sinomo_network::cluster_connectivity_record_for_probe_outcome(
-                    state,
-                    &entry.endpoint,
-                    entry.previous.as_ref(),
-                    false,
-                    latency_ms,
-                    timestamp,
-                    now,
-                )
+                sinomo_network::ClusterConnectivityProbeObservation::Failed
             }
         }
-        Err(_) if startup_settle_active => {
-            sinomo_network::cluster_connectivity_record_for_startup_probe_failure(
-                state,
-                &entry.endpoint,
-                entry.previous.as_ref(),
-                latency_ms,
-                timestamp,
-                now,
-            )
-        }
-        Err(_) => sinomo_network::cluster_connectivity_record_for_probe_outcome(
-            state,
-            &entry.endpoint,
-            entry.previous.as_ref(),
-            false,
-            latency_ms,
-            timestamp,
-            now,
-        ),
+        Err(_) => sinomo_network::ClusterConnectivityProbeObservation::Failed,
     };
+    let record = sinomo_network::cluster_connectivity_record_for_probe_observation(
+        state,
+        &entry,
+        observation,
+        latency_ms,
+        timestamp,
+        now,
+        startup_settle_active,
+    );
     (entry.key, record)
 }
 
