@@ -276,6 +276,13 @@ impl ClusterKvPaths {
         self.raft_store().locked_known_voter_leader_id(state)
     }
 
+    pub fn locked_raft_local_is_leader(
+        &self,
+        state: &ClusterBootstrapState,
+    ) -> Result<bool, KvError> {
+        self.raft_store().locked_local_is_leader(state)
+    }
+
     pub fn set_raft_leader_and_write_snapshot_if_changed(
         &self,
         node_id: &NodeId,
@@ -329,6 +336,30 @@ impl ClusterKvPaths {
 
     pub fn open_raft_node(&self, node_id: &NodeId) -> Result<DurableRaftKvNode, KvError> {
         self.raft_store().open_node(node_id)
+    }
+
+    pub fn append_raft_command_uncommitted(
+        &self,
+        node_id: &NodeId,
+        command: KvCommand,
+    ) -> Result<KvLogEntry, KvError> {
+        self.raft_store()
+            .append_command_uncommitted(node_id, command)
+    }
+
+    pub fn local_raft_command_storage<F>(
+        &self,
+        node_id: NodeId,
+        key_can_defer_materialized_snapshot: F,
+    ) -> ClusterKvRaftLocalCommandStorage<F>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        ClusterKvRaftLocalCommandStorage::new(
+            self.raft_store(),
+            node_id,
+            key_can_defer_materialized_snapshot,
+        )
     }
 
     pub async fn open_raft_node_async(

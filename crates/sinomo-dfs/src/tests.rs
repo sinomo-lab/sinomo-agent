@@ -1,6 +1,6 @@
 use super::*;
 use sinomo_core::{ClusterEndpointPrivacy, ClusterEndpointSource, ClusterTransportKind};
-use sinomo_kv::InProcessKvCluster;
+use sinomo_kv::InProcessKvStore;
 use sinomo_network::{AsyncInProcessNetwork, InProcessNetwork};
 use sinomo_object::Value;
 use std::collections::{BTreeMap, VecDeque};
@@ -1061,12 +1061,12 @@ impl DfsControlPlaneKvClient for ClusterPathDfsControlPlaneKvClient {
 
 #[derive(Debug)]
 struct CountingDfsControlPlaneKvClient {
-    inner: InProcessKvCluster,
+    inner: InProcessKvStore,
     range_prefix_calls: Arc<AtomicUsize>,
 }
 
 impl CountingDfsControlPlaneKvClient {
-    fn new(inner: InProcessKvCluster, range_prefix_calls: Arc<AtomicUsize>) -> Self {
+    fn new(inner: InProcessKvStore, range_prefix_calls: Arc<AtomicUsize>) -> Self {
         Self {
             inner,
             range_prefix_calls,
@@ -4610,9 +4610,7 @@ fn control_plane_default_bootstrap_host_writes_default_dfs_records() {
         "pk-local",
         now,
     );
-    let control_plane = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![local.clone()]).expect("kv"),
-    );
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     let mut host = DfsControlPlaneDefaultClusterBootstrapHost::new(
         data_dir.clone(),
         cluster_paths,
@@ -5045,9 +5043,7 @@ fn metadata_replication_cursor_advances_only_after_replica_ack() {
     let primary = NodeId::from_legacy_named("node_meta_primary").expect("primary");
     let replica = NodeId::from_legacy_named("node_meta_replica").expect("replica");
     let file_system = file_system(primary.clone());
-    let shared_kv = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![primary.clone()]).expect("kv"),
-    );
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     shared_kv.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -7165,9 +7161,7 @@ fn distributed_write_uses_path_selected_metadata_shard_epoch() {
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
     ];
-    let shared_kv = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![owner.clone()]).expect("kv"),
-    );
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     shared_kv.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         for shard in &shard_configs {
@@ -8037,9 +8031,7 @@ fn stateless_endpoint_reader_write_commits_after_primary_fetch_receipt() {
     let version_2 =
         DfsVersion::from_legacy_named("version_stateless_endpoint_fetch_2").expect("version");
     let file_system = file_system(primary.clone());
-    let control_plane = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![writer.clone(), primary.clone()]).expect("kv"),
-    );
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     control_plane.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -8192,9 +8184,7 @@ fn posix_routed_strict_write_prefers_metadata_primary_replica() {
     let replica =
         NodeId::from_legacy_named("node_posix_routed_primary_pref_replica").expect("replica");
     let file_system = file_system(primary.clone());
-    let control_plane = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![writer.clone(), primary.clone()]).expect("kv"),
-    );
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     control_plane.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -8273,9 +8263,7 @@ fn posix_routed_large_write_sends_manifest_only_request() {
     let writer = NodeId::from_legacy_named("node_posix_routed_manifest_writer").expect("writer");
     let primary = NodeId::from_legacy_named("node_posix_routed_manifest_primary").expect("primary");
     let file_system = file_system(primary.clone());
-    let control_plane = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![writer.clone(), primary.clone()]).expect("kv"),
-    );
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     control_plane.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -8383,9 +8371,7 @@ fn posix_local_primary_detached_manifest_write_persists_visible_metadata_without
         assignment: DfsMetadataShardAssignment::Root,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
-    let control_plane = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![local.clone(), peer.clone()]).expect("kv"),
-    );
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     control_plane.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -8497,9 +8483,7 @@ fn routed_manifest_write_controls_response_journal_replay() {
         assignment: DfsMetadataShardAssignment::Root,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
-    let control_plane = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![writer.clone(), primary.clone()]).expect("kv"),
-    );
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     control_plane.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -8647,10 +8631,7 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
     let version_2 =
         DfsVersion::from_legacy_named("version_served_endpoint_fetch_stage_2").expect("version");
     let file_system = file_system(primary.clone());
-    let control_plane = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![writer.clone(), primary.clone(), replica.clone()])
-            .expect("kv"),
-    );
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     control_plane.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -9373,9 +9354,7 @@ fn posix_transient_create_routes_precommit_records_to_path_shard() {
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
     ];
-    let shared_kv = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![owner.clone()]).expect("kv"),
-    );
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     shared_kv.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         for shard in &shard_configs {
@@ -9631,9 +9610,7 @@ fn retry_pending_repairs_skips_sender_that_lost_metadata_primary_authority() {
     let version_2 =
         DfsVersion::from_legacy_named("version_repair_stale_primary_2").expect("version");
     let file_system = file_system(owner.clone());
-    let shared_kv = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![owner.clone(), new_primary.clone()]).expect("kv"),
-    );
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     shared_kv.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -15473,9 +15450,7 @@ fn repair_command_accepts_current_replica_after_metadata_primary_moves() {
     let version_2 =
         DfsVersion::from_legacy_named("version_repair_moved_2").expect("target version");
     let file_system = file_system(source.clone());
-    let shared_kv = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![target.clone()]).expect("kv"),
-    );
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     shared_kv.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -15566,9 +15541,7 @@ fn repair_command_accepts_metadata_primary_for_stored_intent() {
         DfsVersion::from_legacy_named("version_repair_stored_2").expect("target version");
     let intent_id = "dfs_intent_repair_stored_primary";
     let file_system = file_system(coordinator.clone());
-    let shared_kv = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![primary.clone()]).expect("kv"),
-    );
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     shared_kv.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -15675,9 +15648,7 @@ fn fetch_blob_accepts_metadata_primary_for_stored_intent() {
         DfsVersion::from_legacy_named("version_fetch_stored_2").expect("target version");
     let intent_id = "dfs_intent_fetch_stored_primary";
     let file_system = file_system(coordinator.clone());
-    let shared_kv = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![primary.clone()]).expect("kv"),
-    );
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     shared_kv.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -15783,9 +15754,7 @@ fn repair_command_rejects_unknown_object_from_non_primary_metadata_source() {
     let version_2 =
         DfsVersion::from_legacy_named("version_repair_unknown_2").expect("target version");
     let file_system = file_system(source.clone());
-    let shared_kv = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![primary.clone()]).expect("kv"),
-    );
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     shared_kv.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -15928,9 +15897,7 @@ fn stage_command_accepts_metadata_shard_primary_for_transient_object() {
     let version_2 =
         DfsVersion::from_legacy_named("version_stage_transient_2").expect("target version");
     let file_system = file_system(owner.clone());
-    let shared_kv = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![primary.clone()]).expect("kv"),
-    );
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     shared_kv.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -16230,9 +16197,7 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
     object.version = version_1.clone();
     object.policy = DfsObjectPolicy::ReplicatedEventual;
     object.current_locations = vec![owner.clone()];
-    let shared_kv = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![owner.clone()]).expect("kv"),
-    );
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     shared_kv.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -16365,9 +16330,7 @@ fn replica_remote_read_cache_and_prune_do_not_append_authoritative_metadata() {
     object.current_locations = vec![owner.clone()];
     object.content_hash = Some(content_hash.clone());
     object.content_size_bytes = None;
-    let shared_kv = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![owner.clone()]).expect("kv"),
-    );
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     shared_kv.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -21418,7 +21381,7 @@ struct SifsPosixCluster {
 
 fn sifs_posix_cluster_node(
     network: &InProcessNetwork,
-    shared_kv: &SharedDfsControlPlaneKvClient<InProcessKvCluster>,
+    shared_kv: &SharedDfsControlPlaneKvClient<InProcessKvStore>,
     root: &Path,
     name: &str,
     node_id: NodeId,
@@ -21447,9 +21410,7 @@ fn sifs_posix_cluster(name: &str) -> SifsPosixCluster {
         NodeId::from_legacy_named(&format!("node_{node_prefix}_observer")).expect("observer node");
 
     let network = InProcessNetwork::new();
-    let shared_kv = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![primary_node.clone()]).expect("control plane kv"),
-    );
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     shared_kv.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -23327,7 +23288,7 @@ struct SifsTwoPrimaryCluster {
     users_primary_node: NodeId,
     services_primary_node: NodeId,
     replica_node: NodeId,
-    shared_kv: SharedDfsControlPlaneKvClient<InProcessKvCluster>,
+    shared_kv: SharedDfsControlPlaneKvClient<InProcessKvStore>,
     users_primary: NetworkedDfsService<sinomo_network::InProcessTransport>,
     services_primary: NetworkedDfsService<sinomo_network::InProcessTransport>,
     replica: NetworkedDfsService<sinomo_network::InProcessTransport>,
@@ -23451,9 +23412,7 @@ fn sifs_two_primary_cluster(name: &str) -> SifsTwoPrimaryCluster {
         NodeId::from_legacy_named(&format!("node_{node_prefix}_replica")).expect("replica");
 
     let network = InProcessNetwork::new();
-    let shared_kv = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![users_primary_node.clone()]).expect("control plane kv"),
-    );
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     // Genesis: one node is primary of every shard and materializes SIFS.
     let genesis_shards = sifs_two_primary_shard_configs(
         &users_primary_node,
@@ -23806,7 +23765,7 @@ fn apply_transaction_shard_selection_lists_control_plane_once_for_bulk_paths() {
         vec![requester.clone()],
         vec![requester.clone()],
     );
-    let mut kv = InProcessKvCluster::new(vec![primary.clone()]).expect("kv");
+    let mut kv = InProcessKvStore::new();
     {
         let mut control = DfsControlPlaneStore::new(&mut kv);
         control
@@ -24019,12 +23978,7 @@ fn sifs_cluster_posix_rename_across_shard_primaries_moves_object_transactionally
         users_primary_node: NodeId::from_legacy_named("node_unused_users").expect("node"),
         services_primary_node: NodeId::from_legacy_named("node_unused_services").expect("node"),
         replica_node,
-        shared_kv: SharedDfsControlPlaneKvClient::new(
-            InProcessKvCluster::new(vec![
-                NodeId::from_legacy_named("node_unused_kv").expect("node"),
-            ])
-            .expect("kv"),
-        ),
+        shared_kv: SharedDfsControlPlaneKvClient::new(InProcessKvStore::new()),
         users_primary,
         services_primary,
         replica,
@@ -24256,12 +24210,7 @@ fn sifs_cluster_posix_hardlink_across_shard_primaries_links_and_promotes() {
         users_primary_node: NodeId::from_legacy_named("node_unused_users2").expect("node"),
         services_primary_node: NodeId::from_legacy_named("node_unused_services2").expect("node"),
         replica_node,
-        shared_kv: SharedDfsControlPlaneKvClient::new(
-            InProcessKvCluster::new(vec![
-                NodeId::from_legacy_named("node_unused_kv2").expect("node"),
-            ])
-            .expect("kv"),
-        ),
+        shared_kv: SharedDfsControlPlaneKvClient::new(InProcessKvStore::new()),
         users_primary,
         services_primary,
         replica,
@@ -24696,12 +24645,7 @@ fn sifs_cluster_posix_directory_rename_across_shard_primaries_moves_subtree() {
         users_primary_node: NodeId::from_legacy_named("node_unused_users3").expect("node"),
         services_primary_node: NodeId::from_legacy_named("node_unused_services3").expect("node"),
         replica_node,
-        shared_kv: SharedDfsControlPlaneKvClient::new(
-            InProcessKvCluster::new(vec![
-                NodeId::from_legacy_named("node_unused_kv3").expect("node"),
-            ])
-            .expect("kv"),
-        ),
+        shared_kv: SharedDfsControlPlaneKvClient::new(InProcessKvStore::new()),
         users_primary,
         services_primary,
         replica,
@@ -24948,12 +24892,7 @@ fn sifs_cluster_posix_reverse_direction_move_resolves_by_id_on_replicas() {
         users_primary_node: NodeId::from_legacy_named("node_unused_users4").expect("node"),
         services_primary_node: NodeId::from_legacy_named("node_unused_services4").expect("node"),
         replica_node,
-        shared_kv: SharedDfsControlPlaneKvClient::new(
-            InProcessKvCluster::new(vec![
-                NodeId::from_legacy_named("node_unused_kv4").expect("node"),
-            ])
-            .expect("kv"),
-        ),
+        shared_kv: SharedDfsControlPlaneKvClient::new(InProcessKvStore::new()),
         users_primary,
         services_primary,
         replica,
@@ -25619,9 +25558,7 @@ fn sifs_cluster_in_service_publish_repairs_forked_replica_with_snapshot() {
     let follower_node =
         NodeId::from_legacy_named("node_inservice_snap_follower").expect("follower");
     let network = InProcessNetwork::new();
-    let shared_kv = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![primary_node.clone()]).expect("kv"),
-    );
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     shared_kv.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -25758,9 +25695,7 @@ fn sifs_outsider_cluster(name: &str) -> SifsPosixCluster {
         NodeId::from_legacy_named(&format!("node_{node_prefix}_outsider")).expect("outsider node");
 
     let network = InProcessNetwork::new();
-    let shared_kv = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![primary_node.clone()]).expect("control plane kv"),
-    );
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     shared_kv.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -26135,9 +26070,7 @@ fn sifs_routed_namespace_op_follows_authority_redirect() {
     };
 
     // Current control-plane view: the shard moved to `writer_node` at epoch 2.
-    let kv_current = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![primary_node.clone()]).expect("current kv"),
-    );
+    let kv_current = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     kv_current.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -26150,9 +26083,7 @@ fn sifs_routed_namespace_op_follows_authority_redirect() {
             .expect("current shard config");
     });
     // The requester's stale view still names the old primary at epoch 1.
-    let kv_stale = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![observer_node.clone()]).expect("stale kv"),
-    );
+    let kv_stale = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     kv_stale.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -26234,9 +26165,7 @@ fn sifs_routed_write_follows_authority_redirect() {
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
 
-    let kv_current = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![primary_node.clone()]).expect("current kv"),
-    );
+    let kv_current = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     kv_current.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -26248,9 +26177,7 @@ fn sifs_routed_write_follows_authority_redirect() {
             .put_metadata_shard(&shard_config(&writer_node, 2))
             .expect("current shard config");
     });
-    let kv_stale = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![requester_node.clone()]).expect("stale kv"),
-    );
+    let kv_stale = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     kv_stale.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -26348,9 +26275,7 @@ fn sifs_routed_lookup_follows_authority_redirect() {
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
 
-    let kv_current = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![primary_node.clone()]).expect("current kv"),
-    );
+    let kv_current = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     kv_current.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control
@@ -26362,9 +26287,7 @@ fn sifs_routed_lookup_follows_authority_redirect() {
             .put_metadata_shard(&shard_config(&writer_node, 2))
             .expect("current shard config");
     });
-    let kv_stale = SharedDfsControlPlaneKvClient::new(
-        InProcessKvCluster::new(vec![requester_node.clone()]).expect("stale kv"),
-    );
+    let kv_stale = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     kv_stale.with_client(|kv| {
         let mut control = DfsControlPlaneStore::new(kv);
         control

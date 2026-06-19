@@ -16,7 +16,7 @@ use sinomo_dfs::{
     SharedDfsControlPlaneKvClient, file_system_config_key, sifs_node_files_path,
 };
 use sinomo_events::EventId;
-use sinomo_kv::InProcessRaftKvCluster;
+use sinomo_kv::InProcessKvStore;
 use sinomo_network::InProcessNetwork;
 use sinomo_node::NodeId;
 use std::fs;
@@ -2376,10 +2376,7 @@ fn networked_dfs_uses_kv_only_for_control_plane_file_system_config() {
     let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let root = temp_root("networked_control_plane_config");
     let network = InProcessNetwork::new();
-    let control_plane = SharedDfsControlPlaneKvClient::new(
-        InProcessRaftKvCluster::new(vec![owner.clone(), replica.clone()])
-            .expect("control-plane kv cluster"),
-    );
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
@@ -2466,8 +2463,7 @@ fn networked_dfs_uses_kv_only_for_control_plane_file_system_config() {
                 .file_system_id,
             file_system_id
         );
-        let leader_store = kv.store(kv.leader_id()).expect("leader store");
-        let dfs_keys: Vec<_> = leader_store
+        let dfs_keys: Vec<_> = kv
             .range_prefix("/dfs/")
             .into_iter()
             .map(|entry| entry.key)
@@ -2481,13 +2477,9 @@ fn networked_dfs_uses_kv_only_for_control_plane_file_system_config() {
 #[test]
 fn distributed_sifs_bootstrap_exposes_cluster_root_users_and_services_in_metadata_not_kv() {
     let owner = NodeId::from_legacy_named("node_owner").expect("node");
-    let replica = NodeId::from_legacy_named("node_replica").expect("node");
     let root = temp_root("distributed_sifs_bootstrap");
     let network = InProcessNetwork::new();
-    let control_plane = SharedDfsControlPlaneKvClient::new(
-        InProcessRaftKvCluster::new(vec![owner.clone(), replica.clone()])
-            .expect("control-plane kv cluster"),
-    );
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     let backend =
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
             .expect("metadata backend");
@@ -2514,8 +2506,7 @@ fn distributed_sifs_bootstrap_exposes_cluster_root_users_and_services_in_metadat
                 "loopback://content",
             ))
             .expect("content advertisement");
-        let leader = kv.store(kv.leader_id()).expect("leader store");
-        let dfs_keys: Vec<_> = leader
+        let dfs_keys: Vec<_> = kv
             .range_prefix("/dfs/")
             .into_iter()
             .map(|entry| entry.key)
@@ -2908,17 +2899,13 @@ fn networked_dfs_sends_metadata_journal_in_bounded_batches() {
 fn networked_dfs_routes_non_primary_write_to_metadata_shard_primary() {
     let writer = NodeId::from_legacy_named("node_route_writer").expect("node");
     let primary = NodeId::from_legacy_named("node_route_primary").expect("node");
-    let witness = NodeId::from_legacy_named("node_route_witness").expect("node");
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
     let object_id = DfsObjectId::from_legacy_named("obj_route_primary").expect("object");
     let version_1 = DfsVersion::from_legacy_named("version_route_1").expect("version");
     let version_2 = DfsVersion::from_legacy_named("version_route_2").expect("version");
     let root = temp_root("networked_route_non_primary_write");
     let network = InProcessNetwork::new();
-    let control_plane = SharedDfsControlPlaneKvClient::new(
-        InProcessRaftKvCluster::new(vec![writer.clone(), primary.clone(), witness])
-            .expect("control-plane kv cluster"),
-    );
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     control_plane.with_client(|kv| {
         DfsControlPlaneStore::new(kv)
             .put_metadata_shard(&DfsMetadataShardConfig {
@@ -3059,17 +3046,13 @@ fn networked_dfs_routes_non_primary_write_to_metadata_shard_primary() {
 fn networked_dfs_strict_routed_write_completion_resolves_remote_intent_alias() {
     let writer = NodeId::from_legacy_named("node_strict_route_writer").expect("node");
     let primary = NodeId::from_legacy_named("node_strict_route_primary").expect("node");
-    let witness = NodeId::from_legacy_named("node_strict_route_witness").expect("node");
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
     let object_id = DfsObjectId::from_legacy_named("obj_strict_route_primary").expect("object");
     let version_1 = DfsVersion::from_legacy_named("version_strict_route_1").expect("version");
     let version_2 = DfsVersion::from_legacy_named("version_strict_route_2").expect("version");
     let root = temp_root("networked_strict_route_alias");
     let network = InProcessNetwork::new();
-    let control_plane = SharedDfsControlPlaneKvClient::new(
-        InProcessRaftKvCluster::new(vec![writer.clone(), primary.clone(), witness])
-            .expect("control-plane kv cluster"),
-    );
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     control_plane.with_client(|kv| {
         DfsControlPlaneStore::new(kv)
             .put_metadata_shard(&DfsMetadataShardConfig {
@@ -3264,17 +3247,13 @@ fn networked_dfs_strict_routed_write_completion_resolves_remote_intent_alias() {
 fn routed_write_response_does_not_fail_when_requester_becomes_metadata_primary() {
     let writer = NodeId::from_legacy_named("node_route_flip_writer").expect("node");
     let primary = NodeId::from_legacy_named("node_route_flip_primary").expect("node");
-    let witness = NodeId::from_legacy_named("node_route_flip_witness").expect("node");
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
     let object_id = DfsObjectId::from_legacy_named("obj_route_flip_primary").expect("object");
     let version_1 = DfsVersion::from_legacy_named("version_route_flip_1").expect("version");
     let version_2 = DfsVersion::from_legacy_named("version_route_flip_2").expect("version");
     let root = temp_root("routed_write_response_requester_becomes_primary");
     let network = InProcessNetwork::new();
-    let control_plane = SharedDfsControlPlaneKvClient::new(
-        InProcessRaftKvCluster::new(vec![writer.clone(), primary.clone(), witness])
-            .expect("control-plane kv cluster"),
-    );
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     control_plane.with_client(|kv| {
         DfsControlPlaneStore::new(kv)
             .put_metadata_shard(&DfsMetadataShardConfig {
@@ -3431,17 +3410,13 @@ fn routed_write_response_does_not_fail_when_requester_becomes_metadata_primary()
 fn networked_dfs_routes_reader_write_to_metadata_primary_via_fetch() {
     let writer = NodeId::from_legacy_named("node_route_reader_writer").expect("node");
     let primary = NodeId::from_legacy_named("node_route_reader_primary").expect("node");
-    let witness = NodeId::from_legacy_named("node_route_reader_witness").expect("node");
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
     let object_id = DfsObjectId::from_legacy_named("obj_route_reader_primary").expect("object");
     let version_1 = DfsVersion::from_legacy_named("version_route_reader_1").expect("version");
     let version_2 = DfsVersion::from_legacy_named("version_route_reader_2").expect("version");
     let root = temp_root("networked_route_reader_primary_write");
     let network = InProcessNetwork::new();
-    let control_plane = SharedDfsControlPlaneKvClient::new(
-        InProcessRaftKvCluster::new(vec![writer.clone(), primary.clone(), witness])
-            .expect("control-plane kv cluster"),
-    );
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     control_plane.with_client(|kv| {
         DfsControlPlaneStore::new(kv)
             .put_metadata_shard(&DfsMetadataShardConfig {
@@ -3639,10 +3614,7 @@ fn networked_dfs_configured_metadata_replication_drains_bounded_batches() {
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
     let root = temp_root("networked_metadata_bounded_configured");
     let network = InProcessNetwork::new();
-    let control_plane = SharedDfsControlPlaneKvClient::new(
-        InProcessRaftKvCluster::new(vec![owner.clone(), replica.clone()])
-            .expect("control-plane kv cluster"),
-    );
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     control_plane.with_client(|kv| {
         DfsControlPlaneStore::new(kv)
             .put_metadata_shard(&DfsMetadataShardConfig {
@@ -3834,10 +3806,7 @@ fn networked_dfs_replicates_configured_metadata_shard_to_replicas() {
     let version = DfsVersion::from_legacy_named("version_1").expect("version");
     let root = temp_root("networked_metadata_configured_replicas");
     let network = InProcessNetwork::new();
-    let control_plane = SharedDfsControlPlaneKvClient::new(
-        InProcessRaftKvCluster::new(vec![owner.clone(), replica.clone()])
-            .expect("control-plane kv cluster"),
-    );
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     control_plane.with_client(|kv| {
         DfsControlPlaneStore::new(kv)
             .put_metadata_shard(&DfsMetadataShardConfig {
@@ -12299,17 +12268,13 @@ fn networked_dfs_reconnect_reconciliation_uses_backend_current_metadata() {
 fn networked_dfs_owner_handoff_requires_latest_content_and_routes_old_owner() {
     let owner = NodeId::from_legacy_named("node_owner").expect("node");
     let candidate = NodeId::from_legacy_named("node_candidate").expect("node");
-    let witness = NodeId::from_legacy_named("node_witness").expect("node");
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
     let object_id = DfsObjectId::from_legacy_named("obj_artifact").expect("object");
     let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
     let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let root = temp_root("networked_owner_handoff");
     let network = InProcessNetwork::new();
-    let control_plane = SharedDfsControlPlaneKvClient::new(
-        InProcessRaftKvCluster::new(vec![owner.clone(), candidate.clone(), witness])
-            .expect("control-plane kv cluster"),
-    );
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     control_plane.with_client(|kv| {
         DfsControlPlaneStore::new(kv)
             .put_metadata_shard(&DfsMetadataShardConfig {
@@ -12458,7 +12423,6 @@ fn networked_dfs_owner_handoff_requires_latest_content_and_routes_old_owner() {
 fn networked_dfs_owner_handoff_uses_backend_current_metadata() {
     let owner = NodeId::from_legacy_named("node_handoff_backend_owner").expect("node");
     let candidate = NodeId::from_legacy_named("node_handoff_backend_candidate").expect("node");
-    let witness = NodeId::from_legacy_named("node_handoff_backend_witness").expect("node");
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
     let object_id = DfsObjectId::from_legacy_named("obj_handoff_backend").expect("object");
     let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
@@ -12467,10 +12431,7 @@ fn networked_dfs_owner_handoff_uses_backend_current_metadata() {
     let hash = content_hash(bytes);
     let root = temp_root("networked_owner_handoff_backend_current");
     let network = InProcessNetwork::new();
-    let control_plane = SharedDfsControlPlaneKvClient::new(
-        InProcessRaftKvCluster::new(vec![owner.clone(), candidate.clone(), witness])
-            .expect("control-plane kv cluster"),
-    );
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
     control_plane.with_client(|kv| {
         DfsControlPlaneStore::new(kv)
             .put_metadata_shard(&DfsMetadataShardConfig {
