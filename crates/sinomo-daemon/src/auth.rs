@@ -11,10 +11,10 @@ use sinomo_kv::{ClusterKvRouteAuth, cluster_kv_rpc_route_policy};
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
     ClusterControlPlaneTimeouts, ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
-    ClusterInviteId, ClusterPaths,
+    ClusterPaths,
 };
 use sinomo_node::{
-    NodeIdentity, NodeIdentityPaths, load_or_create_main_node_identity,
+    ClusterInviteId, NodeIdentity, NodeIdentityPaths, load_or_create_main_node_identity,
     load_or_create_node_identity,
 };
 use sinomo_rollout::{

@@ -47,11 +47,11 @@ use sinomo_network::{
 };
 #[cfg(test)]
 use sinomo_network::{
-    ClusterConnectivityProbeState, ClusterId, ClusterInviteId, ClusterJoinRegistrationResponse,
+    ClusterConnectivityProbeState, ClusterId, ClusterJoinRegistrationResponse,
     MdnsDiscoveryAdvertisement,
 };
 #[cfg(test)]
-use sinomo_node::cluster_member_key;
+use sinomo_node::{ClusterInviteId, cluster_member_key};
 use sinomo_node::{
     NodeId, cluster_member_expected_daemon_process, cluster_member_is_local_process,
     cluster_node_status_stable_eq, shadow_daemon_node_id,

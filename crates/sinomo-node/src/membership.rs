@@ -11,6 +11,8 @@ use crate::{
     DAEMON_SHADOW_SUPERVISE_CAPABILITY, NodeId, shadow_daemon_node_id,
 };
 
+pub type ClusterInviteId = Id;
+
 pub fn cluster_endpoint_stable_eq(
     left: &ClusterEndpointRecord,
     right: &ClusterEndpointRecord,
@@ -199,11 +201,11 @@ pub fn cluster_member_key(node_id: &NodeId) -> String {
     format!("/cluster/members/{node_id}")
 }
 
-pub fn cluster_invitation_key(invite_id: &Id) -> String {
+pub fn cluster_invitation_key(invite_id: &ClusterInviteId) -> String {
     format!("/cluster/invitations/{invite_id}")
 }
 
-pub fn cluster_invitation_state_key(invite_id: &Id) -> String {
+pub fn cluster_invitation_state_key(invite_id: &ClusterInviteId) -> String {
     format!("/cluster/invitations/{invite_id}/state")
 }
 

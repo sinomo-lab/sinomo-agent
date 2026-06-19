@@ -190,14 +190,15 @@ use sinomo_runtime::network::ClusterJoinRegistrationRequest;
 #[cfg(test)]
 use sinomo_runtime::network::ClusterJoinRegistrationResponse;
 use sinomo_runtime::network::{self, ClusterPaths, cluster_doctor_findings};
-use sinomo_runtime::network::{ClusterDoctorFinding, ClusterHealthRow, ClusterId, ClusterInviteId};
+use sinomo_runtime::network::{ClusterDoctorFinding, ClusterHealthRow, ClusterId};
 #[cfg(test)]
 use sinomo_runtime::network::{ClusterInviteChallengeProof, ClusterInviteChallengeRequest};
 #[cfg(test)]
 use sinomo_runtime::node::DAEMON_MAIN_CLUSTER_ROLE;
 use sinomo_runtime::node::{
-    NodeId, cluster_member_expected_daemon_process, cluster_member_is_local_process,
-    load_or_create_main_node_identity, load_or_create_shadow_node_identity, shadow_daemon_node_id,
+    ClusterInviteId, NodeId, cluster_member_expected_daemon_process,
+    cluster_member_is_local_process, load_or_create_main_node_identity,
+    load_or_create_shadow_node_identity, shadow_daemon_node_id,
 };
 #[cfg(test)]
 use sinomo_runtime::rollout::read_rollout_status;

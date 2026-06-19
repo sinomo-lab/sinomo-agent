@@ -391,7 +391,6 @@ pub use voter_reachability::{
 
 pub type ClusterId = sinomo_core::Id;
 pub type ClusterEndpointId = sinomo_core::Id;
-pub type ClusterInviteId = sinomo_core::Id;
 pub type ClusterCertificateId = sinomo_core::Id;
 
 pub const NETWORK_PROTOCOL: &str = "sinomo.network.v1";
@@ -553,7 +552,7 @@ pub fn register_storage_paths(
 }
 
 pub(crate) mod prelude {
-    pub(crate) use crate::{ClusterEndpointId, ClusterId, ClusterInviteId};
+    pub(crate) use crate::{ClusterEndpointId, ClusterId};
     pub(crate) use serde::{Deserialize, Serialize};
     #[cfg(test)]
     pub(crate) use sinomo_core::ClusterCertificate;
@@ -583,6 +582,7 @@ pub(crate) mod prelude {
     };
     #[cfg(test)]
     pub(crate) use sinomo_local::SinomoDataDir;
+    pub(crate) use sinomo_node::ClusterInviteId;
     #[cfg(test)]
     pub(crate) use sinomo_node::main_daemon_capabilities;
     #[cfg(test)]
