@@ -52,6 +52,7 @@ mod paths;
 mod peer;
 mod raft_election;
 mod raft_fanout;
+mod raft_quorum;
 mod raft_replication;
 mod records;
 mod roaming;
@@ -329,6 +330,11 @@ pub use raft_fanout::{
     fan_out_committed_cluster_raft_command_async_with_host,
     spawn_cluster_raft_committed_fanout_worker_on_runtime,
 };
+pub use raft_quorum::{
+    ClusterRaftQuorumAsyncHost, ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult,
+    ClusterRaftQuorumTransportHost, commit_cluster_raft_command_with_quorum_async_with_host,
+    commit_cluster_raft_command_with_quorum_driver,
+};
 pub use raft_replication::{
     ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
     replicate_cluster_raft_to_endpoint_async_with_host,
@@ -381,11 +387,9 @@ pub use status_publish::{
     sync_cluster_node_status_to_kv,
 };
 pub use storage::{
-    ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost, ClusterRaftQuorumAsyncHost,
-    ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult, ClusterRaftQuorumTransportHost,
+    ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost,
     cleanup_legacy_shadow_daemon_members_with_host, cluster_state_sync_txn,
     commit_cluster_kv_txn_with_quorum_response_with_host,
-    commit_cluster_raft_command_with_quorum_driver,
     handle_cluster_membership_rpc_request_with_hosts, handle_cluster_raft_rpc_request,
     remove_cluster_members_with_host, sync_cluster_state_to_kv_with_host,
     sync_cluster_state_to_local_raft_unchecked, update_cluster_node_role_with_host,
