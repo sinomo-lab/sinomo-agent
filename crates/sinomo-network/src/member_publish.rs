@@ -90,7 +90,7 @@ pub trait ClusterLocalMemberPublishAsyncHost {
     ) -> ClusterMembershipRpcFuture<'a, ClusterMemberPublishResponse>;
 }
 
-pub fn cluster_member_publish_matches_kv(
+pub(crate) fn cluster_member_publish_matches_kv(
     paths: &ClusterPaths,
     members: &[ClusterMemberRecord],
 ) -> Result<bool, NetworkError> {
@@ -574,7 +574,7 @@ where
     }
 }
 
-pub fn cluster_member_publish_authorized_for_signer(
+pub(crate) fn cluster_member_publish_authorized_for_signer(
     member_node_id: &NodeId,
     signer_node_id: &str,
 ) -> bool {
@@ -593,7 +593,9 @@ pub fn cluster_member_publish_authorized_for_signer(
 }
 
 #[cfg(test)]
-pub fn cluster_member_publish_txn(members: &[ClusterMemberRecord]) -> Result<KvTxn, NetworkError> {
+pub(crate) fn cluster_member_publish_txn(
+    members: &[ClusterMemberRecord],
+) -> Result<KvTxn, NetworkError> {
     cluster_member_publish_txn_with_snapshot(None, members)
 }
 
@@ -606,7 +608,7 @@ pub(crate) fn cluster_member_publish_txn_from_kv(
 }
 
 #[cfg(test)]
-pub fn cluster_member_publish_txn_from_snapshot(
+pub(crate) fn cluster_member_publish_txn_from_snapshot(
     snapshot: &KvSnapshot,
     members: &[ClusterMemberRecord],
 ) -> Result<KvTxn, NetworkError> {

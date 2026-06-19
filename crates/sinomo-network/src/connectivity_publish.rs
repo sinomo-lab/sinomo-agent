@@ -420,7 +420,7 @@ pub(crate) fn cluster_connectivity_full_sync_batch_ops_from_snapshot(
 /// cluster KV: no records need adding/refreshing and none need deleting. Lets the
 /// caller skip the raft append (and its disk churn) when connectivity is stable.
 #[cfg(test)]
-pub fn cluster_connectivity_sync_is_noop(
+pub(crate) fn cluster_connectivity_sync_is_noop(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
@@ -457,7 +457,7 @@ pub fn cluster_connectivity_sync_is_noop(
     .is_empty())
 }
 
-pub fn expire_cluster_network_record_ops(
+pub(crate) fn expire_cluster_network_record_ops(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     now: OffsetDateTime,
@@ -573,7 +573,7 @@ pub(crate) fn cluster_connectivity_stable_eq(
 }
 
 #[cfg(test)]
-pub fn expire_cluster_network_records(
+pub(crate) fn expire_cluster_network_records(
     paths: &ClusterPaths,
     now: OffsetDateTime,
 ) -> Result<KvSnapshot, NetworkError> {

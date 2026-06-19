@@ -35,7 +35,7 @@ pub fn read_cluster_invitation_from_kv(
     entry.decode().map_err(Into::into)
 }
 
-pub fn cluster_invitation_publish_txn_from_kv(
+pub(crate) fn cluster_invitation_publish_txn_from_kv(
     paths: &ClusterPaths,
     invite: &ClusterJoinInvite,
 ) -> Result<KvTxn, NetworkError> {
@@ -167,7 +167,7 @@ fn prepare_cluster_invite_publish_request(
     Ok(PreparedClusterInvitePublish::Commit { state, txn })
 }
 
-pub fn handle_cluster_invite_publish_request_with_host<H>(
+pub(crate) fn handle_cluster_invite_publish_request_with_host<H>(
     paths: &ClusterPaths,
     request: ClusterInvitePublishRequest,
     signer_node_id: &str,
