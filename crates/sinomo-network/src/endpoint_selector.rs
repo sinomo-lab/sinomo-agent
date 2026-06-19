@@ -417,7 +417,7 @@ pub(crate) async fn cluster_node_blocks_leader_preference_async(
         })?
 }
 
-pub fn cluster_node_blocks_leader_preference(
+pub(crate) fn cluster_node_blocks_leader_preference(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     node_id: &NodeId,

@@ -125,8 +125,7 @@ pub use endpoint_records::{
 };
 pub use endpoint_selector::{
     ClusterEndpointSelectionPurpose, ClusterEndpointSelector, advertised_peer_route_targets,
-    cluster_node_blocks_leader_preference, discover_peer_route_ip_candidates,
-    discover_peer_route_ip_candidates_async,
+    discover_peer_route_ip_candidates, discover_peer_route_ip_candidates_async,
 };
 #[cfg(test)]
 pub(crate) use endpoint_selector::{

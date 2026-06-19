@@ -10690,10 +10690,6 @@ mod tests {
         .expect("sync unreachable connectivity");
 
         assert!(
-            sinomo_network::cluster_node_blocks_leader_preference(&paths, &state, &remote_node),
-            "a remote member the active probes cannot reach must not be preferred as leader"
-        );
-        assert!(
             sinomo_network::read_cluster_node_statuses_from_kv(&paths)
                 .expect("node statuses")
                 .into_iter()

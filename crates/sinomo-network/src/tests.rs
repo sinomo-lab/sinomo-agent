@@ -10901,6 +10901,65 @@ fn cluster_kv_txn_forward_driver_uses_node_rpc_for_known_leader() {
 }
 
 #[test]
+fn cluster_node_blocks_leader_preference_when_local_probe_marks_member_unreachable() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-leader-preference-unreachable");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, local_node_id, peer_node_id) = cluster_raft_handler_test_state(
+        "cluster_leader_preference_unreachable",
+        "node_leader_preference_unreachable_local",
+        "node_leader_preference_unreachable_peer",
+    );
+    let peer_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.87:21353".to_string(), 10);
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == peer_node_id)
+        .expect("peer member")
+        .endpoints
+        .push(peer_endpoint.clone());
+    write_cluster_state(&paths, &state).expect("write state");
+    let now = OffsetDateTime::now_utc();
+    write_local_cluster_connectivity_records(
+        &paths,
+        &local_node_id,
+        &[ClusterConnectivityRecord {
+            cluster_id: state.cluster_id.clone(),
+            source_node_id: local_node_id.clone(),
+            target_node_id: peer_node_id.clone(),
+            endpoint_id: peer_endpoint.endpoint_id,
+            transport: peer_endpoint.transport,
+            address: peer_endpoint.address,
+            state: ClusterConnectivityState::Unreachable,
+            latency_ms: None,
+            consecutive_failures: 5,
+            last_success_at: None,
+            last_failure_at: Some("2026-05-04T00:10:00Z".to_string()),
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(300),
+        }],
+    )
+    .expect("write local connectivity");
+
+    assert!(
+        crate::endpoint_selector::cluster_node_blocks_leader_preference(
+            &paths,
+            &state,
+            &peer_node_id,
+        ),
+        "a peer the active probes cannot reach must not be preferred as leader"
+    );
+    assert_eq!(
+        ClusterEndpointSelector::new(&paths, &state)
+            .select(ClusterEndpointSelectionPurpose::LiveVoterCommand)
+            .len(),
+        1,
+        "an unreachable peer remains a voter while connectivity recovers"
+    );
+}
+
+#[test]
 fn cluster_kv_txn_forward_driver_uses_node_rpc_without_known_leader() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-kv-forward-node-rpc");
     let data_dir = SinomoDataDir::new(&root);
