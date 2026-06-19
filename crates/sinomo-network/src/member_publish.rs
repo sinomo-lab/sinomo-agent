@@ -130,7 +130,7 @@ pub fn cluster_member_publish_matches_kv(
     Ok(true)
 }
 
-pub fn publish_local_members_via_voter_with_host(
+pub(crate) fn publish_local_members_via_voter_with_host(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     options: ClusterLocalMemberPublishOptions,
@@ -183,7 +183,7 @@ pub fn publish_local_members_via_voter_with_host(
     })
 }
 
-pub async fn publish_local_members_via_voter_async_with_host(
+pub(crate) async fn publish_local_members_via_voter_async_with_host(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -293,12 +293,16 @@ pub fn publish_local_members_to_quorum_if_needed_with_host(
     if members.is_empty() {
         return Ok(None);
     }
-    if cluster_member_publish_matches_kv(paths, &members).unwrap_or(false) {
+    let already_published = cluster_member_publish_matches_kv(paths, &members).unwrap_or(false);
+    if already_published && !options.force_kv_snapshot_sync {
         return Ok(None);
     }
     if sinomo_kv::cluster_kv_raft_local_is_voter(state)
         && host.cluster_has_local_quorum(paths, state)
     {
+        if already_published {
+            return Ok(None);
+        }
         let mut commit_state = state.clone();
         return host
             .commit_cluster_kv_txn_with_quorum(
@@ -334,12 +338,15 @@ pub async fn publish_local_members_to_quorum_if_needed_async_with_host(
             operation: "cluster local member publish match".to_string(),
             detail: format!("member publish match task failed: {source}"),
         })?;
-    if already_published {
+    if already_published && !options.force_kv_snapshot_sync {
         return Ok(None);
     }
     if sinomo_kv::cluster_kv_raft_local_is_voter(state)
         && host.cluster_has_local_quorum_async(paths, state).await?
     {
+        if already_published {
+            return Ok(None);
+        }
         let paths_for_txn = paths.clone();
         let members_for_txn = members.clone();
         let txn = runtime

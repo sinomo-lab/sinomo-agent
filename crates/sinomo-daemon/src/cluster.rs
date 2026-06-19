@@ -188,12 +188,7 @@ impl ClusterNetworkMaintenancePendingWork {
 struct ClusterMemberPublishPendingWork {
     paths: ClusterPaths,
     state: ClusterBootstrapState,
-    mode: ClusterMemberPublishPendingMode,
-}
-
-enum ClusterMemberPublishPendingMode {
-    ToQuorumIfNeeded,
-    ViaVoter { force_kv_snapshot_sync: bool },
+    force_kv_snapshot_sync: bool,
 }
 
 struct ClusterNodeStatusPendingRefresh {
@@ -1608,32 +1603,10 @@ pub(crate) fn publish_local_members_to_quorum_if_needed_on_runtime(
     .map_err(Into::into)
 }
 
-pub(crate) async fn publish_local_members_via_voter_async(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    force_kv_snapshot_sync: bool,
-    runtime: tokio::runtime::Handle,
-) -> Result<(), DaemonError> {
-    let mut host = DaemonClusterControlPlaneTransport {
-        rpc_mode: DaemonClusterRpcMode::new(runtime.clone()),
-    };
-    sinomo_network::publish_local_members_via_voter_async_with_host(
-        &runtime,
-        paths,
-        state,
-        sinomo_network::ClusterLocalMemberPublishOptions {
-            member_publish_timeout: DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT,
-            force_kv_snapshot_sync,
-        },
-        &mut host,
-    )
-    .await
-    .map_err(Into::into)
-}
-
 pub(crate) async fn publish_local_members_to_quorum_if_needed_async(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
+    force_kv_snapshot_sync: bool,
     runtime: tokio::runtime::Handle,
 ) -> Result<Option<KvSnapshot>, DaemonError> {
     let mut host = DaemonClusterControlPlaneTransport {
@@ -1645,7 +1618,7 @@ pub(crate) async fn publish_local_members_to_quorum_if_needed_async(
         state,
         sinomo_network::ClusterLocalMemberPublishOptions {
             member_publish_timeout: DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT,
-            force_kv_snapshot_sync: false,
+            force_kv_snapshot_sync,
         },
         &mut host,
     )
@@ -1945,7 +1918,7 @@ impl ClusterNetworkMaintenance {
                     .push(ClusterMemberPublishPendingWork {
                         paths: cluster_paths.clone(),
                         state: state.clone(),
-                        mode: ClusterMemberPublishPendingMode::ToQuorumIfNeeded,
+                        force_kv_snapshot_sync: false,
                     });
                 pending_work
                     .node_status_refreshes
@@ -1989,9 +1962,7 @@ impl ClusterNetworkMaintenance {
                     .push(ClusterMemberPublishPendingWork {
                         paths: cluster_paths.clone(),
                         state: state.clone(),
-                        mode: ClusterMemberPublishPendingMode::ViaVoter {
-                            force_kv_snapshot_sync: kv_snapshot_pull_due,
-                        },
+                        force_kv_snapshot_sync: kv_snapshot_pull_due,
                     });
             }
             if publish_failed {
@@ -2236,28 +2207,14 @@ impl ClusterNetworkMaintenance {
         pending: ClusterMemberPublishPendingWork,
         runtime: tokio::runtime::Handle,
     ) {
-        let result = match pending.mode {
-            ClusterMemberPublishPendingMode::ToQuorumIfNeeded => {
-                publish_local_members_to_quorum_if_needed_async(
-                    &pending.paths,
-                    &pending.state,
-                    runtime,
-                )
-                .await
-                .map(|_| ())
-            }
-            ClusterMemberPublishPendingMode::ViaVoter {
-                force_kv_snapshot_sync,
-            } => {
-                publish_local_members_via_voter_async(
-                    &pending.paths,
-                    &pending.state,
-                    force_kv_snapshot_sync,
-                    runtime,
-                )
-                .await
-            }
-        };
+        let result = publish_local_members_to_quorum_if_needed_async(
+            &pending.paths,
+            &pending.state,
+            pending.force_kv_snapshot_sync,
+            runtime,
+        )
+        .await
+        .map(|_| ());
         match result {
             Ok(()) => self.record_publish_success(),
             Err(error) => {
@@ -7090,10 +7047,7 @@ mod tests {
         .expect("maintenance tick")
         .expect("runtime publish tick should return pending member publish");
         assert_eq!(pending.member_publishes.len(), 1);
-        assert!(matches!(
-            &pending.member_publishes[0].mode,
-            ClusterMemberPublishPendingMode::ToQuorumIfNeeded
-        ));
+        assert!(!pending.member_publishes[0].force_kv_snapshot_sync);
         assert!(pending.connectivity_probe.is_none());
 
         runtime.block_on(maintenance.run_pending_work_async(pending, runtime.handle().clone()));

@@ -263,7 +263,6 @@ pub use member_publish::{
     handle_cluster_member_publish_request_async_with_host,
     publish_local_members_to_quorum_if_needed_async_with_host,
     publish_local_members_to_quorum_if_needed_with_host,
-    publish_local_members_via_voter_async_with_host, publish_local_members_via_voter_with_host,
 };
 #[cfg(test)]
 pub(crate) use member_publish::{

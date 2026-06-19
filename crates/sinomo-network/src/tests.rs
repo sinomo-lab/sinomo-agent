@@ -30229,7 +30229,7 @@ fn local_member_publish_forced_sync_publishes_even_when_records_current() {
         }),
         ..Default::default()
     };
-    publish_local_members_via_voter_with_host(
+    publish_local_members_to_quorum_if_needed_with_host(
         &paths,
         &state,
         ClusterLocalMemberPublishOptions {
@@ -30253,7 +30253,7 @@ fn local_member_publish_forced_sync_publishes_even_when_records_current() {
         }),
         ..Default::default()
     };
-    publish_local_members_via_voter_with_host(
+    publish_local_members_to_quorum_if_needed_with_host(
         &paths,
         &state,
         ClusterLocalMemberPublishOptions {
@@ -30293,7 +30293,7 @@ fn local_member_publish_forced_sync_publishes_even_when_records_current() {
         }),
         ..Default::default()
     };
-    publish_local_members_via_voter_with_host(
+    publish_local_members_to_quorum_if_needed_with_host(
         &paths,
         &state,
         ClusterLocalMemberPublishOptions {
