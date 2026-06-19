@@ -260,7 +260,7 @@ where
             request,
         )?;
         self.transport
-            .send_cluster_membership_rpc(endpoint, &request, timeout)?
+            .call_endpoint_object_rpc(endpoint, &request, timeout)?
             .decode_body()
     }
 }

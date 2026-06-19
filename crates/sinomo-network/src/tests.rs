@@ -9528,7 +9528,7 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
             panic!("membership forwarding should not fetch kv snapshots")
         }
 
-        fn send_cluster_membership_rpc(
+        fn call_endpoint_object_rpc(
             &mut self,
             endpoint: &ClusterEndpointRecord,
             request: &ObjectRpcRequest,
@@ -9662,7 +9662,7 @@ fn cluster_join_registration_driver_uses_local_membership_observer() {
             panic!("local observation should not fetch kv snapshots")
         }
 
-        fn send_cluster_membership_rpc(
+        fn call_endpoint_object_rpc(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
             _request: &ObjectRpcRequest,
@@ -9778,7 +9778,7 @@ fn cluster_member_mutation_driver_prepares_state_from_local_membership_observer(
             panic!("membership preparation should not fetch kv snapshots")
         }
 
-        fn send_cluster_membership_rpc(
+        fn call_endpoint_object_rpc(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
             _request: &ObjectRpcRequest,
@@ -9928,7 +9928,7 @@ fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
             panic!("cache hook test should not fetch kv snapshots")
         }
 
-        fn send_cluster_membership_rpc(
+        fn call_endpoint_object_rpc(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
             _request: &ObjectRpcRequest,
@@ -13066,7 +13066,7 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
             })
         }
 
-        fn send_cluster_membership_rpc(
+        fn call_endpoint_object_rpc(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
             request: &ObjectRpcRequest,

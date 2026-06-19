@@ -1819,7 +1819,7 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
             })
         }
 
-        fn send_cluster_membership_rpc(
+        fn call_endpoint_object_rpc(
             &mut self,
             endpoint: &ClusterEndpointRecord,
             request: &network::ObjectRpcRequest,

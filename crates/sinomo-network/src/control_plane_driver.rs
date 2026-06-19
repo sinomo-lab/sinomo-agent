@@ -38,7 +38,7 @@ pub trait ClusterControlPlaneTransport {
         timeout: Duration,
     ) -> Result<KvSnapshot, NetworkError>;
 
-    fn send_cluster_membership_rpc(
+    fn call_endpoint_object_rpc(
         &mut self,
         endpoint: &ClusterEndpointRecord,
         request: &ObjectRpcRequest,

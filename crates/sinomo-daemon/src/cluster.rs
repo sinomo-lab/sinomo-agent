@@ -3459,7 +3459,7 @@ impl sinomo_network::ClusterControlPlaneTransport for DaemonClusterControlPlaneT
             .map_err(|error| daemon_host_network_error("cluster kv snapshot", error))
     }
 
-    fn send_cluster_membership_rpc(
+    fn call_endpoint_object_rpc(
         &mut self,
         endpoint: &ClusterEndpointRecord,
         request: &ObjectRpcRequest,
@@ -3471,7 +3471,7 @@ impl sinomo_network::ClusterControlPlaneTransport for DaemonClusterControlPlaneT
             timeout,
             self.rpc_mode.runtime(),
         );
-        result.map_err(|error| daemon_host_network_error("cluster membership rpc", error))
+        result.map_err(|error| daemon_host_network_error("cluster endpoint object rpc", error))
     }
 
     fn call_node_object_rpc(

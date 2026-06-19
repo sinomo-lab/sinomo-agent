@@ -1115,7 +1115,7 @@ where
             timeout,
             |endpoint, request, timeout| {
                 self.transport
-                    .send_cluster_membership_rpc(endpoint, request, timeout)
+                    .call_endpoint_object_rpc(endpoint, request, timeout)
             },
         )
     }

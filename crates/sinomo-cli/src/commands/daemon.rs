@@ -667,14 +667,14 @@ impl network::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
         decode_cluster_kv_snapshot_rpc_response(&response)
     }
 
-    fn send_cluster_membership_rpc(
+    fn call_endpoint_object_rpc(
         &mut self,
         endpoint: &ClusterEndpointRecord,
         request: &network::ObjectRpcRequest,
         timeout: Duration,
     ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
         daemon_send_daemon_rpc_to_endpoint(endpoint, request, timeout)
-            .map_err(|error| cli_daemon_rpc_network_error("cluster membership rpc", error))
+            .map_err(|error| cli_daemon_rpc_network_error("cluster endpoint object rpc", error))
     }
 
     fn call_node_object_rpc(
