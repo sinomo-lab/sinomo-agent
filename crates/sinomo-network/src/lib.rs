@@ -335,7 +335,7 @@ pub use raft_replication::{
     replicate_cluster_raft_to_endpoint_with_host,
 };
 pub use raft_rpc::{handle_cluster_raft_rpc_request, handle_cluster_raft_rpc_request_async};
-pub use records::{ClusterIdentityRecord, ClusterInvitationStateRecord};
+pub use records::ClusterInvitationStateRecord;
 pub(crate) use roaming::read_iroh_endpoint_record_async;
 #[cfg(test)]
 pub(crate) use roaming::send_daemon_rpc_to_cluster_endpoint_async;

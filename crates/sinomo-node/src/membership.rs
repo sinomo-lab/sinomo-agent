@@ -1,7 +1,9 @@
+use serde::{Deserialize, Serialize};
 use sinomo_core::{
     CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
-    ClusterEndpointSource, ClusterMemberRecord, ClusterMemberState, ClusterTransportKind,
+    ClusterEndpointSource, ClusterMemberRecord, ClusterMemberState, ClusterTransportKind, Id,
 };
+use time::OffsetDateTime;
 
 use crate::{
     DAEMON_MAIN_CLUSTER_ROLE, DAEMON_MAIN_RUN_CAPABILITY, DAEMON_SHADOW_CLUSTER_ROLE,
@@ -104,6 +106,50 @@ pub fn upsert_member_record(state: &mut ClusterBootstrapState, member: ClusterMe
     } else {
         state.members.push(member);
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterIdentityRecord {
+    pub cluster_id: Id,
+    pub cluster_name: String,
+    pub local_node_id: NodeId,
+    pub local_node_display_name: String,
+    pub term: u64,
+    pub kv_revision: u64,
+    #[serde(with = "time::serde::rfc3339")]
+    pub initialized_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+impl From<&ClusterBootstrapState> for ClusterIdentityRecord {
+    fn from(state: &ClusterBootstrapState) -> Self {
+        Self {
+            cluster_id: state.cluster_id.clone(),
+            cluster_name: state.cluster_name.clone(),
+            local_node_id: state.local_node_id.clone(),
+            local_node_display_name: state.local_node_display_name.clone(),
+            term: state.term,
+            kv_revision: state.kv_revision,
+            initialized_at: state.initialized_at,
+            updated_at: state.updated_at,
+        }
+    }
+}
+
+/// Compares two cluster identity records ignoring volatile bookkeeping fields
+/// (`kv_revision`, `updated_at`) that change on every publish without reflecting
+/// a real configuration change.
+pub fn cluster_identity_record_stable_eq(
+    left: &ClusterIdentityRecord,
+    right: &ClusterIdentityRecord,
+) -> bool {
+    left.cluster_id == right.cluster_id
+        && left.cluster_name == right.cluster_name
+        && left.local_node_id == right.local_node_id
+        && left.local_node_display_name == right.local_node_display_name
+        && left.term == right.term
+        && left.initialized_at == right.initialized_at
 }
 
 pub fn cluster_member_is_legacy_shadow_daemon(member: &ClusterMemberRecord) -> bool {

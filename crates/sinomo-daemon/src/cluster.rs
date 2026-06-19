@@ -5885,7 +5885,7 @@ mod tests {
         store
             .put_serde(
                 sinomo_network::cluster_identity_key(),
-                &sinomo_network::ClusterIdentityRecord::from(&accepted_state),
+                &sinomo_node::ClusterIdentityRecord::from(&accepted_state),
                 None,
             )
             .expect("identity");
