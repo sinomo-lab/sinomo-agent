@@ -583,8 +583,9 @@ fn append_cluster_raft_command(
     node_id: &NodeId,
     command: sinomo_runtime::kv::KvCommand,
 ) -> Result<KvSnapshot, network::NetworkError> {
-    cluster_kv_raft_store(paths)
-        .append_command_and_publish(
+    paths
+        .kv_paths()
+        .append_kv_command_and_publish(
             node_id,
             command,
             sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,

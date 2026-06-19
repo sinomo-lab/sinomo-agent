@@ -172,4 +172,22 @@ impl ClusterKvPaths {
             )
             .map(|result| (result.snapshot, result.txn_response))
     }
+
+    pub fn append_kv_command_with_response_and_publish_report<F>(
+        &self,
+        node_id: &NodeId,
+        command: KvCommand,
+        key_can_defer_materialized_snapshot: F,
+    ) -> Result<(KvSnapshot, Option<KvTxnResponse>, bool), KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.raft_store()
+            .append_command_with_response_and_publish_report(
+                node_id,
+                command,
+                key_can_defer_materialized_snapshot,
+            )
+            .map(|(result, wrote)| (result.snapshot, result.txn_response, wrote))
+    }
 }

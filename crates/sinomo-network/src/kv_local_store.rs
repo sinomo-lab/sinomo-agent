@@ -549,16 +549,16 @@ pub(crate) fn append_cluster_raft_command_with_response(
     node_id: &NodeId,
     command: KvCommand,
 ) -> Result<(KvSnapshot, Option<KvTxnResponse>), NetworkError> {
-    let store = cluster_kv_raft_store(paths);
-    let (result, wrote) = store
-        .append_command_with_response_and_publish_report(
+    let (snapshot, txn_response, wrote) = paths
+        .kv_paths()
+        .append_kv_command_with_response_and_publish_report(
             node_id,
             command,
             sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
         .map_err(NetworkError::from)?;
     observe_cluster_kv_snapshot_write(paths, wrote);
-    Ok((result.snapshot, result.txn_response))
+    Ok((snapshot, txn_response))
 }
 
 #[cfg(test)]

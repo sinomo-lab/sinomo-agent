@@ -87,8 +87,7 @@ fn run_cluster_migration_seed_source(ctx: &mut SinomoTestContext) -> SinomoTestR
 
     let snapshot = paths
         .kv_paths()
-        .raft_store()
-        .append_command_and_publish(
+        .append_kv_command_and_publish(
             &state.local_node_id,
             KvCommand::Txn(KvTxn {
                 compares: Vec::new(),

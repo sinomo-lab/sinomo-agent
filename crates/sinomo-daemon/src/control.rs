@@ -3975,8 +3975,7 @@ mod tests {
     ) -> Result<sinomo_kv::KvSnapshot, sinomo_network::NetworkError> {
         paths
             .kv_paths()
-            .raft_store()
-            .append_command_and_publish(
+            .append_kv_command_and_publish(
                 node_id,
                 command,
                 sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
