@@ -3612,7 +3612,7 @@ fn daemon_module_rollout_desired_targets_node(
 
 fn daemon_module_rollout_reconciliation_record(
     data_dir: &Path,
-    cluster_id: &sinomo_network::ClusterId,
+    cluster_id: &sinomo_node::ClusterId,
     node_id: &NodeId,
     desired: &ClusterModuleRolloutDesiredRecord,
     runtime_state: Option<&sinomo_rollout::RolloutRuntimeState>,
@@ -4299,7 +4299,7 @@ mod tests {
         let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir);
         cluster_paths.ensure().expect("cluster paths");
         let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_daemon_module_rollout_status")
+            sinomo_node::ClusterId::from_legacy_named("cluster_daemon_module_rollout_status")
                 .expect("cluster");
         let node = NodeId::from_legacy_named("node_daemon_module_rollout_status").expect("node id");
         let cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
@@ -4386,7 +4386,7 @@ mod tests {
         let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir);
         cluster_paths.ensure().expect("cluster paths");
         let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_daemon_desired_blocked")
+            sinomo_node::ClusterId::from_legacy_named("cluster_daemon_desired_blocked")
                 .expect("cluster");
         let node = NodeId::from_legacy_named("node_daemon_desired_blocked").expect("node id");
         let cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
@@ -4472,7 +4472,7 @@ mod tests {
         let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir);
         cluster_paths.ensure().expect("cluster paths");
         let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_daemon_desired_prepared")
+            sinomo_node::ClusterId::from_legacy_named("cluster_daemon_desired_prepared")
                 .expect("cluster");
         let node = NodeId::from_legacy_named("node_daemon_desired_prepared").expect("node id");
         let cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
@@ -4600,7 +4600,7 @@ mod tests {
         let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir);
         cluster_paths.ensure().expect("cluster paths");
         let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_daemon_desired_matched")
+            sinomo_node::ClusterId::from_legacy_named("cluster_daemon_desired_matched")
                 .expect("cluster");
         let node = NodeId::from_legacy_named("node_daemon_desired_matched").expect("node id");
         let cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
@@ -4687,7 +4687,7 @@ mod tests {
         data_dir.ensure_root_layout().expect("data dir");
         let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
-        let cluster_id = sinomo_network::ClusterId::from_legacy_named("cluster_daemon_sharded_dfs")
+        let cluster_id = sinomo_node::ClusterId::from_legacy_named("cluster_daemon_sharded_dfs")
             .expect("cluster");
         let local = NodeId::from_legacy_named("node_daemon_sharded_dfs").expect("node");
         let state = sinomo_core::ClusterBootstrapState::initialized_locally(

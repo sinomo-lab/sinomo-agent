@@ -1257,7 +1257,7 @@ mod tests {
         let primary = NodeId::from_legacy_named("node_daemon_dfs_meta_primary").expect("primary");
         let stale = NodeId::from_legacy_named("node_daemon_dfs_meta_stale").expect("stale");
         let state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            sinomo_network::ClusterId::from_legacy_named("cluster_daemon_dfs_meta_reject")
+            sinomo_node::ClusterId::from_legacy_named("cluster_daemon_dfs_meta_reject")
                 .expect("cluster"),
             "daemon dfs metadata reject",
             local.clone(),
@@ -1384,7 +1384,7 @@ mod tests {
         data_dir.ensure_root_layout().expect("root layout");
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
-        let cluster_id = sinomo_network::ClusterId::from_legacy_named("cluster_dfs_namespace_jobs")
+        let cluster_id = sinomo_node::ClusterId::from_legacy_named("cluster_dfs_namespace_jobs")
             .expect("cluster");
         let node_id = NodeId::from_legacy_named("node_daemon_dfs_namespace_jobs").expect("node");
         let state = sinomo_core::ClusterBootstrapState::initialized_locally(
@@ -1490,9 +1490,8 @@ mod tests {
         data_dir.ensure_root_layout().expect("root layout");
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
-        let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_anti_entropy_tick")
-                .expect("cluster");
+        let cluster_id = sinomo_node::ClusterId::from_legacy_named("cluster_dfs_anti_entropy_tick")
+            .expect("cluster");
         let node_id = NodeId::from_legacy_named("node_daemon_dfs_anti_entropy_tick").expect("node");
         let state = sinomo_core::ClusterBootstrapState::initialized_locally(
             cluster_id,
@@ -1600,7 +1599,7 @@ mod tests {
         data_dir.ensure_root_layout().expect("root layout");
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
-        let cluster_id = sinomo_network::ClusterId::from_legacy_named("cluster_dfs_status_sharded")
+        let cluster_id = sinomo_node::ClusterId::from_legacy_named("cluster_dfs_status_sharded")
             .expect("cluster");
         let node_id = NodeId::from_legacy_named("node_daemon_dfs_status_sharded").expect("node");
         let state = sinomo_core::ClusterBootstrapState::initialized_locally(
@@ -1742,7 +1741,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_status_replica_lag")
+            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_status_replica_lag")
                 .expect("cluster");
         let local = NodeId::from_legacy_named("node_dfs_status_replica_local").expect("local");
         let primary =
@@ -1804,7 +1803,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_cursor")
+            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_cursor")
                 .expect("cluster");
         let local =
             NodeId::from_legacy_named("node_dfs_metadata_publish_local").expect("local node");
@@ -1961,7 +1960,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_all")
+            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_all")
                 .expect("cluster");
         let local =
             NodeId::from_legacy_named("node_dfs_metadata_publish_all_local").expect("local node");
@@ -2095,7 +2094,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_drain")
+            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_drain")
                 .expect("cluster");
         let local =
             NodeId::from_legacy_named("node_dfs_metadata_publish_drain_local").expect("local node");
@@ -2248,7 +2247,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_bad_ack")
+            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_bad_ack")
                 .expect("cluster");
         let local =
             NodeId::from_legacy_named("node_dfs_metadata_publish_bad_ack_local").expect("local");
@@ -2350,7 +2349,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_rejected")
+            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_rejected")
                 .expect("cluster");
         let local =
             NodeId::from_legacy_named("node_dfs_metadata_publish_rejected_local").expect("local");
@@ -2463,7 +2462,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_metadata_snapshot_repair")
+            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_metadata_snapshot_repair")
                 .expect("cluster");
         let local =
             NodeId::from_legacy_named("node_dfs_metadata_snapshot_repair_local").expect("local");
@@ -2594,7 +2593,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_bounds")
+            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_bounds")
                 .expect("cluster");
         let local =
             NodeId::from_legacy_named("node_dfs_metadata_publish_bounds_local").expect("local");
@@ -2960,9 +2959,8 @@ mod tests {
     #[test]
     fn dfs_service_members_include_authorized_voters_and_learners_only() {
         let now = OffsetDateTime::now_utc();
-        let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_service_members")
-                .expect("cluster");
+        let cluster_id = sinomo_node::ClusterId::from_legacy_named("cluster_dfs_service_members")
+            .expect("cluster");
         let local = NodeId::from_legacy_named("node_dfs_service_local").expect("local");
         let voter = NodeId::from_legacy_named("node_dfs_service_voter").expect("voter");
         let learner = NodeId::from_legacy_named("node_dfs_service_learner").expect("learner");
@@ -3424,7 +3422,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_bootstrap_migrate_services")
+            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_bootstrap_migrate_services")
                 .expect("cluster");
         let local = NodeId::from_legacy_named("node_dfs_bootstrap_migrate_services").expect("node");
         let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
@@ -3527,7 +3525,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_bootstrap_non_primary")
+            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_bootstrap_non_primary")
                 .expect("cluster");
         let mut node_ids = [
             NodeId::from_legacy_named("node_dfs_bootstrap_non_primary_a").expect("node a"),
@@ -3589,8 +3587,8 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let local = NodeId::from_legacy_named("node_dfs_smoke_single").expect("local node");
-        let cluster_id = sinomo_network::ClusterId::from_legacy_named("cluster_dfs_smoke_single")
-            .expect("cluster");
+        let cluster_id =
+            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_smoke_single").expect("cluster");
         let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
             cluster_id,
             "dfs smoke single",
@@ -3642,9 +3640,8 @@ mod tests {
     #[test]
     fn dfs_service_endpoint_prefers_internet_direct_for_remote_members() {
         let now = OffsetDateTime::now_utc();
-        let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_service_endpoint")
-                .expect("cluster");
+        let cluster_id = sinomo_node::ClusterId::from_legacy_named("cluster_dfs_service_endpoint")
+            .expect("cluster");
         let local = NodeId::from_legacy_named("node_dfs_service_endpoint_local").expect("local");
         let remote = NodeId::from_legacy_named("node_dfs_service_endpoint_remote").expect("remote");
         let state = sinomo_core::ClusterBootstrapState::initialized_locally(
@@ -3700,9 +3697,8 @@ mod tests {
         address: &str,
     ) {
         let now = OffsetDateTime::now_utc();
-        let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_daemon_dfs_protocol")
-                .expect("cluster");
+        let cluster_id = sinomo_node::ClusterId::from_legacy_named("cluster_daemon_dfs_protocol")
+            .expect("cluster");
         let mut remote = sinomo_core::ClusterMemberRecord::local_non_voting(
             cluster_id.clone(),
             remote_node_id.clone(),
@@ -3728,9 +3724,8 @@ mod tests {
         let data_dir = SinomoDataDir::new(data_root);
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
-        let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_daemon_dfs_protocol")
-                .expect("cluster");
+        let cluster_id = sinomo_node::ClusterId::from_legacy_named("cluster_daemon_dfs_protocol")
+            .expect("cluster");
         let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
             cluster_id,
             "daemon dfs protocol",
@@ -3750,7 +3745,7 @@ mod tests {
     ) -> sinomo_core::ClusterBootstrapState {
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named(cluster_name).expect("cluster id");
+            sinomo_node::ClusterId::from_legacy_named(cluster_name).expect("cluster id");
         let local = NodeId::from_legacy_named(local_name).expect("local node");
         let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
             cluster_id.clone(),

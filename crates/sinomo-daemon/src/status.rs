@@ -8,9 +8,10 @@ use sinomo_core::{
     ClusterNodeAvailability, ClusterNodeRolloutStatus, ClusterNodeStatusRecord,
 };
 use sinomo_local::SinomoDataDir;
-use sinomo_network::{ClusterId, DaemonRpcTimeouts};
+use sinomo_network::DaemonRpcTimeouts;
 use sinomo_node::{
-    DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, NodeId, cluster_node_is_local_process,
+    ClusterId, DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, NodeId,
+    cluster_node_is_local_process,
 };
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};

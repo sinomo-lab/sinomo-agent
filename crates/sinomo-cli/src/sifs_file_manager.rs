@@ -17,7 +17,7 @@ use sinomo_runtime::dfs::{
 use sinomo_runtime::kv::{self, KvError, KvOp, KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
-use sinomo_runtime::node::NodeId;
+use sinomo_runtime::node::{self, NodeId};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
@@ -1251,7 +1251,7 @@ mod tests {
     ) -> network::ClusterConnectivityRecord {
         let now = time::OffsetDateTime::now_utc();
         network::ClusterConnectivityRecord {
-            cluster_id: network::ClusterId::from_legacy_named("cluster_sifs_replica_rank")
+            cluster_id: node::ClusterId::from_legacy_named("cluster_sifs_replica_rank")
                 .expect("cluster"),
             source_node_id: source.clone(),
             target_node_id: target.clone(),

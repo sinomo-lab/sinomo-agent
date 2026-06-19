@@ -540,7 +540,7 @@ impl network::ClusterSignedEndpointRpcAsyncHost for NetworkPingEndpointRpcHost {
     fn endpoint_rpc_cluster_id_async<'a>(
         &'a mut self,
         _endpoint: &'a ClusterEndpointRecord,
-    ) -> network::ClusterSignedEndpointRpcFuture<'a, Option<network::ClusterId>> {
+    ) -> network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_runtime::node::ClusterId>> {
         let cluster_id = self.cluster_state.cluster_id.clone();
         Box::pin(async move { Ok(Some(cluster_id)) })
     }

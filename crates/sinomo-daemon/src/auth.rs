@@ -1209,7 +1209,7 @@ mod tests {
         let peer_public_key =
             daemon_auth_decode_public_key(&peer_identity.public_key).expect("peer public key");
         let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_daemon_auth_same_key_drift")
+            sinomo_node::ClusterId::from_legacy_named("cluster_daemon_auth_same_key_drift")
                 .expect("cluster id");
         let local_node = sinomo_core::Id::from_legacy_named("node_daemon_auth_same_key_local")
             .expect("local node");

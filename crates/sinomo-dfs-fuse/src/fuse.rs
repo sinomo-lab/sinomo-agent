@@ -21,7 +21,7 @@ use sinomo_runtime::kv::{
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, NetworkError};
-use sinomo_runtime::node::NodeId;
+use sinomo_runtime::node::{self, NodeId};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::PathBuf;
@@ -1575,7 +1575,7 @@ impl network::ClusterKvTxnForwardHost for DfsFuseClusterKvTxnForwardHost {
 }
 
 struct DfsFuseSignedObjectRpcHost {
-    cluster_id: network::ClusterId,
+    cluster_id: node::ClusterId,
 }
 
 impl network::ClusterSignedEndpointRpcAsyncHost for DfsFuseSignedObjectRpcHost {
@@ -1592,7 +1592,7 @@ impl network::ClusterSignedEndpointRpcAsyncHost for DfsFuseSignedObjectRpcHost {
     fn endpoint_rpc_cluster_id_async<'a>(
         &'a mut self,
         _endpoint: &'a ClusterEndpointRecord,
-    ) -> network::ClusterSignedEndpointRpcFuture<'a, Option<network::ClusterId>> {
+    ) -> network::ClusterSignedEndpointRpcFuture<'a, Option<node::ClusterId>> {
         Box::pin(async move { Ok(Some(self.cluster_id.clone())) })
     }
 }

@@ -290,7 +290,7 @@ fn migration_imported_dfs_marker_path(
 
 fn find_migration_record_for_target(
     paths: &ClusterPaths,
-    target_cluster_id: &sinomo_runtime::network::ClusterId,
+    target_cluster_id: &sinomo_runtime::node::ClusterId,
 ) -> Result<ClusterMigrationRecord, SinomoTestError> {
     let migrations_root = paths.root.join("migrations");
     let entries = fs::read_dir(&migrations_root).map_err(|source| {

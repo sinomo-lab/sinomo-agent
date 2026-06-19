@@ -3259,7 +3259,7 @@ mod tests {
         let node_id =
             sinomo_node::NodeId::from_legacy_named("node_service_snapshot").expect("node id");
         let cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            sinomo_network::ClusterId::from_legacy_named("cluster_service_snapshot")
+            sinomo_node::ClusterId::from_legacy_named("cluster_service_snapshot")
                 .expect("cluster id"),
             "service snapshot test",
             node_id,

@@ -47,11 +47,10 @@ use sinomo_network::{
 };
 #[cfg(test)]
 use sinomo_network::{
-    ClusterConnectivityProbeState, ClusterId, ClusterJoinRegistrationResponse,
-    MdnsDiscoveryAdvertisement,
+    ClusterConnectivityProbeState, ClusterJoinRegistrationResponse, MdnsDiscoveryAdvertisement,
 };
 #[cfg(test)]
-use sinomo_node::{ClusterInviteId, cluster_member_key};
+use sinomo_node::{ClusterId, ClusterInviteId, cluster_member_key};
 use sinomo_node::{
     NodeId, cluster_member_expected_daemon_process, cluster_member_is_local_process,
     cluster_node_status_stable_eq, shadow_daemon_node_id,
@@ -1454,7 +1453,7 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonClusterJoinRegi
     fn endpoint_rpc_cluster_id_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
-    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_network::ClusterId>> {
+    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_node::ClusterId>> {
         self.endpoint_rpc_host
             .endpoint_rpc_cluster_id_async(endpoint)
     }
@@ -3745,7 +3744,7 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonClusterControlP
     fn endpoint_rpc_cluster_id_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
-    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_network::ClusterId>> {
+    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_node::ClusterId>> {
         let runtime = self.rpc_mode.runtime().clone();
         let endpoint = endpoint.clone();
         Box::pin(async move {

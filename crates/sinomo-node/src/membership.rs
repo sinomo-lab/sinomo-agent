@@ -11,6 +11,7 @@ use crate::{
     DAEMON_SHADOW_SUPERVISE_CAPABILITY, NodeId, shadow_daemon_node_id,
 };
 
+pub type ClusterId = Id;
 pub type ClusterInviteId = Id;
 
 pub fn cluster_endpoint_stable_eq(

@@ -3631,8 +3631,8 @@ fn cluster_dfs_message_command_processor_uses_cluster_local_node_id() {
     data_dir.ensure_root_layout().expect("root layout");
     let cluster_paths = ClusterPaths::new(&data_dir);
     let now = OffsetDateTime::now_utc();
-    let cluster_id = sinomo_network::ClusterId::from_legacy_named("cluster_dfs_message_command")
-        .expect("cluster");
+    let cluster_id =
+        sinomo_node::ClusterId::from_legacy_named("cluster_dfs_message_command").expect("cluster");
     let local = NodeId::from_legacy_named("node_cluster_message_local").expect("local");
     let remote = NodeId::from_legacy_named("node_cluster_message_remote").expect("remote");
     let state = sinomo_core::ClusterBootstrapState::initialized_locally(
@@ -4197,8 +4197,8 @@ fn cluster_maintenance_tick_opens_service_and_publishes_metadata() {
     data_dir.ensure_root_layout().expect("root layout");
     let cluster_paths = ClusterPaths::new(&data_dir);
     let now = OffsetDateTime::now_utc();
-    let cluster_id = sinomo_network::ClusterId::from_legacy_named("cluster_dfs_maintenance_tick")
-        .expect("cluster");
+    let cluster_id =
+        sinomo_node::ClusterId::from_legacy_named("cluster_dfs_maintenance_tick").expect("cluster");
     let local = NodeId::from_legacy_named("node_dfs_maintenance_local").expect("local");
     let replica = NodeId::from_legacy_named("node_dfs_maintenance_replica").expect("replica");
     let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
@@ -4326,7 +4326,7 @@ fn cluster_smoke_opens_service_and_publishes_metadata() {
     let cluster_paths = ClusterPaths::new(&data_dir);
     let now = OffsetDateTime::now_utc();
     let cluster_id =
-        sinomo_network::ClusterId::from_legacy_named("cluster_dfs_smoke_helper").expect("cluster");
+        sinomo_node::ClusterId::from_legacy_named("cluster_dfs_smoke_helper").expect("cluster");
     let local = NodeId::from_legacy_named("node_dfs_smoke_helper_local").expect("local");
     let replica = NodeId::from_legacy_named("node_dfs_smoke_helper_replica").expect("replica");
     let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
@@ -4460,7 +4460,7 @@ fn default_cluster_smoke_bootstraps_dfs_before_running_smoke() {
     let cluster_paths = ClusterPaths::new(&data_dir);
     let now = OffsetDateTime::now_utc();
     let cluster_id =
-        sinomo_network::ClusterId::from_legacy_named("cluster_dfs_default_smoke").expect("cluster");
+        sinomo_node::ClusterId::from_legacy_named("cluster_dfs_default_smoke").expect("cluster");
     let local = NodeId::from_legacy_named("node_dfs_default_smoke_local").expect("local");
     let state = sinomo_core::ClusterBootstrapState::initialized_locally(
         cluster_id,
@@ -4546,8 +4546,8 @@ fn default_cluster_dfs_helper_writes_default_records_to_cluster_kv() {
     data_dir.ensure_root_layout().expect("root layout");
     let cluster_paths = ClusterPaths::new(&data_dir);
     let now = OffsetDateTime::now_utc();
-    let cluster_id = sinomo_network::ClusterId::from_legacy_named("cluster_dfs_default_helper")
-        .expect("cluster");
+    let cluster_id =
+        sinomo_node::ClusterId::from_legacy_named("cluster_dfs_default_helper").expect("cluster");
     let local = NodeId::from_legacy_named("node_dfs_default_helper_local").expect("local");
     let state = sinomo_core::ClusterBootstrapState::initialized_locally(
         cluster_id,
@@ -4612,8 +4612,8 @@ fn control_plane_default_bootstrap_host_writes_default_dfs_records() {
     data_dir.ensure_root_layout().expect("root layout");
     let cluster_paths = ClusterPaths::new(&data_dir);
     let now = OffsetDateTime::now_utc();
-    let cluster_id = sinomo_network::ClusterId::from_legacy_named("cluster_dfs_bootstrap_host")
-        .expect("cluster");
+    let cluster_id =
+        sinomo_node::ClusterId::from_legacy_named("cluster_dfs_bootstrap_host").expect("cluster");
     let local = NodeId::from_legacy_named("node_dfs_bootstrap_host_local").expect("local");
     let state = sinomo_core::ClusterBootstrapState::initialized_locally(
         cluster_id,
@@ -6037,7 +6037,7 @@ fn cluster_metadata_journal_publish_reads_cluster_state_and_shards() {
     let cluster_paths = ClusterPaths::new(&data_dir);
     let now = OffsetDateTime::now_utc();
     let cluster_id =
-        sinomo_network::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_helper")
+        sinomo_node::ClusterId::from_legacy_named("cluster_dfs_metadata_publish_helper")
             .expect("cluster");
     let local = NodeId::from_legacy_named("node_dfs_publish_helper_local").expect("local");
     let replica = NodeId::from_legacy_named("node_dfs_publish_helper_replica").expect("replica");
@@ -6163,7 +6163,7 @@ fn scheduled_cluster_metadata_publish_uses_async_peer_transport() {
     let cluster_paths = ClusterPaths::new(&data_dir);
     let now = OffsetDateTime::now_utc();
     let cluster_id =
-        sinomo_network::ClusterId::from_legacy_named("cluster_dfs_scheduled_async_publish")
+        sinomo_node::ClusterId::from_legacy_named("cluster_dfs_scheduled_async_publish")
             .expect("cluster");
     let local = NodeId::from_legacy_named("node_dfs_scheduled_async_local").expect("local");
     let replica = NodeId::from_legacy_named("node_dfs_scheduled_async_replica").expect("replica");
@@ -6318,7 +6318,7 @@ fn async_cluster_metadata_publish_repairs_sequence_conflict_with_snapshot() {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_async_snapshot_repair")
+            sinomo_node::ClusterId::from_legacy_named("cluster_dfs_async_snapshot_repair")
                 .expect("cluster");
         let local = NodeId::from_legacy_named("node_dfs_async_snapshot_local").expect("local");
         let replica =

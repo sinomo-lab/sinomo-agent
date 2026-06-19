@@ -95,8 +95,8 @@ use sinomo_runtime::module::{
     MODULE_SHADOW_DECISION_EVENT_KIND, ModuleReplayCaseOutcome, ModuleReplayReport,
     read_module_loader_runtime_state,
 };
-use sinomo_runtime::network::{self, ClusterEndpointId, ClusterId, daemon_lan_endpoint};
-use sinomo_runtime::node::{ClusterInviteId, NodeId, main_daemon_capabilities};
+use sinomo_runtime::network::{self, ClusterEndpointId, daemon_lan_endpoint};
+use sinomo_runtime::node::{ClusterId, ClusterInviteId, NodeId, main_daemon_capabilities};
 use sinomo_runtime::rollout::{
     RolloutAction, RolloutController, create_source_repo_bundle, read_rollout_runtime_state,
     write_rollout_runtime_state,

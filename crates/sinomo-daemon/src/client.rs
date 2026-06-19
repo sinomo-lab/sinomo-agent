@@ -668,7 +668,7 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
     fn endpoint_rpc_cluster_id_async<'a>(
         &'a mut self,
         _endpoint: &'a ClusterEndpointRecord,
-    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_network::ClusterId>> {
+    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_node::ClusterId>> {
         if !self.allow_local_route_policy {
             return Box::pin(async { Ok(None) });
         }
@@ -1435,8 +1435,8 @@ mod tests {
         ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterMemberRole,
         ClusterMemberState, ClusterTransportKind,
     };
-    use sinomo_network::{ClusterId, DaemonRpcTimeouts, ObjectRpcRequest, ObjectRpcResponse};
-    use sinomo_node::NodeId;
+    use sinomo_network::{DaemonRpcTimeouts, ObjectRpcRequest, ObjectRpcResponse};
+    use sinomo_node::{ClusterId, NodeId};
     use sinomo_rollout::ROLLOUT_BUILD_ROUTE;
     use std::time::{Duration, Instant};
 
