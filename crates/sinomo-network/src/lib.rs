@@ -312,6 +312,7 @@ pub use object::{
     RawByteStreamChunkOptions, SinomoObjectCodec, object_rpc_request_stream_mode,
     object_rpc_response_stream_mode, send_daemon_control_rpc_request_async,
     set_object_rpc_request_stream_mode, set_object_rpc_response_stream_mode,
+    write_borrowed_object_frame_async,
 };
 pub(crate) use object::{
     DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY, DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE,

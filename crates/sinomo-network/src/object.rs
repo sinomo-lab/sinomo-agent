@@ -1,6 +1,6 @@
 use crate::error::NetworkError;
 use crate::io_observer;
-use sinomo_object::{LengthMode, serde_ext};
+use sinomo_object::{BorrowedDocumentBuilder, LengthMode, serde_ext};
 use std::collections::HashMap;
 #[cfg(test)]
 use std::io::{Read, Write};
@@ -895,6 +895,13 @@ impl SinomoObjectCodec {
     pub fn decode<T: serde::de::DeserializeOwned>(self, bytes: &[u8]) -> Result<T, NetworkError> {
         serde_ext::from_bytes(bytes).map_err(NetworkError::object)
     }
+
+    pub fn decode_borrowed<'de, T>(self, bytes: &'de [u8]) -> Result<T, NetworkError>
+    where
+        T: serde::Deserialize<'de>,
+    {
+        serde_ext::from_borrowed_bytes(bytes).map_err(NetworkError::object)
+    }
 }
 
 pub(crate) fn object_frame_len_prefix(len: usize) -> Result<Vec<u8>, NetworkError> {
@@ -944,6 +951,29 @@ where
     let mut frame = Vec::with_capacity(frame_bytes);
     frame.extend_from_slice(&len_prefix);
     frame.extend_from_slice(&bytes);
+    Ok(frame)
+}
+
+#[cfg(any(feature = "iroh-transport", test))]
+pub fn encode_borrowed_object_frame_to_vec(
+    document: &BorrowedDocumentBuilder<'_>,
+) -> Result<Vec<u8>, NetworkError> {
+    let parts = document.to_parts().map_err(NetworkError::object)?;
+    let body_len = parts.document_len().map_err(NetworkError::object)?;
+    let len_prefix = object_frame_len_prefix(body_len)?;
+    let frame_bytes =
+        len_prefix
+            .len()
+            .checked_add(body_len)
+            .ok_or(NetworkError::FrameTooLarge {
+                actual_bytes: usize::MAX,
+                max_bytes: usize::MAX,
+            })?;
+    let mut frame = Vec::with_capacity(frame_bytes);
+    frame.extend_from_slice(&len_prefix);
+    for slice in parts.as_slices() {
+        frame.extend_from_slice(slice);
+    }
     Ok(frame)
 }
 
@@ -1167,6 +1197,47 @@ where
     .await?;
     if let Some(observer) = io_observer() {
         observer.on_net_sent(len_prefix.len() as u64 + bytes.len() as u64);
+    }
+    Ok(())
+}
+
+pub async fn write_borrowed_object_frame_async<W>(
+    writer: &mut W,
+    document: &BorrowedDocumentBuilder<'_>,
+    options: ObjectFrameIoOptions,
+) -> Result<(), NetworkError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let parts = document.to_parts().map_err(NetworkError::object)?;
+    let body_len = parts.document_len().map_err(NetworkError::object)?;
+    let len_prefix = object_frame_len_prefix(body_len)?;
+    write_all_async_frame(
+        writer,
+        &len_prefix,
+        options.idle_timeout,
+        "write async borrowed object frame",
+        "length",
+    )
+    .await?;
+    write_all_async_frame(
+        writer,
+        &parts.prefix,
+        options.idle_timeout,
+        "write async borrowed object frame",
+        "body prefix",
+    )
+    .await?;
+    write_all_async_frame(
+        writer,
+        parts.payload,
+        options.idle_timeout,
+        "write async borrowed object frame",
+        "body payload",
+    )
+    .await?;
+    if let Some(observer) = io_observer() {
+        observer.on_net_sent(len_prefix.len() as u64 + body_len as u64);
     }
     Ok(())
 }
@@ -1631,18 +1702,20 @@ mod serde_bytes_tests {
     use super::{
         AsyncDaemonControlListener, DaemonRpcTimeouts, ObjectFrameIoOptions,
         ObjectRpcRequestStreamMode, ObjectRpcResponseStreamMode, RawByteStreamChunkOptions,
-        SinomoObjectCodec, decode_single_object_frame_from_slice, encode_object_frame_to_vec,
+        SINOMO_NETWORK_OBJECT_VERSION, SinomoObjectCodec, decode_single_object_frame_from_slice,
+        encode_borrowed_object_frame_to_vec, encode_object_frame_to_vec,
         forward_raw_byte_stream_chunks_async, object_rpc_request_accepts_streamed_daemon_response,
         object_rpc_request_expects_raw_daemon_response, object_rpc_request_reuses_daemon_stream,
         object_rpc_request_stream_mode, object_rpc_response_stream_mode, read_object_frame_async,
         read_object_frame_blocking, read_raw_byte_stream_chunks_to_vec_async,
         send_daemon_control_request_async, set_object_rpc_request_stream_mode,
-        set_object_rpc_response_stream_mode, write_all_async_frame, write_object_frame_blocking,
+        set_object_rpc_response_stream_mode, write_all_async_frame,
+        write_borrowed_object_frame_async, write_object_frame_blocking,
         write_raw_byte_stream_chunk_async,
     };
     use crate::error::NetworkError;
     use serde::{Deserialize, Serialize};
-    use sinomo_object::{DocumentView, LengthMode};
+    use sinomo_object::{BorrowedDocumentBuilder, DocumentView, LengthMode};
     use std::io::Cursor;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1652,6 +1725,13 @@ mod serde_bytes_tests {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
         payload: Option<Vec<u8>>,
+    }
+
+    #[derive(Debug, PartialEq, Deserialize)]
+    struct BorrowedBundleRecord<'a> {
+        name: &'a str,
+        #[serde(with = "serde_bytes")]
+        payload: &'a [u8],
     }
 
     #[test]
@@ -1699,6 +1779,33 @@ mod serde_bytes_tests {
             .decode(&encoded_none)
             .expect("decode none");
         assert_eq!(decoded_none, none);
+    }
+
+    #[test]
+    fn object_codec_can_decode_borrowed_strings_and_bytes() {
+        #[derive(Serialize)]
+        struct OwnedBundleRecord<'a> {
+            name: &'a str,
+            #[serde(with = "serde_bytes")]
+            payload: &'a [u8],
+        }
+
+        let payload: Vec<u8> = (0..=255u8).cycle().take(32 * 1024).collect();
+        let encoded = SinomoObjectCodec::default()
+            .encode(&OwnedBundleRecord {
+                name: "borrowed-bundle",
+                payload: &payload,
+            })
+            .expect("encode");
+
+        let decoded: BorrowedBundleRecord<'_> = SinomoObjectCodec::default()
+            .decode_borrowed(&encoded)
+            .expect("borrowed decode");
+
+        assert_eq!(decoded.name, "borrowed-bundle");
+        assert_eq!(decoded.payload, payload.as_slice());
+        assert!(slice_is_borrowed_from(decoded.name.as_bytes(), &encoded));
+        assert!(slice_is_borrowed_from(decoded.payload, &encoded));
     }
 
     #[test]
@@ -1766,6 +1873,99 @@ mod serde_bytes_tests {
             decode_single_object_frame_from_slice(&frame, 1024).expect("decode frame");
 
         assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn object_frame_large_serde_bytes_payload_baseline_is_compact() {
+        let payload: Vec<u8> = (0..=255u8).cycle().take(1024 * 1024).collect();
+        let record = BundleRecord {
+            name: "large-frame".to_string(),
+            payload: Some(payload.clone()),
+        };
+
+        let frame = encode_object_frame_to_vec(&record).expect("encode frame");
+        let body_len = u32::from_be_bytes(frame[..4].try_into().expect("length")) as usize;
+        let body = &frame[4..];
+
+        assert_eq!(body.len(), body_len);
+        assert!(
+            frame.len() < payload.len() + 512,
+            "expected compact SOBJ bytes payload, got {} frame bytes for {} payload bytes",
+            frame.len(),
+            payload.len()
+        );
+        assert!(
+            body.windows(payload.len()).any(|w| w == payload.as_slice()),
+            "large payload should be embedded as raw bytes in the current contiguous baseline"
+        );
+
+        let view = DocumentView::parse(body).expect("parse body");
+        assert_eq!(view.metadata.length_mode, LengthMode::U64);
+
+        let decoded: BundleRecord =
+            decode_single_object_frame_from_slice(&frame, frame.len()).expect("decode frame");
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn borrowed_object_frame_vec_fallback_preserves_sobj_layout() {
+        let payload: Vec<u8> = (0..=255u8).cycle().take(1024 * 1024).collect();
+        let document = BorrowedDocumentBuilder::dynamic_bytes(
+            SINOMO_NETWORK_OBJECT_VERSION,
+            LengthMode::U64,
+            &payload,
+        );
+        let parts = document.to_parts().expect("parts");
+        assert_eq!(parts.payload.as_ptr(), payload.as_ptr());
+
+        let frame = encode_borrowed_object_frame_to_vec(&document).expect("encode frame");
+        let body_len = u32::from_be_bytes(frame[..4].try_into().expect("length")) as usize;
+        let body = &frame[4..];
+
+        assert_eq!(body.len(), body_len);
+        assert!(
+            frame.len() < payload.len() + 128,
+            "expected compact borrowed SOBJ bytes frame, got {} frame bytes for {} payload bytes",
+            frame.len(),
+            payload.len()
+        );
+        let view = DocumentView::parse(body).expect("parse body");
+        assert_eq!(view.metadata.length_mode, LengthMode::U64);
+        let decoded: serde_bytes::ByteBuf = SinomoObjectCodec::network_frame()
+            .decode(body)
+            .expect("decode body");
+        assert_eq!(decoded.as_ref(), payload.as_slice());
+    }
+
+    #[tokio::test]
+    async fn async_borrowed_object_frame_writer_round_trips() {
+        let payload: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        let document = BorrowedDocumentBuilder::dynamic_bytes(
+            SINOMO_NETWORK_OBJECT_VERSION,
+            LengthMode::U64,
+            &payload,
+        );
+        let parts = document.to_parts().expect("parts");
+        assert_eq!(parts.payload.as_ptr(), payload.as_ptr());
+
+        let (mut writer, mut reader) = tokio::io::duplex(256);
+        let write = write_borrowed_object_frame_async(
+            &mut writer,
+            &document,
+            ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
+        );
+        let read = read_object_frame_async::<_, serde_bytes::ByteBuf>(
+            &mut reader,
+            8192,
+            ObjectFrameIoOptions::idle_timeout(Duration::from_secs(1)),
+        );
+        let (write_result, read_result) = tokio::join!(write, read);
+
+        write_result.expect("write borrowed frame");
+        assert_eq!(
+            read_result.expect("read borrowed frame").as_ref(),
+            payload.as_slice()
+        );
     }
 
     #[test]
@@ -2496,5 +2696,13 @@ mod serde_bytes_tests {
             ObjectRpcResponseStreamMode::Buffered
         );
         assert!(response.metadata.is_empty());
+    }
+
+    fn slice_is_borrowed_from(slice: &[u8], source: &[u8]) -> bool {
+        let source_start = source.as_ptr() as usize;
+        let source_end = source_start + source.len();
+        let slice_start = slice.as_ptr() as usize;
+        let slice_end = slice_start + slice.len();
+        slice_start >= source_start && slice_end <= source_end
     }
 }

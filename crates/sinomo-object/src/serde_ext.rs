@@ -58,6 +58,13 @@ pub fn to_bytes<T: Serialize + ?Sized>(
 }
 
 pub fn from_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    from_borrowed_bytes(bytes)
+}
+
+pub fn from_borrowed_bytes<'de, T>(bytes: &'de [u8]) -> Result<T>
+where
+    T: serde::Deserialize<'de>,
+{
     // Stream the value straight out of the document buffer rather than parsing it
     // into an `ElementView`/`Value` tree first.
     let mut reader = Reader::new(bytes, LengthMode::U64);
@@ -1953,6 +1960,50 @@ mod streaming_tests {
     }
 
     #[test]
+    fn borrowed_decode_returns_str_and_bytes_from_document_buffer() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct BorrowedPacket<'a> {
+            label: &'a str,
+            payload: &'a [u8],
+            note: Option<&'a str>,
+        }
+
+        let document = Document::dynamic(
+            1,
+            LengthMode::U32,
+            Value::Object(Object::new(vec![
+                Field::new("label", Value::String("sensor-a".to_owned())),
+                Field::new("payload", Value::Bytes(vec![0, 1, 2, 250, 255])),
+                Field::new(
+                    "note",
+                    Value::optional(OptionalValue::some(
+                        ElementType::Builtin(TypeId::String),
+                        Value::String("warm".to_owned()),
+                    )),
+                ),
+            ])),
+        );
+        let bytes = document.to_bytes().expect("encode");
+
+        let decoded: BorrowedPacket<'_> = from_borrowed_bytes(&bytes).expect("borrowed decode");
+
+        assert_eq!(
+            decoded,
+            BorrowedPacket {
+                label: "sensor-a",
+                payload: &[0, 1, 2, 250, 255],
+                note: Some("warm"),
+            }
+        );
+        assert!(slice_is_borrowed_from(decoded.label.as_bytes(), &bytes));
+        assert!(slice_is_borrowed_from(decoded.payload, &bytes));
+        assert!(slice_is_borrowed_from(
+            decoded.note.expect("note").as_bytes(),
+            &bytes
+        ));
+    }
+
+    #[test]
     fn large_byte_list_round_trips_without_per_element_blowup() {
         // ~4 MiB list<uint8>. If each element materialized an ~80-byte Value this
         // would allocate hundreds of MiB; streaming keeps it ~O(data).
@@ -1964,5 +2015,13 @@ mod streaming_tests {
         );
         let decoded: Vec<u8> = from_bytes(&encoded).expect("decode");
         assert_eq!(decoded, data);
+    }
+
+    fn slice_is_borrowed_from(slice: &[u8], source: &[u8]) -> bool {
+        let source_start = source.as_ptr() as usize;
+        let source_end = source_start + source.len();
+        let slice_start = slice.as_ptr() as usize;
+        let slice_end = slice_start + slice.len();
+        slice_start >= source_start && slice_end <= source_end
     }
 }
