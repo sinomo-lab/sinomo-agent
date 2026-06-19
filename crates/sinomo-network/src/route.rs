@@ -12,6 +12,10 @@
 //! are supplied by daemon-host callbacks so route construction stays here without
 //! coupling the network crate to daemon identity storage.
 
+use crate::endpoint_selector::{
+    cluster_endpoint_can_carry_main_daemon_rpc,
+    cluster_graph_has_reachable_main_daemon_route_targets, relay_hop_endpoint_is_usable,
+};
 use crate::membership::{
     DAEMON_SHADOW_SUPERVISE_CAPABILITY, locally_learned_bridge_route_endpoint,
 };
@@ -1884,7 +1888,7 @@ fn relay_member_has_usable_bridge_endpoint(
         .best_healthy_endpoint_matching(
             local_node_id,
             &member.node_id,
-            cluster_relay_endpoint_can_carry_main_daemon_rpc,
+            cluster_endpoint_can_carry_main_daemon_rpc,
         )
         .is_some();
     let has_reachable_next_hop_endpoint = has_healthy_next_hop_endpoint
@@ -1892,7 +1896,7 @@ fn relay_member_has_usable_bridge_endpoint(
             .best_reachable_endpoint_matching(
                 local_node_id,
                 &member.node_id,
-                cluster_relay_endpoint_can_carry_main_daemon_rpc,
+                cluster_endpoint_can_carry_main_daemon_rpc,
             )
             .is_some();
     let local_graph_has_reachable_targets =
@@ -1902,7 +1906,7 @@ fn relay_member_has_usable_bridge_endpoint(
         .iter()
         .filter(|endpoint| locally_learned_bridge_route_endpoint(endpoint))
         .any(|endpoint| {
-            cluster_relay_next_hop_endpoint_is_usable(
+            relay_hop_endpoint_is_usable(
                 graph,
                 local_node_id,
                 endpoint,
@@ -1911,28 +1915,6 @@ fn relay_member_has_usable_bridge_endpoint(
                 local_graph_has_reachable_targets,
                 false,
             )
-        })
-}
-
-fn cluster_relay_endpoint_can_carry_main_daemon_rpc(endpoint: &ClusterEndpointRecord) -> bool {
-    !crate::endpoint_selector::cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
-}
-
-fn cluster_graph_has_reachable_main_daemon_route_targets(
-    graph: &ClusterConnectivityGraph,
-    source_node_id: &NodeId,
-) -> bool {
-    graph
-        .reachable_targets(source_node_id)
-        .iter()
-        .any(|target| {
-            graph
-                .best_reachable_endpoint_matching(
-                    source_node_id,
-                    target,
-                    cluster_relay_endpoint_can_carry_main_daemon_rpc,
-                )
-                .is_some()
         })
 }
 
@@ -1986,7 +1968,7 @@ fn relay_candidate_can_transit(
         .best_healthy_endpoint_matching(
             local_node_id,
             candidate,
-            cluster_relay_endpoint_can_carry_main_daemon_rpc,
+            cluster_endpoint_can_carry_main_daemon_rpc,
         )
         .is_some()
     {
@@ -2031,7 +2013,7 @@ fn cluster_relay_can_try_direct_target_fallback(
         .best_reachable_endpoint_matching(
             local_node_id,
             target_node_id,
-            cluster_relay_endpoint_can_carry_main_daemon_rpc,
+            cluster_endpoint_can_carry_main_daemon_rpc,
         )
         .is_some()
         || !cluster_graph_has_reachable_main_daemon_route_targets(graph, local_node_id)
@@ -2080,117 +2062,12 @@ fn cluster_relay_next_hop_endpoints_with_graph_and_policy(
     node_id: &NodeId,
     allow_unknown_locally_learned_endpoint: bool,
 ) -> Vec<ClusterEndpointRecord> {
-    let mut endpoints = Vec::new();
-    let mut seen = BTreeSet::new();
-    let has_healthy_next_hop_endpoint = if let Some(endpoint) = graph
-        .best_healthy_endpoint_matching(
-            source_node_id,
-            node_id,
-            cluster_relay_endpoint_can_carry_main_daemon_rpc,
-        ) {
-        push_unique_cluster_endpoint(&mut endpoints, &mut seen, endpoint);
-        true
-    } else {
-        false
-    };
-    let has_reachable_next_hop_endpoint = if has_healthy_next_hop_endpoint {
-        true
-    } else if let Some(endpoint) = graph.best_reachable_endpoint_matching(
+    ClusterEndpointSelector::new(paths, state).select_relay_hop_with_graph(
+        graph,
         source_node_id,
         node_id,
-        cluster_relay_endpoint_can_carry_main_daemon_rpc,
-    ) {
-        push_unique_cluster_endpoint(&mut endpoints, &mut seen, endpoint);
-        true
-    } else {
-        false
-    };
-    let local_graph_has_reachable_targets =
-        cluster_graph_has_reachable_main_daemon_route_targets(graph, source_node_id);
-    if let Some(member) = state
-        .members
-        .iter()
-        .find(|member| member.node_id == *node_id && member.state.is_authorized())
-    {
-        for endpoint in member
-            .endpoints
-            .iter()
-            .filter(|endpoint| locally_learned_bridge_route_endpoint(endpoint))
-            .filter(|endpoint| cluster_relay_endpoint_can_carry_main_daemon_rpc(endpoint))
-            .filter(|endpoint| {
-                cluster_relay_next_hop_endpoint_is_usable(
-                    graph,
-                    source_node_id,
-                    *endpoint,
-                    has_healthy_next_hop_endpoint,
-                    has_reachable_next_hop_endpoint,
-                    local_graph_has_reachable_targets,
-                    allow_unknown_locally_learned_endpoint,
-                )
-            })
-        {
-            push_unique_cluster_endpoint(&mut endpoints, &mut seen, endpoint.clone());
-        }
-    }
-    for endpoint in ClusterEndpointSelector::new(paths, state)
-        .select_node(ClusterEndpointSelectionPurpose::RelayHop, node_id)
-        .into_iter()
-        .filter(|endpoint| {
-            cluster_relay_next_hop_endpoint_is_usable(
-                graph,
-                source_node_id,
-                endpoint,
-                has_healthy_next_hop_endpoint,
-                has_reachable_next_hop_endpoint,
-                local_graph_has_reachable_targets,
-                allow_unknown_locally_learned_endpoint,
-            )
-        })
-    {
-        push_unique_cluster_endpoint(&mut endpoints, &mut seen, endpoint);
-    }
-    endpoints
-}
-
-fn cluster_relay_next_hop_endpoint_is_usable(
-    graph: &ClusterConnectivityGraph,
-    source_node_id: &NodeId,
-    endpoint: &ClusterEndpointRecord,
-    has_healthy_next_hop_endpoint: bool,
-    has_reachable_next_hop_endpoint: bool,
-    local_graph_has_reachable_targets: bool,
-    allow_unknown_locally_learned_endpoint: bool,
-) -> bool {
-    match graph.state_for_endpoint(endpoint) {
-        Some(crate::ClusterConnectivityState::Healthy) => true,
-        Some(crate::ClusterConnectivityState::Degraded) => !has_healthy_next_hop_endpoint,
-        Some(crate::ClusterConnectivityState::Unreachable) => {
-            !has_reachable_next_hop_endpoint
-                && graph
-                    .reachable_targets(source_node_id)
-                    .contains(&endpoint.node_id)
-        }
-        None => {
-            (!has_healthy_next_hop_endpoint && !local_graph_has_reachable_targets)
-                || (allow_unknown_locally_learned_endpoint
-                    && !has_reachable_next_hop_endpoint
-                    && locally_learned_bridge_route_endpoint(endpoint))
-        }
-    }
-}
-
-fn push_unique_cluster_endpoint(
-    endpoints: &mut Vec<ClusterEndpointRecord>,
-    seen: &mut BTreeSet<(NodeId, String, String)>,
-    endpoint: ClusterEndpointRecord,
-) {
-    if seen.insert((
-        endpoint.node_id.clone(),
-        format!("{:?}", endpoint.transport),
-        endpoint.address.clone(),
-    )) {
-        endpoints.push(endpoint);
-    }
+        allow_unknown_locally_learned_endpoint,
+    )
 }
 
 pub(crate) fn cluster_endpoint_prefers_relay_with_graph(
