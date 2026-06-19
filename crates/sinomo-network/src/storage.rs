@@ -171,8 +171,10 @@ pub use crate::raft_election::{
 };
 #[cfg(test)]
 pub(crate) use crate::raft_replication::replicate_cluster_raft_to_endpoint_with_local_host;
-use crate::raft_replication::{
+pub use crate::raft_replication::{
     ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
+    replicate_cluster_raft_to_endpoint_async_with_host,
+    replicate_cluster_raft_to_endpoint_with_host,
 };
 #[cfg(test)]
 pub(crate) use crate::records::ClusterCapabilityPolicyRecord;
@@ -1630,162 +1632,6 @@ pub fn cleanup_legacy_shadow_daemon_members_with_host(
         host.commit_cluster_kv_txn_with_quorum(paths, &mut state, txn)?;
     }
     Ok(ClusterMemberRemoval { removed })
-}
-
-struct NetworkClusterKvRaftAppendReplicationHost<'a, H> {
-    paths: &'a ClusterPaths,
-    options: ClusterRaftAppendReplicationOptions,
-    host: &'a mut H,
-}
-
-impl<H> sinomo_kv::ClusterKvRaftAppendReplicationHost
-    for NetworkClusterKvRaftAppendReplicationHost<'_, H>
-where
-    H: ClusterRaftAppendReplicationHost,
-{
-    type Error = NetworkError;
-    type Target = ClusterEndpointRecord;
-
-    fn last_local_raft_log_index(
-        &mut self,
-        state: &ClusterBootstrapState,
-    ) -> Result<u64, Self::Error> {
-        self.host.last_local_raft_log_index(self.paths, state)
-    }
-
-    fn build_raft_append_request(
-        &mut self,
-        state: &ClusterBootstrapState,
-        next_index: u64,
-    ) -> Result<ClusterRaftAppendRequest, Self::Error> {
-        self.host
-            .build_raft_append_request(self.paths, state, next_index)
-    }
-
-    fn append_attempt_timeout(
-        &mut self,
-        target: &Self::Target,
-        remaining: Duration,
-        request: &ClusterRaftAppendRequest,
-    ) -> Duration {
-        self.options
-            .append_attempt_timeout(target, remaining, request)
-    }
-
-    fn on_raft_append_sent(&mut self) -> Result<(), Self::Error> {
-        self.host.on_raft_append_sent();
-        Ok(())
-    }
-
-    fn send_raft_append(
-        &mut self,
-        target: &Self::Target,
-        request: &ClusterRaftAppendRequest,
-        timeout: Duration,
-    ) -> Result<ClusterRaftAppendResponse, Self::Error> {
-        self.host.send_raft_append(target, request, timeout)
-    }
-}
-
-struct NetworkClusterKvRaftAppendReplicationAsyncHost<'a, H> {
-    paths: &'a ClusterPaths,
-    options: ClusterRaftAppendReplicationOptions,
-    host: &'a mut H,
-}
-
-impl<H> sinomo_kv::ClusterKvRaftAppendReplicationAsyncHost
-    for NetworkClusterKvRaftAppendReplicationAsyncHost<'_, H>
-where
-    H: ClusterRaftAppendReplicationAsyncHost,
-{
-    type Error = NetworkError;
-    type Target = ClusterEndpointRecord;
-
-    fn last_local_raft_log_index_async<'a>(
-        &'a mut self,
-        state: &'a ClusterBootstrapState,
-    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, u64, Self::Error> {
-        self.host.last_local_raft_log_index_async(self.paths, state)
-    }
-
-    fn build_raft_append_request_async<'a>(
-        &'a mut self,
-        state: &'a ClusterBootstrapState,
-        next_index: u64,
-    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, ClusterRaftAppendRequest, Self::Error> {
-        self.host
-            .build_raft_append_request_async(self.paths, state, next_index)
-    }
-
-    fn append_attempt_timeout(
-        &mut self,
-        target: &Self::Target,
-        remaining: Duration,
-        request: &ClusterRaftAppendRequest,
-    ) -> Duration {
-        self.options
-            .append_attempt_timeout(target, remaining, request)
-    }
-
-    fn on_raft_append_sent_async<'a>(
-        &'a mut self,
-    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, (), Self::Error> {
-        self.host.on_raft_append_sent_async()
-    }
-
-    fn send_raft_append_async<'a>(
-        &'a mut self,
-        target: &'a Self::Target,
-        request: &'a ClusterRaftAppendRequest,
-        timeout: Duration,
-    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, ClusterRaftAppendResponse, Self::Error> {
-        self.host.send_raft_append_async(target, request, timeout)
-    }
-}
-
-pub fn replicate_cluster_raft_to_endpoint_with_host(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    endpoint: &ClusterEndpointRecord,
-    watch_events: &[KvEvent],
-    options: ClusterRaftAppendReplicationOptions,
-    host: &mut impl ClusterRaftAppendReplicationHost,
-) -> Result<ClusterRaftAppendReplicationOutcome, NetworkError> {
-    let mut kv_host = NetworkClusterKvRaftAppendReplicationHost {
-        paths,
-        options,
-        host,
-    };
-    sinomo_kv::replicate_cluster_kv_raft_to_target_with_host(
-        state,
-        endpoint,
-        watch_events,
-        options.kv_options(),
-        &mut kv_host,
-    )
-}
-
-pub async fn replicate_cluster_raft_to_endpoint_async_with_host(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    endpoint: &ClusterEndpointRecord,
-    watch_events: &[KvEvent],
-    options: ClusterRaftAppendReplicationOptions,
-    host: &mut impl ClusterRaftAppendReplicationAsyncHost,
-) -> Result<ClusterRaftAppendReplicationOutcome, NetworkError> {
-    let mut kv_host = NetworkClusterKvRaftAppendReplicationAsyncHost {
-        paths,
-        options,
-        host,
-    };
-    sinomo_kv::replicate_cluster_kv_raft_to_target_async_with_host(
-        state,
-        endpoint,
-        watch_events,
-        options.kv_options(),
-        &mut kv_host,
-    )
-    .await
 }
 
 struct NetworkClusterKvRaftQuorumCommitHost<'a, H> {

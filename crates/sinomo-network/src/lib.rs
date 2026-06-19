@@ -325,6 +325,8 @@ pub use raft_election::{
 };
 pub use raft_replication::{
     ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
+    replicate_cluster_raft_to_endpoint_async_with_host,
+    replicate_cluster_raft_to_endpoint_with_host,
 };
 pub use records::{ClusterIdentityRecord, ClusterInvitationStateRecord};
 pub(crate) use roaming::read_iroh_endpoint_record_async;
@@ -379,15 +381,14 @@ pub use storage::{
     cluster_state_sync_txn, commit_cluster_kv_txn_with_quorum_response_with_host,
     commit_cluster_raft_command_with_quorum_driver,
     handle_cluster_membership_rpc_request_with_hosts, handle_cluster_raft_rpc_request,
-    remove_cluster_members_with_host, replicate_cluster_raft_to_endpoint_with_host,
-    spawn_cluster_raft_committed_fanout_worker_on_runtime, sync_cluster_state_to_kv_with_host,
-    sync_cluster_state_to_local_raft_unchecked, update_cluster_node_role_with_host,
-    update_cluster_raft_role_with_host,
+    remove_cluster_members_with_host, spawn_cluster_raft_committed_fanout_worker_on_runtime,
+    sync_cluster_state_to_kv_with_host, sync_cluster_state_to_local_raft_unchecked,
+    update_cluster_node_role_with_host, update_cluster_raft_role_with_host,
 };
 pub use storage::{
     commit_cluster_kv_txn_with_quorum_response_async_with_host,
     handle_cluster_kv_txn_request_async_with_host, handle_cluster_raft_rpc_request_async,
-    replicate_cluster_raft_to_endpoint_async_with_host, sync_cluster_state_to_kv_async_with_host,
+    sync_cluster_state_to_kv_async_with_host,
 };
 pub use voter_reachability::{
     ClusterVoterReachabilityAsyncHost, ClusterVoterReachabilityHost,
