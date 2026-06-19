@@ -16,7 +16,7 @@ pub(crate) fn cluster_node_status_snapshot_record(
         .and_then(|entry| entry.decode::<ClusterNodeStatusRecord>().ok())
 }
 
-pub fn cluster_network_info_key(node_id: &NodeId) -> String {
+pub(crate) fn cluster_network_info_key(node_id: &NodeId) -> String {
     format!("/cluster/network/info/{node_id}")
 }
 
@@ -24,7 +24,7 @@ pub(crate) fn cluster_connectivity_source_prefix(source_node_id: &NodeId) -> Str
     format!("/cluster/network/connectivity/{source_node_id}/")
 }
 
-pub fn cluster_connectivity_key(
+pub(crate) fn cluster_connectivity_key(
     source_node_id: &NodeId,
     target_node_id: &NodeId,
     endpoint_id: &ClusterEndpointId,
@@ -32,7 +32,7 @@ pub fn cluster_connectivity_key(
     format!("/cluster/network/connectivity/{source_node_id}/{target_node_id}/{endpoint_id}")
 }
 
-pub fn cluster_endpoint_key(node_id: &NodeId, endpoint: &ClusterEndpointRecord) -> String {
+pub(crate) fn cluster_endpoint_key(node_id: &NodeId, endpoint: &ClusterEndpointRecord) -> String {
     format!(
         "{}{}",
         cluster_endpoint_prefix(node_id),

@@ -119,6 +119,25 @@ const PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS_PER_SOURCE: usize =
 const PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS: usize =
     sinomo_kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
 
+#[cfg(test)]
+fn cluster_network_info_key(node_id: &NodeId) -> String {
+    format!("/cluster/network/info/{node_id}")
+}
+
+#[cfg(test)]
+fn cluster_connectivity_key(
+    source_node_id: &NodeId,
+    target_node_id: &NodeId,
+    endpoint_id: &sinomo_network::ClusterEndpointId,
+) -> String {
+    format!("/cluster/network/connectivity/{source_node_id}/{target_node_id}/{endpoint_id}")
+}
+
+#[cfg(test)]
+fn cluster_endpoint_key(node_id: &NodeId, endpoint: &ClusterEndpointRecord) -> String {
+    format!("/cluster/endpoints/{node_id}/{}", endpoint.endpoint_id)
+}
+
 fn daemon_cluster_kv_raft_store(paths: &ClusterPaths) -> sinomo_kv::ClusterKvRaftStore {
     paths.kv_paths().raft_store()
 }
@@ -7542,7 +7561,7 @@ mod tests {
             now,
             CLUSTER_CONNECTIVITY_TTL_SECONDS,
         );
-        let key = sinomo_network::cluster_connectivity_key(
+        let key = cluster_connectivity_key(
             &seeded_record.source_node_id,
             &seeded_record.target_node_id,
             &seeded_record.endpoint_id,
@@ -7701,7 +7720,7 @@ mod tests {
             .expect("observed LAN endpoint");
         observed_endpoint.source = sinomo_core::ClusterEndpointSource::Observed;
         let observed_endpoint = observed_endpoint.clone();
-        let endpoint_key = sinomo_network::cluster_endpoint_key(&local, &observed_endpoint);
+        let endpoint_key = cluster_endpoint_key(&local, &observed_endpoint);
         let endpoint_entry = snapshot.get(&endpoint_key).expect("endpoint entry").clone();
         let wal_path = paths.kv_paths().raft_wal_paths(&local).wal;
         let wal_len_before = std::fs::metadata(&wal_path)
@@ -8246,11 +8265,7 @@ mod tests {
         );
         let mut store = InProcessKvStore::new();
         store
-            .put_serde(
-                sinomo_network::cluster_network_info_key(&local_node),
-                &info,
-                None,
-            )
+            .put_serde(cluster_network_info_key(&local_node), &info, None)
             .expect("seed network info");
         sinomo_kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot())
             .expect("write matching snapshot");
@@ -9482,12 +9497,12 @@ mod tests {
             now,
             600,
         );
-        let current_key = sinomo_network::cluster_connectivity_key(
+        let current_key = cluster_connectivity_key(
             &current_record.source_node_id,
             &current_record.target_node_id,
             &current_record.endpoint_id,
         );
-        let stale_key = sinomo_network::cluster_connectivity_key(
+        let stale_key = cluster_connectivity_key(
             &stale_record.source_node_id,
             &stale_record.target_node_id,
             &stale_record.endpoint_id,
@@ -9592,7 +9607,7 @@ mod tests {
         for record in &stale_records {
             stale_ops.push(
                 KvOp::put_serde(
-                    sinomo_network::cluster_connectivity_key(
+                    cluster_connectivity_key(
                         &record.source_node_id,
                         &record.target_node_id,
                         &record.endpoint_id,

@@ -133,6 +133,22 @@ fn append_cluster_raft_command(
         .map_err(Into::into)
 }
 
+fn cluster_network_info_key(node_id: &NodeId) -> String {
+    format!("/cluster/network/info/{node_id}")
+}
+
+fn cluster_connectivity_key(
+    source_node_id: &NodeId,
+    target_node_id: &NodeId,
+    endpoint_id: &ClusterEndpointId,
+) -> String {
+    format!("/cluster/network/connectivity/{source_node_id}/{target_node_id}/{endpoint_id}")
+}
+
+fn cluster_endpoint_key(node_id: &NodeId, endpoint: &ClusterEndpointRecord) -> String {
+    format!("/cluster/endpoints/{node_id}/{}", endpoint.endpoint_id)
+}
+
 fn rollout_target_endpoint_for_main(
     main_node_id: &NodeId,
     candidates: &[ClusterEndpointRecord],
@@ -6117,8 +6133,8 @@ fn cluster_state_sync_txn_removes_stale_member_endpoint_keys_before_republishing
     };
     state.members[0].endpoints = vec![current_endpoint.clone()];
 
-    let stale_key = sinomo_runtime::network::cluster_endpoint_key(&node_id, &stale_endpoint);
-    let current_key = sinomo_runtime::network::cluster_endpoint_key(&node_id, &current_endpoint);
+    let stale_key = cluster_endpoint_key(&node_id, &stale_endpoint);
+    let current_key = cluster_endpoint_key(&node_id, &current_endpoint);
     let mut store = InProcessKvStore::new();
     store
         .put_serde(stale_key.clone(), &stale_endpoint, None)
@@ -6252,11 +6268,7 @@ fn cluster_network_expiration_keeps_local_owned_records() {
             expires_at: expired,
         };
         store
-            .put_serde(
-                sinomo_runtime::network::cluster_network_info_key(node_id),
-                &info,
-                None,
-            )
+            .put_serde(cluster_network_info_key(node_id), &info, None)
             .expect("local network info");
     }
     let connectivity = sinomo_runtime::network::ClusterConnectivityRecord {
@@ -6276,7 +6288,7 @@ fn cluster_network_expiration_keeps_local_owned_records() {
     };
     store
         .put_serde(
-            sinomo_runtime::network::cluster_connectivity_key(
+            cluster_connectivity_key(
                 &connectivity.source_node_id,
                 &connectivity.target_node_id,
                 &connectivity.endpoint_id,
@@ -6326,11 +6338,7 @@ fn imported_daemon_snapshot_defers_volatile_only_materialized_refresh() {
     };
     let mut imported = InProcessKvStore::restore(baseline.clone());
     imported
-        .put_serde(
-            sinomo_runtime::network::cluster_network_info_key(&node_id),
-            &info,
-            None,
-        )
+        .put_serde(cluster_network_info_key(&node_id), &info, None)
         .expect("volatile network info");
     let imported = imported.snapshot();
     assert!(
@@ -6358,9 +6366,7 @@ fn imported_daemon_snapshot_defers_volatile_only_materialized_refresh() {
         "the materialized snapshot should remain a stale-but-fresh fallback until a structural change or checkpoint interval"
     );
     assert!(
-        cached
-            .get(&sinomo_runtime::network::cluster_network_info_key(&node_id))
-            .is_none(),
+        cached.get(&cluster_network_info_key(&node_id)).is_none(),
         "deferred volatile network info should stay out of the materialized fallback"
     );
 }
@@ -6400,7 +6406,7 @@ fn stable_connectivity_sync_does_not_rewrite_source_prefix() {
     incoming.observed_at = now;
     incoming.expires_at = now + time::Duration::seconds(180);
 
-    let key = sinomo_runtime::network::cluster_connectivity_key(
+    let key = cluster_connectivity_key(
         &stored.source_node_id,
         &stored.target_node_id,
         &stored.endpoint_id,
@@ -11305,7 +11311,7 @@ fn rollout_target_uses_main_endpoint_when_shadow_is_unreachable() {
         };
         store
             .put_serde(
-                sinomo_runtime::network::cluster_connectivity_key(
+                cluster_connectivity_key(
                     &record.source_node_id,
                     &record.target_node_id,
                     &record.endpoint_id,
@@ -11442,11 +11448,7 @@ fn rollout_target_prefers_healthy_main_tcp_over_shadow_iroh_backup() {
     let mut store = InProcessKvStore::new();
     store
         .put_serde(
-            sinomo_runtime::network::cluster_connectivity_key(
-                &local_node_id,
-                &main_node_id,
-                &main_endpoint.endpoint_id,
-            ),
+            cluster_connectivity_key(&local_node_id, &main_node_id, &main_endpoint.endpoint_id),
             &sinomo_runtime::network::ClusterConnectivityRecord {
                 cluster_id,
                 source_node_id: local_node_id,
@@ -11507,7 +11509,7 @@ fn rollout_endpoint_candidates_include_kv_only_endpoint_records() {
     let mut store = InProcessKvStore::new();
     store
         .put_serde(
-            sinomo_runtime::network::cluster_endpoint_key(&remote_node_id, &iroh_endpoint),
+            cluster_endpoint_key(&remote_node_id, &iroh_endpoint),
             &iroh_endpoint,
             None,
         )
