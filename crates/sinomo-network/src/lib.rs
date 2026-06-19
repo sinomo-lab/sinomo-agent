@@ -15,6 +15,7 @@
 mod connectivity;
 mod connectivity_publish;
 mod connectivity_store;
+mod control_plane_driver;
 mod control_plane_options;
 mod endpoint_advertisement;
 mod endpoint_records;
@@ -85,6 +86,7 @@ pub use connectivity_publish::{
 pub use connectivity_store::{
     read_local_cluster_connectivity_records, write_local_cluster_connectivity_records,
 };
+pub use control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlaneTransport};
 pub use control_plane_options::{
     ClusterControlPlaneTimeouts, ClusterKvTxnQuorumOptions, ClusterRaftAppendReplicationOptions,
     ClusterRaftAppendReplicationOutcome, ClusterRaftCommittedFanoutOptions,
@@ -353,14 +355,14 @@ pub use status_publish::{
     sync_cluster_node_status_to_kv,
 };
 pub use storage::{
-    ClusterControlPlaneDriver, ClusterControlPlaneTransport, ClusterKvTxnQuorumAsyncHost,
-    ClusterKvTxnQuorumHost, ClusterMemberMutationDriver, ClusterRaftAppendReplicationAsyncHost,
-    ClusterRaftAppendReplicationHost, ClusterRaftCommittedFanoutAsyncHost,
-    ClusterRaftQuorumAsyncHost, ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult,
-    ClusterRaftQuorumTransportHost, ClusterRaftVoteTransportAsyncHost,
-    ClusterRaftVoteTransportHost, accepted_cluster_join_state_from_kv_snapshot,
-    cleanup_legacy_shadow_daemon_members_with_host, cluster_join_challenge_rpc_request,
-    cluster_state_sync_txn, commit_cluster_kv_txn_with_quorum_response_with_host,
+    ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost, ClusterMemberMutationDriver,
+    ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
+    ClusterRaftCommittedFanoutAsyncHost, ClusterRaftQuorumAsyncHost,
+    ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult, ClusterRaftQuorumTransportHost,
+    ClusterRaftVoteTransportAsyncHost, ClusterRaftVoteTransportHost,
+    accepted_cluster_join_state_from_kv_snapshot, cleanup_legacy_shadow_daemon_members_with_host,
+    cluster_join_challenge_rpc_request, cluster_state_sync_txn,
+    commit_cluster_kv_txn_with_quorum_response_with_host,
     commit_cluster_raft_command_with_quorum_driver, elect_cluster_raft_leader_with_host,
     handle_cluster_join_registration_request_with_host,
     handle_cluster_membership_rpc_request_with_hosts, handle_cluster_raft_rpc_request,

@@ -1,4 +1,5 @@
 use crate::ClusterPaths;
+use crate::control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlaneTransport};
 use crate::error::NetworkError;
 use crate::local_membership::ClusterLocalDaemonMembershipObservation;
 use crate::membership_forward::ClusterMembershipRpcForwardHost;
@@ -7,7 +8,6 @@ use crate::prelude::*;
 use crate::route::ClusterSignedEndpointRpcAsyncHost;
 use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
 use crate::rpc_future::ClusterMembershipRpcFuture;
-use crate::storage::{ClusterControlPlaneDriver, ClusterControlPlaneTransport};
 use std::time::Duration;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
