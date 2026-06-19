@@ -9,7 +9,7 @@ use sinomo_core::ClusterBootstrapState;
 use sinomo_kv::{CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, KvLogEntry, KvWalPaths};
 use sinomo_kv::{
     ClusterKvRaftCommitResult, ClusterKvRaftUncommittedAppend, DurableRaftKvNode, InProcessKvStore,
-    KvCommand, KvEntry, KvLocalCache, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse,
+    KvCommand, KvEntry, KvLocalCache, KvOp, KvRevision, KvSnapshot, KvTxnResponse,
     RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftRequestVoteRequest,
     RaftRequestVoteResponse, RaftSnapshot,
 };
@@ -518,30 +518,13 @@ pub(crate) fn append_cluster_raft_ops_in_batches(
     node_id: &NodeId,
     ops: Vec<KvOp>,
 ) -> Result<KvSnapshot, NetworkError> {
-    let mut ops = ops.into_iter();
-    let mut latest = None;
-    loop {
-        let chunk = ops
-            .by_ref()
-            .take(sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND)
-            .collect::<Vec<_>>();
-        if chunk.is_empty() {
-            break;
-        }
-        latest = Some(append_cluster_raft_command(
-            paths,
-            node_id,
-            KvCommand::Txn(KvTxn {
-                compares: Vec::new(),
-                success: chunk,
-                failure: Vec::new(),
-            }),
-        )?);
-    }
-    latest.ok_or_else(|| NetworkError::StorageIo {
-        path: paths.kv_snapshot.display().to_string(),
-        detail: "cannot append an empty batch of cluster kv operations".to_string(),
-    })
+    let (snapshot, wrote) = paths.kv_paths().append_kv_ops_in_batches_and_publish(
+        node_id,
+        ops,
+        sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
+    )?;
+    observe_cluster_kv_snapshot_write(paths, wrote);
+    Ok(snapshot)
 }
 
 pub(crate) fn append_cluster_raft_command_with_response(

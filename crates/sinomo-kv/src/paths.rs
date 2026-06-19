@@ -190,4 +190,44 @@ impl ClusterKvPaths {
             )
             .map(|(result, wrote)| (result.snapshot, result.txn_response, wrote))
     }
+
+    pub fn append_kv_ops_in_batches_and_publish<F>(
+        &self,
+        node_id: &NodeId,
+        ops: Vec<KvOp>,
+        mut key_can_defer_materialized_snapshot: F,
+    ) -> Result<(KvSnapshot, bool), KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let mut ops = ops.into_iter();
+        let mut latest = None;
+        let mut wrote_any = false;
+        loop {
+            let chunk = ops
+                .by_ref()
+                .take(MAX_KV_MUTATION_EVENTS_PER_COMMAND)
+                .collect::<Vec<_>>();
+            if chunk.is_empty() {
+                break;
+            }
+            let (snapshot, _, wrote) = self.append_kv_command_with_response_and_publish_report(
+                node_id,
+                KvCommand::Txn(KvTxn {
+                    compares: Vec::new(),
+                    success: chunk,
+                    failure: Vec::new(),
+                }),
+                &mut key_can_defer_materialized_snapshot,
+            )?;
+            wrote_any |= wrote;
+            latest = Some(snapshot);
+        }
+        latest
+            .map(|snapshot| (snapshot, wrote_any))
+            .ok_or_else(|| KvError::Io {
+                path: self.snapshot.display().to_string(),
+                detail: "cannot append an empty batch of cluster kv operations".to_string(),
+            })
+    }
 }
