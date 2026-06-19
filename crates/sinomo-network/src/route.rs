@@ -623,7 +623,11 @@ pub trait ClusterSignedEndpointRpcAsyncHost: Send {
             result
         })
     }
+}
 
+impl<H> ClusterSignedRelayRpcAsyncHost for H where H: ClusterSignedEndpointRpcAsyncHost {}
+
+trait ClusterEndpointRpcRoutePolicyHost: ClusterSignedEndpointRpcAsyncHost {
     fn relay_signed_endpoint_rpc_async<'a>(
         &'a mut self,
         _endpoint: &'a ClusterEndpointRecord,
@@ -634,8 +638,6 @@ pub trait ClusterSignedEndpointRpcAsyncHost: Send {
         Box::pin(async { Ok(None) })
     }
 }
-
-impl<H> ClusterSignedRelayRpcAsyncHost for H where H: ClusterSignedEndpointRpcAsyncHost {}
 
 fn cluster_signed_endpoint_rpc_observation(
     result: Result<&ObjectRpcResponse, &NetworkError>,
@@ -653,6 +655,65 @@ fn cluster_signed_endpoint_rpc_observation(
 
 fn cluster_signed_endpoint_rpc_elapsed_latency_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+struct ClusterObjectRpcEndpointOnlyHost<'a, H> {
+    inner: &'a mut H,
+}
+
+impl<H> ClusterSignedEndpointRpcAsyncHost for ClusterObjectRpcEndpointOnlyHost<'_, H>
+where
+    H: ClusterSignedEndpointRpcAsyncHost + Send,
+{
+    fn sign_endpoint_rpc_request_async<'a>(
+        &'a mut self,
+        request: &'a ObjectRpcRequest,
+    ) -> ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
+        self.inner.sign_endpoint_rpc_request_async(request)
+    }
+
+    fn try_gateway_signed_rpc_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        request: &'a ObjectRpcRequest,
+        request_auth: &'a [u8],
+        timeouts: DaemonRpcTimeouts,
+    ) -> ClusterSignedEndpointRpcFuture<'a, Option<ObjectRpcResponse>> {
+        self.inner
+            .try_gateway_signed_rpc_async(endpoint, request, request_auth, timeouts)
+    }
+
+    fn endpoint_rpc_cluster_id_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+    ) -> ClusterSignedEndpointRpcFuture<'a, Option<ClusterId>> {
+        self.inner.endpoint_rpc_cluster_id_async(endpoint)
+    }
+
+    fn observe_signed_endpoint_rpc_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        observation: ClusterSignedEndpointRpcObservation,
+    ) -> ClusterSignedEndpointRpcFuture<'a, ()> {
+        self.inner
+            .observe_signed_endpoint_rpc_async(endpoint, observation)
+    }
+
+    fn send_signed_endpoint_rpc_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        auth: &'a [u8],
+        request: &'a ObjectRpcRequest,
+        timeouts: DaemonRpcTimeouts,
+    ) -> ClusterSignedEndpointRpcFuture<'a, ObjectRpcResponse> {
+        self.inner
+            .send_signed_endpoint_rpc_async(endpoint, auth, request, timeouts)
+    }
+}
+
+impl<H> ClusterEndpointRpcRoutePolicyHost for ClusterObjectRpcEndpointOnlyHost<'_, H> where
+    H: ClusterSignedEndpointRpcAsyncHost + Send
+{
 }
 
 struct ClusterObjectRpcPathRelayHost<'a, H> {
@@ -709,7 +770,12 @@ where
         self.inner
             .send_signed_endpoint_rpc_async(endpoint, auth, request, timeouts)
     }
+}
 
+impl<H> ClusterEndpointRpcRoutePolicyHost for ClusterObjectRpcPathRelayHost<'_, H>
+where
+    H: ClusterSignedEndpointRpcAsyncHost + Send,
+{
     fn relay_signed_endpoint_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
@@ -748,9 +814,9 @@ impl<'a> ClusterObjectRpcRouteContext<'a> {
 ///
 /// Callers provide a typed object-RPC request and call either `call_node` or
 /// `call_endpoint`. The client owns request signing, endpoint ranking, and the
-/// direct-vs-relay routing policy. Lower-level signed endpoint helpers remain
-/// for transport adapters and migration shims, but ordinary control-plane
-/// callers should enter through this facade.
+/// direct-vs-relay routing policy. Lower-level signed endpoint helpers are
+/// transport hooks only; relay fallback is intentionally crate-private so
+/// ordinary control-plane callers enter through this facade.
 pub struct ClusterObjectRpcClient<'a, H> {
     host: &'a mut H,
     route_context: Option<ClusterObjectRpcRouteContext<'a>>,
@@ -776,27 +842,27 @@ impl<'a, H: ClusterSignedEndpointRpcAsyncHost> ClusterObjectRpcClient<'a, H> {
             route_context: Some(route_context),
         }
     }
+}
 
-    async fn call_endpoint_with_relay_preference(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        request: &ObjectRpcRequest,
-        options: ClusterObjectRpcOptions,
-        prefer_relay: bool,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        let request_auth = self.host.sign_endpoint_rpc_request_async(request).await?;
-        send_signed_rpc_to_endpoint_async_with_route_policy(
-            endpoint,
-            request,
-            &request_auth,
-            ClusterSignedEndpointRpcOptions {
-                timeouts: options.timeouts,
-            },
-            prefer_relay,
-            self.host,
-        )
-        .await
-    }
+async fn call_endpoint_with_route_policy_host(
+    host: &mut impl ClusterEndpointRpcRoutePolicyHost,
+    endpoint: &ClusterEndpointRecord,
+    request: &ObjectRpcRequest,
+    options: ClusterObjectRpcOptions,
+    prefer_relay: bool,
+) -> Result<ObjectRpcResponse, NetworkError> {
+    let request_auth = host.sign_endpoint_rpc_request_async(request).await?;
+    send_signed_rpc_to_endpoint_async_with_route_policy(
+        endpoint,
+        request,
+        &request_auth,
+        ClusterSignedEndpointRpcOptions {
+            timeouts: options.timeouts,
+        },
+        prefer_relay,
+        host,
+    )
+    .await
 }
 
 impl<'a, H> ClusterObjectRpcClient<'a, H>
@@ -810,9 +876,15 @@ where
         options: ClusterObjectRpcOptions,
     ) -> Result<ObjectRpcResponse, NetworkError> {
         let Some(context) = self.route_context else {
-            return self
-                .call_endpoint_with_relay_preference(endpoint, request, options, false)
-                .await;
+            let mut endpoint_only_host = ClusterObjectRpcEndpointOnlyHost { inner: self.host };
+            return call_endpoint_with_route_policy_host(
+                &mut endpoint_only_host,
+                endpoint,
+                request,
+                options,
+                false,
+            )
+            .await;
         };
         self.call_endpoint_from_paths(context.runtime, context.paths, endpoint, request, options)
             .await
@@ -857,9 +929,14 @@ where
             paths: paths.clone(),
             inner: self.host,
         };
-        ClusterObjectRpcClient::endpoint_only(&mut relay_host)
-            .call_endpoint_with_relay_preference(endpoint, request, options, prefer_relay)
-            .await
+        call_endpoint_with_route_policy_host(
+            &mut relay_host,
+            endpoint,
+            request,
+            options,
+            prefer_relay,
+        )
+        .await
     }
 
     pub(crate) async fn call_node_from_paths(
@@ -1163,7 +1240,7 @@ async fn send_signed_rpc_to_endpoint_async_with_route_policy(
     request_auth: &[u8],
     options: ClusterSignedEndpointRpcOptions,
     prefers_relay: bool,
-    host: &mut impl ClusterSignedEndpointRpcAsyncHost,
+    host: &mut impl ClusterEndpointRpcRoutePolicyHost,
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let deadline = ClusterEndpointRpcDeadline::new(options.timeouts.connect_timeout);
     let requests_raw_direct = endpoint_rpc_requests_raw_direct(request);
@@ -4741,7 +4818,9 @@ mod tests {
                 self.direct_result.clone()
             })
         }
+    }
 
+    impl ClusterEndpointRpcRoutePolicyHost for RecordingSignedEndpointRpcHost {
         fn relay_signed_endpoint_rpc_async<'a>(
             &'a mut self,
             _endpoint: &'a ClusterEndpointRecord,
