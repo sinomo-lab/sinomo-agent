@@ -191,6 +191,25 @@ impl ClusterKvPaths {
             .map(|(result, wrote)| (result.snapshot, result.txn_response, wrote))
     }
 
+    pub fn current_snapshot_revision_for_node(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<KvRevision, KvError> {
+        read_cluster_kv_current_snapshot_for_node(self, node_id.clone())
+            .map(|snapshot| snapshot.revision)
+    }
+
+    pub fn imported_snapshot_advances_current_for_node(
+        &self,
+        node_id: &NodeId,
+        snapshot: &KvSnapshot,
+    ) -> bool {
+        match self.current_snapshot_revision_for_node(node_id) {
+            Ok(local_revision) => snapshot.revision > local_revision,
+            Err(_) => true,
+        }
+    }
+
     pub fn append_kv_ops_in_batches_and_publish<F>(
         &self,
         node_id: &NodeId,

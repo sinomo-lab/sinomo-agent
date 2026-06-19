@@ -494,23 +494,23 @@ pub(crate) fn append_cluster_raft_command(
 /// The local node's current cluster KV snapshot revision, if one is readable;
 /// `None` asks the voter to ship its full snapshot back.
 pub(crate) fn local_cluster_kv_snapshot_revision(paths: &ClusterPaths) -> Option<KvRevision> {
-    read_cluster_kv_current_snapshot(paths)
+    let node_id = read_cluster_kv_reader_node_id(paths).ok()?;
+    paths
+        .kv_paths()
+        .current_snapshot_revision_for_node(&node_id)
         .ok()
-        .map(|snapshot| snapshot.revision)
 }
 
-/// Direction guard for snapshot imports: under raft's lag-only invariant an
-/// imported snapshot must move local history FORWARD. A responder that lags
-/// the local node (a stale bridge answering a fresher publisher) must never
-/// roll the local KV back.
 pub(crate) fn imported_snapshot_advances_local_kv(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
 ) -> bool {
-    match local_cluster_kv_snapshot_revision(paths) {
-        Some(local) => snapshot.revision > local,
-        None => true,
-    }
+    let Ok(node_id) = read_cluster_kv_reader_node_id(paths) else {
+        return true;
+    };
+    paths
+        .kv_paths()
+        .imported_snapshot_advances_current_for_node(&node_id, snapshot)
 }
 
 pub(crate) fn append_cluster_raft_ops_in_batches(
