@@ -8,7 +8,7 @@ use crate::rpc_future::ClusterMembershipRpcFuture;
 use sinomo_kv::{ClusterKvRaftLocalVoteMetadata, ClusterRaftVoteRequest, ClusterRaftVoteResponse};
 use std::time::{Duration, Instant};
 
-pub trait ClusterRaftVoteTransportHost {
+pub(crate) trait ClusterRaftVoteTransportHost {
     fn send_raft_vote(
         &mut self,
         endpoint: &ClusterEndpointRecord,
@@ -17,7 +17,7 @@ pub trait ClusterRaftVoteTransportHost {
     ) -> Result<ClusterRaftVoteResponse, NetworkError>;
 }
 
-pub trait ClusterRaftVoteTransportAsyncHost {
+pub(crate) trait ClusterRaftVoteTransportAsyncHost {
     fn send_raft_vote_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
@@ -347,7 +347,7 @@ pub(crate) fn locked_cluster_raft_local_vote_metadata(
         .map_err(Into::into)
 }
 
-pub fn elect_cluster_raft_leader_with_host(
+pub(crate) fn elect_cluster_raft_leader_with_host(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     options: ClusterRaftLeaderElectionOptions,
@@ -381,7 +381,7 @@ pub fn elect_cluster_raft_leader_with_host(
     )
 }
 
-pub async fn elect_cluster_raft_leader_async_with_host(
+pub(crate) async fn elect_cluster_raft_leader_async_with_host(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,

@@ -9263,6 +9263,15 @@ impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
         Ok(false)
     }
 
+    fn send_raft_vote(
+        &mut self,
+        _endpoint: &ClusterEndpointRecord,
+        _request: &ClusterRaftVoteRequest,
+        _timeout: Duration,
+    ) -> Result<ClusterRaftVoteResponse, NetworkError> {
+        panic!("recording quorum host overrides election and must not send raft votes")
+    }
+
     fn elect_cluster_raft_leader(
         &mut self,
         _paths: &ClusterPaths,

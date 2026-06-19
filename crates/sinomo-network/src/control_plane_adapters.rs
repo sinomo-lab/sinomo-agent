@@ -119,7 +119,6 @@ pub(crate) use crate::member_store::{
 use crate::membership_rpc::{ClusterMemberPublishRequest, ClusterMemberPublishResponse};
 use crate::network_info::ClusterNetworkInfoRecord;
 use crate::prelude::*;
-use crate::raft_election::ClusterRaftVoteTransportHost;
 #[cfg(test)]
 pub(crate) use crate::raft_election::elect_cluster_raft_leader_with_host;
 #[cfg(test)]
@@ -150,28 +149,12 @@ use crate::status_publish::{ClusterNetworkInfoPublishHost, ClusterNodeStatusPubl
 use crate::voter_reachability::{ClusterVoterReachabilityHost, cluster_has_local_quorum_with_host};
 use std::time::Duration;
 
-use sinomo_kv::{ClusterRaftVoteRequest, ClusterRaftVoteResponse};
-
 impl<T> ClusterVoterReachabilityHost for ClusterControlPlaneDriver<T>
 where
     T: ClusterControlPlaneTransport,
 {
     fn probe_voter(&mut self, endpoint: &ClusterEndpointRecord, timeout: Duration) -> bool {
         self.transport.probe_voter(endpoint, timeout)
-    }
-}
-
-impl<T> ClusterRaftVoteTransportHost for ClusterControlPlaneDriver<T>
-where
-    T: ClusterControlPlaneTransport,
-{
-    fn send_raft_vote(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        request: &ClusterRaftVoteRequest,
-        timeout: Duration,
-    ) -> Result<ClusterRaftVoteResponse, NetworkError> {
-        self.transport.send_raft_vote(endpoint, request, timeout)
     }
 }
 

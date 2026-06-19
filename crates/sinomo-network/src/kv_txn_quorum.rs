@@ -26,12 +26,14 @@ use crate::raft_quorum::{
 };
 use crate::route::ClusterSignedEndpointRpcAsyncHost;
 use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
+use crate::rpc_future::ClusterMembershipRpcFuture;
 use crate::voter_reachability::{
     ClusterVoterReachabilityAsyncHost, ClusterVoterReachabilityOptions,
     cluster_reachable_voter_count_async_with_host, cluster_reachable_voter_count_with_host,
 };
 use sinomo_kv::{
     ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult, ClusterKvTxnCommitResult,
+    ClusterRaftVoteRequest, ClusterRaftVoteResponse,
 };
 use std::time::Duration;
 
@@ -64,6 +66,13 @@ pub trait ClusterKvTxnQuorumHost {
         state: &ClusterBootstrapState,
     ) -> Result<bool, NetworkError>;
 
+    fn send_raft_vote(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ClusterRaftVoteRequest,
+        timeout: Duration,
+    ) -> Result<ClusterRaftVoteResponse, NetworkError>;
+
     fn forward_cluster_kv_txn_to_voter(
         &mut self,
         paths: &ClusterPaths,
@@ -82,7 +91,12 @@ pub trait ClusterKvTxnQuorumHost {
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
         options: ClusterRaftLeaderElectionOptions,
-    ) -> Result<bool, NetworkError>;
+    ) -> Result<bool, NetworkError>
+    where
+        Self: Sized,
+    {
+        elect_cluster_raft_leader_with_host(paths, state, options, self)
+    }
 
     fn reachable_voter_count(
         &mut self,
@@ -129,22 +143,46 @@ where
     }
 }
 
+impl<T> crate::raft_election::ClusterRaftVoteTransportHost for T
+where
+    T: ClusterKvTxnQuorumHost,
+{
+    fn send_raft_vote(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ClusterRaftVoteRequest,
+        timeout: Duration,
+    ) -> Result<ClusterRaftVoteResponse, NetworkError> {
+        ClusterKvTxnQuorumHost::send_raft_vote(self, endpoint, request, timeout)
+    }
+}
+
 pub trait ClusterKvTxnQuorumAsyncHost:
     ClusterSignedEndpointRpcAsyncHost
     + ClusterRaftQuorumAsyncHost
-    + ClusterRaftVoteTransportAsyncHost
     + ClusterVoterReachabilityAsyncHost
     + Send
 {
+    fn send_raft_vote_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        request: &'a ClusterRaftVoteRequest,
+        timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftVoteResponse>;
 }
 
-impl<T> ClusterKvTxnQuorumAsyncHost for T where
-    T: ClusterSignedEndpointRpcAsyncHost
-        + ClusterRaftQuorumAsyncHost
-        + ClusterRaftVoteTransportAsyncHost
-        + ClusterVoterReachabilityAsyncHost
-        + Send
+impl<T> ClusterRaftVoteTransportAsyncHost for T
+where
+    T: ClusterKvTxnQuorumAsyncHost,
 {
+    fn send_raft_vote_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        request: &'a ClusterRaftVoteRequest,
+        timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftVoteResponse> {
+        ClusterKvTxnQuorumAsyncHost::send_raft_vote_async(self, endpoint, request, timeout)
+    }
 }
 
 impl<T> ClusterKvTxnQuorumHost for ClusterControlPlaneDriver<T>
@@ -184,21 +222,21 @@ where
             .send_object_rpc_to_node(state, target_node_id, request, timeout)
     }
 
+    fn send_raft_vote(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ClusterRaftVoteRequest,
+        timeout: Duration,
+    ) -> Result<ClusterRaftVoteResponse, NetworkError> {
+        self.transport.send_raft_vote(endpoint, request, timeout)
+    }
+
     fn local_is_raft_leader(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Result<bool, NetworkError> {
         locked_cluster_raft_local_is_leader(paths, state)
-    }
-
-    fn elect_cluster_raft_leader(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-        options: ClusterRaftLeaderElectionOptions,
-    ) -> Result<bool, NetworkError> {
-        elect_cluster_raft_leader_with_host(paths, state, options, self)
     }
 
     fn reachable_voter_count(

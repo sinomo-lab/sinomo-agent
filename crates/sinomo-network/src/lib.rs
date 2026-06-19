@@ -323,10 +323,8 @@ pub use peer::{
     AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions, InProcessNetwork,
     InProcessTransport,
 };
-pub use raft_election::{
-    ClusterRaftVoteTransportAsyncHost, ClusterRaftVoteTransportHost,
-    elect_cluster_raft_leader_with_host,
-};
+#[cfg(test)]
+pub(crate) use raft_election::ClusterRaftVoteTransportHost;
 pub use raft_fanout::{
     ClusterRaftCommittedFanoutAsyncHost, spawn_cluster_raft_committed_fanout_worker_on_runtime,
 };

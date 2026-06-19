@@ -3594,7 +3594,7 @@ impl sinomo_network::ClusterVoterReachabilityAsyncHost for DaemonClusterControlP
     }
 }
 
-impl sinomo_network::ClusterRaftVoteTransportAsyncHost for DaemonClusterControlPlaneTransport {
+impl sinomo_network::ClusterKvTxnQuorumAsyncHost for DaemonClusterControlPlaneTransport {
     fn send_raft_vote_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,

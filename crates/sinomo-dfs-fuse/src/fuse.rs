@@ -1376,18 +1376,24 @@ impl network::ClusterKvTxnQuorumHost for DfsFuseClusterKvTxnQuorumHost {
         result
     }
 
-    fn elect_cluster_raft_leader(
+    fn send_raft_vote(
         &mut self,
-        paths: &network::ClusterPaths,
-        state: &ClusterBootstrapState,
-        options: network::ClusterRaftLeaderElectionOptions,
-    ) -> std::result::Result<bool, NetworkError> {
-        network::elect_cluster_raft_leader_with_host(
-            paths,
-            state,
-            options,
-            &mut DfsFuseClusterRaftLeaderElectionHost,
-        )
+        endpoint: &ClusterEndpointRecord,
+        request: &sinomo_runtime::kv::ClusterRaftVoteRequest,
+        timeout: Duration,
+    ) -> std::result::Result<sinomo_runtime::kv::ClusterRaftVoteResponse, NetworkError> {
+        let rpc_request = object_rpc_request_from_kv_payload(
+            sinomo_runtime::kv::cluster_raft_vote_rpc_payload(request)?,
+        );
+        let response = dfs_fuse_send_daemon_rpc_to_endpoint(
+            endpoint,
+            &rpc_request,
+            timeout,
+            "cluster raft vote",
+        )?;
+        response.error_detail()?;
+        sinomo_runtime::kv::decode_cluster_raft_vote_rpc_response_body(&response.body)
+            .map_err(Into::into)
     }
 
     fn reachable_voter_count(
@@ -1546,30 +1552,6 @@ struct DfsFuseClusterVoterReachabilityHost;
 impl network::ClusterVoterReachabilityHost for DfsFuseClusterVoterReachabilityHost {
     fn probe_voter(&mut self, endpoint: &ClusterEndpointRecord, timeout: Duration) -> bool {
         daemon::fetch_daemon_status_from_endpoint(endpoint, timeout).is_ok()
-    }
-}
-
-struct DfsFuseClusterRaftLeaderElectionHost;
-
-impl network::ClusterRaftVoteTransportHost for DfsFuseClusterRaftLeaderElectionHost {
-    fn send_raft_vote(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        request: &sinomo_runtime::kv::ClusterRaftVoteRequest,
-        timeout: Duration,
-    ) -> std::result::Result<sinomo_runtime::kv::ClusterRaftVoteResponse, NetworkError> {
-        let rpc_request = object_rpc_request_from_kv_payload(
-            sinomo_runtime::kv::cluster_raft_vote_rpc_payload(request)?,
-        );
-        let response = dfs_fuse_send_daemon_rpc_to_endpoint(
-            endpoint,
-            &rpc_request,
-            timeout,
-            "cluster raft vote",
-        )?;
-        response.error_detail()?;
-        sinomo_runtime::kv::decode_cluster_raft_vote_rpc_response_body(&response.body)
-            .map_err(Into::into)
     }
 }
 

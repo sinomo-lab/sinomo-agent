@@ -713,26 +713,21 @@ impl network::ClusterKvTxnQuorumHost for CliClusterKvTxnQuorumHost {
         result
     }
 
+    fn send_raft_vote(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &sinomo_runtime::kv::ClusterRaftVoteRequest,
+        timeout: Duration,
+    ) -> Result<sinomo_runtime::kv::ClusterRaftVoteResponse, network::NetworkError> {
+        cli_send_cluster_raft_vote(endpoint, request, timeout)
+    }
+
     fn local_is_raft_leader(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Result<bool, network::NetworkError> {
         locked_cluster_raft_local_is_leader(paths, state)
-    }
-
-    fn elect_cluster_raft_leader(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-        options: network::ClusterRaftLeaderElectionOptions,
-    ) -> Result<bool, network::NetworkError> {
-        network::elect_cluster_raft_leader_with_host(
-            paths,
-            state,
-            options,
-            &mut CliClusterRaftLeaderElectionHost,
-        )
     }
 
     fn reachable_voter_count(
@@ -925,19 +920,6 @@ impl network::ClusterRaftAppendReplicationHost for CliClusterRaftAppendReplicati
         timeout: Duration,
     ) -> Result<sinomo_runtime::kv::ClusterRaftAppendResponse, network::NetworkError> {
         cli_send_cluster_raft_append(endpoint, request, timeout)
-    }
-}
-
-struct CliClusterRaftLeaderElectionHost;
-
-impl network::ClusterRaftVoteTransportHost for CliClusterRaftLeaderElectionHost {
-    fn send_raft_vote(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        request: &sinomo_runtime::kv::ClusterRaftVoteRequest,
-        timeout: Duration,
-    ) -> Result<sinomo_runtime::kv::ClusterRaftVoteResponse, network::NetworkError> {
-        cli_send_cluster_raft_vote(endpoint, request, timeout)
     }
 }
 
