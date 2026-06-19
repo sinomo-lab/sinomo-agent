@@ -18,13 +18,13 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClusterKvSnapshotRefreshOptions {
-    pub without_local_snapshot_timeout: Duration,
-    pub with_local_snapshot_timeout: Duration,
-    pub tcp_command_timeout: Duration,
-    pub iroh_command_timeout: Duration,
-    pub tcp_foreground_attempt_timeout: Duration,
-    pub public_foreground_attempt_timeout: Duration,
-    pub iroh_foreground_attempt_timeout: Duration,
+    pub(crate) without_local_snapshot_timeout: Duration,
+    pub(crate) with_local_snapshot_timeout: Duration,
+    pub(crate) tcp_command_timeout: Duration,
+    pub(crate) iroh_command_timeout: Duration,
+    pub(crate) tcp_foreground_attempt_timeout: Duration,
+    pub(crate) public_foreground_attempt_timeout: Duration,
+    pub(crate) iroh_foreground_attempt_timeout: Duration,
 }
 
 impl ClusterKvSnapshotRefreshOptions {
@@ -36,7 +36,7 @@ impl ClusterKvSnapshotRefreshOptions {
         }
     }
 
-    pub fn command_timeout(
+    pub(crate) fn command_timeout(
         &self,
         endpoint: &ClusterEndpointRecord,
         remaining: Duration,
@@ -47,7 +47,7 @@ impl ClusterKvSnapshotRefreshOptions {
         }
     }
 
-    pub fn fair_command_timeout(
+    pub(crate) fn fair_command_timeout(
         &self,
         endpoint: &ClusterEndpointRecord,
         remaining: Duration,
