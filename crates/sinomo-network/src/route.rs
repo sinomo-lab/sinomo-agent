@@ -16,15 +16,14 @@ use crate::endpoint_selector::{
     cluster_endpoint_can_carry_main_daemon_rpc,
     cluster_graph_has_reachable_main_daemon_route_targets, relay_hop_endpoint_is_usable,
 };
-use crate::membership::{
-    DAEMON_SHADOW_SUPERVISE_CAPABILITY, locally_learned_bridge_route_endpoint,
-};
+use crate::membership::locally_learned_bridge_route_endpoint;
 use crate::prelude::*;
 use crate::{
     ClusterConnectivityGraph, ClusterEndpointSelectionPurpose, ClusterEndpointSelector,
     ClusterPaths, DaemonControlRequest, DaemonRpcTimeouts, NetworkError, ObjectRpcRequest,
     ObjectRpcResponse,
 };
+use sinomo_node::{DAEMON_MAIN_RUN_CAPABILITY, DAEMON_SHADOW_SUPERVISE_CAPABILITY};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
@@ -1913,7 +1912,7 @@ fn cluster_relay_member_bridge_next_hops(
                 && member
                     .capabilities
                     .iter()
-                    .any(|capability| capability.as_str() == crate::DAEMON_MAIN_RUN_CAPABILITY)
+                    .any(|capability| capability.as_str() == DAEMON_MAIN_RUN_CAPABILITY)
                 && relay_candidate_member_bridge_rank(state, &member.node_id)
                     < RELAY_CANDIDATE_NO_BRIDGE_EVIDENCE_RANK
                 && relay_member_has_usable_bridge_endpoint(graph, local_node_id, member)
@@ -2033,7 +2032,7 @@ fn relay_candidate_can_transit(
                 && member
                     .capabilities
                     .iter()
-                    .any(|capability| capability.as_str() == crate::DAEMON_MAIN_RUN_CAPABILITY)
+                    .any(|capability| capability.as_str() == DAEMON_MAIN_RUN_CAPABILITY)
         })
 }
 

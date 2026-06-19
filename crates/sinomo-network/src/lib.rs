@@ -272,10 +272,10 @@ pub(crate) use member_publish::{
     handle_cluster_member_publish_request_with_host,
 };
 pub use membership::{
-    DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, DAEMON_SHADOW_SUPERVISE_CAPABILITY,
-    cluster_is_settled_solo, cluster_member_expected_daemon_process,
-    cluster_member_is_legacy_shadow_daemon, cluster_member_is_local_process,
-    cluster_node_is_local_process, live_cluster_member_probe_possible,
+    DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, cluster_is_settled_solo,
+    cluster_member_expected_daemon_process, cluster_member_is_legacy_shadow_daemon,
+    cluster_member_is_local_process, cluster_node_is_local_process,
+    live_cluster_member_probe_possible,
 };
 #[cfg(test)]
 pub(crate) use membership::{cluster_has_remote_peers, cluster_local_process_members};
@@ -377,7 +377,6 @@ pub use rpc::{
 #[cfg(test)]
 pub(crate) use rpc::{call_object_rpc_frame_async, serve_object_rpc_frame_async};
 pub use rpc_future::ClusterMembershipRpcFuture;
-pub use sinomo_node::DAEMON_MAIN_RUN_CAPABILITY;
 #[cfg(test)]
 pub(crate) use sinomo_node::upsert_member_record;
 pub use status_publish::{

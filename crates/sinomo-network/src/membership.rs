@@ -2,12 +2,13 @@ use sinomo_core::{
     CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
     ClusterEndpointSource, ClusterMemberRecord, ClusterMemberState, ClusterTransportKind,
 };
-use sinomo_node::{DAEMON_MAIN_RUN_CAPABILITY, NodeId, shadow_daemon_node_id};
+use sinomo_node::{
+    DAEMON_MAIN_RUN_CAPABILITY, DAEMON_SHADOW_SUPERVISE_CAPABILITY, NodeId, shadow_daemon_node_id,
+};
 use std::net::SocketAddr;
 
 use crate::local_membership::cluster_state_needs_join_registration;
 
-pub const DAEMON_SHADOW_SUPERVISE_CAPABILITY: &str = "daemon.shadow.supervise";
 pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 

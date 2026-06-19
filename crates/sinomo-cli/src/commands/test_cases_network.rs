@@ -423,7 +423,7 @@ fn member_has_main_daemon(member: &ClusterMemberRecord) -> bool {
     member
         .capabilities
         .iter()
-        .any(|capability| capability.as_str() == network::DAEMON_MAIN_RUN_CAPABILITY)
+        .any(|capability| capability.as_str() == sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY)
 }
 
 #[derive(Clone, Debug)]

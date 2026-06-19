@@ -8319,8 +8319,10 @@ fn cleanup_legacy_shadow_daemon_members_removes_only_shadow_only_records() {
         "pk-local-shadow",
         now,
     );
-    local_shadow.capabilities =
-        vec![CapabilityName::new(DAEMON_SHADOW_SUPERVISE_CAPABILITY).expect("shadow capability")];
+    local_shadow.capabilities = vec![
+        CapabilityName::new(sinomo_node::DAEMON_SHADOW_SUPERVISE_CAPABILITY)
+            .expect("shadow capability"),
+    ];
     local_shadow.allowed_capabilities = local_shadow.capabilities.clone();
     local_shadow.endpoints = vec![daemon_lan_endpoint(
         &local_shadow_node_id,
@@ -8335,8 +8337,10 @@ fn cleanup_legacy_shadow_daemon_members_removes_only_shadow_only_records() {
         "pk-remote-shadow",
         now,
     );
-    remote_shadow.capabilities =
-        vec![CapabilityName::new(DAEMON_SHADOW_SUPERVISE_CAPABILITY).expect("shadow capability")];
+    remote_shadow.capabilities = vec![
+        CapabilityName::new(sinomo_node::DAEMON_SHADOW_SUPERVISE_CAPABILITY)
+            .expect("shadow capability"),
+    ];
     remote_shadow.allowed_capabilities = remote_shadow.capabilities.clone();
     remote_shadow.endpoints = vec![daemon_lan_endpoint(
         &remote_shadow_node_id,
@@ -17126,12 +17130,12 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
         now,
     );
     state.members[0].capabilities =
-        vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+        vec![CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
     state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
     let mut remote_member =
         ClusterMemberRecord::local_voter(cluster_id, remote.clone(), "remote", "pk-remote", now);
     remote_member.capabilities =
-        vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+        vec![CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
     remote_member.allowed_capabilities = remote_member.capabilities.clone();
     remote_member.endpoints = vec![daemon_lan_endpoint(
         &remote,
@@ -17326,7 +17330,7 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
         now,
     );
     state.members[0].capabilities =
-        vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+        vec![CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
     state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
 
     let mut bridge = ClusterMemberRecord::local_voter(
@@ -17337,7 +17341,7 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
         now,
     );
     bridge.capabilities =
-        vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+        vec![CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
     bridge.allowed_capabilities = bridge.capabilities.clone();
     bridge.endpoints = vec![daemon_lan_endpoint(
         &bridge_node,
@@ -17353,7 +17357,7 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
         now,
     );
     target.capabilities =
-        vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+        vec![CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
     target.allowed_capabilities = target.capabilities.clone();
     target.endpoints = vec![daemon_lan_endpoint(
         &target_node,
@@ -17369,7 +17373,7 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
         now,
     );
     unknown.capabilities =
-        vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+        vec![CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
     unknown.allowed_capabilities = unknown.capabilities.clone();
 
     state.members.push(bridge.clone());
@@ -17619,7 +17623,7 @@ fn cluster_health_rows_select_member_process_status() {
         now,
     );
     state.members[0].capabilities =
-        vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+        vec![CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
     state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
     state.members[0].endpoints = vec![daemon_lan_endpoint(
         &node_id,
@@ -17733,8 +17737,9 @@ fn cluster_health_and_doctor_ignore_legacy_shadow_members() {
         "main-public-key",
         now,
     );
-    state.members[0].capabilities =
-        vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("main capability")];
+    state.members[0].capabilities = vec![
+        CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("main capability"),
+    ];
     state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
     let mut legacy_shadow = ClusterMemberRecord::local_non_voting(
         cluster_id.clone(),
@@ -17743,8 +17748,10 @@ fn cluster_health_and_doctor_ignore_legacy_shadow_members() {
         "shadow-public-key",
         now,
     );
-    legacy_shadow.capabilities =
-        vec![CapabilityName::new(DAEMON_SHADOW_SUPERVISE_CAPABILITY).expect("shadow capability")];
+    legacy_shadow.capabilities = vec![
+        CapabilityName::new(sinomo_node::DAEMON_SHADOW_SUPERVISE_CAPABILITY)
+            .expect("shadow capability"),
+    ];
     legacy_shadow.allowed_capabilities = legacy_shadow.capabilities.clone();
     legacy_shadow.endpoints = vec![daemon_lan_endpoint(
         &shadow_node_id,

@@ -5,6 +5,7 @@ use sinomo_core::{
 };
 
 pub const DAEMON_MAIN_RUN_CAPABILITY: &str = "daemon.main.run";
+pub const DAEMON_SHADOW_SUPERVISE_CAPABILITY: &str = "daemon.shadow.supervise";
 
 pub fn shadow_daemon_node_id(main_node_id: &NodeId) -> NodeId {
     NodeId::derived("sinomo.node.shadow", main_node_id.as_str())
@@ -42,7 +43,7 @@ pub fn shadow_daemon_capabilities() -> Vec<CapabilityName> {
     vec![
         CapabilityName::new("cluster.message.receive").expect("static capability"),
         CapabilityName::new("cluster.message.send").expect("static capability"),
-        CapabilityName::new("daemon.shadow.supervise").expect("static capability"),
+        CapabilityName::new(DAEMON_SHADOW_SUPERVISE_CAPABILITY).expect("static capability"),
     ]
 }
 

@@ -1448,10 +1448,9 @@ fn inspect_cluster_dfs_status() -> Result<DfsClusterStatusReport, CliError> {
         .filter(|member| {
             member.node_id != state.local_node_id
                 && member.state.is_authorized()
-                && member
-                    .capabilities
-                    .iter()
-                    .any(|capability| capability.as_str() == network::DAEMON_MAIN_RUN_CAPABILITY)
+                && member.capabilities.iter().any(|capability| {
+                    capability.as_str() == sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY
+                })
         })
         .map(|member| member.node_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
