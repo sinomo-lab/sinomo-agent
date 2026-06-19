@@ -48,7 +48,7 @@ pub struct ClusterNodeRoleUpdate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClusterRaftRoleUpdate {
+pub struct ClusterStateAuthorityUpdate {
     pub node_id: NodeId,
     pub previous_role: ClusterMemberRole,
     pub previous_state: ClusterMemberState,
@@ -320,14 +320,14 @@ fn update_local_cluster_node_role_if_present(
     Ok(())
 }
 
-pub fn update_cluster_raft_role_with_host(
+pub fn update_cluster_state_authority_with_host(
     paths: &ClusterPaths,
     mut state: ClusterBootstrapState,
     node_id: NodeId,
     role: ClusterMemberRole,
     now: OffsetDateTime,
     host: &mut impl ClusterMemberMutationHost,
-) -> Result<ClusterRaftRoleUpdate, NetworkError> {
+) -> Result<ClusterStateAuthorityUpdate, NetworkError> {
     let store = host.current_cluster_kv_store(paths, &state)?;
     let member_key = cluster_member_key(&node_id);
     let Some(member_entry) = store.get(&member_key).cloned() else {
@@ -353,7 +353,7 @@ pub fn update_cluster_raft_role_with_host(
             cluster_member_raft_update_txn_from_store(&store, member_entry, &member, now)?,
         )?;
     }
-    Ok(ClusterRaftRoleUpdate {
+    Ok(ClusterStateAuthorityUpdate {
         node_id,
         previous_role,
         previous_state,
@@ -395,7 +395,7 @@ pub fn remove_cluster_members_with_host(
         if sinomo_kv::cluster_kv_store_member_is_raft_voter(&store, &member.node_id)? {
             return Err(NetworkError::ClusterReadOnly {
                 detail: format!(
-                    "cluster member `{}` is a voter; change its raft role before removal",
+                    "cluster member `{}` is a state authority; change its authority role before removal",
                     member.node_id
                 ),
             });
@@ -432,7 +432,7 @@ pub fn cleanup_legacy_shadow_daemon_members_with_host(
         if sinomo_kv::cluster_kv_store_member_is_raft_voter(&store, &member.node_id)? {
             return Err(NetworkError::ClusterReadOnly {
                 detail: format!(
-                    "legacy shadow member `{}` is a voter; change its raft role before cleanup",
+                    "legacy shadow member `{}` is a state authority; change its authority role before cleanup",
                     member.node_id
                 ),
             });

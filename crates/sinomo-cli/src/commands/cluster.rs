@@ -2214,7 +2214,7 @@ pub(crate) fn cluster_raft_role(options: ClusterRaftRoleOptions) -> Result<(), C
     let paths = cluster_paths_from_defaults()?;
     refresh_cluster_kv_from_local_daemon(&paths)?;
     let state = network::read_cluster_state(&paths)?;
-    let update = network::update_cluster_raft_role_with_host(
+    let update = network::update_cluster_state_authority_with_host(
         &paths,
         state,
         options.node_id.clone(),
@@ -2224,7 +2224,7 @@ pub(crate) fn cluster_raft_role(options: ClusterRaftRoleOptions) -> Result<(), C
     )?;
     if !update.changed {
         println!(
-            "cluster member {} already has raft role {}",
+            "cluster member {} already has state authority role {}",
             update.node_id,
             format_member_role(&update.role)
         );
@@ -2232,7 +2232,7 @@ pub(crate) fn cluster_raft_role(options: ClusterRaftRoleOptions) -> Result<(), C
     }
 
     println!(
-        "cluster member {} raft role changed: {} {} -> {} {}",
+        "cluster member {} state authority role changed: {} {} -> {} {}",
         update.node_id,
         format_member_role(&update.previous_role),
         format_member_state(&update.previous_state),
@@ -2333,7 +2333,7 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
 
     if let Some(node_id) = options.promote {
         let state = network::read_cluster_state(&paths)?;
-        let update = network::update_cluster_raft_role_with_host(
+        let update = network::update_cluster_state_authority_with_host(
             &paths,
             state,
             node_id,
@@ -2343,7 +2343,7 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
         )?;
         if update.changed {
             println!(
-                "cluster member {} raft role changed: {} {} -> {} {}",
+                "cluster member {} state authority role changed: {} {} -> {} {}",
                 update.node_id,
                 format_member_role(&update.previous_role),
                 format_member_state(&update.previous_state),
@@ -2352,7 +2352,7 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
             );
         } else {
             println!(
-                "cluster member {} already has raft role {}",
+                "cluster member {} already has state authority role {}",
                 update.node_id,
                 format_member_role(&update.role)
             );
