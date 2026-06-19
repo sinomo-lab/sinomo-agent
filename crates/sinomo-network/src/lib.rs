@@ -117,10 +117,10 @@ pub use endpoint_advertisement::{
 #[cfg(test)]
 pub(crate) use endpoint_records::cleanup_member_iroh_endpoints;
 pub(crate) use endpoint_records::iroh_endpoint_public_key;
+pub(crate) use endpoint_records::upsert_member_endpoint;
 pub use endpoint_records::{
     apply_cluster_iroh_endpoint_advertisement, cleanup_cluster_iroh_endpoints,
     refresh_local_iroh_endpoints_from_disk, refresh_local_iroh_endpoints_from_disk_async,
-    upsert_member_endpoint,
 };
 pub use endpoint_selector::{
     ClusterEndpointSelectionPurpose, ClusterEndpointSelector, advertised_peer_route_targets,

@@ -10083,7 +10083,7 @@ mod tests {
             .iter_mut()
             .find(|member| member.node_id == bridge_learned_endpoint.node_id)
             .expect("bridge member");
-        sinomo_network::upsert_member_endpoint(local_bridge, bridge_learned_endpoint.clone());
+        local_bridge.endpoints.push(bridge_learned_endpoint.clone());
         sinomo_network::write_cluster_state(&paths, &local_state)
             .expect("write local learned route");
 

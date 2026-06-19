@@ -157,7 +157,7 @@ fn iroh_endpoint_preference_rank(endpoint: &ClusterEndpointRecord, was_stable: b
     (stable_rank, reachability_rank)
 }
 
-pub fn upsert_member_endpoint(
+pub(crate) fn upsert_member_endpoint(
     member: &mut ClusterMemberRecord,
     mut endpoint: ClusterEndpointRecord,
 ) -> bool {
