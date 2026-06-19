@@ -161,10 +161,16 @@ pub(crate) use invite_publish::{
 };
 pub(crate) use io_observer::io_observer;
 pub use io_observer::{IoObserver, set_io_observer};
+#[cfg(test)]
+pub(crate) use join_registration::prepare_cluster_join_registration_response;
 pub use join_registration::{
     ClusterJoinReconciliation, ClusterJoinReconciliationHost, ClusterJoinRegistrationAsyncHost,
     ClusterJoinRegistrationDriver, ClusterJoinRegistrationHost,
     ClusterLocalDaemonMembershipAsyncObserver, ClusterLocalDaemonMembershipObserver,
+    handle_cluster_join_registration_request_async_with_host,
+    handle_cluster_join_registration_request_with_host,
+    record_forwarded_join_registration_acceptance_with_host,
+    send_cluster_join_registration_over_membership_rpc,
 };
 #[cfg(test)]
 pub(crate) use keyspace::{
@@ -364,20 +370,16 @@ pub use storage::{
     cleanup_legacy_shadow_daemon_members_with_host, cluster_join_challenge_rpc_request,
     cluster_state_sync_txn, commit_cluster_kv_txn_with_quorum_response_with_host,
     commit_cluster_raft_command_with_quorum_driver, elect_cluster_raft_leader_with_host,
-    handle_cluster_join_registration_request_with_host,
     handle_cluster_membership_rpc_request_with_hosts, handle_cluster_raft_rpc_request,
     join_channel_endpoint_for_accepted_state, reconcile_accepted_cluster_join_response,
-    reconcile_cluster_join_with_introducers_with_host,
-    record_forwarded_join_registration_acceptance_with_host, remove_cluster_members_with_host,
+    reconcile_cluster_join_with_introducers_with_host, remove_cluster_members_with_host,
     replicate_cluster_raft_to_endpoint_with_host,
-    send_cluster_join_registration_over_membership_rpc,
     spawn_cluster_raft_committed_fanout_worker_on_runtime, sync_cluster_state_to_kv_with_host,
     sync_cluster_state_to_local_raft_unchecked, update_cluster_node_role_with_host,
     update_cluster_raft_role_with_host,
 };
 pub use storage::{
     commit_cluster_kv_txn_with_quorum_response_async_with_host,
-    handle_cluster_join_registration_request_async_with_host,
     handle_cluster_kv_txn_request_async_with_host, handle_cluster_raft_rpc_request_async,
     replicate_cluster_raft_to_endpoint_async_with_host, sync_cluster_state_to_kv_async_with_host,
 };
