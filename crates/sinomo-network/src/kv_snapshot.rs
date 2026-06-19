@@ -1,6 +1,6 @@
 use crate::ClusterPaths;
 use crate::endpoint_selector::{
-    cluster_node_blocks_leader_preference, cluster_raft_live_voter_targets,
+    ClusterEndpointSelectionPurpose, ClusterEndpointSelector, cluster_node_blocks_leader_preference,
 };
 use crate::error::NetworkError;
 use crate::kv_local_store::{
@@ -140,7 +140,8 @@ pub fn refresh_current_cluster_kv_store_with_host(
     if let Ok(snapshot) = read_cluster_kv_snapshot(paths) {
         snapshots.push(snapshot);
     }
-    let mut targets = cluster_raft_live_voter_targets(paths, state);
+    let mut targets = ClusterEndpointSelector::new(paths, state)
+        .select(ClusterEndpointSelectionPurpose::LiveVoterCommand);
     if let Ok(Some(leader_id)) = host.known_raft_leader_id(paths, state)
         && !cluster_node_blocks_leader_preference(paths, state, &leader_id)
         && let Some(position) = targets

@@ -1,4 +1,4 @@
-use crate::endpoint_selector::cluster_raft_live_voter_targets;
+use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
 use crate::route::{cluster_endpoint_prefers_relay_with_graph, cluster_route_next_hop};
 use crate::{ClusterConnectivityGraph, ClusterPaths, NetworkError};
 use sinomo_core::{
@@ -74,7 +74,8 @@ pub fn cluster_reachable_voter_count_with_host(
         }
     }
     let deadline = Instant::now() + options.timeout;
-    let targets = cluster_raft_live_voter_targets(paths, state);
+    let targets = ClusterEndpointSelector::new(paths, state)
+        .select(ClusterEndpointSelectionPurpose::LiveVoterCommand);
     let graph = ClusterConnectivityGraph::read_for_local(paths, state);
     for (index, endpoint) in targets.iter().enumerate() {
         let remaining = deadline
@@ -114,7 +115,8 @@ pub async fn cluster_reachable_voter_count_async_with_host(
         }
     }
     let deadline = Instant::now() + options.timeout;
-    let targets = cluster_raft_live_voter_targets(paths, state);
+    let targets = ClusterEndpointSelector::new(paths, state)
+        .select(ClusterEndpointSelectionPurpose::LiveVoterCommand);
     let graph = ClusterConnectivityGraph::read_for_local(paths, state);
     for (index, endpoint) in targets.iter().enumerate() {
         let remaining = deadline

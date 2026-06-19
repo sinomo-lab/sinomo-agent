@@ -1,8 +1,6 @@
 use crate::ClusterPaths;
 use crate::control_plane_options::ClusterRaftLeaderElectionOptions;
-use crate::endpoint_selector::{
-    cluster_raft_live_voter_targets, cluster_raft_live_voter_targets_async,
-};
+use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
 use crate::error::NetworkError;
 use crate::kv_local_store::{cluster_kv_raft_store, locked_apply_cluster_raft_vote};
 use crate::prelude::*;
@@ -356,7 +354,8 @@ pub fn elect_cluster_raft_leader_with_host(
     host: &mut impl ClusterRaftVoteTransportHost,
 ) -> Result<bool, NetworkError> {
     let voter_ids = sinomo_kv::cluster_kv_raft_voter_ids(state);
-    let remote_vote_targets = cluster_raft_live_voter_targets(paths, state)
+    let remote_vote_targets = ClusterEndpointSelector::new(paths, state)
+        .select(ClusterEndpointSelectionPurpose::LiveVoterCommand)
         .into_iter()
         .filter(|endpoint| {
             endpoint.node_id != state.local_node_id && voter_ids.contains(&endpoint.node_id)
@@ -390,13 +389,18 @@ pub async fn elect_cluster_raft_leader_async_with_host(
     host: &mut (impl ClusterRaftVoteTransportAsyncHost + Send),
 ) -> Result<bool, NetworkError> {
     let voter_ids = sinomo_kv::cluster_kv_raft_voter_ids(state);
-    let remote_vote_targets = cluster_raft_live_voter_targets_async(runtime, paths, state)
-        .await?
-        .into_iter()
-        .filter(|endpoint| {
-            endpoint.node_id != state.local_node_id && voter_ids.contains(&endpoint.node_id)
-        })
-        .collect::<Vec<_>>();
+    let remote_vote_targets = ClusterEndpointSelector::select_async(
+        runtime,
+        paths,
+        state,
+        ClusterEndpointSelectionPurpose::LiveVoterCommand,
+    )
+    .await?
+    .into_iter()
+    .filter(|endpoint| {
+        endpoint.node_id != state.local_node_id && voter_ids.contains(&endpoint.node_id)
+    })
+    .collect::<Vec<_>>();
     let remote_vote_target_ids = remote_vote_targets
         .iter()
         .map(|endpoint| endpoint.node_id.clone())

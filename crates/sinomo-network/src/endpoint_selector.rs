@@ -99,7 +99,7 @@ impl<'a> ClusterEndpointSelector<'a> {
                 cluster_invite_publish_targets_impl(self.paths, self.state)
             }
             ClusterEndpointSelectionPurpose::LiveVoterCommand => {
-                cluster_raft_live_voter_targets(self.paths, self.state)
+                cluster_live_voter_command_targets_impl(self.paths, self.state)
             }
             ClusterEndpointSelectionPurpose::MainDaemonCommand => {
                 cluster_main_daemon_command_targets_impl(self.paths, self.state)
@@ -133,6 +133,23 @@ impl<'a> ClusterEndpointSelector<'a> {
                 cluster_voter_command_targets_impl(self.paths, self.state)
             }
         }
+    }
+
+    pub async fn select_async(
+        runtime: &tokio::runtime::Handle,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        purpose: ClusterEndpointSelectionPurpose,
+    ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+        let paths = paths.clone();
+        let state = state.clone();
+        runtime
+            .spawn_blocking(move || ClusterEndpointSelector::new(&paths, &state).select(purpose))
+            .await
+            .map_err(|source| NetworkError::Io {
+                operation: "cluster endpoint selection".to_string(),
+                detail: format!("cluster endpoint selection task failed: {source}"),
+            })
     }
 
     pub fn select_node(
@@ -381,7 +398,7 @@ pub(crate) fn cluster_raft_command_targets_impl(
     targets
 }
 
-pub(crate) fn cluster_raft_live_voter_targets(
+fn cluster_live_voter_command_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -395,49 +412,6 @@ pub(crate) fn cluster_raft_live_voter_targets(
                 .is_some_and(|status| status.availability == ClusterNodeAvailability::Offline)
         })
         .collect()
-}
-
-pub(crate) async fn cluster_raft_live_voter_targets_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
-    let paths = paths.clone();
-    let state = state.clone();
-    runtime
-        .spawn_blocking(move || {
-            Ok(ClusterEndpointSelector::new(&paths, &state)
-                .select(ClusterEndpointSelectionPurpose::LiveVoterCommand))
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster raft voter target selection".to_string(),
-            detail: format!("cluster raft voter target selection task failed: {source}"),
-        })?
-}
-
-pub(crate) fn cluster_raft_member_replication_targets(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Vec<ClusterEndpointRecord> {
-    ClusterEndpointSelector::new(paths, state)
-        .select(ClusterEndpointSelectionPurpose::RaftMemberReplication)
-}
-
-pub(crate) async fn cluster_raft_member_replication_targets_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
-    let paths = paths.clone();
-    let state = state.clone();
-    runtime
-        .spawn_blocking(move || cluster_raft_member_replication_targets(&paths, &state))
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster raft member replication target selection".to_string(),
-            detail: format!("member replication target selection task failed: {source}"),
-        })
 }
 
 pub(crate) fn cluster_raft_member_replication_targets_impl(

@@ -1,8 +1,7 @@
 use crate::ClusterPaths;
 use crate::endpoint_selector::{
-    ClusterEndpointSelectionPurpose, cluster_node_blocks_leader_preference,
-    cluster_node_blocks_leader_preference_async, cluster_raft_live_voter_targets,
-    cluster_raft_live_voter_targets_async,
+    ClusterEndpointSelectionPurpose, ClusterEndpointSelector,
+    cluster_node_blocks_leader_preference, cluster_node_blocks_leader_preference_async,
 };
 use crate::error::NetworkError;
 use crate::kv_local_store::locked_cluster_raft_known_leader_id_async;
@@ -61,7 +60,8 @@ pub(crate) fn forward_cluster_kv_txn_to_voter_with_host(
     options: ClusterKvTxnForwardOptions,
     host: &mut impl ClusterKvTxnForwardHost,
 ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
-    let mut targets = cluster_raft_live_voter_targets(paths, state);
+    let mut targets = ClusterEndpointSelector::new(paths, state)
+        .select(ClusterEndpointSelectionPurpose::LiveVoterCommand);
     if targets.is_empty() {
         return Ok(None);
     }
@@ -164,7 +164,13 @@ pub(crate) async fn forward_cluster_kv_txn_to_voter_async_with_host<H>(
 where
     H: ClusterSignedEndpointRpcAsyncHost + Send,
 {
-    let mut targets = cluster_raft_live_voter_targets_async(runtime, paths, state).await?;
+    let mut targets = ClusterEndpointSelector::select_async(
+        runtime,
+        paths,
+        state,
+        ClusterEndpointSelectionPurpose::LiveVoterCommand,
+    )
+    .await?;
     if targets.is_empty() {
         return Ok(None);
     }
