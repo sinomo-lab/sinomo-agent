@@ -14,6 +14,7 @@ use crate::{
     OptionalValue, Reader, Result, TypeId, Value, encode_element_type, patch_length,
     read_element_type, read_schema, write_bytes, write_length, write_string, write_u16,
 };
+use std::ops::Range;
 
 pub fn to_value<T: Serialize + ?Sized>(value: &T) -> Result<Value> {
     value.serialize(ValueSerializer)
@@ -39,22 +40,47 @@ pub fn to_bytes<T: Serialize + ?Sized>(
     // Stream the value straight into the document buffer rather than building a
     // `Value` tree first; see the "Streaming serde codec" section below.
     let mut out = Vec::new();
+    append_bytes(&mut out, value, version_id, length_mode)?;
+    Ok(out)
+}
+
+pub fn append_bytes<T: Serialize + ?Sized>(
+    out: &mut Vec<u8>,
+    value: &T,
+    version_id: u16,
+    length_mode: LengthMode,
+) -> Result<Range<usize>> {
+    let start = out.len();
+    if let Err(error) = append_bytes_inner(out, value, version_id, length_mode) {
+        out.truncate(start);
+        return Err(error);
+    }
+    Ok(start..out.len())
+}
+
+fn append_bytes_inner<T: Serialize + ?Sized>(
+    out: &mut Vec<u8>,
+    value: &T,
+    version_id: u16,
+    length_mode: LengthMode,
+) -> Result<()> {
+    let start = out.len();
     out.extend_from_slice(MAGIC);
-    write_u16(&mut out, version_id);
+    write_u16(out, version_id);
     out.push(length_mode.code());
     out.push(AlignmentHint::NotAligned.code());
     let length_offset = out.len();
-    write_length(&mut out, length_mode, 0)?; // document length, patched below
-    write_length(&mut out, length_mode, 0)?; // empty dynamic schema (0 types)
-    serialize_element_into(&mut out, length_mode, value)?;
-    let document_length = u64::try_from(out.len()).map_err(|_| Error::LengthTooLarge)?;
+    write_length(out, length_mode, 0)?; // document length, patched below
+    write_length(out, length_mode, 0)?; // empty dynamic schema (0 types)
+    serialize_element_into(out, length_mode, value)?;
+    let document_length = u64::try_from(out.len() - start).map_err(|_| Error::LengthTooLarge)?;
     length_mode.validate(document_length)?;
     patch_length(
         &mut out[length_offset..length_offset + length_mode.width()],
         length_mode,
         document_length,
     )?;
-    Ok(out)
+    Ok(())
 }
 
 pub fn from_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
@@ -2001,6 +2027,35 @@ mod streaming_tests {
             decoded.note.expect("note").as_bytes(),
             &bytes
         ));
+    }
+
+    #[test]
+    fn append_bytes_preserves_existing_buffer_and_rolls_back_on_error() {
+        #[derive(Serialize)]
+        struct Unsupported {
+            values: (u8, u16),
+        }
+
+        let value = sample();
+        let expected = to_bytes(&value, 1, LengthMode::U32).expect("standalone");
+        let mut out = b"prefix".to_vec();
+        let range = append_bytes(&mut out, &value, 1, LengthMode::U32).expect("append");
+
+        assert_eq!(&out[..6], b"prefix");
+        assert_eq!(&out[range.clone()], expected.as_slice());
+        let decoded: Everything = from_bytes(&out[range]).expect("decode appended");
+        assert_eq!(decoded, value);
+
+        let before = out.clone();
+        let error = append_bytes(
+            &mut out,
+            &Unsupported { values: (1, 2) },
+            1,
+            LengthMode::U32,
+        )
+        .expect_err("heterogeneous tuple should fail");
+        assert_eq!(error, Error::TypeMismatch);
+        assert_eq!(out, before);
     }
 
     #[test]

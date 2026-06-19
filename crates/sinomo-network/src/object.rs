@@ -892,6 +892,15 @@ impl SinomoObjectCodec {
         serde_ext::to_bytes(value, self.version_id, self.length_mode).map_err(NetworkError::object)
     }
 
+    pub fn append_to_vec<T: serde::Serialize + ?Sized>(
+        self,
+        out: &mut Vec<u8>,
+        value: &T,
+    ) -> Result<std::ops::Range<usize>, NetworkError> {
+        serde_ext::append_bytes(out, value, self.version_id, self.length_mode)
+            .map_err(NetworkError::object)
+    }
+
     pub fn decode<T: serde::de::DeserializeOwned>(self, bytes: &[u8]) -> Result<T, NetworkError> {
         serde_ext::from_bytes(bytes).map_err(NetworkError::object)
     }
@@ -904,18 +913,37 @@ impl SinomoObjectCodec {
     }
 }
 
-pub(crate) fn object_frame_len_prefix(len: usize) -> Result<Vec<u8>, NetworkError> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ObjectFrameLenPrefix {
+    bytes: [u8; 12],
+    len: usize,
+}
+
+impl ObjectFrameLenPrefix {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.len
+    }
+}
+
+pub(crate) fn object_frame_len_prefix(len: usize) -> Result<ObjectFrameLenPrefix, NetworkError> {
     let len = u64::try_from(len).map_err(|_| NetworkError::FrameTooLarge {
         actual_bytes: usize::MAX,
         max_bytes: usize::MAX,
     })?;
     let extended = len >= u64::from(OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL);
-    let mut prefix = Vec::with_capacity(if extended { 12 } else { 4 });
+    let mut prefix = ObjectFrameLenPrefix {
+        bytes: [0; 12],
+        len: if extended { 12 } else { 4 },
+    };
     if extended {
-        prefix.extend_from_slice(&OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL.to_be_bytes());
-        prefix.extend_from_slice(&len.to_be_bytes());
+        prefix.bytes[..4].copy_from_slice(&OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL.to_be_bytes());
+        prefix.bytes[4..12].copy_from_slice(&len.to_be_bytes());
     } else {
-        prefix.extend_from_slice(&(len as u32).to_be_bytes());
+        prefix.bytes[..4].copy_from_slice(&(len as u32).to_be_bytes());
     }
     Ok(prefix)
 }
@@ -938,19 +966,29 @@ pub fn encode_object_frame_to_vec<T>(value: &T) -> Result<Vec<u8>, NetworkError>
 where
     T: serde::Serialize + ?Sized,
 {
-    let bytes = SinomoObjectCodec::network_frame().encode(value)?;
-    let len_prefix = object_frame_len_prefix(bytes.len())?;
-    let frame_bytes =
-        len_prefix
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&0_u32.to_be_bytes());
+    let body = SinomoObjectCodec::network_frame().append_to_vec(&mut frame, value)?;
+    let body_len = body.len();
+    if body_len >= OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL as usize {
+        let body_len_u64 = u64::try_from(body_len).map_err(|_| NetworkError::FrameTooLarge {
+            actual_bytes: usize::MAX,
+            max_bytes: usize::MAX,
+        })?;
+        let frame_len = frame
             .len()
-            .checked_add(bytes.len())
+            .checked_add(8)
             .ok_or(NetworkError::FrameTooLarge {
                 actual_bytes: usize::MAX,
                 max_bytes: usize::MAX,
             })?;
-    let mut frame = Vec::with_capacity(frame_bytes);
-    frame.extend_from_slice(&len_prefix);
-    frame.extend_from_slice(&bytes);
+        frame.resize(frame_len, 0);
+        frame.copy_within(4..body.end, 12);
+        frame[..4].copy_from_slice(&OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL.to_be_bytes());
+        frame[4..12].copy_from_slice(&body_len_u64.to_be_bytes());
+    } else {
+        frame[..4].copy_from_slice(&(body_len as u32).to_be_bytes());
+    }
     Ok(frame)
 }
 
@@ -970,7 +1008,7 @@ pub fn encode_borrowed_object_frame_to_vec(
                 max_bytes: usize::MAX,
             })?;
     let mut frame = Vec::with_capacity(frame_bytes);
-    frame.extend_from_slice(&len_prefix);
+    frame.extend_from_slice(len_prefix.as_slice());
     for slice in parts.as_slices() {
         frame.extend_from_slice(slice);
     }
@@ -1084,7 +1122,7 @@ where
     let bytes = SinomoObjectCodec::network_frame().encode(value)?;
     let len_prefix = object_frame_len_prefix(bytes.len())?;
     writer
-        .write_all(&len_prefix)
+        .write_all(len_prefix.as_slice())
         .and_then(|()| writer.write_all(&bytes))
         .map_err(|source| NetworkError::Io {
             operation: "write object frame".to_string(),
@@ -1181,7 +1219,7 @@ where
     let len_prefix = object_frame_len_prefix(bytes.len())?;
     write_all_async_frame(
         writer,
-        &len_prefix,
+        len_prefix.as_slice(),
         options.idle_timeout,
         "write async object frame",
         "length",
@@ -1214,7 +1252,7 @@ where
     let len_prefix = object_frame_len_prefix(body_len)?;
     write_all_async_frame(
         writer,
-        &len_prefix,
+        len_prefix.as_slice(),
         options.idle_timeout,
         "write async borrowed object frame",
         "length",
@@ -1905,6 +1943,24 @@ mod serde_bytes_tests {
         let decoded: BundleRecord =
             decode_single_object_frame_from_slice(&frame, frame.len()).expect("decode frame");
         assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn object_frame_vec_encoder_matches_manual_prefix_and_body() {
+        let record = BundleRecord {
+            name: "manual-frame".to_string(),
+            payload: Some(vec![1, 2, 3, 4, 5]),
+        };
+
+        let body = SinomoObjectCodec::network_frame()
+            .encode(&record)
+            .expect("body");
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        expected.extend_from_slice(&body);
+
+        let frame = encode_object_frame_to_vec(&record).expect("frame");
+        assert_eq!(frame, expected);
     }
 
     #[test]

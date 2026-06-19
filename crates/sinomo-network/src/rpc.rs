@@ -112,6 +112,13 @@ impl ObjectRpcRequest {
         SinomoObjectCodec::network_frame().decode(&self.body)
     }
 
+    pub fn decode_body_borrowed<'de, T>(&'de self) -> Result<T, NetworkError>
+    where
+        T: serde::Deserialize<'de>,
+    {
+        SinomoObjectCodec::network_frame().decode_borrowed(&self.body)
+    }
+
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.metadata.insert(key.into(), value.into());
         self
@@ -224,6 +231,14 @@ impl ObjectRpcResponse {
     pub fn decode_body<T: serde::de::DeserializeOwned>(&self) -> Result<T, NetworkError> {
         self.error_detail()?;
         SinomoObjectCodec::network_frame().decode(&self.body)
+    }
+
+    pub fn decode_body_borrowed<'de, T>(&'de self) -> Result<T, NetworkError>
+    where
+        T: serde::Deserialize<'de>,
+    {
+        self.error_detail()?;
+        SinomoObjectCodec::network_frame().decode_borrowed(&self.body)
     }
 
     pub fn encode_error(
@@ -1325,4 +1340,71 @@ fn validate_no_control_chars(value: &str, context: &str) -> Result<(), NetworkEr
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Serialize)]
+    struct OwnedPayload<'a> {
+        name: &'a str,
+        #[serde(with = "serde_bytes")]
+        bytes: &'a [u8],
+    }
+
+    #[derive(Deserialize)]
+    struct BorrowedPayload<'a> {
+        name: &'a str,
+        #[serde(with = "serde_bytes")]
+        bytes: &'a [u8],
+    }
+
+    #[test]
+    fn rpc_body_borrowed_decode_uses_encoded_body_buffer() {
+        let bytes = [1_u8, 2, 3, 4, 5];
+        let request = ObjectRpcRequest::encode_body(
+            "/test/borrowed",
+            "test",
+            &OwnedPayload {
+                name: "payload",
+                bytes: &bytes,
+            },
+        )
+        .expect("request");
+        let decoded: BorrowedPayload<'_> = request.decode_body_borrowed().expect("decode request");
+        assert_eq!(decoded.name, "payload");
+        assert_eq!(decoded.bytes, bytes);
+        assert!(slice_is_borrowed_from(
+            decoded.name.as_bytes(),
+            &request.body
+        ));
+        assert!(slice_is_borrowed_from(decoded.bytes, &request.body));
+
+        let response = ObjectRpcResponse::encode_body(
+            "/test/borrowed",
+            &OwnedPayload {
+                name: "response",
+                bytes: &bytes,
+            },
+        )
+        .expect("response");
+        let decoded: BorrowedPayload<'_> =
+            response.decode_body_borrowed().expect("decode response");
+        assert_eq!(decoded.name, "response");
+        assert_eq!(decoded.bytes, bytes);
+        assert!(slice_is_borrowed_from(
+            decoded.name.as_bytes(),
+            &response.body
+        ));
+        assert!(slice_is_borrowed_from(decoded.bytes, &response.body));
+    }
+
+    fn slice_is_borrowed_from(slice: &[u8], source: &[u8]) -> bool {
+        let source_start = source.as_ptr() as usize;
+        let source_end = source_start + source.len();
+        let slice_start = slice.as_ptr() as usize;
+        let slice_end = slice_start + slice.len();
+        slice_start >= source_start && slice_end <= source_end
+    }
 }

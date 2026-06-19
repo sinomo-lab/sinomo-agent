@@ -597,10 +597,22 @@ pub(crate) fn open_wal_file_for_append(path: &Path) -> Result<File, KvError> {
 }
 
 fn encode_wal_record_payload(entry: &KvLogEntry, path: &Path) -> Result<Vec<u8>, KvError> {
-    let record = sinomo_object_serde::to_bytes(entry, KV_WAL_OBJECT_VERSION_ID, LengthMode::U32)
-        .map_err(|source| KvError::Serialization {
-            detail: source.to_string(),
-        })?;
+    let mut record = Vec::new();
+    let range = append_wal_record_payload(&mut record, entry, path)?;
+    debug_assert_eq!(range.start, 0);
+    Ok(record)
+}
+
+fn append_wal_record_payload(
+    out: &mut Vec<u8>,
+    entry: &KvLogEntry,
+    path: &Path,
+) -> Result<std::ops::Range<usize>, KvError> {
+    let record =
+        sinomo_object_serde::append_bytes(out, entry, KV_WAL_OBJECT_VERSION_ID, LengthMode::U32)
+            .map_err(|source| KvError::Serialization {
+                detail: source.to_string(),
+            })?;
     u32::try_from(record.len()).map_err(|_| KvError::Serialization {
         detail: format!("wal record for {} exceeds u32 length", path.display()),
     })?;
@@ -608,13 +620,13 @@ fn encode_wal_record_payload(entry: &KvLogEntry, path: &Path) -> Result<Vec<u8>,
 }
 
 pub(crate) fn encode_wal_record(entry: &KvLogEntry, path: &Path) -> Result<Vec<u8>, KvError> {
-    let record = encode_wal_record_payload(entry, path)?;
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&0_u32.to_be_bytes());
+    let record = append_wal_record_payload(&mut encoded, entry, path)?;
     let record_len = u32::try_from(record.len()).map_err(|_| KvError::Serialization {
         detail: format!("wal record for {} exceeds u32 length", path.display()),
     })?;
-    let mut encoded = Vec::with_capacity(record.len().saturating_add(4));
-    encoded.extend_from_slice(&record_len.to_be_bytes());
-    encoded.extend_from_slice(&record);
+    encoded[..4].copy_from_slice(&record_len.to_be_bytes());
     Ok(encoded)
 }
 
