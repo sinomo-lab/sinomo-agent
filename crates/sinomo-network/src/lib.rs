@@ -51,6 +51,7 @@ mod object_file_store;
 mod paths;
 mod peer;
 mod raft_election;
+mod raft_fanout;
 mod raft_replication;
 mod records;
 mod roaming;
@@ -323,6 +324,11 @@ pub use raft_election::{
     ClusterRaftVoteTransportAsyncHost, ClusterRaftVoteTransportHost,
     elect_cluster_raft_leader_async_with_host, elect_cluster_raft_leader_with_host,
 };
+pub use raft_fanout::{
+    ClusterRaftCommittedFanoutAsyncHost, ClusterRaftCommittedFanoutReport,
+    fan_out_committed_cluster_raft_command_async_with_host,
+    spawn_cluster_raft_committed_fanout_worker_on_runtime,
+};
 pub use raft_replication::{
     ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
     replicate_cluster_raft_to_endpoint_async_with_host,
@@ -375,15 +381,15 @@ pub use status_publish::{
     sync_cluster_node_status_to_kv,
 };
 pub use storage::{
-    ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost, ClusterRaftCommittedFanoutAsyncHost,
-    ClusterRaftQuorumAsyncHost, ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult,
-    ClusterRaftQuorumTransportHost, cleanup_legacy_shadow_daemon_members_with_host,
-    cluster_state_sync_txn, commit_cluster_kv_txn_with_quorum_response_with_host,
+    ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost, ClusterRaftQuorumAsyncHost,
+    ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult, ClusterRaftQuorumTransportHost,
+    cleanup_legacy_shadow_daemon_members_with_host, cluster_state_sync_txn,
+    commit_cluster_kv_txn_with_quorum_response_with_host,
     commit_cluster_raft_command_with_quorum_driver,
     handle_cluster_membership_rpc_request_with_hosts, handle_cluster_raft_rpc_request,
-    remove_cluster_members_with_host, spawn_cluster_raft_committed_fanout_worker_on_runtime,
-    sync_cluster_state_to_kv_with_host, sync_cluster_state_to_local_raft_unchecked,
-    update_cluster_node_role_with_host, update_cluster_raft_role_with_host,
+    remove_cluster_members_with_host, sync_cluster_state_to_kv_with_host,
+    sync_cluster_state_to_local_raft_unchecked, update_cluster_node_role_with_host,
+    update_cluster_raft_role_with_host,
 };
 pub use storage::{
     commit_cluster_kv_txn_with_quorum_response_async_with_host,
