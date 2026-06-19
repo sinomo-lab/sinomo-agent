@@ -1519,7 +1519,11 @@ pub(crate) fn rollout_cluster_targets_from_state(
         push_unique_rollout_target(&mut targets, local_target);
     }
 
-    let command_endpoints = network::cluster_main_daemon_command_targets(paths, state);
+    let command_endpoints = network::cluster_endpoint_targets(
+        paths,
+        state,
+        network::ClusterEndpointSelectionPurpose::MainDaemonCommand,
+    );
     let mut command_endpoints_by_node = std::collections::BTreeMap::new();
     let mut main_node_ids = Vec::new();
     let mut seen_main_node_ids = std::collections::BTreeSet::new();

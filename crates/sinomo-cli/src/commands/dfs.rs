@@ -1199,11 +1199,12 @@ fn dfs_protocol_frame_sender() -> sinomo_runtime::dfs::DfsProtocolFrameSender {
     }
 
     std::sync::Arc::new(|endpoint, command, timeout| {
-        let request = sinomo_runtime::dfs::dfs_protocol_frame_rpc_request(command)
-            .map_err(transport_error)?;
+        let request =
+            sinomo_runtime::dfs::dfs_message_rpc_request_from_protocol_frame_command(command)
+                .map_err(transport_error)?;
         let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
             .map_err(transport_error)?;
-        sinomo_runtime::dfs::decode_dfs_protocol_frame_rpc_response(&response)
+        sinomo_runtime::dfs::dfs_protocol_frame_response_from_message_rpc_response(&response)
             .map_err(transport_error)
     })
 }

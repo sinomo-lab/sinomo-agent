@@ -6,7 +6,6 @@ pub(crate) use network::advertised_peer_route_targets;
 pub(crate) use network::apply_cluster_node_role;
 #[cfg(test)]
 pub(crate) use network::cluster_connectivity_sync_ops;
-pub(crate) use network::cluster_invite_publish_targets;
 #[cfg(test)]
 pub(crate) use network::cluster_state_sync_txn;
 #[cfg(test)]
@@ -1010,7 +1009,11 @@ fn cluster_invite_requires_voter_error(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> CliError {
-    let targets = cluster_invite_publish_targets(paths, state);
+    let targets = network::cluster_endpoint_targets(
+        paths,
+        state,
+        network::ClusterEndpointSelectionPurpose::InvitePublish,
+    );
     CliError::ClusterReadOnly {
         detail: format!(
             "local node is not a voter; create the invite on a voter node or restore voter connectivity{}",

@@ -80,15 +80,17 @@ pub use protocol::{
     DfsBulkReadResponse, DfsCommitVersionCommand, DfsCommitVersionResponse, DfsDirectReadRequest,
     DfsDistributedWriteCommand, DfsDistributedWriteResponse, DfsDistributedWriteResult,
     DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResponseChunk, DfsFetchBlobResult,
-    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
+    DfsMessageCommand, DfsMessageResponse, DfsMetadataJournalBatchCommand,
+    DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
     DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
     DfsMetadataSnapshotInstallResult, DfsNamespaceCommand, DfsNamespaceOperation,
     DfsNamespacePosixError, DfsNamespaceResponse, DfsNamespaceResult, DfsNamespaceShardCursor,
     DfsNetworkMessage, DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsReadData,
     DfsReadRangeData, DfsReadRequest, DfsReadResponse, DfsReadResponseChunk, DfsReadResult,
     DfsRepairReplicaChunkCommand, DfsRepairReplicaCommand, DfsRepairReplicaResponse,
-    DfsStageBlobChunkCommand, DfsStageBlobCommand, DfsStageBlobResponse, DfsStagePatchChunkCommand,
-    DfsStagePatchCommand, DfsWriteCommand, DfsWriteResponse, DfsWriteResult,
+    DfsRoutedMessage, DfsStageBlobChunkCommand, DfsStageBlobCommand, DfsStageBlobResponse,
+    DfsStagePatchChunkCommand, DfsStagePatchCommand, DfsWriteCommand, DfsWriteResponse,
+    DfsWriteResult,
 };
 
 pub type DfsFileSystemId = sinomo_core::Id;
@@ -330,6 +332,7 @@ pub const DFS_SMOKE_ROUTE: &str = "/dfs/smoke";
 pub const DFS_EXPOSE_CONFIG_ROUTE: &str = "/dfs/expose/config";
 pub const DFS_METADATA_JOURNAL_BATCH_ROUTE: &str = "/dfs/metadata/journal-batch";
 pub const DFS_METADATA_SNAPSHOT_INSTALL_ROUTE: &str = "/dfs/metadata/snapshot-install";
+pub const DFS_MESSAGE_ROUTE: &str = "/dfs/message";
 pub const DFS_PROTOCOL_FRAME_ROUTE: &str = "/dfs/protocol/frame";
 pub const DFS_DIRECT_READ_ROUTE: &str = "/dfs/object/read";
 pub const DFS_POLICY_VIOLATION_EVENT_KIND: &str = "dfs.policy.violation";
@@ -342,6 +345,7 @@ pub const DFS_CONTROL_PLANE_ROUTES: &[&str] = &[
 ];
 pub const DFS_DATA_PLANE_ROUTES: &[&str] = &[
     DFS_SMOKE_ROUTE,
+    DFS_MESSAGE_ROUTE,
     DFS_PROTOCOL_FRAME_ROUTE,
     DFS_DIRECT_READ_ROUTE,
 ];
@@ -352,6 +356,7 @@ pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
     DFS_METADATA_JOURNAL_BATCH_ROUTE,
     DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
     DFS_SMOKE_ROUTE,
+    DFS_MESSAGE_ROUTE,
     DFS_PROTOCOL_FRAME_ROUTE,
     DFS_DIRECT_READ_ROUTE,
 ];
@@ -380,58 +385,130 @@ pub(crate) fn build_dfs_network_frame(
     })
 }
 
-pub fn dfs_protocol_frame_is_read_only_request(frame: &NetworkFrame) -> bool {
+fn dfs_network_message_from_frame(frame: &NetworkFrame) -> Result<DfsNetworkMessage, NetworkError> {
     let MeshMessageBody::Protocol(protocol_message) = &frame.message.body else {
-        return false;
+        return Err(dfs_network_serialization_error(
+            "DFS message route requires a protocol frame",
+        ));
     };
     if protocol_message.protocol != DFS_PROTOCOL {
-        return false;
+        return Err(dfs_network_serialization_error(format!(
+            "DFS message route requires protocol {DFS_PROTOCOL}, got {}",
+            protocol_message.protocol
+        )));
     }
-    protocol_message
-        .decode::<DfsNetworkMessage>()
-        .is_ok_and(|message| {
-            matches!(
-                message,
-                DfsNetworkMessage::ReadRequest(_)
-                    | DfsNetworkMessage::BulkReadRequest(_)
-                    | DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
-                        operation: DfsNamespaceOperation::LookupPath { .. }
-                            | DfsNamespaceOperation::LookupPaths { .. },
-                        ..
-                    })
-            )
-        })
+    protocol_message.decode::<DfsNetworkMessage>()
+}
+
+fn dfs_routed_message_from_network_frame(
+    frame: &NetworkFrame,
+) -> Result<DfsRoutedMessage, NetworkError> {
+    let message = dfs_network_message_from_frame(frame)?;
+    Ok(DfsRoutedMessage {
+        source_node_id: frame.source_node_id.clone(),
+        target_node_id: frame.target_node_id.clone(),
+        frame_id: frame.frame_id.0,
+        message_id: frame.message.message_id.0,
+        message,
+    })
+}
+
+fn dfs_network_frame_from_routed_message(
+    message: &DfsRoutedMessage,
+) -> Result<NetworkFrame, NetworkError> {
+    build_dfs_network_frame(
+        &message.source_node_id,
+        &message.target_node_id,
+        message.frame_id,
+        message.message_id,
+        message.message.clone(),
+    )
+    .map_err(|source| dfs_network_serialization_error(source.to_string()))
+}
+
+pub(crate) fn dfs_protocol_frame_command_to_message_command(
+    command: &DfsProtocolFrameCommand,
+) -> Result<DfsMessageCommand, NetworkError> {
+    Ok(DfsMessageCommand {
+        request_id: command.request_id.clone(),
+        routed_message: dfs_routed_message_from_network_frame(&command.frame)?,
+    })
+}
+
+pub(crate) fn dfs_message_command_to_protocol_frame_command(
+    command: DfsMessageCommand,
+) -> Result<DfsProtocolFrameCommand, NetworkError> {
+    Ok(DfsProtocolFrameCommand {
+        request_id: command.request_id,
+        frame: dfs_network_frame_from_routed_message(&command.routed_message)?,
+    })
+}
+
+pub(crate) fn dfs_protocol_frame_response_to_message_response(
+    response: DfsProtocolFrameResponse,
+) -> Result<DfsMessageResponse, NetworkError> {
+    let outbound_messages = response
+        .outbound_frames
+        .iter()
+        .map(dfs_routed_message_from_network_frame)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(DfsMessageResponse {
+        request_id: response.request_id,
+        outbound_messages,
+    })
+}
+
+pub(crate) fn dfs_message_response_to_protocol_frame_response(
+    response: DfsMessageResponse,
+) -> Result<DfsProtocolFrameResponse, NetworkError> {
+    let outbound_frames = response
+        .outbound_messages
+        .iter()
+        .map(dfs_network_frame_from_routed_message)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(DfsProtocolFrameResponse {
+        request_id: response.request_id,
+        outbound_frames,
+    })
+}
+
+fn dfs_network_message_is_read_only_request(message: &DfsNetworkMessage) -> bool {
+    matches!(
+        message,
+        DfsNetworkMessage::ReadRequest(_)
+            | DfsNetworkMessage::BulkReadRequest(_)
+            | DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                operation: DfsNamespaceOperation::LookupPath { .. }
+                    | DfsNamespaceOperation::LookupPaths { .. },
+                ..
+            })
+    )
+}
+
+pub fn dfs_message_is_read_only_request(command: &DfsMessageCommand) -> bool {
+    dfs_network_message_is_read_only_request(&command.routed_message.message)
+}
+
+pub fn dfs_protocol_frame_is_read_only_request(frame: &NetworkFrame) -> bool {
+    dfs_network_message_from_frame(frame)
+        .is_ok_and(|message| dfs_network_message_is_read_only_request(&message))
+}
+
+fn dfs_network_message_requires_fresh_metadata(message: &DfsNetworkMessage) -> bool {
+    matches!(
+        message,
+        DfsNetworkMessage::ReadRequest(_)
+            | DfsNetworkMessage::BulkReadRequest(_)
+            | DfsNetworkMessage::NamespaceRequest(_)
+    )
 }
 
 pub fn dfs_protocol_frame_requires_fresh_metadata(frame: &NetworkFrame) -> bool {
-    let MeshMessageBody::Protocol(protocol_message) = &frame.message.body else {
-        return false;
-    };
-    if protocol_message.protocol != DFS_PROTOCOL {
-        return false;
-    }
-    protocol_message
-        .decode::<DfsNetworkMessage>()
-        .is_ok_and(|message| {
-            matches!(
-                message,
-                DfsNetworkMessage::ReadRequest(_)
-                    | DfsNetworkMessage::BulkReadRequest(_)
-                    | DfsNetworkMessage::NamespaceRequest(_)
-            )
-        })
+    dfs_network_message_from_frame(frame)
+        .is_ok_and(|message| dfs_network_message_requires_fresh_metadata(&message))
 }
 
-fn dfs_protocol_frame_allows_write_repair_progress(frame: &NetworkFrame) -> bool {
-    let MeshMessageBody::Protocol(protocol_message) = &frame.message.body else {
-        return false;
-    };
-    if protocol_message.protocol != DFS_PROTOCOL {
-        return false;
-    }
-    let Ok(message) = protocol_message.decode::<DfsNetworkMessage>() else {
-        return false;
-    };
+fn dfs_network_message_allows_write_repair_progress(message: &DfsNetworkMessage) -> bool {
     match message {
         DfsNetworkMessage::DistributedWriteRequest(command) => command.foreground_replica_repair,
         DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
@@ -440,6 +517,11 @@ fn dfs_protocol_frame_allows_write_repair_progress(frame: &NetworkFrame) -> bool
         }) => true,
         _ => false,
     }
+}
+
+fn dfs_protocol_frame_allows_write_repair_progress(frame: &NetworkFrame) -> bool {
+    dfs_network_message_from_frame(frame)
+        .is_ok_and(|message| dfs_network_message_allows_write_repair_progress(&message))
 }
 
 pub fn dfs_status_rpc_request() -> Result<ObjectRpcRequest, NetworkError> {
@@ -502,7 +584,39 @@ pub fn decode_dfs_metadata_snapshot_install_rpc_response(
     response.decode_body()
 }
 
-pub fn dfs_protocol_frame_rpc_request(
+pub fn dfs_message_rpc_request(
+    command: &DfsMessageCommand,
+) -> Result<ObjectRpcRequest, NetworkError> {
+    let mut request = ObjectRpcRequest::encode_body(DFS_MESSAGE_ROUTE, DFS_RPC_CATEGORY, command)?;
+    request.metadata.insert(
+        sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY.to_string(),
+        sinomo_network::DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE.to_string(),
+    );
+    Ok(request)
+}
+
+pub fn decode_dfs_message_rpc_response(
+    response: &ObjectRpcResponse,
+) -> Result<DfsMessageResponse, NetworkError> {
+    response.decode_body()
+}
+
+pub fn dfs_message_rpc_request_from_protocol_frame_command(
+    command: &DfsProtocolFrameCommand,
+) -> Result<ObjectRpcRequest, NetworkError> {
+    let message_command = dfs_protocol_frame_command_to_message_command(command)?;
+    dfs_message_rpc_request(&message_command)
+}
+
+pub fn dfs_protocol_frame_response_from_message_rpc_response(
+    response: &ObjectRpcResponse,
+) -> Result<DfsProtocolFrameResponse, NetworkError> {
+    let message_response = decode_dfs_message_rpc_response(response)?;
+    dfs_message_response_to_protocol_frame_response(message_response)
+}
+
+#[cfg(test)]
+pub(crate) fn dfs_protocol_frame_rpc_request(
     command: &DfsProtocolFrameCommand,
 ) -> Result<ObjectRpcRequest, NetworkError> {
     let mut request =
@@ -514,7 +628,8 @@ pub fn dfs_protocol_frame_rpc_request(
     Ok(request)
 }
 
-pub fn decode_dfs_protocol_frame_rpc_response(
+#[cfg(test)]
+pub(crate) fn decode_dfs_protocol_frame_rpc_response(
     response: &ObjectRpcResponse,
 ) -> Result<DfsProtocolFrameResponse, NetworkError> {
     response.decode_body()
@@ -563,7 +678,8 @@ pub fn dfs_direct_read_rpc_request_accepts_streamed_response(request: &ObjectRpc
         && sinomo_network::object_rpc_request_accepts_streamed_daemon_response(request)
 }
 
-pub fn dfs_direct_read_rpc_request_from_protocol_frame_command(
+#[cfg(test)]
+pub(crate) fn dfs_direct_read_rpc_request_from_protocol_frame_command(
     command: &DfsProtocolFrameCommand,
 ) -> Result<Option<ObjectRpcRequest>, NetworkError> {
     let MeshMessageBody::Protocol(protocol_message) = &command.frame.message.body else {
@@ -582,6 +698,7 @@ pub fn dfs_direct_read_rpc_request_from_protocol_frame_command(
     dfs_direct_read_rpc_request(&request).map(Some)
 }
 
+#[cfg(test)]
 fn dfs_direct_read_request_from_read_request(
     request: &DfsReadRequest,
 ) -> Option<DfsDirectReadRequest> {
@@ -843,7 +960,8 @@ fn dfs_direct_read_rpc_response(
     Ok(rpc_response)
 }
 
-pub fn dfs_protocol_frame_response_from_direct_read_rpc_response(
+#[cfg(test)]
+pub(crate) fn dfs_protocol_frame_response_from_direct_read_rpc_response(
     command: &DfsProtocolFrameCommand,
     response: ObjectRpcResponse,
 ) -> Result<DfsProtocolFrameResponse, NetworkError> {
@@ -1108,6 +1226,12 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
             ModuleRouteAuth::LocalCommand,
         ))
         .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            DFS_MESSAGE_ROUTE,
+            DFS_RPC_CATEGORY,
+            "dfs.object.transfer",
+            ModuleRouteAuth::LocalOrClusterMember,
+        ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
             DFS_PROTOCOL_FRAME_ROUTE,
             DFS_RPC_CATEGORY,
             "dfs.object.transfer",
@@ -1227,6 +1351,14 @@ mod module_registration_tests {
         assert_eq!(
             registration.surfaces.object_rpc_routes.len(),
             DFS_OBJECT_RPC_ROUTES.len()
+        );
+        assert!(
+            registration
+                .surfaces
+                .object_rpc_routes
+                .iter()
+                .any(|route| route.route == DFS_MESSAGE_ROUTE
+                    && route.operation == "dfs.object.transfer")
         );
         assert!(
             registration
@@ -1599,7 +1731,11 @@ pub fn publish_cluster_dfs_metadata_journal(
     let file_system = distributed_sifs(state.local_node_id.clone());
     let shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
 
-    let endpoints = sinomo_network::cluster_dfs_protocol_targets(cluster_paths, &state);
+    let endpoints = sinomo_network::cluster_endpoint_targets(
+        cluster_paths,
+        &state,
+        sinomo_network::ClusterEndpointSelectionPurpose::DfsData,
+    );
     let mut transport = DfsMetadataEndpointTransport::new(endpoints, sender, snapshot_sender);
     let mut host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     publish_dfs_metadata_journal_with_host(
@@ -2963,7 +3099,11 @@ pub fn run_cluster_dfs_maintenance_tick(
     let local_node_id = state.local_node_id.clone();
     let file_system = distributed_sifs(local_node_id.clone());
     let metadata_shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
-    let endpoints = sinomo_network::cluster_dfs_protocol_targets(cluster_paths, &state);
+    let endpoints = sinomo_network::cluster_endpoint_targets(
+        cluster_paths,
+        &state,
+        sinomo_network::ClusterEndpointSelectionPurpose::DfsData,
+    );
     let mut service = open_cluster_dfs_service(
         data_dir,
         cluster_paths,
@@ -3013,7 +3153,11 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport(
     let local_node_id = state.local_node_id.clone();
     let file_system = distributed_sifs(local_node_id.clone());
     let metadata_shards = cluster_dfs_metadata_shards(&cluster_paths, &file_system.file_system_id)?;
-    let endpoints = sinomo_network::cluster_dfs_protocol_targets(&cluster_paths, &state);
+    let endpoints = sinomo_network::cluster_endpoint_targets(
+        &cluster_paths,
+        &state,
+        sinomo_network::ClusterEndpointSelectionPurpose::DfsData,
+    );
     let mut service = open_cluster_dfs_service_with_protocol_senders(
         &data_dir,
         &cluster_paths,
@@ -3163,7 +3307,11 @@ pub fn run_cluster_dfs_smoke(
     let local_node_id = state.local_node_id.clone();
     let file_system = distributed_sifs(local_node_id.clone());
     let metadata_shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
-    let endpoints = sinomo_network::cluster_dfs_protocol_targets(cluster_paths, &state);
+    let endpoints = sinomo_network::cluster_endpoint_targets(
+        cluster_paths,
+        &state,
+        sinomo_network::ClusterEndpointSelectionPurpose::DfsData,
+    );
     let routable_node_ids = endpoints
         .iter()
         .map(|endpoint| endpoint.node_id.clone())
@@ -6582,7 +6730,11 @@ fn prepare_cluster_dfs_metadata_journal_publish(
         .map_err(DfsError::from_network)?;
     let file_system = distributed_sifs(state.local_node_id.clone());
     let shards = cluster_dfs_metadata_shards(&cluster_paths, &file_system.file_system_id)?;
-    let endpoints = sinomo_network::cluster_dfs_protocol_targets(&cluster_paths, &state);
+    let endpoints = sinomo_network::cluster_endpoint_targets(
+        &cluster_paths,
+        &state,
+        sinomo_network::ClusterEndpointSelectionPurpose::DfsData,
+    );
     let mut host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     let (outcomes, targets) = prepare_dfs_metadata_journal_publish_with_host(
         file_system.file_system_id,
@@ -7795,23 +7947,71 @@ pub type DfsDirectReadSender = Arc<
         + Sync,
 >;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DfsObjectRpcSendOptions {
+    pub connect_timeout: Duration,
+    pub observe_connectivity: bool,
+}
+
+impl DfsObjectRpcSendOptions {
+    pub fn new(connect_timeout: Duration) -> Self {
+        Self {
+            connect_timeout,
+            observe_connectivity: true,
+        }
+    }
+
+    pub fn with_observe_connectivity(mut self, observe_connectivity: bool) -> Self {
+        self.observe_connectivity = observe_connectivity;
+        self
+    }
+}
+
 pub trait DfsPeerTransport: Send + Sync {
+    fn call_object_rpc(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ObjectRpcRequest,
+        options: DfsObjectRpcSendOptions,
+    ) -> Result<ObjectRpcResponse, DfsPeerTransportError>;
+
     fn send_protocol_frame(
         &self,
         endpoint: &ClusterEndpointRecord,
         command: &DfsProtocolFrameCommand,
         connect_timeout: Duration,
-    ) -> Result<DfsProtocolFrameResponse, DfsPeerTransportError>;
+    ) -> Result<DfsProtocolFrameResponse, DfsPeerTransportError> {
+        let message_command = dfs_protocol_frame_command_to_message_command(command)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+        let request = dfs_message_rpc_request(&message_command)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+        let response = self.call_object_rpc(
+            endpoint,
+            &request,
+            DfsObjectRpcSendOptions::new(connect_timeout)
+                .with_observe_connectivity(!dfs_message_is_read_only_request(&message_command)),
+        )?;
+        let message_response = decode_dfs_message_rpc_response(&response)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+        dfs_message_response_to_protocol_frame_response(message_response)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+    }
 
     fn send_direct_read(
         &self,
-        _endpoint: &ClusterEndpointRecord,
-        _request: &DfsDirectReadRequest,
-        _connect_timeout: Duration,
+        endpoint: &ClusterEndpointRecord,
+        request: &DfsDirectReadRequest,
+        connect_timeout: Duration,
     ) -> Result<DfsReadResponse, DfsPeerTransportError> {
-        Err(DfsPeerTransportError::new(
-            "DFS peer transport does not support direct reads",
-        ))
+        let rpc_request = dfs_direct_read_rpc_request(request)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+        let response = self.call_object_rpc(
+            endpoint,
+            &rpc_request,
+            DfsObjectRpcSendOptions::new(connect_timeout).with_observe_connectivity(false),
+        )?;
+        dfs_direct_read_response_from_rpc_response(response)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
     }
 
     fn send_metadata_journal_batch(
@@ -7819,25 +8019,76 @@ pub trait DfsPeerTransport: Send + Sync {
         endpoint: &ClusterEndpointRecord,
         command: &DfsMetadataJournalBatchCommand,
         connect_timeout: Duration,
-    ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataPeerTransportError>;
+    ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataPeerTransportError> {
+        let request = dfs_metadata_journal_batch_rpc_request(command)
+            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
+        let response = self
+            .call_object_rpc(
+                endpoint,
+                &request,
+                DfsObjectRpcSendOptions::new(connect_timeout),
+            )
+            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
+        decode_dfs_metadata_journal_batch_rpc_response(&response)
+            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
+    }
 
     fn send_metadata_snapshot_install(
         &self,
         endpoint: &ClusterEndpointRecord,
         command: &DfsMetadataSnapshotInstallCommand,
         connect_timeout: Duration,
-    ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataPeerTransportError>;
+    ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataPeerTransportError> {
+        let request = dfs_metadata_snapshot_install_rpc_request(command)
+            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
+        let response = self
+            .call_object_rpc(
+                endpoint,
+                &request,
+                DfsObjectRpcSendOptions::new(connect_timeout),
+            )
+            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
+        decode_dfs_metadata_snapshot_install_rpc_response(&response)
+            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
+    }
 }
 
 pub type DfsPeerTransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub trait AsyncDfsPeerTransport: Send + Sync {
+    fn call_object_rpc_async<'a>(
+        &'a self,
+        endpoint: &'a ClusterEndpointRecord,
+        request: &'a ObjectRpcRequest,
+        options: DfsObjectRpcSendOptions,
+    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResponse, DfsPeerTransportError>>;
+
     fn send_protocol_frame_async<'a>(
         &'a self,
         endpoint: &'a ClusterEndpointRecord,
         command: &'a DfsProtocolFrameCommand,
         connect_timeout: Duration,
-    ) -> DfsPeerTransportFuture<'a, Result<DfsProtocolFrameResponse, DfsPeerTransportError>>;
+    ) -> DfsPeerTransportFuture<'a, Result<DfsProtocolFrameResponse, DfsPeerTransportError>> {
+        Box::pin(async move {
+            let message_command = dfs_protocol_frame_command_to_message_command(command)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            let request = dfs_message_rpc_request(&message_command)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            let response = self
+                .call_object_rpc_async(
+                    endpoint,
+                    &request,
+                    DfsObjectRpcSendOptions::new(connect_timeout).with_observe_connectivity(
+                        !dfs_message_is_read_only_request(&message_command),
+                    ),
+                )
+                .await?;
+            let message_response = decode_dfs_message_rpc_response(&response)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            dfs_message_response_to_protocol_frame_response(message_response)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+        })
+    }
 
     fn send_metadata_journal_batch_async<'a>(
         &'a self,
@@ -7847,7 +8098,22 @@ pub trait AsyncDfsPeerTransport: Send + Sync {
     ) -> DfsPeerTransportFuture<
         'a,
         Result<DfsMetadataJournalBatchResponse, DfsMetadataPeerTransportError>,
-    >;
+    > {
+        Box::pin(async move {
+            let request = dfs_metadata_journal_batch_rpc_request(command)
+                .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
+            let response = self
+                .call_object_rpc_async(
+                    endpoint,
+                    &request,
+                    DfsObjectRpcSendOptions::new(connect_timeout),
+                )
+                .await
+                .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
+            decode_dfs_metadata_journal_batch_rpc_response(&response)
+                .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
+        })
+    }
 
     fn send_metadata_snapshot_install_async<'a>(
         &'a self,
@@ -7857,7 +8123,22 @@ pub trait AsyncDfsPeerTransport: Send + Sync {
     ) -> DfsPeerTransportFuture<
         'a,
         Result<DfsMetadataSnapshotInstallResponse, DfsMetadataPeerTransportError>,
-    >;
+    > {
+        Box::pin(async move {
+            let request = dfs_metadata_snapshot_install_rpc_request(command)
+                .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
+            let response = self
+                .call_object_rpc_async(
+                    endpoint,
+                    &request,
+                    DfsObjectRpcSendOptions::new(connect_timeout),
+                )
+                .await
+                .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
+            decode_dfs_metadata_snapshot_install_rpc_response(&response)
+                .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
+        })
+    }
 }
 
 pub type AsyncDfsProtocolFrameSender = Arc<
@@ -9011,7 +9292,11 @@ pub fn process_cluster_dfs_protocol_frame_with_endpoint_sender(
     let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
         .map_err(DfsError::from_network)?;
     let local_node_id = state.local_node_id.clone();
-    let endpoints = sinomo_network::cluster_dfs_protocol_targets(cluster_paths, &state);
+    let endpoints = sinomo_network::cluster_endpoint_targets(
+        cluster_paths,
+        &state,
+        sinomo_network::ClusterEndpointSelectionPurpose::DfsData,
+    );
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
     let metadata_backend = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
     process_dfs_protocol_frame_with_endpoint_sender(

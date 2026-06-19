@@ -164,13 +164,6 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                         endpoint.node_id
                     ))
                 })?;
-                let request_auth =
-                    sign_daemon_rpc_request_for_local_node(&request).map_err(|source| {
-                        SinomoTestError::failed(format!(
-                            "cannot sign network ping request for {}: {source}",
-                            endpoint.node_id
-                        ))
-                    })?;
                 jobs.push(NetworkPingJob {
                     target_node_id: endpoint.node_id.clone(),
                     endpoint: endpoint.clone(),
@@ -179,7 +172,6 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     response_payload_bytes,
                     nonce,
                     request,
-                    request_auth,
                     route_mode: route_mode.clone(),
                     runtime: runtime_handle.clone(),
                     paths: cluster_paths.clone(),
@@ -557,7 +549,6 @@ struct NetworkPingJob {
     request_payload_bytes: usize,
     response_payload_bytes: usize,
     request: network::ObjectRpcRequest,
-    request_auth: Vec<u8>,
     route_mode: String,
     runtime: tokio::runtime::Handle,
     paths: ClusterPaths,
@@ -597,18 +588,17 @@ async fn run_network_ping_job(job: NetworkPingJob) -> NetworkPingResult {
 
 async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome {
     let mut host = NetworkPingEndpointRpcHost {
-        runtime: job.runtime.clone(),
-        paths: job.paths.clone(),
         cluster_state: Arc::clone(&job.cluster_state),
         route_graph: Arc::clone(&job.route_graph),
     };
-    let response = match network::send_signed_rpc_to_endpoint_async_with_host(
+    let response = match network::call_object_rpc_endpoint_from_paths_async_with_host(
+        &job.runtime,
+        &job.paths,
         &job.endpoint,
         &job.request,
-        &job.request_auth,
-        network::ClusterSignedEndpointRpcOptions {
-            timeouts: network::DaemonRpcTimeouts::connect_and_idle(job.timeout),
-        },
+        network::ClusterObjectRpcOptions::new(network::DaemonRpcTimeouts::connect_and_idle(
+            job.timeout,
+        )),
         &mut host,
     )
     .await
@@ -649,8 +639,6 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
 }
 
 struct NetworkPingEndpointRpcHost {
-    runtime: tokio::runtime::Handle,
-    paths: ClusterPaths,
     cluster_state: Arc<ClusterBootstrapState>,
     route_graph: Arc<network::ClusterConnectivityGraph>,
 }
@@ -712,31 +700,6 @@ impl network::ClusterSignedEndpointRpcAsyncHost for NetworkPingEndpointRpcHost {
                 Some(auth),
                 request,
                 timeouts,
-            )
-            .await
-        })
-    }
-
-    fn relay_signed_endpoint_rpc_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        request: &'a network::ObjectRpcRequest,
-        request_auth: &'a [u8],
-        timeouts: network::DaemonRpcTimeouts,
-    ) -> network::ClusterSignedEndpointRpcFuture<'a, Option<network::ObjectRpcResponse>> {
-        let runtime = self.runtime.clone();
-        let paths = self.paths.clone();
-        let state = Arc::clone(&self.cluster_state);
-        Box::pin(async move {
-            network::relay_rpc_to_endpoint_async_with_host(
-                &runtime,
-                &paths,
-                &state,
-                endpoint,
-                request,
-                request_auth.to_vec(),
-                network::ClusterSignedRelayRpcOptions { timeouts },
-                self,
             )
             .await
         })

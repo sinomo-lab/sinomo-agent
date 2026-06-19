@@ -2571,7 +2571,9 @@ pub fn forward_cluster_membership_rpc_to_voter_with_host(
     host: &mut impl ClusterMembershipRpcForwardHost,
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let mut failures = Vec::new();
-    for voter in cluster_join_voter_targets(paths, state) {
+    for voter in
+        cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::VoterCommand)
+    {
         match host.send_membership_rpc(&voter, request) {
             Ok(response) => return Ok(response),
             Err(error) => failures.push(format!(
@@ -2580,10 +2582,13 @@ pub fn forward_cluster_membership_rpc_to_voter_with_host(
             )),
         }
     }
-    for voter in cluster_join_voter_targets(paths, state) {
-        for peer in cluster_member_publish_targets(paths, state)
-            .into_iter()
-            .filter(|peer| peer.node_id != voter.node_id)
+    for voter in
+        cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::VoterCommand)
+    {
+        for peer in
+            cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::MemberPublish)
+                .into_iter()
+                .filter(|peer| peer.node_id != voter.node_id)
         {
             match host.relay_membership_rpc_to_voter_via_peer(state, &voter, &peer, request) {
                 Ok(response) => return Ok(response),
@@ -2619,8 +2624,16 @@ pub async fn forward_cluster_membership_rpc_to_voter_async_with_host(
     let (voter_targets, publish_targets) = runtime
         .spawn_blocking(move || {
             (
-                cluster_join_voter_targets(&paths_for_targets, &state_for_targets),
-                cluster_member_publish_targets(&paths_for_targets, &state_for_targets),
+                cluster_endpoint_targets(
+                    &paths_for_targets,
+                    &state_for_targets,
+                    ClusterEndpointSelectionPurpose::VoterCommand,
+                ),
+                cluster_endpoint_targets(
+                    &paths_for_targets,
+                    &state_for_targets,
+                    ClusterEndpointSelectionPurpose::MemberPublish,
+                ),
             )
         })
         .await
@@ -4456,7 +4469,7 @@ where
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Vec<ClusterEndpointRecord> {
-        cluster_member_publish_targets(paths, state)
+        cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::MemberPublish)
     }
 
     fn relay_rpc_to_node(
@@ -4506,7 +4519,7 @@ where
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Vec<ClusterEndpointRecord> {
-        cluster_member_publish_targets(paths, state)
+        cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::MemberPublish)
     }
 
     fn relay_rpc_to_node(
@@ -7978,6 +7991,7 @@ pub fn cluster_raft_vote_targets(
         .collect()
 }
 
+#[cfg(test)]
 pub fn cluster_join_voter_targets(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -7985,7 +7999,7 @@ pub fn cluster_join_voter_targets(
     // Join bootstrap must not depend on this node's current health view of the voter.
     // Bridges often need to ask a voter for invite proofs before their connectivity graph
     // and status probes have converged, so try the ordered voter command targets directly.
-    cluster_voter_command_targets(paths, state)
+    cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::VoterCommand)
 }
 
 #[cfg(test)]
@@ -10819,7 +10833,9 @@ fn cluster_voter_probe_timeout(
     options: ClusterVoterReachabilityOptions,
     remaining: Duration,
 ) -> Duration {
-    if crate::cluster_endpoint_prefers_relay_with_graph(graph, state, endpoint) {
+    if crate::cluster_route_next_hop(graph, &state.local_node_id, &endpoint.node_id).is_some()
+        && crate::cluster_endpoint_prefers_relay_with_graph(graph, state, endpoint)
+    {
         options.command_timeout(endpoint, remaining)
     } else {
         options.fair_command_timeout(endpoint, remaining)
@@ -11226,7 +11242,13 @@ async fn cluster_member_publish_targets_async(
     let paths = paths.clone();
     let state = state.clone();
     runtime
-        .spawn_blocking(move || Ok(cluster_member_publish_targets(&paths, &state)))
+        .spawn_blocking(move || {
+            Ok(cluster_endpoint_targets(
+                &paths,
+                &state,
+                ClusterEndpointSelectionPurpose::MemberPublish,
+            ))
+        })
         .await
         .map_err(|source| NetworkError::Io {
             operation: "cluster relay peer target selection".to_string(),
@@ -11804,9 +11826,9 @@ fn cluster_sync_targets_with_connectivity_context(
         let node_status_rank = cluster_node_status_route_rank(node_statuses.get(&endpoint.node_id));
         (
             node_status_rank,
-            cluster_endpoint_connectivity_attempt_rank(graph, endpoint),
             graph.unavailability_rank(endpoint),
             cluster_endpoint_static_fallback_rank(endpoint),
+            cluster_endpoint_connectivity_attempt_rank(graph, endpoint),
             graph.quality_rank(endpoint),
             endpoint.priority,
             endpoint.address.clone(),
@@ -11969,7 +11991,54 @@ pub fn cluster_node_blocks_leader_preference(
         .is_some_and(|member| cluster_member_unreachable_via_connectivity(paths, state, member))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClusterEndpointSelectionPurpose {
+    DaemonCommand,
+    DfsData,
+    InvitePublish,
+    MainDaemonCommand,
+    MemberPublish,
+    MemberPublishVoterFirst,
+    VoterCommand,
+}
+
+pub fn cluster_endpoint_targets(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    purpose: ClusterEndpointSelectionPurpose,
+) -> Vec<ClusterEndpointRecord> {
+    match purpose {
+        ClusterEndpointSelectionPurpose::DaemonCommand => {
+            cluster_daemon_command_targets_impl(paths, state)
+        }
+        ClusterEndpointSelectionPurpose::DfsData => cluster_dfs_protocol_targets_impl(paths, state),
+        ClusterEndpointSelectionPurpose::InvitePublish => {
+            cluster_invite_publish_targets_impl(paths, state)
+        }
+        ClusterEndpointSelectionPurpose::MainDaemonCommand => {
+            cluster_main_daemon_command_targets_impl(paths, state)
+        }
+        ClusterEndpointSelectionPurpose::MemberPublish => {
+            cluster_member_publish_targets_impl(paths, state)
+        }
+        ClusterEndpointSelectionPurpose::MemberPublishVoterFirst => {
+            cluster_member_publish_targets_voter_first_impl(paths, state)
+        }
+        ClusterEndpointSelectionPurpose::VoterCommand => {
+            cluster_voter_command_targets_impl(paths, state)
+        }
+    }
+}
+
+#[cfg(test)]
 pub fn cluster_daemon_command_targets(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::DaemonCommand)
+}
+
+fn cluster_daemon_command_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -11993,7 +12062,15 @@ fn cluster_daemon_command_endpoint_is_usable(
     }
 }
 
+#[cfg(test)]
 pub fn cluster_dfs_protocol_targets(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::DfsData)
+}
+
+fn cluster_dfs_protocol_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -12006,7 +12083,19 @@ pub fn cluster_dfs_protocol_targets(
     ))
 }
 
+#[cfg(test)]
 pub fn cluster_main_daemon_command_targets(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    cluster_endpoint_targets(
+        paths,
+        state,
+        ClusterEndpointSelectionPurpose::MainDaemonCommand,
+    )
+}
+
+fn cluster_main_daemon_command_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -12034,7 +12123,7 @@ pub fn cluster_main_daemon_command_endpoint_candidates(
         })
         .map(|member| member.node_id.clone())
         .collect::<BTreeSet<_>>();
-    cluster_daemon_command_targets(paths, state)
+    cluster_daemon_command_targets_impl(paths, state)
         .into_iter()
         .filter(|endpoint| {
             endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
@@ -12085,18 +12174,38 @@ fn cluster_endpoint_address_port(address: &str) -> Option<u16> {
 /// sibling learner with an equally stale snapshot answers "current" and the
 /// sync silently stalls. Preferring voters (then bridges, whose own snapshots
 /// converge the same way) forms a convergence chain rooted at the voter.
+#[cfg(test)]
 pub fn cluster_member_publish_targets_voter_first(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
-    let mut targets = cluster_member_publish_targets(paths, state);
+    cluster_endpoint_targets(
+        paths,
+        state,
+        ClusterEndpointSelectionPurpose::MemberPublishVoterFirst,
+    )
+}
+
+fn cluster_member_publish_targets_voter_first_impl(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    let mut targets = cluster_member_publish_targets_impl(paths, state);
     targets.sort_by_key(|endpoint| {
         !sinomo_kv::cluster_kv_raft_node_is_voter(state, &endpoint.node_id)
     });
     targets
 }
 
+#[cfg(test)]
 pub fn cluster_member_publish_targets(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::MemberPublish)
+}
+
+fn cluster_member_publish_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -12143,9 +12252,9 @@ pub fn cluster_member_publish_targets(
         push_unique_cluster_endpoint(&mut targets, &mut seen, endpoint);
     }
 
-    for endpoint in cluster_main_daemon_command_targets(paths, state)
+    for endpoint in cluster_main_daemon_command_targets_impl(paths, state)
         .into_iter()
-        .chain(cluster_voter_command_targets(paths, state))
+        .chain(cluster_voter_command_targets_impl(paths, state))
     {
         if endpoint.node_id == state.local_node_id {
             continue;
@@ -12187,7 +12296,15 @@ fn push_unique_cluster_endpoint(
     }
 }
 
+#[cfg(test)]
 pub fn cluster_voter_command_targets(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::VoterCommand)
+}
+
+fn cluster_voter_command_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -12197,13 +12314,21 @@ pub fn cluster_voter_command_targets(
         .collect()
 }
 
+#[cfg(test)]
 pub fn cluster_invite_publish_targets(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    cluster_endpoint_targets(paths, state, ClusterEndpointSelectionPurpose::InvitePublish)
+}
+
+fn cluster_invite_publish_targets_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
     let mut seen_nodes = BTreeSet::new();
     let mut targets = Vec::new();
-    for endpoint in cluster_voter_command_targets(paths, state) {
+    for endpoint in cluster_voter_command_targets_impl(paths, state) {
         if !seen_nodes.insert(endpoint.node_id.clone()) {
             continue;
         }
@@ -14462,7 +14587,7 @@ pub fn publish_local_members_via_voter_with_host(
         local_kv_revision: local_cluster_kv_snapshot_revision(paths),
     };
     let mut failures = Vec::new();
-    for endpoint in cluster_member_publish_targets_voter_first(paths, state) {
+    for endpoint in cluster_member_publish_targets_voter_first_impl(paths, state) {
         match host.send_cluster_member_publish(&endpoint, &request, options.member_publish_timeout)
         {
             Ok(response) if response.accepted => {
@@ -14527,7 +14652,7 @@ pub async fn publish_local_members_via_voter_async_with_host(
     let state_for_targets = state.clone();
     let targets = runtime
         .spawn_blocking(move || {
-            cluster_member_publish_targets_voter_first(&paths_for_targets, &state_for_targets)
+            cluster_member_publish_targets_voter_first_impl(&paths_for_targets, &state_for_targets)
         })
         .await
         .map_err(|source| NetworkError::Io {

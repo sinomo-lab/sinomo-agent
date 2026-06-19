@@ -723,6 +723,27 @@ pub struct DfsProtocolFrameResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsRoutedMessage {
+    pub source_node_id: NodeId,
+    pub target_node_id: NodeId,
+    pub frame_id: u64,
+    pub message_id: u64,
+    pub message: DfsNetworkMessage,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMessageCommand {
+    pub request_id: String,
+    pub routed_message: DfsRoutedMessage,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMessageResponse {
+    pub request_id: String,
+    pub outbound_messages: Vec<DfsRoutedMessage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsMetadataJournalBatchResult {
     Applied,

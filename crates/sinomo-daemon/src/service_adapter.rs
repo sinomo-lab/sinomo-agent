@@ -3677,6 +3677,7 @@ mod tests {
                 sinomo_network::CLUSTER_NETWORK_PING_ROUTE,
                 CLUSTER_RELAY_ROUTE,
                 sinomo_dfs::DFS_SMOKE_ROUTE,
+                sinomo_dfs::DFS_MESSAGE_ROUTE,
                 sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE,
                 sinomo_dfs::DFS_DIRECT_READ_ROUTE,
                 CLUSTER_JOIN_CHALLENGE_ROUTE,
@@ -3710,6 +3711,10 @@ mod tests {
         assert_eq!(
             registry.category_for_route(CLUSTER_JOIN_REGISTER_ROUTE),
             Some(CLUSTER_MEMBERSHIP_RPC_CATEGORY)
+        );
+        assert_eq!(
+            registry.category_for_route(sinomo_dfs::DFS_MESSAGE_ROUTE),
+            Some(sinomo_dfs::DFS_RPC_CATEGORY)
         );
         assert_eq!(
             registry.category_for_route(sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE),
@@ -3801,6 +3806,18 @@ mod tests {
                 .iter()
                 .map(|capability| capability.as_str().to_string())
                 .collect::<Vec<_>>()
+        );
+        let dfs_message = route_metadata
+            .iter()
+            .find(|route| route.route == sinomo_dfs::DFS_MESSAGE_ROUTE)
+            .expect("dfs message route metadata");
+        assert_eq!(
+            dfs_message.auth_scope.as_deref(),
+            Some(sinomo_module::ModuleRouteAuth::LocalOrClusterMember.as_scope())
+        );
+        assert_eq!(
+            dfs_message.required_capabilities,
+            vec!["dfs.object.transfer".to_string()]
         );
         let dfs_frame = route_metadata
             .iter()

@@ -8,8 +8,7 @@ use sinomo_config::{
 use sinomo_core::ClusterEndpointRecord;
 use sinomo_dfs::{
     DfsDirectReadRequest, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
-    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse, DfsProtocolFrameCommand,
-    DfsProtocolFrameResponse, DfsReadResponse,
+    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse, DfsReadResponse,
 };
 use sinomo_kv::{
     ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, ClusterRaftAppendRequest,
@@ -389,27 +388,24 @@ async fn send_daemon_rpc_to_endpoint_async_with_connectivity_observation(
     runtime: &tokio::runtime::Handle,
     observe_connectivity: bool,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
-    let request_for_signing = request.clone();
-    let signed = runtime
-        .spawn_blocking(move || sign_daemon_rpc_request_for_local_node(&request_for_signing))
-        .await
-        .map_err(|source| DaemonError::Network {
-            address: endpoint.address.clone(),
-            detail: format!("daemon RPC signing task failed: {source}"),
-        })??;
     let mut host = DaemonSignedEndpointRpcAsyncHost {
         runtime: runtime.clone(),
         observe_connectivity,
     };
-    sinomo_network::send_signed_rpc_to_endpoint_async_with_host(
-        endpoint,
-        request,
-        &signed,
-        sinomo_network::ClusterSignedEndpointRpcOptions { timeouts },
-        &mut host,
-    )
-    .await
-    .map_err(DaemonError::from)
+    let options = sinomo_network::ClusterObjectRpcOptions::new(timeouts);
+    if let Some(paths) = cluster_paths_from_env() {
+        sinomo_network::call_object_rpc_endpoint_from_paths_async_with_host(
+            runtime, &paths, endpoint, request, options, &mut host,
+        )
+        .await
+        .map_err(DaemonError::from)
+    } else {
+        sinomo_network::call_object_rpc_endpoint_async_with_host(
+            endpoint, request, options, &mut host,
+        )
+        .await
+        .map_err(DaemonError::from)
+    }
 }
 
 fn block_on_daemon_client<F, T>(future: F) -> Result<T, DaemonError>
@@ -794,32 +790,6 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
             result
         })
     }
-
-    fn relay_signed_endpoint_rpc_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        request: &'a ObjectRpcRequest,
-        request_auth: &'a [u8],
-        timeouts: sinomo_network::DaemonRpcTimeouts,
-    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_network::ObjectRpcResponse>>
-    {
-        let runtime = self.runtime.clone();
-        Box::pin(async move {
-            let Some(paths) = cluster_paths_from_env() else {
-                return Ok(None);
-            };
-            sinomo_network::relay_rpc_to_endpoint_from_paths_async_with_host(
-                &runtime,
-                &paths,
-                endpoint,
-                request,
-                request_auth.to_vec(),
-                sinomo_network::ClusterSignedRelayRpcOptions { timeouts },
-                self,
-            )
-            .await
-        })
-    }
 }
 
 impl sinomo_network::ClusterSignedRelayRpcAsyncHost for DaemonSignedEndpointRpcAsyncHost {
@@ -1145,22 +1115,6 @@ pub async fn fetch_daemon_status_from_endpoint_async(
     .await
 }
 
-pub(crate) fn send_dfs_metadata_journal_batch_to_endpoint_on_runtime(
-    endpoint: &ClusterEndpointRecord,
-    request: &DfsMetadataJournalBatchCommand,
-    connect_timeout: Duration,
-    runtime: &tokio::runtime::Handle,
-) -> Result<DfsMetadataJournalBatchResponse, DaemonError> {
-    let rpc_request = sinomo_dfs::dfs_metadata_journal_batch_rpc_request(request)?;
-    send_daemon_rpc_request_to_endpoint_with_decoder_on_runtime(
-        endpoint,
-        &rpc_request,
-        connect_timeout,
-        runtime,
-        |response| sinomo_dfs::decode_dfs_metadata_journal_batch_rpc_response(response),
-    )
-}
-
 pub async fn send_dfs_metadata_journal_batch_to_endpoint_async(
     endpoint: &ClusterEndpointRecord,
     request: &DfsMetadataJournalBatchCommand,
@@ -1178,22 +1132,6 @@ pub async fn send_dfs_metadata_journal_batch_to_endpoint_async(
     .await
 }
 
-pub(crate) fn send_dfs_metadata_snapshot_install_to_endpoint_on_runtime(
-    endpoint: &ClusterEndpointRecord,
-    request: &DfsMetadataSnapshotInstallCommand,
-    connect_timeout: Duration,
-    runtime: &tokio::runtime::Handle,
-) -> Result<DfsMetadataSnapshotInstallResponse, DaemonError> {
-    let rpc_request = sinomo_dfs::dfs_metadata_snapshot_install_rpc_request(request)?;
-    send_daemon_rpc_request_to_endpoint_with_decoder_on_runtime(
-        endpoint,
-        &rpc_request,
-        connect_timeout,
-        runtime,
-        |response| sinomo_dfs::decode_dfs_metadata_snapshot_install_rpc_response(response),
-    )
-}
-
 pub async fn send_dfs_metadata_snapshot_install_to_endpoint_async(
     endpoint: &ClusterEndpointRecord,
     request: &DfsMetadataSnapshotInstallCommand,
@@ -1207,6 +1145,45 @@ pub async fn send_dfs_metadata_snapshot_install_to_endpoint_async(
         sinomo_network::DaemonRpcTimeouts::connect_and_idle(connect_timeout),
         runtime,
         |response| sinomo_dfs::decode_dfs_metadata_snapshot_install_rpc_response(response),
+    )
+    .await
+}
+
+pub(crate) fn send_dfs_object_rpc_to_endpoint_on_runtime(
+    endpoint: &ClusterEndpointRecord,
+    request: &ObjectRpcRequest,
+    connect_timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+    observe_connectivity: bool,
+) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
+    let endpoint = endpoint.clone();
+    let request = request.clone();
+    let runtime_for_future = runtime.clone();
+    block_on_daemon_client_on_owner_runtime(runtime, async move {
+        send_dfs_object_rpc_to_endpoint_async(
+            &endpoint,
+            &request,
+            connect_timeout,
+            &runtime_for_future,
+            observe_connectivity,
+        )
+        .await
+    })
+}
+
+pub async fn send_dfs_object_rpc_to_endpoint_async(
+    endpoint: &ClusterEndpointRecord,
+    request: &ObjectRpcRequest,
+    connect_timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+    observe_connectivity: bool,
+) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
+    send_daemon_rpc_to_endpoint_async_with_connectivity_observation(
+        endpoint,
+        request,
+        sinomo_network::DaemonRpcTimeouts::connect_and_idle(connect_timeout),
+        runtime,
+        observe_connectivity,
     )
     .await
 }
@@ -1267,149 +1244,6 @@ pub async fn send_dfs_direct_read_to_endpoint_async(
     )
     .await?;
     sinomo_dfs::dfs_direct_read_response_from_rpc_response(response).map_err(DaemonError::from)
-}
-
-pub(crate) fn send_dfs_protocol_frame_to_endpoint_on_runtime(
-    endpoint: &ClusterEndpointRecord,
-    request: &DfsProtocolFrameCommand,
-    connect_timeout: Duration,
-    runtime: &tokio::runtime::Handle,
-) -> Result<DfsProtocolFrameResponse, DaemonError> {
-    if let Some(response) = try_send_dfs_direct_read_protocol_frame_to_endpoint_on_runtime(
-        endpoint,
-        request,
-        connect_timeout,
-        runtime,
-    )? {
-        return Ok(response);
-    }
-    let rpc_request = sinomo_dfs::dfs_protocol_frame_rpc_request(request)?;
-    let observe_connectivity = !sinomo_dfs::dfs_protocol_frame_is_read_only_request(&request.frame);
-    send_daemon_rpc_request_to_endpoint_with_decoder_on_runtime_with_connectivity_observation(
-        endpoint,
-        &rpc_request,
-        connect_timeout,
-        runtime,
-        observe_connectivity,
-        |response| sinomo_dfs::decode_dfs_protocol_frame_rpc_response(response),
-    )
-}
-
-fn try_send_dfs_direct_read_protocol_frame_to_endpoint_on_runtime(
-    endpoint: &ClusterEndpointRecord,
-    request: &DfsProtocolFrameCommand,
-    connect_timeout: Duration,
-    runtime: &tokio::runtime::Handle,
-) -> Result<Option<DfsProtocolFrameResponse>, DaemonError> {
-    let Some(rpc_request) =
-        sinomo_dfs::dfs_direct_read_rpc_request_from_protocol_frame_command(request)?
-    else {
-        return Ok(None);
-    };
-    let endpoint = endpoint.clone();
-    let request = request.clone();
-    let runtime_for_future = runtime.clone();
-    block_on_daemon_client_on_owner_runtime(runtime, async move {
-        send_dfs_direct_read_protocol_frame_to_endpoint_async_inner(
-            &endpoint,
-            &request,
-            rpc_request,
-            connect_timeout,
-            &runtime_for_future,
-        )
-        .await
-    })
-    .map(Some)
-}
-
-pub fn send_dfs_protocol_frame_to_endpoint(
-    endpoint: &ClusterEndpointRecord,
-    request: &DfsProtocolFrameCommand,
-    connect_timeout: Duration,
-) -> Result<DfsProtocolFrameResponse, DaemonError> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|source| DaemonError::Io {
-            path: "tokio runtime".to_string(),
-            detail: source.to_string(),
-        })?;
-    send_dfs_protocol_frame_to_endpoint_on_runtime(
-        endpoint,
-        request,
-        connect_timeout,
-        runtime.handle(),
-    )
-}
-
-pub async fn send_dfs_protocol_frame_to_endpoint_async(
-    endpoint: &ClusterEndpointRecord,
-    request: &DfsProtocolFrameCommand,
-    connect_timeout: Duration,
-    runtime: &tokio::runtime::Handle,
-) -> Result<DfsProtocolFrameResponse, DaemonError> {
-    if let Some(response) = try_send_dfs_direct_read_protocol_frame_to_endpoint_async(
-        endpoint,
-        request,
-        connect_timeout,
-        runtime,
-    )
-    .await?
-    {
-        return Ok(response);
-    }
-    let rpc_request = sinomo_dfs::dfs_protocol_frame_rpc_request(request)?;
-    let observe_connectivity = !sinomo_dfs::dfs_protocol_frame_is_read_only_request(&request.frame);
-    send_daemon_rpc_request_to_endpoint_with_decoder_async_with_connectivity_observation(
-        endpoint,
-        &rpc_request,
-        sinomo_network::DaemonRpcTimeouts::connect_and_idle(connect_timeout),
-        runtime,
-        observe_connectivity,
-        |response| sinomo_dfs::decode_dfs_protocol_frame_rpc_response(response),
-    )
-    .await
-}
-
-async fn try_send_dfs_direct_read_protocol_frame_to_endpoint_async(
-    endpoint: &ClusterEndpointRecord,
-    request: &DfsProtocolFrameCommand,
-    connect_timeout: Duration,
-    runtime: &tokio::runtime::Handle,
-) -> Result<Option<DfsProtocolFrameResponse>, DaemonError> {
-    let Some(rpc_request) =
-        sinomo_dfs::dfs_direct_read_rpc_request_from_protocol_frame_command(request)?
-    else {
-        return Ok(None);
-    };
-    send_dfs_direct_read_protocol_frame_to_endpoint_async_inner(
-        endpoint,
-        request,
-        rpc_request,
-        connect_timeout,
-        runtime,
-    )
-    .await
-    .map(Some)
-}
-
-async fn send_dfs_direct_read_protocol_frame_to_endpoint_async_inner(
-    endpoint: &ClusterEndpointRecord,
-    request: &DfsProtocolFrameCommand,
-    rpc_request: ObjectRpcRequest,
-    connect_timeout: Duration,
-    runtime: &tokio::runtime::Handle,
-) -> Result<DfsProtocolFrameResponse, DaemonError> {
-    let response = send_daemon_rpc_to_endpoint_async_with_connectivity_observation(
-        endpoint,
-        &rpc_request,
-        sinomo_network::DaemonRpcTimeouts::connect_and_idle(connect_timeout),
-        runtime,
-        false,
-    )
-    .await?;
-    sinomo_dfs::dfs_protocol_frame_response_from_direct_read_rpc_response(request, response)
-        .map_err(DaemonError::from)
 }
 
 pub fn fetch_daemon_status_from_address(

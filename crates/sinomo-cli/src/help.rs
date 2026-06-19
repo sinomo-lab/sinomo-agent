@@ -188,7 +188,7 @@ pub(super) fn print_install_help() {
         "  sinomo install [--host <host>] [--port <port>] [--shadow-port <port>] [--no-start]"
     );
     println!(
-        "      Create or update the local install, add boot entries for the main and shadow daemons, then start them."
+        "      Create or update the local install, add boot entries, expose the client in the user bin directory, then start daemons."
     );
     println!("  sinomo uninstall [--no-stop]");
     println!("      Remove Sinomo boot entries and stop daemons. The data directory is retained.");

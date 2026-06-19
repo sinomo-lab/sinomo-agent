@@ -9,9 +9,9 @@
 //!   roundtrip; read-your-write must hold immediately on the writing node.
 //! - `cluster.dfs.invariants` — operational-metric sweep: no open conflicts,
 //!   no stuck routed namespace ops, no leaked cross-shard locks.
-//! - `cluster.dfs.protocol-codec-baseline` — in-memory DFS data-plane
-//!   protocol-frame/object-RPC codec throughput for representative chunk
-//!   messages, independent of disk and live network conditions.
+//! - `cluster.dfs.protocol-codec-baseline` — in-memory DFS typed message
+//!   object-RPC codec throughput for representative chunk messages, independent
+//!   of disk and live network conditions.
 //! - `cluster.dfs.write` / `cluster.dfs.expect-file` / `cluster.dfs.expect-absent`
 //!   / `cluster.dfs.rename` / `cluster.dfs.remove` — parameterized probes
 //!   (`--param path=... --param payload=...`); the expect-* probes poll with a
@@ -35,14 +35,11 @@
 use crate::file_manager::FileManagerBackend;
 use crate::sifs_file_manager::SifsFileManagerBackend;
 use sinomo_runtime::dfs::{
-    self, DfsFetchBlobResponseChunk, DfsFileSystemId, DfsNetworkMessage, DfsObjectId,
-    DfsProtocolFrameCommand, DfsReadResponseChunk, DfsStageBlobChunkCommand, DfsVersion,
+    self, DfsFetchBlobResponseChunk, DfsFileSystemId, DfsMessageCommand, DfsNetworkMessage,
+    DfsObjectId, DfsReadResponseChunk, DfsRoutedMessage, DfsStageBlobChunkCommand, DfsVersion,
     SIFS_FILE_SYSTEM_ID,
 };
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::network::{
-    MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrame, NetworkFrameId, ProtocolMessage,
-};
 use sinomo_runtime::node::NodeId;
 use sinomo_runtime::test::{
     SinomoTestContext, SinomoTestError, SinomoTestOutcome, SinomoTestRegistryBuilder,
@@ -329,13 +326,12 @@ fn run_protocol_codec_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult 
     let encoded_samples = samples
         .iter()
         .map(|sample| {
-            let request =
-                dfs::dfs_protocol_frame_rpc_request(&sample.command).map_err(|error| {
-                    SinomoTestError::failed(format!(
-                        "cannot encode {} DFS protocol frame request: {error}",
-                        sample.label
-                    ))
-                })?;
+            let request = dfs::dfs_message_rpc_request(&sample.command).map_err(|error| {
+                SinomoTestError::failed(format!(
+                    "cannot encode {} DFS message request: {error}",
+                    sample.label
+                ))
+            })?;
             Ok(EncodedDfsProtocolCodecSample {
                 label: sample.label,
                 request_body_bytes: request.body.len(),
@@ -360,13 +356,12 @@ fn run_protocol_codec_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult 
     let mut encoded_request_body_bytes = 0_usize;
     for _ in 0..iterations {
         for sample in &samples {
-            let request =
-                dfs::dfs_protocol_frame_rpc_request(&sample.command).map_err(|error| {
-                    SinomoTestError::failed(format!(
-                        "cannot encode {} DFS protocol frame request: {error}",
-                        sample.label
-                    ))
-                })?;
+            let request = dfs::dfs_message_rpc_request(&sample.command).map_err(|error| {
+                SinomoTestError::failed(format!(
+                    "cannot encode {} DFS message request: {error}",
+                    sample.label
+                ))
+            })?;
             encoded_request_body_bytes =
                 encoded_request_body_bytes.saturating_add(request.body.len());
             std::hint::black_box(&request);
@@ -380,14 +375,14 @@ fn run_protocol_codec_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult 
         for sample in &encoded_samples {
             let decoded = sample
                 .request
-                .decode_body::<DfsProtocolFrameCommand>()
+                .decode_body::<DfsMessageCommand>()
                 .map_err(|error| {
                     SinomoTestError::failed(format!(
-                        "cannot decode {} DFS protocol frame request body: {error}",
+                        "cannot decode {} DFS message request body: {error}",
                         sample.label
                     ))
                 })?;
-            let decoded_payload_bytes = decoded_dfs_protocol_payload_bytes(&decoded)?;
+            let decoded_payload_bytes = decoded_dfs_message_payload_bytes(&decoded)?;
             if decoded_payload_bytes != bytes {
                 return Ok(SinomoTestOutcome::failed(format!(
                     "decoded {} DFS protocol payload had {decoded_payload_bytes} bytes, expected {bytes}",
@@ -1515,7 +1510,7 @@ where
 
 struct DfsProtocolCodecSample {
     label: &'static str,
-    command: DfsProtocolFrameCommand,
+    command: DfsMessageCommand,
     protocol_payload_bytes: usize,
 }
 
@@ -1611,57 +1606,43 @@ fn dfs_protocol_codec_sample(
     target_node_id: &NodeId,
     message: DfsNetworkMessage,
 ) -> Result<DfsProtocolCodecSample, SinomoTestError> {
-    let protocol_message =
-        ProtocolMessage::encode(dfs::DFS_PROTOCOL, &message).map_err(|error| {
-            SinomoTestError::failed(format!(
-                "cannot encode {label} DFS protocol message: {error}"
-            ))
-        })?;
-    let protocol_payload_bytes = protocol_message.payload.len();
-    let frame = NetworkFrame {
-        frame_id: NetworkFrameId(frame_id),
-        source_node_id: source_node_id.clone(),
-        target_node_id: target_node_id.clone(),
-        message: MeshMessage {
-            message_id: MeshMessageId(message_id),
-            origin_node_id: source_node_id.clone(),
-            target_node_id: target_node_id.clone(),
-            body: MeshMessageBody::Protocol(protocol_message),
-        },
-    };
+    let protocol_payload_bytes = dfs_message_payload_bytes(&message)?;
     Ok(DfsProtocolCodecSample {
         label,
-        command: DfsProtocolFrameCommand {
+        command: DfsMessageCommand {
             request_id: format!("dfs-codec-{label}-{frame_id}"),
-            frame,
+            routed_message: DfsRoutedMessage {
+                source_node_id: source_node_id.clone(),
+                target_node_id: target_node_id.clone(),
+                frame_id,
+                message_id,
+                message,
+            },
         },
         protocol_payload_bytes,
     })
 }
 
-fn decoded_dfs_protocol_payload_bytes(
-    command: &DfsProtocolFrameCommand,
-) -> Result<usize, SinomoTestError> {
-    let MeshMessageBody::Protocol(protocol_message) = &command.frame.message.body else {
-        return Err(SinomoTestError::failed(
-            "decoded DFS protocol frame was not a protocol message",
-        ));
-    };
-    let message = protocol_message
-        .decode::<DfsNetworkMessage>()
-        .map_err(|error| {
-            SinomoTestError::failed(format!(
-                "cannot decode nested DFS protocol message: {error}"
-            ))
-        })?;
+fn dfs_message_payload_bytes(message: &DfsNetworkMessage) -> Result<usize, SinomoTestError> {
     match message {
         DfsNetworkMessage::StageBlobChunk(command) => Ok(command.bytes.len()),
         DfsNetworkMessage::ReadResponseChunk(command) => Ok(command.bytes.len()),
         DfsNetworkMessage::FetchBlobResponseChunk(command) => Ok(command.bytes.len()),
         other => Err(SinomoTestError::failed(format!(
-            "decoded unexpected DFS protocol message variant: {other:?}"
+            "unexpected DFS protocol message variant: {other:?}"
         ))),
     }
+}
+
+fn decoded_dfs_message_payload_bytes(
+    command: &DfsMessageCommand,
+) -> Result<usize, SinomoTestError> {
+    if command.routed_message.source_node_id == command.routed_message.target_node_id {
+        return Err(SinomoTestError::failed(
+            "decoded DFS message did not preserve distinct source and target nodes",
+        ));
+    }
+    dfs_message_payload_bytes(&command.routed_message.message)
 }
 
 fn expect_timeout(ctx: &SinomoTestContext) -> Result<Duration, SinomoTestError> {

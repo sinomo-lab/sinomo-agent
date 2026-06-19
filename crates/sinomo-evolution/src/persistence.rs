@@ -2558,7 +2558,11 @@ fn open_evolution_sifs_service(
                 detail: source.to_string(),
             }
         })?;
-        let endpoints = network::cluster_dfs_protocol_targets(&cluster_paths, &state);
+        let endpoints = network::cluster_endpoint_targets(
+            &cluster_paths,
+            &state,
+            network::ClusterEndpointSelectionPurpose::DfsData,
+        );
         (state.local_node_id, endpoints)
     } else {
         (fallback_dfs_node_id(), Vec::new())
@@ -2620,11 +2624,11 @@ fn evolution_send_dfs_protocol_frame(
     command: &DfsProtocolFrameCommand,
     timeout: std::time::Duration,
 ) -> Result<DfsProtocolFrameResponse, DfsPeerTransportError> {
-    let request = sinomo_runtime::dfs::dfs_protocol_frame_rpc_request(command)
+    let request = sinomo_runtime::dfs::dfs_message_rpc_request_from_protocol_frame_command(command)
         .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
     let response = sinomo_runtime::daemon::send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
         .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
-    sinomo_runtime::dfs::decode_dfs_protocol_frame_rpc_response(&response)
+    sinomo_runtime::dfs::dfs_protocol_frame_response_from_message_rpc_response(&response)
         .map_err(|error| DfsPeerTransportError::new(error.to_string()))
 }
 

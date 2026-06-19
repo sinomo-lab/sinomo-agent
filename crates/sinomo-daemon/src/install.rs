@@ -321,7 +321,15 @@ pub fn ensure_local_bin_symlink(
     let Some(home) = env::var_os("HOME") else {
         return Ok(LocalBinSymlinkStatus::HomeNotSet);
     };
-    let user_bin = PathBuf::from(home).join(".local").join("bin");
+    ensure_local_bin_symlink_in_home(layout, Path::new(&home))
+}
+
+#[cfg(not(windows))]
+fn ensure_local_bin_symlink_in_home(
+    layout: &InstallLayout,
+    home: &Path,
+) -> Result<LocalBinSymlinkStatus, DaemonError> {
+    let user_bin = home.join(".local").join("bin");
     fs::create_dir_all(&user_bin).map_err(|source| DaemonError::Io {
         path: user_bin.display().to_string(),
         detail: source.to_string(),
@@ -1058,6 +1066,50 @@ mod tests {
             Some("install option update")
         );
         assert_eq!(installed_daemon_install_stop_reason(false, false), None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn ensure_local_bin_symlink_creates_user_bin_link_to_installed_binary() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-local-bin-link");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let layout = InstallLayout::new(&data_dir, root.join("startup"));
+        std::fs::create_dir_all(&layout.bin_dir).expect("create installed bin dir");
+        std::fs::write(&layout.binary, b"installed sinomo").expect("write installed binary");
+
+        let home = root.join("home");
+        let status = ensure_local_bin_symlink_in_home(&layout, &home).expect("local bin symlink");
+        let link = home.join(".local").join("bin").join("sinomo");
+
+        assert_eq!(
+            status,
+            LocalBinSymlinkStatus::Created { link: link.clone() }
+        );
+        assert_eq!(std::fs::read_link(&link).expect("read link"), layout.binary);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn ensure_local_bin_symlink_refreshes_stale_symlink() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-local-bin-refresh");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let layout = InstallLayout::new(&data_dir, root.join("startup"));
+        std::fs::create_dir_all(&layout.bin_dir).expect("create installed bin dir");
+        std::fs::write(&layout.binary, b"installed sinomo").expect("write installed binary");
+
+        let home = root.join("home");
+        let link = home.join(".local").join("bin").join("sinomo");
+        std::fs::create_dir_all(link.parent().expect("link parent")).expect("create user bin");
+        std::os::unix::fs::symlink(root.join("old").join("sinomo"), &link)
+            .expect("stale local bin symlink");
+
+        let status = ensure_local_bin_symlink_in_home(&layout, &home).expect("local bin symlink");
+
+        assert_eq!(
+            status,
+            LocalBinSymlinkStatus::Created { link: link.clone() }
+        );
+        assert_eq!(std::fs::read_link(&link).expect("read link"), layout.binary);
     }
 
     #[test]

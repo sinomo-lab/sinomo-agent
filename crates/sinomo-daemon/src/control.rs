@@ -1025,7 +1025,9 @@ fn daemon_rpc_request_allows_reusable_stream(request: &sinomo_network::ObjectRpc
 pub(crate) fn daemon_dfs_frame_replay_key(
     request: &sinomo_network::DaemonControlRequest,
 ) -> Option<Vec<u8>> {
-    if request.route != sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE {
+    if request.route != sinomo_dfs::DFS_MESSAGE_ROUTE
+        && request.route != sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE
+    {
         return None;
     }
     let auth = request.auth.as_ref()?;
@@ -3428,7 +3430,11 @@ pub(crate) fn open_daemon_sandbox_dfs_service_on_runtime(
             detail: source.to_string(),
         },
     )?;
-    let endpoints = sinomo_network::cluster_dfs_protocol_targets(&cluster_paths, &state);
+    let endpoints = sinomo_network::cluster_endpoint_targets(
+        &cluster_paths,
+        &state,
+        sinomo_network::ClusterEndpointSelectionPurpose::DfsData,
+    );
     let transport = if let Some(runtime) = runtime {
         daemon_dfs_endpoint_transport_on_runtime(state.local_node_id.clone(), endpoints, runtime)
     } else {
