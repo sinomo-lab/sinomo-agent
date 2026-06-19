@@ -590,7 +590,7 @@ pub fn cluster_member_publish_txn(members: &[ClusterMemberRecord]) -> Result<KvT
     cluster_member_publish_txn_with_snapshot(None, members)
 }
 
-pub fn cluster_member_publish_txn_from_kv(
+pub(crate) fn cluster_member_publish_txn_from_kv(
     paths: &ClusterPaths,
     members: &[ClusterMemberRecord],
 ) -> Result<KvTxn, NetworkError> {

@@ -256,7 +256,7 @@ pub use member_mutation::{
 };
 pub use member_publish::{
     ClusterLocalMemberPublishAsyncHost, ClusterLocalMemberPublishHost,
-    ClusterLocalMemberPublishOptions, ClusterMemberPublishHost, cluster_member_publish_txn_from_kv,
+    ClusterLocalMemberPublishOptions, ClusterMemberPublishHost,
     handle_cluster_member_publish_request_async_with_host,
     publish_local_members_to_quorum_if_needed_async_with_host,
     publish_local_members_to_quorum_if_needed_with_host,

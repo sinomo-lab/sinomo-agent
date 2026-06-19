@@ -1132,35 +1132,27 @@ fn advertise_daemon_iroh_endpoint_with_runtime(
     // upsert delta: otherwise a brand-new endpoint that prepare merged would
     // never be written, while an idle re-advertise still short-circuits here
     // without touching disk, the KV mirror, or the raft log.
-    if let Some(published_member) = sinomo_network::apply_cluster_iroh_endpoint_advertisement(
+    if sinomo_network::apply_cluster_iroh_endpoint_advertisement(
         &mut state,
         record,
         persisted_endpoints.as_deref(),
         OffsetDateTime::now_utc(),
-    ) {
+    )
+    .is_some()
+    {
         sinomo_network::write_cluster_state(&cluster_paths, &state)?;
         if let Some(runtime) = runtime {
             if let Err(error) = sync_cluster_state_to_kv_on_runtime(&cluster_paths, &state, runtime)
             {
                 eprintln!("sinomo iroh endpoint cluster state publication failed: {error}");
             }
-            let mut commit_state = state.clone();
-            let publish_result = commit_cluster_kv_txn_with_quorum_on_runtime(
+            let publish_result = publish_local_members_to_quorum_if_needed_on_runtime(
                 &cluster_paths,
-                &mut commit_state,
-                sinomo_network::cluster_member_publish_txn_from_kv(
-                    &cluster_paths,
-                    &[published_member],
-                )?,
+                &state,
                 runtime,
             );
             if let Err(error) = publish_result {
-                eprintln!("sinomo iroh endpoint local quorum publication failed: {error}");
-                if let Err(error) =
-                    publish_local_members_via_voter_on_runtime(&cluster_paths, &state, runtime)
-                {
-                    eprintln!("sinomo iroh endpoint voter publication failed: {error}");
-                }
+                eprintln!("sinomo iroh endpoint member publication failed: {error}");
             }
         }
     }
@@ -1598,22 +1590,13 @@ fn send_object_rpc_to_node(
     .map_err(DaemonError::from)
 }
 
-#[cfg(test)]
-pub(crate) fn publish_local_members_via_voter(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Result<(), DaemonError> {
-    let runtime = daemon_cluster_test_runtime();
-    publish_local_members_via_voter_on_runtime(paths, state, runtime.handle())
-}
-
-pub(crate) fn publish_local_members_via_voter_on_runtime(
+pub(crate) fn publish_local_members_to_quorum_if_needed_on_runtime(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     runtime: &tokio::runtime::Handle,
-) -> Result<(), DaemonError> {
+) -> Result<Option<KvSnapshot>, DaemonError> {
     let mut host = daemon_cluster_control_plane_driver_on_runtime(runtime);
-    sinomo_network::publish_local_members_via_voter_with_host(
+    sinomo_network::publish_local_members_to_quorum_if_needed_with_host(
         paths,
         state,
         sinomo_network::ClusterLocalMemberPublishOptions {
@@ -10144,7 +10127,8 @@ mod tests {
         sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
             .expect("seed local kv snapshot");
 
-        publish_local_members_via_voter(&paths, &state)
+        let runtime = daemon_cluster_test_runtime();
+        publish_local_members_to_quorum_if_needed_on_runtime(&paths, &state, runtime.handle())
             .expect("stable local members should not be republished");
     }
 
