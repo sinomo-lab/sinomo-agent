@@ -4002,7 +4002,7 @@ mod tests {
             .append_command_and_publish(
                 node_id,
                 command,
-                sinomo_network::cluster_kv_key_can_defer_materialized_snapshot,
+                sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
             )
             .map_err(Into::into)
     }

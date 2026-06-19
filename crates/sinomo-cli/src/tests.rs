@@ -130,7 +130,7 @@ fn append_cluster_raft_command(
         .append_command_and_publish(
             node_id,
             command,
-            network::cluster_kv_key_can_defer_materialized_snapshot,
+            sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
         .map_err(Into::into)
 }
@@ -174,7 +174,7 @@ fn append_cluster_raft_command_with_response(
         .append_command_with_response_and_publish(
             node_id,
             command,
-            network::cluster_kv_key_can_defer_materialized_snapshot,
+            sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
         .map(|result| (result.snapshot, result.txn_response))
         .map_err(Into::into)

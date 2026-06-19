@@ -715,6 +715,25 @@ mod tests {
     }
 
     #[test]
+    fn cluster_kv_materialized_snapshot_default_defer_policy_covers_high_churn_status_keys() {
+        assert!(cluster_kv_key_can_defer_materialized_snapshot(
+            "/cluster/network/connectivity/node-a/node-b"
+        ));
+        assert!(cluster_kv_key_can_defer_materialized_snapshot(
+            "/cluster/network/info/node-a"
+        ));
+        assert!(cluster_kv_key_can_defer_materialized_snapshot(
+            "/cluster/node-status/node-a"
+        ));
+        assert!(!cluster_kv_key_can_defer_materialized_snapshot(
+            "/cluster/members/node-a"
+        ));
+        assert!(!cluster_kv_key_can_defer_materialized_snapshot(
+            "/config/models/default"
+        ));
+    }
+
+    #[test]
     fn cluster_kv_snapshot_delta_defers_only_predicate_matched_changes() {
         let entry = |key: &str, value: &[u8]| KvEntry {
             key: key.to_string(),

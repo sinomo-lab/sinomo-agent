@@ -194,7 +194,6 @@ pub use kv_forward::{
     ClusterKvTxnForwardHost, ClusterKvTxnForwardOptions, ClusterKvTxnForwardResult,
     forward_cluster_kv_txn_to_voter_with_host,
 };
-pub use kv_local_store::cluster_kv_key_can_defer_materialized_snapshot;
 pub use kv_read_model::{
     read_cluster_connectivity_graph_from_kv, read_cluster_members_from_kv,
     read_cluster_node_statuses_from_kv,

@@ -237,16 +237,10 @@ pub(crate) fn write_imported_cluster_kv_snapshot_if_changed(
     let wrote = sinomo_kv::write_imported_cluster_kv_snapshot_if_changed(
         &paths.kv_paths(),
         snapshot,
-        cluster_kv_key_can_defer_materialized_snapshot,
+        sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
     )?;
     observe_cluster_kv_snapshot_write(paths, wrote);
     Ok(wrote)
-}
-
-pub fn cluster_kv_key_can_defer_materialized_snapshot(key: &str) -> bool {
-    key.starts_with("/cluster/network/connectivity/")
-        || key.starts_with("/cluster/network/info/")
-        || key.starts_with("/cluster/node-status/")
 }
 
 pub(crate) fn observe_cluster_kv_snapshot_write(paths: &ClusterPaths, wrote: bool) {
@@ -560,7 +554,7 @@ pub(crate) fn append_cluster_raft_command_with_response(
         .append_command_with_response_and_publish_report(
             node_id,
             command,
-            cluster_kv_key_can_defer_materialized_snapshot,
+            sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
         .map_err(NetworkError::from)?;
     observe_cluster_kv_snapshot_write(paths, wrote);
@@ -648,7 +642,7 @@ pub(crate) fn apply_cluster_raft_append(
             node_id,
             snapshot,
             append,
-            cluster_kv_key_can_defer_materialized_snapshot,
+            sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
         )?;
     observe_cluster_kv_snapshot_write(paths, wrote);
     Ok(outcome.response)
@@ -676,7 +670,7 @@ impl<'a> LocalClusterRaftCommandStorage<'a> {
             inner: sinomo_kv::ClusterKvRaftLocalCommandStorage::new(
                 cluster_kv_raft_store(paths),
                 local_node_id,
-                cluster_kv_key_can_defer_materialized_snapshot,
+                sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
             ),
         }
     }

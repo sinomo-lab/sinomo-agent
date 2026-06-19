@@ -325,6 +325,7 @@ pub use watch::{
     append_cluster_kv_watch_events_to_storage_with_observers, cancel_cluster_kv_watch,
     cluster_kv_active_watch_registration_report, cluster_kv_events_can_defer_materialized_snapshot,
     cluster_kv_events_contain, cluster_kv_events_contain_all,
+    cluster_kv_key_can_defer_materialized_snapshot,
     cluster_kv_materialized_snapshot_is_fresh_enough_against, cluster_kv_snapshot_compare,
     cluster_kv_snapshot_delta_only_deferable,
     cluster_kv_watch_allocator_after_registration_removed, cluster_kv_watch_allocator_after_scan,

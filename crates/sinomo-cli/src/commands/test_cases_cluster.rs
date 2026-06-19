@@ -106,7 +106,7 @@ fn run_cluster_migration_seed_source(ctx: &mut SinomoTestContext) -> SinomoTestR
                 ],
                 failure: Vec::new(),
             }),
-            network::cluster_kv_key_can_defer_materialized_snapshot,
+            sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
         .map_err(|source| {
             SinomoTestError::failed(format!("cannot seed source cluster KV: {source}"))

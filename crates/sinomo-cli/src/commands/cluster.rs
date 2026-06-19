@@ -573,7 +573,7 @@ fn append_cluster_raft_command(
         .append_command_and_publish(
             node_id,
             command,
-            network::cluster_kv_key_can_defer_materialized_snapshot,
+            sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
         .map_err(Into::into)
 }
@@ -2626,7 +2626,7 @@ pub(crate) fn write_imported_cluster_kv_snapshot(
     sinomo_runtime::kv::write_imported_cluster_kv_snapshot_if_changed(
         &paths.kv_paths(),
         snapshot,
-        network::cluster_kv_key_can_defer_materialized_snapshot,
+        sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
     )
     .map(|_| ())
     .map_err(Into::into)

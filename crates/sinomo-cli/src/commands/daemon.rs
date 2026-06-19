@@ -606,7 +606,7 @@ pub(crate) fn handle_daemon_cluster_kv_txn_request(
     sinomo_runtime::kv::write_imported_cluster_kv_snapshot_if_changed(
         &cluster_paths.kv_paths(),
         &result.snapshot,
-        network::cluster_kv_key_can_defer_materialized_snapshot,
+        sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
     )?;
     Ok(result.txn_response.unwrap_or(KvTxnResponse {
         succeeded: true,
@@ -804,7 +804,7 @@ impl sinomo_runtime::kv::ClusterKvRaftCommandStorage for CliClusterRaftCommandSt
         store
             .publish_commit_result(
                 &result,
-                network::cluster_kv_key_can_defer_materialized_snapshot,
+                sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
             )
             .map_err(network::NetworkError::from)?;
         Ok(result)
