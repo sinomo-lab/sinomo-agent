@@ -333,6 +333,30 @@ mod tests {
     }
 
     #[test]
+    fn cluster_invitation_state_stable_eq_ignores_updated_at() {
+        let timestamp = time::OffsetDateTime::parse(
+            "2026-05-02T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("timestamp");
+        let left = ClusterInvitationStateRecord {
+            cluster_id: Id::from_legacy_named("cluster_invitation_stable").expect("cluster"),
+            invite_id: Id::from_legacy_named("invite_stable").expect("invite"),
+            state: "active".to_string(),
+            issuer_node_id: Id::from_legacy_named("node_invitation_issuer").expect("node"),
+            expires_at: timestamp + time::Duration::hours(1),
+            updated_at: timestamp,
+        };
+        let mut right = left.clone();
+        right.updated_at = right.updated_at + time::Duration::minutes(1);
+
+        assert!(cluster_invitation_state_stable_eq(&left, &right));
+
+        right.state = "revoked".to_string();
+        assert!(!cluster_invitation_state_stable_eq(&left, &right));
+    }
+
+    #[test]
     fn upsert_member_record_replaces_by_node_id() {
         let timestamp = time::OffsetDateTime::parse(
             "2026-05-02T12:00:00Z",

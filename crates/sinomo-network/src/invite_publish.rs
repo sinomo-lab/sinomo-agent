@@ -9,8 +9,8 @@ use crate::local_state_store::{read_cluster_state, read_cluster_state_without_kv
 use crate::member_mutation::ClusterMemberMutationAsyncHost;
 use crate::membership_rpc::{ClusterInvitePublishRequest, ClusterInvitePublishResponse};
 use crate::prelude::*;
-use crate::records::{ClusterInvitationStateRecord, cluster_invitation_state_stable_eq};
 use sinomo_kv::push_bounded_txn_success_op;
+use sinomo_node::{ClusterInvitationStateRecord, cluster_invitation_state_stable_eq};
 
 pub trait ClusterInvitePublishHost {
     type Error: From<NetworkError> + ToString;

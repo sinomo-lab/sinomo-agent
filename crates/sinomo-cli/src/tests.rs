@@ -8354,7 +8354,7 @@ fn cluster_invite_generates_portable_join_payload() {
         ))
         .expect("invite state")
         .clone();
-    let invite_state: super::network::ClusterInvitationStateRecord =
+    let invite_state: sinomo_runtime::r1::node::ClusterInvitationStateRecord =
         invite_state_entry.decode().expect("invite state record");
     assert_eq!(invite_state.state, "active");
     assert_eq!(

@@ -56,7 +56,6 @@ mod raft_fanout;
 mod raft_quorum;
 mod raft_replication;
 mod raft_rpc;
-mod records;
 mod roaming;
 mod route;
 mod route_graph_read_model;
@@ -335,7 +334,6 @@ pub use raft_replication::{
     replicate_cluster_raft_to_endpoint_with_host,
 };
 pub use raft_rpc::{handle_cluster_raft_rpc_request, handle_cluster_raft_rpc_request_async};
-pub use records::ClusterInvitationStateRecord;
 pub(crate) use roaming::read_iroh_endpoint_record_async;
 #[cfg(test)]
 pub(crate) use roaming::send_daemon_rpc_to_cluster_endpoint_async;
