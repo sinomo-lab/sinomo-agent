@@ -294,7 +294,7 @@ pub fn cluster_connectivity_record_for_identity_mismatch(
     )
 }
 
-pub fn cluster_connectivity_record_for_hard_failure(
+pub(crate) fn cluster_connectivity_record_for_hard_failure(
     state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
     previous: Option<&ClusterConnectivityRecord>,
