@@ -87,8 +87,8 @@ pub struct ReadyState {
 }
 
 impl ReadyState {
-    /// Build all tab sub-states from a resolved backend (spawns the chat worker, opens the file
-    /// browser, loads config). Runs on the UI thread when the connection completes.
+    /// Build all tab sub-states from a resolved backend (spawns the chat worker and loads config;
+    /// SIFS browsing is opened lazily by the Files tab).
     pub fn build(backend: Backend) -> Self {
         let chat = ChatState::new(&backend);
         let evolution = EvolutionState::new(&backend);

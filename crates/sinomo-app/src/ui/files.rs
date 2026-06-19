@@ -22,6 +22,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use sui::{
     Alignment, ArrangeCtx, Breadcrumb, BreadcrumbItem, Constraints, DefaultTheme, Event, EventCtx,
@@ -31,6 +32,7 @@ use sui::{
 };
 
 use sinomo_cli::app_api::{SifsBrowser, SifsEntry};
+use sinomo_runtime::local::SinomoDataDir;
 
 use crate::backend::Backend;
 use crate::state::Shared;
@@ -54,9 +56,12 @@ type ThemeReader = Rc<dyn Fn() -> DefaultTheme>;
 
 /// State backing the files tab.
 pub struct FilesState {
+    pub data_dir: Arc<SinomoDataDir>,
     pub browser: Option<SifsBrowser>,
     pub error: Option<String>,
     pub clustered: bool,
+    pub loaded: bool,
+    pub list_revision: u64,
     pub node_id: String,
     pub path: String,
     pub entries: Vec<SifsEntry>,
@@ -66,25 +71,39 @@ pub struct FilesState {
 
 impl FilesState {
     pub fn new(backend: &Backend) -> Self {
-        let (browser, error, node_id) = match SifsBrowser::open(&backend.data_dir) {
-            Ok(browser) => {
-                let node = browser.node_id().to_string();
-                (Some(browser), None, node)
-            }
-            Err(error) => (None, Some(error), String::new()),
-        };
-        let mut state = Self {
-            browser,
-            error,
+        Self {
+            data_dir: backend.data_dir.clone(),
+            browser: None,
+            error: None,
             clustered: backend.connection.is_clustered(),
-            node_id,
+            loaded: false,
+            list_revision: 0,
+            node_id: String::new(),
             path: "/".to_string(),
             entries: Vec::new(),
             selected: None,
             scroll: 0.0,
-        };
-        state.reload();
-        state
+        }
+    }
+
+    fn ensure_loaded(&mut self) {
+        if self.loaded {
+            return;
+        }
+        self.loaded = true;
+        match SifsBrowser::open(&self.data_dir) {
+            Ok(browser) => {
+                self.node_id = browser.node_id().to_string();
+                self.browser = Some(browser);
+                self.error = None;
+            }
+            Err(error) => {
+                self.browser = None;
+                self.node_id.clear();
+                self.error = Some(error);
+            }
+        }
+        self.reload();
     }
 
     fn reload(&mut self) {
@@ -103,6 +122,7 @@ impl FilesState {
             }
             None => {}
         }
+        self.list_revision = self.list_revision.wrapping_add(1);
     }
 
     fn navigate(&mut self, path: String) {
@@ -902,9 +922,12 @@ fn list_column(
     RebuildOnChange::new(
         {
             let s = s.clone();
-            move || s.files().path.clone()
+            move || {
+                let files = s.files();
+                (files.path.clone(), files.list_revision)
+            }
         },
-        move |_path| listing(&s, &r, &ss),
+        move |_key| listing(&s, &r, &ss),
     )
 }
 
@@ -952,6 +975,7 @@ fn narrow_pod(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState)
 /// (constraints-driven) and cached so `arrange`/`paint`/event routing all stay in sync. Mirrors the
 /// Settings `SettingsView` host.
 pub struct FilesView {
+    shared: Shared,
     wide: WidgetPod,
     narrow: WidgetPod,
     use_wide: Cell<bool>,
@@ -968,6 +992,7 @@ impl FilesView {
         let wide = wide_pod(&shared, &theme_reader, &scroll_state);
         let narrow = narrow_pod(&shared, &theme_reader, &scroll_state);
         Self {
+            shared,
             wide,
             narrow,
             // Default to wide before the first measure.
@@ -1009,6 +1034,7 @@ impl Widget for FilesView {
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.shared.files_mut().ensure_loaded();
         let use_wide = constraints.max.width >= WIDE_THRESHOLD;
         self.use_wide.set(use_wide);
         self.active_mut().measure(ctx, constraints)
@@ -1065,6 +1091,17 @@ mod tests {
                 .skip(1)
                 .all(|(_, target)| target.starts_with('/'))
         );
+    }
+
+    #[test]
+    fn new_defers_sifs_open_until_files_tab_is_rendered() {
+        let backend = Backend::local_fallback();
+        let state = FilesState::new(&backend);
+
+        assert!(!state.loaded);
+        assert!(state.browser.is_none());
+        assert!(state.error.is_none());
+        assert!(state.entries.is_empty());
     }
 
     #[test]

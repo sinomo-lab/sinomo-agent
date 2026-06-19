@@ -1094,10 +1094,7 @@ fn capture_chat_runtime_activity() {
             },
         ];
         chat.streaming = true;
-        chat.notice = Some(
-            "session saved locally; SIFS mirror failed: DFS services shard replay delayed"
-                .to_string(),
-        );
+        chat.notice = Some("session save failed: DFS services shard replay delayed".to_string());
         chat.context = Some(ChatContextSnapshot {
             step_index: 4,
             provider: "codex".to_string(),
@@ -1201,8 +1198,8 @@ fn capture_chat_runtime_activity() {
                 tone: ActivityTone::Good,
             },
             ChatActivityEntry {
-                title: "session mirror".to_string(),
-                detail: "SIFS mirror failed: DFS services shard replay delayed".to_string(),
+                title: "session save".to_string(),
+                detail: "DFS services shard replay delayed".to_string(),
                 tone: ActivityTone::Warn,
             },
             ChatActivityEntry {
