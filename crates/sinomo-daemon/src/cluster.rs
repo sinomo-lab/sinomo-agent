@@ -1417,17 +1417,12 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonClusterJoinRegi
     fn try_gateway_signed_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
-        request: &'a sinomo_network::ObjectRpcRequest,
-        request_auth: &'a [u8],
+        gateway_request: &'a sinomo_network::ObjectRpcRequest,
         timeouts: sinomo_network::DaemonRpcTimeouts,
     ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_network::ObjectRpcResponse>>
     {
-        self.endpoint_rpc_host.try_gateway_signed_rpc_async(
-            endpoint,
-            request,
-            request_auth,
-            timeouts,
-        )
+        self.endpoint_rpc_host
+            .try_gateway_signed_rpc_async(endpoint, gateway_request, timeouts)
     }
 
     fn endpoint_rpc_cluster_id_async<'a>(
@@ -3593,17 +3588,15 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonClusterControlP
     fn try_gateway_signed_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
-        request: &'a ObjectRpcRequest,
-        request_auth: &'a [u8],
+        gateway_request: &'a ObjectRpcRequest,
         timeouts: sinomo_network::DaemonRpcTimeouts,
     ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<ObjectRpcResponse>> {
         let runtime = self.rpc_mode.runtime().clone();
         let endpoint = endpoint.clone();
-        let request = request.clone();
-        let request_auth = request_auth.to_vec();
+        let gateway_request = gateway_request.clone();
         Box::pin(async move {
             let mut host = DaemonSignedEndpointRpcAsyncHost::new(&runtime, true);
-            host.try_gateway_signed_rpc_async(&endpoint, &request, &request_auth, timeouts)
+            host.try_gateway_signed_rpc_async(&endpoint, &gateway_request, timeouts)
                 .await
         })
     }

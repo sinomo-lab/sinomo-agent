@@ -643,8 +643,7 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
     fn try_gateway_signed_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
-        request: &'a ObjectRpcRequest,
-        request_auth: &'a [u8],
+        gateway_request: &'a ObjectRpcRequest,
         timeouts: sinomo_network::DaemonRpcTimeouts,
     ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_network::ObjectRpcResponse>>
     {
@@ -652,15 +651,13 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonSignedEndpointR
             return Box::pin(async { Ok(None) });
         }
         let endpoint = endpoint.clone();
-        let request = request.clone();
-        let request_auth = request_auth.to_vec();
+        let gateway_request = gateway_request.clone();
         let runtime = self.runtime.clone();
         Box::pin(async move {
             match route_endpoint_request_via_local_daemon_async(
                 &runtime,
                 &endpoint,
-                &request,
-                &request_auth,
+                &gateway_request,
                 timeouts,
                 &DaemonRpcAttemptDeadline::from_policy(timeouts),
             )
@@ -889,12 +886,11 @@ impl DaemonRpcAttemptDeadline {
 async fn route_endpoint_request_via_local_daemon_async(
     runtime: &tokio::runtime::Handle,
     endpoint: &ClusterEndpointRecord,
-    request: &ObjectRpcRequest,
-    request_auth: &[u8],
+    gateway_request: &ObjectRpcRequest,
     timeouts: sinomo_network::DaemonRpcTimeouts,
     deadline: &DaemonRpcAttemptDeadline,
 ) -> Option<Result<sinomo_network::ObjectRpcResponse, DaemonError>> {
-    if request.route == sinomo_network::CLUSTER_RELAY_ROUTE {
+    if gateway_request.route != sinomo_network::CLUSTER_RELAY_ROUTE {
         return None;
     }
     let status = match crate::status::default_main_daemon_status_with_timeouts_async(
@@ -915,20 +911,9 @@ async fn route_endpoint_request_via_local_daemon_async(
         return None;
     }
 
-    let cluster = status.cluster.as_ref()?;
-    let outer = sinomo_network::cluster_relay_rpc_request(
-        &cluster.cluster_id,
-        &endpoint.node_id,
-        request.clone().with_auth(request_auth.to_vec()),
-    )
-    .map_err(DaemonError::from);
-    let outer = match outer {
-        Ok(outer) => outer,
-        Err(error) => return Some(Err(error)),
-    };
     match send_daemon_rpc_async(
         &status.address,
-        &outer,
+        gateway_request,
         deadline.checked_remaining_policy(timeouts)?,
         runtime,
     )

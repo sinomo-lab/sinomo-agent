@@ -609,8 +609,7 @@ pub trait ClusterSignedEndpointRpcAsyncHost: Send {
     fn try_gateway_signed_rpc_async<'a>(
         &'a mut self,
         _endpoint: &'a ClusterEndpointRecord,
-        _request: &'a ObjectRpcRequest,
-        _request_auth: &'a [u8],
+        _gateway_request: &'a ObjectRpcRequest,
         _timeouts: DaemonRpcTimeouts,
     ) -> ClusterSignedEndpointRpcFuture<'a, Option<ObjectRpcResponse>> {
         Box::pin(async { Ok(None) })
@@ -709,12 +708,11 @@ where
     fn try_gateway_signed_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
-        request: &'a ObjectRpcRequest,
-        request_auth: &'a [u8],
+        gateway_request: &'a ObjectRpcRequest,
         timeouts: DaemonRpcTimeouts,
     ) -> ClusterSignedEndpointRpcFuture<'a, Option<ObjectRpcResponse>> {
         self.inner
-            .try_gateway_signed_rpc_async(endpoint, request, request_auth, timeouts)
+            .try_gateway_signed_rpc_async(endpoint, gateway_request, timeouts)
     }
 
     fn endpoint_rpc_cluster_id_async<'a>(
@@ -770,12 +768,11 @@ where
     fn try_gateway_signed_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
-        request: &'a ObjectRpcRequest,
-        request_auth: &'a [u8],
+        gateway_request: &'a ObjectRpcRequest,
         timeouts: DaemonRpcTimeouts,
     ) -> ClusterSignedEndpointRpcFuture<'a, Option<ObjectRpcResponse>> {
         self.inner
-            .try_gateway_signed_rpc_async(endpoint, request, request_auth, timeouts)
+            .try_gateway_signed_rpc_async(endpoint, gateway_request, timeouts)
     }
 
     fn endpoint_rpc_cluster_id_async<'a>(
@@ -1071,21 +1068,17 @@ async fn send_targeted_direct_signed_endpoint_rpc_async(
     endpoint: &ClusterEndpointRecord,
     request: &ObjectRpcRequest,
     request_auth: &[u8],
+    cluster_id: Option<&ClusterId>,
     timeouts: DaemonRpcTimeouts,
     host: &mut impl ClusterSignedEndpointRpcAsyncHost,
 ) -> Result<ObjectRpcResponse, NetworkError> {
-    if !endpoint_rpc_should_use_targeted_direct(request) {
-        return host
-            .send_signed_endpoint_rpc_async(endpoint, request_auth, request, timeouts)
-            .await;
-    }
-    let Some(cluster_id) = host.endpoint_rpc_cluster_id_async(endpoint).await? else {
+    let Some(cluster_id) = cluster_id else {
         return host
             .send_signed_endpoint_rpc_async(endpoint, request_auth, request, timeouts)
             .await;
     };
     let outer = relay_request_for_signed_rpc(
-        &cluster_id,
+        cluster_id,
         &endpoint.node_id,
         request,
         request_auth.to_vec(),
@@ -1277,19 +1270,34 @@ async fn send_signed_rpc_to_endpoint_async_with_route_policy(
     let deadline = ClusterEndpointRpcDeadline::new(options.timeouts.connect_timeout);
     let requests_raw_direct = endpoint_rpc_requests_raw_direct(request);
     let direct_attempt_override = endpoint_rpc_has_explicit_raw_direct_metadata(request);
+    let targeted_cluster_id = if !prefers_relay && endpoint_rpc_should_use_targeted_direct(request)
+    {
+        host.endpoint_rpc_cluster_id_async(endpoint).await?
+    } else {
+        None
+    };
     if !prefers_relay
         && !requests_raw_direct
+        && let Some(cluster_id) = targeted_cluster_id.as_ref()
         && let Some(remaining) = deadline.checked_remaining()
-        && let Some(response) = host
+    {
+        let gateway_request = relay_request_for_signed_rpc(
+            cluster_id,
+            &endpoint.node_id,
+            request,
+            request_auth.to_vec(),
+            std::iter::empty::<NodeId>(),
+        )?;
+        if let Some(response) = host
             .try_gateway_signed_rpc_async(
                 endpoint,
-                request,
-                request_auth,
+                &gateway_request,
                 cluster_endpoint_direct_attempt_timeouts(options.timeouts, remaining),
             )
             .await?
-    {
-        return Ok(response);
+        {
+            return Ok(response);
+        }
     }
 
     if !prefers_relay || direct_attempt_override {
@@ -1300,6 +1308,7 @@ async fn send_signed_rpc_to_endpoint_async_with_route_policy(
             endpoint,
             request,
             request_auth,
+            targeted_cluster_id.as_ref(),
             cluster_endpoint_direct_attempt_timeouts(options.timeouts, remaining),
             host,
         )
@@ -4231,8 +4240,7 @@ mod tests {
         fn try_gateway_signed_rpc_async<'a>(
             &'a mut self,
             _endpoint: &'a ClusterEndpointRecord,
-            _request: &'a ObjectRpcRequest,
-            _request_auth: &'a [u8],
+            _gateway_request: &'a ObjectRpcRequest,
             _timeouts: DaemonRpcTimeouts,
         ) -> ClusterSignedEndpointRpcFuture<'a, Option<ObjectRpcResponse>> {
             Box::pin(async { Ok(None) })
@@ -4753,6 +4761,7 @@ mod tests {
         direct_timeout_policies: Vec<DaemonRpcTimeouts>,
         relay_timeout_policies: Vec<DaemonRpcTimeouts>,
         signed_routes: Vec<String>,
+        gateway_requests: Vec<ObjectRpcRequest>,
         direct_requests: Vec<ObjectRpcRequest>,
         direct_auth: Vec<Vec<u8>>,
         relay_auth: Vec<Vec<u8>>,
@@ -4773,6 +4782,7 @@ mod tests {
                 direct_timeout_policies: Vec::new(),
                 relay_timeout_policies: Vec::new(),
                 signed_routes: Vec::new(),
+                gateway_requests: Vec::new(),
                 direct_requests: Vec::new(),
                 direct_auth: Vec::new(),
                 relay_auth: Vec::new(),
@@ -4804,12 +4814,12 @@ mod tests {
         fn try_gateway_signed_rpc_async<'a>(
             &'a mut self,
             _endpoint: &'a ClusterEndpointRecord,
-            _request: &'a ObjectRpcRequest,
-            _request_auth: &'a [u8],
+            gateway_request: &'a ObjectRpcRequest,
             _timeouts: DaemonRpcTimeouts,
         ) -> ClusterSignedEndpointRpcFuture<'a, Option<ObjectRpcResponse>> {
             Box::pin(async move {
                 self.calls.push("gateway");
+                self.gateway_requests.push(gateway_request.clone());
                 Ok(self.gateway_response.clone())
             })
         }
@@ -4911,7 +4921,7 @@ mod tests {
             .expect("endpoint rpc");
 
         assert_eq!(response.decode_body::<String>().expect("body"), "direct");
-        assert_eq!(host.calls, vec!["gateway", "cluster_id", "direct"]);
+        assert_eq!(host.calls, vec!["cluster_id", "direct"]);
         assert_eq!(host.signed_routes, vec![request.route.clone()]);
         assert_eq!(host.direct_requests[0].route, request.route);
         assert_eq!(host.direct_auth, vec![b"fresh-auth-1".to_vec()]);
@@ -4972,7 +4982,7 @@ mod tests {
             .expect("node rpc");
 
         assert_eq!(response.decode_body::<String>().expect("body"), "direct");
-        assert_eq!(host.calls, vec!["gateway", "cluster_id", "direct"]);
+        assert_eq!(host.calls, vec!["cluster_id", "direct"]);
         assert_eq!(host.direct_requests[0].route, request.route);
         assert_eq!(host.direct_auth, vec![b"fresh-auth-1".to_vec()]);
         assert!(host.relay_auth.is_empty());
@@ -5003,8 +5013,15 @@ mod tests {
         .expect("endpoint rpc");
 
         assert_eq!(response.decode_body::<String>().expect("body"), "direct");
-        assert_eq!(host.calls, vec!["gateway", "cluster_id", "direct"]);
+        assert_eq!(host.calls, vec!["cluster_id", "gateway", "direct"]);
         assert_eq!(host.signed_routes, vec![CLUSTER_RELAY_ROUTE.to_string()]);
+        let gateway_envelope =
+            RelayEnvelope::from_request(host.gateway_requests.first().expect("gateway request"))
+                .expect("gateway relay envelope");
+        assert_eq!(gateway_envelope.cluster_id, cluster_id);
+        assert_eq!(gateway_envelope.target_node_id, target);
+        assert_eq!(gateway_envelope.inner.auth, Some(b"inner-auth".to_vec()));
+        assert_eq!(gateway_envelope.inner.route, "/cluster/kv/range");
         assert_eq!(host.direct_requests[0].route, CLUSTER_RELAY_ROUTE);
         assert_ne!(host.direct_auth, vec![b"inner-auth".to_vec()]);
         let envelope =
@@ -5273,7 +5290,7 @@ mod tests {
         .expect("endpoint rpc");
 
         assert_eq!(response.decode_body::<String>().expect("body"), "relay-ok");
-        assert_eq!(host.calls, vec!["gateway", "cluster_id", "direct", "relay"]);
+        assert_eq!(host.calls, vec!["cluster_id", "direct", "relay"]);
         assert!(host.signed_routes.is_empty());
         assert_eq!(host.direct_auth, vec![b"inner-auth".to_vec()]);
         assert_eq!(host.relay_auth, vec![b"inner-auth".to_vec()]);
@@ -5315,7 +5332,7 @@ mod tests {
         .expect("endpoint rpc");
 
         assert_eq!(response.decode_body::<String>().expect("body"), "relay-ok");
-        assert_eq!(host.calls, vec!["gateway", "cluster_id", "direct", "relay"]);
+        assert_eq!(host.calls, vec!["cluster_id", "direct", "relay"]);
         assert_eq!(host.direct_auth, vec![b"inner-auth".to_vec()]);
         assert_eq!(host.relay_auth, vec![b"inner-auth".to_vec()]);
     }
@@ -5342,7 +5359,7 @@ mod tests {
         .expect("endpoint rpc");
 
         assert_eq!(response.decode_body::<String>().expect("body"), "direct");
-        assert_eq!(host.calls, vec!["gateway", "cluster_id", "direct"]);
+        assert_eq!(host.calls, vec!["cluster_id", "direct"]);
         assert_eq!(
             host.direct_timeout_policies,
             vec![DaemonRpcTimeouts::none()]
