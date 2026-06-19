@@ -3674,6 +3674,16 @@ fn drain_dfs_messages(
         .collect()
 }
 
+trait InProcessDfsTestTransportExt {
+    fn drain_dfs_incoming(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError>;
+}
+
+impl InProcessDfsTestTransportExt for sinomo_network::InProcessTransport {
+    fn drain_dfs_incoming(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
+        DfsMessageTransport::drain_incoming_messages(self)
+    }
+}
+
 fn test_chunked_assembler(
     root: &Path,
     name: &str,
@@ -12691,7 +12701,7 @@ fn stale_pending_remote_read_can_be_retried() {
     );
     assert_eq!(
         owner_transport
-            .drain_incoming()
+            .drain_dfs_incoming()
             .expect("initial owner mailbox")
             .len(),
         1
@@ -12704,7 +12714,7 @@ fn stale_pending_remote_read_can_be_retried() {
     );
     assert!(
         owner_transport
-            .drain_incoming()
+            .drain_dfs_incoming()
             .expect("deduped owner mailbox")
             .is_empty()
     );
@@ -12725,7 +12735,7 @@ fn stale_pending_remote_read_can_be_retried() {
     );
     assert_eq!(
         owner_transport
-            .drain_incoming()
+            .drain_dfs_incoming()
             .expect("retried owner mailbox")
             .len(),
         1
@@ -13036,7 +13046,7 @@ fn remote_read_planning_deduplicates_duplicate_locations() {
     );
     assert_eq!(
         owner_transport
-            .drain_incoming()
+            .drain_dfs_incoming()
             .expect("owner mailbox")
             .len(),
         1
@@ -13076,14 +13086,14 @@ fn remote_read_planning_uses_single_active_source_and_falls_back_after_miss() {
     );
     assert_eq!(
         owner_a_transport
-            .drain_incoming()
+            .drain_dfs_incoming()
             .expect("source a mailbox")
             .len(),
         1
     );
     assert!(
         owner_b_transport
-            .drain_incoming()
+            .drain_dfs_incoming()
             .expect("source b mailbox")
             .is_empty(),
         "remote reads should not fan out to every replica when one source is active"
@@ -13120,7 +13130,7 @@ fn remote_read_planning_uses_single_active_source_and_falls_back_after_miss() {
     );
     assert_eq!(
         owner_b_transport
-            .drain_incoming()
+            .drain_dfs_incoming()
             .expect("source b fallback mailbox")
             .len(),
         1
@@ -13162,7 +13172,7 @@ fn pending_remote_read_to_removed_location_does_not_block_fallback() {
     );
     assert_eq!(
         source_a_transport
-            .drain_incoming()
+            .drain_dfs_incoming()
             .expect("source a mailbox")
             .len(),
         1
@@ -13226,7 +13236,7 @@ fn pending_remote_read_to_removed_location_does_not_block_fallback() {
     );
     assert_eq!(
         source_b_transport
-            .drain_incoming()
+            .drain_dfs_incoming()
             .expect("source b mailbox")
             .len(),
         1
@@ -13266,7 +13276,7 @@ fn expired_remote_read_attempt_rotates_to_next_location_before_retrying_same_sou
     );
     assert_eq!(
         source_a_transport
-            .drain_incoming()
+            .drain_dfs_incoming()
             .expect("source a first mailbox")
             .len(),
         1
@@ -13283,14 +13293,14 @@ fn expired_remote_read_attempt_rotates_to_next_location_before_retrying_same_sou
     );
     assert!(
         source_a_transport
-            .drain_incoming()
+            .drain_dfs_incoming()
             .expect("source a retry mailbox")
             .is_empty(),
         "expired read should try a later replica before retrying the same silent source"
     );
     assert_eq!(
         source_b_transport
-            .drain_incoming()
+            .drain_dfs_incoming()
             .expect("source b mailbox")
             .len(),
         1
@@ -13332,7 +13342,7 @@ fn late_remote_read_from_removed_location_does_not_clear_fallback_request() {
         .expect("request source a");
     assert_eq!(
         source_a_transport
-            .drain_incoming()
+            .drain_dfs_incoming()
             .expect("source a mailbox")
             .len(),
         1
@@ -13353,7 +13363,7 @@ fn late_remote_read_from_removed_location_does_not_clear_fallback_request() {
         .expect("fallback source b");
     assert_eq!(
         source_b_transport
-            .drain_incoming()
+            .drain_dfs_incoming()
             .expect("source b mailbox")
             .len(),
         1
@@ -13445,12 +13455,12 @@ fn remote_read_rejection_from_stale_location_falls_back_to_next_source() {
     assert_eq!(
         if rejected_source == source_a {
             source_a_transport
-                .drain_incoming()
+                .drain_dfs_incoming()
                 .expect("source a mailbox")
                 .len()
         } else {
             source_b_transport
-                .drain_incoming()
+                .drain_dfs_incoming()
                 .expect("source b mailbox")
                 .len()
         },
@@ -13505,12 +13515,12 @@ fn remote_read_rejection_from_stale_location_falls_back_to_next_source() {
     assert_eq!(
         if fallback_source == source_a {
             source_a_transport
-                .drain_incoming()
+                .drain_dfs_incoming()
                 .expect("source a fallback mailbox")
                 .len()
         } else {
             source_b_transport
-                .drain_incoming()
+                .drain_dfs_incoming()
                 .expect("source b fallback mailbox")
                 .len()
         },
@@ -13572,12 +13582,12 @@ fn inline_remote_read_wrong_object_is_isolated_and_falls_back() {
     assert_eq!(
         if wrong_source == source_a {
             source_a_transport
-                .drain_incoming()
+                .drain_dfs_incoming()
                 .expect("source a mailbox")
                 .len()
         } else {
             source_b_transport
-                .drain_incoming()
+                .drain_dfs_incoming()
                 .expect("source b mailbox")
                 .len()
         },
@@ -13636,12 +13646,12 @@ fn inline_remote_read_wrong_object_is_isolated_and_falls_back() {
     assert_eq!(
         if fallback_source == source_a {
             source_a_transport
-                .drain_incoming()
+                .drain_dfs_incoming()
                 .expect("source a fallback mailbox")
                 .len()
         } else {
             source_b_transport
-                .drain_incoming()
+                .drain_dfs_incoming()
                 .expect("source b fallback mailbox")
                 .len()
         },
@@ -13685,7 +13695,7 @@ fn inline_remote_read_wrong_payload_object_is_isolated_and_falls_back() {
     );
     assert_eq!(
         source_a_transport
-            .drain_incoming()
+            .drain_dfs_incoming()
             .expect("source a mailbox")
             .len(),
         1
@@ -13742,7 +13752,7 @@ fn inline_remote_read_wrong_payload_object_is_isolated_and_falls_back() {
     );
     assert_eq!(
         source_b_transport
-            .drain_incoming()
+            .drain_dfs_incoming()
             .expect("source b mailbox")
             .len(),
         1

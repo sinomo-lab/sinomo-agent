@@ -220,7 +220,7 @@ impl Default for LanQuicFrameCodec {
 
 #[cfg(test)]
 impl LanQuicFrameCodec {
-    pub fn encode(&self, frame: &NetworkFrame) -> Result<Vec<u8>, NetworkError> {
+    pub(crate) fn encode(&self, frame: &NetworkFrame) -> Result<Vec<u8>, NetworkError> {
         let bytes = SinomoObjectCodec::default().encode(frame)?;
         if bytes.len() > self.max_frame_bytes {
             return Err(NetworkError::FrameTooLarge {
@@ -231,7 +231,7 @@ impl LanQuicFrameCodec {
         Ok(bytes)
     }
 
-    pub fn decode(&self, bytes: &[u8]) -> Result<NetworkFrame, NetworkError> {
+    pub(crate) fn decode(&self, bytes: &[u8]) -> Result<NetworkFrame, NetworkError> {
         if bytes.len() > self.max_frame_bytes {
             return Err(NetworkError::FrameTooLarge {
                 actual_bytes: bytes.len(),

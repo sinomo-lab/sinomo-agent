@@ -575,11 +575,13 @@ pub(crate) mod prelude {
     pub(crate) use serde::{Deserialize, Serialize};
     #[cfg(test)]
     pub(crate) use sinomo_core::ClusterCertificate;
+    #[cfg(test)]
+    pub(crate) use sinomo_core::EventEnvelope;
     pub(crate) use sinomo_core::{
         CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
         ClusterEndpointSource, ClusterInvitationChannel, ClusterJoinInvite, ClusterMemberRecord,
         ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability, ClusterNodeRole,
-        ClusterNodeStatusRecord, ClusterTransportKind, EventEnvelope, TrustDomain,
+        ClusterNodeStatusRecord, ClusterTransportKind, TrustDomain,
     };
     #[cfg(test)]
     pub(crate) use sinomo_core::{LatencyClass, RoutingScope};

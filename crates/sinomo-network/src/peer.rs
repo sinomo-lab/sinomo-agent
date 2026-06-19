@@ -509,26 +509,30 @@ impl Default for HeartbeatPolicy {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct Heartbeat {
-    pub node_id: NodeId,
-    pub tick: u64,
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[cfg(test)]
+pub(crate) struct Heartbeat {
+    pub(crate) node_id: NodeId,
+    pub(crate) tick: u64,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct MeshMessageId(pub u64);
+#[cfg(test)]
+pub(crate) struct MeshMessageId(pub(crate) u64);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct MeshMessage {
-    pub message_id: MeshMessageId,
-    pub origin_node_id: NodeId,
-    pub target_node_id: NodeId,
-    pub body: MeshMessageBody,
+#[cfg(test)]
+pub(crate) struct MeshMessage {
+    pub(crate) message_id: MeshMessageId,
+    pub(crate) origin_node_id: NodeId,
+    pub(crate) target_node_id: NodeId,
+    pub(crate) body: MeshMessageBody,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-pub enum MeshMessageBody {
+#[cfg(test)]
+pub(crate) enum MeshMessageBody {
     Event {
         delivery_id: RouteDeliveryId,
         event: Box<EventEnvelope>,
@@ -539,21 +543,23 @@ pub enum MeshMessageBody {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ProtocolMessage {
-    pub protocol: String,
+#[cfg(test)]
+pub(crate) struct ProtocolMessage {
+    pub(crate) protocol: String,
     #[serde(default, with = "serde_bytes")]
-    pub payload: Vec<u8>,
+    pub(crate) payload: Vec<u8>,
 }
 
+#[cfg(test)]
 impl ProtocolMessage {
-    pub fn new(protocol: impl Into<String>, payload: Vec<u8>) -> Self {
+    pub(crate) fn new(protocol: impl Into<String>, payload: Vec<u8>) -> Self {
         Self {
             protocol: protocol.into(),
             payload,
         }
     }
 
-    pub fn encode<T: serde::Serialize + ?Sized>(
+    pub(crate) fn encode<T: serde::Serialize + ?Sized>(
         protocol: impl Into<String>,
         payload: &T,
     ) -> Result<Self, NetworkError> {
@@ -563,26 +569,29 @@ impl ProtocolMessage {
         ))
     }
 
-    pub fn decode<T: serde::de::DeserializeOwned>(&self) -> Result<T, NetworkError> {
+    pub(crate) fn decode<T: serde::de::DeserializeOwned>(&self) -> Result<T, NetworkError> {
         crate::object::SinomoObjectCodec::default().decode(&self.payload)
     }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct NetworkFrameId(pub u64);
+#[cfg(test)]
+pub(crate) struct NetworkFrameId(pub(crate) u64);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct NetworkFrame {
-    pub frame_id: NetworkFrameId,
-    pub source_node_id: NodeId,
-    pub target_node_id: NodeId,
-    pub message: MeshMessage,
+#[cfg(test)]
+pub(crate) struct NetworkFrame {
+    pub(crate) frame_id: NetworkFrameId,
+    pub(crate) source_node_id: NodeId,
+    pub(crate) target_node_id: NodeId,
+    pub(crate) message: MeshMessage,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct InboundFrame {
-    pub received_by: NodeId,
-    pub frame: NetworkFrame,
+#[cfg(test)]
+pub(crate) struct InboundFrame {
+    pub(crate) received_by: NodeId,
+    pub(crate) frame: NetworkFrame,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -639,7 +648,7 @@ impl AsyncNetworkSendOptions {
 }
 
 #[cfg(test)]
-pub trait AsyncNetworkTransport {
+pub(crate) trait AsyncNetworkTransport {
     fn local_node_id(&self) -> &NodeId;
 
     fn send_async<'a>(
@@ -763,11 +772,10 @@ fn ingest_event<S: EventStore>(
     }
 }
 
-/// Synchronous in-memory frame harness.
+/// Synchronous in-memory object-RPC harness.
 ///
-/// This remains available for DFS and tests that drive frames manually. It is
-/// intentionally not an [`AsyncNetworkTransport`]; actor code uses
-/// [`AsyncInProcessNetwork`] or another async transport.
+/// DFS tests use this to drive routed messages through the canonical object-RPC
+/// mailbox. The legacy frame mailbox is compiled only for network crate tests.
 #[derive(Clone, Debug, Default)]
 pub struct InProcessNetwork {
     inner: Arc<InProcessNetworkInner>,
@@ -788,6 +796,7 @@ impl InProcessNetwork {
 
     pub fn add_node(&self, node_id: NodeId) -> InProcessTransport {
         let mut state = self.inner.state.lock().expect("in-process network lock");
+        #[cfg(test)]
         state.mailboxes.entry(node_id.clone()).or_default();
         state
             .object_rpc_mailboxes
@@ -810,6 +819,7 @@ struct InProcessNetworkInner {
 
 #[derive(Clone, Debug, Default)]
 struct InProcessNetworkState {
+    #[cfg(test)]
     mailboxes: BTreeMap<NodeId, VecDeque<InboundFrame>>,
     object_rpc_mailboxes: BTreeMap<NodeId, VecDeque<InboundObjectRpcMessage>>,
 }
@@ -825,7 +835,8 @@ impl InProcessTransport {
         &self.local_node_id
     }
 
-    pub fn send(
+    #[cfg(test)]
+    pub(crate) fn send(
         &mut self,
         target_node_id: &NodeId,
         frame: NetworkFrame,
@@ -912,7 +923,8 @@ impl InProcessTransport {
         Ok(())
     }
 
-    pub fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
+    #[cfg(test)]
+    pub(crate) fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
         let mut inner = self
             .inner
             .state
@@ -950,7 +962,8 @@ impl InProcessTransport {
         Ok(mailbox.drain(..).collect())
     }
 
-    pub fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+    #[cfg(test)]
+    pub(crate) fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
         let inner = self
             .inner
             .state
@@ -985,7 +998,8 @@ impl InProcessTransport {
         Ok(Some(mailbox.len()))
     }
 
-    pub fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {
+    #[cfg(test)]
+    pub(crate) fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {
         let mut inner = self
             .inner
             .state
@@ -1081,28 +1095,6 @@ impl InProcessTransport {
                 node_id: self.local_node_id.clone(),
             })?;
         Ok(!mailbox.is_empty())
-    }
-
-    pub fn drain_incoming_limited(
-        &mut self,
-        max_frames: usize,
-    ) -> Result<Vec<InboundFrame>, NetworkError> {
-        let mut inner = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| NetworkError::Serialization {
-                detail: "in-process network lock poisoned".to_string(),
-            })?;
-        let mailbox = inner
-            .mailboxes
-            .get_mut(&self.local_node_id)
-            .ok_or_else(|| NetworkError::UnknownNode {
-                node_id: self.local_node_id.clone(),
-            })?;
-        let take = mailbox.len().min(max_frames.max(1));
-
-        Ok(mailbox.drain(..take).collect())
     }
 }
 
@@ -2607,6 +2599,7 @@ fn network_service_command_timed_out(operation: &str, timeout: Duration) -> Netw
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[cfg(test)]
 pub struct DeliveryAck {
     pub delivery_id: RouteDeliveryId,
     pub event_id: EventId,
