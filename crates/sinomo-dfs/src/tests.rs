@@ -982,15 +982,14 @@ impl ClusterPathDfsControlPlaneKvClient {
     }
 }
 
-fn append_cluster_raft_command(
+fn append_cluster_kv_command(
     paths: &ClusterPaths,
     node_id: &NodeId,
     command: sinomo_kv::KvCommand,
 ) -> Result<sinomo_kv::KvSnapshot, sinomo_network::NetworkError> {
     paths
         .kv_paths()
-        .raft_store()
-        .append_command_and_publish(
+        .append_kv_command_and_publish(
             node_id,
             command,
             sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
@@ -998,7 +997,7 @@ fn append_cluster_raft_command(
         .map_err(Into::into)
 }
 
-fn append_cluster_raft_command_with_response(
+fn append_cluster_kv_command_with_response(
     paths: &ClusterPaths,
     node_id: &NodeId,
     command: sinomo_kv::KvCommand,
@@ -1006,13 +1005,11 @@ fn append_cluster_raft_command_with_response(
 {
     paths
         .kv_paths()
-        .raft_store()
-        .append_command_with_response_and_publish(
+        .append_kv_command_with_response_and_publish(
             node_id,
             command,
             sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
-        .map(|result| (result.snapshot, result.txn_response))
         .map_err(Into::into)
 }
 
@@ -1048,7 +1045,7 @@ impl DfsControlPlaneKvClient for ClusterPathDfsControlPlaneKvClient {
     ) -> Result<sinomo_kv::KvTxnResponse, sinomo_kv::KvError> {
         let state = sinomo_network::read_cluster_state(&self.cluster_paths)
             .map_err(|source| self.kv_error(source))?;
-        let (snapshot, response) = append_cluster_raft_command_with_response(
+        let (snapshot, response) = append_cluster_kv_command_with_response(
             &self.cluster_paths,
             &state.local_node_id,
             sinomo_kv::KvCommand::Txn(txn),
@@ -4239,7 +4236,7 @@ fn cluster_maintenance_tick_opens_service_and_publishes_metadata() {
         assignment: DfsMetadataShardAssignment::Root,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
-    append_cluster_raft_command(
+    append_cluster_kv_command(
         &cluster_paths,
         &local,
         sinomo_kv::KvCommand::Op(
@@ -4367,7 +4364,7 @@ fn cluster_smoke_opens_service_and_publishes_metadata() {
         assignment: DfsMetadataShardAssignment::Root,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
-    append_cluster_raft_command(
+    append_cluster_kv_command(
         &cluster_paths,
         &local,
         sinomo_kv::KvCommand::Op(
@@ -6079,7 +6076,7 @@ fn cluster_metadata_journal_publish_reads_cluster_state_and_shards() {
         assignment: DfsMetadataShardAssignment::Root,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
-    append_cluster_raft_command(
+    append_cluster_kv_command(
         &cluster_paths,
         &local,
         sinomo_kv::KvCommand::Op(
@@ -6205,7 +6202,7 @@ fn scheduled_cluster_metadata_publish_uses_async_peer_transport() {
         assignment: DfsMetadataShardAssignment::Root,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
-    append_cluster_raft_command(
+    append_cluster_kv_command(
         &cluster_paths,
         &local,
         sinomo_kv::KvCommand::Op(
@@ -6361,7 +6358,7 @@ fn async_cluster_metadata_publish_repairs_sequence_conflict_with_snapshot() {
             assignment: DfsMetadataShardAssignment::Root,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
-        append_cluster_raft_command(
+        append_cluster_kv_command(
             &cluster_paths,
             &local,
             sinomo_kv::KvCommand::Op(

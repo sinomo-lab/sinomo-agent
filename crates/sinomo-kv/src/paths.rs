@@ -138,4 +138,38 @@ impl ClusterKvPaths {
     pub fn raft_store(&self) -> ClusterKvRaftStore {
         ClusterKvRaftStore::new(self.clone(), default_cluster_kv_raft_compaction_policy())
     }
+
+    pub fn append_kv_command_and_publish<F>(
+        &self,
+        node_id: &NodeId,
+        command: KvCommand,
+        key_can_defer_materialized_snapshot: F,
+    ) -> Result<KvSnapshot, KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.raft_store().append_command_and_publish(
+            node_id,
+            command,
+            key_can_defer_materialized_snapshot,
+        )
+    }
+
+    pub fn append_kv_command_with_response_and_publish<F>(
+        &self,
+        node_id: &NodeId,
+        command: KvCommand,
+        key_can_defer_materialized_snapshot: F,
+    ) -> Result<(KvSnapshot, Option<KvTxnResponse>), KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.raft_store()
+            .append_command_with_response_and_publish(
+                node_id,
+                command,
+                key_can_defer_materialized_snapshot,
+            )
+            .map(|result| (result.snapshot, result.txn_response))
+    }
 }
