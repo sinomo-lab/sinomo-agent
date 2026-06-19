@@ -50,6 +50,24 @@ impl<'a> ClusterEndpointSelector<'a> {
         Self { paths, state }
     }
 
+    pub fn advertised_peer_route_targets_for_state(
+        state: &ClusterBootstrapState,
+    ) -> Vec<SocketAddr> {
+        advertised_peer_route_targets(state)
+    }
+
+    pub fn discover_peer_route_ip_candidates_for_state(
+        state: &ClusterBootstrapState,
+    ) -> Vec<IpAddr> {
+        discover_peer_route_ip_candidates(state)
+    }
+
+    pub async fn discover_peer_route_ip_candidates_for_state_async(
+        state: &ClusterBootstrapState,
+    ) -> Vec<IpAddr> {
+        discover_peer_route_ip_candidates_async(state).await
+    }
+
     pub fn select(&self, purpose: ClusterEndpointSelectionPurpose) -> Vec<ClusterEndpointRecord> {
         match purpose {
             ClusterEndpointSelectionPurpose::DaemonCommand => {
@@ -1052,7 +1070,7 @@ pub(crate) fn prefer_bounded_daemon_command_targets(
     selected
 }
 
-pub fn advertised_peer_route_targets(state: &ClusterBootstrapState) -> Vec<SocketAddr> {
+pub(crate) fn advertised_peer_route_targets(state: &ClusterBootstrapState) -> Vec<SocketAddr> {
     let mut targets = Vec::new();
     for member in &state.members {
         if member.node_id == state.local_node_id || !member.state.is_authorized() {
@@ -1080,11 +1098,13 @@ pub fn advertised_peer_route_targets(state: &ClusterBootstrapState) -> Vec<Socke
     targets
 }
 
-pub fn discover_peer_route_ip_candidates(state: &ClusterBootstrapState) -> Vec<IpAddr> {
+pub(crate) fn discover_peer_route_ip_candidates(state: &ClusterBootstrapState) -> Vec<IpAddr> {
     discover_local_ip_candidates_for_targets(advertised_peer_route_targets(state))
 }
 
-pub async fn discover_peer_route_ip_candidates_async(state: &ClusterBootstrapState) -> Vec<IpAddr> {
+pub(crate) async fn discover_peer_route_ip_candidates_async(
+    state: &ClusterBootstrapState,
+) -> Vec<IpAddr> {
     discover_local_ip_candidates_for_targets_async(advertised_peer_route_targets(state)).await
 }
 

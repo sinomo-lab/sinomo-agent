@@ -122,7 +122,8 @@ pub(crate) fn ensure_daemon_cluster_members(
     let main_node_id = state.local_node_id.clone();
     let shadow_node_id = sinomo_node::shadow_daemon_node_id(&state.local_node_id);
     let lan_ips = sinomo_network::discover_default_lan_ip_candidates();
-    let route_ips = sinomo_network::discover_peer_route_ip_candidates(state);
+    let route_ips =
+        sinomo_network::ClusterEndpointSelector::discover_peer_route_ip_candidates_for_state(state);
     let main_endpoints = daemon_advertised_endpoints_for_state(
         state,
         &main_node_id,

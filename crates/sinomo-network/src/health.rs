@@ -11,10 +11,9 @@ use crate::rpc::{
 };
 use crate::rpc_future::ClusterMembershipRpcFuture;
 use crate::{
-    ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityState, ClusterPaths,
-    NetworkError, iroh_endpoint_public_key,
+    ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityState,
+    ClusterEndpointSelector, ClusterPaths, NetworkError, iroh_endpoint_public_key,
 };
-use crate::{advertised_peer_route_targets, discover_peer_route_ip_candidates};
 use sinomo_node::{
     DAEMON_MAIN_RUN_CAPABILITY, cluster_member_expected_daemon_process,
     cluster_member_is_legacy_shadow_daemon, live_cluster_member_probe_possible,
@@ -478,9 +477,9 @@ pub fn cluster_doctor_findings(
         }
     }
 
-    let route_targets = advertised_peer_route_targets(state);
+    let route_targets = ClusterEndpointSelector::advertised_peer_route_targets_for_state(state);
     if !route_targets.is_empty() {
-        let route_ips = discover_peer_route_ip_candidates(state);
+        let route_ips = ClusterEndpointSelector::discover_peer_route_ip_candidates_for_state(state);
         if route_ips.is_empty() {
             findings.push(ClusterDoctorFinding::warning(
                 "peer-route-unadvertised",

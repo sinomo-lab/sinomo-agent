@@ -4178,7 +4178,8 @@ fn local_daemon_membership_observation(
     timestamp: OffsetDateTime,
 ) -> Result<sinomo_network::ClusterLocalDaemonMembershipObservation, DaemonError> {
     let lan_ips = sinomo_network::discover_default_lan_ip_candidates();
-    let route_ips = sinomo_network::discover_peer_route_ip_candidates(state);
+    let route_ips =
+        sinomo_network::ClusterEndpointSelector::discover_peer_route_ip_candidates_for_state(state);
     let main_node_id = state.local_node_id.clone();
     let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
     let main_endpoints = crate::daemon_advertised_endpoints_for_state(
@@ -4217,7 +4218,10 @@ async fn local_daemon_membership_observation_async(
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_network::ClusterLocalDaemonMembershipObservation, DaemonError> {
     let lan_ips = sinomo_network::discover_default_lan_ip_candidates_async();
-    let route_ips = sinomo_network::discover_peer_route_ip_candidates_async(state);
+    let route_ips =
+        sinomo_network::ClusterEndpointSelector::discover_peer_route_ip_candidates_for_state_async(
+            state,
+        );
     let (lan_ips, route_ips) = tokio::join!(lan_ips, route_ips);
     let main_node_id = state.local_node_id.clone();
     let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);

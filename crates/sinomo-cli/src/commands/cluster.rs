@@ -1,8 +1,6 @@
 use super::*;
 
 #[cfg(test)]
-pub(crate) use network::advertised_peer_route_targets;
-#[cfg(test)]
 pub(crate) use network::apply_cluster_node_role;
 #[cfg(test)]
 pub(crate) use network::cluster_state_sync_txn;
@@ -1716,7 +1714,8 @@ fn local_daemon_member_endpoints(
     let main_node_id = state.local_node_id.clone();
     let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
     let lan_ips = network::discover_default_lan_ip_candidates();
-    let route_ips = network::discover_peer_route_ip_candidates(state);
+    let route_ips =
+        network::ClusterEndpointSelector::discover_peer_route_ip_candidates_for_state(state);
     let main_endpoints = daemon_advertised_endpoints_for_state(
         state,
         &main_node_id,
