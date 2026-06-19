@@ -539,39 +539,6 @@ pub(crate) enum MeshMessageBody {
     },
     Ack(DeliveryAck),
     Heartbeat(Heartbeat),
-    Protocol(ProtocolMessage),
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg(test)]
-pub(crate) struct ProtocolMessage {
-    pub(crate) protocol: String,
-    #[serde(default, with = "serde_bytes")]
-    pub(crate) payload: Vec<u8>,
-}
-
-#[cfg(test)]
-impl ProtocolMessage {
-    pub(crate) fn new(protocol: impl Into<String>, payload: Vec<u8>) -> Self {
-        Self {
-            protocol: protocol.into(),
-            payload,
-        }
-    }
-
-    pub(crate) fn encode<T: serde::Serialize + ?Sized>(
-        protocol: impl Into<String>,
-        payload: &T,
-    ) -> Result<Self, NetworkError> {
-        Ok(Self::new(
-            protocol,
-            crate::object::SinomoObjectCodec::default().encode(payload)?,
-        ))
-    }
-
-    pub(crate) fn decode<T: serde::de::DeserializeOwned>(&self) -> Result<T, NetworkError> {
-        crate::object::SinomoObjectCodec::default().decode(&self.payload)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1815,12 +1782,6 @@ impl<T: AsyncNetworkTransport> NetworkService<T> {
                         requeued,
                     });
                 }
-                MeshMessageBody::Protocol(protocol_message) => {
-                    outcomes.push(InboundOutcome::ProtocolIgnored {
-                        protocol: protocol_message.protocol,
-                        source_node_id: inbound.frame.source_node_id,
-                    });
-                }
             }
         }
 
@@ -2654,10 +2615,6 @@ pub enum InboundOutcome {
     },
     HeartbeatIgnored {
         node_id: NodeId,
-        source_node_id: NodeId,
-    },
-    ProtocolIgnored {
-        protocol: String,
         source_node_id: NodeId,
     },
 }
