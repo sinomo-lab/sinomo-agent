@@ -1,4 +1,4 @@
-use crate::endpoint_selector::{ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector};
+use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
 use crate::route::{cluster_endpoint_prefers_relay_with_graph, cluster_route_next_hop};
 use crate::{ClusterConnectivityGraph, ClusterPaths, NetworkError};
 use sinomo_core::{
@@ -79,7 +79,7 @@ pub fn cluster_reachable_state_authority_count_with_host(
     }
     let deadline = Instant::now() + options.timeout;
     let targets = ClusterEndpointSelector::new(paths, state)
-        .select_internal(ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand);
+        .select(ClusterEndpointSelectionPurpose::AvailableClusterStateAuthority);
     let graph = ClusterConnectivityGraph::read_for_local(paths, state);
     for (index, endpoint) in targets.iter().enumerate() {
         let remaining = deadline
@@ -120,7 +120,7 @@ pub async fn cluster_reachable_state_authority_count_async_with_host(
     }
     let deadline = Instant::now() + options.timeout;
     let targets = ClusterEndpointSelector::new(paths, state)
-        .select_internal(ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand);
+        .select(ClusterEndpointSelectionPurpose::AvailableClusterStateAuthority);
     let graph = ClusterConnectivityGraph::read_for_local(paths, state);
     for (index, endpoint) in targets.iter().enumerate() {
         let remaining = deadline

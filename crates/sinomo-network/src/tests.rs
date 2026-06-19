@@ -4761,7 +4761,7 @@ fn local_route_graph_uses_persisted_self_connectivity_after_cache_loss() {
     );
 
     let targets = ClusterEndpointSelector::new(&paths, &state)
-        .select_internal(ClusterEndpointInternalSelectionPurpose::RaftCommand);
+        .select(ClusterEndpointSelectionPurpose::ClusterStateCommand);
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&iroh.endpoint_id),
@@ -5265,7 +5265,7 @@ fn raft_command_targets_try_unknown_tcp_before_unknown_iroh_fallbacks() {
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
 
     let targets = ClusterEndpointSelector::new(&paths, &state)
-        .select_internal(ClusterEndpointInternalSelectionPurpose::RaftCommand);
+        .select(ClusterEndpointSelectionPurpose::ClusterStateCommand);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
@@ -5353,7 +5353,7 @@ fn raft_command_targets_preserve_verified_connectivity_before_unknown_tcp() {
     .expect("connectivity records");
 
     let targets = ClusterEndpointSelector::new(&paths, &state)
-        .select_internal(ClusterEndpointInternalSelectionPurpose::RaftCommand);
+        .select(ClusterEndpointSelectionPurpose::ClusterStateCommand);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
@@ -5461,7 +5461,7 @@ fn raft_command_targets_keep_degraded_direct_before_iroh() {
     .expect("connectivity records");
 
     let targets = ClusterEndpointSelector::new(&paths, &state)
-        .select_internal(ClusterEndpointInternalSelectionPurpose::RaftCommand);
+        .select(ClusterEndpointSelectionPurpose::ClusterStateCommand);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
@@ -5574,7 +5574,7 @@ fn raft_command_targets_prefer_reachable_voter_over_unreachable_voter() {
     .expect("sync connectivity");
 
     let targets = ClusterEndpointSelector::new(&paths, &state)
-        .select_internal(ClusterEndpointInternalSelectionPurpose::RaftCommand);
+        .select(ClusterEndpointSelectionPurpose::ClusterStateCommand);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.node_id),
@@ -14212,8 +14212,7 @@ fn advertised_hostname_outranks_opportunistic_private_ip_for_docker_routes() {
     .expect("connectivity records");
 
     let selector = ClusterEndpointSelector::new(&paths, &state);
-    let raft_targets =
-        selector.select_internal(ClusterEndpointInternalSelectionPurpose::RaftCommand);
+    let raft_targets = selector.select(ClusterEndpointSelectionPurpose::ClusterStateCommand);
     assert_eq!(
         raft_targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&stable_hostname.endpoint_id),
