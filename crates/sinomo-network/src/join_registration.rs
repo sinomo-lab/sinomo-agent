@@ -15,6 +15,7 @@ use crate::local_membership::{
 use crate::local_state_store::{
     read_cluster_state, read_cluster_state_without_kv, write_cluster_state,
 };
+use crate::member_mutation::sync_cluster_state_to_kv_with_host;
 use crate::member_store::upsert_member_record;
 use crate::membership::cluster_member_is_local_process;
 use crate::membership_forward::{
@@ -30,7 +31,6 @@ use crate::rpc::{
     ObjectRpcRequest, ObjectRpcResponse,
 };
 use crate::rpc_future::ClusterMembershipRpcFuture;
-use crate::storage::sync_cluster_state_to_kv_with_host;
 use sinomo_kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
 use std::time::{Duration, Instant};
 

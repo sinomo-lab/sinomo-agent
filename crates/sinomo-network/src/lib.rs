@@ -256,7 +256,11 @@ pub use maintenance::{
 };
 pub use member_mutation::{
     ClusterMemberMutationAsyncHost, ClusterMemberMutationDriver, ClusterMemberMutationHost,
-    ClusterNodeRoleUpdate,
+    ClusterMemberRemoval, ClusterNodeRoleUpdate, ClusterRaftRoleUpdate,
+    cleanup_legacy_shadow_daemon_members_with_host, cluster_state_sync_txn,
+    remove_cluster_members_with_host, sync_cluster_state_to_kv_async_with_host,
+    sync_cluster_state_to_kv_with_host, sync_cluster_state_to_local_raft_unchecked,
+    update_cluster_node_role_with_host, update_cluster_raft_role_with_host,
 };
 pub use member_publish::{
     ClusterLocalMemberPublishAsyncHost, ClusterLocalMemberPublishHost,
@@ -393,12 +397,6 @@ pub use status_publish::{
     publish_cluster_node_status_to_quorum_with_host, stored_cluster_network_info_matches,
     stored_cluster_node_status_matches, sync_cluster_network_info_to_kv,
     sync_cluster_node_status_to_kv,
-};
-pub use storage::{
-    cleanup_legacy_shadow_daemon_members_with_host, cluster_state_sync_txn,
-    remove_cluster_members_with_host, sync_cluster_state_to_kv_async_with_host,
-    sync_cluster_state_to_kv_with_host, sync_cluster_state_to_local_raft_unchecked,
-    update_cluster_node_role_with_host, update_cluster_raft_role_with_host,
 };
 pub use voter_reachability::{
     ClusterVoterReachabilityAsyncHost, ClusterVoterReachabilityHost,
