@@ -3101,23 +3101,23 @@ pub(crate) fn open_cluster_dfs_service_with_message_sender(
     service.with_boxed_metadata_backend(metadata)
 }
 
-pub(crate) fn open_cluster_dfs_service_with_message_senders(
+fn open_cluster_dfs_service_with_peer_transports(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     local_node_id: NodeId,
     endpoints: Vec<ClusterEndpointRecord>,
-    message_sender: DfsMessageSender,
-    async_message_sender: AsyncDfsMessageSender,
+    peer_transport: Arc<dyn DfsPeerTransport>,
+    async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
     control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
 ) -> Result<NetworkedDfsService<DfsEndpointTransport>, DfsError> {
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
     let mut service = NetworkedDfsService::new(
-        DfsEndpointTransport::with_connect_timeout_and_message_senders(
+        DfsEndpointTransport::with_peer_transports(
             local_node_id,
             endpoints,
             DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
-            message_sender,
-            async_message_sender,
+            peer_transport,
+            async_peer_transport,
         ),
         content,
     );
@@ -3223,13 +3223,13 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport(
     let file_system = distributed_sifs(local_node_id.clone());
     let metadata_shards = cluster_dfs_metadata_shards(&cluster_paths, &file_system.file_system_id)?;
     let endpoints = cluster_dfs_data_endpoints(&cluster_paths, &state);
-    let mut service = open_cluster_dfs_service_with_message_senders(
+    let mut service = open_cluster_dfs_service_with_peer_transports(
         &data_dir,
         &cluster_paths,
         local_node_id.clone(),
         endpoints.clone(),
-        dfs_message_sender_from_peer_transport(sync_peer_transport),
-        async_dfs_message_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        sync_peer_transport,
+        Arc::clone(&peer_transport),
         control_plane,
     )?;
     let mut maintenance_host = LocalDfsMaintenanceHost::new(data_dir.clone());
@@ -8128,7 +8128,7 @@ pub(crate) fn async_dfs_message_sender_from_peer_transport(
     Arc::new(move |endpoint, command, connect_timeout| {
         let peer_transport = Arc::clone(&peer_transport);
         Box::pin(async move {
-            let request = dfs_routed_message_rpc_request(&command.routed_message)
+            let request = dfs_message_rpc_request(command)
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
             let response = peer_transport
                 .call_object_rpc_async(
@@ -8213,7 +8213,7 @@ pub(crate) fn dfs_message_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsMessageSender {
     Arc::new(move |endpoint, command, connect_timeout| {
-        let request = dfs_routed_message_rpc_request(&command.routed_message)
+        let request = dfs_message_rpc_request(command)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
         let response = peer_transport.call_object_rpc(
             endpoint,
@@ -8382,24 +8382,6 @@ impl DfsEndpointTransport {
 
     #[cfg(test)]
     pub(crate) fn with_connect_timeout_and_senders(
-        local_node_id: NodeId,
-        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
-        connect_timeout: Duration,
-        sender: DfsMessageSender,
-        async_sender: AsyncDfsMessageSender,
-    ) -> Self {
-        Self::with_senders(
-            local_node_id,
-            endpoints,
-            connect_timeout,
-            Some(sender),
-            Some(async_sender),
-            None,
-            None,
-        )
-    }
-
-    pub(crate) fn with_connect_timeout_and_message_senders(
         local_node_id: NodeId,
         endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
         connect_timeout: Duration,
