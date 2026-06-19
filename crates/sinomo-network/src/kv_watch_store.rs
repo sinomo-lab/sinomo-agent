@@ -1,4 +1,6 @@
+#[cfg(test)]
 use crate::ClusterPaths;
+#[cfg(test)]
 use crate::error::NetworkError;
 #[cfg(test)]
 use crate::file_mark::{ClusterFileMark, cluster_file_mark};
@@ -9,7 +11,6 @@ use crate::kv_local_store::{
     cluster_raft_wal_paths, read_cluster_kv_cached_snapshot_if_present,
     read_cluster_kv_current_snapshot_arc, read_cluster_kv_reader_node_id,
 };
-use crate::local_state_store::read_cluster_state;
 
 #[cfg(test)]
 use sinomo_kv::{
@@ -17,7 +18,6 @@ use sinomo_kv::{
     ClusterKvWatchDrainResponse, ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration, KvError,
     KvEvent, KvRevision, WatchId,
 };
-use sinomo_kv::{ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse};
 #[cfg(test)]
 use std::collections::HashMap;
 #[cfg(test)]
@@ -962,15 +962,6 @@ pub(crate) fn wait_for_cluster_kv_watch_change_for_test(
     timeout: Duration,
 ) -> bool {
     wait_for_cluster_kv_watch_change(paths, observed_generation, timeout)
-}
-
-pub fn handle_cluster_kv_watch_events(
-    paths: &ClusterPaths,
-    request: ClusterKvWatchEventsRequest,
-) -> Result<ClusterKvWatchEventsResponse, NetworkError> {
-    let state = read_cluster_state(paths)?;
-    sinomo_kv::handle_cluster_kv_watch_events(&paths.kv_paths(), &state, request)
-        .map_err(Into::into)
 }
 
 #[cfg(test)]

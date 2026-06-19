@@ -260,7 +260,8 @@ fn handle_cluster_kv_watch_events_request(
     request: &ObjectRpcRequest,
 ) -> Result<ObjectRpcResponse, ServiceError> {
     let payload = sinomo_kv::decode_cluster_kv_watch_events_rpc_request_body(&request.body)?;
-    let response = sinomo_network::handle_cluster_kv_watch_events(paths, payload)?;
+    let state = sinomo_network::read_cluster_state(paths)?;
+    let response = sinomo_kv::handle_cluster_kv_watch_events(&paths.kv_paths(), &state, payload)?;
     let payload = sinomo_kv::cluster_kv_watch_events_response_rpc_payload(&response)?;
     Ok(object_rpc_response_from_kv_payload(payload))
 }

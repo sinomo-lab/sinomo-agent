@@ -210,7 +210,6 @@ pub use kv_txn_quorum::{
     commit_cluster_kv_txn_with_quorum_response_with_host,
     handle_cluster_kv_txn_request_async_with_host,
 };
-pub use kv_watch_store::handle_cluster_kv_watch_events;
 pub use lan::{
     AsyncMdnsDiscoverySocket, MdnsDiscoveryAdvertisement, MdnsDiscoveryCache, MdnsDiscoveryRecord,
     apply_lan_discovery_advertisements, discover_default_lan_ip_candidates,

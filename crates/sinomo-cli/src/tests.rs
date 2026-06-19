@@ -10425,8 +10425,9 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
     let host_events = read_cluster_kv_snapshot(&host_paths)
         .expect("host watch snapshot")
         .events;
-    let watch_fanout = network::handle_cluster_kv_watch_events(
-        &peer_paths,
+    let watch_fanout = sinomo_runtime::kv::handle_cluster_kv_watch_events(
+        &peer_paths.kv_paths(),
+        &peer_state,
         sinomo_runtime::kv::ClusterKvWatchEventsRequest {
             state: host_state.clone(),
             leader_id: host_state.local_node_id.clone(),

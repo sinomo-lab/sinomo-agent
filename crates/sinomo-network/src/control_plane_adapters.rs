@@ -60,8 +60,6 @@ use crate::kv_txn_quorum::commit_cluster_kv_txn_with_quorum_response_with_host;
 #[cfg(test)]
 pub(crate) use crate::kv_txn_quorum::handle_cluster_kv_txn_request_with_host;
 #[cfg(test)]
-pub(crate) use crate::kv_watch_store::handle_cluster_kv_watch_events;
-#[cfg(test)]
 pub(crate) use crate::kv_watch_store::{
     append_cluster_kv_watch_events, append_cluster_kv_watch_events_for_active_watches,
     cached_cluster_kv_watch_events_contain_all, cached_cluster_kv_watch_events_for_test,

@@ -20133,10 +20133,11 @@ fn cluster_kv_watch_events_receiver_skips_storage_without_active_watchers() {
         },
     };
 
-    let response = handle_cluster_kv_watch_events(
-        &paths,
+    let response = sinomo_kv::handle_cluster_kv_watch_events(
+        &paths.kv_paths(),
+        &state,
         ClusterKvWatchEventsRequest {
-            state,
+            state: state.clone(),
             leader_id,
             events: vec![event],
         },
