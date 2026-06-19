@@ -200,8 +200,9 @@ static PUBLISHED_NETWORK_INFO: OnceLock<Mutex<BTreeMap<String, ClusterNetworkInf
     OnceLock::new();
 static PUBLISHED_NODE_STATUS: OnceLock<Mutex<BTreeMap<String, ClusterNodeStatusRecord>>> =
     OnceLock::new();
-static PUBLISHED_CONNECTIVITY: OnceLock<Mutex<BTreeMap<String, PublishedConnectivitySourceCache>>> =
-    OnceLock::new();
+static PUBLISHED_CONNECTIVITY: OnceLock<
+    Mutex<BTreeMap<PublishedConnectivitySourceKey, PublishedConnectivitySourceCache>>,
+> = OnceLock::new();
 
 thread_local! {
     static COMMAND_CONNECTIVITY_SYNC_IN_FLIGHT: std::cell::Cell<bool> =
@@ -358,9 +359,23 @@ async fn current_shadow_daemon_options_for_cluster_async(
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct PublishedConnectivitySourceKey {
+    root: String,
+    source_node_id: NodeId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct PublishedConnectivityRecordKey {
+    root: String,
+    source_node_id: NodeId,
+    target_node_id: NodeId,
+    endpoint_id: sinomo_network::ClusterEndpointId,
+}
+
 #[derive(Clone, Debug, Default)]
 struct PublishedConnectivitySourceCache {
-    records: BTreeMap<String, ClusterConnectivityRecord>,
+    records: BTreeMap<PublishedConnectivityRecordKey, ClusterConnectivityRecord>,
 }
 
 fn publish_cache_key(paths: &ClusterPaths, node_id: &NodeId) -> String {
@@ -385,16 +400,16 @@ fn insert_bounded_published_cache<T>(
 }
 
 fn published_connectivity_cache_record_count(
-    cache: &BTreeMap<String, PublishedConnectivitySourceCache>,
+    cache: &BTreeMap<PublishedConnectivitySourceKey, PublishedConnectivitySourceCache>,
 ) -> usize {
     cache.values().map(|source| source.records.len()).sum()
 }
 
 fn ensure_published_connectivity_source(
-    cache: &mut BTreeMap<String, PublishedConnectivitySourceCache>,
-    source_prefix: String,
+    cache: &mut BTreeMap<PublishedConnectivitySourceKey, PublishedConnectivitySourceCache>,
+    source_key: PublishedConnectivitySourceKey,
 ) {
-    if cache.contains_key(&source_prefix) {
+    if cache.contains_key(&source_key) {
         return;
     }
     while cache.len() >= PUBLISHED_CONNECTIVITY_CACHE_MAX_SOURCES {
@@ -403,34 +418,34 @@ fn ensure_published_connectivity_source(
         };
         cache.remove(&oldest);
     }
-    cache.insert(source_prefix, PublishedConnectivitySourceCache::default());
+    cache.insert(source_key, PublishedConnectivitySourceCache::default());
 }
 
 fn trim_published_connectivity_cache_records(
-    cache: &mut BTreeMap<String, PublishedConnectivitySourceCache>,
-    protected_source_prefix: &str,
+    cache: &mut BTreeMap<PublishedConnectivitySourceKey, PublishedConnectivitySourceCache>,
+    protected_source_key: &PublishedConnectivitySourceKey,
 ) {
     while published_connectivity_cache_record_count(cache)
         > PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS
     {
         let evict_source = cache
             .iter()
-            .find(|(source_prefix, source)| {
-                source_prefix.as_str() != protected_source_prefix && !source.records.is_empty()
+            .find(|(source_key, source)| {
+                *source_key != protected_source_key && !source.records.is_empty()
             })
-            .map(|(source_prefix, _)| source_prefix.clone())
+            .map(|(source_key, _)| source_key.clone())
             .or_else(|| {
                 cache
                     .keys()
-                    .find(|source_prefix| source_prefix.as_str() != protected_source_prefix)
+                    .find(|source_key| *source_key != protected_source_key)
                     .cloned()
             });
-        if let Some(source_prefix) = evict_source {
-            cache.remove(&source_prefix);
+        if let Some(source_key) = evict_source {
+            cache.remove(&source_key);
             continue;
         }
 
-        let Some(source) = cache.get_mut(protected_source_prefix) else {
+        let Some(source) = cache.get_mut(protected_source_key) else {
             break;
         };
         while source.records.len() > PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS {
@@ -503,28 +518,28 @@ fn remember_node_status(paths: &ClusterPaths, status: &ClusterNodeStatusRecord) 
     }
 }
 
-fn connectivity_cache_key(paths: &ClusterPaths, record: &ClusterConnectivityRecord) -> String {
-    format!(
-        "{}:{}",
-        paths.root.display(),
-        sinomo_network::cluster_connectivity_key(
-            &record.source_node_id,
-            &record.target_node_id,
-            &record.endpoint_id,
-        )
-    )
+fn connectivity_cache_key(
+    paths: &ClusterPaths,
+    record: &ClusterConnectivityRecord,
+) -> PublishedConnectivityRecordKey {
+    PublishedConnectivityRecordKey {
+        root: paths.root.display().to_string(),
+        source_node_id: record.source_node_id.clone(),
+        target_node_id: record.target_node_id.clone(),
+        endpoint_id: record.endpoint_id.clone(),
+    }
 }
 
 fn cached_connectivity_matches(paths: &ClusterPaths, record: &ClusterConnectivityRecord) -> bool {
     let key = connectivity_cache_key(paths, record);
-    let source_prefix = connectivity_cache_source_prefix(paths, &record.source_node_id);
+    let source_key = connectivity_cache_source_key(paths, &record.source_node_id);
     let now = OffsetDateTime::now_utc();
     PUBLISHED_CONNECTIVITY
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
         .is_ok_and(|cache| {
             cache
-                .get(&source_prefix)
+                .get(&source_key)
                 .and_then(|source| source.records.get(&key))
                 .is_some_and(|known| {
                     sinomo_network::cluster_connectivity_publish_record_matches(known, record, now)
@@ -532,12 +547,14 @@ fn cached_connectivity_matches(paths: &ClusterPaths, record: &ClusterConnectivit
         })
 }
 
-fn connectivity_cache_source_prefix(paths: &ClusterPaths, source_node_id: &NodeId) -> String {
-    format!(
-        "{}:{}",
-        paths.root.display(),
-        sinomo_network::cluster_connectivity_source_prefix(source_node_id)
-    )
+fn connectivity_cache_source_key(
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+) -> PublishedConnectivitySourceKey {
+    PublishedConnectivitySourceKey {
+        root: paths.root.display().to_string(),
+        source_node_id: source_node_id.clone(),
+    }
 }
 
 fn cached_connectivity_record_set_matches(
@@ -550,12 +567,12 @@ fn cached_connectivity_record_set_matches(
         .iter()
         .map(|record| connectivity_cache_key(paths, record))
         .collect::<BTreeSet<_>>();
-    let source_prefix = connectivity_cache_source_prefix(paths, source_node_id);
+    let source_key = connectivity_cache_source_key(paths, source_node_id);
     PUBLISHED_CONNECTIVITY
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
         .is_ok_and(|cache| {
-            let Some(source) = cache.get(&source_prefix) else {
+            let Some(source) = cache.get(&source_key) else {
                 return false;
             };
             if source
@@ -599,11 +616,11 @@ fn remember_connectivity_record_set(
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
     {
-        let source_prefix = connectivity_cache_source_prefix(paths, source_node_id);
-        ensure_published_connectivity_source(&mut cache, source_prefix.clone());
+        let source_key = connectivity_cache_source_key(paths, source_node_id);
+        ensure_published_connectivity_source(&mut cache, source_key.clone());
         {
             let source = cache
-                .get_mut(&source_prefix)
+                .get_mut(&source_key)
                 .expect("published connectivity source was inserted");
             source.records.clear();
             if records.len() > PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS_PER_SOURCE {
@@ -615,7 +632,7 @@ fn remember_connectivity_record_set(
                     .insert(connectivity_cache_key(paths, record), record.clone());
             }
         }
-        trim_published_connectivity_cache_records(&mut cache, &source_prefix);
+        trim_published_connectivity_cache_records(&mut cache, &source_key);
     }
 }
 
@@ -5960,14 +5977,39 @@ mod tests {
             observed_at: now,
             expires_at: now + time::Duration::seconds(300),
         };
-        let source_a = "source-a".to_string();
-        let source_b = "source-b".to_string();
+        let source_a = PublishedConnectivitySourceKey {
+            root: "root".to_string(),
+            source_node_id: record_a.source_node_id.clone(),
+        };
+        let source_b = PublishedConnectivitySourceKey {
+            root: "root".to_string(),
+            source_node_id: record_b.source_node_id.clone(),
+        };
         let mut source_a_records = BTreeMap::new();
         for index in 0..PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS {
-            source_a_records.insert(format!("a-{index:04}"), record_a.clone());
+            source_a_records.insert(
+                PublishedConnectivityRecordKey {
+                    root: "root".to_string(),
+                    source_node_id: record_a.source_node_id.clone(),
+                    target_node_id: record_a.target_node_id.clone(),
+                    endpoint_id: sinomo_network::ClusterEndpointId::from_legacy_named(format!(
+                        "endpoint_daemon_total_cache_a_{index:04}"
+                    ))
+                    .expect("endpoint a"),
+                },
+                record_a.clone(),
+            );
         }
         let mut source_b_records = BTreeMap::new();
-        source_b_records.insert("b".to_string(), record_b);
+        source_b_records.insert(
+            PublishedConnectivityRecordKey {
+                root: "root".to_string(),
+                source_node_id: record_b.source_node_id.clone(),
+                target_node_id: record_b.target_node_id.clone(),
+                endpoint_id: record_b.endpoint_id.clone(),
+            },
+            record_b.clone(),
+        );
 
         let mut cache = BTreeMap::new();
         cache.insert(
@@ -5993,7 +6035,7 @@ mod tests {
         assert!(
             cache
                 .get(&source_b)
-                .and_then(|source| source.records.get("b"))
+                .and_then(|source| source.records.values().next())
                 .is_some(),
             "the source that was just published should be preserved when trimming"
         );
@@ -9607,18 +9649,12 @@ mod tests {
         sync_cluster_connectivity_records_to_kv(&paths, &local_node, Vec::new())
             .expect("delete stale connectivity in batches");
 
-        let snapshot = sinomo_kv::read_cluster_kv_current_snapshot_for_node(
-            &paths.kv_paths(),
-            local_node.clone(),
-        )
-        .expect("snapshot");
+        let records =
+            sinomo_network::read_cluster_connectivity_graph_from_kv(&paths).expect("records");
         assert!(
-            snapshot
-                .prefix_entries(&sinomo_network::cluster_connectivity_source_prefix(
-                    &local_node
-                ))
-                .next()
-                .is_none(),
+            records
+                .iter()
+                .all(|record| record.source_node_id != local_node),
             "daemon connectivity sync should delete large stale prefixes in bounded batches"
         );
     }

@@ -13,7 +13,7 @@ use crate::invite::{
     CLUSTER_INVITE_CHALLENGE_PROTOCOL, cluster_invite_challenge_signing_payload,
     verify_cluster_invite_challenge_proof,
 };
-use crate::keyspace::cluster_endpoint_prefix;
+use crate::keyspace::{cluster_connectivity_source_prefix, cluster_endpoint_prefix};
 use crate::lan::{
     AsyncMdnsDiscoverySocket, LanQuicEventFrameCodec, MdnsDiscoveryAdvertisement,
     MdnsDiscoveryCache, MdnsDiscoveryRecord, apply_lan_discovery_advertisements,

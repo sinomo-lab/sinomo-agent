@@ -191,10 +191,7 @@ pub(crate) use keyspace::{
     cluster_member_key, cluster_node_status_key, cluster_node_status_key_for_process,
     cluster_node_status_key_for_record,
 };
-pub use keyspace::{
-    cluster_connectivity_key, cluster_connectivity_source_prefix, cluster_endpoint_key,
-    cluster_network_info_key,
-};
+pub use keyspace::{cluster_connectivity_key, cluster_endpoint_key, cluster_network_info_key};
 #[cfg(test)]
 pub(crate) use kv_forward::forward_cluster_kv_txn_to_voter_with_host;
 pub use kv_forward::{ClusterKvTxnForwardHost, ClusterKvTxnForwardOptions};

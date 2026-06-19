@@ -20,7 +20,7 @@ pub fn cluster_network_info_key(node_id: &NodeId) -> String {
     format!("/cluster/network/info/{node_id}")
 }
 
-pub fn cluster_connectivity_source_prefix(source_node_id: &NodeId) -> String {
+pub(crate) fn cluster_connectivity_source_prefix(source_node_id: &NodeId) -> String {
     format!("/cluster/network/connectivity/{source_node_id}/")
 }
 
