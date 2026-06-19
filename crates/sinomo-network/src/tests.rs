@@ -9063,20 +9063,24 @@ impl ClusterRaftCommittedFanoutAsyncHost for RecordingCommittedFanoutHost {
 }
 
 #[derive(Default)]
-struct RecordingVoterReachabilityHost {
+struct RecordingStateAuthorityReachabilityHost {
     reachable: BTreeSet<NodeId>,
     probes: Vec<(NodeId, Duration)>,
 }
 
-impl ClusterVoterReachabilityHost for RecordingVoterReachabilityHost {
-    fn probe_voter(&mut self, endpoint: &ClusterEndpointRecord, timeout: Duration) -> bool {
+impl ClusterStateAuthorityReachabilityHost for RecordingStateAuthorityReachabilityHost {
+    fn probe_cluster_state_authority(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        timeout: Duration,
+    ) -> bool {
         self.probes.push((endpoint.node_id.clone(), timeout));
         self.reachable.contains(&endpoint.node_id)
     }
 }
 
-impl ClusterVoterReachabilityAsyncHost for RecordingVoterReachabilityHost {
-    fn probe_voter_async<'a>(
+impl ClusterStateAuthorityReachabilityAsyncHost for RecordingStateAuthorityReachabilityHost {
+    fn probe_cluster_state_authority_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
         timeout: Duration,
@@ -9283,11 +9287,11 @@ impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
         Ok(true)
     }
 
-    fn reachable_voter_count(
+    fn reachable_cluster_state_authority_count(
         &mut self,
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
-        _options: ClusterVoterReachabilityOptions,
+        _options: ClusterStateAuthorityReachabilityOptions,
     ) -> usize {
         1
     }
@@ -9318,8 +9322,8 @@ fn forward_test_txn_response(revision: KvRevision) -> KvTxnResponse {
     }
 }
 
-fn voter_reachability_test_options() -> ClusterVoterReachabilityOptions {
-    ClusterVoterReachabilityOptions {
+fn voter_reachability_test_options() -> ClusterStateAuthorityReachabilityOptions {
+    ClusterStateAuthorityReachabilityOptions {
         timeout: Duration::from_secs(10),
         tcp_command_timeout: Duration::from_secs(8),
         iroh_command_timeout: Duration::from_secs(6),
@@ -9376,7 +9380,7 @@ fn kv_txn_quorum_test_options(allow_forwarding: bool) -> ClusterKvTxnQuorumOptio
         },
         forward_options: kv_txn_forward_test_options(),
         leader_election_options: leader_election_test_options(),
-        voter_reachability_options: voter_reachability_test_options(),
+        state_authority_reachability_options: voter_reachability_test_options(),
     }
 }
 
@@ -9432,8 +9436,8 @@ fn cluster_control_plane_timeouts_derive_driver_options() {
         }
     );
     assert_eq!(
-        timeouts.voter_reachability_options(),
-        ClusterVoterReachabilityOptions {
+        timeouts.state_authority_reachability_options(),
+        ClusterStateAuthorityReachabilityOptions {
             timeout: Duration::from_secs(10),
             tcp_command_timeout: Duration::from_secs(8),
             iroh_command_timeout: Duration::from_secs(6),
@@ -9459,7 +9463,7 @@ fn cluster_control_plane_timeouts_derive_driver_options() {
                 .raft_append_replication_options(Duration::from_secs(10)),
             forward_options: timeouts.kv_txn_forward_options(),
             leader_election_options: timeouts.leader_election_options(),
-            voter_reachability_options: timeouts.voter_reachability_options(),
+            state_authority_reachability_options: timeouts.state_authority_reachability_options(),
         }
     );
     assert_eq!(
@@ -9504,7 +9508,11 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
             panic!("membership forwarding should not send raft vote")
         }
 
-        fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
+        fn probe_cluster_state_authority(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _timeout: Duration,
+        ) -> bool {
             panic!("membership forwarding should not probe voters")
         }
 
@@ -9639,7 +9647,11 @@ fn cluster_join_registration_driver_uses_local_membership_observer() {
             panic!("local observation should not send raft vote")
         }
 
-        fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
+        fn probe_cluster_state_authority(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _timeout: Duration,
+        ) -> bool {
             panic!("local observation should not probe voters")
         }
 
@@ -9751,7 +9763,11 @@ fn cluster_member_mutation_driver_prepares_state_from_local_membership_observer(
             panic!("membership preparation should not send raft vote")
         }
 
-        fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
+        fn probe_cluster_state_authority(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _timeout: Duration,
+        ) -> bool {
             panic!("membership preparation should not probe voters")
         }
 
@@ -9897,7 +9913,11 @@ fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
             panic!("cache hook test should not send raft vote")
         }
 
-        fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
+        fn probe_cluster_state_authority(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _timeout: Duration,
+        ) -> bool {
             panic!("cache hook test should not probe voters")
         }
 
@@ -10323,10 +10343,10 @@ fn cluster_voter_reachability_counts_single_local_voter_without_probe() {
     );
     state.members[0].capabilities = main_daemon_capabilities(&state.members[0].role);
     state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
-    let mut host = RecordingVoterReachabilityHost::default();
+    let mut host = RecordingStateAuthorityReachabilityHost::default();
 
     assert_eq!(
-        cluster_reachable_voter_count_with_host(
+        cluster_reachable_state_authority_count_with_host(
             &paths,
             &state,
             voter_reachability_test_options(),
@@ -10375,13 +10395,13 @@ fn cluster_voter_reachability_probes_remote_live_voters_until_quorum() {
     )];
     state.members.push(remote_member);
 
-    let mut host = RecordingVoterReachabilityHost {
+    let mut host = RecordingStateAuthorityReachabilityHost {
         reachable: BTreeSet::from([remote.clone()]),
         ..Default::default()
     };
 
     assert_eq!(
-        cluster_reachable_voter_count_with_host(
+        cluster_reachable_state_authority_count_with_host(
             &paths,
             &state,
             voter_reachability_test_options(),
@@ -10487,13 +10507,13 @@ fn cluster_voter_reachability_uses_command_timeout_for_relay_routed_voter() {
     sync_cluster_connectivity_records_to_kv(&paths, &bridge, vec![bridge_to_remote])
         .expect("bridge connectivity records");
 
-    let mut host = RecordingVoterReachabilityHost {
+    let mut host = RecordingStateAuthorityReachabilityHost {
         reachable: BTreeSet::from([remote.clone()]),
         ..Default::default()
     };
 
     assert_eq!(
-        cluster_reachable_voter_count_with_host(
+        cluster_reachable_state_authority_count_with_host(
             &paths,
             &state,
             voter_reachability_test_options(),
@@ -10540,7 +10560,7 @@ fn cluster_voter_reachability_async_probes_remote_live_voters_until_quorum() {
         .enable_all()
         .build()
         .expect("runtime");
-    let mut host = RecordingVoterReachabilityHost {
+    let mut host = RecordingStateAuthorityReachabilityHost {
         reachable: BTreeSet::from([remote.clone()]),
         ..Default::default()
     };
@@ -13027,7 +13047,11 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
             panic!("join reconciliation should not send raft vote")
         }
 
-        fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
+        fn probe_cluster_state_authority(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _timeout: Duration,
+        ) -> bool {
             panic!("join reconciliation should not probe voters")
         }
 

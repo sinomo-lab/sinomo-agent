@@ -173,7 +173,7 @@ pub(crate) fn publish_local_members_via_voter_with_host(
     }
     Err(NetworkError::ClusterReadOnly {
         detail: format!(
-            "local node is not a voter and no reachable voter or bridge accepted member publication{}",
+            "local node cannot commit cluster state and no reachable cluster state authority or bridge accepted member publication{}",
             if failures.is_empty() {
                 String::new()
             } else {
@@ -273,7 +273,7 @@ pub(crate) async fn publish_local_members_via_voter_async_with_host(
     }
     Err(NetworkError::ClusterReadOnly {
         detail: format!(
-            "local node is not a voter and no reachable voter or bridge accepted member publication{}",
+            "local node cannot commit cluster state and no reachable cluster state authority or bridge accepted member publication{}",
             if failures.is_empty() {
                 String::new()
             } else {

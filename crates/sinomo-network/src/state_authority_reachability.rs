@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ClusterVoterReachabilityOptions {
+pub struct ClusterStateAuthorityReachabilityOptions {
     pub timeout: Duration,
     pub tcp_command_timeout: Duration,
     pub iroh_command_timeout: Duration,
@@ -19,7 +19,7 @@ pub struct ClusterVoterReachabilityOptions {
     pub iroh_foreground_attempt_timeout: Duration,
 }
 
-impl ClusterVoterReachabilityOptions {
+impl ClusterStateAuthorityReachabilityOptions {
     pub fn command_timeout(
         &self,
         endpoint: &ClusterEndpointRecord,
@@ -47,23 +47,27 @@ impl ClusterVoterReachabilityOptions {
     }
 }
 
-pub trait ClusterVoterReachabilityHost {
-    fn probe_voter(&mut self, endpoint: &ClusterEndpointRecord, timeout: Duration) -> bool;
+pub trait ClusterStateAuthorityReachabilityHost {
+    fn probe_cluster_state_authority(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        timeout: Duration,
+    ) -> bool;
 }
 
-pub trait ClusterVoterReachabilityAsyncHost {
-    fn probe_voter_async<'a>(
+pub trait ClusterStateAuthorityReachabilityAsyncHost {
+    fn probe_cluster_state_authority_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<bool, NetworkError>> + Send + 'a>>;
 }
 
-pub fn cluster_reachable_voter_count_with_host(
+pub fn cluster_reachable_state_authority_count_with_host(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
-    options: ClusterVoterReachabilityOptions,
-    host: &mut impl ClusterVoterReachabilityHost,
+    options: ClusterStateAuthorityReachabilityOptions,
+    host: &mut impl ClusterStateAuthorityReachabilityHost,
 ) -> usize {
     let quorum_size = sinomo_kv::cluster_kv_raft_quorum_size_for_state(state);
     let mut voters = BTreeSet::new();
@@ -84,9 +88,9 @@ pub fn cluster_reachable_voter_count_with_host(
         if remaining.is_zero() {
             break;
         }
-        if host.probe_voter(
+        if host.probe_cluster_state_authority(
             endpoint,
-            cluster_voter_probe_timeout(&graph, state, endpoint, options, remaining),
+            cluster_state_authority_probe_timeout(&graph, state, endpoint, options, remaining),
         ) {
             voters.insert(endpoint.node_id.clone());
             if voters.len() >= quorum_size {
@@ -100,11 +104,11 @@ pub fn cluster_reachable_voter_count_with_host(
     voters.len()
 }
 
-pub async fn cluster_reachable_voter_count_async_with_host(
+pub async fn cluster_reachable_state_authority_count_async_with_host(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
-    options: ClusterVoterReachabilityOptions,
-    host: &mut impl ClusterVoterReachabilityAsyncHost,
+    options: ClusterStateAuthorityReachabilityOptions,
+    host: &mut impl ClusterStateAuthorityReachabilityAsyncHost,
 ) -> Result<usize, NetworkError> {
     let quorum_size = sinomo_kv::cluster_kv_raft_quorum_size_for_state(state);
     let mut voters = BTreeSet::new();
@@ -126,9 +130,9 @@ pub async fn cluster_reachable_voter_count_async_with_host(
             break;
         }
         if host
-            .probe_voter_async(
+            .probe_cluster_state_authority_async(
                 endpoint,
-                cluster_voter_probe_timeout(&graph, state, endpoint, options, remaining),
+                cluster_state_authority_probe_timeout(&graph, state, endpoint, options, remaining),
             )
             .await?
         {
@@ -144,11 +148,11 @@ pub async fn cluster_reachable_voter_count_async_with_host(
     Ok(voters.len())
 }
 
-fn cluster_voter_probe_timeout(
+fn cluster_state_authority_probe_timeout(
     graph: &ClusterConnectivityGraph,
     state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
-    options: ClusterVoterReachabilityOptions,
+    options: ClusterStateAuthorityReachabilityOptions,
     remaining: Duration,
 ) -> Duration {
     if cluster_route_next_hop(graph, &state.local_node_id, &endpoint.node_id).is_some()
@@ -163,21 +167,22 @@ fn cluster_voter_probe_timeout(
 pub fn cluster_has_local_quorum_with_host(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
-    options: ClusterVoterReachabilityOptions,
-    host: &mut impl ClusterVoterReachabilityHost,
+    options: ClusterStateAuthorityReachabilityOptions,
+    host: &mut impl ClusterStateAuthorityReachabilityHost,
 ) -> bool {
-    cluster_reachable_voter_count_with_host(paths, state, options, host)
+    cluster_reachable_state_authority_count_with_host(paths, state, options, host)
         >= sinomo_kv::cluster_kv_raft_quorum_size_for_state(state)
 }
 
 pub async fn cluster_has_local_quorum_async_with_host(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
-    options: ClusterVoterReachabilityOptions,
-    host: &mut impl ClusterVoterReachabilityAsyncHost,
+    options: ClusterStateAuthorityReachabilityOptions,
+    host: &mut impl ClusterStateAuthorityReachabilityAsyncHost,
 ) -> Result<bool, NetworkError> {
     Ok(
-        cluster_reachable_voter_count_async_with_host(paths, state, options, host).await?
+        cluster_reachable_state_authority_count_async_with_host(paths, state, options, host)
+            .await?
             >= sinomo_kv::cluster_kv_raft_quorum_size_for_state(state),
     )
 }

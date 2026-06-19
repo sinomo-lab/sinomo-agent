@@ -105,8 +105,9 @@ pub async fn forward_cluster_membership_rpc_to_voter_async_with_host(
 
 /// A bridge introducer named in an invite minted before it joined is not itself a
 /// proof-capable channel/issuer, so it cannot answer a join challenge. Relay the challenge to
-/// a reachable voter (the invite issuer can produce an issuer-signed proof). The routing-aware
-/// send routes the challenge across segments when no voter is directly reachable.
+/// a reachable cluster state authority (the invite issuer can produce an issuer-signed proof).
+/// The routing-aware send routes the challenge across segments when no authority is directly
+/// reachable.
 #[cfg(test)]
 pub(crate) fn forward_cluster_join_challenge_rpc_to_voter_with_host(
     paths: &ClusterPaths,

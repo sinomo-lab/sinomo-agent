@@ -145,16 +145,23 @@ use crate::rpc::{
     CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY, ObjectRpcRequest,
     ObjectRpcResponse,
 };
+use crate::state_authority_reachability::{
+    ClusterStateAuthorityReachabilityHost, cluster_has_local_quorum_with_host,
+};
 use crate::status_publish::{ClusterNetworkInfoPublishHost, ClusterNodeStatusPublishHost};
-use crate::voter_reachability::{ClusterVoterReachabilityHost, cluster_has_local_quorum_with_host};
 use std::time::Duration;
 
-impl<T> ClusterVoterReachabilityHost for ClusterControlPlaneDriver<T>
+impl<T> ClusterStateAuthorityReachabilityHost for ClusterControlPlaneDriver<T>
 where
     T: ClusterControlPlaneTransport,
 {
-    fn probe_voter(&mut self, endpoint: &ClusterEndpointRecord, timeout: Duration) -> bool {
-        self.transport.probe_voter(endpoint, timeout)
+    fn probe_cluster_state_authority(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        timeout: Duration,
+    ) -> bool {
+        self.transport
+            .probe_cluster_state_authority(endpoint, timeout)
     }
 }
 
@@ -226,7 +233,7 @@ where
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> bool {
-        let options = self.timeouts.voter_reachability_options();
+        let options = self.timeouts.state_authority_reachability_options();
         cluster_has_local_quorum_with_host(paths, state, options, self)
     }
 

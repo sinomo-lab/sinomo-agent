@@ -729,17 +729,17 @@ impl network::ClusterKvTxnQuorumHost for CliClusterKvTxnQuorumHost {
         locked_cluster_raft_local_is_leader(paths, state)
     }
 
-    fn reachable_voter_count(
+    fn reachable_cluster_state_authority_count(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
-        options: network::ClusterVoterReachabilityOptions,
+        options: network::ClusterStateAuthorityReachabilityOptions,
     ) -> usize {
-        network::cluster_reachable_voter_count_with_host(
+        network::cluster_reachable_state_authority_count_with_host(
             paths,
             state,
             options,
-            &mut CliClusterVoterReachabilityHost,
+            &mut CliClusterStateAuthorityReachabilityHost,
         )
     }
 
@@ -945,7 +945,7 @@ fn cli_cluster_kv_txn_quorum_options(allow_forwarding: bool) -> network::Cluster
             public_foreground_attempt_timeout: Duration::from_secs(5),
             iroh_foreground_attempt_timeout: Duration::from_secs(3),
         },
-        voter_reachability_options: cli_cluster_voter_reachability_options(),
+        state_authority_reachability_options: cli_cluster_state_authority_reachability_options(),
     }
 }
 

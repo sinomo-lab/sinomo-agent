@@ -62,8 +62,8 @@ mod route;
 mod route_graph_read_model;
 mod rpc;
 mod rpc_future;
+mod state_authority_reachability;
 mod status_publish;
-mod voter_reachability;
 
 pub use connectivity::{
     CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD, CLUSTER_CONNECTIVITY_TTL_SECONDS,
@@ -380,6 +380,12 @@ pub(crate) use rpc::{call_object_rpc_frame_async, serve_object_rpc_frame_async};
 pub use rpc_future::ClusterMembershipRpcFuture;
 #[cfg(test)]
 pub(crate) use sinomo_node::upsert_member_record;
+pub use state_authority_reachability::{
+    ClusterStateAuthorityReachabilityAsyncHost, ClusterStateAuthorityReachabilityHost,
+    ClusterStateAuthorityReachabilityOptions, cluster_has_local_quorum_async_with_host,
+    cluster_has_local_quorum_with_host, cluster_reachable_state_authority_count_async_with_host,
+    cluster_reachable_state_authority_count_with_host,
+};
 pub use status_publish::{
     ClusterNetworkInfoPublishAsyncHost, ClusterNetworkInfoPublishHost,
     ClusterNodePresencePublishMatches, ClusterNodeStatusPublishAsyncHost,
@@ -394,12 +400,6 @@ pub use status_publish::{
 pub(crate) use status_publish::{
     cluster_network_info_publish_matches_with_host, cluster_node_status_publish_matches_with_host,
     sync_cluster_network_info_to_kv, sync_cluster_node_status_to_kv,
-};
-pub use voter_reachability::{
-    ClusterVoterReachabilityAsyncHost, ClusterVoterReachabilityHost,
-    ClusterVoterReachabilityOptions, cluster_has_local_quorum_async_with_host,
-    cluster_has_local_quorum_with_host, cluster_reachable_voter_count_async_with_host,
-    cluster_reachable_voter_count_with_host,
 };
 
 pub type ClusterEndpointId = sinomo_core::Id;

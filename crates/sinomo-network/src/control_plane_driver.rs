@@ -26,7 +26,11 @@ pub trait ClusterControlPlaneTransport {
         timeout: Duration,
     ) -> Result<ClusterRaftVoteResponse, NetworkError>;
 
-    fn probe_voter(&mut self, endpoint: &ClusterEndpointRecord, timeout: Duration) -> bool;
+    fn probe_cluster_state_authority(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        timeout: Duration,
+    ) -> bool;
 
     fn fetch_cluster_kv_snapshot(
         &mut self,

@@ -1,6 +1,6 @@
 use crate::kv_forward::ClusterKvTxnForwardOptions;
 use crate::kv_snapshot::ClusterKvSnapshotRefreshOptions;
-use crate::voter_reachability::ClusterVoterReachabilityOptions;
+use crate::state_authority_reachability::ClusterStateAuthorityReachabilityOptions;
 use sinomo_core::{ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterTransportKind};
 use sinomo_kv::{ClusterKvRaftLeaderElectionOptions, ClusterRaftAppendRequest};
 use std::time::Duration;
@@ -119,7 +119,7 @@ pub struct ClusterKvTxnQuorumOptions {
     pub raft_append_replication_options: ClusterRaftAppendReplicationOptions,
     pub forward_options: ClusterKvTxnForwardOptions,
     pub leader_election_options: ClusterRaftLeaderElectionOptions,
-    pub voter_reachability_options: ClusterVoterReachabilityOptions,
+    pub state_authority_reachability_options: ClusterStateAuthorityReachabilityOptions,
 }
 
 pub const DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_MAX_ATTEMPTS: usize = 32;
@@ -202,8 +202,8 @@ impl ClusterControlPlaneTimeouts {
         }
     }
 
-    pub fn voter_reachability_options(&self) -> ClusterVoterReachabilityOptions {
-        ClusterVoterReachabilityOptions {
+    pub fn state_authority_reachability_options(&self) -> ClusterStateAuthorityReachabilityOptions {
+        ClusterStateAuthorityReachabilityOptions {
             timeout: self.raft_append_timeout,
             tcp_command_timeout: self.tcp_command_timeout,
             iroh_command_timeout: self.iroh_command_timeout,
@@ -229,7 +229,7 @@ impl ClusterControlPlaneTimeouts {
                 .raft_append_replication_options(self.raft_append_timeout),
             forward_options: self.kv_txn_forward_options(),
             leader_election_options: self.leader_election_options(),
-            voter_reachability_options: self.voter_reachability_options(),
+            state_authority_reachability_options: self.state_authority_reachability_options(),
         }
     }
 

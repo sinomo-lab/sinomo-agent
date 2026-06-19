@@ -665,8 +665,8 @@ pub(crate) fn require_cluster_runtime_quorum_with_paths_and_daemon(
     } else {
         Err(CliError::ClusterReadOnly {
             detail: format!(
-                "quorum unavailable; cluster-dependent operations are paused ({} reachable voters, {} required)",
-                cluster_reachable_voter_count(&paths, &state),
+                "quorum unavailable; cluster-dependent operations are paused ({} reachable cluster state authorities, {} required)",
+                cluster_reachable_state_authority_count(&paths, &state),
                 sinomo_runtime::kv::cluster_kv_raft_quorum_size_for_state(&state)
             ),
         })
@@ -1797,7 +1797,11 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
             ))
         }
 
-        fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
+        fn probe_cluster_state_authority(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _timeout: Duration,
+        ) -> bool {
             false
         }
 

@@ -267,16 +267,21 @@ use time::format_description::well_known::Rfc3339;
 pub use tui::*;
 pub(crate) use voice::*;
 
-struct CliClusterVoterReachabilityHost;
+struct CliClusterStateAuthorityReachabilityHost;
 
-impl network::ClusterVoterReachabilityHost for CliClusterVoterReachabilityHost {
-    fn probe_voter(&mut self, endpoint: &ClusterEndpointRecord, timeout: Duration) -> bool {
+impl network::ClusterStateAuthorityReachabilityHost for CliClusterStateAuthorityReachabilityHost {
+    fn probe_cluster_state_authority(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        timeout: Duration,
+    ) -> bool {
         daemon_fetch_daemon_status_from_endpoint(endpoint, timeout).is_ok()
     }
 }
 
-fn cli_cluster_voter_reachability_options() -> network::ClusterVoterReachabilityOptions {
-    network::ClusterVoterReachabilityOptions {
+fn cli_cluster_state_authority_reachability_options()
+-> network::ClusterStateAuthorityReachabilityOptions {
+    network::ClusterStateAuthorityReachabilityOptions {
         timeout: Duration::from_secs(5),
         tcp_command_timeout: Duration::from_secs(5),
         iroh_command_timeout: Duration::from_secs(3),
@@ -290,17 +295,20 @@ fn cluster_has_local_quorum(paths: &ClusterPaths, state: &ClusterBootstrapState)
     network::cluster_has_local_quorum_with_host(
         paths,
         state,
-        cli_cluster_voter_reachability_options(),
-        &mut CliClusterVoterReachabilityHost,
+        cli_cluster_state_authority_reachability_options(),
+        &mut CliClusterStateAuthorityReachabilityHost,
     )
 }
 
-fn cluster_reachable_voter_count(paths: &ClusterPaths, state: &ClusterBootstrapState) -> usize {
-    network::cluster_reachable_voter_count_with_host(
+fn cluster_reachable_state_authority_count(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> usize {
+    network::cluster_reachable_state_authority_count_with_host(
         paths,
         state,
-        cli_cluster_voter_reachability_options(),
-        &mut CliClusterVoterReachabilityHost,
+        cli_cluster_state_authority_reachability_options(),
+        &mut CliClusterStateAuthorityReachabilityHost,
     )
 }
 

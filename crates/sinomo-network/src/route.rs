@@ -6,7 +6,8 @@
 //! [`RelayEnvelope`]. Each hop's daemon makes a [`relay_decision`] -- deliver locally,
 //! forward to the next hop (TTL-decremented, visit-stamped), or drop on a loop/TTL/no-route
 //! -- and the response travels back along the chain. This generalizes the existing
-//! single-hop "forward to a directly reachable voter" path to "any target, via relay".
+//! single-hop "forward to a directly reachable cluster state authority" path to "any target,
+//! via relay".
 //!
 //! This module owns routing logic over the graph + envelope. Signing and dialing
 //! are supplied by daemon-host callbacks so route construction stays here without

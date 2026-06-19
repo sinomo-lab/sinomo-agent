@@ -27,9 +27,10 @@ use crate::raft_quorum::{
 use crate::route::ClusterSignedEndpointRpcAsyncHost;
 use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
 use crate::rpc_future::ClusterMembershipRpcFuture;
-use crate::voter_reachability::{
-    ClusterVoterReachabilityAsyncHost, ClusterVoterReachabilityOptions,
-    cluster_reachable_voter_count_async_with_host, cluster_reachable_voter_count_with_host,
+use crate::state_authority_reachability::{
+    ClusterStateAuthorityReachabilityAsyncHost, ClusterStateAuthorityReachabilityOptions,
+    cluster_reachable_state_authority_count_async_with_host,
+    cluster_reachable_state_authority_count_with_host,
 };
 use sinomo_kv::{
     ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult, ClusterKvTxnCommitResult,
@@ -98,11 +99,11 @@ pub trait ClusterKvTxnQuorumHost {
         elect_cluster_raft_leader_with_host(paths, state, options, self)
     }
 
-    fn reachable_voter_count(
+    fn reachable_cluster_state_authority_count(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
-        options: ClusterVoterReachabilityOptions,
+        options: ClusterStateAuthorityReachabilityOptions,
     ) -> usize;
 
     fn commit_cluster_raft_command_with_quorum(
@@ -160,7 +161,7 @@ where
 pub trait ClusterKvTxnQuorumAsyncHost:
     ClusterSignedEndpointRpcAsyncHost
     + ClusterRaftQuorumAsyncHost
-    + ClusterVoterReachabilityAsyncHost
+    + ClusterStateAuthorityReachabilityAsyncHost
     + Send
 {
     fn send_raft_vote_async<'a>(
@@ -239,13 +240,13 @@ where
         locked_cluster_raft_local_is_leader(paths, state)
     }
 
-    fn reachable_voter_count(
+    fn reachable_cluster_state_authority_count(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
-        options: ClusterVoterReachabilityOptions,
+        options: ClusterStateAuthorityReachabilityOptions,
     ) -> usize {
-        cluster_reachable_voter_count_with_host(paths, state, options, self)
+        cluster_reachable_state_authority_count_with_host(paths, state, options, self)
     }
 
     fn commit_cluster_raft_command_with_quorum(
@@ -308,10 +309,10 @@ where
         &mut self,
         state: &ClusterBootstrapState,
     ) -> Result<usize, Self::Error> {
-        Ok(self.host.reachable_voter_count(
+        Ok(self.host.reachable_cluster_state_authority_count(
             self.paths,
             state,
-            self.options.voter_reachability_options,
+            self.options.state_authority_reachability_options,
         ))
     }
 
@@ -517,10 +518,11 @@ where
         state: &'a ClusterBootstrapState,
     ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, usize, Self::Error> {
         let paths = self.paths;
-        let options = self.options.voter_reachability_options;
+        let options = self.options.state_authority_reachability_options;
         let host = &mut *self.host;
         Box::pin(async move {
-            cluster_reachable_voter_count_async_with_host(paths, state, options, host).await
+            cluster_reachable_state_authority_count_async_with_host(paths, state, options, host)
+                .await
         })
     }
 

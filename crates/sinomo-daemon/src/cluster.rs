@@ -3438,7 +3438,11 @@ impl sinomo_network::ClusterControlPlaneTransport for DaemonClusterControlPlaneT
         })
     }
 
-    fn probe_voter(&mut self, endpoint: &ClusterEndpointRecord, timeout: Duration) -> bool {
+    fn probe_cluster_state_authority(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        timeout: Duration,
+    ) -> bool {
         fetch_daemon_status_from_endpoint_on_runtime(endpoint, timeout, self.rpc_mode.runtime())
             .is_ok()
     }
@@ -3575,8 +3579,10 @@ impl sinomo_network::ClusterControlPlaneTransport for DaemonClusterControlPlaneT
     }
 }
 
-impl sinomo_network::ClusterVoterReachabilityAsyncHost for DaemonClusterControlPlaneTransport {
-    fn probe_voter_async<'a>(
+impl sinomo_network::ClusterStateAuthorityReachabilityAsyncHost
+    for DaemonClusterControlPlaneTransport
+{
+    fn probe_cluster_state_authority_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
         timeout: Duration,
@@ -3695,7 +3701,7 @@ impl sinomo_network::ClusterLocalMemberPublishAsyncHost for DaemonClusterControl
             sinomo_network::cluster_has_local_quorum_async_with_host(
                 paths,
                 state,
-                cluster_voter_reachability_options(),
+                cluster_state_authority_reachability_options(),
                 self,
             )
             .await
@@ -4384,7 +4390,7 @@ pub(crate) fn cluster_has_local_quorum_on_runtime(
     sinomo_network::cluster_has_local_quorum_with_host(
         paths,
         state,
-        cluster_voter_reachability_options(),
+        cluster_state_authority_reachability_options(),
         &mut host,
     )
 }
@@ -4400,7 +4406,7 @@ pub(crate) async fn cluster_has_local_quorum_async(
     sinomo_network::cluster_has_local_quorum_async_with_host(
         paths,
         state,
-        cluster_voter_reachability_options(),
+        cluster_state_authority_reachability_options(),
         &mut host,
     )
     .await
@@ -5051,8 +5057,9 @@ fn cluster_raft_committed_fanout_options() -> sinomo_network::ClusterRaftCommitt
     cluster_control_plane_timeouts().committed_fanout_options()
 }
 
-fn cluster_voter_reachability_options() -> sinomo_network::ClusterVoterReachabilityOptions {
-    cluster_control_plane_timeouts().voter_reachability_options()
+fn cluster_state_authority_reachability_options()
+-> sinomo_network::ClusterStateAuthorityReachabilityOptions {
+    cluster_control_plane_timeouts().state_authority_reachability_options()
 }
 
 fn cluster_kv_txn_quorum_options(
@@ -10595,7 +10602,7 @@ mod tests {
         .endpoint();
 
         assert_eq!(
-            cluster_voter_reachability_options().command_timeout(
+            cluster_state_authority_reachability_options().command_timeout(
                 &endpoint,
                 sinomo_network::DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT
             ),
@@ -10629,7 +10636,7 @@ mod tests {
         )
         .endpoint();
 
-        let timeout_options = cluster_voter_reachability_options();
+        let timeout_options = cluster_state_authority_reachability_options();
         assert_eq!(
             timeout_options.fair_command_timeout(
                 &lan,
