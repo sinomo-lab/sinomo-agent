@@ -391,7 +391,6 @@ pub use voter_reachability::{
 
 pub type ClusterId = sinomo_core::Id;
 pub type ClusterEndpointId = sinomo_core::Id;
-pub type ClusterCertificateId = sinomo_core::Id;
 
 pub const NETWORK_PROTOCOL: &str = "sinomo.network.v1";
 pub const SINOMO_NETWORK_MODULE_LEGACY_ID: &str = "module.network";

@@ -23006,7 +23006,7 @@ fn certificate(
     expires_at: time::OffsetDateTime,
 ) -> ClusterCertificate {
     ClusterCertificate {
-        certificate_id: ClusterCertificateId::generate(),
+        certificate_id: sinomo_core::Id::generate(),
         cluster_id,
         node_id,
         issuer_node_id,
