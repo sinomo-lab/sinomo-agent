@@ -80,8 +80,7 @@ pub use connectivity::{
 pub use connectivity_publish::{
     ClusterConnectivityPublishAsyncHost, ClusterConnectivityPublishHost,
     ClusterNetworkRecordExpiryHost, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
-    cluster_connectivity_full_sync_ops, cluster_connectivity_stable_eq,
-    cluster_connectivity_sync_ops, cluster_network_publish_interval_for_node,
+    cluster_connectivity_stable_eq, cluster_network_publish_interval_for_node,
     cluster_network_record_should_refresh, expire_cluster_network_records_with_host,
     sync_cluster_connectivity_records_to_kv,
     sync_cluster_connectivity_records_to_quorum_async_with_host,

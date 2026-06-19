@@ -5,8 +5,6 @@ pub(crate) use network::advertised_peer_route_targets;
 #[cfg(test)]
 pub(crate) use network::apply_cluster_node_role;
 #[cfg(test)]
-pub(crate) use network::cluster_connectivity_sync_ops;
-#[cfg(test)]
 pub(crate) use network::cluster_state_sync_txn;
 #[cfg(test)]
 pub(crate) use network::invite_channels_for_join_registration;

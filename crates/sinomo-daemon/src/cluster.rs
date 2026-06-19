@@ -9634,18 +9634,6 @@ mod tests {
             seeded.get(&stale_key).is_some(),
             "stale connectivity should be seeded"
         );
-        assert!(
-            sinomo_network::cluster_connectivity_full_sync_ops(
-                &paths,
-                &local_node,
-                std::slice::from_ref(&current_record),
-            )
-            .expect("planned connectivity sync")
-            .iter()
-            .any(|op| matches!(op, KvOp::Delete { key } if key == &stale_key)),
-            "planner should delete stale connectivity"
-        );
-
         sync_cluster_connectivity_records_to_kv(&paths, &local_node, vec![current_record.clone()])
             .expect("sync should delete stale connectivity");
 

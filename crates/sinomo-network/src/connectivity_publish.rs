@@ -338,73 +338,7 @@ where
     }
 }
 
-pub fn cluster_connectivity_sync_ops(
-    paths: &ClusterPaths,
-    source_node_id: &NodeId,
-    records: &[ClusterConnectivityRecord],
-) -> Result<Vec<KvOp>, NetworkError> {
-    validate_cluster_connectivity_records_for_source(source_node_id, records)?;
-    let now = OffsetDateTime::now_utc();
-    let snapshot = read_cluster_kv_current_or_empty_snapshot_arc(paths)?;
-    cluster_connectivity_sync_ops_from_snapshot(snapshot.as_ref(), source_node_id, records, now)
-}
-
-fn cluster_connectivity_sync_ops_from_snapshot(
-    snapshot: &KvSnapshot,
-    source_node_id: &NodeId,
-    records: &[ClusterConnectivityRecord],
-    now: OffsetDateTime,
-) -> Result<Vec<KvOp>, NetworkError> {
-    let mut incoming = BTreeMap::new();
-    for record in records {
-        let key = cluster_connectivity_key(
-            &record.source_node_id,
-            &record.target_node_id,
-            &record.endpoint_id,
-        );
-        incoming.insert(key, record);
-    }
-
-    let prefix = cluster_connectivity_source_prefix(source_node_id);
-    for entry in snapshot.prefix_entries(&prefix) {
-        let stable = incoming.get(&entry.key).is_some_and(|record| {
-            entry
-                .decode::<ClusterConnectivityRecord>()
-                .is_ok_and(|existing| {
-                    existing == **record
-                        || (cluster_connectivity_stable_eq(&existing, record)
-                            && !cluster_network_record_should_refresh(existing.expires_at, now))
-                })
-        });
-        if stable {
-            incoming.remove(&entry.key);
-        }
-    }
-
-    let mut ops = Vec::new();
-    for (key, record) in incoming {
-        ops.push(KvOp::put_serde(key, record, None)?);
-    }
-    Ok(ops)
-}
-
-pub fn cluster_connectivity_full_sync_ops(
-    paths: &ClusterPaths,
-    source_node_id: &NodeId,
-    records: &[ClusterConnectivityRecord],
-) -> Result<Vec<KvOp>, NetworkError> {
-    validate_cluster_connectivity_records_for_source(source_node_id, records)?;
-    let now = OffsetDateTime::now_utc();
-    let snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
-    cluster_connectivity_full_sync_ops_from_snapshot(
-        snapshot.as_ref(),
-        source_node_id,
-        records,
-        now,
-    )
-}
-
-pub fn cluster_connectivity_full_sync_batch_ops(
+pub(crate) fn cluster_connectivity_full_sync_batch_ops(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
@@ -420,50 +354,6 @@ pub fn cluster_connectivity_full_sync_batch_ops(
         now,
         max_ops,
     )
-}
-
-fn cluster_connectivity_full_sync_ops_from_snapshot(
-    snapshot: &KvSnapshot,
-    source_node_id: &NodeId,
-    records: &[ClusterConnectivityRecord],
-    now: OffsetDateTime,
-) -> Result<Vec<KvOp>, NetworkError> {
-    let mut incoming = BTreeMap::new();
-    for record in records {
-        let key = cluster_connectivity_key(
-            &record.source_node_id,
-            &record.target_node_id,
-            &record.endpoint_id,
-        );
-        incoming.insert(key, record);
-    }
-
-    let mut existing = BTreeMap::new();
-    let mut ops = Vec::new();
-    let prefix = cluster_connectivity_source_prefix(source_node_id);
-    for entry in snapshot.prefix_entries(&prefix) {
-        if !incoming.contains_key(&entry.key) {
-            ops.push(KvOp::Delete {
-                key: entry.key.clone(),
-            });
-            continue;
-        }
-        if let Ok(record) = entry.decode::<ClusterConnectivityRecord>() {
-            existing.insert(entry.key.clone(), record);
-        }
-    }
-
-    for (key, record) in incoming {
-        if existing.get(&key).is_some_and(|existing| {
-            existing == record
-                || (cluster_connectivity_stable_eq(existing, record)
-                    && !cluster_network_record_should_refresh(existing.expires_at, now))
-        }) {
-            continue;
-        }
-        ops.push(KvOp::put_serde(key, record, None)?);
-    }
-    Ok(ops)
 }
 
 pub(crate) fn cluster_connectivity_full_sync_batch_ops_from_snapshot(
@@ -557,11 +447,12 @@ pub fn cluster_connectivity_sync_is_noop(
     }
     // Any incoming record that differs from what is stored (or is due for a TTL
     // refresh) would need a put.
-    Ok(cluster_connectivity_sync_ops_from_snapshot(
+    Ok(cluster_connectivity_full_sync_batch_ops_from_snapshot(
         snapshot.as_ref(),
         source_node_id,
         records,
         now,
+        sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
     )?
     .is_empty())
 }

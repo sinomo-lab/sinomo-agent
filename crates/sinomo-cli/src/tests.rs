@@ -21,9 +21,9 @@ use super::{
     apply_cluster_raft_role, authenticate_daemon_control_request,
     build_cluster_raft_append_request_from_next_index, cli_command_is_help,
     cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
-    cli_invocation_force_local_mode, cluster_connectivity_sync_ops, cluster_doctor_findings,
-    cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_with_paths,
-    cluster_join_with_paths, cluster_leave_with_paths, cluster_migration_plan_with_paths,
+    cli_invocation_force_local_mode, cluster_doctor_findings, cluster_has_local_quorum,
+    cluster_init_with_paths, cluster_invite_with_paths, cluster_join_with_paths,
+    cluster_leave_with_paths, cluster_migration_plan_with_paths,
     cluster_node_status_from_daemon_status, cluster_peer_members, cluster_raft_known_leader_id,
     cluster_state_sync_txn, compact_default_invite_introducers,
     daemon_advertised_endpoints_for_state, daemon_handle_daemon_sandbox_http_fetch,
@@ -6400,25 +6400,36 @@ fn stable_connectivity_sync_does_not_rewrite_source_prefix() {
     incoming.observed_at = now;
     incoming.expires_at = now + time::Duration::seconds(180);
 
+    let key = sinomo_runtime::network::cluster_connectivity_key(
+        &stored.source_node_id,
+        &stored.target_node_id,
+        &stored.endpoint_id,
+    );
     let mut store = InProcessKvStore::new();
     store
-        .put_serde(
-            sinomo_runtime::network::cluster_connectivity_key(
-                &stored.source_node_id,
-                &stored.target_node_id,
-                &stored.endpoint_id,
-            ),
-            &stored,
-            None,
-        )
+        .put_serde(key.clone(), &stored, None)
         .expect("stored connectivity");
     sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot())
         .expect("cluster kv snapshot");
 
-    let ops = cluster_connectivity_sync_ops(&paths, &source_node_id, &[incoming])
-        .expect("connectivity sync ops");
+    sinomo_runtime::network::sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &source_node_id,
+        vec![incoming],
+    )
+    .expect("connectivity sync");
 
-    assert!(ops.is_empty());
+    let snapshot = sinomo_runtime::kv::read_cluster_kv_current_snapshot_for_node(
+        &paths.kv_paths(),
+        source_node_id,
+    )
+    .expect("cluster kv snapshot");
+    let persisted = snapshot
+        .get(&key)
+        .expect("persisted connectivity")
+        .decode::<sinomo_runtime::network::ClusterConnectivityRecord>()
+        .expect("decode connectivity");
+    assert_eq!(persisted, stored);
 }
 
 #[test]

@@ -4491,77 +4491,6 @@ fn connectivity_noop_handles_prefix_larger_than_public_range_limit() {
 }
 
 #[test]
-fn connectivity_partial_sync_ignores_unrelated_malformed_large_prefix() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-partial-large-prefix");
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("paths");
-    let now = OffsetDateTime::now_utc();
-    let cluster_id = ClusterId::from_legacy_named("cluster_conn_partial_large").expect("cluster");
-    let node_a = NodeId::from_legacy_named("node_conn_partial_large_a").expect("node a");
-    let node_b = NodeId::from_legacy_named("node_conn_partial_large_b").expect("node b");
-    let state = ClusterBootstrapState::initialized_locally(
-        cluster_id,
-        "connectivity partial large prefix",
-        node_a.clone(),
-        "node a",
-        "pk-a",
-        now,
-    );
-    let endpoint_b = daemon_lan_endpoint(&node_b, "10.0.0.52:21353".to_string(), 10);
-    let stable = cluster_connectivity_record(
-        &state,
-        &endpoint_b,
-        ClusterConnectivityState::Healthy,
-        Some(5),
-        0,
-        Some("ok".to_string()),
-        None,
-        now,
-        600,
-    );
-    let stable_key = cluster_connectivity_key(
-        &stable.source_node_id,
-        &stable.target_node_id,
-        &stable.endpoint_id,
-    );
-    let prefix = cluster_connectivity_source_prefix(&node_a);
-    let mut store = InProcessKvStore::new();
-    store
-        .put_serde(stable_key, &stable, None)
-        .expect("stable connectivity");
-    for index in 0..=CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES {
-        store
-            .put(
-                format!("{prefix}malformed-target-{index:05}/endpoint"),
-                b"not a connectivity record".to_vec(),
-                None,
-            )
-            .expect("malformed connectivity");
-    }
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
-
-    let later = now + time::Duration::seconds(5);
-    let stable_later = cluster_connectivity_record(
-        &state,
-        &endpoint_b,
-        ClusterConnectivityState::Healthy,
-        Some(5),
-        0,
-        Some("ok".to_string()),
-        None,
-        later,
-        600,
-    );
-    let ops = cluster_connectivity_sync_ops(&paths, &node_a, &[stable_later])
-        .expect("partial connectivity sync");
-    assert!(
-        ops.is_empty(),
-        "stable incoming connectivity should remain a no-op without retaining unrelated prefix records"
-    );
-}
-
-#[test]
 fn stable_connectivity_sync_does_not_open_raft_node() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-noop-no-raft-open");
     let data_dir = SinomoDataDir::new(&root);
@@ -18945,13 +18874,6 @@ fn cluster_network_records_publish_overwrite_and_expire() {
         "expired connectivity should be ignored by read views"
     );
 
-    let partial_probe_ops =
-        cluster_connectivity_sync_ops(&paths, &node_a, &[]).expect("partial probe ops");
-    assert!(
-        partial_probe_ops.is_empty(),
-        "unprobed but unexpired connectivity records should be retained"
-    );
-
     expire_cluster_network_records(&paths, now + time::Duration::seconds(31))
         .expect("expire network");
     assert!(
@@ -19831,8 +19753,13 @@ fn connectivity_sync_refreshes_stable_records_near_expiry() {
         .expect("stored connectivity");
     write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("cluster kv snapshot");
 
-    let ops = cluster_connectivity_sync_ops(&paths, &source_node_id, &[incoming.clone()])
-        .expect("connectivity sync ops");
+    let ops = cluster_connectivity_full_sync_batch_ops(
+        &paths,
+        &source_node_id,
+        &[incoming.clone()],
+        sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+    )
+    .expect("connectivity sync ops");
     assert_eq!(
         ops.len(),
         1,
@@ -19852,8 +19779,13 @@ fn connectivity_sync_refreshes_stable_records_near_expiry() {
         )
         .expect("fresh stored connectivity");
     write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("fresh cluster kv snapshot");
-    let ops =
-        cluster_connectivity_sync_ops(&paths, &source_node_id, &[incoming]).expect("fresh ops");
+    let ops = cluster_connectivity_full_sync_batch_ops(
+        &paths,
+        &source_node_id,
+        &[incoming],
+        sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+    )
+    .expect("fresh ops");
     assert!(
         ops.is_empty(),
         "fresh stable connectivity records should not be rewritten just to update timestamps"
