@@ -1,6 +1,6 @@
 use crate::ClusterPaths;
 use crate::control_plane_options::DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT;
-use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
+use crate::endpoint_selector::{ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector};
 use crate::error::NetworkError;
 #[cfg(test)]
 use crate::local_state_store::read_cluster_state;
@@ -30,7 +30,7 @@ pub(crate) fn forward_cluster_membership_rpc_to_voter_with_host(
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let mut failures = Vec::new();
     for target_node_id in ClusterEndpointSelector::new(paths, state)
-        .select_unique_node_targets(ClusterEndpointSelectionPurpose::VoterCommand)
+        .select_internal_unique_node_targets(ClusterEndpointInternalSelectionPurpose::VoterCommand)
         .into_iter()
         .map(|endpoint| endpoint.node_id)
     {
@@ -61,11 +61,11 @@ pub async fn forward_cluster_membership_rpc_to_voter_async_with_host(
     failure_detail: &str,
     host: &mut (impl ClusterSignedEndpointRpcAsyncHost + Send),
 ) -> Result<ObjectRpcResponse, NetworkError> {
-    let voter_targets = ClusterEndpointSelector::select_unique_node_targets_async(
+    let voter_targets = ClusterEndpointSelector::select_internal_unique_node_targets_async(
         runtime,
         paths,
         state,
-        ClusterEndpointSelectionPurpose::VoterCommand,
+        ClusterEndpointInternalSelectionPurpose::VoterCommand,
     )
     .await?;
     let mut failures = Vec::new();
@@ -76,8 +76,8 @@ pub async fn forward_cluster_membership_rpc_to_voter_async_with_host(
                 state,
                 &target.node_id,
                 request,
-                ClusterObjectRpcNodeOptions::new(
-                    ClusterEndpointSelectionPurpose::VoterCommand,
+                ClusterObjectRpcNodeOptions::internal(
+                    ClusterEndpointInternalSelectionPurpose::VoterCommand,
                     DaemonRpcTimeouts::connect_and_idle(
                         DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
                     ),

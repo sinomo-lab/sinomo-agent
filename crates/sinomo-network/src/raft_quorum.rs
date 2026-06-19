@@ -4,7 +4,7 @@ use crate::control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlane
 #[cfg(test)]
 use crate::control_plane_options::ClusterControlPlaneTimeouts;
 use crate::control_plane_options::ClusterRaftAppendReplicationOptions;
-use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
+use crate::endpoint_selector::{ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector};
 use crate::error::NetworkError;
 use crate::kv_local_store::{
     LocalClusterRaftCommandStorage, append_cluster_raft_command_uncommitted_or_no_effect_async,
@@ -448,8 +448,11 @@ where
         &mut self,
         state: &ClusterBootstrapState,
     ) -> Result<Vec<Self::Target>, NetworkError> {
-        Ok(ClusterEndpointSelector::new(self.paths, state)
-            .select(ClusterEndpointSelectionPurpose::LiveVoterCommand))
+        Ok(
+            ClusterEndpointSelector::new(self.paths, state).select_internal(
+                ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
+            ),
+        )
     }
 
     fn target_node_id<'a>(&self, target: &'a Self::Target) -> &'a NodeId {
@@ -635,11 +638,11 @@ where
         let runtime = self.runtime;
         let paths = self.paths;
         Box::pin(async move {
-            ClusterEndpointSelector::select_async(
+            ClusterEndpointSelector::select_internal_async(
                 runtime,
                 paths,
                 state,
-                ClusterEndpointSelectionPurpose::LiveVoterCommand,
+                ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
             )
             .await
         })

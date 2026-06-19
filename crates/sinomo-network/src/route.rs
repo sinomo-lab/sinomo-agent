@@ -13,7 +13,7 @@
 //! coupling the network crate to daemon identity storage.
 
 use crate::endpoint_selector::{
-    cluster_endpoint_can_carry_main_daemon_rpc,
+    ClusterEndpointInternalSelectionPurpose, cluster_endpoint_can_carry_main_daemon_rpc,
     cluster_graph_has_reachable_main_daemon_route_targets, relay_hop_endpoint_is_usable,
 };
 use crate::membership::locally_learned_bridge_route_endpoint;
@@ -528,13 +528,30 @@ impl ClusterObjectRpcOptions {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClusterObjectRpcNodeOptions {
-    endpoint_selection: ClusterEndpointSelectionPurpose,
+    endpoint_selection: ClusterEndpointInternalSelectionPurpose,
     timeouts: DaemonRpcTimeouts,
 }
 
 impl ClusterObjectRpcNodeOptions {
     pub fn new(
         endpoint_selection: ClusterEndpointSelectionPurpose,
+        timeouts: DaemonRpcTimeouts,
+    ) -> Self {
+        Self {
+            endpoint_selection: endpoint_selection.into(),
+            timeouts,
+        }
+    }
+
+    pub fn cluster_state_authority(timeouts: DaemonRpcTimeouts) -> Self {
+        Self {
+            endpoint_selection: ClusterEndpointInternalSelectionPurpose::VoterCommand,
+            timeouts,
+        }
+    }
+
+    pub(crate) fn internal(
+        endpoint_selection: ClusterEndpointInternalSelectionPurpose,
         timeouts: DaemonRpcTimeouts,
     ) -> Self {
         Self {
@@ -1036,7 +1053,7 @@ async fn cluster_object_rpc_node_targets(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     target_node_id: &NodeId,
-    endpoint_selection: ClusterEndpointSelectionPurpose,
+    endpoint_selection: ClusterEndpointInternalSelectionPurpose,
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
     let paths = paths.clone();
     let state = state.clone();
@@ -5096,8 +5113,8 @@ mod tests {
                 &state,
                 &target,
                 &request,
-                ClusterObjectRpcNodeOptions::new(
-                    ClusterEndpointSelectionPurpose::VoterCommand,
+                ClusterObjectRpcNodeOptions::internal(
+                    ClusterEndpointInternalSelectionPurpose::VoterCommand,
                     DaemonRpcTimeouts::connect_only(Duration::from_secs(5)),
                 ),
             )

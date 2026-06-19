@@ -1,6 +1,6 @@
 use crate::ClusterPaths;
 use crate::endpoint_records::cleanup_member_iroh_endpoints;
-use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
+use crate::endpoint_selector::{ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector};
 use crate::error::NetworkError;
 use crate::keyspace::{
     cluster_capability_policy_key, cluster_endpoint_key, cluster_endpoint_prefix,
@@ -773,6 +773,7 @@ fn member_publish_targets_voter_first(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
-    ClusterEndpointSelector::new(paths, state)
-        .select(ClusterEndpointSelectionPurpose::MemberPublishVoterFirst)
+    ClusterEndpointSelector::new(paths, state).select_internal(
+        ClusterEndpointInternalSelectionPurpose::MemberPublishClusterStateAuthorityFirst,
+    )
 }

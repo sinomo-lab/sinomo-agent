@@ -26,18 +26,29 @@ pub enum ClusterEndpointSelectionPurpose {
     DaemonCommand,
     DfsData,
     InvitePublish,
-    LiveVoterCommand,
     MainDaemonCommand,
     MainDaemonCommandCandidates,
     MemberDaemonStatus,
     MemberPublish,
-    MemberPublishVoterFirst,
     NetworkProbe,
-    RaftCommand,
-    RaftMemberReplication,
     RelayHop,
     Rollout,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClusterEndpointInternalSelectionPurpose {
+    Public(ClusterEndpointSelectionPurpose),
+    LiveClusterStateAuthorityCommand,
+    MemberPublishClusterStateAuthorityFirst,
+    RaftCommand,
+    RaftMemberReplication,
     VoterCommand,
+}
+
+impl From<ClusterEndpointSelectionPurpose> for ClusterEndpointInternalSelectionPurpose {
+    fn from(purpose: ClusterEndpointSelectionPurpose) -> Self {
+        Self::Public(purpose)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,50 +99,85 @@ impl<'a> ClusterEndpointSelector<'a> {
     }
 
     pub fn select(&self, purpose: ClusterEndpointSelectionPurpose) -> Vec<ClusterEndpointRecord> {
+        self.select_internal(purpose.into())
+    }
+
+    pub fn select_cluster_state_command_targets(&self) -> Vec<ClusterEndpointRecord> {
+        self.select_internal(ClusterEndpointInternalSelectionPurpose::RaftCommand)
+    }
+
+    pub fn select_cluster_state_authority_targets(&self) -> Vec<ClusterEndpointRecord> {
+        self.select_internal(ClusterEndpointInternalSelectionPurpose::VoterCommand)
+    }
+
+    pub fn select_available_cluster_state_authority_targets(&self) -> Vec<ClusterEndpointRecord> {
+        self.select_internal(
+            ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
+        )
+    }
+
+    pub async fn select_cluster_state_authority_targets_async(
+        runtime: &tokio::runtime::Handle,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+        Self::select_internal_unique_node_targets_async(
+            runtime,
+            paths,
+            state,
+            ClusterEndpointInternalSelectionPurpose::VoterCommand,
+        )
+        .await
+    }
+
+    pub(crate) fn select_internal(
+        &self,
+        purpose: ClusterEndpointInternalSelectionPurpose,
+    ) -> Vec<ClusterEndpointRecord> {
         match purpose {
-            ClusterEndpointSelectionPurpose::DaemonCommand => {
-                cluster_daemon_command_targets_impl(self.paths, self.state)
-            }
-            ClusterEndpointSelectionPurpose::DfsData => {
-                cluster_dfs_data_targets_impl(self.paths, self.state)
-            }
-            ClusterEndpointSelectionPurpose::InvitePublish => {
-                cluster_invite_publish_targets_impl(self.paths, self.state)
-            }
-            ClusterEndpointSelectionPurpose::LiveVoterCommand => {
+            ClusterEndpointInternalSelectionPurpose::Public(
+                ClusterEndpointSelectionPurpose::DaemonCommand,
+            ) => cluster_daemon_command_targets_impl(self.paths, self.state),
+            ClusterEndpointInternalSelectionPurpose::Public(
+                ClusterEndpointSelectionPurpose::DfsData,
+            ) => cluster_dfs_data_targets_impl(self.paths, self.state),
+            ClusterEndpointInternalSelectionPurpose::Public(
+                ClusterEndpointSelectionPurpose::InvitePublish,
+            ) => cluster_invite_publish_targets_impl(self.paths, self.state),
+            ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand => {
                 cluster_live_voter_command_targets_impl(self.paths, self.state)
             }
-            ClusterEndpointSelectionPurpose::MainDaemonCommand => {
-                cluster_main_daemon_command_targets_impl(self.paths, self.state)
-            }
-            ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates => {
-                cluster_main_daemon_command_endpoint_candidates_impl(self.paths, self.state)
-            }
-            ClusterEndpointSelectionPurpose::MemberDaemonStatus => {
-                cluster_member_daemon_status_targets_impl(self.paths, self.state)
-            }
-            ClusterEndpointSelectionPurpose::MemberPublish => {
-                cluster_member_publish_targets_impl(self.paths, self.state)
-            }
-            ClusterEndpointSelectionPurpose::MemberPublishVoterFirst => {
+            ClusterEndpointInternalSelectionPurpose::Public(
+                ClusterEndpointSelectionPurpose::MainDaemonCommand,
+            ) => cluster_main_daemon_command_targets_impl(self.paths, self.state),
+            ClusterEndpointInternalSelectionPurpose::Public(
+                ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates,
+            ) => cluster_main_daemon_command_endpoint_candidates_impl(self.paths, self.state),
+            ClusterEndpointInternalSelectionPurpose::Public(
+                ClusterEndpointSelectionPurpose::MemberDaemonStatus,
+            ) => cluster_member_daemon_status_targets_impl(self.paths, self.state),
+            ClusterEndpointInternalSelectionPurpose::Public(
+                ClusterEndpointSelectionPurpose::MemberPublish,
+            ) => cluster_member_publish_targets_impl(self.paths, self.state),
+            ClusterEndpointInternalSelectionPurpose::MemberPublishClusterStateAuthorityFirst => {
                 cluster_member_publish_targets_voter_first_impl(self.paths, self.state)
             }
-            ClusterEndpointSelectionPurpose::NetworkProbe => {
-                cluster_network_probe_targets_impl(self.state)
-            }
-            ClusterEndpointSelectionPurpose::RaftCommand => {
+            ClusterEndpointInternalSelectionPurpose::Public(
+                ClusterEndpointSelectionPurpose::NetworkProbe,
+            ) => cluster_network_probe_targets_impl(self.state),
+            ClusterEndpointInternalSelectionPurpose::RaftCommand => {
                 cluster_raft_command_targets_impl(self.paths, self.state)
             }
-            ClusterEndpointSelectionPurpose::RaftMemberReplication => {
+            ClusterEndpointInternalSelectionPurpose::RaftMemberReplication => {
                 cluster_raft_member_replication_targets_impl(self.paths, self.state)
             }
-            ClusterEndpointSelectionPurpose::RelayHop => {
-                cluster_main_daemon_command_endpoint_candidates_impl(self.paths, self.state)
-            }
-            ClusterEndpointSelectionPurpose::Rollout => {
-                cluster_rollout_endpoint_targets_impl(self.paths, self.state)
-            }
-            ClusterEndpointSelectionPurpose::VoterCommand => {
+            ClusterEndpointInternalSelectionPurpose::Public(
+                ClusterEndpointSelectionPurpose::RelayHop,
+            ) => cluster_main_daemon_command_endpoint_candidates_impl(self.paths, self.state),
+            ClusterEndpointInternalSelectionPurpose::Public(
+                ClusterEndpointSelectionPurpose::Rollout,
+            ) => cluster_rollout_endpoint_targets_impl(self.paths, self.state),
+            ClusterEndpointInternalSelectionPurpose::VoterCommand => {
                 cluster_voter_command_targets_impl(self.paths, self.state)
             }
         }
@@ -154,6 +200,13 @@ impl<'a> ClusterEndpointSelector<'a> {
         Self::unique_node_targets(self.select(purpose))
     }
 
+    pub(crate) fn select_internal_unique_node_targets(
+        &self,
+        purpose: ClusterEndpointInternalSelectionPurpose,
+    ) -> Vec<ClusterEndpointRecord> {
+        Self::unique_node_targets(self.select_internal(purpose))
+    }
+
     pub async fn select_async(
         runtime: &tokio::runtime::Handle,
         paths: &ClusterPaths,
@@ -164,6 +217,25 @@ impl<'a> ClusterEndpointSelector<'a> {
         let state = state.clone();
         runtime
             .spawn_blocking(move || ClusterEndpointSelector::new(&paths, &state).select(purpose))
+            .await
+            .map_err(|source| NetworkError::Io {
+                operation: "cluster endpoint selection".to_string(),
+                detail: format!("cluster endpoint selection task failed: {source}"),
+            })
+    }
+
+    pub(crate) async fn select_internal_async(
+        runtime: &tokio::runtime::Handle,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        purpose: ClusterEndpointInternalSelectionPurpose,
+    ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+        let paths = paths.clone();
+        let state = state.clone();
+        runtime
+            .spawn_blocking(move || {
+                ClusterEndpointSelector::new(&paths, &state).select_internal(purpose)
+            })
             .await
             .map_err(|source| NetworkError::Io {
                 operation: "cluster endpoint selection".to_string(),
@@ -190,13 +262,33 @@ impl<'a> ClusterEndpointSelector<'a> {
             })
     }
 
+    pub(crate) async fn select_internal_unique_node_targets_async(
+        runtime: &tokio::runtime::Handle,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        purpose: ClusterEndpointInternalSelectionPurpose,
+    ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+        let paths = paths.clone();
+        let state = state.clone();
+        runtime
+            .spawn_blocking(move || {
+                ClusterEndpointSelector::new(&paths, &state)
+                    .select_internal_unique_node_targets(purpose)
+            })
+            .await
+            .map_err(|source| NetworkError::Io {
+                operation: "cluster unique node target selection".to_string(),
+                detail: format!("cluster unique node target selection task failed: {source}"),
+            })
+    }
+
     pub(crate) fn select_node(
         &self,
-        purpose: ClusterEndpointSelectionPurpose,
+        purpose: ClusterEndpointInternalSelectionPurpose,
         node_id: &NodeId,
     ) -> Vec<ClusterEndpointRecord> {
         let mut seen = BTreeSet::new();
-        self.select(purpose)
+        self.select_internal(purpose)
             .into_iter()
             .filter(|endpoint| endpoint.node_id == *node_id)
             .filter(|endpoint| {
@@ -269,7 +361,7 @@ impl<'a> ClusterEndpointSelector<'a> {
             }
         }
         for endpoint in self
-            .select_node(ClusterEndpointSelectionPurpose::RelayHop, node_id)
+            .select_node(ClusterEndpointSelectionPurpose::RelayHop.into(), node_id)
             .into_iter()
             .filter(|endpoint| {
                 relay_hop_endpoint_is_usable(

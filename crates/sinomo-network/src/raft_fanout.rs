@@ -1,7 +1,7 @@
 use crate::ClusterPaths;
 use crate::control_plane_driver::ClusterControlPlaneDriver;
 use crate::control_plane_options::ClusterRaftCommittedFanoutOptions;
-use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
+use crate::endpoint_selector::{ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector};
 use crate::error::NetworkError;
 use crate::kv_local_store::read_cluster_kv_snapshot;
 use crate::local_state_store::read_cluster_state;
@@ -82,11 +82,11 @@ pub async fn fan_out_committed_cluster_raft_command_async_with_host(
 ) -> Result<ClusterRaftCommittedFanoutReport, NetworkError> {
     let mut report = ClusterRaftCommittedFanoutReport::default();
     let mut replicated_nodes = BTreeSet::new();
-    for endpoint in ClusterEndpointSelector::select_async(
+    for endpoint in ClusterEndpointSelector::select_internal_async(
         runtime,
         paths,
         state,
-        ClusterEndpointSelectionPurpose::RaftMemberReplication,
+        ClusterEndpointInternalSelectionPurpose::RaftMemberReplication,
     )
     .await?
     {

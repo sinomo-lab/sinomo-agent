@@ -78,7 +78,8 @@ use tower_layer::Layer;
 use crate::auth::{AuthenticatedDaemonCommand, DaemonSignerAuthority};
 use crate::cluster::{
     DaemonClusterJoinRegistrationHost, DaemonClusterMemberMutationHost, DaemonClusterStatusProbe,
-    cluster_paths_from_daemon_paths, forward_cluster_invite_challenge_to_voter_async_on_runtime,
+    cluster_paths_from_daemon_paths,
+    forward_cluster_invite_challenge_to_cluster_state_authority_async_on_runtime,
     handle_daemon_cluster_kv_snapshot_async, handle_daemon_cluster_kv_txn_request_async_on_runtime,
     handle_daemon_cluster_relay_request_on_runtime,
     handle_forwarded_daemon_cluster_kv_txn_request_async_on_runtime,
@@ -728,7 +729,7 @@ fn service_signer_cluster_identity(
 
 /// Daemon adapter for cluster membership object-RPC routes. The domain join decision
 /// lives in `sinomo-network`; the daemon handler still supplies host-local member refresh,
-/// voter forwarding, and quorum persistence.
+/// authority forwarding, and cluster state persistence.
 /// Server-side budgets for join handling, deliberately below the joiner's
 /// 30s idle deadline so a stuck step yields a structured error the retry
 /// loop can act on.
@@ -765,7 +766,7 @@ impl Service for ClusterMembershipService {
             if request.route == CLUSTER_JOIN_CHALLENGE_ROUTE {
                 let challenge: sinomo_network::ClusterInviteChallengeRequest =
                     request.decode_body()?;
-                // The whole proof acquisition (local attempt + voter forward)
+                // The whole proof acquisition (local attempt + authority forward)
                 // runs under a hard budget: a hung step must surface an error
                 // to the joiner — never hold its stream open silently, or the
                 // joiner's bounded retry loop can wedge for its whole window.
@@ -791,12 +792,12 @@ impl Service for ClusterMembershipService {
                         Ok(proof) => Ok(proof),
                         Err(local_error) => {
                             // A bridge introducer may hold the invite but not be proof-capable.
-                            // Relay to a voter that can produce an issuer-signed proof.
+                            // Relay to a cluster state authority that can produce an issuer-signed proof.
                             let runtime = require_service_runtime(
                                 proof_runtime.as_ref(),
                                 "cluster join challenge",
                             )?;
-                            match forward_cluster_invite_challenge_to_voter_async_on_runtime(
+                            match forward_cluster_invite_challenge_to_cluster_state_authority_async_on_runtime(
                                 &proof_paths,
                                 &proof_challenge,
                                 runtime,
@@ -806,7 +807,7 @@ impl Service for ClusterMembershipService {
                                 Ok(proof) => Ok(proof),
                                 Err(forward_error) => {
                                     eprintln!(
-                                        "sinomo daemon join challenge for invite {} failed (local: {local_error}; forward-to-voter: {forward_error})",
+                                        "sinomo daemon join challenge for invite {} failed (local: {local_error}; forward-to-authority: {forward_error})",
                                         proof_challenge.invite_id
                                     );
                                     Err(daemon_error(local_error))

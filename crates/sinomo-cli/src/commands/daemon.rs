@@ -702,8 +702,7 @@ impl network::ClusterKvTxnQuorumHost for CliClusterKvTxnQuorumHost {
             Some(state.cluster_id.clone()),
             "cli endpoint rpc signing",
         );
-        let options = network::ClusterObjectRpcNodeOptions::new(
-            network::ClusterEndpointSelectionPurpose::VoterCommand,
+        let options = network::ClusterObjectRpcNodeOptions::cluster_state_authority(
             network::DaemonRpcTimeouts::connect_and_idle(timeout),
         );
         let mut client =

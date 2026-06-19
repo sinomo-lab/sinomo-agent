@@ -1,6 +1,6 @@
 use crate::ClusterPaths;
 use crate::endpoint_selector::{
-    ClusterEndpointSelectionPurpose, ClusterEndpointSelector,
+    ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector,
     cluster_node_blocks_leader_preference, cluster_node_blocks_leader_preference_async,
 };
 use crate::error::NetworkError;
@@ -59,7 +59,9 @@ pub(crate) fn forward_cluster_kv_txn_to_voter_with_host(
     host: &mut impl ClusterKvTxnForwardHost,
 ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
     let mut targets = ClusterEndpointSelector::new(paths, state)
-        .select_unique_node_targets(ClusterEndpointSelectionPurpose::LiveVoterCommand);
+        .select_internal_unique_node_targets(
+            ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
+        );
     if targets.is_empty() {
         return Ok(None);
     }
@@ -158,11 +160,11 @@ pub(crate) async fn forward_cluster_kv_txn_to_voter_async_with_host<H>(
 where
     H: ClusterSignedEndpointRpcAsyncHost + Send,
 {
-    let mut targets = ClusterEndpointSelector::select_unique_node_targets_async(
+    let mut targets = ClusterEndpointSelector::select_internal_unique_node_targets_async(
         runtime,
         paths,
         state,
-        ClusterEndpointSelectionPurpose::LiveVoterCommand,
+        ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
     )
     .await?;
     if targets.is_empty() {
@@ -245,8 +247,8 @@ where
             state,
             voter_node_id,
             &txn_request,
-            ClusterObjectRpcNodeOptions::new(
-                ClusterEndpointSelectionPurpose::VoterCommand,
+            ClusterObjectRpcNodeOptions::internal(
+                ClusterEndpointInternalSelectionPurpose::VoterCommand,
                 DaemonRpcTimeouts::connect_and_idle(timeout),
             ),
         )
@@ -268,8 +270,8 @@ where
             state,
             voter_node_id,
             &snapshot_request,
-            ClusterObjectRpcNodeOptions::new(
-                ClusterEndpointSelectionPurpose::VoterCommand,
+            ClusterObjectRpcNodeOptions::internal(
+                ClusterEndpointInternalSelectionPurpose::VoterCommand,
                 DaemonRpcTimeouts::connect_and_idle(snapshot_timeout),
             ),
         )

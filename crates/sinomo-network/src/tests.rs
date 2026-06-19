@@ -4,6 +4,7 @@ use crate::control_plane_adapters::{
     cluster_member_removal_txns_from_store, cluster_member_update_ops_from_store,
     cluster_raft_config_from_store,
 };
+use crate::endpoint_selector::ClusterEndpointInternalSelectionPurpose;
 use crate::health::{
     cluster_health_rows_with_async_probe, cluster_health_rpc_request_is_local_scope,
     handle_cluster_health_rpc_request, handle_cluster_health_rpc_request_async,
@@ -4760,7 +4761,7 @@ fn local_route_graph_uses_persisted_self_connectivity_after_cache_loss() {
     );
 
     let targets = ClusterEndpointSelector::new(&paths, &state)
-        .select(ClusterEndpointSelectionPurpose::RaftCommand);
+        .select_internal(ClusterEndpointInternalSelectionPurpose::RaftCommand);
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&iroh.endpoint_id),
@@ -5264,7 +5265,7 @@ fn raft_command_targets_try_unknown_tcp_before_unknown_iroh_fallbacks() {
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
 
     let targets = ClusterEndpointSelector::new(&paths, &state)
-        .select(ClusterEndpointSelectionPurpose::RaftCommand);
+        .select_internal(ClusterEndpointInternalSelectionPurpose::RaftCommand);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
@@ -5352,7 +5353,7 @@ fn raft_command_targets_preserve_verified_connectivity_before_unknown_tcp() {
     .expect("connectivity records");
 
     let targets = ClusterEndpointSelector::new(&paths, &state)
-        .select(ClusterEndpointSelectionPurpose::RaftCommand);
+        .select_internal(ClusterEndpointInternalSelectionPurpose::RaftCommand);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
@@ -5460,7 +5461,7 @@ fn raft_command_targets_keep_degraded_direct_before_iroh() {
     .expect("connectivity records");
 
     let targets = ClusterEndpointSelector::new(&paths, &state)
-        .select(ClusterEndpointSelectionPurpose::RaftCommand);
+        .select_internal(ClusterEndpointInternalSelectionPurpose::RaftCommand);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
@@ -5573,7 +5574,7 @@ fn raft_command_targets_prefer_reachable_voter_over_unreachable_voter() {
     .expect("sync connectivity");
 
     let targets = ClusterEndpointSelector::new(&paths, &state)
-        .select(ClusterEndpointSelectionPurpose::RaftCommand);
+        .select_internal(ClusterEndpointInternalSelectionPurpose::RaftCommand);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.node_id),
@@ -5688,7 +5689,7 @@ fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
     let candidates = selector.select(ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates);
     let relay_hop_candidates = selector.select(ClusterEndpointSelectionPurpose::RelayHop);
     let relay_hop_for_remote = selector.select_node(
-        ClusterEndpointSelectionPurpose::RelayHop,
+        ClusterEndpointSelectionPurpose::RelayHop.into(),
         &main_endpoint.node_id,
     );
     let dfs_targets = selector.select(ClusterEndpointSelectionPurpose::DfsData);
@@ -10910,7 +10911,9 @@ fn cluster_node_blocks_leader_preference_when_local_probe_marks_member_unreachab
     );
     assert_eq!(
         ClusterEndpointSelector::new(&paths, &state)
-            .select(ClusterEndpointSelectionPurpose::LiveVoterCommand)
+            .select_internal(
+                ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand
+            )
             .len(),
         1,
         "an unreachable peer remains a voter while connectivity recovers"
@@ -13257,13 +13260,15 @@ fn join_voter_targets_do_not_filter_offline_status_during_bootstrap() {
 
     assert!(
         ClusterEndpointSelector::new(&paths, &state)
-            .select(ClusterEndpointSelectionPurpose::LiveVoterCommand)
+            .select_internal(
+                ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand
+            )
             .is_empty(),
         "ordinary live-voter routing should honor explicit offline status"
     );
     assert_eq!(
         ClusterEndpointSelector::new(&paths, &state)
-            .select(ClusterEndpointSelectionPurpose::VoterCommand)
+            .select_internal(ClusterEndpointInternalSelectionPurpose::VoterCommand)
             .first()
             .map(|endpoint| &endpoint.endpoint_id),
         Some(&voter_endpoint.endpoint_id),
@@ -14183,7 +14188,8 @@ fn advertised_hostname_outranks_opportunistic_private_ip_for_docker_routes() {
     .expect("connectivity records");
 
     let selector = ClusterEndpointSelector::new(&paths, &state);
-    let raft_targets = selector.select(ClusterEndpointSelectionPurpose::RaftCommand);
+    let raft_targets =
+        selector.select_internal(ClusterEndpointInternalSelectionPurpose::RaftCommand);
     assert_eq!(
         raft_targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&stable_hostname.endpoint_id),
