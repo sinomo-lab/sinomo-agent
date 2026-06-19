@@ -4677,11 +4677,11 @@ pub(crate) async fn handle_daemon_cluster_relay_request_on_runtime(
         &state,
         &local_node_id,
         envelope,
-        sinomo_network::ClusterRelayOptions {
-            timeouts: sinomo_network::DaemonRpcTimeouts::connect_and_idle(
+        sinomo_network::ClusterRelayOptions::new(
+            sinomo_network::DaemonRpcTimeouts::connect_and_idle(
                 DAEMON_CLUSTER_RELAY_CONNECT_TIMEOUT,
             ),
-        },
+        ),
         &mut host,
     )
     .await
@@ -4711,11 +4711,11 @@ pub(crate) async fn handle_daemon_cluster_relay_stream_forward_on_runtime(
         &state,
         &local_node_id,
         envelope,
-        sinomo_network::ClusterRelayOptions {
-            timeouts: sinomo_network::DaemonRpcTimeouts::connect_and_idle(
+        sinomo_network::ClusterRelayOptions::new(
+            sinomo_network::DaemonRpcTimeouts::connect_and_idle(
                 DAEMON_CLUSTER_RELAY_CONNECT_TIMEOUT,
             ),
-        },
+        ),
         &mut host,
     )
     .await
@@ -10313,11 +10313,9 @@ mod tests {
                     &state,
                     &local_node,
                     envelope,
-                    sinomo_network::ClusterRelayOptions {
-                        timeouts: sinomo_network::DaemonRpcTimeouts::connect_and_idle(
-                            Duration::from_secs(5),
-                        ),
-                    },
+                    sinomo_network::ClusterRelayOptions::new(
+                        sinomo_network::DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5)),
+                    ),
                     &mut host,
                 ),
             )
@@ -10412,11 +10410,9 @@ mod tests {
                     &state,
                     &local_node,
                     envelope,
-                    sinomo_network::ClusterRelayOptions {
-                        timeouts: sinomo_network::DaemonRpcTimeouts::connect_and_idle(
-                            Duration::from_secs(5),
-                        ),
-                    },
+                    sinomo_network::ClusterRelayOptions::new(
+                        sinomo_network::DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5)),
+                    ),
                     &mut host,
                 ),
             )

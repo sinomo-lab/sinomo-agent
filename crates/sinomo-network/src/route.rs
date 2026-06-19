@@ -394,7 +394,13 @@ fn relay_decision(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClusterRelayOptions {
-    pub timeouts: DaemonRpcTimeouts,
+    timeouts: DaemonRpcTimeouts,
+}
+
+impl ClusterRelayOptions {
+    pub fn new(timeouts: DaemonRpcTimeouts) -> Self {
+        Self { timeouts }
+    }
 }
 
 pub type ClusterRelayFuture<'a, T> =
@@ -473,7 +479,7 @@ struct ClusterSignedEndpointRpcOptions {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClusterObjectRpcOptions {
-    pub timeouts: DaemonRpcTimeouts,
+    timeouts: DaemonRpcTimeouts,
 }
 
 impl ClusterObjectRpcOptions {
@@ -484,8 +490,8 @@ impl ClusterObjectRpcOptions {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClusterObjectRpcNodeOptions {
-    pub endpoint_selection: ClusterEndpointSelectionPurpose,
-    pub timeouts: DaemonRpcTimeouts,
+    endpoint_selection: ClusterEndpointSelectionPurpose,
+    timeouts: DaemonRpcTimeouts,
 }
 
 impl ClusterObjectRpcNodeOptions {
@@ -691,8 +697,8 @@ where
 
 #[derive(Clone, Copy)]
 pub struct ClusterObjectRpcRouteContext<'a> {
-    pub runtime: &'a tokio::runtime::Handle,
-    pub paths: &'a ClusterPaths,
+    runtime: &'a tokio::runtime::Handle,
+    paths: &'a ClusterPaths,
 }
 
 impl<'a> ClusterObjectRpcRouteContext<'a> {
@@ -5359,9 +5365,7 @@ mod tests {
             &state,
             &local,
             envelope,
-            ClusterRelayOptions {
-                timeouts: DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5)),
-            },
+            ClusterRelayOptions::new(DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5))),
             &mut async_host,
         )
         .await
@@ -5392,9 +5396,7 @@ mod tests {
             &state,
             &local,
             stream_envelope,
-            ClusterRelayOptions {
-                timeouts: DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5)),
-            },
+            ClusterRelayOptions::new(DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5))),
             &mut stream_host,
         )
         .await
