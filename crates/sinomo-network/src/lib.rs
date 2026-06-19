@@ -15,6 +15,7 @@
 mod connectivity;
 mod connectivity_publish;
 mod connectivity_store;
+mod control_plane_adapters;
 mod control_plane_driver;
 mod control_plane_options;
 mod endpoint_advertisement;
@@ -63,7 +64,6 @@ mod route_graph_read_model;
 mod rpc;
 mod rpc_future;
 mod status_publish;
-mod storage;
 mod voter_reachability;
 
 pub use connectivity::{

@@ -1,3 +1,9 @@
+use crate::control_plane_adapters::*;
+use crate::control_plane_adapters::{
+    LocalClusterRaftCommandStorage, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
+    cluster_member_removal_txns_from_store, cluster_member_update_ops_from_store,
+    cluster_raft_config_from_store,
+};
 use crate::health::{
     cluster_health_rows_with_async_probe, cluster_health_rpc_request_is_local_scope,
     handle_cluster_health_rpc_request, handle_cluster_health_rpc_request_async,
@@ -33,12 +39,6 @@ use crate::roaming::{
 #[cfg(feature = "iroh-transport")]
 use crate::roaming::{iroh_public_key_for_node_async, load_or_create_iroh_secret_key};
 use crate::rpc::ObjectRpcFuture;
-use crate::storage::*;
-use crate::storage::{
-    LocalClusterRaftCommandStorage, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
-    cluster_member_removal_txns_from_store, cluster_member_update_ops_from_store,
-    cluster_raft_config_from_store,
-};
 use crate::*;
 use sinomo_kv::ClusterKvRaftConfigRecord;
 
@@ -7911,12 +7911,20 @@ async fn async_cluster_raft_committed_fanout_uses_async_host_and_batches_watch_e
 fn cluster_raft_fanout_handoff_claims_pending_pass_after_clearing_active() {
     let active = AtomicBool::new(true);
     let pending = AtomicBool::new(false);
-    assert!(!crate::storage::claim_next_cluster_raft_fanout_pass_for_test(&active, &pending));
+    assert!(
+        !crate::control_plane_adapters::claim_next_cluster_raft_fanout_pass_for_test(
+            &active, &pending
+        )
+    );
     assert!(!active.load(Ordering::Acquire));
 
     active.store(true, Ordering::Release);
     pending.store(true, Ordering::Release);
-    assert!(crate::storage::claim_next_cluster_raft_fanout_pass_for_test(&active, &pending));
+    assert!(
+        crate::control_plane_adapters::claim_next_cluster_raft_fanout_pass_for_test(
+            &active, &pending
+        )
+    );
     assert!(active.load(Ordering::Acquire));
 }
 
@@ -18937,7 +18945,7 @@ fn expire_cluster_network_records_handles_prefix_larger_than_public_range_limit(
             _ => unreachable!("put_serde creates put op"),
         }
     }
-    let first_batch = crate::storage::cluster_network_expiry_delete_ops(
+    let first_batch = crate::control_plane_adapters::cluster_network_expiry_delete_ops(
         &store.snapshot(),
         now,
         sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
@@ -19893,7 +19901,7 @@ fn cluster_kv_watch_events_append_log_suppresses_duplicate_batches() {
         .len();
 
     assert!(
-        crate::storage::cached_cluster_kv_watch_events_contain_all(
+        crate::control_plane_adapters::cached_cluster_kv_watch_events_contain_all(
             &paths,
             std::slice::from_ref(&event)
         ),
