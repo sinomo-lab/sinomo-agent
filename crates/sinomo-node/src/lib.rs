@@ -335,6 +335,7 @@ mod tests {
     #[test]
     fn cluster_node_key_helpers_are_stable() {
         let node_id = Id::from_legacy_named("node_policy_key").expect("node");
+        let invite_id = Id::from_legacy_named("invite_policy_key").expect("invite");
         let observed_at = time::OffsetDateTime::parse(
             "2026-05-02T12:00:00Z",
             &time::format_description::well_known::Rfc3339,
@@ -362,6 +363,18 @@ mod tests {
         assert_eq!(
             cluster_capability_policy_key(&node_id),
             format!("/cluster/policy/capabilities/{node_id}")
+        );
+        assert_eq!(
+            cluster_member_key(&node_id),
+            format!("/cluster/members/{node_id}")
+        );
+        assert_eq!(
+            cluster_invitation_key(&invite_id),
+            format!("/cluster/invitations/{invite_id}")
+        );
+        assert_eq!(
+            cluster_invitation_state_key(&invite_id),
+            format!("/cluster/invitations/{invite_id}/state")
         );
         assert_eq!(
             cluster_node_status_key(&node_id),

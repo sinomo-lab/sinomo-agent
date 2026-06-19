@@ -195,6 +195,18 @@ pub fn cluster_capability_policy_key(node_id: &NodeId) -> String {
     format!("/cluster/policy/capabilities/{node_id}")
 }
 
+pub fn cluster_member_key(node_id: &NodeId) -> String {
+    format!("/cluster/members/{node_id}")
+}
+
+pub fn cluster_invitation_key(invite_id: &Id) -> String {
+    format!("/cluster/invitations/{invite_id}")
+}
+
+pub fn cluster_invitation_state_key(invite_id: &Id) -> String {
+    format!("/cluster/invitations/{invite_id}/state")
+}
+
 pub fn cluster_node_status_key(node_id: &NodeId) -> String {
     format!("/cluster/node-status/{node_id}")
 }

@@ -7756,7 +7756,7 @@ fn local_voter_republishes_local_members_missing_from_kv() {
         &paths,
         &local_state.local_node_id,
         sinomo_runtime::kv::KvCommand::Op(KvOp::Delete {
-            key: sinomo_runtime::network::cluster_member_key(&local_state.local_node_id),
+            key: sinomo_runtime::node::cluster_member_key(&local_state.local_node_id),
         }),
     )
     .expect("delete local member from kv");
@@ -8349,7 +8349,7 @@ fn cluster_invite_generates_portable_join_payload() {
     assert_eq!(parsed.invitation_secret, persisted_invite.invitation_secret);
     let invite_state_entry = super::read_cluster_kv_store(&paths)
         .expect("cluster kv store")
-        .get(&super::network::cluster_invitation_state_key(
+        .get(&sinomo_runtime::node::cluster_invitation_state_key(
             &parsed.invite_id,
         ))
         .expect("invite state")
@@ -8359,7 +8359,7 @@ fn cluster_invite_generates_portable_join_payload() {
     assert_eq!(invite_state.state, "active");
     assert_eq!(
         rendered.persisted_key,
-        super::network::cluster_invitation_key(&parsed.invite_id)
+        sinomo_runtime::node::cluster_invitation_key(&parsed.invite_id)
     );
     assert_eq!(
         std::fs::read_to_string(output).expect("invite file").trim(),

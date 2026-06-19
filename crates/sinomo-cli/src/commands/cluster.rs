@@ -965,7 +965,7 @@ pub(crate) fn cluster_invite_with_paths(
         })?;
     }
     Ok(RenderedClusterInvite {
-        persisted_key: network::cluster_invitation_key(&invite.invite_id),
+        persisted_key: sinomo_runtime::node::cluster_invitation_key(&invite.invite_id),
         invite,
         uri,
         join_command,
