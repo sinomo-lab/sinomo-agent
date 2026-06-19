@@ -268,7 +268,7 @@ impl DfsMessageTransport for sinomo_network::InProcessTransport {
         target_node_id: &NodeId,
         message: DfsRoutedMessage,
     ) -> Result<(), NetworkError> {
-        let request = dfs_message_rpc_request(&dfs_message_command_from_routed_message(message))?;
+        let request = dfs_routed_message_rpc_request(&message)?;
         self.send_object_rpc_request(target_node_id, request)
     }
 
@@ -304,8 +304,7 @@ impl AsyncDfsMessageTransport for sinomo_network::AsyncInProcessTransport {
         message: DfsRoutedMessage,
     ) -> DfsMessageTransportFuture<'a, Result<(), NetworkError>> {
         Box::pin(async move {
-            let request =
-                dfs_message_rpc_request(&dfs_message_command_from_routed_message(message))?;
+            let request = dfs_routed_message_rpc_request(&message)?;
             self.send_object_rpc_request_async(
                 target_node_id,
                 request,
@@ -526,7 +525,7 @@ fn dfs_routed_message_from_object_rpc_request(
     Ok(decode_dfs_message_rpc_request(request)?.routed_message)
 }
 
-pub fn decode_dfs_message_rpc_request(
+fn decode_dfs_message_rpc_request(
     request: &ObjectRpcRequest,
 ) -> Result<DfsMessageCommand, NetworkError> {
     if !dfs_route_is_message_data_plane(&request.route) {
@@ -554,11 +553,11 @@ pub fn dfs_route_is_message_data_plane(route: &str) -> bool {
     DFS_MESSAGE_DATA_PLANE_ROUTES.contains(&route)
 }
 
-pub fn dfs_message_route(command: &DfsMessageCommand) -> &'static str {
+fn dfs_message_route(command: &DfsMessageCommand) -> &'static str {
     dfs_message_route_for_network_message(&command.routed_message.message)
 }
 
-pub fn dfs_message_route_for_network_message(message: &DfsNetworkMessage) -> &'static str {
+fn dfs_message_route_for_network_message(message: &DfsNetworkMessage) -> &'static str {
     match message {
         DfsNetworkMessage::ReadRequest(_) => DFS_DATA_READ_ROUTE,
         DfsNetworkMessage::ReadResponse(_) => DFS_DATA_READ_RESPONSE_ROUTE,
@@ -700,9 +699,13 @@ pub fn decode_dfs_metadata_snapshot_install_rpc_response(
     response.decode_body()
 }
 
-pub fn dfs_message_rpc_request(
-    command: &DfsMessageCommand,
+pub fn dfs_routed_message_rpc_request(
+    message: &DfsRoutedMessage,
 ) -> Result<ObjectRpcRequest, NetworkError> {
+    dfs_message_rpc_request(&dfs_message_command_from_routed_message(message.clone()))
+}
+
+fn dfs_message_rpc_request(command: &DfsMessageCommand) -> Result<ObjectRpcRequest, NetworkError> {
     let mut request =
         ObjectRpcRequest::encode_body(dfs_message_route(command), DFS_RPC_CATEGORY, command)?;
     sinomo_network::set_object_rpc_request_stream_mode(
@@ -712,7 +715,7 @@ pub fn dfs_message_rpc_request(
     Ok(request)
 }
 
-pub fn decode_dfs_message_rpc_response(
+fn decode_dfs_message_rpc_response(
     response: &ObjectRpcResponse,
 ) -> Result<DfsMessageResponse, NetworkError> {
     response.decode_body()
@@ -8125,7 +8128,7 @@ pub(crate) fn async_dfs_message_sender_from_peer_transport(
     Arc::new(move |endpoint, command, connect_timeout| {
         let peer_transport = Arc::clone(&peer_transport);
         Box::pin(async move {
-            let request = dfs_message_rpc_request(command)
+            let request = dfs_routed_message_rpc_request(&command.routed_message)
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
             let response = peer_transport
                 .call_object_rpc_async(
@@ -8210,7 +8213,7 @@ pub(crate) fn dfs_message_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsMessageSender {
     Arc::new(move |endpoint, command, connect_timeout| {
-        let request = dfs_message_rpc_request(command)
+        let request = dfs_routed_message_rpc_request(&command.routed_message)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
         let response = peer_transport.call_object_rpc(
             endpoint,

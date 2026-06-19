@@ -326,12 +326,13 @@ fn run_protocol_codec_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult 
     let encoded_samples = samples
         .iter()
         .map(|sample| {
-            let request = dfs::dfs_message_rpc_request(&sample.command).map_err(|error| {
-                SinomoTestError::failed(format!(
-                    "cannot encode {} DFS message request: {error}",
-                    sample.label
-                ))
-            })?;
+            let request = dfs::dfs_routed_message_rpc_request(&sample.command.routed_message)
+                .map_err(|error| {
+                    SinomoTestError::failed(format!(
+                        "cannot encode {} DFS message request: {error}",
+                        sample.label
+                    ))
+                })?;
             Ok(EncodedDfsProtocolCodecSample {
                 label: sample.label,
                 request_body_bytes: request.body.len(),
@@ -356,12 +357,13 @@ fn run_protocol_codec_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult 
     let mut encoded_request_body_bytes = 0_usize;
     for _ in 0..iterations {
         for sample in &samples {
-            let request = dfs::dfs_message_rpc_request(&sample.command).map_err(|error| {
-                SinomoTestError::failed(format!(
-                    "cannot encode {} DFS message request: {error}",
-                    sample.label
-                ))
-            })?;
+            let request = dfs::dfs_routed_message_rpc_request(&sample.command.routed_message)
+                .map_err(|error| {
+                    SinomoTestError::failed(format!(
+                        "cannot encode {} DFS message request: {error}",
+                        sample.label
+                    ))
+                })?;
             encoded_request_body_bytes =
                 encoded_request_body_bytes.saturating_add(request.body.len());
             std::hint::black_box(&request);
