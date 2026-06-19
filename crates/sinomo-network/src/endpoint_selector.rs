@@ -147,7 +147,7 @@ impl<'a> ClusterEndpointSelector<'a> {
     }
 }
 
-pub fn cluster_sync_targets_with_connectivity(
+pub(crate) fn cluster_sync_targets_with_connectivity(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
@@ -892,7 +892,7 @@ pub(crate) fn cluster_network_probe_targets_impl(
     endpoints
 }
 
-pub fn prefer_bounded_daemon_command_targets(
+pub(crate) fn prefer_bounded_daemon_command_targets(
     endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
 ) -> Vec<ClusterEndpointRecord> {
     let mut endpoint_route_keys = BTreeSet::new();
