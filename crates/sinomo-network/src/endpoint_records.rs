@@ -2,7 +2,7 @@ use crate::ClusterPaths;
 use crate::error::NetworkError;
 use crate::prelude::*;
 
-pub fn cluster_endpoint_stable_eq(
+pub(crate) fn cluster_endpoint_stable_eq(
     left: &ClusterEndpointRecord,
     right: &ClusterEndpointRecord,
 ) -> bool {

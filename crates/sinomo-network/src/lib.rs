@@ -122,8 +122,8 @@ pub(crate) use endpoint_records::cleanup_member_iroh_endpoints;
 pub(crate) use endpoint_records::iroh_endpoint_public_key;
 pub use endpoint_records::{
     apply_cluster_iroh_endpoint_advertisement, cleanup_cluster_iroh_endpoints,
-    cluster_endpoint_stable_eq, refresh_local_iroh_endpoints_from_disk,
-    refresh_local_iroh_endpoints_from_disk_async, upsert_member_endpoint,
+    refresh_local_iroh_endpoints_from_disk, refresh_local_iroh_endpoints_from_disk_async,
+    upsert_member_endpoint,
 };
 pub use endpoint_selector::{
     ClusterEndpointSelectionPurpose, ClusterEndpointSelector, advertised_peer_route_targets,
