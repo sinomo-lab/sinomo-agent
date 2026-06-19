@@ -108,9 +108,8 @@ pub use protocol::{
     ClusterRolloutBuildRequest, ClusterRolloutNativeDylibModuleArtifact,
     ClusterRolloutNativeDylibModuleRequest, ClusterRolloutNativeDylibModuleResponse,
     ClusterRolloutNativeDylibModuleUploadSpec, ClusterRolloutUploadArtifactSpec,
-    cluster_rollout_targets_from_state, prepare_cluster_rollout_binary_request,
-    prepare_cluster_rollout_build_request, prepare_cluster_rollout_native_dylib_module_request,
-    prepare_rollout_cluster_targets, unique_rollout_targets,
+    prepare_cluster_rollout_binary_request, prepare_cluster_rollout_build_request,
+    prepare_cluster_rollout_native_dylib_module_request, unique_rollout_targets,
 };
 pub use service::{RolloutService, register_services};
 pub use source::{
