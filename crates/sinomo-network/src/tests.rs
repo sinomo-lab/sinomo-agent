@@ -24127,6 +24127,98 @@ fn refresh_local_iroh_endpoints_from_disk_updates_local_daemon_members() {
 }
 
 #[test]
+fn refresh_local_daemon_membership_cleans_duplicate_iroh_endpoints() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-iroh-membership-cleanup");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let updated_at = now + time::Duration::seconds(1);
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_iroh_membership_cleanup").expect("cluster");
+    let local_node_id =
+        NodeId::from_legacy_named("node_iroh_membership_cleanup_local").expect("local node");
+    let remote_node_id =
+        NodeId::from_legacy_named("node_iroh_membership_cleanup_remote").expect("remote node");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "iroh membership cleanup",
+        local_node_id,
+        "local",
+        "local-public-key",
+        now,
+    );
+    let mut remote = ClusterMemberRecord::local_voter(
+        cluster_id,
+        remote_node_id.clone(),
+        "remote",
+        "remote-public-key",
+        now,
+    );
+    remote.endpoints = vec![
+        ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named(
+                "endpoint_iroh_membership_cleanup_old",
+            )
+            .expect("old endpoint"),
+            node_id: remote_node_id.clone(),
+            transport: ClusterTransportKind::Iroh,
+            address: "iroh://same_remote_key?direct=203.0.113.7:21353".to_string(),
+            source: ClusterEndpointSource::Rendezvous,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 20,
+            last_observed_latency_ms: None,
+        },
+        ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named(
+                "endpoint_iroh_membership_cleanup_new",
+            )
+            .expect("new endpoint"),
+            node_id: remote_node_id.clone(),
+            transport: ClusterTransportKind::Iroh,
+            address: "iroh://same_remote_key?direct=203.0.113.8:21353".to_string(),
+            source: ClusterEndpointSource::Rendezvous,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 30,
+            last_observed_latency_ms: None,
+        },
+    ];
+    state.members.push(remote);
+
+    let refresh = refresh_local_daemon_membership_from_disk(
+        &paths,
+        &mut state,
+        ClusterLocalDaemonMembershipObservation {
+            main_endpoints: Vec::new(),
+            shadow_endpoints: Vec::new(),
+            main_public_key: "local-public-key".to_string(),
+            shadow_public_key: "shadow-public-key".to_string(),
+            timestamp: updated_at,
+        },
+    )
+    .expect("membership refresh");
+
+    assert!(refresh.iroh_endpoints_changed);
+    assert_eq!(state.updated_at, updated_at);
+    let remote = state
+        .members
+        .iter()
+        .find(|member| member.node_id == remote_node_id)
+        .expect("remote member");
+    let iroh_endpoints = remote
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.transport == ClusterTransportKind::Iroh)
+        .collect::<Vec<_>>();
+    assert_eq!(iroh_endpoints.len(), 1);
+    assert_eq!(
+        iroh_endpoints[0].endpoint_id,
+        stable_iroh_endpoint_id(&remote_node_id, "same_remote_key")
+    );
+}
+
+#[test]
 fn read_cluster_members_from_kv_collapses_duplicate_iroh_endpoint_records() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-iroh-kv-cleanup");
     let data_dir = SinomoDataDir::new(&root);

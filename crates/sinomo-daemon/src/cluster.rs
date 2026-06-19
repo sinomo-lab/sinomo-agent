@@ -1847,7 +1847,6 @@ impl ClusterNetworkMaintenance {
         }
 
         if publish_due || probe_due {
-            sinomo_network::cleanup_cluster_iroh_endpoints(&mut state);
             let shadow_options = current_shadow_daemon_options_for_cluster_async(
                 data_dir,
                 DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT,

@@ -114,13 +114,11 @@ pub use endpoint_advertisement::{
     daemon_advertised_endpoints_from_addresses_with_public_discovery_and_advertise_host_async,
     daemon_advertised_endpoints_from_static_addresses, daemon_lan_endpoint,
 };
+pub use endpoint_records::apply_cluster_iroh_endpoint_advertisement;
 #[cfg(test)]
 pub(crate) use endpoint_records::cleanup_member_iroh_endpoints;
 pub(crate) use endpoint_records::iroh_endpoint_public_key;
 pub(crate) use endpoint_records::upsert_member_endpoint;
-pub use endpoint_records::{
-    apply_cluster_iroh_endpoint_advertisement, cleanup_cluster_iroh_endpoints,
-};
 #[cfg(test)]
 pub(crate) use endpoint_records::{
     refresh_local_iroh_endpoints_from_disk, refresh_local_iroh_endpoints_from_disk_async,

@@ -4,8 +4,8 @@ use crate::connectivity_store::{
     write_local_cluster_connectivity_record_set, write_local_cluster_connectivity_record_set_async,
 };
 use crate::endpoint_records::{
-    refresh_local_iroh_endpoints_from_disk, refresh_local_iroh_endpoints_from_disk_async,
-    upsert_member_endpoint,
+    cleanup_cluster_iroh_endpoints, refresh_local_iroh_endpoints_from_disk,
+    refresh_local_iroh_endpoints_from_disk_async, upsert_member_endpoint,
 };
 use crate::error::NetworkError;
 use crate::network_info::{CLUSTER_NETWORK_INFO_TTL_SECONDS, build_cluster_network_info_record};
@@ -186,9 +186,13 @@ pub fn refresh_local_daemon_membership_from_disk(
     observation: ClusterLocalDaemonMembershipObservation,
 ) -> Result<ClusterLocalDaemonMembershipRefresh, NetworkError> {
     let timestamp = observation.timestamp;
+    let iroh_cleanup_changed = cleanup_cluster_iroh_endpoints(state);
     let mut refresh = apply_local_daemon_membership_observation(state, observation);
     refresh.iroh_endpoints_changed =
-        refresh_local_iroh_endpoints_from_disk(paths, state, timestamp)?;
+        iroh_cleanup_changed | refresh_local_iroh_endpoints_from_disk(paths, state, timestamp)?;
+    if iroh_cleanup_changed {
+        state.updated_at = timestamp;
+    }
     Ok(refresh)
 }
 
@@ -199,9 +203,13 @@ pub async fn refresh_local_daemon_membership_from_disk_async(
     observation: ClusterLocalDaemonMembershipObservation,
 ) -> Result<ClusterLocalDaemonMembershipRefresh, NetworkError> {
     let timestamp = observation.timestamp;
+    let iroh_cleanup_changed = cleanup_cluster_iroh_endpoints(state);
     let mut refresh = apply_local_daemon_membership_observation(state, observation);
-    refresh.iroh_endpoints_changed =
-        refresh_local_iroh_endpoints_from_disk_async(runtime, paths, state, timestamp).await?;
+    refresh.iroh_endpoints_changed = iroh_cleanup_changed
+        | refresh_local_iroh_endpoints_from_disk_async(runtime, paths, state, timestamp).await?;
+    if iroh_cleanup_changed {
+        state.updated_at = timestamp;
+    }
     Ok(refresh)
 }
 

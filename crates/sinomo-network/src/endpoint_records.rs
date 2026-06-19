@@ -3,7 +3,7 @@ use crate::error::NetworkError;
 use crate::prelude::*;
 use sinomo_node::cluster_endpoint_stable_eq;
 
-pub fn cleanup_cluster_iroh_endpoints(state: &mut ClusterBootstrapState) -> bool {
+pub(crate) fn cleanup_cluster_iroh_endpoints(state: &mut ClusterBootstrapState) -> bool {
     state.members.iter_mut().fold(false, |changed, member| {
         cleanup_member_iroh_endpoints(member) || changed
     })
