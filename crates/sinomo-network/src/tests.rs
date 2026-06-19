@@ -9235,7 +9235,7 @@ struct RecordingKvTxnQuorumHost {
     commit_calls: usize,
 }
 
-impl ClusterKvTxnForwardHost for RecordingKvTxnQuorumHost {
+impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
     fn known_raft_leader_id(
         &mut self,
         _paths: &ClusterPaths,
@@ -9253,9 +9253,7 @@ impl ClusterKvTxnForwardHost for RecordingKvTxnQuorumHost {
     ) -> Result<ObjectRpcResponse, NetworkError> {
         panic!("forwarded non-leader requests must not forward again")
     }
-}
 
-impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
     fn local_is_raft_leader(
         &mut self,
         _paths: &ClusterPaths,

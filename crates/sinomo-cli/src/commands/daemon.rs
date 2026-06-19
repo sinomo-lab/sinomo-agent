@@ -670,6 +670,49 @@ impl network::ClusterKvTxnQuorumHost for CliClusterKvTxnQuorumHost {
         .map_err(network::NetworkError::from)
     }
 
+    fn known_raft_leader_id(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, network::NetworkError> {
+        locked_cluster_raft_known_leader_id(paths, state)
+    }
+
+    fn send_object_rpc_to_node(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &network::ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
+        let data_dir =
+            SinomoDataDir::from_env_or_home().map_err(|error| network::NetworkError::Io {
+                operation: "cli daemon cluster paths".to_string(),
+                detail: error.to_string(),
+            })?;
+        let paths = ClusterPaths::new(&data_dir);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| network::NetworkError::Io {
+                operation: "cli daemon node object rpc runtime".to_string(),
+                detail: error.to_string(),
+            })?;
+        let mut host = CliSignedEndpointRpcHost::new(
+            Some(state.cluster_id.clone()),
+            "cli endpoint rpc signing",
+        );
+        let options = network::ClusterObjectRpcNodeOptions::new(
+            network::ClusterEndpointSelectionPurpose::VoterCommand,
+            network::DaemonRpcTimeouts::connect_and_idle(timeout),
+        );
+        let mut client =
+            network::ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
+        let result = runtime.block_on(client.call_node(state, target_node_id, request, options));
+        runtime.shutdown_timeout(Duration::from_millis(250));
+        result
+    }
+
     fn local_is_raft_leader(
         &mut self,
         paths: &ClusterPaths,
@@ -895,51 +938,6 @@ impl network::ClusterRaftVoteTransportHost for CliClusterRaftLeaderElectionHost 
         timeout: Duration,
     ) -> Result<sinomo_runtime::kv::ClusterRaftVoteResponse, network::NetworkError> {
         cli_send_cluster_raft_vote(endpoint, request, timeout)
-    }
-}
-
-impl network::ClusterKvTxnForwardHost for CliClusterKvTxnQuorumHost {
-    fn known_raft_leader_id(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Result<Option<NodeId>, network::NetworkError> {
-        locked_cluster_raft_known_leader_id(paths, state)
-    }
-
-    fn send_object_rpc_to_node(
-        &mut self,
-        state: &ClusterBootstrapState,
-        target_node_id: &NodeId,
-        request: &network::ObjectRpcRequest,
-        timeout: Duration,
-    ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
-        let data_dir =
-            SinomoDataDir::from_env_or_home().map_err(|error| network::NetworkError::Io {
-                operation: "cli daemon cluster paths".to_string(),
-                detail: error.to_string(),
-            })?;
-        let paths = ClusterPaths::new(&data_dir);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| network::NetworkError::Io {
-                operation: "cli daemon node object rpc runtime".to_string(),
-                detail: error.to_string(),
-            })?;
-        let mut host = CliSignedEndpointRpcHost::new(
-            Some(state.cluster_id.clone()),
-            "cli endpoint rpc signing",
-        );
-        let options = network::ClusterObjectRpcNodeOptions::new(
-            network::ClusterEndpointSelectionPurpose::VoterCommand,
-            network::DaemonRpcTimeouts::connect_and_idle(timeout),
-        );
-        let mut client =
-            network::ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
-        let result = runtime.block_on(client.call_node(state, target_node_id, request, options));
-        runtime.shutdown_timeout(Duration::from_millis(250));
-        result
     }
 }
 

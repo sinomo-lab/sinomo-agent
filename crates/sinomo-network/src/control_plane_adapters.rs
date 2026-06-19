@@ -21,7 +21,6 @@ pub(crate) use crate::connectivity_store::{
 use crate::control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlaneTransport};
 use crate::error::NetworkError;
 use crate::invite_publish::ClusterInvitePublishHost;
-use crate::kv_forward::ClusterKvTxnForwardHost;
 #[cfg(test)]
 pub(crate) use crate::kv_local_store::apply_cluster_raft_append;
 use crate::kv_local_store::locked_cluster_raft_known_leader_id;
@@ -203,30 +202,6 @@ where
         snapshot: KvSnapshot,
     ) -> Result<bool, NetworkError> {
         locked_restore_cluster_raft_from_snapshot_if_newer(paths, local_node_id, snapshot)
-    }
-
-    fn send_object_rpc_to_node(
-        &mut self,
-        state: &ClusterBootstrapState,
-        target_node_id: &NodeId,
-        request: &ObjectRpcRequest,
-        timeout: Duration,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        self.transport
-            .send_object_rpc_to_node(state, target_node_id, request, timeout)
-    }
-}
-
-impl<T> ClusterKvTxnForwardHost for ClusterControlPlaneDriver<T>
-where
-    T: ClusterControlPlaneTransport,
-{
-    fn known_raft_leader_id(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Result<Option<NodeId>, NetworkError> {
-        locked_cluster_raft_known_leader_id(paths, state)
     }
 
     fn send_object_rpc_to_node(

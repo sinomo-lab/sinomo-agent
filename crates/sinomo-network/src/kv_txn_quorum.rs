@@ -8,7 +8,7 @@ use crate::kv_forward::{
 };
 use crate::kv_local_store::{
     cluster_kv_raft_store, imported_snapshot_advances_local_kv,
-    write_imported_cluster_kv_snapshot_if_changed,
+    locked_cluster_raft_known_leader_id, write_imported_cluster_kv_snapshot_if_changed,
 };
 use crate::kv_semantics::cluster_semantic_txn_no_effect_response;
 use crate::kv_snapshot::refresh_current_cluster_kv_store_with_host;
@@ -25,6 +25,7 @@ use crate::raft_quorum::{
     commit_cluster_raft_command_with_quorum_async_with_host,
 };
 use crate::route::ClusterSignedEndpointRpcAsyncHost;
+use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
 use crate::voter_reachability::{
     ClusterVoterReachabilityAsyncHost, ClusterVoterReachabilityOptions,
     cluster_reachable_voter_count_async_with_host, cluster_reachable_voter_count_with_host,
@@ -32,8 +33,9 @@ use crate::voter_reachability::{
 use sinomo_kv::{
     ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult, ClusterKvTxnCommitResult,
 };
+use std::time::Duration;
 
-pub trait ClusterKvTxnQuorumHost: crate::kv_forward::ClusterKvTxnForwardHost {
+pub trait ClusterKvTxnQuorumHost {
     fn refresh_current_cluster_kv_store(
         &mut self,
         _paths: &ClusterPaths,
@@ -41,6 +43,20 @@ pub trait ClusterKvTxnQuorumHost: crate::kv_forward::ClusterKvTxnForwardHost {
     ) -> Result<(), NetworkError> {
         Ok(())
     }
+
+    fn known_raft_leader_id(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, NetworkError>;
+
+    fn send_object_rpc_to_node(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError>;
 
     fn local_is_raft_leader(
         &mut self,
@@ -84,6 +100,35 @@ pub trait ClusterKvTxnQuorumHost: crate::kv_forward::ClusterKvTxnForwardHost {
     ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError>;
 }
 
+impl<T> crate::kv_forward::ClusterKvTxnForwardHost for T
+where
+    T: ClusterKvTxnQuorumHost,
+{
+    fn known_raft_leader_id(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, NetworkError> {
+        ClusterKvTxnQuorumHost::known_raft_leader_id(self, paths, state)
+    }
+
+    fn send_object_rpc_to_node(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        ClusterKvTxnQuorumHost::send_object_rpc_to_node(
+            self,
+            state,
+            target_node_id,
+            request,
+            timeout,
+        )
+    }
+}
+
 pub trait ClusterKvTxnQuorumAsyncHost:
     ClusterSignedEndpointRpcAsyncHost
     + ClusterRaftQuorumAsyncHost
@@ -118,6 +163,25 @@ where
             self,
         )
         .map(|_| ())
+    }
+
+    fn known_raft_leader_id(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, NetworkError> {
+        locked_cluster_raft_known_leader_id(paths, state)
+    }
+
+    fn send_object_rpc_to_node(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        self.transport
+            .send_object_rpc_to_node(state, target_node_id, request, timeout)
     }
 
     fn local_is_raft_leader(

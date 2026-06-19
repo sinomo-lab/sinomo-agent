@@ -1333,6 +1333,49 @@ impl network::ClusterKvTxnQuorumHost for DfsFuseClusterKvTxnQuorumHost {
         })
     }
 
+    fn known_raft_leader_id(
+        &mut self,
+        paths: &network::ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> std::result::Result<Option<NodeId>, NetworkError> {
+        with_dfs_fuse_cluster_raft_operation(paths, "cluster raft leader lookup", || {
+            dfs_fuse_cluster_raft_known_leader_id(paths, state)
+        })
+    }
+
+    fn send_object_rpc_to_node(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &network::ObjectRpcRequest,
+        timeout: Duration,
+    ) -> std::result::Result<network::ObjectRpcResponse, NetworkError> {
+        let data_dir = SinomoDataDir::from_env_or_home().map_err(|error| NetworkError::Io {
+            operation: "dfs fuse cluster paths".to_string(),
+            detail: error.to_string(),
+        })?;
+        let paths = network::ClusterPaths::new(&data_dir);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| NetworkError::Io {
+                operation: "dfs fuse node object rpc runtime".to_string(),
+                detail: error.to_string(),
+            })?;
+        let mut host = DfsFuseSignedObjectRpcHost {
+            cluster_id: state.cluster_id.clone(),
+        };
+        let options = network::ClusterObjectRpcNodeOptions::new(
+            network::ClusterEndpointSelectionPurpose::VoterCommand,
+            network::DaemonRpcTimeouts::connect_and_idle(timeout),
+        );
+        let mut client =
+            network::ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
+        let result = runtime.block_on(client.call_node(state, target_node_id, request, options));
+        runtime.shutdown_timeout(Duration::from_millis(250));
+        result
+    }
+
     fn elect_cluster_raft_leader(
         &mut self,
         paths: &network::ClusterPaths,
@@ -1527,51 +1570,6 @@ impl network::ClusterRaftVoteTransportHost for DfsFuseClusterRaftLeaderElectionH
         response.error_detail()?;
         sinomo_runtime::kv::decode_cluster_raft_vote_rpc_response_body(&response.body)
             .map_err(Into::into)
-    }
-}
-
-impl network::ClusterKvTxnForwardHost for DfsFuseClusterKvTxnQuorumHost {
-    fn known_raft_leader_id(
-        &mut self,
-        paths: &network::ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> std::result::Result<Option<NodeId>, NetworkError> {
-        with_dfs_fuse_cluster_raft_operation(paths, "cluster raft leader lookup", || {
-            dfs_fuse_cluster_raft_known_leader_id(paths, state)
-        })
-    }
-
-    fn send_object_rpc_to_node(
-        &mut self,
-        state: &ClusterBootstrapState,
-        target_node_id: &NodeId,
-        request: &network::ObjectRpcRequest,
-        timeout: Duration,
-    ) -> std::result::Result<network::ObjectRpcResponse, NetworkError> {
-        let data_dir = SinomoDataDir::from_env_or_home().map_err(|error| NetworkError::Io {
-            operation: "dfs fuse cluster paths".to_string(),
-            detail: error.to_string(),
-        })?;
-        let paths = network::ClusterPaths::new(&data_dir);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| NetworkError::Io {
-                operation: "dfs fuse node object rpc runtime".to_string(),
-                detail: error.to_string(),
-            })?;
-        let mut host = DfsFuseSignedObjectRpcHost {
-            cluster_id: state.cluster_id.clone(),
-        };
-        let options = network::ClusterObjectRpcNodeOptions::new(
-            network::ClusterEndpointSelectionPurpose::VoterCommand,
-            network::DaemonRpcTimeouts::connect_and_idle(timeout),
-        );
-        let mut client =
-            network::ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
-        let result = runtime.block_on(client.call_node(state, target_node_id, request, options));
-        runtime.shutdown_timeout(Duration::from_millis(250));
-        result
     }
 }
 

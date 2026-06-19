@@ -194,8 +194,10 @@ pub(crate) use keyspace::{
     cluster_node_status_key_for_record,
 };
 #[cfg(test)]
+pub(crate) use kv_forward::ClusterKvTxnForwardHost;
+pub use kv_forward::ClusterKvTxnForwardOptions;
+#[cfg(test)]
 pub(crate) use kv_forward::forward_cluster_kv_txn_to_voter_with_host;
-pub use kv_forward::{ClusterKvTxnForwardHost, ClusterKvTxnForwardOptions};
 pub use kv_read_model::{
     read_cluster_connectivity_graph_from_kv, read_cluster_members_from_kv,
     read_cluster_members_from_snapshot, read_cluster_node_statuses_from_kv,

@@ -35,7 +35,7 @@ impl ClusterKvTxnForwardOptions {
     }
 }
 
-pub trait ClusterKvTxnForwardHost {
+pub(crate) trait ClusterKvTxnForwardHost {
     fn known_raft_leader_id(
         &mut self,
         paths: &ClusterPaths,
