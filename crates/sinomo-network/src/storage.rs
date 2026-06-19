@@ -37,9 +37,7 @@ use crate::invite_publish::{
     ClusterInvitePublishHost, handle_cluster_invite_publish_request_with_host,
 };
 use crate::join_registration::{
-    ClusterJoinReconciliation, ClusterJoinReconciliationHost, ClusterJoinRegistrationHost,
-    handle_cluster_join_registration_request_with_host,
-    send_cluster_join_registration_over_membership_rpc,
+    ClusterJoinRegistrationHost, handle_cluster_join_registration_request_with_host,
 };
 #[cfg(test)]
 pub(crate) use crate::keyspace::cluster_certificate_key;
@@ -162,7 +160,7 @@ use crate::membership::cluster_member_is_legacy_shadow_daemon;
 use crate::membership_forward::ClusterMembershipRpcForwardHost;
 use crate::membership_rpc::{
     ClusterAuthenticatedPeer, ClusterInvitePublishRequest, ClusterJoinRegistrationRequest,
-    ClusterJoinRegistrationResponse, ClusterMemberPublishRequest, ClusterMemberPublishResponse,
+    ClusterMemberPublishRequest, ClusterMemberPublishResponse,
 };
 use crate::network_info::ClusterNetworkInfoRecord;
 use crate::prelude::*;
@@ -1531,88 +1529,6 @@ where
             request,
             self.timeouts.membership_rpc_timeout,
         )
-    }
-}
-
-impl<T> ClusterJoinRegistrationHost for ClusterControlPlaneDriver<T>
-where
-    T: ClusterControlPlaneTransport,
-{
-    fn commit_join_registration_state(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Result<KvSnapshot, NetworkError> {
-        sync_cluster_state_to_kv_with_host(paths, state, self)
-    }
-
-    fn remember_successful_join_endpoint(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-        endpoint: &ClusterEndpointRecord,
-    ) -> Result<(), NetworkError> {
-        self.transport.record_endpoint_command_connectivity(
-            paths,
-            state,
-            endpoint,
-            ClusterConnectivityState::Healthy,
-            None,
-        );
-        Ok(())
-    }
-}
-
-impl<T> ClusterJoinReconciliationHost for ClusterControlPlaneDriver<T>
-where
-    T: ClusterControlPlaneTransport,
-{
-    fn send_join_registration(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        request: &ClusterJoinRegistrationRequest,
-        tcp_timeout: Duration,
-        iroh_timeout: Duration,
-    ) -> Result<ClusterJoinRegistrationResponse, NetworkError> {
-        let timeout = match endpoint.transport {
-            ClusterTransportKind::Iroh => iroh_timeout,
-            _ => tcp_timeout,
-        };
-        send_cluster_join_registration_over_membership_rpc(
-            endpoint,
-            request,
-            timeout,
-            |endpoint, request, timeout| {
-                self.transport
-                    .send_cluster_membership_rpc(endpoint, request, timeout)
-            },
-        )
-    }
-
-    fn fetch_cluster_kv_snapshot(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        timeout: Duration,
-    ) -> Result<KvSnapshot, NetworkError> {
-        self.transport.fetch_cluster_kv_snapshot(endpoint, timeout)
-    }
-
-    fn observe_join_reconciliation_connectivity(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-        reconciliation: &ClusterJoinReconciliation,
-    ) -> Result<(), NetworkError> {
-        if let Some(endpoint) = reconciliation.accepted_endpoint.as_ref() {
-            self.transport.record_endpoint_command_connectivity(
-                paths,
-                state,
-                endpoint,
-                ClusterConnectivityState::Healthy,
-                None,
-            );
-        }
-        Ok(())
     }
 }
 
