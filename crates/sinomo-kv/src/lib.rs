@@ -245,6 +245,7 @@ mod internal {
 }
 
 pub use in_process::{InProcessKvStore, InProcessRaftKvCluster};
+pub type InProcessKvCluster = InProcessRaftKvCluster;
 pub use model::{
     KvCommand, KvCompare, KvEntry, KvError, KvEvent, KvEventKind, KvLease, KvOp, KvOpResponse,
     KvRevision, KvSnapshot, KvTxn, KvTxnResponse, KvVersion, KvWatch, LeaseId, WatchId,
