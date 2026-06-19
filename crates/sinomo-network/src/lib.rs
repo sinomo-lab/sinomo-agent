@@ -55,6 +55,7 @@ mod raft_election;
 mod raft_fanout;
 mod raft_quorum;
 mod raft_replication;
+mod raft_rpc;
 mod records;
 mod roaming;
 mod route;
@@ -346,6 +347,7 @@ pub use raft_replication::{
     replicate_cluster_raft_to_endpoint_async_with_host,
     replicate_cluster_raft_to_endpoint_with_host,
 };
+pub use raft_rpc::{handle_cluster_raft_rpc_request, handle_cluster_raft_rpc_request_async};
 pub use records::{ClusterIdentityRecord, ClusterInvitationStateRecord};
 pub(crate) use roaming::read_iroh_endpoint_record_async;
 #[cfg(test)]
@@ -394,7 +396,6 @@ pub use status_publish::{
 };
 pub use storage::{
     cleanup_legacy_shadow_daemon_members_with_host, cluster_state_sync_txn,
-    handle_cluster_raft_rpc_request, handle_cluster_raft_rpc_request_async,
     remove_cluster_members_with_host, sync_cluster_state_to_kv_async_with_host,
     sync_cluster_state_to_kv_with_host, sync_cluster_state_to_local_raft_unchecked,
     update_cluster_node_role_with_host, update_cluster_raft_role_with_host,
