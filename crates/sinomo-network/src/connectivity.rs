@@ -484,7 +484,7 @@ pub fn cluster_connectivity_probe_due_with_graph(
     true
 }
 
-pub fn cluster_connectivity_probe_key(
+pub(crate) fn cluster_connectivity_probe_key(
     source_node_id: &NodeId,
     endpoint: &ClusterEndpointRecord,
 ) -> String {

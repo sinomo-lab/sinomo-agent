@@ -138,6 +138,17 @@ fn cluster_endpoint_key(node_id: &NodeId, endpoint: &ClusterEndpointRecord) -> S
     format!("/cluster/endpoints/{node_id}/{}", endpoint.endpoint_id)
 }
 
+#[cfg(test)]
+fn cluster_connectivity_probe_key(
+    source_node_id: &NodeId,
+    endpoint: &ClusterEndpointRecord,
+) -> String {
+    format!(
+        "{}:{}:{}",
+        source_node_id, endpoint.node_id, endpoint.endpoint_id
+    )
+}
+
 fn daemon_cluster_kv_raft_store(paths: &ClusterPaths) -> sinomo_kv::ClusterKvRaftStore {
     paths.kv_paths().raft_store()
 }
@@ -8448,7 +8459,7 @@ mod tests {
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::from([(
-                sinomo_network::cluster_connectivity_probe_key(&local_node, &endpoint),
+                cluster_connectivity_probe_key(&local_node, &endpoint),
                 ClusterConnectivityProbeState {
                     record: record.clone(),
                 },
@@ -8532,7 +8543,7 @@ mod tests {
             discovery: None,
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::from([(
-                sinomo_network::cluster_connectivity_probe_key(&local_node, &endpoint),
+                cluster_connectivity_probe_key(&local_node, &endpoint),
                 ClusterConnectivityProbeState { record },
             )]),
             connectivity_cursor: 0,
@@ -8627,7 +8638,7 @@ mod tests {
             now,
             CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
         );
-        let key = sinomo_network::cluster_connectivity_probe_key(&local_node, &endpoint);
+        let key = cluster_connectivity_probe_key(&local_node, &endpoint);
         let maintenance_now = Instant::now();
         let idle_stats = Arc::new(IdleStatsAtomics::new());
         let mut maintenance = ClusterNetworkMaintenance {
@@ -9391,7 +9402,7 @@ mod tests {
             .endpoints
             .clear();
 
-        let key = sinomo_network::cluster_connectivity_probe_key(&local_node, &endpoint);
+        let key = cluster_connectivity_probe_key(&local_node, &endpoint);
         let maintenance_now = Instant::now();
         let mut maintenance = ClusterNetworkMaintenance {
             discovery: None,

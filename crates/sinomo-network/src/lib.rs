@@ -71,13 +71,12 @@ pub use connectivity::{
     ClusterConnectivityProbeObservation, ClusterConnectivityProbeState, ClusterConnectivityRecord,
     ClusterConnectivityRecordQuery, ClusterConnectivityState,
     apply_cluster_connectivity_probe_results, cluster_connectivity_probe_due_with_graph,
-    cluster_connectivity_probe_due_with_startup_settle, cluster_connectivity_probe_key,
-    cluster_connectivity_record, cluster_connectivity_record_for_probe_observation,
-    select_cluster_connectivity_probe_batch,
+    cluster_connectivity_probe_due_with_startup_settle, cluster_connectivity_record,
+    cluster_connectivity_record_for_probe_observation, select_cluster_connectivity_probe_batch,
 };
 #[cfg(test)]
 pub(crate) use connectivity::{
-    cluster_connectivity_record_for_hard_failure,
+    cluster_connectivity_probe_key, cluster_connectivity_record_for_hard_failure,
     cluster_connectivity_record_for_identity_mismatch,
     cluster_connectivity_record_for_probe_outcome,
     cluster_connectivity_record_for_startup_probe_failure,
