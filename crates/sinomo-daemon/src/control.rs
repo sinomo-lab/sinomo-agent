@@ -887,40 +887,35 @@ async fn try_handle_streamed_cluster_relay_request_async(
     service_runtime: &tokio::runtime::Handle,
     stream_address: &str,
 ) -> Result<bool, DaemonError> {
-    let envelope =
-        sinomo_network::RelayEnvelope::from_request(request).map_err(DaemonError::from)?;
-    if !relay_envelope_inner_expects_streamed_response(&envelope) {
-        return Ok(false);
-    }
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
     let state =
         sinomo_network::read_cluster_state_without_kv(&cluster_paths).map_err(DaemonError::from)?;
-    if envelope.target_node_id() == &state.local_node_id {
-        dispatch_streamed_cluster_relay_local_request_async(
-            envelope.into_inner(),
-            stream,
-            paths,
-            service_host,
-            stream_address,
-        )
-        .await?;
-    } else {
-        handle_daemon_cluster_relay_stream_forward_on_runtime(
-            paths,
-            request,
-            service_runtime,
-            stream,
-            stream_address,
-        )
-        .await?;
+    match sinomo_network::cluster_relay_stream_request_action(&state.local_node_id, request)
+        .map_err(DaemonError::from)?
+    {
+        sinomo_network::ClusterRelayStreamRequestAction::NotStreamed => return Ok(false),
+        sinomo_network::ClusterRelayStreamRequestAction::DeliverLocal(inner_request) => {
+            dispatch_streamed_cluster_relay_local_request_async(
+                inner_request,
+                stream,
+                paths,
+                service_host,
+                stream_address,
+            )
+            .await?;
+        }
+        sinomo_network::ClusterRelayStreamRequestAction::Forward => {
+            handle_daemon_cluster_relay_stream_forward_on_runtime(
+                paths,
+                request,
+                service_runtime,
+                stream,
+                stream_address,
+            )
+            .await?;
+        }
     }
     Ok(true)
-}
-
-fn relay_envelope_inner_expects_streamed_response(
-    envelope: &sinomo_network::RelayEnvelope,
-) -> bool {
-    sinomo_network::object_rpc_request_stream_mode(envelope.inner()).expects_raw_streamed_response()
 }
 
 async fn dispatch_streamed_cluster_relay_local_request_async(

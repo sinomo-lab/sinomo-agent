@@ -293,7 +293,7 @@ fn best_effort_candidate_forward_frontier(
 
 /// An inner cluster RPC wrapped for hop-by-hop delivery toward `target_node_id`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RelayEnvelope {
+pub(crate) struct RelayEnvelope {
     pub(crate) cluster_id: ClusterId,
     pub(crate) target_node_id: NodeId,
     pub(crate) ttl: u8,
@@ -335,27 +335,15 @@ impl RelayEnvelope {
     }
 
     /// Decode an envelope from a relay-route [`ObjectRpcRequest`].
-    pub fn from_request(request: &ObjectRpcRequest) -> Result<Self, NetworkError> {
+    pub(crate) fn from_request(request: &ObjectRpcRequest) -> Result<Self, NetworkError> {
         request.decode_body()
     }
 
-    pub fn target_node_id(&self) -> &NodeId {
-        &self.target_node_id
-    }
-
-    pub fn ttl(&self) -> u8 {
-        self.ttl
-    }
-
-    pub fn visited(&self) -> &[NodeId] {
-        &self.visited
-    }
-
-    pub fn inner(&self) -> &DaemonControlRequest {
+    pub(crate) fn inner(&self) -> &DaemonControlRequest {
         &self.inner
     }
 
-    pub fn into_inner(self) -> DaemonControlRequest {
+    pub(crate) fn into_inner(self) -> DaemonControlRequest {
         self.inner
     }
 }
@@ -458,6 +446,30 @@ pub enum ClusterRelayStreamForwardOutcome {
     Forwarded,
     ErrorResponse(ObjectRpcResponse),
     StreamStartedThenFailed(NetworkError),
+}
+
+#[derive(Debug)]
+pub enum ClusterRelayStreamRequestAction {
+    NotStreamed,
+    DeliverLocal(ObjectRpcRequest),
+    Forward,
+}
+
+pub fn cluster_relay_stream_request_action(
+    local_node_id: &NodeId,
+    request: &ObjectRpcRequest,
+) -> Result<ClusterRelayStreamRequestAction, NetworkError> {
+    let envelope = RelayEnvelope::from_request(request)?;
+    if !relay_envelope_inner_expects_streamed_response(&envelope) {
+        return Ok(ClusterRelayStreamRequestAction::NotStreamed);
+    }
+    if envelope.target_node_id == *local_node_id {
+        Ok(ClusterRelayStreamRequestAction::DeliverLocal(
+            envelope.into_inner(),
+        ))
+    } else {
+        Ok(ClusterRelayStreamRequestAction::Forward)
+    }
 }
 
 pub trait ClusterRelayStreamForwardAsyncHost {
@@ -3521,6 +3533,49 @@ mod tests {
         assert_eq!(request.category, CLUSTER_ROUTING_RPC_CATEGORY);
         let decoded = RelayEnvelope::from_request(&request).expect("decode");
         assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn relay_stream_request_action_hides_envelope_decoding() {
+        let target = nid("node_target");
+        let mut inner = inner_request();
+        crate::set_object_rpc_request_stream_mode(
+            &mut inner,
+            crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
+        );
+        let relay_request = RelayEnvelope::new(
+            ClusterId::from_legacy_named("cluster_route_stream_action").expect("cluster"),
+            target.clone(),
+            inner,
+        )
+        .into_request()
+        .expect("relay request");
+
+        match cluster_relay_stream_request_action(&target, &relay_request).expect("local action") {
+            ClusterRelayStreamRequestAction::DeliverLocal(inner) => {
+                assert_eq!(inner.route, sinomo_kv::CLUSTER_KV_TXN_ROUTE);
+            }
+            other => panic!("expected local delivery, got {other:?}"),
+        }
+
+        let other = nid("node_other");
+        assert!(matches!(
+            cluster_relay_stream_request_action(&other, &relay_request).expect("forward action"),
+            ClusterRelayStreamRequestAction::Forward
+        ));
+
+        let not_streamed = RelayEnvelope::new(
+            ClusterId::from_legacy_named("cluster_route_stream_action_plain").expect("cluster"),
+            target.clone(),
+            inner_request(),
+        )
+        .into_request()
+        .expect("plain relay request");
+        assert!(matches!(
+            cluster_relay_stream_request_action(&target, &not_streamed)
+                .expect("not streamed action"),
+            ClusterRelayStreamRequestAction::NotStreamed
+        ));
     }
 
     #[test]

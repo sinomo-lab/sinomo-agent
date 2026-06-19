@@ -5087,7 +5087,7 @@ mod tests {
         mode: RecordingRelayStreamForwardMode,
         sent: Vec<(
             ClusterEndpointRecord,
-            sinomo_network::RelayEnvelope,
+            sinomo_network::ObjectRpcRequest,
             sinomo_network::DaemonRpcTimeouts,
         )>,
     }
@@ -5120,8 +5120,7 @@ mod tests {
             let mode = self.mode;
             let sent = &mut self.sent;
             Box::pin(async move {
-                let envelope = sinomo_network::RelayEnvelope::from_request(&request)?;
-                sent.push((endpoint, envelope, timeouts));
+                sent.push((endpoint, request, timeouts));
                 match mode {
                     RecordingRelayStreamForwardMode::Forward => {
                         Ok(sinomo_network::ClusterRelayStreamSendOutcome::Forwarded)
@@ -10192,9 +10191,6 @@ mod tests {
         sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
         let runtime = daemon_cluster_test_runtime();
         let relay_request = test_relay_request(&state, &target_node);
-        let envelope =
-            sinomo_network::RelayEnvelope::from_request(&relay_request).expect("relay envelope");
-        let initial_ttl = envelope.ttl();
         let mut host = RecordingRelayStreamForwardHost::forwarding();
         let outcome = runtime
             .block_on(
@@ -10226,9 +10222,7 @@ mod tests {
             endpoint.endpoint_id, target_endpoint.endpoint_id,
             "relay should use the known target command endpoint"
         );
-        assert_eq!(forwarded.target_node_id(), &target_node);
-        assert_eq!(forwarded.ttl(), initial_ttl.saturating_sub(1));
-        assert_eq!(forwarded.visited(), &[local_node]);
+        assert_eq!(forwarded.route, sinomo_network::CLUSTER_RELAY_ROUTE);
     }
 
     #[test]
