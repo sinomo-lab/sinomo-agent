@@ -16,8 +16,8 @@ use crate::prelude::*;
 #[cfg(test)]
 use crate::raft_replication::replicate_cluster_raft_to_endpoint_with_local_host;
 use crate::raft_replication::{
-    ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
-    replicate_cluster_raft_to_endpoint_async_with_options,
+    ClusterKvAppendReplicationAsyncHost, ClusterRaftAppendReplicationAsyncHost,
+    ClusterRaftAppendReplicationHost, replicate_cluster_raft_to_endpoint_async_with_options,
     replicate_cluster_raft_to_endpoint_with_host,
 };
 use crate::rpc_future::ClusterMembershipRpcFuture;
@@ -27,7 +27,29 @@ use sinomo_kv::{
 };
 use std::time::Duration;
 
-pub trait ClusterRaftQuorumAsyncHost: ClusterRaftAppendReplicationAsyncHost {
+pub trait ClusterKvQuorumAsyncHost: ClusterKvAppendReplicationAsyncHost {
+    fn record_endpoint_command_connectivity(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+        _endpoint: &ClusterEndpointRecord,
+        _connectivity_state: ClusterConnectivityState,
+        _latency_ms: Option<u64>,
+    ) {
+    }
+
+    fn fan_out_committed_cluster_kv_command_async<'a>(
+        &'a mut self,
+        _paths: ClusterPaths,
+        _state: ClusterBootstrapState,
+        _events: Vec<KvEvent>,
+        _targets: Vec<ClusterEndpointRecord>,
+    ) -> ClusterMembershipRpcFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+pub(crate) trait ClusterRaftQuorumAsyncHost: ClusterRaftAppendReplicationAsyncHost {
     fn record_endpoint_command_connectivity(
         &mut self,
         _paths: &ClusterPaths,
@@ -46,6 +68,39 @@ pub trait ClusterRaftQuorumAsyncHost: ClusterRaftAppendReplicationAsyncHost {
         _targets: Vec<ClusterEndpointRecord>,
     ) -> ClusterMembershipRpcFuture<'a, ()> {
         Box::pin(async { Ok(()) })
+    }
+}
+
+impl<T> ClusterRaftQuorumAsyncHost for T
+where
+    T: ClusterKvQuorumAsyncHost,
+{
+    fn record_endpoint_command_connectivity(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+        connectivity_state: ClusterConnectivityState,
+        latency_ms: Option<u64>,
+    ) {
+        ClusterKvQuorumAsyncHost::record_endpoint_command_connectivity(
+            self,
+            paths,
+            state,
+            endpoint,
+            connectivity_state,
+            latency_ms,
+        );
+    }
+
+    fn fan_out_committed_cluster_raft_command_async<'a>(
+        &'a mut self,
+        paths: ClusterPaths,
+        state: ClusterBootstrapState,
+        events: Vec<KvEvent>,
+        targets: Vec<ClusterEndpointRecord>,
+    ) -> ClusterMembershipRpcFuture<'a, ()> {
+        self.fan_out_committed_cluster_kv_command_async(paths, state, events, targets)
     }
 }
 

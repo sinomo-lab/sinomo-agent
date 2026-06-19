@@ -3738,8 +3738,8 @@ impl sinomo_network::ClusterLocalMemberPublishAsyncHost for DaemonClusterControl
     }
 }
 
-impl sinomo_network::ClusterRaftAppendReplicationAsyncHost for DaemonClusterControlPlaneTransport {
-    fn last_local_raft_log_index_async<'a>(
+impl sinomo_network::ClusterKvAppendReplicationAsyncHost for DaemonClusterControlPlaneTransport {
+    fn last_local_kv_replication_index_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a ClusterBootstrapState,
@@ -3754,7 +3754,7 @@ impl sinomo_network::ClusterRaftAppendReplicationAsyncHost for DaemonClusterCont
         })
     }
 
-    fn build_raft_append_request_async<'a>(
+    fn build_kv_replication_request_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a ClusterBootstrapState,
@@ -3770,7 +3770,7 @@ impl sinomo_network::ClusterRaftAppendReplicationAsyncHost for DaemonClusterCont
         })
     }
 
-    fn send_raft_append_async<'a>(
+    fn send_kv_replication_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
         request: &'a ClusterRaftAppendRequest,
@@ -3787,7 +3787,7 @@ impl sinomo_network::ClusterRaftAppendReplicationAsyncHost for DaemonClusterCont
         })
     }
 
-    fn on_raft_append_sent_async<'a>(
+    fn on_kv_replication_sent_async<'a>(
         &'a mut self,
     ) -> sinomo_network::ClusterMembershipRpcFuture<'a, ()> {
         Box::pin(async move {
@@ -3912,8 +3912,8 @@ impl sinomo_network::ClusterNodeStatusPublishAsyncHost for DaemonClusterControlP
     }
 }
 
-impl sinomo_network::ClusterRaftCommittedFanoutAsyncHost for DaemonClusterControlPlaneTransport {
-    fn replicate_cluster_raft_to_endpoint_async<'a>(
+impl sinomo_network::ClusterKvCommittedFanoutAsyncHost for DaemonClusterControlPlaneTransport {
+    fn replicate_cluster_kv_to_endpoint_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
         state: &'a ClusterBootstrapState,
@@ -3922,7 +3922,7 @@ impl sinomo_network::ClusterRaftCommittedFanoutAsyncHost for DaemonClusterContro
         timeout: Duration,
     ) -> sinomo_network::ClusterMembershipRpcFuture<'a, ClusterKvRaftAppendReplicationOutcome> {
         Box::pin(async move {
-            sinomo_network::replicate_cluster_raft_to_endpoint_async_with_host(
+            sinomo_network::replicate_cluster_kv_to_endpoint_async_with_host(
                 paths,
                 state,
                 endpoint,
@@ -3950,7 +3950,7 @@ impl sinomo_network::ClusterRaftCommittedFanoutAsyncHost for DaemonClusterContro
     }
 }
 
-impl sinomo_network::ClusterRaftQuorumAsyncHost for DaemonClusterControlPlaneTransport {
+impl sinomo_network::ClusterKvQuorumAsyncHost for DaemonClusterControlPlaneTransport {
     fn record_endpoint_command_connectivity(
         &mut self,
         paths: &ClusterPaths,
@@ -3969,7 +3969,7 @@ impl sinomo_network::ClusterRaftQuorumAsyncHost for DaemonClusterControlPlaneTra
         );
     }
 
-    fn fan_out_committed_cluster_raft_command_async<'a>(
+    fn fan_out_committed_cluster_kv_command_async<'a>(
         &'a mut self,
         paths: ClusterPaths,
         state: ClusterBootstrapState,
@@ -4423,7 +4423,7 @@ fn fan_out_committed_cluster_raft_command_on_runtime(
 ) {
     if let Some(runtime) = runtime.cloned() {
         let host_runtime = runtime.clone();
-        sinomo_network::spawn_cluster_raft_committed_fanout_worker_on_runtime(
+        sinomo_network::spawn_cluster_kv_committed_fanout_worker_on_runtime(
             runtime,
             paths,
             state,

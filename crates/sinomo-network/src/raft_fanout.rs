@@ -24,7 +24,25 @@ pub struct ClusterRaftCommittedFanoutReport {
     pub watch_event_batches_sent: usize,
 }
 
-pub trait ClusterRaftCommittedFanoutAsyncHost {
+pub trait ClusterKvCommittedFanoutAsyncHost {
+    fn replicate_cluster_kv_to_endpoint_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+        endpoint: &'a ClusterEndpointRecord,
+        watch_events: &'a [KvEvent],
+        timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterKvRaftAppendReplicationOutcome>;
+
+    fn send_cluster_kv_watch_events_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        request: &'a ClusterKvWatchEventsRequest,
+        timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterKvWatchEventsResponse>;
+}
+
+pub(crate) trait ClusterRaftCommittedFanoutAsyncHost {
     fn replicate_cluster_raft_to_endpoint_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
@@ -42,9 +60,9 @@ pub trait ClusterRaftCommittedFanoutAsyncHost {
     ) -> ClusterMembershipRpcFuture<'a, ClusterKvWatchEventsResponse>;
 }
 
-impl<T> ClusterRaftCommittedFanoutAsyncHost for ClusterControlPlaneDriver<T>
+impl<T> ClusterRaftCommittedFanoutAsyncHost for T
 where
-    T: ClusterRaftCommittedFanoutAsyncHost,
+    T: ClusterKvCommittedFanoutAsyncHost,
 {
     fn replicate_cluster_raft_to_endpoint_async<'a>(
         &'a mut self,
@@ -54,7 +72,34 @@ where
         watch_events: &'a [KvEvent],
         timeout: Duration,
     ) -> ClusterMembershipRpcFuture<'a, ClusterKvRaftAppendReplicationOutcome> {
-        self.transport.replicate_cluster_raft_to_endpoint_async(
+        self.replicate_cluster_kv_to_endpoint_async(paths, state, endpoint, watch_events, timeout)
+    }
+
+    fn send_cluster_kv_watch_events_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        request: &'a ClusterKvWatchEventsRequest,
+        timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterKvWatchEventsResponse> {
+        ClusterKvCommittedFanoutAsyncHost::send_cluster_kv_watch_events_async(
+            self, endpoint, request, timeout,
+        )
+    }
+}
+
+impl<T> ClusterKvCommittedFanoutAsyncHost for ClusterControlPlaneDriver<T>
+where
+    T: ClusterKvCommittedFanoutAsyncHost,
+{
+    fn replicate_cluster_kv_to_endpoint_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+        endpoint: &'a ClusterEndpointRecord,
+        watch_events: &'a [KvEvent],
+        timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterKvRaftAppendReplicationOutcome> {
+        self.transport.replicate_cluster_kv_to_endpoint_async(
             paths,
             state,
             endpoint,
@@ -128,7 +173,7 @@ pub async fn fan_out_committed_cluster_raft_command_async_with_host(
     Ok(report)
 }
 
-pub fn spawn_cluster_raft_committed_fanout_worker_on_runtime<H, F>(
+pub(crate) fn spawn_cluster_raft_committed_fanout_worker_on_runtime<H, F>(
     runtime: tokio::runtime::Handle,
     paths: ClusterPaths,
     state: ClusterBootstrapState,
@@ -156,6 +201,27 @@ pub fn spawn_cluster_raft_committed_fanout_worker_on_runtime<H, F>(
         )
         .await;
     });
+}
+
+pub fn spawn_cluster_kv_committed_fanout_worker_on_runtime<H, F>(
+    runtime: tokio::runtime::Handle,
+    paths: ClusterPaths,
+    state: ClusterBootstrapState,
+    events: Vec<KvEvent>,
+    timeouts: ClusterControlPlaneTimeouts,
+    host_factory: F,
+) where
+    H: ClusterKvCommittedFanoutAsyncHost + Send + 'static,
+    F: FnMut() -> H + Send + 'static,
+{
+    spawn_cluster_raft_committed_fanout_worker_on_runtime(
+        runtime,
+        paths,
+        state,
+        events,
+        timeouts,
+        host_factory,
+    );
 }
 
 async fn run_cluster_raft_committed_fanout_worker_async_with_host<H, F>(

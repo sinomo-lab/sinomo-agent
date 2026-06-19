@@ -333,16 +333,22 @@ pub use peer::{
 };
 #[cfg(test)]
 pub(crate) use raft_election::ClusterRaftVoteTransportHost;
+#[cfg(test)]
+pub(crate) use raft_fanout::ClusterRaftCommittedFanoutAsyncHost;
 pub use raft_fanout::{
-    ClusterRaftCommittedFanoutAsyncHost, spawn_cluster_raft_committed_fanout_worker_on_runtime,
+    ClusterKvCommittedFanoutAsyncHost, spawn_cluster_kv_committed_fanout_worker_on_runtime,
 };
-pub use raft_quorum::ClusterRaftQuorumAsyncHost;
+pub use raft_quorum::ClusterKvQuorumAsyncHost;
+#[cfg(test)]
+pub(crate) use raft_quorum::ClusterRaftQuorumAsyncHost;
 pub use raft_replication::{
-    ClusterRaftAppendReplicationAsyncHost, replicate_cluster_raft_to_endpoint_async_with_host,
+    ClusterKvAppendReplicationAsyncHost, replicate_cluster_kv_to_endpoint_async_with_host,
 };
 #[cfg(test)]
 pub(crate) use raft_replication::{
-    ClusterRaftAppendReplicationHost, replicate_cluster_raft_to_endpoint_with_host,
+    ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
+    replicate_cluster_raft_to_endpoint_async_with_host,
+    replicate_cluster_raft_to_endpoint_with_host,
 };
 #[cfg(test)]
 pub(crate) use raft_rpc::handle_cluster_raft_rpc_request;

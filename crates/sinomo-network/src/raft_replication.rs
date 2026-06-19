@@ -36,7 +36,33 @@ pub trait ClusterRaftAppendReplicationHost {
     fn on_raft_append_sent(&mut self) {}
 }
 
-pub trait ClusterRaftAppendReplicationAsyncHost {
+pub trait ClusterKvAppendReplicationAsyncHost {
+    fn last_local_kv_replication_index_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+    ) -> ClusterMembershipRpcFuture<'a, u64>;
+
+    fn build_kv_replication_request_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+        next_index: u64,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendRequest>;
+
+    fn send_kv_replication_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        request: &'a ClusterRaftAppendRequest,
+        timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendResponse>;
+
+    fn on_kv_replication_sent_async<'a>(&'a mut self) -> ClusterMembershipRpcFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+pub(crate) trait ClusterRaftAppendReplicationAsyncHost {
     fn last_local_raft_log_index_async<'a>(
         &'a mut self,
         paths: &'a ClusterPaths,
@@ -59,6 +85,41 @@ pub trait ClusterRaftAppendReplicationAsyncHost {
 
     fn on_raft_append_sent_async<'a>(&'a mut self) -> ClusterMembershipRpcFuture<'a, ()> {
         Box::pin(async { Ok(()) })
+    }
+}
+
+impl<T> ClusterRaftAppendReplicationAsyncHost for T
+where
+    T: ClusterKvAppendReplicationAsyncHost,
+{
+    fn last_local_raft_log_index_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+    ) -> ClusterMembershipRpcFuture<'a, u64> {
+        self.last_local_kv_replication_index_async(paths, state)
+    }
+
+    fn build_raft_append_request_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+        next_index: u64,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendRequest> {
+        self.build_kv_replication_request_async(paths, state, next_index)
+    }
+
+    fn send_raft_append_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        request: &'a ClusterRaftAppendRequest,
+        timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendResponse> {
+        self.send_kv_replication_async(endpoint, request, timeout)
+    }
+
+    fn on_raft_append_sent_async<'a>(&'a mut self) -> ClusterMembershipRpcFuture<'a, ()> {
+        self.on_kv_replication_sent_async()
     }
 }
 
@@ -195,7 +256,8 @@ pub fn replicate_cluster_raft_to_endpoint_with_host(
     )
 }
 
-pub async fn replicate_cluster_raft_to_endpoint_async_with_host(
+#[cfg(test)]
+pub(crate) async fn replicate_cluster_raft_to_endpoint_async_with_host(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
@@ -203,6 +265,26 @@ pub async fn replicate_cluster_raft_to_endpoint_async_with_host(
     timeouts: ClusterControlPlaneTimeouts,
     timeout: Duration,
     host: &mut impl ClusterRaftAppendReplicationAsyncHost,
+) -> Result<ClusterKvRaftAppendReplicationOutcome, NetworkError> {
+    replicate_cluster_raft_to_endpoint_async_with_options(
+        paths,
+        state,
+        endpoint,
+        watch_events,
+        timeouts.raft_append_replication_options(timeout),
+        host,
+    )
+    .await
+}
+
+pub async fn replicate_cluster_kv_to_endpoint_async_with_host(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    watch_events: &[KvEvent],
+    timeouts: ClusterControlPlaneTimeouts,
+    timeout: Duration,
+    host: &mut impl ClusterKvAppendReplicationAsyncHost,
 ) -> Result<ClusterKvRaftAppendReplicationOutcome, NetworkError> {
     replicate_cluster_raft_to_endpoint_async_with_options(
         paths,

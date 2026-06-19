@@ -20,7 +20,7 @@ use crate::raft_election::{
     elect_cluster_raft_leader_with_host,
 };
 use crate::raft_quorum::{
-    ClusterRaftQuorumAsyncHost, commit_cluster_raft_command_with_control_plane_driver,
+    ClusterKvQuorumAsyncHost, commit_cluster_raft_command_with_control_plane_driver,
     commit_cluster_raft_command_with_quorum_async_with_host,
 };
 use crate::route::ClusterSignedEndpointRpcAsyncHost;
@@ -159,7 +159,7 @@ where
 
 pub trait ClusterKvTxnQuorumAsyncHost:
     ClusterSignedEndpointRpcAsyncHost
-    + ClusterRaftQuorumAsyncHost
+    + ClusterKvQuorumAsyncHost
     + ClusterStateAuthorityReachabilityAsyncHost
     + Send
 {
