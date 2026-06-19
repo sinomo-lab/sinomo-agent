@@ -998,12 +998,16 @@ fn open_sifs_service(data_dir: Option<PathBuf>) -> Result<OpenedSifsService> {
         .unwrap_or_default();
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
         .map_err(|source| DfsFuseError::Dfs(source.to_string()))?;
+    let peer_transport = Arc::new(DfsFusePeerTransport);
+    let sync_peer_transport: Arc<dyn dfs::DfsPeerTransport> = peer_transport.clone();
+    let async_peer_transport: Arc<dyn dfs::AsyncDfsPeerTransport> = peer_transport;
     let mut service = NetworkedDfsService::new(
-        DfsEndpointTransport::with_message_sender(
+        DfsEndpointTransport::with_peer_transports(
             local_node_id.clone(),
             endpoints,
             DEFAULT_FUSE_TIMEOUT,
-            dfs::dfs_message_sender_from_peer_transport(Arc::new(DfsFusePeerTransport)),
+            sync_peer_transport,
+            async_peer_transport,
         ),
         content,
     );
@@ -1172,6 +1176,22 @@ impl dfs::DfsPeerTransport for DfsFusePeerTransport {
             "dfs fuse object rpc",
         )
         .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+    }
+}
+
+impl dfs::AsyncDfsPeerTransport for DfsFusePeerTransport {
+    fn call_object_rpc_async<'a>(
+        &'a self,
+        endpoint: &'a ClusterEndpointRecord,
+        request: &'a network::ObjectRpcRequest,
+        options: dfs::DfsObjectRpcSendOptions,
+    ) -> dfs::DfsPeerTransportFuture<
+        'a,
+        std::result::Result<network::ObjectRpcResponse, DfsPeerTransportError>,
+    > {
+        Box::pin(async move {
+            <Self as dfs::DfsPeerTransport>::call_object_rpc(self, endpoint, request, options)
+        })
     }
 }
 
