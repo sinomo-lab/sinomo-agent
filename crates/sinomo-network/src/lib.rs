@@ -34,6 +34,7 @@ mod kv_read_model;
 mod kv_semantics;
 mod kv_snapshot;
 mod kv_txn_ops;
+mod kv_txn_quorum;
 mod kv_watch_store;
 mod lan;
 mod local_membership;
@@ -207,6 +208,12 @@ pub use kv_snapshot::{
     ClusterKvSnapshotRefreshHost, ClusterKvSnapshotRefreshOptions,
     refresh_current_cluster_kv_store_with_host,
     refresh_current_cluster_kv_store_with_local_storage_and_transport,
+};
+pub use kv_txn_quorum::{
+    ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost,
+    commit_cluster_kv_txn_with_quorum_response_async_with_host,
+    commit_cluster_kv_txn_with_quorum_response_with_host,
+    handle_cluster_kv_txn_request_async_with_host,
 };
 pub use kv_watch_store::handle_cluster_kv_watch_events;
 pub use lan::{
@@ -387,18 +394,12 @@ pub use status_publish::{
     sync_cluster_node_status_to_kv,
 };
 pub use storage::{
-    ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost,
     cleanup_legacy_shadow_daemon_members_with_host, cluster_state_sync_txn,
-    commit_cluster_kv_txn_with_quorum_response_with_host,
     handle_cluster_membership_rpc_request_with_hosts, handle_cluster_raft_rpc_request,
-    remove_cluster_members_with_host, sync_cluster_state_to_kv_with_host,
+    handle_cluster_raft_rpc_request_async, remove_cluster_members_with_host,
+    sync_cluster_state_to_kv_async_with_host, sync_cluster_state_to_kv_with_host,
     sync_cluster_state_to_local_raft_unchecked, update_cluster_node_role_with_host,
     update_cluster_raft_role_with_host,
-};
-pub use storage::{
-    commit_cluster_kv_txn_with_quorum_response_async_with_host,
-    handle_cluster_kv_txn_request_async_with_host, handle_cluster_raft_rpc_request_async,
-    sync_cluster_state_to_kv_async_with_host,
 };
 pub use voter_reachability::{
     ClusterVoterReachabilityAsyncHost, ClusterVoterReachabilityHost,
