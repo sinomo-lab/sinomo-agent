@@ -5884,7 +5884,7 @@ mod tests {
         let mut store = InProcessKvStore::new();
         store
             .put_serde(
-                sinomo_network::cluster_identity_key(),
+                sinomo_node::cluster_identity_key(),
                 &sinomo_node::ClusterIdentityRecord::from(&accepted_state),
                 None,
             )

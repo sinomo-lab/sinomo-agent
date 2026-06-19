@@ -333,6 +333,17 @@ mod tests {
     }
 
     #[test]
+    fn cluster_node_key_helpers_are_stable() {
+        let node_id = Id::from_legacy_named("node_policy_key").expect("node");
+
+        assert_eq!(cluster_identity_key(), "/cluster/config/identity");
+        assert_eq!(
+            cluster_capability_policy_key(&node_id),
+            format!("/cluster/policy/capabilities/{node_id}")
+        );
+    }
+
+    #[test]
     fn cluster_invitation_state_stable_eq_ignores_updated_at() {
         let timestamp = time::OffsetDateTime::parse(
             "2026-05-02T12:00:00Z",

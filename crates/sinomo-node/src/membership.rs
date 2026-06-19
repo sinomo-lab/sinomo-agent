@@ -186,6 +186,14 @@ pub fn cluster_capability_policy_stable_eq(
         && left.allowed_capabilities == right.allowed_capabilities
 }
 
+pub fn cluster_identity_key() -> String {
+    "/cluster/config/identity".to_string()
+}
+
+pub fn cluster_capability_policy_key(node_id: &NodeId) -> String {
+    format!("/cluster/policy/capabilities/{node_id}")
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterInvitationStateRecord {
     pub cluster_id: Id,

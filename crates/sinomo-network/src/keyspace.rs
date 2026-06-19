@@ -1,5 +1,6 @@
 use crate::prelude::*;
 use sinomo_node::DAEMON_MAIN_CLUSTER_ROLE;
+pub(crate) use sinomo_node::{cluster_capability_policy_key, cluster_identity_key};
 
 pub(crate) fn cluster_node_status_key(node_id: &NodeId) -> String {
     format!("/cluster/node-status/{node_id}")
@@ -56,10 +57,6 @@ pub fn cluster_connectivity_key(
     format!("/cluster/network/connectivity/{source_node_id}/{target_node_id}/{endpoint_id}")
 }
 
-pub fn cluster_identity_key() -> String {
-    "/cluster/config/identity".to_string()
-}
-
 pub fn cluster_member_key(node_id: &NodeId) -> String {
     format!("/cluster/members/{node_id}")
 }
@@ -74,10 +71,6 @@ pub fn cluster_endpoint_key(node_id: &NodeId, endpoint: &ClusterEndpointRecord) 
 
 pub fn cluster_endpoint_prefix(node_id: &NodeId) -> String {
     format!("/cluster/endpoints/{node_id}/")
-}
-
-pub(crate) fn cluster_capability_policy_key(node_id: &NodeId) -> String {
-    format!("/cluster/policy/capabilities/{node_id}")
 }
 
 #[cfg(test)]

@@ -179,14 +179,16 @@ pub use join_registration::{
     send_cluster_join_registration_over_membership_rpc,
 };
 #[cfg(test)]
+pub(crate) use keyspace::cluster_identity_key;
+#[cfg(test)]
 pub(crate) use keyspace::{
     cluster_capability_policy_key, cluster_node_status_key, cluster_node_status_key_for_process,
     cluster_node_status_key_for_record,
 };
 pub use keyspace::{
     cluster_connectivity_key, cluster_connectivity_source_prefix, cluster_endpoint_key,
-    cluster_endpoint_prefix, cluster_identity_key, cluster_invitation_key,
-    cluster_invitation_state_key, cluster_member_key, cluster_network_info_key,
+    cluster_endpoint_prefix, cluster_invitation_key, cluster_invitation_state_key,
+    cluster_member_key, cluster_network_info_key,
 };
 pub use kv_forward::{
     ClusterKvTxnForwardHost, ClusterKvTxnForwardOptions, ClusterKvTxnForwardResult,
