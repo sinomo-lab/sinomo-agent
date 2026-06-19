@@ -236,7 +236,8 @@ pub use maintenance::{
     cluster_network_publish_interval_for_role, cluster_network_stable_discovery_announcement_due,
 };
 pub use member_mutation::{
-    ClusterMemberMutationAsyncHost, ClusterMemberMutationHost, ClusterNodeRoleUpdate,
+    ClusterMemberMutationAsyncHost, ClusterMemberMutationDriver, ClusterMemberMutationHost,
+    ClusterNodeRoleUpdate,
 };
 pub use member_publish::{
     ClusterLocalMemberPublishAsyncHost, ClusterLocalMemberPublishHost,
@@ -355,14 +356,13 @@ pub use status_publish::{
     sync_cluster_node_status_to_kv,
 };
 pub use storage::{
-    ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost, ClusterMemberMutationDriver,
-    ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
-    ClusterRaftCommittedFanoutAsyncHost, ClusterRaftQuorumAsyncHost,
-    ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult, ClusterRaftQuorumTransportHost,
-    ClusterRaftVoteTransportAsyncHost, ClusterRaftVoteTransportHost,
-    accepted_cluster_join_state_from_kv_snapshot, cleanup_legacy_shadow_daemon_members_with_host,
-    cluster_join_challenge_rpc_request, cluster_state_sync_txn,
-    commit_cluster_kv_txn_with_quorum_response_with_host,
+    ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost, ClusterRaftAppendReplicationAsyncHost,
+    ClusterRaftAppendReplicationHost, ClusterRaftCommittedFanoutAsyncHost,
+    ClusterRaftQuorumAsyncHost, ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult,
+    ClusterRaftQuorumTransportHost, ClusterRaftVoteTransportAsyncHost,
+    ClusterRaftVoteTransportHost, accepted_cluster_join_state_from_kv_snapshot,
+    cleanup_legacy_shadow_daemon_members_with_host, cluster_join_challenge_rpc_request,
+    cluster_state_sync_txn, commit_cluster_kv_txn_with_quorum_response_with_host,
     commit_cluster_raft_command_with_quorum_driver, elect_cluster_raft_leader_with_host,
     handle_cluster_join_registration_request_with_host,
     handle_cluster_membership_rpc_request_with_hosts, handle_cluster_raft_rpc_request,

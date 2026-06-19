@@ -41,7 +41,7 @@ use crate::invite_publish::{
 };
 use crate::join_registration::{
     ClusterJoinReconciliation, ClusterJoinReconciliationHost, ClusterJoinRegistrationAsyncHost,
-    ClusterJoinRegistrationHost, ClusterLocalDaemonMembershipObserver,
+    ClusterJoinRegistrationHost,
 };
 use crate::keyspace::cluster_capability_policy_key;
 #[cfg(test)]
@@ -126,10 +126,7 @@ pub(crate) use crate::kv_watch_store::{
     reset_cluster_kv_watch_unchanged_wakeups_for_test, touch_cluster_kv_watch_notifier_for_test,
     wait_for_cluster_kv_watch_change_for_test,
 };
-use crate::local_membership::{
-    apply_cluster_node_role, merge_cluster_join_registration,
-    refresh_local_daemon_membership_from_disk,
-};
+use crate::local_membership::{apply_cluster_node_role, merge_cluster_join_registration};
 pub(crate) use crate::local_membership::{
     apply_local_daemon_membership_observation, cluster_state_needs_join_registration,
 };
@@ -2394,71 +2391,6 @@ where
             );
         }
         Ok(())
-    }
-}
-
-pub struct ClusterMemberMutationDriver<T, O> {
-    driver: ClusterControlPlaneDriver<T>,
-    observer: O,
-}
-
-impl<T, O> ClusterMemberMutationDriver<T, O> {
-    pub fn new(driver: ClusterControlPlaneDriver<T>, observer: O) -> Self {
-        Self { driver, observer }
-    }
-
-    pub fn with_transport(transport: T, observer: O) -> Self {
-        Self::new(ClusterControlPlaneDriver::new(transport), observer)
-    }
-
-    pub fn driver_mut(&mut self) -> &mut ClusterControlPlaneDriver<T> {
-        &mut self.driver
-    }
-
-    pub fn observer_mut(&mut self) -> &mut O {
-        &mut self.observer
-    }
-}
-
-impl<T, O> ClusterMemberMutationHost for ClusterMemberMutationDriver<T, O>
-where
-    T: ClusterControlPlaneTransport,
-    O: ClusterLocalDaemonMembershipObserver,
-{
-    fn prepare_cluster_state_for_kv_sync(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &mut ClusterBootstrapState,
-    ) -> Result<(), NetworkError> {
-        if let Some(observation) = self
-            .observer
-            .local_daemon_membership_observation(paths, state)?
-        {
-            refresh_local_daemon_membership_from_disk(paths, state, observation)?;
-        }
-        Ok(())
-    }
-
-    fn current_cluster_kv_store(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Result<InProcessKvStore, NetworkError> {
-        ClusterMemberMutationHost::current_cluster_kv_store(&mut self.driver, paths, state)
-    }
-
-    fn commit_cluster_kv_txn_with_quorum(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, NetworkError> {
-        ClusterMemberMutationHost::commit_cluster_kv_txn_with_quorum(
-            &mut self.driver,
-            paths,
-            state,
-            txn,
-        )
     }
 }
 
