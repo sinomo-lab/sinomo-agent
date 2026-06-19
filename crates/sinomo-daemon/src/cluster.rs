@@ -2481,19 +2481,13 @@ pub(crate) fn refresh_daemon_node_status_in_kv_on_runtime(
         return Ok(NodeStatusPublishOutcome::default());
     };
     let mut publish_match_host = daemon_cluster_control_plane_driver_on_runtime(runtime);
-    let network_info_matches = sinomo_network::cluster_network_info_publish_matches_with_host(
+    let publish_matches = sinomo_network::cluster_node_presence_publish_matches_with_host(
         &cluster_paths,
         &network_info,
-        &mut publish_match_host,
-    )
-    .unwrap_or(false);
-    let node_status_matches = sinomo_network::cluster_node_status_publish_matches_with_host(
-        &cluster_paths,
         &record,
         &mut publish_match_host,
-    )
-    .unwrap_or(false);
-    if network_info_matches && node_status_matches {
+    );
+    if publish_matches.all_match() {
         return Ok(NodeStatusPublishOutcome::default());
     }
     if !cluster_has_local_quorum_on_runtime(&cluster_paths, &state, runtime) {
@@ -2504,7 +2498,7 @@ pub(crate) fn refresh_daemon_node_status_in_kv_on_runtime(
     // ~60s margin; network info on a ~9min margin. Bundling them rewrote the KV
     // snapshot far more often than necessary.
     let mut outcome = NodeStatusPublishOutcome::default();
-    if !network_info_matches {
+    if !publish_matches.network_info_matches {
         if let Err(error) =
             sync_cluster_network_info_to_kv_on_runtime(&cluster_paths, network_info, runtime)
         {
@@ -2513,7 +2507,7 @@ pub(crate) fn refresh_daemon_node_status_in_kv_on_runtime(
             outcome.network_info_published = true;
         }
     }
-    if !node_status_matches {
+    if !publish_matches.node_status_matches {
         sync_cluster_node_status_to_kv_on_runtime(&cluster_paths, record, runtime)?;
         outcome.node_status_published = true;
     }
@@ -2572,30 +2566,18 @@ pub(crate) async fn refresh_daemon_node_status_in_kv_async(
         rollout_status,
         time::OffsetDateTime::now_utc(),
     );
-    let mut network_match_host = DaemonClusterControlPlaneTransport {
+    let mut publish_match_host = DaemonClusterControlPlaneTransport {
         rpc_mode: DaemonClusterRpcMode::new(runtime.clone()),
     };
-    let network_info_matches =
-        sinomo_network::cluster_network_info_publish_matches_async_with_host(
-            &runtime,
-            &cluster_paths,
-            &network_info,
-            &mut network_match_host,
-        )
-        .await
-        .unwrap_or(false);
-    let mut node_match_host = DaemonClusterControlPlaneTransport {
-        rpc_mode: DaemonClusterRpcMode::new(runtime.clone()),
-    };
-    let node_status_matches = sinomo_network::cluster_node_status_publish_matches_async_with_host(
+    let publish_matches = sinomo_network::cluster_node_presence_publish_matches_async_with_host(
         &runtime,
         &cluster_paths,
+        &network_info,
         &record,
-        &mut node_match_host,
+        &mut publish_match_host,
     )
-    .await
-    .unwrap_or(false);
-    if network_info_matches && node_status_matches {
+    .await;
+    if publish_matches.all_match() {
         return Ok(NodeStatusPublishOutcome::default());
     }
 
@@ -2606,12 +2588,12 @@ pub(crate) async fn refresh_daemon_node_status_in_kv_async(
     }
 
     let mut outcome = NodeStatusPublishOutcome::default();
-    if !network_info_matches {
+    if !publish_matches.network_info_matches {
         sync_cluster_network_info_to_kv_async(&cluster_paths, network_info, runtime.clone())
             .await?;
         outcome.network_info_published = true;
     }
-    if !node_status_matches {
+    if !publish_matches.node_status_matches {
         sync_cluster_node_status_to_kv_async(&cluster_paths, record, runtime).await?;
         outcome.node_status_published = true;
     }

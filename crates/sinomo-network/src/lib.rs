@@ -373,18 +373,19 @@ pub use rpc_future::ClusterMembershipRpcFuture;
 pub(crate) use sinomo_node::upsert_member_record;
 pub use status_publish::{
     ClusterNetworkInfoPublishAsyncHost, ClusterNetworkInfoPublishHost,
-    ClusterNodeStatusPublishAsyncHost, ClusterNodeStatusPublishHost,
-    cluster_network_info_publish_matches_async_with_host,
-    cluster_network_info_publish_matches_with_host,
-    cluster_node_status_publish_matches_async_with_host,
-    cluster_node_status_publish_matches_with_host, cluster_node_status_publish_record_matches,
+    ClusterNodePresencePublishMatches, ClusterNodeStatusPublishAsyncHost,
+    ClusterNodeStatusPublishHost, cluster_node_presence_publish_matches_async_with_host,
+    cluster_node_presence_publish_matches_with_host, cluster_node_status_publish_record_matches,
     publish_cluster_network_info_to_quorum_async_with_host,
     publish_cluster_network_info_to_quorum_with_host,
     publish_cluster_node_status_to_quorum_async_with_host,
     publish_cluster_node_status_to_quorum_with_host,
 };
 #[cfg(test)]
-pub(crate) use status_publish::{sync_cluster_network_info_to_kv, sync_cluster_node_status_to_kv};
+pub(crate) use status_publish::{
+    cluster_network_info_publish_matches_with_host, cluster_node_status_publish_matches_with_host,
+    sync_cluster_network_info_to_kv, sync_cluster_node_status_to_kv,
+};
 pub use voter_reachability::{
     ClusterVoterReachabilityAsyncHost, ClusterVoterReachabilityHost,
     ClusterVoterReachabilityOptions, cluster_has_local_quorum_async_with_host,

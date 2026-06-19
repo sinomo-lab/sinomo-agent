@@ -121,6 +121,18 @@ pub trait ClusterNodeStatusPublishAsyncHost {
     ) -> ClusterMembershipRpcFuture<'a, KvSnapshot>;
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ClusterNodePresencePublishMatches {
+    pub network_info_matches: bool,
+    pub node_status_matches: bool,
+}
+
+impl ClusterNodePresencePublishMatches {
+    pub fn all_match(self) -> bool {
+        self.network_info_matches && self.node_status_matches
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn sync_cluster_node_status_to_kv(
     paths: &ClusterPaths,
@@ -142,7 +154,7 @@ pub(crate) fn sync_cluster_node_status_to_kv(
     )
 }
 
-pub fn cluster_node_status_publish_matches_with_host<H>(
+pub(crate) fn cluster_node_status_publish_matches_with_host<H>(
     paths: &ClusterPaths,
     status: &ClusterNodeStatusRecord,
     host: &mut H,
@@ -186,7 +198,7 @@ where
     Ok(Some(snapshot))
 }
 
-pub async fn cluster_node_status_publish_matches_async_with_host<H>(
+pub(crate) async fn cluster_node_status_publish_matches_async_with_host<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     status: &ClusterNodeStatusRecord,
@@ -283,7 +295,7 @@ pub(crate) fn sync_cluster_network_info_to_kv(
     )
 }
 
-pub fn cluster_network_info_publish_matches_with_host<H>(
+pub(crate) fn cluster_network_info_publish_matches_with_host<H>(
     paths: &ClusterPaths,
     info: &ClusterNetworkInfoRecord,
     host: &mut H,
@@ -330,7 +342,7 @@ where
     Ok(Some(snapshot))
 }
 
-pub async fn cluster_network_info_publish_matches_async_with_host<H>(
+pub(crate) async fn cluster_network_info_publish_matches_async_with_host<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     info: &ClusterNetworkInfoRecord,
@@ -408,6 +420,61 @@ where
     host.remember_published_network_info_async(paths, &info)
         .await?;
     Ok(Some(snapshot))
+}
+
+pub fn cluster_node_presence_publish_matches_with_host<H>(
+    paths: &ClusterPaths,
+    network_info: &ClusterNetworkInfoRecord,
+    node_status: &ClusterNodeStatusRecord,
+    host: &mut H,
+) -> ClusterNodePresencePublishMatches
+where
+    H: ClusterNetworkInfoPublishHost + ClusterNodeStatusPublishHost,
+{
+    ClusterNodePresencePublishMatches {
+        network_info_matches: cluster_network_info_publish_matches_with_host(
+            paths,
+            network_info,
+            host,
+        )
+        .unwrap_or(false),
+        node_status_matches: cluster_node_status_publish_matches_with_host(
+            paths,
+            node_status,
+            host,
+        )
+        .unwrap_or(false),
+    }
+}
+
+pub async fn cluster_node_presence_publish_matches_async_with_host<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    network_info: &ClusterNetworkInfoRecord,
+    node_status: &ClusterNodeStatusRecord,
+    host: &mut H,
+) -> ClusterNodePresencePublishMatches
+where
+    H: ClusterNetworkInfoPublishAsyncHost + ClusterNodeStatusPublishAsyncHost,
+{
+    ClusterNodePresencePublishMatches {
+        network_info_matches: cluster_network_info_publish_matches_async_with_host(
+            runtime,
+            paths,
+            network_info,
+            host,
+        )
+        .await
+        .unwrap_or(false),
+        node_status_matches: cluster_node_status_publish_matches_async_with_host(
+            runtime,
+            paths,
+            node_status,
+            host,
+        )
+        .await
+        .unwrap_or(false),
+    }
 }
 
 pub(crate) fn stored_cluster_node_status_matches(
