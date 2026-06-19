@@ -10116,20 +10116,21 @@ fn cluster_kv_snapshot_refresh_driver_prefers_known_state_authority_and_imports_
             20,
         ));
     let now = OffsetDateTime::now_utc();
-    let leader_id = NodeId::from_legacy_named("node_kv_refresh_known_authority").expect("leader");
-    let mut leader_member = state.members[0].clone();
-    leader_member.node_id = leader_id.clone();
-    leader_member.display_name = "leader".to_string();
-    leader_member.node_public_key = "leader-public-key".to_string();
-    leader_member.endpoints = vec![daemon_lan_endpoint(
-        &leader_id,
+    let authority_id =
+        NodeId::from_legacy_named("node_kv_refresh_known_authority").expect("authority");
+    let mut authority_member = state.members[0].clone();
+    authority_member.node_id = authority_id.clone();
+    authority_member.display_name = "authority".to_string();
+    authority_member.node_public_key = "authority-public-key".to_string();
+    authority_member.endpoints = vec![daemon_lan_endpoint(
+        &authority_id,
         "10.0.0.90:21353".to_string(),
         10,
     )];
-    leader_member.joined_at = now;
-    leader_member.updated_at = now;
-    mark_test_member_as_voter(&mut leader_member);
-    state.members.push(leader_member);
+    authority_member.joined_at = now;
+    authority_member.updated_at = now;
+    mark_test_member_as_voter(&mut authority_member);
+    state.members.push(authority_member);
     write_cluster_state(&paths, &state).expect("write state");
     let local_snapshot =
         sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("seed local snapshot");
@@ -10139,20 +10140,20 @@ fn cluster_kv_snapshot_refresh_driver_prefers_known_state_authority_and_imports_
         .put("/refresh/first-peer", b"first".to_vec(), None)
         .expect("first peer snapshot put");
     let first_snapshot = first_store.snapshot();
-    let mut leader_store = InProcessKvStore::restore(local_snapshot);
-    leader_store
-        .put("/refresh/leader/one", b"leader-one".to_vec(), None)
-        .expect("leader snapshot put one");
-    leader_store
-        .put("/refresh/leader/two", b"leader-two".to_vec(), None)
-        .expect("leader snapshot put two");
-    let leader_snapshot = leader_store.snapshot();
+    let mut authority_store = InProcessKvStore::restore(local_snapshot);
+    authority_store
+        .put("/refresh/authority/one", b"authority-one".to_vec(), None)
+        .expect("authority snapshot put one");
+    authority_store
+        .put("/refresh/authority/two", b"authority-two".to_vec(), None)
+        .expect("authority snapshot put two");
+    let authority_snapshot = authority_store.snapshot();
 
     let mut host = RecordingKvSnapshotRefreshHost {
-        known_authority: Some(leader_id.clone()),
+        known_authority: Some(authority_id.clone()),
         snapshots: BTreeMap::from([
             (first_peer_id.clone(), first_snapshot),
-            (leader_id.clone(), leader_snapshot.clone()),
+            (authority_id.clone(), authority_snapshot.clone()),
         ]),
         fetches: Vec::new(),
         restored: None,
@@ -10168,23 +10169,23 @@ fn cluster_kv_snapshot_refresh_driver_prefers_known_state_authority_and_imports_
 
     assert_eq!(
         host.fetches.first().map(|(node_id, _)| node_id),
-        Some(&leader_id),
-        "snapshot refresh should try the known leader before other voters"
+        Some(&authority_id),
+        "snapshot refresh should try the known state authority before other state authorities"
     );
     assert_eq!(
         host.restored,
-        Some((local_node_id, leader_snapshot.revision)),
+        Some((local_node_id, authority_snapshot.revision)),
         "snapshot refresh should ask the host to restore the newest imported snapshot"
     );
     assert!(
-        refreshed.get("/refresh/leader/two").is_some(),
+        refreshed.get("/refresh/authority/two").is_some(),
         "the returned store should be restored from the newest fetched snapshot"
     );
     assert_eq!(
         read_cluster_kv_snapshot(&paths)
             .expect("materialized imported snapshot")
             .revision,
-        leader_snapshot.revision
+        authority_snapshot.revision
     );
 }
 
@@ -10807,7 +10808,7 @@ fn cluster_raft_leader_election_driver_sets_leader_after_remote_voter_grants() {
             .kv_paths()
             .raft_store()
             .known_voter_leader_id(&state)
-            .expect("known leader"),
+            .expect("known state authority"),
         Some(local_node_id)
     );
     let expected_term = sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP + 1;

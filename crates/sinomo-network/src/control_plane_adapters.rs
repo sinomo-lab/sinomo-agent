@@ -23,7 +23,7 @@ use crate::error::NetworkError;
 use crate::invite_publish::ClusterInvitePublishHost;
 #[cfg(test)]
 pub(crate) use crate::kv_local_store::apply_cluster_raft_append;
-use crate::kv_local_store::locked_cluster_raft_known_leader_id;
+use crate::kv_local_store::locked_kv_state_authority_id;
 use crate::kv_local_store::locked_restore_cluster_raft_from_snapshot_if_newer;
 #[cfg(test)]
 pub(crate) use crate::kv_local_store::write_imported_cluster_kv_snapshot_if_changed;
@@ -174,7 +174,7 @@ where
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError> {
-        locked_cluster_raft_known_leader_id(paths, state)
+        locked_kv_state_authority_id(paths, state)
     }
 
     fn fetch_cluster_kv_snapshot(

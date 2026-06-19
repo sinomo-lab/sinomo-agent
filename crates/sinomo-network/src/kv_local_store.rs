@@ -447,7 +447,7 @@ pub(crate) fn locked_restore_cluster_raft_from_snapshot_if_newer(
         .map_err(NetworkError::from)
 }
 
-pub(crate) fn locked_cluster_raft_known_leader_id(
+pub(crate) fn locked_kv_state_authority_id(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<Option<NodeId>, NetworkError> {
@@ -456,7 +456,7 @@ pub(crate) fn locked_cluster_raft_known_leader_id(
         .map_err(Into::into)
 }
 
-pub(crate) async fn locked_cluster_raft_known_leader_id_async(
+pub(crate) async fn locked_kv_state_authority_id_async(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -464,11 +464,11 @@ pub(crate) async fn locked_cluster_raft_known_leader_id_async(
     let paths = paths.clone();
     let state = state.clone();
     runtime
-        .spawn_blocking(move || locked_cluster_raft_known_leader_id(&paths, &state))
+        .spawn_blocking(move || locked_kv_state_authority_id(&paths, &state))
         .await
         .map_err(|source| NetworkError::Io {
-            operation: "cluster raft known leader".to_string(),
-            detail: format!("known leader task failed: {source}"),
+            operation: "cluster kv state authority".to_string(),
+            detail: format!("known state authority task failed: {source}"),
         })?
 }
 

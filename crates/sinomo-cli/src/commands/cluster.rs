@@ -592,13 +592,15 @@ fn append_cluster_raft_command(
         .map_err(Into::into)
 }
 
-pub(crate) fn cluster_raft_known_leader_id(
+pub(crate) fn cluster_kv_state_authority_id(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<Option<NodeId>, network::NetworkError> {
     Ok(cluster_kv_raft_store(paths)
         .known_leader_id(&state.local_node_id)?
-        .filter(|leader_id| sinomo_runtime::kv::cluster_kv_raft_node_is_voter(state, leader_id)))
+        .filter(|authority_id| {
+            sinomo_runtime::kv::cluster_kv_raft_node_is_voter(state, authority_id)
+        }))
 }
 
 #[cfg(test)]
@@ -2559,7 +2561,7 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
             paths: &ClusterPaths,
             state: &ClusterBootstrapState,
         ) -> Result<Option<NodeId>, network::NetworkError> {
-            cluster_raft_known_leader_id(paths, state).or(Ok(None))
+            cluster_kv_state_authority_id(paths, state).or(Ok(None))
         }
 
         fn fetch_cluster_kv_snapshot(

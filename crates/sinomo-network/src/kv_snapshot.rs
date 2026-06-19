@@ -5,7 +5,7 @@ use crate::endpoint_selector::{
 };
 use crate::error::NetworkError;
 use crate::kv_local_store::{
-    locked_cluster_raft_known_leader_id, locked_restore_cluster_raft_from_snapshot_if_newer,
+    locked_kv_state_authority_id, locked_restore_cluster_raft_from_snapshot_if_newer,
     read_cluster_kv_snapshot, write_imported_cluster_kv_snapshot_if_changed,
 };
 use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
@@ -109,7 +109,7 @@ where
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError> {
-        locked_cluster_raft_known_leader_id(paths, state)
+        locked_kv_state_authority_id(paths, state)
     }
 
     fn fetch_cluster_kv_snapshot(

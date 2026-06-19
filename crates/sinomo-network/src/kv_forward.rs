@@ -4,7 +4,7 @@ use crate::endpoint_selector::{
     cluster_node_blocks_leader_preference, cluster_node_blocks_leader_preference_async,
 };
 use crate::error::NetworkError;
-use crate::kv_local_store::locked_cluster_raft_known_leader_id_async;
+use crate::kv_local_store::locked_kv_state_authority_id_async;
 use crate::object::DaemonRpcTimeouts;
 use crate::route::{
     ClusterObjectRpcClient, ClusterObjectRpcNodeOptions, ClusterSignedEndpointRpcAsyncHost,
@@ -175,8 +175,7 @@ where
     if targets.is_empty() {
         return Ok(None);
     }
-    if let Ok(Some(authority_id)) =
-        locked_cluster_raft_known_leader_id_async(runtime, paths, state).await
+    if let Ok(Some(authority_id)) = locked_kv_state_authority_id_async(runtime, paths, state).await
         && !cluster_node_blocks_leader_preference_async(runtime, paths, state, &authority_id)
             .await?
         && let Some(position) = targets

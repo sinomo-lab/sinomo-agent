@@ -155,13 +155,13 @@ fn daemon_cluster_kv_raft_store(paths: &ClusterPaths) -> sinomo_kv::ClusterKvRaf
 }
 
 #[cfg(test)]
-fn daemon_cluster_raft_known_leader_id(
+fn daemon_cluster_kv_state_authority_id(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<Option<NodeId>, sinomo_network::NetworkError> {
     Ok(daemon_cluster_kv_raft_store(paths)
         .known_leader_id(&state.local_node_id)?
-        .filter(|leader_id| sinomo_kv::cluster_kv_raft_node_is_voter(state, leader_id)))
+        .filter(|authority_id| sinomo_kv::cluster_kv_raft_node_is_voter(state, authority_id)))
 }
 
 #[cfg(test)]
@@ -7793,9 +7793,10 @@ mod tests {
         sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
         sinomo_network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync state to raft");
-        daemon_clear_cluster_raft_leader(&paths, &state.local_node_id).expect("clear known leader");
+        daemon_clear_cluster_raft_leader(&paths, &state.local_node_id)
+            .expect("clear known state authority");
         assert_eq!(
-            daemon_cluster_raft_known_leader_id(&paths, &state).expect("known leader"),
+            daemon_cluster_kv_state_authority_id(&paths, &state).expect("known state authority"),
             None
         );
 
@@ -7816,7 +7817,7 @@ mod tests {
         .expect_err("forwarded non-leader must reject instead of electing");
         assert!(error.to_string().contains("non-leader voter"));
         assert_eq!(
-            daemon_cluster_raft_known_leader_id(&paths, &state).expect("known leader"),
+            daemon_cluster_kv_state_authority_id(&paths, &state).expect("known state authority"),
             None
         );
     }
