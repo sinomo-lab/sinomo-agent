@@ -169,8 +169,8 @@ mod tests {
     use super::*;
     use sinomo_core::{
         ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
-        ClusterEndpointSource, ClusterMemberRecord, ClusterMemberState, ClusterTransportKind, Id,
-        NodeCapability,
+        ClusterEndpointSource, ClusterMemberRecord, ClusterMemberState, ClusterNodeAvailability,
+        ClusterNodeStatusRecord, ClusterTransportKind, Id, NodeCapability,
     };
 
     #[test]
@@ -335,12 +335,84 @@ mod tests {
     #[test]
     fn cluster_node_key_helpers_are_stable() {
         let node_id = Id::from_legacy_named("node_policy_key").expect("node");
+        let observed_at = time::OffsetDateTime::parse(
+            "2026-05-02T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("timestamp");
+        let shadow_status = ClusterNodeStatusRecord {
+            cluster_id: Id::from_legacy_named("cluster_status_key").expect("cluster"),
+            node_id: node_id.clone(),
+            process: DAEMON_SHADOW_CLUSTER_ROLE.to_string(),
+            availability: ClusterNodeAvailability::Online,
+            daemon_version: "0.1.0-test".to_string(),
+            commit: Some("abcdef0".to_string()),
+            target_os: Some("linux".to_string()),
+            target_arch: Some("x86_64".to_string()),
+            pid: Some(42),
+            address: Some("127.0.0.1:21354".to_string()),
+            bind_address: Some("0.0.0.0:21354".to_string()),
+            executable: Some("/tmp/sinomo-shadow".to_string()),
+            rollout: None,
+            daemon_started_at: Some("2026-05-02T12:00:00Z".to_string()),
+            observed_at,
+        };
 
         assert_eq!(cluster_identity_key(), "/cluster/config/identity");
         assert_eq!(
             cluster_capability_policy_key(&node_id),
             format!("/cluster/policy/capabilities/{node_id}")
         );
+        assert_eq!(
+            cluster_node_status_key(&node_id),
+            format!("/cluster/node-status/{node_id}")
+        );
+        assert_eq!(
+            cluster_node_status_key_for_process(&node_id, DAEMON_MAIN_CLUSTER_ROLE),
+            cluster_node_status_key(&node_id)
+        );
+        assert_eq!(
+            cluster_node_status_key_for_record(&shadow_status),
+            format!("/cluster/node-status/{node_id}/daemon-shadow")
+        );
+        assert!(cluster_node_status_key_matches_record(
+            &cluster_node_status_key_for_record(&shadow_status),
+            &shadow_status
+        ));
+    }
+
+    #[test]
+    fn cluster_node_status_stable_eq_ignores_volatile_observation_fields() {
+        let timestamp = time::OffsetDateTime::parse(
+            "2026-05-02T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("timestamp");
+        let left = ClusterNodeStatusRecord {
+            cluster_id: Id::from_legacy_named("cluster_status_stable").expect("cluster"),
+            node_id: Id::from_legacy_named("node_status_stable").expect("node"),
+            process: DAEMON_MAIN_CLUSTER_ROLE.to_string(),
+            availability: ClusterNodeAvailability::Online,
+            daemon_version: "0.1.0-test".to_string(),
+            commit: Some("abcdef0".to_string()),
+            target_os: Some("linux".to_string()),
+            target_arch: Some("x86_64".to_string()),
+            pid: Some(100),
+            address: Some("127.0.0.1:21353".to_string()),
+            bind_address: Some("0.0.0.0:21353".to_string()),
+            executable: Some("/tmp/sinomo".to_string()),
+            rollout: None,
+            daemon_started_at: Some("2026-05-02T12:00:00Z".to_string()),
+            observed_at: timestamp,
+        };
+        let mut right = left.clone();
+        right.pid = Some(200);
+        right.observed_at = right.observed_at + time::Duration::minutes(1);
+
+        assert!(cluster_node_status_stable_eq(&left, &right));
+
+        right.address = Some("127.0.0.1:21354".to_string());
+        assert!(!cluster_node_status_stable_eq(&left, &right));
     }
 
     #[test]

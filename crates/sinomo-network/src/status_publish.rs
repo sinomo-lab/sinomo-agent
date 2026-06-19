@@ -13,6 +13,7 @@ use crate::local_state_store::{read_cluster_state, read_cluster_state_without_kv
 use crate::network_info::{ClusterNetworkInfoRecord, cluster_network_info_stable_eq};
 use crate::prelude::*;
 use crate::rpc_future::ClusterMembershipRpcFuture;
+use sinomo_node::cluster_node_status_stable_eq;
 
 pub trait ClusterNetworkInfoPublishHost {
     type Error: From<NetworkError>;
@@ -363,25 +364,6 @@ pub fn stored_cluster_node_status_matches(
     // (no observed_at heartbeat). A live node's status is republished when its
     // content changes; crash detection is handled by active connectivity probes.
     Ok(cluster_node_status_stable_eq(&existing, status))
-}
-
-pub fn cluster_node_status_stable_eq(
-    left: &ClusterNodeStatusRecord,
-    right: &ClusterNodeStatusRecord,
-) -> bool {
-    left.cluster_id == right.cluster_id
-        && left.node_id == right.node_id
-        && left.process == right.process
-        && left.availability == right.availability
-        && left.daemon_version == right.daemon_version
-        && left.commit == right.commit
-        && left.target_os == right.target_os
-        && left.target_arch == right.target_arch
-        && left.address == right.address
-        && left.bind_address == right.bind_address
-        && left.executable == right.executable
-        && left.rollout == right.rollout
-        && left.daemon_started_at == right.daemon_started_at
 }
 
 pub fn stored_cluster_network_info_matches(

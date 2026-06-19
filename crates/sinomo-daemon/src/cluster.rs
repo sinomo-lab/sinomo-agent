@@ -52,7 +52,7 @@ use sinomo_network::{
 };
 use sinomo_node::{
     NodeId, cluster_member_expected_daemon_process, cluster_member_is_local_process,
-    shadow_daemon_node_id,
+    cluster_node_status_stable_eq, shadow_daemon_node_id,
 };
 use sinomo_node::{load_or_create_main_node_identity, load_or_create_shadow_node_identity};
 use sinomo_rollout::{
@@ -488,7 +488,7 @@ fn cached_node_status_matches(paths: &ClusterPaths, status: &ClusterNodeStatusRe
         .is_ok_and(|cache| {
             cache
                 .get(&key)
-                .is_some_and(|known| sinomo_network::cluster_node_status_stable_eq(known, status))
+                .is_some_and(|known| cluster_node_status_stable_eq(known, status))
         })
 }
 

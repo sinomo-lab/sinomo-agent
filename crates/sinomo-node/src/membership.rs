@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
     CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
-    ClusterEndpointSource, ClusterMemberRecord, ClusterMemberState, ClusterTransportKind, Id,
+    ClusterEndpointSource, ClusterMemberRecord, ClusterMemberState, ClusterNodeStatusRecord,
+    ClusterTransportKind, Id,
 };
 use time::OffsetDateTime;
 
@@ -192,6 +193,49 @@ pub fn cluster_identity_key() -> String {
 
 pub fn cluster_capability_policy_key(node_id: &NodeId) -> String {
     format!("/cluster/policy/capabilities/{node_id}")
+}
+
+pub fn cluster_node_status_key(node_id: &NodeId) -> String {
+    format!("/cluster/node-status/{node_id}")
+}
+
+pub fn cluster_node_status_key_for_record(status: &ClusterNodeStatusRecord) -> String {
+    cluster_node_status_key_for_process(&status.node_id, &status.process)
+}
+
+pub fn cluster_node_status_key_for_process(node_id: &NodeId, process: &str) -> String {
+    if process == DAEMON_MAIN_CLUSTER_ROLE {
+        cluster_node_status_key(node_id)
+    } else {
+        format!("/cluster/node-status/{node_id}/{process}")
+    }
+}
+
+pub fn cluster_node_status_key_matches_record(key: &str, status: &ClusterNodeStatusRecord) -> bool {
+    key == cluster_node_status_key_for_record(status)
+        || (status.process == DAEMON_MAIN_CLUSTER_ROLE
+            && key == cluster_node_status_key(&status.node_id))
+}
+
+/// Compares two node status records ignoring volatile observation fields that
+/// do not represent a daemon state change.
+pub fn cluster_node_status_stable_eq(
+    left: &ClusterNodeStatusRecord,
+    right: &ClusterNodeStatusRecord,
+) -> bool {
+    left.cluster_id == right.cluster_id
+        && left.node_id == right.node_id
+        && left.process == right.process
+        && left.availability == right.availability
+        && left.daemon_version == right.daemon_version
+        && left.commit == right.commit
+        && left.target_os == right.target_os
+        && left.target_arch == right.target_arch
+        && left.address == right.address
+        && left.bind_address == right.bind_address
+        && left.executable == right.executable
+        && left.rollout == right.rollout
+        && left.daemon_started_at == right.daemon_started_at
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

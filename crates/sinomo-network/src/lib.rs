@@ -374,7 +374,7 @@ pub use rpc_future::ClusterMembershipRpcFuture;
 pub(crate) use sinomo_node::upsert_member_record;
 pub use status_publish::{
     ClusterNetworkInfoPublishAsyncHost, ClusterNetworkInfoPublishHost,
-    ClusterNodeStatusPublishAsyncHost, ClusterNodeStatusPublishHost, cluster_node_status_stable_eq,
+    ClusterNodeStatusPublishAsyncHost, ClusterNodeStatusPublishHost,
     publish_cluster_network_info_to_quorum_async_with_host,
     publish_cluster_network_info_to_quorum_with_host,
     publish_cluster_node_status_to_quorum_async_with_host,

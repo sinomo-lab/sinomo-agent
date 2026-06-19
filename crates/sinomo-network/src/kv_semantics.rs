@@ -11,11 +11,11 @@ use crate::keyspace::{
 use crate::kv_local_store::read_cluster_kv_current_snapshot;
 use crate::network_info::{ClusterNetworkInfoRecord, cluster_network_info_stable_eq};
 use crate::prelude::*;
-use crate::status_publish::cluster_node_status_stable_eq;
 use sinomo_kv::ClusterKvRaftConfigRecord;
 use sinomo_node::{
     ClusterCapabilityPolicyRecord, ClusterIdentityRecord, cluster_capability_policy_stable_eq,
     cluster_endpoint_stable_eq, cluster_identity_record_stable_eq, cluster_member_stable_eq,
+    cluster_node_status_stable_eq,
 };
 use time::OffsetDateTime;
 
