@@ -904,9 +904,9 @@ async fn try_handle_streamed_cluster_relay_request_async(
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
     let state =
         sinomo_network::read_cluster_state_without_kv(&cluster_paths).map_err(DaemonError::from)?;
-    if envelope.target_node_id == state.local_node_id {
+    if envelope.target_node_id() == &state.local_node_id {
         dispatch_streamed_cluster_relay_local_request_async(
-            envelope.inner,
+            envelope.into_inner(),
             stream,
             paths,
             service_host,
@@ -929,7 +929,7 @@ async fn try_handle_streamed_cluster_relay_request_async(
 fn relay_envelope_inner_expects_streamed_response(
     envelope: &sinomo_network::RelayEnvelope,
 ) -> bool {
-    sinomo_network::object_rpc_request_stream_mode(&envelope.inner).expects_raw_streamed_response()
+    sinomo_network::object_rpc_request_stream_mode(envelope.inner()).expects_raw_streamed_response()
 }
 
 async fn dispatch_streamed_cluster_relay_local_request_async(

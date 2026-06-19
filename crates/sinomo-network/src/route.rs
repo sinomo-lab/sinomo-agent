@@ -294,23 +294,27 @@ fn best_effort_candidate_forward_frontier(
 /// An inner cluster RPC wrapped for hop-by-hop delivery toward `target_node_id`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RelayEnvelope {
-    pub cluster_id: ClusterId,
-    pub target_node_id: NodeId,
-    pub ttl: u8,
+    pub(crate) cluster_id: ClusterId,
+    pub(crate) target_node_id: NodeId,
+    pub(crate) ttl: u8,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub visited: Vec<NodeId>,
+    pub(crate) visited: Vec<NodeId>,
     /// Maximum per-hop transport timeout, in milliseconds, inherited from the
     /// originating caller. Intermediate relays must not expand this budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_hop_timeout_ms: Option<u64>,
+    pub(crate) max_hop_timeout_ms: Option<u64>,
     /// The original signed request to deliver at the target, re-injected through its
     /// normal auth + dispatch path (its own signature/invite-proof is carried within).
-    pub inner: DaemonControlRequest,
+    pub(crate) inner: DaemonControlRequest,
 }
 
 impl RelayEnvelope {
     /// A fresh envelope with the default TTL and an empty visited set.
-    pub fn new(cluster_id: ClusterId, target_node_id: NodeId, inner: DaemonControlRequest) -> Self {
+    pub(crate) fn new(
+        cluster_id: ClusterId,
+        target_node_id: NodeId,
+        inner: DaemonControlRequest,
+    ) -> Self {
         Self {
             cluster_id,
             target_node_id,
@@ -323,7 +327,7 @@ impl RelayEnvelope {
 
     /// Encode this envelope as an [`ObjectRpcRequest`] on [`CLUSTER_RELAY_ROUTE`] for
     /// transport to the next hop.
-    pub fn into_request(&self) -> Result<ObjectRpcRequest, NetworkError> {
+    pub(crate) fn into_request(&self) -> Result<ObjectRpcRequest, NetworkError> {
         let mut request =
             ObjectRpcRequest::encode_body(CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY, self)?;
         propagate_relay_response_metadata(&self.inner, &mut request);
@@ -334,6 +338,34 @@ impl RelayEnvelope {
     pub fn from_request(request: &ObjectRpcRequest) -> Result<Self, NetworkError> {
         request.decode_body()
     }
+
+    pub fn target_node_id(&self) -> &NodeId {
+        &self.target_node_id
+    }
+
+    pub fn ttl(&self) -> u8 {
+        self.ttl
+    }
+
+    pub fn visited(&self) -> &[NodeId] {
+        &self.visited
+    }
+
+    pub fn inner(&self) -> &DaemonControlRequest {
+        &self.inner
+    }
+
+    pub fn into_inner(self) -> DaemonControlRequest {
+        self.inner
+    }
+}
+
+pub fn cluster_relay_rpc_request(
+    cluster_id: &ClusterId,
+    target_node_id: &NodeId,
+    inner: DaemonControlRequest,
+) -> Result<ObjectRpcRequest, NetworkError> {
+    RelayEnvelope::new(cluster_id.clone(), target_node_id.clone(), inner).into_request()
 }
 
 /// What a node should do with a [`RelayEnvelope`] it received.

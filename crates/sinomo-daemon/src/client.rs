@@ -916,12 +916,11 @@ async fn route_endpoint_request_via_local_daemon_async(
     }
 
     let cluster = status.cluster.as_ref()?;
-    let outer = sinomo_network::RelayEnvelope::new(
-        cluster.cluster_id.clone(),
-        endpoint.node_id.clone(),
+    let outer = sinomo_network::cluster_relay_rpc_request(
+        &cluster.cluster_id,
+        &endpoint.node_id,
         request.clone().with_auth(request_auth.to_vec()),
     )
-    .into_request()
     .map_err(DaemonError::from);
     let outer = match outer {
         Ok(outer) => outer,

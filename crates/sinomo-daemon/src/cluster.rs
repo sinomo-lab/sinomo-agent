@@ -4602,14 +4602,14 @@ impl sinomo_network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost<'_> {
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
         let state = state.clone();
-        let target_node_id = envelope.target_node_id.clone();
+        let target_node_id = envelope.target_node_id().clone();
         let envelope = envelope.clone();
         Box::pin(async move {
             if target_node_id == relay_local_node_id(&paths, &state) {
                 return crate::control::dispatch_daemon_control_request_in_process_async(
                     paths,
                     runtime,
-                    envelope.inner,
+                    envelope.into_inner(),
                 )
                 .await
                 .map(Some)
@@ -4627,12 +4627,11 @@ impl sinomo_network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost<'_> {
             let Some(delivery) = delivery else {
                 return Ok(None);
             };
+            let inner = envelope.into_inner();
             match delivery {
                 RelayLocalDeliveryTarget::CurrentProcess(paths) => {
                     crate::control::dispatch_daemon_control_request_in_process_async(
-                        paths,
-                        runtime,
-                        envelope.inner,
+                        paths, runtime, inner,
                     )
                     .await
                     .map(Some)
@@ -4641,10 +4640,9 @@ impl sinomo_network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost<'_> {
                     })
                 }
                 RelayLocalDeliveryTarget::LoopbackAddress(local_address) => {
-                    let inner = &envelope.inner;
                     sinomo_network::send_daemon_control_rpc_request_async(
                         &local_address,
-                        inner,
+                        &inner,
                         timeouts,
                         sinomo_network::IROH_DAEMON_COMMAND_MAX_BYTES,
                     )
@@ -4854,7 +4852,7 @@ async fn send_cluster_relay_request_to_next_hop_async(
 fn relay_envelope_inner_expects_streamed_response(
     envelope: &sinomo_network::RelayEnvelope,
 ) -> bool {
-    sinomo_network::object_rpc_request_stream_mode(&envelope.inner).expects_raw_streamed_response()
+    sinomo_network::object_rpc_request_stream_mode(envelope.inner()).expects_raw_streamed_response()
 }
 
 enum ClusterRelayStreamForwardResult {
@@ -10092,9 +10090,9 @@ mod tests {
         state: &ClusterBootstrapState,
         target_node: &NodeId,
     ) -> sinomo_network::RelayEnvelope {
-        sinomo_network::RelayEnvelope::new(
-            state.cluster_id.clone(),
-            target_node.clone(),
+        let request = sinomo_network::cluster_relay_rpc_request(
+            &state.cluster_id,
+            target_node,
             sinomo_network::ObjectRpcRequest {
                 route: "/test/relay".to_string(),
                 category: "test".to_string(),
@@ -10103,6 +10101,8 @@ mod tests {
                 body: Vec::new(),
             },
         )
+        .expect("relay rpc request");
+        sinomo_network::RelayEnvelope::from_request(&request).expect("relay envelope")
     }
 
     #[test]
@@ -10144,7 +10144,7 @@ mod tests {
         sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
         let runtime = daemon_cluster_test_runtime();
         let envelope = test_relay_envelope(&state, &target_node);
-        let initial_ttl = envelope.ttl;
+        let initial_ttl = envelope.ttl();
         let mut host = RecordingRelayStreamForwardHost::forwarding();
         let outcome = runtime
             .block_on(
@@ -10176,9 +10176,9 @@ mod tests {
             endpoint.endpoint_id, target_endpoint.endpoint_id,
             "relay should use the known target command endpoint"
         );
-        assert_eq!(forwarded.target_node_id, target_node);
-        assert_eq!(forwarded.ttl, initial_ttl.saturating_sub(1));
-        assert_eq!(forwarded.visited, vec![local_node]);
+        assert_eq!(forwarded.target_node_id(), &target_node);
+        assert_eq!(forwarded.ttl(), initial_ttl.saturating_sub(1));
+        assert_eq!(forwarded.visited(), &[local_node]);
     }
 
     #[test]
