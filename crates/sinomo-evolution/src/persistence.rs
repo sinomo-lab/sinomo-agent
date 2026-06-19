@@ -24,9 +24,9 @@ use sinomo_runtime::dfs::{
     DfsMetadataJournalBatchSender, DfsMetadataJournalReplicationOptions,
     DfsMetadataPeerTransportError, DfsMetadataShardConfig, DfsMetadataSnapshotInstallSender,
     DfsPeerTransportError, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
-    default_dfs_metadata_root, default_dfs_metadata_shards_root, fallback_dfs_node_id,
-    metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
-    publish_cluster_dfs_metadata_journal, sifs_file_system_id,
+    cluster_dfs_data_endpoints, default_dfs_metadata_root, default_dfs_metadata_shards_root,
+    fallback_dfs_node_id, metadata_shards_prefix, open_local_sharded_metadata_backend,
+    open_root_local_metadata_backend, publish_cluster_dfs_metadata_journal, sifs_file_system_id,
 };
 use sinomo_runtime::eval::CommandRunResult;
 use sinomo_runtime::kv::read_cluster_kv_prefix_entries;
@@ -2558,8 +2558,7 @@ fn open_evolution_sifs_service(
                 detail: source.to_string(),
             }
         })?;
-        let endpoints = network::ClusterEndpointSelector::new(&cluster_paths, &state)
-            .select(network::ClusterEndpointSelectionPurpose::DfsData);
+        let endpoints = cluster_dfs_data_endpoints(&cluster_paths, &state);
         (state.local_node_id, endpoints)
     } else {
         (fallback_dfs_node_id(), Vec::new())

@@ -135,7 +135,7 @@ pub(crate) use endpoint_selector::{
     cluster_sync_targets, cluster_sync_targets_with_connectivity,
     prefer_bounded_daemon_command_targets,
 };
-pub use error::*;
+pub use error::NetworkError;
 pub use health::{
     ClusterDoctorFinding, ClusterHealthRow, ClusterNetworkPingRequest, ClusterNetworkPingResponse,
     ClusterStatusAsyncProbe, ClusterStatusProbe, cluster_doctor_findings,
