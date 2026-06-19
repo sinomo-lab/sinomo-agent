@@ -14,10 +14,9 @@ use crate::{
     fetch_cluster_kv_snapshot_from_endpoint_on_runtime, fetch_daemon_status_from_endpoint_async,
     fetch_daemon_status_from_endpoint_on_runtime, handle_daemon_rollout_build_request,
     read_daemon_status, send_cluster_kv_watch_events_async, send_cluster_member_publish_async,
-    send_cluster_member_publish_on_runtime, send_cluster_raft_append_async,
-    send_cluster_raft_append_on_runtime, send_cluster_raft_vote_async,
-    send_cluster_raft_vote_on_runtime, send_daemon_rpc_to_endpoint_async,
-    send_daemon_rpc_to_endpoint_on_runtime, write_daemon_status,
+    send_cluster_raft_append_async, send_cluster_raft_append_on_runtime,
+    send_cluster_raft_vote_async, send_cluster_raft_vote_on_runtime,
+    send_daemon_rpc_to_endpoint_async, send_daemon_rpc_to_endpoint_on_runtime, write_daemon_status,
 };
 use sinomo_core::{
     ClusterBootstrapState, ClusterEndpointRecord, ClusterMemberRecord, ClusterNodeRole,
@@ -3551,17 +3550,6 @@ impl sinomo_network::ClusterControlPlaneTransport for DaemonClusterControlPlaneT
         let runtime = self.rpc_mode.runtime();
         fetch_cluster_kv_snapshot_from_endpoint_on_runtime(endpoint, timeout, runtime)
             .map_err(|error| daemon_host_network_error("cluster kv snapshot", error))
-    }
-
-    fn send_cluster_member_publish(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        request: &ClusterMemberPublishRequest,
-        timeout: Duration,
-    ) -> Result<ClusterMemberPublishResponse, sinomo_network::NetworkError> {
-        let runtime = self.rpc_mode.runtime();
-        send_cluster_member_publish_on_runtime(endpoint, request, timeout, runtime)
-            .map_err(|error| daemon_host_network_error("cluster local member publish rpc", error))
     }
 
     fn send_cluster_membership_rpc(

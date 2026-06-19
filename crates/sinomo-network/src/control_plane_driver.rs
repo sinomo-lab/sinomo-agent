@@ -2,7 +2,6 @@ use crate::ClusterPaths;
 use crate::connectivity::{ClusterConnectivityRecord, ClusterConnectivityState};
 use crate::control_plane_options::ClusterControlPlaneTimeouts;
 use crate::error::NetworkError;
-use crate::membership_rpc::{ClusterMemberPublishRequest, ClusterMemberPublishResponse};
 use crate::network_info::ClusterNetworkInfoRecord;
 use crate::prelude::*;
 use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
@@ -34,13 +33,6 @@ pub trait ClusterControlPlaneTransport {
         endpoint: &ClusterEndpointRecord,
         timeout: Duration,
     ) -> Result<KvSnapshot, NetworkError>;
-
-    fn send_cluster_member_publish(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        request: &ClusterMemberPublishRequest,
-        timeout: Duration,
-    ) -> Result<ClusterMemberPublishResponse, NetworkError>;
 
     fn send_cluster_membership_rpc(
         &mut self,

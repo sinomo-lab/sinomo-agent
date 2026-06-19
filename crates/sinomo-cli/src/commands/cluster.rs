@@ -1782,17 +1782,6 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
             })
         }
 
-        fn send_cluster_member_publish(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _request: &network::ClusterMemberPublishRequest,
-            _timeout: Duration,
-        ) -> Result<network::ClusterMemberPublishResponse, network::NetworkError> {
-            Err(unsupported_join_reconciliation_transport(
-                "cluster join member publish",
-            ))
-        }
-
         fn send_cluster_membership_rpc(
             &mut self,
             endpoint: &ClusterEndpointRecord,

@@ -92,9 +92,9 @@ pub(crate) use client::{
     DaemonSignedEndpointRpcAsyncHost, cluster_paths_from_env,
     fetch_cluster_kv_snapshot_from_endpoint_on_runtime,
     fetch_daemon_status_from_endpoint_on_runtime, send_cluster_kv_watch_events_async,
-    send_cluster_member_publish_async, send_cluster_member_publish_on_runtime,
-    send_cluster_raft_append_async, send_cluster_raft_append_on_runtime,
-    send_cluster_raft_vote_async, send_cluster_raft_vote_on_runtime, send_daemon_rpc_on_runtime,
+    send_cluster_member_publish_async, send_cluster_raft_append_async,
+    send_cluster_raft_append_on_runtime, send_cluster_raft_vote_async,
+    send_cluster_raft_vote_on_runtime, send_daemon_rpc_on_runtime,
     send_daemon_rpc_to_endpoint_on_runtime, send_dfs_object_rpc_to_endpoint_on_runtime,
 };
 pub use client::{

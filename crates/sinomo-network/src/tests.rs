@@ -9538,15 +9538,6 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
             panic!("membership forwarding should not fetch kv snapshots")
         }
 
-        fn send_cluster_member_publish(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterMemberPublishRequest,
-            _timeout: Duration,
-        ) -> Result<ClusterMemberPublishResponse, NetworkError> {
-            panic!("membership forwarding should not publish members")
-        }
-
         fn send_cluster_membership_rpc(
             &mut self,
             endpoint: &ClusterEndpointRecord,
@@ -9682,15 +9673,6 @@ fn cluster_join_registration_driver_uses_local_membership_observer() {
             panic!("local observation should not fetch kv snapshots")
         }
 
-        fn send_cluster_member_publish(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterMemberPublishRequest,
-            _timeout: Duration,
-        ) -> Result<ClusterMemberPublishResponse, NetworkError> {
-            panic!("local observation should not publish members")
-        }
-
         fn send_cluster_membership_rpc(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
@@ -9801,15 +9783,6 @@ fn cluster_member_mutation_driver_prepares_state_from_local_membership_observer(
             _timeout: Duration,
         ) -> Result<KvSnapshot, NetworkError> {
             panic!("membership preparation should not fetch kv snapshots")
-        }
-
-        fn send_cluster_member_publish(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterMemberPublishRequest,
-            _timeout: Duration,
-        ) -> Result<ClusterMemberPublishResponse, NetworkError> {
-            panic!("membership preparation should not publish members")
         }
 
         fn send_cluster_membership_rpc(
@@ -9956,15 +9929,6 @@ fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
             _timeout: Duration,
         ) -> Result<KvSnapshot, NetworkError> {
             panic!("cache hook test should not fetch kv snapshots")
-        }
-
-        fn send_cluster_member_publish(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterMemberPublishRequest,
-            _timeout: Duration,
-        ) -> Result<ClusterMemberPublishResponse, NetworkError> {
-            panic!("cache hook test should not publish members")
         }
 
         fn send_cluster_membership_rpc(
@@ -13040,15 +13004,6 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
                 operation: "test snapshot fetch".to_string(),
                 detail: "accepted response should not need snapshot fallback".to_string(),
             })
-        }
-
-        fn send_cluster_member_publish(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterMemberPublishRequest,
-            _timeout: Duration,
-        ) -> Result<ClusterMemberPublishResponse, NetworkError> {
-            panic!("join reconciliation should not publish members")
         }
 
         fn send_cluster_membership_rpc(

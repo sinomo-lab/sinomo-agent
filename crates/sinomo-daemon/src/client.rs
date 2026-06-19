@@ -1265,22 +1265,6 @@ pub(crate) async fn send_cluster_raft_vote_async(
     .await
 }
 
-pub(crate) fn send_cluster_member_publish_on_runtime(
-    endpoint: &ClusterEndpointRecord,
-    request: &ClusterMemberPublishRequest,
-    timeout: Duration,
-    runtime: &tokio::runtime::Handle,
-) -> Result<ClusterMemberPublishResponse, DaemonError> {
-    send_daemon_rpc_body_to_endpoint_on_runtime(
-        endpoint,
-        sinomo_network::CLUSTER_MEMBER_PUBLISH_ROUTE,
-        sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
-        request,
-        timeout,
-        runtime,
-    )
-}
-
 pub(crate) async fn send_cluster_member_publish_async(
     endpoint: &ClusterEndpointRecord,
     request: &ClusterMemberPublishRequest,

@@ -167,7 +167,7 @@ pub(crate) use crate::route_graph_read_model::read_cluster_connectivity_graph;
 pub(crate) use crate::route_graph_read_model::read_cluster_connectivity_graph_with_query;
 use crate::rpc::{
     CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE, CLUSTER_MEMBER_PUBLISH_ROUTE,
-    ObjectRpcRequest, ObjectRpcResponse,
+    CLUSTER_MEMBERSHIP_RPC_CATEGORY, ObjectRpcRequest, ObjectRpcResponse,
 };
 use crate::status_publish::{ClusterNetworkInfoPublishHost, ClusterNodeStatusPublishHost};
 use crate::voter_reachability::{ClusterVoterReachabilityHost, cluster_has_local_quorum_with_host};
@@ -315,8 +315,14 @@ where
         request: &ClusterMemberPublishRequest,
         timeout: Duration,
     ) -> Result<ClusterMemberPublishResponse, NetworkError> {
+        let request = ObjectRpcRequest::encode_body(
+            CLUSTER_MEMBER_PUBLISH_ROUTE,
+            CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+            request,
+        )?;
         self.transport
-            .send_cluster_member_publish(endpoint, request, timeout)
+            .send_cluster_membership_rpc(endpoint, &request, timeout)?
+            .decode_body()
     }
 }
 
