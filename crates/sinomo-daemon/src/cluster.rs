@@ -2545,18 +2545,25 @@ pub(crate) fn refresh_daemon_node_status_in_kv_on_runtime(
         read_rollout_status(&rollout_paths)?,
         time::OffsetDateTime::now_utc(),
     );
-    let network_info_matches =
-        sinomo_network::stored_cluster_network_info_matches(&cluster_paths, &network_info)
-            .unwrap_or(false);
-    let node_status_matches =
-        sinomo_network::stored_cluster_node_status_matches(&cluster_paths, &record)
-            .unwrap_or(false);
-    if network_info_matches && node_status_matches {
-        return Ok(NodeStatusPublishOutcome::default());
-    }
     let Some(runtime) = runtime else {
         return Ok(NodeStatusPublishOutcome::default());
     };
+    let mut publish_match_host = daemon_cluster_control_plane_driver_on_runtime(runtime);
+    let network_info_matches = sinomo_network::cluster_network_info_publish_matches_with_host(
+        &cluster_paths,
+        &network_info,
+        &mut publish_match_host,
+    )
+    .unwrap_or(false);
+    let node_status_matches = sinomo_network::cluster_node_status_publish_matches_with_host(
+        &cluster_paths,
+        &record,
+        &mut publish_match_host,
+    )
+    .unwrap_or(false);
+    if network_info_matches && node_status_matches {
+        return Ok(NodeStatusPublishOutcome::default());
+    }
     if !cluster_has_local_quorum_on_runtime(&cluster_paths, &state, runtime) {
         return Ok(NodeStatusPublishOutcome::default());
     }
@@ -2633,25 +2640,29 @@ pub(crate) async fn refresh_daemon_node_status_in_kv_async(
         rollout_status,
         time::OffsetDateTime::now_utc(),
     );
-    let network_match_paths = cluster_paths.clone();
-    let network_match_info = network_info.clone();
-    let node_match_paths = cluster_paths.clone();
-    let node_match_record = record.clone();
-    let network_info_matches = tokio::task::spawn_blocking(move || {
-        sinomo_network::stored_cluster_network_info_matches(
-            &network_match_paths,
-            &network_match_info,
+    let mut network_match_host = DaemonClusterControlPlaneTransport {
+        rpc_mode: DaemonClusterRpcMode::new(runtime.clone()),
+    };
+    let network_info_matches =
+        sinomo_network::cluster_network_info_publish_matches_async_with_host(
+            &runtime,
+            &cluster_paths,
+            &network_info,
+            &mut network_match_host,
         )
-        .unwrap_or(false)
-    });
-    let node_status_matches = tokio::task::spawn_blocking(move || {
-        sinomo_network::stored_cluster_node_status_matches(&node_match_paths, &node_match_record)
-            .unwrap_or(false)
-    });
-    let (network_info_matches, node_status_matches) =
-        tokio::join!(network_info_matches, node_status_matches);
-    let network_info_matches = network_info_matches.unwrap_or(false);
-    let node_status_matches = node_status_matches.unwrap_or(false);
+        .await
+        .unwrap_or(false);
+    let mut node_match_host = DaemonClusterControlPlaneTransport {
+        rpc_mode: DaemonClusterRpcMode::new(runtime.clone()),
+    };
+    let node_status_matches = sinomo_network::cluster_node_status_publish_matches_async_with_host(
+        &runtime,
+        &cluster_paths,
+        &record,
+        &mut node_match_host,
+    )
+    .await
+    .unwrap_or(false);
     if network_info_matches && node_status_matches {
         return Ok(NodeStatusPublishOutcome::default());
     }

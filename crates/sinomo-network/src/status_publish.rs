@@ -140,6 +140,24 @@ pub fn sync_cluster_node_status_to_kv(
     )
 }
 
+pub fn cluster_node_status_publish_matches_with_host<H>(
+    paths: &ClusterPaths,
+    status: &ClusterNodeStatusRecord,
+    host: &mut H,
+) -> Result<bool, H::Error>
+where
+    H: ClusterNodeStatusPublishHost,
+{
+    if host.published_node_status_matches(paths, status) {
+        return Ok(true);
+    }
+    if stored_cluster_node_status_matches(paths, status)? {
+        host.remember_published_node_status(paths, status);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 pub fn publish_cluster_node_status_to_quorum_with_host<H>(
     paths: &ClusterPaths,
     status: ClusterNodeStatusRecord,
@@ -148,11 +166,7 @@ pub fn publish_cluster_node_status_to_quorum_with_host<H>(
 where
     H: ClusterNodeStatusPublishHost,
 {
-    if host.published_node_status_matches(paths, &status) {
-        return Ok(None);
-    }
-    if stored_cluster_node_status_matches(paths, &status)? {
-        host.remember_published_node_status(paths, &status);
+    if cluster_node_status_publish_matches_with_host(paths, &status, host)? {
         return Ok(None);
     }
     let mut state = read_cluster_state(paths)?;
@@ -170,20 +184,20 @@ where
     Ok(Some(snapshot))
 }
 
-pub async fn publish_cluster_node_status_to_quorum_async_with_host<H>(
+pub async fn cluster_node_status_publish_matches_async_with_host<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
-    status: ClusterNodeStatusRecord,
+    status: &ClusterNodeStatusRecord,
     host: &mut H,
-) -> Result<Option<KvSnapshot>, H::Error>
+) -> Result<bool, H::Error>
 where
     H: ClusterNodeStatusPublishAsyncHost,
 {
     if host
-        .published_node_status_matches_async(paths, &status)
+        .published_node_status_matches_async(paths, status)
         .await?
     {
-        return Ok(None);
+        return Ok(true);
     }
     let match_paths = paths.clone();
     let match_status = status.clone();
@@ -198,8 +212,23 @@ where
         })?
         .map_err(H::Error::from)?;
     if stored_matches {
-        host.remember_published_node_status_async(paths, &status)
+        host.remember_published_node_status_async(paths, status)
             .await?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+pub async fn publish_cluster_node_status_to_quorum_async_with_host<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    status: ClusterNodeStatusRecord,
+    host: &mut H,
+) -> Result<Option<KvSnapshot>, H::Error>
+where
+    H: ClusterNodeStatusPublishAsyncHost,
+{
+    if cluster_node_status_publish_matches_async_with_host(runtime, paths, &status, host).await? {
         return Ok(None);
     }
 
@@ -251,6 +280,24 @@ pub fn sync_cluster_network_info_to_kv(
     )
 }
 
+pub fn cluster_network_info_publish_matches_with_host<H>(
+    paths: &ClusterPaths,
+    info: &ClusterNetworkInfoRecord,
+    host: &mut H,
+) -> Result<bool, H::Error>
+where
+    H: ClusterNetworkInfoPublishHost,
+{
+    if host.published_network_info_matches(paths, info) {
+        return Ok(true);
+    }
+    if stored_cluster_network_info_matches(paths, info)? {
+        host.remember_published_network_info(paths, info);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 pub fn publish_cluster_network_info_to_quorum_with_host<H>(
     paths: &ClusterPaths,
     info: ClusterNetworkInfoRecord,
@@ -259,11 +306,7 @@ pub fn publish_cluster_network_info_to_quorum_with_host<H>(
 where
     H: ClusterNetworkInfoPublishHost,
 {
-    if host.published_network_info_matches(paths, &info) {
-        return Ok(None);
-    }
-    if stored_cluster_network_info_matches(paths, &info)? {
-        host.remember_published_network_info(paths, &info);
+    if cluster_network_info_publish_matches_with_host(paths, &info, host)? {
         return Ok(None);
     }
     let mut state = read_cluster_state(paths)?;
@@ -284,20 +327,20 @@ where
     Ok(Some(snapshot))
 }
 
-pub async fn publish_cluster_network_info_to_quorum_async_with_host<H>(
+pub async fn cluster_network_info_publish_matches_async_with_host<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
-    info: ClusterNetworkInfoRecord,
+    info: &ClusterNetworkInfoRecord,
     host: &mut H,
-) -> Result<Option<KvSnapshot>, H::Error>
+) -> Result<bool, H::Error>
 where
     H: ClusterNetworkInfoPublishAsyncHost,
 {
     if host
-        .published_network_info_matches_async(paths, &info)
+        .published_network_info_matches_async(paths, info)
         .await?
     {
-        return Ok(None);
+        return Ok(true);
     }
     let match_paths = paths.clone();
     let match_info = info.clone();
@@ -312,8 +355,23 @@ where
         })?
         .map_err(H::Error::from)?;
     if stored_matches {
-        host.remember_published_network_info_async(paths, &info)
+        host.remember_published_network_info_async(paths, info)
             .await?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+pub async fn publish_cluster_network_info_to_quorum_async_with_host<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    info: ClusterNetworkInfoRecord,
+    host: &mut H,
+) -> Result<Option<KvSnapshot>, H::Error>
+where
+    H: ClusterNetworkInfoPublishAsyncHost,
+{
+    if cluster_network_info_publish_matches_async_with_host(runtime, paths, &info, host).await? {
         return Ok(None);
     }
 
@@ -349,7 +407,7 @@ where
     Ok(Some(snapshot))
 }
 
-pub fn stored_cluster_node_status_matches(
+pub(crate) fn stored_cluster_node_status_matches(
     paths: &ClusterPaths,
     status: &ClusterNodeStatusRecord,
 ) -> Result<bool, NetworkError> {
@@ -367,7 +425,7 @@ pub fn stored_cluster_node_status_matches(
     ))
 }
 
-pub fn stored_cluster_network_info_matches(
+pub(crate) fn stored_cluster_network_info_matches(
     paths: &ClusterPaths,
     info: &ClusterNetworkInfoRecord,
 ) -> Result<bool, NetworkError> {

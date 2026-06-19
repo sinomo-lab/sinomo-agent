@@ -16817,9 +16817,23 @@ fn cluster_node_status_storage_keeps_processes_distinct_for_same_node() {
             .is_some(),
         "shadow status key should be present"
     );
-    assert!(stored_cluster_node_status_matches(&paths, &main_status).expect("main status match"));
+    let mut main_status_match_host = RecordingClusterNodeStatusPublishHost::default();
     assert!(
-        stored_cluster_node_status_matches(&paths, &shadow_status).expect("shadow status match")
+        cluster_node_status_publish_matches_with_host(
+            &paths,
+            &main_status,
+            &mut main_status_match_host,
+        )
+        .expect("main status match")
+    );
+    let mut shadow_status_match_host = RecordingClusterNodeStatusPublishHost::default();
+    assert!(
+        cluster_node_status_publish_matches_with_host(
+            &paths,
+            &shadow_status,
+            &mut shadow_status_match_host,
+        )
+        .expect("shadow status match")
     );
 
     let statuses = read_cluster_node_statuses_from_kv(&paths).expect("statuses");
@@ -18072,6 +18086,45 @@ impl ClusterNetworkInfoPublishHost for RecordingClusterNetworkInfoPublishHost {
     }
 }
 
+impl ClusterNetworkInfoPublishAsyncHost for RecordingClusterNetworkInfoPublishHost {
+    type Error = NetworkError;
+
+    fn published_network_info_matches_async<'a>(
+        &'a mut self,
+        _paths: &'a ClusterPaths,
+        _info: &'a ClusterNetworkInfoRecord,
+    ) -> ClusterMembershipRpcFuture<'a, bool> {
+        Box::pin(async move {
+            self.cache_checks += 1;
+            Ok(self.cache_matches)
+        })
+    }
+
+    fn remember_published_network_info_async<'a>(
+        &'a mut self,
+        _paths: &'a ClusterPaths,
+        _info: &'a ClusterNetworkInfoRecord,
+    ) -> ClusterMembershipRpcFuture<'a, ()> {
+        Box::pin(async move {
+            self.remembers += 1;
+            Ok(())
+        })
+    }
+
+    fn commit_cluster_kv_txn_with_quorum_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> ClusterMembershipRpcFuture<'a, KvSnapshot> {
+        Box::pin(async move {
+            self.commits += 1;
+            self.last_txn = Some(txn.clone());
+            append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
+        })
+    }
+}
+
 #[derive(Default)]
 struct RecordingClusterNodeStatusPublishHost {
     cache_matches: bool,
@@ -18370,6 +18423,67 @@ fn network_info_quorum_publish_driver_delegates_and_uses_publish_cache() {
     assert!(cached.is_none());
     assert_eq!(host.commits, 0);
     assert_eq!(host.remembers, 1, "cache hit should not re-remember");
+}
+
+#[test]
+fn network_info_async_quorum_publish_driver_delegates() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let root = sinomo_testdir::TestDir::new("sinomo-network-info-async-quorum-driver");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_info_async_quorum_driver").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_network_info_async_quorum_driver").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network info async quorum driver",
+        node_id.clone(),
+        "node",
+        "public-key",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let info = ClusterNetworkInfoRecord {
+        cluster_id,
+        node_id: node_id.clone(),
+        environment_id: "env_network_info_async_quorum_driver".to_string(),
+        observed_addresses: vec!["192.0.2.23".to_string()],
+        endpoints: Vec::new(),
+        observed_at: now,
+        expires_at: now + time::Duration::seconds(600),
+    };
+    let key = cluster_network_info_key(&node_id);
+
+    let mut host = RecordingClusterNetworkInfoPublishHost::default();
+    let result = runtime
+        .block_on(publish_cluster_network_info_to_quorum_async_with_host(
+            runtime.handle(),
+            &paths,
+            info,
+            &mut host,
+        ))
+        .expect("async network info publish");
+    assert!(result.is_some());
+    assert_eq!(host.cache_checks, 1);
+    assert_eq!(host.commits, 1);
+    assert_eq!(host.remembers, 1);
+    assert!(
+        host.last_txn
+            .as_ref()
+            .expect("committed txn")
+            .success
+            .iter()
+            .any(|op| matches!(op, KvOp::Put { key: put_key, .. } if put_key == &key)),
+        "async network driver should plan network-info publication"
+    );
 }
 
 #[test]
@@ -21091,8 +21205,10 @@ fn cluster_kv_metadata_reads_are_empty_without_materialized_snapshot() {
         daemon_started_at: Some("2026-05-04T00:00:00Z".to_string()),
         observed_at: now,
     };
+    let mut status_match_host = RecordingClusterNodeStatusPublishHost::default();
     assert!(
-        !stored_cluster_node_status_matches(&paths, &status).expect("missing status match"),
+        !cluster_node_status_publish_matches_with_host(&paths, &status, &mut status_match_host)
+            .expect("missing status match"),
         "missing materialized snapshots should make status no-op checks miss, not error"
     );
     let info = ClusterNetworkInfoRecord {
@@ -21104,8 +21220,14 @@ fn cluster_kv_metadata_reads_are_empty_without_materialized_snapshot() {
         observed_at: now,
         expires_at: now + time::Duration::seconds(300),
     };
+    let mut network_info_match_host = RecordingClusterNetworkInfoPublishHost::default();
     assert!(
-        !stored_cluster_network_info_matches(&paths, &info).expect("missing network-info match"),
+        !cluster_network_info_publish_matches_with_host(
+            &paths,
+            &info,
+            &mut network_info_match_host,
+        )
+        .expect("missing network-info match"),
         "missing materialized snapshots should make network-info no-op checks miss, not error"
     );
     assert_eq!(
