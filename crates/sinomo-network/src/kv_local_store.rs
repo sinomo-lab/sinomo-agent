@@ -451,8 +451,9 @@ pub(crate) fn locked_kv_state_authority_id(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<Option<NodeId>, NetworkError> {
-    cluster_kv_raft_store(paths)
-        .locked_known_voter_leader_id(state)
+    paths
+        .kv_paths()
+        .locked_known_raft_voter_leader_id(state)
         .map_err(Into::into)
 }
 

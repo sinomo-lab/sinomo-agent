@@ -574,10 +574,6 @@ pub(crate) fn cluster_paths_from_defaults() -> Result<ClusterPaths, CliError> {
     Ok(ClusterPaths::new(&data_dir))
 }
 
-fn cluster_kv_raft_store(paths: &ClusterPaths) -> sinomo_runtime::kv::ClusterKvRaftStore {
-    paths.kv_paths().raft_store()
-}
-
 fn append_cluster_raft_command(
     paths: &ClusterPaths,
     node_id: &NodeId,
@@ -597,11 +593,10 @@ pub(crate) fn cluster_kv_state_authority_id(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<Option<NodeId>, network::NetworkError> {
-    Ok(cluster_kv_raft_store(paths)
-        .known_leader_id(&state.local_node_id)?
-        .filter(|authority_id| {
-            sinomo_runtime::kv::cluster_kv_raft_node_is_voter(state, authority_id)
-        }))
+    paths
+        .kv_paths()
+        .known_raft_voter_leader_id(state)
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -610,8 +605,9 @@ pub(crate) fn set_cluster_raft_leader(
     node_id: &NodeId,
     term: u64,
 ) -> Result<KvSnapshot, network::NetworkError> {
-    cluster_kv_raft_store(paths)
-        .set_leader_and_write_snapshot_if_changed(node_id, term)
+    paths
+        .kv_paths()
+        .set_raft_leader_and_write_snapshot_if_changed(node_id, term)
         .map_err(Into::into)
 }
 
@@ -620,8 +616,9 @@ pub(crate) fn locked_set_cluster_raft_leader(
     node_id: &NodeId,
     term: u64,
 ) -> Result<KvSnapshot, network::NetworkError> {
-    cluster_kv_raft_store(paths)
-        .locked_set_leader_and_write_snapshot_if_changed(node_id, term)
+    paths
+        .kv_paths()
+        .locked_set_raft_leader_and_write_snapshot_if_changed(node_id, term)
         .map_err(Into::into)
 }
 
@@ -630,8 +627,9 @@ pub(crate) fn clear_cluster_raft_leader(
     paths: &ClusterPaths,
     node_id: &NodeId,
 ) -> Result<KvSnapshot, network::NetworkError> {
-    cluster_kv_raft_store(paths)
-        .clear_leader_and_write_snapshot_if_changed(node_id)
+    paths
+        .kv_paths()
+        .clear_raft_leader_and_write_snapshot_if_changed(node_id)
         .map_err(Into::into)
 }
 

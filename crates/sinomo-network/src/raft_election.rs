@@ -2,7 +2,7 @@ use crate::ClusterPaths;
 use crate::control_plane_options::ClusterRaftLeaderElectionOptions;
 use crate::endpoint_selector::{ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector};
 use crate::error::NetworkError;
-use crate::kv_local_store::{cluster_kv_raft_store, locked_apply_cluster_raft_vote};
+use crate::kv_local_store::locked_apply_cluster_raft_vote;
 use crate::prelude::*;
 use crate::rpc_future::ClusterMembershipRpcFuture;
 use sinomo_kv::{ClusterKvRaftLocalVoteMetadata, ClusterRaftVoteRequest, ClusterRaftVoteResponse};
@@ -323,8 +323,9 @@ pub(crate) fn locked_observe_cluster_raft_term(
     node_id: &NodeId,
     term: u64,
 ) -> Result<bool, NetworkError> {
-    cluster_kv_raft_store(paths)
-        .locked_observe_term_and_write_snapshot_if_changed(node_id, term)
+    paths
+        .kv_paths()
+        .locked_observe_raft_term_and_write_snapshot_if_changed(node_id, term)
         .map_err(Into::into)
 }
 
@@ -333,8 +334,9 @@ pub(crate) fn locked_set_cluster_raft_leader(
     node_id: &NodeId,
     term: u64,
 ) -> Result<KvSnapshot, NetworkError> {
-    cluster_kv_raft_store(paths)
-        .locked_set_leader_and_write_snapshot_if_changed(node_id, term)
+    paths
+        .kv_paths()
+        .locked_set_raft_leader_and_write_snapshot_if_changed(node_id, term)
         .map_err(Into::into)
 }
 
@@ -342,8 +344,9 @@ pub(crate) fn locked_cluster_raft_local_vote_metadata(
     paths: &ClusterPaths,
     node_id: &NodeId,
 ) -> Result<ClusterKvRaftLocalVoteMetadata, NetworkError> {
-    cluster_kv_raft_store(paths)
-        .locked_local_vote_metadata(node_id)
+    paths
+        .kv_paths()
+        .locked_local_raft_vote_metadata(node_id)
         .map_err(Into::into)
 }
 

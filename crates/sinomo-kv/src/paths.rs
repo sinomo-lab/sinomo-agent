@@ -262,6 +262,67 @@ impl ClusterKvPaths {
             .cluster_raft_vote_rejection_response(state, detail)
     }
 
+    pub fn known_raft_voter_leader_id(
+        &self,
+        state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, KvError> {
+        self.raft_store().known_voter_leader_id(state)
+    }
+
+    pub fn locked_known_raft_voter_leader_id(
+        &self,
+        state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, KvError> {
+        self.raft_store().locked_known_voter_leader_id(state)
+    }
+
+    pub fn set_raft_leader_and_write_snapshot_if_changed(
+        &self,
+        node_id: &NodeId,
+        term: u64,
+    ) -> Result<KvSnapshot, KvError> {
+        self.raft_store()
+            .set_leader_and_write_snapshot_if_changed(node_id, term)
+    }
+
+    pub fn locked_set_raft_leader_and_write_snapshot_if_changed(
+        &self,
+        node_id: &NodeId,
+        term: u64,
+    ) -> Result<KvSnapshot, KvError> {
+        self.raft_store()
+            .locked_set_leader_and_write_snapshot_if_changed(node_id, term)
+    }
+
+    pub fn clear_raft_leader_and_write_snapshot_if_changed(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<KvSnapshot, KvError> {
+        self.raft_store()
+            .clear_leader_and_write_snapshot_if_changed(node_id)
+    }
+
+    pub fn locked_discard_raft_uncommitted_tail(&self, node_id: &NodeId) -> Result<bool, KvError> {
+        let _raft_guard = lock_cluster_kv_raft_operation_for_paths(self)?;
+        self.raft_store().discard_uncommitted_tail(node_id)
+    }
+
+    pub fn locked_observe_raft_term_and_write_snapshot_if_changed(
+        &self,
+        node_id: &NodeId,
+        term: u64,
+    ) -> Result<bool, KvError> {
+        self.raft_store()
+            .locked_observe_term_and_write_snapshot_if_changed(node_id, term)
+    }
+
+    pub fn locked_local_raft_vote_metadata(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<ClusterKvRaftLocalVoteMetadata, KvError> {
+        self.raft_store().locked_local_vote_metadata(node_id)
+    }
+
     pub fn append_kv_ops_in_batches_and_publish<F>(
         &self,
         node_id: &NodeId,

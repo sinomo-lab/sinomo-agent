@@ -150,18 +150,15 @@ fn cluster_connectivity_probe_key(
     )
 }
 
-fn daemon_cluster_kv_raft_store(paths: &ClusterPaths) -> sinomo_kv::ClusterKvRaftStore {
-    paths.kv_paths().raft_store()
-}
-
 #[cfg(test)]
 fn daemon_cluster_kv_state_authority_id(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<Option<NodeId>, sinomo_network::NetworkError> {
-    Ok(daemon_cluster_kv_raft_store(paths)
-        .known_leader_id(&state.local_node_id)?
-        .filter(|authority_id| sinomo_kv::cluster_kv_raft_node_is_voter(state, authority_id)))
+    paths
+        .kv_paths()
+        .known_raft_voter_leader_id(state)
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -170,8 +167,9 @@ fn daemon_locked_set_cluster_raft_leader(
     node_id: &NodeId,
     term: u64,
 ) -> Result<KvSnapshot, sinomo_network::NetworkError> {
-    daemon_cluster_kv_raft_store(paths)
-        .locked_set_leader_and_write_snapshot_if_changed(node_id, term)
+    paths
+        .kv_paths()
+        .locked_set_raft_leader_and_write_snapshot_if_changed(node_id, term)
         .map_err(Into::into)
 }
 
@@ -180,8 +178,9 @@ fn daemon_clear_cluster_raft_leader(
     paths: &ClusterPaths,
     node_id: &NodeId,
 ) -> Result<KvSnapshot, sinomo_network::NetworkError> {
-    daemon_cluster_kv_raft_store(paths)
-        .clear_leader_and_write_snapshot_if_changed(node_id)
+    paths
+        .kv_paths()
+        .clear_raft_leader_and_write_snapshot_if_changed(node_id)
         .map_err(Into::into)
 }
 const CLUSTER_CONNECTIVITY_PROBE_CONCURRENCY: usize = 16;
@@ -1179,10 +1178,9 @@ pub(crate) fn prune_local_cluster_raft_uncommitted_tail(
     let Ok(state) = sinomo_network::read_cluster_state_without_kv(&cluster_paths) else {
         return Ok(());
     };
-    let _raft_guard =
-        sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&cluster_paths.kv_paths())?;
-    daemon_cluster_kv_raft_store(&cluster_paths)
-        .discard_uncommitted_tail(&state.local_node_id)
+    cluster_paths
+        .kv_paths()
+        .locked_discard_raft_uncommitted_tail(&state.local_node_id)
         .map(|_| ())?;
     Ok(())
 }
