@@ -3,8 +3,8 @@ use crate::control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlane
 use crate::control_plane_options::{ClusterKvTxnQuorumOptions, ClusterRaftLeaderElectionOptions};
 use crate::error::NetworkError;
 use crate::kv_forward::{
-    ClusterKvTxnForwardOptions, ClusterKvTxnForwardResult,
-    forward_cluster_kv_txn_to_voter_async_with_host, forward_cluster_kv_txn_to_voter_with_host,
+    ClusterKvTxnForwardOptions, forward_cluster_kv_txn_to_voter_async_with_host,
+    forward_cluster_kv_txn_to_voter_with_host,
 };
 use crate::kv_local_store::{
     cluster_kv_raft_store, imported_snapshot_advances_local_kv,
@@ -21,14 +21,16 @@ use crate::raft_election::{
     elect_cluster_raft_leader_with_host,
 };
 use crate::raft_quorum::{
-    ClusterRaftQuorumAsyncHost, ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult,
-    commit_cluster_raft_command_with_control_plane_driver,
+    ClusterRaftQuorumAsyncHost, commit_cluster_raft_command_with_control_plane_driver,
     commit_cluster_raft_command_with_quorum_async_with_host,
 };
 use crate::route::ClusterSignedEndpointRpcAsyncHost;
 use crate::voter_reachability::{
     ClusterVoterReachabilityAsyncHost, ClusterVoterReachabilityOptions,
     cluster_reachable_voter_count_async_with_host, cluster_reachable_voter_count_with_host,
+};
+use sinomo_kv::{
+    ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult, ClusterKvTxnCommitResult,
 };
 
 pub trait ClusterKvTxnQuorumHost {
@@ -52,7 +54,7 @@ pub trait ClusterKvTxnQuorumHost {
         state: &ClusterBootstrapState,
         txn: &KvTxn,
         options: ClusterKvTxnForwardOptions,
-    ) -> Result<Option<ClusterKvTxnForwardResult>, NetworkError>;
+    ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError>;
 
     fn elect_cluster_raft_leader(
         &mut self,
@@ -73,8 +75,8 @@ pub trait ClusterKvTxnQuorumHost {
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
         command: KvCommand,
-        options: ClusterRaftQuorumCommitOptions,
-    ) -> Result<ClusterRaftQuorumCommitResult, NetworkError>;
+        options: ClusterKvRaftQuorumCommitOptions,
+    ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError>;
 }
 
 pub trait ClusterKvTxnQuorumAsyncHost:
@@ -127,7 +129,7 @@ where
         state: &ClusterBootstrapState,
         txn: &KvTxn,
         options: ClusterKvTxnForwardOptions,
-    ) -> Result<Option<ClusterKvTxnForwardResult>, NetworkError> {
+    ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
         forward_cluster_kv_txn_to_voter_with_host(paths, state, txn, options, self)
     }
 
@@ -154,8 +156,8 @@ where
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
         command: KvCommand,
-        options: ClusterRaftQuorumCommitOptions,
-    ) -> Result<ClusterRaftQuorumCommitResult, NetworkError> {
+        options: ClusterKvRaftQuorumCommitOptions,
+    ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError> {
         commit_cluster_raft_command_with_control_plane_driver(paths, state, command, options, self)
     }
 }
@@ -240,7 +242,7 @@ where
             self.paths,
             state,
             KvCommand::Txn(txn),
-            ClusterRaftQuorumCommitOptions {
+            ClusterKvRaftQuorumCommitOptions {
                 timeout: self.options.raft_append_timeout,
             },
         )
@@ -257,7 +259,7 @@ pub fn commit_cluster_kv_txn_with_quorum_response_with_host(
     txn: KvTxn,
     options: ClusterKvTxnQuorumOptions,
     host: &mut impl ClusterKvTxnQuorumHost,
-) -> Result<ClusterKvTxnForwardResult, NetworkError> {
+) -> Result<ClusterKvTxnCommitResult, NetworkError> {
     let allow_forwarding = options.allow_forwarding;
     let mut kv_host = NetworkClusterKvTxnQuorumHost {
         paths,
@@ -471,7 +473,7 @@ where
                 paths,
                 state,
                 KvCommand::Txn(txn),
-                ClusterRaftQuorumCommitOptions {
+                ClusterKvRaftQuorumCommitOptions {
                     timeout: options.raft_append_timeout,
                 },
                 options.raft_append_replication_options,
@@ -493,7 +495,7 @@ pub async fn commit_cluster_kv_txn_with_quorum_response_async_with_host<H>(
     txn: KvTxn,
     options: ClusterKvTxnQuorumOptions,
     host: &mut H,
-) -> Result<ClusterKvTxnForwardResult, NetworkError>
+) -> Result<ClusterKvTxnCommitResult, NetworkError>
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {

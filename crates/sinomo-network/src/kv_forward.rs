@@ -13,7 +13,7 @@ use crate::route::{
 };
 use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_core::{ClusterBootstrapState, ClusterEndpointRecord, ClusterTransportKind};
-use sinomo_kv::KvTxn;
+use sinomo_kv::{ClusterKvTxnCommitResult, KvTxn};
 use sinomo_node::NodeId;
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -38,8 +38,6 @@ impl ClusterKvTxnForwardOptions {
     }
 }
 
-pub type ClusterKvTxnForwardResult = sinomo_kv::ClusterKvTxnCommitResult;
-
 pub trait ClusterKvTxnForwardHost {
     fn known_raft_leader_id(
         &mut self,
@@ -62,7 +60,7 @@ pub fn forward_cluster_kv_txn_to_voter_with_host(
     txn: &KvTxn,
     options: ClusterKvTxnForwardOptions,
     host: &mut impl ClusterKvTxnForwardHost,
-) -> Result<Option<ClusterKvTxnForwardResult>, NetworkError> {
+) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
     let mut targets = cluster_raft_live_voter_targets(paths, state);
     if targets.is_empty() {
         return Ok(None);
@@ -124,7 +122,7 @@ fn forward_cluster_kv_txn_to_voter_node_with_host(
     txn: &KvTxn,
     timeout: Duration,
     host: &mut impl ClusterKvTxnForwardHost,
-) -> Result<ClusterKvTxnForwardResult, NetworkError> {
+) -> Result<ClusterKvTxnCommitResult, NetworkError> {
     let started = Instant::now();
     let txn_payload = sinomo_kv::cluster_kv_txn_rpc_payload(txn)?;
     let txn_request = ObjectRpcRequest::from_encoded_body(
@@ -149,7 +147,7 @@ fn forward_cluster_kv_txn_to_voter_node_with_host(
         host.send_object_rpc_to_node(state, voter_node_id, &snapshot_request, snapshot_timeout)?;
     snapshot_response.error_detail()?;
     let snapshot = sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&snapshot_response.body)?;
-    Ok(ClusterKvTxnForwardResult {
+    Ok(ClusterKvTxnCommitResult {
         snapshot,
         txn_response: Some(txn_response),
     })
@@ -162,7 +160,7 @@ pub async fn forward_cluster_kv_txn_to_voter_async_with_host<H>(
     txn: &KvTxn,
     options: ClusterKvTxnForwardOptions,
     host: &mut H,
-) -> Result<Option<ClusterKvTxnForwardResult>, NetworkError>
+) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError>
 where
     H: ClusterSignedEndpointRpcAsyncHost + Send,
 {
@@ -234,7 +232,7 @@ async fn forward_cluster_kv_txn_to_voter_node_async_with_host<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     host: &mut H,
-) -> Result<ClusterKvTxnForwardResult, NetworkError>
+) -> Result<ClusterKvTxnCommitResult, NetworkError>
 where
     H: ClusterSignedEndpointRpcAsyncHost + Send,
 {
@@ -283,7 +281,7 @@ where
         .await?;
     snapshot_response.error_detail()?;
     let snapshot = sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&snapshot_response.body)?;
-    Ok(ClusterKvTxnForwardResult {
+    Ok(ClusterKvTxnCommitResult {
         snapshot,
         txn_response: Some(txn_response),
     })

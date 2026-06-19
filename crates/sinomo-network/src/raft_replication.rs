@@ -1,13 +1,13 @@
 use crate::ClusterPaths;
-use crate::control_plane_options::{
-    ClusterRaftAppendReplicationOptions, ClusterRaftAppendReplicationOutcome,
-};
+use crate::control_plane_options::ClusterRaftAppendReplicationOptions;
 use crate::error::NetworkError;
 #[cfg(test)]
 use crate::kv_local_store::cluster_kv_raft_store;
 use crate::prelude::*;
 use crate::rpc_future::ClusterMembershipRpcFuture;
-use sinomo_kv::{ClusterRaftAppendRequest, ClusterRaftAppendResponse};
+use sinomo_kv::{
+    ClusterKvRaftAppendReplicationOutcome, ClusterRaftAppendRequest, ClusterRaftAppendResponse,
+};
 use std::time::Duration;
 
 pub trait ClusterRaftAppendReplicationHost {
@@ -178,7 +178,7 @@ pub fn replicate_cluster_raft_to_endpoint_with_host(
     watch_events: &[KvEvent],
     options: ClusterRaftAppendReplicationOptions,
     host: &mut impl ClusterRaftAppendReplicationHost,
-) -> Result<ClusterRaftAppendReplicationOutcome, NetworkError> {
+) -> Result<ClusterKvRaftAppendReplicationOutcome, NetworkError> {
     let mut kv_host = NetworkClusterKvRaftAppendReplicationHost {
         paths,
         options,
@@ -200,7 +200,7 @@ pub async fn replicate_cluster_raft_to_endpoint_async_with_host(
     watch_events: &[KvEvent],
     options: ClusterRaftAppendReplicationOptions,
     host: &mut impl ClusterRaftAppendReplicationAsyncHost,
-) -> Result<ClusterRaftAppendReplicationOutcome, NetworkError> {
+) -> Result<ClusterKvRaftAppendReplicationOutcome, NetworkError> {
     let mut kv_host = NetworkClusterKvRaftAppendReplicationAsyncHost {
         paths,
         options,
@@ -276,7 +276,7 @@ pub fn replicate_cluster_raft_to_endpoint_with_local_host<S, O>(
     options: ClusterRaftAppendReplicationOptions,
     send_raft_append: S,
     on_raft_append_sent: O,
-) -> Result<ClusterRaftAppendReplicationOutcome, NetworkError>
+) -> Result<ClusterKvRaftAppendReplicationOutcome, NetworkError>
 where
     S: FnMut(
         &ClusterEndpointRecord,

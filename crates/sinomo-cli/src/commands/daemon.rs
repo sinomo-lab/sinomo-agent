@@ -568,7 +568,7 @@ pub(crate) fn cli_commit_cluster_kv_txn_with_quorum_response(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
     txn: KvTxn,
-) -> Result<network::ClusterKvTxnForwardResult, network::NetworkError> {
+) -> Result<sinomo_runtime::kv::ClusterKvTxnCommitResult, network::NetworkError> {
     network::commit_cluster_kv_txn_with_quorum_response_with_host(
         paths,
         state,
@@ -684,7 +684,7 @@ impl network::ClusterKvTxnQuorumHost for CliClusterKvTxnQuorumHost {
         state: &ClusterBootstrapState,
         txn: &KvTxn,
         options: network::ClusterKvTxnForwardOptions,
-    ) -> Result<Option<network::ClusterKvTxnForwardResult>, network::NetworkError> {
+    ) -> Result<Option<sinomo_runtime::kv::ClusterKvTxnCommitResult>, network::NetworkError> {
         network::forward_cluster_kv_txn_to_voter_with_host(
             paths,
             state,
@@ -727,8 +727,8 @@ impl network::ClusterKvTxnQuorumHost for CliClusterKvTxnQuorumHost {
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
         command: sinomo_runtime::kv::KvCommand,
-        options: network::ClusterRaftQuorumCommitOptions,
-    ) -> Result<network::ClusterRaftQuorumCommitResult, network::NetworkError> {
+        options: sinomo_runtime::kv::ClusterKvRaftQuorumCommitOptions,
+    ) -> Result<sinomo_runtime::kv::ClusterKvRaftQuorumCommitResult, network::NetworkError> {
         let mut host = CliClusterRaftQuorumCommitHost {
             storage: CliClusterRaftCommandStorage::new(paths, state.local_node_id.clone()),
         };

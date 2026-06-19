@@ -53,14 +53,16 @@ use sinomo_events::{EventId, EventStore, InMemoryEventStore, ReplayQuery, Sessio
 use sinomo_kv::{
     CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_TXN_ROUTE,
     CLUSTER_KV_WATCH_DEFERRED_CURSOR_MAX_REVISION_LAG, CLUSTER_RAFT_APPEND_ROUTE,
-    CLUSTER_RAFT_RPC_CATEGORY, CLUSTER_RAFT_VOTE_ROUTE, ClusterKvRaftCommandStorage,
-    ClusterKvRaftLeaderElectionOptions, ClusterKvRaftUncommittedAppend,
-    ClusterKvWatchAllocatorState, ClusterKvWatchCancelRequest, ClusterKvWatchCancelResponse,
-    ClusterKvWatchDrainRequest, ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse,
-    ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration, ClusterRaftAppendRequest,
-    ClusterRaftAppendResponse, ClusterRaftVoteRequest, ClusterRaftVoteResponse, InProcessKvStore,
-    KvCommand, KvCompare, KvEntry, KvError, KvEventKind, KvOp, KvOpResponse, KvRevision,
-    KvSnapshot, KvTxn, LeaseId, MAX_CLUSTER_KV_ACTIVE_WATCHES, MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+    CLUSTER_RAFT_RPC_CATEGORY, CLUSTER_RAFT_VOTE_ROUTE, ClusterKvRaftAppendReplicationOutcome,
+    ClusterKvRaftCommandStorage, ClusterKvRaftLeaderElectionOptions,
+    ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult,
+    ClusterKvRaftUncommittedAppend, ClusterKvTxnCommitResult, ClusterKvWatchAllocatorState,
+    ClusterKvWatchCancelRequest, ClusterKvWatchCancelResponse, ClusterKvWatchDrainRequest,
+    ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, ClusterKvWatchPrefixRequest,
+    ClusterKvWatchRegistration, ClusterRaftAppendRequest, ClusterRaftAppendResponse,
+    ClusterRaftVoteRequest, ClusterRaftVoteResponse, InProcessKvStore, KvCommand, KvCompare,
+    KvEntry, KvError, KvEventKind, KvOp, KvOpResponse, KvRevision, KvSnapshot, KvTxn, LeaseId,
+    MAX_CLUSTER_KV_ACTIVE_WATCHES, MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
     MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES, MAX_CLUSTER_KV_WATCH_EVENTS, RaftAppendEntriesRequest,
     RaftAppendEntriesResponse, RaftRequestVoteRequest, RaftSnapshot,
 };
@@ -9073,13 +9075,13 @@ impl ClusterRaftCommittedFanoutAsyncHost for RecordingCommittedFanoutHost {
         endpoint: &'a ClusterEndpointRecord,
         watch_events: &'a [KvEvent],
         timeout: Duration,
-    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendReplicationOutcome> {
+    ) -> ClusterMembershipRpcFuture<'a, ClusterKvRaftAppendReplicationOutcome> {
         self.appended_nodes.push(endpoint.node_id.clone());
         self.appended_event_counts.push(watch_events.len());
         self.append_timeouts.push(timeout);
         let state = state.clone();
         Box::pin(async move {
-            Ok(ClusterRaftAppendReplicationOutcome {
+            Ok(ClusterKvRaftAppendReplicationOutcome {
                 response: ClusterRaftAppendResponse {
                     accepted: true,
                     detail: "accepted".to_string(),
@@ -9308,7 +9310,7 @@ impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
         _state: &ClusterBootstrapState,
         _txn: &KvTxn,
         _options: ClusterKvTxnForwardOptions,
-    ) -> Result<Option<ClusterKvTxnForwardResult>, NetworkError> {
+    ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
         panic!("forwarded non-leader requests must not forward again")
     }
 
@@ -9336,8 +9338,8 @@ impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
         _paths: &ClusterPaths,
         _state: &mut ClusterBootstrapState,
         _command: KvCommand,
-        _options: ClusterRaftQuorumCommitOptions,
-    ) -> Result<ClusterRaftQuorumCommitResult, NetworkError> {
+        _options: ClusterKvRaftQuorumCommitOptions,
+    ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError> {
         self.commit_calls += 1;
         panic!("forwarded non-leader requests must not commit locally")
     }
@@ -10630,7 +10632,7 @@ fn cluster_raft_quorum_commit_driver_commits_after_remote_voter_ack() {
             value: b"committed".to_vec(),
             lease_id: None,
         }),
-        ClusterRaftQuorumCommitOptions {
+        ClusterKvRaftQuorumCommitOptions {
             timeout: Duration::from_secs(5),
         },
         &mut host,
@@ -10701,7 +10703,7 @@ fn cluster_raft_local_storage_quorum_helper_uses_callbacks_for_transport_and_fan
             value: b"committed".to_vec(),
             lease_id: None,
         }),
-        ClusterRaftQuorumCommitOptions {
+        ClusterKvRaftQuorumCommitOptions {
             timeout: Duration::from_secs(5),
         },
         ClusterControlPlaneTimeouts::default_daemon_transport(),
@@ -17172,7 +17174,7 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
                     value: b"ok".to_vec(),
                     lease_id: None,
                 }),
-                ClusterRaftQuorumCommitOptions {
+                ClusterKvRaftQuorumCommitOptions {
                     timeout: Duration::from_secs(5),
                 },
                 ClusterRaftAppendReplicationOptions {

@@ -93,8 +93,8 @@ pub use connectivity_store::{
 pub use control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlaneTransport};
 pub use control_plane_options::{
     ClusterControlPlaneTimeouts, ClusterKvTxnQuorumOptions, ClusterRaftAppendReplicationOptions,
-    ClusterRaftAppendReplicationOutcome, ClusterRaftCommittedFanoutOptions,
-    ClusterRaftLeaderElectionOptions, DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT,
+    ClusterRaftCommittedFanoutOptions, ClusterRaftLeaderElectionOptions,
+    DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_IROH_FOREGROUND_ATTEMPT_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,
@@ -191,8 +191,7 @@ pub use keyspace::{
     cluster_endpoint_prefix, cluster_network_info_key,
 };
 pub use kv_forward::{
-    ClusterKvTxnForwardHost, ClusterKvTxnForwardOptions, ClusterKvTxnForwardResult,
-    forward_cluster_kv_txn_to_voter_with_host,
+    ClusterKvTxnForwardHost, ClusterKvTxnForwardOptions, forward_cluster_kv_txn_to_voter_with_host,
 };
 pub use kv_read_model::{
     read_cluster_connectivity_graph_from_kv, read_cluster_members_from_kv,
@@ -327,8 +326,8 @@ pub use raft_fanout::{
     ClusterRaftCommittedFanoutAsyncHost, spawn_cluster_raft_committed_fanout_worker_on_runtime,
 };
 pub use raft_quorum::{
-    ClusterRaftQuorumAsyncHost, ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult,
-    ClusterRaftQuorumTransportHost, commit_cluster_raft_command_with_quorum_driver,
+    ClusterRaftQuorumAsyncHost, ClusterRaftQuorumTransportHost,
+    commit_cluster_raft_command_with_quorum_driver,
 };
 pub use raft_replication::{
     ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,

@@ -13,10 +13,11 @@ use sinomo_runtime::dfs::{
     DfsPeerTransportError, DfsPosixError, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
 };
 use sinomo_runtime::kv::{
-    ClusterKvRaftCommandStorage, ClusterKvRaftCommitResult, ClusterKvRaftStore,
-    ClusterKvRaftUncommittedAppend, KvCommand, KvEntry, KvError, KvEvent, KvOp, KvRevision, KvTxn,
-    KvTxnResponse, cluster_kv_raft_local_is_voter, cluster_kv_raft_node_is_voter,
-    lock_cluster_kv_raft_operation_for_paths, read_cluster_kv_entry,
+    ClusterKvRaftAppendReplicationOutcome, ClusterKvRaftCommandStorage, ClusterKvRaftCommitResult,
+    ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult, ClusterKvRaftStore,
+    ClusterKvRaftUncommittedAppend, ClusterKvTxnCommitResult, KvCommand, KvEntry, KvError, KvEvent,
+    KvOp, KvRevision, KvTxn, KvTxnResponse, cluster_kv_raft_local_is_voter,
+    cluster_kv_raft_node_is_voter, lock_cluster_kv_raft_operation_for_paths, read_cluster_kv_entry,
     read_cluster_kv_prefix_entries,
 };
 use sinomo_runtime::local::SinomoDataDir;
@@ -1275,7 +1276,7 @@ fn dfs_fuse_replicate_cluster_raft_to_endpoint_with_timeout_result(
     endpoint: &ClusterEndpointRecord,
     timeout: Duration,
     watch_events: &[KvEvent],
-) -> std::result::Result<network::ClusterRaftAppendReplicationOutcome, NetworkError> {
+) -> std::result::Result<ClusterKvRaftAppendReplicationOutcome, NetworkError> {
     network::replicate_cluster_raft_to_endpoint_with_host(
         paths,
         state,
@@ -1318,7 +1319,7 @@ impl network::ClusterKvTxnQuorumHost for DfsFuseClusterKvTxnQuorumHost {
         state: &ClusterBootstrapState,
         txn: &KvTxn,
         options: network::ClusterKvTxnForwardOptions,
-    ) -> std::result::Result<Option<network::ClusterKvTxnForwardResult>, NetworkError> {
+    ) -> std::result::Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
         network::forward_cluster_kv_txn_to_voter_with_host(
             paths,
             state,
@@ -1361,8 +1362,8 @@ impl network::ClusterKvTxnQuorumHost for DfsFuseClusterKvTxnQuorumHost {
         paths: &network::ClusterPaths,
         state: &mut ClusterBootstrapState,
         command: KvCommand,
-        options: network::ClusterRaftQuorumCommitOptions,
-    ) -> std::result::Result<network::ClusterRaftQuorumCommitResult, NetworkError> {
+        options: ClusterKvRaftQuorumCommitOptions,
+    ) -> std::result::Result<ClusterKvRaftQuorumCommitResult, NetworkError> {
         let mut host = DfsFuseClusterRaftQuorumCommitHost {
             paths,
             local_node_id: state.local_node_id.clone(),

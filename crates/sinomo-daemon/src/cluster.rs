@@ -28,8 +28,9 @@ use sinomo_core::{
     ClusterNodeAvailability, TrustDomain,
 };
 use sinomo_kv::{
-    ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, ClusterRaftAppendRequest,
-    ClusterRaftAppendResponse, ClusterRaftVoteRequest, ClusterRaftVoteResponse,
+    ClusterKvRaftAppendReplicationOutcome, ClusterKvWatchEventsRequest,
+    ClusterKvWatchEventsResponse, ClusterRaftAppendRequest, ClusterRaftAppendResponse,
+    ClusterRaftVoteRequest, ClusterRaftVoteResponse,
 };
 use sinomo_kv::{InProcessKvStore, KvEvent, KvSnapshot, KvTxn, KvTxnResponse};
 #[cfg(test)]
@@ -4032,10 +4033,7 @@ impl sinomo_network::ClusterRaftCommittedFanoutAsyncHost for DaemonClusterContro
         endpoint: &'a ClusterEndpointRecord,
         watch_events: &'a [KvEvent],
         timeout: Duration,
-    ) -> sinomo_network::ClusterMembershipRpcFuture<
-        'a,
-        sinomo_network::ClusterRaftAppendReplicationOutcome,
-    > {
+    ) -> sinomo_network::ClusterMembershipRpcFuture<'a, ClusterKvRaftAppendReplicationOutcome> {
         Box::pin(async move {
             sinomo_network::replicate_cluster_raft_to_endpoint_async_with_host(
                 paths,

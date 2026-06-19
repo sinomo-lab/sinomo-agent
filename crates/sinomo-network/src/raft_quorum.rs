@@ -23,7 +23,10 @@ use crate::raft_replication::{
     replicate_cluster_raft_to_endpoint_with_host,
 };
 use crate::rpc_future::ClusterMembershipRpcFuture;
-use sinomo_kv::{ClusterRaftAppendRequest, ClusterRaftAppendResponse};
+use sinomo_kv::{
+    ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult, ClusterRaftAppendRequest,
+    ClusterRaftAppendResponse,
+};
 use std::time::Duration;
 
 pub trait ClusterRaftQuorumAsyncHost: ClusterRaftAppendReplicationAsyncHost {
@@ -47,10 +50,6 @@ pub trait ClusterRaftQuorumAsyncHost: ClusterRaftAppendReplicationAsyncHost {
         Box::pin(async { Ok(()) })
     }
 }
-
-pub type ClusterRaftQuorumCommitOptions = sinomo_kv::ClusterKvRaftQuorumCommitOptions;
-
-pub type ClusterRaftQuorumCommitResult = sinomo_kv::ClusterKvRaftQuorumCommitResult;
 
 pub trait ClusterRaftQuorumTransportHost {
     fn replicate_cluster_raft_to_endpoint(
@@ -210,13 +209,13 @@ pub fn commit_cluster_raft_command_with_local_storage_and_transport<S, R, F, O>(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
     command: KvCommand,
-    options: ClusterRaftQuorumCommitOptions,
+    options: ClusterKvRaftQuorumCommitOptions,
     control_plane_timeouts: ClusterControlPlaneTimeouts,
     send_raft_append: S,
     record_endpoint_command_connectivity: R,
     fan_out_committed_cluster_raft_command: F,
     on_raft_append_sent: O,
-) -> Result<ClusterRaftQuorumCommitResult, NetworkError>
+) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError>
 where
     S: FnMut(
         &ClusterEndpointRecord,
@@ -385,9 +384,9 @@ pub(crate) fn commit_cluster_raft_command_with_control_plane_driver<T>(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
     command: KvCommand,
-    options: ClusterRaftQuorumCommitOptions,
+    options: ClusterKvRaftQuorumCommitOptions,
     driver: &mut ClusterControlPlaneDriver<T>,
-) -> Result<ClusterRaftQuorumCommitResult, NetworkError>
+) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError>
 where
     T: ClusterControlPlaneTransport,
 {
@@ -532,9 +531,9 @@ pub fn commit_cluster_raft_command_with_quorum_driver(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
     command: KvCommand,
-    options: ClusterRaftQuorumCommitOptions,
+    options: ClusterKvRaftQuorumCommitOptions,
     host: &mut impl ClusterRaftQuorumCommitHost,
-) -> Result<ClusterRaftQuorumCommitResult, NetworkError> {
+) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError> {
     let mut kv_host = NetworkClusterKvRaftQuorumCommitHost { paths, host };
     sinomo_kv::commit_cluster_kv_raft_command_with_quorum(state, command, options, &mut kv_host)
 }
@@ -737,10 +736,10 @@ pub async fn commit_cluster_raft_command_with_quorum_async_with_host<H>(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
     command: KvCommand,
-    options: ClusterRaftQuorumCommitOptions,
+    options: ClusterKvRaftQuorumCommitOptions,
     append_options: ClusterRaftAppendReplicationOptions,
     host: &mut H,
-) -> Result<ClusterRaftQuorumCommitResult, NetworkError>
+) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError>
 where
     H: ClusterRaftQuorumAsyncHost + Send,
 {

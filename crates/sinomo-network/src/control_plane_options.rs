@@ -63,8 +63,6 @@ impl ClusterRaftAppendReplicationOptions {
     }
 }
 
-pub type ClusterRaftAppendReplicationOutcome = sinomo_kv::ClusterKvRaftAppendReplicationOutcome;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClusterRaftCommittedFanoutOptions {
     pub raft_append_timeout: Duration,

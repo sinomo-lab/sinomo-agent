@@ -1,14 +1,13 @@
 use crate::ClusterPaths;
 use crate::control_plane_driver::ClusterControlPlaneDriver;
-use crate::control_plane_options::{
-    ClusterRaftAppendReplicationOutcome, ClusterRaftCommittedFanoutOptions,
-};
+use crate::control_plane_options::ClusterRaftCommittedFanoutOptions;
 use crate::endpoint_selector::cluster_raft_member_replication_targets_async;
 use crate::error::NetworkError;
 use crate::kv_local_store::read_cluster_kv_snapshot;
 use crate::local_state_store::read_cluster_state;
 use crate::prelude::*;
 use crate::rpc_future::ClusterMembershipRpcFuture;
+use sinomo_kv::ClusterKvRaftAppendReplicationOutcome;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -31,7 +30,7 @@ pub trait ClusterRaftCommittedFanoutAsyncHost {
         endpoint: &'a ClusterEndpointRecord,
         watch_events: &'a [KvEvent],
         timeout: Duration,
-    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendReplicationOutcome>;
+    ) -> ClusterMembershipRpcFuture<'a, ClusterKvRaftAppendReplicationOutcome>;
 
     fn send_cluster_kv_watch_events_async<'a>(
         &'a mut self,
@@ -52,7 +51,7 @@ where
         endpoint: &'a ClusterEndpointRecord,
         watch_events: &'a [KvEvent],
         timeout: Duration,
-    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendReplicationOutcome> {
+    ) -> ClusterMembershipRpcFuture<'a, ClusterKvRaftAppendReplicationOutcome> {
         self.transport.replicate_cluster_raft_to_endpoint_async(
             paths,
             state,
