@@ -50,6 +50,7 @@ mod object;
 mod object_file_store;
 mod paths;
 mod peer;
+mod raft_replication;
 mod records;
 mod roaming;
 mod route;
@@ -317,6 +318,9 @@ pub use peer::{
     AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions, InProcessNetwork,
     InProcessObjectRpcMessage, InProcessTransport, InboundObjectRpcMessage,
 };
+pub use raft_replication::{
+    ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
+};
 pub use records::{ClusterIdentityRecord, ClusterInvitationStateRecord};
 pub(crate) use roaming::read_iroh_endpoint_record_async;
 #[cfg(test)]
@@ -364,8 +368,7 @@ pub use status_publish::{
     sync_cluster_node_status_to_kv,
 };
 pub use storage::{
-    ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost, ClusterRaftAppendReplicationAsyncHost,
-    ClusterRaftAppendReplicationHost, ClusterRaftCommittedFanoutAsyncHost,
+    ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost, ClusterRaftCommittedFanoutAsyncHost,
     ClusterRaftQuorumAsyncHost, ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult,
     ClusterRaftQuorumTransportHost, ClusterRaftVoteTransportAsyncHost,
     ClusterRaftVoteTransportHost, cleanup_legacy_shadow_daemon_members_with_host,
