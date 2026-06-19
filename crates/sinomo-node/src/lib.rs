@@ -169,7 +169,8 @@ mod tests {
     use super::*;
     use sinomo_core::{
         ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
-        ClusterEndpointSource, ClusterMemberRecord, ClusterTransportKind, Id, NodeCapability,
+        ClusterEndpointSource, ClusterMemberRecord, ClusterMemberState, ClusterTransportKind, Id,
+        NodeCapability,
     };
 
     #[test]
@@ -312,5 +313,65 @@ mod tests {
         assert_eq!(state.members.len(), 1);
         assert_eq!(state.members[0].display_name, "renamed");
         assert_eq!(state.members[0].endpoints.len(), 1);
+    }
+
+    #[test]
+    fn cluster_member_process_helpers_treat_main_and_shadow_as_local() {
+        let timestamp = time::OffsetDateTime::parse(
+            "2026-05-02T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("timestamp");
+        let cluster_id = Id::from_legacy_named("cluster_node_process_helpers").expect("cluster");
+        let local = Id::from_legacy_named("node_process_local").expect("node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "home",
+            local.clone(),
+            "desktop",
+            "pk-local",
+            timestamp,
+        );
+        state.members[0].capabilities = main_daemon_capabilities(&state.members[0].role);
+
+        let mut shadow = ClusterMemberRecord::local_non_voting(
+            cluster_id.clone(),
+            shadow_daemon_node_id(&local),
+            "desktop shadow",
+            "pk-shadow",
+            timestamp,
+        );
+        shadow.capabilities = shadow_daemon_capabilities();
+        state.members.push(shadow.clone());
+
+        assert_eq!(
+            cluster_member_expected_daemon_process(&state.members[0]),
+            Some(DAEMON_MAIN_CLUSTER_ROLE)
+        );
+        assert_eq!(
+            cluster_member_expected_daemon_process(&shadow),
+            Some(DAEMON_SHADOW_CLUSTER_ROLE)
+        );
+        assert!(cluster_member_is_legacy_shadow_daemon(&shadow));
+        assert_eq!(cluster_local_process_members(&state).len(), 2);
+        assert!(!cluster_has_remote_peers(&state));
+
+        let remote = Id::from_legacy_named("node_process_remote").expect("remote");
+        state.members.push(ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            timestamp,
+        ));
+        assert!(cluster_has_remote_peers(&state));
+
+        let remote_member = state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == remote)
+            .expect("remote member");
+        remote_member.state = ClusterMemberState::Removed;
+        assert!(!cluster_has_remote_peers(&state));
     }
 }

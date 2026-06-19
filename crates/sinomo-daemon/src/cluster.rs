@@ -50,8 +50,10 @@ use sinomo_network::{
     ClusterConnectivityProbeState, ClusterId, ClusterInviteId, ClusterJoinRegistrationResponse,
     MdnsDiscoveryAdvertisement, cluster_member_key,
 };
-use sinomo_node::NodeId;
-use sinomo_node::shadow_daemon_node_id;
+use sinomo_node::{
+    NodeId, cluster_member_expected_daemon_process, cluster_member_is_local_process,
+    shadow_daemon_node_id,
+};
 use sinomo_node::{load_or_create_main_node_identity, load_or_create_shadow_node_identity};
 use sinomo_rollout::{
     ClusterRolloutBuildRequest, SelfRolloutPaths, managed_source_status, read_rollout_status,
@@ -3016,7 +3018,7 @@ async fn probe_member_daemon_status_async(
     member: &ClusterMemberRecord,
     runtime: &tokio::runtime::Handle,
 ) -> Result<Option<ClusterNodeStatusRecord>, DaemonError> {
-    if sinomo_network::cluster_member_is_local_process(state, member)
+    if cluster_member_is_local_process(state, member)
         && let Some(status) =
             probe_local_member_daemon_status_async(paths, state, member, runtime).await?
     {
@@ -3097,14 +3099,14 @@ async fn probe_member_daemon_status_async(
             None,
             OffsetDateTime::now_utc(),
         );
-        if sinomo_network::cluster_member_expected_daemon_process(member)
+        if cluster_member_expected_daemon_process(member)
             .is_some_and(|process| status.process != process)
         {
             eprintln!(
                 "sinomo daemon cluster health probe of {} via {}: process mismatch (expected {}, responder {})",
                 member.node_id,
                 endpoint.address,
-                sinomo_network::cluster_member_expected_daemon_process(member).unwrap_or("unknown"),
+                cluster_member_expected_daemon_process(member).unwrap_or("unknown"),
                 status.process
             );
             continue;
@@ -3153,7 +3155,7 @@ async fn probe_local_member_daemon_status_async(
     }
     let status =
         cluster_node_status_from_daemon_status(&status, cluster, None, OffsetDateTime::now_utc());
-    if sinomo_network::cluster_member_expected_daemon_process(member)
+    if cluster_member_expected_daemon_process(member)
         .is_some_and(|process| status.process != process)
     {
         return Ok(None);

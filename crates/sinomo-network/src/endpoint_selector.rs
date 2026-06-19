@@ -5,7 +5,7 @@ use crate::lan::{
     discover_local_ip_candidates_for_targets, discover_local_ip_candidates_for_targets_async,
     is_invitable_ip,
 };
-use crate::membership::{cluster_member_is_local_process, locally_learned_bridge_route_endpoint};
+use crate::membership::locally_learned_bridge_route_endpoint;
 use crate::{ClusterConnectivityGraph, ClusterConnectivityState};
 use crate::{ClusterPaths, iroh_endpoint_public_key};
 use sinomo_core::{
@@ -13,8 +13,8 @@ use sinomo_core::{
     ClusterNodeAvailability, ClusterNodeStatusRecord, ClusterTransportKind,
 };
 use sinomo_node::{
-    DAEMON_MAIN_RUN_CAPABILITY, NodeId, daemon_lan_endpoint_id, daemon_loopback_endpoint_id,
-    shadow_daemon_node_id,
+    DAEMON_MAIN_RUN_CAPABILITY, NodeId, cluster_member_is_local_process, daemon_lan_endpoint_id,
+    daemon_loopback_endpoint_id, shadow_daemon_node_id,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};

@@ -3817,7 +3817,7 @@ fn cluster_solo_predicate_treats_main_and_shadow_as_local() {
         now,
     );
 
-    assert!(!cluster_has_remote_peers(&state));
+    assert!(!sinomo_node::cluster_has_remote_peers(&state));
     assert!(cluster_is_settled_solo(&state));
 
     let shadow = sinomo_node::shadow_daemon_node_id(&local);
@@ -3830,7 +3830,7 @@ fn cluster_solo_predicate_treats_main_and_shadow_as_local() {
     ));
 
     assert!(
-        !cluster_has_remote_peers(&state),
+        !sinomo_node::cluster_has_remote_peers(&state),
         "main + shadow on one node must count as solo"
     );
     assert!(cluster_is_settled_solo(&state));
@@ -3843,7 +3843,7 @@ fn cluster_solo_predicate_treats_main_and_shadow_as_local() {
         "pk-remote",
         now,
     ));
-    assert!(cluster_has_remote_peers(&state));
+    assert!(sinomo_node::cluster_has_remote_peers(&state));
     assert!(!cluster_is_settled_solo(&state));
 
     let remote_member = state
@@ -3852,7 +3852,7 @@ fn cluster_solo_predicate_treats_main_and_shadow_as_local() {
         .find(|member| member.node_id == remote)
         .expect("remote member");
     remote_member.state = ClusterMemberState::Removed;
-    assert!(!cluster_has_remote_peers(&state));
+    assert!(!sinomo_node::cluster_has_remote_peers(&state));
     assert!(cluster_is_settled_solo(&state));
 
     let state = ClusterBootstrapState::pending_join(
@@ -30196,7 +30196,7 @@ fn local_member_publish_forced_sync_publishes_even_when_records_current() {
     // Seed the local snapshot so the local member records already match —
     // the historical short-circuit that froze learner snapshots forever.
     let mut seeded = InProcessKvStore::new();
-    for member in cluster_local_process_members(&state) {
+    for member in sinomo_node::cluster_local_process_members(&state) {
         let txn = KvTxn {
             compares: Vec::new(),
             success: vec![
@@ -30209,8 +30209,11 @@ fn local_member_publish_forced_sync_publishes_even_when_records_current() {
     }
     write_cluster_kv_snapshot(&paths, &seeded.snapshot()).expect("seed snapshot");
     assert!(
-        cluster_member_publish_matches_kv(&paths, &cluster_local_process_members(&state))
-            .expect("matches kv"),
+        cluster_member_publish_matches_kv(
+            &paths,
+            &sinomo_node::cluster_local_process_members(&state)
+        )
+        .expect("matches kv"),
         "fixture must reproduce the already-published state"
     );
 

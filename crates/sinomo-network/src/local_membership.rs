@@ -8,10 +8,9 @@ use crate::endpoint_records::{
     upsert_member_endpoint,
 };
 use crate::error::NetworkError;
-use crate::membership::cluster_node_is_local_process;
 use crate::network_info::{CLUSTER_NETWORK_INFO_TTL_SECONDS, build_cluster_network_info_record};
 use crate::prelude::*;
-use sinomo_node::{main_daemon_capabilities, shadow_daemon_node_id};
+use sinomo_node::{cluster_node_is_local_process, main_daemon_capabilities, shadow_daemon_node_id};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use time::OffsetDateTime;

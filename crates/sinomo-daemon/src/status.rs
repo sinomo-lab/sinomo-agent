@@ -9,7 +9,9 @@ use sinomo_core::{
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{ClusterId, DaemonRpcTimeouts};
-use sinomo_node::{DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, NodeId};
+use sinomo_node::{
+    DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, NodeId, cluster_node_is_local_process,
+};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::net::IpAddr;
@@ -152,7 +154,7 @@ pub fn daemon_advertised_endpoints_for_state(
     lan_ips: &[IpAddr],
     route_ips: &[IpAddr],
 ) -> Vec<ClusterEndpointRecord> {
-    let allow_public_ip_discovery = sinomo_network::cluster_node_is_local_process(state, node_id);
+    let allow_public_ip_discovery = cluster_node_is_local_process(state, node_id);
     daemon_advertised_endpoints_from_ips(
         node_id,
         options,
@@ -171,7 +173,7 @@ pub async fn daemon_advertised_endpoints_for_state_async(
     lan_ips: &[IpAddr],
     route_ips: &[IpAddr],
 ) -> Vec<ClusterEndpointRecord> {
-    let allow_public_ip_discovery = sinomo_network::cluster_node_is_local_process(state, node_id);
+    let allow_public_ip_discovery = cluster_node_is_local_process(state, node_id);
     daemon_advertised_endpoints_from_ips_async(
         node_id,
         options,

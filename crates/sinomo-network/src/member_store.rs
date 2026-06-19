@@ -8,7 +8,6 @@ use crate::keyspace::{
     cluster_endpoint_prefix, cluster_identity_key, cluster_member_key, cluster_node_status_key,
     cluster_node_status_key_for_process,
 };
-use crate::membership::cluster_capabilities_are_legacy_shadow_only;
 use crate::object::SinomoObjectCodec;
 use crate::records::{
     ClusterCapabilityPolicyRecord, ClusterIdentityRecord, cluster_capability_policy_stable_eq,
@@ -25,7 +24,8 @@ use sinomo_kv::{
     push_bounded_txn_success_op,
 };
 use sinomo_node::{
-    DAEMON_SHADOW_CLUSTER_ROLE, NodeId, cluster_endpoint_stable_eq, cluster_member_stable_eq,
+    DAEMON_SHADOW_CLUSTER_ROLE, NodeId, cluster_capabilities_are_legacy_shadow_only,
+    cluster_endpoint_stable_eq, cluster_member_stable_eq,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use time::OffsetDateTime;

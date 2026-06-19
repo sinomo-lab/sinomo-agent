@@ -12,12 +12,11 @@ use crate::local_membership::{
     locally_learned_remote_route_endpoints, preserve_locally_learned_remote_route_endpoints,
 };
 use crate::member_store::merge_member_record;
-use crate::membership::cluster_node_is_local_process;
 #[cfg(test)]
 use crate::object_file_store::remove_optional_file;
 use crate::object_file_store::{read_optional_object_file, write_object_file};
 use sinomo_core::ClusterBootstrapState;
-use sinomo_node::upsert_member_record;
+use sinomo_node::{cluster_node_is_local_process, upsert_member_record};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};

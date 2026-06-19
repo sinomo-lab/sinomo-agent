@@ -23,7 +23,6 @@ use crate::member_store::{
     cluster_member_update_txn_from_store, cluster_raft_state_for_role,
     cluster_state_sync_txn_from_store,
 };
-use crate::membership::cluster_member_is_legacy_shadow_daemon;
 use crate::rpc_future::ClusterMembershipRpcFuture;
 #[cfg(test)]
 use serde::Serialize;
@@ -36,7 +35,7 @@ use sinomo_core::{
 #[cfg(test)]
 use sinomo_kv::KvOp;
 use sinomo_kv::{ClusterKvRaftConfigRecord, InProcessKvStore, KvCommand, KvSnapshot, KvTxn};
-use sinomo_node::{NodeId, shadow_daemon_node_id};
+use sinomo_node::{NodeId, cluster_member_is_legacy_shadow_daemon, shadow_daemon_node_id};
 use std::collections::BTreeSet;
 use time::OffsetDateTime;
 

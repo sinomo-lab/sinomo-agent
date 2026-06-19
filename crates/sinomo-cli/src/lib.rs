@@ -196,8 +196,8 @@ use sinomo_runtime::network::{ClusterInviteChallengeProof, ClusterInviteChalleng
 #[cfg(test)]
 use sinomo_runtime::node::DAEMON_MAIN_CLUSTER_ROLE;
 use sinomo_runtime::node::{
-    NodeId, load_or_create_main_node_identity, load_or_create_shadow_node_identity,
-    shadow_daemon_node_id,
+    NodeId, cluster_member_expected_daemon_process, cluster_member_is_local_process,
+    load_or_create_main_node_identity, load_or_create_shadow_node_identity, shadow_daemon_node_id,
 };
 #[cfg(test)]
 use sinomo_runtime::rollout::read_rollout_status;
@@ -330,7 +330,7 @@ fn cli_probe_member_daemon_status(
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,
 ) -> Option<ClusterNodeStatusRecord> {
-    if network::cluster_member_is_local_process(state, member)
+    if cluster_member_is_local_process(state, member)
         && let Some(status) = cli_probe_local_member_daemon_status(paths, state, member)
     {
         return Some(status);
@@ -356,7 +356,7 @@ fn cli_probe_member_daemon_status(
             None,
             OffsetDateTime::now_utc(),
         );
-        if network::cluster_member_expected_daemon_process(member)
+        if cluster_member_expected_daemon_process(member)
             .is_some_and(|process| status.process != process)
         {
             continue;
@@ -392,7 +392,7 @@ fn cli_probe_local_member_daemon_status(
     }
     let status =
         cluster_node_status_from_daemon_status(&status, cluster, None, OffsetDateTime::now_utc());
-    if network::cluster_member_expected_daemon_process(member)
+    if cluster_member_expected_daemon_process(member)
         .is_some_and(|process| status.process != process)
     {
         return None;

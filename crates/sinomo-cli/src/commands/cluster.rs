@@ -30,6 +30,7 @@ pub(crate) use network::{
 pub(crate) use network::{compact_default_invite_introducers, push_unique_introducer};
 #[cfg(test)]
 pub(crate) use sinomo_runtime::node::apply_cluster_raft_role;
+use sinomo_runtime::node::cluster_member_is_local_process;
 
 #[cfg(test)]
 pub(crate) fn build_cluster_raft_append_request_from_next_index(
@@ -859,7 +860,7 @@ pub(crate) fn cluster_migration_plan_with_paths(
         .iter()
         .filter(|member| {
             !matches!(member.state, ClusterMemberState::Removed)
-                && !network::cluster_member_is_local_process(&source, member)
+                && !cluster_member_is_local_process(&source, member)
         })
         .count();
     let migration = ClusterMigrationRecord {

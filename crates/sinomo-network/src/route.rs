@@ -1522,7 +1522,7 @@ pub async fn handle_cluster_relay_async_with_host(
     options: ClusterRelayOptions,
     host: &mut impl ClusterRelayAsyncHost,
 ) -> Result<ObjectRpcResponse, NetworkError> {
-    if crate::cluster_node_is_local_process(state, &envelope.target_node_id) {
+    if sinomo_node::cluster_node_is_local_process(state, &envelope.target_node_id) {
         if let Some(response) = host
             .try_deliver_local_async(state, &envelope, options.timeouts)
             .await?
@@ -1619,7 +1619,7 @@ pub async fn handle_cluster_relay_stream_forward_async_with_host(
     options: ClusterRelayOptions,
     host: &mut impl ClusterRelayStreamForwardAsyncHost,
 ) -> Result<ClusterRelayStreamForwardOutcome, NetworkError> {
-    if crate::cluster_node_is_local_process(state, &envelope.target_node_id) {
+    if sinomo_node::cluster_node_is_local_process(state, &envelope.target_node_id) {
         return ObjectRpcResponse::encode_error(
             CLUSTER_RELAY_ROUTE,
             "stream relay local delivery must be handled by the daemon control loop",

@@ -12,11 +12,11 @@ use crate::maintenance::{
     CLUSTER_NETWORK_PUBLISH_INTERVAL, CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS,
     cluster_network_publish_interval_for_role,
 };
-use crate::membership::cluster_node_is_local_process;
 use crate::network_info::ClusterNetworkInfoRecord;
 use crate::prelude::*;
 use crate::rpc_future::ClusterMembershipRpcFuture;
 use sinomo_kv::{CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, KvCompare, KvOp, KvSnapshot, KvTxn};
+use sinomo_node::cluster_node_is_local_process;
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeSet;
