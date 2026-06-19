@@ -100,8 +100,7 @@ pub use connectivity_store::{
 };
 pub use control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlaneTransport};
 pub use control_plane_options::{
-    ClusterControlPlaneTimeouts, ClusterKvTxnQuorumOptions, ClusterRaftAppendReplicationOptions,
-    ClusterRaftCommittedFanoutOptions, ClusterRaftLeaderElectionOptions,
+    ClusterControlPlaneTimeouts, ClusterKvTxnQuorumOptions,
     DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_IROH_FOREGROUND_ATTEMPT_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,

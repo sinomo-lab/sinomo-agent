@@ -17,7 +17,7 @@ use crate::prelude::*;
 use crate::raft_replication::replicate_cluster_raft_to_endpoint_with_local_host;
 use crate::raft_replication::{
     ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
-    replicate_cluster_raft_to_endpoint_async_with_host,
+    replicate_cluster_raft_to_endpoint_async_with_options,
     replicate_cluster_raft_to_endpoint_with_host,
 };
 use crate::rpc_future::ClusterMembershipRpcFuture;
@@ -667,7 +667,7 @@ where
         let host = &mut *self.host;
         Box::pin(async move {
             endpoint_options.timeout = timeout;
-            replicate_cluster_raft_to_endpoint_async_with_host(
+            replicate_cluster_raft_to_endpoint_async_with_options(
                 paths,
                 state,
                 target,

@@ -4,6 +4,10 @@ use crate::control_plane_adapters::{
     cluster_member_removal_txns_from_store, cluster_member_update_ops_from_store,
     cluster_raft_config_from_store,
 };
+use crate::control_plane_options::{
+    ClusterRaftAppendReplicationOptions, ClusterRaftCommittedFanoutOptions,
+    ClusterRaftLeaderElectionOptions,
+};
 use crate::endpoint_selector::ClusterEndpointInternalSelectionPurpose;
 use crate::health::{
     cluster_health_rows_with_async_probe, cluster_health_rpc_request_is_local_scope,
@@ -9281,7 +9285,7 @@ impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
         &mut self,
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
-        _options: ClusterRaftLeaderElectionOptions,
+        _options: ClusterKvTxnQuorumOptions,
     ) -> Result<bool, NetworkError> {
         self.elect_calls += 1;
         Ok(true)
@@ -17123,15 +17127,18 @@ fn async_cluster_raft_append_replication_retries_from_rejected_match_index() {
             &state,
             &endpoint,
             &[],
-            ClusterRaftAppendReplicationOptions {
-                timeout: Duration::from_secs(5),
-                max_attempts: 3,
+            ClusterControlPlaneTimeouts {
+                max_raft_append_attempts: 3,
                 tcp_command_timeout: Duration::from_secs(1),
                 iroh_command_timeout: Duration::from_secs(1),
                 tcp_foreground_attempt_timeout: Duration::from_secs(1),
                 public_foreground_attempt_timeout: Duration::from_secs(1),
                 iroh_foreground_attempt_timeout: Duration::from_secs(1),
+                raft_append_timeout: Duration::from_secs(5),
+                rpc_timeout: Duration::from_secs(5),
+                membership_rpc_timeout: Duration::from_secs(5),
             },
+            Duration::from_secs(5),
             &mut host,
         ))
         .expect("async replicate");

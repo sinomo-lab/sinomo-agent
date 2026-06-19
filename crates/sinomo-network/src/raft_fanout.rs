@@ -1,6 +1,8 @@
 use crate::ClusterPaths;
 use crate::control_plane_driver::ClusterControlPlaneDriver;
-use crate::control_plane_options::ClusterRaftCommittedFanoutOptions;
+use crate::control_plane_options::{
+    ClusterControlPlaneTimeouts, ClusterRaftCommittedFanoutOptions,
+};
 use crate::endpoint_selector::{ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector};
 use crate::error::NetworkError;
 use crate::kv_local_store::read_cluster_kv_snapshot;
@@ -131,12 +133,13 @@ pub fn spawn_cluster_raft_committed_fanout_worker_on_runtime<H, F>(
     paths: ClusterPaths,
     state: ClusterBootstrapState,
     events: Vec<KvEvent>,
-    options: ClusterRaftCommittedFanoutOptions,
+    timeouts: ClusterControlPlaneTimeouts,
     host_factory: F,
 ) where
     H: ClusterRaftCommittedFanoutAsyncHost + Send + 'static,
     F: FnMut() -> H + Send + 'static,
 {
+    let options = timeouts.committed_fanout_options();
     CLUSTER_RAFT_FANOUT_PENDING.store(true, Ordering::Release);
     if CLUSTER_RAFT_FANOUT_ACTIVE.swap(true, Ordering::AcqRel) {
         return;

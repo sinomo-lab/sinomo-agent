@@ -6,25 +6,25 @@ use sinomo_kv::{ClusterKvRaftLeaderElectionOptions, ClusterRaftAppendRequest};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ClusterRaftAppendReplicationOptions {
-    pub max_attempts: usize,
-    pub timeout: Duration,
-    pub tcp_command_timeout: Duration,
-    pub iroh_command_timeout: Duration,
-    pub tcp_foreground_attempt_timeout: Duration,
-    pub public_foreground_attempt_timeout: Duration,
-    pub iroh_foreground_attempt_timeout: Duration,
+pub(crate) struct ClusterRaftAppendReplicationOptions {
+    pub(crate) max_attempts: usize,
+    pub(crate) timeout: Duration,
+    pub(crate) tcp_command_timeout: Duration,
+    pub(crate) iroh_command_timeout: Duration,
+    pub(crate) tcp_foreground_attempt_timeout: Duration,
+    pub(crate) public_foreground_attempt_timeout: Duration,
+    pub(crate) iroh_foreground_attempt_timeout: Duration,
 }
 
 impl ClusterRaftAppendReplicationOptions {
-    pub fn kv_options(&self) -> sinomo_kv::ClusterKvRaftAppendReplicationOptions {
+    pub(crate) fn kv_options(&self) -> sinomo_kv::ClusterKvRaftAppendReplicationOptions {
         sinomo_kv::ClusterKvRaftAppendReplicationOptions {
             max_attempts: self.max_attempts,
             timeout: self.timeout,
         }
     }
 
-    pub fn command_timeout(
+    pub(crate) fn command_timeout(
         &self,
         endpoint: &ClusterEndpointRecord,
         remaining: Duration,
@@ -35,7 +35,7 @@ impl ClusterRaftAppendReplicationOptions {
         }
     }
 
-    pub fn fair_command_timeout(
+    pub(crate) fn fair_command_timeout(
         &self,
         endpoint: &ClusterEndpointRecord,
         remaining: Duration,
@@ -50,7 +50,7 @@ impl ClusterRaftAppendReplicationOptions {
         self.command_timeout(endpoint, remaining.min(attempt_cap))
     }
 
-    pub fn append_attempt_timeout(
+    pub(crate) fn append_attempt_timeout(
         &self,
         endpoint: &ClusterEndpointRecord,
         remaining: Duration,
@@ -64,28 +64,28 @@ impl ClusterRaftAppendReplicationOptions {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ClusterRaftCommittedFanoutOptions {
-    pub raft_append_timeout: Duration,
-    pub watch_event_timeout: Duration,
+pub(crate) struct ClusterRaftCommittedFanoutOptions {
+    pub(crate) raft_append_timeout: Duration,
+    pub(crate) watch_event_timeout: Duration,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ClusterRaftLeaderElectionOptions {
-    pub kv: ClusterKvRaftLeaderElectionOptions,
-    pub timeout: Duration,
-    pub tcp_command_timeout: Duration,
-    pub iroh_command_timeout: Duration,
-    pub tcp_foreground_attempt_timeout: Duration,
-    pub public_foreground_attempt_timeout: Duration,
-    pub iroh_foreground_attempt_timeout: Duration,
+pub(crate) struct ClusterRaftLeaderElectionOptions {
+    pub(crate) kv: ClusterKvRaftLeaderElectionOptions,
+    pub(crate) timeout: Duration,
+    pub(crate) tcp_command_timeout: Duration,
+    pub(crate) iroh_command_timeout: Duration,
+    pub(crate) tcp_foreground_attempt_timeout: Duration,
+    pub(crate) public_foreground_attempt_timeout: Duration,
+    pub(crate) iroh_foreground_attempt_timeout: Duration,
 }
 
 impl ClusterRaftLeaderElectionOptions {
-    pub fn kv_options(&self) -> sinomo_kv::ClusterKvRaftLeaderElectionOptions {
+    pub(crate) fn kv_options(&self) -> sinomo_kv::ClusterKvRaftLeaderElectionOptions {
         self.kv
     }
 
-    pub fn command_timeout(
+    pub(crate) fn command_timeout(
         &self,
         endpoint: &ClusterEndpointRecord,
         remaining: Duration,
@@ -96,7 +96,7 @@ impl ClusterRaftLeaderElectionOptions {
         }
     }
 
-    pub fn fair_command_timeout(
+    pub(crate) fn fair_command_timeout(
         &self,
         endpoint: &ClusterEndpointRecord,
         remaining: Duration,
@@ -176,7 +176,7 @@ impl ClusterControlPlaneTimeouts {
         }
     }
 
-    pub fn raft_append_replication_options(
+    pub(crate) fn raft_append_replication_options(
         &self,
         timeout: Duration,
     ) -> ClusterRaftAppendReplicationOptions {
@@ -191,14 +191,24 @@ impl ClusterControlPlaneTimeouts {
         }
     }
 
-    pub fn committed_fanout_options(&self) -> ClusterRaftCommittedFanoutOptions {
+    pub(crate) fn committed_fanout_options(&self) -> ClusterRaftCommittedFanoutOptions {
         ClusterRaftCommittedFanoutOptions {
             raft_append_timeout: self.raft_append_timeout,
             watch_event_timeout: self.rpc_timeout,
         }
     }
 
-    pub fn leader_election_options(&self) -> ClusterRaftLeaderElectionOptions {
+    pub fn raft_append_attempt_timeout(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+        remaining: Duration,
+        request: &ClusterRaftAppendRequest,
+    ) -> Duration {
+        self.raft_append_replication_options(remaining)
+            .append_attempt_timeout(endpoint, remaining, request)
+    }
+
+    pub(crate) fn leader_election_options(&self) -> ClusterRaftLeaderElectionOptions {
         ClusterRaftLeaderElectionOptions {
             kv: ClusterKvRaftLeaderElectionOptions {
                 max_attempts: sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_ATTEMPTS,

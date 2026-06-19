@@ -1,5 +1,7 @@
 use crate::ClusterPaths;
-use crate::control_plane_options::ClusterRaftAppendReplicationOptions;
+use crate::control_plane_options::{
+    ClusterControlPlaneTimeouts, ClusterRaftAppendReplicationOptions,
+};
 use crate::error::NetworkError;
 #[cfg(test)]
 use crate::kv_local_store::cluster_kv_raft_store;
@@ -194,6 +196,26 @@ pub fn replicate_cluster_raft_to_endpoint_with_host(
 }
 
 pub async fn replicate_cluster_raft_to_endpoint_async_with_host(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    watch_events: &[KvEvent],
+    timeouts: ClusterControlPlaneTimeouts,
+    timeout: Duration,
+    host: &mut impl ClusterRaftAppendReplicationAsyncHost,
+) -> Result<ClusterKvRaftAppendReplicationOutcome, NetworkError> {
+    replicate_cluster_raft_to_endpoint_async_with_options(
+        paths,
+        state,
+        endpoint,
+        watch_events,
+        timeouts.raft_append_replication_options(timeout),
+        host,
+    )
+    .await
+}
+
+pub(crate) async fn replicate_cluster_raft_to_endpoint_async_with_options(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,

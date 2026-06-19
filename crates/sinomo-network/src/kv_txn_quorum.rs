@@ -1,6 +1,6 @@
 use crate::ClusterPaths;
 use crate::control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlaneTransport};
-use crate::control_plane_options::{ClusterKvTxnQuorumOptions, ClusterRaftLeaderElectionOptions};
+use crate::control_plane_options::ClusterKvTxnQuorumOptions;
 use crate::error::NetworkError;
 use crate::kv_forward::{
     forward_cluster_kv_txn_to_voter_async_with_host, forward_cluster_kv_txn_to_voter_with_host,
@@ -90,12 +90,12 @@ pub trait ClusterKvTxnQuorumHost {
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
-        options: ClusterRaftLeaderElectionOptions,
+        options: ClusterKvTxnQuorumOptions,
     ) -> Result<bool, NetworkError>
     where
         Self: Sized,
     {
-        elect_cluster_raft_leader_with_host(paths, state, options, self)
+        elect_cluster_raft_leader_with_host(paths, state, options.leader_election_options, self)
     }
 
     fn reachable_cluster_state_authority_count(
@@ -297,7 +297,7 @@ where
         state: &ClusterBootstrapState,
     ) -> Result<bool, Self::Error> {
         self.host
-            .elect_cluster_raft_leader(self.paths, state, self.options.leader_election_options)
+            .elect_cluster_raft_leader(self.paths, state, self.options)
     }
 
     fn reachable_voter_count(

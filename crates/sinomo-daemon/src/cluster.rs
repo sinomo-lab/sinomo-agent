@@ -3927,7 +3927,8 @@ impl sinomo_network::ClusterRaftCommittedFanoutAsyncHost for DaemonClusterContro
                 state,
                 endpoint,
                 watch_events,
-                cluster_control_plane_timeouts().raft_append_replication_options(timeout),
+                cluster_control_plane_timeouts(),
+                timeout,
                 self,
             )
             .await
@@ -4427,7 +4428,7 @@ fn fan_out_committed_cluster_raft_command_on_runtime(
             paths,
             state,
             events,
-            cluster_raft_committed_fanout_options(),
+            cluster_control_plane_timeouts(),
             move || daemon_cluster_control_plane_driver_on_runtime(&host_runtime),
         );
     } else {
@@ -5047,17 +5048,6 @@ fn cluster_control_plane_timeouts() -> sinomo_network::ClusterControlPlaneTimeou
     sinomo_network::ClusterControlPlaneTimeouts::default_daemon_transport()
 }
 
-#[cfg(test)]
-fn cluster_raft_append_replication_options(
-    timeout: Duration,
-) -> sinomo_network::ClusterRaftAppendReplicationOptions {
-    cluster_control_plane_timeouts().raft_append_replication_options(timeout)
-}
-
-fn cluster_raft_committed_fanout_options() -> sinomo_network::ClusterRaftCommittedFanoutOptions {
-    cluster_control_plane_timeouts().committed_fanout_options()
-}
-
 fn cluster_state_authority_reachability_options()
 -> sinomo_network::ClusterStateAuthorityReachabilityOptions {
     cluster_control_plane_timeouts().state_authority_reachability_options()
@@ -5075,8 +5065,7 @@ fn cluster_raft_append_attempt_timeout(
     remaining: Duration,
     request: &ClusterRaftAppendRequest,
 ) -> Duration {
-    cluster_raft_append_replication_options(remaining)
-        .append_attempt_timeout(endpoint, remaining, request)
+    cluster_control_plane_timeouts().raft_append_attempt_timeout(endpoint, remaining, request)
 }
 
 #[cfg(test)]
