@@ -223,18 +223,18 @@ const NODE_ROLE_CHOICES: &[ValueChoice] = &[
     },
 ];
 
-const RAFT_ROLE_CHOICES: &[ValueChoice] = &[
+const STATE_AUTHORITY_ROLE_CHOICES: &[ValueChoice] = &[
     ValueChoice {
-        value: Cow::Borrowed("voter"),
-        detail: Cow::Borrowed("participates in quorum"),
+        value: Cow::Borrowed("authority"),
+        detail: Cow::Borrowed("participates in state authority quorum"),
     },
     ValueChoice {
-        value: Cow::Borrowed("learner"),
-        detail: Cow::Borrowed("replicates without voting"),
+        value: Cow::Borrowed("replica"),
+        detail: Cow::Borrowed("replicates cluster state without authority"),
     },
     ValueChoice {
-        value: Cow::Borrowed("non-voting"),
-        detail: Cow::Borrowed("non-voting cluster member"),
+        value: Cow::Borrowed("observer"),
+        detail: Cow::Borrowed("cluster member without state authority"),
     },
 ];
 
@@ -989,13 +989,13 @@ fn slash_command_registry() -> CommandSpec {
                         ],
                     ),
                     cmd(
-                        "raft-role",
-                        "set Raft membership role",
+                        "state-authority",
+                        "set cluster state authority role",
                         vec![],
                         vec![],
                         vec![
                             value("node-id", "cluster node id", &[]),
-                            value("role", "Raft role", RAFT_ROLE_CHOICES),
+                            value("role", "state authority role", STATE_AUTHORITY_ROLE_CHOICES),
                         ],
                     ),
                     cmd(
@@ -1007,7 +1007,7 @@ fn slash_command_registry() -> CommandSpec {
                     ),
                     cmd(
                         "remove",
-                        "remove non-voter members",
+                        "remove members without state authority",
                         vec![],
                         vec![],
                         vec![value("node-id", "cluster node id", &[])],
@@ -2133,9 +2133,24 @@ mod tests {
             completions
                 .items
                 .iter()
-                .any(|item| item.label == "raft-role")
+                .any(|item| item.label == "repair-members")
         );
         assert!(!completions.items.iter().any(|item| item.label == "health"));
+
+        let completions =
+            slash_completions("/cluster s", "/cluster s".len()).expect("state completions");
+        assert!(
+            completions
+                .items
+                .iter()
+                .any(|item| item.label == "state-authority")
+        );
+        assert!(
+            !completions
+                .items
+                .iter()
+                .any(|item| item.label == "raft-role")
+        );
     }
 
     #[test]

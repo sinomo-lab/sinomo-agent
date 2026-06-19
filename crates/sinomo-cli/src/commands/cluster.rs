@@ -49,7 +49,7 @@ pub(crate) enum ClusterCliCommand {
     Join(ClusterJoinOptions),
     Migrate(ClusterMigrateCommand),
     Role(ClusterRoleOptions),
-    RaftRole(ClusterRaftRoleOptions),
+    StateAuthority(ClusterStateAuthorityOptions),
     RepairMembers(ClusterRepairMembersOptions),
     Remove(ClusterRemoveOptions),
     CleanupLegacyShadowMembers,
@@ -110,7 +110,7 @@ pub(crate) struct ClusterRoleOptions {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ClusterRaftRoleOptions {
+pub(crate) struct ClusterStateAuthorityOptions {
     pub(crate) node_id: NodeId,
     pub(crate) role: ClusterMemberRole,
 }
@@ -157,10 +157,22 @@ pub(crate) fn parse_cluster_command(args: &[String]) -> Result<ClusterCliCommand
         Some((command, rest)) if matches!(command.as_str(), "role" | "set-role") => {
             Ok(ClusterCliCommand::Role(parse_cluster_role_options(rest)?))
         }
-        Some((command, rest)) if matches!(command.as_str(), "raft-role" | "set-raft-role") => Ok(
-            ClusterCliCommand::RaftRole(parse_cluster_raft_role_options(rest)?),
-        ),
-        Some((command, rest)) if command == "promote" => Ok(ClusterCliCommand::RaftRole(
+        Some((command, rest))
+            if matches!(
+                command.as_str(),
+                "state-authority"
+                    | "authority-role"
+                    | "set-state-authority"
+                    | "set-authority-role"
+                    | "raft-role"
+                    | "set-raft-role"
+            ) =>
+        {
+            Ok(ClusterCliCommand::StateAuthority(
+                parse_cluster_state_authority_options(rest)?,
+            ))
+        }
+        Some((command, rest)) if command == "promote" => Ok(ClusterCliCommand::StateAuthority(
             parse_cluster_promote_options(rest)?,
         )),
         Some((command, rest)) if matches!(command.as_str(), "repair-members" | "repair") => Ok(
@@ -388,31 +400,31 @@ pub(crate) fn parse_cluster_role_options(args: &[String]) -> Result<ClusterRoleO
     })
 }
 
-pub(crate) fn parse_cluster_raft_role_options(
+pub(crate) fn parse_cluster_state_authority_options(
     args: &[String],
-) -> Result<ClusterRaftRoleOptions, CliError> {
+) -> Result<ClusterStateAuthorityOptions, CliError> {
     let [node_id, role] = args else {
         return Err(CliError::Usage);
     };
-    Ok(ClusterRaftRoleOptions {
+    Ok(ClusterStateAuthorityOptions {
         node_id: NodeId::new(node_id.clone()).map_err(|source| CliError::Parse {
             detail: format!("invalid node id `{node_id}`: {source}"),
         })?,
-        role: parse_cluster_member_role(role)?,
+        role: parse_cluster_state_authority_role(role)?,
     })
 }
 
 pub(crate) fn parse_cluster_promote_options(
     args: &[String],
-) -> Result<ClusterRaftRoleOptions, CliError> {
+) -> Result<ClusterStateAuthorityOptions, CliError> {
     match args {
-        [node_id] => Ok(ClusterRaftRoleOptions {
+        [node_id] => Ok(ClusterStateAuthorityOptions {
             node_id: NodeId::new(node_id.clone()).map_err(|source| CliError::Parse {
                 detail: format!("invalid node id `{node_id}`: {source}"),
             })?,
             role: ClusterMemberRole::Voter,
         }),
-        _ => parse_cluster_raft_role_options(args),
+        _ => parse_cluster_state_authority_options(args),
     }
 }
 
@@ -489,14 +501,19 @@ pub(crate) fn parse_cluster_node_role(role: &str) -> Result<ClusterNodeRole, Cli
     }
 }
 
-pub(crate) fn parse_cluster_member_role(role: &str) -> Result<ClusterMemberRole, CliError> {
+pub(crate) fn parse_cluster_state_authority_role(
+    role: &str,
+) -> Result<ClusterMemberRole, CliError> {
     match role.trim().to_ascii_lowercase().as_str() {
-        "voter" => Ok(ClusterMemberRole::Voter),
-        "learner" => Ok(ClusterMemberRole::Learner),
-        "non-voting" | "non_voting" | "nonvoting" => Ok(ClusterMemberRole::NonVoting),
+        "authority" | "state-authority" | "state_authority" | "voter" => {
+            Ok(ClusterMemberRole::Voter)
+        }
+        "replica" | "learner" => Ok(ClusterMemberRole::Learner),
+        "observer" | "non-authority" | "non_authority" | "non-voting" | "non_voting"
+        | "nonvoting" => Ok(ClusterMemberRole::NonVoting),
         _ => Err(CliError::Parse {
             detail: format!(
-                "invalid cluster member role `{role}`; expected voter, learner, or non-voting"
+                "invalid cluster state authority role `{role}`; expected authority, replica, or observer"
             ),
         }),
     }
@@ -539,7 +556,7 @@ pub(crate) fn run_cluster_cli_command(command: ClusterCliCommand) -> Result<(), 
         ClusterCliCommand::Join(options) => cluster_join(options),
         ClusterCliCommand::Migrate(command) => cluster_migrate(command),
         ClusterCliCommand::Role(options) => cluster_role(options),
-        ClusterCliCommand::RaftRole(options) => cluster_raft_role(options),
+        ClusterCliCommand::StateAuthority(options) => cluster_state_authority_role(options),
         ClusterCliCommand::RepairMembers(options) => cluster_repair_members(options),
         ClusterCliCommand::Remove(options) => cluster_remove(options),
         ClusterCliCommand::CleanupLegacyShadowMembers => cluster_cleanup_legacy_shadow_members(),
@@ -2210,7 +2227,9 @@ pub(crate) fn cluster_role(options: ClusterRoleOptions) -> Result<(), CliError> 
     Ok(())
 }
 
-pub(crate) fn cluster_raft_role(options: ClusterRaftRoleOptions) -> Result<(), CliError> {
+pub(crate) fn cluster_state_authority_role(
+    options: ClusterStateAuthorityOptions,
+) -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
     refresh_cluster_kv_from_local_daemon(&paths)?;
     let state = network::read_cluster_state(&paths)?;
@@ -2761,9 +2780,9 @@ pub(crate) fn read_cluster_rollout_status(
 
 pub(crate) fn format_member_role(role: &ClusterMemberRole) -> &'static str {
     match role {
-        ClusterMemberRole::Voter => "voter",
-        ClusterMemberRole::Learner => "learner",
-        ClusterMemberRole::NonVoting => "non-voting",
+        ClusterMemberRole::Voter => "authority",
+        ClusterMemberRole::Learner => "replica",
+        ClusterMemberRole::NonVoting => "observer",
     }
 }
 
@@ -2781,9 +2800,9 @@ pub(crate) fn format_member_state(state: &ClusterMemberState) -> &'static str {
     match state {
         ClusterMemberState::Pending => "pending",
         ClusterMemberState::Active => "active",
-        ClusterMemberState::Learner => "learner",
-        ClusterMemberState::Voter => "voter",
-        ClusterMemberState::NonVoting => "non-voting",
+        ClusterMemberState::Learner => "replica",
+        ClusterMemberState::Voter => "authority",
+        ClusterMemberState::NonVoting => "observer",
         ClusterMemberState::Suspect => "suspect",
         ClusterMemberState::Offline => "offline",
         ClusterMemberState::Removed => "removed",

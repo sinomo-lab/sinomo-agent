@@ -5,8 +5,8 @@ use super::{
     AgentSessionTerminalResultsOptions, AgentValidateOptions, BUILTIN_TOP_LEVEL_USAGE_COMMANDS,
     CliClusterMemberMutationHost, CliCommand, CliError, CliRuntimeOptions, ClusterCliCommand,
     ClusterInitOptions, ClusterInviteOptions, ClusterJoinOptions, ClusterJoinRegistrationRequest,
-    ClusterMigrateCommand, ClusterMigrationPlanOptions, ClusterPaths, ClusterRaftRoleOptions,
-    ClusterRemoveOptions, ClusterRoleOptions, ClusterRolloutBuildRequest, DaemonCliCommand,
+    ClusterMigrateCommand, ClusterMigrationPlanOptions, ClusterPaths, ClusterRemoveOptions,
+    ClusterRoleOptions, ClusterRolloutBuildRequest, ClusterStateAuthorityOptions, DaemonCliCommand,
     DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
     DebugCliCommand, DfsCliCommand, DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions,
     DfsMountOptions, DfsPinCliCommand, InstallLayout, InstallOptions, InteractionModel,
@@ -7252,12 +7252,24 @@ fn cluster_parser_accepts_init_and_join_options() {
     );
     assert_eq!(
         parse_cluster_command(&[
+            "state-authority".to_string(),
+            "01hxy6qa9k0t9vr4g9n8d3q5d6".to_string(),
+            "observer".to_string(),
+        ])
+        .expect("cluster state-authority"),
+        ClusterCliCommand::StateAuthority(ClusterStateAuthorityOptions {
+            node_id: NodeId::new("01hxy6qa9k0t9vr4g9n8d3q5d6").expect("node"),
+            role: ClusterMemberRole::NonVoting,
+        })
+    );
+    assert_eq!(
+        parse_cluster_command(&[
             "raft-role".to_string(),
             "01hxy6qa9k0t9vr4g9n8d3q5d6".to_string(),
             "non_voting".to_string(),
         ])
-        .expect("cluster raft-role"),
-        ClusterCliCommand::RaftRole(ClusterRaftRoleOptions {
+        .expect("cluster raft-role compatibility alias"),
+        ClusterCliCommand::StateAuthority(ClusterStateAuthorityOptions {
             node_id: NodeId::new("01hxy6qa9k0t9vr4g9n8d3q5d6").expect("node"),
             role: ClusterMemberRole::NonVoting,
         })
@@ -7268,7 +7280,7 @@ fn cluster_parser_accepts_init_and_join_options() {
             "01hxy6qa9k0t9vr4g9n8d3q5d6".to_string()
         ])
         .expect("cluster promote"),
-        ClusterCliCommand::RaftRole(ClusterRaftRoleOptions {
+        ClusterCliCommand::StateAuthority(ClusterStateAuthorityOptions {
             node_id: NodeId::new("01hxy6qa9k0t9vr4g9n8d3q5d6").expect("node"),
             role: ClusterMemberRole::Voter,
         })
