@@ -8017,7 +8017,7 @@ pub type DfsMessageSender = Arc<
         + Sync,
 >;
 
-pub type DfsDirectReadSender = Arc<
+pub(crate) type DfsDirectReadSender = Arc<
     dyn Fn(
             &ClusterEndpointRecord,
             &DfsDirectReadRequest,
@@ -8027,7 +8027,7 @@ pub type DfsDirectReadSender = Arc<
         + Sync,
 >;
 
-pub type AsyncDfsDirectReadSender = Arc<
+pub(crate) type AsyncDfsDirectReadSender = Arc<
     dyn for<'a> Fn(
             &'a ClusterEndpointRecord,
             &'a DfsDirectReadRequest,
@@ -8135,7 +8135,7 @@ pub fn async_dfs_message_sender_from_peer_transport(
     })
 }
 
-pub fn async_dfs_direct_read_sender_from_peer_transport(
+fn async_dfs_direct_read_sender_from_peer_transport(
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
 ) -> AsyncDfsDirectReadSender {
     Arc::new(move |endpoint, request, connect_timeout| {
@@ -8217,7 +8217,7 @@ pub fn dfs_message_sender_from_peer_transport(
     })
 }
 
-pub fn dfs_direct_read_sender_from_peer_transport(
+fn dfs_direct_read_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsDirectReadSender {
     Arc::new(move |endpoint, request, connect_timeout| {
@@ -8471,7 +8471,34 @@ impl DfsEndpointTransport {
         )
     }
 
-    pub fn new_with_message_peer_senders(
+    pub fn with_peer_transports(
+        local_node_id: NodeId,
+        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+        connect_timeout: Duration,
+        peer_transport: Arc<dyn DfsPeerTransport>,
+        async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    ) -> Self {
+        let direct_read_peer_transport = Arc::clone(&peer_transport);
+        let async_direct_read_peer_transport = Arc::clone(&async_peer_transport);
+        Self::with_senders(
+            local_node_id,
+            endpoints,
+            connect_timeout,
+            Some(dfs_message_sender_from_peer_transport(peer_transport)),
+            Some(async_dfs_message_sender_from_peer_transport(
+                async_peer_transport,
+            )),
+            Some(dfs_direct_read_sender_from_peer_transport(
+                direct_read_peer_transport,
+            )),
+            Some(async_dfs_direct_read_sender_from_peer_transport(
+                async_direct_read_peer_transport,
+            )),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_message_peer_senders(
         local_node_id: NodeId,
         endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
         sender: DfsMessageSender,

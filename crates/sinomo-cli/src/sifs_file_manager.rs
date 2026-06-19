@@ -661,21 +661,14 @@ fn open_sifs_service_with_hydration(
         .map_err(|error| format!("cannot open DFS content store: {error}"))?;
     let peer_transport = Arc::new(SifsDfsPeerTransport::new(rpc_runtime.clone()));
     let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
-    let direct_read_peer_transport = Arc::clone(&sync_peer_transport);
     let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer_transport;
-    let async_direct_read_peer_transport = Arc::clone(&async_peer_transport);
     let mut service = NetworkedDfsService::new(
-        DfsEndpointTransport::new_with_message_peer_senders(
+        DfsEndpointTransport::with_peer_transports(
             local_node_id,
             endpoints,
-            sinomo_runtime::dfs::dfs_message_sender_from_peer_transport(sync_peer_transport),
-            sinomo_runtime::dfs::async_dfs_message_sender_from_peer_transport(async_peer_transport),
-            sinomo_runtime::dfs::dfs_direct_read_sender_from_peer_transport(
-                direct_read_peer_transport,
-            ),
-            sinomo_runtime::dfs::async_dfs_direct_read_sender_from_peer_transport(
-                async_direct_read_peer_transport,
-            ),
+            sinomo_runtime::dfs::DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+            sync_peer_transport,
+            async_peer_transport,
         ),
         content,
     );
