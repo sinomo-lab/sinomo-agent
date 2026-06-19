@@ -2,12 +2,33 @@ use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointS
 use crate::route::{cluster_endpoint_prefers_relay_with_graph, cluster_route_next_hop};
 use crate::{ClusterConnectivityGraph, ClusterPaths, NetworkError};
 use sinomo_core::{
-    ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterTransportKind,
+    ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
+    ClusterMemberRole, ClusterTransportKind,
 };
+use sinomo_node::{ClusterId, NodeId};
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
+use time::OffsetDateTime;
+
+pub fn local_cluster_state_authority_member(
+    cluster_id: ClusterId,
+    node_id: NodeId,
+    display_name: impl Into<String>,
+    node_public_key: impl Into<String>,
+    timestamp: OffsetDateTime,
+) -> ClusterMemberRecord {
+    let mut member = ClusterMemberRecord::local_voter(
+        cluster_id,
+        node_id,
+        display_name,
+        node_public_key,
+        timestamp,
+    );
+    sinomo_node::apply_cluster_raft_role(&mut member, ClusterMemberRole::Voter, timestamp);
+    member
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClusterStateAuthorityReachabilityOptions {

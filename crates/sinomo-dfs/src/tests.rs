@@ -4206,16 +4206,11 @@ fn cluster_maintenance_tick_opens_service_and_publishes_metadata() {
         "pk-local",
         now,
     );
-    let mut replica_member = sinomo_core::ClusterMemberRecord::local_voter(
+    let mut replica_member = sinomo_network::local_cluster_state_authority_member(
         cluster_id,
         replica.clone(),
         "replica",
         "pk-replica",
-        now,
-    );
-    sinomo_node::apply_cluster_raft_role(
-        &mut replica_member,
-        sinomo_core::ClusterMemberRole::Voter,
         now,
     );
     replica_member
@@ -4334,16 +4329,11 @@ fn cluster_smoke_opens_service_and_publishes_metadata() {
         "pk-local",
         now,
     );
-    let mut replica_member = sinomo_core::ClusterMemberRecord::local_voter(
+    let mut replica_member = sinomo_network::local_cluster_state_authority_member(
         cluster_id,
         replica.clone(),
         "replica",
         "pk-replica",
-        now,
-    );
-    sinomo_node::apply_cluster_raft_role(
-        &mut replica_member,
-        sinomo_core::ClusterMemberRole::Voter,
         now,
     );
     replica_member
@@ -6046,16 +6036,11 @@ fn cluster_metadata_journal_publish_reads_cluster_state_and_shards() {
         "pk-local",
         now,
     );
-    let mut replica_member = sinomo_core::ClusterMemberRecord::local_voter(
+    let mut replica_member = sinomo_network::local_cluster_state_authority_member(
         cluster_id.clone(),
         replica.clone(),
         "replica",
         "pk-replica",
-        now,
-    );
-    sinomo_node::apply_cluster_raft_role(
-        &mut replica_member,
-        sinomo_core::ClusterMemberRole::Voter,
         now,
     );
     replica_member
@@ -6172,16 +6157,11 @@ fn scheduled_cluster_metadata_publish_uses_async_peer_transport() {
         "pk-local",
         now,
     );
-    let mut replica_member = sinomo_core::ClusterMemberRecord::local_voter(
+    let mut replica_member = sinomo_network::local_cluster_state_authority_member(
         cluster_id.clone(),
         replica.clone(),
         "replica",
         "pk-replica",
-        now,
-    );
-    sinomo_node::apply_cluster_raft_role(
-        &mut replica_member,
-        sinomo_core::ClusterMemberRole::Voter,
         now,
     );
     replica_member
@@ -6328,16 +6308,11 @@ fn async_cluster_metadata_publish_repairs_sequence_conflict_with_snapshot() {
             "pk-local",
             now,
         );
-        let mut replica_member = sinomo_core::ClusterMemberRecord::local_voter(
+        let mut replica_member = sinomo_network::local_cluster_state_authority_member(
             cluster_id.clone(),
             replica.clone(),
             "replica",
             "pk-replica",
-            now,
-        );
-        sinomo_node::apply_cluster_raft_role(
-            &mut replica_member,
-            sinomo_core::ClusterMemberRole::Voter,
             now,
         );
         replica_member

@@ -387,7 +387,7 @@ pub use state_authority_reachability::{
     ClusterStateAuthorityReachabilityAsyncHost, ClusterStateAuthorityReachabilityHost,
     ClusterStateAuthorityReachabilityOptions, cluster_has_local_quorum_async_with_host,
     cluster_has_local_quorum_with_host, cluster_reachable_state_authority_count_async_with_host,
-    cluster_reachable_state_authority_count_with_host,
+    cluster_reachable_state_authority_count_with_host, local_cluster_state_authority_member,
 };
 pub use status_publish::{
     ClusterNetworkInfoPublishAsyncHost, ClusterNetworkInfoPublishHost,
