@@ -1703,6 +1703,16 @@ fn ensure_local_daemon_cluster_members(
     shadow_options: &DaemonRunOptions,
     timestamp: OffsetDateTime,
 ) -> bool {
+    let (main_endpoints, shadow_endpoints) =
+        local_daemon_member_endpoints(state, main_options, shadow_options);
+    network::ensure_daemon_cluster_members(state, main_endpoints, shadow_endpoints, timestamp)
+}
+
+fn local_daemon_member_endpoints(
+    state: &ClusterBootstrapState,
+    main_options: &DaemonRunOptions,
+    shadow_options: &DaemonRunOptions,
+) -> (Vec<ClusterEndpointRecord>, Vec<ClusterEndpointRecord>) {
     let main_node_id = state.local_node_id.clone();
     let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
     let lan_ips = network::discover_default_lan_ip_candidates();
@@ -1723,7 +1733,31 @@ fn ensure_local_daemon_cluster_members(
         &lan_ips,
         &route_ips,
     );
-    network::ensure_daemon_cluster_members(state, main_endpoints, shadow_endpoints, timestamp)
+    (main_endpoints, shadow_endpoints)
+}
+
+fn refresh_local_daemon_membership_from_disk_for_cli(
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    main_options: &DaemonRunOptions,
+    shadow_options: &DaemonRunOptions,
+    timestamp: OffsetDateTime,
+) -> Result<network::ClusterLocalDaemonMembershipRefresh, CliError> {
+    let (main_endpoints, shadow_endpoints) =
+        local_daemon_member_endpoints(state, main_options, shadow_options);
+    let (main_public_key, shadow_public_key) = local_daemon_public_keys(paths)?;
+    network::refresh_local_daemon_membership_from_disk(
+        paths,
+        state,
+        network::ClusterLocalDaemonMembershipObservation {
+            main_endpoints,
+            shadow_endpoints,
+            main_public_key,
+            shadow_public_key,
+            timestamp,
+        },
+    )
+    .map_err(Into::into)
 }
 
 pub(crate) fn reconcile_cluster_join_with_introducers(
@@ -2504,15 +2538,13 @@ fn prepare_local_cluster_state_for_cli(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
 ) -> Result<(), CliError> {
-    ensure_local_daemon_cluster_members(
+    refresh_local_daemon_membership_from_disk_for_cli(
+        paths,
         state,
         &DaemonRunOptions::default(),
         &DaemonRunOptions::shadow_default(),
         OffsetDateTime::now_utc(),
-    );
-    let (main_public_key, shadow_public_key) = local_daemon_public_keys(paths)?;
-    network::assign_local_daemon_member_public_keys(state, main_public_key, shadow_public_key);
-    network::refresh_local_iroh_endpoints_from_disk(paths, state, OffsetDateTime::now_utc())?;
+    )?;
     Ok(())
 }
 
@@ -2728,15 +2760,13 @@ pub(crate) fn daemon_cluster_status_from_local_state(
     registration: &DaemonClusterRegistration,
 ) -> Result<DaemonClusterStatus, CliError> {
     let mut state = network::read_cluster_state_without_kv(paths)?;
-    ensure_local_daemon_cluster_members(
+    refresh_local_daemon_membership_from_disk_for_cli(
+        paths,
         &mut state,
         &registration.main_options,
         &registration.shadow_options,
         OffsetDateTime::now_utc(),
-    );
-    let (main_public_key, shadow_public_key) = local_daemon_public_keys(paths)?;
-    network::assign_local_daemon_member_public_keys(&mut state, main_public_key, shadow_public_key);
-    network::refresh_local_iroh_endpoints_from_disk(paths, &mut state, OffsetDateTime::now_utc())?;
+    )?;
     daemon_cluster_status(&state, registration.process).ok_or_else(|| CliError::Parse {
         detail: "daemon cluster member could not be resolved from local state".to_string(),
     })

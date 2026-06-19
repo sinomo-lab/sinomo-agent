@@ -37,7 +37,7 @@ fn apply_local_iroh_endpoint_record_to_state(
     changed
 }
 
-pub fn refresh_local_iroh_endpoints_from_disk(
+pub(crate) fn refresh_local_iroh_endpoints_from_disk(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
     timestamp: OffsetDateTime,
@@ -55,7 +55,7 @@ pub fn refresh_local_iroh_endpoints_from_disk(
     Ok(changed)
 }
 
-pub async fn refresh_local_iroh_endpoints_from_disk_async(
+pub(crate) async fn refresh_local_iroh_endpoints_from_disk_async(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
