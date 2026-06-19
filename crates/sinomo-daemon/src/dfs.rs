@@ -20,8 +20,8 @@ use sinomo_dfs::{
     DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture,
     DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions,
     DfsEndpointServedMessageTransport, DfsEndpointTransport, DfsMaintenanceTickOptions,
-    DfsMessageCommand, DfsMessageProcessResult, DfsMessageResponse, DfsMessageSender,
-    DfsMetadataBackend, DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
+    DfsMessageCommand, DfsMessageProcessResult, DfsMessageResponse, DfsMetadataBackend,
+    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
     DfsMetadataPublishScheduleOptions, DfsObjectRpcSendOptions, DfsPeerTransport,
     DfsPeerTransportError, NetworkedDfsService,
 };
@@ -295,15 +295,15 @@ pub(crate) fn daemon_dfs_endpoint_transport(
     local_node_id: sinomo_node::NodeId,
     endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
 ) -> DfsEndpointTransport {
-    DfsEndpointTransport::with_message_sender(
+    let peer_transport = Arc::new(DaemonDfsUnavailablePeerTransport);
+    let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
+    let async_peer_transport: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = peer_transport;
+    DfsEndpointTransport::with_peer_transports(
         local_node_id,
         endpoints,
         sinomo_dfs::DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
-        Arc::new(|_endpoint, _command, _timeout| {
-            Err(DfsPeerTransportError::new(
-                "local-only DFS message transport cannot send without the daemon-owned Tokio runtime",
-            ))
-        }),
+        sync_peer_transport,
+        async_peer_transport,
     )
 }
 
@@ -331,6 +331,40 @@ struct DaemonDfsBlockingPeerTransport {
 #[derive(Clone, Debug)]
 struct DaemonDfsAsyncPeerTransport {
     runtime: tokio::runtime::Handle,
+}
+
+#[derive(Clone, Debug)]
+struct DaemonDfsUnavailablePeerTransport;
+
+fn daemon_dfs_unavailable_peer_transport_error() -> DfsPeerTransportError {
+    DfsPeerTransportError::new(
+        "local-only DFS peer transport cannot send without the daemon-owned Tokio runtime",
+    )
+}
+
+impl DfsPeerTransport for DaemonDfsUnavailablePeerTransport {
+    fn call_object_rpc(
+        &self,
+        _endpoint: &ClusterEndpointRecord,
+        _request: &sinomo_network::ObjectRpcRequest,
+        _options: DfsObjectRpcSendOptions,
+    ) -> Result<sinomo_network::ObjectRpcResponse, DfsPeerTransportError> {
+        Err(daemon_dfs_unavailable_peer_transport_error())
+    }
+}
+
+impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsUnavailablePeerTransport {
+    fn call_object_rpc_async<'a>(
+        &'a self,
+        _endpoint: &'a ClusterEndpointRecord,
+        _request: &'a sinomo_network::ObjectRpcRequest,
+        _options: DfsObjectRpcSendOptions,
+    ) -> sinomo_dfs::DfsPeerTransportFuture<
+        'a,
+        Result<sinomo_network::ObjectRpcResponse, DfsPeerTransportError>,
+    > {
+        Box::pin(async { Err(daemon_dfs_unavailable_peer_transport_error()) })
+    }
 }
 
 impl DfsPeerTransport for DaemonDfsBlockingPeerTransport {
@@ -390,12 +424,6 @@ fn daemon_dfs_async_peer_transport(
     Arc::new(DaemonDfsAsyncPeerTransport {
         runtime: runtime.clone(),
     })
-}
-
-fn daemon_dfs_message_sender_on_runtime(runtime: &tokio::runtime::Handle) -> DfsMessageSender {
-    sinomo_dfs::dfs_message_sender_from_peer_transport(
-        daemon_dfs_blocking_peer_transport_on_runtime(runtime),
-    )
 }
 
 #[cfg(test)]
@@ -582,10 +610,10 @@ fn open_daemon_dfs_message_service_lane(
     let content = sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
     let metadata_backend =
         sinomo_dfs::open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
-    let transport = DfsEndpointServedMessageTransport::new_with_message_sender(
+    let transport = DfsEndpointServedMessageTransport::new_with_peer_transport(
         local_node_id.clone(),
         endpoints,
-        daemon_dfs_message_sender_on_runtime(runtime),
+        daemon_dfs_blocking_peer_transport_on_runtime(runtime),
         sinomo_dfs::DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
     );
     let service = NetworkedDfsService::new(transport, content);

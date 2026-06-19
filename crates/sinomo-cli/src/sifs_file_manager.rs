@@ -12,12 +12,12 @@ use sinomo_runtime::dfs::{
     cluster_dfs_data_endpoints, content_services_prefix, default_dfs_metadata_root,
     default_dfs_metadata_shards_root, fallback_dfs_node_id, metadata_shards_prefix,
     open_local_sharded_metadata_backend, open_root_local_metadata_backend,
-    publish_cluster_dfs_metadata_journal, sifs_file_system_id,
+    publish_cluster_dfs_metadata_journal_with_peer_transport, sifs_file_system_id,
 };
 use sinomo_runtime::kv::{self, KvError, KvOp, KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
-use sinomo_runtime::node::{self, NodeId};
+use sinomo_runtime::node::NodeId;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
@@ -969,15 +969,10 @@ fn publish_sifs_metadata_journal_from_data_dir(
     let cluster_paths = ClusterPaths::new(data_dir);
     let peer_transport: Arc<dyn DfsPeerTransport> =
         Arc::new(SifsDfsPeerTransport::new(rpc_runtime.clone()));
-    publish_cluster_dfs_metadata_journal(
+    publish_cluster_dfs_metadata_journal_with_peer_transport(
         data_dir,
         &cluster_paths,
-        sinomo_runtime::dfs::dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(
-            &peer_transport,
-        )),
-        sinomo_runtime::dfs::dfs_metadata_snapshot_install_sender_from_peer_transport(
-            peer_transport,
-        ),
+        peer_transport,
         DfsMetadataJournalReplicationOptions::default(),
     )?;
     Ok(())
@@ -1251,8 +1246,10 @@ mod tests {
     ) -> network::ClusterConnectivityRecord {
         let now = time::OffsetDateTime::now_utc();
         network::ClusterConnectivityRecord {
-            cluster_id: node::ClusterId::from_legacy_named("cluster_sifs_replica_rank")
-                .expect("cluster"),
+            cluster_id: sinomo_runtime::node::ClusterId::from_legacy_named(
+                "cluster_sifs_replica_rank",
+            )
+            .expect("cluster"),
             source_node_id: source.clone(),
             target_node_id: target.clone(),
             endpoint_id: network::ClusterEndpointId::from_legacy_named(format!(

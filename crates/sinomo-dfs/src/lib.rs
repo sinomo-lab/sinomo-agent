@@ -3073,7 +3073,7 @@ where
     })
 }
 
-pub fn open_cluster_dfs_service_with_message_sender(
+pub(crate) fn open_cluster_dfs_service_with_message_sender(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     local_node_id: NodeId,
@@ -3098,7 +3098,7 @@ pub fn open_cluster_dfs_service_with_message_sender(
     service.with_boxed_metadata_backend(metadata)
 }
 
-pub fn open_cluster_dfs_service_with_message_senders(
+pub(crate) fn open_cluster_dfs_service_with_message_senders(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     local_node_id: NodeId,
@@ -3146,7 +3146,7 @@ pub(crate) fn run_cluster_dfs_maintenance_tick(
     )
 }
 
-pub fn run_cluster_dfs_maintenance_tick_with_message_sender(
+pub(crate) fn run_cluster_dfs_maintenance_tick_with_message_sender(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     message_sender: DfsMessageSender,
@@ -3354,7 +3354,7 @@ pub(crate) fn run_cluster_dfs_smoke(
     )
 }
 
-pub fn run_cluster_dfs_smoke_with_message_sender(
+pub(crate) fn run_cluster_dfs_smoke_with_message_sender(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     message_sender: DfsMessageSender,
@@ -4237,7 +4237,7 @@ pub(crate) fn run_default_cluster_dfs_smoke(
     )
 }
 
-pub fn run_default_cluster_dfs_smoke_with_message_sender(
+pub(crate) fn run_default_cluster_dfs_smoke_with_message_sender(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     message_sender: DfsMessageSender,
@@ -8013,7 +8013,7 @@ impl std::fmt::Display for DfsPeerTransportError {
 
 impl std::error::Error for DfsPeerTransportError {}
 
-pub type DfsMessageSender = Arc<
+pub(crate) type DfsMessageSender = Arc<
     dyn Fn(
             &ClusterEndpointRecord,
             &DfsMessageCommand,
@@ -8084,7 +8084,7 @@ pub trait AsyncDfsPeerTransport: Send + Sync {
     ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResponse, DfsPeerTransportError>>;
 }
 
-pub type AsyncDfsMessageSender = Arc<
+pub(crate) type AsyncDfsMessageSender = Arc<
     dyn for<'a> Fn(
             &'a ClusterEndpointRecord,
             &'a DfsMessageCommand,
@@ -8119,7 +8119,7 @@ pub type AsyncDfsMetadataSnapshotInstallSender = Arc<
         + Sync,
 >;
 
-pub fn async_dfs_message_sender_from_peer_transport(
+pub(crate) fn async_dfs_message_sender_from_peer_transport(
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
 ) -> AsyncDfsMessageSender {
     Arc::new(move |endpoint, command, connect_timeout| {
@@ -8162,7 +8162,7 @@ fn async_dfs_direct_read_sender_from_peer_transport(
     })
 }
 
-pub fn async_dfs_metadata_journal_batch_sender_from_peer_transport(
+pub(crate) fn async_dfs_metadata_journal_batch_sender_from_peer_transport(
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
 ) -> AsyncDfsMetadataJournalBatchSender {
     Arc::new(move |endpoint, command, connect_timeout| {
@@ -8184,7 +8184,7 @@ pub fn async_dfs_metadata_journal_batch_sender_from_peer_transport(
     })
 }
 
-pub fn async_dfs_metadata_snapshot_install_sender_from_peer_transport(
+pub(crate) fn async_dfs_metadata_snapshot_install_sender_from_peer_transport(
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
 ) -> AsyncDfsMetadataSnapshotInstallSender {
     Arc::new(move |endpoint, command, connect_timeout| {
@@ -8206,7 +8206,7 @@ pub fn async_dfs_metadata_snapshot_install_sender_from_peer_transport(
     })
 }
 
-pub fn dfs_message_sender_from_peer_transport(
+pub(crate) fn dfs_message_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsMessageSender {
     Arc::new(move |endpoint, command, connect_timeout| {
@@ -8239,7 +8239,7 @@ fn dfs_direct_read_sender_from_peer_transport(
     })
 }
 
-pub fn dfs_metadata_journal_batch_sender_from_peer_transport(
+pub(crate) fn dfs_metadata_journal_batch_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsMetadataJournalBatchSender {
     Arc::new(move |endpoint, command, connect_timeout| {
@@ -8257,7 +8257,7 @@ pub fn dfs_metadata_journal_batch_sender_from_peer_transport(
     })
 }
 
-pub fn dfs_metadata_snapshot_install_sender_from_peer_transport(
+pub(crate) fn dfs_metadata_snapshot_install_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsMetadataSnapshotInstallSender {
     Arc::new(move |endpoint, command, connect_timeout| {
@@ -8342,7 +8342,7 @@ impl DfsEndpointTransport {
         )
     }
 
-    pub fn with_message_sender(
+    pub(crate) fn with_message_sender(
         local_node_id: NodeId,
         endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
         connect_timeout: Duration,
@@ -8361,23 +8361,6 @@ impl DfsEndpointTransport {
 
     #[cfg(test)]
     pub(crate) fn with_connect_timeout_async(
-        local_node_id: NodeId,
-        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
-        connect_timeout: Duration,
-        sender: AsyncDfsMessageSender,
-    ) -> Self {
-        Self::with_senders(
-            local_node_id,
-            endpoints,
-            connect_timeout,
-            None,
-            Some(sender),
-            None,
-            None,
-        )
-    }
-
-    pub fn with_async_message_sender(
         local_node_id: NodeId,
         endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
         connect_timeout: Duration,
@@ -8413,7 +8396,7 @@ impl DfsEndpointTransport {
         )
     }
 
-    pub fn with_connect_timeout_and_message_senders(
+    pub(crate) fn with_connect_timeout_and_message_senders(
         local_node_id: NodeId,
         endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
         connect_timeout: Duration,
@@ -9161,7 +9144,21 @@ pub struct DfsEndpointServedMessageTransport {
 }
 
 impl DfsEndpointServedMessageTransport {
-    pub fn new_with_message_sender(
+    pub fn new_with_peer_transport(
+        local_node_id: NodeId,
+        endpoints: Vec<ClusterEndpointRecord>,
+        peer_transport: Arc<dyn DfsPeerTransport>,
+        connect_timeout: Duration,
+    ) -> Self {
+        Self::new_with_message_sender(
+            local_node_id,
+            endpoints,
+            dfs_message_sender_from_peer_transport(peer_transport),
+            connect_timeout,
+        )
+    }
+
+    pub(crate) fn new_with_message_sender(
         local_node_id: NodeId,
         endpoints: Vec<ClusterEndpointRecord>,
         sender: DfsMessageSender,
