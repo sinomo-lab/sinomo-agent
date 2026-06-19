@@ -9,7 +9,7 @@ use sinomo_core::{
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{ClusterId, DaemonRpcTimeouts};
-use sinomo_node::NodeId;
+use sinomo_node::{DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, NodeId};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::net::IpAddr;
@@ -21,8 +21,6 @@ use time::format_description::well_known::Rfc3339;
 pub const SINOMO_DAEMON_DEFAULT_HOST: &str = "127.0.0.1";
 pub const SINOMO_DAEMON_DEFAULT_PORT: u16 = 21_353;
 pub const SINOMO_SHADOW_DAEMON_DEFAULT_PORT: u16 = 21_354;
-pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
-pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 pub const SINOMO_DAEMON_ADVERTISE_HOST_ENV: &str = "SINOMO_DAEMON_ADVERTISE_HOST";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

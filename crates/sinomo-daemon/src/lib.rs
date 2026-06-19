@@ -169,9 +169,8 @@ pub(crate) use rollout::{
     handle_daemon_finalize_shadow_rollout,
 };
 pub use status::{
-    DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, DaemonClusterProcess,
-    DaemonClusterRegistration, DaemonClusterStatus, DaemonDataOwnerLock, DaemonLock,
-    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, SINOMO_DAEMON_DEFAULT_HOST,
+    DaemonClusterProcess, DaemonClusterRegistration, DaemonClusterStatus, DaemonDataOwnerLock,
+    DaemonLock, DaemonProbeStatus, DaemonRunOptions, DaemonStatus, SINOMO_DAEMON_DEFAULT_HOST,
     SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
     cluster_node_status_from_daemon_status, current_shadow_daemon_options,
     daemon_advertised_endpoints_for_state, daemon_advertised_endpoints_for_state_async,

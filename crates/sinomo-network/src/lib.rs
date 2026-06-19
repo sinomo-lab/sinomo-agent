@@ -271,14 +271,13 @@ pub(crate) use member_publish::{
     cluster_member_publish_txn, cluster_member_publish_txn_from_snapshot,
     handle_cluster_member_publish_request_with_host,
 };
-pub use membership::{
-    DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, cluster_is_settled_solo,
-    cluster_member_expected_daemon_process, cluster_member_is_legacy_shadow_daemon,
-    cluster_member_is_local_process, cluster_node_is_local_process,
-    live_cluster_member_probe_possible,
-};
 #[cfg(test)]
 pub(crate) use membership::{cluster_has_remote_peers, cluster_local_process_members};
+pub use membership::{
+    cluster_is_settled_solo, cluster_member_expected_daemon_process,
+    cluster_member_is_legacy_shadow_daemon, cluster_member_is_local_process,
+    cluster_node_is_local_process, live_cluster_member_probe_possible,
+};
 #[cfg(test)]
 pub(crate) use membership_forward::forward_cluster_join_challenge_rpc_to_voter_with_host;
 #[cfg(test)]

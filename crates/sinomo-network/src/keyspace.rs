@@ -1,5 +1,5 @@
-use crate::membership::DAEMON_MAIN_CLUSTER_ROLE;
 use crate::prelude::*;
+use sinomo_node::DAEMON_MAIN_CLUSTER_ROLE;
 
 pub(crate) fn cluster_node_status_key(node_id: &NodeId) -> String {
     format!("/cluster/node-status/{node_id}")

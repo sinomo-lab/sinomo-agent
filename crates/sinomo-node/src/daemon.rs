@@ -6,6 +6,8 @@ use sinomo_core::{
 
 pub const DAEMON_MAIN_RUN_CAPABILITY: &str = "daemon.main.run";
 pub const DAEMON_SHADOW_SUPERVISE_CAPABILITY: &str = "daemon.shadow.supervise";
+pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
+pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 
 pub fn shadow_daemon_node_id(main_node_id: &NodeId) -> NodeId {
     NodeId::derived("sinomo.node.shadow", main_node_id.as_str())

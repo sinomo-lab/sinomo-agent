@@ -1519,7 +1519,7 @@ mod tests {
         DaemonClusterStatus {
             cluster_id: ClusterId::from_legacy_named("cluster_gateway_test").expect("cluster id"),
             node_id,
-            process: "daemon-main".to_string(),
+            process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
             member_role: ClusterMemberRole::Voter,
             member_state: ClusterMemberState::Voter,
         }

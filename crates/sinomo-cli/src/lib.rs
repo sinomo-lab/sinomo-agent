@@ -84,10 +84,9 @@ use sinomo_runtime::core::{
 };
 #[cfg(test)]
 use sinomo_runtime::daemon::{
-    AuthenticatedDaemonCommand, DAEMON_MAIN_CLUSTER_ROLE, DaemonError, DaemonSignerAuthority,
-    SignedDaemonCommand, authenticate_daemon_control_request,
-    authorize_authenticated_daemon_command, daemon_package_version,
-    sign_daemon_rpc_request_from_data_dir, write_daemon_status,
+    AuthenticatedDaemonCommand, DaemonError, DaemonSignerAuthority, SignedDaemonCommand,
+    authenticate_daemon_control_request, authorize_authenticated_daemon_command,
+    daemon_package_version, sign_daemon_rpc_request_from_data_dir, write_daemon_status,
 };
 use sinomo_runtime::daemon::{
     DaemonClusterProcess, DaemonClusterRegistration, DaemonClusterStatus, DaemonPaths,
@@ -194,6 +193,8 @@ use sinomo_runtime::network::{self, ClusterPaths, cluster_doctor_findings};
 use sinomo_runtime::network::{ClusterDoctorFinding, ClusterHealthRow, ClusterId, ClusterInviteId};
 #[cfg(test)]
 use sinomo_runtime::network::{ClusterInviteChallengeProof, ClusterInviteChallengeRequest};
+#[cfg(test)]
+use sinomo_runtime::node::DAEMON_MAIN_CLUSTER_ROLE;
 use sinomo_runtime::node::{
     NodeId, load_or_create_main_node_identity, load_or_create_shadow_node_identity,
     shadow_daemon_node_id,

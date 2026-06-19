@@ -5580,7 +5580,7 @@ fn raft_command_targets_prefer_reachable_voter_over_unreachable_voter() {
             ClusterNodeStatusRecord {
                 cluster_id: state.cluster_id.clone(),
                 node_id,
-                process: "daemon-main".to_string(),
+                process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
                 availability: ClusterNodeAvailability::Online,
                 daemon_version: "0.1.0-test".to_string(),
                 commit: None,
@@ -8489,7 +8489,7 @@ fn cleanup_legacy_shadow_daemon_members_removes_only_shadow_only_records() {
     let orphan_status = ClusterNodeStatusRecord {
         cluster_id: cluster_id.clone(),
         node_id: orphan_shadow_node_id.clone(),
-        process: DAEMON_SHADOW_CLUSTER_ROLE.to_string(),
+        process: sinomo_node::DAEMON_SHADOW_CLUSTER_ROLE.to_string(),
         availability: ClusterNodeAvailability::Offline,
         daemon_version: "0.1.0".to_string(),
         commit: None,
@@ -8518,7 +8518,10 @@ fn cleanup_legacy_shadow_daemon_members_removes_only_shadow_only_records() {
     );
     host.store
         .put_serde(
-            cluster_node_status_key_for_process(&orphan_shadow_node_id, DAEMON_SHADOW_CLUSTER_ROLE),
+            cluster_node_status_key_for_process(
+                &orphan_shadow_node_id,
+                sinomo_node::DAEMON_SHADOW_CLUSTER_ROLE,
+            ),
             &orphan_status,
             None,
         )
@@ -8541,7 +8544,7 @@ fn cleanup_legacy_shadow_daemon_members_removes_only_shadow_only_records() {
         host.store
             .get(&cluster_node_status_key_for_process(
                 &orphan_shadow_node_id,
-                DAEMON_SHADOW_CLUSTER_ROLE
+                sinomo_node::DAEMON_SHADOW_CLUSTER_ROLE
             ))
             .is_none(),
         "orphan shadow status should be removed"
@@ -10037,7 +10040,7 @@ fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
     let status = ClusterNodeStatusRecord {
         cluster_id: cluster_id.clone(),
         node_id: node_id.clone(),
-        process: "daemon-main".to_string(),
+        process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
         availability: ClusterNodeAvailability::Online,
         daemon_version: "0.1.0-test".to_string(),
         commit: None,
@@ -13218,7 +13221,7 @@ fn join_voter_targets_do_not_filter_offline_status_during_bootstrap() {
         ClusterNodeStatusRecord {
             cluster_id,
             node_id: voter_node,
-            process: "daemon-main".to_string(),
+            process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
             availability: ClusterNodeAvailability::Offline,
             daemon_version: "0.1.0-test".to_string(),
             commit: None,
@@ -16680,7 +16683,7 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
     let status = ClusterNodeStatusRecord {
         cluster_id: state.cluster_id.clone(),
         node_id: state.local_node_id.clone(),
-        process: "daemon-main".to_string(),
+        process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
         availability: ClusterNodeAvailability::Online,
         daemon_version: "0.1.0-test".to_string(),
         commit: None,
@@ -16761,7 +16764,7 @@ fn cluster_node_status_storage_keeps_processes_distinct_for_same_node() {
     let main_status = ClusterNodeStatusRecord {
         cluster_id: cluster_id.clone(),
         node_id: node_id.clone(),
-        process: DAEMON_MAIN_CLUSTER_ROLE.to_string(),
+        process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
         availability: ClusterNodeAvailability::Online,
         daemon_version: "0.1.0-test".to_string(),
         commit: None,
@@ -16776,7 +16779,7 @@ fn cluster_node_status_storage_keeps_processes_distinct_for_same_node() {
         observed_at: now,
     };
     let mut shadow_status = main_status.clone();
-    shadow_status.process = DAEMON_SHADOW_CLUSTER_ROLE.to_string();
+    shadow_status.process = sinomo_node::DAEMON_SHADOW_CLUSTER_ROLE.to_string();
     shadow_status.pid = Some(43);
     shadow_status.address = Some("127.0.0.1:21354".to_string());
     shadow_status.bind_address = Some("0.0.0.0:21354".to_string());
@@ -16818,12 +16821,12 @@ fn cluster_node_status_storage_keeps_processes_distinct_for_same_node() {
     assert!(
         statuses
             .iter()
-            .any(|status| status.process == DAEMON_MAIN_CLUSTER_ROLE)
+            .any(|status| status.process == sinomo_node::DAEMON_MAIN_CLUSTER_ROLE)
     );
     assert!(
         statuses
             .iter()
-            .any(|status| status.process == DAEMON_SHADOW_CLUSTER_ROLE)
+            .any(|status| status.process == sinomo_node::DAEMON_SHADOW_CLUSTER_ROLE)
     );
 }
 
@@ -17254,7 +17257,7 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
         ClusterNodeStatusRecord {
             cluster_id: cluster_id.clone(),
             node_id: node_id.clone(),
-            process: DAEMON_MAIN_CLUSTER_ROLE.to_string(),
+            process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
             availability,
             daemon_version: "0.1.0-test".to_string(),
             commit: None,
@@ -17636,7 +17639,7 @@ fn cluster_health_rows_select_member_process_status() {
     let shadow_status = ClusterNodeStatusRecord {
         cluster_id: cluster_id.clone(),
         node_id: node_id.clone(),
-        process: DAEMON_SHADOW_CLUSTER_ROLE.to_string(),
+        process: sinomo_node::DAEMON_SHADOW_CLUSTER_ROLE.to_string(),
         availability: ClusterNodeAvailability::Online,
         daemon_version: "0.1.0-test".to_string(),
         commit: None,
@@ -17670,7 +17673,8 @@ fn cluster_health_rows_select_member_process_status() {
         .find(|row| row.member.node_id == node_id)
         .expect("main member row");
     assert_eq!(
-        row.status.process, DAEMON_MAIN_CLUSTER_ROLE,
+        row.status.process,
+        sinomo_node::DAEMON_MAIN_CLUSTER_ROLE,
         "a shadow status must not occupy the main member row"
     );
     assert_eq!(
@@ -17692,7 +17696,10 @@ fn cluster_health_rows_select_member_process_status() {
         .iter()
         .find(|row| row.member.node_id == node_id)
         .expect("async main member row");
-    assert_eq!(async_row.status.process, DAEMON_MAIN_CLUSTER_ROLE);
+    assert_eq!(
+        async_row.status.process,
+        sinomo_node::DAEMON_MAIN_CLUSTER_ROLE
+    );
     assert_eq!(async_row.availability, ClusterNodeAvailability::Offline);
 }
 
@@ -18164,7 +18171,7 @@ fn node_status_quorum_publish_driver_delegates_and_cleans_rollout_sidecar() {
     let status = ClusterNodeStatusRecord {
         cluster_id,
         node_id: node_id.clone(),
-        process: "daemon-main".to_string(),
+        process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
         availability: ClusterNodeAvailability::Online,
         daemon_version: "0.1.0-test".to_string(),
         commit: None,
@@ -18243,7 +18250,7 @@ fn node_status_async_quorum_publish_driver_delegates() {
     let status = ClusterNodeStatusRecord {
         cluster_id,
         node_id: node_id.clone(),
-        process: "daemon-main".to_string(),
+        process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
         availability: ClusterNodeAvailability::Online,
         daemon_version: "0.1.0-test".to_string(),
         commit: None,
@@ -18385,7 +18392,7 @@ fn stable_status_and_network_info_sync_do_not_append_raft_log_entries() {
     let status = ClusterNodeStatusRecord {
         cluster_id: cluster_id.clone(),
         node_id: node_id.clone(),
-        process: "daemon-main".to_string(),
+        process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
         availability: ClusterNodeAvailability::Online,
         daemon_version: "0.1.0-test".to_string(),
         commit: None,
@@ -21060,7 +21067,7 @@ fn cluster_kv_metadata_reads_are_empty_without_materialized_snapshot() {
     let status = ClusterNodeStatusRecord {
         cluster_id: cluster_id.clone(),
         node_id: node_id.clone(),
-        process: "daemon-main".to_string(),
+        process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
         availability: ClusterNodeAvailability::Online,
         daemon_version: "0.1.0-test".to_string(),
         commit: None,

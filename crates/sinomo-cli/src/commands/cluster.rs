@@ -2281,7 +2281,7 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
     }
     if let Some(cluster) = peer_status.cluster.as_ref()
         && cluster.cluster_id == state.cluster_id
-        && cluster.process == "daemon-main"
+        && cluster.process == sinomo_runtime::node::DAEMON_MAIN_CLUSTER_ROLE
     {
         let observed_endpoint =
             network::daemon_lan_endpoint(&cluster.node_id, options.from.clone(), 0);

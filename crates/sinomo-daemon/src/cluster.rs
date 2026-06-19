@@ -7936,7 +7936,7 @@ mod tests {
             .expect("shadow cluster status");
 
         assert_eq!(status.cluster_id, state.cluster_id);
-        assert_eq!(status.process, crate::DAEMON_SHADOW_CLUSTER_ROLE);
+        assert_eq!(status.process, sinomo_node::DAEMON_SHADOW_CLUSTER_ROLE);
         assert_eq!(status.member_role, ClusterMemberRole::Voter);
         assert_eq!(status.member_state, ClusterMemberState::Voter);
     }
@@ -10476,7 +10476,7 @@ mod tests {
             ClusterNodeStatusRecord {
                 cluster_id,
                 node_id: voter_node,
-                process: "daemon-main".to_string(),
+                process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
                 availability: ClusterNodeAvailability::Offline,
                 daemon_version: "0.1.0-test".to_string(),
                 commit: None,
@@ -10649,7 +10649,7 @@ mod tests {
             ClusterNodeStatusRecord {
                 cluster_id: cluster_id.clone(),
                 node_id: remote_node.clone(),
-                process: "daemon-main".to_string(),
+                process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
                 availability: ClusterNodeAvailability::Online,
                 daemon_version: "0.1.0-test".to_string(),
                 commit: None,
