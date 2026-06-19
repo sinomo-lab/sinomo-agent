@@ -11,15 +11,13 @@ use crate::{
     current_shadow_daemon_options_on_runtime, daemon_cluster_options_from_status,
     daemon_cluster_process_from_paths, daemon_cluster_status, daemon_cluster_status_matches,
     daemon_connect_address, daemon_options_from_status, daemon_paths_are_shadow,
-    fetch_cluster_kv_snapshot_from_endpoint_async,
     fetch_cluster_kv_snapshot_from_endpoint_on_runtime, fetch_daemon_status_from_endpoint_async,
     fetch_daemon_status_from_endpoint_on_runtime, handle_daemon_rollout_build_request,
-    read_daemon_status, send_cluster_kv_txn_async, send_cluster_kv_txn_on_runtime,
-    send_cluster_kv_watch_events_async, send_cluster_member_publish_async,
-    send_cluster_member_publish_on_runtime, send_cluster_raft_append_async,
-    send_cluster_raft_append_on_runtime, send_cluster_raft_vote_async,
-    send_cluster_raft_vote_on_runtime, send_daemon_rpc_to_endpoint_async,
-    send_daemon_rpc_to_endpoint_on_runtime, write_daemon_status,
+    read_daemon_status, send_cluster_kv_txn_on_runtime, send_cluster_kv_watch_events_async,
+    send_cluster_member_publish_async, send_cluster_member_publish_on_runtime,
+    send_cluster_raft_append_async, send_cluster_raft_append_on_runtime,
+    send_cluster_raft_vote_async, send_cluster_raft_vote_on_runtime,
+    send_daemon_rpc_to_endpoint_async, send_daemon_rpc_to_endpoint_on_runtime, write_daemon_status,
 };
 use sinomo_core::{
     ClusterBootstrapState, ClusterEndpointRecord, ClusterMemberRecord, ClusterNodeRole,
@@ -3731,35 +3729,6 @@ impl sinomo_network::ClusterRaftVoteTransportAsyncHost for DaemonClusterControlP
                     operation: "cluster raft vote".to_string(),
                     detail: error.to_string(),
                 })
-        })
-    }
-}
-
-impl sinomo_network::ClusterKvTxnForwardAsyncHost for DaemonClusterControlPlaneTransport {
-    fn send_cluster_kv_txn_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        txn: &'a KvTxn,
-        timeout: Duration,
-    ) -> sinomo_network::ClusterMembershipRpcFuture<'a, KvTxnResponse> {
-        let runtime = self.rpc_mode.runtime().clone();
-        Box::pin(async move {
-            send_cluster_kv_txn_async(endpoint, txn, timeout, &runtime)
-                .await
-                .map_err(|error| daemon_host_network_error("cluster kv txn", error))
-        })
-    }
-
-    fn fetch_cluster_kv_snapshot_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        timeout: Duration,
-    ) -> sinomo_network::ClusterMembershipRpcFuture<'a, KvSnapshot> {
-        let runtime = self.rpc_mode.runtime().clone();
-        Box::pin(async move {
-            fetch_cluster_kv_snapshot_from_endpoint_async(endpoint, timeout, &runtime)
-                .await
-                .map_err(|error| daemon_host_network_error("cluster kv snapshot", error))
         })
     }
 }

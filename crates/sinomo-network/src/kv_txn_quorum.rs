@@ -3,7 +3,7 @@ use crate::control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlane
 use crate::control_plane_options::{ClusterKvTxnQuorumOptions, ClusterRaftLeaderElectionOptions};
 use crate::error::NetworkError;
 use crate::kv_forward::{
-    ClusterKvTxnForwardAsyncHost, ClusterKvTxnForwardOptions, ClusterKvTxnForwardResult,
+    ClusterKvTxnForwardOptions, ClusterKvTxnForwardResult,
     forward_cluster_kv_txn_to_voter_async_with_host, forward_cluster_kv_txn_to_voter_with_host,
 };
 use crate::kv_local_store::{
@@ -78,8 +78,7 @@ pub trait ClusterKvTxnQuorumHost {
 }
 
 pub trait ClusterKvTxnQuorumAsyncHost:
-    ClusterKvTxnForwardAsyncHost
-    + ClusterSignedEndpointRpcAsyncHost
+    ClusterSignedEndpointRpcAsyncHost
     + ClusterRaftQuorumAsyncHost
     + ClusterRaftVoteTransportAsyncHost
     + ClusterVoterReachabilityAsyncHost
@@ -88,8 +87,7 @@ pub trait ClusterKvTxnQuorumAsyncHost:
 }
 
 impl<T> ClusterKvTxnQuorumAsyncHost for T where
-    T: ClusterKvTxnForwardAsyncHost
-        + ClusterSignedEndpointRpcAsyncHost
+    T: ClusterSignedEndpointRpcAsyncHost
         + ClusterRaftQuorumAsyncHost
         + ClusterRaftVoteTransportAsyncHost
         + ClusterVoterReachabilityAsyncHost

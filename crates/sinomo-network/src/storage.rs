@@ -255,23 +255,6 @@ where
         locked_cluster_raft_known_leader_id(paths, state)
     }
 
-    fn send_cluster_kv_txn(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        txn: &KvTxn,
-        timeout: Duration,
-    ) -> Result<KvTxnResponse, NetworkError> {
-        self.transport.send_cluster_kv_txn(endpoint, txn, timeout)
-    }
-
-    fn fetch_cluster_kv_snapshot(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        timeout: Duration,
-    ) -> Result<KvSnapshot, NetworkError> {
-        self.transport.fetch_cluster_kv_snapshot(endpoint, timeout)
-    }
-
     fn send_object_rpc_to_node(
         &mut self,
         state: &ClusterBootstrapState,

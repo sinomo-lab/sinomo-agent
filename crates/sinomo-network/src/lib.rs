@@ -190,9 +190,8 @@ pub use keyspace::{
     cluster_invitation_state_key, cluster_member_key, cluster_network_info_key,
 };
 pub use kv_forward::{
-    ClusterKvTxnForwardAsyncHost, ClusterKvTxnForwardHost, ClusterKvTxnForwardOptions,
-    ClusterKvTxnForwardResult, forward_cluster_kv_txn_to_voter_async_with_host,
-    forward_cluster_kv_txn_to_voter_with_host,
+    ClusterKvTxnForwardHost, ClusterKvTxnForwardOptions, ClusterKvTxnForwardResult,
+    forward_cluster_kv_txn_to_voter_async_with_host, forward_cluster_kv_txn_to_voter_with_host,
 };
 pub use kv_local_store::{
     cluster_kv_key_can_defer_materialized_snapshot, commit_cluster_raft_index_with_events_async,

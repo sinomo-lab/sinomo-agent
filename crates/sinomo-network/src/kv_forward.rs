@@ -12,9 +12,8 @@ use crate::route::{
     ClusterSignedEndpointRpcAsyncHost,
 };
 use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
-use crate::rpc_future::ClusterMembershipRpcFuture;
 use sinomo_core::{ClusterBootstrapState, ClusterEndpointRecord, ClusterTransportKind};
-use sinomo_kv::{KvSnapshot, KvTxn, KvTxnResponse};
+use sinomo_kv::KvTxn;
 use sinomo_node::NodeId;
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -48,19 +47,6 @@ pub trait ClusterKvTxnForwardHost {
         state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError>;
 
-    fn send_cluster_kv_txn(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        txn: &KvTxn,
-        timeout: Duration,
-    ) -> Result<KvTxnResponse, NetworkError>;
-
-    fn fetch_cluster_kv_snapshot(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        timeout: Duration,
-    ) -> Result<KvSnapshot, NetworkError>;
-
     fn send_object_rpc_to_node(
         &mut self,
         state: &ClusterBootstrapState,
@@ -68,21 +54,6 @@ pub trait ClusterKvTxnForwardHost {
         request: &ObjectRpcRequest,
         timeout: Duration,
     ) -> Result<ObjectRpcResponse, NetworkError>;
-}
-
-pub trait ClusterKvTxnForwardAsyncHost {
-    fn send_cluster_kv_txn_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        txn: &'a KvTxn,
-        timeout: Duration,
-    ) -> ClusterMembershipRpcFuture<'a, KvTxnResponse>;
-
-    fn fetch_cluster_kv_snapshot_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        timeout: Duration,
-    ) -> ClusterMembershipRpcFuture<'a, KvSnapshot>;
 }
 
 pub fn forward_cluster_kv_txn_to_voter_with_host(
@@ -108,39 +79,6 @@ pub fn forward_cluster_kv_txn_to_voter_with_host(
 
     let mut failures = Vec::new();
     let deadline = Instant::now() + options.timeout;
-    for endpoint in &targets {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .unwrap_or_default();
-        if remaining.is_zero() {
-            failures.push(format!(
-                "forwarding did not complete before {}ms command budget",
-                options.timeout.as_millis()
-            ));
-            break;
-        }
-        match host.send_cluster_kv_txn(endpoint, txn, options.command_timeout(endpoint, remaining))
-        {
-            Ok(response) => {
-                let remaining = deadline
-                    .checked_duration_since(Instant::now())
-                    .unwrap_or_default();
-                let snapshot = host.fetch_cluster_kv_snapshot(
-                    endpoint,
-                    options.command_timeout(endpoint, remaining),
-                )?;
-                return Ok(Some(ClusterKvTxnForwardResult {
-                    snapshot,
-                    txn_response: Some(response),
-                }));
-            }
-            Err(error) => failures.push(format!(
-                "{} ({:?}) failed: {}",
-                endpoint.address, endpoint.transport, error
-            )),
-        }
-    }
-
     let mut seen_voters = BTreeSet::new();
     for voter in targets
         .iter()
@@ -160,7 +98,7 @@ pub fn forward_cluster_kv_txn_to_voter_with_host(
             state,
             &voter.node_id,
             txn,
-            remaining,
+            options.command_timeout(voter, remaining),
             host,
         ) {
             Ok(response) => return Ok(Some(response)),
@@ -226,7 +164,7 @@ pub async fn forward_cluster_kv_txn_to_voter_async_with_host<H>(
     host: &mut H,
 ) -> Result<Option<ClusterKvTxnForwardResult>, NetworkError>
 where
-    H: ClusterKvTxnForwardAsyncHost + ClusterSignedEndpointRpcAsyncHost + Send,
+    H: ClusterSignedEndpointRpcAsyncHost + Send,
 {
     let mut targets = cluster_raft_live_voter_targets_async(runtime, paths, state).await?;
     if targets.is_empty() {
@@ -245,43 +183,6 @@ where
 
     let mut failures = Vec::new();
     let deadline = Instant::now() + options.timeout;
-    for endpoint in &targets {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .unwrap_or_default();
-        if remaining.is_zero() {
-            failures.push(format!(
-                "forwarding did not complete before {}ms command budget",
-                options.timeout.as_millis()
-            ));
-            break;
-        }
-        match host
-            .send_cluster_kv_txn_async(endpoint, txn, options.command_timeout(endpoint, remaining))
-            .await
-        {
-            Ok(response) => {
-                let remaining = deadline
-                    .checked_duration_since(Instant::now())
-                    .unwrap_or_default();
-                let snapshot = host
-                    .fetch_cluster_kv_snapshot_async(
-                        endpoint,
-                        options.command_timeout(endpoint, remaining),
-                    )
-                    .await?;
-                return Ok(Some(ClusterKvTxnForwardResult {
-                    snapshot,
-                    txn_response: Some(response),
-                }));
-            }
-            Err(error) => failures.push(format!(
-                "{} ({:?}) failed: {}",
-                endpoint.address, endpoint.transport, error
-            )),
-        }
-    }
-
     let mut seen_voters = BTreeSet::new();
     for voter in targets
         .iter()
@@ -301,7 +202,7 @@ where
             state,
             &voter.node_id,
             txn,
-            remaining,
+            options.command_timeout(voter, remaining),
             runtime,
             paths,
             host,

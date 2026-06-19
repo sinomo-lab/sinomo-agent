@@ -14,9 +14,9 @@ use sinomo_runtime::dfs::{
 };
 use sinomo_runtime::kv::{
     ClusterKvRaftCommandStorage, ClusterKvRaftCommitResult, ClusterKvRaftStore,
-    ClusterKvRaftUncommittedAppend, KvCommand, KvEntry, KvError, KvEvent, KvOp, KvRevision,
-    KvSnapshot, KvTxn, KvTxnResponse, cluster_kv_raft_local_is_voter,
-    cluster_kv_raft_node_is_voter, lock_cluster_kv_raft_operation_for_paths, read_cluster_kv_entry,
+    ClusterKvRaftUncommittedAppend, KvCommand, KvEntry, KvError, KvEvent, KvOp, KvRevision, KvTxn,
+    KvTxnResponse, cluster_kv_raft_local_is_voter, cluster_kv_raft_node_is_voter,
+    lock_cluster_kv_raft_operation_for_paths, read_cluster_kv_entry,
     read_cluster_kv_prefix_entries,
 };
 use sinomo_runtime::local::SinomoDataDir;
@@ -1539,43 +1539,6 @@ impl network::ClusterKvTxnForwardHost for DfsFuseClusterKvTxnForwardHost {
         with_dfs_fuse_cluster_raft_operation(paths, "cluster raft leader lookup", || {
             dfs_fuse_cluster_raft_known_leader_id(paths, state)
         })
-    }
-
-    fn send_cluster_kv_txn(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        txn: &KvTxn,
-        timeout: Duration,
-    ) -> std::result::Result<KvTxnResponse, NetworkError> {
-        let rpc_request = object_rpc_request_from_kv_payload(
-            sinomo_runtime::kv::cluster_kv_txn_rpc_payload(txn)?,
-        );
-        let response = dfs_fuse_send_daemon_rpc_to_endpoint(
-            endpoint,
-            &rpc_request,
-            timeout,
-            "cluster kv txn",
-        )?;
-        response.error_detail()?;
-        sinomo_runtime::kv::decode_cluster_kv_txn_rpc_body(&response.body).map_err(Into::into)
-    }
-
-    fn fetch_cluster_kv_snapshot(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        timeout: Duration,
-    ) -> std::result::Result<KvSnapshot, NetworkError> {
-        let rpc_request = object_rpc_request_from_kv_payload(
-            sinomo_runtime::kv::cluster_kv_snapshot_rpc_payload()?,
-        );
-        let response = dfs_fuse_send_daemon_rpc_to_endpoint(
-            endpoint,
-            &rpc_request,
-            timeout,
-            "cluster kv snapshot",
-        )?;
-        response.error_detail()?;
-        sinomo_runtime::kv::decode_cluster_kv_snapshot_rpc_body(&response.body).map_err(Into::into)
     }
 
     fn send_object_rpc_to_node(

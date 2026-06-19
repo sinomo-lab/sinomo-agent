@@ -1203,23 +1203,6 @@ pub(crate) fn fetch_cluster_kv_snapshot_from_endpoint(
     )
 }
 
-pub(crate) async fn fetch_cluster_kv_snapshot_from_endpoint_async(
-    endpoint: &ClusterEndpointRecord,
-    timeout: Duration,
-    runtime: &tokio::runtime::Handle,
-) -> Result<KvSnapshot, DaemonError> {
-    let rpc_request =
-        object_rpc_request_from_kv_payload(sinomo_kv::cluster_kv_snapshot_rpc_payload()?);
-    send_daemon_rpc_request_to_endpoint_with_decoder_async(
-        endpoint,
-        &rpc_request,
-        sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
-        runtime,
-        decode_cluster_kv_snapshot_rpc_response,
-    )
-    .await
-}
-
 pub(crate) fn send_cluster_kv_txn_on_runtime(
     endpoint: &ClusterEndpointRecord,
     txn: &KvTxn,
@@ -1235,24 +1218,6 @@ pub(crate) fn send_cluster_kv_txn_on_runtime(
         runtime,
         decode_cluster_kv_txn_rpc_response,
     )
-}
-
-pub(crate) async fn send_cluster_kv_txn_async(
-    endpoint: &ClusterEndpointRecord,
-    txn: &KvTxn,
-    timeout: Duration,
-    runtime: &tokio::runtime::Handle,
-) -> Result<KvTxnResponse, DaemonError> {
-    let rpc_request =
-        object_rpc_request_from_kv_payload(sinomo_kv::cluster_kv_txn_rpc_payload(txn)?);
-    send_daemon_rpc_request_to_endpoint_with_decoder_async(
-        endpoint,
-        &rpc_request,
-        sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
-        runtime,
-        decode_cluster_kv_txn_rpc_response,
-    )
-    .await
 }
 
 pub(crate) fn send_cluster_raft_append_on_runtime(

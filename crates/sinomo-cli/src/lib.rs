@@ -3144,25 +3144,9 @@ fn cluster_kv_snapshot_rpc_request() -> Result<network::ObjectRpcRequest, KvErro
     ))
 }
 
-fn cluster_kv_txn_rpc_request(txn: &KvTxn) -> Result<network::ObjectRpcRequest, KvError> {
-    let payload = sinomo_runtime::kv::cluster_kv_txn_rpc_payload(txn)?;
-    Ok(network::ObjectRpcRequest::from_encoded_body(
-        payload.route,
-        payload.category,
-        payload.body,
-    ))
-}
-
 fn decode_cluster_kv_snapshot_rpc_response(
     response: &network::ObjectRpcResponse,
 ) -> Result<KvSnapshot, network::NetworkError> {
     response.error_detail()?;
     sinomo_runtime::kv::decode_cluster_kv_snapshot_rpc_body(&response.body).map_err(Into::into)
-}
-
-fn decode_cluster_kv_txn_rpc_response(
-    response: &network::ObjectRpcResponse,
-) -> Result<KvTxnResponse, network::NetworkError> {
-    response.error_detail()?;
-    sinomo_runtime::kv::decode_cluster_kv_txn_rpc_body(&response.body).map_err(Into::into)
 }

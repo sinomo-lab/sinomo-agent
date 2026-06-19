@@ -925,26 +925,6 @@ impl network::ClusterKvTxnForwardHost for CliClusterKvTxnForwardHost {
         locked_cluster_raft_known_leader_id(paths, state)
     }
 
-    fn send_cluster_kv_txn(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        txn: &KvTxn,
-        timeout: Duration,
-    ) -> Result<KvTxnResponse, network::NetworkError> {
-        cli_send_cluster_kv_txn(endpoint, txn, timeout)
-    }
-
-    fn fetch_cluster_kv_snapshot(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        timeout: Duration,
-    ) -> Result<KvSnapshot, network::NetworkError> {
-        let request = cluster_kv_snapshot_rpc_request()?;
-        let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
-            .map_err(|error| cli_daemon_rpc_network_error("cluster kv snapshot", error))?;
-        decode_cluster_kv_snapshot_rpc_response(&response)
-    }
-
     fn send_object_rpc_to_node(
         &mut self,
         state: &ClusterBootstrapState,
@@ -1034,17 +1014,6 @@ fn cli_cluster_raft_append_replication_options(
         public_foreground_attempt_timeout: Duration::from_secs(5).min(timeout),
         iroh_foreground_attempt_timeout: Duration::from_secs(3).min(timeout),
     }
-}
-
-fn cli_send_cluster_kv_txn(
-    endpoint: &ClusterEndpointRecord,
-    txn: &KvTxn,
-    timeout: Duration,
-) -> Result<KvTxnResponse, network::NetworkError> {
-    let request = cluster_kv_txn_rpc_request(txn)?;
-    let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
-        .map_err(|error| cli_daemon_rpc_network_error("cluster kv txn", error))?;
-    decode_cluster_kv_txn_rpc_response(&response)
 }
 
 fn cli_send_cluster_raft_append(
