@@ -1596,9 +1596,10 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
     let message_request = dfs_message_rpc_request(&message_command).expect("message request");
     assert_eq!(message_request.route, DFS_DATA_READ_ROUTE);
     assert_eq!(message_request.category, DFS_RPC_CATEGORY);
-    assert!(sinomo_network::object_rpc_request_reuses_daemon_stream(
-        &message_request
-    ));
+    assert_eq!(
+        sinomo_network::object_rpc_request_stream_mode(&message_request),
+        sinomo_network::ObjectRpcRequestStreamMode::ReuseDaemonStream
+    );
     assert_eq!(
         message_request
             .decode_body::<DfsMessageCommand>()
@@ -1696,8 +1697,10 @@ fn direct_read_rpc_uses_raw_body_and_reconstructs_message_response() {
         .expect("direct read request")
         .expect("direct read eligible");
     assert_eq!(direct_request.route, DFS_DIRECT_READ_ROUTE);
-    assert!(sinomo_network::object_rpc_request_expects_raw_daemon_response(&direct_request));
-    assert!(sinomo_network::object_rpc_request_accepts_streamed_daemon_response(&direct_request));
+    assert_eq!(
+        sinomo_network::object_rpc_request_stream_mode(&direct_request),
+        sinomo_network::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse
+    );
     let decoded_direct_request = direct_request
         .decode_body::<DfsDirectReadRequest>()
         .expect("decode direct request");
@@ -1778,8 +1781,9 @@ fn direct_read_stream_rpc_keeps_blob_out_of_initial_response() {
             .map(String::as_str),
         Some(DFS_DIRECT_READ_STATUS_FOUND)
     );
-    assert!(
-        sinomo_network::object_rpc_response_has_streamed_daemon_body(&stream_response.response)
+    assert_eq!(
+        sinomo_network::object_rpc_response_stream_mode(&stream_response.response),
+        sinomo_network::ObjectRpcResponseStreamMode::RawStreamedDaemonBody
     );
     assert!(stream_response.response.body.is_empty());
     let mut streamed = Vec::new();

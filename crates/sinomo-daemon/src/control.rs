@@ -929,8 +929,7 @@ async fn try_handle_streamed_cluster_relay_request_async(
 fn relay_envelope_inner_expects_streamed_response(
     envelope: &sinomo_network::RelayEnvelope,
 ) -> bool {
-    sinomo_network::object_rpc_request_expects_raw_daemon_response(&envelope.inner)
-        && sinomo_network::object_rpc_request_accepts_streamed_daemon_response(&envelope.inner)
+    sinomo_network::object_rpc_request_stream_mode(&envelope.inner).expects_raw_streamed_response()
 }
 
 async fn dispatch_streamed_cluster_relay_local_request_async(
@@ -1013,7 +1012,7 @@ async fn dispatch_streamed_cluster_relay_local_request_async(
 }
 
 fn daemon_rpc_request_allows_reusable_stream(request: &sinomo_network::ObjectRpcRequest) -> bool {
-    sinomo_network::object_rpc_request_reuses_daemon_stream(request)
+    sinomo_network::object_rpc_request_stream_mode(request).reuses_daemon_stream()
 }
 
 pub(crate) fn daemon_dfs_message_replay_key(

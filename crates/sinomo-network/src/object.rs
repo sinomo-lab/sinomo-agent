@@ -621,7 +621,100 @@ async fn send_daemon_control_rpc_request_raw_response_on_stream_async(
     Ok(response)
 }
 
-pub fn object_rpc_request_expects_raw_daemon_response(request: &crate::ObjectRpcRequest) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectRpcRequestStreamMode {
+    Buffered,
+    ReuseDaemonStream,
+    RawStreamedDaemonResponse,
+}
+
+impl ObjectRpcRequestStreamMode {
+    pub const fn reuses_daemon_stream(self) -> bool {
+        matches!(
+            self,
+            Self::ReuseDaemonStream | Self::RawStreamedDaemonResponse
+        )
+    }
+
+    pub const fn expects_raw_streamed_response(self) -> bool {
+        matches!(self, Self::RawStreamedDaemonResponse)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectRpcResponseStreamMode {
+    Buffered,
+    RawStreamedDaemonBody,
+}
+
+pub fn set_object_rpc_request_stream_mode(
+    request: &mut crate::ObjectRpcRequest,
+    mode: ObjectRpcRequestStreamMode,
+) {
+    request
+        .metadata
+        .remove(DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY);
+    request
+        .metadata
+        .remove(DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY);
+    request
+        .metadata
+        .remove(DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY);
+
+    match mode {
+        ObjectRpcRequestStreamMode::Buffered => {}
+        ObjectRpcRequestStreamMode::ReuseDaemonStream => {
+            mark_object_rpc_request_reuses_daemon_stream(request);
+        }
+        ObjectRpcRequestStreamMode::RawStreamedDaemonResponse => {
+            mark_object_rpc_request_reuses_daemon_stream(request);
+            mark_object_rpc_request_accepts_raw_streamed_daemon_response(request);
+        }
+    }
+}
+
+pub fn object_rpc_request_stream_mode(
+    request: &crate::ObjectRpcRequest,
+) -> ObjectRpcRequestStreamMode {
+    if object_rpc_request_expects_raw_daemon_response(request)
+        && object_rpc_request_accepts_streamed_daemon_response(request)
+    {
+        return ObjectRpcRequestStreamMode::RawStreamedDaemonResponse;
+    }
+    if object_rpc_request_reuses_daemon_stream(request) {
+        return ObjectRpcRequestStreamMode::ReuseDaemonStream;
+    }
+    ObjectRpcRequestStreamMode::Buffered
+}
+
+pub fn set_object_rpc_response_stream_mode(
+    response: &mut crate::ObjectRpcResponse,
+    mode: ObjectRpcResponseStreamMode,
+) {
+    response
+        .metadata
+        .remove(DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY);
+    match mode {
+        ObjectRpcResponseStreamMode::Buffered => {}
+        ObjectRpcResponseStreamMode::RawStreamedDaemonBody => {
+            mark_object_rpc_response_has_streamed_daemon_body(response);
+        }
+    }
+}
+
+pub fn object_rpc_response_stream_mode(
+    response: &crate::ObjectRpcResponse,
+) -> ObjectRpcResponseStreamMode {
+    if object_rpc_response_has_streamed_daemon_body(response) {
+        ObjectRpcResponseStreamMode::RawStreamedDaemonBody
+    } else {
+        ObjectRpcResponseStreamMode::Buffered
+    }
+}
+
+pub(crate) fn object_rpc_request_expects_raw_daemon_response(
+    request: &crate::ObjectRpcRequest,
+) -> bool {
     request
         .metadata
         .get(DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY)
@@ -631,7 +724,7 @@ pub fn object_rpc_request_expects_raw_daemon_response(request: &crate::ObjectRpc
         })
 }
 
-pub fn object_rpc_request_accepts_streamed_daemon_response(
+pub(crate) fn object_rpc_request_accepts_streamed_daemon_response(
     request: &crate::ObjectRpcRequest,
 ) -> bool {
     request
@@ -643,14 +736,14 @@ pub fn object_rpc_request_accepts_streamed_daemon_response(
         })
 }
 
-pub fn mark_object_rpc_request_reuses_daemon_stream(request: &mut crate::ObjectRpcRequest) {
+pub(crate) fn mark_object_rpc_request_reuses_daemon_stream(request: &mut crate::ObjectRpcRequest) {
     request.metadata.insert(
         DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY.to_string(),
         DAEMON_CONTROL_REUSE_STREAM_METADATA_VALUE.to_string(),
     );
 }
 
-pub fn object_rpc_request_reuses_daemon_stream(request: &crate::ObjectRpcRequest) -> bool {
+pub(crate) fn object_rpc_request_reuses_daemon_stream(request: &crate::ObjectRpcRequest) -> bool {
     request
         .metadata
         .get(DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY)
@@ -660,7 +753,7 @@ pub fn object_rpc_request_reuses_daemon_stream(request: &crate::ObjectRpcRequest
         })
 }
 
-pub fn mark_object_rpc_request_accepts_raw_streamed_daemon_response(
+pub(crate) fn mark_object_rpc_request_accepts_raw_streamed_daemon_response(
     request: &mut crate::ObjectRpcRequest,
 ) {
     request.metadata.insert(
@@ -673,14 +766,18 @@ pub fn mark_object_rpc_request_accepts_raw_streamed_daemon_response(
     );
 }
 
-pub fn mark_object_rpc_response_has_streamed_daemon_body(response: &mut crate::ObjectRpcResponse) {
+pub(crate) fn mark_object_rpc_response_has_streamed_daemon_body(
+    response: &mut crate::ObjectRpcResponse,
+) {
     response.metadata.insert(
         DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY.to_string(),
         DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE.to_string(),
     );
 }
 
-pub fn object_rpc_response_has_streamed_daemon_body(response: &crate::ObjectRpcResponse) -> bool {
+pub(crate) fn object_rpc_response_has_streamed_daemon_body(
+    response: &crate::ObjectRpcResponse,
+) -> bool {
     response
         .metadata
         .get(DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY)
@@ -1512,10 +1609,14 @@ fn object_frame_eof_detail(part: &str, read: usize, expected: usize) -> String {
 mod serde_bytes_tests {
     use super::{
         AsyncDaemonControlListener, DaemonRpcTimeouts, ObjectFrameIoOptions,
-        RawByteStreamChunkOptions, SinomoObjectCodec, decode_single_object_frame_from_slice,
-        encode_object_frame_to_vec, forward_raw_byte_stream_chunks_async, read_object_frame_async,
+        ObjectRpcRequestStreamMode, ObjectRpcResponseStreamMode, RawByteStreamChunkOptions,
+        SinomoObjectCodec, decode_single_object_frame_from_slice, encode_object_frame_to_vec,
+        forward_raw_byte_stream_chunks_async, object_rpc_request_accepts_streamed_daemon_response,
+        object_rpc_request_expects_raw_daemon_response, object_rpc_request_reuses_daemon_stream,
+        object_rpc_request_stream_mode, object_rpc_response_stream_mode, read_object_frame_async,
         read_object_frame_blocking, read_raw_byte_stream_chunks_to_vec_async,
-        send_daemon_control_request_async, write_all_async_frame, write_object_frame_blocking,
+        send_daemon_control_request_async, set_object_rpc_request_stream_mode,
+        set_object_rpc_response_stream_mode, write_all_async_frame, write_object_frame_blocking,
         write_raw_byte_stream_chunk_async,
     };
     use crate::error::NetworkError;
@@ -2311,5 +2412,68 @@ mod serde_bytes_tests {
         assert_eq!(forwarded_total, 8);
         assert_eq!(read, 8);
         assert_eq!(forwarded, b"abcdefgh");
+    }
+
+    #[test]
+    fn object_rpc_stream_modes_round_trip_metadata() {
+        let mut request =
+            crate::ObjectRpcRequest::from_encoded_body("/test/stream-mode", "test", Vec::new());
+        assert_eq!(
+            object_rpc_request_stream_mode(&request),
+            ObjectRpcRequestStreamMode::Buffered
+        );
+
+        set_object_rpc_request_stream_mode(
+            &mut request,
+            ObjectRpcRequestStreamMode::ReuseDaemonStream,
+        );
+        assert_eq!(
+            object_rpc_request_stream_mode(&request),
+            ObjectRpcRequestStreamMode::ReuseDaemonStream
+        );
+        assert!(object_rpc_request_reuses_daemon_stream(&request));
+        assert!(!object_rpc_request_expects_raw_daemon_response(&request));
+
+        set_object_rpc_request_stream_mode(
+            &mut request,
+            ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
+        );
+        assert_eq!(
+            object_rpc_request_stream_mode(&request),
+            ObjectRpcRequestStreamMode::RawStreamedDaemonResponse
+        );
+        assert!(object_rpc_request_reuses_daemon_stream(&request));
+        assert!(object_rpc_request_expects_raw_daemon_response(&request));
+        assert!(object_rpc_request_accepts_streamed_daemon_response(
+            &request
+        ));
+
+        set_object_rpc_request_stream_mode(&mut request, ObjectRpcRequestStreamMode::Buffered);
+        assert_eq!(
+            object_rpc_request_stream_mode(&request),
+            ObjectRpcRequestStreamMode::Buffered
+        );
+        assert!(request.metadata.is_empty());
+
+        let mut response =
+            crate::ObjectRpcResponse::from_encoded_body("/test/stream-mode", Vec::new());
+        assert_eq!(
+            object_rpc_response_stream_mode(&response),
+            ObjectRpcResponseStreamMode::Buffered
+        );
+        set_object_rpc_response_stream_mode(
+            &mut response,
+            ObjectRpcResponseStreamMode::RawStreamedDaemonBody,
+        );
+        assert_eq!(
+            object_rpc_response_stream_mode(&response),
+            ObjectRpcResponseStreamMode::RawStreamedDaemonBody
+        );
+        set_object_rpc_response_stream_mode(&mut response, ObjectRpcResponseStreamMode::Buffered);
+        assert_eq!(
+            object_rpc_response_stream_mode(&response),
+            ObjectRpcResponseStreamMode::Buffered
+        );
+        assert!(response.metadata.is_empty());
     }
 }

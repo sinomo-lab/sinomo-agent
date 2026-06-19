@@ -5004,8 +5004,7 @@ async fn send_cluster_relay_request_to_next_hop_async(
 fn relay_envelope_inner_expects_streamed_response(
     envelope: &sinomo_network::RelayEnvelope,
 ) -> bool {
-    sinomo_network::object_rpc_request_expects_raw_daemon_response(&envelope.inner)
-        && sinomo_network::object_rpc_request_accepts_streamed_daemon_response(&envelope.inner)
+    sinomo_network::object_rpc_request_stream_mode(&envelope.inner).expects_raw_streamed_response()
 }
 
 enum ClusterRelayStreamForwardResult {
@@ -5071,7 +5070,9 @@ async fn send_cluster_relay_request_to_next_hop_streaming_async(
         .write_rpc_response(stream_address, &response, frame_options)
         .await
         .map_err(DaemonError::from)?;
-    if sinomo_network::object_rpc_response_has_streamed_daemon_body(&response) {
+    if sinomo_network::object_rpc_response_stream_mode(&response)
+        == sinomo_network::ObjectRpcResponseStreamMode::RawStreamedDaemonBody
+    {
         if let Err(error) = downstream
             .forward_raw_byte_stream_chunks_to(
                 &endpoint.address,

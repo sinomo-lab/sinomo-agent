@@ -694,7 +694,10 @@ pub fn dfs_message_rpc_request(
 ) -> Result<ObjectRpcRequest, NetworkError> {
     let mut request =
         ObjectRpcRequest::encode_body(dfs_message_route(command), DFS_RPC_CATEGORY, command)?;
-    sinomo_network::mark_object_rpc_request_reuses_daemon_stream(&mut request);
+    sinomo_network::set_object_rpc_request_stream_mode(
+        &mut request,
+        sinomo_network::ObjectRpcRequestStreamMode::ReuseDaemonStream,
+    );
     Ok(request)
 }
 
@@ -727,14 +730,16 @@ pub fn dfs_direct_read_rpc_request(
 ) -> Result<ObjectRpcRequest, NetworkError> {
     let mut rpc_request =
         ObjectRpcRequest::encode_body(DFS_DIRECT_READ_ROUTE, DFS_RPC_CATEGORY, request)?;
-    sinomo_network::mark_object_rpc_request_reuses_daemon_stream(&mut rpc_request);
-    sinomo_network::mark_object_rpc_request_accepts_raw_streamed_daemon_response(&mut rpc_request);
+    sinomo_network::set_object_rpc_request_stream_mode(
+        &mut rpc_request,
+        sinomo_network::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
+    );
     Ok(rpc_request)
 }
 
 pub fn dfs_direct_read_rpc_request_accepts_streamed_response(request: &ObjectRpcRequest) -> bool {
     request.route == DFS_DIRECT_READ_ROUTE
-        && sinomo_network::object_rpc_request_accepts_streamed_daemon_response(request)
+        && sinomo_network::object_rpc_request_stream_mode(request).expects_raw_streamed_response()
 }
 
 #[cfg(test)]
@@ -909,7 +914,10 @@ fn serve_dfs_direct_read_stream_request(
         DFS_DIRECT_READ_CONTENT_SIZE_METADATA_KEY.to_string(),
         request.content_size_bytes.to_string(),
     );
-    sinomo_network::mark_object_rpc_response_has_streamed_daemon_body(&mut response);
+    sinomo_network::set_object_rpc_response_stream_mode(
+        &mut response,
+        sinomo_network::ObjectRpcResponseStreamMode::RawStreamedDaemonBody,
+    );
     Ok(DfsDirectReadStreamResponse {
         response,
         reader: Some(reader),
