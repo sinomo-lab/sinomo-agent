@@ -1924,7 +1924,7 @@ async fn send_join_endpoint_rpc_async(
     timeouts: network::DaemonRpcTimeouts,
 ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
     let mut host = CliSignedEndpointRpcHost::new(None, "cluster join endpoint rpc signing");
-    let mut client = network::ClusterObjectRpcClient::new(&mut host);
+    let mut client = network::ClusterObjectRpcClient::endpoint_only(&mut host);
     client
         .call_endpoint(
             endpoint,

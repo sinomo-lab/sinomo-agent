@@ -744,13 +744,19 @@ pub struct ClusterObjectRpcClient<'a, H> {
 }
 
 impl<'a, H: ClusterSignedEndpointRpcAsyncHost> ClusterObjectRpcClient<'a, H> {
-    pub fn new(host: &'a mut H) -> Self {
+    /// Build a client for a caller that intentionally has only a concrete endpoint.
+    ///
+    /// Prefer `routed` when cluster route state is available. Endpoint-only
+    /// clients cannot resolve node targets and cannot consult relay policy
+    /// before the endpoint RPC attempt.
+    pub fn endpoint_only(host: &'a mut H) -> Self {
         Self {
             host,
             route_context: None,
         }
     }
 
+    /// Build the canonical route-aware cluster object-RPC client.
     pub fn routed(host: &'a mut H, route_context: ClusterObjectRpcRouteContext<'a>) -> Self {
         Self {
             host,
@@ -838,7 +844,7 @@ where
             paths: paths.clone(),
             inner: self.host,
         };
-        ClusterObjectRpcClient::new(&mut relay_host)
+        ClusterObjectRpcClient::endpoint_only(&mut relay_host)
             .call_endpoint_with_relay_preference(endpoint, request, options, prefer_relay)
             .await
     }
@@ -4768,7 +4774,7 @@ mod tests {
             endpoint_rpc_response("/test/object-rpc-endpoint-client-ok", "direct");
         let mut host = RecordingSignedEndpointRpcHost::new(Ok(direct_response), Ok(None));
 
-        let mut client = ClusterObjectRpcClient::new(&mut host);
+        let mut client = ClusterObjectRpcClient::endpoint_only(&mut host);
         let response = client
             .call_endpoint(
                 &endpoint,

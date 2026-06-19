@@ -2560,7 +2560,7 @@ async fn fetch_daemon_status_from_endpoint_direct_async(
     let timeouts = sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout);
     let runtime = tokio::runtime::Handle::current();
     let mut host = DaemonSignedEndpointRpcAsyncHost::direct_only(&runtime);
-    let mut client = sinomo_network::ClusterObjectRpcClient::new(&mut host);
+    let mut client = sinomo_network::ClusterObjectRpcClient::endpoint_only(&mut host);
     let response = client
         .call_endpoint(
             endpoint,
@@ -4990,7 +4990,7 @@ async fn send_cluster_relay_request_to_next_hop_async(
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     let runtime = tokio::runtime::Handle::current();
     let mut host = DaemonSignedEndpointRpcAsyncHost::direct_only(&runtime);
-    let mut client = sinomo_network::ClusterObjectRpcClient::new(&mut host);
+    let mut client = sinomo_network::ClusterObjectRpcClient::endpoint_only(&mut host);
     client
         .call_endpoint(
             endpoint,
