@@ -210,6 +210,58 @@ impl ClusterKvPaths {
         }
     }
 
+    pub fn apply_raft_append_with_response_and_publish_report<F>(
+        &self,
+        node_id: &NodeId,
+        snapshot: Option<RaftSnapshot>,
+        append: RaftAppendEntriesRequest,
+        key_can_defer_materialized_snapshot: F,
+    ) -> Result<(RaftAppendEntriesResponse, bool), KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.raft_store()
+            .apply_append_entries_with_optional_snapshot_and_publish(
+                node_id,
+                snapshot,
+                append,
+                key_can_defer_materialized_snapshot,
+            )
+            .map(|(outcome, wrote)| (outcome.response, wrote))
+    }
+
+    pub fn apply_raft_vote_response(
+        &self,
+        state: &ClusterBootstrapState,
+        vote: RaftRequestVoteRequest,
+    ) -> Result<ClusterRaftVoteResponse, KvError> {
+        self.raft_store().apply_vote_response(state, vote)
+    }
+
+    pub fn locked_apply_raft_vote(
+        &self,
+        node_id: &NodeId,
+        vote: RaftRequestVoteRequest,
+    ) -> Result<RaftRequestVoteResponse, KvError> {
+        self.raft_store().locked_apply_vote(node_id, vote)
+    }
+
+    pub fn raft_append_rejection_response(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<RaftAppendEntriesResponse, KvError> {
+        self.raft_store().append_entries_rejection_response(node_id)
+    }
+
+    pub fn raft_vote_rejection_response(
+        &self,
+        state: &ClusterBootstrapState,
+        detail: String,
+    ) -> Result<ClusterRaftVoteResponse, KvError> {
+        self.raft_store()
+            .cluster_raft_vote_rejection_response(state, detail)
+    }
+
     pub fn append_kv_ops_in_batches_and_publish<F>(
         &self,
         node_id: &NodeId,

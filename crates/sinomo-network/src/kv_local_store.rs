@@ -620,15 +620,16 @@ pub(crate) fn apply_cluster_raft_append(
     snapshot: Option<RaftSnapshot>,
     append: RaftAppendEntriesRequest,
 ) -> Result<RaftAppendEntriesResponse, NetworkError> {
-    let (outcome, wrote) = cluster_kv_raft_store(paths)
-        .apply_append_entries_with_optional_snapshot_and_publish(
+    let (response, wrote) = paths
+        .kv_paths()
+        .apply_raft_append_with_response_and_publish_report(
             node_id,
             snapshot,
             append,
             sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
         )?;
     observe_cluster_kv_snapshot_write(paths, wrote);
-    Ok(outcome.response)
+    Ok(response)
 }
 
 pub(crate) fn locked_apply_cluster_raft_vote(
@@ -636,8 +637,9 @@ pub(crate) fn locked_apply_cluster_raft_vote(
     node_id: &NodeId,
     vote: RaftRequestVoteRequest,
 ) -> Result<RaftRequestVoteResponse, NetworkError> {
-    cluster_kv_raft_store(paths)
-        .locked_apply_vote(node_id, vote)
+    paths
+        .kv_paths()
+        .locked_apply_raft_vote(node_id, vote)
         .map_err(Into::into)
 }
 

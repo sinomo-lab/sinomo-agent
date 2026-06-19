@@ -1,6 +1,6 @@
 use crate::ClusterPaths;
 use crate::error::NetworkError;
-use crate::kv_local_store::{apply_cluster_raft_append, cluster_kv_raft_store};
+use crate::kv_local_store::apply_cluster_raft_append;
 use crate::local_membership::cluster_state_needs_join_registration;
 use crate::local_state_store::{read_cluster_state, write_cluster_state};
 use crate::member_store::merge_cluster_state_from_peer;
@@ -131,8 +131,9 @@ fn cluster_raft_append_rejection(
         accepted: false,
         detail,
         state: state.clone(),
-        append: cluster_kv_raft_store(paths)
-            .append_entries_rejection_response(&state.local_node_id)?,
+        append: paths
+            .kv_paths()
+            .raft_append_rejection_response(&state.local_node_id)?,
     })
 }
 
@@ -143,8 +144,9 @@ pub(crate) fn handle_cluster_raft_vote_request(
 ) -> Result<ClusterRaftVoteResponse, NetworkError> {
     let mut state = read_cluster_state(paths)?;
     if request.state.cluster_id != state.cluster_id {
-        return cluster_kv_raft_store(paths)
-            .cluster_raft_vote_rejection_response(
+        return paths
+            .kv_paths()
+            .raft_vote_rejection_response(
                 &state,
                 format!(
                     "peer cluster `{}` does not match local cluster `{}`",
@@ -164,8 +166,9 @@ pub(crate) fn handle_cluster_raft_vote_request(
             &request.vote.candidate_id,
         )
     {
-        return cluster_kv_raft_store(paths)
-            .cluster_raft_vote_rejection_response(
+        return paths
+            .kv_paths()
+            .raft_vote_rejection_response(
                 &state,
                 format!(
                     "raft vote rejected for unauthorized or mismatched candidate {}",
@@ -176,8 +179,9 @@ pub(crate) fn handle_cluster_raft_vote_request(
     }
     merge_cluster_state_from_peer(&mut state, request.state);
     write_cluster_state(paths, &state)?;
-    cluster_kv_raft_store(paths)
-        .apply_vote_response(&state, request.vote)
+    paths
+        .kv_paths()
+        .apply_raft_vote_response(&state, request.vote)
         .map_err(Into::into)
 }
 
