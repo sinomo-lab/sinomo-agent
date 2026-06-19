@@ -1638,9 +1638,11 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
             }),
         }],
     };
-    let message_rpc_response =
-        sinomo_network::ObjectRpcResponse::encode_body(DFS_MESSAGE_ROUTE, &message_response)
-            .expect("message response");
+    let message_rpc_response = sinomo_network::ObjectRpcResponse::encode_body(
+        DFS_DATA_READ_RESPONSE_ROUTE,
+        &message_response,
+    )
+    .expect("message response");
     assert_eq!(
         decode_dfs_message_rpc_response(&message_rpc_response).expect("message response body"),
         message_response
@@ -12100,7 +12102,7 @@ fn malformed_dfs_object_rpc_message_does_not_block_following_valid_message() {
         .send_object_rpc_request(
             &server,
             ObjectRpcRequest::from_encoded_body(
-                DFS_MESSAGE_ROUTE,
+                DFS_DATA_READ_ROUTE,
                 DFS_RPC_CATEGORY,
                 b"not a sinomo object payload".to_vec(),
             ),

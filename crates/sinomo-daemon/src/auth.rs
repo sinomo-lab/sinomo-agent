@@ -1411,7 +1411,6 @@ mod tests {
     #[test]
     fn dfs_object_transfer_routes_authorize_cluster_members() {
         for route in std::iter::once(sinomo_dfs::DFS_DIRECT_READ_ROUTE)
-            .chain(std::iter::once(sinomo_dfs::DFS_MESSAGE_ROUTE))
             .chain(sinomo_dfs::DFS_MESSAGE_DATA_PLANE_ROUTES.iter().copied())
         {
             for signer in [

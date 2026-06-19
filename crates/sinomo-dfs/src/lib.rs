@@ -339,7 +339,6 @@ pub const DFS_SMOKE_ROUTE: &str = "/dfs/smoke";
 pub const DFS_EXPOSE_CONFIG_ROUTE: &str = "/dfs/expose/config";
 pub const DFS_METADATA_JOURNAL_BATCH_ROUTE: &str = "/dfs/metadata/journal-batch";
 pub const DFS_METADATA_SNAPSHOT_INSTALL_ROUTE: &str = "/dfs/metadata/snapshot-install";
-pub const DFS_MESSAGE_ROUTE: &str = "/dfs/message";
 pub const DFS_DIRECT_READ_ROUTE: &str = "/dfs/object/read";
 pub const DFS_DATA_READ_ROUTE: &str = "/dfs/data/read";
 pub const DFS_DATA_READ_RESPONSE_ROUTE: &str = "/dfs/data/read/response";
@@ -412,7 +411,6 @@ pub const DFS_CONTROL_PLANE_ROUTES: &[&str] = &[
 /// Canonical DFS data-plane object-RPC routes.
 pub const DFS_DATA_PLANE_ROUTES: &[&str] = &[
     DFS_SMOKE_ROUTE,
-    DFS_MESSAGE_ROUTE,
     DFS_DIRECT_READ_ROUTE,
     DFS_DATA_READ_ROUTE,
     DFS_DATA_READ_RESPONSE_ROUTE,
@@ -452,7 +450,6 @@ pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
     DFS_METADATA_JOURNAL_BATCH_ROUTE,
     DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
     DFS_SMOKE_ROUTE,
-    DFS_MESSAGE_ROUTE,
     DFS_DIRECT_READ_ROUTE,
     DFS_DATA_READ_ROUTE,
     DFS_DATA_READ_RESPONSE_ROUTE,
@@ -521,14 +518,14 @@ pub fn decode_dfs_message_rpc_request(
     if !dfs_route_is_message_data_plane(&request.route) {
         return Err(NetworkError::Serialization {
             detail: format!(
-                "DFS message RPC requires a DFS data-plane route, got {} (legacy route is {})",
-                request.route, DFS_MESSAGE_ROUTE
+                "DFS message RPC requires a typed DFS data-plane route, got {}",
+                request.route
             ),
         });
     }
     let command: DfsMessageCommand = request.decode_body()?;
     let expected_route = dfs_message_route_for_network_message(&command.routed_message.message);
-    if request.route != DFS_MESSAGE_ROUTE && request.route != expected_route {
+    if request.route != expected_route {
         return Err(NetworkError::Serialization {
             detail: format!(
                 "DFS data-plane route {} does not match message route {}",
@@ -540,7 +537,7 @@ pub fn decode_dfs_message_rpc_request(
 }
 
 pub fn dfs_route_is_message_data_plane(route: &str) -> bool {
-    route == DFS_MESSAGE_ROUTE || DFS_MESSAGE_DATA_PLANE_ROUTES.contains(&route)
+    DFS_MESSAGE_DATA_PLANE_ROUTES.contains(&route)
 }
 
 pub fn dfs_message_route(command: &DfsMessageCommand) -> &'static str {
@@ -1287,9 +1284,7 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
         ))
         .with_event_kind_name(DFS_POLICY_VIOLATION_EVENT_KIND)
         .with_storage_owner(SINOMO_DFS_MODULE_OWNER);
-    for route in
-        std::iter::once(DFS_MESSAGE_ROUTE).chain(DFS_MESSAGE_DATA_PLANE_ROUTES.iter().copied())
-    {
+    for route in DFS_MESSAGE_DATA_PLANE_ROUTES.iter().copied() {
         surfaces = surfaces.with_object_rpc_route(ModuleObjectRpcRoute::new(
             route,
             DFS_RPC_CATEGORY,
@@ -1409,8 +1404,7 @@ mod module_registration_tests {
                 .surfaces
                 .object_rpc_routes
                 .iter()
-                .any(|route| route.route == DFS_MESSAGE_ROUTE
-                    && route.operation == "dfs.object.transfer")
+                .all(|route| route.route != "/dfs/message")
         );
         assert!(
             registration

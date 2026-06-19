@@ -662,7 +662,7 @@ mod tests {
         let registry =
             register_data_plane_services(ServiceRegistry::builder(), host.clone()).build();
         assert!(registry.owns(DFS_SMOKE_ROUTE));
-        assert!(registry.owns(crate::DFS_MESSAGE_ROUTE));
+        assert!(!registry.owns("/dfs/message"));
         assert!(registry.owns(crate::DFS_DATA_READ_ROUTE));
         assert!(registry.owns(DFS_DIRECT_READ_ROUTE));
 

@@ -3709,10 +3709,8 @@ mod tests {
             registry.category_for_route(CLUSTER_JOIN_REGISTER_ROUTE),
             Some(CLUSTER_MEMBERSHIP_RPC_CATEGORY)
         );
-        assert_eq!(
-            registry.category_for_route(sinomo_dfs::DFS_MESSAGE_ROUTE),
-            Some(sinomo_dfs::DFS_RPC_CATEGORY)
-        );
+        assert!(!registry.owns("/dfs/message"));
+        assert_eq!(registry.category_for_route("/dfs/message"), None);
         assert_eq!(
             registry.category_for_route(sinomo_dfs::DFS_DATA_READ_ROUTE),
             Some(sinomo_dfs::DFS_RPC_CATEGORY)
@@ -3806,16 +3804,16 @@ mod tests {
                 .map(|capability| capability.as_str().to_string())
                 .collect::<Vec<_>>()
         );
-        let dfs_message = route_metadata
+        let dfs_data_read = route_metadata
             .iter()
-            .find(|route| route.route == sinomo_dfs::DFS_MESSAGE_ROUTE)
-            .expect("dfs message route metadata");
+            .find(|route| route.route == sinomo_dfs::DFS_DATA_READ_ROUTE)
+            .expect("dfs data read route metadata");
         assert_eq!(
-            dfs_message.auth_scope.as_deref(),
+            dfs_data_read.auth_scope.as_deref(),
             Some(sinomo_module::ModuleRouteAuth::LocalOrClusterMember.as_scope())
         );
         assert_eq!(
-            dfs_message.required_capabilities,
+            dfs_data_read.required_capabilities,
             vec!["dfs.object.transfer".to_string()]
         );
         let dfs_read = route_metadata
