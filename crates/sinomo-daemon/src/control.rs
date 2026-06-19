@@ -4059,12 +4059,22 @@ mod tests {
             .build()
             .expect("client runtime");
         let response = client_runtime
-            .block_on(sinomo_network::send_daemon_control_request_async(
-                &address,
-                &control_request,
-                sinomo_network::DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(2)),
-                DAEMON_COMMAND_MAX_BYTES,
-            ))
+            .block_on(async {
+                let timeouts =
+                    sinomo_network::DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(2));
+                let frame_options = sinomo_network::ObjectFrameIoOptions::none()
+                    .with_idle_timeout(timeouts.idle_timeout);
+                let mut stream = sinomo_network::AsyncDaemonControlStream::connect_with_options(
+                    &address, timeouts,
+                )
+                .await?;
+                stream
+                    .write_request(&address, &control_request, frame_options)
+                    .await?;
+                stream
+                    .read_response(&address, DAEMON_COMMAND_MAX_BYTES, frame_options)
+                    .await
+            })
             .expect("framed auth error response");
         assert_eq!(response.route, sinomo_rollout::ROLLOUT_DIAGNOSTICS_ROUTE);
         let error = response

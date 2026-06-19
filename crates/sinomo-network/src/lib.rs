@@ -296,16 +296,15 @@ pub use object::{
     DaemonControlRequest, DaemonControlResponse, DaemonRpcTimeouts, OBJECT_STREAM_MAX_CHUNK_BYTES,
     ObjectFrameIoOptions, ObjectRpcRequestStreamMode, ObjectRpcResponseStreamMode,
     RawByteStreamChunkOptions, SinomoObjectCodec, object_rpc_request_stream_mode,
-    object_rpc_response_stream_mode, send_daemon_control_request_async,
-    send_daemon_control_rpc_request_async, set_object_rpc_request_stream_mode,
-    set_object_rpc_response_stream_mode,
+    object_rpc_response_stream_mode, send_daemon_control_rpc_request_async,
+    set_object_rpc_request_stream_mode, set_object_rpc_response_stream_mode,
 };
 pub(crate) use object::{
     DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY, DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE,
     DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY,
     DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE, ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY,
     ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE, object_rpc_request_accepts_streamed_daemon_response,
-    object_rpc_request_expects_raw_daemon_response,
+    object_rpc_request_expects_raw_daemon_response, send_daemon_control_request_async,
     send_daemon_control_rpc_request_raw_response_async,
 };
 #[cfg(any(feature = "iroh-transport", test))]

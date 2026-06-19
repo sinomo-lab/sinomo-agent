@@ -427,7 +427,7 @@ impl AsyncDaemonControlStream {
     }
 }
 
-pub async fn send_daemon_control_request_async(
+pub(crate) async fn send_daemon_control_request_async(
     address: &str,
     request: &DaemonControlRequest,
     timeouts: DaemonRpcTimeouts,
@@ -474,7 +474,7 @@ pub async fn send_daemon_control_rpc_request_async(
     Ok(response)
 }
 
-pub async fn send_daemon_control_rpc_request_raw_response_async(
+pub(crate) async fn send_daemon_control_rpc_request_raw_response_async(
     address: &str,
     request: &DaemonControlRequest,
     timeouts: DaemonRpcTimeouts,
