@@ -137,7 +137,7 @@ impl<'a> ClusterEndpointSelector<'a> {
         }
     }
 
-    pub(crate) fn unique_node_targets(
+    pub fn unique_node_targets(
         endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
     ) -> Vec<ClusterEndpointRecord> {
         let mut seen = BTreeSet::new();
@@ -147,7 +147,7 @@ impl<'a> ClusterEndpointSelector<'a> {
             .collect()
     }
 
-    pub(crate) fn select_unique_node_targets(
+    pub fn select_unique_node_targets(
         &self,
         purpose: ClusterEndpointSelectionPurpose,
     ) -> Vec<ClusterEndpointRecord> {
@@ -171,7 +171,7 @@ impl<'a> ClusterEndpointSelector<'a> {
             })
     }
 
-    pub(crate) async fn select_unique_node_targets_async(
+    pub async fn select_unique_node_targets_async(
         runtime: &tokio::runtime::Handle,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,

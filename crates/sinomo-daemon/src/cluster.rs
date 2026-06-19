@@ -1513,16 +1513,59 @@ pub(crate) async fn forward_cluster_invite_challenge_to_voter_async_on_runtime(
         detail: "daemon paths have no data directory parent".to_string(),
     })?;
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    let state_paths = cluster_paths.clone();
+    let state = runtime
+        .spawn_blocking(move || sinomo_network::read_cluster_state(&state_paths))
+        .await
+        .map_err(|source| {
+            DaemonError::from(sinomo_network::NetworkError::Io {
+                operation: "read cluster state".to_string(),
+                detail: format!("cluster state read task failed: {source}"),
+            })
+        })??;
     let rpc_request = sinomo_network::cluster_join_challenge_rpc_request(challenge)?;
     let mut host = DaemonClusterJoinRegistrationHost::new_on_runtime(paths, runtime);
-    let response = sinomo_network::forward_cluster_join_challenge_rpc_to_voter_async_with_host(
+    let voter_targets = sinomo_network::ClusterEndpointSelector::select_unique_node_targets_async(
         runtime,
         &cluster_paths,
-        &rpc_request,
-        &mut host,
+        &state,
+        sinomo_network::ClusterEndpointSelectionPurpose::VoterCommand,
     )
     .await?;
-    response.decode_body().map_err(DaemonError::from)
+    let mut client =
+        sinomo_network::ClusterObjectRpcClient::routed(&mut host, runtime, &cluster_paths);
+    let mut failures = Vec::new();
+    for target in &voter_targets {
+        match client
+            .call_node(
+                &state,
+                &target.node_id,
+                &rpc_request,
+                sinomo_network::ClusterObjectRpcNodeOptions::new(
+                    sinomo_network::ClusterEndpointSelectionPurpose::VoterCommand,
+                    sinomo_network::DaemonRpcTimeouts::connect_and_idle(
+                        sinomo_network::DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
+                    ),
+                ),
+            )
+            .await
+        {
+            Ok(response) => return response.decode_body().map_err(DaemonError::from),
+            Err(error) => failures.push(format!("node {}: {error}", target.node_id)),
+        }
+    }
+    Err(DaemonError::from(
+        sinomo_network::NetworkError::ClusterReadOnly {
+            detail: format!(
+                "join challenge introducer is not a channel/issuer and could not relay the challenge to any voter{}",
+                if failures.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", failures.join("; "))
+                }
+            ),
+        },
+    ))
 }
 
 fn send_object_rpc_to_node(

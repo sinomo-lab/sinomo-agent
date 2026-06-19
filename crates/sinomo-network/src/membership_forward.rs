@@ -2,6 +2,7 @@ use crate::ClusterPaths;
 use crate::control_plane_options::DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT;
 use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
 use crate::error::NetworkError;
+#[cfg(test)]
 use crate::local_state_store::read_cluster_state;
 use crate::object::DaemonRpcTimeouts;
 use crate::route::{
@@ -122,7 +123,8 @@ pub(crate) fn forward_cluster_join_challenge_rpc_to_voter_with_host(
     )
 }
 
-pub async fn forward_cluster_join_challenge_rpc_to_voter_async_with_host(
+#[cfg(test)]
+pub(crate) async fn forward_cluster_join_challenge_rpc_to_voter_async_with_host(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     request: &ObjectRpcRequest,
