@@ -201,7 +201,8 @@ pub(crate) use keyspace::{
 };
 #[cfg(test)]
 pub(crate) use kv_forward::ClusterKvTxnForwardHost;
-pub use kv_forward::ClusterKvTxnForwardOptions;
+#[cfg(test)]
+pub(crate) use kv_forward::ClusterKvTxnForwardOptions;
 #[cfg(test)]
 pub(crate) use kv_forward::forward_cluster_kv_txn_to_voter_with_host;
 pub use kv_read_model::{

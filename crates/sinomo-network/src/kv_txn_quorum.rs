@@ -3,8 +3,7 @@ use crate::control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlane
 use crate::control_plane_options::{ClusterKvTxnQuorumOptions, ClusterRaftLeaderElectionOptions};
 use crate::error::NetworkError;
 use crate::kv_forward::{
-    ClusterKvTxnForwardOptions, forward_cluster_kv_txn_to_voter_async_with_host,
-    forward_cluster_kv_txn_to_voter_with_host,
+    forward_cluster_kv_txn_to_voter_async_with_host, forward_cluster_kv_txn_to_voter_with_host,
 };
 use crate::kv_local_store::{
     cluster_kv_raft_store, imported_snapshot_advances_local_kv,
@@ -79,12 +78,12 @@ pub trait ClusterKvTxnQuorumHost {
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
         txn: &KvTxn,
-        options: ClusterKvTxnForwardOptions,
+        options: ClusterKvTxnQuorumOptions,
     ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError>
     where
         Self: Sized,
     {
-        forward_cluster_kv_txn_to_voter_with_host(paths, state, txn, options, self)
+        forward_cluster_kv_txn_to_voter_with_host(paths, state, txn, options.forward_options, self)
     }
 
     fn elect_cluster_raft_leader(
@@ -289,12 +288,8 @@ where
         state: &ClusterBootstrapState,
         txn: &KvTxn,
     ) -> Result<Option<sinomo_kv::ClusterKvTxnCommitResult>, Self::Error> {
-        self.host.forward_cluster_kv_txn_to_voter(
-            self.paths,
-            state,
-            txn,
-            self.options.forward_options,
-        )
+        self.host
+            .forward_cluster_kv_txn_to_voter(self.paths, state, txn, self.options)
     }
 
     fn elect_cluster_raft_leader(

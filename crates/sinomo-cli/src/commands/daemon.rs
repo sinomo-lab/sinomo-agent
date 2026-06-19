@@ -726,10 +726,11 @@ fn cli_cluster_control_plane_timeouts() -> network::ClusterControlPlaneTimeouts 
 }
 
 fn cli_cluster_kv_txn_quorum_options(allow_forwarding: bool) -> network::ClusterKvTxnQuorumOptions {
-    let mut options = cli_cluster_control_plane_timeouts().kv_txn_quorum_options(allow_forwarding);
-    options.state_authority_reachability_options =
-        cli_cluster_state_authority_reachability_options();
-    options
+    cli_cluster_control_plane_timeouts()
+        .kv_txn_quorum_options(allow_forwarding)
+        .with_state_authority_reachability_options(
+            cli_cluster_state_authority_reachability_options(),
+        )
 }
 
 fn cli_cluster_kv_snapshot_refresh_options() -> network::ClusterKvSnapshotRefreshOptions {

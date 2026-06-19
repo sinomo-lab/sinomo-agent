@@ -114,12 +114,22 @@ impl ClusterRaftLeaderElectionOptions {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClusterKvTxnQuorumOptions {
-    pub allow_forwarding: bool,
-    pub raft_append_timeout: Duration,
-    pub raft_append_replication_options: ClusterRaftAppendReplicationOptions,
-    pub forward_options: ClusterKvTxnForwardOptions,
-    pub leader_election_options: ClusterRaftLeaderElectionOptions,
-    pub state_authority_reachability_options: ClusterStateAuthorityReachabilityOptions,
+    pub(crate) allow_forwarding: bool,
+    pub(crate) raft_append_timeout: Duration,
+    pub(crate) raft_append_replication_options: ClusterRaftAppendReplicationOptions,
+    pub(crate) forward_options: ClusterKvTxnForwardOptions,
+    pub(crate) leader_election_options: ClusterRaftLeaderElectionOptions,
+    pub(crate) state_authority_reachability_options: ClusterStateAuthorityReachabilityOptions,
+}
+
+impl ClusterKvTxnQuorumOptions {
+    pub fn with_state_authority_reachability_options(
+        mut self,
+        options: ClusterStateAuthorityReachabilityOptions,
+    ) -> Self {
+        self.state_authority_reachability_options = options;
+        self
+    }
 }
 
 pub const DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_MAX_ATTEMPTS: usize = 32;
@@ -213,7 +223,7 @@ impl ClusterControlPlaneTimeouts {
         }
     }
 
-    pub fn kv_txn_forward_options(&self) -> ClusterKvTxnForwardOptions {
+    pub(crate) fn kv_txn_forward_options(&self) -> ClusterKvTxnForwardOptions {
         ClusterKvTxnForwardOptions {
             timeout: self.raft_append_timeout,
             tcp_command_timeout: self.tcp_command_timeout,

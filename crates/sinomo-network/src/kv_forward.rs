@@ -16,14 +16,14 @@ use sinomo_node::NodeId;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ClusterKvTxnForwardOptions {
-    pub timeout: Duration,
-    pub tcp_command_timeout: Duration,
-    pub iroh_command_timeout: Duration,
+pub(crate) struct ClusterKvTxnForwardOptions {
+    pub(crate) timeout: Duration,
+    pub(crate) tcp_command_timeout: Duration,
+    pub(crate) iroh_command_timeout: Duration,
 }
 
 impl ClusterKvTxnForwardOptions {
-    pub fn command_timeout(
+    pub(crate) fn command_timeout(
         &self,
         endpoint: &ClusterEndpointRecord,
         remaining: Duration,
