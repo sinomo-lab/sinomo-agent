@@ -265,6 +265,24 @@ pub struct IrohEndpointRecord {
 }
 
 impl IrohEndpointRecord {
+    pub fn from_relay_url(
+        cluster_id: ClusterId,
+        node_id: NodeId,
+        endpoint_public_key: impl Into<String>,
+        relay_url: impl Into<String>,
+    ) -> Self {
+        let relay_url = relay_url.into();
+        Self {
+            cluster_id,
+            node_id,
+            endpoint_public_key: endpoint_public_key.into(),
+            direct_addresses: Vec::new(),
+            relay_url: Some(relay_url.clone()),
+            relay_mode: IrohRelayMode::Custom { relay_url },
+            expires_after_tick: 0,
+        }
+    }
+
     pub fn endpoint(&self) -> ClusterEndpointRecord {
         let has_relay = self.relay_url.is_some();
         let address = if has_relay {
@@ -339,7 +357,10 @@ impl Drop for IrohDaemonProxyHandle {
     }
 }
 
-pub fn stable_iroh_endpoint_id(node_id: &NodeId, endpoint_public_key: &str) -> ClusterEndpointId {
+pub(crate) fn stable_iroh_endpoint_id(
+    node_id: &NodeId,
+    endpoint_public_key: &str,
+) -> ClusterEndpointId {
     ClusterEndpointId::derived(
         "sinomo.iroh.endpoint",
         format!("{}\0{endpoint_public_key}", node_id.as_str()),

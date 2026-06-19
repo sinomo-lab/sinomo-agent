@@ -9054,21 +9054,13 @@ mod tests {
         );
         let tcp =
             sinomo_network::daemon_lan_endpoint(&remote_node, "10.0.0.53:21353".to_string(), 10);
-        let iroh = ClusterEndpointRecord {
-            endpoint_id: sinomo_network::stable_iroh_endpoint_id(
-                &remote_node,
-                "iroh_public_key_daemon_command_connectivity",
-            ),
-            node_id: remote_node.clone(),
-            transport: ClusterTransportKind::Iroh,
-            address:
-                "iroh://iroh_public_key_daemon_command_connectivity?relay=https://relay.example./"
-                    .to_string(),
-            source: sinomo_core::ClusterEndpointSource::Rendezvous,
-            privacy: ClusterEndpointPrivacy::Relayed,
-            priority: 90,
-            last_observed_latency_ms: None,
-        };
+        let iroh = IrohEndpointRecord::from_relay_url(
+            cluster_id.clone(),
+            remote_node.clone(),
+            "iroh_public_key_daemon_command_connectivity",
+            "https://relay.example./",
+        )
+        .endpoint();
         let mut remote_member = ClusterMemberRecord::local_voter(
             cluster_id,
             remote_node.clone(),
@@ -9752,21 +9744,13 @@ mod tests {
         );
         let tcp =
             sinomo_network::daemon_lan_endpoint(&remote_node, "10.0.0.41:21353".to_string(), 10);
-        let iroh = ClusterEndpointRecord {
-            endpoint_id: sinomo_network::stable_iroh_endpoint_id(
-                &remote_node,
-                "iroh_public_key_daemon_raft_connectivity",
-            ),
-            node_id: remote_node.clone(),
-            transport: ClusterTransportKind::Iroh,
-            address:
-                "iroh://iroh_public_key_daemon_raft_connectivity?relay=https://relay.example./"
-                    .to_string(),
-            source: sinomo_core::ClusterEndpointSource::Rendezvous,
-            privacy: ClusterEndpointPrivacy::Relayed,
-            priority: 90,
-            last_observed_latency_ms: None,
-        };
+        let iroh = IrohEndpointRecord::from_relay_url(
+            cluster_id.clone(),
+            remote_node.clone(),
+            "iroh_public_key_daemon_raft_connectivity",
+            "https://relay.example./",
+        )
+        .endpoint();
         let mut remote_member = ClusterMemberRecord::local_voter(
             cluster_id.clone(),
             remote_node,
@@ -10142,20 +10126,13 @@ mod tests {
             sinomo_network::daemon_lan_endpoint(&remote_node, "203.0.113.41:21353".to_string(), 10);
         let private_tcp =
             sinomo_network::daemon_lan_endpoint(&remote_node, "10.0.0.41:21353".to_string(), 20);
-        let iroh = ClusterEndpointRecord {
-            endpoint_id: sinomo_network::stable_iroh_endpoint_id(
-                &remote_node,
-                "iroh_public_key_daemon_raft_unknown_tcp",
-            ),
-            node_id: remote_node.clone(),
-            transport: ClusterTransportKind::Iroh,
-            address: "iroh://iroh_public_key_daemon_raft_unknown_tcp?relay=https://relay.example./"
-                .to_string(),
-            source: sinomo_core::ClusterEndpointSource::Rendezvous,
-            privacy: ClusterEndpointPrivacy::Relayed,
-            priority: 90,
-            last_observed_latency_ms: None,
-        };
+        let iroh = IrohEndpointRecord::from_relay_url(
+            cluster_id.clone(),
+            remote_node.clone(),
+            "iroh_public_key_daemon_raft_unknown_tcp",
+            "https://relay.example./",
+        )
+        .endpoint();
         let mut remote_member = ClusterMemberRecord::local_voter(
             cluster_id.clone(),
             remote_node,
@@ -10492,21 +10469,13 @@ mod tests {
         );
         let first_tcp =
             sinomo_network::daemon_lan_endpoint(&first_node, "10.0.0.41:21353".to_string(), 10);
-        let first_iroh = ClusterEndpointRecord {
-            endpoint_id: sinomo_network::stable_iroh_endpoint_id(
-                &first_node,
-                "iroh_public_key_daemon_raft_interleave_first",
-            ),
-            node_id: first_node.clone(),
-            transport: ClusterTransportKind::Iroh,
-            address:
-                "iroh://iroh_public_key_daemon_raft_interleave_first?relay=https://relay.example./"
-                    .to_string(),
-            source: sinomo_core::ClusterEndpointSource::Rendezvous,
-            privacy: ClusterEndpointPrivacy::Relayed,
-            priority: 90,
-            last_observed_latency_ms: None,
-        };
+        let first_iroh = IrohEndpointRecord::from_relay_url(
+            cluster_id.clone(),
+            first_node.clone(),
+            "iroh_public_key_daemon_raft_interleave_first",
+            "https://relay.example./",
+        )
+        .endpoint();
         let second_tcp =
             sinomo_network::daemon_lan_endpoint(&second_node, "10.0.0.42:21353".to_string(), 10);
         for (node_id, name, public_key, endpoints) in [
@@ -10665,20 +10634,13 @@ mod tests {
     #[test]
     fn raft_command_timeout_caps_single_iroh_attempt_to_preserve_fallback_budget() {
         let node_id = NodeId::from_legacy_named("node_daemon_raft_iroh_timeout").expect("node");
-        let endpoint = ClusterEndpointRecord {
-            endpoint_id: sinomo_network::stable_iroh_endpoint_id(
-                &node_id,
-                "iroh_public_key_daemon_raft_timeout",
-            ),
+        let endpoint = IrohEndpointRecord::from_relay_url(
+            ClusterId::from_legacy_named("cluster_daemon_raft_iroh_timeout").expect("cluster"),
             node_id,
-            transport: ClusterTransportKind::Iroh,
-            address: "iroh://iroh_public_key_daemon_raft_timeout?relay=https://relay.example./"
-                .to_string(),
-            source: sinomo_core::ClusterEndpointSource::Rendezvous,
-            privacy: ClusterEndpointPrivacy::Relayed,
-            priority: 90,
-            last_observed_latency_ms: None,
-        };
+            "iroh_public_key_daemon_raft_timeout",
+            "https://relay.example./",
+        )
+        .endpoint();
 
         assert_eq!(
             cluster_voter_reachability_options().command_timeout(
@@ -10707,20 +10669,13 @@ mod tests {
             priority: 20,
             last_observed_latency_ms: None,
         };
-        let iroh = ClusterEndpointRecord {
-            endpoint_id: sinomo_network::stable_iroh_endpoint_id(
-                &node_id,
-                "iroh_public_key_daemon_raft_foreground",
-            ),
+        let iroh = IrohEndpointRecord::from_relay_url(
+            ClusterId::from_legacy_named("cluster_daemon_raft_foreground").expect("cluster"),
             node_id,
-            transport: ClusterTransportKind::Iroh,
-            address: "iroh://iroh_public_key_daemon_raft_foreground?relay=https://relay.example./"
-                .to_string(),
-            source: sinomo_core::ClusterEndpointSource::Rendezvous,
-            privacy: ClusterEndpointPrivacy::Relayed,
-            priority: 90,
-            last_observed_latency_ms: None,
-        };
+            "iroh_public_key_daemon_raft_foreground",
+            "https://relay.example./",
+        )
+        .endpoint();
 
         let timeout_options = cluster_voter_reachability_options();
         assert_eq!(
