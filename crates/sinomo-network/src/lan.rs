@@ -1,7 +1,7 @@
 use crate::error::NetworkError;
 use crate::object::SinomoObjectCodec;
 #[cfg(test)]
-use crate::peer::NetworkFrame;
+use crate::peer::EventFrame;
 use crate::peer::PeerEndpointCandidate;
 use crate::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -205,12 +205,12 @@ impl Default for LanQuicEndpointConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[cfg(test)]
-pub(crate) struct LanQuicFrameCodec {
+pub(crate) struct LanQuicEventFrameCodec {
     pub max_frame_bytes: usize,
 }
 
 #[cfg(test)]
-impl Default for LanQuicFrameCodec {
+impl Default for LanQuicEventFrameCodec {
     fn default() -> Self {
         Self {
             max_frame_bytes: LanQuicEndpointConfig::default().max_frame_bytes,
@@ -219,8 +219,8 @@ impl Default for LanQuicFrameCodec {
 }
 
 #[cfg(test)]
-impl LanQuicFrameCodec {
-    pub(crate) fn encode(&self, frame: &NetworkFrame) -> Result<Vec<u8>, NetworkError> {
+impl LanQuicEventFrameCodec {
+    pub(crate) fn encode(&self, frame: &EventFrame) -> Result<Vec<u8>, NetworkError> {
         let bytes = SinomoObjectCodec::default().encode(frame)?;
         if bytes.len() > self.max_frame_bytes {
             return Err(NetworkError::FrameTooLarge {
@@ -231,7 +231,7 @@ impl LanQuicFrameCodec {
         Ok(bytes)
     }
 
-    pub(crate) fn decode(&self, bytes: &[u8]) -> Result<NetworkFrame, NetworkError> {
+    pub(crate) fn decode(&self, bytes: &[u8]) -> Result<EventFrame, NetworkError> {
         if bytes.len() > self.max_frame_bytes {
             return Err(NetworkError::FrameTooLarge {
                 actual_bytes: bytes.len(),

@@ -543,12 +543,12 @@ pub(crate) enum MeshMessageBody {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[cfg(test)]
-pub(crate) struct NetworkFrameId(pub(crate) u64);
+pub(crate) struct EventFrameId(pub(crate) u64);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[cfg(test)]
-pub(crate) struct NetworkFrame {
-    pub(crate) frame_id: NetworkFrameId,
+pub(crate) struct EventFrame {
+    pub(crate) frame_id: EventFrameId,
     pub(crate) source_node_id: NodeId,
     pub(crate) target_node_id: NodeId,
     pub(crate) message: MeshMessage,
@@ -556,9 +556,9 @@ pub(crate) struct NetworkFrame {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[cfg(test)]
-pub(crate) struct InboundFrame {
+pub(crate) struct InboundEventFrame {
     pub(crate) received_by: NodeId,
-    pub(crate) frame: NetworkFrame,
+    pub(crate) frame: EventFrame,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -621,14 +621,14 @@ pub(crate) trait AsyncNetworkTransport {
     fn send_async<'a>(
         &'a mut self,
         target_node_id: &'a NodeId,
-        frame: NetworkFrame,
+        frame: EventFrame,
         options: AsyncNetworkSendOptions,
     ) -> AsyncNetworkTransportFuture<'a, Result<(), NetworkError>>;
 
     fn drain_incoming_async<'a>(
         &'a mut self,
         max_frames: usize,
-    ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>>;
+    ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundEventFrame>, NetworkError>>;
 
     fn pending_incoming_count_async<'a>(
         &'a mut self,
@@ -787,7 +787,7 @@ struct InProcessNetworkInner {
 #[derive(Clone, Debug, Default)]
 struct InProcessNetworkState {
     #[cfg(test)]
-    mailboxes: BTreeMap<NodeId, VecDeque<InboundFrame>>,
+    mailboxes: BTreeMap<NodeId, VecDeque<InboundEventFrame>>,
     object_rpc_mailboxes: BTreeMap<NodeId, VecDeque<InboundObjectRpcMessage>>,
 }
 
@@ -806,7 +806,7 @@ impl InProcessTransport {
     pub(crate) fn send(
         &mut self,
         target_node_id: &NodeId,
-        frame: NetworkFrame,
+        frame: EventFrame,
     ) -> Result<(), NetworkError> {
         if &frame.source_node_id != self.local_node_id() {
             return Err(NetworkError::FrameSourceMismatch {
@@ -843,7 +843,7 @@ impl InProcessTransport {
             });
         }
 
-        mailbox.push_back(InboundFrame {
+        mailbox.push_back(InboundEventFrame {
             received_by: target_node_id.clone(),
             frame,
         });
@@ -891,7 +891,7 @@ impl InProcessTransport {
     }
 
     #[cfg(test)]
-    pub(crate) fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
+    pub(crate) fn drain_incoming(&mut self) -> Result<Vec<InboundEventFrame>, NetworkError> {
         let mut inner = self
             .inner
             .state
@@ -1149,7 +1149,7 @@ struct AsyncInProcessNetworkInner {
 #[derive(Clone)]
 struct AsyncInProcessTarget {
     #[cfg(test)]
-    sender: tokio::sync::mpsc::Sender<InboundFrame>,
+    sender: tokio::sync::mpsc::Sender<InboundEventFrame>,
     object_rpc_sender: tokio::sync::mpsc::Sender<InboundObjectRpcMessage>,
     mailbox_capacity: usize,
     #[cfg(test)]
@@ -1161,9 +1161,9 @@ pub struct AsyncInProcessTransport {
     local_node_id: NodeId,
     inner: Arc<AsyncInProcessNetworkInner>,
     #[cfg(test)]
-    incoming: tokio::sync::mpsc::Receiver<InboundFrame>,
+    incoming: tokio::sync::mpsc::Receiver<InboundEventFrame>,
     #[cfg(test)]
-    pending: VecDeque<InboundFrame>,
+    pending: VecDeque<InboundEventFrame>,
     object_rpc_incoming: tokio::sync::mpsc::Receiver<InboundObjectRpcMessage>,
     object_rpc_pending: VecDeque<InboundObjectRpcMessage>,
 }
@@ -1177,7 +1177,7 @@ impl AsyncInProcessTransport {
     fn validate_outbound_frame(
         &self,
         target_node_id: &NodeId,
-        frame: &NetworkFrame,
+        frame: &EventFrame,
     ) -> Result<(), NetworkError> {
         if frame.source_node_id != self.local_node_id {
             return Err(NetworkError::FrameSourceMismatch {
@@ -1295,7 +1295,7 @@ impl AsyncNetworkTransport for AsyncInProcessTransport {
     fn send_async<'a>(
         &'a mut self,
         target_node_id: &'a NodeId,
-        frame: NetworkFrame,
+        frame: EventFrame,
         options: AsyncNetworkSendOptions,
     ) -> AsyncNetworkTransportFuture<'a, Result<(), NetworkError>> {
         Box::pin(async move {
@@ -1308,7 +1308,7 @@ impl AsyncNetworkTransport for AsyncInProcessTransport {
     fn drain_incoming_async<'a>(
         &'a mut self,
         max_frames: usize,
-    ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
+    ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundEventFrame>, NetworkError>> {
         Box::pin(async move {
             let take = max_frames.max(1);
             let mut frames = self.pending.drain(..).collect::<Vec<_>>();
@@ -1363,10 +1363,10 @@ impl AsyncNetworkTransport for AsyncInProcessTransport {
 async fn send_async_in_process_frame(
     target: AsyncInProcessTarget,
     target_node_id: &NodeId,
-    frame: NetworkFrame,
+    frame: EventFrame,
     options: AsyncNetworkSendOptions,
 ) -> Result<(), NetworkError> {
-    let inbound = InboundFrame {
+    let inbound = InboundEventFrame {
         received_by: target_node_id.clone(),
         frame,
     };
@@ -1809,7 +1809,7 @@ impl<T: AsyncNetworkTransport> NetworkService<T> {
     async fn send_heartbeat_with_transport_deadline_async(
         &mut self,
         target_node_id: &NodeId,
-        frame: NetworkFrame,
+        frame: EventFrame,
         send_deadline: Option<tokio::time::Instant>,
     ) -> Result<(), NetworkError> {
         self.transport
@@ -1842,9 +1842,9 @@ impl<T: AsyncNetworkTransport> NetworkService<T> {
         &mut self,
         local_node_id: &NodeId,
         record: &DeliveryRecord,
-    ) -> NetworkFrame {
-        let frame = NetworkFrame {
-            frame_id: NetworkFrameId(self.next_frame_id),
+    ) -> EventFrame {
+        let frame = EventFrame {
+            frame_id: EventFrameId(self.next_frame_id),
             source_node_id: local_node_id.clone(),
             target_node_id: record.delivery.target_node_id.clone(),
             message: MeshMessage {
@@ -1867,9 +1867,9 @@ impl<T: AsyncNetworkTransport> NetworkService<T> {
         local_node_id: &NodeId,
         target_node_id: NodeId,
         ack: DeliveryAck,
-    ) -> NetworkFrame {
-        let frame = NetworkFrame {
-            frame_id: NetworkFrameId(self.next_frame_id),
+    ) -> EventFrame {
+        let frame = EventFrame {
+            frame_id: EventFrameId(self.next_frame_id),
             source_node_id: local_node_id.clone(),
             target_node_id: target_node_id.clone(),
             message: MeshMessage {
@@ -1889,9 +1889,9 @@ impl<T: AsyncNetworkTransport> NetworkService<T> {
         local_node_id: &NodeId,
         target_node_id: NodeId,
         heartbeat: Heartbeat,
-    ) -> NetworkFrame {
-        let frame = NetworkFrame {
-            frame_id: NetworkFrameId(self.next_frame_id),
+    ) -> EventFrame {
+        let frame = EventFrame {
+            frame_id: EventFrameId(self.next_frame_id),
             source_node_id: local_node_id.clone(),
             target_node_id: target_node_id.clone(),
             message: MeshMessage {

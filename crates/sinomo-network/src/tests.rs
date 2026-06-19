@@ -14,20 +14,20 @@ use crate::invite::{
     verify_cluster_invite_challenge_proof,
 };
 use crate::lan::{
-    AsyncMdnsDiscoverySocket, LanQuicFrameCodec, MdnsDiscoveryAdvertisement, MdnsDiscoveryCache,
-    MdnsDiscoveryRecord, apply_lan_discovery_advertisements, is_advertisable_interface_ip,
-    is_invitable_ip, lan_discovery_advertisement_for_state,
+    AsyncMdnsDiscoverySocket, LanQuicEventFrameCodec, MdnsDiscoveryAdvertisement,
+    MdnsDiscoveryCache, MdnsDiscoveryRecord, apply_lan_discovery_advertisements,
+    is_advertisable_interface_ip, is_invitable_ip, lan_discovery_advertisement_for_state,
 };
 use crate::member_store::MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS;
 use crate::object::{DaemonControlStream, read_object_frame_blocking, write_object_frame_blocking};
 use crate::object_file_store::*;
 use crate::peer::{
     AsyncNetworkServiceHandle, AsyncNetworkTransport, AsyncNetworkTransportFuture, DeliveryAck,
-    DeliveryLedger, DeliveryStatus, Heartbeat, HeartbeatPolicy, InProcessRouter, InboundFrame,
-    InboundOutcome, MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrame, NetworkFrameId,
-    NetworkService, NetworkServiceActorOptions, NetworkServiceCommandOptions, NodeEndpoint,
-    PeerEndpointCandidate, PeerRegistry, PeerStatus, RetryPolicy, RouteDelivery, RouteDeliveryId,
-    TransportKind,
+    DeliveryLedger, DeliveryStatus, EventFrame, EventFrameId, Heartbeat, HeartbeatPolicy,
+    InProcessRouter, InboundEventFrame, InboundOutcome, MeshMessage, MeshMessageBody,
+    MeshMessageId, NetworkService, NetworkServiceActorOptions, NetworkServiceCommandOptions,
+    NodeEndpoint, PeerEndpointCandidate, PeerRegistry, PeerStatus, RetryPolicy, RouteDelivery,
+    RouteDeliveryId, TransportKind,
 };
 use crate::prelude::*;
 use crate::roaming::{
@@ -23109,12 +23109,12 @@ fn node_endpoint_maps_iroh_transport() {
 }
 
 #[test]
-fn lan_quic_frame_codec_round_trips_network_frames_and_limits_size() {
+fn lan_quic_event_frame_codec_round_trips_event_frames_and_limits_size() {
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_b").expect("node");
     let event = fixture_event("evt_codec", node_a.clone());
-    let frame = NetworkFrame {
-        frame_id: NetworkFrameId(7),
+    let frame = EventFrame {
+        frame_id: EventFrameId(7),
         source_node_id: node_a.clone(),
         target_node_id: node_b.clone(),
         message: MeshMessage {
@@ -23127,7 +23127,7 @@ fn lan_quic_frame_codec_round_trips_network_frames_and_limits_size() {
             },
         },
     };
-    let codec = LanQuicFrameCodec {
+    let codec = LanQuicEventFrameCodec {
         max_frame_bytes: 16 * 1024,
     };
 
@@ -23137,7 +23137,7 @@ fn lan_quic_frame_codec_round_trips_network_frames_and_limits_size() {
     assert_eq!(&encoded[..4], sinomo_object::MAGIC);
     assert_eq!(decoded, frame);
     assert!(matches!(
-        LanQuicFrameCodec { max_frame_bytes: 1 }.encode(&frame),
+        LanQuicEventFrameCodec { max_frame_bytes: 1 }.encode(&frame),
         Err(NetworkError::FrameTooLarge { .. })
     ));
 }
@@ -24494,8 +24494,8 @@ fn in_process_transport_delivers_typed_frames() {
     let mut transport_b = network.add_node(node_b.clone());
     let event = fixture_event("evt_transport", node_a.clone());
 
-    let frame = NetworkFrame {
-        frame_id: NetworkFrameId(1),
+    let frame = EventFrame {
+        frame_id: EventFrameId(1),
         source_node_id: node_a.clone(),
         target_node_id: node_b.clone(),
         message: MeshMessage {
@@ -24583,8 +24583,8 @@ fn in_process_transport_wait_for_incoming_wakes_on_send() {
     transport_a
         .send(
             &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(1),
+            EventFrame {
+                frame_id: EventFrameId(1),
                 source_node_id: node_a.clone(),
                 target_node_id: node_b.clone(),
                 message: MeshMessage {
@@ -24626,8 +24626,8 @@ fn in_process_transport_rejects_unknown_targets() {
     let error = transport_a
         .send(
             &node_missing,
-            NetworkFrame {
-                frame_id: NetworkFrameId(1),
+            EventFrame {
+                frame_id: EventFrameId(1),
                 source_node_id: node_a.clone(),
                 target_node_id: node_missing.clone(),
                 message: MeshMessage {
@@ -24673,7 +24673,7 @@ where
 async fn send_async_test_frame<T: AsyncNetworkTransport>(
     transport: &mut T,
     target_node_id: &NodeId,
-    frame: NetworkFrame,
+    frame: EventFrame,
 ) -> Result<(), NetworkError> {
     transport
         .send_async(target_node_id, frame, AsyncNetworkSendOptions::default())
@@ -24682,7 +24682,7 @@ async fn send_async_test_frame<T: AsyncNetworkTransport>(
 
 async fn drain_async_test_frames<T: AsyncNetworkTransport>(
     transport: &mut T,
-) -> Result<Vec<InboundFrame>, NetworkError> {
+) -> Result<Vec<InboundEventFrame>, NetworkError> {
     transport.drain_incoming_async(usize::MAX).await
 }
 
@@ -24778,7 +24778,7 @@ async fn network_service_dropped_wait_command_releases_actor() {
         fn send_async<'a>(
             &'a mut self,
             target_node_id: &'a NodeId,
-            _frame: NetworkFrame,
+            _frame: EventFrame,
             _options: AsyncNetworkSendOptions,
         ) -> AsyncNetworkTransportFuture<'a, Result<(), NetworkError>> {
             Box::pin(async move {
@@ -24791,7 +24791,7 @@ async fn network_service_dropped_wait_command_releases_actor() {
         fn drain_incoming_async<'a>(
             &'a mut self,
             _max_frames: usize,
-        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
+        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundEventFrame>, NetworkError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
 
@@ -24882,8 +24882,8 @@ async fn network_service_dropped_pump_outbound_keeps_delivery_retryable() {
     send_async_test_frame(
         &mut transport_a,
         &node_b,
-        NetworkFrame {
-            frame_id: NetworkFrameId(1),
+        EventFrame {
+            frame_id: EventFrameId(1),
             source_node_id: node_a.clone(),
             target_node_id: node_b.clone(),
             message: MeshMessage {
@@ -25006,8 +25006,8 @@ async fn network_service_pump_outbound_does_not_block_healthy_targets_behind_ful
     send_async_test_frame(
         &mut filler,
         &node_b,
-        NetworkFrame {
-            frame_id: NetworkFrameId(1),
+        EventFrame {
+            frame_id: EventFrameId(1),
             source_node_id: node_filler.clone(),
             target_node_id: node_b.clone(),
             message: MeshMessage {
@@ -25112,8 +25112,8 @@ async fn network_service_dropped_heartbeat_send_releases_actor() {
     send_async_test_frame(
         &mut transport_a,
         &node_b,
-        NetworkFrame {
-            frame_id: NetworkFrameId(1),
+        EventFrame {
+            frame_id: EventFrameId(1),
             source_node_id: node_a.clone(),
             target_node_id: node_b.clone(),
             message: MeshMessage {
@@ -25287,8 +25287,8 @@ async fn async_in_process_transport_applies_bounded_mpsc_backpressure() {
     transport_a
         .send_async(
             &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(1),
+            EventFrame {
+                frame_id: EventFrameId(1),
                 source_node_id: node_a.clone(),
                 target_node_id: node_b.clone(),
                 message: MeshMessage {
@@ -25308,8 +25308,8 @@ async fn async_in_process_transport_applies_bounded_mpsc_backpressure() {
 
     let second = transport_a.send_async(
         &node_b,
-        NetworkFrame {
-            frame_id: NetworkFrameId(2),
+        EventFrame {
+            frame_id: EventFrameId(2),
             source_node_id: node_a.clone(),
             target_node_id: node_b.clone(),
             message: MeshMessage {
@@ -25368,8 +25368,8 @@ async fn async_in_process_transport_zero_wait_reports_queued_frames() {
     transport_a
         .send_async(
             &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(1),
+            EventFrame {
+                frame_id: EventFrameId(1),
                 source_node_id: node_a.clone(),
                 target_node_id: node_b.clone(),
                 message: MeshMessage {
@@ -25413,9 +25413,9 @@ async fn async_in_process_transport_zero_wait_reports_queued_frames() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn async_in_process_transport_limits_concurrent_sends_per_target() {
-    fn heartbeat_frame(source: &NodeId, target: &NodeId, frame_id: u64) -> NetworkFrame {
-        NetworkFrame {
-            frame_id: NetworkFrameId(frame_id),
+    fn heartbeat_frame(source: &NodeId, target: &NodeId, frame_id: u64) -> EventFrame {
+        EventFrame {
+            frame_id: EventFrameId(frame_id),
             source_node_id: source.clone(),
             target_node_id: target.clone(),
             message: MeshMessage {
@@ -25494,7 +25494,7 @@ async fn async_in_process_transport_limits_concurrent_sends_per_target() {
         .await
         .expect("drain first pending send");
     assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].frame.frame_id, NetworkFrameId(2));
+    assert_eq!(remaining[0].frame.frame_id, EventFrameId(2));
 }
 
 #[tokio::test]
@@ -25567,7 +25567,7 @@ async fn network_service_async_pump_timeout_cancels_in_flight_transport_send() {
         fn send_async<'a>(
             &'a mut self,
             _target_node_id: &'a NodeId,
-            _frame: NetworkFrame,
+            _frame: EventFrame,
             _options: AsyncNetworkSendOptions,
         ) -> AsyncNetworkTransportFuture<'a, Result<(), NetworkError>> {
             let send_entered = Arc::clone(&self.send_entered);
@@ -25580,7 +25580,7 @@ async fn network_service_async_pump_timeout_cancels_in_flight_transport_send() {
         fn drain_incoming_async<'a>(
             &'a mut self,
             _max_frames: usize,
-        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
+        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundEventFrame>, NetworkError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
 
@@ -25673,7 +25673,7 @@ async fn network_service_async_transport_timeout_uses_remaining_command_budget()
         fn send_async<'a>(
             &'a mut self,
             _target_node_id: &'a NodeId,
-            _frame: NetworkFrame,
+            _frame: EventFrame,
             options: AsyncNetworkSendOptions,
         ) -> AsyncNetworkTransportFuture<'a, Result<(), NetworkError>> {
             let sent_timeouts = Arc::clone(&self.sent_timeouts);
@@ -25689,7 +25689,7 @@ async fn network_service_async_transport_timeout_uses_remaining_command_budget()
         fn drain_incoming_async<'a>(
             &'a mut self,
             _max_frames: usize,
-        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
+        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundEventFrame>, NetworkError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
 
@@ -25857,8 +25857,8 @@ async fn network_service_async_command_timeout_bounds_waiting_for_actor_reply() 
     send_async_test_frame(
         &mut transport_a,
         &node_b,
-        NetworkFrame {
-            frame_id: NetworkFrameId(1),
+        EventFrame {
+            frame_id: EventFrameId(1),
             source_node_id: node_a.clone(),
             target_node_id: node_b.clone(),
             message: MeshMessage {
@@ -25896,7 +25896,7 @@ async fn network_service_actor_drops_timed_out_queued_commands_before_transport_
         fn send_async<'a>(
             &'a mut self,
             target_node_id: &'a NodeId,
-            _frame: NetworkFrame,
+            _frame: EventFrame,
             _options: AsyncNetworkSendOptions,
         ) -> AsyncNetworkTransportFuture<'a, Result<(), NetworkError>> {
             Box::pin(async move {
@@ -25909,7 +25909,7 @@ async fn network_service_actor_drops_timed_out_queued_commands_before_transport_
         fn drain_incoming_async<'a>(
             &'a mut self,
             _max_frames: usize,
-        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
+        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundEventFrame>, NetworkError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
 
@@ -26048,8 +26048,8 @@ async fn network_service_async_process_incoming_after_wait_wakes_on_send() {
     let event =
         fixture_event("evt_async_wait_receive", node_a.clone()).with_target_node(node_b.clone());
 
-    let frame = NetworkFrame {
-        frame_id: NetworkFrameId(1),
+    let frame = EventFrame {
+        frame_id: EventFrameId(1),
         source_node_id: node_a.clone(),
         target_node_id: node_b.clone(),
         message: MeshMessage {
@@ -26107,8 +26107,8 @@ async fn process_incoming_ignores_stale_ack_and_continues_batch() {
     send_async_test_frame(
         &mut transport_b,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(1),
+        EventFrame {
+            frame_id: EventFrameId(1),
             source_node_id: node_b.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26128,8 +26128,8 @@ async fn process_incoming_ignores_stale_ack_and_continues_batch() {
     send_async_test_frame(
         &mut transport_b,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(2),
+        EventFrame {
+            frame_id: EventFrameId(2),
             source_node_id: node_b.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26195,8 +26195,8 @@ async fn process_incoming_ignores_mismatched_ack_event_until_real_ack_arrives() 
     send_async_test_frame(
         &mut transport_b,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(99),
+        EventFrame {
+            frame_id: EventFrameId(99),
             source_node_id: node_b.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26293,8 +26293,8 @@ async fn process_incoming_ignores_wrong_source_ack_and_continues_batch() {
     send_async_test_frame(
         &mut transport_c,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(1),
+        EventFrame {
+            frame_id: EventFrameId(1),
             source_node_id: node_c.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26314,8 +26314,8 @@ async fn process_incoming_ignores_wrong_source_ack_and_continues_batch() {
     send_async_test_frame(
         &mut transport_c,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(2),
+        EventFrame {
+            frame_id: EventFrameId(2),
             source_node_id: node_c.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26397,8 +26397,8 @@ async fn process_incoming_ignores_mismatched_heartbeat_source_and_continues_batc
     send_async_test_frame(
         &mut transport_c,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(1),
+        EventFrame {
+            frame_id: EventFrameId(1),
             source_node_id: node_c.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26417,8 +26417,8 @@ async fn process_incoming_ignores_mismatched_heartbeat_source_and_continues_batc
     send_async_test_frame(
         &mut transport_c,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(2),
+        EventFrame {
+            frame_id: EventFrameId(2),
             source_node_id: node_c.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26499,8 +26499,8 @@ async fn process_incoming_ignores_message_target_mismatch_and_continues_batch() 
     send_async_test_frame(
         &mut transport_b,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(1),
+        EventFrame {
+            frame_id: EventFrameId(1),
             source_node_id: node_b.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26519,8 +26519,8 @@ async fn process_incoming_ignores_message_target_mismatch_and_continues_batch() 
     send_async_test_frame(
         &mut transport_b,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(2),
+        EventFrame {
+            frame_id: EventFrameId(2),
             source_node_id: node_b.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26606,8 +26606,8 @@ async fn process_incoming_ignores_message_origin_mismatch_and_continues_batch() 
     send_async_test_frame(
         &mut transport_b,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(1),
+        EventFrame {
+            frame_id: EventFrameId(1),
             source_node_id: node_b.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26626,8 +26626,8 @@ async fn process_incoming_ignores_message_origin_mismatch_and_continues_batch() 
     send_async_test_frame(
         &mut transport_b,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(2),
+        EventFrame {
+            frame_id: EventFrameId(2),
             source_node_id: node_b.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26706,8 +26706,8 @@ async fn process_incoming_ignores_event_origin_mismatch_and_continues_batch() {
         send_async_test_frame(
             &mut transport_a,
             &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(delivery_id.0),
+            EventFrame {
+                frame_id: EventFrameId(delivery_id.0),
                 source_node_id: node_a.clone(),
                 target_node_id: node_b.clone(),
                 message: MeshMessage {
@@ -26796,8 +26796,8 @@ async fn process_incoming_ignores_event_target_mismatch_and_continues_batch() {
         send_async_test_frame(
             &mut transport_a,
             &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(delivery_id.0),
+            EventFrame {
+                frame_id: EventFrameId(delivery_id.0),
                 source_node_id: node_a.clone(),
                 target_node_id: node_b.clone(),
                 message: MeshMessage {
@@ -26887,8 +26887,8 @@ async fn process_incoming_ignores_targetless_origin_only_events_and_continues_ba
         send_async_test_frame(
             &mut transport_a,
             &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(delivery_id.0),
+            EventFrame {
+                frame_id: EventFrameId(delivery_id.0),
                 source_node_id: node_a.clone(),
                 target_node_id: node_b.clone(),
                 message: MeshMessage {
@@ -27023,8 +27023,8 @@ async fn network_service_process_incoming_batches_large_mailboxes() {
         send_async_test_frame(
             &mut transport_a,
             &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(index as u64 + 1),
+            EventFrame {
+                frame_id: EventFrameId(index as u64 + 1),
                 source_node_id: node_a.clone(),
                 target_node_id: node_b.clone(),
                 message: MeshMessage {
@@ -27155,8 +27155,8 @@ async fn network_service_actor_options_bound_queue_and_batches() {
         send_async_test_frame(
             &mut transport_a,
             &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(index + 1),
+            EventFrame {
+                frame_id: EventFrameId(index + 1),
                 source_node_id: node_a.clone(),
                 target_node_id: node_b.clone(),
                 message: MeshMessage {
@@ -27217,7 +27217,7 @@ async fn network_service_process_incoming_skips_drain_when_transport_reports_emp
         fn send_async<'a>(
             &'a mut self,
             target_node_id: &'a NodeId,
-            _frame: NetworkFrame,
+            _frame: EventFrame,
             _options: AsyncNetworkSendOptions,
         ) -> AsyncNetworkTransportFuture<'a, Result<(), NetworkError>> {
             Box::pin(async move {
@@ -27230,7 +27230,7 @@ async fn network_service_process_incoming_skips_drain_when_transport_reports_emp
         fn drain_incoming_async<'a>(
             &'a mut self,
             _max_frames: usize,
-        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
+        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundEventFrame>, NetworkError>> {
             let drain_calls = Arc::clone(&self.drain_calls);
             Box::pin(async move {
                 *drain_calls.lock().expect("drain calls") += 1;
@@ -27364,8 +27364,8 @@ fn in_process_transport_rejects_full_mailbox() {
         transport_a
             .send(
                 &node_b,
-                NetworkFrame {
-                    frame_id: NetworkFrameId(index as u64 + 1),
+                EventFrame {
+                    frame_id: EventFrameId(index as u64 + 1),
                     source_node_id: node_a.clone(),
                     target_node_id: node_b.clone(),
                     message: MeshMessage {
@@ -27385,8 +27385,8 @@ fn in_process_transport_rejects_full_mailbox() {
     let error = transport_a
         .send(
             &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(999_999),
+            EventFrame {
+                frame_id: EventFrameId(999_999),
                 source_node_id: node_a.clone(),
                 target_node_id: node_b.clone(),
                 message: MeshMessage {
@@ -27432,8 +27432,8 @@ async fn inbound_duplicate_event_is_acked_without_duplicate_append() {
         fixture_event("evt_duplicate_inbound", node_a.clone()).with_target_node(node_b.clone());
 
     for frame_id in [1, 2] {
-        let frame = NetworkFrame {
-            frame_id: NetworkFrameId(frame_id),
+        let frame = EventFrame {
+            frame_id: EventFrameId(frame_id),
             source_node_id: node_a.clone(),
             target_node_id: node_b.clone(),
             message: MeshMessage {
@@ -27486,8 +27486,8 @@ async fn inbound_duplicate_event_after_cache_eviction_is_deduped_by_store() {
         send_async_test_frame(
             &mut transport_a,
             &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(delivery_id.0),
+            EventFrame {
+                frame_id: EventFrameId(delivery_id.0),
                 source_node_id: node_a.clone(),
                 target_node_id: node_b.clone(),
                 message: MeshMessage {
@@ -27512,8 +27512,8 @@ async fn inbound_duplicate_event_after_cache_eviction_is_deduped_by_store() {
     send_async_test_frame(
         &mut transport_a,
         &node_b,
-        NetworkFrame {
-            frame_id: NetworkFrameId(3),
+        EventFrame {
+            frame_id: EventFrameId(3),
             source_node_id: node_a.clone(),
             target_node_id: node_b.clone(),
             message: MeshMessage {
