@@ -124,8 +124,7 @@ fn append_cluster_raft_command(
 ) -> Result<sinomo_runtime::kv::KvSnapshot, network::NetworkError> {
     paths
         .kv_paths()
-        .raft_store()
-        .append_command_and_publish(
+        .append_kv_command_and_publish(
             node_id,
             command,
             sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
@@ -184,13 +183,11 @@ fn append_cluster_raft_command_with_response(
 > {
     paths
         .kv_paths()
-        .raft_store()
-        .append_command_with_response_and_publish(
+        .append_kv_command_with_response_and_publish(
             node_id,
             command,
             sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
-        .map(|result| (result.snapshot, result.txn_response))
         .map_err(Into::into)
 }
 
@@ -10050,8 +10047,7 @@ fn network_raft_handlers_reject_mismatched_authenticated_peer() {
 
     let vote_metadata = paths
         .kv_paths()
-        .raft_store()
-        .local_vote_metadata(&state.local_node_id)
+        .locked_local_raft_vote_metadata(&state.local_node_id)
         .expect("raft vote metadata");
     let vote_request = sinomo_runtime::kv::ClusterRaftVoteRequest {
         state: state.clone(),

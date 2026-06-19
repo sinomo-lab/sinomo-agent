@@ -896,8 +896,15 @@ pub fn cancel_cluster_kv_watch(
     request: ClusterKvWatchCancelRequest,
 ) -> Result<ClusterKvWatchCancelResponse, KvError> {
     let report = remove_cluster_kv_watch_registration_with_allocator(paths, request.watch_id)?;
+    #[cfg(any(test, feature = "test-support"))]
+    crate::watch_store::invalidate_cluster_kv_watch_registration_cache(&report.watch_path);
     if let Some(allocator) = report.allocator {
         write_cluster_kv_watch_allocator_state(paths, &allocator)?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::watch_store::record_current_cluster_kv_watch_allocator_trust(
+            paths,
+            allocator.active_watch_count,
+        );
     }
     if report.removed {
         notify_cluster_kv_watchers(paths);

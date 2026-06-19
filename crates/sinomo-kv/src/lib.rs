@@ -231,6 +231,8 @@ mod snapshot;
 mod test_support;
 mod wal;
 mod watch;
+#[cfg(any(test, feature = "test-support"))]
+mod watch_store;
 
 mod internal {
     pub(crate) use super::in_process::*;
@@ -365,4 +367,31 @@ pub use watch::{
     record_cluster_kv_watch_notifier_waiter_key_for_test,
     remove_cluster_kv_watch_notifier_entries_under_root_for_test,
     reset_cluster_kv_watch_unchanged_wakeups_for_test, touch_cluster_kv_watch_notifier_for_test,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use watch_store::{
+    append_cluster_kv_watch_events, append_cluster_kv_watch_events_for_active_watches,
+    cached_cluster_kv_watch_events_contain_all, cached_cluster_kv_watch_events_for_test,
+    cached_cluster_kv_watch_registration_for_test,
+    cluster_kv_watch_allocator_trust_contains_for_test, cluster_kv_watch_dir_scans_for_test,
+    cluster_kv_watch_drain_once_calls_for_test, cluster_kv_watch_drain_read_passes_for_test,
+    cluster_kv_watch_event_cache_capacity_for_test, cluster_kv_watch_event_cache_contains_for_test,
+    cluster_kv_watch_event_log_read_bytes_for_test,
+    cluster_kv_watch_event_log_write_bytes_for_test, cluster_kv_watch_events,
+    cluster_kv_watch_registration_cache_capacity_for_test,
+    cluster_kv_watch_registration_cache_contains_for_test, create_cluster_kv_watch,
+    drain_cluster_kv_watch, drain_cluster_kv_watch_once_limited_by_payload_bytes,
+    fail_next_cluster_kv_watch_allocator_persist_for_test,
+    record_cluster_kv_watch_allocator_trust_for_test, record_cluster_kv_watch_event_cache_for_test,
+    record_cluster_kv_watch_registration_cache_for_test,
+    refresh_cluster_kv_watch_allocator_trust_for_test,
+    refresh_cluster_kv_watch_event_cache_for_test,
+    refresh_cluster_kv_watch_registration_cache_for_test,
+    remove_cluster_kv_watch_allocator_trust_entries_under_root_for_test,
+    remove_cluster_kv_watch_event_cache_entries_under_root_for_test,
+    remove_cluster_kv_watch_registration_cache_entries_under_root_for_test,
+    reset_cluster_kv_watch_dir_scans_for_test, reset_cluster_kv_watch_drain_once_calls_for_test,
+    reset_cluster_kv_watch_drain_read_passes_for_test,
+    reset_cluster_kv_watch_event_log_read_bytes_for_test,
+    reset_cluster_kv_watch_event_log_write_bytes_for_test,
 };

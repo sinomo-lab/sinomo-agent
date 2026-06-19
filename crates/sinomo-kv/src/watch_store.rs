@@ -1,77 +1,79 @@
-#[cfg(test)]
-use crate::ClusterPaths;
-#[cfg(test)]
-use crate::error::NetworkError;
-#[cfg(test)]
-use crate::file_mark::{ClusterFileMark, cluster_file_mark};
-#[cfg(test)]
-use crate::io_observer::io_observer;
-#[cfg(test)]
-use crate::kv_local_store::{
-    cluster_raft_wal_paths, read_cluster_kv_cached_snapshot_if_present,
-    read_cluster_kv_current_snapshot_arc, read_cluster_kv_reader_node_id,
-};
+#[cfg(any(test, feature = "test-support"))]
+use crate::internal::*;
 
-#[cfg(test)]
-use sinomo_kv::{
-    ClusterKvWatchCancelRequest, ClusterKvWatchCancelResponse, ClusterKvWatchDrainRequest,
-    ClusterKvWatchDrainResponse, ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration, KvError,
-    KvEvent, KvRevision, WatchId,
-};
-#[cfg(test)]
-use std::collections::HashMap;
-#[cfg(test)]
-use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(test)]
-use std::sync::{Arc, LazyLock, Mutex};
-#[cfg(test)]
-use std::time::{Duration, Instant, SystemTime};
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClusterFileMark {
+    exists: bool,
+    len: u64,
+    modified: Option<SystemTime>,
+    ino: u64,
+}
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+fn cluster_file_mark(path: &PathBuf) -> Option<ClusterFileMark> {
+    match fs::metadata(path) {
+        Ok(metadata) => Some(ClusterFileMark {
+            exists: true,
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            ino: file_ino(&metadata),
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Some(ClusterFileMark {
+            exists: false,
+            len: 0,
+            modified: None,
+            ino: 0,
+        }),
+        Err(_) => None,
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 const MAX_CLUSTER_KV_WATCH_EVENT_CACHE_ENTRIES: usize = 128;
-#[cfg(test)]
-const MAX_CLUSTER_KV_WATCH_REGISTRATION_CACHE_ENTRIES: usize =
-    sinomo_kv::MAX_CLUSTER_KV_ACTIVE_WATCHES;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+const MAX_CLUSTER_KV_WATCH_REGISTRATION_CACHE_ENTRIES: usize = crate::MAX_CLUSTER_KV_ACTIVE_WATCHES;
+#[cfg(any(test, feature = "test-support"))]
 const MAX_CLUSTER_KV_WATCH_ALLOCATOR_TRUST_CACHE_ENTRIES: usize = 4096;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static CLUSTER_KV_WATCH_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static CLUSTER_KV_WATCH_EVENT_CACHE: LazyLock<
     Mutex<HashMap<PathBuf, ClusterKvWatchEventCacheEntry>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static CLUSTER_KV_WATCH_EVENT_APPEND_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static CLUSTER_KV_WATCH_REGISTRATION_CACHE: LazyLock<
     Mutex<HashMap<PathBuf, ClusterKvWatchRegistrationCacheEntry>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static CLUSTER_KV_WATCH_ALLOCATOR_TRUST: LazyLock<
     Mutex<HashMap<PathBuf, ClusterKvWatchAllocatorTrustEntry>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static CLUSTER_KV_WATCH_DRAIN_ONCE_CALLS_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+static CLUSTER_KV_WATCH_DRAIN_READ_PASSES_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(any(test, feature = "test-support"))]
 static CLUSTER_KV_WATCH_EVENT_LOG_READ_BYTES_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static CLUSTER_KV_WATCH_EVENT_LOG_WRITE_BYTES_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static CLUSTER_KV_WATCH_DIR_SCANS_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static CLUSTER_KV_WATCH_ALLOCATOR_PERSIST_FAILURES_FOR_TEST: LazyLock<
     Mutex<HashMap<PathBuf, u64>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone)]
 struct ClusterKvWatchEventCacheEntry {
     checkpoint: ClusterFileMark,
@@ -82,7 +84,7 @@ struct ClusterKvWatchEventCacheEntry {
     last_used: u64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone)]
 struct ClusterKvWatchRegistrationCacheEntry {
     mark: ClusterFileMark,
@@ -92,18 +94,18 @@ struct ClusterKvWatchRegistrationCacheEntry {
     last_used: u64,
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ClusterKvWatchEmptyDrainMark {
-    generation: sinomo_kv::ClusterKvWatchObservedGeneration,
-    state: ClusterFileMark,
+    generation: crate::ClusterKvWatchObservedGeneration,
+    reader_node_id: NodeId,
     materialized_snapshot: ClusterFileMark,
     raft_hard_state: ClusterFileMark,
     raft_wal: ClusterFileMark,
     raft_snapshot: ClusterFileMark,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ClusterKvWatchAllocatorTrustEntry {
     allocator_mark: ClusterFileMark,
@@ -113,39 +115,39 @@ struct ClusterKvWatchAllocatorTrustEntry {
     last_used: u64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn cluster_kv_watch_event_cache_marks(
-    paths: &ClusterPaths,
+    paths: &ClusterKvPaths,
 ) -> Option<(ClusterFileMark, ClusterFileMark)> {
     Some((
-        cluster_file_mark(&paths.kv_watch_events)?,
-        cluster_file_mark(&paths.kv_watch_events_log)?,
+        cluster_file_mark(&paths.watch_events)?,
+        cluster_file_mark(&paths.watch_events_log)?,
     ))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn cluster_kv_watch_empty_drain_mark(
-    paths: &ClusterPaths,
-    generation: sinomo_kv::ClusterKvWatchObservedGeneration,
+    paths: &ClusterKvPaths,
+    node_id: &NodeId,
+    generation: crate::ClusterKvWatchObservedGeneration,
 ) -> Option<ClusterKvWatchEmptyDrainMark> {
-    let node_id = read_cluster_kv_reader_node_id(paths).ok()?;
-    let raft_paths = cluster_raft_wal_paths(paths, &node_id);
+    let raft_paths = paths.raft_wal_paths(node_id);
     Some(ClusterKvWatchEmptyDrainMark {
         generation,
-        state: cluster_file_mark(&paths.state)?,
-        materialized_snapshot: cluster_file_mark(&paths.kv_snapshot)?,
+        reader_node_id: node_id.clone(),
+        materialized_snapshot: cluster_file_mark(&paths.snapshot)?,
         raft_hard_state: cluster_file_mark(&raft_paths.hard_state)?,
         raft_wal: cluster_file_mark(&raft_paths.wal)?,
         raft_snapshot: cluster_file_mark(&raft_paths.snapshot)?,
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn cluster_kv_watch_cache_tick() -> u64 {
     CLUSTER_KV_WATCH_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn evict_cluster_kv_watch_event_cache_entry_if_needed(
     cache: &mut HashMap<PathBuf, ClusterKvWatchEventCacheEntry>,
     protected: &PathBuf,
@@ -163,7 +165,7 @@ fn evict_cluster_kv_watch_event_cache_entry_if_needed(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn evict_cluster_kv_watch_registration_cache_entry_if_needed(
     cache: &mut HashMap<PathBuf, ClusterKvWatchRegistrationCacheEntry>,
     protected: &PathBuf,
@@ -183,7 +185,7 @@ fn evict_cluster_kv_watch_registration_cache_entry_if_needed(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn evict_cluster_kv_watch_allocator_trust_entry_if_needed(
     cache: &mut HashMap<PathBuf, ClusterKvWatchAllocatorTrustEntry>,
     protected: &PathBuf,
@@ -203,23 +205,23 @@ fn evict_cluster_kv_watch_allocator_trust_entry_if_needed(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn current_cluster_kv_watch_allocator_trust_marks(
-    paths: &ClusterPaths,
+    paths: &ClusterKvPaths,
 ) -> Option<(ClusterFileMark, ClusterFileMark)> {
-    let allocator_mark = cluster_file_mark(&paths.kv_watches_next_id)?;
+    let allocator_mark = cluster_file_mark(&paths.watches_next_id)?;
     if !allocator_mark.exists {
         return None;
     }
-    let watch_dir_mark = cluster_file_mark(&paths.kv_watches)?;
+    let watch_dir_mark = cluster_file_mark(&paths.watches)?;
     if !watch_dir_mark.exists {
         return None;
     }
     Some((allocator_mark, watch_dir_mark))
 }
 
-#[cfg(test)]
-fn cluster_kv_watch_allocator_trusted(paths: &ClusterPaths) -> bool {
+#[cfg(any(test, feature = "test-support"))]
+fn cluster_kv_watch_allocator_trusted(paths: &ClusterKvPaths) -> bool {
     let Some((allocator_mark, watch_dir_mark)) =
         current_cluster_kv_watch_allocator_trust_marks(paths)
     else {
@@ -228,40 +230,40 @@ fn cluster_kv_watch_allocator_trusted(paths: &ClusterPaths) -> bool {
     let Ok(mut cache) = CLUSTER_KV_WATCH_ALLOCATOR_TRUST.lock() else {
         return false;
     };
-    let Some(entry) = cache.get_mut(&paths.kv_watches_next_id) else {
+    let Some(entry) = cache.get_mut(&paths.watches_next_id) else {
         return false;
     };
     if entry.allocator_mark != allocator_mark || entry.watch_dir_mark != watch_dir_mark {
-        cache.remove(&paths.kv_watches_next_id);
+        cache.remove(&paths.watches_next_id);
         return false;
     }
     entry.last_used = cluster_kv_watch_cache_tick();
     true
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn cached_cluster_kv_active_watch_registrations(
-    paths: &ClusterPaths,
+    paths: &ClusterKvPaths,
 ) -> Option<Vec<ClusterKvWatchRegistration>> {
     let (allocator_mark, watch_dir_mark) = current_cluster_kv_watch_allocator_trust_marks(paths)?;
     let mut cache = CLUSTER_KV_WATCH_ALLOCATOR_TRUST.lock().ok()?;
-    let entry = cache.get_mut(&paths.kv_watches_next_id)?;
+    let entry = cache.get_mut(&paths.watches_next_id)?;
     if entry.allocator_mark != allocator_mark || entry.watch_dir_mark != watch_dir_mark {
-        cache.remove(&paths.kv_watches_next_id);
+        cache.remove(&paths.watches_next_id);
         return None;
     }
     let registrations = entry.active_registrations.clone()?;
     if entry.active_watch_count != Some(registrations.len()) {
-        cache.remove(&paths.kv_watches_next_id);
+        cache.remove(&paths.watches_next_id);
         return None;
     }
     entry.last_used = cluster_kv_watch_cache_tick();
     Some(registrations)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn refresh_cached_cluster_kv_active_watch_registration(
-    paths: &ClusterPaths,
+    paths: &ClusterKvPaths,
     registration: &ClusterKvWatchRegistration,
 ) {
     let Some((allocator_mark, watch_dir_mark)) =
@@ -272,11 +274,11 @@ fn refresh_cached_cluster_kv_active_watch_registration(
     let Ok(mut cache) = CLUSTER_KV_WATCH_ALLOCATOR_TRUST.lock() else {
         return;
     };
-    let Some(entry) = cache.get_mut(&paths.kv_watches_next_id) else {
+    let Some(entry) = cache.get_mut(&paths.watches_next_id) else {
         return;
     };
     if entry.allocator_mark != allocator_mark || entry.watch_dir_mark != watch_dir_mark {
-        cache.remove(&paths.kv_watches_next_id);
+        cache.remove(&paths.watches_next_id);
         return;
     }
     let Some(registrations) = entry.active_registrations.as_mut() else {
@@ -291,8 +293,8 @@ fn refresh_cached_cluster_kv_active_watch_registration(
     }
 }
 
-#[cfg(test)]
-fn cluster_kv_watch_event_append_lock(paths: &ClusterPaths) -> Arc<Mutex<()>> {
+#[cfg(any(test, feature = "test-support"))]
+fn cluster_kv_watch_event_append_lock(paths: &ClusterKvPaths) -> Arc<Mutex<()>> {
     let key = cluster_kv_watch_notify_key(paths);
     let mut locks = CLUSTER_KV_WATCH_EVENT_APPEND_LOCKS
         .lock()
@@ -303,18 +305,18 @@ fn cluster_kv_watch_event_append_lock(paths: &ClusterPaths) -> Arc<Mutex<()>> {
         .clone()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn cached_cluster_kv_watch_events_arc(
-    paths: &ClusterPaths,
+    paths: &ClusterKvPaths,
     checkpoint: ClusterFileMark,
     log: ClusterFileMark,
 ) -> Option<Arc<Vec<KvEvent>>> {
     cached_cluster_kv_watch_event_cache_entry(paths, checkpoint, log).map(|entry| entry.events)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn cached_cluster_kv_watch_event_cache_entry(
-    paths: &ClusterPaths,
+    paths: &ClusterKvPaths,
     checkpoint: ClusterFileMark,
     log: ClusterFileMark,
 ) -> Option<ClusterKvWatchEventCacheEntry> {
@@ -329,13 +331,13 @@ fn cached_cluster_kv_watch_event_cache_entry(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn cluster_kv_watch_event_append_cache_view(
-    paths: &ClusterPaths,
-) -> Option<sinomo_kv::ClusterKvWatchEventAppendCacheView> {
+    paths: &ClusterKvPaths,
+) -> Option<crate::ClusterKvWatchEventAppendCacheView> {
     let (checkpoint, log) = cluster_kv_watch_event_cache_marks(paths)?;
     let entry = cached_cluster_kv_watch_event_cache_entry(paths, checkpoint, log)?;
-    Some(sinomo_kv::ClusterKvWatchEventAppendCacheView {
+    Some(crate::ClusterKvWatchEventAppendCacheView {
         events: entry.events.as_ref().clone(),
         log_records: entry.log_records,
         log_bytes: log.len,
@@ -343,9 +345,9 @@ fn cluster_kv_watch_event_append_cache_view(
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn record_cluster_kv_watch_event_cache(
-    paths: &ClusterPaths,
+    paths: &ClusterKvPaths,
     checkpoint: ClusterFileMark,
     log: ClusterFileMark,
     events: Vec<KvEvent>,
@@ -362,9 +364,9 @@ fn record_cluster_kv_watch_event_cache(
     );
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn record_cluster_kv_watch_event_cache_arc(
-    paths: &ClusterPaths,
+    paths: &ClusterKvPaths,
     checkpoint: ClusterFileMark,
     log: ClusterFileMark,
     events: Arc<Vec<KvEvent>>,
@@ -388,9 +390,9 @@ fn record_cluster_kv_watch_event_cache_arc(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn record_current_cluster_kv_watch_event_cache(
-    paths: &ClusterPaths,
+    paths: &ClusterKvPaths,
     events: Vec<KvEvent>,
     log_records: usize,
     append_safe: bool,
@@ -407,7 +409,7 @@ fn record_current_cluster_kv_watch_event_cache(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn cached_cluster_kv_watch_registration_entry(
     path: &PathBuf,
     mark: ClusterFileMark,
@@ -422,7 +424,7 @@ fn cached_cluster_kv_watch_registration_entry(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn record_cluster_kv_watch_registration_cache(
     path: &PathBuf,
     mark: ClusterFileMark,
@@ -436,7 +438,7 @@ fn record_cluster_kv_watch_registration_cache(
     );
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn record_cluster_kv_watch_registration_cache_with_durable(
     path: &PathBuf,
     mark: ClusterFileMark,
@@ -452,7 +454,7 @@ fn record_cluster_kv_watch_registration_cache_with_durable(
     );
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn record_cluster_kv_watch_registration_cache_with_durable_and_empty_mark(
     path: &PathBuf,
     mark: ClusterFileMark,
@@ -475,7 +477,7 @@ fn record_cluster_kv_watch_registration_cache_with_durable_and_empty_mark(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn record_cluster_kv_watch_registration_empty_drain_cache(
     path: &PathBuf,
     registration_read: &ClusterKvWatchRegistrationRead,
@@ -491,7 +493,7 @@ fn record_cluster_kv_watch_registration_empty_drain_cache(
     );
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn record_current_cluster_kv_watch_registration_cache(
     path: &PathBuf,
     registration: ClusterKvWatchRegistration,
@@ -503,16 +505,16 @@ fn record_current_cluster_kv_watch_registration_cache(
     }
 }
 
-#[cfg(test)]
-fn invalidate_cluster_kv_watch_registration_cache(path: &PathBuf) {
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn invalidate_cluster_kv_watch_registration_cache(path: &PathBuf) {
     if let Ok(mut cache) = CLUSTER_KV_WATCH_REGISTRATION_CACHE.lock() {
         cache.remove(path);
     }
 }
 
-#[cfg(test)]
-fn record_current_cluster_kv_watch_allocator_trust(
-    paths: &ClusterPaths,
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn record_current_cluster_kv_watch_allocator_trust(
+    paths: &ClusterKvPaths,
     active_watch_count: Option<usize>,
 ) {
     record_current_cluster_kv_watch_allocator_trust_with_active_registrations(
@@ -522,31 +524,28 @@ fn record_current_cluster_kv_watch_allocator_trust(
     );
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn record_current_cluster_kv_watch_allocator_trust_with_active_registrations(
-    paths: &ClusterPaths,
+    paths: &ClusterKvPaths,
     active_watch_count: Option<usize>,
     active_registrations: Option<Vec<ClusterKvWatchRegistration>>,
 ) {
-    let Some(allocator_mark) = cluster_file_mark(&paths.kv_watches_next_id) else {
+    let Some(allocator_mark) = cluster_file_mark(&paths.watches_next_id) else {
         return;
     };
     if !allocator_mark.exists {
         return;
     }
-    let Some(watch_dir_mark) = cluster_file_mark(&paths.kv_watches) else {
+    let Some(watch_dir_mark) = cluster_file_mark(&paths.watches) else {
         return;
     };
     if !watch_dir_mark.exists {
         return;
     }
     if let Ok(mut cache) = CLUSTER_KV_WATCH_ALLOCATOR_TRUST.lock() {
-        evict_cluster_kv_watch_allocator_trust_entry_if_needed(
-            &mut cache,
-            &paths.kv_watches_next_id,
-        );
+        evict_cluster_kv_watch_allocator_trust_entry_if_needed(&mut cache, &paths.watches_next_id);
         cache.insert(
-            paths.kv_watches_next_id.clone(),
+            paths.watches_next_id.clone(),
             ClusterKvWatchAllocatorTrustEntry {
                 allocator_mark,
                 watch_dir_mark,
@@ -558,17 +557,15 @@ fn record_current_cluster_kv_watch_allocator_trust_with_active_registrations(
     }
 }
 
-#[cfg(test)]
-pub(crate) fn cached_cluster_kv_watch_events_for_test(
-    paths: &ClusterPaths,
-) -> Option<Vec<KvEvent>> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn cached_cluster_kv_watch_events_for_test(paths: &ClusterKvPaths) -> Option<Vec<KvEvent>> {
     let (checkpoint, log) = cluster_kv_watch_event_cache_marks(paths)?;
     cached_cluster_kv_watch_events_arc(paths, checkpoint, log).map(|events| events.as_ref().clone())
 }
 
-#[cfg(test)]
-pub(crate) fn cached_cluster_kv_watch_registration_for_test(
-    paths: &ClusterPaths,
+#[cfg(any(test, feature = "test-support"))]
+pub fn cached_cluster_kv_watch_registration_for_test(
+    paths: &ClusterKvPaths,
     watch_id: WatchId,
 ) -> Option<ClusterKvWatchRegistration> {
     let path = cluster_kv_watch_path(paths, watch_id);
@@ -576,22 +573,29 @@ pub(crate) fn cached_cluster_kv_watch_registration_for_test(
     cached_cluster_kv_watch_registration_entry(&path, mark).map(|entry| entry.registration)
 }
 
-#[cfg(test)]
-fn record_cluster_kv_watch_drain_once_for_test(paths: &ClusterPaths) {
+#[cfg(any(test, feature = "test-support"))]
+fn record_cluster_kv_watch_drain_once_for_test(paths: &ClusterKvPaths) {
     if let Ok(mut calls) = CLUSTER_KV_WATCH_DRAIN_ONCE_CALLS_FOR_TEST.lock() {
         *calls.entry(cluster_kv_watch_notify_key(paths)).or_default() += 1;
     }
 }
 
-#[cfg(test)]
-pub(crate) fn reset_cluster_kv_watch_drain_once_calls_for_test(paths: &ClusterPaths) {
+#[cfg(any(test, feature = "test-support"))]
+fn record_cluster_kv_watch_drain_read_pass_for_test(paths: &ClusterKvPaths) {
+    if let Ok(mut calls) = CLUSTER_KV_WATCH_DRAIN_READ_PASSES_FOR_TEST.lock() {
+        *calls.entry(cluster_kv_watch_notify_key(paths)).or_default() += 1;
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_cluster_kv_watch_drain_once_calls_for_test(paths: &ClusterKvPaths) {
     if let Ok(mut calls) = CLUSTER_KV_WATCH_DRAIN_ONCE_CALLS_FOR_TEST.lock() {
         calls.remove(&cluster_kv_watch_notify_key(paths));
     }
 }
 
-#[cfg(test)]
-pub(crate) fn cluster_kv_watch_drain_once_calls_for_test(paths: &ClusterPaths) -> u64 {
+#[cfg(any(test, feature = "test-support"))]
+pub fn cluster_kv_watch_drain_once_calls_for_test(paths: &ClusterKvPaths) -> u64 {
     CLUSTER_KV_WATCH_DRAIN_ONCE_CALLS_FOR_TEST
         .lock()
         .ok()
@@ -599,15 +603,31 @@ pub(crate) fn cluster_kv_watch_drain_once_calls_for_test(paths: &ClusterPaths) -
         .unwrap_or(0)
 }
 
-#[cfg(test)]
-fn record_cluster_kv_watch_event_log_read_for_test(paths: &ClusterPaths, bytes: u64) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_cluster_kv_watch_drain_read_passes_for_test(paths: &ClusterKvPaths) {
+    if let Ok(mut calls) = CLUSTER_KV_WATCH_DRAIN_READ_PASSES_FOR_TEST.lock() {
+        calls.remove(&cluster_kv_watch_notify_key(paths));
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn cluster_kv_watch_drain_read_passes_for_test(paths: &ClusterKvPaths) -> u64 {
+    CLUSTER_KV_WATCH_DRAIN_READ_PASSES_FOR_TEST
+        .lock()
+        .ok()
+        .and_then(|calls| calls.get(&cluster_kv_watch_notify_key(paths)).copied())
+        .unwrap_or(0)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn record_cluster_kv_watch_event_log_read_for_test(paths: &ClusterKvPaths, bytes: u64) {
     if let Ok(mut reads) = CLUSTER_KV_WATCH_EVENT_LOG_READ_BYTES_FOR_TEST.lock() {
         *reads.entry(cluster_kv_watch_notify_key(paths)).or_default() += bytes;
     }
 }
 
-#[cfg(test)]
-fn record_cluster_kv_watch_event_log_write_for_test(paths: &ClusterPaths, bytes: u64) {
+#[cfg(any(test, feature = "test-support"))]
+fn record_cluster_kv_watch_event_log_write_for_test(paths: &ClusterKvPaths, bytes: u64) {
     if let Ok(mut writes) = CLUSTER_KV_WATCH_EVENT_LOG_WRITE_BYTES_FOR_TEST.lock() {
         *writes
             .entry(cluster_kv_watch_notify_key(paths))
@@ -615,15 +635,15 @@ fn record_cluster_kv_watch_event_log_write_for_test(paths: &ClusterPaths, bytes:
     }
 }
 
-#[cfg(test)]
-pub(crate) fn reset_cluster_kv_watch_event_log_read_bytes_for_test(paths: &ClusterPaths) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_cluster_kv_watch_event_log_read_bytes_for_test(paths: &ClusterKvPaths) {
     if let Ok(mut reads) = CLUSTER_KV_WATCH_EVENT_LOG_READ_BYTES_FOR_TEST.lock() {
         reads.remove(&cluster_kv_watch_notify_key(paths));
     }
 }
 
-#[cfg(test)]
-pub(crate) fn cluster_kv_watch_event_log_read_bytes_for_test(paths: &ClusterPaths) -> u64 {
+#[cfg(any(test, feature = "test-support"))]
+pub fn cluster_kv_watch_event_log_read_bytes_for_test(paths: &ClusterKvPaths) -> u64 {
     CLUSTER_KV_WATCH_EVENT_LOG_READ_BYTES_FOR_TEST
         .lock()
         .ok()
@@ -631,15 +651,15 @@ pub(crate) fn cluster_kv_watch_event_log_read_bytes_for_test(paths: &ClusterPath
         .unwrap_or(0)
 }
 
-#[cfg(test)]
-pub(crate) fn reset_cluster_kv_watch_event_log_write_bytes_for_test(paths: &ClusterPaths) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_cluster_kv_watch_event_log_write_bytes_for_test(paths: &ClusterKvPaths) {
     if let Ok(mut writes) = CLUSTER_KV_WATCH_EVENT_LOG_WRITE_BYTES_FOR_TEST.lock() {
         writes.remove(&cluster_kv_watch_notify_key(paths));
     }
 }
 
-#[cfg(test)]
-pub(crate) fn cluster_kv_watch_event_log_write_bytes_for_test(paths: &ClusterPaths) -> u64 {
+#[cfg(any(test, feature = "test-support"))]
+pub fn cluster_kv_watch_event_log_write_bytes_for_test(paths: &ClusterKvPaths) -> u64 {
     CLUSTER_KV_WATCH_EVENT_LOG_WRITE_BYTES_FOR_TEST
         .lock()
         .ok()
@@ -647,15 +667,15 @@ pub(crate) fn cluster_kv_watch_event_log_write_bytes_for_test(paths: &ClusterPat
         .unwrap_or(0)
 }
 
-#[cfg(test)]
-pub(crate) fn reset_cluster_kv_watch_dir_scans_for_test(paths: &ClusterPaths) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_cluster_kv_watch_dir_scans_for_test(paths: &ClusterKvPaths) {
     if let Ok(mut scans) = CLUSTER_KV_WATCH_DIR_SCANS_FOR_TEST.lock() {
         scans.remove(&cluster_kv_watch_notify_key(paths));
     }
 }
 
-#[cfg(test)]
-pub(crate) fn cluster_kv_watch_dir_scans_for_test(paths: &ClusterPaths) -> u64 {
+#[cfg(any(test, feature = "test-support"))]
+pub fn cluster_kv_watch_dir_scans_for_test(paths: &ClusterKvPaths) -> u64 {
     CLUSTER_KV_WATCH_DIR_SCANS_FOR_TEST
         .lock()
         .ok()
@@ -663,49 +683,47 @@ pub(crate) fn cluster_kv_watch_dir_scans_for_test(paths: &ClusterPaths) -> u64 {
         .unwrap_or(0)
 }
 
-#[cfg(test)]
-fn record_cluster_kv_watch_dir_scan_for_test(paths: &ClusterPaths) {
+#[cfg(any(test, feature = "test-support"))]
+fn record_cluster_kv_watch_dir_scan_for_test(paths: &ClusterKvPaths) {
     if let Ok(mut scans) = CLUSTER_KV_WATCH_DIR_SCANS_FOR_TEST.lock() {
         *scans.entry(cluster_kv_watch_notify_key(paths)).or_default() += 1;
     }
 }
 
-#[cfg(test)]
-pub(crate) fn fail_next_cluster_kv_watch_allocator_persist_for_test(paths: &ClusterPaths) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn fail_next_cluster_kv_watch_allocator_persist_for_test(paths: &ClusterKvPaths) {
     if let Ok(mut failures) = CLUSTER_KV_WATCH_ALLOCATOR_PERSIST_FAILURES_FOR_TEST.lock() {
-        *failures
-            .entry(paths.kv_watches_next_id.clone())
-            .or_default() += 1;
+        *failures.entry(paths.watches_next_id.clone()).or_default() += 1;
     }
 }
 
-#[cfg(test)]
-fn consume_cluster_kv_watch_allocator_persist_failure_for_test(paths: &ClusterPaths) -> bool {
+#[cfg(any(test, feature = "test-support"))]
+fn consume_cluster_kv_watch_allocator_persist_failure_for_test(paths: &ClusterKvPaths) -> bool {
     let Ok(mut failures) = CLUSTER_KV_WATCH_ALLOCATOR_PERSIST_FAILURES_FOR_TEST.lock() else {
         return false;
     };
-    let Some(remaining) = failures.get_mut(&paths.kv_watches_next_id) else {
+    let Some(remaining) = failures.get_mut(&paths.watches_next_id) else {
         return false;
     };
     *remaining = remaining.saturating_sub(1);
     if *remaining == 0 {
-        failures.remove(&paths.kv_watches_next_id);
+        failures.remove(&paths.watches_next_id);
     }
     true
 }
 
-#[cfg(test)]
-pub(crate) fn cluster_kv_watch_event_cache_capacity_for_test() -> usize {
+#[cfg(any(test, feature = "test-support"))]
+pub fn cluster_kv_watch_event_cache_capacity_for_test() -> usize {
     MAX_CLUSTER_KV_WATCH_EVENT_CACHE_ENTRIES
 }
 
-#[cfg(test)]
-pub(crate) fn cluster_kv_watch_registration_cache_capacity_for_test() -> usize {
+#[cfg(any(test, feature = "test-support"))]
+pub fn cluster_kv_watch_registration_cache_capacity_for_test() -> usize {
     MAX_CLUSTER_KV_WATCH_REGISTRATION_CACHE_ENTRIES
 }
 
-#[cfg(test)]
-pub(crate) fn record_cluster_kv_watch_event_cache_for_test(paths: &ClusterPaths) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn record_cluster_kv_watch_event_cache_for_test(paths: &ClusterKvPaths) {
     record_cluster_kv_watch_event_cache(
         paths,
         ClusterFileMark {
@@ -726,8 +744,8 @@ pub(crate) fn record_cluster_kv_watch_event_cache_for_test(paths: &ClusterPaths)
     );
 }
 
-#[cfg(test)]
-pub(crate) fn refresh_cluster_kv_watch_event_cache_for_test(paths: &ClusterPaths) -> bool {
+#[cfg(any(test, feature = "test-support"))]
+pub fn refresh_cluster_kv_watch_event_cache_for_test(paths: &ClusterKvPaths) -> bool {
     cached_cluster_kv_watch_event_cache_entry(
         paths,
         ClusterFileMark {
@@ -746,8 +764,8 @@ pub(crate) fn refresh_cluster_kv_watch_event_cache_for_test(paths: &ClusterPaths
     .is_some()
 }
 
-#[cfg(test)]
-pub(crate) fn cluster_kv_watch_event_cache_contains_for_test(paths: &ClusterPaths) -> bool {
+#[cfg(any(test, feature = "test-support"))]
+pub fn cluster_kv_watch_event_cache_contains_for_test(paths: &ClusterKvPaths) -> bool {
     let key = cluster_kv_watch_notify_key(paths);
     CLUSTER_KV_WATCH_EVENT_CACHE
         .lock()
@@ -755,15 +773,15 @@ pub(crate) fn cluster_kv_watch_event_cache_contains_for_test(paths: &ClusterPath
         .unwrap_or(false)
 }
 
-#[cfg(test)]
-pub(crate) fn remove_cluster_kv_watch_event_cache_entries_under_root_for_test(root: &Path) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn remove_cluster_kv_watch_event_cache_entries_under_root_for_test(root: &Path) {
     if let Ok(mut cache) = CLUSTER_KV_WATCH_EVENT_CACHE.lock() {
         cache.retain(|path, _| !path.starts_with(root));
     }
 }
 
-#[cfg(test)]
-pub(crate) fn record_cluster_kv_watch_registration_cache_for_test(path: &PathBuf) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn record_cluster_kv_watch_registration_cache_for_test(path: &PathBuf) {
     record_cluster_kv_watch_registration_cache(
         path,
         ClusterFileMark {
@@ -780,8 +798,8 @@ pub(crate) fn record_cluster_kv_watch_registration_cache_for_test(path: &PathBuf
     );
 }
 
-#[cfg(test)]
-pub(crate) fn refresh_cluster_kv_watch_registration_cache_for_test(path: &PathBuf) -> bool {
+#[cfg(any(test, feature = "test-support"))]
+pub fn refresh_cluster_kv_watch_registration_cache_for_test(path: &PathBuf) -> bool {
     cached_cluster_kv_watch_registration_entry(
         path,
         ClusterFileMark {
@@ -794,30 +812,27 @@ pub(crate) fn refresh_cluster_kv_watch_registration_cache_for_test(path: &PathBu
     .is_some()
 }
 
-#[cfg(test)]
-pub(crate) fn cluster_kv_watch_registration_cache_contains_for_test(path: &PathBuf) -> bool {
+#[cfg(any(test, feature = "test-support"))]
+pub fn cluster_kv_watch_registration_cache_contains_for_test(path: &PathBuf) -> bool {
     CLUSTER_KV_WATCH_REGISTRATION_CACHE
         .lock()
         .map(|cache| cache.contains_key(path))
         .unwrap_or(false)
 }
 
-#[cfg(test)]
-pub(crate) fn remove_cluster_kv_watch_registration_cache_entries_under_root_for_test(root: &Path) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn remove_cluster_kv_watch_registration_cache_entries_under_root_for_test(root: &Path) {
     if let Ok(mut cache) = CLUSTER_KV_WATCH_REGISTRATION_CACHE.lock() {
         cache.retain(|path, _| !path.starts_with(root));
     }
 }
 
-#[cfg(test)]
-pub(crate) fn record_cluster_kv_watch_allocator_trust_for_test(paths: &ClusterPaths) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn record_cluster_kv_watch_allocator_trust_for_test(paths: &ClusterKvPaths) {
     if let Ok(mut cache) = CLUSTER_KV_WATCH_ALLOCATOR_TRUST.lock() {
-        evict_cluster_kv_watch_allocator_trust_entry_if_needed(
-            &mut cache,
-            &paths.kv_watches_next_id,
-        );
+        evict_cluster_kv_watch_allocator_trust_entry_if_needed(&mut cache, &paths.watches_next_id);
         cache.insert(
-            paths.kv_watches_next_id.clone(),
+            paths.watches_next_id.clone(),
             ClusterKvWatchAllocatorTrustEntry {
                 allocator_mark: ClusterFileMark {
                     exists: true,
@@ -839,150 +854,63 @@ pub(crate) fn record_cluster_kv_watch_allocator_trust_for_test(paths: &ClusterPa
     }
 }
 
-#[cfg(test)]
-pub(crate) fn refresh_cluster_kv_watch_allocator_trust_for_test(paths: &ClusterPaths) -> bool {
+#[cfg(any(test, feature = "test-support"))]
+pub fn refresh_cluster_kv_watch_allocator_trust_for_test(paths: &ClusterKvPaths) -> bool {
     CLUSTER_KV_WATCH_ALLOCATOR_TRUST
         .lock()
         .ok()
         .and_then(|mut cache| {
-            cache.get_mut(&paths.kv_watches_next_id).map(|entry| {
+            cache.get_mut(&paths.watches_next_id).map(|entry| {
                 entry.last_used = cluster_kv_watch_cache_tick();
             })
         })
         .is_some()
 }
 
-#[cfg(test)]
-pub(crate) fn cluster_kv_watch_allocator_trust_contains_for_test(paths: &ClusterPaths) -> bool {
+#[cfg(any(test, feature = "test-support"))]
+pub fn cluster_kv_watch_allocator_trust_contains_for_test(paths: &ClusterKvPaths) -> bool {
     CLUSTER_KV_WATCH_ALLOCATOR_TRUST
         .lock()
-        .map(|cache| cache.contains_key(&paths.kv_watches_next_id))
+        .map(|cache| cache.contains_key(&paths.watches_next_id))
         .unwrap_or(false)
 }
 
-#[cfg(test)]
-pub(crate) fn remove_cluster_kv_watch_allocator_trust_entries_under_root_for_test(root: &Path) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn remove_cluster_kv_watch_allocator_trust_entries_under_root_for_test(root: &Path) {
     if let Ok(mut cache) = CLUSTER_KV_WATCH_ALLOCATOR_TRUST.lock() {
         cache.retain(|path, _| !path.starts_with(root));
     }
 }
 
-#[cfg(test)]
-fn cluster_kv_watch_notify_key(paths: &ClusterPaths) -> PathBuf {
+#[cfg(any(test, feature = "test-support"))]
+fn cluster_kv_watch_notify_key(paths: &ClusterKvPaths) -> PathBuf {
     paths.root.clone()
 }
 
-#[cfg(test)]
-fn cluster_kv_watch_generation(paths: &ClusterPaths) -> u64 {
-    sinomo_kv::cluster_kv_watch_generation(&paths.kv_paths())
+fn notify_cluster_kv_watchers_for_events(paths: &ClusterKvPaths, events: &[KvEvent]) {
+    crate::notify_cluster_kv_watchers_for_events(paths, events);
 }
 
-#[cfg(test)]
-fn cluster_kv_watch_observed_generation(
-    paths: &ClusterPaths,
-    watch_id: WatchId,
-) -> sinomo_kv::ClusterKvWatchObservedGeneration {
-    sinomo_kv::cluster_kv_watch_observed_generation(&paths.kv_paths(), watch_id)
-}
-
-#[cfg(test)]
-fn notify_cluster_kv_watchers_for_events(paths: &ClusterPaths, events: &[KvEvent]) {
-    sinomo_kv::notify_cluster_kv_watchers_for_events(&paths.kv_paths(), events);
-}
-
-#[cfg(test)]
-fn wait_for_cluster_kv_watch_change(
-    paths: &ClusterPaths,
-    observed_generation: u64,
-    timeout: Duration,
-) -> bool {
-    sinomo_kv::wait_for_cluster_kv_watch_change(&paths.kv_paths(), observed_generation, timeout)
-}
-
-#[cfg(test)]
-pub(crate) fn cluster_kv_watch_notifier_capacity_for_test() -> usize {
-    sinomo_kv::cluster_kv_watch_notifier_capacity_for_test()
-}
-
-#[cfg(test)]
-pub(crate) fn cluster_kv_watch_notifier_generation_for_test(paths: &ClusterPaths) -> u64 {
-    cluster_kv_watch_generation(paths)
-}
-
-#[cfg(test)]
-pub(crate) fn cluster_kv_watch_notifier_has_key_for_test(paths: &ClusterPaths) -> bool {
-    sinomo_kv::cluster_kv_watch_notifier_has_key_for_test(&paths.kv_paths())
-}
-
-#[cfg(test)]
-pub(crate) fn cluster_kv_watch_notifier_has_raw_key_for_test(path: &Path) -> bool {
-    sinomo_kv::cluster_kv_watch_notifier_has_raw_key_for_test(path)
-}
-
-#[cfg(test)]
-pub(crate) fn cluster_kv_watch_notifier_waiter_count_for_test(paths: &ClusterPaths) -> usize {
-    sinomo_kv::cluster_kv_watch_notifier_waiter_count_for_test(&paths.kv_paths())
-}
-
-#[cfg(test)]
-pub(crate) fn remove_cluster_kv_watch_notifier_entries_under_root_for_test(root: &Path) {
-    sinomo_kv::remove_cluster_kv_watch_notifier_entries_under_root_for_test(root);
-}
-
-#[cfg(test)]
-pub(crate) fn touch_cluster_kv_watch_notifier_for_test(paths: &ClusterPaths) {
-    sinomo_kv::touch_cluster_kv_watch_notifier_for_test(&paths.kv_paths());
-}
-
-#[cfg(test)]
-pub(crate) fn record_cluster_kv_watch_notifier_waiter_key_for_test(path: PathBuf) {
-    sinomo_kv::record_cluster_kv_watch_notifier_waiter_key_for_test(path);
-}
-
-#[cfg(test)]
-pub(crate) fn reset_cluster_kv_watch_unchanged_wakeups_for_test(
-    paths: &ClusterPaths,
-    watch_id: WatchId,
-) {
-    sinomo_kv::reset_cluster_kv_watch_unchanged_wakeups_for_test(&paths.kv_paths(), watch_id);
-}
-
-#[cfg(test)]
-pub(crate) fn cluster_kv_watch_unchanged_wakeups_for_test(
-    paths: &ClusterPaths,
-    watch_id: WatchId,
-) -> u64 {
-    sinomo_kv::cluster_kv_watch_unchanged_wakeups_for_test(&paths.kv_paths(), watch_id)
-}
-
-#[cfg(test)]
-pub(crate) fn wait_for_cluster_kv_watch_change_for_test(
-    paths: &ClusterPaths,
-    observed_generation: u64,
-    timeout: Duration,
-) -> bool {
-    wait_for_cluster_kv_watch_change(paths, observed_generation, timeout)
-}
-
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn create_cluster_kv_watch(
-    paths: &ClusterPaths,
+    paths: &ClusterKvPaths,
+    node_id: NodeId,
     request: ClusterKvWatchPrefixRequest,
-) -> Result<ClusterKvWatchRegistration, NetworkError> {
-    let snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
+) -> Result<ClusterKvWatchRegistration, KvError> {
+    let snapshot = read_cluster_kv_current_snapshot_arc_for_node(paths, node_id.clone())?;
     let allocator_trusted = cluster_kv_watch_allocator_trusted(paths);
-    let report = sinomo_kv::create_cluster_kv_watch_registration(
-        &paths.kv_paths(),
+    let report = crate::create_cluster_kv_watch_registration(
+        paths,
         request,
         snapshot.compacted_revision,
         allocator_trusted,
-        sinomo_kv::MAX_CLUSTER_KV_ACTIVE_WATCHES,
+        crate::MAX_CLUSTER_KV_ACTIVE_WATCHES,
     )?;
     if let Some(scan) = report.scan.as_ref() {
         record_cluster_kv_watch_scan_observation(paths, scan);
     }
     if let Err(error) = persist_cluster_kv_watch_allocator_state(paths, &report.allocator) {
-        let _ = sinomo_kv::remove_cluster_kv_watch_registration_file_if_exists(&report.watch_path);
+        let _ = crate::remove_cluster_kv_watch_registration_file_if_exists(&report.watch_path);
         invalidate_cluster_kv_watch_registration_cache(&report.watch_path);
         return Err(error);
     }
@@ -993,32 +921,36 @@ pub fn create_cluster_kv_watch(
     Ok(report.registration)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn drain_cluster_kv_watch(
-    paths: &ClusterPaths,
+    paths: &ClusterKvPaths,
+    node_id: NodeId,
     request: ClusterKvWatchDrainRequest,
-) -> Result<ClusterKvWatchDrainResponse, NetworkError> {
+) -> Result<ClusterKvWatchDrainResponse, KvError> {
     let wait_timeout = request.wait_timeout();
     if wait_timeout.is_zero() {
         return drain_cluster_kv_watch_once_limited_by_payload_bytes(
             paths,
+            node_id,
             request.watch_id,
-            sinomo_kv::MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES,
+            crate::MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES,
         );
     }
     let Some(deadline) = Instant::now().checked_add(wait_timeout) else {
         return drain_cluster_kv_watch_once_limited_by_payload_bytes(
             paths,
+            node_id,
             request.watch_id,
-            sinomo_kv::MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES,
+            crate::MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES,
         );
     };
     loop {
         let observed_generation = cluster_kv_watch_observed_generation(paths, request.watch_id);
         let response = drain_cluster_kv_watch_once_limited_by_payload_bytes(
             paths,
+            node_id.clone(),
             request.watch_id,
-            sinomo_kv::MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES,
+            crate::MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES,
         )?;
         if !response.events.is_empty() {
             return Ok(response);
@@ -1027,8 +959,8 @@ pub fn drain_cluster_kv_watch(
         if remaining.is_zero() {
             return Ok(response);
         }
-        if !sinomo_kv::wait_for_cluster_kv_watch_change_for_watch(
-            &paths.kv_paths(),
+        if !crate::wait_for_cluster_kv_watch_change_for_watch(
+            paths,
             request.watch_id,
             observed_generation,
             remaining,
@@ -1038,12 +970,13 @@ pub fn drain_cluster_kv_watch(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn cached_cluster_kv_watch_empty_drain_response(
-    paths: &ClusterPaths,
+    paths: &ClusterKvPaths,
+    node_id: &NodeId,
     watch_path: &PathBuf,
     watch_id: WatchId,
-    observed_generation: sinomo_kv::ClusterKvWatchObservedGeneration,
+    observed_generation: crate::ClusterKvWatchObservedGeneration,
 ) -> Option<ClusterKvWatchDrainResponse> {
     let mark = cluster_file_mark(watch_path)?;
     if !mark.exists {
@@ -1053,7 +986,7 @@ fn cached_cluster_kv_watch_empty_drain_response(
     if entry.registration.watch_id != watch_id {
         return None;
     }
-    let current_mark = cluster_kv_watch_empty_drain_mark(paths, observed_generation)?;
+    let current_mark = cluster_kv_watch_empty_drain_mark(paths, node_id, observed_generation)?;
     if entry.empty_drain_mark != Some(current_mark) {
         return None;
     }
@@ -1064,32 +997,35 @@ fn cached_cluster_kv_watch_empty_drain_response(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn drain_cluster_kv_watch_once_limited_by_payload_bytes(
-    paths: &ClusterPaths,
+#[cfg(any(test, feature = "test-support"))]
+pub fn drain_cluster_kv_watch_once_limited_by_payload_bytes(
+    paths: &ClusterKvPaths,
+    node_id: NodeId,
     watch_id: WatchId,
     max_payload_bytes: usize,
-) -> Result<ClusterKvWatchDrainResponse, NetworkError> {
+) -> Result<ClusterKvWatchDrainResponse, KvError> {
     record_cluster_kv_watch_drain_once_for_test(paths);
 
     let watch_path = cluster_kv_watch_path(paths, watch_id);
     let observed_generation = cluster_kv_watch_observed_generation(paths, watch_id);
     if let Some(response) = cached_cluster_kv_watch_empty_drain_response(
         paths,
+        &node_id,
         &watch_path,
         watch_id,
         observed_generation,
     ) {
         return Ok(response);
     }
+    record_cluster_kv_watch_drain_read_pass_for_test(paths);
     let empty_drain_mark_before_read =
-        cluster_kv_watch_empty_drain_mark(paths, observed_generation);
+        cluster_kv_watch_empty_drain_mark(paths, &node_id, observed_generation);
     let registration_read = read_cluster_kv_watch_registration_with_cursor(&watch_path, watch_id)?;
-    let snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
+    let snapshot = read_cluster_kv_current_snapshot_arc_for_node(paths, node_id.clone())?;
     let persisted_events = cluster_kv_watch_events_arc(paths)?;
     let (registration_file_unchanged, registration_file_age) =
         cluster_kv_watch_registration_cursor_observation(&watch_path, &registration_read);
-    let report = match sinomo_kv::drain_cluster_kv_watch_registration(
+    let report = match crate::drain_cluster_kv_watch_registration(
         registration_read.registration.clone(),
         registration_read.durable_next_revision,
         persisted_events.as_ref(),
@@ -1101,9 +1037,9 @@ pub(crate) fn drain_cluster_kv_watch_once_limited_by_payload_bytes(
         Ok(report) => report,
         Err(error @ KvError::Compacted { .. }) => {
             remove_cluster_kv_watch_registration_with_allocator(paths, watch_id)?;
-            return Err(NetworkError::Kv(error));
+            return Err(error);
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(error),
     };
     if !report.response.events.is_empty() {
         update_cluster_kv_watch_registration_after_drain(
@@ -1113,7 +1049,8 @@ pub(crate) fn drain_cluster_kv_watch_once_limited_by_payload_bytes(
             &report,
         )?;
     } else if let Some(empty_drain_mark) = empty_drain_mark_before_read
-        && cluster_kv_watch_empty_drain_mark(paths, observed_generation) == Some(empty_drain_mark)
+        && cluster_kv_watch_empty_drain_mark(paths, &node_id, observed_generation)
+            == Some(empty_drain_mark.clone())
     {
         record_cluster_kv_watch_registration_empty_drain_cache(
             &watch_path,
@@ -1125,19 +1062,19 @@ pub(crate) fn drain_cluster_kv_watch_once_limited_by_payload_bytes(
     Ok(report.response)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn update_cluster_kv_watch_registration_after_drain(
-    paths: &ClusterPaths,
+    paths: &ClusterKvPaths,
     watch_path: &PathBuf,
     registration_read: &ClusterKvWatchRegistrationRead,
-    report: &sinomo_kv::ClusterKvWatchDrainRegistrationReport,
-) -> Result<(), NetworkError> {
-    let persistence = sinomo_kv::persist_cluster_kv_watch_drain_cursor(watch_path, report)?;
+    report: &crate::ClusterKvWatchDrainRegistrationReport,
+) -> Result<(), KvError> {
+    let persistence = crate::persist_cluster_kv_watch_drain_cursor(watch_path, report)?;
     match persistence {
-        sinomo_kv::ClusterKvWatchDrainCursorPersistence::Persisted { registration } => {
+        crate::ClusterKvWatchDrainCursorPersistence::Persisted { registration } => {
             record_current_cluster_kv_watch_registration_cache(watch_path, registration.clone());
         }
-        sinomo_kv::ClusterKvWatchDrainCursorPersistence::CacheOnly {
+        crate::ClusterKvWatchDrainCursorPersistence::CacheOnly {
             registration,
             durable_next_revision,
         } => {
@@ -1148,13 +1085,13 @@ fn update_cluster_kv_watch_registration_after_drain(
                 durable_next_revision,
             );
         }
-        sinomo_kv::ClusterKvWatchDrainCursorPersistence::Unchanged { .. } => {}
+        crate::ClusterKvWatchDrainCursorPersistence::Unchanged { .. } => {}
     };
     refresh_cached_cluster_kv_active_watch_registration(paths, &report.registration);
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn cluster_kv_watch_registration_cursor_observation(
     watch_path: &PathBuf,
     registration_read: &ClusterKvWatchRegistrationRead,
@@ -1169,32 +1106,17 @@ fn cluster_kv_watch_registration_cursor_observation(
     (registration_file_unchanged, registration_file_age)
 }
 
-#[cfg(test)]
-pub fn cancel_cluster_kv_watch(
-    paths: &ClusterPaths,
-    request: ClusterKvWatchCancelRequest,
-) -> Result<ClusterKvWatchCancelResponse, NetworkError> {
-    let removed = remove_cluster_kv_watch_registration_with_allocator(paths, request.watch_id)?;
-    if removed {
-        sinomo_kv::notify_cluster_kv_watchers(&paths.kv_paths());
-    }
-    Ok(ClusterKvWatchCancelResponse {
-        watch_id: request.watch_id,
-        cancelled: removed,
-    })
-}
-
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn append_cluster_kv_watch_events(
-    paths: &ClusterPaths,
+    paths: &ClusterKvPaths,
     incoming: &[KvEvent],
-) -> Result<usize, NetworkError> {
+) -> Result<usize, KvError> {
     if incoming.is_empty() {
         return Ok(0);
     }
     let append_lock = cluster_kv_watch_event_append_lock(paths);
-    let _append_guard = append_lock.lock().map_err(|source| NetworkError::Io {
-        operation: "cluster kv watch event append".to_string(),
+    let _append_guard = append_lock.lock().map_err(|source| KvError::Io {
+        path: paths.watch_events_log.display().to_string(),
         detail: format!("append mutex poisoned: {source}"),
     })?;
     if cached_cluster_kv_watch_events_contain_all(paths, incoming) {
@@ -1207,8 +1129,8 @@ pub fn append_cluster_kv_watch_events(
         return Ok(0);
     }
     let cache = cluster_kv_watch_event_append_cache_view(paths);
-    let report = sinomo_kv::append_cluster_kv_watch_events_to_storage_with_observers(
-        &paths.kv_paths(),
+    let report = crate::append_cluster_kv_watch_events_to_storage_with_observers(
+        paths,
         incoming,
         cache.as_ref(),
         |read| observe_cluster_kv_watch_event_log_read(paths, read),
@@ -1227,86 +1149,84 @@ pub fn append_cluster_kv_watch_events(
     Ok(report.appended.len())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn append_cluster_kv_watch_events_for_active_watches(
-    paths: &ClusterPaths,
+    paths: &ClusterKvPaths,
+    node_id: NodeId,
     incoming: &[KvEvent],
-) -> Result<usize, NetworkError> {
-    if incoming.is_empty() || (!paths.kv_watches.exists() && !paths.kv_watches_next_id.exists()) {
+) -> Result<usize, KvError> {
+    if incoming.is_empty() || (!paths.watches.exists() && !paths.watches_next_id.exists()) {
         return Ok(0);
     }
-    let snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
-    let registrations =
-        if let Some(registrations) = cached_cluster_kv_active_watch_registrations(paths) {
+    let snapshot = read_cluster_kv_current_snapshot_arc_for_node(paths, node_id.clone())?;
+    let registrations = if let Some(registrations) =
+        cached_cluster_kv_active_watch_registrations(paths)
+    {
+        registrations
+    } else {
+        let active =
+            crate::cluster_kv_active_watch_registration_report(paths, snapshot.compacted_revision)?;
+        if let Some(scan) = active.scan.as_ref() {
+            record_cluster_kv_watch_scan_observation(paths, scan);
+        }
+        if let Some(allocator) = active.allocator.as_ref() {
+            let registrations = active
+                .scan
+                .as_ref()
+                .map(|scan| {
+                    scan.retained_registrations
+                        .iter()
+                        .map(|retained| retained.registration.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            persist_cluster_kv_watch_allocator_state(paths, allocator)?;
+            record_current_cluster_kv_watch_allocator_trust_with_active_registrations(
+                paths,
+                allocator.active_watch_count,
+                Some(registrations.clone()),
+            );
             registrations
         } else {
-            let active = sinomo_kv::cluster_kv_active_watch_registration_report(
-                &paths.kv_paths(),
-                snapshot.compacted_revision,
-            )?;
-            if let Some(scan) = active.scan.as_ref() {
-                record_cluster_kv_watch_scan_observation(paths, scan);
-            }
-            if let Some(allocator) = active.allocator.as_ref() {
-                let registrations = active
-                    .scan
-                    .as_ref()
-                    .map(|scan| {
-                        scan.retained_registrations
-                            .iter()
-                            .map(|retained| retained.registration.clone())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                persist_cluster_kv_watch_allocator_state(paths, allocator)?;
-                record_current_cluster_kv_watch_allocator_trust_with_active_registrations(
-                    paths,
-                    allocator.active_watch_count,
-                    Some(registrations.clone()),
-                );
-                registrations
-            } else {
-                Vec::new()
-            }
-        };
+            Vec::new()
+        }
+    };
     if registrations.is_empty() {
         return Ok(0);
     }
-    let incoming =
-        sinomo_kv::cluster_kv_watch_events_matching_registrations(&registrations, incoming);
+    let incoming = crate::cluster_kv_watch_events_matching_registrations(&registrations, incoming);
     if incoming.is_empty()
         || incoming
             .iter()
-            .all(|event| sinomo_kv::cluster_kv_events_contain(&snapshot.events, event))
+            .all(|event| crate::cluster_kv_events_contain(&snapshot.events, event))
     {
         return Ok(0);
     }
     append_cluster_kv_watch_events(paths, &incoming)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn persisted_cluster_kv_watch_events_contain_all(
-    paths: &ClusterPaths,
+    paths: &ClusterKvPaths,
     incoming: &[KvEvent],
-) -> Result<bool, NetworkError> {
-    let Some(log_mark) = cluster_file_mark(&paths.kv_watch_events_log) else {
+) -> Result<bool, KvError> {
+    let Some(log_mark) = cluster_file_mark(&paths.watch_events_log) else {
         return Ok(false);
     };
     if log_mark.exists {
         return Ok(false);
     }
     let events = cluster_kv_watch_events_arc(paths)?;
-    let still_no_log =
-        cluster_file_mark(&paths.kv_watch_events_log).is_some_and(|mark| !mark.exists);
+    let still_no_log = cluster_file_mark(&paths.watch_events_log).is_some_and(|mark| !mark.exists);
     Ok(still_no_log
         && incoming
             .iter()
-            .all(|event| sinomo_kv::cluster_kv_events_contain(events.as_ref(), event)))
+            .all(|event| crate::cluster_kv_events_contain(events.as_ref(), event)))
 }
 
-#[cfg(test)]
-pub(crate) fn cached_cluster_kv_watch_events_contain_all(
-    paths: &ClusterPaths,
+#[cfg(any(test, feature = "test-support"))]
+pub fn cached_cluster_kv_watch_events_contain_all(
+    paths: &ClusterKvPaths,
     incoming: &[KvEvent],
 ) -> bool {
     let Some((checkpoint, log)) = cluster_kv_watch_event_cache_marks(paths) else {
@@ -1320,37 +1240,40 @@ pub(crate) fn cached_cluster_kv_watch_events_contain_all(
     }
     incoming
         .iter()
-        .all(|event| sinomo_kv::cluster_kv_events_contain(entry.events.as_ref(), event))
+        .all(|event| crate::cluster_kv_events_contain(entry.events.as_ref(), event))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn cached_cluster_kv_snapshot_events_contain_all(
-    paths: &ClusterPaths,
+    paths: &ClusterKvPaths,
     incoming: &[KvEvent],
 ) -> bool {
-    read_cluster_kv_cached_snapshot_if_present(paths).is_ok_and(|snapshot| {
-        snapshot.is_some_and(|snapshot| {
-            incoming
-                .iter()
-                .all(|event| sinomo_kv::cluster_kv_events_contain(&snapshot.events, event))
+    paths
+        .local_cache()
+        .cached_snapshot_arc_if_present()
+        .is_ok_and(|snapshot| {
+            snapshot.is_some_and(|snapshot| {
+                incoming
+                    .iter()
+                    .all(|event| crate::cluster_kv_events_contain(&snapshot.events, event))
+            })
         })
-    })
 }
 
-#[cfg(test)]
-pub fn cluster_kv_watch_events(paths: &ClusterPaths) -> Result<Vec<KvEvent>, NetworkError> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn cluster_kv_watch_events(paths: &ClusterKvPaths) -> Result<Vec<KvEvent>, KvError> {
     cluster_kv_watch_events_arc(paths).map(|events| events.as_ref().clone())
 }
 
-#[cfg(test)]
-fn cluster_kv_watch_events_arc(paths: &ClusterPaths) -> Result<Arc<Vec<KvEvent>>, NetworkError> {
+#[cfg(any(test, feature = "test-support"))]
+fn cluster_kv_watch_events_arc(paths: &ClusterKvPaths) -> Result<Arc<Vec<KvEvent>>, KvError> {
     let cache_marks = cluster_kv_watch_event_cache_marks(paths);
     if let Some((checkpoint_mark, log_mark)) = cache_marks {
         if let Some(events) = cached_cluster_kv_watch_events_arc(paths, checkpoint_mark, log_mark) {
             return Ok(events);
         }
     }
-    let read = sinomo_kv::read_cluster_kv_watch_events_with_observer(&paths.kv_paths(), |read| {
+    let read = crate::read_cluster_kv_watch_events_with_observer(paths, |read| {
         observe_cluster_kv_watch_event_log_read(paths, read)
     });
     let read = read?;
@@ -1370,39 +1293,33 @@ fn cluster_kv_watch_events_arc(paths: &ClusterPaths) -> Result<Arc<Vec<KvEvent>>
     Ok(events)
 }
 
-#[cfg(test)]
-fn observe_cluster_kv_watch_event_log_read(paths: &ClusterPaths, read: u64) {
+#[cfg(any(test, feature = "test-support"))]
+fn observe_cluster_kv_watch_event_log_read(paths: &ClusterKvPaths, read: u64) {
     record_cluster_kv_watch_event_log_read_for_test(paths, read);
-    if let Some(observer) = io_observer() {
-        observer.on_disk_read(read);
-    }
 }
 
-#[cfg(test)]
-fn observe_cluster_kv_watch_event_log_write(paths: &ClusterPaths, written: u64) {
+#[cfg(any(test, feature = "test-support"))]
+fn observe_cluster_kv_watch_event_log_write(paths: &ClusterKvPaths, written: u64) {
     record_cluster_kv_watch_event_log_write_for_test(paths, written);
-    if let Some(observer) = io_observer() {
-        observer.on_disk_write(written);
-    }
 }
 
-#[cfg(test)]
-fn cluster_kv_watch_path(paths: &ClusterPaths, watch_id: WatchId) -> PathBuf {
-    paths.kv_paths().watch_path(watch_id)
+#[cfg(any(test, feature = "test-support"))]
+fn cluster_kv_watch_path(paths: &ClusterKvPaths, watch_id: WatchId) -> PathBuf {
+    paths.watch_path(watch_id)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 struct ClusterKvWatchRegistrationRead {
     mark: ClusterFileMark,
     registration: ClusterKvWatchRegistration,
     durable_next_revision: KvRevision,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn read_cluster_kv_watch_registration_with_cursor(
     path: &PathBuf,
     watch_id: WatchId,
-) -> Result<ClusterKvWatchRegistrationRead, NetworkError> {
+) -> Result<ClusterKvWatchRegistrationRead, KvError> {
     let Some(mark) = cluster_file_mark(path) else {
         return read_cluster_kv_watch_registration_from_file(path, watch_id).map(|registration| {
             ClusterKvWatchRegistrationRead {
@@ -1418,7 +1335,7 @@ fn read_cluster_kv_watch_registration_with_cursor(
         });
     };
     if !mark.exists {
-        return Err(NetworkError::Kv(KvError::UnknownWatch { watch_id }));
+        return Err(KvError::UnknownWatch { watch_id });
     }
     if let Some(entry) = cached_cluster_kv_watch_registration_entry(path, mark) {
         if entry.registration.watch_id == watch_id {
@@ -1430,7 +1347,7 @@ fn read_cluster_kv_watch_registration_with_cursor(
         }
         invalidate_cluster_kv_watch_registration_cache(path);
         remove_cluster_kv_watch_file(path);
-        return Err(NetworkError::Kv(KvError::UnknownWatch { watch_id }));
+        return Err(KvError::UnknownWatch { watch_id });
     }
     read_cluster_kv_watch_registration_from_file(path, watch_id).map(|registration| {
         ClusterKvWatchRegistrationRead {
@@ -1441,24 +1358,24 @@ fn read_cluster_kv_watch_registration_with_cursor(
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn read_cluster_kv_watch_registration_from_file(
     path: &PathBuf,
     watch_id: WatchId,
-) -> Result<ClusterKvWatchRegistration, NetworkError> {
-    let registration = match sinomo_kv::read_cluster_kv_watch_registration_file(path, watch_id) {
+) -> Result<ClusterKvWatchRegistration, KvError> {
+    let registration = match crate::read_cluster_kv_watch_registration_file(path, watch_id) {
         Ok(registration) => registration,
         Err(KvError::UnknownWatch { watch_id }) => {
             remove_cluster_kv_watch_file(path);
-            return Err(NetworkError::Kv(KvError::UnknownWatch { watch_id }));
+            return Err(KvError::UnknownWatch { watch_id });
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(error),
     };
     record_current_cluster_kv_watch_registration_cache(path, registration.clone());
     Ok(registration)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn remove_cluster_kv_watch_file(path: &PathBuf) {
     if let Err(error) = remove_cluster_kv_watch_file_if_exists(path) {
         eprintln!(
@@ -1469,22 +1386,19 @@ fn remove_cluster_kv_watch_file(path: &PathBuf) {
     }
 }
 
-#[cfg(test)]
-fn remove_cluster_kv_watch_file_if_exists(path: &PathBuf) -> Result<bool, NetworkError> {
-    let removed = sinomo_kv::remove_cluster_kv_watch_registration_file_if_exists(path)?;
+#[cfg(any(test, feature = "test-support"))]
+fn remove_cluster_kv_watch_file_if_exists(path: &PathBuf) -> Result<bool, KvError> {
+    let removed = crate::remove_cluster_kv_watch_registration_file_if_exists(path)?;
     invalidate_cluster_kv_watch_registration_cache(path);
     Ok(removed)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn remove_cluster_kv_watch_registration_with_allocator(
-    paths: &ClusterPaths,
+    paths: &ClusterKvPaths,
     watch_id: WatchId,
-) -> Result<bool, NetworkError> {
-    let report = sinomo_kv::remove_cluster_kv_watch_registration_with_allocator(
-        &paths.kv_paths(),
-        watch_id,
-    )?;
+) -> Result<bool, KvError> {
+    let report = crate::remove_cluster_kv_watch_registration_with_allocator(paths, watch_id)?;
     invalidate_cluster_kv_watch_registration_cache(&report.watch_path);
     if let Some(allocator) = report.allocator {
         persist_cluster_kv_watch_allocator_state(paths, &allocator)?;
@@ -1492,26 +1406,26 @@ fn remove_cluster_kv_watch_registration_with_allocator(
     Ok(report.removed)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn persist_cluster_kv_watch_allocator_state(
-    paths: &ClusterPaths,
-    state: &sinomo_kv::ClusterKvWatchAllocatorState,
-) -> Result<(), NetworkError> {
+    paths: &ClusterKvPaths,
+    state: &crate::ClusterKvWatchAllocatorState,
+) -> Result<(), KvError> {
     if consume_cluster_kv_watch_allocator_persist_failure_for_test(paths) {
-        return Err(NetworkError::StorageIo {
-            path: paths.kv_watches_next_id.display().to_string(),
+        return Err(KvError::Io {
+            path: paths.watches_next_id.display().to_string(),
             detail: "injected cluster kv watch allocator persist failure".to_string(),
         });
     }
-    sinomo_kv::write_cluster_kv_watch_allocator_state(&paths.kv_paths(), state)?;
+    crate::write_cluster_kv_watch_allocator_state(paths, state)?;
     record_current_cluster_kv_watch_allocator_trust(paths, state.active_watch_count);
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn record_cluster_kv_watch_scan_observation(
-    paths: &ClusterPaths,
-    scan: &sinomo_kv::ClusterKvWatchScanResult,
+    paths: &ClusterKvPaths,
+    scan: &crate::ClusterKvWatchScanResult,
 ) {
     if scan.scanned {
         record_cluster_kv_watch_dir_scan_for_test(paths);

@@ -70,7 +70,38 @@ use sinomo_kv::{
     KvOp, KvOpResponse, KvRevision, KvSnapshot, KvTxn, LeaseId, MAX_CLUSTER_KV_ACTIVE_WATCHES,
     MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS, MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES,
     MAX_CLUSTER_KV_WATCH_EVENTS, RaftAppendEntriesRequest, RaftAppendEntriesResponse,
-    RaftRequestVoteRequest, RaftSnapshot,
+    RaftRequestVoteRequest, RaftSnapshot, WatchId, append_cluster_kv_watch_events,
+    append_cluster_kv_watch_events_for_active_watches, cached_cluster_kv_watch_events_contain_all,
+    cached_cluster_kv_watch_events_for_test, cached_cluster_kv_watch_registration_for_test,
+    cancel_cluster_kv_watch, cluster_kv_watch_allocator_trust_contains_for_test,
+    cluster_kv_watch_dir_scans_for_test, cluster_kv_watch_drain_once_calls_for_test,
+    cluster_kv_watch_drain_read_passes_for_test, cluster_kv_watch_event_cache_capacity_for_test,
+    cluster_kv_watch_event_cache_contains_for_test, cluster_kv_watch_event_log_read_bytes_for_test,
+    cluster_kv_watch_event_log_write_bytes_for_test, cluster_kv_watch_events,
+    cluster_kv_watch_generation, cluster_kv_watch_notifier_capacity_for_test,
+    cluster_kv_watch_notifier_has_key_for_test, cluster_kv_watch_notifier_has_raw_key_for_test,
+    cluster_kv_watch_notifier_waiter_count_for_test,
+    cluster_kv_watch_registration_cache_capacity_for_test,
+    cluster_kv_watch_registration_cache_contains_for_test,
+    cluster_kv_watch_unchanged_wakeups_for_test, create_cluster_kv_watch, drain_cluster_kv_watch,
+    drain_cluster_kv_watch_once_limited_by_payload_bytes,
+    fail_next_cluster_kv_watch_allocator_persist_for_test,
+    record_cluster_kv_watch_allocator_trust_for_test, record_cluster_kv_watch_event_cache_for_test,
+    record_cluster_kv_watch_notifier_waiter_key_for_test,
+    record_cluster_kv_watch_registration_cache_for_test,
+    refresh_cluster_kv_watch_allocator_trust_for_test,
+    refresh_cluster_kv_watch_event_cache_for_test,
+    refresh_cluster_kv_watch_registration_cache_for_test,
+    remove_cluster_kv_watch_allocator_trust_entries_under_root_for_test,
+    remove_cluster_kv_watch_event_cache_entries_under_root_for_test,
+    remove_cluster_kv_watch_notifier_entries_under_root_for_test,
+    remove_cluster_kv_watch_registration_cache_entries_under_root_for_test,
+    reset_cluster_kv_watch_dir_scans_for_test, reset_cluster_kv_watch_drain_once_calls_for_test,
+    reset_cluster_kv_watch_drain_read_passes_for_test,
+    reset_cluster_kv_watch_event_log_read_bytes_for_test,
+    reset_cluster_kv_watch_event_log_write_bytes_for_test,
+    reset_cluster_kv_watch_unchanged_wakeups_for_test, touch_cluster_kv_watch_notifier_for_test,
+    wait_for_cluster_kv_watch_change,
 };
 use sinomo_node::{
     ClusterCapabilityPolicyRecord, ClusterIdentityRecord, ClusterInvitationStateRecord, NodeId,
@@ -90,6 +121,10 @@ fn object_rpc_response_from_kv_payload(
     payload: sinomo_kv::ClusterKvRpcPayload,
 ) -> ObjectRpcResponse {
     ObjectRpcResponse::from_encoded_body(payload.route, payload.body)
+}
+
+fn cluster_kv_watch_test_node_id() -> NodeId {
+    NodeId::from_legacy_named("cluster_kv_watch_test_node").expect("cluster kv watch test node")
 }
 
 fn first_cluster_rollout_target_endpoint_for_main(
@@ -8858,8 +8893,7 @@ impl ClusterRaftAppendReplicationHost for RecordingRaftAppendHost {
     ) -> Result<ClusterRaftAppendRequest, NetworkError> {
         paths
             .kv_paths()
-            .raft_store()
-            .build_cluster_raft_append_request_from_next_index(state, next_index)
+            .build_raft_append_request_from_next_index(state, next_index)
             .map_err(Into::into)
     }
 
@@ -10806,8 +10840,7 @@ fn cluster_raft_leader_election_driver_sets_leader_after_remote_voter_grants() {
     assert_eq!(
         paths
             .kv_paths()
-            .raft_store()
-            .known_voter_leader_id(&state)
+            .known_raft_voter_leader_id(&state)
             .expect("known state authority"),
         Some(local_node_id)
     );
@@ -13947,8 +13980,7 @@ fn raft_append_request_omits_snapshot_for_up_to_date_compacted_follower() {
     // A caught-up follower (prev == snapshot index) gets a heartbeat, no snapshot.
     let heartbeat = paths
         .kv_paths()
-        .raft_store()
-        .build_cluster_raft_append_request_from_next_index(&state, last_log_index.saturating_add(1))
+        .build_raft_append_request_from_next_index(&state, last_log_index.saturating_add(1))
         .expect("build heartbeat");
     assert!(heartbeat.snapshot.is_none());
     assert!(heartbeat.append.entries.is_empty());
@@ -13958,8 +13990,7 @@ fn raft_append_request_omits_snapshot_for_up_to_date_compacted_follower() {
     // up with incremental entries — no snapshot install.
     let near = paths
         .kv_paths()
-        .raft_store()
-        .build_cluster_raft_append_request_from_next_index(&state, earliest_retained + 1)
+        .build_raft_append_request_from_next_index(&state, earliest_retained + 1)
         .expect("build near catchup");
     assert!(
         near.snapshot.is_none(),
@@ -13970,8 +14001,7 @@ fn raft_append_request_omits_snapshot_for_up_to_date_compacted_follower() {
     // A follower behind the retained tail still requires a full snapshot install.
     let far = paths
         .kv_paths()
-        .raft_store()
-        .build_cluster_raft_append_request_from_next_index(
+        .build_raft_append_request_from_next_index(
             &state,
             earliest_retained.saturating_sub(1).max(1),
         )
@@ -16984,8 +17014,7 @@ fn async_cluster_raft_append_request_builder_matches_sync_builder() {
 
     let sync_request = paths
         .kv_paths()
-        .raft_store()
-        .build_cluster_raft_append_request_from_next_index(&state, 1)
+        .build_raft_append_request_from_next_index(&state, 1)
         .expect("sync build");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -16995,16 +17024,14 @@ fn async_cluster_raft_append_request_builder_matches_sync_builder() {
         .block_on(
             paths
                 .kv_paths()
-                .raft_store()
-                .locked_build_cluster_raft_append_request_from_next_index_async(&state, 1),
+                .locked_build_raft_append_request_from_next_index_async(&state, 1),
         )
         .expect("async build");
     let last_log_index = runtime
         .block_on(
             paths
                 .kv_paths()
-                .raft_store()
-                .locked_last_log_index_async(&state.local_node_id),
+                .locked_last_raft_log_index_async(&state.local_node_id),
         )
         .expect("async last log index");
 
@@ -17165,8 +17192,7 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
             Box::pin(async move {
                 paths
                     .kv_paths()
-                    .raft_store()
-                    .locked_last_log_index_async(&state.local_node_id)
+                    .locked_last_raft_log_index_async(&state.local_node_id)
                     .await
                     .map_err(Into::into)
             })
@@ -17181,10 +17207,7 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
             Box::pin(async move {
                 paths
                     .kv_paths()
-                    .raft_store()
-                    .locked_build_cluster_raft_append_request_from_next_index_async(
-                        state, next_index,
-                    )
+                    .locked_build_raft_append_request_from_next_index_async(state, next_index)
                     .await
                     .map_err(Into::into)
             })
@@ -20107,11 +20130,11 @@ fn cluster_kv_watch_event_log_is_bounded() {
         .collect::<Vec<_>>();
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, &events).expect("append watch events"),
+        append_cluster_kv_watch_events(&paths.kv_paths(), &events).expect("append watch events"),
         MAX_CLUSTER_KV_WATCH_EVENTS
     );
 
-    let retained = cluster_kv_watch_events(&paths).expect("read watch events");
+    let retained = cluster_kv_watch_events(&paths.kv_paths()).expect("read watch events");
     assert_eq!(retained.len(), MAX_CLUSTER_KV_WATCH_EVENTS);
     assert_eq!(
         retained.first().expect("first retained").revision,
@@ -20138,7 +20161,7 @@ fn cluster_kv_watch_events_append_log_suppresses_duplicate_batches() {
     };
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
             .expect("append watch event"),
         1
     );
@@ -20155,14 +20178,11 @@ fn cluster_kv_watch_events_append_log_suppresses_duplicate_batches() {
         .len();
 
     assert!(
-        crate::control_plane_adapters::cached_cluster_kv_watch_events_contain_all(
-            &paths,
-            std::slice::from_ref(&event)
-        ),
+        cached_cluster_kv_watch_events_contain_all(&paths.kv_paths(), std::slice::from_ref(&event)),
         "first append should seed the cache used for duplicate suppression"
     );
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
             .expect("duplicate watch event"),
         0
     );
@@ -20174,7 +20194,7 @@ fn cluster_kv_watch_events_append_log_suppresses_duplicate_batches() {
         "duplicate batches should not append more log bytes"
     );
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("read watch events"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("read watch events"),
         vec![event]
     );
 }
@@ -20199,7 +20219,7 @@ fn cluster_kv_watch_events_append_skips_missing_snapshot_probe() {
 
     reset_cluster_kv_cached_snapshot_reads_for_test(&paths);
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
             .expect("append watch event"),
         1
     );
@@ -20209,7 +20229,7 @@ fn cluster_kv_watch_events_append_skips_missing_snapshot_probe() {
         "watch appends without a materialized snapshot should not take the required snapshot read path"
     );
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("read watch events"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("read watch events"),
         vec![event]
     );
 }
@@ -20235,10 +20255,14 @@ fn cluster_kv_watch_event_fanout_skips_storage_without_active_watchers() {
     };
 
     reset_cluster_kv_cached_snapshot_reads_for_test(&paths);
-    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     assert_eq!(
-        append_cluster_kv_watch_events_for_active_watches(&paths, std::slice::from_ref(&event))
-            .expect("fanout without active watchers"),
+        append_cluster_kv_watch_events_for_active_watches(
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
+            std::slice::from_ref(&event)
+        )
+        .expect("fanout without active watchers"),
         0,
         "fanout events should not hit disk when no local watch can consume them"
     );
@@ -20248,7 +20272,7 @@ fn cluster_kv_watch_event_fanout_skips_storage_without_active_watchers() {
         "no-active-watch fanout should not probe the materialized snapshot"
     );
     assert_eq!(
-        cluster_kv_watch_dir_scans_for_test(&paths),
+        cluster_kv_watch_dir_scans_for_test(&paths.kv_paths()),
         0,
         "no-active-watch fanout should not scan a missing watch directory"
     );
@@ -20262,7 +20286,8 @@ fn cluster_kv_watch_event_fanout_skips_storage_without_active_watchers() {
     );
 
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/fanout-active/".to_string(),
             start_revision: KvRevision(1),
@@ -20278,8 +20303,12 @@ fn cluster_kv_watch_event_fanout_skips_storage_without_active_watchers() {
     };
     reset_cluster_kv_cached_snapshot_reads_for_test(&paths);
     assert_eq!(
-        append_cluster_kv_watch_events_for_active_watches(&paths, std::slice::from_ref(&unrelated))
-            .expect("fanout with no matching active watcher"),
+        append_cluster_kv_watch_events_for_active_watches(
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
+            std::slice::from_ref(&unrelated)
+        )
+        .expect("fanout with no matching active watcher"),
         0,
         "fanout events for unrelated prefixes should not be persisted just because some watch exists"
     );
@@ -20297,7 +20326,8 @@ fn cluster_kv_watch_event_fanout_skips_storage_without_active_watchers() {
         "unmatched active-watch fanout should avoid log appends"
     );
     let empty = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -20311,8 +20341,12 @@ fn cluster_kv_watch_event_fanout_skips_storage_without_active_watchers() {
     assert_eq!(empty.next_revision, KvRevision(1));
 
     assert_eq!(
-        append_cluster_kv_watch_events_for_active_watches(&paths, std::slice::from_ref(&event))
-            .expect("fanout with active watcher"),
+        append_cluster_kv_watch_events_for_active_watches(
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
+            std::slice::from_ref(&event)
+        )
+        .expect("fanout with active watcher"),
         1,
         "active local watchers still require omitted snapshot events to be stored"
     );
@@ -20321,7 +20355,8 @@ fn cluster_kv_watch_event_fanout_skips_storage_without_active_watchers() {
         "active watcher fanout should append to the watch log"
     );
     let drained = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -20398,7 +20433,8 @@ fn cluster_kv_watch_event_fanout_reuses_active_registration_cache() {
         .expect("write empty snapshot");
 
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/fanout-cache/".to_string(),
             start_revision: KvRevision(1),
@@ -20420,27 +20456,32 @@ fn cluster_kv_watch_event_fanout_reuses_active_registration_cache() {
         },
     };
 
-    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     assert_eq!(
-        append_cluster_kv_watch_events_for_active_watches(&paths, std::slice::from_ref(&unrelated))
-            .expect("first unrelated fanout"),
+        append_cluster_kv_watch_events_for_active_watches(
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
+            std::slice::from_ref(&unrelated)
+        )
+        .expect("first unrelated fanout"),
         0
     );
     assert_eq!(
-        cluster_kv_watch_dir_scans_for_test(&paths),
+        cluster_kv_watch_dir_scans_for_test(&paths.kv_paths()),
         1,
         "first active-watch fanout should scan registrations to build the cache"
     );
     assert_eq!(
         append_cluster_kv_watch_events_for_active_watches(
-            &paths,
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             std::slice::from_ref(&unrelated_two)
         )
         .expect("second unrelated fanout"),
         0
     );
     assert_eq!(
-        cluster_kv_watch_dir_scans_for_test(&paths),
+        cluster_kv_watch_dir_scans_for_test(&paths.kv_paths()),
         1,
         "repeated fanout should reuse cached active watch registrations"
     );
@@ -20453,17 +20494,22 @@ fn cluster_kv_watch_event_fanout_reuses_active_registration_cache() {
         },
     };
     assert_eq!(
-        append_cluster_kv_watch_events_for_active_watches(&paths, std::slice::from_ref(&matching))
-            .expect("matching fanout"),
+        append_cluster_kv_watch_events_for_active_watches(
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
+            std::slice::from_ref(&matching)
+        )
+        .expect("matching fanout"),
         1
     );
     assert_eq!(
-        cluster_kv_watch_dir_scans_for_test(&paths),
+        cluster_kv_watch_dir_scans_for_test(&paths.kv_paths()),
         1,
         "matching fanout should still use the cached registration list"
     );
     let drained = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -20480,10 +20526,11 @@ fn cluster_kv_watch_event_fanout_reuses_active_registration_cache() {
             value: b"old".to_vec(),
         },
     };
-    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     assert_eq!(
         append_cluster_kv_watch_events_for_active_watches(
-            &paths,
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             std::slice::from_ref(&old_matching)
         )
         .expect("old matching fanout"),
@@ -20491,7 +20538,7 @@ fn cluster_kv_watch_event_fanout_reuses_active_registration_cache() {
         "fanout filtering must observe the advanced watch cursor after a drain"
     );
     assert_eq!(
-        cluster_kv_watch_dir_scans_for_test(&paths),
+        cluster_kv_watch_dir_scans_for_test(&paths.kv_paths()),
         0,
         "draining a hot watch should refresh the cached registration cursor without rescanning the watch directory"
     );
@@ -20506,20 +20553,25 @@ fn cluster_kv_watch_event_fanout_reuses_active_registration_cache() {
             },
         })
         .collect::<Vec<_>>();
-    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     assert_eq!(
-        append_cluster_kv_watch_events_for_active_watches(&paths, &lag_events)
-            .expect("lag-bound matching fanout"),
+        append_cluster_kv_watch_events_for_active_watches(
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
+            &lag_events
+        )
+        .expect("lag-bound matching fanout"),
         lag_events.len(),
         "matching events should be persisted for the active watch"
     );
     assert_eq!(
-        cluster_kv_watch_dir_scans_for_test(&paths),
+        cluster_kv_watch_dir_scans_for_test(&paths.kv_paths()),
         0,
         "hot matching fanout should keep using the cached active registration list"
     );
     let drained = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -20536,17 +20588,18 @@ fn cluster_kv_watch_event_fanout_reuses_active_registration_cache() {
             value: b"stale".to_vec(),
         },
     };
-    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     assert_eq!(
         append_cluster_kv_watch_events_for_active_watches(
-            &paths,
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             std::slice::from_ref(&stale_after_flush)
         )
         .expect("stale fanout after durable cursor flush"),
         0,
         "fanout filtering must observe the durable cursor flush"
     );
-    let durable_flush_scans = cluster_kv_watch_dir_scans_for_test(&paths);
+    let durable_flush_scans = cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     assert!(
         (1..=2).contains(&durable_flush_scans),
         "durable cursor flush replaces the watch file, so the changed directory mark should force a bounded cache rebuild; got {durable_flush_scans} scans"
@@ -20559,7 +20612,7 @@ fn cluster_kv_watch_events_large_batch_checkpoints_without_log_append_write() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    reset_cluster_kv_watch_event_log_write_bytes_for_test(&paths);
+    reset_cluster_kv_watch_event_log_write_bytes_for_test(&paths.kv_paths());
     let event = KvEvent {
         revision: KvRevision(1),
         key: "/watch/large-direct-checkpoint".to_string(),
@@ -20569,7 +20622,7 @@ fn cluster_kv_watch_events_large_batch_checkpoints_without_log_append_write() {
     };
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
             .expect("append large watch event"),
         1
     );
@@ -20589,12 +20642,12 @@ fn cluster_kv_watch_events_large_batch_checkpoints_without_log_append_write() {
         "large batches should checkpoint directly instead of writing and truncating the append log"
     );
     assert_eq!(
-        cluster_kv_watch_event_log_write_bytes_for_test(&paths),
+        cluster_kv_watch_event_log_write_bytes_for_test(&paths.kv_paths()),
         0,
         "direct checkpoint should avoid the extra append-log write for large batches"
     );
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("read retained large event"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("read retained large event"),
         vec![event]
     );
 }
@@ -20614,7 +20667,7 @@ fn cluster_kv_watch_events_duplicate_checkpoint_append_does_not_create_empty_log
     };
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
             .expect("append large watch event"),
         1
     );
@@ -20625,7 +20678,7 @@ fn cluster_kv_watch_events_duplicate_checkpoint_append_does_not_create_empty_log
     let _ = std::fs::remove_file(&paths.kv_watch_events_log);
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
             .expect("duplicate checkpoint watch event"),
         0
     );
@@ -20634,7 +20687,7 @@ fn cluster_kv_watch_events_duplicate_checkpoint_append_does_not_create_empty_log
         "cold duplicate suppression should not create an empty append log"
     );
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("read retained large event"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("read retained large event"),
         vec![event]
     );
 }
@@ -20653,7 +20706,8 @@ fn cluster_kv_watch_events_duplicate_append_repairs_damaged_log() {
         },
     };
 
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event)).expect("append first");
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
+        .expect("append first");
     let mut log = std::fs::OpenOptions::new()
         .append(true)
         .open(&paths.kv_watch_events_log)
@@ -20665,12 +20719,12 @@ fn cluster_kv_watch_events_duplicate_append_repairs_damaged_log() {
     drop(log);
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
             .expect("append duplicate after partial tail"),
         0
     );
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("read repaired events"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("read repaired events"),
         vec![event]
     );
     let log = std::fs::read(&paths.kv_watch_events_log).expect("read repaired log");
@@ -20703,24 +20757,24 @@ fn cluster_kv_watch_events_append_log_uses_warm_cache_without_rescan() {
     };
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&first))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&first))
             .expect("append first watch event"),
         1
     );
-    reset_cluster_kv_watch_event_log_read_bytes_for_test(&paths);
+    reset_cluster_kv_watch_event_log_read_bytes_for_test(&paths.kv_paths());
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&second))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&second))
             .expect("append second watch event"),
         1
     );
     assert_eq!(
-        cluster_kv_watch_event_log_read_bytes_for_test(&paths),
+        cluster_kv_watch_event_log_read_bytes_for_test(&paths.kv_paths()),
         0,
         "a validated warm watch-event cache should let new appends avoid rescanning the existing log"
     );
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("read watch events"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("read watch events"),
         vec![first, second]
     );
 }
@@ -20742,11 +20796,11 @@ fn cluster_kv_watch_event_log_compacts_to_checkpoint_after_large_batch() {
         .collect::<Vec<_>>();
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, &events).expect("append watch events"),
+        append_cluster_kv_watch_events(&paths.kv_paths(), &events).expect("append watch events"),
         MAX_CLUSTER_KV_WATCH_EVENTS
     );
 
-    let retained = cluster_kv_watch_events(&paths).expect("read compacted watch events");
+    let retained = cluster_kv_watch_events(&paths.kv_paths()).expect("read compacted watch events");
     assert_eq!(retained.len(), MAX_CLUSTER_KV_WATCH_EVENTS);
     assert_eq!(
         retained.first().expect("first retained").revision,
@@ -20808,12 +20862,12 @@ fn cluster_kv_watch_event_log_repairs_overgrown_valid_log_before_append() {
     };
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&new_event))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&new_event))
             .expect("append after overgrown log"),
         1
     );
 
-    let retained = cluster_kv_watch_events(&paths).expect("read repaired events");
+    let retained = cluster_kv_watch_events(&paths.kv_paths()).expect("read repaired events");
     assert_eq!(retained.len(), MAX_CLUSTER_KV_WATCH_EVENTS);
     assert_eq!(
         retained.last().expect("last retained").revision,
@@ -20856,11 +20910,11 @@ fn cluster_kv_watch_event_log_keeps_complete_boundary_revision() {
     });
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, &events).expect("append watch events"),
+        append_cluster_kv_watch_events(&paths.kv_paths(), &events).expect("append watch events"),
         MAX_CLUSTER_KV_WATCH_EVENTS + 1
     );
 
-    let retained = cluster_kv_watch_events(&paths).expect("read retained events");
+    let retained = cluster_kv_watch_events(&paths.kv_paths()).expect("read retained events");
     assert_eq!(
         retained.first().expect("first retained").revision,
         KvRevision(11)
@@ -20891,7 +20945,7 @@ fn cluster_kv_watch_event_log_drops_delayed_events_older_than_retention_floor() 
             },
         })
         .collect::<Vec<_>>();
-    append_cluster_kv_watch_events(&paths, &events).expect("append watch events");
+    append_cluster_kv_watch_events(&paths.kv_paths(), &events).expect("append watch events");
     let log_len = std::fs::metadata(&paths.kv_watch_events_log)
         .expect("watch event log metadata")
         .len();
@@ -20904,7 +20958,7 @@ fn cluster_kv_watch_event_log_drops_delayed_events_older_than_retention_floor() 
     };
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&stale))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&stale))
             .expect("append stale watch event"),
         0
     );
@@ -20916,7 +20970,7 @@ fn cluster_kv_watch_event_log_drops_delayed_events_older_than_retention_floor() 
         "stale delayed events should not add write amplification"
     );
     assert!(
-        !cluster_kv_watch_events(&paths)
+        !cluster_kv_watch_events(&paths.kv_paths())
             .expect("read watch events")
             .contains(&stale)
     );
@@ -20937,7 +20991,7 @@ fn cluster_kv_watch_event_log_drops_large_stale_batches_without_rewrite() {
             },
         })
         .collect::<Vec<_>>();
-    append_cluster_kv_watch_events(&paths, &events).expect("append watch events");
+    append_cluster_kv_watch_events(&paths.kv_paths(), &events).expect("append watch events");
     let checkpoint_len = std::fs::metadata(&paths.kv_watch_events)
         .expect("watch event checkpoint metadata")
         .len();
@@ -20955,7 +21009,8 @@ fn cluster_kv_watch_event_log_drops_large_stale_batches_without_rewrite() {
         .collect::<Vec<_>>();
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, &stale).expect("append stale watch events"),
+        append_cluster_kv_watch_events(&paths.kv_paths(), &stale)
+            .expect("append stale watch events"),
         0
     );
     assert_eq!(
@@ -20995,7 +21050,8 @@ fn cluster_kv_watch_event_log_repairs_partial_tail_before_append() {
         },
     };
 
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&first)).expect("append first");
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&first))
+        .expect("append first");
     let mut log = std::fs::OpenOptions::new()
         .append(true)
         .open(&paths.kv_watch_events_log)
@@ -21007,12 +21063,12 @@ fn cluster_kv_watch_event_log_repairs_partial_tail_before_append() {
     drop(log);
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&second))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&second))
             .expect("append after partial tail"),
         1
     );
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("read repaired events"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("read repaired events"),
         vec![first, second]
     );
 }
@@ -21038,7 +21094,8 @@ fn cluster_kv_watch_event_log_repairs_oversized_tail_before_append() {
         },
     };
 
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&first)).expect("append first");
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&first))
+        .expect("append first");
     let mut log = std::fs::OpenOptions::new()
         .append(true)
         .open(&paths.kv_watch_events_log)
@@ -21050,12 +21107,12 @@ fn cluster_kv_watch_event_log_repairs_oversized_tail_before_append() {
     drop(log);
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&second))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&second))
             .expect("append after oversized tail"),
         1
     );
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("read repaired events"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("read repaired events"),
         vec![first, second]
     );
     let log = std::fs::read(&paths.kv_watch_events_log).expect("read repaired log");
@@ -21087,7 +21144,8 @@ fn cluster_kv_watch_event_log_repairs_unreadable_tail_before_append() {
         },
     };
 
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&first)).expect("append first");
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&first))
+        .expect("append first");
     let mut log = std::fs::OpenOptions::new()
         .append(true)
         .open(&paths.kv_watch_events_log)
@@ -21099,12 +21157,12 @@ fn cluster_kv_watch_event_log_repairs_unreadable_tail_before_append() {
     drop(log);
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&second))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&second))
             .expect("append after unreadable tail"),
         1
     );
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("read repaired events"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("read repaired events"),
         vec![first, second]
     );
 }
@@ -21131,7 +21189,7 @@ fn cluster_kv_watch_event_log_serializes_concurrent_duplicate_appends() {
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+                append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
                     .expect("append duplicate watch event")
             })
         })
@@ -21143,7 +21201,7 @@ fn cluster_kv_watch_event_log_serializes_concurrent_duplicate_appends() {
 
     assert_eq!(stored, 1);
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("read concurrent events"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("read concurrent events"),
         vec![event]
     );
 }
@@ -21180,7 +21238,8 @@ fn cluster_kv_watch_drain_reads_current_raft_view_when_snapshot_is_stale() {
         .expect("overwrite stale materialized snapshot");
 
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        node_id.clone(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/".to_string(),
             start_revision: KvRevision(1),
@@ -21188,7 +21247,8 @@ fn cluster_kv_watch_drain_reads_current_raft_view_when_snapshot_is_stale() {
     )
     .expect("create watch");
     let drained = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        node_id,
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -21407,17 +21467,17 @@ fn cluster_kv_metadata_caches_retain_recent_entries_at_capacity() {
         let quiet_paths = ClusterPaths::new(&SinomoDataDir::new(
             root.join(format!("100-allocator-{index:04}")),
         ));
-        record_cluster_kv_watch_allocator_trust_for_test(&quiet_paths);
+        record_cluster_kv_watch_allocator_trust_for_test(&quiet_paths.kv_paths());
     }
-    record_cluster_kv_watch_allocator_trust_for_test(&hot_paths);
+    record_cluster_kv_watch_allocator_trust_for_test(&hot_paths.kv_paths());
     assert!(
-        refresh_cluster_kv_watch_allocator_trust_for_test(&hot_paths),
+        refresh_cluster_kv_watch_allocator_trust_for_test(&hot_paths.kv_paths()),
         "looking up hot allocator trust should refresh its recency"
     );
     let extra_paths = ClusterPaths::new(&SinomoDataDir::new(root.join("999-extra-allocator")));
-    record_cluster_kv_watch_allocator_trust_for_test(&extra_paths);
+    record_cluster_kv_watch_allocator_trust_for_test(&extra_paths.kv_paths());
     assert!(
-        cluster_kv_watch_allocator_trust_contains_for_test(&hot_paths),
+        cluster_kv_watch_allocator_trust_contains_for_test(&hot_paths.kv_paths()),
         "recent allocator trust should survive capacity churn"
     );
 
@@ -21440,7 +21500,7 @@ fn cluster_kv_metadata_caches_retain_recent_entries_at_capacity() {
         "recent reader node id should survive capacity churn"
     );
 
-    remove_cluster_kv_watch_allocator_trust_entries_under_root_for_test(&root);
+    remove_cluster_kv_watch_allocator_trust_entries_under_root_for_test(root.path());
     remove_cluster_kv_reader_node_id_cache_entries_under_root_for_test(&root);
 }
 
@@ -21453,7 +21513,8 @@ fn cluster_kv_watch_drain_waits_for_fanned_out_events() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/wait/".to_string(),
             start_revision: KvRevision(1),
@@ -21466,7 +21527,8 @@ fn cluster_kv_watch_drain_waits_for_fanned_out_events() {
         started_tx.send(()).expect("signal drain start");
         let started = Instant::now();
         let drained = drain_cluster_kv_watch(
-            &drain_paths,
+            &drain_paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             ClusterKvWatchDrainRequest {
                 watch_id: watch.watch_id,
                 wait_timeout_millis: 5_000,
@@ -21485,7 +21547,7 @@ fn cluster_kv_watch_drain_waits_for_fanned_out_events() {
         },
     };
 
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
         .expect("append fanout event");
     let (elapsed, drained) = handle.join().expect("wait drain thread");
 
@@ -21508,7 +21570,8 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/long-poll-a/".to_string(),
             start_revision: KvRevision(1),
@@ -21517,14 +21580,15 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
     .expect("create watch");
     let watch_id = watch.watch_id;
 
-    reset_cluster_kv_watch_drain_once_calls_for_test(&paths);
-    reset_cluster_kv_watch_unchanged_wakeups_for_test(&paths, watch_id);
+    reset_cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths());
+    reset_cluster_kv_watch_unchanged_wakeups_for_test(&paths.kv_paths(), watch_id);
     let drain_paths = paths.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let unrelated_handle = thread::spawn(move || {
         let started = Instant::now();
         let drained = drain_cluster_kv_watch(
-            &drain_paths,
+            &drain_paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             ClusterKvWatchDrainRequest {
                 watch_id,
                 wait_timeout_millis: 1_000,
@@ -21535,13 +21599,13 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
         (started.elapsed(), drained)
     });
     let wait_started = Instant::now();
-    while cluster_kv_watch_drain_once_calls_for_test(&paths) == 0
+    while cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths()) == 0
         && wait_started.elapsed() < Duration::from_secs(1)
     {
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(
-        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths()),
         1,
         "long poll should enter its first empty drain before the unrelated event is appended"
     );
@@ -21553,7 +21617,7 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
             value: b"unrelated".to_vec(),
         },
     };
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&unrelated))
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&unrelated))
         .expect("append unrelated watch event");
     thread::sleep(Duration::from_millis(75));
     assert!(
@@ -21564,12 +21628,12 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
         "unrelated prefix event should not wake the waiting watch"
     );
     assert_eq!(
-        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths()),
         1,
         "unrelated prefix event should not trigger another empty drain"
     );
     assert_eq!(
-        cluster_kv_watch_unchanged_wakeups_for_test(&paths, watch_id),
+        cluster_kv_watch_unchanged_wakeups_for_test(&paths.kv_paths(), watch_id),
         0,
         "unrelated prefix event should not wake the waiting watch"
     );
@@ -21582,17 +21646,18 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
     assert!(drained.events.is_empty());
     assert_eq!(drained.next_revision, KvRevision(1));
     assert_eq!(
-        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths()),
         1,
         "unrelated prefix timeout should not reread snapshot/log state"
     );
 
-    reset_cluster_kv_watch_drain_once_calls_for_test(&paths);
+    reset_cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths());
     let drain_paths = paths.clone();
     let matching_handle = thread::spawn(move || {
         let started = Instant::now();
         let drained = drain_cluster_kv_watch(
-            &drain_paths,
+            &drain_paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             ClusterKvWatchDrainRequest {
                 watch_id,
                 wait_timeout_millis: 5_000,
@@ -21602,13 +21667,13 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
         (started.elapsed(), drained)
     });
     let wait_started = Instant::now();
-    while cluster_kv_watch_drain_once_calls_for_test(&paths) == 0
+    while cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths()) == 0
         && wait_started.elapsed() < Duration::from_secs(1)
     {
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(
-        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths()),
         1,
         "matching long poll should enter its first empty drain"
     );
@@ -21620,7 +21685,7 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
             value: b"matching".to_vec(),
         },
     };
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&matching))
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&matching))
         .expect("append matching watch event");
     let (elapsed, drained) = matching_handle.join().expect("matching drain thread");
     assert!(
@@ -21643,7 +21708,8 @@ fn cluster_kv_watch_long_poll_ignores_other_matching_watch_notification() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let watch_a = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/targeted-a/".to_string(),
             start_revision: KvRevision(1),
@@ -21651,7 +21717,8 @@ fn cluster_kv_watch_long_poll_ignores_other_matching_watch_notification() {
     )
     .expect("create watch a");
     let _watch_b = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/targeted-b/".to_string(),
             start_revision: KvRevision(1),
@@ -21660,14 +21727,15 @@ fn cluster_kv_watch_long_poll_ignores_other_matching_watch_notification() {
     .expect("create watch b");
     let watch_a_id = watch_a.watch_id;
 
-    reset_cluster_kv_watch_drain_once_calls_for_test(&paths);
-    reset_cluster_kv_watch_unchanged_wakeups_for_test(&paths, watch_a_id);
+    reset_cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths());
+    reset_cluster_kv_watch_unchanged_wakeups_for_test(&paths.kv_paths(), watch_a_id);
     let drain_paths = paths.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let handle = thread::spawn(move || {
         let started = Instant::now();
         let drained = drain_cluster_kv_watch(
-            &drain_paths,
+            &drain_paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             ClusterKvWatchDrainRequest {
                 watch_id: watch_a_id,
                 wait_timeout_millis: 5_000,
@@ -21678,13 +21746,13 @@ fn cluster_kv_watch_long_poll_ignores_other_matching_watch_notification() {
         (started.elapsed(), drained)
     });
     let wait_started = Instant::now();
-    while cluster_kv_watch_drain_once_calls_for_test(&paths) == 0
+    while cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths()) == 0
         && wait_started.elapsed() < Duration::from_secs(1)
     {
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(
-        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths()),
         1,
         "watch a long poll should complete its first empty drain before unrelated fanout"
     );
@@ -21696,7 +21764,7 @@ fn cluster_kv_watch_long_poll_ignores_other_matching_watch_notification() {
             value: b"watch-b".to_vec(),
         },
     };
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&watch_b_event))
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&watch_b_event))
         .expect("append watch b event");
     thread::sleep(Duration::from_millis(75));
     assert!(
@@ -21707,12 +21775,12 @@ fn cluster_kv_watch_long_poll_ignores_other_matching_watch_notification() {
         "an event matching another active watch should not complete watch a's long poll"
     );
     assert_eq!(
-        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths()),
         1,
         "an event matching another active watch should not make watch a re-drain"
     );
     assert_eq!(
-        cluster_kv_watch_unchanged_wakeups_for_test(&paths, watch_a_id),
+        cluster_kv_watch_unchanged_wakeups_for_test(&paths.kv_paths(), watch_a_id),
         0,
         "an event matching another active watch should not wake watch a's waiter"
     );
@@ -21724,7 +21792,7 @@ fn cluster_kv_watch_long_poll_ignores_other_matching_watch_notification() {
             value: b"watch-a".to_vec(),
         },
     };
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&watch_a_event))
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&watch_a_event))
         .expect("append watch a event");
     let (elapsed, drained) = handle.join().expect("watch a drain thread");
     assert!(
@@ -21743,13 +21811,13 @@ fn cluster_kv_watch_notifier_retains_active_waiters_under_path_churn() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-watch-notifier-churn");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
-    touch_cluster_kv_watch_notifier_for_test(&paths);
-    let observed_generation = cluster_kv_watch_notifier_generation_for_test(&paths);
+    touch_cluster_kv_watch_notifier_for_test(&paths.kv_paths());
+    let observed_generation = cluster_kv_watch_generation(&paths.kv_paths());
     let wait_paths = paths.clone();
     let handle = thread::spawn(move || {
         let started = Instant::now();
-        let changed = wait_for_cluster_kv_watch_change_for_test(
-            &wait_paths,
+        let changed = wait_for_cluster_kv_watch_change(
+            &wait_paths.kv_paths(),
             observed_generation,
             Duration::from_secs(5),
         );
@@ -21757,13 +21825,13 @@ fn cluster_kv_watch_notifier_retains_active_waiters_under_path_churn() {
     });
 
     let wait_started = Instant::now();
-    while cluster_kv_watch_notifier_waiter_count_for_test(&paths) == 0
+    while cluster_kv_watch_notifier_waiter_count_for_test(&paths.kv_paths()) == 0
         && wait_started.elapsed() < Duration::from_secs(1)
     {
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(
-        cluster_kv_watch_notifier_waiter_count_for_test(&paths),
+        cluster_kv_watch_notifier_waiter_count_for_test(&paths.kv_paths()),
         1,
         "watch waiter should be registered before churning notifier roots"
     );
@@ -21771,16 +21839,16 @@ fn cluster_kv_watch_notifier_retains_active_waiters_under_path_churn() {
     for index in 0..=cluster_kv_watch_notifier_capacity_for_test() {
         let quiet_data_dir = SinomoDataDir::new(root.join(format!("quiet-{index}")));
         let quiet_paths = ClusterPaths::new(&quiet_data_dir);
-        touch_cluster_kv_watch_notifier_for_test(&quiet_paths);
+        touch_cluster_kv_watch_notifier_for_test(&quiet_paths.kv_paths());
     }
 
     assert!(
-        cluster_kv_watch_notifier_has_key_for_test(&paths),
+        cluster_kv_watch_notifier_has_key_for_test(&paths.kv_paths()),
         "active long-poll waiter should not be evicted by unrelated watch roots"
     );
-    touch_cluster_kv_watch_notifier_for_test(&paths);
+    touch_cluster_kv_watch_notifier_for_test(&paths.kv_paths());
     let (elapsed, changed) = handle.join().expect("waiter thread");
-    remove_cluster_kv_watch_notifier_entries_under_root_for_test(&root);
+    remove_cluster_kv_watch_notifier_entries_under_root_for_test(root.path());
 
     assert!(changed, "active waiter should observe the generation bump");
     assert!(
@@ -21795,7 +21863,7 @@ fn cluster_kv_watch_notifier_does_not_evict_active_waiters_at_capacity() {
         .lock()
         .expect("notifier mutex");
     let root = sinomo_testdir::TestDir::new("sinomo-network-watch-notifier-active-capacity");
-    remove_cluster_kv_watch_notifier_entries_under_root_for_test(&root);
+    remove_cluster_kv_watch_notifier_entries_under_root_for_test(root.path());
     let active_keys = (0..cluster_kv_watch_notifier_capacity_for_test())
         .map(|index| root.join(format!("active-{index:04}")))
         .collect::<Vec<_>>();
@@ -21805,7 +21873,7 @@ fn cluster_kv_watch_notifier_does_not_evict_active_waiters_at_capacity() {
 
     let extra_data_dir = SinomoDataDir::new(root.join("extra"));
     let extra_paths = ClusterPaths::new(&extra_data_dir);
-    touch_cluster_kv_watch_notifier_for_test(&extra_paths);
+    touch_cluster_kv_watch_notifier_for_test(&extra_paths.kv_paths());
 
     for key in &active_keys {
         assert!(
@@ -21814,7 +21882,7 @@ fn cluster_kv_watch_notifier_does_not_evict_active_waiters_at_capacity() {
             key.display()
         );
     }
-    remove_cluster_kv_watch_notifier_entries_under_root_for_test(&root);
+    remove_cluster_kv_watch_notifier_entries_under_root_for_test(root.path());
 }
 
 #[test]
@@ -21826,7 +21894,8 @@ fn cluster_kv_watch_drain_payload_limit_does_not_skip_events() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/payload/".to_string(),
             start_revision: KvRevision(1),
@@ -21847,12 +21916,13 @@ fn cluster_kv_watch_drain_payload_limit_does_not_skip_events() {
             value: vec![2_u8; 32],
         },
     };
-    append_cluster_kv_watch_events(&paths, &[first.clone(), second.clone()])
+    append_cluster_kv_watch_events(&paths.kv_paths(), &[first.clone(), second.clone()])
         .expect("append watch events");
 
     let max_payload_bytes = first.key.len() + 32;
     let drained = drain_cluster_kv_watch_once_limited_by_payload_bytes(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         watch.watch_id,
         max_payload_bytes,
     )
@@ -21861,7 +21931,8 @@ fn cluster_kv_watch_drain_payload_limit_does_not_skip_events() {
     assert_eq!(drained.next_revision, KvRevision(2));
 
     let drained = drain_cluster_kv_watch_once_limited_by_payload_bytes(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         watch.watch_id,
         max_payload_bytes,
     )
@@ -21879,7 +21950,8 @@ fn cluster_kv_watch_drain_payload_limit_keeps_revision_groups() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/revision-group/".to_string(),
             start_revision: KvRevision(1),
@@ -21907,12 +21979,16 @@ fn cluster_kv_watch_drain_payload_limit_keeps_revision_groups() {
             value: vec![3_u8; 32],
         },
     };
-    append_cluster_kv_watch_events(&paths, &[first.clone(), second.clone(), third.clone()])
-        .expect("append watch events");
+    append_cluster_kv_watch_events(
+        &paths.kv_paths(),
+        &[first.clone(), second.clone(), third.clone()],
+    )
+    .expect("append watch events");
 
     let max_payload_bytes = first.key.len() + 32;
     let drained = drain_cluster_kv_watch_once_limited_by_payload_bytes(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         watch.watch_id,
         max_payload_bytes,
     )
@@ -21921,7 +21997,8 @@ fn cluster_kv_watch_drain_payload_limit_keeps_revision_groups() {
     assert_eq!(drained.next_revision, KvRevision(2));
 
     let drained = drain_cluster_kv_watch_once_limited_by_payload_bytes(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         watch.watch_id,
         max_payload_bytes,
     )
@@ -21944,7 +22021,7 @@ fn cluster_kv_watch_drain_deduplicates_snapshot_and_fanout_events() {
     let duplicate = snapshot.events.first().expect("snapshot event").clone();
     write_cluster_kv_snapshot(&paths, &snapshot).expect("write snapshot");
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&duplicate))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&duplicate))
             .expect("append duplicate fanout event"),
         0
     );
@@ -21957,7 +22034,8 @@ fn cluster_kv_watch_drain_deduplicates_snapshot_and_fanout_events() {
         "duplicate snapshot events should not append the watch log"
     );
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/dedup/".to_string(),
             start_revision: KvRevision(1),
@@ -21966,7 +22044,8 @@ fn cluster_kv_watch_drain_deduplicates_snapshot_and_fanout_events() {
     .expect("create watch");
 
     let drained = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -21990,7 +22069,8 @@ fn cluster_kv_watch_drain_long_poll_avoids_redundant_pre_wait_poll() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/empty-long-poll/".to_string(),
             start_revision: KvRevision(1),
@@ -21998,9 +22078,10 @@ fn cluster_kv_watch_drain_long_poll_avoids_redundant_pre_wait_poll() {
     )
     .expect("create watch");
 
-    reset_cluster_kv_watch_drain_once_calls_for_test(&paths);
+    reset_cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths());
     let drained = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 10,
@@ -22010,7 +22091,7 @@ fn cluster_kv_watch_drain_long_poll_avoids_redundant_pre_wait_poll() {
 
     assert!(drained.events.is_empty());
     assert_eq!(
-        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths()),
         1,
         "empty long-poll timeout should not reread snapshot/log state when no watch generation changed"
     );
@@ -22025,7 +22106,8 @@ fn cluster_kv_watch_drain_zero_timeout_reuses_empty_result_until_change() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/empty-zero-timeout/".to_string(),
             start_revision: KvRevision(1),
@@ -22033,9 +22115,10 @@ fn cluster_kv_watch_drain_zero_timeout_reuses_empty_result_until_change() {
     )
     .expect("create watch");
 
-    reset_cluster_kv_current_snapshot_reads_for_test(&paths);
+    reset_cluster_kv_watch_drain_read_passes_for_test(&paths.kv_paths());
     let first = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -22045,13 +22128,14 @@ fn cluster_kv_watch_drain_zero_timeout_reuses_empty_result_until_change() {
     assert!(first.events.is_empty());
     assert_eq!(first.next_revision, KvRevision(1));
     assert_eq!(
-        cluster_kv_current_snapshot_reads_for_test(&paths),
+        cluster_kv_watch_drain_read_passes_for_test(&paths.kv_paths()),
         1,
-        "the first empty drain must inspect the current snapshot"
+        "the first empty drain must inspect current watch state"
     );
 
     let second = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -22061,9 +22145,9 @@ fn cluster_kv_watch_drain_zero_timeout_reuses_empty_result_until_change() {
     assert!(second.events.is_empty());
     assert_eq!(second.next_revision, KvRevision(1));
     assert_eq!(
-        cluster_kv_current_snapshot_reads_for_test(&paths),
+        cluster_kv_watch_drain_read_passes_for_test(&paths.kv_paths()),
         1,
-        "repeated empty zero-timeout drains should not reread current snapshot state"
+        "repeated empty zero-timeout drains should not reread current watch state"
     );
 
     let event = KvEvent {
@@ -22073,10 +22157,11 @@ fn cluster_kv_watch_drain_zero_timeout_reuses_empty_result_until_change() {
             value: b"one".to_vec(),
         },
     };
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
         .expect("append watch event");
     let changed = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -22086,7 +22171,7 @@ fn cluster_kv_watch_drain_zero_timeout_reuses_empty_result_until_change() {
     assert_eq!(changed.events, vec![event]);
     assert_eq!(changed.next_revision, KvRevision(2));
     assert_eq!(
-        cluster_kv_current_snapshot_reads_for_test(&paths),
+        cluster_kv_watch_drain_read_passes_for_test(&paths.kv_paths()),
         2,
         "watch event generation changes must invalidate the cached empty result"
     );
@@ -22101,7 +22186,8 @@ fn write_cluster_kv_snapshot_identical_does_not_wake_waiting_watch() {
     let snapshot = InProcessKvStore::new().snapshot();
     write_cluster_kv_snapshot(&paths, &snapshot).expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/identical-snapshot/".to_string(),
             start_revision: KvRevision(1),
@@ -22109,11 +22195,12 @@ fn write_cluster_kv_snapshot_identical_does_not_wake_waiting_watch() {
     )
     .expect("create watch");
 
-    reset_cluster_kv_watch_drain_once_calls_for_test(&paths);
+    reset_cluster_kv_watch_drain_read_passes_for_test(&paths.kv_paths());
     let drain_paths = paths.clone();
     let handle = thread::spawn(move || {
         drain_cluster_kv_watch(
-            &drain_paths,
+            &drain_paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             ClusterKvWatchDrainRequest {
                 watch_id: watch.watch_id,
                 wait_timeout_millis: 150,
@@ -22123,13 +22210,13 @@ fn write_cluster_kv_snapshot_identical_does_not_wake_waiting_watch() {
     });
 
     let started = Instant::now();
-    while cluster_kv_watch_drain_once_calls_for_test(&paths) == 0
+    while cluster_kv_watch_drain_read_passes_for_test(&paths.kv_paths()) == 0
         && started.elapsed() < Duration::from_secs(1)
     {
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(
-        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        cluster_kv_watch_drain_read_passes_for_test(&paths.kv_paths()),
         1,
         "watch drain should have completed its initial read pass"
     );
@@ -22139,7 +22226,7 @@ fn write_cluster_kv_snapshot_identical_does_not_wake_waiting_watch() {
 
     assert!(drained.events.is_empty());
     assert_eq!(
-        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        cluster_kv_watch_drain_read_passes_for_test(&paths.kv_paths()),
         1,
         "identical snapshot materialization should not wake quiet watchers"
     );
@@ -22154,7 +22241,8 @@ fn cluster_kv_watch_cancel_wakes_waiting_drain() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/cancel/wake/".to_string(),
             start_revision: KvRevision(1),
@@ -22168,7 +22256,8 @@ fn cluster_kv_watch_cancel_wakes_waiting_drain() {
         started_tx.send(()).expect("signal drain start");
         let started = Instant::now();
         let result = drain_cluster_kv_watch(
-            &drain_paths,
+            &drain_paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             ClusterKvWatchDrainRequest {
                 watch_id: expected_watch_id,
                 wait_timeout_millis: 5_000,
@@ -22180,7 +22269,7 @@ fn cluster_kv_watch_cancel_wakes_waiting_drain() {
     thread::sleep(Duration::from_millis(50));
 
     let cancelled = cancel_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
         ClusterKvWatchCancelRequest {
             watch_id: expected_watch_id,
         },
@@ -22195,7 +22284,7 @@ fn cluster_kv_watch_cancel_wakes_waiting_drain() {
     );
     assert!(matches!(
         result,
-        Err(NetworkError::Kv(KvError::UnknownWatch { watch_id }))
+        Err(KvError::UnknownWatch { watch_id })
             if watch_id == expected_watch_id
     ));
 }
@@ -22210,7 +22299,8 @@ fn cluster_kv_watch_drain_reports_unknown_watch_for_missing_registration() {
         .expect("write initial snapshot");
     let watch_id = WatchId(42);
     let error = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id,
             wait_timeout_millis: 0,
@@ -22219,7 +22309,7 @@ fn cluster_kv_watch_drain_reports_unknown_watch_for_missing_registration() {
     .expect_err("missing watch");
     assert!(matches!(
         error,
-        NetworkError::Kv(KvError::UnknownWatch { watch_id: returned }) if returned == watch_id
+        KvError::UnknownWatch { watch_id: returned } if returned == watch_id
     ));
 }
 
@@ -22244,7 +22334,8 @@ fn cluster_kv_watch_drain_waits_for_local_raft_commit() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        node_id.clone(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/wait/".to_string(),
             start_revision: KvRevision(1),
@@ -22253,11 +22344,13 @@ fn cluster_kv_watch_drain_waits_for_local_raft_commit() {
     .expect("create watch");
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let drain_paths = paths.clone();
+    let drain_node_id = node_id.clone();
     let handle = thread::spawn(move || {
         started_tx.send(()).expect("signal drain start");
         let started = Instant::now();
         let drained = drain_cluster_kv_watch(
-            &drain_paths,
+            &drain_paths.kv_paths(),
+            drain_node_id,
             ClusterKvWatchDrainRequest {
                 watch_id: watch.watch_id,
                 wait_timeout_millis: 5_000,
@@ -22310,7 +22403,8 @@ fn cluster_kv_watch_create_allocates_unique_ids_concurrently() {
             thread::spawn(move || {
                 barrier.wait();
                 create_cluster_kv_watch(
-                    &paths,
+                    &paths.kv_paths(),
+                    cluster_kv_watch_test_node_id(),
                     ClusterKvWatchPrefixRequest {
                         prefix: format!("/watch/concurrent/{index}/"),
                         start_revision: KvRevision(1),
@@ -22360,7 +22454,8 @@ fn cluster_kv_watch_cancel_removes_registration_without_reusing_id() {
         .expect("write initial snapshot");
 
     let first = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/cancel/".to_string(),
             start_revision: KvRevision(1),
@@ -22373,7 +22468,7 @@ fn cluster_kv_watch_cancel_removes_registration_without_reusing_id() {
     assert!(first_path.exists(), "first watch registration should exist");
 
     let cancelled = cancel_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
         ClusterKvWatchCancelRequest {
             watch_id: first.watch_id,
         },
@@ -22391,7 +22486,7 @@ fn cluster_kv_watch_cancel_removes_registration_without_reusing_id() {
         "cancelled watch registration should be removed"
     );
     let cancelled_again = cancel_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
         ClusterKvWatchCancelRequest {
             watch_id: first.watch_id,
         },
@@ -22400,7 +22495,8 @@ fn cluster_kv_watch_cancel_removes_registration_without_reusing_id() {
     assert!(!cancelled_again.cancelled);
 
     let second = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/cancel/".to_string(),
             start_revision: KvRevision(1),
@@ -22429,7 +22525,8 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
         .expect("write initial snapshot");
 
     let first = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/no-scan/first/".to_string(),
             start_revision: KvRevision(1),
@@ -22441,9 +22538,10 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
     assert_eq!(allocator.active_watch_count, Some(1));
     assert_eq!(allocator.pruned_compacted_revision, Some(KvRevision::ZERO));
 
-    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     let second = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/no-scan/second/".to_string(),
             start_revision: KvRevision(1),
@@ -22451,7 +22549,7 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
     )
     .expect("create second watch");
     assert_eq!(
-        cluster_kv_watch_dir_scans_for_test(&paths),
+        cluster_kv_watch_dir_scans_for_test(&paths.kv_paths()),
         0,
         "steady-state watch creation should use the durable allocator count"
     );
@@ -22461,7 +22559,7 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
     assert_eq!(allocator.next_watch_id, second.watch_id.0.saturating_add(1));
 
     cancel_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
         ClusterKvWatchCancelRequest {
             watch_id: first.watch_id,
         },
@@ -22471,9 +22569,10 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
         read_object_file(&paths.kv_watches_next_id).expect("read allocator after cancel");
     assert_eq!(allocator.active_watch_count, Some(1));
 
-    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     let replacement = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/no-scan/replacement/".to_string(),
             start_revision: KvRevision(1),
@@ -22481,7 +22580,7 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
     )
     .expect("create replacement watch");
     assert_eq!(
-        cluster_kv_watch_dir_scans_for_test(&paths),
+        cluster_kv_watch_dir_scans_for_test(&paths.kv_paths()),
         0,
         "replacement after a normal cancel should not need a directory scan"
     );
@@ -22504,7 +22603,8 @@ fn create_cluster_kv_watch_rescans_after_watch_directory_changes() {
         .expect("write initial snapshot");
 
     create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/rescan/first/".to_string(),
             start_revision: KvRevision(1),
@@ -22514,9 +22614,10 @@ fn create_cluster_kv_watch_rescans_after_watch_directory_changes() {
     let corrupt_path = paths.kv_watches.join("watch-99.sobj");
     std::fs::write(&corrupt_path, b"not-a-sinomo-object").expect("write corrupt watch");
 
-    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     let repaired = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/rescan/repaired/".to_string(),
             start_revision: KvRevision(1),
@@ -22524,7 +22625,7 @@ fn create_cluster_kv_watch_rescans_after_watch_directory_changes() {
     )
     .expect("create watch after external directory change");
     assert_eq!(
-        cluster_kv_watch_dir_scans_for_test(&paths),
+        cluster_kv_watch_dir_scans_for_test(&paths.kv_paths()),
         1,
         "watch-directory changes should invalidate allocator trust and force repair"
     );
@@ -22547,16 +22648,17 @@ fn create_cluster_kv_watch_rolls_back_registration_after_allocator_persist_failu
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
 
-    fail_next_cluster_kv_watch_allocator_persist_for_test(&paths);
+    fail_next_cluster_kv_watch_allocator_persist_for_test(&paths.kv_paths());
     let error = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/persist-failure/".to_string(),
             start_revision: KvRevision(1),
         },
     )
     .expect_err("allocator persist failure");
-    assert!(matches!(error, NetworkError::StorageIo { .. }));
+    assert!(matches!(error, KvError::Io { .. }));
     assert_eq!(
         std::fs::read_dir(&paths.kv_watches)
             .expect("watch registration directory")
@@ -22570,7 +22672,8 @@ fn create_cluster_kv_watch_rolls_back_registration_after_allocator_persist_failu
     );
 
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/persist-failure/retry/".to_string(),
             start_revision: KvRevision(1),
@@ -22594,7 +22697,8 @@ fn cluster_kv_watch_registration_cache_tracks_create_drain_and_cancel() {
         .expect("write initial snapshot");
 
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/cache-registration/".to_string(),
             start_revision: KvRevision(1),
@@ -22602,7 +22706,7 @@ fn cluster_kv_watch_registration_cache_tracks_create_drain_and_cancel() {
     )
     .expect("create watch");
     assert_eq!(
-        cached_cluster_kv_watch_registration_for_test(&paths, watch.watch_id),
+        cached_cluster_kv_watch_registration_for_test(&paths.kv_paths(), watch.watch_id),
         Some(watch.clone()),
         "watch creation should seed the registration cache"
     );
@@ -22614,10 +22718,11 @@ fn cluster_kv_watch_registration_cache_tracks_create_drain_and_cancel() {
             value: b"one".to_vec(),
         },
     };
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
         .expect("append watch event");
     let drained = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -22627,7 +22732,7 @@ fn cluster_kv_watch_registration_cache_tracks_create_drain_and_cancel() {
     assert_eq!(drained.events, vec![event]);
     assert_eq!(drained.next_revision, KvRevision(2));
 
-    let cached = cached_cluster_kv_watch_registration_for_test(&paths, watch.watch_id)
+    let cached = cached_cluster_kv_watch_registration_for_test(&paths.kv_paths(), watch.watch_id)
         .expect("cached registration after drain");
     assert_eq!(
         cached.next_revision,
@@ -22636,14 +22741,14 @@ fn cluster_kv_watch_registration_cache_tracks_create_drain_and_cancel() {
     );
 
     cancel_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
         ClusterKvWatchCancelRequest {
             watch_id: watch.watch_id,
         },
     )
     .expect("cancel watch");
     assert!(
-        cached_cluster_kv_watch_registration_for_test(&paths, watch.watch_id).is_none(),
+        cached_cluster_kv_watch_registration_for_test(&paths.kv_paths(), watch.watch_id).is_none(),
         "cancel should invalidate the cached registration"
     );
 }
@@ -22658,7 +22763,8 @@ fn cluster_kv_watch_drain_defers_small_cursor_writes_until_lag_bound() {
         .expect("write initial snapshot");
 
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/deferred-cursor/".to_string(),
             start_revision: KvRevision(1),
@@ -22682,10 +22788,11 @@ fn cluster_kv_watch_drain_defers_small_cursor_writes_until_lag_bound() {
             value: b"one".to_vec(),
         },
     };
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&first))
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&first))
         .expect("append first watch event");
     let drained = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -22695,7 +22802,7 @@ fn cluster_kv_watch_drain_defers_small_cursor_writes_until_lag_bound() {
     assert_eq!(drained.events, vec![first]);
     assert_eq!(drained.next_revision, KvRevision(2));
     assert_eq!(
-        cached_cluster_kv_watch_registration_for_test(&paths, watch.watch_id)
+        cached_cluster_kv_watch_registration_for_test(&paths.kv_paths(), watch.watch_id)
             .expect("cached registration")
             .next_revision,
         KvRevision(2),
@@ -22719,9 +22826,10 @@ fn cluster_kv_watch_drain_defers_small_cursor_writes_until_lag_bound() {
             },
         })
         .collect::<Vec<_>>();
-    append_cluster_kv_watch_events(&paths, &events).expect("append lag-bound events");
+    append_cluster_kv_watch_events(&paths.kv_paths(), &events).expect("append lag-bound events");
     let drained = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -22750,7 +22858,8 @@ fn create_cluster_kv_watch_enforces_active_registration_limit() {
 
     for index in 0..MAX_CLUSTER_KV_ACTIVE_WATCHES {
         create_cluster_kv_watch(
-            &paths,
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             ClusterKvWatchPrefixRequest {
                 prefix: format!("/watch/limit/{index}/"),
                 start_revision: KvRevision(1),
@@ -22760,7 +22869,8 @@ fn create_cluster_kv_watch_enforces_active_registration_limit() {
     }
 
     let error = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/limit/overflow/".to_string(),
             start_revision: KvRevision(1),
@@ -22769,9 +22879,9 @@ fn create_cluster_kv_watch_enforces_active_registration_limit() {
     .expect_err("active watch limit");
     assert!(matches!(
         error,
-        NetworkError::Kv(KvError::WatchLimit {
+        KvError::WatchLimit {
             max: MAX_CLUSTER_KV_ACTIVE_WATCHES
-        })
+        }
     ));
     assert_eq!(
         std::fs::read_dir(&paths.kv_watches)
@@ -22794,7 +22904,8 @@ fn create_cluster_kv_watch_allows_replacement_after_cancel_at_limit() {
     let mut last_watch = None;
     for index in 0..MAX_CLUSTER_KV_ACTIVE_WATCHES {
         let watch = create_cluster_kv_watch(
-            &paths,
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             ClusterKvWatchPrefixRequest {
                 prefix: format!("/watch/limit-cancel/{index}/"),
                 start_revision: KvRevision(1),
@@ -22808,7 +22919,7 @@ fn create_cluster_kv_watch_allows_replacement_after_cancel_at_limit() {
     let last_watch = last_watch.expect("last watch id");
 
     let cancelled = cancel_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
         ClusterKvWatchCancelRequest {
             watch_id: first_watch,
         },
@@ -22817,7 +22928,8 @@ fn create_cluster_kv_watch_allows_replacement_after_cancel_at_limit() {
     assert!(cancelled.cancelled);
 
     let replacement = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/limit-cancel/replacement/".to_string(),
             start_revision: KvRevision(1),
@@ -22846,7 +22958,8 @@ fn cluster_kv_watch_drain_removes_compacted_registration() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/".to_string(),
             start_revision: KvRevision(1),
@@ -22866,7 +22979,8 @@ fn cluster_kv_watch_drain_removes_compacted_registration() {
     write_cluster_kv_snapshot(&paths, &compacted.snapshot()).expect("write compacted snapshot");
 
     let error = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -22875,10 +22989,10 @@ fn cluster_kv_watch_drain_removes_compacted_registration() {
     .expect_err("compacted watch");
     assert!(matches!(
         error,
-        NetworkError::Kv(KvError::Compacted {
+        KvError::Compacted {
             requested: KvRevision(1),
             compacted: KvRevision(1),
-        })
+        }
     ));
     assert!(
         !watch_path.exists(),
@@ -22895,7 +23009,8 @@ fn create_cluster_kv_watch_prunes_compacted_registrations() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let stale = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/".to_string(),
             start_revision: KvRevision(1),
@@ -22903,7 +23018,8 @@ fn create_cluster_kv_watch_prunes_compacted_registrations() {
     )
     .expect("create stale watch");
     let live = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/".to_string(),
             start_revision: KvRevision(2),
@@ -22927,7 +23043,8 @@ fn create_cluster_kv_watch_prunes_compacted_registrations() {
     write_cluster_kv_snapshot(&paths, &compacted.snapshot()).expect("write compacted snapshot");
 
     let newest = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/".to_string(),
             start_revision: KvRevision(2),
@@ -22966,7 +23083,8 @@ fn create_cluster_kv_watch_prunes_unreadable_registration_without_reusing_id() {
     std::fs::write(&corrupt_path, b"not-a-sinomo-object").expect("write corrupt watch");
 
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/unreadable/".to_string(),
             start_revision: KvRevision(1),
@@ -23004,7 +23122,8 @@ fn create_cluster_kv_watch_prunes_mismatched_registration_without_reusing_id() {
     .expect("write mismatched watch registration");
 
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/mismatched/".to_string(),
             start_revision: KvRevision(1),
@@ -23057,9 +23176,10 @@ fn create_cluster_kv_watch_prunes_and_allocates_with_one_directory_scan() {
     compacted.compact(KvRevision(1)).expect("compact store");
     write_cluster_kv_snapshot(&paths, &compacted.snapshot()).expect("write compacted snapshot");
 
-    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/scan/new/".to_string(),
             start_revision: KvRevision(2),
@@ -23068,7 +23188,7 @@ fn create_cluster_kv_watch_prunes_and_allocates_with_one_directory_scan() {
     .expect("create watch after pruning");
 
     assert_eq!(
-        cluster_kv_watch_dir_scans_for_test(&paths),
+        cluster_kv_watch_dir_scans_for_test(&paths.kv_paths()),
         1,
         "watch creation should combine stale-pruning and max-id allocation in one directory scan"
     );
@@ -30035,34 +30155,34 @@ fn cluster_kv_watch_events_cache_reuses_unchanged_event_view() {
     drop(log);
 
     assert!(
-        cached_cluster_kv_watch_events_for_test(&paths).is_none(),
+        cached_cluster_kv_watch_events_for_test(&paths.kv_paths()).is_none(),
         "cold watch-event reads should start without a cache entry"
     );
 
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("first read"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("first read"),
         vec![first.clone()]
     );
     assert_eq!(
-        cached_cluster_kv_watch_events_for_test(&paths),
+        cached_cluster_kv_watch_events_for_test(&paths.kv_paths()),
         Some(vec![first.clone()]),
         "first read should cache the compacted watch-event view"
     );
 
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("cached read"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("cached read"),
         vec![first.clone()]
     );
 
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&second))
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&second))
         .expect("append second event");
     assert_eq!(
-        cached_cluster_kv_watch_events_for_test(&paths),
+        cached_cluster_kv_watch_events_for_test(&paths.kv_paths()),
         Some(vec![first.clone(), second.clone()]),
         "append should refresh the cache for the next drain"
     );
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("cached read after append"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("cached read after append"),
         vec![first, second]
     );
 }
@@ -30079,17 +30199,17 @@ fn cluster_kv_watch_caches_retain_recent_entries_at_capacity() {
         let quiet_paths = ClusterPaths::new(&SinomoDataDir::new(
             root.join(format!("100-event-{index:04}")),
         ));
-        record_cluster_kv_watch_event_cache_for_test(&quiet_paths);
+        record_cluster_kv_watch_event_cache_for_test(&quiet_paths.kv_paths());
     }
-    record_cluster_kv_watch_event_cache_for_test(&hot_event_paths);
+    record_cluster_kv_watch_event_cache_for_test(&hot_event_paths.kv_paths());
     assert!(
-        refresh_cluster_kv_watch_event_cache_for_test(&hot_event_paths),
+        refresh_cluster_kv_watch_event_cache_for_test(&hot_event_paths.kv_paths()),
         "looking up the hot watch-event cache entry should refresh its recency"
     );
     let extra_event_paths = ClusterPaths::new(&SinomoDataDir::new(root.join("999-extra-events")));
-    record_cluster_kv_watch_event_cache_for_test(&extra_event_paths);
+    record_cluster_kv_watch_event_cache_for_test(&extra_event_paths.kv_paths());
     assert!(
-        cluster_kv_watch_event_cache_contains_for_test(&hot_event_paths),
+        cluster_kv_watch_event_cache_contains_for_test(&hot_event_paths.kv_paths()),
         "recent watch-event cache entry should survive capacity churn"
     );
 
@@ -30110,8 +30230,8 @@ fn cluster_kv_watch_caches_retain_recent_entries_at_capacity() {
         "recent watch-registration cache entry should survive capacity churn"
     );
 
-    remove_cluster_kv_watch_event_cache_entries_under_root_for_test(&root);
-    remove_cluster_kv_watch_registration_cache_entries_under_root_for_test(&root);
+    remove_cluster_kv_watch_event_cache_entries_under_root_for_test(root.path());
+    remove_cluster_kv_watch_registration_cache_entries_under_root_for_test(root.path());
 }
 
 #[test]

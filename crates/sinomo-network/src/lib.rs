@@ -36,7 +36,6 @@ mod kv_read_model;
 mod kv_semantics;
 mod kv_snapshot;
 mod kv_txn_quorum;
-mod kv_watch_store;
 mod lan;
 mod local_membership;
 mod local_state_store;
@@ -594,8 +593,6 @@ pub(crate) mod prelude {
     pub(crate) use sinomo_events::{EventSequence, SessionId, StoredEvent};
     #[cfg(test)]
     pub(crate) use sinomo_kv::LeaseId;
-    #[cfg(test)]
-    pub(crate) use sinomo_kv::WatchId;
     pub(crate) use sinomo_kv::{
         ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, InProcessKvStore, KvCommand,
         KvError, KvEvent, KvOp, KvSnapshot, KvTxn, KvTxnResponse, RaftRequestVoteRequest,

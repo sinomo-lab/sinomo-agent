@@ -31,16 +31,15 @@ pub(crate) use crate::kv_local_store::write_imported_cluster_kv_snapshot_if_chan
 pub(crate) use crate::kv_local_store::{
     LocalClusterRaftCommandStorage, append_cluster_raft_command_uncommitted,
     append_cluster_raft_command_with_response, cached_cluster_kv_reader_node_id_for_test,
-    cluster_kv_cached_snapshot_reads_for_test, cluster_kv_current_snapshot_reads_for_test,
-    cluster_kv_metadata_cache_capacity_for_test, cluster_kv_reader_node_id_cache_contains_for_test,
-    cluster_raft_wal_paths, open_cluster_raft_kv_node_async, read_cluster_kv_prefix_entries,
+    cluster_kv_cached_snapshot_reads_for_test, cluster_kv_metadata_cache_capacity_for_test,
+    cluster_kv_reader_node_id_cache_contains_for_test, cluster_raft_wal_paths,
+    open_cluster_raft_kv_node_async, read_cluster_kv_prefix_entries,
     read_cluster_kv_prefix_entries_limited,
     read_cluster_kv_prefix_entries_limited_by_payload_bytes, read_cluster_kv_snapshot,
     read_cluster_kv_store, record_cluster_kv_reader_node_id_cache_for_test,
     refresh_cluster_kv_reader_node_id_cache_for_test,
     remove_cluster_kv_reader_node_id_cache_entries_under_root_for_test,
-    reset_cluster_kv_cached_snapshot_reads_for_test,
-    reset_cluster_kv_current_snapshot_reads_for_test, restore_cluster_raft_from_snapshot_if_newer,
+    reset_cluster_kv_cached_snapshot_reads_for_test, restore_cluster_raft_from_snapshot_if_newer,
 };
 #[cfg(test)]
 pub(crate) use crate::kv_local_store::{
@@ -57,39 +56,6 @@ use crate::kv_snapshot::{
 use crate::kv_txn_quorum::commit_cluster_kv_txn_with_quorum_response_with_host;
 #[cfg(test)]
 pub(crate) use crate::kv_txn_quorum::handle_cluster_kv_txn_request_with_host;
-#[cfg(test)]
-pub(crate) use crate::kv_watch_store::{
-    append_cluster_kv_watch_events, append_cluster_kv_watch_events_for_active_watches,
-    cached_cluster_kv_watch_events_contain_all, cached_cluster_kv_watch_events_for_test,
-    cached_cluster_kv_watch_registration_for_test, cancel_cluster_kv_watch,
-    cluster_kv_watch_allocator_trust_contains_for_test, cluster_kv_watch_dir_scans_for_test,
-    cluster_kv_watch_drain_once_calls_for_test, cluster_kv_watch_event_cache_capacity_for_test,
-    cluster_kv_watch_event_cache_contains_for_test, cluster_kv_watch_event_log_read_bytes_for_test,
-    cluster_kv_watch_event_log_write_bytes_for_test, cluster_kv_watch_events,
-    cluster_kv_watch_notifier_capacity_for_test, cluster_kv_watch_notifier_generation_for_test,
-    cluster_kv_watch_notifier_has_key_for_test, cluster_kv_watch_notifier_has_raw_key_for_test,
-    cluster_kv_watch_notifier_waiter_count_for_test,
-    cluster_kv_watch_registration_cache_capacity_for_test,
-    cluster_kv_watch_registration_cache_contains_for_test,
-    cluster_kv_watch_unchanged_wakeups_for_test, create_cluster_kv_watch, drain_cluster_kv_watch,
-    drain_cluster_kv_watch_once_limited_by_payload_bytes,
-    fail_next_cluster_kv_watch_allocator_persist_for_test,
-    record_cluster_kv_watch_allocator_trust_for_test, record_cluster_kv_watch_event_cache_for_test,
-    record_cluster_kv_watch_notifier_waiter_key_for_test,
-    record_cluster_kv_watch_registration_cache_for_test,
-    refresh_cluster_kv_watch_allocator_trust_for_test,
-    refresh_cluster_kv_watch_event_cache_for_test,
-    refresh_cluster_kv_watch_registration_cache_for_test,
-    remove_cluster_kv_watch_allocator_trust_entries_under_root_for_test,
-    remove_cluster_kv_watch_event_cache_entries_under_root_for_test,
-    remove_cluster_kv_watch_notifier_entries_under_root_for_test,
-    remove_cluster_kv_watch_registration_cache_entries_under_root_for_test,
-    reset_cluster_kv_watch_dir_scans_for_test, reset_cluster_kv_watch_drain_once_calls_for_test,
-    reset_cluster_kv_watch_event_log_read_bytes_for_test,
-    reset_cluster_kv_watch_event_log_write_bytes_for_test,
-    reset_cluster_kv_watch_unchanged_wakeups_for_test, touch_cluster_kv_watch_notifier_for_test,
-    wait_for_cluster_kv_watch_change_for_test,
-};
 #[cfg(test)]
 pub(crate) use crate::local_membership::apply_local_daemon_membership_observation;
 #[cfg(test)]
