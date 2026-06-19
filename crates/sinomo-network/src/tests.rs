@@ -12171,17 +12171,6 @@ struct RecordingJoinRegistrationHost {
     remembered_targets: usize,
 }
 
-impl ClusterMembershipRpcForwardHost for RecordingJoinRegistrationHost {
-    fn send_membership_rpc_to_node(
-        &mut self,
-        _state: &ClusterBootstrapState,
-        _target_node_id: &NodeId,
-        _request: &ObjectRpcRequest,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        panic!("voter-local join registration should not forward membership node RPCs")
-    }
-}
-
 impl ClusterJoinRegistrationHost for RecordingJoinRegistrationHost {
     fn local_daemon_membership_observation(
         &mut self,
@@ -12190,6 +12179,15 @@ impl ClusterJoinRegistrationHost for RecordingJoinRegistrationHost {
     ) -> Result<Option<ClusterLocalDaemonMembershipObservation>, NetworkError> {
         self.observations += 1;
         Ok(self.observation.clone())
+    }
+
+    fn send_membership_rpc_to_node(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        _target_node_id: &NodeId,
+        _request: &ObjectRpcRequest,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        panic!("voter-local join registration should not forward membership node RPCs")
     }
 
     fn commit_join_registration_state(
@@ -12262,7 +12260,7 @@ struct RecordingJoinEndpointHost {
     remembered: Vec<ClusterEndpointRecord>,
 }
 
-impl ClusterMembershipRpcForwardHost for RecordingJoinEndpointHost {
+impl ClusterJoinRegistrationHost for RecordingJoinEndpointHost {
     fn send_membership_rpc_to_node(
         &mut self,
         _state: &ClusterBootstrapState,
@@ -12271,9 +12269,7 @@ impl ClusterMembershipRpcForwardHost for RecordingJoinEndpointHost {
     ) -> Result<ObjectRpcResponse, NetworkError> {
         panic!("default target remembering should not send membership node RPCs")
     }
-}
 
-impl ClusterJoinRegistrationHost for RecordingJoinEndpointHost {
     fn commit_join_registration_state(
         &mut self,
         _paths: &ClusterPaths,
@@ -15980,7 +15976,7 @@ impl ClusterMemberMutationAsyncHost for RecordingClusterMemberPublishHost {
 
 struct UnusedClusterJoinRegistrationHost;
 
-impl ClusterMembershipRpcForwardHost for UnusedClusterJoinRegistrationHost {
+impl ClusterJoinRegistrationHost for UnusedClusterJoinRegistrationHost {
     fn send_membership_rpc_to_node(
         &mut self,
         _state: &ClusterBootstrapState,
@@ -15991,9 +15987,7 @@ impl ClusterMembershipRpcForwardHost for UnusedClusterJoinRegistrationHost {
             detail: "unused membership forward host".to_string(),
         })
     }
-}
 
-impl ClusterJoinRegistrationHost for UnusedClusterJoinRegistrationHost {
     fn commit_join_registration_state(
         &mut self,
         _paths: &ClusterPaths,

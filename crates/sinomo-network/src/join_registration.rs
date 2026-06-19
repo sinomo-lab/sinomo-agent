@@ -810,7 +810,7 @@ pub fn cluster_join_challenge_rpc_request<T: Serialize + ?Sized>(
     )
 }
 
-pub trait ClusterJoinRegistrationHost: ClusterMembershipRpcForwardHost {
+pub trait ClusterJoinRegistrationHost {
     fn local_daemon_membership_observation(
         &mut self,
         _paths: &ClusterPaths,
@@ -818,6 +818,13 @@ pub trait ClusterJoinRegistrationHost: ClusterMembershipRpcForwardHost {
     ) -> Result<Option<ClusterLocalDaemonMembershipObservation>, NetworkError> {
         Ok(None)
     }
+
+    fn send_membership_rpc_to_node(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+    ) -> Result<ObjectRpcResponse, NetworkError>;
 
     fn commit_join_registration_state(
         &mut self,
@@ -852,6 +859,25 @@ pub trait ClusterJoinRegistrationHost: ClusterMembershipRpcForwardHost {
         _endpoint: &ClusterEndpointRecord,
     ) -> Result<(), NetworkError> {
         Ok(())
+    }
+}
+
+impl<T> ClusterMembershipRpcForwardHost for T
+where
+    T: ClusterJoinRegistrationHost,
+{
+    fn send_membership_rpc_to_node(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        ClusterJoinRegistrationHost::send_membership_rpc_to_node(
+            self,
+            state,
+            target_node_id,
+            request,
+        )
     }
 }
 
@@ -949,25 +975,6 @@ impl<T, O> ClusterJoinRegistrationDriver<T, O> {
     }
 }
 
-impl<T, O> ClusterMembershipRpcForwardHost for ClusterJoinRegistrationDriver<T, O>
-where
-    T: ClusterControlPlaneTransport,
-{
-    fn send_membership_rpc_to_node(
-        &mut self,
-        state: &ClusterBootstrapState,
-        target_node_id: &NodeId,
-        request: &ObjectRpcRequest,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        ClusterMembershipRpcForwardHost::send_membership_rpc_to_node(
-            &mut self.driver,
-            state,
-            target_node_id,
-            request,
-        )
-    }
-}
-
 impl<T, O> ClusterJoinRegistrationHost for ClusterJoinRegistrationDriver<T, O>
 where
     T: ClusterControlPlaneTransport,
@@ -980,6 +987,20 @@ where
     ) -> Result<Option<ClusterLocalDaemonMembershipObservation>, NetworkError> {
         self.observer
             .local_daemon_membership_observation(paths, state)
+    }
+
+    fn send_membership_rpc_to_node(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        ClusterMembershipRpcForwardHost::send_membership_rpc_to_node(
+            &mut self.driver,
+            state,
+            target_node_id,
+            request,
+        )
     }
 
     fn commit_join_registration_state(
@@ -1034,6 +1055,20 @@ impl<T> ClusterJoinRegistrationHost for ClusterControlPlaneDriver<T>
 where
     T: ClusterControlPlaneTransport,
 {
+    fn send_membership_rpc_to_node(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        self.transport.send_object_rpc_to_node(
+            state,
+            target_node_id,
+            request,
+            self.timeouts.membership_rpc_timeout,
+        )
+    }
+
     fn commit_join_registration_state(
         &mut self,
         paths: &ClusterPaths,

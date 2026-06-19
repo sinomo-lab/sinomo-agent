@@ -273,7 +273,8 @@ pub(crate) use member_publish::{
     handle_cluster_member_publish_request_with_host,
 };
 pub use membership::cluster_is_settled_solo;
-pub use membership_forward::ClusterMembershipRpcForwardHost;
+#[cfg(test)]
+pub(crate) use membership_forward::ClusterMembershipRpcForwardHost;
 #[cfg(test)]
 pub(crate) use membership_forward::forward_cluster_membership_rpc_to_voter_with_host;
 #[cfg(test)]

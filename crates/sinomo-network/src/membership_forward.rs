@@ -12,7 +12,7 @@ use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_core::ClusterBootstrapState;
 use sinomo_node::NodeId;
 
-pub trait ClusterMembershipRpcForwardHost {
+pub(crate) trait ClusterMembershipRpcForwardHost {
     fn send_membership_rpc_to_node(
         &mut self,
         state: &ClusterBootstrapState,

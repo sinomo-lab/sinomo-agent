@@ -117,7 +117,6 @@ pub(crate) use crate::member_store::{
     cluster_member_put_command, cluster_member_update_ops_from_store,
     cluster_raft_config_from_store,
 };
-use crate::membership_forward::ClusterMembershipRpcForwardHost;
 use crate::membership_rpc::{ClusterMemberPublishRequest, ClusterMemberPublishResponse};
 use crate::network_info::ClusterNetworkInfoRecord;
 use crate::prelude::*;
@@ -469,24 +468,5 @@ where
         let options = self.timeouts.kv_txn_quorum_options(true);
         commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, txn, options, self)
             .map(|result| result.snapshot)
-    }
-}
-
-impl<T> ClusterMembershipRpcForwardHost for ClusterControlPlaneDriver<T>
-where
-    T: ClusterControlPlaneTransport,
-{
-    fn send_membership_rpc_to_node(
-        &mut self,
-        state: &ClusterBootstrapState,
-        target_node_id: &NodeId,
-        request: &ObjectRpcRequest,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        self.transport.send_object_rpc_to_node(
-            state,
-            target_node_id,
-            request,
-            self.timeouts.membership_rpc_timeout,
-        )
     }
 }

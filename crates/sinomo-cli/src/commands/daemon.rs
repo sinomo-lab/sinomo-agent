@@ -1059,7 +1059,7 @@ pub(crate) fn handle_daemon_cluster_join_request(
 struct CliClusterJoinRegistrationHost;
 
 #[cfg(test)]
-impl network::ClusterMembershipRpcForwardHost for CliClusterJoinRegistrationHost {
+impl network::ClusterJoinRegistrationHost for CliClusterJoinRegistrationHost {
     fn send_membership_rpc_to_node(
         &mut self,
         _state: &ClusterBootstrapState,
@@ -1071,10 +1071,7 @@ impl network::ClusterMembershipRpcForwardHost for CliClusterJoinRegistrationHost
             detail: "CLI test join host does not route membership node RPCs".to_string(),
         })
     }
-}
 
-#[cfg(test)]
-impl network::ClusterJoinRegistrationHost for CliClusterJoinRegistrationHost {
     fn commit_join_registration_state(
         &mut self,
         paths: &ClusterPaths,

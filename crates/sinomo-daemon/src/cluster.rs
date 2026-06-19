@@ -1339,22 +1339,6 @@ impl sinomo_network::ClusterLocalDaemonMembershipAsyncObserver
     }
 }
 
-impl sinomo_network::ClusterMembershipRpcForwardHost for DaemonClusterJoinRegistrationHost<'_> {
-    fn send_membership_rpc_to_node(
-        &mut self,
-        state: &ClusterBootstrapState,
-        target_node_id: &NodeId,
-        request: &sinomo_network::ObjectRpcRequest,
-    ) -> Result<sinomo_network::ObjectRpcResponse, sinomo_network::NetworkError> {
-        sinomo_network::ClusterMembershipRpcForwardHost::send_membership_rpc_to_node(
-            &mut self.driver,
-            state,
-            target_node_id,
-            request,
-        )
-    }
-}
-
 impl sinomo_network::ClusterJoinRegistrationHost for DaemonClusterJoinRegistrationHost<'_> {
     fn local_daemon_membership_observation(
         &mut self,
@@ -1368,6 +1352,20 @@ impl sinomo_network::ClusterJoinRegistrationHost for DaemonClusterJoinRegistrati
             &mut self.driver,
             paths,
             state,
+        )
+    }
+
+    fn send_membership_rpc_to_node(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &sinomo_network::ObjectRpcRequest,
+    ) -> Result<sinomo_network::ObjectRpcResponse, sinomo_network::NetworkError> {
+        sinomo_network::ClusterJoinRegistrationHost::send_membership_rpc_to_node(
+            &mut self.driver,
+            state,
+            target_node_id,
+            request,
         )
     }
 
@@ -5598,7 +5596,7 @@ mod tests {
 
     struct TestClusterJoinRegistrationHost;
 
-    impl sinomo_network::ClusterMembershipRpcForwardHost for TestClusterJoinRegistrationHost {
+    impl sinomo_network::ClusterJoinRegistrationHost for TestClusterJoinRegistrationHost {
         fn send_membership_rpc_to_node(
             &mut self,
             _state: &ClusterBootstrapState,
@@ -5607,9 +5605,7 @@ mod tests {
         ) -> Result<sinomo_network::ObjectRpcResponse, sinomo_network::NetworkError> {
             panic!("forwarded acceptance recorder should not send membership node RPCs")
         }
-    }
 
-    impl sinomo_network::ClusterJoinRegistrationHost for TestClusterJoinRegistrationHost {
         fn commit_join_registration_state(
             &mut self,
             _paths: &ClusterPaths,
