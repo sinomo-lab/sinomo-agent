@@ -13,7 +13,6 @@ use sinomo_core::{
 };
 use sinomo_kv::{InProcessKvStore, KvSnapshot};
 use sinomo_node::NodeId;
-use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -169,11 +168,8 @@ pub fn refresh_current_cluster_kv_store_with_host(
         }
     }
     if !fetched_remote {
-        let mut seen_voters = BTreeSet::new();
-        'node_targets: for voter in targets
-            .iter()
-            .filter(|voter| seen_voters.insert(voter.node_id.clone()))
-        {
+        let unique_node_targets = ClusterEndpointSelector::unique_node_targets(targets.clone());
+        'node_targets: for voter in &unique_node_targets {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .unwrap_or_default();

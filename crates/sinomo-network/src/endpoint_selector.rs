@@ -137,6 +137,23 @@ impl<'a> ClusterEndpointSelector<'a> {
         }
     }
 
+    pub(crate) fn unique_node_targets(
+        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+    ) -> Vec<ClusterEndpointRecord> {
+        let mut seen = BTreeSet::new();
+        endpoints
+            .into_iter()
+            .filter(|endpoint| seen.insert(endpoint.node_id.clone()))
+            .collect()
+    }
+
+    pub(crate) fn select_unique_node_targets(
+        &self,
+        purpose: ClusterEndpointSelectionPurpose,
+    ) -> Vec<ClusterEndpointRecord> {
+        Self::unique_node_targets(self.select(purpose))
+    }
+
     pub async fn select_async(
         runtime: &tokio::runtime::Handle,
         paths: &ClusterPaths,
@@ -151,6 +168,25 @@ impl<'a> ClusterEndpointSelector<'a> {
             .map_err(|source| NetworkError::Io {
                 operation: "cluster endpoint selection".to_string(),
                 detail: format!("cluster endpoint selection task failed: {source}"),
+            })
+    }
+
+    pub(crate) async fn select_unique_node_targets_async(
+        runtime: &tokio::runtime::Handle,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        purpose: ClusterEndpointSelectionPurpose,
+    ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+        let paths = paths.clone();
+        let state = state.clone();
+        runtime
+            .spawn_blocking(move || {
+                ClusterEndpointSelector::new(&paths, &state).select_unique_node_targets(purpose)
+            })
+            .await
+            .map_err(|source| NetworkError::Io {
+                operation: "cluster unique node target selection".to_string(),
+                detail: format!("cluster unique node target selection task failed: {source}"),
             })
     }
 

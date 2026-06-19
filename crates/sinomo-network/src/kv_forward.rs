@@ -13,7 +13,6 @@ use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_core::{ClusterBootstrapState, ClusterEndpointRecord, ClusterTransportKind};
 use sinomo_kv::{ClusterKvTxnCommitResult, KvTxn};
 use sinomo_node::NodeId;
-use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,7 +59,7 @@ pub(crate) fn forward_cluster_kv_txn_to_voter_with_host(
     host: &mut impl ClusterKvTxnForwardHost,
 ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
     let mut targets = ClusterEndpointSelector::new(paths, state)
-        .select(ClusterEndpointSelectionPurpose::LiveVoterCommand);
+        .select_unique_node_targets(ClusterEndpointSelectionPurpose::LiveVoterCommand);
     if targets.is_empty() {
         return Ok(None);
     }
@@ -76,11 +75,7 @@ pub(crate) fn forward_cluster_kv_txn_to_voter_with_host(
 
     let mut failures = Vec::new();
     let deadline = Instant::now() + options.timeout;
-    let mut seen_voters = BTreeSet::new();
-    for voter in targets
-        .iter()
-        .filter(|voter| seen_voters.insert(voter.node_id.clone()))
-    {
+    for voter in &targets {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
@@ -163,7 +158,7 @@ pub(crate) async fn forward_cluster_kv_txn_to_voter_async_with_host<H>(
 where
     H: ClusterSignedEndpointRpcAsyncHost + Send,
 {
-    let mut targets = ClusterEndpointSelector::select_async(
+    let mut targets = ClusterEndpointSelector::select_unique_node_targets_async(
         runtime,
         paths,
         state,
@@ -186,11 +181,7 @@ where
 
     let mut failures = Vec::new();
     let deadline = Instant::now() + options.timeout;
-    let mut seen_voters = BTreeSet::new();
-    for voter in targets
-        .iter()
-        .filter(|voter| seen_voters.insert(voter.node_id.clone()))
-    {
+    for voter in &targets {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();

@@ -10,7 +10,6 @@ use crate::route::{
 use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_core::ClusterBootstrapState;
 use sinomo_node::NodeId;
-use std::collections::BTreeSet;
 
 pub trait ClusterMembershipRpcForwardHost {
     fn send_membership_rpc_to_node(
@@ -29,15 +28,10 @@ pub(crate) fn forward_cluster_membership_rpc_to_voter_with_host(
     host: &mut impl ClusterMembershipRpcForwardHost,
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let mut failures = Vec::new();
-    let mut seen_voters = BTreeSet::new();
     for target_node_id in ClusterEndpointSelector::new(paths, state)
-        .select(ClusterEndpointSelectionPurpose::VoterCommand)
+        .select_unique_node_targets(ClusterEndpointSelectionPurpose::VoterCommand)
         .into_iter()
-        .filter_map(|endpoint| {
-            seen_voters
-                .insert(endpoint.node_id.clone())
-                .then_some(endpoint.node_id)
-        })
+        .map(|endpoint| endpoint.node_id)
     {
         match host.send_membership_rpc_to_node(state, &target_node_id, request) {
             Ok(response) => return Ok(response),
@@ -66,33 +60,20 @@ pub async fn forward_cluster_membership_rpc_to_voter_async_with_host(
     failure_detail: &str,
     host: &mut (impl ClusterSignedEndpointRpcAsyncHost + Send),
 ) -> Result<ObjectRpcResponse, NetworkError> {
-    let paths_for_targets = paths.clone();
-    let state_for_targets = state.clone();
-    let voter_node_ids = runtime
-        .spawn_blocking(move || {
-            let mut seen_voters = BTreeSet::new();
-            ClusterEndpointSelector::new(&paths_for_targets, &state_for_targets)
-                .select(ClusterEndpointSelectionPurpose::VoterCommand)
-                .into_iter()
-                .filter_map(|endpoint| {
-                    seen_voters
-                        .insert(endpoint.node_id.clone())
-                        .then_some(endpoint.node_id)
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster membership voter target selection".to_string(),
-            detail: format!("voter target selection task failed: {source}"),
-        })?;
+    let voter_targets = ClusterEndpointSelector::select_unique_node_targets_async(
+        runtime,
+        paths,
+        state,
+        ClusterEndpointSelectionPurpose::VoterCommand,
+    )
+    .await?;
     let mut failures = Vec::new();
     let mut client = ClusterObjectRpcClient::routed(host, runtime, paths);
-    for target_node_id in &voter_node_ids {
+    for target in &voter_targets {
         match client
             .call_node(
                 state,
-                target_node_id,
+                &target.node_id,
                 request,
                 ClusterObjectRpcNodeOptions::new(
                     ClusterEndpointSelectionPurpose::VoterCommand,
@@ -105,7 +86,7 @@ pub async fn forward_cluster_membership_rpc_to_voter_async_with_host(
         {
             Ok(response) => return Ok(response),
             Err(error) => {
-                failures.push(format!("node {target_node_id}: {error}"));
+                failures.push(format!("node {}: {error}", target.node_id));
             }
         }
     }
