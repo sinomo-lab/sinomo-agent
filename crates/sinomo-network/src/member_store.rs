@@ -76,7 +76,10 @@ pub fn cluster_bootstrap_state_stable_eq(
             .all(|(left, right)| cluster_member_stable_eq(left, right))
 }
 
-pub fn cluster_member_stable_eq(left: &ClusterMemberRecord, right: &ClusterMemberRecord) -> bool {
+pub(crate) fn cluster_member_stable_eq(
+    left: &ClusterMemberRecord,
+    right: &ClusterMemberRecord,
+) -> bool {
     left.cluster_id == right.cluster_id
         && left.node_id == right.node_id
         && left.display_name == right.display_name
@@ -92,7 +95,7 @@ pub fn cluster_member_stable_eq(left: &ClusterMemberRecord, right: &ClusterMembe
         && left.joined_at == right.joined_at
 }
 
-pub fn merge_cluster_state_from_peer(
+pub(crate) fn merge_cluster_state_from_peer(
     local: &mut ClusterBootstrapState,
     peer: ClusterBootstrapState,
 ) -> bool {
@@ -112,7 +115,7 @@ pub fn merge_cluster_state_from_peer(
     changed
 }
 
-pub fn merge_member_record(
+pub(crate) fn merge_member_record(
     local: &mut ClusterBootstrapState,
     incoming: ClusterMemberRecord,
 ) -> bool {
