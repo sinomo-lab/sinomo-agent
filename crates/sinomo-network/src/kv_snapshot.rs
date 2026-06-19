@@ -64,7 +64,7 @@ impl ClusterKvSnapshotRefreshOptions {
 }
 
 pub trait ClusterKvSnapshotRefreshHost {
-    fn known_raft_leader_id(
+    fn known_kv_state_authority_id(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
@@ -76,7 +76,7 @@ pub trait ClusterKvSnapshotRefreshHost {
         timeout: Duration,
     ) -> Result<KvSnapshot, NetworkError>;
 
-    fn restore_cluster_raft_from_snapshot_if_newer(
+    fn restore_cluster_kv_from_snapshot_if_newer(
         &mut self,
         paths: &ClusterPaths,
         local_node_id: &NodeId,
@@ -104,7 +104,7 @@ impl<F> ClusterKvSnapshotRefreshHost for LocalClusterKvSnapshotRefreshHost<F>
 where
     F: FnMut(&ClusterEndpointRecord, Duration) -> Result<KvSnapshot, NetworkError>,
 {
-    fn known_raft_leader_id(
+    fn known_kv_state_authority_id(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
@@ -120,7 +120,7 @@ where
         (self.fetch_cluster_kv_snapshot)(endpoint, timeout)
     }
 
-    fn restore_cluster_raft_from_snapshot_if_newer(
+    fn restore_cluster_kv_from_snapshot_if_newer(
         &mut self,
         paths: &ClusterPaths,
         local_node_id: &NodeId,
@@ -142,7 +142,7 @@ pub fn refresh_current_cluster_kv_store_with_host(
     }
     let mut targets = ClusterEndpointSelector::new(paths, state)
         .select_internal(ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand);
-    if let Ok(Some(leader_id)) = host.known_raft_leader_id(paths, state)
+    if let Ok(Some(leader_id)) = host.known_kv_state_authority_id(paths, state)
         && !cluster_node_blocks_leader_preference(paths, state, &leader_id)
         && let Some(position) = targets
             .iter()
@@ -192,11 +192,7 @@ pub fn refresh_current_cluster_kv_store_with_host(
             detail: "no local or reachable cluster KV snapshot is available".to_string(),
         })?;
     write_imported_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
-    host.restore_cluster_raft_from_snapshot_if_newer(
-        paths,
-        &state.local_node_id,
-        snapshot.clone(),
-    )?;
+    host.restore_cluster_kv_from_snapshot_if_newer(paths, &state.local_node_id, snapshot.clone())?;
     Ok(InProcessKvStore::restore(snapshot))
 }
 

@@ -331,11 +331,12 @@ where
         request: &ClusterRaftAppendRequest,
         timeout: Duration,
     ) -> Result<ClusterRaftAppendResponse, NetworkError> {
-        self.transport.send_raft_append(endpoint, request, timeout)
+        self.transport
+            .send_kv_replication(endpoint, request, timeout)
     }
 
     fn on_raft_append_sent(&mut self) {
-        self.transport.on_raft_append_sent();
+        self.transport.on_kv_replication_sent();
     }
 }
 
@@ -429,7 +430,7 @@ where
     ) {
         self.driver
             .transport
-            .fan_out_committed_cluster_raft_command(paths, state, events, targets);
+            .fan_out_committed_cluster_kv_command(paths, state, events, targets);
     }
 }
 

@@ -1757,25 +1757,27 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
     struct CliClusterJoinReconciliationTransport;
 
     impl network::ClusterControlPlaneTransport for CliClusterJoinReconciliationTransport {
-        fn send_raft_append(
+        fn send_kv_replication(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &sinomo_runtime::kv::ClusterRaftAppendRequest,
+            _request: &sinomo_runtime::kv::ClusterKvReplicationRequest,
             _timeout: Duration,
-        ) -> Result<sinomo_runtime::kv::ClusterRaftAppendResponse, network::NetworkError> {
+        ) -> Result<sinomo_runtime::kv::ClusterKvReplicationResponse, network::NetworkError>
+        {
             Err(unsupported_join_reconciliation_transport(
-                "cluster join raft append",
+                "cluster join kv replication",
             ))
         }
 
-        fn send_raft_vote(
+        fn request_kv_state_authority_vote(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &sinomo_runtime::kv::ClusterRaftVoteRequest,
+            _request: &sinomo_runtime::kv::ClusterKvStateAuthorityVoteRequest,
             _timeout: Duration,
-        ) -> Result<sinomo_runtime::kv::ClusterRaftVoteResponse, network::NetworkError> {
+        ) -> Result<sinomo_runtime::kv::ClusterKvStateAuthorityVoteResponse, network::NetworkError>
+        {
             Err(unsupported_join_reconciliation_transport(
-                "cluster join raft vote",
+                "cluster join kv state authority vote",
             ))
         }
 
@@ -2533,7 +2535,7 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
     struct CliClusterKvSnapshotRefreshHost;
 
     impl network::ClusterKvSnapshotRefreshHost for CliClusterKvSnapshotRefreshHost {
-        fn known_raft_leader_id(
+        fn known_kv_state_authority_id(
             &mut self,
             paths: &ClusterPaths,
             state: &ClusterBootstrapState,
@@ -2554,7 +2556,7 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
             })
         }
 
-        fn restore_cluster_raft_from_snapshot_if_newer(
+        fn restore_cluster_kv_from_snapshot_if_newer(
             &mut self,
             paths: &ClusterPaths,
             local_node_id: &NodeId,

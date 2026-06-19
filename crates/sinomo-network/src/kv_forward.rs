@@ -36,7 +36,7 @@ impl ClusterKvTxnForwardOptions {
 }
 
 pub(crate) trait ClusterKvTxnForwardHost {
-    fn known_raft_leader_id(
+    fn known_kv_state_authority_id(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
@@ -65,7 +65,7 @@ pub(crate) fn forward_cluster_kv_txn_to_voter_with_host(
     if targets.is_empty() {
         return Ok(None);
     }
-    if let Ok(Some(leader_id)) = host.known_raft_leader_id(paths, state)
+    if let Ok(Some(leader_id)) = host.known_kv_state_authority_id(paths, state)
         && !cluster_node_blocks_leader_preference(paths, state, &leader_id)
         && let Some(position) = targets
             .iter()

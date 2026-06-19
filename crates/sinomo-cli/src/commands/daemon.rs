@@ -629,21 +629,22 @@ fn cli_cluster_control_plane_driver()
 struct CliClusterControlPlaneTransport;
 
 impl network::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
-    fn send_raft_append(
+    fn send_kv_replication(
         &mut self,
         endpoint: &ClusterEndpointRecord,
-        request: &sinomo_runtime::kv::ClusterRaftAppendRequest,
+        request: &sinomo_runtime::kv::ClusterKvReplicationRequest,
         timeout: Duration,
-    ) -> Result<sinomo_runtime::kv::ClusterRaftAppendResponse, network::NetworkError> {
+    ) -> Result<sinomo_runtime::kv::ClusterKvReplicationResponse, network::NetworkError> {
         cli_send_cluster_raft_append(endpoint, request, timeout)
     }
 
-    fn send_raft_vote(
+    fn request_kv_state_authority_vote(
         &mut self,
         endpoint: &ClusterEndpointRecord,
-        request: &sinomo_runtime::kv::ClusterRaftVoteRequest,
+        request: &sinomo_runtime::kv::ClusterKvStateAuthorityVoteRequest,
         timeout: Duration,
-    ) -> Result<sinomo_runtime::kv::ClusterRaftVoteResponse, network::NetworkError> {
+    ) -> Result<sinomo_runtime::kv::ClusterKvStateAuthorityVoteResponse, network::NetworkError>
+    {
         cli_send_cluster_raft_vote(endpoint, request, timeout)
     }
 

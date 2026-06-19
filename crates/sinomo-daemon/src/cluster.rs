@@ -28,9 +28,10 @@ use sinomo_core::{
     ClusterNodeAvailability, TrustDomain,
 };
 use sinomo_kv::{
-    ClusterKvRaftAppendReplicationOutcome, ClusterKvWatchEventsRequest,
-    ClusterKvWatchEventsResponse, ClusterRaftAppendRequest, ClusterRaftAppendResponse,
-    ClusterRaftVoteRequest, ClusterRaftVoteResponse,
+    ClusterKvRaftAppendReplicationOutcome, ClusterKvReplicationRequest,
+    ClusterKvReplicationResponse, ClusterKvStateAuthorityVoteRequest,
+    ClusterKvStateAuthorityVoteResponse, ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse,
+    ClusterRaftAppendRequest, ClusterRaftAppendResponse,
 };
 use sinomo_kv::{InProcessKvStore, KvEvent, KvSnapshot, KvTxn, KvTxnResponse};
 #[cfg(test)]
@@ -3409,12 +3410,12 @@ pub(crate) struct DaemonClusterControlPlaneTransport {
 }
 
 impl sinomo_network::ClusterControlPlaneTransport for DaemonClusterControlPlaneTransport {
-    fn send_raft_append(
+    fn send_kv_replication(
         &mut self,
         endpoint: &ClusterEndpointRecord,
-        request: &ClusterRaftAppendRequest,
+        request: &ClusterKvReplicationRequest,
         timeout: Duration,
-    ) -> Result<ClusterRaftAppendResponse, sinomo_network::NetworkError> {
+    ) -> Result<ClusterKvReplicationResponse, sinomo_network::NetworkError> {
         let runtime = self.rpc_mode.runtime();
         send_cluster_raft_append_on_runtime(endpoint, request, timeout, runtime).map_err(|error| {
             sinomo_network::NetworkError::Io {
@@ -3424,12 +3425,12 @@ impl sinomo_network::ClusterControlPlaneTransport for DaemonClusterControlPlaneT
         })
     }
 
-    fn send_raft_vote(
+    fn request_kv_state_authority_vote(
         &mut self,
         endpoint: &ClusterEndpointRecord,
-        request: &ClusterRaftVoteRequest,
+        request: &ClusterKvStateAuthorityVoteRequest,
         timeout: Duration,
-    ) -> Result<ClusterRaftVoteResponse, sinomo_network::NetworkError> {
+    ) -> Result<ClusterKvStateAuthorityVoteResponse, sinomo_network::NetworkError> {
         let runtime = self.rpc_mode.runtime();
         send_cluster_raft_vote_on_runtime(endpoint, request, timeout, runtime).map_err(|error| {
             sinomo_network::NetworkError::Io {
@@ -3558,7 +3559,7 @@ impl sinomo_network::ClusterControlPlaneTransport for DaemonClusterControlPlaneT
         remember_connectivity_record_set(paths, source_node_id, records);
     }
 
-    fn fan_out_committed_cluster_raft_command(
+    fn fan_out_committed_cluster_kv_command(
         &mut self,
         paths: ClusterPaths,
         state: ClusterBootstrapState,
@@ -3573,7 +3574,7 @@ impl sinomo_network::ClusterControlPlaneTransport for DaemonClusterControlPlaneT
         );
     }
 
-    fn on_raft_append_sent(&mut self) {
+    fn on_kv_replication_sent(&mut self) {
         if let Some(stats) = crate::process_idle_stats() {
             stats.incr_raft_appends_sent();
         }
@@ -3600,12 +3601,12 @@ impl sinomo_network::ClusterStateAuthorityReachabilityAsyncHost
 }
 
 impl sinomo_network::ClusterKvTxnQuorumAsyncHost for DaemonClusterControlPlaneTransport {
-    fn send_raft_vote_async<'a>(
+    fn request_kv_state_authority_vote_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
-        request: &'a ClusterRaftVoteRequest,
+        request: &'a ClusterKvStateAuthorityVoteRequest,
         timeout: Duration,
-    ) -> sinomo_network::ClusterMembershipRpcFuture<'a, ClusterRaftVoteResponse> {
+    ) -> sinomo_network::ClusterMembershipRpcFuture<'a, ClusterKvStateAuthorityVoteResponse> {
         let runtime = self.rpc_mode.runtime().clone();
         Box::pin(async move {
             send_cluster_raft_vote_async(endpoint, request, timeout, &runtime)

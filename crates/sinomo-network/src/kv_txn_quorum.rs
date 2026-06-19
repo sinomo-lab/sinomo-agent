@@ -32,8 +32,9 @@ use crate::state_authority_reachability::{
     cluster_reachable_state_authority_count_with_host,
 };
 use sinomo_kv::{
-    ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult, ClusterKvTxnCommitResult,
-    ClusterRaftVoteRequest, ClusterRaftVoteResponse,
+    ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult,
+    ClusterKvStateAuthorityVoteRequest, ClusterKvStateAuthorityVoteResponse,
+    ClusterKvTxnCommitResult,
 };
 use std::time::Duration;
 
@@ -46,7 +47,7 @@ pub trait ClusterKvTxnQuorumHost {
         Ok(())
     }
 
-    fn known_raft_leader_id(
+    fn known_kv_state_authority_id(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
@@ -60,20 +61,20 @@ pub trait ClusterKvTxnQuorumHost {
         timeout: Duration,
     ) -> Result<ObjectRpcResponse, NetworkError>;
 
-    fn local_is_raft_leader(
+    fn local_is_kv_state_authority(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Result<bool, NetworkError>;
 
-    fn send_raft_vote(
+    fn request_kv_state_authority_vote(
         &mut self,
         endpoint: &ClusterEndpointRecord,
-        request: &ClusterRaftVoteRequest,
+        request: &ClusterKvStateAuthorityVoteRequest,
         timeout: Duration,
-    ) -> Result<ClusterRaftVoteResponse, NetworkError>;
+    ) -> Result<ClusterKvStateAuthorityVoteResponse, NetworkError>;
 
-    fn forward_cluster_kv_txn_to_voter(
+    fn forward_cluster_kv_txn_to_state_authority(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
@@ -86,7 +87,7 @@ pub trait ClusterKvTxnQuorumHost {
         forward_cluster_kv_txn_to_voter_with_host(paths, state, txn, options.forward_options, self)
     }
 
-    fn elect_cluster_raft_leader(
+    fn elect_kv_state_authority(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
@@ -105,7 +106,7 @@ pub trait ClusterKvTxnQuorumHost {
         options: ClusterStateAuthorityReachabilityOptions,
     ) -> usize;
 
-    fn commit_cluster_raft_command_with_quorum(
+    fn commit_cluster_kv_command_with_quorum(
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
@@ -118,12 +119,12 @@ impl<T> crate::kv_forward::ClusterKvTxnForwardHost for T
 where
     T: ClusterKvTxnQuorumHost,
 {
-    fn known_raft_leader_id(
+    fn known_kv_state_authority_id(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError> {
-        ClusterKvTxnQuorumHost::known_raft_leader_id(self, paths, state)
+        ClusterKvTxnQuorumHost::known_kv_state_authority_id(self, paths, state)
     }
 
     fn send_object_rpc_to_node(
@@ -150,10 +151,10 @@ where
     fn send_raft_vote(
         &mut self,
         endpoint: &ClusterEndpointRecord,
-        request: &ClusterRaftVoteRequest,
+        request: &sinomo_kv::ClusterRaftVoteRequest,
         timeout: Duration,
-    ) -> Result<ClusterRaftVoteResponse, NetworkError> {
-        ClusterKvTxnQuorumHost::send_raft_vote(self, endpoint, request, timeout)
+    ) -> Result<sinomo_kv::ClusterRaftVoteResponse, NetworkError> {
+        ClusterKvTxnQuorumHost::request_kv_state_authority_vote(self, endpoint, request, timeout)
     }
 }
 
@@ -163,12 +164,12 @@ pub trait ClusterKvTxnQuorumAsyncHost:
     + ClusterStateAuthorityReachabilityAsyncHost
     + Send
 {
-    fn send_raft_vote_async<'a>(
+    fn request_kv_state_authority_vote_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
-        request: &'a ClusterRaftVoteRequest,
+        request: &'a ClusterKvStateAuthorityVoteRequest,
         timeout: Duration,
-    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftVoteResponse>;
+    ) -> ClusterMembershipRpcFuture<'a, ClusterKvStateAuthorityVoteResponse>;
 }
 
 impl<T> ClusterRaftVoteTransportAsyncHost for T
@@ -178,10 +179,12 @@ where
     fn send_raft_vote_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
-        request: &'a ClusterRaftVoteRequest,
+        request: &'a sinomo_kv::ClusterRaftVoteRequest,
         timeout: Duration,
-    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftVoteResponse> {
-        ClusterKvTxnQuorumAsyncHost::send_raft_vote_async(self, endpoint, request, timeout)
+    ) -> ClusterMembershipRpcFuture<'a, sinomo_kv::ClusterRaftVoteResponse> {
+        ClusterKvTxnQuorumAsyncHost::request_kv_state_authority_vote_async(
+            self, endpoint, request, timeout,
+        )
     }
 }
 
@@ -203,7 +206,7 @@ where
         .map(|_| ())
     }
 
-    fn known_raft_leader_id(
+    fn known_kv_state_authority_id(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
@@ -222,16 +225,17 @@ where
             .send_object_rpc_to_node(state, target_node_id, request, timeout)
     }
 
-    fn send_raft_vote(
+    fn request_kv_state_authority_vote(
         &mut self,
         endpoint: &ClusterEndpointRecord,
-        request: &ClusterRaftVoteRequest,
+        request: &ClusterKvStateAuthorityVoteRequest,
         timeout: Duration,
-    ) -> Result<ClusterRaftVoteResponse, NetworkError> {
-        self.transport.send_raft_vote(endpoint, request, timeout)
+    ) -> Result<ClusterKvStateAuthorityVoteResponse, NetworkError> {
+        self.transport
+            .request_kv_state_authority_vote(endpoint, request, timeout)
     }
 
-    fn local_is_raft_leader(
+    fn local_is_kv_state_authority(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
@@ -248,7 +252,7 @@ where
         cluster_reachable_state_authority_count_with_host(paths, state, options, self)
     }
 
-    fn commit_cluster_raft_command_with_quorum(
+    fn commit_cluster_kv_command_with_quorum(
         &mut self,
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
@@ -280,7 +284,7 @@ where
     }
 
     fn local_is_raft_leader(&mut self, state: &ClusterBootstrapState) -> Result<bool, Self::Error> {
-        self.host.local_is_raft_leader(self.paths, state)
+        self.host.local_is_kv_state_authority(self.paths, state)
     }
 
     fn forward_cluster_kv_txn_to_voter(
@@ -289,7 +293,7 @@ where
         txn: &KvTxn,
     ) -> Result<Option<sinomo_kv::ClusterKvTxnCommitResult>, Self::Error> {
         self.host
-            .forward_cluster_kv_txn_to_voter(self.paths, state, txn, self.options)
+            .forward_cluster_kv_txn_to_state_authority(self.paths, state, txn, self.options)
     }
 
     fn elect_cluster_raft_leader(
@@ -297,7 +301,7 @@ where
         state: &ClusterBootstrapState,
     ) -> Result<bool, Self::Error> {
         self.host
-            .elect_cluster_raft_leader(self.paths, state, self.options)
+            .elect_kv_state_authority(self.paths, state, self.options)
     }
 
     fn reachable_voter_count(
@@ -331,7 +335,7 @@ where
         state: &mut ClusterBootstrapState,
         txn: KvTxn,
     ) -> Result<sinomo_kv::ClusterKvRaftQuorumCommitResult, Self::Error> {
-        self.host.commit_cluster_raft_command_with_quorum(
+        self.host.commit_cluster_kv_command_with_quorum(
             self.paths,
             state,
             KvCommand::Txn(txn),

@@ -6,25 +6,25 @@ use crate::network_info::ClusterNetworkInfoRecord;
 use crate::prelude::*;
 use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_kv::{
-    ClusterRaftAppendRequest, ClusterRaftAppendResponse, ClusterRaftVoteRequest,
-    ClusterRaftVoteResponse,
+    ClusterKvReplicationRequest, ClusterKvReplicationResponse, ClusterKvStateAuthorityVoteRequest,
+    ClusterKvStateAuthorityVoteResponse,
 };
 use std::time::Duration;
 
 pub trait ClusterControlPlaneTransport {
-    fn send_raft_append(
+    fn send_kv_replication(
         &mut self,
         endpoint: &ClusterEndpointRecord,
-        request: &ClusterRaftAppendRequest,
+        request: &ClusterKvReplicationRequest,
         timeout: Duration,
-    ) -> Result<ClusterRaftAppendResponse, NetworkError>;
+    ) -> Result<ClusterKvReplicationResponse, NetworkError>;
 
-    fn send_raft_vote(
+    fn request_kv_state_authority_vote(
         &mut self,
         endpoint: &ClusterEndpointRecord,
-        request: &ClusterRaftVoteRequest,
+        request: &ClusterKvStateAuthorityVoteRequest,
         timeout: Duration,
-    ) -> Result<ClusterRaftVoteResponse, NetworkError>;
+    ) -> Result<ClusterKvStateAuthorityVoteResponse, NetworkError>;
 
     fn probe_cluster_state_authority(
         &mut self,
@@ -110,7 +110,7 @@ pub trait ClusterControlPlaneTransport {
     ) {
     }
 
-    fn fan_out_committed_cluster_raft_command(
+    fn fan_out_committed_cluster_kv_command(
         &mut self,
         _paths: ClusterPaths,
         _state: ClusterBootstrapState,
@@ -119,7 +119,7 @@ pub trait ClusterControlPlaneTransport {
     ) {
     }
 
-    fn on_raft_append_sent(&mut self) {}
+    fn on_kv_replication_sent(&mut self) {}
 }
 
 pub struct ClusterControlPlaneDriver<T> {

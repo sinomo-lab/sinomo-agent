@@ -169,7 +169,7 @@ impl<T> ClusterKvSnapshotRefreshHost for ClusterControlPlaneDriver<T>
 where
     T: ClusterControlPlaneTransport,
 {
-    fn known_raft_leader_id(
+    fn known_kv_state_authority_id(
         &mut self,
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
@@ -185,7 +185,7 @@ where
         self.transport.fetch_cluster_kv_snapshot(endpoint, timeout)
     }
 
-    fn restore_cluster_raft_from_snapshot_if_newer(
+    fn restore_cluster_kv_from_snapshot_if_newer(
         &mut self,
         paths: &ClusterPaths,
         local_node_id: &NodeId,

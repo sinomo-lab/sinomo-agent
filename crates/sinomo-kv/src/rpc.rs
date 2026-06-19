@@ -128,6 +128,11 @@ pub struct ClusterRaftVoteResponse {
     pub vote: RaftRequestVoteResponse,
 }
 
+pub type ClusterKvReplicationRequest = ClusterRaftAppendRequest;
+pub type ClusterKvReplicationResponse = ClusterRaftAppendResponse;
+pub type ClusterKvStateAuthorityVoteRequest = ClusterRaftVoteRequest;
+pub type ClusterKvStateAuthorityVoteResponse = ClusterRaftVoteResponse;
+
 pub fn cluster_kv_watch_events_noop_response(
     request: &ClusterKvWatchEventsRequest,
 ) -> Option<ClusterKvWatchEventsResponse> {

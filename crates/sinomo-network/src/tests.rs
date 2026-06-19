@@ -9130,7 +9130,7 @@ struct RecordingKvTxnForwardHost {
 }
 
 impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
-    fn known_raft_leader_id(
+    fn known_kv_state_authority_id(
         &mut self,
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
@@ -9203,7 +9203,7 @@ struct RecordingKvSnapshotRefreshHost {
 }
 
 impl ClusterKvSnapshotRefreshHost for RecordingKvSnapshotRefreshHost {
-    fn known_raft_leader_id(
+    fn known_kv_state_authority_id(
         &mut self,
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
@@ -9226,7 +9226,7 @@ impl ClusterKvSnapshotRefreshHost for RecordingKvSnapshotRefreshHost {
             })
     }
 
-    fn restore_cluster_raft_from_snapshot_if_newer(
+    fn restore_cluster_kv_from_snapshot_if_newer(
         &mut self,
         _paths: &ClusterPaths,
         local_node_id: &NodeId,
@@ -9245,7 +9245,7 @@ struct RecordingKvTxnQuorumHost {
 }
 
 impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
-    fn known_raft_leader_id(
+    fn known_kv_state_authority_id(
         &mut self,
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
@@ -9263,7 +9263,7 @@ impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
         panic!("forwarded non-leader requests must not forward again")
     }
 
-    fn local_is_raft_leader(
+    fn local_is_kv_state_authority(
         &mut self,
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
@@ -9272,16 +9272,16 @@ impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
         Ok(false)
     }
 
-    fn send_raft_vote(
+    fn request_kv_state_authority_vote(
         &mut self,
         _endpoint: &ClusterEndpointRecord,
-        _request: &ClusterRaftVoteRequest,
+        _request: &sinomo_kv::ClusterKvStateAuthorityVoteRequest,
         _timeout: Duration,
-    ) -> Result<ClusterRaftVoteResponse, NetworkError> {
+    ) -> Result<sinomo_kv::ClusterKvStateAuthorityVoteResponse, NetworkError> {
         panic!("recording quorum host overrides election and must not send raft votes")
     }
 
-    fn elect_cluster_raft_leader(
+    fn elect_kv_state_authority(
         &mut self,
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
@@ -9300,7 +9300,7 @@ impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
         1
     }
 
-    fn commit_cluster_raft_command_with_quorum(
+    fn commit_cluster_kv_command_with_quorum(
         &mut self,
         _paths: &ClusterPaths,
         _state: &mut ClusterBootstrapState,
@@ -9494,22 +9494,22 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
     }
 
     impl ClusterControlPlaneTransport for RecordingMembershipTransport {
-        fn send_raft_append(
+        fn send_kv_replication(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterRaftAppendRequest,
+            _request: &sinomo_kv::ClusterKvReplicationRequest,
             _timeout: Duration,
-        ) -> Result<ClusterRaftAppendResponse, NetworkError> {
-            panic!("membership forwarding should not send raft append")
+        ) -> Result<sinomo_kv::ClusterKvReplicationResponse, NetworkError> {
+            panic!("membership forwarding should not send kv replication")
         }
 
-        fn send_raft_vote(
+        fn request_kv_state_authority_vote(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterRaftVoteRequest,
+            _request: &sinomo_kv::ClusterKvStateAuthorityVoteRequest,
             _timeout: Duration,
-        ) -> Result<ClusterRaftVoteResponse, NetworkError> {
-            panic!("membership forwarding should not send raft vote")
+        ) -> Result<sinomo_kv::ClusterKvStateAuthorityVoteResponse, NetworkError> {
+            panic!("membership forwarding should not send kv state authority vote")
         }
 
         fn probe_cluster_state_authority(
@@ -9633,22 +9633,22 @@ fn cluster_join_registration_driver_uses_local_membership_observer() {
     struct UnusedControlPlaneTransport;
 
     impl ClusterControlPlaneTransport for UnusedControlPlaneTransport {
-        fn send_raft_append(
+        fn send_kv_replication(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterRaftAppendRequest,
+            _request: &sinomo_kv::ClusterKvReplicationRequest,
             _timeout: Duration,
-        ) -> Result<ClusterRaftAppendResponse, NetworkError> {
-            panic!("local observation should not send raft append")
+        ) -> Result<sinomo_kv::ClusterKvReplicationResponse, NetworkError> {
+            panic!("local observation should not send kv replication")
         }
 
-        fn send_raft_vote(
+        fn request_kv_state_authority_vote(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterRaftVoteRequest,
+            _request: &sinomo_kv::ClusterKvStateAuthorityVoteRequest,
             _timeout: Duration,
-        ) -> Result<ClusterRaftVoteResponse, NetworkError> {
-            panic!("local observation should not send raft vote")
+        ) -> Result<sinomo_kv::ClusterKvStateAuthorityVoteResponse, NetworkError> {
+            panic!("local observation should not send kv state authority vote")
         }
 
         fn probe_cluster_state_authority(
@@ -9749,22 +9749,22 @@ fn cluster_member_mutation_driver_prepares_state_from_local_membership_observer(
     struct UnusedControlPlaneTransport;
 
     impl ClusterControlPlaneTransport for UnusedControlPlaneTransport {
-        fn send_raft_append(
+        fn send_kv_replication(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterRaftAppendRequest,
+            _request: &sinomo_kv::ClusterKvReplicationRequest,
             _timeout: Duration,
-        ) -> Result<ClusterRaftAppendResponse, NetworkError> {
-            panic!("membership preparation should not send raft append")
+        ) -> Result<sinomo_kv::ClusterKvReplicationResponse, NetworkError> {
+            panic!("membership preparation should not send kv replication")
         }
 
-        fn send_raft_vote(
+        fn request_kv_state_authority_vote(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterRaftVoteRequest,
+            _request: &sinomo_kv::ClusterKvStateAuthorityVoteRequest,
             _timeout: Duration,
-        ) -> Result<ClusterRaftVoteResponse, NetworkError> {
-            panic!("membership preparation should not send raft vote")
+        ) -> Result<sinomo_kv::ClusterKvStateAuthorityVoteResponse, NetworkError> {
+            panic!("membership preparation should not send kv state authority vote")
         }
 
         fn probe_cluster_state_authority(
@@ -9899,22 +9899,22 @@ fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
     }
 
     impl ClusterControlPlaneTransport for RecordingPublishCacheTransport {
-        fn send_raft_append(
+        fn send_kv_replication(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterRaftAppendRequest,
+            _request: &sinomo_kv::ClusterKvReplicationRequest,
             _timeout: Duration,
-        ) -> Result<ClusterRaftAppendResponse, NetworkError> {
-            panic!("cache hook test should not send raft append")
+        ) -> Result<sinomo_kv::ClusterKvReplicationResponse, NetworkError> {
+            panic!("cache hook test should not send kv replication")
         }
 
-        fn send_raft_vote(
+        fn request_kv_state_authority_vote(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterRaftVoteRequest,
+            _request: &sinomo_kv::ClusterKvStateAuthorityVoteRequest,
             _timeout: Duration,
-        ) -> Result<ClusterRaftVoteResponse, NetworkError> {
-            panic!("cache hook test should not send raft vote")
+        ) -> Result<sinomo_kv::ClusterKvStateAuthorityVoteResponse, NetworkError> {
+            panic!("cache hook test should not send kv state authority vote")
         }
 
         fn probe_cluster_state_authority(
@@ -13033,22 +13033,22 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
     }
 
     impl ClusterControlPlaneTransport for RecordingJoinReconciliationTransport {
-        fn send_raft_append(
+        fn send_kv_replication(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterRaftAppendRequest,
+            _request: &sinomo_kv::ClusterKvReplicationRequest,
             _timeout: Duration,
-        ) -> Result<ClusterRaftAppendResponse, NetworkError> {
-            panic!("join reconciliation should not send raft append")
+        ) -> Result<sinomo_kv::ClusterKvReplicationResponse, NetworkError> {
+            panic!("join reconciliation should not send kv replication")
         }
 
-        fn send_raft_vote(
+        fn request_kv_state_authority_vote(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterRaftVoteRequest,
+            _request: &sinomo_kv::ClusterKvStateAuthorityVoteRequest,
             _timeout: Duration,
-        ) -> Result<ClusterRaftVoteResponse, NetworkError> {
-            panic!("join reconciliation should not send raft vote")
+        ) -> Result<sinomo_kv::ClusterKvStateAuthorityVoteResponse, NetworkError> {
+            panic!("join reconciliation should not send kv state authority vote")
         }
 
         fn probe_cluster_state_authority(
@@ -30657,7 +30657,7 @@ struct NodeOnlySnapshotRefreshHost {
 }
 
 impl ClusterKvSnapshotRefreshHost for NodeOnlySnapshotRefreshHost {
-    fn known_raft_leader_id(
+    fn known_kv_state_authority_id(
         &mut self,
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
@@ -30677,7 +30677,7 @@ impl ClusterKvSnapshotRefreshHost for NodeOnlySnapshotRefreshHost {
         })
     }
 
-    fn restore_cluster_raft_from_snapshot_if_newer(
+    fn restore_cluster_kv_from_snapshot_if_newer(
         &mut self,
         _paths: &ClusterPaths,
         _local_node_id: &NodeId,
