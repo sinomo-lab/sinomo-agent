@@ -635,11 +635,11 @@ fn publish_command_connectivity_if_needed(
             return;
         }
         in_flight.set(true);
-        let records = sinomo_network::read_local_cluster_connectivity_records(paths)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|record| record.source_node_id == state.local_node_id)
-            .collect::<Vec<_>>();
+        let records = sinomo_network::read_local_cluster_connectivity_records_for_source(
+            paths,
+            &state.local_node_id,
+        )
+        .unwrap_or_default();
         match runtime {
             Some(runtime) => {
                 let _ = sync_cluster_connectivity_records_to_kv_on_runtime(
@@ -711,63 +711,17 @@ fn remember_cluster_endpoint_command_connectivity_with_failure_grace(
     allow_failure_grace: bool,
     runtime: Option<&tokio::runtime::Handle>,
 ) {
-    let now = OffsetDateTime::now_utc();
-    let timestamp = now
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "unknown".to_string());
-    let previous = sinomo_network::read_local_cluster_connectivity_records(paths)
-        .unwrap_or_default()
-        .into_iter()
-        .find(|record| {
-            record.source_node_id == state.local_node_id
-                && record.target_node_id == endpoint.node_id
-                && record.endpoint_id == endpoint.endpoint_id
-        });
-    let is_healthy = matches!(
-        connectivity_state,
-        sinomo_network::ClusterConnectivityState::Healthy
-    );
-    let observed_latency_ms = latency_ms.unwrap_or_else(|| {
-        previous
-            .as_ref()
-            .and_then(|record| record.latency_ms)
-            .unwrap_or(0)
-    });
-    let record = if matches!(
-        connectivity_state,
-        sinomo_network::ClusterConnectivityState::Unreachable
-    ) {
-        sinomo_network::cluster_connectivity_record_for_identity_mismatch(
-            state, endpoint, &timestamp, now,
-        )
-    } else if !is_healthy && !allow_failure_grace {
-        sinomo_network::cluster_connectivity_record_for_hard_failure(
-            state,
-            endpoint,
-            previous.as_ref(),
-            &timestamp,
-            now,
-        )
-    } else {
-        sinomo_network::cluster_connectivity_record_for_probe_outcome(
-            state,
-            endpoint,
-            previous.as_ref(),
-            is_healthy,
-            observed_latency_ms,
-            &timestamp,
-            now,
-        )
-    };
-    if sinomo_network::write_local_cluster_connectivity_records(
+    let Ok(record) = sinomo_network::record_local_cluster_endpoint_command_connectivity(
         paths,
-        &state.local_node_id,
-        std::slice::from_ref(&record),
-    )
-    .is_ok()
-    {
-        publish_command_connectivity_if_needed(paths, state, &record, runtime);
-    }
+        state,
+        endpoint,
+        connectivity_state,
+        latency_ms,
+        allow_failure_grace,
+    ) else {
+        return;
+    };
+    publish_command_connectivity_if_needed(paths, state, &record, runtime);
 }
 
 pub(crate) fn cluster_paths_from_daemon_paths(
@@ -6878,8 +6832,11 @@ mod tests {
         runtime.block_on(maintenance.run_pending_work_async(pending, runtime.handle().clone()));
 
         assert!(maintenance.connectivity_converged);
-        let records = sinomo_network::read_local_cluster_connectivity_records(&cluster_paths)
-            .expect("connectivity records");
+        let records = sinomo_network::read_local_cluster_connectivity_records_for_source(
+            &cluster_paths,
+            &local_node,
+        )
+        .expect("connectivity records");
         assert!(
             records
                 .iter()
@@ -8557,21 +8514,13 @@ mod tests {
         remote_member.endpoints = vec![endpoint.clone()];
         state.members.push(remote_member);
 
-        let record = sinomo_network::cluster_connectivity_record(
+        let record = sinomo_network::record_local_cluster_endpoint_command_connectivity(
+            &paths,
             &state,
             &endpoint,
             sinomo_network::ClusterConnectivityState::Healthy,
             Some(7),
-            0,
-            Some("ok".to_string()),
-            None,
-            now,
-            600,
-        );
-        sinomo_network::write_local_cluster_connectivity_records(
-            &paths,
-            &local_node,
-            std::slice::from_ref(&record),
+            true,
         )
         .expect("persist local connectivity");
         assert!(
@@ -8617,7 +8566,7 @@ mod tests {
             "network changes should clear in-memory probe state"
         );
         assert!(
-            sinomo_network::read_local_cluster_connectivity_records(&paths)
+            sinomo_network::read_local_cluster_connectivity_records_for_source(&paths, &local_node)
                 .expect("local connectivity after environment change")
                 .is_empty(),
             "network changes should clear persisted local probe state"
@@ -9069,13 +9018,11 @@ mod tests {
         state.members.push(remote_member);
 
         let read_tcp_record = || {
-            sinomo_network::read_local_cluster_connectivity_records(&paths)
+            sinomo_network::read_local_cluster_connectivity_records_for_source(&paths, &local_node)
                 .expect("local connectivity records")
                 .into_iter()
                 .find(|record| {
-                    record.source_node_id == local_node
-                        && record.target_node_id == remote_node
-                        && record.endpoint_id == tcp.endpoint_id
+                    record.target_node_id == remote_node && record.endpoint_id == tcp.endpoint_id
                 })
                 .expect("tcp connectivity record")
         };

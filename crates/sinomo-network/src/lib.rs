@@ -85,8 +85,13 @@ pub use connectivity_publish::{
     sync_cluster_connectivity_records_to_quorum_async_with_host,
     sync_cluster_connectivity_records_to_quorum_with_host,
 };
-pub use connectivity_store::{
+#[cfg(test)]
+pub(crate) use connectivity_store::{
     read_local_cluster_connectivity_records, write_local_cluster_connectivity_records,
+};
+pub use connectivity_store::{
+    read_local_cluster_connectivity_records_for_source,
+    record_local_cluster_endpoint_command_connectivity,
 };
 pub use control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlaneTransport};
 pub use control_plane_options::{

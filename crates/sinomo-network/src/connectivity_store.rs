@@ -1,5 +1,10 @@
 use crate::ClusterPaths;
-use crate::connectivity::ClusterConnectivityRecord;
+use crate::connectivity::{
+    ClusterConnectivityRecord, ClusterConnectivityState,
+    cluster_connectivity_record_for_hard_failure,
+    cluster_connectivity_record_for_identity_mismatch,
+    cluster_connectivity_record_for_probe_outcome,
+};
 use crate::connectivity_publish::{
     MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, cluster_connectivity_stable_eq,
     cluster_network_record_live, cluster_network_record_should_refresh,
@@ -14,7 +19,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const MAX_LOCAL_CLUSTER_CONNECTIVITY_CACHE_ENTRIES: usize = 128;
 
@@ -42,7 +47,7 @@ fn bump_local_cluster_connectivity_content_generation() {
     LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
-pub fn read_local_cluster_connectivity_records(
+pub(crate) fn read_local_cluster_connectivity_records(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
     let now = OffsetDateTime::now_utc();
@@ -88,7 +93,70 @@ pub fn read_local_cluster_connectivity_records(
     Ok(records)
 }
 
-pub fn write_local_cluster_connectivity_records(
+pub fn read_local_cluster_connectivity_records_for_source(
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
+    Ok(read_local_cluster_connectivity_records(paths)?
+        .into_iter()
+        .filter(|record| record.source_node_id == *source_node_id)
+        .collect())
+}
+
+pub fn record_local_cluster_endpoint_command_connectivity(
+    paths: &ClusterPaths,
+    state: &sinomo_core::ClusterBootstrapState,
+    endpoint: &sinomo_core::ClusterEndpointRecord,
+    connectivity_state: ClusterConnectivityState,
+    latency_ms: Option<u64>,
+    allow_failure_grace: bool,
+) -> Result<ClusterConnectivityRecord, NetworkError> {
+    let previous = read_local_cluster_connectivity_records_for_source(paths, &state.local_node_id)?
+        .into_iter()
+        .find(|record| {
+            record.target_node_id == endpoint.node_id && record.endpoint_id == endpoint.endpoint_id
+        });
+    let now = OffsetDateTime::now_utc();
+    let timestamp = now
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string());
+    let is_healthy = matches!(&connectivity_state, ClusterConnectivityState::Healthy);
+    let observed_latency_ms = latency_ms.unwrap_or_else(|| {
+        previous
+            .as_ref()
+            .and_then(|record| record.latency_ms)
+            .unwrap_or(0)
+    });
+    let record = if matches!(&connectivity_state, ClusterConnectivityState::Unreachable) {
+        cluster_connectivity_record_for_identity_mismatch(state, endpoint, &timestamp, now)
+    } else if !is_healthy && !allow_failure_grace {
+        cluster_connectivity_record_for_hard_failure(
+            state,
+            endpoint,
+            previous.as_ref(),
+            &timestamp,
+            now,
+        )
+    } else {
+        cluster_connectivity_record_for_probe_outcome(
+            state,
+            endpoint,
+            previous.as_ref(),
+            is_healthy,
+            observed_latency_ms,
+            &timestamp,
+            now,
+        )
+    };
+    write_local_cluster_connectivity_records(
+        paths,
+        &state.local_node_id,
+        std::slice::from_ref(&record),
+    )?;
+    Ok(record)
+}
+
+pub(crate) fn write_local_cluster_connectivity_records(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
