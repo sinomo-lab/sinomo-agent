@@ -1064,7 +1064,7 @@ pub(crate) fn default_invite_introducers(
             for endpoint in invite_introducers_from_daemon_status(&state.local_node_id, &status) {
                 network::push_unique_introducer(&mut introducers, endpoint);
             }
-            if let Ok(record) = network::read_iroh_endpoint_record(paths, &state.local_node_id) {
+            if let Ok(record) = network::IrohEndpointRecord::read(paths, &state.local_node_id) {
                 network::push_unique_introducer(&mut introducers, record.endpoint());
             }
         }

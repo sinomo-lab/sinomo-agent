@@ -993,7 +993,7 @@ fn refresh_daemon_iroh_repair_route_with_runtime(
         return Ok(false);
     };
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    match sinomo_network::read_iroh_endpoint_record(&cluster_paths, &cluster.node_id) {
+    match IrohEndpointRecord::read(&cluster_paths, &cluster.node_id) {
         Ok(record) => {
             advertise_daemon_iroh_endpoint_with_runtime(paths, record, runtime)?;
             Ok(true)
@@ -7997,18 +7997,13 @@ mod tests {
             &crate::DaemonStatus::new(&shadow_options, &shadow_paths, Some(shadow_cluster)),
         )
         .expect("write shadow status");
-        sinomo_network::write_iroh_endpoint_record(
-            &cluster_paths,
-            &IrohEndpointRecord {
-                cluster_id: state.cluster_id.clone(),
-                node_id: state.local_node_id.clone(),
-                endpoint_public_key: "iroh_public_key_shadow_repair_route".to_string(),
-                direct_addresses: Vec::new(),
-                relay_url: Some("https://relay.example./".to_string()),
-                relay_mode: sinomo_network::IrohRelayMode::Default,
-                expires_after_tick: 0,
-            },
+        IrohEndpointRecord::from_relay_url(
+            state.cluster_id.clone(),
+            state.local_node_id.clone(),
+            "iroh_public_key_shadow_repair_route",
+            "https://relay.example./",
         )
+        .write(&cluster_paths)
         .expect("write iroh endpoint record");
 
         assert!(

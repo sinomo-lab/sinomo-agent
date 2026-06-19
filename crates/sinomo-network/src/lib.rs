@@ -334,8 +334,7 @@ pub(crate) use roaming::send_daemon_rpc_to_cluster_endpoint_async;
 pub(crate) use roaming::stable_iroh_endpoint_id;
 pub use roaming::{
     IROH_DAEMON_COMMAND_MAX_BYTES, IrohDaemonProxyHandle, IrohEndpointRecord, IrohRelayMode,
-    read_iroh_endpoint_record, send_daemon_rpc_to_address_async, start_iroh_daemon_proxy,
-    write_iroh_endpoint_record,
+    send_daemon_rpc_to_address_async, start_iroh_daemon_proxy,
 };
 pub use route::{
     CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY, CLUSTER_ROUTING_RPC_ROUTE_METADATA,

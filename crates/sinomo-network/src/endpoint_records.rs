@@ -44,7 +44,7 @@ pub(crate) fn refresh_local_iroh_endpoints_from_disk(
 ) -> Result<bool, NetworkError> {
     let mut changed = false;
     for node_id in local_daemon_iroh_node_ids(state) {
-        let Ok(record) = crate::read_iroh_endpoint_record(paths, &node_id) else {
+        let Ok(record) = crate::IrohEndpointRecord::read(paths, &node_id) else {
             continue;
         };
         changed |= apply_local_iroh_endpoint_record_to_state(state, record);

@@ -24157,33 +24157,29 @@ fn refresh_local_iroh_endpoints_from_disk_updates_local_daemon_members() {
     );
     ensure_daemon_cluster_members(&mut state, Vec::new(), Vec::new(), now);
 
-    write_iroh_endpoint_record(
-        &paths,
-        &IrohEndpointRecord {
-            cluster_id: cluster_id.clone(),
-            node_id: local_node_id.clone(),
-            endpoint_public_key: "main_iroh_public_key".to_string(),
-            direct_addresses: vec!["203.0.113.21:21356".to_string()],
-            relay_url: None,
-            relay_mode: IrohRelayMode::Default,
-            expires_after_tick: 10,
-        },
-    )
+    IrohEndpointRecord {
+        cluster_id: cluster_id.clone(),
+        node_id: local_node_id.clone(),
+        endpoint_public_key: "main_iroh_public_key".to_string(),
+        direct_addresses: vec!["203.0.113.21:21356".to_string()],
+        relay_url: None,
+        relay_mode: IrohRelayMode::Default,
+        expires_after_tick: 10,
+    }
+    .write(&paths)
     .expect("write main iroh endpoint");
-    write_iroh_endpoint_record(
-        &paths,
-        &IrohEndpointRecord {
-            cluster_id,
-            node_id: shadow_node_id.clone(),
-            endpoint_public_key: "shadow_iroh_public_key".to_string(),
-            direct_addresses: Vec::new(),
-            relay_url: Some("https://relay.example/".to_string()),
-            relay_mode: IrohRelayMode::Custom {
-                relay_url: "https://relay.example/".to_string(),
-            },
-            expires_after_tick: 10,
+    IrohEndpointRecord {
+        cluster_id,
+        node_id: shadow_node_id.clone(),
+        endpoint_public_key: "shadow_iroh_public_key".to_string(),
+        direct_addresses: Vec::new(),
+        relay_url: Some("https://relay.example/".to_string()),
+        relay_mode: IrohRelayMode::Custom {
+            relay_url: "https://relay.example/".to_string(),
         },
-    )
+        expires_after_tick: 10,
+    }
+    .write(&paths)
     .expect("write shadow iroh endpoint");
 
     let mut async_state = state.clone();

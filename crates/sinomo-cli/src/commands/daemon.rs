@@ -506,7 +506,7 @@ fn print_local_daemon_iroh_endpoint(paths: &DaemonPaths, status: &DaemonStatus) 
         return;
     };
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
-    let Ok(record) = network::read_iroh_endpoint_record(&cluster_paths, &cluster.node_id) else {
+    let Ok(record) = network::IrohEndpointRecord::read(&cluster_paths, &cluster.node_id) else {
         return;
     };
     println!("  iroh endpoint: {}", record.endpoint().address);

@@ -265,6 +265,10 @@ pub struct IrohEndpointRecord {
 }
 
 impl IrohEndpointRecord {
+    pub fn read(paths: &ClusterPaths, node_id: &NodeId) -> Result<Self, NetworkError> {
+        read_iroh_endpoint_record(paths, node_id)
+    }
+
     pub fn from_relay_url(
         cluster_id: ClusterId,
         node_id: NodeId,
@@ -309,6 +313,10 @@ impl IrohEndpointRecord {
             priority: 90,
             last_observed_latency_ms: None,
         }
+    }
+
+    pub fn write(&self, paths: &ClusterPaths) -> Result<(), NetworkError> {
+        write_iroh_endpoint_record(paths, self)
     }
 }
 
@@ -618,7 +626,7 @@ pub(crate) async fn iroh_public_key_for_node_async(
     )
 }
 
-pub fn read_iroh_endpoint_record(
+pub(crate) fn read_iroh_endpoint_record(
     paths: &ClusterPaths,
     node_id: &NodeId,
 ) -> Result<IrohEndpointRecord, NetworkError> {
@@ -626,7 +634,7 @@ pub fn read_iroh_endpoint_record(
     read_object_file(&path)
 }
 
-pub async fn read_iroh_endpoint_record_async(
+pub(crate) async fn read_iroh_endpoint_record_async(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     node_id: &NodeId,
@@ -634,12 +642,12 @@ pub async fn read_iroh_endpoint_record_async(
     let paths = paths.clone();
     let node_id = node_id.clone();
     spawn_roaming_disk_task_on_runtime(runtime, "read iroh endpoint record", move || {
-        read_iroh_endpoint_record(&paths, &node_id)
+        IrohEndpointRecord::read(&paths, &node_id)
     })
     .await
 }
 
-pub fn write_iroh_endpoint_record(
+pub(crate) fn write_iroh_endpoint_record(
     paths: &ClusterPaths,
     record: &IrohEndpointRecord,
 ) -> Result<(), NetworkError> {
@@ -655,7 +663,7 @@ pub(crate) async fn write_iroh_endpoint_record_async(
     let paths = paths.clone();
     let record = record.clone();
     spawn_roaming_disk_task_on_runtime(runtime, "write iroh endpoint record", move || {
-        write_iroh_endpoint_record(&paths, &record)
+        record.write(&paths)
     })
     .await
 }
