@@ -697,23 +697,14 @@ pub(crate) async fn handle_daemon_connection_async(
             {
                 continue;
             }
-            let response = match sinomo_network::RelayEnvelope::from_request(request) {
-                Ok(envelope) => {
-                    match handle_daemon_cluster_relay_request_on_runtime(
-                        &paths,
-                        envelope,
-                        Some(&service_runtime),
-                    )
-                    .await
-                    {
-                        Ok(response) => response,
-                        Err(error) => sinomo_network::ObjectRpcResponse::encode_error(
-                            sinomo_network::CLUSTER_RELAY_ROUTE,
-                            error.to_string(),
-                        )
-                        .map_err(DaemonError::from)?,
-                    }
-                }
+            let response = match handle_daemon_cluster_relay_request_on_runtime(
+                &paths,
+                request,
+                Some(&service_runtime),
+            )
+            .await
+            {
+                Ok(response) => response,
                 Err(error) => sinomo_network::ObjectRpcResponse::encode_error(
                     sinomo_network::CLUSTER_RELAY_ROUTE,
                     error.to_string(),
@@ -1181,23 +1172,14 @@ async fn handle_authenticated_daemon_command_async(
         {
             return Ok(false);
         }
-        let response = match sinomo_network::RelayEnvelope::from_request(request) {
-            Ok(envelope) => {
-                match handle_daemon_cluster_relay_request_on_runtime(
-                    &paths,
-                    envelope,
-                    Some(&service_runtime),
-                )
-                .await
-                {
-                    Ok(response) => response,
-                    Err(error) => sinomo_network::ObjectRpcResponse::encode_error(
-                        sinomo_network::CLUSTER_RELAY_ROUTE,
-                        error.to_string(),
-                    )
-                    .map_err(DaemonError::from)?,
-                }
-            }
+        let response = match handle_daemon_cluster_relay_request_on_runtime(
+            &paths,
+            request,
+            Some(&service_runtime),
+        )
+        .await
+        {
+            Ok(response) => response,
             Err(error) => sinomo_network::ObjectRpcResponse::encode_error(
                 sinomo_network::CLUSTER_RELAY_ROUTE,
                 error.to_string(),

@@ -4486,9 +4486,11 @@ const DAEMON_CLUSTER_RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// the connectivity graph. The inner request's response flows back along the relay chain.
 pub(crate) async fn handle_daemon_cluster_relay_request_on_runtime(
     paths: &DaemonPaths,
-    envelope: sinomo_network::RelayEnvelope,
+    request: &sinomo_network::ObjectRpcRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
+    let envelope =
+        sinomo_network::RelayEnvelope::from_request(request).map_err(DaemonError::from)?;
     if relay_envelope_inner_expects_streamed_response(&envelope) {
         return Err(DaemonError::Network {
             address: sinomo_network::CLUSTER_RELAY_ROUTE.to_string(),

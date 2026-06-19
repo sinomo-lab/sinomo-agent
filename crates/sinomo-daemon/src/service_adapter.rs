@@ -43,7 +43,7 @@ use sinomo_network::{
     NETWORK_OBJECT_RPC_ROUTES, NetworkError, ObjectRouteDescriptor, ObjectRpcAuthorizationLayer,
     ObjectRpcCancelRequest, ObjectRpcCancelResponse, ObjectRpcRequest, ObjectRpcResponse,
     ObjectRpcRouteCatalog, ObjectRpcRoutePolicyLayer, ObjectRpcRouteRegistry, ObjectRpcRouter,
-    RelayEnvelope, ServiceCatalog,
+    ServiceCatalog,
 };
 use sinomo_network_module::network_module_surfaces;
 use sinomo_rollout::{
@@ -645,9 +645,8 @@ impl Service for ClusterRelayService {
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
         Box::pin(async move {
-            let envelope = RelayEnvelope::from_request(&request)?;
             let response =
-                handle_daemon_cluster_relay_request_on_runtime(&paths, envelope, runtime.as_ref())
+                handle_daemon_cluster_relay_request_on_runtime(&paths, &request, runtime.as_ref())
                     .await
                     .map_err(daemon_error)?;
             ctx.respond(response)?;
