@@ -30,9 +30,6 @@ static CLUSTER_KV_READER_NODE_ID_CACHE: LazyLock<
 #[cfg(test)]
 static CLUSTER_KV_CACHED_SNAPSHOT_READS_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-#[cfg(test)]
-static CLUSTER_KV_CURRENT_SNAPSHOT_READS_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone)]
 struct ClusterKvReaderNodeIdCacheEntry {
@@ -103,36 +100,6 @@ pub(crate) fn invalidate_cluster_kv_reader_node_id_cache(path: &PathBuf) {
     if let Ok(mut cache) = CLUSTER_KV_READER_NODE_ID_CACHE.lock() {
         cache.remove(path);
     }
-}
-
-#[cfg(test)]
-fn cluster_kv_metadata_cache_key(paths: &ClusterPaths) -> PathBuf {
-    paths.root.clone()
-}
-
-#[cfg(test)]
-fn record_cluster_kv_current_snapshot_read_for_test(paths: &ClusterPaths) {
-    if let Ok(mut reads) = CLUSTER_KV_CURRENT_SNAPSHOT_READS_FOR_TEST.lock() {
-        *reads
-            .entry(cluster_kv_metadata_cache_key(paths))
-            .or_default() += 1;
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn reset_cluster_kv_current_snapshot_reads_for_test(paths: &ClusterPaths) {
-    if let Ok(mut reads) = CLUSTER_KV_CURRENT_SNAPSHOT_READS_FOR_TEST.lock() {
-        reads.remove(&cluster_kv_metadata_cache_key(paths));
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn cluster_kv_current_snapshot_reads_for_test(paths: &ClusterPaths) -> u64 {
-    CLUSTER_KV_CURRENT_SNAPSHOT_READS_FOR_TEST
-        .lock()
-        .ok()
-        .and_then(|reads| reads.get(&cluster_kv_metadata_cache_key(paths)).copied())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -273,9 +240,6 @@ pub(crate) fn read_cluster_kv_current_snapshot(
 pub(crate) fn read_cluster_kv_current_snapshot_arc(
     paths: &ClusterPaths,
 ) -> Result<Arc<KvSnapshot>, NetworkError> {
-    #[cfg(test)]
-    record_cluster_kv_current_snapshot_read_for_test(paths);
-
     let node_id = read_cluster_kv_reader_node_id(paths)?;
     sinomo_kv::read_cluster_kv_current_snapshot_arc_for_node(&paths.kv_paths(), node_id)
         .map_err(Into::into)
