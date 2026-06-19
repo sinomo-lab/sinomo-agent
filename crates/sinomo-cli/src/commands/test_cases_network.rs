@@ -405,11 +405,9 @@ fn network_ping_targets_from_state(
             continue;
         }
         let Some(endpoint) = network::ClusterEndpointSelector::new(&paths, &state)
-            .select_member(
-                member,
-                network::ClusterEndpointSelectionPurpose::MemberDaemonStatus,
-            )
+            .select(network::ClusterEndpointSelectionPurpose::MemberDaemonStatus)
             .into_iter()
+            .filter(|endpoint| endpoint.node_id == member.node_id)
             .find(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly)
         else {
             continue;

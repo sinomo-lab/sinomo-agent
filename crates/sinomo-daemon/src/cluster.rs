@@ -2800,15 +2800,15 @@ async fn fetch_local_cluster_health_rows_from_member_async(
 ) -> Result<Option<Vec<ClusterHealthRow>>, DaemonError> {
     let paths_for_targets = paths.clone();
     let state_for_targets = state.clone();
-    let member_for_targets = member.clone();
     let member_node_id = member.node_id.as_str().to_string();
+    let member_node_id_for_targets = member.node_id.clone();
     let endpoints = runtime
         .spawn_blocking(move || {
             sinomo_network::ClusterEndpointSelector::new(&paths_for_targets, &state_for_targets)
-                .select_member(
-                    &member_for_targets,
-                    sinomo_network::ClusterEndpointSelectionPurpose::MemberDaemonStatus,
-                )
+                .select(sinomo_network::ClusterEndpointSelectionPurpose::MemberDaemonStatus)
+                .into_iter()
+                .filter(|endpoint| endpoint.node_id == member_node_id_for_targets)
+                .collect::<Vec<_>>()
         })
         .await
         .map_err(|source| DaemonError::Network {
@@ -2894,14 +2894,14 @@ async fn probe_member_daemon_status_async(
     }
     let paths_for_targets = paths.clone();
     let state_for_targets = state.clone();
-    let member_for_targets = member.clone();
     let member_node_id = member.node_id.as_str().to_string();
+    let member_node_id_for_targets = member.node_id.clone();
     let endpoints = tokio::task::spawn_blocking(move || {
         sinomo_network::ClusterEndpointSelector::new(&paths_for_targets, &state_for_targets)
-            .select_member(
-                &member_for_targets,
-                sinomo_network::ClusterEndpointSelectionPurpose::MemberDaemonStatus,
-            )
+            .select(sinomo_network::ClusterEndpointSelectionPurpose::MemberDaemonStatus)
+            .into_iter()
+            .filter(|endpoint| endpoint.node_id == member_node_id_for_targets)
+            .collect::<Vec<_>>()
     })
     .await
     .map_err(|source| DaemonError::Network {

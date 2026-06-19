@@ -107,7 +107,9 @@ impl<'a> ClusterEndpointSelector<'a> {
             ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates => {
                 cluster_main_daemon_command_endpoint_candidates_impl(self.paths, self.state)
             }
-            ClusterEndpointSelectionPurpose::MemberDaemonStatus => Vec::new(),
+            ClusterEndpointSelectionPurpose::MemberDaemonStatus => {
+                cluster_member_daemon_status_targets_impl(self.paths, self.state)
+            }
             ClusterEndpointSelectionPurpose::MemberPublish => {
                 cluster_member_publish_targets_impl(self.paths, self.state)
             }
@@ -250,21 +252,6 @@ impl<'a> ClusterEndpointSelector<'a> {
         endpoints
     }
 
-    pub fn select_member(
-        &self,
-        member: &ClusterMemberRecord,
-        purpose: ClusterEndpointSelectionPurpose,
-    ) -> Vec<ClusterEndpointRecord> {
-        match purpose {
-            ClusterEndpointSelectionPurpose::MemberDaemonStatus => {
-                cluster_member_daemon_status_targets_with_connectivity(
-                    self.paths, self.state, member,
-                )
-            }
-            _ => Vec::new(),
-        }
-    }
-
     pub fn rollout_targets_for_main_with_command_endpoint(
         &self,
         main_node_id: &NodeId,
@@ -279,6 +266,18 @@ impl<'a> ClusterEndpointSelector<'a> {
             candidates,
         )
     }
+}
+
+fn cluster_member_daemon_status_targets_impl(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
+    state
+        .members
+        .iter()
+        .flat_map(|member| cluster_member_daemon_status_targets_with_graph(state, member, &graph))
+        .collect()
 }
 
 fn cluster_endpoint_transfer_profile(
@@ -793,15 +792,6 @@ pub(crate) fn cluster_invite_publish_targets_impl(
         targets.push(endpoint);
     }
     targets
-}
-
-pub(crate) fn cluster_member_daemon_status_targets_with_connectivity(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    member: &ClusterMemberRecord,
-) -> Vec<ClusterEndpointRecord> {
-    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
-    cluster_member_daemon_status_targets_with_graph(state, member, &graph)
 }
 
 fn cluster_member_daemon_status_targets_with_graph(
