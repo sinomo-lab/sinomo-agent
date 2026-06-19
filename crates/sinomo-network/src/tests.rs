@@ -7665,7 +7665,11 @@ fn cluster_semantic_txn_no_effect_accepts_stable_connectivity_refresh() {
         900,
     );
     assert!(
-        cluster_connectivity_stable_eq(&seeded_record, &refreshed_record),
+        cluster_connectivity_publish_record_matches(
+            &seeded_record,
+            &refreshed_record,
+            now + time::Duration::seconds(5),
+        ),
         "test record should differ only by non-durable connectivity observations"
     );
     let (snapshot, response) = cluster_semantic_txn_no_effect_response(

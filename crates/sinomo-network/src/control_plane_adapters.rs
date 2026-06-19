@@ -6,9 +6,8 @@ pub(crate) use crate::connectivity_publish::{
 #[cfg(test)]
 pub(crate) use crate::connectivity_publish::{
     MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, cluster_connectivity_full_sync_batch_ops,
-    cluster_connectivity_stable_eq, cluster_connectivity_sync_is_noop,
-    cluster_network_expiry_delete_ops, expire_cluster_network_record_ops,
-    expire_cluster_network_records,
+    cluster_connectivity_sync_is_noop, cluster_network_expiry_delete_ops,
+    expire_cluster_network_record_ops, expire_cluster_network_records,
 };
 #[cfg(test)]
 pub(crate) use crate::connectivity_store::{

@@ -54,7 +54,7 @@ use sinomo_network::{
 use sinomo_node::{ClusterId, ClusterInviteId, cluster_member_key};
 use sinomo_node::{
     NodeId, cluster_member_expected_daemon_process, cluster_member_is_local_process,
-    cluster_node_status_stable_eq, shadow_daemon_node_id,
+    shadow_daemon_node_id,
 };
 use sinomo_node::{load_or_create_main_node_identity, load_or_create_shadow_node_identity};
 use sinomo_rollout::{
@@ -451,8 +451,7 @@ fn cached_network_info_matches(paths: &ClusterPaths, info: &ClusterNetworkInfoRe
         .lock()
         .is_ok_and(|cache| {
             cache.get(&key).is_some_and(|known| {
-                sinomo_network::cluster_network_info_stable_eq(known, info)
-                    && !sinomo_network::cluster_network_record_should_refresh(known.expires_at, now)
+                sinomo_network::cluster_network_info_publish_record_matches(known, info, now)
             })
         })
 }
@@ -483,9 +482,9 @@ fn cached_node_status_matches(paths: &ClusterPaths, status: &ClusterNodeStatusRe
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
         .is_ok_and(|cache| {
-            cache
-                .get(&key)
-                .is_some_and(|known| cluster_node_status_stable_eq(known, status))
+            cache.get(&key).is_some_and(|known| {
+                sinomo_network::cluster_node_status_publish_record_matches(known, status)
+            })
         })
 }
 
@@ -528,11 +527,7 @@ fn cached_connectivity_matches(paths: &ClusterPaths, record: &ClusterConnectivit
                 .get(&source_prefix)
                 .and_then(|source| source.records.get(&key))
                 .is_some_and(|known| {
-                    sinomo_network::cluster_connectivity_stable_eq(known, record)
-                        && !sinomo_network::cluster_network_record_should_refresh(
-                            known.expires_at,
-                            now,
-                        )
+                    sinomo_network::cluster_connectivity_publish_record_matches(known, record, now)
                 })
         })
 }
@@ -573,11 +568,7 @@ fn cached_connectivity_record_set_matches(
             records.iter().all(|record| {
                 let key = connectivity_cache_key(paths, record);
                 source.records.get(&key).is_some_and(|known| {
-                    sinomo_network::cluster_connectivity_stable_eq(known, record)
-                        && !sinomo_network::cluster_network_record_should_refresh(
-                            known.expires_at,
-                            now,
-                        )
+                    sinomo_network::cluster_connectivity_publish_record_matches(known, record, now)
                 })
             })
         })
@@ -7612,7 +7603,11 @@ mod tests {
             CLUSTER_CONNECTIVITY_TTL_SECONDS,
         );
         assert!(
-            sinomo_network::cluster_connectivity_stable_eq(&seeded_record, &refreshed_record),
+            sinomo_network::cluster_connectivity_publish_record_matches(
+                &seeded_record,
+                &refreshed_record,
+                now
+            ),
             "test record should differ only by non-durable connectivity observations"
         );
         let (snapshot, response) = commit_cluster_kv_txn_with_quorum_response(
@@ -8400,8 +8395,9 @@ mod tests {
             "stable network-info records should not force short idle refresh cycles"
         );
         assert!(
-            !sinomo_network::cluster_network_record_should_refresh(
-                info.expires_at,
+            sinomo_network::cluster_network_info_publish_record_matches(
+                &info,
+                &info,
                 now + time::Duration::minutes(30)
             ),
             "stable network info should remain fresh well past ordinary maintenance intervals"

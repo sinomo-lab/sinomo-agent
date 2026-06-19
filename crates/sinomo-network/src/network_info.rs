@@ -74,7 +74,19 @@ fn cluster_network_environment_id(values: &[String]) -> String {
     format!("env_{hash:016x}")
 }
 
-pub fn cluster_network_info_stable_eq(
+pub fn cluster_network_info_publish_record_matches(
+    known: &ClusterNetworkInfoRecord,
+    info: &ClusterNetworkInfoRecord,
+    now: OffsetDateTime,
+) -> bool {
+    cluster_network_info_stable_eq(known, info)
+        && !crate::connectivity_publish::cluster_network_record_should_refresh(
+            known.expires_at,
+            now,
+        )
+}
+
+pub(crate) fn cluster_network_info_stable_eq(
     left: &ClusterNetworkInfoRecord,
     right: &ClusterNetworkInfoRecord,
 ) -> bool {

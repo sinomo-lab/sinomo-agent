@@ -543,14 +543,23 @@ pub(crate) fn cluster_network_record_live(expires_at: OffsetDateTime, now: Offse
     expires_at > now
 }
 
-pub fn cluster_network_record_should_refresh(
+pub(crate) fn cluster_network_record_should_refresh(
     expires_at: OffsetDateTime,
     now: OffsetDateTime,
 ) -> bool {
     expires_at <= now + time::Duration::seconds(CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS)
 }
 
-pub fn cluster_connectivity_stable_eq(
+pub fn cluster_connectivity_publish_record_matches(
+    known: &ClusterConnectivityRecord,
+    record: &ClusterConnectivityRecord,
+    now: OffsetDateTime,
+) -> bool {
+    cluster_connectivity_stable_eq(known, record)
+        && !cluster_network_record_should_refresh(known.expires_at, now)
+}
+
+pub(crate) fn cluster_connectivity_stable_eq(
     left: &ClusterConnectivityRecord,
     right: &ClusterConnectivityRecord,
 ) -> bool {

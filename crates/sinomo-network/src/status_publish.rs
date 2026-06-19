@@ -1,5 +1,4 @@
 use crate::ClusterPaths;
-use crate::connectivity_publish::cluster_network_record_should_refresh;
 use crate::error::NetworkError;
 use crate::keyspace::{
     cluster_network_info_key, cluster_node_status_key_for_record,
@@ -10,7 +9,7 @@ use crate::kv_local_store::{
     read_cluster_kv_snapshot,
 };
 use crate::local_state_store::{read_cluster_state, read_cluster_state_without_kv};
-use crate::network_info::{ClusterNetworkInfoRecord, cluster_network_info_stable_eq};
+use crate::network_info::{ClusterNetworkInfoRecord, cluster_network_info_publish_record_matches};
 use crate::prelude::*;
 use crate::rpc_future::ClusterMembershipRpcFuture;
 use sinomo_node::cluster_node_status_stable_eq;
@@ -363,7 +362,9 @@ pub fn stored_cluster_node_status_matches(
     // Match on stable content only: node status is not periodically refreshed
     // (no observed_at heartbeat). A live node's status is republished when its
     // content changes; crash detection is handled by active connectivity probes.
-    Ok(cluster_node_status_stable_eq(&existing, status))
+    Ok(cluster_node_status_publish_record_matches(
+        &existing, status,
+    ))
 }
 
 pub fn stored_cluster_network_info_matches(
@@ -380,6 +381,14 @@ pub fn stored_cluster_network_info_matches(
         return Ok(false);
     };
     let now = OffsetDateTime::now_utc();
-    Ok(cluster_network_info_stable_eq(&existing, info)
-        && !cluster_network_record_should_refresh(existing.expires_at, now))
+    Ok(cluster_network_info_publish_record_matches(
+        &existing, info, now,
+    ))
+}
+
+pub fn cluster_node_status_publish_record_matches(
+    known: &ClusterNodeStatusRecord,
+    status: &ClusterNodeStatusRecord,
+) -> bool {
+    cluster_node_status_stable_eq(known, status)
 }

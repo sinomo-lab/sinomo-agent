@@ -80,9 +80,8 @@ pub use connectivity::{
 pub use connectivity_publish::{
     ClusterConnectivityPublishAsyncHost, ClusterConnectivityPublishHost,
     ClusterNetworkRecordExpiryHost, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
-    cluster_connectivity_stable_eq, cluster_network_publish_interval_for_node,
-    cluster_network_record_should_refresh, expire_cluster_network_records_with_host,
-    sync_cluster_connectivity_records_to_kv,
+    cluster_connectivity_publish_record_matches, cluster_network_publish_interval_for_node,
+    expire_cluster_network_records_with_host, sync_cluster_connectivity_records_to_kv,
     sync_cluster_connectivity_records_to_quorum_async_with_host,
     sync_cluster_connectivity_records_to_quorum_with_host,
 };
@@ -283,7 +282,7 @@ pub use membership_rpc::{
 };
 pub use network_info::{
     CLUSTER_NETWORK_INFO_TTL_SECONDS, ClusterNetworkInfoRecord, build_cluster_network_info_record,
-    cluster_network_info_stable_eq,
+    cluster_network_info_publish_record_matches,
 };
 #[cfg(any(feature = "iroh-transport", test))]
 pub(crate) use object::read_object_frame_async;
@@ -371,6 +370,7 @@ pub(crate) use sinomo_node::upsert_member_record;
 pub use status_publish::{
     ClusterNetworkInfoPublishAsyncHost, ClusterNetworkInfoPublishHost,
     ClusterNodeStatusPublishAsyncHost, ClusterNodeStatusPublishHost,
+    cluster_node_status_publish_record_matches,
     publish_cluster_network_info_to_quorum_async_with_host,
     publish_cluster_network_info_to_quorum_with_host,
     publish_cluster_node_status_to_quorum_async_with_host,
