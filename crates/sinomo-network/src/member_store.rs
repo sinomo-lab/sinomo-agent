@@ -1,7 +1,6 @@
 use crate::connectivity::ClusterConnectivityRecord;
 use crate::endpoint_records::{
-    cleanup_cluster_iroh_endpoints, cleanup_member_iroh_endpoints, cluster_endpoint_list_stable_eq,
-    cluster_endpoint_stable_eq, upsert_member_endpoint,
+    cleanup_cluster_iroh_endpoints, cleanup_member_iroh_endpoints, upsert_member_endpoint,
 };
 use crate::error::NetworkError;
 use crate::keyspace::{
@@ -25,7 +24,7 @@ use sinomo_kv::{
     ClusterKvRaftConfigRecord, InProcessKvStore, KvCompare, KvEntry, KvOp, KvTxn,
     push_bounded_txn_success_op,
 };
-use sinomo_node::NodeId;
+use sinomo_node::{NodeId, cluster_endpoint_stable_eq, cluster_member_stable_eq};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use time::OffsetDateTime;
 
@@ -58,43 +57,6 @@ pub(crate) fn cluster_member_put_command(
     member: &ClusterMemberRecord,
 ) -> Result<KvCommand, NetworkError> {
     cluster_member_put_op(member).map(KvCommand::Op)
-}
-
-pub fn cluster_bootstrap_state_stable_eq(
-    left: &ClusterBootstrapState,
-    right: &ClusterBootstrapState,
-) -> bool {
-    left.cluster_id == right.cluster_id
-        && left.cluster_name == right.cluster_name
-        && left.local_node_id == right.local_node_id
-        && left.local_node_display_name == right.local_node_display_name
-        && left.term == right.term
-        && left.initialized_at == right.initialized_at
-        && left.members.len() == right.members.len()
-        && left
-            .members
-            .iter()
-            .zip(right.members.iter())
-            .all(|(left, right)| cluster_member_stable_eq(left, right))
-}
-
-pub(crate) fn cluster_member_stable_eq(
-    left: &ClusterMemberRecord,
-    right: &ClusterMemberRecord,
-) -> bool {
-    left.cluster_id == right.cluster_id
-        && left.node_id == right.node_id
-        && left.display_name == right.display_name
-        && left.node_role == right.node_role
-        && left.role == right.role
-        && left.state == right.state
-        && left.trust_domain == right.trust_domain
-        && left.node_public_key == right.node_public_key
-        && left.certificate_id == right.certificate_id
-        && left.capabilities == right.capabilities
-        && left.allowed_capabilities == right.allowed_capabilities
-        && cluster_endpoint_list_stable_eq(&left.endpoints, &right.endpoints)
-        && left.joined_at == right.joined_at
 }
 
 pub(crate) fn merge_cluster_state_from_peer(
@@ -145,18 +107,6 @@ pub(crate) fn merge_member_record(
         cleanup_member_iroh_endpoints(&mut incoming);
         local.members.push(incoming);
         true
-    }
-}
-
-pub fn upsert_member_record(state: &mut ClusterBootstrapState, member: ClusterMemberRecord) {
-    if let Some(existing) = state
-        .members
-        .iter_mut()
-        .find(|existing| existing.node_id == member.node_id)
-    {
-        *existing = member;
-    } else {
-        state.members.push(member);
     }
 }
 

@@ -1,5 +1,5 @@
-use crate::endpoint_records::cluster_endpoint_list_stable_eq;
 use crate::prelude::*;
+use sinomo_node::cluster_endpoint_list_stable_eq;
 
 pub const CLUSTER_NETWORK_INFO_TTL_SECONDS: i64 = 3600;
 

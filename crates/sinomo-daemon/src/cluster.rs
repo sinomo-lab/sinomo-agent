@@ -1942,7 +1942,7 @@ impl ClusterNetworkMaintenance {
                     eprintln!("sinomo daemon distributed DFS control publish failed: {error}");
                     publish_failed = true;
                 }
-                if !sinomo_network::cluster_bootstrap_state_stable_eq(
+                if !sinomo_node::cluster_bootstrap_state_stable_eq(
                     &state_before_maintenance,
                     &state,
                 ) && let Err(error) =
@@ -2038,10 +2038,7 @@ impl ClusterNetworkMaintenance {
         }
 
         let maintenance_changed = discovered
-            || !sinomo_network::cluster_bootstrap_state_stable_eq(
-                &state_before_maintenance,
-                &state,
-            );
+            || !sinomo_node::cluster_bootstrap_state_stable_eq(&state_before_maintenance, &state);
         if discovery_due
             && !discovery_already_processed
             && sinomo_network::cluster_network_stable_discovery_announcement_due(
@@ -5787,7 +5784,7 @@ mod tests {
             now,
         );
         sinomo_node::apply_cluster_raft_role(&mut bridge_member, ClusterMemberRole::Learner, now);
-        sinomo_network::upsert_member_record(&mut accepted_state, bridge_member);
+        sinomo_node::upsert_member_record(&mut accepted_state, bridge_member);
         let mut joined_member = ClusterMemberRecord::local_voter(
             accepted_state.cluster_id.clone(),
             joined.clone(),
@@ -5796,7 +5793,7 @@ mod tests {
             now,
         );
         sinomo_node::apply_cluster_raft_role(&mut joined_member, ClusterMemberRole::Learner, now);
-        sinomo_network::upsert_member_record(&mut accepted_state, joined_member.clone());
+        sinomo_node::upsert_member_record(&mut accepted_state, joined_member.clone());
         let response = ClusterJoinRegistrationResponse {
             accepted: true,
             detail: "join registered".to_string(),
@@ -5868,8 +5865,8 @@ mod tests {
             now,
         );
         sinomo_node::apply_cluster_raft_role(&mut joined_member, ClusterMemberRole::Learner, now);
-        sinomo_network::upsert_member_record(&mut accepted_state, joined_member);
-        sinomo_network::upsert_member_record(
+        sinomo_node::upsert_member_record(&mut accepted_state, joined_member);
+        sinomo_node::upsert_member_record(
             &mut accepted_state,
             ClusterMemberRecord::local_non_voting(
                 actual_cluster.clone(),
@@ -5979,8 +5976,8 @@ mod tests {
             now,
         );
         sinomo_node::apply_cluster_raft_role(&mut joined_member, ClusterMemberRole::Learner, now);
-        sinomo_network::upsert_member_record(&mut accepted_state, joined_member);
-        sinomo_network::upsert_member_record(
+        sinomo_node::upsert_member_record(&mut accepted_state, joined_member);
+        sinomo_node::upsert_member_record(
             &mut accepted_state,
             ClusterMemberRecord::local_non_voting(
                 actual_cluster,

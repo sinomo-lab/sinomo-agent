@@ -271,7 +271,6 @@ pub(crate) use member_publish::{
     cluster_member_publish_txn, cluster_member_publish_txn_from_snapshot,
     handle_cluster_member_publish_request_with_host,
 };
-pub use member_store::{cluster_bootstrap_state_stable_eq, upsert_member_record};
 pub use membership::{
     DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, DAEMON_SHADOW_SUPERVISE_CAPABILITY,
     cluster_is_settled_solo, cluster_member_expected_daemon_process,
@@ -379,6 +378,8 @@ pub use rpc::{
 pub(crate) use rpc::{call_object_rpc_frame_async, serve_object_rpc_frame_async};
 pub use rpc_future::ClusterMembershipRpcFuture;
 pub use sinomo_node::DAEMON_MAIN_RUN_CAPABILITY;
+#[cfg(test)]
+pub(crate) use sinomo_node::upsert_member_record;
 pub use status_publish::{
     ClusterNetworkInfoPublishAsyncHost, ClusterNetworkInfoPublishHost,
     ClusterNodeStatusPublishAsyncHost, ClusterNodeStatusPublishHost, cluster_node_status_stable_eq,

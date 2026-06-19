@@ -1,7 +1,5 @@
 use crate::ClusterPaths;
-use crate::endpoint_records::{
-    cleanup_member_iroh_endpoints, cluster_endpoint_list_stable_eq, cluster_endpoint_stable_eq,
-};
+use crate::endpoint_records::cleanup_member_iroh_endpoints;
 use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
 use crate::error::NetworkError;
 use crate::keyspace::{
@@ -15,13 +13,16 @@ use crate::kv_local_store::{
 };
 use crate::local_state_store::read_cluster_state;
 use crate::member_mutation::ClusterMemberMutationAsyncHost;
-use crate::member_store::{MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS, cluster_member_stable_eq};
+use crate::member_store::MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS;
 use crate::membership::cluster_local_process_members;
 use crate::membership_rpc::{ClusterMemberPublishRequest, ClusterMemberPublishResponse};
 use crate::prelude::*;
 use crate::records::{ClusterCapabilityPolicyRecord, cluster_capability_policy_stable_eq};
 use crate::rpc_future::ClusterMembershipRpcFuture;
 use sinomo_kv::{KvRevision, push_bounded_txn_success_op};
+use sinomo_node::{
+    cluster_endpoint_list_stable_eq, cluster_endpoint_stable_eq, cluster_member_stable_eq,
+};
 
 pub trait ClusterMemberPublishHost {
     type Error: From<NetworkError> + ToString;

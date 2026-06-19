@@ -3,14 +3,12 @@ use crate::connectivity::ClusterConnectivityRecord;
 use crate::connectivity_publish::{
     cluster_connectivity_stable_eq, cluster_network_record_should_refresh,
 };
-use crate::endpoint_records::cluster_endpoint_stable_eq;
 use crate::error::NetworkError;
 use crate::keyspace::{
     cluster_capability_policy_key, cluster_connectivity_key, cluster_endpoint_key,
     cluster_identity_key, cluster_network_info_key, cluster_node_status_key_matches_record,
 };
 use crate::kv_local_store::read_cluster_kv_current_snapshot;
-use crate::member_store::cluster_member_stable_eq;
 use crate::network_info::{ClusterNetworkInfoRecord, cluster_network_info_stable_eq};
 use crate::prelude::*;
 use crate::records::{
@@ -19,6 +17,7 @@ use crate::records::{
 };
 use crate::status_publish::cluster_node_status_stable_eq;
 use sinomo_kv::ClusterKvRaftConfigRecord;
+use sinomo_node::{cluster_endpoint_stable_eq, cluster_member_stable_eq};
 use time::OffsetDateTime;
 
 pub(crate) fn cluster_semantic_txn_no_effect_response(

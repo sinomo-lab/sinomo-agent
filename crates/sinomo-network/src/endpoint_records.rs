@@ -1,58 +1,7 @@
 use crate::ClusterPaths;
 use crate::error::NetworkError;
 use crate::prelude::*;
-
-pub(crate) fn cluster_endpoint_stable_eq(
-    left: &ClusterEndpointRecord,
-    right: &ClusterEndpointRecord,
-) -> bool {
-    left.endpoint_id == right.endpoint_id
-        && left.node_id == right.node_id
-        && left.transport == right.transport
-        && left.address == right.address
-        && cluster_endpoint_source_stable_eq(&left.source, &right.source)
-        && left.privacy == right.privacy
-        && left.priority == right.priority
-        && left.last_observed_latency_ms == right.last_observed_latency_ms
-}
-
-fn cluster_endpoint_source_stable_eq(
-    left: &ClusterEndpointSource,
-    right: &ClusterEndpointSource,
-) -> bool {
-    left == right
-        || matches!(
-            (left, right),
-            (ClusterEndpointSource::Mdns, ClusterEndpointSource::Observed)
-                | (ClusterEndpointSource::Observed, ClusterEndpointSource::Mdns)
-        )
-}
-
-pub(crate) fn cluster_endpoint_list_stable_eq(
-    left: &[ClusterEndpointRecord],
-    right: &[ClusterEndpointRecord],
-) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut left = left.iter().collect::<Vec<_>>();
-    let mut right = right.iter().collect::<Vec<_>>();
-    left.sort_by(cluster_endpoint_record_order);
-    right.sort_by(cluster_endpoint_record_order);
-    left.into_iter()
-        .zip(right)
-        .all(|(left, right)| cluster_endpoint_stable_eq(left, right))
-}
-
-fn cluster_endpoint_record_order(
-    left: &&ClusterEndpointRecord,
-    right: &&ClusterEndpointRecord,
-) -> std::cmp::Ordering {
-    left.endpoint_id
-        .cmp(&right.endpoint_id)
-        .then_with(|| left.node_id.cmp(&right.node_id))
-        .then_with(|| left.address.cmp(&right.address))
-}
+use sinomo_node::cluster_endpoint_stable_eq;
 
 pub fn cleanup_cluster_iroh_endpoints(state: &mut ClusterBootstrapState) -> bool {
     state.members.iter_mut().fold(false, |changed, member| {
