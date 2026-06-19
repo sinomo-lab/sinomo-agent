@@ -42,7 +42,7 @@ pub(crate) trait ClusterKvTxnForwardHost {
         state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError>;
 
-    fn send_object_rpc_to_node(
+    fn call_node_object_rpc(
         &mut self,
         state: &ClusterBootstrapState,
         target_node_id: &NodeId,
@@ -127,7 +127,7 @@ fn forward_cluster_kv_txn_to_state_authority_node_with_host(
         txn_payload.body,
     );
     let txn_response =
-        host.send_object_rpc_to_node(state, authority_node_id, &txn_request, timeout)?;
+        host.call_node_object_rpc(state, authority_node_id, &txn_request, timeout)?;
     txn_response.error_detail()?;
     let txn_response = sinomo_kv::decode_cluster_kv_txn_rpc_body(&txn_response.body)?;
 
@@ -140,7 +140,7 @@ fn forward_cluster_kv_txn_to_state_authority_node_with_host(
         snapshot_payload.category,
         snapshot_payload.body,
     );
-    let snapshot_response = host.send_object_rpc_to_node(
+    let snapshot_response = host.call_node_object_rpc(
         state,
         authority_node_id,
         &snapshot_request,

@@ -677,7 +677,7 @@ impl network::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
             .map_err(|error| cli_daemon_rpc_network_error("cluster membership rpc", error))
     }
 
-    fn send_object_rpc_to_node(
+    fn call_node_object_rpc(
         &mut self,
         state: &ClusterBootstrapState,
         target_node_id: &NodeId,
@@ -802,7 +802,7 @@ struct CliClusterJoinRegistrationHost;
 
 #[cfg(test)]
 impl network::ClusterJoinRegistrationHost for CliClusterJoinRegistrationHost {
-    fn send_membership_rpc_to_node(
+    fn call_node_object_rpc(
         &mut self,
         _state: &ClusterBootstrapState,
         _target_node_id: &NodeId,

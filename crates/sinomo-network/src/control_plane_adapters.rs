@@ -194,7 +194,7 @@ where
         locked_restore_cluster_raft_from_snapshot_if_newer(paths, local_node_id, snapshot)
     }
 
-    fn send_object_rpc_to_node(
+    fn call_node_object_rpc(
         &mut self,
         state: &ClusterBootstrapState,
         target_node_id: &NodeId,
@@ -202,7 +202,7 @@ where
         timeout: Duration,
     ) -> Result<ObjectRpcResponse, NetworkError> {
         self.transport
-            .send_object_rpc_to_node(state, target_node_id, request, timeout)
+            .call_node_object_rpc(state, target_node_id, request, timeout)
     }
 }
 

@@ -13,7 +13,7 @@ use sinomo_core::ClusterBootstrapState;
 use sinomo_node::NodeId;
 
 pub(crate) trait ClusterMembershipRpcForwardHost {
-    fn send_membership_rpc_to_node(
+    fn call_node_object_rpc(
         &mut self,
         state: &ClusterBootstrapState,
         target_node_id: &NodeId,
@@ -34,7 +34,7 @@ pub(crate) fn forward_cluster_membership_rpc_to_state_authority_with_host(
         .into_iter()
         .map(|endpoint| endpoint.node_id)
     {
-        match host.send_membership_rpc_to_node(state, &target_node_id, request) {
+        match host.call_node_object_rpc(state, &target_node_id, request) {
             Ok(response) => return Ok(response),
             Err(error) => {
                 failures.push(format!("node {target_node_id}: {error}"));

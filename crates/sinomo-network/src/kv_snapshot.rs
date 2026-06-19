@@ -83,7 +83,7 @@ pub trait ClusterKvSnapshotRefreshHost {
         snapshot: KvSnapshot,
     ) -> Result<bool, NetworkError>;
 
-    fn send_object_rpc_to_node(
+    fn call_node_object_rpc(
         &mut self,
         _state: &ClusterBootstrapState,
         _target_node_id: &NodeId,
@@ -170,16 +170,19 @@ pub fn refresh_current_cluster_kv_store_with_host(
     }
     if !fetched_remote {
         let unique_node_targets = ClusterEndpointSelector::unique_node_targets(targets.clone());
-        'node_targets: for voter in &unique_node_targets {
+        'node_targets: for target in &unique_node_targets {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .unwrap_or_default();
             if remaining.is_zero() {
                 break 'node_targets;
             }
-            if let Ok(snapshot) =
-                fetch_cluster_kv_snapshot_from_voter_node(state, &voter.node_id, remaining, host)
-            {
+            if let Ok(snapshot) = fetch_cluster_kv_snapshot_from_state_authority_node(
+                state,
+                &target.node_id,
+                remaining,
+                host,
+            ) {
                 snapshots.push(snapshot);
                 break 'node_targets;
             }
@@ -196,16 +199,16 @@ pub fn refresh_current_cluster_kv_store_with_host(
     Ok(InProcessKvStore::restore(snapshot))
 }
 
-fn fetch_cluster_kv_snapshot_from_voter_node(
+fn fetch_cluster_kv_snapshot_from_state_authority_node(
     state: &ClusterBootstrapState,
-    voter_node_id: &NodeId,
+    authority_node_id: &NodeId,
     timeout: Duration,
     host: &mut impl ClusterKvSnapshotRefreshHost,
 ) -> Result<KvSnapshot, NetworkError> {
     let payload = sinomo_kv::cluster_kv_snapshot_rpc_payload()?;
     let request =
         ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
-    let response = host.send_object_rpc_to_node(state, voter_node_id, &request, timeout)?;
+    let response = host.call_node_object_rpc(state, authority_node_id, &request, timeout)?;
     response.error_detail()?;
     sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&response.body).map_err(Into::into)
 }

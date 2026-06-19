@@ -1356,13 +1356,13 @@ impl sinomo_network::ClusterJoinRegistrationHost for DaemonClusterJoinRegistrati
         )
     }
 
-    fn send_membership_rpc_to_node(
+    fn call_node_object_rpc(
         &mut self,
         state: &ClusterBootstrapState,
         target_node_id: &NodeId,
         request: &sinomo_network::ObjectRpcRequest,
     ) -> Result<sinomo_network::ObjectRpcResponse, sinomo_network::NetworkError> {
-        sinomo_network::ClusterJoinRegistrationHost::send_membership_rpc_to_node(
+        sinomo_network::ClusterJoinRegistrationHost::call_node_object_rpc(
             &mut self.driver,
             state,
             target_node_id,
@@ -1567,7 +1567,7 @@ pub(crate) async fn forward_cluster_invite_challenge_to_cluster_state_authority_
     ))
 }
 
-fn send_object_rpc_to_node(
+fn call_node_object_rpc_on_runtime(
     state: &ClusterBootstrapState,
     target_node_id: &NodeId,
     rpc_request: &sinomo_network::ObjectRpcRequest,
@@ -3474,14 +3474,14 @@ impl sinomo_network::ClusterControlPlaneTransport for DaemonClusterControlPlaneT
         result.map_err(|error| daemon_host_network_error("cluster membership rpc", error))
     }
 
-    fn send_object_rpc_to_node(
+    fn call_node_object_rpc(
         &mut self,
         state: &ClusterBootstrapState,
         target_node_id: &NodeId,
         request: &ObjectRpcRequest,
         timeout: Duration,
     ) -> Result<ObjectRpcResponse, sinomo_network::NetworkError> {
-        send_object_rpc_to_node(
+        call_node_object_rpc_on_runtime(
             state,
             target_node_id,
             request,
@@ -5592,7 +5592,7 @@ mod tests {
     struct TestClusterJoinRegistrationHost;
 
     impl sinomo_network::ClusterJoinRegistrationHost for TestClusterJoinRegistrationHost {
-        fn send_membership_rpc_to_node(
+        fn call_node_object_rpc(
             &mut self,
             _state: &ClusterBootstrapState,
             _target_node_id: &NodeId,

@@ -1831,7 +1831,7 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
             })
         }
 
-        fn send_object_rpc_to_node(
+        fn call_node_object_rpc(
             &mut self,
             _state: &ClusterBootstrapState,
             _target_node_id: &NodeId,

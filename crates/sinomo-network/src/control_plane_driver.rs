@@ -45,7 +45,7 @@ pub trait ClusterControlPlaneTransport {
         timeout: Duration,
     ) -> Result<ObjectRpcResponse, NetworkError>;
 
-    fn send_object_rpc_to_node(
+    fn call_node_object_rpc(
         &mut self,
         state: &ClusterBootstrapState,
         target_node_id: &NodeId,

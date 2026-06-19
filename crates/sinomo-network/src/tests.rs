@@ -9138,7 +9138,7 @@ impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
         Ok(self.known_authority.clone())
     }
 
-    fn send_object_rpc_to_node(
+    fn call_node_object_rpc(
         &mut self,
         _state: &ClusterBootstrapState,
         target_node_id: &NodeId,
@@ -9253,7 +9253,7 @@ impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
         panic!("forwarded non-leader requests must not forward again")
     }
 
-    fn send_object_rpc_to_node(
+    fn call_node_object_rpc(
         &mut self,
         _state: &ClusterBootstrapState,
         _target_node_id: &NodeId,
@@ -9539,7 +9539,7 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
             ObjectRpcResponse::encode_body(request.route.clone(), &())
         }
 
-        fn send_object_rpc_to_node(
+        fn call_node_object_rpc(
             &mut self,
             _state: &ClusterBootstrapState,
             target_node_id: &NodeId,
@@ -9597,13 +9597,8 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
     let mut driver =
         ClusterControlPlaneDriver::with_timeouts(RecordingMembershipTransport::default(), timeouts);
 
-    ClusterMembershipRpcForwardHost::send_membership_rpc_to_node(
-        &mut driver,
-        &state,
-        &voter,
-        &request,
-    )
-    .expect("send membership node rpc");
+    ClusterMembershipRpcForwardHost::call_node_object_rpc(&mut driver, &state, &voter, &request)
+        .expect("send membership node rpc");
     ClusterJoinRegistrationHost::remember_successful_join_endpoint(
         &mut driver,
         &paths,
@@ -9676,7 +9671,7 @@ fn cluster_join_registration_driver_uses_local_membership_observer() {
             panic!("local observation should not send membership rpc")
         }
 
-        fn send_object_rpc_to_node(
+        fn call_node_object_rpc(
             &mut self,
             _state: &ClusterBootstrapState,
             _target_node_id: &NodeId,
@@ -9792,7 +9787,7 @@ fn cluster_member_mutation_driver_prepares_state_from_local_membership_observer(
             panic!("membership preparation should not send membership rpc")
         }
 
-        fn send_object_rpc_to_node(
+        fn call_node_object_rpc(
             &mut self,
             _state: &ClusterBootstrapState,
             _target_node_id: &NodeId,
@@ -9942,7 +9937,7 @@ fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
             panic!("cache hook test should not send membership rpc")
         }
 
-        fn send_object_rpc_to_node(
+        fn call_node_object_rpc(
             &mut self,
             _state: &ClusterBootstrapState,
             _target_node_id: &NodeId,
@@ -12215,7 +12210,7 @@ impl ClusterJoinRegistrationHost for RecordingJoinRegistrationHost {
         Ok(self.observation.clone())
     }
 
-    fn send_membership_rpc_to_node(
+    fn call_node_object_rpc(
         &mut self,
         _state: &ClusterBootstrapState,
         _target_node_id: &NodeId,
@@ -12295,7 +12290,7 @@ struct RecordingJoinEndpointHost {
 }
 
 impl ClusterJoinRegistrationHost for RecordingJoinEndpointHost {
-    fn send_membership_rpc_to_node(
+    fn call_node_object_rpc(
         &mut self,
         _state: &ClusterBootstrapState,
         _target_node_id: &NodeId,
@@ -13108,7 +13103,7 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
             }
         }
 
-        fn send_object_rpc_to_node(
+        fn call_node_object_rpc(
             &mut self,
             _state: &ClusterBootstrapState,
             _target_node_id: &NodeId,
@@ -13311,7 +13306,7 @@ fn membership_forwarding_uses_single_state_authority_node_rpc() {
     }
 
     impl ClusterMembershipRpcForwardHost for RecordingForwardHost {
-        fn send_membership_rpc_to_node(
+        fn call_node_object_rpc(
             &mut self,
             _state: &ClusterBootstrapState,
             target_node_id: &NodeId,
@@ -13405,7 +13400,7 @@ fn join_challenge_forwarding_uses_membership_state_authority_policy() {
     }
 
     impl ClusterMembershipRpcForwardHost for RecordingForwardHost {
-        fn send_membership_rpc_to_node(
+        fn call_node_object_rpc(
             &mut self,
             _state: &ClusterBootstrapState,
             target_node_id: &NodeId,
@@ -16020,7 +16015,7 @@ impl ClusterMemberMutationAsyncHost for RecordingClusterMemberPublishHost {
 struct UnusedClusterJoinRegistrationHost;
 
 impl ClusterJoinRegistrationHost for UnusedClusterJoinRegistrationHost {
-    fn send_membership_rpc_to_node(
+    fn call_node_object_rpc(
         &mut self,
         _state: &ClusterBootstrapState,
         _target_node_id: &NodeId,
@@ -30689,7 +30684,7 @@ impl ClusterKvSnapshotRefreshHost for NodeOnlySnapshotRefreshHost {
         Ok(false)
     }
 
-    fn send_object_rpc_to_node(
+    fn call_node_object_rpc(
         &mut self,
         _state: &ClusterBootstrapState,
         target_node_id: &NodeId,
