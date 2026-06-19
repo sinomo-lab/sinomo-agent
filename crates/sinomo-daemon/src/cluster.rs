@@ -6882,8 +6882,8 @@ mod tests {
         remote_member.allowed_capabilities = remote_member.capabilities.clone();
         state.members.push(remote_member);
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
-            .expect("sync state to local raft");
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("sync state to local kv");
         let cluster =
             daemon_cluster_status(&state, crate::DaemonClusterProcess::Main).expect("cluster");
         write_daemon_status(
@@ -6981,8 +6981,8 @@ mod tests {
         remote_member.allowed_capabilities = remote_member.capabilities.clone();
         state.members.push(remote_member);
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
-            .expect("sync state to local raft");
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("sync state to local kv");
         let cluster =
             daemon_cluster_status(&state, crate::DaemonClusterProcess::Main).expect("cluster");
         write_daemon_status(
@@ -7213,7 +7213,7 @@ mod tests {
         state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
         let synced =
-            sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+            sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
                 .expect("sync cluster state");
 
         let authenticated = AuthenticatedDaemonCommand {
@@ -7317,7 +7317,7 @@ mod tests {
         state.members[0].capabilities = capabilities.clone();
         state.members[0].allowed_capabilities = capabilities;
         sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync state to raft");
 
         let (held_tx, held_rx) = std::sync::mpsc::channel();
@@ -7383,7 +7383,7 @@ mod tests {
         state.members[0].capabilities = capabilities.clone();
         state.members[0].allowed_capabilities = capabilities;
         sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync state to raft");
 
         let (committed, _) = commit_cluster_kv_txn_with_quorum_response(
@@ -7465,7 +7465,7 @@ mod tests {
         state.members[0].capabilities = capabilities.clone();
         state.members[0].allowed_capabilities = capabilities;
         sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync state to raft");
         daemon_locked_set_cluster_raft_leader(&paths, &local, 1).expect("set leader");
 
@@ -7538,7 +7538,7 @@ mod tests {
         remote_member.endpoints = vec![endpoint.clone()];
         state.members.push(remote_member);
         sinomo_network::write_cluster_state(&paths, &state).expect("write state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync state");
 
         let seeded_record = sinomo_network::cluster_connectivity_record(
@@ -7690,7 +7690,7 @@ mod tests {
             .endpoints
             .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
         sinomo_network::write_cluster_state(&paths, &state).expect("write state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync state");
 
         let snapshot =
@@ -7790,7 +7790,7 @@ mod tests {
         state.members[0].capabilities = capabilities.clone();
         state.members[0].allowed_capabilities = capabilities;
         sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync state to raft");
         daemon_clear_cluster_raft_leader(&paths, &state.local_node_id).expect("clear known leader");
         assert_eq!(
@@ -8296,7 +8296,7 @@ mod tests {
         );
         assign_local_node_public_keys(&paths, &mut state).expect("assign keys");
         sinomo_network::write_cluster_state(&paths, &state).expect("write state");
-        let current = sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        let current = sinomo_network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("seed raft");
         let member_key = cluster_member_key(&local_node);
         assert!(
@@ -9463,7 +9463,7 @@ mod tests {
         remote_member.endpoints = vec![current_endpoint.clone(), stale_endpoint.clone()];
         state.members.push(remote_member);
         sinomo_network::write_cluster_state(&paths, &state).expect("write state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync state");
 
         let current_record = sinomo_network::cluster_connectivity_record(
@@ -9568,7 +9568,7 @@ mod tests {
             sinomo_node::main_daemon_capabilities(&ClusterMemberRole::Voter);
         state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
         sinomo_network::write_cluster_state(&paths, &state).expect("write state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync state");
 
         let mut stale_records = Vec::new();
@@ -9691,7 +9691,7 @@ mod tests {
         state.members.push(remote_member);
 
         sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync state to raft kv");
         sinomo_network::sync_cluster_connectivity_records_to_kv(
             &paths,
@@ -9793,7 +9793,7 @@ mod tests {
         state.members.push(bridge_member);
 
         sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync state to raft kv");
         sinomo_network::sync_cluster_connectivity_records_to_kv(
             &paths,
@@ -9969,7 +9969,7 @@ mod tests {
         kv_state.members.push(bridge_member);
 
         sinomo_network::write_cluster_state(&paths, &kv_state).expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &kv_state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&paths, &kv_state)
             .expect("sync state to raft kv");
 
         let mut local_state = kv_state.clone();
@@ -10019,7 +10019,7 @@ mod tests {
             now,
         );
         sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("seed local kv snapshot");
 
         let runtime = daemon_cluster_test_runtime();
@@ -10073,7 +10073,7 @@ mod tests {
         state.members.push(remote_member);
 
         sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync state to raft kv");
 
         let targets = sinomo_network::ClusterEndpointSelector::new(&paths, &state)
@@ -10352,7 +10352,7 @@ mod tests {
         state.members.push(voter_member);
 
         sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync cluster state");
         seed_cluster_node_status_to_kv(
             &paths,
@@ -10457,7 +10457,7 @@ mod tests {
         }
 
         sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync state to raft kv");
 
         let targets = sinomo_network::ClusterEndpointSelector::new(&paths, &state)
@@ -10515,7 +10515,7 @@ mod tests {
         state.members.push(remote_member);
 
         sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync state to raft kv");
         // The remote still self-reports Online (it never published an explicit
         // Offline). Liveness now follows the active probes, not the self-reported

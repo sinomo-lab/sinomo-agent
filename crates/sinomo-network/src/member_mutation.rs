@@ -167,13 +167,13 @@ where
     }
 }
 
-/// Mirrors a cluster state into the local durable Raft store without proving
+/// Mirrors a cluster state into the local durable KV store without proving
 /// replication to a quorum.
 ///
 /// Runtime cluster-control writes should go through the CLI quorum wrapper.
 /// This helper remains public for bootstrapping, recovery tooling, and tests
 /// that need to seed a local store deliberately.
-pub fn sync_cluster_state_to_local_raft_unchecked(
+pub fn sync_cluster_state_to_local_kv_unchecked(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<KvSnapshot, NetworkError> {
@@ -190,6 +190,14 @@ pub fn sync_cluster_state_to_local_raft_unchecked(
         return Ok(initial_snapshot);
     }
     append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
+}
+
+#[cfg(test)]
+pub(crate) fn sync_cluster_state_to_local_raft_unchecked(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<KvSnapshot, NetworkError> {
+    sync_cluster_state_to_local_kv_unchecked(paths, state)
 }
 
 pub fn cluster_state_sync_txn(

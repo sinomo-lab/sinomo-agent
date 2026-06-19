@@ -259,12 +259,14 @@ pub use maintenance::{
     cluster_network_maintenance_next_due_duration, cluster_network_probe_interval_for_role,
     cluster_network_publish_interval_for_role, cluster_network_stable_discovery_announcement_due,
 };
+#[cfg(test)]
+pub(crate) use member_mutation::sync_cluster_state_to_local_raft_unchecked;
 pub use member_mutation::{
     ClusterMemberMutationAsyncHost, ClusterMemberMutationDriver, ClusterMemberMutationHost,
     ClusterMemberRemoval, ClusterNodeRoleUpdate, ClusterRaftRoleUpdate,
     cleanup_legacy_shadow_daemon_members_with_host, cluster_state_sync_txn,
     remove_cluster_members_with_host, sync_cluster_state_to_kv_async_with_host,
-    sync_cluster_state_to_kv_with_host, sync_cluster_state_to_local_raft_unchecked,
+    sync_cluster_state_to_kv_with_host, sync_cluster_state_to_local_kv_unchecked,
     update_cluster_node_role_with_host, update_cluster_raft_role_with_host,
 };
 pub use member_publish::{

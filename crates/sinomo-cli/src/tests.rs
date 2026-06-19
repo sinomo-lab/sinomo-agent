@@ -6595,7 +6595,7 @@ fn cluster_peer_members_preserves_pending_local_member() {
         OffsetDateTime::now_utc(),
     ));
     sinomo_runtime::network::write_cluster_state(&paths, &state).expect("write joined state");
-    super::network::sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync kv");
+    super::network::sync_cluster_state_to_local_kv_unchecked(&paths, &state).expect("sync kv");
     std::fs::write(&paths.kv_snapshot, "{\"revision\":1}trailing").expect("corrupt kv");
 
     let members = cluster_peer_members(&paths).expect("peer members");
@@ -7087,7 +7087,7 @@ fn dfs_operator_inspection_uses_configured_metadata_shards() {
     );
     sinomo_runtime::network::write_cluster_state(&cluster_paths, &state)
         .expect("write cluster state");
-    super::network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+    super::network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
         .expect("sync cluster state");
 
     let file_system = distributed_sifs(node_id.clone());
@@ -9931,7 +9931,7 @@ fn daemon_cluster_kv_txn_does_not_ack_without_append_quorum() {
     peer.endpoints = vec![daemon_lan_endpoint(&peer_node_id, peer_address, 0)];
     state.members.push(peer);
     sinomo_runtime::network::write_cluster_state(&paths, &state).expect("write cluster state");
-    super::network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+    super::network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
         .expect("sync state to kv");
 
     let txn = KvTxn {
@@ -10021,7 +10021,7 @@ fn network_raft_handlers_reject_mismatched_authenticated_peer() {
     )
     .expect("cluster init");
     let state = read_cluster_state(&paths).expect("cluster state");
-    super::network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+    super::network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
         .expect("sync state to kv");
     let bad_auth = authenticated_test_command(
         sinomo_runtime::kv::CLUSTER_RAFT_APPEND_ROUTE,
@@ -10124,7 +10124,7 @@ fn stale_raft_snapshot_append_does_not_roll_back_local_state() {
     )
     .expect("cluster init");
     let state = read_cluster_state(&paths).expect("cluster state");
-    super::network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+    super::network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
         .expect("sync state to kv");
     let stale_snapshot = read_cluster_kv_snapshot(&paths).expect("stale snapshot");
     append_cluster_raft_command_with_response(
@@ -10391,7 +10391,7 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
         host_state.local_node_id.as_str(),
         host_identity.public_key.clone(),
     );
-    super::network::sync_cluster_state_to_local_raft_unchecked(&host_paths, &host_state)
+    super::network::sync_cluster_state_to_local_kv_unchecked(&host_paths, &host_state)
         .expect("host kv");
     let request = build_cluster_raft_append_request_from_next_index(&host_paths, &host_state, 1)
         .expect("raft append");
@@ -11225,7 +11225,7 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
     remote.endpoints = vec![lan_endpoint.clone(), iroh_endpoint.clone()];
     state.members.push(remote);
     sinomo_runtime::network::write_cluster_state(&paths, &state).expect("write state");
-    super::network::sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    super::network::sync_cluster_state_to_local_kv_unchecked(&paths, &state).expect("sync state");
 
     let now = OffsetDateTime::now_utc();
     let records = [

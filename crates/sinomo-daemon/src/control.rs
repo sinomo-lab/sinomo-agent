@@ -4299,7 +4299,7 @@ mod tests {
         );
         sinomo_network::write_cluster_state(&cluster_paths, &cluster_state)
             .expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &cluster_state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &cluster_state)
             .expect("sync cluster state");
 
         let rollout_paths = SelfRolloutPaths::new(&root);
@@ -4386,7 +4386,7 @@ mod tests {
         );
         sinomo_network::write_cluster_state(&cluster_paths, &cluster_state)
             .expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &cluster_state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &cluster_state)
             .expect("sync cluster state");
 
         let module_id =
@@ -4472,7 +4472,7 @@ mod tests {
         );
         sinomo_network::write_cluster_state(&cluster_paths, &cluster_state)
             .expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &cluster_state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &cluster_state)
             .expect("sync cluster state");
 
         let module_id =
@@ -4600,7 +4600,7 @@ mod tests {
         );
         sinomo_network::write_cluster_state(&cluster_paths, &cluster_state)
             .expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &cluster_state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &cluster_state)
             .expect("sync cluster state");
 
         let module_id =
@@ -4686,7 +4686,7 @@ mod tests {
             now,
         );
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
             .expect("sync raft");
         let file_system = sinomo_dfs::distributed_sifs(local.clone());
         let root_shard = sinomo_dfs::DfsMetadataShardConfig {

@@ -1425,7 +1425,7 @@ mod tests {
             now,
         );
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
             .expect("sync raft");
 
         let old_dir = "/services/sandbox/instances/daemon_namespace_job/work/old";
@@ -1531,7 +1531,7 @@ mod tests {
             now,
         );
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
             .expect("sync raft");
 
         let file_system = sinomo_dfs::default_cluster_sifs(&state);
@@ -1640,7 +1640,7 @@ mod tests {
             now,
         );
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
             .expect("sync raft");
         let remote_node_id =
             NodeId::from_legacy_named("node_daemon_dfs_status_sharded_remote").expect("remote");
@@ -1784,7 +1784,7 @@ mod tests {
             now,
         );
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
             .expect("sync raft");
         let file_system = distributed_sifs(local.clone());
         let shard = DfsMetadataShardConfig {
@@ -3474,7 +3474,7 @@ mod tests {
             sinomo_node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
         state.members.push(local_member);
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
             .expect("sync raft");
         let file_system = sinomo_dfs::default_cluster_sifs(&state);
         let mut legacy_object = distributed_sifs_bootstrap_objects(local.clone())
@@ -3630,7 +3630,7 @@ mod tests {
         state.members[0].capabilities =
             sinomo_node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
             .expect("sync raft");
         let runtime = daemon_test_runtime("daemon-dfs-smoke-single-node");
         runtime

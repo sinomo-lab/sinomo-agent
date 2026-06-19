@@ -818,7 +818,7 @@ impl network::ClusterJoinRegistrationHost for CliClusterJoinRegistrationHost {
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Result<KvSnapshot, network::NetworkError> {
-        network::sync_cluster_state_to_local_raft_unchecked(paths, state)
+        network::sync_cluster_state_to_local_kv_unchecked(paths, state)
     }
 }
 
