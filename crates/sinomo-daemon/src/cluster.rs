@@ -4527,7 +4527,7 @@ pub(crate) async fn handle_daemon_cluster_relay_request_on_runtime(
 
 pub(crate) async fn handle_daemon_cluster_relay_stream_forward_on_runtime(
     paths: &DaemonPaths,
-    envelope: sinomo_network::RelayEnvelope,
+    request: &sinomo_network::ObjectRpcRequest,
     runtime: &tokio::runtime::Handle,
     stream: &mut sinomo_network::AsyncDaemonControlStream,
     stream_address: &str,
@@ -4547,7 +4547,7 @@ pub(crate) async fn handle_daemon_cluster_relay_stream_forward_on_runtime(
         &cluster_paths,
         &state,
         &local_node_id,
-        envelope,
+        request,
         sinomo_network::ClusterRelayOptions::new(
             sinomo_network::DaemonRpcTimeouts::connect_and_idle(
                 DAEMON_CLUSTER_RELAY_CONNECT_TIMEOUT,
@@ -10082,11 +10082,22 @@ mod tests {
         inner: sinomo_network::DaemonControlRequest,
     }
 
-    fn test_relay_envelope(
+    fn test_relay_request(
         state: &ClusterBootstrapState,
         target_node: &NodeId,
-    ) -> sinomo_network::RelayEnvelope {
-        let request = sinomo_network::ObjectRpcRequest::encode_body(
+    ) -> sinomo_network::ObjectRpcRequest {
+        let mut inner = sinomo_network::ObjectRpcRequest {
+            route: "/test/relay".to_string(),
+            category: "test".to_string(),
+            metadata: BTreeMap::new(),
+            auth: None,
+            body: Vec::new(),
+        };
+        sinomo_network::set_object_rpc_request_stream_mode(
+            &mut inner,
+            sinomo_network::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
+        );
+        sinomo_network::ObjectRpcRequest::encode_body(
             sinomo_network::CLUSTER_RELAY_ROUTE,
             sinomo_network::CLUSTER_ROUTING_RPC_CATEGORY,
             &TestRelayEnvelope {
@@ -10095,17 +10106,10 @@ mod tests {
                 ttl: 8,
                 visited: Vec::new(),
                 max_hop_timeout_ms: None,
-                inner: sinomo_network::ObjectRpcRequest {
-                    route: "/test/relay".to_string(),
-                    category: "test".to_string(),
-                    metadata: BTreeMap::new(),
-                    auth: None,
-                    body: Vec::new(),
-                },
+                inner,
             },
         )
-        .expect("relay rpc request");
-        sinomo_network::RelayEnvelope::from_request(&request).expect("relay envelope")
+        .expect("relay rpc request")
     }
 
     #[test]
@@ -10146,7 +10150,9 @@ mod tests {
 
         sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
         let runtime = daemon_cluster_test_runtime();
-        let envelope = test_relay_envelope(&state, &target_node);
+        let relay_request = test_relay_request(&state, &target_node);
+        let envelope =
+            sinomo_network::RelayEnvelope::from_request(&relay_request).expect("relay envelope");
         let initial_ttl = envelope.ttl();
         let mut host = RecordingRelayStreamForwardHost::forwarding();
         let outcome = runtime
@@ -10156,7 +10162,7 @@ mod tests {
                     &paths,
                     &state,
                     &local_node,
-                    envelope,
+                    &relay_request,
                     sinomo_network::ClusterRelayOptions::new(
                         sinomo_network::DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5)),
                     ),
@@ -10244,7 +10250,7 @@ mod tests {
             None,
         );
         let runtime = daemon_cluster_test_runtime();
-        let envelope = test_relay_envelope(&state, &target_node);
+        let relay_request = test_relay_request(&state, &target_node);
         let mut host = RecordingRelayStreamForwardHost::routing_error();
         let outcome = runtime
             .block_on(
@@ -10253,7 +10259,7 @@ mod tests {
                     &paths,
                     &state,
                     &local_node,
-                    envelope,
+                    &relay_request,
                     sinomo_network::ClusterRelayOptions::new(
                         sinomo_network::DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5)),
                     ),

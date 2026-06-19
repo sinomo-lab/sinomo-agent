@@ -1757,6 +1757,35 @@ pub async fn handle_cluster_relay_stream_forward_async_with_host(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     local_node_id: &NodeId,
+    request: &ObjectRpcRequest,
+    options: ClusterRelayOptions,
+    host: &mut impl ClusterRelayStreamForwardAsyncHost,
+) -> Result<ClusterRelayStreamForwardOutcome, NetworkError> {
+    let envelope = RelayEnvelope::from_request(request)?;
+    if !relay_envelope_inner_expects_streamed_response(&envelope) {
+        return ObjectRpcResponse::encode_error(
+            CLUSTER_RELAY_ROUTE,
+            "stream relay forwarding requires an inner request that expects a streamed raw response",
+        )
+        .map(ClusterRelayStreamForwardOutcome::ErrorResponse);
+    }
+    handle_cluster_relay_stream_forward_envelope_async_with_host(
+        runtime,
+        paths,
+        state,
+        local_node_id,
+        envelope,
+        options,
+        host,
+    )
+    .await
+}
+
+async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    local_node_id: &NodeId,
     envelope: RelayEnvelope,
     options: ClusterRelayOptions,
     host: &mut impl ClusterRelayStreamForwardAsyncHost,
@@ -2403,6 +2432,15 @@ mod tests {
             auth: None,
             body: vec![1, 2, 3, 4],
         }
+    }
+
+    fn streamed_inner_request() -> DaemonControlRequest {
+        let mut request = inner_request();
+        crate::set_object_rpc_request_stream_mode(
+            &mut request,
+            crate::ObjectRpcRequestStreamMode::RawStreamedDaemonResponse,
+        );
+        request
     }
 
     #[test]
@@ -5580,15 +5618,19 @@ mod tests {
         assert_eq!(async_host.sent[0].1.visited, vec![local.clone()]);
         assert_eq!(async_host.sent[0].1.max_hop_timeout_ms, Some(1_500));
 
-        let mut stream_envelope = RelayEnvelope::new(cluster_id, target.clone(), inner_request());
+        let mut stream_envelope =
+            RelayEnvelope::new(cluster_id, target.clone(), streamed_inner_request());
         stream_envelope.max_hop_timeout_ms = Some(1_500);
+        let stream_relay_request = stream_envelope
+            .into_request()
+            .expect("stream relay request");
         let mut stream_host = RecordingRelayStreamForwardHost::default();
         let stream_outcome = handle_cluster_relay_stream_forward_async_with_host(
             &runtime,
             &paths,
             &state,
             &local,
-            stream_envelope,
+            &stream_relay_request,
             ClusterRelayOptions::new(DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5))),
             &mut stream_host,
         )

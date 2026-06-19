@@ -907,7 +907,7 @@ async fn try_handle_streamed_cluster_relay_request_async(
     } else {
         handle_daemon_cluster_relay_stream_forward_on_runtime(
             paths,
-            envelope,
+            request,
             service_runtime,
             stream,
             stream_address,
