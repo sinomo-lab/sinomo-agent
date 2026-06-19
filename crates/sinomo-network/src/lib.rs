@@ -131,7 +131,9 @@ pub(crate) use endpoint_records::upsert_member_endpoint;
 pub(crate) use endpoint_records::{
     refresh_local_iroh_endpoints_from_disk, refresh_local_iroh_endpoints_from_disk_async,
 };
-pub use endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
+pub use endpoint_selector::{
+    ClusterEndpointSelectionPurpose, ClusterEndpointSelector, ClusterEndpointTransferProfile,
+};
 #[cfg(test)]
 pub(crate) use endpoint_selector::{
     cluster_sync_targets, cluster_sync_targets_with_connectivity,

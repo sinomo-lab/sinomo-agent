@@ -166,6 +166,16 @@ pub enum DfsTransferProfile {
     Local,
 }
 
+impl From<sinomo_network::ClusterEndpointTransferProfile> for DfsTransferProfile {
+    fn from(profile: sinomo_network::ClusterEndpointTransferProfile) -> Self {
+        match profile {
+            sinomo_network::ClusterEndpointTransferProfile::Conservative => Self::Conservative,
+            sinomo_network::ClusterEndpointTransferProfile::Lan => Self::Lan,
+            sinomo_network::ClusterEndpointTransferProfile::Local => Self::Local,
+        }
+    }
+}
+
 pub trait DfsMessageTransport: DfsTransportIdentity {
     fn send_routed_message(
         &mut self,
@@ -8299,33 +8309,6 @@ impl std::fmt::Debug for DfsEndpointTransport {
     }
 }
 
-fn dfs_endpoint_transfer_profile(endpoint: &ClusterEndpointRecord) -> DfsTransferProfile {
-    match &endpoint.transport {
-        ClusterTransportKind::InProcess | ClusterTransportKind::Loopback => {
-            DfsTransferProfile::Local
-        }
-        ClusterTransportKind::LanTcp | ClusterTransportKind::LanQuic => DfsTransferProfile::Lan,
-        ClusterTransportKind::Iroh
-        | ClusterTransportKind::WebRtc
-        | ClusterTransportKind::TurnRelay
-        | ClusterTransportKind::HttpsRelay => DfsTransferProfile::Conservative,
-    }
-}
-
-fn dfs_endpoint_transfer_profile_for_targets<'a>(
-    endpoints: impl IntoIterator<Item = &'a ClusterEndpointRecord>,
-) -> DfsTransferProfile {
-    let mut profile = DfsTransferProfile::Conservative;
-    for endpoint in endpoints {
-        match dfs_endpoint_transfer_profile(endpoint) {
-            DfsTransferProfile::Local => return DfsTransferProfile::Local,
-            DfsTransferProfile::Lan => profile = DfsTransferProfile::Lan,
-            DfsTransferProfile::Conservative => {}
-        }
-    }
-    profile
-}
-
 impl DfsEndpointTransport {
     #[cfg(test)]
     pub(crate) fn new(
@@ -8565,7 +8548,12 @@ impl DfsEndpointTransport {
         }
         self.endpoints_by_node_id
             .get(target_node_id)
-            .map(|endpoints| dfs_endpoint_transfer_profile_for_targets(endpoints.iter()))
+            .map(|endpoints| {
+                sinomo_network::ClusterEndpointSelector::transfer_profile_for_endpoints(
+                    endpoints.iter(),
+                )
+                .into()
+            })
             .unwrap_or(DfsTransferProfile::Conservative)
     }
 

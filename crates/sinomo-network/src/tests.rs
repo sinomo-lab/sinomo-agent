@@ -14276,6 +14276,63 @@ fn dfs_data_targets_prefer_healthy_bridge_ip_over_degraded_hostname() {
 }
 
 #[test]
+fn endpoint_transfer_profile_is_owned_by_network_endpoint_policy() {
+    let node = NodeId::from_legacy_named("node_endpoint_transfer_profile").expect("node");
+    let endpoint = |transport: ClusterTransportKind| {
+        let address = format!("{transport:?}");
+        ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::derived(
+                "sinomo.test.endpoint-transfer-profile",
+                address.clone(),
+            ),
+            node_id: node.clone(),
+            transport,
+            address,
+            source: ClusterEndpointSource::Observed,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 0,
+            last_observed_latency_ms: None,
+        }
+    };
+
+    let loopback = endpoint(ClusterTransportKind::Loopback);
+    let in_process = endpoint(ClusterTransportKind::InProcess);
+    let lan_tcp = endpoint(ClusterTransportKind::LanTcp);
+    let lan_quic = endpoint(ClusterTransportKind::LanQuic);
+    let iroh = endpoint(ClusterTransportKind::Iroh);
+    let relay = endpoint(ClusterTransportKind::HttpsRelay);
+
+    assert_eq!(
+        ClusterEndpointSelector::transfer_profile_for_endpoint(&loopback),
+        ClusterEndpointTransferProfile::Local
+    );
+    assert_eq!(
+        ClusterEndpointSelector::transfer_profile_for_endpoint(&in_process),
+        ClusterEndpointTransferProfile::Local
+    );
+    assert_eq!(
+        ClusterEndpointSelector::transfer_profile_for_endpoint(&lan_tcp),
+        ClusterEndpointTransferProfile::Lan
+    );
+    assert_eq!(
+        ClusterEndpointSelector::transfer_profile_for_endpoint(&lan_quic),
+        ClusterEndpointTransferProfile::Lan
+    );
+    assert_eq!(
+        ClusterEndpointSelector::transfer_profile_for_endpoint(&iroh),
+        ClusterEndpointTransferProfile::Conservative
+    );
+    assert_eq!(
+        ClusterEndpointSelector::transfer_profile_for_endpoints([&iroh, &lan_tcp]),
+        ClusterEndpointTransferProfile::Lan
+    );
+    assert_eq!(
+        ClusterEndpointSelector::transfer_profile_for_endpoints([&relay, &lan_tcp, &loopback]),
+        ClusterEndpointTransferProfile::Local
+    );
+}
+
+#[test]
 fn connectivity_sort_uses_lan_public_iroh_fallback_order() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-lan-public-iroh-sort");
     let data_dir = SinomoDataDir::new(&root);
