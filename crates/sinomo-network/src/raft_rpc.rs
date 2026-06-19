@@ -12,7 +12,7 @@ use sinomo_kv::{
     ClusterRaftVoteResponse,
 };
 
-pub fn handle_cluster_raft_rpc_request(
+pub(crate) fn handle_cluster_raft_rpc_request(
     paths: &ClusterPaths,
     request: ObjectRpcRequest,
     authenticated_peer: &ClusterAuthenticatedPeer,

@@ -452,11 +452,21 @@ fn handle_cluster_raft_append_rpc(
     let payload = sinomo_runtime::kv::cluster_raft_append_rpc_payload(&request)?;
     let rpc =
         network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
-    let response = network::handle_cluster_raft_rpc_request(
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| network::NetworkError::Io {
+            operation: "cli test cluster raft rpc runtime".to_string(),
+            detail: error.to_string(),
+        })?;
+    let peer = authenticated_cluster_peer(authenticated);
+    let response = runtime.block_on(network::handle_cluster_raft_rpc_request_async(
+        runtime.handle(),
         paths,
         rpc,
-        &authenticated_cluster_peer(authenticated),
-    )?;
+        &peer,
+    ))?;
+    runtime.shutdown_timeout(Duration::from_millis(250));
     response.error_detail()?;
     sinomo_runtime::kv::decode_cluster_raft_append_rpc_response_body(&response.body)
         .map_err(Into::into)
@@ -470,11 +480,21 @@ fn handle_cluster_raft_vote_rpc(
     let payload = sinomo_runtime::kv::cluster_raft_vote_rpc_payload(&request)?;
     let rpc =
         network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
-    let response = network::handle_cluster_raft_rpc_request(
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| network::NetworkError::Io {
+            operation: "cli test cluster raft rpc runtime".to_string(),
+            detail: error.to_string(),
+        })?;
+    let peer = authenticated_cluster_peer(authenticated);
+    let response = runtime.block_on(network::handle_cluster_raft_rpc_request_async(
+        runtime.handle(),
         paths,
         rpc,
-        &authenticated_cluster_peer(authenticated),
-    )?;
+        &peer,
+    ))?;
+    runtime.shutdown_timeout(Duration::from_millis(250));
     response.error_detail()?;
     sinomo_runtime::kv::decode_cluster_raft_vote_rpc_response_body(&response.body)
         .map_err(Into::into)
@@ -10459,6 +10479,7 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
     let host_events = read_cluster_kv_snapshot(&host_paths)
         .expect("host watch snapshot")
         .events;
+    let peer_state = read_cluster_state(&peer_paths).expect("peer state after append");
     let watch_fanout = sinomo_runtime::kv::handle_cluster_kv_watch_events(
         &peer_paths.kv_paths(),
         &peer_state,
