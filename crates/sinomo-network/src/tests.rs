@@ -7864,7 +7864,7 @@ async fn async_cluster_raft_committed_fanout_uses_async_host_and_batches_watch_e
     let mut host = RecordingCommittedFanoutHost::default();
     let runtime = tokio::runtime::Handle::current();
 
-    let report = fan_out_committed_cluster_raft_command_async_with_host(
+    let report = crate::raft_fanout::fan_out_committed_cluster_raft_command_async_with_host(
         &runtime,
         &paths,
         &state,
@@ -11005,22 +11005,24 @@ fn cluster_kv_txn_async_forward_driver_uses_object_rpc_client() {
         .expect("runtime");
 
     let result = runtime
-        .block_on(forward_cluster_kv_txn_to_voter_async_with_host(
-            runtime.handle(),
-            &paths,
-            &state,
-            &KvTxn {
-                compares: Vec::new(),
-                success: Vec::new(),
-                failure: Vec::new(),
-            },
-            ClusterKvTxnForwardOptions {
-                timeout: Duration::from_secs(5),
-                tcp_command_timeout: Duration::from_secs(5),
-                iroh_command_timeout: Duration::from_secs(3),
-            },
-            &mut host,
-        ))
+        .block_on(
+            crate::kv_forward::forward_cluster_kv_txn_to_voter_async_with_host(
+                runtime.handle(),
+                &paths,
+                &state,
+                &KvTxn {
+                    compares: Vec::new(),
+                    success: Vec::new(),
+                    failure: Vec::new(),
+                },
+                ClusterKvTxnForwardOptions {
+                    timeout: Duration::from_secs(5),
+                    tcp_command_timeout: Duration::from_secs(5),
+                    iroh_command_timeout: Duration::from_secs(3),
+                },
+                &mut host,
+            ),
+        )
         .expect("async forward")
         .expect("targeted voter");
 
@@ -17151,29 +17153,31 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
         .build()
         .expect("runtime");
     let result = runtime
-        .block_on(commit_cluster_raft_command_with_quorum_async_with_host(
-            runtime.handle(),
-            &paths,
-            &mut state,
-            KvCommand::Op(KvOp::Put {
-                key: "/test/async-quorum".to_string(),
-                value: b"ok".to_vec(),
-                lease_id: None,
-            }),
-            ClusterRaftQuorumCommitOptions {
-                timeout: Duration::from_secs(5),
-            },
-            ClusterRaftAppendReplicationOptions {
-                timeout: Duration::from_secs(5),
-                max_attempts: 3,
-                tcp_command_timeout: Duration::from_secs(1),
-                iroh_command_timeout: Duration::from_secs(1),
-                tcp_foreground_attempt_timeout: Duration::from_secs(1),
-                public_foreground_attempt_timeout: Duration::from_secs(1),
-                iroh_foreground_attempt_timeout: Duration::from_secs(1),
-            },
-            &mut host,
-        ))
+        .block_on(
+            crate::raft_quorum::commit_cluster_raft_command_with_quorum_async_with_host(
+                runtime.handle(),
+                &paths,
+                &mut state,
+                KvCommand::Op(KvOp::Put {
+                    key: "/test/async-quorum".to_string(),
+                    value: b"ok".to_vec(),
+                    lease_id: None,
+                }),
+                ClusterRaftQuorumCommitOptions {
+                    timeout: Duration::from_secs(5),
+                },
+                ClusterRaftAppendReplicationOptions {
+                    timeout: Duration::from_secs(5),
+                    max_attempts: 3,
+                    tcp_command_timeout: Duration::from_secs(1),
+                    iroh_command_timeout: Duration::from_secs(1),
+                    tcp_foreground_attempt_timeout: Duration::from_secs(1),
+                    public_foreground_attempt_timeout: Duration::from_secs(1),
+                    iroh_foreground_attempt_timeout: Duration::from_secs(1),
+                },
+                &mut host,
+            ),
+        )
         .expect("async quorum commit");
 
     assert_eq!(

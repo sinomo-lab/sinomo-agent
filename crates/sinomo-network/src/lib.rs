@@ -192,12 +192,9 @@ pub use keyspace::{
 };
 pub use kv_forward::{
     ClusterKvTxnForwardHost, ClusterKvTxnForwardOptions, ClusterKvTxnForwardResult,
-    forward_cluster_kv_txn_to_voter_async_with_host, forward_cluster_kv_txn_to_voter_with_host,
+    forward_cluster_kv_txn_to_voter_with_host,
 };
-pub use kv_local_store::{
-    cluster_kv_key_can_defer_materialized_snapshot, commit_cluster_raft_index_with_events_async,
-    discard_cluster_raft_uncommitted_tail_and_clear_leader_async,
-};
+pub use kv_local_store::cluster_kv_key_can_defer_materialized_snapshot;
 pub use kv_read_model::{
     read_cluster_connectivity_graph_from_kv, read_cluster_members_from_kv,
     read_cluster_node_statuses_from_kv,
@@ -333,17 +330,14 @@ pub use peer::{
 };
 pub use raft_election::{
     ClusterRaftVoteTransportAsyncHost, ClusterRaftVoteTransportHost,
-    elect_cluster_raft_leader_async_with_host, elect_cluster_raft_leader_with_host,
+    elect_cluster_raft_leader_with_host,
 };
 pub use raft_fanout::{
-    ClusterRaftCommittedFanoutAsyncHost, ClusterRaftCommittedFanoutReport,
-    fan_out_committed_cluster_raft_command_async_with_host,
-    spawn_cluster_raft_committed_fanout_worker_on_runtime,
+    ClusterRaftCommittedFanoutAsyncHost, spawn_cluster_raft_committed_fanout_worker_on_runtime,
 };
 pub use raft_quorum::{
     ClusterRaftQuorumAsyncHost, ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult,
-    ClusterRaftQuorumTransportHost, commit_cluster_raft_command_with_quorum_async_with_host,
-    commit_cluster_raft_command_with_quorum_driver,
+    ClusterRaftQuorumTransportHost, commit_cluster_raft_command_with_quorum_driver,
 };
 pub use raft_replication::{
     ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
