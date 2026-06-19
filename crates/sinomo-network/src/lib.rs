@@ -25,6 +25,7 @@ mod health;
 mod invite;
 mod invite_publish;
 mod io_observer;
+mod join_registration;
 mod keyspace;
 mod kv_forward;
 mod kv_local_store;
@@ -158,6 +159,11 @@ pub(crate) use invite_publish::{
 };
 pub(crate) use io_observer::io_observer;
 pub use io_observer::{IoObserver, set_io_observer};
+pub use join_registration::{
+    ClusterJoinReconciliation, ClusterJoinReconciliationHost, ClusterJoinRegistrationAsyncHost,
+    ClusterJoinRegistrationDriver, ClusterJoinRegistrationHost,
+    ClusterLocalDaemonMembershipAsyncObserver, ClusterLocalDaemonMembershipObserver,
+};
 #[cfg(test)]
 pub(crate) use keyspace::{
     cluster_capability_policy_key, cluster_node_status_key, cluster_node_status_key_for_process,
@@ -347,17 +353,14 @@ pub use status_publish::{
     sync_cluster_node_status_to_kv,
 };
 pub use storage::{
-    ClusterControlPlaneDriver, ClusterControlPlaneTransport, ClusterJoinRegistrationAsyncHost,
-    ClusterJoinRegistrationDriver, ClusterJoinRegistrationHost, ClusterKvTxnQuorumAsyncHost,
-    ClusterKvTxnQuorumHost, ClusterLocalDaemonMembershipAsyncObserver,
-    ClusterLocalDaemonMembershipObserver, ClusterMemberMutationDriver,
-    ClusterRaftAppendReplicationAsyncHost, ClusterRaftAppendReplicationHost,
-    ClusterRaftCommittedFanoutAsyncHost, ClusterRaftQuorumAsyncHost,
-    ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult, ClusterRaftQuorumTransportHost,
-    ClusterRaftVoteTransportAsyncHost, ClusterRaftVoteTransportHost,
-    accepted_cluster_join_state_from_kv_snapshot, cleanup_legacy_shadow_daemon_members_with_host,
-    cluster_join_challenge_rpc_request, cluster_state_sync_txn,
-    commit_cluster_kv_txn_with_quorum_response_with_host,
+    ClusterControlPlaneDriver, ClusterControlPlaneTransport, ClusterKvTxnQuorumAsyncHost,
+    ClusterKvTxnQuorumHost, ClusterMemberMutationDriver, ClusterRaftAppendReplicationAsyncHost,
+    ClusterRaftAppendReplicationHost, ClusterRaftCommittedFanoutAsyncHost,
+    ClusterRaftQuorumAsyncHost, ClusterRaftQuorumCommitOptions, ClusterRaftQuorumCommitResult,
+    ClusterRaftQuorumTransportHost, ClusterRaftVoteTransportAsyncHost,
+    ClusterRaftVoteTransportHost, accepted_cluster_join_state_from_kv_snapshot,
+    cleanup_legacy_shadow_daemon_members_with_host, cluster_join_challenge_rpc_request,
+    cluster_state_sync_txn, commit_cluster_kv_txn_with_quorum_response_with_host,
     commit_cluster_raft_command_with_quorum_driver, elect_cluster_raft_leader_with_host,
     handle_cluster_join_registration_request_with_host,
     handle_cluster_membership_rpc_request_with_hosts, handle_cluster_raft_rpc_request,
