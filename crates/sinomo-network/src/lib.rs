@@ -374,9 +374,10 @@ pub use status_publish::{
     publish_cluster_network_info_to_quorum_async_with_host,
     publish_cluster_network_info_to_quorum_with_host,
     publish_cluster_node_status_to_quorum_async_with_host,
-    publish_cluster_node_status_to_quorum_with_host, sync_cluster_network_info_to_kv,
-    sync_cluster_node_status_to_kv,
+    publish_cluster_node_status_to_quorum_with_host,
 };
+#[cfg(test)]
+pub(crate) use status_publish::{sync_cluster_network_info_to_kv, sync_cluster_node_status_to_kv};
 pub use voter_reachability::{
     ClusterVoterReachabilityAsyncHost, ClusterVoterReachabilityHost,
     ClusterVoterReachabilityOptions, cluster_has_local_quorum_async_with_host,

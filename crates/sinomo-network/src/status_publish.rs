@@ -4,11 +4,12 @@ use crate::keyspace::{
     cluster_network_info_key, cluster_node_status_key_for_record,
     cluster_node_status_snapshot_record,
 };
-use crate::kv_local_store::{
-    append_cluster_raft_command, read_cluster_kv_current_or_cached_snapshot_arc_if_present,
-    read_cluster_kv_snapshot,
-};
-use crate::local_state_store::{read_cluster_state, read_cluster_state_without_kv};
+use crate::kv_local_store::read_cluster_kv_current_or_cached_snapshot_arc_if_present;
+#[cfg(test)]
+use crate::kv_local_store::{append_cluster_raft_command, read_cluster_kv_snapshot};
+use crate::local_state_store::read_cluster_state;
+#[cfg(test)]
+use crate::local_state_store::read_cluster_state_without_kv;
 use crate::network_info::{ClusterNetworkInfoRecord, cluster_network_info_publish_record_matches};
 use crate::prelude::*;
 use crate::rpc_future::ClusterMembershipRpcFuture;
@@ -120,7 +121,8 @@ pub trait ClusterNodeStatusPublishAsyncHost {
     ) -> ClusterMembershipRpcFuture<'a, KvSnapshot>;
 }
 
-pub fn sync_cluster_node_status_to_kv(
+#[cfg(test)]
+pub(crate) fn sync_cluster_node_status_to_kv(
     paths: &ClusterPaths,
     status: ClusterNodeStatusRecord,
 ) -> Result<KvSnapshot, NetworkError> {
@@ -264,7 +266,8 @@ where
     Ok(Some(snapshot))
 }
 
-pub fn sync_cluster_network_info_to_kv(
+#[cfg(test)]
+pub(crate) fn sync_cluster_network_info_to_kv(
     paths: &ClusterPaths,
     info: ClusterNetworkInfoRecord,
 ) -> Result<KvSnapshot, NetworkError> {

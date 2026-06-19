@@ -10269,8 +10269,24 @@ fn daemon_node_status_publishes_version_and_rollout_to_kv() {
         read_cluster_rollout_status(&rollout_paths).expect("read rollout"),
         time::OffsetDateTime::now_utc(),
     );
-    sinomo_runtime::network::sync_cluster_node_status_to_kv(&cluster_paths, record)
-        .expect("refresh status");
+    let cluster_state = read_cluster_state(&cluster_paths).expect("read cluster state");
+    append_cluster_raft_command(
+        &cluster_paths,
+        &cluster_state.local_node_id,
+        KvCommand::Txn(KvTxn {
+            compares: Vec::new(),
+            success: vec![
+                KvOp::put_serde(
+                    sinomo_runtime::node::cluster_node_status_key_for_record(&record),
+                    &record,
+                    None,
+                )
+                .expect("node status op"),
+            ],
+            failure: Vec::new(),
+        }),
+    )
+    .expect("refresh status");
     let statuses =
         read_cluster_node_statuses_from_kv(&cluster_paths).expect("node statuses from kv");
 

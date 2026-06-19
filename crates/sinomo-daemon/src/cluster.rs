@@ -5223,6 +5223,26 @@ mod tests {
             .map_err(Into::into)
     }
 
+    fn seed_cluster_node_status_to_kv(
+        paths: &ClusterPaths,
+        status: ClusterNodeStatusRecord,
+    ) -> Result<KvSnapshot, sinomo_network::NetworkError> {
+        let state = sinomo_network::read_cluster_state_without_kv(paths)?;
+        append_cluster_raft_command(
+            paths,
+            &state.local_node_id,
+            KvCommand::Txn(KvTxn {
+                compares: Vec::new(),
+                success: vec![KvOp::put_serde(
+                    sinomo_node::cluster_node_status_key_for_record(&status),
+                    &status,
+                    None,
+                )?],
+                failure: Vec::new(),
+            }),
+        )
+    }
+
     #[test]
     fn cluster_owner_runtime_bridge_rejects_current_thread_runtime() {
         let owner_runtime = tokio::runtime::Builder::new_current_thread()
@@ -10408,7 +10428,7 @@ mod tests {
         sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
         sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
             .expect("sync cluster state");
-        sinomo_network::sync_cluster_node_status_to_kv(
+        seed_cluster_node_status_to_kv(
             &paths,
             ClusterNodeStatusRecord {
                 cluster_id,
@@ -10581,7 +10601,7 @@ mod tests {
         // Offline). Liveness now follows the active probes, not the self-reported
         // observed_at, so a fresh-looking status must not earn leader preference
         // once the probes can no longer reach the node.
-        sinomo_network::sync_cluster_node_status_to_kv(
+        seed_cluster_node_status_to_kv(
             &paths,
             ClusterNodeStatusRecord {
                 cluster_id: cluster_id.clone(),
