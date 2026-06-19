@@ -248,7 +248,7 @@ pub use in_process::{InProcessKvStore, InProcessRaftKvCluster};
 pub use model::{
     KvCommand, KvCompare, KvEntry, KvError, KvEvent, KvEventKind, KvLease, KvOp, KvOpResponse,
     KvRevision, KvSnapshot, KvTxn, KvTxnResponse, KvVersion, KvWatch, LeaseId, WatchId,
-    decode_kv_value, encode_kv_value,
+    decode_kv_value, encode_kv_value, push_bounded_txn_success_op,
 };
 pub use paths::{
     CLUSTER_KV_COMMIT_SEQUENCE_LOCK_WAIT, ClusterKvPaths, lock_cluster_kv_commit_sequence,

@@ -3766,6 +3766,35 @@ mod tests {
     }
 
     #[test]
+    fn bounded_txn_success_op_reports_success_branch_limit() {
+        let mut ops = (0..MAX_KV_TXN_OPS_PER_BRANCH)
+            .map(|index| KvOp::Delete {
+                key: format!("/success/{index}"),
+            })
+            .collect::<Vec<_>>();
+
+        let error = push_bounded_txn_success_op(
+            &mut ops,
+            KvOp::Delete {
+                key: "/success/overflow".to_string(),
+            },
+        )
+        .expect_err("success branch limit");
+
+        assert_eq!(ops.len(), MAX_KV_TXN_OPS_PER_BRANCH);
+        assert_eq!(
+            error,
+            KvError::TxnLimit {
+                compares: 0,
+                success_ops: MAX_KV_TXN_OPS_PER_BRANCH + 1,
+                failure_ops: 0,
+                max_compares: MAX_KV_TXN_COMPARES,
+                max_ops_per_branch: MAX_KV_TXN_OPS_PER_BRANCH,
+            }
+        );
+    }
+
+    #[test]
     fn txn_preflight_tracks_lease_state_without_partial_apply() {
         let mut store = InProcessKvStore::new();
         for index in 1..=MAX_ACTIVE_LEASES {

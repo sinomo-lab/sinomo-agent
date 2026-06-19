@@ -5,12 +5,12 @@ use crate::kv_local_store::{
     append_cluster_raft_command, read_cluster_kv_current_snapshot,
     read_cluster_kv_current_snapshot_arc, read_cluster_kv_entry,
 };
-use crate::kv_txn_ops::push_bounded_txn_success_op;
 use crate::local_state_store::{read_cluster_state, read_cluster_state_without_kv};
 use crate::member_mutation::ClusterMemberMutationAsyncHost;
 use crate::membership_rpc::{ClusterInvitePublishRequest, ClusterInvitePublishResponse};
 use crate::prelude::*;
 use crate::records::{ClusterInvitationStateRecord, cluster_invitation_state_stable_eq};
+use sinomo_kv::push_bounded_txn_success_op;
 
 pub trait ClusterInvitePublishHost {
     type Error: From<NetworkError> + ToString;

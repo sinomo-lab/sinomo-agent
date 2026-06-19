@@ -13,7 +13,6 @@ use crate::kv_local_store::{
     read_cluster_kv_cached_snapshot, read_cluster_kv_current_snapshot,
     read_cluster_kv_current_snapshot_arc, write_imported_cluster_kv_snapshot_if_changed,
 };
-use crate::kv_txn_ops::push_bounded_txn_success_op;
 use crate::local_state_store::read_cluster_state;
 use crate::member_mutation::ClusterMemberMutationAsyncHost;
 use crate::member_store::{MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS, cluster_member_stable_eq};
@@ -22,7 +21,7 @@ use crate::membership_rpc::{ClusterMemberPublishRequest, ClusterMemberPublishRes
 use crate::prelude::*;
 use crate::records::{ClusterCapabilityPolicyRecord, cluster_capability_policy_stable_eq};
 use crate::rpc_future::ClusterMembershipRpcFuture;
-use sinomo_kv::KvRevision;
+use sinomo_kv::{KvRevision, push_bounded_txn_success_op};
 
 pub trait ClusterMemberPublishHost {
     type Error: From<NetworkError> + ToString;

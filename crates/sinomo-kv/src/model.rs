@@ -227,6 +227,20 @@ pub(crate) fn validate_kv_txn_payload(txn: &KvTxn) -> Result<(), KvError> {
     validate_kv_payload_total(payload_bytes)
 }
 
+pub fn push_bounded_txn_success_op(ops: &mut Vec<KvOp>, op: KvOp) -> Result<(), KvError> {
+    if ops.len() >= MAX_KV_TXN_OPS_PER_BRANCH {
+        return Err(KvError::TxnLimit {
+            compares: 0,
+            success_ops: ops.len().saturating_add(1),
+            failure_ops: 0,
+            max_compares: MAX_KV_TXN_COMPARES,
+            max_ops_per_branch: MAX_KV_TXN_OPS_PER_BRANCH,
+        });
+    }
+    ops.push(op);
+    Ok(())
+}
+
 pub(crate) fn validate_kv_command_payload(command: &KvCommand) -> Result<(), KvError> {
     match command {
         KvCommand::Op(op) => {

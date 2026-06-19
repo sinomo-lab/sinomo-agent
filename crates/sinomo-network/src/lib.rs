@@ -34,7 +34,6 @@ mod kv_local_store;
 mod kv_read_model;
 mod kv_semantics;
 mod kv_snapshot;
-mod kv_txn_ops;
 mod kv_txn_quorum;
 mod kv_watch_store;
 mod lan;
