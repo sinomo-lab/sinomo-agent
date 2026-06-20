@@ -430,6 +430,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn stat(&self, path: &str) -> Result<FileManagerMetadata, String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
         let stat = service
             .posix_stat_distributed(&path)
             .map_err(|error| format!("cannot inspect {path}: {error}"))?;
@@ -442,22 +443,17 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn list_dir(&self, path: &str) -> Result<Vec<FileManagerEntry>, String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
         let entries = service
             .posix_list_dir_distributed(&path)
             .map_err(|error| format!("cannot list {path}: {error}"))?;
         let mut results = Vec::new();
         for entry in entries {
-            let stat = service.posix_stat_distributed(&entry.path).ok();
-            let kind = stat
-                .as_ref()
-                .map(|stat| sifs_entry_kind(&stat.kind))
-                .unwrap_or_else(|| sifs_entry_kind(&entry.kind));
-            let size = stat.and_then(|stat| stat.size_bytes);
             results.push(FileManagerEntry {
                 name: entry.name,
                 path: entry.path,
-                kind,
-                size,
+                kind: sifs_entry_kind(&entry.kind),
+                size: None,
             });
         }
         Ok(results)
@@ -466,6 +462,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn read_file_prefix(&self, path: &str, max_bytes: u64) -> Result<FileManagerRead, String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
         let stat = service
             .posix_stat_distributed(&path)
             .map_err(|error| format!("cannot inspect {path}: {error}"))?;
@@ -488,10 +485,15 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn directory_entry_count(&self, path: &str) -> Result<usize, String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
         service
             .posix_list_dir_distributed(&path)
             .map(|entries| entries.len())
             .map_err(|error| error.to_string())
+    }
+
+    fn eager_preview_enabled(&self) -> bool {
+        false
     }
 
     fn create_file(&self, path: &str) -> Result<(), String> {

@@ -15,7 +15,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use crate::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_PLANE_SERVICE_ROUTES, DFS_DIRECT_READ_ROUTE,
@@ -42,6 +43,25 @@ use sinomo_service::{
 
 const DFS_DEFAULT_ROUTE_CONCURRENCY_LIMIT: usize = 8;
 const DFS_DATA_PLANE_ROUTE_CONCURRENCY_LIMIT: usize = 64;
+
+fn dfs_service_perf_trace_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("SINOMO_DFS_PERF_TRACE")
+            .ok()
+            .is_some_and(|value| {
+                value == "1"
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("yes")
+            })
+    });
+    *ENABLED
+}
+
+fn dfs_service_perf_trace(args: std::fmt::Arguments<'_>) {
+    if dfs_service_perf_trace_enabled() {
+        eprintln!("[sinomo-dfs-perf] {args}");
+    }
+}
 
 /// DFS control-plane service. Host-agnostic: it derives everything from the request's
 /// [`ServiceContext::data_dir`], so it runs with or without a daemon/cluster.
@@ -155,8 +175,19 @@ impl Service for DfsService {
         Box::pin(async move {
             let response = match request.route.as_str() {
                 DFS_STATUS_ROUTE => {
+                    let started_at = Instant::now();
                     let _: () = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(DFS_STATUS_ROUTE, &dfs_status(&ctx.data_dir)?)?
+                    let status_started_at = Instant::now();
+                    let status = dfs_status(&ctx.data_dir)?;
+                    let status_ms = status_started_at.elapsed().as_millis();
+                    let response = ObjectRpcResponse::encode_body(DFS_STATUS_ROUTE, &status)?;
+                    dfs_service_perf_trace(format_args!(
+                        "service route={} status_ms={} total_ms={}",
+                        DFS_STATUS_ROUTE,
+                        status_ms,
+                        started_at.elapsed().as_millis()
+                    ));
+                    response
                 }
                 DFS_EXPOSE_CONFIG_ROUTE => {
                     let _: () = request.decode_body()?;
@@ -270,12 +301,30 @@ fn open_metadata_backend(
 
 /// Build the DFS operator status, then trim shard detail to the local node's role.
 fn dfs_status(data_dir: &SinomoDataDir) -> Result<DfsOperatorStatus, ServiceError> {
+    let started_at = Instant::now();
     data_dir.ensure_root_layout().map_err(service_error)?;
+    dfs_service_perf_trace(format_args!(
+        "status ensure_layout_ms={}",
+        started_at.elapsed().as_millis()
+    ));
+    let metadata_started_at = Instant::now();
     let metadata = open_metadata_backend(data_dir)?;
+    dfs_service_perf_trace(format_args!(
+        "status open_metadata_ms={} total_ms={}",
+        metadata_started_at.elapsed().as_millis(),
+        started_at.elapsed().as_millis()
+    ));
+    let inspector_started_at = Instant::now();
     let mut status = DfsOperatorInspector::new(metadata.as_ref())
         .status()
         .map_err(service_error)?;
+    dfs_service_perf_trace(format_args!(
+        "status inspector_ms={} total_ms={}",
+        inspector_started_at.elapsed().as_millis(),
+        started_at.elapsed().as_millis()
+    ));
     let cluster_paths = ClusterPaths::new(data_dir);
+    let trim_started_at = Instant::now();
     if let Ok(state) = read_cluster_state_without_kv(&cluster_paths) {
         for shard in &mut status.metadata_shards {
             if shard.primary_node_id.as_ref() == Some(&state.local_node_id) {
@@ -285,6 +334,11 @@ fn dfs_status(data_dir: &SinomoDataDir) -> Result<DfsOperatorStatus, ServiceErro
             }
         }
     }
+    dfs_service_perf_trace(format_args!(
+        "status trim_ms={} total_ms={}",
+        trim_started_at.elapsed().as_millis(),
+        started_at.elapsed().as_millis()
+    ));
     Ok(status)
 }
 

@@ -83,6 +83,9 @@ pub(crate) trait FileManagerBackend: fmt::Debug + Send + Sync {
     fn list_dir(&self, path: &str) -> Result<Vec<FileManagerEntry>, String>;
     fn read_file_prefix(&self, path: &str, max_bytes: u64) -> Result<FileManagerRead, String>;
     fn directory_entry_count(&self, path: &str) -> Result<usize, String>;
+    fn eager_preview_enabled(&self) -> bool {
+        true
+    }
     fn create_file(&self, path: &str) -> Result<(), String>;
     fn create_dir(&self, path: &str) -> Result<(), String>;
     fn rename(&self, from: &str, to: &str) -> Result<(), String>;
@@ -294,8 +297,9 @@ impl FileManagerState {
     }
 
     pub(crate) fn update_preview(&mut self) {
-        self.preview = match self.selected_entry() {
-            Some(entry) => self.preview_entry(entry),
+        self.preview = match self.selected_entry().cloned() {
+            Some(entry) if self.backend.eager_preview_enabled() => self.preview_entry(&entry),
+            Some(entry) => self.metadata_preview(&entry),
             None => FileManagerPreview::new("Empty", vec!["directory has no entries".to_string()]),
         };
     }
@@ -345,6 +349,21 @@ impl FileManagerState {
             }
             _ => self.file_preview(entry),
         }
+    }
+
+    fn metadata_preview(&self, entry: &FileManagerEntry) -> FileManagerPreview {
+        let mut lines = vec![format!("path: {}", entry.path)];
+        if let Some(size) = entry.size {
+            lines.push(format!("size: {}", format_file_size(size)));
+        }
+        let title = match entry.kind {
+            FileManagerEntryKind::Parent => "Parent".to_string(),
+            FileManagerEntryKind::Directory => format!("Directory {}", entry.name),
+            FileManagerEntryKind::File => format!("File {}", entry.name),
+            FileManagerEntryKind::Symlink => format!("Link {}", entry.name),
+            FileManagerEntryKind::Other => format!("Item {}", entry.name),
+        };
+        FileManagerPreview::new(title, lines)
     }
 
     fn directory_preview(&self, entry: &FileManagerEntry) -> FileManagerPreview {

@@ -974,8 +974,19 @@ where
         request: &ObjectRpcRequest,
         options: ClusterObjectRpcOptions,
     ) -> Result<ObjectRpcResponse, NetworkError> {
+        let trace = cluster_object_rpc_trace_enabled();
+        let relay_preference_started_at = Instant::now();
         let prefer_relay =
             cluster_endpoint_prefers_relay_from_paths_async(runtime, paths, endpoint).await?;
+        if trace {
+            eprintln!(
+                "sinomo cluster object rpc: endpoint={} transport={:?} prefer_relay={} relay_preference_ms={}",
+                endpoint.address,
+                endpoint.transport,
+                prefer_relay,
+                relay_preference_started_at.elapsed().as_millis()
+            );
+        }
         let mut relay_host = ClusterObjectRpcPathRelayHost {
             runtime: runtime.clone(),
             paths: paths.clone(),
@@ -1008,6 +1019,16 @@ where
             options.endpoint_selection,
         )
         .await?;
+        let trace = cluster_object_rpc_trace_enabled();
+        let call_started_at = Instant::now();
+        if trace {
+            eprintln!(
+                "sinomo cluster object rpc: target={} purpose={:?} selected_endpoints={}",
+                target_node_id,
+                options.endpoint_selection,
+                cluster_object_rpc_endpoint_trace_list(&endpoints)
+            );
+        }
         if endpoints.is_empty() {
             return Err(NetworkError::Io {
                 operation: "cluster node rpc target selection".to_string(),
@@ -1017,6 +1038,13 @@ where
 
         let mut failures = Vec::new();
         for endpoint in endpoints {
+            let attempt_started_at = Instant::now();
+            if trace {
+                eprintln!(
+                    "sinomo cluster object rpc: target={} attempt endpoint={} transport={:?}",
+                    target_node_id, endpoint.address, endpoint.transport
+                );
+            }
             match self
                 .call_endpoint_from_paths(
                     runtime,
@@ -1027,11 +1055,36 @@ where
                 )
                 .await
             {
-                Ok(response) => return Ok(response),
-                Err(error) => failures.push(format!(
-                    "{} ({:?}): {error}",
-                    endpoint.address, endpoint.transport
-                )),
+                Ok(response) => {
+                    if trace {
+                        eprintln!(
+                            "sinomo cluster object rpc: target={} endpoint={} transport={:?} ok attempt_ms={} total_ms={}",
+                            target_node_id,
+                            endpoint.address,
+                            endpoint.transport,
+                            attempt_started_at.elapsed().as_millis(),
+                            call_started_at.elapsed().as_millis()
+                        );
+                    }
+                    return Ok(response);
+                }
+                Err(error) => {
+                    if trace {
+                        eprintln!(
+                            "sinomo cluster object rpc: target={} endpoint={} transport={:?} error attempt_ms={} total_ms={} error={}",
+                            target_node_id,
+                            endpoint.address,
+                            endpoint.transport,
+                            attempt_started_at.elapsed().as_millis(),
+                            call_started_at.elapsed().as_millis(),
+                            error
+                        );
+                    }
+                    failures.push(format!(
+                        "{} ({:?}): {error}",
+                        endpoint.address, endpoint.transport
+                    ));
+                }
             }
         }
 
@@ -1047,6 +1100,28 @@ where
             ),
         })
     }
+}
+
+fn cluster_object_rpc_trace_enabled() -> bool {
+    std::env::var_os("SINOMO_TRACE_CLUSTER_OBJECT_RPC").is_some()
+}
+
+fn cluster_object_rpc_endpoint_trace_list(endpoints: &[ClusterEndpointRecord]) -> String {
+    endpoints
+        .iter()
+        .map(|endpoint| {
+            format!(
+                "{}:{:?}:priority={}:source={:?}:privacy={:?}:latency={:?}",
+                endpoint.address,
+                endpoint.transport,
+                endpoint.priority,
+                endpoint.source,
+                endpoint.privacy,
+                endpoint.last_observed_latency_ms
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 async fn cluster_object_rpc_node_targets(

@@ -1392,27 +1392,40 @@ struct DfsClusterNodeStatus {
 }
 
 fn inspect_cluster_dfs_status() -> Result<DfsClusterStatusReport, CliError> {
+    let trace = dfs_cluster_status_trace_enabled();
+    let started_at = std::time::Instant::now();
+    trace_dfs_cluster_status(trace, started_at, "start");
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_root_layout()?;
     let cluster_paths = ClusterPaths::new(&data_dir);
     let state = read_cluster_state(&cluster_paths)?;
+    trace_dfs_cluster_status(
+        trace,
+        started_at,
+        format_args!(
+            "loaded cluster state local={} members={}",
+            state.local_node_id,
+            state.members.len()
+        ),
+    );
+    let local_status_started_at = std::time::Instant::now();
+    let local_status =
+        sinomo_runtime::dfs::inspect_cluster_aware_dfs_status(&data_dir, &cluster_paths)?;
+    trace_dfs_cluster_status(
+        trace,
+        started_at,
+        format_args!(
+            "local status complete in {}ms",
+            local_status_started_at.elapsed().as_millis()
+        ),
+    );
     let mut nodes = vec![DfsClusterNodeStatus {
         node_id: state.local_node_id.clone(),
         local: true,
         endpoint: Some("local-daemon".to_string()),
-        status: Some(sinomo_runtime::dfs::inspect_cluster_aware_dfs_status(
-            &data_dir,
-            &cluster_paths,
-        )?),
+        status: Some(local_status),
         error: None,
     }];
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|source| CliError::Network {
-            address: "cluster dfs status".to_string(),
-            detail: source.to_string(),
-        })?;
     let remote_node_ids = state
         .members
         .iter()
@@ -1425,61 +1438,228 @@ fn inspect_cluster_dfs_status() -> Result<DfsClusterStatusReport, CliError> {
         })
         .map(|member| member.node_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
+    trace_dfs_cluster_status(
+        trace,
+        started_at,
+        format_args!("remote probes={}", remote_node_ids.len()),
+    );
+    let remote_timeout = std::time::Duration::from_secs(5);
+    let mut probes = Vec::new();
     for node_id in remote_node_ids {
-        nodes.push(
-            match fetch_dfs_status_from_node(
-                runtime.handle(),
-                &cluster_paths,
-                &state,
-                &node_id,
-                std::time::Duration::from_secs(5),
-            ) {
-                Ok(status) => DfsClusterNodeStatus {
-                    node_id,
-                    local: false,
-                    endpoint: Some("cluster-object-rpc".to_string()),
-                    status: Some(status),
-                    error: None,
-                },
-                Err(error) => DfsClusterNodeStatus {
-                    node_id,
-                    local: false,
-                    endpoint: None,
-                    status: None,
-                    error: Some(error.to_string()),
-                },
-            },
-        );
+        probes.push(spawn_dfs_status_probe(
+            &cluster_paths,
+            &state,
+            &node_id,
+            remote_timeout,
+            trace,
+        )?);
     }
-    runtime.shutdown_timeout(std::time::Duration::from_millis(250));
+    for probe in probes {
+        let node_id = probe.node_id.clone();
+        nodes.push(match receive_dfs_status_probe(probe, trace, started_at) {
+            Ok(status) => DfsClusterNodeStatus {
+                node_id,
+                local: false,
+                endpoint: Some("cluster-object-rpc".to_string()),
+                status: Some(status),
+                error: None,
+            },
+            Err(error) => DfsClusterNodeStatus {
+                node_id,
+                local: false,
+                endpoint: None,
+                status: None,
+                error: Some(error.to_string()),
+            },
+        });
+    }
+    trace_dfs_cluster_status(
+        trace,
+        started_at,
+        format_args!("complete nodes={}", nodes.len()),
+    );
     Ok(DfsClusterStatusReport { nodes })
 }
 
-fn fetch_dfs_status_from_node(
-    runtime: &tokio::runtime::Handle,
+struct DfsStatusProbe {
+    node_id: NodeId,
+    started_at: std::time::Instant,
+    timeout: std::time::Duration,
+    receiver: std::sync::mpsc::Receiver<Result<sinomo_runtime::dfs::DfsOperatorStatus, CliError>>,
+}
+
+fn spawn_dfs_status_probe(
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_runtime::core::ClusterBootstrapState,
+    node_id: &NodeId,
+    timeout: std::time::Duration,
+    trace: bool,
+) -> Result<DfsStatusProbe, CliError> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let cluster_paths = cluster_paths.clone();
+    let state = state.clone();
+    let node_id = node_id.clone();
+    let worker_node_id = node_id.clone();
+    let node_id_label = node_id.to_string();
+    let started_at = std::time::Instant::now();
+    let thread_name = format!("sinomo-dfs-status-{node_id}");
+    std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            if trace {
+                eprintln!("sinomo dfs cluster status node={worker_node_id}: probe start");
+            }
+            let result = fetch_dfs_status_from_node_blocking(
+                &cluster_paths,
+                &state,
+                &worker_node_id,
+                timeout,
+            );
+            if trace {
+                eprintln!(
+                    "sinomo dfs cluster status node={worker_node_id}: probe done in {}ms",
+                    started_at.elapsed().as_millis()
+                );
+            }
+            let _ = sender.send(result);
+        })
+        .map_err(|source| CliError::Network {
+            address: format!("cluster dfs status {node_id_label}"),
+            detail: format!("failed to start probe thread: {source}"),
+        })?;
+    Ok(DfsStatusProbe {
+        node_id,
+        started_at,
+        timeout,
+        receiver,
+    })
+}
+
+fn receive_dfs_status_probe(
+    probe: DfsStatusProbe,
+    trace: bool,
+    trace_started_at: std::time::Instant,
+) -> Result<sinomo_runtime::dfs::DfsOperatorStatus, CliError> {
+    let remaining = probe
+        .timeout
+        .checked_sub(probe.started_at.elapsed())
+        .unwrap_or_default();
+    let result = if remaining.is_zero() {
+        probe.receiver.try_recv().map_err(|source| match source {
+            std::sync::mpsc::TryRecvError::Empty => std::sync::mpsc::RecvTimeoutError::Timeout,
+            std::sync::mpsc::TryRecvError::Disconnected => {
+                std::sync::mpsc::RecvTimeoutError::Disconnected
+            }
+        })
+    } else {
+        probe.receiver.recv_timeout(remaining)
+    };
+    let result = match result {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(CliError::Network {
+            address: format!("cluster dfs status {}", probe.node_id),
+            detail: format!("timed out after {}ms", probe.timeout.as_millis()),
+        }),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(CliError::Network {
+            address: format!("cluster dfs status {}", probe.node_id),
+            detail: "probe thread exited without a result".to_string(),
+        }),
+    };
+    if trace {
+        let outcome = if result.is_ok() { "ok" } else { "error" };
+        trace_dfs_cluster_status(
+            true,
+            trace_started_at,
+            format_args!(
+                "probe result node={} outcome={} elapsed={}ms",
+                probe.node_id,
+                outcome,
+                probe.started_at.elapsed().as_millis()
+            ),
+        );
+    }
+    result
+}
+
+fn dfs_cluster_status_trace_enabled() -> bool {
+    std::env::var_os("SINOMO_TRACE_DFS_CLUSTER_STATUS").is_some()
+}
+
+fn trace_dfs_cluster_status(
+    enabled: bool,
+    started_at: std::time::Instant,
+    message: impl std::fmt::Display,
+) {
+    if enabled {
+        eprintln!(
+            "sinomo dfs cluster status +{}ms: {message}",
+            started_at.elapsed().as_millis()
+        );
+    }
+}
+
+fn fetch_dfs_status_from_node_blocking(
     cluster_paths: &ClusterPaths,
     state: &sinomo_runtime::core::ClusterBootstrapState,
     node_id: &NodeId,
     timeout: std::time::Duration,
 ) -> Result<sinomo_runtime::dfs::DfsOperatorStatus, CliError> {
+    let trace = dfs_cluster_status_trace_enabled();
+    let started_at = std::time::Instant::now();
     let rpc_request = sinomo_runtime::dfs::dfs_status_rpc_request()?;
+    if trace {
+        eprintln!(
+            "sinomo dfs cluster status node={node_id} +{}ms: request built",
+            started_at.elapsed().as_millis()
+        );
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| CliError::Network {
+            address: format!("cluster dfs status {node_id}"),
+            detail: source.to_string(),
+        })?;
+    if trace {
+        eprintln!(
+            "sinomo dfs cluster status node={node_id} +{}ms: runtime ready",
+            started_at.elapsed().as_millis()
+        );
+    }
     let mut host = CliSignedEndpointRpcHost::new(
         Some(state.cluster_id.clone()),
         "dfs status object rpc signing",
     );
-    let mut client = network::ClusterObjectRpcClient::routed(&mut host, runtime, cluster_paths);
-    let response = runtime
-        .block_on(client.call_node(
-            state,
-            node_id,
-            &rpc_request,
-            network::ClusterObjectRpcNodeOptions::new(
-                network::ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates,
-                network::DaemonRpcTimeouts::connect_and_idle(timeout),
-            ),
-        ))
-        .map_err(CliError::from)?;
-    sinomo_runtime::dfs::decode_dfs_status_rpc_response(&response).map_err(Into::into)
+    let mut client =
+        network::ClusterObjectRpcClient::routed(&mut host, runtime.handle(), cluster_paths);
+    let response = runtime.block_on(client.call_node(
+        state,
+        node_id,
+        &rpc_request,
+        network::ClusterObjectRpcNodeOptions::new(
+            network::ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates,
+            network::DaemonRpcTimeouts::connect_and_idle(timeout),
+        ),
+    ));
+    if trace {
+        let outcome = if response.is_ok() { "ok" } else { "error" };
+        eprintln!(
+            "sinomo dfs cluster status node={node_id} +{}ms: rpc {outcome}",
+            started_at.elapsed().as_millis()
+        );
+    }
+    runtime.shutdown_timeout(std::time::Duration::from_millis(250));
+    let response = response.map_err(CliError::from)?;
+    let decoded =
+        sinomo_runtime::dfs::decode_dfs_status_rpc_response(&response).map_err(Into::into);
+    if trace {
+        let outcome = if decoded.is_ok() { "ok" } else { "error" };
+        eprintln!(
+            "sinomo dfs cluster status node={node_id} +{}ms: decode {outcome}",
+            started_at.elapsed().as_millis()
+        );
+    }
+    decoded
 }
 
 fn decode_dfs_advertisements(

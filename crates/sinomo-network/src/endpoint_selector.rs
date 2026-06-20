@@ -419,15 +419,6 @@ fn cluster_endpoint_transfer_profile_for_targets<'e>(
     profile
 }
 
-pub(crate) fn cluster_sync_targets_with_connectivity(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Vec<ClusterEndpointRecord> {
-    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
-    let node_statuses = cluster_node_status_map_from_kv(paths);
-    cluster_sync_targets_with_connectivity_context(state, &graph, &node_statuses)
-}
-
 fn cluster_sync_targets_with_connectivity_context(
     state: &ClusterBootstrapState,
     graph: &ClusterConnectivityGraph,
@@ -447,6 +438,16 @@ fn cluster_sync_targets_with_connectivity_context(
         )
     });
     endpoints
+}
+
+#[cfg(test)]
+pub(crate) fn cluster_sync_targets_with_connectivity(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
+    let node_statuses = cluster_node_status_map_from_kv(paths);
+    cluster_sync_targets_with_connectivity_context(state, &graph, &node_statuses)
 }
 
 pub(crate) fn cluster_raft_command_targets_impl(
@@ -631,11 +632,29 @@ pub(crate) fn cluster_daemon_command_targets_impl(
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
     let graph = ClusterConnectivityGraph::read_for_local(paths, state);
-    prefer_bounded_daemon_command_targets(
-        cluster_sync_targets_with_connectivity(paths, state)
-            .into_iter()
-            .filter(|endpoint| cluster_daemon_command_endpoint_is_usable(&graph, endpoint)),
-    )
+    let node_statuses = cluster_node_status_map_from_kv(paths);
+    let sync_targets =
+        cluster_sync_targets_with_connectivity_context(state, &graph, &node_statuses);
+    let trace = cluster_endpoint_selector_trace_enabled();
+    let usable_targets = sync_targets
+        .iter()
+        .filter(|endpoint| cluster_daemon_command_endpoint_is_usable(&graph, endpoint))
+        .cloned()
+        .collect::<Vec<_>>();
+    let selected = prefer_bounded_daemon_command_targets(usable_targets);
+    if trace {
+        cluster_endpoint_selector_trace(
+            trace,
+            format_args!(
+                "daemon-command-targets sync={} usable={} selected={} sync_targets={}",
+                sync_targets.len(),
+                selected.len(),
+                cluster_endpoint_selector_endpoint_list(&selected),
+                cluster_endpoint_selector_endpoint_list_with_graph(&sync_targets, &graph)
+            ),
+        );
+    }
+    selected
 }
 
 fn cluster_daemon_command_endpoint_is_usable(
@@ -678,6 +697,7 @@ pub(crate) fn cluster_main_daemon_command_endpoint_candidates_impl(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
+    let trace = cluster_endpoint_selector_trace_enabled();
     let main_daemon_node_ids = state
         .members
         .iter()
@@ -691,14 +711,26 @@ pub(crate) fn cluster_main_daemon_command_endpoint_candidates_impl(
         })
         .map(|member| member.node_id.clone())
         .collect::<BTreeSet<_>>();
-    cluster_daemon_command_targets_impl(paths, state)
+    let command_targets = cluster_daemon_command_targets_impl(paths, state);
+    let selected = command_targets
         .into_iter()
         .filter(|endpoint| {
             endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
                 && main_daemon_node_ids.contains(&endpoint.node_id)
                 && !cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if trace {
+        cluster_endpoint_selector_trace(
+            trace,
+            format_args!(
+                "main-daemon-command-candidates main_nodes={:?} selected={}",
+                main_daemon_node_ids,
+                cluster_endpoint_selector_endpoint_list(&selected)
+            ),
+        );
+    }
+    selected
 }
 
 pub(crate) fn cluster_endpoint_identifies_shadow_daemon_for_node(
@@ -783,6 +815,50 @@ fn cluster_endpoint_address_port(address: &str) -> Option<u16> {
         return Some(socket.port());
     }
     address.rsplit_once(':')?.1.parse::<u16>().ok()
+}
+
+fn cluster_endpoint_selector_trace_enabled() -> bool {
+    std::env::var_os("SINOMO_TRACE_CLUSTER_ENDPOINT_SELECTOR").is_some()
+        || std::env::var_os("SINOMO_TRACE_CLUSTER_OBJECT_RPC").is_some()
+}
+
+fn cluster_endpoint_selector_trace(enabled: bool, args: std::fmt::Arguments<'_>) {
+    if enabled {
+        eprintln!("sinomo cluster endpoint selector: {args}");
+    }
+}
+
+fn cluster_endpoint_selector_endpoint_list(endpoints: &[ClusterEndpointRecord]) -> String {
+    endpoints
+        .iter()
+        .map(|endpoint| {
+            format!(
+                "{}:{}:{:?}",
+                endpoint.node_id, endpoint.address, endpoint.transport
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn cluster_endpoint_selector_endpoint_list_with_graph(
+    endpoints: &[ClusterEndpointRecord],
+    graph: &ClusterConnectivityGraph,
+) -> String {
+    endpoints
+        .iter()
+        .map(|endpoint| {
+            format!(
+                "{}:{}:{:?}:state={:?}:privacy={:?}",
+                endpoint.node_id,
+                endpoint.address,
+                endpoint.transport,
+                graph.state_for_endpoint(endpoint),
+                endpoint.privacy
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub(crate) fn cluster_member_publish_targets_voter_first_impl(
