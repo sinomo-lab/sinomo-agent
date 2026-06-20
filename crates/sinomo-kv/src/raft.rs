@@ -1434,6 +1434,7 @@ pub fn cluster_kv_raft_snapshot_byte_limit() -> u64 {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn set_cluster_kv_raft_snapshot_byte_limit_for_test(limit: u64) -> u64 {
     CLUSTER_KV_RAFT_SNAPSHOT_BYTES_LIMIT_FOR_TEST.swap(limit, Ordering::Relaxed)
 }

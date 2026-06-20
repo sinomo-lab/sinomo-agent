@@ -713,7 +713,9 @@ pub fn dfs_routed_message_rpc_request(
     dfs_message_rpc_request(&dfs_message_command_from_routed_message(message.clone()))
 }
 
-fn dfs_message_rpc_request(command: &DfsMessageCommand) -> Result<ObjectRpcRequest, NetworkError> {
+pub fn dfs_message_rpc_request(
+    command: &DfsMessageCommand,
+) -> Result<ObjectRpcRequest, NetworkError> {
     let mut request =
         ObjectRpcRequest::encode_body(dfs_message_route(command), DFS_RPC_CATEGORY, command)?;
     sinomo_network::set_object_rpc_request_stream_mode(
@@ -723,7 +725,7 @@ fn dfs_message_rpc_request(command: &DfsMessageCommand) -> Result<ObjectRpcReque
     Ok(request)
 }
 
-fn decode_dfs_message_rpc_response(
+pub fn decode_dfs_message_rpc_response(
     response: &ObjectRpcResponse,
 ) -> Result<DfsMessageResponse, NetworkError> {
     response.decode_body()

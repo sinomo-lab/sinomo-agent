@@ -1131,6 +1131,7 @@ impl InProcessKvStore {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn matching_watch_ids_for_event_key_for_test(&self, key: &str) -> Vec<WatchId> {
         let mut watch_ids = self.matching_watch_ids_for_event_key(key);
         watch_ids.sort();
