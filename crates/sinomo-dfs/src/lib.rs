@@ -17,8 +17,8 @@ pub use content_store::{
     BlobRangeReader, BlobReader, ChunkedBlobAssembler, ContentManifest, ContentStoreError,
     ContentStoreGcOptions, ContentStoreGcReport, ContentStoreQuota, ContentStoreQuotaResource,
     ContentStoreQuotaUsage, ContentStoreScrubIssue, ContentStoreScrubReport, ContentStoreStats,
-    ContentStoreVersionGcOptions, ContentStoreVersionGcReport, LocalContentStore,
-    ObjectVersionReader,
+    ContentStoreVersionGcOptions, ContentStoreVersionGcReport, ContentVersionIdentity,
+    LocalContentStore, ObjectVersionReader,
 };
 pub use control_plane::{
     AsyncDfsControlPlaneKvClient, DfsControlPlaneAsyncStore, DfsControlPlaneKvClient,
@@ -12589,14 +12589,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return;
         }
         let live_path = path_index_key(&object.file_system_id, &object.path).map(|(_, path)| path);
-        if self
-            .metadata
-            .object_by_normalized_posix_path(
-                &object.file_system_id,
-                live_path.as_deref().unwrap_or(&object.path),
-            )
-            .is_none()
-        {
+        let visible_object = self.metadata.object_by_normalized_posix_path(
+            &object.file_system_id,
+            live_path.as_deref().unwrap_or(&object.path),
+        );
+        if visible_object.is_none_or(|visible| visible.version < object.version) {
             self.track_metadata_tombstone(object);
         }
     }
@@ -14050,13 +14047,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(None);
         }
 
-        let patch_info = match self.content.put_object_version_patch_with_info(
-            request.object_id.as_str(),
-            expected_base_version.as_str(),
-            request.target_version.as_str(),
-            offset,
-            bytes,
-        ) {
+        let base_identity = object_content_identity(&object);
+        let patch_info = match self
+            .content
+            .put_object_version_patch_with_info_and_base_identity(
+                request.object_id.as_str(),
+                expected_base_version.as_str(),
+                request.target_version.as_str(),
+                offset,
+                bytes,
+                base_identity.as_ref(),
+            ) {
             Ok(patch_info) => patch_info,
             Err(_) => return Ok(None),
         };
@@ -14226,14 +14227,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(None);
         }
 
+        let base_identity = object_content_identity(&object);
         let patch_info = self
             .content
-            .put_object_version_patch_from_reader_with_info(
+            .put_object_version_patch_from_reader_with_info_and_base_identity(
                 request.object_id.as_str(),
                 expected_base_version.as_str(),
                 request.target_version.as_str(),
                 offset,
                 reader,
+                base_identity.as_ref(),
             )?;
         let manifest = patch_info.manifest;
         let Some(patch_hash) = patch_info.patch_hash.clone() else {
@@ -14380,14 +14383,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(None);
         }
 
-        let manifest = match self.content.put_object_version_patch(
-            request.object_id.as_str(),
-            expected_base_version.as_str(),
-            request.target_version.as_str(),
-            offset,
-            bytes,
-        ) {
-            Ok(manifest) => manifest,
+        let base_identity = object_content_identity(&object);
+        let manifest = match self
+            .content
+            .put_object_version_patch_with_info_and_base_identity(
+                request.object_id.as_str(),
+                expected_base_version.as_str(),
+                request.target_version.as_str(),
+                offset,
+                bytes,
+                base_identity.as_ref(),
+            ) {
+            Ok(patch_info) => patch_info.manifest,
             Err(_) => return Ok(None),
         };
         self.commit_self_only_eventual_patch_manifest(request, object, manifest)
@@ -14460,13 +14467,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(None);
         }
 
-        let manifest = self.content.put_object_version_patch_from_reader(
-            request.object_id.as_str(),
-            expected_base_version.as_str(),
-            request.target_version.as_str(),
-            offset,
-            reader,
-        )?;
+        let base_identity = object_content_identity(&object);
+        let manifest = self
+            .content
+            .put_object_version_patch_from_reader_with_base_identity(
+                request.object_id.as_str(),
+                expected_base_version.as_str(),
+                request.target_version.as_str(),
+                offset,
+                reader,
+                base_identity.as_ref(),
+            )?;
         self.commit_self_only_eventual_patch_manifest(request, object, manifest)
     }
 
@@ -16538,6 +16549,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     remote_intent_alias = Some((intent_id.clone(), pending.clone()));
                 }
             }
+            DfsDistributedWriteResult::Outcome {
+                outcome: outcome @ NetworkedDfsWriteOutcome::Committed { intent_id, .. },
+            } => {
+                pending.result = Some(Ok(outcome.clone()));
+                if intent_id != &response.request_id {
+                    remote_intent_alias = Some((intent_id.clone(), pending.clone()));
+                }
+            }
             DfsDistributedWriteResult::Outcome { outcome } => {
                 pending.result = Some(Ok(outcome.clone()));
             }
@@ -17439,7 +17458,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     operation.clone(),
                     timeout,
                     false,
-                    true,
+                    false,
                 )?;
             match settled.result {
                 DfsNamespaceResult::Applied => return Ok(settled.synced_path_object),
@@ -17489,7 +17508,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     operation.clone(),
                     timeout,
                     false,
-                    true,
+                    false,
                 )?;
             match settled.result {
                 DfsNamespaceResult::Applied => return Ok(settled.synced_path_objects),
@@ -19150,6 +19169,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )
             })
             .and_then(|()| {
+                let base_identity = self.patch_base_identity_for_current_object(
+                    &command.object_id,
+                    &command.base_version,
+                )?;
                 self.store_command_patch(
                     &command.object_id,
                     &command.base_version,
@@ -19158,6 +19181,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     command.offset,
                     &command.patch_hash,
                     &command.bytes,
+                    base_identity.as_ref(),
                 )
             }) {
             Ok(()) => {
@@ -19446,11 +19470,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .incoming_patch_transfers
             .remove(&transfer_key)
             .expect("completed transfer");
-        let manifest = match self.content.commit_chunked_object_version_patch(
-            transfer.chunks.assembler,
-            transfer.base_version.as_str(),
-            transfer.offset,
-        ) {
+        let base_identity = self
+            .patch_base_identity_for_current_object(&transfer.object_id, &transfer.base_version)?;
+        let manifest = match self
+            .content
+            .commit_chunked_object_version_patch_with_base_identity(
+                transfer.chunks.assembler,
+                transfer.base_version.as_str(),
+                transfer.offset,
+                base_identity.as_ref(),
+            ) {
             Ok(manifest) => manifest,
             Err(error) => {
                 return self.reject_stage_patch_chunk(
@@ -20111,6 +20140,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         Ok(())
+    }
+
+    fn patch_base_identity_for_current_object(
+        &self,
+        object_id: &DfsObjectId,
+        base_version: &DfsVersion,
+    ) -> Result<Option<ContentVersionIdentity>, DfsError> {
+        let current = if let Some(backend) = self.metadata_backend.as_ref() {
+            backend.get_object(object_id)?
+        } else {
+            self.metadata.object(object_id).cloned()
+        };
+        Ok(current
+            .as_ref()
+            .filter(|object| object.version == *base_version)
+            .and_then(object_content_identity))
     }
 
     fn ensure_no_conflicting_pending_replica_write(
@@ -25604,6 +25649,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         if object.current_locations.contains(replica_node_id) {
+            self.metadata.add_object(object.clone())?;
             self.put_visible_object_in_metadata_backend(&object)?;
             return Ok(());
         }
@@ -26151,6 +26197,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         expected_patch_hash: &str,
         bytes: &[u8],
+        base_identity: Option<&ContentVersionIdentity>,
     ) -> Result<(), DfsError> {
         let actual_patch_hash = content_hash(bytes);
         if actual_patch_hash != expected_patch_hash {
@@ -26159,13 +26206,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 actual: actual_patch_hash,
             });
         }
-        let manifest = self.content.put_object_version_patch(
-            object_id.as_str(),
-            base_version.as_str(),
-            target_version.as_str(),
-            offset,
-            bytes,
-        )?;
+        let manifest = self
+            .content
+            .put_object_version_patch_with_info_and_base_identity(
+                object_id.as_str(),
+                base_version.as_str(),
+                target_version.as_str(),
+                offset,
+                bytes,
+                base_identity,
+            )?
+            .manifest;
         if manifest.content_hash != expected_hash {
             return Err(DfsError::ContentHashMismatch {
                 expected: expected_hash.to_string(),
@@ -26540,6 +26591,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn write_outcome(&self, intent_id: &str) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        if let Some(intent) = self.coordinator.intent(intent_id)
+            && matches!(intent.state, DfsWriteIntentState::Committed)
+        {
+            return self.local_write_outcome(intent_id, intent);
+        }
         if let Some(pending) = self.pending_routed_writes.get(intent_id) {
             match &pending.result {
                 Some(Ok(outcome)) => return Ok(outcome.clone()),
@@ -27298,6 +27354,13 @@ fn read_small_blob_from_reader(
 
 pub(crate) fn content_hash(bytes: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(bytes).to_hex())
+}
+
+fn object_content_identity(object: &DfsObjectMetadata) -> Option<ContentVersionIdentity> {
+    Some(ContentVersionIdentity {
+        content_hash: object.content_hash.clone()?,
+        size_bytes: object.content_size_bytes?,
+    })
 }
 
 fn routed_write_command_content_hash(command: &DfsDistributedWriteCommand) -> String {

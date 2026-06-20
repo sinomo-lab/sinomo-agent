@@ -263,6 +263,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 intent_id = next_intent_id.clone();
             }
             if !matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }) {
+                let (_, repair_events) = self.retry_pending_repairs_best_effort();
+                if !repair_events.is_empty() {
+                    events.extend(repair_events);
+                    self.last_events = events;
+                }
                 return Ok(outcome);
             }
             let (scheduled, repair_events) = self.retry_pending_repairs_best_effort();
@@ -536,7 +541,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
             }
         }
-        let mut hydrated_local_replica_miss = false;
         for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
             if let Some(object) = self.lookup_sifs_path(&resolved)?
                 && object.kind != DfsObjectKind::Tombstone
@@ -566,12 +570,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 break;
             };
             if self.is_local_metadata_replica_for_shard(&shard) {
-                if !hydrated_local_replica_miss {
-                    self.hydrate_from_metadata_backend()?;
-                    hydrated_local_replica_miss = true;
-                    resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
-                    continue;
-                }
                 if shard.primary_node_id != self.node_id
                     && let Some(object) = self.route_namespace_lookup_path_to_metadata_primary(
                         sifs_file_system_id(),
