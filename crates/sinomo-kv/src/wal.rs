@@ -186,6 +186,7 @@ pub(crate) fn record_durable_state_path_exists_probe_for_test(path: &Path) {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn reset_durable_state_path_exists_probes_for_test(paths: &KvWalPaths) {
     if let Ok(mut probes) = durable_state_path_exists_probes_for_test().lock() {
         probes.remove(&paths.hard_state);
@@ -195,6 +196,7 @@ pub(crate) fn reset_durable_state_path_exists_probes_for_test(paths: &KvWalPaths
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn durable_state_path_exists_probe_count_for_test(paths: &KvWalPaths) -> u64 {
     durable_state_path_exists_probes_for_test()
         .lock()
@@ -422,6 +424,7 @@ pub(crate) fn record_persisted_hard_state_actual_read_for_test(path: &Path) {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn reset_persisted_hard_state_actual_reads_for_test(path: &Path) {
     if let Ok(mut reads) = persisted_hard_state_reads_for_test().lock() {
         reads.remove(path);
@@ -429,6 +432,7 @@ pub(crate) fn reset_persisted_hard_state_actual_reads_for_test(path: &Path) {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn persisted_hard_state_actual_reads_for_test(path: &Path) -> u64 {
     persisted_hard_state_reads_for_test()
         .lock()
@@ -756,6 +760,7 @@ pub(crate) fn record_required_object_file_read_for_test(path: &Path) {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn reset_required_object_file_reads_for_test(path: &Path) {
     if let Ok(mut reads) = required_object_file_reads_for_test().lock() {
         reads.remove(path);
@@ -763,6 +768,7 @@ pub(crate) fn reset_required_object_file_reads_for_test(path: &Path) {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn required_object_file_read_count_for_test(path: &Path) -> u64 {
     required_object_file_reads_for_test()
         .lock()

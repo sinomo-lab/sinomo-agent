@@ -13,6 +13,7 @@ pub use event_log::{
     read_cluster_kv_watch_events_with_observer, write_cluster_kv_watch_event_checkpoint,
 };
 #[cfg(test)]
+#[allow(unused_imports)]
 pub(crate) use event_log::{
     append_cluster_kv_watch_event_log_batch_to_file, decode_cluster_kv_watch_event_log_record,
     encode_cluster_kv_watch_event_log_batch, lock_cluster_kv_watch_event_log_for_append,

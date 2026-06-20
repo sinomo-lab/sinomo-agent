@@ -1,4 +1,7 @@
+include!("../src/root.rs");
+
 use crate::internal::*;
+use std::io::Write;
 
 #[cfg(test)]
 mod tests {
