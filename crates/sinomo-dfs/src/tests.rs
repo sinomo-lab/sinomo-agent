@@ -25868,7 +25868,7 @@ fn sifs_non_replica_node_reads_converge_via_sync_pulls() {
 }
 
 #[test]
-fn sifs_replica_distributed_stat_checks_primary_before_returning_stale_live_entry() {
+fn sifs_replica_distributed_stat_uses_local_hit_without_primary_lookup() {
     let mut cluster = sifs_posix_cluster("sifs-replica-stat-stale-live");
     let path = "/users/stat-stale-live.txt";
     let bytes = b"writer-local stale entry should lose to primary tombstone".to_vec();
@@ -25880,40 +25880,23 @@ fn sifs_replica_distributed_stat_checks_primary_before_returning_stale_live_entr
     );
     assert!(cluster.writer.posix_stat(path).is_ok());
 
-    let SifsPosixCluster {
-        root,
-        mut primary,
-        mut writer,
-        ..
-    } = cluster;
-
-    primary.posix_unlink(path).expect("primary unlink");
+    cluster.primary.posix_unlink(path).expect("primary unlink");
     assert!(matches!(
-        primary.posix_stat(path),
+        cluster.primary.posix_stat(path),
         Err(DfsPosixError::NotFound { .. })
     ));
     assert!(
-        writer.posix_stat(path).is_ok(),
+        cluster.writer.posix_stat(path).is_ok(),
         "test setup must leave a stale local live entry on the writer"
     );
 
-    let stop_primary = Arc::new(AtomicBool::new(false));
-    let primary_stop = Arc::clone(&stop_primary);
-    let primary_thread = std::thread::spawn(move || {
-        while !primary_stop.load(Ordering::SeqCst) {
-            primary.process_incoming().expect("primary pump");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        primary
-    });
+    let stale_stat = cluster
+        .writer
+        .posix_stat_distributed(path)
+        .expect("configured replica serves its local hit without a primary lookup");
+    assert_eq!(stale_stat.size_bytes, Some(bytes.len() as u64));
 
-    let stat_result = writer.posix_stat_distributed(path);
-    stop_primary.store(true, Ordering::SeqCst);
-    primary_thread.join().expect("primary thread");
-
-    assert!(matches!(stat_result, Err(DfsPosixError::NotFound { .. })));
-
-    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&cluster.root).ok();
 }
 
 #[test]

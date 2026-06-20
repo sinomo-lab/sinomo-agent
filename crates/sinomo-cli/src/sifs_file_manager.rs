@@ -20,12 +20,16 @@ use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::NodeId;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const SIFS_ENDPOINT_TARGET_REFRESH_TTL: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub(crate) struct SifsFileManagerBackend {
     data_dir: SinomoDataDir,
     rpc_runtime: SifsRpcRuntime,
     service: Mutex<NetworkedDfsService<DfsEndpointTransport>>,
+    endpoint_targets_refreshed_at: Mutex<Option<Instant>>,
     replica_candidates: Vec<NodeId>,
 }
 
@@ -64,6 +68,7 @@ impl SifsFileManagerBackend {
             data_dir: data_dir.clone(),
             rpc_runtime,
             service: Mutex::new(service),
+            endpoint_targets_refreshed_at: Mutex::new(Some(Instant::now())),
             replica_candidates,
         })
     }
@@ -80,14 +85,35 @@ impl SifsFileManagerBackend {
         &self,
         service: &mut NetworkedDfsService<DfsEndpointTransport>,
     ) {
-        let cluster_paths = ClusterPaths::new(&self.data_dir);
-        if !cluster_paths.state.exists() {
+        let now = Instant::now();
+        if let Ok(mut refreshed_at) = self.endpoint_targets_refreshed_at.lock() {
+            if refreshed_at
+                .as_ref()
+                .is_some_and(|last| now.duration_since(*last) < SIFS_ENDPOINT_TARGET_REFRESH_TTL)
+            {
+                return;
+            }
+            if self.refresh_service_endpoint_targets_now(service) {
+                *refreshed_at = Some(now);
+            }
             return;
         }
+        let _ = self.refresh_service_endpoint_targets_now(service);
+    }
+
+    fn refresh_service_endpoint_targets_now(
+        &self,
+        service: &mut NetworkedDfsService<DfsEndpointTransport>,
+    ) -> bool {
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        if !cluster_paths.state.exists() {
+            return false;
+        }
         let Ok(state) = network::read_cluster_state_without_kv(&cluster_paths) else {
-            return;
+            return false;
         };
         service.refresh_endpoint_targets(cluster_dfs_data_endpoints(&cluster_paths, &state));
+        true
     }
 
     pub(crate) fn publish_metadata_after_mutation(&self) {
