@@ -4,6 +4,13 @@ use crate::internal::*;
 use std::io::Write;
 
 #[cfg(test)]
+#[path = "kv/cluster_hardening.rs"]
+mod cluster_hardening;
+#[cfg(test)]
+#[path = "kv/power_loss.rs"]
+mod power_loss;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
