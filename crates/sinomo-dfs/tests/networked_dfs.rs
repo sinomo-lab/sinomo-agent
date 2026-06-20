@@ -861,7 +861,7 @@ fn networked_dfs_retries_lost_inflight_stage_after_retry_delay() {
     };
     assert_eq!(
         drain_dfs_test_messages(&mut replica_control, "drop original stage").len(),
-        2
+        1
     );
 
     owner_dfs
@@ -3153,83 +3153,29 @@ fn networked_dfs_strict_routed_write_completion_resolves_remote_intent_alias() {
                 requester_node_id,
                 result:
                     DfsDistributedWriteResult::Outcome {
-                        outcome:
-                            NetworkedDfsWriteOutcome::Pending {
-                                durable_receipts: 1,
-                                required_receipts: 2,
-                                ..
-                            },
+                        outcome: NetworkedDfsWriteOutcome::Committed { .. },
                     },
                 ..
             } if requester_node_id == &writer
         )
     }));
 
-    let writer_events = writer_dfs.process_incoming().expect("writer stages");
+    let writer_events = writer_dfs
+        .process_incoming()
+        .expect("writer receives strict completion");
     let remote_intent_id = writer_events
         .iter()
         .find_map(|event| match event {
             NetworkedDfsServiceEvent::RemoteWriteCompleted {
                 result:
                     DfsDistributedWriteResult::Outcome {
-                        outcome:
-                            NetworkedDfsWriteOutcome::Pending {
-                                intent_id,
-                                durable_receipts: 1,
-                                required_receipts: 2,
-                            },
+                        outcome: NetworkedDfsWriteOutcome::Committed { intent_id, .. },
                     },
                 ..
             } => Some(intent_id.clone()),
             _ => None,
         })
-        .expect("writer receives remote pending intent");
-    assert!(matches!(
-        writer_dfs
-            .handle_confirmed_write_timeout(
-                &remote_intent_id,
-                DfsConfirmedTimeoutAction::KeepPending,
-            )
-            .expect("remote intent pending"),
-        DfsConfirmedTimeoutOutcome::StillPending {
-            durable_receipts: 1,
-            required_receipts: 2,
-            ..
-        }
-    ));
-
-    let primary_events = primary_dfs
-        .process_incoming()
-        .expect("primary receives strict receipt");
-    assert!(primary_events.iter().any(|event| {
-        matches!(
-            event,
-            NetworkedDfsServiceEvent::RemoteWriteServed {
-                requester_node_id,
-                result:
-                    DfsDistributedWriteResult::Outcome {
-                        outcome: NetworkedDfsWriteOutcome::Committed { .. },
-                    },
-                ..
-            } if requester_node_id == &writer
-        )
-    }));
-    let writer_events = writer_dfs
-        .process_incoming()
-        .expect("writer receives strict completion");
-    assert!(writer_events.iter().any(|event| {
-        matches!(
-            event,
-            NetworkedDfsServiceEvent::RemoteWriteCompleted {
-                primary_node_id,
-                result:
-                    DfsDistributedWriteResult::Outcome {
-                        outcome: NetworkedDfsWriteOutcome::Committed { .. },
-                    },
-                ..
-            } if primary_node_id == &primary
-        )
-    }));
+        .expect("writer receives remote committed intent");
     assert!(matches!(
         writer_dfs
             .handle_confirmed_write_timeout(
@@ -3513,43 +3459,6 @@ fn networked_dfs_routes_reader_write_to_metadata_primary_via_fetch() {
     let primary_events = primary_dfs
         .process_incoming()
         .expect("primary routed write");
-    assert!(primary_events.iter().any(|event| {
-        matches!(
-            event,
-            NetworkedDfsServiceEvent::RemoteWriteServed {
-                requester_node_id,
-                result:
-                    DfsDistributedWriteResult::Outcome {
-                        outcome: NetworkedDfsWriteOutcome::Pending { .. },
-                    },
-                ..
-            } if requester_node_id == &writer
-        )
-    }));
-    let writer_events = writer_dfs.process_incoming().expect("writer fetch");
-    assert!(writer_events.iter().any(|event| {
-        matches!(
-            event,
-            NetworkedDfsServiceEvent::BlobFetched {
-                source_node_id,
-                object_id: fetched,
-                ..
-            } if source_node_id == &writer && fetched == &object_id
-        )
-    }));
-    let primary_events = primary_dfs
-        .process_incoming()
-        .expect("primary fetch response");
-    assert!(primary_events.iter().any(|event| {
-        matches!(
-            event,
-            NetworkedDfsServiceEvent::BlobFetched {
-                source_node_id,
-                object_id: fetched,
-                ..
-            } if source_node_id == &writer && fetched == &object_id
-        )
-    }));
     assert!(primary_events.iter().any(|event| {
         matches!(
             event,

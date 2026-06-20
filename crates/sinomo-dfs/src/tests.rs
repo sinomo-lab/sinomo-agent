@@ -10932,6 +10932,7 @@ fn operational_metrics_report_transfer_window_progress() {
 
     let total_chunks = DFS_LOCAL_CHUNK_WINDOW_SIZE + 2;
     let bytes = vec![0x5a; total_chunks as usize * DFS_BLOB_CHUNK_BYTES];
+    let total_size_bytes = bytes.len() as u64;
     let write = owner_dfs
         .write_distributed_eventual(
             DfsWriteRequest {
@@ -10954,7 +10955,12 @@ fn operational_metrics_report_transfer_window_progress() {
         }
     ));
 
-    let first_window_bytes = u64::from(DFS_LOCAL_CHUNK_WINDOW_SIZE) * DFS_BLOB_CHUNK_BYTES as u64;
+    let first_window_chunks = dfs_adaptive_chunk_window_size(
+        DfsTransferProfile::Local,
+        total_size_bytes,
+        DFS_STAGE_CHUNK_WINDOW_SIZE,
+    );
+    let first_window_bytes = u64::from(first_window_chunks) * DFS_BLOB_CHUNK_BYTES as u64;
     let owner_metrics = owner_dfs.operational_metrics().expect("owner metrics");
     assert_eq!(owner_metrics.stage_window_resume_count, 1);
     assert_eq!(owner_metrics.stage_window_resume_bytes, first_window_bytes);

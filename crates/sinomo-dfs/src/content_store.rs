@@ -125,6 +125,12 @@ pub struct ContentPatchManifest {
     pub patch_size_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentVersionIdentity {
+    pub content_hash: String,
+    pub size_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentExtent {
     pub logical_offset: u64,
@@ -1234,9 +1240,24 @@ impl LocalContentStore {
 
     pub fn commit_chunked_object_version_patch(
         &self,
+        assembler: ChunkedBlobAssembler,
+        base_version: &str,
+        offset: u64,
+    ) -> Result<ContentManifest> {
+        self.commit_chunked_object_version_patch_with_base_identity(
+            assembler,
+            base_version,
+            offset,
+            None,
+        )
+    }
+
+    pub fn commit_chunked_object_version_patch_with_base_identity(
+        &self,
         mut assembler: ChunkedBlobAssembler,
         base_version: &str,
         offset: u64,
+        base_identity: Option<&ContentVersionIdentity>,
     ) -> Result<ContentManifest> {
         if !assembler.is_complete() {
             return Err(ContentStoreError::IncompleteChunkedContent {
@@ -1275,6 +1296,7 @@ impl LocalContentStore {
                 &assembler.version,
                 offset,
                 &assembler.path,
+                base_identity,
             )?
             .manifest;
         self.remove_tracked_staging_file_if_exists(&assembler.path)?;
@@ -1965,11 +1987,31 @@ impl LocalContentStore {
         offset: u64,
         bytes: &[u8],
     ) -> Result<ContentPatchManifest> {
+        self.put_object_version_patch_with_info_and_base_identity(
+            object_id,
+            base_version,
+            target_version,
+            offset,
+            bytes,
+            None,
+        )
+    }
+
+    pub fn put_object_version_patch_with_info_and_base_identity(
+        &self,
+        object_id: &str,
+        base_version: &str,
+        target_version: &str,
+        offset: u64,
+        bytes: &[u8],
+        base_identity: Option<&ContentVersionIdentity>,
+    ) -> Result<ContentPatchManifest> {
         self.validate_object_version_patch_source(
             object_id,
             base_version,
             offset,
             bytes.len() as u64,
+            base_identity,
         )?;
         let (patch_hash, patch_size) = if bytes.is_empty() {
             (None, 0)
@@ -1984,6 +2026,7 @@ impl LocalContentStore {
             offset,
             patch_hash,
             patch_size,
+            base_identity,
         )
     }
 
@@ -2001,6 +2044,26 @@ impl LocalContentStore {
             target_version,
             offset,
             reader,
+            None,
+        )
+    }
+
+    pub fn put_object_version_patch_from_reader_with_info_and_base_identity<R: Read>(
+        &self,
+        object_id: &str,
+        base_version: &str,
+        target_version: &str,
+        offset: u64,
+        reader: R,
+        base_identity: Option<&ContentVersionIdentity>,
+    ) -> Result<ContentPatchManifest> {
+        self.put_object_version_patch_from_reader_impl(
+            object_id,
+            base_version,
+            target_version,
+            offset,
+            reader,
+            base_identity,
         )
     }
 
@@ -2019,6 +2082,28 @@ impl LocalContentStore {
                 target_version,
                 offset,
                 reader,
+                None,
+            )?
+            .manifest)
+    }
+
+    pub fn put_object_version_patch_from_reader_with_base_identity<R: Read>(
+        &self,
+        object_id: &str,
+        base_version: &str,
+        target_version: &str,
+        offset: u64,
+        reader: R,
+        base_identity: Option<&ContentVersionIdentity>,
+    ) -> Result<ContentManifest> {
+        Ok(self
+            .put_object_version_patch_from_reader_impl(
+                object_id,
+                base_version,
+                target_version,
+                offset,
+                reader,
+                base_identity,
             )?
             .manifest)
     }
@@ -2030,6 +2115,7 @@ impl LocalContentStore {
         target_version: &str,
         offset: u64,
         mut reader: R,
+        base_identity: Option<&ContentVersionIdentity>,
     ) -> Result<ContentPatchManifest> {
         let staging_anchor = self
             .root
@@ -2054,6 +2140,7 @@ impl LocalContentStore {
             target_version,
             offset,
             &tmp_path,
+            base_identity,
         );
         self.remove_tracked_staging_file_if_exists(&tmp_path).ok();
         result
@@ -2066,9 +2153,16 @@ impl LocalContentStore {
         target_version: &str,
         offset: u64,
         source_path: &Path,
+        base_identity: Option<&ContentVersionIdentity>,
     ) -> Result<ContentPatchManifest> {
         let (patch_hash, patch_size) = file_content_hash_and_size(source_path)?;
-        self.validate_object_version_patch_source(object_id, base_version, offset, patch_size)?;
+        self.validate_object_version_patch_source(
+            object_id,
+            base_version,
+            offset,
+            patch_size,
+            base_identity,
+        )?;
         if patch_size == 0 {
             return self.put_object_version_patch_from_blob(
                 object_id,
@@ -2077,6 +2171,7 @@ impl LocalContentStore {
                 offset,
                 None,
                 0,
+                base_identity,
             );
         }
         let blob_path = self.blob_path(&patch_hash)?;
@@ -2094,7 +2189,42 @@ impl LocalContentStore {
             offset,
             Some(patch_hash),
             patch_size,
+            base_identity,
         )
+    }
+
+    fn patch_base_manifest(
+        &self,
+        object_id: &str,
+        base_version: &str,
+        base_identity: Option<&ContentVersionIdentity>,
+    ) -> Result<ContentManifest> {
+        match self.read_manifest(object_id, base_version) {
+            Ok(manifest) => return Ok(manifest),
+            Err(error) if !content_error_is_not_found(&error) => return Err(error),
+            Err(error) if base_identity.is_none() => return Err(error),
+            Err(_) => {}
+        }
+        let base_identity = base_identity.expect("checked above");
+        hash_hex(&base_identity.content_hash)?;
+        let reader = self.open_blob_stream(&base_identity.content_hash)?;
+        if reader.size_bytes() != base_identity.size_bytes {
+            return Err(ContentStoreError::InvalidChunkedContent {
+                message: format!(
+                    "blob-only patch base has wrong size: object={object_id}, base={base_version}, hash={}, expected={}, actual={}",
+                    base_identity.content_hash,
+                    base_identity.size_bytes,
+                    reader.size_bytes()
+                ),
+            });
+        }
+        Ok(ContentManifest {
+            object_id: object_id.to_owned(),
+            version: base_version.to_owned(),
+            content_hash: base_identity.content_hash.clone(),
+            size_bytes: base_identity.size_bytes,
+            extents: Vec::new(),
+        })
     }
 
     fn validate_object_version_patch_source(
@@ -2103,8 +2233,9 @@ impl LocalContentStore {
         base_version: &str,
         offset: u64,
         patch_size: u64,
+        base_identity: Option<&ContentVersionIdentity>,
     ) -> Result<()> {
-        let base_manifest = self.read_manifest(object_id, base_version)?;
+        let base_manifest = self.patch_base_manifest(object_id, base_version, base_identity)?;
         let base_extents = self.logical_extents_for_manifest(&base_manifest)?;
         self.ensure_extents_readable(&base_extents)?;
         if offset > base_manifest.size_bytes {
@@ -2133,8 +2264,9 @@ impl LocalContentStore {
         offset: u64,
         patch_hash: Option<String>,
         patch_size: u64,
+        base_identity: Option<&ContentVersionIdentity>,
     ) -> Result<ContentPatchManifest> {
-        let base_manifest = self.read_manifest(object_id, base_version)?;
+        let base_manifest = self.patch_base_manifest(object_id, base_version, base_identity)?;
         let base_extents = self.logical_extents_for_manifest(&base_manifest)?;
         self.ensure_extents_readable(&base_extents)?;
         if offset > base_manifest.size_bytes {
@@ -4468,6 +4600,13 @@ fn hash_hex(hash: &str) -> Result<&str> {
         return Err(ContentStoreError::InvalidHash(hash.to_owned()));
     }
     Ok(hex)
+}
+
+fn content_error_is_not_found(error: &ContentStoreError) -> bool {
+    matches!(
+        error,
+        ContentStoreError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound
+    )
 }
 
 fn validate_chunked_object_shape(
