@@ -293,8 +293,7 @@ fn cluster_delivery_route_plan(
 ) -> Option<ClusterDeliveryRoutePlan> {
     let graph =
         cluster_delivery_route_graph(paths, state, local_node_id, failed_edges, target_node_id);
-    let local_private_prefixes = cluster_delivery_local_private_prefixes(state, local_node_id);
-    let Some(next_hop) =
+    let next_hop =
         cluster_delivery_shortest_path_next_hop(&graph, local_node_id, target_node_id, visited)
             .or_else(|| {
                 cluster_delivery_exploratory_next_hop(
@@ -303,17 +302,7 @@ fn cluster_delivery_route_plan(
                     target_node_id,
                     visited,
                 )
-            })
-    else {
-        return cluster_delivery_direct_target_fallback_plan(
-            paths,
-            state,
-            local_node_id,
-            target_node_id,
-            failed_edges,
-            &local_private_prefixes,
-        );
-    };
+            })?;
     let endpoints = graph.endpoints_for_next_hop(local_node_id, &next_hop);
     Some(ClusterDeliveryRoutePlan {
         next_hop,
@@ -697,65 +686,6 @@ fn cluster_delivery_exploratory_next_hop(
         .map(|edge| edge.target.clone())
 }
 
-fn cluster_delivery_direct_target_fallback_plan(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    local_node_id: &NodeId,
-    target_node_id: &NodeId,
-    failed_edges: &BTreeSet<ClusterDeliveryFailedEdge>,
-    local_private_prefixes: &BTreeSet<ClusterDeliveryPrivatePrefix>,
-) -> Option<ClusterDeliveryRoutePlan> {
-    if failed_edges.contains(&ClusterDeliveryFailedEdge::new(
-        local_node_id,
-        target_node_id,
-    )) {
-        return None;
-    }
-    let local_connectivity = ClusterConnectivityGraph::read_for_local(paths, state);
-    let mut endpoints = state
-        .members
-        .iter()
-        .filter(|member| member.state.is_authorized() && member.node_id == *target_node_id)
-        .flat_map(|member| member.endpoints.iter())
-        .filter(|endpoint| cluster_delivery_local_endpoint_is_usable(local_node_id, endpoint))
-        .filter(
-            |endpoint| match local_connectivity.record_for_endpoint(endpoint) {
-                Some(record) => record.state != ClusterConnectivityState::Unreachable,
-                None => cluster_delivery_endpoint_shares_local_private_prefix(
-                    endpoint,
-                    local_private_prefixes,
-                ),
-            },
-        )
-        .map(|endpoint| {
-            (
-                cluster_delivery_endpoint_path_cost(
-                    &endpoint.transport,
-                    &endpoint.address,
-                    &endpoint.privacy,
-                ) + u64::from(endpoint.priority),
-                endpoint,
-            )
-        })
-        .collect::<Vec<_>>();
-    endpoints.sort_by_key(|(cost, endpoint)| {
-        (
-            *cost,
-            endpoint.priority,
-            format!("{:?}", endpoint.transport),
-            endpoint.address.clone(),
-        )
-    });
-    let endpoints = endpoints
-        .into_iter()
-        .map(|(_, endpoint)| endpoint.clone())
-        .collect::<Vec<_>>();
-    (!endpoints.is_empty()).then_some(ClusterDeliveryRoutePlan {
-        next_hop: target_node_id.clone(),
-        endpoints,
-    })
-}
-
 fn cluster_delivery_local_endpoint_cost(
     graph: &ClusterConnectivityGraph,
     endpoint: &ClusterEndpointRecord,
@@ -769,17 +699,21 @@ fn cluster_delivery_local_endpoint_cost(
     );
     let endpoint_priority = u64::from(endpoint.priority);
     match graph.record_for_endpoint(endpoint) {
-        Some(record) if record.state == ClusterConnectivityState::Healthy => {
-            cluster_delivery_connectivity_state_cost(
+        Some(record) => cluster_delivery_connectivity_state_cost(
+            path_cost,
+            record.latency_ms,
+            record.consecutive_failures,
+            &record.state,
+        )
+        .map(|cost| cost + endpoint_priority),
+        None if endpoint.node_id == *target_node_id => {
+            cluster_delivery_unobserved_target_endpoint_cost(
+                endpoint,
                 path_cost,
-                record.latency_ms,
-                record.consecutive_failures,
-                &record.state,
+                endpoint_priority,
+                local_private_prefixes,
             )
-            .map(|cost| cost + endpoint_priority)
         }
-        Some(_) => None,
-        None if endpoint.node_id == *target_node_id => None,
         None if cluster_delivery_endpoint_shares_local_private_prefix(
             endpoint,
             local_private_prefixes,
@@ -788,6 +722,31 @@ fn cluster_delivery_local_endpoint_cost(
             Some(CLUSTER_DELIVERY_UNOBSERVED_NEIGHBOR_COST + path_cost + endpoint_priority)
         }
         None => None,
+    }
+}
+
+fn cluster_delivery_unobserved_target_endpoint_cost(
+    endpoint: &ClusterEndpointRecord,
+    path_cost: u64,
+    endpoint_priority: u64,
+    local_private_prefixes: &BTreeSet<ClusterDeliveryPrivatePrefix>,
+) -> Option<u64> {
+    let globally_routable = endpoint.privacy == ClusterEndpointPrivacy::InternetDirect
+        || endpoint.privacy == ClusterEndpointPrivacy::Relayed
+        || cluster_delivery_address_is_public(&endpoint.address)
+        || matches!(
+            endpoint.transport,
+            ClusterTransportKind::Iroh
+                | ClusterTransportKind::WebRtc
+                | ClusterTransportKind::TurnRelay
+                | ClusterTransportKind::HttpsRelay
+        );
+    if globally_routable
+        || cluster_delivery_endpoint_shares_local_private_prefix(endpoint, local_private_prefixes)
+    {
+        Some(path_cost + endpoint_priority)
+    } else {
+        None
     }
 }
 
@@ -2165,6 +2124,100 @@ mod tests {
     }
 
     #[test]
+    fn delivery_plan_treats_unobserved_direct_target_as_normal_edge() {
+        let (_root, paths) = test_paths("sinomo-network-delivery-plan-direct-unobserved");
+        let cluster_id = cid("cluster_delivery_plan_direct_unobserved");
+        let local = nid("node_delivery_plan_direct_unobserved_local");
+        let target = nid("node_delivery_plan_direct_unobserved_target");
+        let bridge = nid("node_delivery_plan_direct_unobserved_bridge");
+        let mut state = test_state(cluster_id.clone(), local.clone());
+        add_local_endpoint(&mut state, endpoint(&local, "172.25.0.9:21353", 0));
+        let target_endpoint = endpoint(&target, "172.25.0.10:21353", 0);
+        let bridge_endpoint = endpoint(&bridge, "172.25.0.2:21353", 0);
+        add_member(
+            &mut state,
+            target.clone(),
+            "target",
+            vec![target_endpoint.clone()],
+        );
+        add_member(
+            &mut state,
+            bridge.clone(),
+            "bridge",
+            vec![bridge_endpoint.clone()],
+        );
+        mark_local_endpoints_healthy(&paths, &state, std::slice::from_ref(&bridge_endpoint));
+        let bridge_to_target_record = connectivity_record_from_source(
+            &cluster_id,
+            &bridge,
+            &target_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+        );
+        crate::write_local_cluster_connectivity_records(
+            &paths,
+            &bridge,
+            std::slice::from_ref(&bridge_to_target_record),
+        )
+        .expect("write bridge record");
+
+        let plan =
+            cluster_delivery_route_plan(&paths, &state, &local, &target, &BTreeSet::new(), &[])
+                .expect("route plan");
+
+        assert_eq!(plan.next_hop, target);
+        assert_eq!(plan.endpoints.len(), 1);
+        assert_eq!(plan.endpoints[0].address, target_endpoint.address);
+    }
+
+    #[test]
+    fn delivery_plan_can_choose_lower_cost_multihop_over_direct_target() {
+        let (_root, paths) = test_paths("sinomo-network-delivery-plan-direct-vs-multihop");
+        let cluster_id = cid("cluster_delivery_plan_direct_vs_multihop");
+        let local = nid("node_delivery_plan_direct_vs_multihop_local");
+        let target = nid("node_delivery_plan_direct_vs_multihop_target");
+        let bridge = nid("node_delivery_plan_direct_vs_multihop_bridge");
+        let mut state = test_state(cluster_id.clone(), local.clone());
+        add_local_endpoint(&mut state, endpoint(&local, "172.25.0.9:21353", 0));
+        let target_endpoint = endpoint(&target, "172.25.0.10:21353", 100);
+        let bridge_endpoint = endpoint(&bridge, "172.25.0.2:21353", 0);
+        add_member(
+            &mut state,
+            target.clone(),
+            "target",
+            vec![target_endpoint.clone()],
+        );
+        add_member(
+            &mut state,
+            bridge.clone(),
+            "bridge",
+            vec![bridge_endpoint.clone()],
+        );
+        mark_local_endpoints_healthy(&paths, &state, std::slice::from_ref(&bridge_endpoint));
+        let bridge_to_target_record = connectivity_record_from_source(
+            &cluster_id,
+            &bridge,
+            &target_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+        );
+        crate::write_local_cluster_connectivity_records(
+            &paths,
+            &bridge,
+            std::slice::from_ref(&bridge_to_target_record),
+        )
+        .expect("write bridge record");
+
+        let plan =
+            cluster_delivery_route_plan(&paths, &state, &local, &target, &BTreeSet::new(), &[])
+                .expect("route plan");
+
+        assert_eq!(plan.next_hop, bridge);
+        assert_eq!(plan.endpoints.len(), 1);
+        assert_eq!(plan.endpoints[0].address, bridge_endpoint.address);
+    }
+
+    #[test]
     fn delivery_plan_uses_exploratory_neighbor_after_failed_direct_edge() {
         let (_root, paths) = test_paths("sinomo-network-delivery-plan-failed-direct");
         let cluster_id = cid("cluster_delivery_plan_failed_direct");
@@ -2210,13 +2263,14 @@ mod tests {
         let bridge = nid("node_delivery_plan_observed_bridge");
         let target = nid("node_delivery_plan_observed_target");
         let mut state = test_state(cluster_id, local.clone());
+        add_local_endpoint(&mut state, endpoint(&local, "172.25.0.9:21353", 0));
         add_member(
             &mut state,
             target.clone(),
             "target",
-            vec![endpoint(&target, "node3:21353", 0)],
+            vec![endpoint(&target, "172.23.0.2:21353", 0)],
         );
-        let bridge_endpoint = endpoint(&bridge, "node4:21353", 0);
+        let bridge_endpoint = endpoint(&bridge, "172.25.0.2:21353", 0);
         add_member(
             &mut state,
             bridge.clone(),
@@ -2234,7 +2288,7 @@ mod tests {
     }
 
     #[test]
-    fn delivery_plan_ignores_degraded_local_target_for_healthy_bridge() {
+    fn delivery_plan_keeps_degraded_direct_target_as_candidate() {
         let (_root, paths) = test_paths("sinomo-network-delivery-plan-degraded-target");
         let cluster_id = cid("cluster_delivery_plan_degraded_target");
         let local = nid("node_delivery_plan_degraded_local");
@@ -2274,8 +2328,9 @@ mod tests {
             cluster_delivery_route_plan(&paths, &state, &local, &target, &BTreeSet::new(), &[])
                 .expect("route plan");
 
-        assert_eq!(plan.next_hop, bridge);
+        assert_eq!(plan.next_hop, target);
         assert_eq!(plan.endpoints.len(), 1);
+        assert_eq!(plan.endpoints[0].address, target_endpoint.address);
     }
 
     #[test]
