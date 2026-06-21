@@ -6297,6 +6297,7 @@ dependencies = [
  "sinomo-registry",
  "sinomo-rollout",
  "sinomo-sandbox",
+ "sinomo-sandbox-simple",
  "sinomo-sandbox-wasix-api",
  "sinomo-sandbox-wasix-host",
  "sinomo-service",
@@ -6332,6 +6333,17 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+]
+
+[[package]]
+name = "sinomo-sandbox-simple"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sinomo-node",
+ "sinomo-sandbox",
+ "sinomo-testdir",
+ "time",
 ]
 
 [[package]]

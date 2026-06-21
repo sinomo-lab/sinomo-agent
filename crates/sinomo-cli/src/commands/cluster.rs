@@ -1,15 +1,9 @@
 use super::*;
 
 #[cfg(test)]
-pub(crate) use network::advertised_peer_route_targets;
-#[cfg(test)]
 pub(crate) use network::apply_cluster_node_role;
 #[cfg(test)]
-pub(crate) use network::cluster_connectivity_sync_ops;
-#[cfg(test)]
 pub(crate) use network::cluster_state_sync_txn;
-#[cfg(test)]
-pub(crate) use network::cluster_sync_targets;
 #[cfg(test)]
 pub(crate) use network::invite_channels_for_join_registration;
 #[cfg(test)]
@@ -32,6 +26,7 @@ pub(crate) use network::{
 pub(crate) use network::{compact_default_invite_introducers, push_unique_introducer};
 #[cfg(test)]
 pub(crate) use sinomo_runtime::node::apply_cluster_raft_role;
+use sinomo_runtime::node::cluster_member_is_local_process;
 
 #[cfg(test)]
 pub(crate) fn build_cluster_raft_append_request_from_next_index(
@@ -41,8 +36,7 @@ pub(crate) fn build_cluster_raft_append_request_from_next_index(
 ) -> Result<sinomo_runtime::kv::ClusterRaftAppendRequest, network::NetworkError> {
     paths
         .kv_paths()
-        .raft_store()
-        .build_cluster_raft_append_request_from_next_index(state, next_index)
+        .build_raft_append_request_from_next_index(state, next_index)
         .map_err(Into::into)
 }
 
@@ -54,7 +48,7 @@ pub(crate) enum ClusterCliCommand {
     Join(ClusterJoinOptions),
     Migrate(ClusterMigrateCommand),
     Role(ClusterRoleOptions),
-    RaftRole(ClusterRaftRoleOptions),
+    StateAuthority(ClusterStateAuthorityOptions),
     RepairMembers(ClusterRepairMembersOptions),
     Remove(ClusterRemoveOptions),
     CleanupLegacyShadowMembers,
@@ -115,7 +109,7 @@ pub(crate) struct ClusterRoleOptions {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ClusterRaftRoleOptions {
+pub(crate) struct ClusterStateAuthorityOptions {
     pub(crate) node_id: NodeId,
     pub(crate) role: ClusterMemberRole,
 }
@@ -162,10 +156,22 @@ pub(crate) fn parse_cluster_command(args: &[String]) -> Result<ClusterCliCommand
         Some((command, rest)) if matches!(command.as_str(), "role" | "set-role") => {
             Ok(ClusterCliCommand::Role(parse_cluster_role_options(rest)?))
         }
-        Some((command, rest)) if matches!(command.as_str(), "raft-role" | "set-raft-role") => Ok(
-            ClusterCliCommand::RaftRole(parse_cluster_raft_role_options(rest)?),
-        ),
-        Some((command, rest)) if command == "promote" => Ok(ClusterCliCommand::RaftRole(
+        Some((command, rest))
+            if matches!(
+                command.as_str(),
+                "state-authority"
+                    | "authority-role"
+                    | "set-state-authority"
+                    | "set-authority-role"
+                    | "raft-role"
+                    | "set-raft-role"
+            ) =>
+        {
+            Ok(ClusterCliCommand::StateAuthority(
+                parse_cluster_state_authority_options(rest)?,
+            ))
+        }
+        Some((command, rest)) if command == "promote" => Ok(ClusterCliCommand::StateAuthority(
             parse_cluster_promote_options(rest)?,
         )),
         Some((command, rest)) if matches!(command.as_str(), "repair-members" | "repair") => Ok(
@@ -393,31 +399,31 @@ pub(crate) fn parse_cluster_role_options(args: &[String]) -> Result<ClusterRoleO
     })
 }
 
-pub(crate) fn parse_cluster_raft_role_options(
+pub(crate) fn parse_cluster_state_authority_options(
     args: &[String],
-) -> Result<ClusterRaftRoleOptions, CliError> {
+) -> Result<ClusterStateAuthorityOptions, CliError> {
     let [node_id, role] = args else {
         return Err(CliError::Usage);
     };
-    Ok(ClusterRaftRoleOptions {
+    Ok(ClusterStateAuthorityOptions {
         node_id: NodeId::new(node_id.clone()).map_err(|source| CliError::Parse {
             detail: format!("invalid node id `{node_id}`: {source}"),
         })?,
-        role: parse_cluster_member_role(role)?,
+        role: parse_cluster_state_authority_role(role)?,
     })
 }
 
 pub(crate) fn parse_cluster_promote_options(
     args: &[String],
-) -> Result<ClusterRaftRoleOptions, CliError> {
+) -> Result<ClusterStateAuthorityOptions, CliError> {
     match args {
-        [node_id] => Ok(ClusterRaftRoleOptions {
+        [node_id] => Ok(ClusterStateAuthorityOptions {
             node_id: NodeId::new(node_id.clone()).map_err(|source| CliError::Parse {
                 detail: format!("invalid node id `{node_id}`: {source}"),
             })?,
             role: ClusterMemberRole::Voter,
         }),
-        _ => parse_cluster_raft_role_options(args),
+        _ => parse_cluster_state_authority_options(args),
     }
 }
 
@@ -494,14 +500,19 @@ pub(crate) fn parse_cluster_node_role(role: &str) -> Result<ClusterNodeRole, Cli
     }
 }
 
-pub(crate) fn parse_cluster_member_role(role: &str) -> Result<ClusterMemberRole, CliError> {
+pub(crate) fn parse_cluster_state_authority_role(
+    role: &str,
+) -> Result<ClusterMemberRole, CliError> {
     match role.trim().to_ascii_lowercase().as_str() {
-        "voter" => Ok(ClusterMemberRole::Voter),
-        "learner" => Ok(ClusterMemberRole::Learner),
-        "non-voting" | "non_voting" | "nonvoting" => Ok(ClusterMemberRole::NonVoting),
+        "authority" | "state-authority" | "state_authority" | "voter" => {
+            Ok(ClusterMemberRole::Voter)
+        }
+        "replica" | "learner" => Ok(ClusterMemberRole::Learner),
+        "observer" | "non-authority" | "non_authority" | "non-voting" | "non_voting"
+        | "nonvoting" => Ok(ClusterMemberRole::NonVoting),
         _ => Err(CliError::Parse {
             detail: format!(
-                "invalid cluster member role `{role}`; expected voter, learner, or non-voting"
+                "invalid cluster state authority role `{role}`; expected authority, replica, or observer"
             ),
         }),
     }
@@ -544,7 +555,7 @@ pub(crate) fn run_cluster_cli_command(command: ClusterCliCommand) -> Result<(), 
         ClusterCliCommand::Join(options) => cluster_join(options),
         ClusterCliCommand::Migrate(command) => cluster_migrate(command),
         ClusterCliCommand::Role(options) => cluster_role(options),
-        ClusterCliCommand::RaftRole(options) => cluster_raft_role(options),
+        ClusterCliCommand::StateAuthority(options) => cluster_state_authority_role(options),
         ClusterCliCommand::RepairMembers(options) => cluster_repair_members(options),
         ClusterCliCommand::Remove(options) => cluster_remove(options),
         ClusterCliCommand::CleanupLegacyShadowMembers => cluster_cleanup_legacy_shadow_members(),
@@ -562,49 +573,29 @@ pub(crate) fn cluster_paths_from_defaults() -> Result<ClusterPaths, CliError> {
     Ok(ClusterPaths::new(&data_dir))
 }
 
-fn cluster_kv_raft_store(paths: &ClusterPaths) -> sinomo_runtime::kv::ClusterKvRaftStore {
-    paths.kv_paths().raft_store()
-}
-
 fn append_cluster_raft_command(
     paths: &ClusterPaths,
     node_id: &NodeId,
     command: sinomo_runtime::kv::KvCommand,
 ) -> Result<KvSnapshot, network::NetworkError> {
-    cluster_kv_raft_store(paths)
-        .append_command_and_publish(
+    paths
+        .kv_paths()
+        .append_kv_command_and_publish(
             node_id,
             command,
-            network::cluster_kv_key_can_defer_materialized_snapshot,
+            sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
         .map_err(Into::into)
 }
 
-pub(crate) fn cluster_raft_known_leader_id(
+pub(crate) fn cluster_kv_state_authority_id(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<Option<NodeId>, network::NetworkError> {
-    Ok(cluster_kv_raft_store(paths)
-        .known_leader_id(&state.local_node_id)?
-        .filter(|leader_id| sinomo_runtime::kv::cluster_kv_raft_node_is_voter(state, leader_id)))
-}
-
-pub(crate) fn locked_cluster_raft_known_leader_id(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Result<Option<NodeId>, network::NetworkError> {
-    Ok(cluster_kv_raft_store(paths)
-        .locked_known_leader_id(&state.local_node_id)?
-        .filter(|leader_id| sinomo_runtime::kv::cluster_kv_raft_node_is_voter(state, leader_id)))
-}
-
-pub(crate) fn locked_cluster_raft_local_is_leader(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Result<bool, network::NetworkError> {
-    Ok(sinomo_runtime::kv::cluster_kv_raft_local_is_voter(state)
-        && locked_cluster_raft_known_leader_id(paths, state)?.as_ref()
-            == Some(&state.local_node_id))
+    paths
+        .kv_paths()
+        .known_raft_voter_leader_id(state)
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -613,8 +604,9 @@ pub(crate) fn set_cluster_raft_leader(
     node_id: &NodeId,
     term: u64,
 ) -> Result<KvSnapshot, network::NetworkError> {
-    cluster_kv_raft_store(paths)
-        .set_leader_and_write_snapshot_if_changed(node_id, term)
+    paths
+        .kv_paths()
+        .set_raft_leader_and_write_snapshot_if_changed(node_id, term)
         .map_err(Into::into)
 }
 
@@ -623,8 +615,9 @@ pub(crate) fn locked_set_cluster_raft_leader(
     node_id: &NodeId,
     term: u64,
 ) -> Result<KvSnapshot, network::NetworkError> {
-    cluster_kv_raft_store(paths)
-        .locked_set_leader_and_write_snapshot_if_changed(node_id, term)
+    paths
+        .kv_paths()
+        .locked_set_raft_leader_and_write_snapshot_if_changed(node_id, term)
         .map_err(Into::into)
 }
 
@@ -633,8 +626,9 @@ pub(crate) fn clear_cluster_raft_leader(
     paths: &ClusterPaths,
     node_id: &NodeId,
 ) -> Result<KvSnapshot, network::NetworkError> {
-    cluster_kv_raft_store(paths)
-        .clear_leader_and_write_snapshot_if_changed(node_id)
+    paths
+        .kv_paths()
+        .clear_raft_leader_and_write_snapshot_if_changed(node_id)
         .map_err(Into::into)
 }
 
@@ -670,8 +664,8 @@ pub(crate) fn require_cluster_runtime_quorum_with_paths_and_daemon(
     } else {
         Err(CliError::ClusterReadOnly {
             detail: format!(
-                "quorum unavailable; cluster-dependent operations are paused ({} reachable voters, {} required)",
-                cluster_reachable_voter_count(&paths, &state),
+                "quorum unavailable; cluster-dependent operations are paused ({} reachable cluster state authorities, {} required)",
+                cluster_reachable_state_authority_count(&paths, &state),
                 sinomo_runtime::kv::cluster_kv_raft_quorum_size_for_state(&state)
             ),
         })
@@ -861,7 +855,7 @@ pub(crate) fn cluster_migration_plan_with_paths(
         .iter()
         .filter(|member| {
             !matches!(member.state, ClusterMemberState::Removed)
-                && !network::cluster_member_is_local_process(&source, member)
+                && !cluster_member_is_local_process(&source, member)
         })
         .count();
     let migration = ClusterMigrationRecord {
@@ -966,7 +960,7 @@ pub(crate) fn cluster_invite_with_paths(
         })?;
     }
     Ok(RenderedClusterInvite {
-        persisted_key: network::cluster_invitation_key(&invite.invite_id),
+        persisted_key: sinomo_runtime::node::cluster_invitation_key(&invite.invite_id),
         invite,
         uri,
         join_command,
@@ -1009,11 +1003,8 @@ fn cluster_invite_requires_voter_error(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> CliError {
-    let targets = network::cluster_endpoint_targets(
-        paths,
-        state,
-        network::ClusterEndpointSelectionPurpose::InvitePublish,
-    );
+    let targets = network::ClusterEndpointSelector::new(paths, state)
+        .select(network::ClusterEndpointSelectionPurpose::InvitePublish);
     CliError::ClusterReadOnly {
         detail: format!(
             "local node is not a voter; create the invite on a voter node or restore voter connectivity{}",
@@ -1072,7 +1063,7 @@ pub(crate) fn default_invite_introducers(
             for endpoint in invite_introducers_from_daemon_status(&state.local_node_id, &status) {
                 network::push_unique_introducer(&mut introducers, endpoint);
             }
-            if let Ok(record) = network::read_iroh_endpoint_record(paths, &state.local_node_id) {
+            if let Ok(record) = network::IrohEndpointRecord::read(paths, &state.local_node_id) {
                 network::push_unique_introducer(&mut introducers, record.endpoint());
             }
         }
@@ -1709,10 +1700,21 @@ fn ensure_local_daemon_cluster_members(
     shadow_options: &DaemonRunOptions,
     timestamp: OffsetDateTime,
 ) -> bool {
+    let (main_endpoints, shadow_endpoints) =
+        local_daemon_member_endpoints(state, main_options, shadow_options);
+    network::ensure_daemon_cluster_members(state, main_endpoints, shadow_endpoints, timestamp)
+}
+
+fn local_daemon_member_endpoints(
+    state: &ClusterBootstrapState,
+    main_options: &DaemonRunOptions,
+    shadow_options: &DaemonRunOptions,
+) -> (Vec<ClusterEndpointRecord>, Vec<ClusterEndpointRecord>) {
     let main_node_id = state.local_node_id.clone();
     let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
     let lan_ips = network::discover_default_lan_ip_candidates();
-    let route_ips = network::discover_peer_route_ip_candidates(state);
+    let route_ips =
+        network::ClusterEndpointSelector::discover_peer_route_ip_candidates_for_state(state);
     let main_endpoints = daemon_advertised_endpoints_for_state(
         state,
         &main_node_id,
@@ -1729,7 +1731,31 @@ fn ensure_local_daemon_cluster_members(
         &lan_ips,
         &route_ips,
     );
-    network::ensure_daemon_cluster_members(state, main_endpoints, shadow_endpoints, timestamp)
+    (main_endpoints, shadow_endpoints)
+}
+
+fn refresh_local_daemon_membership_from_disk_for_cli(
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    main_options: &DaemonRunOptions,
+    shadow_options: &DaemonRunOptions,
+    timestamp: OffsetDateTime,
+) -> Result<network::ClusterLocalDaemonMembershipRefresh, CliError> {
+    let (main_endpoints, shadow_endpoints) =
+        local_daemon_member_endpoints(state, main_options, shadow_options);
+    let (main_public_key, shadow_public_key) = local_daemon_public_keys(paths)?;
+    network::refresh_local_daemon_membership_from_disk(
+        paths,
+        state,
+        network::ClusterLocalDaemonMembershipObservation {
+            main_endpoints,
+            shadow_endpoints,
+            main_public_key,
+            shadow_public_key,
+            timestamp,
+        },
+    )
+    .map_err(Into::into)
 }
 
 pub(crate) fn reconcile_cluster_join_with_introducers(
@@ -1748,41 +1774,36 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
     struct CliClusterJoinReconciliationTransport;
 
     impl network::ClusterControlPlaneTransport for CliClusterJoinReconciliationTransport {
-        fn send_raft_append(
+        fn send_kv_replication(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &sinomo_runtime::kv::ClusterRaftAppendRequest,
+            _request: &sinomo_runtime::kv::ClusterKvReplicationRequest,
             _timeout: Duration,
-        ) -> Result<sinomo_runtime::kv::ClusterRaftAppendResponse, network::NetworkError> {
+        ) -> Result<sinomo_runtime::kv::ClusterKvReplicationResponse, network::NetworkError>
+        {
             Err(unsupported_join_reconciliation_transport(
-                "cluster join raft append",
+                "cluster join kv replication",
             ))
         }
 
-        fn send_raft_vote(
+        fn request_kv_state_authority_vote(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &sinomo_runtime::kv::ClusterRaftVoteRequest,
+            _request: &sinomo_runtime::kv::ClusterKvStateAuthorityVoteRequest,
             _timeout: Duration,
-        ) -> Result<sinomo_runtime::kv::ClusterRaftVoteResponse, network::NetworkError> {
+        ) -> Result<sinomo_runtime::kv::ClusterKvStateAuthorityVoteResponse, network::NetworkError>
+        {
             Err(unsupported_join_reconciliation_transport(
-                "cluster join raft vote",
+                "cluster join kv state authority vote",
             ))
         }
 
-        fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
+        fn probe_cluster_state_authority(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _timeout: Duration,
+        ) -> bool {
             false
-        }
-
-        fn send_cluster_kv_txn(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _txn: &KvTxn,
-            _timeout: Duration,
-        ) -> Result<KvTxnResponse, network::NetworkError> {
-            Err(unsupported_join_reconciliation_transport(
-                "cluster join kv txn",
-            ))
         }
 
         fn fetch_cluster_kv_snapshot(
@@ -1798,18 +1819,7 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
             })
         }
 
-        fn send_cluster_member_publish(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _request: &network::ClusterMemberPublishRequest,
-            _timeout: Duration,
-        ) -> Result<network::ClusterMemberPublishResponse, network::NetworkError> {
-            Err(unsupported_join_reconciliation_transport(
-                "cluster join member publish",
-            ))
-        }
-
-        fn send_cluster_membership_rpc(
+        fn call_endpoint_object_rpc(
             &mut self,
             endpoint: &ClusterEndpointRecord,
             request: &network::ObjectRpcRequest,
@@ -1821,16 +1831,15 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
             })
         }
 
-        fn relay_rpc_to_node(
+        fn call_node_object_rpc(
             &mut self,
             _state: &ClusterBootstrapState,
             _target_node_id: &NodeId,
-            _peer: &ClusterEndpointRecord,
             _request: &network::ObjectRpcRequest,
             _timeout: Duration,
         ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
             Err(unsupported_join_reconciliation_transport(
-                "cluster join relay rpc",
+                "cluster join node rpc",
             ))
         }
     }
@@ -1890,10 +1899,7 @@ fn send_join_rpc(
     timeout: Duration,
 ) -> Result<network::ObjectRpcResponse, CliError> {
     match endpoint.transport {
-        ClusterTransportKind::Iroh => {
-            daemon_send_daemon_rpc_direct_to_endpoint(endpoint, request, timeout)
-                .map_err(Into::into)
-        }
+        ClusterTransportKind::Iroh => send_join_endpoint_rpc(endpoint, request, timeout),
         // Join RPCs must carry an idle deadline, not just a connect timeout:
         // an introducer that accepts the stream and never answers otherwise
         // hangs the join forever, and the caller's bounded retry loop (the
@@ -1910,6 +1916,59 @@ fn send_join_rpc(
         )
         .map_err(Into::into),
     }
+}
+
+fn send_join_endpoint_rpc(
+    endpoint: &ClusterEndpointRecord,
+    request: &network::ObjectRpcRequest,
+    timeout: Duration,
+) -> Result<network::ObjectRpcResponse, CliError> {
+    let timeouts = network::DaemonRpcTimeouts::connect_and_idle(timeout);
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return if matches!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            let runtime = handle.clone();
+            tokio::task::block_in_place(|| {
+                runtime.block_on(send_join_endpoint_rpc_async(endpoint, request, timeouts))
+            })
+            .map_err(CliError::from)
+        } else {
+            Err(CliError::Network {
+                address: "cluster join membership rpc".to_string(),
+                detail: "cluster join endpoint RPC sync client cannot run inside a current-thread Tokio runtime".to_string(),
+            })
+        };
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| CliError::Network {
+            address: "cluster join membership rpc".to_string(),
+            detail: source.to_string(),
+        })?;
+    let output = runtime
+        .block_on(send_join_endpoint_rpc_async(endpoint, request, timeouts))
+        .map_err(CliError::from);
+    runtime.shutdown_timeout(Duration::from_millis(250));
+    output
+}
+
+async fn send_join_endpoint_rpc_async(
+    endpoint: &ClusterEndpointRecord,
+    request: &network::ObjectRpcRequest,
+    timeouts: network::DaemonRpcTimeouts,
+) -> Result<network::ObjectRpcResponse, network::NetworkError> {
+    let mut host = CliSignedEndpointRpcHost::new(None, "cluster join endpoint rpc signing");
+    let mut client = network::ClusterObjectRpcClient::endpoint_only(&mut host);
+    client
+        .call_endpoint(
+            endpoint,
+            request,
+            network::ClusterObjectRpcOptions::new(timeouts),
+        )
+        .await
 }
 
 /// Idle deadline for join challenge/registration streams; covers a
@@ -2168,11 +2227,13 @@ pub(crate) fn cluster_role(options: ClusterRoleOptions) -> Result<(), CliError> 
     Ok(())
 }
 
-pub(crate) fn cluster_raft_role(options: ClusterRaftRoleOptions) -> Result<(), CliError> {
+pub(crate) fn cluster_state_authority_role(
+    options: ClusterStateAuthorityOptions,
+) -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
     refresh_cluster_kv_from_local_daemon(&paths)?;
     let state = network::read_cluster_state(&paths)?;
-    let update = network::update_cluster_raft_role_with_host(
+    let update = network::update_cluster_state_authority_with_host(
         &paths,
         state,
         options.node_id.clone(),
@@ -2182,7 +2243,7 @@ pub(crate) fn cluster_raft_role(options: ClusterRaftRoleOptions) -> Result<(), C
     )?;
     if !update.changed {
         println!(
-            "cluster member {} already has raft role {}",
+            "cluster member {} already has state authority role {}",
             update.node_id,
             format_member_role(&update.role)
         );
@@ -2190,7 +2251,7 @@ pub(crate) fn cluster_raft_role(options: ClusterRaftRoleOptions) -> Result<(), C
     }
 
     println!(
-        "cluster member {} raft role changed: {} {} -> {} {}",
+        "cluster member {} state authority role changed: {} {} -> {} {}",
         update.node_id,
         format_member_role(&update.previous_role),
         format_member_state(&update.previous_state),
@@ -2206,25 +2267,11 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
     let mut state = read_cluster_state(&paths)?;
     let peer_status = daemon_fetch_daemon_status_from_address(&options.from, DAEMON_JOIN_TIMEOUT)?;
     let peer_snapshot = daemon_fetch_cluster_kv_snapshot(&options.from, DAEMON_JOIN_TIMEOUT)?;
-    let peer_store = InProcessKvStore::restore(peer_snapshot);
     let mut imported = Vec::new();
     let mut endpoint_updates = Vec::new();
-    for entry in peer_store.range_prefix("/cluster/members/") {
-        let mut member: ClusterMemberRecord = entry.decode()?;
+    for mut member in network::read_cluster_members_from_snapshot(&peer_snapshot)? {
         if member.cluster_id != state.cluster_id {
             continue;
-        }
-        for endpoint_entry in
-            peer_store.range_prefix(&network::cluster_endpoint_prefix(&member.node_id))
-        {
-            let endpoint: ClusterEndpointRecord = endpoint_entry.decode()?;
-            if !member
-                .endpoints
-                .iter()
-                .any(|candidate| candidate.endpoint_id == endpoint.endpoint_id)
-            {
-                member.endpoints.push(endpoint);
-            }
         }
         if let Some(existing) = state
             .members
@@ -2259,7 +2306,7 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
     }
     if let Some(cluster) = peer_status.cluster.as_ref()
         && cluster.cluster_id == state.cluster_id
-        && cluster.process == "daemon-main"
+        && cluster.process == sinomo_runtime::node::DAEMON_MAIN_CLUSTER_ROLE
     {
         let observed_endpoint =
             network::daemon_lan_endpoint(&cluster.node_id, options.from.clone(), 0);
@@ -2305,7 +2352,7 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
 
     if let Some(node_id) = options.promote {
         let state = network::read_cluster_state(&paths)?;
-        let update = network::update_cluster_raft_role_with_host(
+        let update = network::update_cluster_state_authority_with_host(
             &paths,
             state,
             node_id,
@@ -2315,7 +2362,7 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
         )?;
         if update.changed {
             println!(
-                "cluster member {} raft role changed: {} {} -> {} {}",
+                "cluster member {} state authority role changed: {} {} -> {} {}",
                 update.node_id,
                 format_member_role(&update.previous_role),
                 format_member_state(&update.previous_state),
@@ -2324,7 +2371,7 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
             );
         } else {
             println!(
-                "cluster member {} already has raft role {}",
+                "cluster member {} already has state authority role {}",
                 update.node_id,
                 format_member_role(&update.role)
             );
@@ -2483,15 +2530,13 @@ fn prepare_local_cluster_state_for_cli(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
 ) -> Result<(), CliError> {
-    ensure_local_daemon_cluster_members(
+    refresh_local_daemon_membership_from_disk_for_cli(
+        paths,
         state,
         &DaemonRunOptions::default(),
         &DaemonRunOptions::shadow_default(),
         OffsetDateTime::now_utc(),
-    );
-    let (main_public_key, shadow_public_key) = local_daemon_public_keys(paths)?;
-    network::assign_local_daemon_member_public_keys(state, main_public_key, shadow_public_key);
-    network::refresh_local_iroh_endpoints_from_disk(paths, state, OffsetDateTime::now_utc())?;
+    )?;
     Ok(())
 }
 
@@ -2509,12 +2554,12 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
     struct CliClusterKvSnapshotRefreshHost;
 
     impl network::ClusterKvSnapshotRefreshHost for CliClusterKvSnapshotRefreshHost {
-        fn known_raft_leader_id(
+        fn known_kv_state_authority_id(
             &mut self,
             paths: &ClusterPaths,
             state: &ClusterBootstrapState,
         ) -> Result<Option<NodeId>, network::NetworkError> {
-            cluster_raft_known_leader_id(paths, state).or(Ok(None))
+            cluster_kv_state_authority_id(paths, state).or(Ok(None))
         }
 
         fn fetch_cluster_kv_snapshot(
@@ -2530,7 +2575,7 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
             })
         }
 
-        fn restore_cluster_raft_from_snapshot_if_newer(
+        fn restore_cluster_kv_from_snapshot_if_newer(
             &mut self,
             paths: &ClusterPaths,
             local_node_id: &NodeId,
@@ -2604,7 +2649,7 @@ pub(crate) fn write_imported_cluster_kv_snapshot(
     sinomo_runtime::kv::write_imported_cluster_kv_snapshot_if_changed(
         &paths.kv_paths(),
         snapshot,
-        network::cluster_kv_key_can_defer_materialized_snapshot,
+        sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
     )
     .map(|_| ())
     .map_err(Into::into)
@@ -2707,15 +2752,13 @@ pub(crate) fn daemon_cluster_status_from_local_state(
     registration: &DaemonClusterRegistration,
 ) -> Result<DaemonClusterStatus, CliError> {
     let mut state = network::read_cluster_state_without_kv(paths)?;
-    ensure_local_daemon_cluster_members(
+    refresh_local_daemon_membership_from_disk_for_cli(
+        paths,
         &mut state,
         &registration.main_options,
         &registration.shadow_options,
         OffsetDateTime::now_utc(),
-    );
-    let (main_public_key, shadow_public_key) = local_daemon_public_keys(paths)?;
-    network::assign_local_daemon_member_public_keys(&mut state, main_public_key, shadow_public_key);
-    network::refresh_local_iroh_endpoints_from_disk(paths, &mut state, OffsetDateTime::now_utc())?;
+    )?;
     daemon_cluster_status(&state, registration.process).ok_or_else(|| CliError::Parse {
         detail: "daemon cluster member could not be resolved from local state".to_string(),
     })
@@ -2737,9 +2780,9 @@ pub(crate) fn read_cluster_rollout_status(
 
 pub(crate) fn format_member_role(role: &ClusterMemberRole) -> &'static str {
     match role {
-        ClusterMemberRole::Voter => "voter",
-        ClusterMemberRole::Learner => "learner",
-        ClusterMemberRole::NonVoting => "non-voting",
+        ClusterMemberRole::Voter => "authority",
+        ClusterMemberRole::Learner => "replica",
+        ClusterMemberRole::NonVoting => "observer",
     }
 }
 
@@ -2757,9 +2800,9 @@ pub(crate) fn format_member_state(state: &ClusterMemberState) -> &'static str {
     match state {
         ClusterMemberState::Pending => "pending",
         ClusterMemberState::Active => "active",
-        ClusterMemberState::Learner => "learner",
-        ClusterMemberState::Voter => "voter",
-        ClusterMemberState::NonVoting => "non-voting",
+        ClusterMemberState::Learner => "replica",
+        ClusterMemberState::Voter => "authority",
+        ClusterMemberState::NonVoting => "observer",
         ClusterMemberState::Suspect => "suspect",
         ClusterMemberState::Offline => "offline",
         ClusterMemberState::Removed => "removed",

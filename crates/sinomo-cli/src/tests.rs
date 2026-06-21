@@ -5,31 +5,29 @@ use super::{
     AgentSessionTerminalResultsOptions, AgentValidateOptions, BUILTIN_TOP_LEVEL_USAGE_COMMANDS,
     CliClusterMemberMutationHost, CliCommand, CliError, CliRuntimeOptions, ClusterCliCommand,
     ClusterInitOptions, ClusterInviteOptions, ClusterJoinOptions, ClusterJoinRegistrationRequest,
-    ClusterMigrateCommand, ClusterMigrationPlanOptions, ClusterPaths, ClusterRaftRoleOptions,
-    ClusterRemoveOptions, ClusterRoleOptions, ClusterRolloutBuildRequest, DaemonCliCommand,
+    ClusterMigrateCommand, ClusterMigrationPlanOptions, ClusterPaths, ClusterRemoveOptions,
+    ClusterRoleOptions, ClusterRolloutBuildRequest, ClusterStateAuthorityOptions, DaemonCliCommand,
     DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
     DebugCliCommand, DfsCliCommand, DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions,
     DfsMountOptions, DfsPinCliCommand, InstallLayout, InstallOptions, InteractionModel,
     InteractionRuntime, InteractionSession, InteractionSurface, InteractionSurfaceKind,
-    ModelBackedInteractionHandler, ModelOptionValueUpdate, ModelOptionsCliCommand,
-    ModelOptionsSetOptions, ModelOptionsTarget, ModelRuntimeCliCommand, ModelRuntimeSetOptions,
-    ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions, ProviderName,
-    RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation,
-    RolloutModuleNativeDylibOptions, RolloutOptions, RolloutProgressExpectation,
-    RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler, SelfRolloutPaths,
-    TestCliCommand, UninstallOptions, advertised_peer_route_targets, apply_cluster_node_role,
+    ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions, ModelOptionsTarget,
+    ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand,
+    ProviderCommandOptions, ProviderName, RolloutAdvanceOptions, RolloutCliCommand,
+    RolloutMainActivation, RolloutModuleNativeDylibOptions, RolloutOptions,
+    RolloutProgressExpectation, RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler,
+    SelfRolloutPaths, TestCliCommand, UninstallOptions, apply_cluster_node_role,
     apply_cluster_raft_role, authenticate_daemon_control_request,
     build_cluster_raft_append_request_from_next_index, cli_command_is_help,
     cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
-    cli_invocation_force_local_mode, cluster_connectivity_sync_ops, cluster_doctor_findings,
-    cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_with_paths,
-    cluster_join_with_paths, cluster_leave_with_paths, cluster_migration_plan_with_paths,
-    cluster_node_status_from_daemon_status, cluster_peer_members, cluster_raft_known_leader_id,
-    cluster_state_sync_txn, cluster_sync_targets, compact_default_invite_introducers,
-    daemon_advertised_endpoints_for_state, daemon_handle_daemon_sandbox_http_fetch,
-    daemon_package_version, data_dir_storage_contract_findings, decode_cluster_join_invite,
-    encode_cluster_join_invite, ensure_rollout_layout, expire_cluster_network_records_in_kv,
-    extend_rollout_endpoints_from_kv, format_rollout_progress_line,
+    cli_invocation_force_local_mode, cluster_doctor_findings, cluster_has_local_quorum,
+    cluster_init_with_paths, cluster_invite_with_paths, cluster_join_with_paths,
+    cluster_kv_state_authority_id, cluster_leave_with_paths, cluster_migration_plan_with_paths,
+    cluster_node_status_from_daemon_status, cluster_peer_members, cluster_state_sync_txn,
+    compact_default_invite_introducers, daemon_advertised_endpoints_for_state,
+    daemon_handle_daemon_sandbox_http_fetch, daemon_package_version,
+    data_dir_storage_contract_findings, decode_cluster_join_invite, encode_cluster_join_invite,
+    ensure_rollout_layout, expire_cluster_network_records_in_kv, format_rollout_progress_line,
     handle_daemon_cluster_join_request, handle_daemon_cluster_kv_txn_request,
     handle_daemon_rollout_build_request, install_should_update_binary, install_with_layout,
     invite_channels_for_join_registration, invite_communication_channels,
@@ -46,16 +44,14 @@ use super::{
     read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
     read_cluster_state, require_cluster_runtime_quorum_with_paths_and_daemon,
     rollout_advance_with_data_dir, rollout_cluster_targets, rollout_cluster_targets_from_state,
-    rollout_endpoint_candidates, rollout_pending_error_grace, rollout_progress_bar,
-    rollout_status_matches_expectation, rollout_target_endpoint_for_main,
-    rollout_target_endpoint_for_main_in_order, rollout_target_endpoint_for_main_with_connectivity,
-    rollout_telemetry_gates_set_with_data_dir, rollout_terminal_response, run_tui_with_handler_io,
-    run_tui_with_handler_io_and_daemon, send_cluster_join_registration_over_iroh,
-    shadow_daemon_node_id, sign_cluster_join_invite, sign_daemon_rpc_request_from_data_dir,
-    sort_rollout_endpoints_by_connectivity, stage_rollout_main_activation,
-    sync_cluster_state_to_kv, test_command_requires_cluster_state, tui_default_daemon_status,
-    uninstall_with_layout, with_cli_force_local_mode, write_daemon_status,
-    write_imported_cluster_kv_snapshot, write_model_runtime_config_for_node, write_rollout_status,
+    rollout_pending_error_grace, rollout_progress_bar, rollout_status_matches_expectation,
+    rollout_target_endpoint_for_main_with_connectivity, rollout_telemetry_gates_set_with_data_dir,
+    rollout_terminal_response, run_tui_with_handler_io, run_tui_with_handler_io_and_daemon,
+    send_cluster_join_registration_over_iroh, shadow_daemon_node_id, sign_cluster_join_invite,
+    sign_daemon_rpc_request_from_data_dir, stage_rollout_main_activation, sync_cluster_state_to_kv,
+    test_command_requires_cluster_state, tui_default_daemon_status, uninstall_with_layout,
+    with_cli_force_local_mode, write_daemon_status, write_imported_cluster_kv_snapshot,
+    write_model_runtime_config_for_node, write_rollout_status,
 };
 #[cfg(feature = "sandbox")]
 use super::{
@@ -67,8 +63,8 @@ use super::{
 use base64::Engine;
 use sinomo_agent::{AgentRuntimeControlHost, AgentSessionResumeRequest, AgentSessionSteerRequest};
 use sinomo_lm::{
-    LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
-    ProviderReasoningEffort, ProviderTextVerbosity,
+    LanguageModelError, LanguageModelRequest, LanguageModelResponse, ProviderReasoningEffort,
+    ProviderTextVerbosity,
 };
 use sinomo_runtime::cli_registry::{
     CliCommandContext, CliCommandError, CliCommandHandler, CliCommandHelp, CliCommandMetadata,
@@ -98,10 +94,8 @@ use sinomo_runtime::module::{
     MODULE_SHADOW_DECISION_EVENT_KIND, ModuleReplayCaseOutcome, ModuleReplayReport,
     read_module_loader_runtime_state,
 };
-use sinomo_runtime::network::{
-    self, ClusterEndpointId, ClusterId, ClusterInviteId, daemon_lan_endpoint,
-};
-use sinomo_runtime::node::{NodeId, main_daemon_capabilities};
+use sinomo_runtime::network::{self, ClusterEndpointId, daemon_lan_endpoint};
+use sinomo_runtime::node::{ClusterId, ClusterInviteId, NodeId, main_daemon_capabilities};
 use sinomo_runtime::rollout::{
     RolloutAction, RolloutController, create_source_repo_bundle, read_rollout_runtime_state,
     write_rollout_runtime_state,
@@ -116,8 +110,7 @@ use std::io::{Cursor, Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Command;
-#[cfg(feature = "sandbox")]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -129,13 +122,50 @@ fn append_cluster_raft_command(
 ) -> Result<sinomo_runtime::kv::KvSnapshot, network::NetworkError> {
     paths
         .kv_paths()
-        .raft_store()
-        .append_command_and_publish(
+        .append_kv_command_and_publish(
             node_id,
             command,
-            network::cluster_kv_key_can_defer_materialized_snapshot,
+            sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
         .map_err(Into::into)
+}
+
+fn cluster_network_info_key(node_id: &NodeId) -> String {
+    format!("/cluster/network/info/{node_id}")
+}
+
+fn cluster_connectivity_key(
+    source_node_id: &NodeId,
+    target_node_id: &NodeId,
+    endpoint_id: &ClusterEndpointId,
+) -> String {
+    format!("/cluster/network/connectivity/{source_node_id}/{target_node_id}/{endpoint_id}")
+}
+
+fn cluster_endpoint_key(node_id: &NodeId, endpoint: &ClusterEndpointRecord) -> String {
+    format!("/cluster/endpoints/{node_id}/{}", endpoint.endpoint_id)
+}
+
+fn rollout_target_endpoint_for_main(
+    main_node_id: &NodeId,
+    candidates: &[ClusterEndpointRecord],
+) -> Option<ClusterEndpointRecord> {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-target-helper");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let state = ClusterBootstrapState::initialized_locally(
+        ClusterId::from_legacy_named("cluster_rollout_target_helper").expect("cluster"),
+        "rollout target helper",
+        NodeId::from_legacy_named("node_rollout_target_helper_local").expect("local node"),
+        "local",
+        "local-public-key",
+        OffsetDateTime::now_utc(),
+    );
+    network::ClusterEndpointSelector::new(&paths, &state)
+        .rollout_targets_for_main_with_command_endpoint(main_node_id, None, candidates)
+        .into_iter()
+        .next()
 }
 
 fn append_cluster_raft_command_with_response(
@@ -151,13 +181,11 @@ fn append_cluster_raft_command_with_response(
 > {
     paths
         .kv_paths()
-        .raft_store()
-        .append_command_with_response_and_publish(
+        .append_kv_command_with_response_and_publish(
             node_id,
             command,
-            network::cluster_kv_key_can_defer_materialized_snapshot,
+            sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
-        .map(|result| (result.snapshot, result.txn_response))
         .map_err(Into::into)
 }
 
@@ -419,11 +447,21 @@ fn handle_cluster_raft_append_rpc(
     let payload = sinomo_runtime::kv::cluster_raft_append_rpc_payload(&request)?;
     let rpc =
         network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
-    let response = network::handle_cluster_raft_rpc_request(
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| network::NetworkError::Io {
+            operation: "cli test cluster kv consensus rpc runtime".to_string(),
+            detail: error.to_string(),
+        })?;
+    let peer = authenticated_cluster_peer(authenticated);
+    let response = runtime.block_on(network::handle_cluster_kv_consensus_rpc_request_async(
+        runtime.handle(),
         paths,
         rpc,
-        &authenticated_cluster_peer(authenticated),
-    )?;
+        &peer,
+    ))?;
+    runtime.shutdown_timeout(Duration::from_millis(250));
     response.error_detail()?;
     sinomo_runtime::kv::decode_cluster_raft_append_rpc_response_body(&response.body)
         .map_err(Into::into)
@@ -437,11 +475,21 @@ fn handle_cluster_raft_vote_rpc(
     let payload = sinomo_runtime::kv::cluster_raft_vote_rpc_payload(&request)?;
     let rpc =
         network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
-    let response = network::handle_cluster_raft_rpc_request(
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| network::NetworkError::Io {
+            operation: "cli test cluster kv consensus rpc runtime".to_string(),
+            detail: error.to_string(),
+        })?;
+    let peer = authenticated_cluster_peer(authenticated);
+    let response = runtime.block_on(network::handle_cluster_kv_consensus_rpc_request_async(
+        runtime.handle(),
         paths,
         rpc,
-        &authenticated_cluster_peer(authenticated),
-    )?;
+        &peer,
+    ))?;
+    runtime.shutdown_timeout(Duration::from_millis(250));
     response.error_detail()?;
     sinomo_runtime::kv::decode_cluster_raft_vote_rpc_response_body(&response.body)
         .map_err(Into::into)
@@ -1090,6 +1138,32 @@ fn sandbox_run_parser_accepts_container_backend_options() {
 }
 
 #[test]
+fn sandbox_run_parser_accepts_simple_native_backend() {
+    let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
+    let command = parse_sandbox_command(&[
+        "run".to_string(),
+        sandbox_id.to_string(),
+        "--simple-native".to_string(),
+        "sh".to_string(),
+        "--".to_string(),
+        "-c".to_string(),
+        "pwd".to_string(),
+    ])
+    .expect("sandbox run");
+
+    let SandboxCliCommand::Run(options) = command else {
+        panic!("expected run");
+    };
+    assert_eq!(options.sandbox_id, sandbox_id);
+    assert_eq!(
+        options.target,
+        SandboxRunTarget::ToolchainCommand("sh".to_string())
+    );
+    assert_eq!(options.argv, vec!["sh", "-c", "pwd"]);
+    assert_eq!(options.execution, SandboxRunExecution::SimpleNative);
+}
+
+#[test]
 fn sandbox_run_parser_rejects_container_wasm_and_policy_overrides() {
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
     assert!(matches!(
@@ -1121,6 +1195,43 @@ fn sandbox_run_parser_rejects_container_wasm_and_policy_overrides() {
             sandbox_id.to_string(),
             "--daemon".to_string(),
             "--podman".to_string(),
+            "alpine:3.20".to_string(),
+            "sh".to_string(),
+        ]),
+        Err(SandboxCliError::Parse { .. })
+    ));
+}
+
+#[test]
+fn sandbox_run_parser_rejects_simple_native_wasm_and_policy_overrides() {
+    let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
+    assert!(matches!(
+        parse_sandbox_command(&[
+            "run".to_string(),
+            sandbox_id.to_string(),
+            "--simple-native".to_string(),
+            "--wasm".to_string(),
+            "/tmp/hello.wasm".to_string(),
+        ]),
+        Err(SandboxCliError::Parse { .. })
+    ));
+    assert!(matches!(
+        parse_sandbox_command(&[
+            "run".to_string(),
+            sandbox_id.to_string(),
+            "--simple-native".to_string(),
+            "--allow-capability".to_string(),
+            "wasix.unpinned-child-exec".to_string(),
+            "sh".to_string(),
+        ]),
+        Err(SandboxCliError::Parse { .. })
+    ));
+    assert!(matches!(
+        parse_sandbox_command(&[
+            "run".to_string(),
+            sandbox_id.to_string(),
+            "--simple-native".to_string(),
+            "--docker".to_string(),
             "alpine:3.20".to_string(),
             "sh".to_string(),
         ]),
@@ -1257,6 +1368,18 @@ fn sandbox_process_plan_parser_accepts_plan_path_and_timeout() {
         container_options.execution,
         SandboxRunExecution::Container(_)
     ));
+
+    let simple_command = parse_sandbox_command(&[
+        "process-plan".to_string(),
+        sandbox_id.to_string(),
+        "--simple-native".to_string(),
+        "/tmp/plan.json".to_string(),
+    ])
+    .expect("simple-native sandbox process plan");
+    let SandboxCliCommand::ProcessPlan(simple_options) = simple_command else {
+        panic!("expected process plan");
+    };
+    assert_eq!(simple_options.execution, SandboxRunExecution::SimpleNative);
 }
 
 #[test]
@@ -1297,6 +1420,19 @@ fn sandbox_shell_parser_accepts_script_and_timeout() {
         container_options.execution,
         SandboxRunExecution::Container(_)
     ));
+
+    let simple_command = parse_sandbox_command(&[
+        "shell".to_string(),
+        sandbox_id.to_string(),
+        "--simple-native".to_string(),
+        "--".to_string(),
+        "echo hi".to_string(),
+    ])
+    .expect("simple-native sandbox shell");
+    let SandboxCliCommand::Shell(simple_options) = simple_command else {
+        panic!("expected shell");
+    };
+    assert_eq!(simple_options.execution, SandboxRunExecution::SimpleNative);
 }
 
 #[test]
@@ -5792,7 +5928,11 @@ fn cluster_sync_targets_skip_remote_local_only_endpoints() {
     remote.endpoints.push(lan_endpoint);
     state.members.push(remote);
 
-    let targets = cluster_sync_targets(&state);
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-sync-targets");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    paths.ensure().expect("cluster paths");
+    let targets = network::ClusterEndpointSelector::new(&paths, &state)
+        .select(network::ClusterEndpointSelectionPurpose::DaemonCommand);
 
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].address, "192.168.1.10:21353");
@@ -6096,8 +6236,8 @@ fn cluster_state_sync_txn_removes_stale_member_endpoint_keys_before_republishing
     };
     state.members[0].endpoints = vec![current_endpoint.clone()];
 
-    let stale_key = sinomo_runtime::network::cluster_endpoint_key(&node_id, &stale_endpoint);
-    let current_key = sinomo_runtime::network::cluster_endpoint_key(&node_id, &current_endpoint);
+    let stale_key = cluster_endpoint_key(&node_id, &stale_endpoint);
+    let current_key = cluster_endpoint_key(&node_id, &current_endpoint);
     let mut store = InProcessKvStore::new();
     store
         .put_serde(stale_key.clone(), &stale_endpoint, None)
@@ -6231,11 +6371,7 @@ fn cluster_network_expiration_keeps_local_owned_records() {
             expires_at: expired,
         };
         store
-            .put_serde(
-                sinomo_runtime::network::cluster_network_info_key(node_id),
-                &info,
-                None,
-            )
+            .put_serde(cluster_network_info_key(node_id), &info, None)
             .expect("local network info");
     }
     let connectivity = sinomo_runtime::network::ClusterConnectivityRecord {
@@ -6255,7 +6391,7 @@ fn cluster_network_expiration_keeps_local_owned_records() {
     };
     store
         .put_serde(
-            sinomo_runtime::network::cluster_connectivity_key(
+            cluster_connectivity_key(
                 &connectivity.source_node_id,
                 &connectivity.target_node_id,
                 &connectivity.endpoint_id,
@@ -6305,11 +6441,7 @@ fn imported_daemon_snapshot_defers_volatile_only_materialized_refresh() {
     };
     let mut imported = InProcessKvStore::restore(baseline.clone());
     imported
-        .put_serde(
-            sinomo_runtime::network::cluster_network_info_key(&node_id),
-            &info,
-            None,
-        )
+        .put_serde(cluster_network_info_key(&node_id), &info, None)
         .expect("volatile network info");
     let imported = imported.snapshot();
     assert!(
@@ -6337,9 +6469,7 @@ fn imported_daemon_snapshot_defers_volatile_only_materialized_refresh() {
         "the materialized snapshot should remain a stale-but-fresh fallback until a structural change or checkpoint interval"
     );
     assert!(
-        cached
-            .get(&sinomo_runtime::network::cluster_network_info_key(&node_id))
-            .is_none(),
+        cached.get(&cluster_network_info_key(&node_id)).is_none(),
         "deferred volatile network info should stay out of the materialized fallback"
     );
 }
@@ -6379,25 +6509,36 @@ fn stable_connectivity_sync_does_not_rewrite_source_prefix() {
     incoming.observed_at = now;
     incoming.expires_at = now + time::Duration::seconds(180);
 
+    let key = cluster_connectivity_key(
+        &stored.source_node_id,
+        &stored.target_node_id,
+        &stored.endpoint_id,
+    );
     let mut store = InProcessKvStore::new();
     store
-        .put_serde(
-            sinomo_runtime::network::cluster_connectivity_key(
-                &stored.source_node_id,
-                &stored.target_node_id,
-                &stored.endpoint_id,
-            ),
-            &stored,
-            None,
-        )
+        .put_serde(key.clone(), &stored, None)
         .expect("stored connectivity");
     sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot())
         .expect("cluster kv snapshot");
 
-    let ops = cluster_connectivity_sync_ops(&paths, &source_node_id, &[incoming])
-        .expect("connectivity sync ops");
+    sinomo_runtime::network::sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &source_node_id,
+        vec![incoming],
+    )
+    .expect("connectivity sync");
 
-    assert!(ops.is_empty());
+    let snapshot = sinomo_runtime::kv::read_cluster_kv_current_snapshot_for_node(
+        &paths.kv_paths(),
+        source_node_id,
+    )
+    .expect("cluster kv snapshot");
+    let persisted = snapshot
+        .get(&key)
+        .expect("persisted connectivity")
+        .decode::<sinomo_runtime::network::ClusterConnectivityRecord>()
+        .expect("decode connectivity");
+    assert_eq!(persisted, stored);
 }
 
 #[test]
@@ -6429,7 +6570,8 @@ fn daemon_advertised_endpoints_use_route_addresses_for_known_peers() {
     )];
     state.members.push(remote);
 
-    let route_targets = advertised_peer_route_targets(&state);
+    let route_targets =
+        network::ClusterEndpointSelector::advertised_peer_route_targets_for_state(&state);
     assert_eq!(route_targets.len(), 1);
     assert_eq!(route_targets[0].to_string(), "192.0.2.11:21353");
 
@@ -6536,7 +6678,7 @@ fn cluster_peer_members_preserves_pending_local_member() {
         OffsetDateTime::now_utc(),
     ));
     sinomo_runtime::network::write_cluster_state(&paths, &state).expect("write joined state");
-    super::network::sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync kv");
+    super::network::sync_cluster_state_to_local_kv_unchecked(&paths, &state).expect("sync kv");
     std::fs::write(&paths.kv_snapshot, "{\"revision\":1}trailing").expect("corrupt kv");
 
     let members = cluster_peer_members(&paths).expect("peer members");
@@ -7028,7 +7170,7 @@ fn dfs_operator_inspection_uses_configured_metadata_shards() {
     );
     sinomo_runtime::network::write_cluster_state(&cluster_paths, &state)
         .expect("write cluster state");
-    super::network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+    super::network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
         .expect("sync cluster state");
 
     let file_system = distributed_sifs(node_id.clone());
@@ -7193,12 +7335,24 @@ fn cluster_parser_accepts_init_and_join_options() {
     );
     assert_eq!(
         parse_cluster_command(&[
+            "state-authority".to_string(),
+            "01hxy6qa9k0t9vr4g9n8d3q5d6".to_string(),
+            "observer".to_string(),
+        ])
+        .expect("cluster state-authority"),
+        ClusterCliCommand::StateAuthority(ClusterStateAuthorityOptions {
+            node_id: NodeId::new("01hxy6qa9k0t9vr4g9n8d3q5d6").expect("node"),
+            role: ClusterMemberRole::NonVoting,
+        })
+    );
+    assert_eq!(
+        parse_cluster_command(&[
             "raft-role".to_string(),
             "01hxy6qa9k0t9vr4g9n8d3q5d6".to_string(),
             "non_voting".to_string(),
         ])
-        .expect("cluster raft-role"),
-        ClusterCliCommand::RaftRole(ClusterRaftRoleOptions {
+        .expect("cluster raft-role compatibility alias"),
+        ClusterCliCommand::StateAuthority(ClusterStateAuthorityOptions {
             node_id: NodeId::new("01hxy6qa9k0t9vr4g9n8d3q5d6").expect("node"),
             role: ClusterMemberRole::NonVoting,
         })
@@ -7209,7 +7363,7 @@ fn cluster_parser_accepts_init_and_join_options() {
             "01hxy6qa9k0t9vr4g9n8d3q5d6".to_string()
         ])
         .expect("cluster promote"),
-        ClusterCliCommand::RaftRole(ClusterRaftRoleOptions {
+        ClusterCliCommand::StateAuthority(ClusterStateAuthorityOptions {
             node_id: NodeId::new("01hxy6qa9k0t9vr4g9n8d3q5d6").expect("node"),
             role: ClusterMemberRole::Voter,
         })
@@ -7289,18 +7443,18 @@ fn cluster_init_persists_local_cluster_state() {
     assert_eq!(kv_main.state, ClusterMemberState::Voter);
     assert_eq!(kv_main.node_public_key, main.node_public_key);
     assert_eq!(
-        cluster_raft_known_leader_id(&paths, &state).expect("known leader"),
+        cluster_kv_state_authority_id(&paths, &state).expect("known state authority"),
         Some(NodeId::from_legacy_named("node_local").expect("node"))
     );
     crate::clear_cluster_raft_leader(&paths, &state.local_node_id).expect("clear leader");
     assert_eq!(
-        cluster_raft_known_leader_id(&paths, &state).expect("cleared leader"),
+        cluster_kv_state_authority_id(&paths, &state).expect("cleared state authority"),
         None
     );
     crate::set_cluster_raft_leader(&paths, &state.local_node_id, 65)
         .expect("set single-voter leader");
     assert_eq!(
-        cluster_raft_known_leader_id(&paths, &state).expect("reelected leader"),
+        cluster_kv_state_authority_id(&paths, &state).expect("reelected state authority"),
         Some(NodeId::from_legacy_named("node_local").expect("node"))
     );
 }
@@ -7350,7 +7504,7 @@ fn cluster_leave_reinitializes_single_node_cluster() {
     assert_eq!(state.members[0].role, ClusterMemberRole::Voter);
     assert_eq!(state.members[0].state, ClusterMemberState::Voter);
     assert_eq!(
-        cluster_raft_known_leader_id(&paths, &state).expect("known leader"),
+        cluster_kv_state_authority_id(&paths, &state).expect("known state authority"),
         Some(report.local_node_id.clone())
     );
 
@@ -7733,7 +7887,7 @@ fn local_voter_republishes_local_members_missing_from_kv() {
         &paths,
         &local_state.local_node_id,
         sinomo_runtime::kv::KvCommand::Op(KvOp::Delete {
-            key: sinomo_runtime::network::cluster_member_key(&local_state.local_node_id),
+            key: sinomo_runtime::node::cluster_member_key(&local_state.local_node_id),
         }),
     )
     .expect("delete local member from kv");
@@ -8326,17 +8480,17 @@ fn cluster_invite_generates_portable_join_payload() {
     assert_eq!(parsed.invitation_secret, persisted_invite.invitation_secret);
     let invite_state_entry = super::read_cluster_kv_store(&paths)
         .expect("cluster kv store")
-        .get(&super::network::cluster_invitation_state_key(
+        .get(&sinomo_runtime::node::cluster_invitation_state_key(
             &parsed.invite_id,
         ))
         .expect("invite state")
         .clone();
-    let invite_state: super::network::ClusterInvitationStateRecord =
+    let invite_state: sinomo_runtime::r1::node::ClusterInvitationStateRecord =
         invite_state_entry.decode().expect("invite state record");
     assert_eq!(invite_state.state, "active");
     assert_eq!(
         rendered.persisted_key,
-        super::network::cluster_invitation_key(&parsed.invite_id)
+        sinomo_runtime::node::cluster_invitation_key(&parsed.invite_id)
     );
     assert_eq!(
         std::fs::read_to_string(output).expect("invite file").trim(),
@@ -9872,7 +10026,7 @@ fn daemon_cluster_kv_txn_does_not_ack_without_append_quorum() {
     peer.endpoints = vec![daemon_lan_endpoint(&peer_node_id, peer_address, 0)];
     state.members.push(peer);
     sinomo_runtime::network::write_cluster_state(&paths, &state).expect("write cluster state");
-    super::network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+    super::network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
         .expect("sync state to kv");
 
     let txn = KvTxn {
@@ -9962,7 +10116,7 @@ fn network_raft_handlers_reject_mismatched_authenticated_peer() {
     )
     .expect("cluster init");
     let state = read_cluster_state(&paths).expect("cluster state");
-    super::network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+    super::network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
         .expect("sync state to kv");
     let bad_auth = authenticated_test_command(
         sinomo_runtime::kv::CLUSTER_RAFT_APPEND_ROUTE,
@@ -9979,8 +10133,7 @@ fn network_raft_handlers_reject_mismatched_authenticated_peer() {
 
     let vote_metadata = paths
         .kv_paths()
-        .raft_store()
-        .local_vote_metadata(&state.local_node_id)
+        .locked_local_raft_vote_metadata(&state.local_node_id)
         .expect("raft vote metadata");
     let vote_request = sinomo_runtime::kv::ClusterRaftVoteRequest {
         state: state.clone(),
@@ -10065,7 +10218,7 @@ fn stale_raft_snapshot_append_does_not_roll_back_local_state() {
     )
     .expect("cluster init");
     let state = read_cluster_state(&paths).expect("cluster state");
-    super::network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+    super::network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
         .expect("sync state to kv");
     let stale_snapshot = read_cluster_kv_snapshot(&paths).expect("stale snapshot");
     append_cluster_raft_command_with_response(
@@ -10236,8 +10389,24 @@ fn daemon_node_status_publishes_version_and_rollout_to_kv() {
         read_cluster_rollout_status(&rollout_paths).expect("read rollout"),
         time::OffsetDateTime::now_utc(),
     );
-    sinomo_runtime::network::sync_cluster_node_status_to_kv(&cluster_paths, record)
-        .expect("refresh status");
+    let cluster_state = read_cluster_state(&cluster_paths).expect("read cluster state");
+    append_cluster_raft_command(
+        &cluster_paths,
+        &cluster_state.local_node_id,
+        KvCommand::Txn(KvTxn {
+            compares: Vec::new(),
+            success: vec![
+                KvOp::put_serde(
+                    sinomo_runtime::node::cluster_node_status_key_for_record(&record),
+                    &record,
+                    None,
+                )
+                .expect("node status op"),
+            ],
+            failure: Vec::new(),
+        }),
+    )
+    .expect("refresh status");
     let statuses =
         read_cluster_node_statuses_from_kv(&cluster_paths).expect("node statuses from kv");
 
@@ -10316,7 +10485,7 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
         host_state.local_node_id.as_str(),
         host_identity.public_key.clone(),
     );
-    super::network::sync_cluster_state_to_local_raft_unchecked(&host_paths, &host_state)
+    super::network::sync_cluster_state_to_local_kv_unchecked(&host_paths, &host_state)
         .expect("host kv");
     let request = build_cluster_raft_append_request_from_next_index(&host_paths, &host_state, 1)
         .expect("raft append");
@@ -10404,8 +10573,10 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
     let host_events = read_cluster_kv_snapshot(&host_paths)
         .expect("host watch snapshot")
         .events;
-    let watch_fanout = network::handle_cluster_kv_watch_events(
-        &peer_paths,
+    let peer_state = read_cluster_state(&peer_paths).expect("peer state after append");
+    let watch_fanout = sinomo_runtime::kv::handle_cluster_kv_watch_events(
+        &peer_paths.kv_paths(),
+        &peer_state,
         sinomo_runtime::kv::ClusterKvWatchEventsRequest {
             state: host_state.clone(),
             leader_id: host_state.local_node_id.clone(),
@@ -11018,6 +11189,11 @@ fn rollout_cluster_targets_keep_one_route_per_main_node() {
 
 #[test]
 fn rollout_endpoint_candidates_include_remote_shadow_members() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-endpoint-candidates");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
     let cluster_id =
         ClusterId::from_legacy_named("cluster_rollout_endpoint_candidates").expect("cluster");
     let local_node_id =
@@ -11063,7 +11239,8 @@ fn rollout_endpoint_candidates_include_remote_shadow_members() {
     state.members.push(remote_main);
     state.members.push(remote_shadow);
 
-    let endpoints = rollout_endpoint_candidates(&state);
+    let endpoints = network::ClusterEndpointSelector::new(&paths, &state)
+        .select(network::ClusterEndpointSelectionPurpose::Rollout);
 
     assert!(endpoints.iter().any(|endpoint| {
         endpoint.node_id == remote_shadow_id && endpoint.address == "10.0.0.42:21354"
@@ -11108,25 +11285,6 @@ fn rollout_cluster_target_prefers_direct_shadow_endpoint_before_iroh() {
 }
 
 #[test]
-fn rollout_cluster_target_can_preserve_connectivity_order() {
-    let main_node_id =
-        NodeId::from_legacy_named("node_rollout_shadow_connectivity_main").expect("main node");
-    let shadow_node_id = shadow_daemon_node_id(&main_node_id);
-    let lan_endpoint = invite_introducer_endpoint(&shadow_node_id, "192.0.2.42:21354".to_string());
-    let iroh_endpoint = invite_introducer_endpoint(
-        &shadow_node_id,
-        "iroh://shadow_connectivity_rollout?relay=https://relay.example./".to_string(),
-    );
-
-    let selected =
-        rollout_target_endpoint_for_main_in_order(&main_node_id, &[iroh_endpoint, lan_endpoint])
-            .expect("shadow target");
-
-    assert_eq!(selected.node_id, shadow_node_id);
-    assert_eq!(selected.transport, ClusterTransportKind::Iroh);
-}
-
-#[test]
 fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-connectivity-order");
     let data_dir = SinomoDataDir::new(&root);
@@ -11138,7 +11296,7 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
     let local_node_id = NodeId::from_legacy_named("node_rollout_connectivity_local").expect("node");
     let remote_node_id =
         NodeId::from_legacy_named("node_rollout_connectivity_remote").expect("node");
-    let state = ClusterBootstrapState::initialized_locally(
+    let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id.clone(),
         "rollout connectivity order",
         local_node_id.clone(),
@@ -11146,14 +11304,22 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
         "local-public-key",
         OffsetDateTime::now_utc(),
     );
-    sinomo_runtime::network::write_cluster_state(&paths, &state).expect("write state");
-    super::network::sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
-
     let lan_endpoint = invite_introducer_endpoint(&remote_node_id, "192.0.2.42:21354".to_string());
     let iroh_endpoint = invite_introducer_endpoint(
         &remote_node_id,
         "iroh://rollout_connectivity_remote?relay=https://relay.example./".to_string(),
     );
+    let mut remote = ClusterMemberRecord::local_non_voting(
+        cluster_id,
+        remote_node_id,
+        "remote",
+        "remote-public-key",
+        OffsetDateTime::now_utc(),
+    );
+    remote.endpoints = vec![lan_endpoint.clone(), iroh_endpoint.clone()];
+    state.members.push(remote);
+    sinomo_runtime::network::write_cluster_state(&paths, &state).expect("write state");
+    super::network::sync_cluster_state_to_local_kv_unchecked(&paths, &state).expect("sync state");
 
     let now = OffsetDateTime::now_utc();
     let records = [
@@ -11196,8 +11362,8 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
     )
     .expect("connectivity records");
 
-    let mut endpoints = vec![lan_endpoint, iroh_endpoint.clone()];
-    sort_rollout_endpoints_by_connectivity(&paths, &state, &mut endpoints);
+    let endpoints = network::ClusterEndpointSelector::new(&paths, &state)
+        .select(network::ClusterEndpointSelectionPurpose::Rollout);
 
     assert_eq!(
         endpoints.first().expect("endpoint").endpoint_id,
@@ -11260,7 +11426,7 @@ fn rollout_target_uses_main_endpoint_when_shadow_is_unreachable() {
         };
         store
             .put_serde(
-                sinomo_runtime::network::cluster_connectivity_key(
+                cluster_connectivity_key(
                     &record.source_node_id,
                     &record.target_node_id,
                     &record.endpoint_id,
@@ -11397,11 +11563,7 @@ fn rollout_target_prefers_healthy_main_tcp_over_shadow_iroh_backup() {
     let mut store = InProcessKvStore::new();
     store
         .put_serde(
-            sinomo_runtime::network::cluster_connectivity_key(
-                &local_node_id,
-                &main_node_id,
-                &main_endpoint.endpoint_id,
-            ),
+            cluster_connectivity_key(&local_node_id, &main_node_id, &main_endpoint.endpoint_id),
             &sinomo_runtime::network::ClusterConnectivityRecord {
                 cluster_id,
                 source_node_id: local_node_id,
@@ -11442,6 +11604,16 @@ fn rollout_endpoint_candidates_include_kv_only_endpoint_records() {
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
 
+    let cluster_id = ClusterId::from_legacy_named("cluster_rollout_kv_endpoint").expect("cluster");
+    let local_node_id = NodeId::from_legacy_named("node_rollout_kv_endpoint_local").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "rollout kv endpoint",
+        local_node_id,
+        "local",
+        "local-public-key",
+        OffsetDateTime::now_utc(),
+    );
     let remote_node_id =
         NodeId::from_legacy_named("node_rollout_kv_endpoint_remote").expect("node");
     let iroh_endpoint = invite_introducer_endpoint(
@@ -11452,7 +11624,7 @@ fn rollout_endpoint_candidates_include_kv_only_endpoint_records() {
     let mut store = InProcessKvStore::new();
     store
         .put_serde(
-            sinomo_runtime::network::cluster_endpoint_key(&remote_node_id, &iroh_endpoint),
+            cluster_endpoint_key(&remote_node_id, &iroh_endpoint),
             &iroh_endpoint,
             None,
         )
@@ -11460,8 +11632,8 @@ fn rollout_endpoint_candidates_include_kv_only_endpoint_records() {
     sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot())
         .expect("cluster kv snapshot");
 
-    let mut endpoints = Vec::new();
-    extend_rollout_endpoints_from_kv(&paths, &mut endpoints);
+    let endpoints = network::ClusterEndpointSelector::new(&paths, &state)
+        .select(network::ClusterEndpointSelectionPurpose::Rollout);
 
     assert!(
         endpoints
@@ -12204,47 +12376,6 @@ fn files_slash_command_is_tui_only() {
 }
 
 #[test]
-fn interaction_runtime_records_message_input_as_events() {
-    let session = InteractionSession::new(
-        SessionId::from_legacy_named("sess_cli_test").expect("session"),
-        NodeId::from_legacy_named("node_cli_test").expect("node"),
-        InteractionSurface::new("surface.test", InteractionSurfaceKind::CommandLine),
-    );
-    let mut runtime = InteractionRuntime::new(
-        InMemoryEventStore::new(),
-        fixture_handler("hello from fixture"),
-        session,
-    );
-
-    let outputs = runtime
-        .ingest_user_input("start a conversation")
-        .expect("input");
-
-    assert_eq!(outputs.len(), 1);
-    assert_eq!(
-        outputs[0],
-        super::InteractionOutput::Line("sinomo: hello from fixture".to_string())
-    );
-    let events = runtime.store().replay(ReplayQuery::all()).expect("replay");
-    assert_eq!(events.len(), 4);
-    assert_eq!(events[0].event.kind.as_str(), "interaction.input.received");
-    assert_eq!(
-        events[1].event.kind.as_str(),
-        "interaction.message.received"
-    );
-    assert_eq!(events[2].event.kind.as_str(), "interaction.model.requested");
-    assert_eq!(events[3].event.kind.as_str(), "interaction.model.responded");
-    assert_eq!(
-        events[1].event.links.caused_by,
-        vec![events[0].event.event_id.clone()]
-    );
-    assert_eq!(
-        events[3].event.links.caused_by,
-        vec![events[2].event.event_id.clone()]
-    );
-}
-
-#[test]
 fn main_agent_handler_routes_plain_input_through_agent_loop() {
     let session = InteractionSession::new(
         SessionId::from_legacy_named("sess_main_agent_cli_test").expect("session"),
@@ -12287,6 +12418,56 @@ fn main_agent_handler_routes_plain_input_through_agent_loop() {
         events[3].event.kind.as_str(),
         "interaction.main_agent.queued"
     );
+}
+
+#[test]
+fn main_agent_handler_sends_native_tools_through_agent_runtime() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-tui-agent-tools");
+    let data_dir = SinomoDataDir::new(&root);
+    let session = InteractionSession::new(
+        SessionId::from_legacy_named("sess_main_agent_tools_test").expect("session"),
+        NodeId::from_legacy_named("node_main_agent_tools_test").expect("node"),
+        InteractionSurface::new("surface.test", InteractionSurfaceKind::CommandLine),
+    );
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let handler = RuntimeMainAgentInteractionHandler::with_thinking(
+        CapturingMainAgentFixtureModel {
+            requests: requests.clone(),
+        },
+        "fixture-provider",
+        "fixture-model",
+        super::ThinkingControl::default(),
+    )
+    .with_tool_registry(main_agent_config_tool_registry(&data_dir).expect("tool registry"));
+    let mut runtime = InteractionRuntime::new(InMemoryEventStore::new(), handler, session);
+
+    let outputs = runtime
+        .ingest_user_input("what tools are available to you?")
+        .expect("input");
+
+    assert!(outputs.is_empty());
+    runtime.handler_mut().join_active_tui_turn().expect("join");
+    let requests = requests.lock().expect("captured requests");
+    let request = requests.first().expect("captured model request");
+    assert_eq!(request.metadata["loop"], "agent");
+    assert_eq!(
+        request.response_format,
+        sinomo_lm::LanguageModelResponseFormat::JsonObject
+    );
+    assert_eq!(
+        request.tool_choice,
+        Some(sinomo_lm::LanguageModelToolChoice::Auto)
+    );
+    assert!(!request.tools.is_empty());
+    let tool_names = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"tool_search"));
+    assert!(tool_names.contains(&"config_search"));
+    assert!(tool_names.contains(&"config_get"));
+    assert!(tool_names.contains(&"config_set"));
 }
 
 #[test]
@@ -12471,40 +12652,57 @@ fn minicpm_main_agent_prompt_uses_official_chat_template_shape() {
             sinomo_lm::LanguageModelMessage {
                 role: sinomo_lm::LanguageModelRole::User,
                 content: serde_json::json!({
-                    "session": {"node_id": "node_test"},
-                    "latest_event": {"payload": {"text": "hello"}},
-                    "context": {"events": [{
-                        "event": {
-                            "kind": "interaction.cluster.context",
-                            "payload": {
-                                "daemon": {
-                                    "address": "127.0.0.1:21353",
-                                    "cluster": {"cluster_id": "cluster_test"}
-                                }
-                            }
-                        }
-                    }]},
-                    "tool_specs": [{"name": "cluster_status", "description": "Summarize cluster health."}]
+                    "kind": "turn_context",
+                    "runtime": {
+                        "agent_output_format": "json-decision",
+                        "available_tool_count": 1
+                    },
+                    "context_report_id": "ctx_test"
+                })
+                .to_string(),
+            },
+            sinomo_lm::LanguageModelMessage {
+                role: sinomo_lm::LanguageModelRole::User,
+                content: serde_json::json!({
+                    "kind": "agent_loop_input",
+                    "input": {
+                        "session": {"node_id": "node_test"},
+                        "latest_event": {"payload": {"text": "hello"}}
+                    }
                 })
                 .to_string(),
             },
         ],
         items: Vec::new(),
-        tools: Vec::new(),
+        tools: vec![sinomo_lm::LanguageModelToolSpec {
+            name: "config_search".to_string(),
+            description: "Search registered Sinomo configuration keys.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"}
+                }
+            }),
+            output_schema: serde_json::Value::Null,
+            supports_parallel: false,
+            provider_specs: Vec::new(),
+        }],
         tool_choice: None,
         parallel_tool_calls: None,
         temperature: None,
         max_output_tokens: None,
         response_format: sinomo_lm::LanguageModelResponseFormat::JsonObject,
-        metadata: serde_json::json!({"loop": "main-agent"}),
+        metadata: serde_json::json!({"loop": "agent", "agent_name": "main-agent"}),
     };
 
     let prompt = super::minicpm_main_agent_prompt(&request, false).expect("prompt");
 
     assert!(prompt.contains("<|im_start|>system\n# Tools"));
     assert!(prompt.contains("<tools>"));
-    assert!(prompt.contains("<|im_start|>user\nNode: node_test"));
-    assert!(prompt.contains("Cluster: cluster cluster_test through daemon 127.0.0.1:21353"));
+    assert!(prompt.contains("\"name\":\"config_search\""));
+    assert!(prompt.contains("<|im_start|>user\nuser:"));
+    assert!(prompt.contains("\"kind\":\"turn_context\""));
+    assert!(prompt.contains("\"kind\":\"agent_loop_input\""));
     assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
 
     let prompt = super::minicpm_main_agent_prompt(&request, true).expect("prompt");
@@ -12676,18 +12874,14 @@ fn cui_loop_uses_connected_daemon_cluster_node_when_available() {
 }
 
 fn fixture_handler(
-    response: &'static str,
-) -> ModelBackedInteractionHandler<FixtureInteractionModel> {
-    ModelBackedInteractionHandler::new(
-        FixtureInteractionModel { response },
-        "fixture",
+    _response: &'static str,
+) -> RuntimeMainAgentInteractionHandler<MainAgentFixtureModel> {
+    RuntimeMainAgentInteractionHandler::with_thinking(
+        MainAgentFixtureModel,
+        "fixture-provider",
         "fixture-model",
+        super::ThinkingControl::default(),
     )
-}
-
-#[derive(Clone, Debug)]
-struct FixtureInteractionModel {
-    response: &'static str,
 }
 
 struct MainAgentFixtureModel;
@@ -12701,8 +12895,9 @@ impl InteractionModel for MainAgentFixtureModel {
         assert_eq!(request.model, "fixture-model");
         assert_eq!(
             request.response_format,
-            sinomo_lm::LanguageModelResponseFormat::Text
+            sinomo_lm::LanguageModelResponseFormat::JsonObject
         );
+        assert_eq!(request.metadata["loop"], "agent");
         assert!(
             request.messages[0]
                 .content
@@ -12714,14 +12909,24 @@ impl InteractionModel for MainAgentFixtureModel {
                 .iter()
                 .any(|message| message.content.contains("what is the cluster doing?"))
         );
-        Ok(LanguageModelResponse {
-            provider: request.provider.clone(),
-            model: request.model.clone(),
-            content: "cluster-aware reply".to_string(),
-            items: Vec::new(),
-            tool_calls: Vec::new(),
-            usage: None,
-        })
+        Ok(main_agent_fixture_response(request, "cluster-aware reply"))
+    }
+}
+
+struct CapturingMainAgentFixtureModel {
+    requests: Arc<Mutex<Vec<LanguageModelRequest>>>,
+}
+
+impl InteractionModel for CapturingMainAgentFixtureModel {
+    fn complete(
+        &self,
+        request: &LanguageModelRequest,
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        self.requests
+            .lock()
+            .expect("capture requests")
+            .push(request.clone());
+        Ok(main_agent_fixture_response(request, "tools captured"))
     }
 }
 
@@ -12753,32 +12958,17 @@ fn main_agent_fixture_response(
     LanguageModelResponse {
         provider: request.provider.clone(),
         model: request.model.clone(),
-        content: text.to_string(),
+        content: serde_json::json!({
+            "response_mode": "answer",
+            "text": text,
+            "tool_calls": [],
+            "background_handoff": null,
+            "next_state": "listening"
+        })
+        .to_string(),
         items: Vec::new(),
         tool_calls: Vec::new(),
         usage: None,
-    }
-}
-
-impl InteractionModel for FixtureInteractionModel {
-    fn complete(
-        &self,
-        request: &LanguageModelRequest,
-    ) -> Result<LanguageModelResponse, LanguageModelError> {
-        assert_eq!(request.provider, "fixture");
-        assert_eq!(request.model, "fixture-model");
-        assert!(request.messages[1].content.contains("start a conversation"));
-        Ok(LanguageModelResponse {
-            provider: request.provider.clone(),
-            model: request.model.clone(),
-            content: self.response.to_string(),
-            items: Vec::new(),
-            tool_calls: Vec::new(),
-            usage: Some(LanguageModelUsage {
-                input_tokens: Some(1),
-                output_tokens: Some(1),
-            }),
-        })
     }
 }
 

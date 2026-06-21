@@ -9,28 +9,27 @@
 //! either apply locally (journal batch) or reject gracefully (snapshot install), the
 //! same way the daemon's handlers do.
 //!
-//! Covers the host-agnostic DFS control-plane routes. Smoke, typed message, and
-//! legacy protocol-frame data-plane routes bind to a [`DfsDataPlaneHost`], so
-//! `sinomo-dfs` still owns the route contract while an embedding process supplies
-//! cluster transport.
+//! Covers the host-agnostic DFS control-plane routes. Smoke and typed message
+//! data-plane routes bind to a [`DfsDataPlaneHost`], so `sinomo-dfs` still owns
+//! the route contract while an embedding process supplies cluster transport.
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use crate::{
-    DFS_CONTROL_PLANE_ROUTES, DFS_DATA_PLANE_ROUTES, DFS_DIRECT_READ_ROUTE,
-    DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE, DFS_MESSAGE_ROUTE,
-    DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
-    DFS_PROTOCOL_FRAME_ROUTE, DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE, DaemonDfsInspectionRequest,
-    DaemonDfsInspectionResponse, DfsMessageCommand, DfsMetadataBackend,
-    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataShardConfig,
-    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse, DfsOperatorInspector,
-    DfsOperatorStatus, DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsSmokeReport,
+    DFS_CONTROL_PLANE_ROUTES, DFS_DATA_PLANE_SERVICE_ROUTES, DFS_DIRECT_READ_ROUTE,
+    DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE, DFS_METADATA_JOURNAL_BATCH_ROUTE,
+    DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE,
+    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMessageCommand, DfsMessageResponse,
+    DfsMetadataBackend, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
+    DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
+    DfsOperatorInspector, DfsOperatorStatus, DfsSmokeReport, decode_dfs_message_rpc_request,
     default_dfs_metadata_root, default_dfs_metadata_shards_root, dfs_module_surfaces,
-    ensure_default_cluster_aware_dfs_expose_config, handle_dfs_direct_read_rpc_request,
-    metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
-    sifs_file_system_id,
+    dfs_route_is_message_data_plane, ensure_default_cluster_aware_dfs_expose_config,
+    handle_dfs_direct_read_rpc_request, metadata_shards_prefix,
+    open_local_sharded_metadata_backend, open_root_local_metadata_backend, sifs_file_system_id,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
@@ -43,7 +42,26 @@ use sinomo_service::{
 };
 
 const DFS_DEFAULT_ROUTE_CONCURRENCY_LIMIT: usize = 8;
-const DFS_PROTOCOL_FRAME_ROUTE_CONCURRENCY_LIMIT: usize = 64;
+const DFS_DATA_PLANE_ROUTE_CONCURRENCY_LIMIT: usize = 64;
+
+fn dfs_service_perf_trace_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("SINOMO_DFS_PERF_TRACE")
+            .ok()
+            .is_some_and(|value| {
+                value == "1"
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("yes")
+            })
+    });
+    *ENABLED
+}
+
+fn dfs_service_perf_trace(args: std::fmt::Arguments<'_>) {
+    if dfs_service_perf_trace_enabled() {
+        eprintln!("[sinomo-dfs-perf] {args}");
+    }
+}
 
 /// DFS control-plane service. Host-agnostic: it derives everything from the request's
 /// [`ServiceContext::data_dir`], so it runs with or without a daemon/cluster.
@@ -85,11 +103,8 @@ fn dfs_service_route(route: &'static str) -> ServiceRoute {
 }
 
 fn dfs_service_route_concurrency_limit(route: &str) -> usize {
-    if route == DFS_MESSAGE_ROUTE
-        || route == DFS_PROTOCOL_FRAME_ROUTE
-        || route == DFS_DIRECT_READ_ROUTE
-    {
-        DFS_PROTOCOL_FRAME_ROUTE_CONCURRENCY_LIMIT
+    if dfs_route_is_message_data_plane(route) || route == DFS_DIRECT_READ_ROUTE {
+        DFS_DATA_PLANE_ROUTE_CONCURRENCY_LIMIT
     } else {
         DFS_DEFAULT_ROUTE_CONCURRENCY_LIMIT
     }
@@ -123,10 +138,10 @@ impl std::error::Error for DfsDataPlaneHostError {}
 pub trait DfsDataPlaneHost: Send + Sync {
     fn run_smoke<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, DfsSmokeReport>;
 
-    fn handle_protocol_frame<'a>(
+    fn handle_message<'a>(
         &'a self,
-        command: DfsProtocolFrameCommand,
-    ) -> DfsDataPlaneHostFuture<'a, DfsProtocolFrameResponse>;
+        command: DfsMessageCommand,
+    ) -> DfsDataPlaneHostFuture<'a, DfsMessageResponse>;
 }
 
 pub type DfsDataPlaneHostFuture<'a, T> =
@@ -160,8 +175,19 @@ impl Service for DfsService {
         Box::pin(async move {
             let response = match request.route.as_str() {
                 DFS_STATUS_ROUTE => {
+                    let started_at = Instant::now();
                     let _: () = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(DFS_STATUS_ROUTE, &dfs_status(&ctx.data_dir)?)?
+                    let status_started_at = Instant::now();
+                    let status = dfs_status(&ctx.data_dir)?;
+                    let status_ms = status_started_at.elapsed().as_millis();
+                    let response = ObjectRpcResponse::encode_body(DFS_STATUS_ROUTE, &status)?;
+                    dfs_service_perf_trace(format_args!(
+                        "service route={} status_ms={} total_ms={}",
+                        DFS_STATUS_ROUTE,
+                        status_ms,
+                        started_at.elapsed().as_millis()
+                    ));
+                    response
                 }
                 DFS_EXPOSE_CONFIG_ROUTE => {
                     let _: () = request.decode_body()?;
@@ -205,11 +231,11 @@ impl Service for DfsDataPlaneService {
     }
 
     fn routes(&self) -> &'static [&'static str] {
-        DFS_DATA_PLANE_ROUTES
+        DFS_DATA_PLANE_SERVICE_ROUTES
     }
 
     fn route_categories(&self) -> Vec<ServiceRoute> {
-        dfs_service_routes(DFS_DATA_PLANE_ROUTES)
+        dfs_service_routes(DFS_DATA_PLANE_SERVICE_ROUTES)
     }
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
@@ -221,27 +247,11 @@ impl Service for DfsDataPlaneService {
                     let report = host.run_smoke().await.map_err(service_error)?;
                     ObjectRpcResponse::encode_body(DFS_SMOKE_ROUTE, &report)?
                 }
-                DFS_MESSAGE_ROUTE => {
-                    let command: DfsMessageCommand = request.decode_body()?;
-                    let frame_command =
-                        crate::dfs_message_command_to_protocol_frame_command(command)
-                            .map_err(service_error)?;
-                    let frame_response = host
-                        .handle_protocol_frame(frame_command)
-                        .await
-                        .map_err(service_error)?;
+                route if dfs_route_is_message_data_plane(route) => {
+                    let command = decode_dfs_message_rpc_request(&request)?;
                     let message_response =
-                        crate::dfs_protocol_frame_response_to_message_response(frame_response)
-                            .map_err(service_error)?;
-                    ObjectRpcResponse::encode_body(DFS_MESSAGE_ROUTE, &message_response)?
-                }
-                DFS_PROTOCOL_FRAME_ROUTE => {
-                    let command: DfsProtocolFrameCommand = request.decode_body()?;
-                    let frame_response = host
-                        .handle_protocol_frame(command)
-                        .await
-                        .map_err(service_error)?;
-                    ObjectRpcResponse::encode_body(DFS_PROTOCOL_FRAME_ROUTE, &frame_response)?
+                        host.handle_message(command).await.map_err(service_error)?;
+                    ObjectRpcResponse::encode_body(route, &message_response)?
                 }
                 DFS_DIRECT_READ_ROUTE => handle_dfs_direct_read_rpc_request(&ctx.data_dir, request)
                     .map_err(service_error)?,
@@ -291,12 +301,30 @@ fn open_metadata_backend(
 
 /// Build the DFS operator status, then trim shard detail to the local node's role.
 fn dfs_status(data_dir: &SinomoDataDir) -> Result<DfsOperatorStatus, ServiceError> {
+    let started_at = Instant::now();
     data_dir.ensure_root_layout().map_err(service_error)?;
+    dfs_service_perf_trace(format_args!(
+        "status ensure_layout_ms={}",
+        started_at.elapsed().as_millis()
+    ));
+    let metadata_started_at = Instant::now();
     let metadata = open_metadata_backend(data_dir)?;
+    dfs_service_perf_trace(format_args!(
+        "status open_metadata_ms={} total_ms={}",
+        metadata_started_at.elapsed().as_millis(),
+        started_at.elapsed().as_millis()
+    ));
+    let inspector_started_at = Instant::now();
     let mut status = DfsOperatorInspector::new(metadata.as_ref())
         .status()
         .map_err(service_error)?;
+    dfs_service_perf_trace(format_args!(
+        "status inspector_ms={} total_ms={}",
+        inspector_started_at.elapsed().as_millis(),
+        started_at.elapsed().as_millis()
+    ));
     let cluster_paths = ClusterPaths::new(data_dir);
+    let trim_started_at = Instant::now();
     if let Ok(state) = read_cluster_state_without_kv(&cluster_paths) {
         for shard in &mut status.metadata_shards {
             if shard.primary_node_id.as_ref() == Some(&state.local_node_id) {
@@ -306,6 +334,11 @@ fn dfs_status(data_dir: &SinomoDataDir) -> Result<DfsOperatorStatus, ServiceErro
             }
         }
     }
+    dfs_service_perf_trace(format_args!(
+        "status trim_ms={} total_ms={}",
+        trim_started_at.elapsed().as_millis(),
+        started_at.elapsed().as_millis()
+    ));
     Ok(status)
 }
 
@@ -420,9 +453,6 @@ mod tests {
         DfsMetadataSnapshotInstallResult, DfsObjectId, DfsSmokeAttempt, DfsVersion,
         LocalSobjMetadataBackend, sifs_file_system_id,
     };
-    use sinomo_network::{
-        Heartbeat, MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrame, NetworkFrameId,
-    };
     use sinomo_service::{ResponseSink, ServiceRegistry, ServiceSigner};
     use std::sync::{Arc, Mutex};
 
@@ -441,7 +471,7 @@ mod tests {
     #[derive(Default)]
     struct StubDfsDataPlaneHost {
         smoke_calls: Mutex<usize>,
-        frame_request_ids: Mutex<Vec<String>>,
+        message_request_ids: Mutex<Vec<String>>,
     }
 
     impl DfsDataPlaneHost for StubDfsDataPlaneHost {
@@ -476,18 +506,18 @@ mod tests {
             })
         }
 
-        fn handle_protocol_frame<'a>(
+        fn handle_message<'a>(
             &'a self,
-            command: DfsProtocolFrameCommand,
-        ) -> DfsDataPlaneHostFuture<'a, DfsProtocolFrameResponse> {
+            command: DfsMessageCommand,
+        ) -> DfsDataPlaneHostFuture<'a, DfsMessageResponse> {
             Box::pin(async move {
-                self.frame_request_ids
+                self.message_request_ids
                     .lock()
-                    .expect("frame request ids")
+                    .expect("message request ids")
                     .push(command.request_id.clone());
-                Ok(DfsProtocolFrameResponse {
+                Ok(DfsMessageResponse {
                     request_id: command.request_id,
-                    outbound_frames: Vec::new(),
+                    outbound_messages: Vec::new(),
                 })
             })
         }
@@ -686,8 +716,8 @@ mod tests {
         let registry =
             register_data_plane_services(ServiceRegistry::builder(), host.clone()).build();
         assert!(registry.owns(DFS_SMOKE_ROUTE));
-        assert!(registry.owns(DFS_MESSAGE_ROUTE));
-        assert!(registry.owns(DFS_PROTOCOL_FRAME_ROUTE));
+        assert!(!registry.owns("/dfs/message"));
+        assert!(registry.owns(crate::DFS_DATA_READ_ROUTE));
         assert!(registry.owns(DFS_DIRECT_READ_ROUTE));
 
         let (disposition, smoke_response) = {
@@ -726,7 +756,7 @@ mod tests {
         let (disposition, message_response) = dispatch_local(
             &registry,
             test_data_dir.clone(),
-            DFS_MESSAGE_ROUTE,
+            crate::DFS_DATA_READ_ROUTE,
             &typed_command,
         )
         .await;
@@ -736,41 +766,13 @@ mod tests {
         assert_eq!(message.request_id, "message-route-1");
         assert!(message.outbound_messages.is_empty());
 
-        let command = DfsProtocolFrameCommand {
-            request_id: "frame-route-1".to_string(),
-            frame: NetworkFrame {
-                frame_id: NetworkFrameId(1),
-                source_node_id: local.clone(),
-                target_node_id: local.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(1),
-                    origin_node_id: local.clone(),
-                    target_node_id: local.clone(),
-                    body: MeshMessageBody::Heartbeat(Heartbeat {
-                        node_id: local,
-                        tick: 1,
-                    }),
-                },
-            },
-        };
-        let (_test_root, test_data_dir) = temp_data_dir();
-        let (disposition, frame_response) = dispatch_local(
-            &registry,
-            test_data_dir.clone(),
-            DFS_PROTOCOL_FRAME_ROUTE,
-            &command,
-        )
-        .await;
-        assert_eq!(disposition, ServiceDisposition::Continue);
-        let frame: DfsProtocolFrameResponse = frame_response.decode_body().expect("decode frame");
-        assert_eq!(frame.request_id, "frame-route-1");
-        assert!(frame.outbound_frames.is_empty());
         assert_eq!(
-            host.frame_request_ids
+            host.message_request_ids
                 .lock()
-                .expect("frame request ids")
+                .expect("message request ids")
                 .as_slice(),
-            ["message-route-1", "frame-route-1"]
+            ["message-route-1"]
         );
+        assert!(!registry.owns("/dfs/protocol/frame"));
     }
 }

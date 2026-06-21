@@ -47,6 +47,10 @@ pub enum Error {
     ZeroArrayElementSize,
     #[error("array byte length mismatch")]
     ArrayByteLengthMismatch,
+    #[error("fixed-layout payload is not aligned to {alignment}-byte boundary")]
+    UnalignedFixedLayoutPayload { alignment: usize },
+    #[error("fixed-layout payload requires a little-endian target")]
+    UnsupportedFixedLayoutEndian,
     #[error("integer overflow while calculating size")]
     SizeOverflow,
     #[error("text format error: {0}")]
@@ -278,6 +282,249 @@ impl Document {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BorrowedDocumentBuilder<'a> {
+    pub metadata: Metadata,
+    pub schema: Schema,
+    pub payload: BorrowedPayload<'a>,
+}
+
+impl<'a> BorrowedDocumentBuilder<'a> {
+    pub fn dynamic_bytes(version_id: u16, length_mode: LengthMode, data: &'a [u8]) -> Self {
+        Self {
+            metadata: Metadata::new(version_id, length_mode),
+            schema: Schema::default(),
+            payload: BorrowedPayload::Dynamic(BorrowedValue::Bytes(data)),
+        }
+    }
+
+    pub fn dynamic_array(
+        version_id: u16,
+        length_mode: LengthMode,
+        array: BorrowedArray<'a>,
+    ) -> Result<Self> {
+        array.validate()?;
+        Ok(Self {
+            metadata: Metadata::new(version_id, length_mode),
+            schema: Schema::default(),
+            payload: BorrowedPayload::Dynamic(BorrowedValue::array(array)),
+        })
+    }
+
+    pub fn schema_payload(
+        version_id: u16,
+        length_mode: LengthMode,
+        schema: Schema,
+        root_schema_type_id: u16,
+        root_count: u64,
+        data: &'a [u8],
+    ) -> Result<Self> {
+        validate_schema_payload_data(&schema, root_schema_type_id, root_count, data.len())?;
+        Ok(Self {
+            metadata: Metadata::new(version_id, length_mode),
+            schema,
+            payload: BorrowedPayload::Schema {
+                root_schema_type_id,
+                root_count,
+                data,
+            },
+        })
+    }
+
+    pub fn fixed_layout_records<T: FixedLayoutRecord>(
+        version_id: u16,
+        length_mode: LengthMode,
+        records: &'a [T],
+    ) -> Result<Self> {
+        let root_count = u64::try_from(records.len()).map_err(|_| Error::LengthTooLarge)?;
+        Self::schema_payload(
+            version_id,
+            length_mode,
+            T::schema(),
+            T::SCHEMA_TYPE_ID,
+            root_count,
+            fixed_layout_record_bytes(records)?,
+        )
+    }
+
+    pub fn aligned(mut self) -> Self {
+        self.metadata = self.metadata.aligned();
+        self
+    }
+
+    pub fn with_schema(mut self, schema: Schema) -> Self {
+        self.schema = schema;
+        self
+    }
+
+    pub fn to_vec(&self) -> Result<Vec<u8>> {
+        self.to_parts().map(BorrowedDocumentParts::to_vec)
+    }
+
+    pub fn to_parts(&self) -> Result<BorrowedDocumentParts<'a>> {
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(MAGIC);
+        write_u16(&mut prefix, self.metadata.version_id);
+        prefix.push(self.metadata.length_mode.code());
+        prefix.push(self.metadata.alignment_hint.code());
+        let length_offset = prefix.len();
+        write_length(&mut prefix, self.metadata.length_mode, 0)?;
+        self.schema.encode(&mut prefix, self.metadata.length_mode)?;
+        let payload = self.encode_payload_prefix(&mut prefix)?;
+        let document_length = prefix
+            .len()
+            .checked_add(payload.len())
+            .ok_or(Error::SizeOverflow)
+            .and_then(|length| u64::try_from(length).map_err(|_| Error::LengthTooLarge))?;
+        self.metadata.length_mode.validate(document_length)?;
+        patch_length(
+            &mut prefix[length_offset..length_offset + self.metadata.length_mode.width()],
+            self.metadata.length_mode,
+            document_length,
+        )?;
+        Ok(BorrowedDocumentParts { prefix, payload })
+    }
+
+    fn encode_payload_prefix(&self, out: &mut Vec<u8>) -> Result<&'a [u8]> {
+        match &self.payload {
+            BorrowedPayload::Dynamic(value) => {
+                value.encode_element_prefix(out, self.metadata.length_mode)
+            }
+            BorrowedPayload::Schema {
+                root_schema_type_id,
+                root_count,
+                data,
+            } => {
+                validate_schema_payload_data(
+                    &self.schema,
+                    *root_schema_type_id,
+                    *root_count,
+                    data.len(),
+                )?;
+                write_u16(out, *root_schema_type_id);
+                write_length(out, self.metadata.length_mode, *root_count)?;
+                Ok(data)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BorrowedDocumentParts<'a> {
+    pub prefix: Vec<u8>,
+    pub payload: &'a [u8],
+}
+
+impl<'a> BorrowedDocumentParts<'a> {
+    pub fn document_len(&self) -> Result<usize> {
+        self.prefix
+            .len()
+            .checked_add(self.payload.len())
+            .ok_or(Error::SizeOverflow)
+    }
+
+    pub fn as_slices(&self) -> [&[u8]; 2] {
+        [self.prefix.as_slice(), self.payload]
+    }
+
+    pub fn to_vec(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.prefix.len() + self.payload.len());
+        out.extend_from_slice(&self.prefix);
+        out.extend_from_slice(self.payload);
+        out
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BorrowedPayload<'a> {
+    Dynamic(BorrowedValue<'a>),
+    Schema {
+        root_schema_type_id: u16,
+        root_count: u64,
+        data: &'a [u8],
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BorrowedValue<'a> {
+    Bytes(&'a [u8]),
+    Array(Box<BorrowedArray<'a>>),
+}
+
+impl<'a> BorrowedValue<'a> {
+    pub fn array(value: BorrowedArray<'a>) -> Self {
+        Self::Array(Box::new(value))
+    }
+
+    pub const fn type_id(&self) -> TypeId {
+        match self {
+            Self::Bytes(_) => TypeId::Bytes,
+            Self::Array(_) => TypeId::Array,
+        }
+    }
+
+    fn encode_element_prefix(&self, out: &mut Vec<u8>, mode: LengthMode) -> Result<&'a [u8]> {
+        out.push(self.type_id().byte());
+        self.encode_value_prefix(out, mode)
+    }
+
+    fn encode_value_prefix(&self, out: &mut Vec<u8>, mode: LengthMode) -> Result<&'a [u8]> {
+        match self {
+            Self::Bytes(value) => {
+                write_length(out, mode, value.len() as u64)?;
+                Ok(value)
+            }
+            Self::Array(value) => value.encode_prefix(out, mode),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BorrowedArray<'a> {
+    pub element_type: ElementType,
+    pub element_size: u64,
+    pub dimensions: Vec<u64>,
+    pub data: &'a [u8],
+}
+
+impl<'a> BorrowedArray<'a> {
+    pub fn new(
+        element_type: ElementType,
+        element_size: u64,
+        dimensions: Vec<u64>,
+        data: &'a [u8],
+    ) -> Result<Self> {
+        let array = Self {
+            element_type,
+            element_size,
+            dimensions,
+            data,
+        };
+        array.validate()?;
+        Ok(array)
+    }
+
+    fn encode_prefix(&self, out: &mut Vec<u8>, mode: LengthMode) -> Result<&'a [u8]> {
+        self.validate()?;
+        encode_element_type(out, mode, &self.element_type)?;
+        write_length(out, mode, self.element_size)?;
+        out.push(u8::try_from(self.dimensions.len()).map_err(|_| Error::LengthTooLarge)?);
+        for dimension in &self.dimensions {
+            write_length(out, mode, *dimension)?;
+        }
+        Ok(self.data)
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_array_data(
+            &self.element_type,
+            self.element_size,
+            &self.dimensions,
+            self.data.len(),
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Payload {
     Dynamic(Value),
@@ -494,25 +741,12 @@ impl Array {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.element_size == 0 {
-            return Err(Error::ZeroArrayElementSize);
-        }
-        let count = product(&self.dimensions)?;
-        let expected = count
-            .checked_mul(self.element_size)
-            .ok_or(Error::SizeOverflow)?;
-        let actual = u64::try_from(self.data.len()).map_err(|_| Error::LengthTooLarge)?;
-        if expected != actual {
-            return Err(Error::ArrayByteLengthMismatch);
-        }
-        if let ElementType::Builtin(type_id) = self.element_type {
-            if let Some(size) = type_id.fixed_size() {
-                if size != self.element_size {
-                    return Err(Error::ArrayByteLengthMismatch);
-                }
-            }
-        }
-        Ok(())
+        validate_array_data(
+            &self.element_type,
+            self.element_size,
+            &self.dimensions,
+            self.data.len(),
+        )
     }
 }
 
@@ -599,6 +833,64 @@ pub struct SchemaField {
     pub element_type: ElementType,
 }
 
+/// Marker for schema-payload records that can be safely exposed as a borrowed
+/// typed slice.
+///
+/// # Safety
+///
+/// Implementors must have a stable byte layout, normally `#[repr(C)]`, and must
+/// not contain pointers, references, heap-owned fields, or any other value whose
+/// in-memory representation is not the SOBJ wire representation. Every byte of
+/// the record, including padding, must be initialized and deterministic. Numeric
+/// fields must already be stored in SOBJ little-endian order on the target.
+pub unsafe trait FixedLayoutRecord: Copy + Sized + 'static {
+    const SCHEMA_TYPE_ID: u16;
+    const SCHEMA_TYPE_NAME: &'static str;
+
+    fn schema_fields() -> Vec<SchemaField>;
+
+    fn schema_type() -> SchemaType {
+        SchemaType {
+            id: Self::SCHEMA_TYPE_ID,
+            name: Self::SCHEMA_TYPE_NAME.to_owned(),
+            payload_size: std::mem::size_of::<Self>() as u64,
+            fields: Self::schema_fields(),
+        }
+    }
+
+    fn schema() -> Schema {
+        Schema {
+            types: vec![Self::schema_type()],
+        }
+    }
+}
+
+pub fn fixed_layout_record_bytes<T: FixedLayoutRecord>(records: &[T]) -> Result<&[u8]> {
+    ensure_fixed_layout_supported::<T>()?;
+    let byte_len = records
+        .len()
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or(Error::SizeOverflow)?;
+    Ok(unsafe { std::slice::from_raw_parts(records.as_ptr().cast::<u8>(), byte_len) })
+}
+
+pub fn fixed_layout_records_from_bytes<T: FixedLayoutRecord>(bytes: &[u8]) -> Result<&[T]> {
+    ensure_fixed_layout_supported::<T>()?;
+    let record_size = std::mem::size_of::<T>();
+    if bytes.len() % record_size != 0 {
+        return Err(Error::ArrayByteLengthMismatch);
+    }
+    let alignment = std::mem::align_of::<T>();
+    if alignment > 1 && !(bytes.as_ptr() as usize).is_multiple_of(alignment) {
+        return Err(Error::UnalignedFixedLayoutPayload { alignment });
+    }
+    Ok(
+        unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr().cast::<T>(), bytes.len() / record_size)
+        },
+    )
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DocumentView<'a> {
     pub metadata: Metadata,
@@ -661,6 +953,38 @@ impl<'a> DocumentView<'a> {
     pub const fn bytes(&self) -> &'a [u8] {
         self.bytes
     }
+
+    pub fn fixed_layout_records<T: FixedLayoutRecord>(&self) -> Result<&'a [T]> {
+        ensure_fixed_layout_supported::<T>()?;
+        let PayloadView::Schema {
+            root_schema_type_id,
+            root_count,
+            data,
+        } = self.payload
+        else {
+            return Err(Error::TypeMismatch);
+        };
+        if root_schema_type_id != T::SCHEMA_TYPE_ID {
+            return Err(Error::TypeMismatch);
+        }
+        let Some(schema_type) = self
+            .schema
+            .types
+            .iter()
+            .find(|schema_type| schema_type.id == root_schema_type_id)
+        else {
+            return Err(Error::TypeMismatch);
+        };
+        if schema_type.payload_size != std::mem::size_of::<T>() as u64 {
+            return Err(Error::TypeMismatch);
+        }
+        validate_schema_payload_data(&self.schema, root_schema_type_id, root_count, data.len())?;
+        let records = fixed_layout_records_from_bytes::<T>(data)?;
+        if u64::try_from(records.len()).map_err(|_| Error::LengthTooLarge)? != root_count {
+            return Err(Error::ArrayByteLengthMismatch);
+        }
+        Ok(records)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -671,6 +995,318 @@ pub enum PayloadView<'a> {
         root_count: u64,
         data: &'a [u8],
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocumentCursor<'a> {
+    pub metadata: Metadata,
+    pub schema: Schema,
+    pub payload: PayloadCursor<'a>,
+    bytes: &'a [u8],
+}
+
+impl<'a> DocumentCursor<'a> {
+    pub fn parse(bytes: &'a [u8]) -> Result<Self> {
+        let mut reader = Reader::new(bytes, LengthMode::U64);
+        let magic = reader.take(4)?;
+        if magic != MAGIC {
+            return Err(Error::InvalidMagic);
+        }
+        let version_id = reader.read_u16()?;
+        let length_mode = LengthMode::from_code(reader.read_u8()?)?;
+        reader.mode = length_mode;
+        let alignment_hint = AlignmentHint::from_code(reader.read_u8()?)?;
+        let document_length = reader.read_length()?;
+        let actual = u64::try_from(bytes.len()).map_err(|_| Error::LengthTooLarge)?;
+        if document_length != actual {
+            return Err(Error::DocumentLengthMismatch {
+                expected: document_length,
+                actual,
+            });
+        }
+        let metadata = Metadata {
+            version_id,
+            length_mode,
+            alignment_hint,
+            document_length,
+        };
+        let schema = read_schema(&mut reader)?;
+        let payload = if schema.types.is_empty() {
+            PayloadCursor::Dynamic(read_element_cursor(&mut reader)?)
+        } else {
+            let root_schema_type_id = reader.read_u16()?;
+            let root_count = reader.read_length()?;
+            let data = reader.remaining_bytes();
+            reader.pos = bytes.len();
+            PayloadCursor::Schema {
+                root_schema_type_id,
+                root_count,
+                data,
+            }
+        };
+        reader.skip_padding();
+        if reader.remaining() != 0 {
+            return Err(Error::UnexpectedEof);
+        }
+        Ok(Self {
+            metadata,
+            schema,
+            payload,
+            bytes,
+        })
+    }
+
+    pub const fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PayloadCursor<'a> {
+    Dynamic(ElementCursor<'a>),
+    Schema {
+        root_schema_type_id: u16,
+        root_count: u64,
+        data: &'a [u8],
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ElementCursor<'a> {
+    type_id: TypeId,
+    value_offset: usize,
+    next_offset: usize,
+    bytes: &'a [u8],
+    mode: LengthMode,
+}
+
+impl<'a> ElementCursor<'a> {
+    pub const fn type_id(&self) -> TypeId {
+        self.type_id
+    }
+
+    pub fn as_u32(&self) -> Result<u32> {
+        if self.type_id != TypeId::Uint32 {
+            return Err(Error::TypeMismatch);
+        }
+        let mut reader = self.value_reader();
+        let value = reader.read_u32()?;
+        self.finish_reader(&reader)?;
+        Ok(value)
+    }
+
+    pub fn as_str(&self) -> Result<&'a str> {
+        if self.type_id != TypeId::String {
+            return Err(Error::TypeMismatch);
+        }
+        let mut reader = self.value_reader();
+        let value = reader.read_string()?;
+        self.finish_reader(&reader)?;
+        Ok(value)
+    }
+
+    pub fn as_bytes(&self) -> Result<&'a [u8]> {
+        if self.type_id != TypeId::Bytes {
+            return Err(Error::TypeMismatch);
+        }
+        let mut reader = self.value_reader();
+        let value = reader.read_bytes()?;
+        self.finish_reader(&reader)?;
+        Ok(value)
+    }
+
+    pub fn as_object(&self) -> Result<ObjectCursor<'a>> {
+        if self.type_id != TypeId::Object {
+            return Err(Error::TypeMismatch);
+        }
+        let mut reader = self.value_reader();
+        let field_count = reader.read_len_usize()?;
+        Ok(ObjectCursor {
+            bytes: self.bytes,
+            mode: self.mode,
+            field_count,
+            fields_offset: reader.pos,
+            end_offset: self.next_offset,
+        })
+    }
+
+    pub fn as_list(&self) -> Result<ListCursor<'a>> {
+        if self.type_id != TypeId::List {
+            return Err(Error::TypeMismatch);
+        }
+        let mut reader = self.value_reader();
+        let element_type = read_element_type(&mut reader)?;
+        let len = reader.read_len_usize()?;
+        Ok(ListCursor {
+            bytes: self.bytes,
+            mode: self.mode,
+            element_type,
+            len,
+            values_offset: reader.pos,
+            end_offset: self.next_offset,
+        })
+    }
+
+    pub fn as_array(&self) -> Result<ArrayView<'a>> {
+        if self.type_id != TypeId::Array {
+            return Err(Error::TypeMismatch);
+        }
+        let mut reader = self.value_reader();
+        let value = reader.read_array()?;
+        self.finish_reader(&reader)?;
+        Ok(value)
+    }
+
+    fn value_reader(&self) -> Reader<'a> {
+        Reader {
+            bytes: self.bytes,
+            pos: self.value_offset,
+            mode: self.mode,
+        }
+    }
+
+    fn finish_reader(&self, reader: &Reader<'_>) -> Result<()> {
+        if reader.pos == self.next_offset {
+            Ok(())
+        } else {
+            Err(Error::UnexpectedEof)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectCursor<'a> {
+    bytes: &'a [u8],
+    mode: LengthMode,
+    field_count: usize,
+    fields_offset: usize,
+    end_offset: usize,
+}
+
+impl<'a> ObjectCursor<'a> {
+    pub const fn field_count(&self) -> usize {
+        self.field_count
+    }
+
+    pub fn iter(&self) -> ObjectCursorIter<'a> {
+        ObjectCursorIter {
+            reader: Reader {
+                bytes: self.bytes,
+                pos: self.fields_offset,
+                mode: self.mode,
+            },
+            remaining: self.field_count,
+            end_offset: self.end_offset,
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Result<Option<ElementCursor<'a>>> {
+        for field in self.iter() {
+            let field = field?;
+            if field.key == key {
+                return Ok(Some(field.value));
+            }
+        }
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectFieldCursor<'a> {
+    pub key: &'a str,
+    pub value: ElementCursor<'a>,
+}
+
+pub struct ObjectCursorIter<'a> {
+    reader: Reader<'a>,
+    remaining: usize,
+    end_offset: usize,
+}
+
+impl<'a> Iterator for ObjectCursorIter<'a> {
+    type Item = Result<ObjectFieldCursor<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        let key = match self.reader.read_string() {
+            Ok(key) => key,
+            Err(error) => return Some(Err(error)),
+        };
+        let value = match read_element_cursor(&mut self.reader) {
+            Ok(value) => value,
+            Err(error) => return Some(Err(error)),
+        };
+        if self.remaining == 0 && self.reader.pos != self.end_offset {
+            return Some(Err(Error::UnexpectedEof));
+        }
+        Some(Ok(ObjectFieldCursor { key, value }))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListCursor<'a> {
+    bytes: &'a [u8],
+    mode: LengthMode,
+    element_type: ElementType,
+    len: usize,
+    values_offset: usize,
+    end_offset: usize,
+}
+
+impl<'a> ListCursor<'a> {
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub const fn element_type(&self) -> &ElementType {
+        &self.element_type
+    }
+
+    pub fn iter(&self) -> ListCursorIter<'a> {
+        ListCursorIter {
+            reader: Reader {
+                bytes: self.bytes,
+                pos: self.values_offset,
+                mode: self.mode,
+            },
+            element_type: self.element_type.clone(),
+            remaining: self.len,
+            end_offset: self.end_offset,
+        }
+    }
+}
+
+pub struct ListCursorIter<'a> {
+    reader: Reader<'a>,
+    element_type: ElementType,
+    remaining: usize,
+    end_offset: usize,
+}
+
+impl<'a> Iterator for ListCursorIter<'a> {
+    type Item = Result<ElementCursor<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        let value = match read_typed_value_cursor(&mut self.reader, &self.element_type) {
+            Ok(value) => value,
+            Err(error) => return Some(Err(error)),
+        };
+        if self.remaining == 0 && self.reader.pos != self.end_offset {
+            return Some(Err(Error::UnexpectedEof));
+        }
+        Some(Ok(value))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -999,6 +1635,174 @@ impl<'a> Reader<'a> {
     }
 }
 
+fn read_element_cursor<'a>(reader: &mut Reader<'a>) -> Result<ElementCursor<'a>> {
+    reader.skip_padding();
+    let type_id = TypeId::from_byte(reader.read_u8()?)?;
+    if type_id == TypeId::Padding {
+        return Err(Error::InvalidTypeId(TypeId::Padding.byte()));
+    }
+    let value_offset = reader.pos;
+    skip_value(reader, type_id)?;
+    Ok(ElementCursor {
+        type_id,
+        value_offset,
+        next_offset: reader.pos,
+        bytes: reader.bytes,
+        mode: reader.mode,
+    })
+}
+
+fn read_typed_value_cursor<'a>(
+    reader: &mut Reader<'a>,
+    element_type: &ElementType,
+) -> Result<ElementCursor<'a>> {
+    let type_id = cursor_type_id_for_element_type(element_type)?;
+    let value_offset = reader.pos;
+    skip_typed_value(reader, element_type)?;
+    Ok(ElementCursor {
+        type_id,
+        value_offset,
+        next_offset: reader.pos,
+        bytes: reader.bytes,
+        mode: reader.mode,
+    })
+}
+
+fn cursor_type_id_for_element_type(element_type: &ElementType) -> Result<TypeId> {
+    match element_type {
+        ElementType::Builtin(type_id) => Ok(*type_id),
+        ElementType::Object => Ok(TypeId::Object),
+        ElementType::List(_) => Ok(TypeId::List),
+        ElementType::Array(_) => Ok(TypeId::Array),
+        ElementType::Optional(_) => Ok(TypeId::Optional),
+        ElementType::SchemaRef(_) | ElementType::Extension(_) => {
+            Err(Error::UnsupportedTypeId(0x40))
+        }
+    }
+}
+
+fn skip_value(reader: &mut Reader<'_>, type_id: TypeId) -> Result<()> {
+    match type_id {
+        TypeId::Boolean | TypeId::Uint8 | TypeId::Int8 => {
+            reader.take(1)?;
+            Ok(())
+        }
+        TypeId::Uint16 | TypeId::Int16 => {
+            reader.take(2)?;
+            Ok(())
+        }
+        TypeId::Uint32 | TypeId::Int32 | TypeId::Float => {
+            reader.take(4)?;
+            Ok(())
+        }
+        TypeId::Uint64 | TypeId::Int64 | TypeId::Double => {
+            reader.take(8)?;
+            Ok(())
+        }
+        TypeId::Object => skip_object(reader),
+        TypeId::List => skip_list(reader).map(|_| ()),
+        TypeId::Array => skip_array(reader).map(|_| ()),
+        TypeId::String | TypeId::Bytes => {
+            let len = reader.read_len_usize()?;
+            reader.take(len)?;
+            Ok(())
+        }
+        TypeId::Optional => {
+            let element_type = read_element_type(reader)?;
+            let present = reader.read_u8()?;
+            match present {
+                0 => Ok(()),
+                1 => skip_typed_value(reader, &element_type),
+                other => Err(Error::InvalidBoolean(other)),
+            }
+        }
+        TypeId::Padding => Err(Error::InvalidTypeId(TypeId::Padding.byte())),
+        TypeId::Document => Err(Error::UnsupportedTypeId(type_id.byte())),
+    }
+}
+
+fn skip_typed_value(reader: &mut Reader<'_>, element_type: &ElementType) -> Result<()> {
+    match element_type {
+        ElementType::Builtin(type_id) => skip_value(reader, *type_id),
+        ElementType::Object => skip_object(reader),
+        ElementType::List(inner) => {
+            let actual = skip_list(reader)?;
+            if actual == **inner {
+                Ok(())
+            } else {
+                Err(Error::TypeMismatch)
+            }
+        }
+        ElementType::Array(inner) => {
+            let actual = skip_array(reader)?;
+            if actual == **inner {
+                Ok(())
+            } else {
+                Err(Error::TypeMismatch)
+            }
+        }
+        ElementType::Optional(inner) => {
+            let present = reader.read_u8()?;
+            match present {
+                0 => Ok(()),
+                1 => skip_typed_value(reader, inner),
+                other => Err(Error::InvalidBoolean(other)),
+            }
+        }
+        ElementType::SchemaRef(_) | ElementType::Extension(_) => {
+            Err(Error::UnsupportedTypeId(0x40))
+        }
+    }
+}
+
+fn skip_object(reader: &mut Reader<'_>) -> Result<()> {
+    let len = reader.read_len_usize()?;
+    let mut keys = HashSet::with_capacity(len);
+    for _ in 0..len {
+        let key = reader.read_string()?;
+        if !keys.insert(key) {
+            return Err(Error::DuplicateKey(key.to_owned()));
+        }
+        read_element_cursor(reader)?;
+    }
+    Ok(())
+}
+
+fn skip_list(reader: &mut Reader<'_>) -> Result<ElementType> {
+    let element_type = read_element_type(reader)?;
+    let len = reader.read_len_usize()?;
+    for _ in 0..len {
+        skip_typed_value(reader, &element_type)?;
+    }
+    Ok(element_type)
+}
+
+fn skip_array(reader: &mut Reader<'_>) -> Result<ElementType> {
+    let element_type = read_element_type(reader)?;
+    let element_size = reader.read_length()?;
+    if element_size == 0 {
+        return Err(Error::ZeroArrayElementSize);
+    }
+    let rank = reader.read_u8()? as usize;
+    let mut count = 1u64;
+    for _ in 0..rank {
+        count = count
+            .checked_mul(reader.read_length()?)
+            .ok_or(Error::SizeOverflow)?;
+    }
+    let byte_len_u64 = count.checked_mul(element_size).ok_or(Error::SizeOverflow)?;
+    let byte_len = usize::try_from(byte_len_u64).map_err(|_| Error::LengthTooLarge)?;
+    if let ElementType::Builtin(type_id) = &element_type {
+        if let Some(size) = type_id.fixed_size() {
+            if size != element_size {
+                return Err(Error::ArrayByteLengthMismatch);
+            }
+        }
+    }
+    reader.take(byte_len)?;
+    Ok(element_type)
+}
+
 fn encode_typed_value(
     out: &mut Vec<u8>,
     mode: LengthMode,
@@ -1171,6 +1975,67 @@ fn product(values: &[u64]) -> Result<u64> {
     })
 }
 
+fn validate_array_data(
+    element_type: &ElementType,
+    element_size: u64,
+    dimensions: &[u64],
+    data_len: usize,
+) -> Result<()> {
+    if element_size == 0 {
+        return Err(Error::ZeroArrayElementSize);
+    }
+    let count = product(dimensions)?;
+    let expected = count.checked_mul(element_size).ok_or(Error::SizeOverflow)?;
+    let actual = u64::try_from(data_len).map_err(|_| Error::LengthTooLarge)?;
+    if expected != actual {
+        return Err(Error::ArrayByteLengthMismatch);
+    }
+    if let ElementType::Builtin(type_id) = element_type {
+        if let Some(size) = type_id.fixed_size() {
+            if size != element_size {
+                return Err(Error::ArrayByteLengthMismatch);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_fixed_layout_supported<T: FixedLayoutRecord>() -> Result<()> {
+    if cfg!(target_endian = "big") {
+        return Err(Error::UnsupportedFixedLayoutEndian);
+    }
+    if std::mem::size_of::<T>() == 0 {
+        return Err(Error::ZeroArrayElementSize);
+    }
+    Ok(())
+}
+
+fn validate_schema_payload_data(
+    schema: &Schema,
+    root_schema_type_id: u16,
+    root_count: u64,
+    data_len: usize,
+) -> Result<()> {
+    let Some(schema_type) = schema
+        .types
+        .iter()
+        .find(|schema_type| schema_type.id == root_schema_type_id)
+    else {
+        return Err(Error::TypeMismatch);
+    };
+    if schema_type.payload_size == 0 {
+        return Ok(());
+    }
+    let expected = root_count
+        .checked_mul(schema_type.payload_size)
+        .ok_or(Error::SizeOverflow)?;
+    let actual = u64::try_from(data_len).map_err(|_| Error::LengthTooLarge)?;
+    if expected != actual {
+        return Err(Error::ArrayByteLengthMismatch);
+    }
+    Ok(())
+}
+
 fn validate_unique_keys<'a>(keys: impl Iterator<Item = &'a str>) -> Result<()> {
     let mut seen = HashSet::new();
     for key in keys {
@@ -1184,6 +2049,36 @@ fn validate_unique_keys<'a>(keys: impl Iterator<Item = &'a str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct PackedVec3 {
+        x: f32,
+        y: f32,
+        z: f32,
+    }
+
+    unsafe impl FixedLayoutRecord for PackedVec3 {
+        const SCHEMA_TYPE_ID: u16 = 7;
+        const SCHEMA_TYPE_NAME: &'static str = "vector3";
+
+        fn schema_fields() -> Vec<SchemaField> {
+            vec![
+                SchemaField {
+                    name: "x".to_owned(),
+                    element_type: ElementType::Builtin(TypeId::Float),
+                },
+                SchemaField {
+                    name: "y".to_owned(),
+                    element_type: ElementType::Builtin(TypeId::Float),
+                },
+                SchemaField {
+                    name: "z".to_owned(),
+                    element_type: ElementType::Builtin(TypeId::Float),
+                },
+            ]
+        }
+    }
 
     #[test]
     fn dynamic_document_round_trips_ordered_object() {
@@ -1356,6 +2251,308 @@ mod tests {
         assert_eq!(root_schema_type_id, 7);
         assert_eq!(root_count, 1);
         assert_eq!(data.len(), 12);
+    }
+
+    #[test]
+    fn borrowed_builder_writes_dynamic_bytes_like_owned_document() {
+        let payload: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        let borrowed = BorrowedDocumentBuilder::dynamic_bytes(1, LengthMode::U32, &payload)
+            .to_vec()
+            .unwrap();
+        let owned = Document::dynamic(1, LengthMode::U32, Value::Bytes(payload.clone()))
+            .to_bytes()
+            .unwrap();
+
+        assert_eq!(borrowed, owned);
+        let view = DocumentView::parse(&borrowed).unwrap();
+        let PayloadView::Dynamic(ElementView::Bytes(data)) = view.payload else {
+            panic!("expected bytes payload");
+        };
+        assert_eq!(data, payload.as_slice());
+        assert!(slice_is_borrowed_from(data, &borrowed));
+    }
+
+    #[test]
+    fn borrowed_builder_writes_dynamic_array_like_owned_document() {
+        let tensor_bytes: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let borrowed_array = BorrowedArray::new(
+            ElementType::Builtin(TypeId::Float),
+            4,
+            vec![2, 2],
+            &tensor_bytes,
+        )
+        .unwrap();
+        let borrowed = BorrowedDocumentBuilder::dynamic_array(1, LengthMode::U32, borrowed_array)
+            .unwrap()
+            .to_vec()
+            .unwrap();
+        let owned = Document::dynamic(
+            1,
+            LengthMode::U32,
+            Value::array(
+                Array::new(
+                    ElementType::Builtin(TypeId::Float),
+                    4,
+                    vec![2, 2],
+                    tensor_bytes.clone(),
+                )
+                .unwrap(),
+            ),
+        )
+        .to_bytes()
+        .unwrap();
+
+        assert_eq!(borrowed, owned);
+        let view = DocumentView::parse(&borrowed).unwrap();
+        let PayloadView::Dynamic(ElementView::Array(array)) = view.payload else {
+            panic!("expected array payload");
+        };
+        assert_eq!(array.element_size, 4);
+        assert_eq!(array.dimensions, &[2, 2]);
+        assert_eq!(array.data, tensor_bytes.as_slice());
+        assert!(slice_is_borrowed_from(array.data, &borrowed));
+    }
+
+    #[test]
+    fn borrowed_builder_writes_raw_schema_payload() {
+        let schema = Schema {
+            types: vec![SchemaType {
+                id: 7,
+                name: "vector3".to_owned(),
+                payload_size: 12,
+                fields: vec![
+                    SchemaField {
+                        name: "x".to_owned(),
+                        element_type: ElementType::Builtin(TypeId::Float),
+                    },
+                    SchemaField {
+                        name: "y".to_owned(),
+                        element_type: ElementType::Builtin(TypeId::Float),
+                    },
+                    SchemaField {
+                        name: "z".to_owned(),
+                        element_type: ElementType::Builtin(TypeId::Float),
+                    },
+                ],
+            }],
+        };
+        let payload: Vec<u8> = [1.0f32, 2.0, 3.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+
+        let bytes =
+            BorrowedDocumentBuilder::schema_payload(1, LengthMode::U32, schema, 7, 1, &payload)
+                .unwrap()
+                .to_vec()
+                .unwrap();
+
+        let view = DocumentView::parse(&bytes).unwrap();
+        let PayloadView::Schema {
+            root_schema_type_id,
+            root_count,
+            data,
+        } = view.payload
+        else {
+            panic!("expected schema payload");
+        };
+        assert_eq!(root_schema_type_id, 7);
+        assert_eq!(root_count, 1);
+        assert_eq!(data, payload.as_slice());
+        assert!(slice_is_borrowed_from(data, &bytes));
+    }
+
+    #[test]
+    fn fixed_layout_records_borrow_original_slice() {
+        assert_eq!(std::mem::size_of::<PackedVec3>(), 12);
+        let records = [
+            PackedVec3 {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
+            PackedVec3 {
+                x: 4.0,
+                y: 5.0,
+                z: 6.0,
+            },
+        ];
+
+        let record_bytes = fixed_layout_record_bytes(&records).unwrap();
+        assert_eq!(record_bytes.as_ptr(), records.as_ptr().cast::<u8>());
+        let typed_records = fixed_layout_records_from_bytes::<PackedVec3>(record_bytes).unwrap();
+        assert_eq!(typed_records, &records);
+
+        let view = DocumentView {
+            metadata: Metadata::new(1, LengthMode::U32),
+            schema: PackedVec3::schema(),
+            payload: PayloadView::Schema {
+                root_schema_type_id: PackedVec3::SCHEMA_TYPE_ID,
+                root_count: records.len() as u64,
+                data: record_bytes,
+            },
+            bytes: record_bytes,
+        };
+        assert_eq!(view.fixed_layout_records::<PackedVec3>().unwrap(), &records);
+    }
+
+    #[test]
+    fn borrowed_builder_writes_fixed_layout_records_as_schema_payload() {
+        let records = [
+            PackedVec3 {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
+            PackedVec3 {
+                x: 4.0,
+                y: 5.0,
+                z: 6.0,
+            },
+        ];
+        let builder =
+            BorrowedDocumentBuilder::fixed_layout_records(1, LengthMode::U32, &records).unwrap();
+        let parts = builder.to_parts().unwrap();
+        assert_eq!(parts.payload.as_ptr(), records.as_ptr().cast::<u8>());
+
+        let bytes = parts.to_vec();
+        let view = DocumentView::parse(&bytes).unwrap();
+        let PayloadView::Schema {
+            root_schema_type_id,
+            root_count,
+            data,
+        } = view.payload
+        else {
+            panic!("expected schema payload");
+        };
+        assert_eq!(root_schema_type_id, PackedVec3::SCHEMA_TYPE_ID);
+        assert_eq!(root_count, records.len() as u64);
+        assert_eq!(
+            data.len(),
+            records.len() * std::mem::size_of::<PackedVec3>()
+        );
+        assert_eq!(data, fixed_layout_record_bytes(&records).unwrap());
+    }
+
+    #[test]
+    fn document_cursor_scans_large_object_without_view_vectors() {
+        let fields = (0..1000u32)
+            .map(|value| Field::new(format!("k{value:04}"), Value::Uint32(value)))
+            .collect();
+        let document = Document::dynamic(1, LengthMode::U32, Value::Object(Object::new(fields)));
+        let bytes = document.to_bytes().unwrap();
+
+        let cursor = DocumentCursor::parse(&bytes).unwrap();
+        let PayloadCursor::Dynamic(root) = cursor.payload else {
+            panic!("expected dynamic payload");
+        };
+        let object = root.as_object().unwrap();
+        assert_eq!(object.field_count(), 1000);
+        assert_eq!(
+            object
+                .get("k0420")
+                .unwrap()
+                .expect("field")
+                .as_u32()
+                .unwrap(),
+            420
+        );
+
+        let mut count = 0usize;
+        let mut sum = 0u64;
+        for field in object.iter() {
+            let field = field.unwrap();
+            assert_eq!(field.value.type_id(), TypeId::Uint32);
+            count += 1;
+            sum += field.value.as_u32().unwrap() as u64;
+        }
+        assert_eq!(count, 1000);
+        assert_eq!(sum, (0..1000u64).sum());
+    }
+
+    #[test]
+    fn document_cursor_scans_large_list_without_view_vectors() {
+        let values = (0..1000u32).map(Value::Uint32).collect();
+        let document = Document::dynamic(
+            1,
+            LengthMode::U32,
+            Value::list(List::new(ElementType::Builtin(TypeId::Uint32), values)),
+        );
+        let bytes = document.to_bytes().unwrap();
+
+        let cursor = DocumentCursor::parse(&bytes).unwrap();
+        let PayloadCursor::Dynamic(root) = cursor.payload else {
+            panic!("expected dynamic payload");
+        };
+        let list = root.as_list().unwrap();
+        assert_eq!(list.len(), 1000);
+        assert_eq!(list.element_type(), &ElementType::Builtin(TypeId::Uint32));
+
+        let sum = list
+            .iter()
+            .map(|value| value.unwrap().as_u32().unwrap() as u64)
+            .sum::<u64>();
+        assert_eq!(sum, (0..1000u64).sum());
+    }
+
+    #[test]
+    fn document_cursor_reads_requested_borrowed_values() {
+        let tensor_bytes: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let document = Document::dynamic(
+            1,
+            LengthMode::U32,
+            Value::Object(Object::new(vec![
+                Field::new("name", Value::String("sensor-a".to_owned())),
+                Field::new("blob", Value::Bytes(vec![1, 2, 3, 4])),
+                Field::new(
+                    "tensor",
+                    Value::array(
+                        Array::new(
+                            ElementType::Builtin(TypeId::Float),
+                            4,
+                            vec![2, 2],
+                            tensor_bytes.clone(),
+                        )
+                        .unwrap(),
+                    ),
+                ),
+            ])),
+        );
+        let bytes = document.to_bytes().unwrap();
+
+        let cursor = DocumentCursor::parse(&bytes).unwrap();
+        let PayloadCursor::Dynamic(root) = cursor.payload else {
+            panic!("expected dynamic payload");
+        };
+        let object = root.as_object().unwrap();
+        assert_eq!(
+            object.get("name").unwrap().expect("name").as_str().unwrap(),
+            "sensor-a"
+        );
+        assert_eq!(
+            object
+                .get("blob")
+                .unwrap()
+                .expect("blob")
+                .as_bytes()
+                .unwrap(),
+            &[1, 2, 3, 4]
+        );
+        let array = object
+            .get("tensor")
+            .unwrap()
+            .expect("tensor")
+            .as_array()
+            .unwrap();
+        assert_eq!(array.dimensions, &[2, 2]);
+        assert_eq!(array.data, tensor_bytes.as_slice());
+        assert!(slice_is_borrowed_from(array.data, &bytes));
     }
 
     // Golden byte-exact conformance tests. Round-trip tests only prove the encoder
@@ -1556,5 +2753,13 @@ mod tests {
             .map(|field| field.key.as_str())
             .collect::<Vec<_>>();
         assert_eq!(keys, ["z", "a", "middle"]);
+    }
+
+    fn slice_is_borrowed_from(slice: &[u8], source: &[u8]) -> bool {
+        let source_start = source.as_ptr() as usize;
+        let source_end = source_start + source.len();
+        let slice_start = slice.as_ptr() as usize;
+        let slice_end = slice_start + slice.len();
+        slice_start >= source_start && slice_end <= source_end
     }
 }

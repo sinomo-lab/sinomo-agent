@@ -6,13 +6,13 @@ use super::support::{
 };
 
 #[derive(Debug)]
-pub struct SifsSandboxToolchainStore<T: DfsFrameTransport> {
+pub struct SifsSandboxToolchainStore<T: DfsMessageTransport> {
     dfs: NetworkedDfsService<T>,
     replica_candidates: Vec<NodeId>,
     ensured_dirs: BTreeSet<String>,
 }
 
-impl<T: DfsFrameTransport> SifsSandboxToolchainStore<T> {
+impl<T: DfsMessageTransport> SifsSandboxToolchainStore<T> {
     pub fn new(dfs: NetworkedDfsService<T>) -> Self {
         let replica_candidates = vec![dfs.node_id().clone()];
         Self {

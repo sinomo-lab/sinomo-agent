@@ -1,10 +1,50 @@
-use crate::prelude::*;
-use crate::storage::{
+use crate::control_plane_adapters::*;
+use crate::control_plane_adapters::{
     LocalClusterRaftCommandStorage, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
-    MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS, MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES,
     cluster_member_removal_txns_from_store, cluster_member_update_ops_from_store,
     cluster_raft_config_from_store,
 };
+use crate::control_plane_options::{
+    ClusterRaftAppendReplicationOptions, ClusterRaftCommittedFanoutOptions,
+    ClusterRaftLeaderElectionOptions,
+};
+use crate::endpoint_selector::ClusterEndpointInternalSelectionPurpose;
+use crate::health::{
+    cluster_health_rows_with_async_probe, cluster_health_rpc_request_is_local_scope,
+    handle_cluster_health_rpc_request, handle_cluster_health_rpc_request_async,
+    handle_cluster_network_ping_rpc_request_for_node, handle_current_cluster_health_rpc_request,
+};
+use crate::invite::{
+    CLUSTER_INVITE_CHALLENGE_PROTOCOL, cluster_invite_challenge_signing_payload,
+    verify_cluster_invite_challenge_proof,
+};
+use crate::keyspace::{cluster_connectivity_source_prefix, cluster_endpoint_prefix};
+use crate::lan::{
+    AsyncMdnsDiscoverySocket, LanQuicEventFrameCodec, MdnsDiscoveryAdvertisement,
+    MdnsDiscoveryCache, MdnsDiscoveryRecord, apply_lan_discovery_advertisements,
+    is_advertisable_interface_ip, is_invitable_ip, lan_discovery_advertisement_for_state,
+};
+use crate::member_store::MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS;
+use crate::object::{DaemonControlStream, read_object_frame_blocking, write_object_frame_blocking};
+use crate::object_file_store::*;
+use crate::peer::{
+    AsyncNetworkServiceHandle, AsyncNetworkTransport, AsyncNetworkTransportFuture, DeliveryAck,
+    DeliveryLedger, DeliveryStatus, EventFrame, EventFrameId, Heartbeat, HeartbeatPolicy,
+    InProcessRouter, InboundEventFrame, InboundOutcome, MeshMessage, MeshMessageBody,
+    MeshMessageId, NetworkService, NetworkServiceActorOptions, NetworkServiceCommandOptions,
+    NodeEndpoint, PeerEndpointCandidate, PeerRegistry, PeerStatus, RetryPolicy, RouteDelivery,
+    RouteDeliveryId, TransportKind,
+};
+use crate::prelude::*;
+use crate::roaming::{
+    ClusterAuthMaterial, ClusterAuthVerifier, IceCandidateRecord, IceCandidateType, IrohKvExchange,
+    LanConnectionPlanner, RoamingConnectionPlanner, RoamingPathSelection, WebRtcKvExchange,
+    WebRtcSignalMessage, WebRtcSignalingEnvelope, default_sinomo_iroh_relay_urls,
+    iroh_endpoint_record_from_cluster_endpoint, write_iroh_endpoint_record_async,
+};
+#[cfg(feature = "iroh-transport")]
+use crate::roaming::{iroh_public_key_for_node_async, load_or_create_iroh_secret_key};
+use crate::rpc::ObjectRpcFuture;
 use crate::*;
 use sinomo_kv::ClusterKvRaftConfigRecord;
 
@@ -19,18 +59,53 @@ use sinomo_events::{EventId, EventStore, InMemoryEventStore, ReplayQuery, Sessio
 use sinomo_kv::{
     CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_TXN_ROUTE,
     CLUSTER_KV_WATCH_DEFERRED_CURSOR_MAX_REVISION_LAG, CLUSTER_RAFT_APPEND_ROUTE,
-    CLUSTER_RAFT_RPC_CATEGORY, CLUSTER_RAFT_VOTE_ROUTE, ClusterKvRaftCommandStorage,
-    ClusterKvRaftLeaderElectionOptions, ClusterKvRaftUncommittedAppend,
-    ClusterKvWatchAllocatorState, ClusterKvWatchCancelRequest, ClusterKvWatchCancelResponse,
-    ClusterKvWatchDrainRequest, ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse,
-    ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration, ClusterRaftAppendRequest,
-    ClusterRaftAppendResponse, ClusterRaftVoteRequest, ClusterRaftVoteResponse, InProcessKvStore,
-    KvCommand, KvCompare, KvEntry, KvError, KvEventKind, KvOp, KvOpResponse, KvRevision,
-    KvSnapshot, KvTxn, LeaseId, MAX_CLUSTER_KV_ACTIVE_WATCHES, MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
-    MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES, MAX_CLUSTER_KV_WATCH_EVENTS, RaftAppendEntriesRequest,
-    RaftAppendEntriesResponse, RaftRequestVoteRequest, RaftSnapshot,
+    CLUSTER_RAFT_RPC_CATEGORY, CLUSTER_RAFT_VOTE_ROUTE, ClusterKvRaftAppendReplicationOutcome,
+    ClusterKvRaftCommandStorage, ClusterKvRaftLeaderElectionOptions,
+    ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult,
+    ClusterKvRaftUncommittedAppend, ClusterKvWatchAllocatorState, ClusterKvWatchCancelRequest,
+    ClusterKvWatchCancelResponse, ClusterKvWatchDrainRequest, ClusterKvWatchEventsRequest,
+    ClusterKvWatchEventsResponse, ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration,
+    ClusterRaftAppendRequest, ClusterRaftAppendResponse, ClusterRaftVoteRequest,
+    ClusterRaftVoteResponse, InProcessKvStore, KvCommand, KvCompare, KvEntry, KvError, KvEventKind,
+    KvOp, KvOpResponse, KvRevision, KvSnapshot, KvTxn, LeaseId, MAX_CLUSTER_KV_ACTIVE_WATCHES,
+    MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS, MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES,
+    MAX_CLUSTER_KV_WATCH_EVENTS, RaftAppendEntriesRequest, RaftAppendEntriesResponse,
+    RaftRequestVoteRequest, RaftSnapshot, WatchId, append_cluster_kv_watch_events,
+    append_cluster_kv_watch_events_for_active_watches, cached_cluster_kv_watch_events_contain_all,
+    cached_cluster_kv_watch_events_for_test, cached_cluster_kv_watch_registration_for_test,
+    cancel_cluster_kv_watch, cluster_kv_watch_allocator_trust_contains_for_test,
+    cluster_kv_watch_dir_scans_for_test, cluster_kv_watch_drain_once_calls_for_test,
+    cluster_kv_watch_drain_read_passes_for_test, cluster_kv_watch_event_cache_capacity_for_test,
+    cluster_kv_watch_event_cache_contains_for_test, cluster_kv_watch_event_log_read_bytes_for_test,
+    cluster_kv_watch_event_log_write_bytes_for_test, cluster_kv_watch_events,
+    cluster_kv_watch_generation, cluster_kv_watch_notifier_capacity_for_test,
+    cluster_kv_watch_notifier_has_key_for_test, cluster_kv_watch_notifier_has_raw_key_for_test,
+    cluster_kv_watch_notifier_waiter_count_for_test,
+    cluster_kv_watch_registration_cache_capacity_for_test,
+    cluster_kv_watch_registration_cache_contains_for_test,
+    cluster_kv_watch_unchanged_wakeups_for_test, create_cluster_kv_watch, drain_cluster_kv_watch,
+    drain_cluster_kv_watch_once_limited_by_payload_bytes,
+    fail_next_cluster_kv_watch_allocator_persist_for_test,
+    record_cluster_kv_watch_allocator_trust_for_test, record_cluster_kv_watch_event_cache_for_test,
+    record_cluster_kv_watch_notifier_waiter_key_for_test,
+    record_cluster_kv_watch_registration_cache_for_test,
+    refresh_cluster_kv_watch_allocator_trust_for_test,
+    refresh_cluster_kv_watch_event_cache_for_test,
+    refresh_cluster_kv_watch_registration_cache_for_test,
+    remove_cluster_kv_watch_allocator_trust_entries_under_root_for_test,
+    remove_cluster_kv_watch_event_cache_entries_under_root_for_test,
+    remove_cluster_kv_watch_notifier_entries_under_root_for_test,
+    remove_cluster_kv_watch_registration_cache_entries_under_root_for_test,
+    reset_cluster_kv_watch_dir_scans_for_test, reset_cluster_kv_watch_drain_once_calls_for_test,
+    reset_cluster_kv_watch_drain_read_passes_for_test,
+    reset_cluster_kv_watch_event_log_read_bytes_for_test,
+    reset_cluster_kv_watch_event_log_write_bytes_for_test,
+    reset_cluster_kv_watch_unchanged_wakeups_for_test, touch_cluster_kv_watch_notifier_for_test,
+    wait_for_cluster_kv_watch_change,
 };
-use sinomo_node::NodeId;
+use sinomo_node::{
+    ClusterCapabilityPolicyRecord, ClusterIdentityRecord, ClusterInvitationStateRecord, NodeId,
+};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -46,6 +121,38 @@ fn object_rpc_response_from_kv_payload(
     payload: sinomo_kv::ClusterKvRpcPayload,
 ) -> ObjectRpcResponse {
     ObjectRpcResponse::from_encoded_body(payload.route, payload.body)
+}
+
+fn cluster_kv_watch_test_node_id() -> NodeId {
+    NodeId::from_legacy_named("cluster_kv_watch_test_node").expect("cluster kv watch test node")
+}
+
+fn first_cluster_rollout_target_endpoint_for_main(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    main_node_id: &NodeId,
+    candidates: &[ClusterEndpointRecord],
+) -> Option<ClusterEndpointRecord> {
+    first_cluster_rollout_target_endpoint_for_main_with_command_endpoint(
+        paths,
+        state,
+        main_node_id,
+        None,
+        candidates,
+    )
+}
+
+fn first_cluster_rollout_target_endpoint_for_main_with_command_endpoint(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    main_node_id: &NodeId,
+    command_endpoint: Option<&ClusterEndpointRecord>,
+    candidates: &[ClusterEndpointRecord],
+) -> Option<ClusterEndpointRecord> {
+    ClusterEndpointSelector::new(paths, state)
+        .rollout_targets_for_main_with_command_endpoint(main_node_id, command_endpoint, candidates)
+        .into_iter()
+        .next()
 }
 
 #[test]
@@ -372,7 +479,7 @@ fn iroh_secret_key_creation_is_atomic_under_concurrency() {
     let paths = ClusterPaths::new(&data_dir);
     let node_id = NodeId::from_legacy_named("node_iroh_secret_concurrent").expect("node");
     let key_path = crate::roaming::iroh_endpoint_key_path(&paths, &node_id);
-    crate::storage::reset_write_object_file_create_new_attempts_for_test(&key_path);
+    crate::object_file_store::reset_write_object_file_create_new_attempts_for_test(&key_path);
     let threads = 8;
     let barrier = Arc::new(Barrier::new(threads));
     let handles = (0..threads)
@@ -407,7 +514,7 @@ fn iroh_secret_key_creation_is_atomic_under_concurrency() {
         .to_string();
     assert_eq!(persisted_public_key, public_keys[0]);
     assert_eq!(
-        crate::storage::write_object_file_create_new_attempts_for_test(&key_path),
+        crate::object_file_store::write_object_file_create_new_attempts_for_test(&key_path),
         1,
         "concurrent Iroh secret initialization should serialize creation so only one temporary key is written"
     );
@@ -1286,7 +1393,6 @@ fn object_rpc_authorization_layer_enforces_descriptor_policy_before_handler() {
         }
         Ok(())
     });
-    let router = ServiceCategoryLayer::new("test", "test routes").layer(router);
     let mut router = layer.layer(router);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1349,7 +1455,6 @@ fn object_rpc_authorization_layer_preserves_route_readiness() {
     let service = ObjectRpcRoutePolicyLayer::new(router.catalog())
         .expect("policy layer")
         .layer(router);
-    let service = ServiceCategoryLayer::new("test", "test routes").layer(service);
     let service = ObjectRpcAuthorizationLayer::new(|_, _| async { Ok(()) }).layer(service);
 
     let initial = service
@@ -1830,11 +1935,11 @@ fn async_daemon_control_client_round_trips_object_frames() {
         });
         let request =
             ObjectRpcRequest::encode_body("/test/status", "test", &()).expect("rpc request");
-        let response = send_daemon_rpc_to_address_async(
+        let response = crate::send_daemon_control_rpc_request_async(
             &address,
-            None,
             &request,
             DaemonRpcTimeouts::connect_only(Duration::from_secs(1)),
+            crate::IROH_DAEMON_COMMAND_MAX_BYTES,
         )
         .await
         .expect("response");
@@ -1927,11 +2032,11 @@ fn async_daemon_control_client_timeout_is_idle_not_total_transfer() {
         });
         let request =
             ObjectRpcRequest::encode_body("/test/slow", "test", &()).expect("rpc request");
-        let response = send_daemon_rpc_to_address_async(
+        let response = crate::send_daemon_control_rpc_request_async(
             &address,
-            None,
             &request,
             DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(25)),
+            crate::IROH_DAEMON_COMMAND_MAX_BYTES,
         )
         .await
         .expect("response");
@@ -1968,11 +2073,11 @@ fn async_daemon_control_client_without_idle_timeout_allows_response_gap() {
         });
         let request = ObjectRpcRequest::encode_body("/test/no-idle-timeout", "test", &())
             .expect("rpc request");
-        let response = send_daemon_rpc_to_address_async(
+        let response = crate::send_daemon_control_rpc_request_async(
             &address,
-            None,
             &request,
             DaemonRpcTimeouts::connect_only(Duration::from_millis(20)),
+            crate::IROH_DAEMON_COMMAND_MAX_BYTES,
         )
         .await
         .expect("response");
@@ -2003,11 +2108,11 @@ fn async_daemon_control_client_explicit_idle_timeout_still_fails_on_stall() {
         });
         let request =
             ObjectRpcRequest::encode_body("/test/idle-timeout", "test", &()).expect("rpc request");
-        let error = send_daemon_rpc_to_address_async(
+        let error = crate::send_daemon_control_rpc_request_async(
             &address,
-            None,
             &request,
             DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(20)),
+            crate::IROH_DAEMON_COMMAND_MAX_BYTES,
         )
         .await
         .expect_err("explicit idle timeout should fail");
@@ -2056,11 +2161,11 @@ fn async_daemon_rpc_client_rejects_legacy_wrapped_response() {
         });
         let request =
             ObjectRpcRequest::encode_body("/test/status", "test", &()).expect("rpc request");
-        let error = send_daemon_rpc_to_address_async(
+        let error = crate::send_daemon_control_rpc_request_async(
             &address,
-            None,
             &request,
             DaemonRpcTimeouts::connect_only(Duration::from_secs(1)),
+            crate::IROH_DAEMON_COMMAND_MAX_BYTES,
         )
         .await
         .expect_err("legacy wrapped response");
@@ -2078,9 +2183,20 @@ fn iroh_daemon_rpc_async_reports_missing_transport_feature() {
         .expect("current-thread runtime");
     let request = ObjectRpcRequest::encode_body("/test/status", "test", &()).expect("request");
 
+    let endpoint = ClusterEndpointRecord {
+        endpoint_id: sinomo_core::Id::generate(),
+        node_id: NodeId::from_legacy_named("node_iroh_missing_transport").expect("node"),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://example".to_string(),
+        source: ClusterEndpointSource::KvMembership,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 0,
+        last_observed_latency_ms: None,
+    };
+
     let error = runtime
-        .block_on(send_daemon_rpc_to_address_async(
-            "iroh://example",
+        .block_on(send_daemon_rpc_to_cluster_endpoint_async(
+            &endpoint,
             None,
             &request,
             DaemonRpcTimeouts::connect_only(Duration::from_millis(1)),
@@ -3757,7 +3873,7 @@ fn cluster_solo_predicate_treats_main_and_shadow_as_local() {
         now,
     );
 
-    assert!(!cluster_has_remote_peers(&state));
+    assert!(!sinomo_node::cluster_has_remote_peers(&state));
     assert!(cluster_is_settled_solo(&state));
 
     let shadow = sinomo_node::shadow_daemon_node_id(&local);
@@ -3770,7 +3886,7 @@ fn cluster_solo_predicate_treats_main_and_shadow_as_local() {
     ));
 
     assert!(
-        !cluster_has_remote_peers(&state),
+        !sinomo_node::cluster_has_remote_peers(&state),
         "main + shadow on one node must count as solo"
     );
     assert!(cluster_is_settled_solo(&state));
@@ -3783,7 +3899,7 @@ fn cluster_solo_predicate_treats_main_and_shadow_as_local() {
         "pk-remote",
         now,
     ));
-    assert!(cluster_has_remote_peers(&state));
+    assert!(sinomo_node::cluster_has_remote_peers(&state));
     assert!(!cluster_is_settled_solo(&state));
 
     let remote_member = state
@@ -3792,7 +3908,7 @@ fn cluster_solo_predicate_treats_main_and_shadow_as_local() {
         .find(|member| member.node_id == remote)
         .expect("remote member");
     remote_member.state = ClusterMemberState::Removed;
-    assert!(!cluster_has_remote_peers(&state));
+    assert!(!sinomo_node::cluster_has_remote_peers(&state));
     assert!(cluster_is_settled_solo(&state));
 
     let state = ClusterBootstrapState::pending_join(
@@ -4427,77 +4543,6 @@ fn connectivity_noop_handles_prefix_larger_than_public_range_limit() {
 }
 
 #[test]
-fn connectivity_partial_sync_ignores_unrelated_malformed_large_prefix() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-partial-large-prefix");
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("paths");
-    let now = OffsetDateTime::now_utc();
-    let cluster_id = ClusterId::from_legacy_named("cluster_conn_partial_large").expect("cluster");
-    let node_a = NodeId::from_legacy_named("node_conn_partial_large_a").expect("node a");
-    let node_b = NodeId::from_legacy_named("node_conn_partial_large_b").expect("node b");
-    let state = ClusterBootstrapState::initialized_locally(
-        cluster_id,
-        "connectivity partial large prefix",
-        node_a.clone(),
-        "node a",
-        "pk-a",
-        now,
-    );
-    let endpoint_b = daemon_lan_endpoint(&node_b, "10.0.0.52:21353".to_string(), 10);
-    let stable = cluster_connectivity_record(
-        &state,
-        &endpoint_b,
-        ClusterConnectivityState::Healthy,
-        Some(5),
-        0,
-        Some("ok".to_string()),
-        None,
-        now,
-        600,
-    );
-    let stable_key = cluster_connectivity_key(
-        &stable.source_node_id,
-        &stable.target_node_id,
-        &stable.endpoint_id,
-    );
-    let prefix = cluster_connectivity_source_prefix(&node_a);
-    let mut store = InProcessKvStore::new();
-    store
-        .put_serde(stable_key, &stable, None)
-        .expect("stable connectivity");
-    for index in 0..=CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES {
-        store
-            .put(
-                format!("{prefix}malformed-target-{index:05}/endpoint"),
-                b"not a connectivity record".to_vec(),
-                None,
-            )
-            .expect("malformed connectivity");
-    }
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
-
-    let later = now + time::Duration::seconds(5);
-    let stable_later = cluster_connectivity_record(
-        &state,
-        &endpoint_b,
-        ClusterConnectivityState::Healthy,
-        Some(5),
-        0,
-        Some("ok".to_string()),
-        None,
-        later,
-        600,
-    );
-    let ops = cluster_connectivity_sync_ops(&paths, &node_a, &[stable_later])
-        .expect("partial connectivity sync");
-    assert!(
-        ops.is_empty(),
-        "stable incoming connectivity should remain a no-op without retaining unrelated prefix records"
-    );
-}
-
-#[test]
 fn stable_connectivity_sync_does_not_open_raft_node() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-noop-no-raft-open");
     let data_dir = SinomoDataDir::new(&root);
@@ -4754,7 +4799,8 @@ fn local_route_graph_uses_persisted_self_connectivity_after_cache_loss() {
         "same-environment restart should retain the local fallback probe result"
     );
 
-    let targets = cluster_raft_command_targets(&paths, &state);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::ClusterStateCommand);
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&iroh.endpoint_id),
@@ -5257,7 +5303,8 @@ fn raft_command_targets_try_unknown_tcp_before_unknown_iroh_fallbacks() {
     write_cluster_state(&paths, &state).expect("write state");
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
 
-    let targets = cluster_raft_command_targets(&paths, &state);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::ClusterStateCommand);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
@@ -5344,7 +5391,8 @@ fn raft_command_targets_preserve_verified_connectivity_before_unknown_tcp() {
     )
     .expect("connectivity records");
 
-    let targets = cluster_raft_command_targets(&paths, &state);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::ClusterStateCommand);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
@@ -5451,7 +5499,8 @@ fn raft_command_targets_keep_degraded_direct_before_iroh() {
     )
     .expect("connectivity records");
 
-    let targets = cluster_raft_command_targets(&paths, &state);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::ClusterStateCommand);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
@@ -5516,7 +5565,7 @@ fn raft_command_targets_prefer_reachable_voter_over_unreachable_voter() {
             ClusterNodeStatusRecord {
                 cluster_id: state.cluster_id.clone(),
                 node_id,
-                process: "daemon-main".to_string(),
+                process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
                 availability: ClusterNodeAvailability::Online,
                 daemon_version: "0.1.0-test".to_string(),
                 commit: None,
@@ -5563,7 +5612,8 @@ fn raft_command_targets_prefer_reachable_voter_over_unreachable_voter() {
     )
     .expect("sync connectivity");
 
-    let targets = cluster_raft_command_targets(&paths, &state);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::ClusterStateCommand);
 
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.node_id),
@@ -5628,7 +5678,8 @@ fn main_daemon_command_targets_select_one_route_per_remote_main() {
     )
     .expect("connectivity records");
 
-    let targets = cluster_main_daemon_command_targets(&paths, &state);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::MainDaemonCommand);
 
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].endpoint_id, remote_tcp.endpoint_id);
@@ -5673,14 +5724,15 @@ fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
     write_cluster_state(&paths, &state).expect("write state");
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
 
-    let candidates = cluster_main_daemon_command_endpoint_candidates(&paths, &state);
-    let dfs_targets = cluster_dfs_protocol_targets(&paths, &state);
-
-    assert_eq!(
-        dfs_targets,
-        cluster_endpoint_targets(&paths, &state, ClusterEndpointSelectionPurpose::DfsData),
-        "DFS target wrapper should stay aligned with the canonical endpoint selector"
-    );
+    let selector = ClusterEndpointSelector::new(&paths, &state);
+    let candidates = selector.select(ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates);
+    let relay_hop_candidates = selector.select(ClusterEndpointSelectionPurpose::RelayHop);
+    let relay_hop_for_remote = relay_hop_candidates
+        .iter()
+        .filter(|endpoint| endpoint.node_id == main_endpoint.node_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let dfs_targets = selector.select(ClusterEndpointSelectionPurpose::DfsData);
     assert_eq!(
         candidates
             .iter()
@@ -5689,19 +5741,33 @@ fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
         vec![main_endpoint.endpoint_id.clone()],
         "main daemon command candidates must not include shadow supervision endpoints folded under the main member"
     );
+    assert_eq!(
+        relay_hop_candidates
+            .iter()
+            .map(|endpoint| endpoint.endpoint_id.clone())
+            .collect::<Vec<_>>(),
+        vec![main_endpoint.endpoint_id.clone()],
+        "relay-hop endpoint selection must use the same main-daemon surface instead of a bespoke shadow-prone path"
+    );
+    assert_eq!(
+        relay_hop_for_remote
+            .iter()
+            .map(|endpoint| endpoint.endpoint_id.clone())
+            .collect::<Vec<_>>(),
+        vec![main_endpoint.endpoint_id.clone()],
+        "node-scoped relay-hop selection should return only the target main endpoint"
+    );
     assert!(
         dfs_targets.iter().all(|endpoint| endpoint.endpoint_id
             != folded_shadow_endpoint.endpoint_id
             && endpoint.endpoint_id != port_only_shadow_endpoint.endpoint_id),
-        "DFS protocol routing uses the same main-daemon target surface"
+        "DFS data routing uses the same main-daemon target surface"
     );
-    let remote_member = state
-        .members
-        .iter()
-        .find(|member| member.node_id == main_endpoint.node_id)
-        .expect("remote main member");
-    let status_targets =
-        cluster_member_daemon_status_targets_with_connectivity(&paths, &state, remote_member);
+    let status_targets = selector
+        .select(ClusterEndpointSelectionPurpose::MemberDaemonStatus)
+        .into_iter()
+        .filter(|endpoint| endpoint.node_id == main_endpoint.node_id)
+        .collect::<Vec<_>>();
     assert_eq!(
         status_targets
             .iter()
@@ -5759,20 +5825,22 @@ fn main_daemon_command_targets_filter_known_unreachable_endpoints() {
     )
     .expect("connectivity records");
 
-    let targets = cluster_main_daemon_command_targets(&paths, &state);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::MainDaemonCommand);
 
     assert!(
         targets.is_empty(),
         "known-unreachable direct endpoints should not remain daemon command targets"
     );
-    let dfs_targets = cluster_dfs_protocol_targets(&paths, &state);
+    let dfs_targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::DfsData);
     assert_eq!(
         dfs_targets
             .iter()
             .map(|endpoint| &endpoint.endpoint_id)
             .collect::<Vec<_>>(),
         vec![&stale_tcp.endpoint_id],
-        "DFS frame routing should keep the target record so relay can handle known-bad direct paths"
+        "DFS data routing should keep the target record so relay can handle known-bad direct paths"
     );
 }
 
@@ -5826,7 +5894,8 @@ fn main_daemon_endpoint_candidates_keep_static_fallback_order() {
     write_cluster_state(&paths, &state).expect("write state");
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
 
-    let candidates = cluster_main_daemon_command_endpoint_candidates(&paths, &state);
+    let candidates = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates);
     let ordered_endpoint_ids = candidates
         .iter()
         .map(|endpoint| endpoint.endpoint_id.clone())
@@ -5879,17 +5948,8 @@ fn member_publish_targets_prefer_locally_learned_bridge_endpoint() {
     write_cluster_state(&paths, &state).expect("write state");
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
 
-    let targets = cluster_member_publish_targets(&paths, &state);
-
-    assert_eq!(
-        targets,
-        cluster_endpoint_targets(
-            &paths,
-            &state,
-            ClusterEndpointSelectionPurpose::MemberPublish
-        ),
-        "member-publish wrapper should stay aligned with the canonical endpoint selector"
-    );
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::MemberPublish);
     assert_eq!(
         targets
             .first()
@@ -5931,7 +5991,7 @@ fn rollout_target_selection_prefers_main_route_before_shadow_backup() {
     let main_endpoint = daemon_lan_endpoint(&main, "10.0.0.41:21353".to_string(), 10);
     let shadow_endpoint = daemon_lan_endpoint(&shadow, "10.0.0.42:21354".to_string(), 10);
 
-    let selected = cluster_rollout_target_endpoint_for_main(
+    let selected = first_cluster_rollout_target_endpoint_for_main(
         &paths,
         &state,
         &main,
@@ -5986,7 +6046,7 @@ fn rollout_target_selection_applies_connectivity_to_equivalent_tcp_route() {
     )
     .expect("connectivity record");
 
-    let selected = cluster_rollout_target_endpoint_for_main(
+    let selected = first_cluster_rollout_target_endpoint_for_main(
         &paths,
         &state,
         &main,
@@ -6047,9 +6107,13 @@ fn rollout_target_selection_keeps_transient_public_tcp_before_iroh() {
     )
     .expect("connectivity record");
 
-    let selected =
-        cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &[iroh, public.clone()])
-            .expect("rollout endpoint");
+    let selected = first_cluster_rollout_target_endpoint_for_main(
+        &paths,
+        &state,
+        &main,
+        &[iroh, public.clone()],
+    )
+    .expect("rollout endpoint");
 
     assert_eq!(selected.endpoint_id, public.endpoint_id);
 }
@@ -6090,7 +6154,7 @@ fn rollout_target_selection_uses_command_route_context_for_shadow_fallbacks() {
         last_observed_latency_ms: None,
     };
 
-    let selected = cluster_rollout_target_endpoint_for_main_with_command_endpoint(
+    let selected = first_cluster_rollout_target_endpoint_for_main_with_command_endpoint(
         &paths,
         &state,
         &main,
@@ -6103,30 +6167,28 @@ fn rollout_target_selection_uses_command_route_context_for_shadow_fallbacks() {
     )
     .expect("public-context rollout endpoint");
     assert_eq!(selected.endpoint_id, public_main.endpoint_id);
-    let ordered = cluster_rollout_target_endpoints_for_main_with_command_endpoint(
-        &paths,
-        &state,
-        &main,
-        Some(&public_main),
-        &[
-            private_shadow.clone(),
-            shadow_iroh.clone(),
-            public_main.clone(),
-        ],
-    );
+    let ordered = ClusterEndpointSelector::new(&paths, &state)
+        .rollout_targets_for_main_with_command_endpoint(
+            &main,
+            Some(&public_main),
+            &[
+                private_shadow.clone(),
+                shadow_iroh.clone(),
+                public_main.clone(),
+            ],
+        );
     assert_eq!(ordered[0].endpoint_id, public_main.endpoint_id);
     assert_eq!(ordered[1].endpoint_id, private_shadow.endpoint_id);
     assert_eq!(ordered[2].endpoint_id, shadow_iroh.endpoint_id);
-    let ordered = cluster_rollout_target_endpoints_for_main_with_command_endpoint(
-        &paths,
-        &state,
-        &main,
-        Some(&public_main),
-        &[private_shadow.clone(), shadow_iroh.clone()],
-    );
+    let ordered = ClusterEndpointSelector::new(&paths, &state)
+        .rollout_targets_for_main_with_command_endpoint(
+            &main,
+            Some(&public_main),
+            &[private_shadow.clone(), shadow_iroh.clone()],
+        );
     assert_eq!(ordered[0].endpoint_id, public_main.endpoint_id);
 
-    let selected = cluster_rollout_target_endpoint_for_main_with_command_endpoint(
+    let selected = first_cluster_rollout_target_endpoint_for_main_with_command_endpoint(
         &paths,
         &state,
         &main,
@@ -6139,6 +6201,9 @@ fn rollout_target_selection_uses_command_route_context_for_shadow_fallbacks() {
 
 #[test]
 fn cluster_network_probe_targets_include_remote_shadow_endpoints() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-probe-shadow-targets");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
     let now = OffsetDateTime::now_utc();
     let cluster_id = ClusterId::from_legacy_named("cluster_network_probe_shadow").expect("cluster");
     let local = NodeId::from_legacy_named("node_network_probe_shadow_local").expect("local");
@@ -6171,7 +6236,8 @@ fn cluster_network_probe_targets_include_remote_shadow_endpoints() {
     state.members.push(main_member);
     state.members.push(shadow_member);
 
-    let targets = cluster_network_probe_targets(&state);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::NetworkProbe);
     let endpoint_ids = targets
         .into_iter()
         .map(|endpoint| endpoint.endpoint_id)
@@ -7006,12 +7072,12 @@ async fn iroh_daemon_proxy_round_trips_rpc_request() {
     let fixture = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept daemon fixture");
         let request: crate::DaemonControlRequest =
-            crate::read_object_frame_blocking(&mut stream, crate::IROH_DAEMON_COMMAND_MAX_BYTES)
+            read_object_frame_blocking(&mut stream, crate::IROH_DAEMON_COMMAND_MAX_BYTES)
                 .expect("read daemon fixture request");
         assert_eq!(request.route, "/test/ping");
         let rpc_response = crate::ObjectRpcResponse::encode_body("/test/ping", &"PONG".to_string())
             .expect("rpc response");
-        crate::write_object_frame_blocking(&mut stream, &rpc_response)
+        write_object_frame_blocking(&mut stream, &rpc_response)
             .expect("write daemon fixture response");
     });
 
@@ -7648,7 +7714,11 @@ fn cluster_semantic_txn_no_effect_accepts_stable_connectivity_refresh() {
         900,
     );
     assert!(
-        cluster_connectivity_stable_eq(&seeded_record, &refreshed_record),
+        cluster_connectivity_publish_record_matches(
+            &seeded_record,
+            &refreshed_record,
+            now + time::Duration::seconds(5),
+        ),
         "test record should differ only by non-durable connectivity observations"
     );
     let (snapshot, response) = cluster_semantic_txn_no_effect_response(
@@ -7780,7 +7850,7 @@ async fn async_cluster_raft_committed_fanout_uses_async_host_and_batches_watch_e
     let mut host = RecordingCommittedFanoutHost::default();
     let runtime = tokio::runtime::Handle::current();
 
-    let report = fan_out_committed_cluster_raft_command_async_with_host(
+    let report = crate::raft_fanout::fan_out_committed_cluster_raft_command_async_with_host(
         &runtime,
         &paths,
         &state,
@@ -7827,12 +7897,20 @@ async fn async_cluster_raft_committed_fanout_uses_async_host_and_batches_watch_e
 fn cluster_raft_fanout_handoff_claims_pending_pass_after_clearing_active() {
     let active = AtomicBool::new(true);
     let pending = AtomicBool::new(false);
-    assert!(!crate::storage::claim_next_cluster_raft_fanout_pass_for_test(&active, &pending));
+    assert!(
+        !crate::control_plane_adapters::claim_next_cluster_raft_fanout_pass_for_test(
+            &active, &pending
+        )
+    );
     assert!(!active.load(Ordering::Acquire));
 
     active.store(true, Ordering::Release);
     pending.store(true, Ordering::Release);
-    assert!(crate::storage::claim_next_cluster_raft_fanout_pass_for_test(&active, &pending));
+    assert!(
+        crate::control_plane_adapters::claim_next_cluster_raft_fanout_pass_for_test(
+            &active, &pending
+        )
+    );
     assert!(active.load(Ordering::Acquire));
 }
 
@@ -8227,8 +8305,10 @@ fn cleanup_legacy_shadow_daemon_members_removes_only_shadow_only_records() {
         "pk-local-shadow",
         now,
     );
-    local_shadow.capabilities =
-        vec![CapabilityName::new(DAEMON_SHADOW_SUPERVISE_CAPABILITY).expect("shadow capability")];
+    local_shadow.capabilities = vec![
+        CapabilityName::new(sinomo_node::DAEMON_SHADOW_SUPERVISE_CAPABILITY)
+            .expect("shadow capability"),
+    ];
     local_shadow.allowed_capabilities = local_shadow.capabilities.clone();
     local_shadow.endpoints = vec![daemon_lan_endpoint(
         &local_shadow_node_id,
@@ -8243,8 +8323,10 @@ fn cleanup_legacy_shadow_daemon_members_removes_only_shadow_only_records() {
         "pk-remote-shadow",
         now,
     );
-    remote_shadow.capabilities =
-        vec![CapabilityName::new(DAEMON_SHADOW_SUPERVISE_CAPABILITY).expect("shadow capability")];
+    remote_shadow.capabilities = vec![
+        CapabilityName::new(sinomo_node::DAEMON_SHADOW_SUPERVISE_CAPABILITY)
+            .expect("shadow capability"),
+    ];
     remote_shadow.allowed_capabilities = remote_shadow.capabilities.clone();
     remote_shadow.endpoints = vec![daemon_lan_endpoint(
         &remote_shadow_node_id,
@@ -8393,7 +8475,7 @@ fn cleanup_legacy_shadow_daemon_members_removes_only_shadow_only_records() {
     let orphan_status = ClusterNodeStatusRecord {
         cluster_id: cluster_id.clone(),
         node_id: orphan_shadow_node_id.clone(),
-        process: DAEMON_SHADOW_CLUSTER_ROLE.to_string(),
+        process: sinomo_node::DAEMON_SHADOW_CLUSTER_ROLE.to_string(),
         availability: ClusterNodeAvailability::Offline,
         daemon_version: "0.1.0".to_string(),
         commit: None,
@@ -8422,7 +8504,10 @@ fn cleanup_legacy_shadow_daemon_members_removes_only_shadow_only_records() {
     );
     host.store
         .put_serde(
-            cluster_node_status_key_for_process(&orphan_shadow_node_id, DAEMON_SHADOW_CLUSTER_ROLE),
+            cluster_node_status_key_for_process(
+                &orphan_shadow_node_id,
+                sinomo_node::DAEMON_SHADOW_CLUSTER_ROLE,
+            ),
             &orphan_status,
             None,
         )
@@ -8445,7 +8530,7 @@ fn cleanup_legacy_shadow_daemon_members_removes_only_shadow_only_records() {
         host.store
             .get(&cluster_node_status_key_for_process(
                 &orphan_shadow_node_id,
-                DAEMON_SHADOW_CLUSTER_ROLE
+                sinomo_node::DAEMON_SHADOW_CLUSTER_ROLE
             ))
             .is_none(),
         "orphan shadow status should be removed"
@@ -8679,7 +8764,7 @@ fn cluster_raft_rpc_dispatch_decodes_and_encodes_append_and_vote() {
         .build()
         .expect("runtime");
     let vote_response = runtime
-        .block_on(handle_cluster_raft_rpc_request_async(
+        .block_on(handle_cluster_kv_consensus_rpc_request_async(
             runtime.handle(),
             &paths,
             vote_rpc,
@@ -8809,8 +8894,7 @@ impl ClusterRaftAppendReplicationHost for RecordingRaftAppendHost {
     ) -> Result<ClusterRaftAppendRequest, NetworkError> {
         paths
             .kv_paths()
-            .raft_store()
-            .build_cluster_raft_append_request_from_next_index(state, next_index)
+            .build_raft_append_request_from_next_index(state, next_index)
             .map_err(Into::into)
     }
 
@@ -8972,13 +9056,13 @@ impl ClusterRaftCommittedFanoutAsyncHost for RecordingCommittedFanoutHost {
         endpoint: &'a ClusterEndpointRecord,
         watch_events: &'a [KvEvent],
         timeout: Duration,
-    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendReplicationOutcome> {
+    ) -> ClusterMembershipRpcFuture<'a, ClusterKvRaftAppendReplicationOutcome> {
         self.appended_nodes.push(endpoint.node_id.clone());
         self.appended_event_counts.push(watch_events.len());
         self.append_timeouts.push(timeout);
         let state = state.clone();
         Box::pin(async move {
-            Ok(ClusterRaftAppendReplicationOutcome {
+            Ok(ClusterKvRaftAppendReplicationOutcome {
                 response: ClusterRaftAppendResponse {
                     accepted: true,
                     detail: "accepted".to_string(),
@@ -9018,20 +9102,24 @@ impl ClusterRaftCommittedFanoutAsyncHost for RecordingCommittedFanoutHost {
 }
 
 #[derive(Default)]
-struct RecordingVoterReachabilityHost {
+struct RecordingStateAuthorityReachabilityHost {
     reachable: BTreeSet<NodeId>,
     probes: Vec<(NodeId, Duration)>,
 }
 
-impl ClusterVoterReachabilityHost for RecordingVoterReachabilityHost {
-    fn probe_voter(&mut self, endpoint: &ClusterEndpointRecord, timeout: Duration) -> bool {
+impl ClusterStateAuthorityReachabilityHost for RecordingStateAuthorityReachabilityHost {
+    fn probe_cluster_state_authority(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        timeout: Duration,
+    ) -> bool {
         self.probes.push((endpoint.node_id.clone(), timeout));
         self.reachable.contains(&endpoint.node_id)
     }
 }
 
-impl ClusterVoterReachabilityAsyncHost for RecordingVoterReachabilityHost {
-    fn probe_voter_async<'a>(
+impl ClusterStateAuthorityReachabilityAsyncHost for RecordingStateAuthorityReachabilityHost {
+    fn probe_cluster_state_authority_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
         timeout: Duration,
@@ -9070,71 +9158,30 @@ impl ClusterRaftVoteTransportHost for RecordingLeaderElectionHost {
 }
 
 struct RecordingKvTxnForwardHost {
-    known_leader: Option<NodeId>,
-    direct_error: bool,
+    known_authority: Option<NodeId>,
     snapshot: KvSnapshot,
     txn_response: KvTxnResponse,
-    relay_peers: Vec<ClusterEndpointRecord>,
-    direct_sends: Vec<NodeId>,
-    snapshot_fetches: Vec<NodeId>,
-    relays: Vec<(NodeId, NodeId, String)>,
+    node_rpcs: Vec<(NodeId, String)>,
 }
 
 impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
-    fn known_raft_leader_id(
+    fn known_kv_state_authority_id(
         &mut self,
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError> {
-        Ok(self.known_leader.clone())
+        Ok(self.known_authority.clone())
     }
 
-    fn send_cluster_kv_txn(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        _txn: &KvTxn,
-        _timeout: Duration,
-    ) -> Result<KvTxnResponse, NetworkError> {
-        self.direct_sends.push(endpoint.node_id.clone());
-        if self.direct_error {
-            return Err(NetworkError::Io {
-                operation: "test direct txn".to_string(),
-                detail: "unreachable".to_string(),
-            });
-        }
-        Ok(self.txn_response.clone())
-    }
-
-    fn fetch_cluster_kv_snapshot(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        _timeout: Duration,
-    ) -> Result<KvSnapshot, NetworkError> {
-        self.snapshot_fetches.push(endpoint.node_id.clone());
-        Ok(self.snapshot.clone())
-    }
-
-    fn relay_peers(
-        &mut self,
-        _paths: &ClusterPaths,
-        _state: &ClusterBootstrapState,
-    ) -> Vec<ClusterEndpointRecord> {
-        self.relay_peers.clone()
-    }
-
-    fn relay_rpc_to_node(
+    fn call_node_object_rpc(
         &mut self,
         _state: &ClusterBootstrapState,
         target_node_id: &NodeId,
-        peer: &ClusterEndpointRecord,
         request: &ObjectRpcRequest,
         _timeout: Duration,
     ) -> Result<ObjectRpcResponse, NetworkError> {
-        self.relays.push((
-            target_node_id.clone(),
-            peer.node_id.clone(),
-            request.route.clone(),
-        ));
+        self.node_rpcs
+            .push((target_node_id.clone(), request.route.clone()));
         match request.route.as_str() {
             CLUSTER_KV_TXN_ROUTE => {
                 let payload = sinomo_kv::cluster_kv_txn_response_rpc_payload(&self.txn_response)?;
@@ -9149,20 +9196,54 @@ impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
     }
 }
 
+impl ClusterSignedEndpointRpcAsyncHost for RecordingKvTxnForwardHost {
+    fn sign_endpoint_rpc_request_async<'a>(
+        &'a mut self,
+        _request: &'a ObjectRpcRequest,
+    ) -> ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
+        Box::pin(async { Ok(b"test-signature".to_vec()) })
+    }
+
+    fn send_signed_endpoint_rpc_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        _auth: &'a [u8],
+        request: &'a ObjectRpcRequest,
+        _timeouts: DaemonRpcTimeouts,
+    ) -> ClusterSignedEndpointRpcFuture<'a, ObjectRpcResponse> {
+        self.node_rpcs
+            .push((endpoint.node_id.clone(), request.route.clone()));
+        let response: Result<ObjectRpcResponse, NetworkError> = match request.route.as_str() {
+            CLUSTER_KV_TXN_ROUTE => {
+                sinomo_kv::cluster_kv_txn_response_rpc_payload(&self.txn_response)
+                    .map(object_rpc_response_from_kv_payload)
+                    .map_err(NetworkError::from)
+            }
+            CLUSTER_KV_SNAPSHOT_ROUTE => {
+                sinomo_kv::cluster_kv_snapshot_response_rpc_payload(&self.snapshot)
+                    .map(object_rpc_response_from_kv_payload)
+                    .map_err(NetworkError::from)
+            }
+            route => ObjectRpcResponse::encode_error(route, "unexpected route"),
+        };
+        Box::pin(async move { response })
+    }
+}
+
 struct RecordingKvSnapshotRefreshHost {
-    known_leader: Option<NodeId>,
+    known_authority: Option<NodeId>,
     snapshots: BTreeMap<NodeId, KvSnapshot>,
     fetches: Vec<(NodeId, Duration)>,
     restored: Option<(NodeId, KvRevision)>,
 }
 
 impl ClusterKvSnapshotRefreshHost for RecordingKvSnapshotRefreshHost {
-    fn known_raft_leader_id(
+    fn known_kv_state_authority_id(
         &mut self,
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError> {
-        Ok(self.known_leader.clone())
+        Ok(self.known_authority.clone())
     }
 
     fn fetch_cluster_kv_snapshot(
@@ -9180,7 +9261,7 @@ impl ClusterKvSnapshotRefreshHost for RecordingKvSnapshotRefreshHost {
             })
     }
 
-    fn restore_cluster_raft_from_snapshot_if_newer(
+    fn restore_cluster_kv_from_snapshot_if_newer(
         &mut self,
         _paths: &ClusterPaths,
         local_node_id: &NodeId,
@@ -9199,7 +9280,25 @@ struct RecordingKvTxnQuorumHost {
 }
 
 impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
-    fn local_is_raft_leader(
+    fn known_kv_state_authority_id(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, NetworkError> {
+        panic!("forwarded non-leader requests must not forward again")
+    }
+
+    fn call_node_object_rpc(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        _target_node_id: &NodeId,
+        _request: &ObjectRpcRequest,
+        _timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        panic!("forwarded non-leader requests must not forward again")
+    }
+
+    fn local_is_kv_state_authority(
         &mut self,
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
@@ -9208,42 +9307,41 @@ impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
         Ok(false)
     }
 
-    fn forward_cluster_kv_txn_to_voter(
+    fn request_kv_state_authority_vote(
         &mut self,
-        _paths: &ClusterPaths,
-        _state: &ClusterBootstrapState,
-        _txn: &KvTxn,
-        _options: ClusterKvTxnForwardOptions,
-    ) -> Result<Option<ClusterKvTxnForwardResult>, NetworkError> {
-        panic!("forwarded non-leader requests must not forward again")
+        _endpoint: &ClusterEndpointRecord,
+        _request: &sinomo_kv::ClusterKvStateAuthorityVoteRequest,
+        _timeout: Duration,
+    ) -> Result<sinomo_kv::ClusterKvStateAuthorityVoteResponse, NetworkError> {
+        panic!("recording quorum host overrides election and must not send raft votes")
     }
 
-    fn elect_cluster_raft_leader(
+    fn elect_kv_state_authority(
         &mut self,
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
-        _options: ClusterRaftLeaderElectionOptions,
+        _options: ClusterKvTxnQuorumOptions,
     ) -> Result<bool, NetworkError> {
         self.elect_calls += 1;
         Ok(true)
     }
 
-    fn reachable_voter_count(
+    fn reachable_cluster_state_authority_count(
         &mut self,
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
-        _options: ClusterVoterReachabilityOptions,
+        _options: ClusterStateAuthorityReachabilityOptions,
     ) -> usize {
         1
     }
 
-    fn commit_cluster_raft_command_with_quorum(
+    fn commit_cluster_kv_command_with_quorum(
         &mut self,
         _paths: &ClusterPaths,
         _state: &mut ClusterBootstrapState,
         _command: KvCommand,
-        _options: ClusterRaftQuorumCommitOptions,
-    ) -> Result<ClusterRaftQuorumCommitResult, NetworkError> {
+        _options: ClusterKvRaftQuorumCommitOptions,
+    ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError> {
         self.commit_calls += 1;
         panic!("forwarded non-leader requests must not commit locally")
     }
@@ -9263,8 +9361,8 @@ fn forward_test_txn_response(revision: KvRevision) -> KvTxnResponse {
     }
 }
 
-fn voter_reachability_test_options() -> ClusterVoterReachabilityOptions {
-    ClusterVoterReachabilityOptions {
+fn voter_reachability_test_options() -> ClusterStateAuthorityReachabilityOptions {
+    ClusterStateAuthorityReachabilityOptions {
         timeout: Duration::from_secs(10),
         tcp_command_timeout: Duration::from_secs(8),
         iroh_command_timeout: Duration::from_secs(6),
@@ -9321,7 +9419,7 @@ fn kv_txn_quorum_test_options(allow_forwarding: bool) -> ClusterKvTxnQuorumOptio
         },
         forward_options: kv_txn_forward_test_options(),
         leader_election_options: leader_election_test_options(),
-        voter_reachability_options: voter_reachability_test_options(),
+        state_authority_reachability_options: voter_reachability_test_options(),
     }
 }
 
@@ -9377,8 +9475,8 @@ fn cluster_control_plane_timeouts_derive_driver_options() {
         }
     );
     assert_eq!(
-        timeouts.voter_reachability_options(),
-        ClusterVoterReachabilityOptions {
+        timeouts.state_authority_reachability_options(),
+        ClusterStateAuthorityReachabilityOptions {
             timeout: Duration::from_secs(10),
             tcp_command_timeout: Duration::from_secs(8),
             iroh_command_timeout: Duration::from_secs(6),
@@ -9404,7 +9502,7 @@ fn cluster_control_plane_timeouts_derive_driver_options() {
                 .raft_append_replication_options(Duration::from_secs(10)),
             forward_options: timeouts.kv_txn_forward_options(),
             leader_election_options: timeouts.leader_election_options(),
-            voter_reachability_options: timeouts.voter_reachability_options(),
+            state_authority_reachability_options: timeouts.state_authority_reachability_options(),
         }
     );
     assert_eq!(
@@ -9426,40 +9524,35 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
     #[derive(Default)]
     struct RecordingMembershipTransport {
         sent: Vec<(NodeId, Duration, String)>,
-        relayed: Vec<(NodeId, NodeId, Duration, String)>,
+        node_rpcs: Vec<(NodeId, Duration, String)>,
         connectivity: Vec<(NodeId, ClusterConnectivityState, Option<u64>)>,
     }
 
     impl ClusterControlPlaneTransport for RecordingMembershipTransport {
-        fn send_raft_append(
+        fn send_kv_replication(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterRaftAppendRequest,
+            _request: &sinomo_kv::ClusterKvReplicationRequest,
             _timeout: Duration,
-        ) -> Result<ClusterRaftAppendResponse, NetworkError> {
-            panic!("membership forwarding should not send raft append")
+        ) -> Result<sinomo_kv::ClusterKvReplicationResponse, NetworkError> {
+            panic!("membership forwarding should not send kv replication")
         }
 
-        fn send_raft_vote(
+        fn request_kv_state_authority_vote(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterRaftVoteRequest,
+            _request: &sinomo_kv::ClusterKvStateAuthorityVoteRequest,
             _timeout: Duration,
-        ) -> Result<ClusterRaftVoteResponse, NetworkError> {
-            panic!("membership forwarding should not send raft vote")
+        ) -> Result<sinomo_kv::ClusterKvStateAuthorityVoteResponse, NetworkError> {
+            panic!("membership forwarding should not send kv state authority vote")
         }
 
-        fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
+        fn probe_cluster_state_authority(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _timeout: Duration,
+        ) -> bool {
             panic!("membership forwarding should not probe voters")
-        }
-
-        fn send_cluster_kv_txn(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _txn: &KvTxn,
-            _timeout: Duration,
-        ) -> Result<KvTxnResponse, NetworkError> {
-            panic!("membership forwarding should not send kv txn")
         }
 
         fn fetch_cluster_kv_snapshot(
@@ -9470,16 +9563,7 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
             panic!("membership forwarding should not fetch kv snapshots")
         }
 
-        fn send_cluster_member_publish(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterMemberPublishRequest,
-            _timeout: Duration,
-        ) -> Result<ClusterMemberPublishResponse, NetworkError> {
-            panic!("membership forwarding should not publish members")
-        }
-
-        fn send_cluster_membership_rpc(
+        fn call_endpoint_object_rpc(
             &mut self,
             endpoint: &ClusterEndpointRecord,
             request: &ObjectRpcRequest,
@@ -9490,20 +9574,15 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
             ObjectRpcResponse::encode_body(request.route.clone(), &())
         }
 
-        fn relay_rpc_to_node(
+        fn call_node_object_rpc(
             &mut self,
             _state: &ClusterBootstrapState,
             target_node_id: &NodeId,
-            peer: &ClusterEndpointRecord,
             request: &ObjectRpcRequest,
             timeout: Duration,
         ) -> Result<ObjectRpcResponse, NetworkError> {
-            self.relayed.push((
-                target_node_id.clone(),
-                peer.node_id.clone(),
-                timeout,
-                request.route.clone(),
-            ));
+            self.node_rpcs
+                .push((target_node_id.clone(), timeout, request.route.clone()));
             ObjectRpcResponse::encode_body(request.route.clone(), &())
         }
 
@@ -9539,7 +9618,7 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
     let root = sinomo_testdir::TestDir::new("sinomo-network-membership-driver");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
-    let voter_endpoint = daemon_lan_endpoint(&voter, "10.81.0.2:21353".to_string(), 10);
+    let _voter_endpoint = daemon_lan_endpoint(&voter, "10.81.0.2:21353".to_string(), 10);
     let peer_endpoint = daemon_lan_endpoint(&peer, "10.81.0.3:21353".to_string(), 20);
     let request = ObjectRpcRequest::encode_body(
         CLUSTER_JOIN_REGISTER_ROUTE,
@@ -9553,16 +9632,8 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
     let mut driver =
         ClusterControlPlaneDriver::with_timeouts(RecordingMembershipTransport::default(), timeouts);
 
-    ClusterMembershipRpcForwardHost::send_membership_rpc(&mut driver, &voter_endpoint, &request)
-        .expect("send membership rpc");
-    ClusterMembershipRpcForwardHost::relay_membership_rpc_to_voter_via_peer(
-        &mut driver,
-        &state,
-        &voter_endpoint,
-        &peer_endpoint,
-        &request,
-    )
-    .expect("relay membership rpc");
+    ClusterMembershipRpcForwardHost::call_node_object_rpc(&mut driver, &state, &voter, &request)
+        .expect("send membership node rpc");
     ClusterJoinRegistrationHost::remember_successful_join_endpoint(
         &mut driver,
         &paths,
@@ -9572,19 +9643,11 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
     .expect("remember endpoint");
 
     let transport = driver.into_transport();
+    assert!(transport.sent.is_empty());
     assert_eq!(
-        transport.sent,
-        vec![(
-            voter.clone(),
-            membership_timeout,
-            CLUSTER_JOIN_REGISTER_ROUTE.to_string(),
-        )]
-    );
-    assert_eq!(
-        transport.relayed,
+        transport.node_rpcs,
         vec![(
             voter,
-            peer.clone(),
             membership_timeout,
             CLUSTER_JOIN_REGISTER_ROUTE.to_string(),
         )]
@@ -9600,35 +9663,30 @@ fn cluster_join_registration_driver_uses_local_membership_observer() {
     struct UnusedControlPlaneTransport;
 
     impl ClusterControlPlaneTransport for UnusedControlPlaneTransport {
-        fn send_raft_append(
+        fn send_kv_replication(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterRaftAppendRequest,
+            _request: &sinomo_kv::ClusterKvReplicationRequest,
             _timeout: Duration,
-        ) -> Result<ClusterRaftAppendResponse, NetworkError> {
-            panic!("local observation should not send raft append")
+        ) -> Result<sinomo_kv::ClusterKvReplicationResponse, NetworkError> {
+            panic!("local observation should not send kv replication")
         }
 
-        fn send_raft_vote(
+        fn request_kv_state_authority_vote(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterRaftVoteRequest,
+            _request: &sinomo_kv::ClusterKvStateAuthorityVoteRequest,
             _timeout: Duration,
-        ) -> Result<ClusterRaftVoteResponse, NetworkError> {
-            panic!("local observation should not send raft vote")
+        ) -> Result<sinomo_kv::ClusterKvStateAuthorityVoteResponse, NetworkError> {
+            panic!("local observation should not send kv state authority vote")
         }
 
-        fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
+        fn probe_cluster_state_authority(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _timeout: Duration,
+        ) -> bool {
             panic!("local observation should not probe voters")
-        }
-
-        fn send_cluster_kv_txn(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _txn: &KvTxn,
-            _timeout: Duration,
-        ) -> Result<KvTxnResponse, NetworkError> {
-            panic!("local observation should not send kv txn")
         }
 
         fn fetch_cluster_kv_snapshot(
@@ -9639,16 +9697,7 @@ fn cluster_join_registration_driver_uses_local_membership_observer() {
             panic!("local observation should not fetch kv snapshots")
         }
 
-        fn send_cluster_member_publish(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterMemberPublishRequest,
-            _timeout: Duration,
-        ) -> Result<ClusterMemberPublishResponse, NetworkError> {
-            panic!("local observation should not publish members")
-        }
-
-        fn send_cluster_membership_rpc(
+        fn call_endpoint_object_rpc(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
             _request: &ObjectRpcRequest,
@@ -9657,15 +9706,14 @@ fn cluster_join_registration_driver_uses_local_membership_observer() {
             panic!("local observation should not send membership rpc")
         }
 
-        fn relay_rpc_to_node(
+        fn call_node_object_rpc(
             &mut self,
             _state: &ClusterBootstrapState,
             _target_node_id: &NodeId,
-            _peer: &ClusterEndpointRecord,
             _request: &ObjectRpcRequest,
             _timeout: Duration,
         ) -> Result<ObjectRpcResponse, NetworkError> {
-            panic!("local observation should not relay membership rpc")
+            panic!("local observation should not send node rpc")
         }
     }
 
@@ -9731,35 +9779,30 @@ fn cluster_member_mutation_driver_prepares_state_from_local_membership_observer(
     struct UnusedControlPlaneTransport;
 
     impl ClusterControlPlaneTransport for UnusedControlPlaneTransport {
-        fn send_raft_append(
+        fn send_kv_replication(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterRaftAppendRequest,
+            _request: &sinomo_kv::ClusterKvReplicationRequest,
             _timeout: Duration,
-        ) -> Result<ClusterRaftAppendResponse, NetworkError> {
-            panic!("membership preparation should not send raft append")
+        ) -> Result<sinomo_kv::ClusterKvReplicationResponse, NetworkError> {
+            panic!("membership preparation should not send kv replication")
         }
 
-        fn send_raft_vote(
+        fn request_kv_state_authority_vote(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterRaftVoteRequest,
+            _request: &sinomo_kv::ClusterKvStateAuthorityVoteRequest,
             _timeout: Duration,
-        ) -> Result<ClusterRaftVoteResponse, NetworkError> {
-            panic!("membership preparation should not send raft vote")
+        ) -> Result<sinomo_kv::ClusterKvStateAuthorityVoteResponse, NetworkError> {
+            panic!("membership preparation should not send kv state authority vote")
         }
 
-        fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
+        fn probe_cluster_state_authority(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _timeout: Duration,
+        ) -> bool {
             panic!("membership preparation should not probe voters")
-        }
-
-        fn send_cluster_kv_txn(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _txn: &KvTxn,
-            _timeout: Duration,
-        ) -> Result<KvTxnResponse, NetworkError> {
-            panic!("membership preparation should not send kv txn")
         }
 
         fn fetch_cluster_kv_snapshot(
@@ -9770,16 +9813,7 @@ fn cluster_member_mutation_driver_prepares_state_from_local_membership_observer(
             panic!("membership preparation should not fetch kv snapshots")
         }
 
-        fn send_cluster_member_publish(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterMemberPublishRequest,
-            _timeout: Duration,
-        ) -> Result<ClusterMemberPublishResponse, NetworkError> {
-            panic!("membership preparation should not publish members")
-        }
-
-        fn send_cluster_membership_rpc(
+        fn call_endpoint_object_rpc(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
             _request: &ObjectRpcRequest,
@@ -9788,15 +9822,14 @@ fn cluster_member_mutation_driver_prepares_state_from_local_membership_observer(
             panic!("membership preparation should not send membership rpc")
         }
 
-        fn relay_rpc_to_node(
+        fn call_node_object_rpc(
             &mut self,
             _state: &ClusterBootstrapState,
             _target_node_id: &NodeId,
-            _peer: &ClusterEndpointRecord,
             _request: &ObjectRpcRequest,
             _timeout: Duration,
         ) -> Result<ObjectRpcResponse, NetworkError> {
-            panic!("membership preparation should not relay membership rpc")
+            panic!("membership preparation should not send node rpc")
         }
     }
 
@@ -9896,35 +9929,30 @@ fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
     }
 
     impl ClusterControlPlaneTransport for RecordingPublishCacheTransport {
-        fn send_raft_append(
+        fn send_kv_replication(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterRaftAppendRequest,
+            _request: &sinomo_kv::ClusterKvReplicationRequest,
             _timeout: Duration,
-        ) -> Result<ClusterRaftAppendResponse, NetworkError> {
-            panic!("cache hook test should not send raft append")
+        ) -> Result<sinomo_kv::ClusterKvReplicationResponse, NetworkError> {
+            panic!("cache hook test should not send kv replication")
         }
 
-        fn send_raft_vote(
+        fn request_kv_state_authority_vote(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterRaftVoteRequest,
+            _request: &sinomo_kv::ClusterKvStateAuthorityVoteRequest,
             _timeout: Duration,
-        ) -> Result<ClusterRaftVoteResponse, NetworkError> {
-            panic!("cache hook test should not send raft vote")
+        ) -> Result<sinomo_kv::ClusterKvStateAuthorityVoteResponse, NetworkError> {
+            panic!("cache hook test should not send kv state authority vote")
         }
 
-        fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
+        fn probe_cluster_state_authority(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _timeout: Duration,
+        ) -> bool {
             panic!("cache hook test should not probe voters")
-        }
-
-        fn send_cluster_kv_txn(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _txn: &KvTxn,
-            _timeout: Duration,
-        ) -> Result<KvTxnResponse, NetworkError> {
-            panic!("cache hook test should not send kv txn")
         }
 
         fn fetch_cluster_kv_snapshot(
@@ -9935,16 +9963,7 @@ fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
             panic!("cache hook test should not fetch kv snapshots")
         }
 
-        fn send_cluster_member_publish(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterMemberPublishRequest,
-            _timeout: Duration,
-        ) -> Result<ClusterMemberPublishResponse, NetworkError> {
-            panic!("cache hook test should not publish members")
-        }
-
-        fn send_cluster_membership_rpc(
+        fn call_endpoint_object_rpc(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
             _request: &ObjectRpcRequest,
@@ -9953,15 +9972,14 @@ fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
             panic!("cache hook test should not send membership rpc")
         }
 
-        fn relay_rpc_to_node(
+        fn call_node_object_rpc(
             &mut self,
             _state: &ClusterBootstrapState,
             _target_node_id: &NodeId,
-            _peer: &ClusterEndpointRecord,
             _request: &ObjectRpcRequest,
             _timeout: Duration,
         ) -> Result<ObjectRpcResponse, NetworkError> {
-            panic!("cache hook test should not relay rpc")
+            panic!("cache hook test should not send node rpc")
         }
 
         fn published_network_info_matches(
@@ -10039,7 +10057,7 @@ fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
     let status = ClusterNodeStatusRecord {
         cluster_id: cluster_id.clone(),
         node_id: node_id.clone(),
-        process: "daemon-main".to_string(),
+        process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
         availability: ClusterNodeAvailability::Online,
         daemon_version: "0.1.0-test".to_string(),
         commit: None,
@@ -10111,7 +10129,7 @@ fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
 }
 
 #[test]
-fn cluster_kv_snapshot_refresh_driver_prefers_known_leader_and_imports_newest_snapshot() {
+fn cluster_kv_snapshot_refresh_driver_prefers_known_state_authority_and_imports_newest_snapshot() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-kv-refresh-driver");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -10133,20 +10151,21 @@ fn cluster_kv_snapshot_refresh_driver_prefers_known_leader_and_imports_newest_sn
             20,
         ));
     let now = OffsetDateTime::now_utc();
-    let leader_id = NodeId::from_legacy_named("node_kv_refresh_known_leader").expect("leader");
-    let mut leader_member = state.members[0].clone();
-    leader_member.node_id = leader_id.clone();
-    leader_member.display_name = "leader".to_string();
-    leader_member.node_public_key = "leader-public-key".to_string();
-    leader_member.endpoints = vec![daemon_lan_endpoint(
-        &leader_id,
+    let authority_id =
+        NodeId::from_legacy_named("node_kv_refresh_known_authority").expect("authority");
+    let mut authority_member = state.members[0].clone();
+    authority_member.node_id = authority_id.clone();
+    authority_member.display_name = "authority".to_string();
+    authority_member.node_public_key = "authority-public-key".to_string();
+    authority_member.endpoints = vec![daemon_lan_endpoint(
+        &authority_id,
         "10.0.0.90:21353".to_string(),
         10,
     )];
-    leader_member.joined_at = now;
-    leader_member.updated_at = now;
-    mark_test_member_as_voter(&mut leader_member);
-    state.members.push(leader_member);
+    authority_member.joined_at = now;
+    authority_member.updated_at = now;
+    mark_test_member_as_voter(&mut authority_member);
+    state.members.push(authority_member);
     write_cluster_state(&paths, &state).expect("write state");
     let local_snapshot =
         sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("seed local snapshot");
@@ -10156,20 +10175,20 @@ fn cluster_kv_snapshot_refresh_driver_prefers_known_leader_and_imports_newest_sn
         .put("/refresh/first-peer", b"first".to_vec(), None)
         .expect("first peer snapshot put");
     let first_snapshot = first_store.snapshot();
-    let mut leader_store = InProcessKvStore::restore(local_snapshot);
-    leader_store
-        .put("/refresh/leader/one", b"leader-one".to_vec(), None)
-        .expect("leader snapshot put one");
-    leader_store
-        .put("/refresh/leader/two", b"leader-two".to_vec(), None)
-        .expect("leader snapshot put two");
-    let leader_snapshot = leader_store.snapshot();
+    let mut authority_store = InProcessKvStore::restore(local_snapshot);
+    authority_store
+        .put("/refresh/authority/one", b"authority-one".to_vec(), None)
+        .expect("authority snapshot put one");
+    authority_store
+        .put("/refresh/authority/two", b"authority-two".to_vec(), None)
+        .expect("authority snapshot put two");
+    let authority_snapshot = authority_store.snapshot();
 
     let mut host = RecordingKvSnapshotRefreshHost {
-        known_leader: Some(leader_id.clone()),
+        known_authority: Some(authority_id.clone()),
         snapshots: BTreeMap::from([
             (first_peer_id.clone(), first_snapshot),
-            (leader_id.clone(), leader_snapshot.clone()),
+            (authority_id.clone(), authority_snapshot.clone()),
         ]),
         fetches: Vec::new(),
         restored: None,
@@ -10185,23 +10204,23 @@ fn cluster_kv_snapshot_refresh_driver_prefers_known_leader_and_imports_newest_sn
 
     assert_eq!(
         host.fetches.first().map(|(node_id, _)| node_id),
-        Some(&leader_id),
-        "snapshot refresh should try the known leader before other voters"
+        Some(&authority_id),
+        "snapshot refresh should try the known state authority before other state authorities"
     );
     assert_eq!(
         host.restored,
-        Some((local_node_id, leader_snapshot.revision)),
+        Some((local_node_id, authority_snapshot.revision)),
         "snapshot refresh should ask the host to restore the newest imported snapshot"
     );
     assert!(
-        refreshed.get("/refresh/leader/two").is_some(),
+        refreshed.get("/refresh/authority/two").is_some(),
         "the returned store should be restored from the newest fetched snapshot"
     );
     assert_eq!(
         read_cluster_kv_snapshot(&paths)
             .expect("materialized imported snapshot")
             .revision,
-        leader_snapshot.revision
+        authority_snapshot.revision
     );
 }
 
@@ -10359,10 +10378,10 @@ fn cluster_voter_reachability_counts_single_local_voter_without_probe() {
     );
     state.members[0].capabilities = main_daemon_capabilities(&state.members[0].role);
     state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
-    let mut host = RecordingVoterReachabilityHost::default();
+    let mut host = RecordingStateAuthorityReachabilityHost::default();
 
     assert_eq!(
-        cluster_reachable_voter_count_with_host(
+        cluster_reachable_state_authority_count_with_host(
             &paths,
             &state,
             voter_reachability_test_options(),
@@ -10411,13 +10430,13 @@ fn cluster_voter_reachability_probes_remote_live_voters_until_quorum() {
     )];
     state.members.push(remote_member);
 
-    let mut host = RecordingVoterReachabilityHost {
+    let mut host = RecordingStateAuthorityReachabilityHost {
         reachable: BTreeSet::from([remote.clone()]),
         ..Default::default()
     };
 
     assert_eq!(
-        cluster_reachable_voter_count_with_host(
+        cluster_reachable_state_authority_count_with_host(
             &paths,
             &state,
             voter_reachability_test_options(),
@@ -10429,7 +10448,7 @@ fn cluster_voter_reachability_probes_remote_live_voters_until_quorum() {
 }
 
 #[test]
-fn cluster_voter_reachability_uses_command_timeout_for_relay_routed_voter() {
+fn cluster_voter_reachability_uses_fair_timeout_even_when_relay_route_exists() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-voter-reachability-relay");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -10523,13 +10542,13 @@ fn cluster_voter_reachability_uses_command_timeout_for_relay_routed_voter() {
     sync_cluster_connectivity_records_to_kv(&paths, &bridge, vec![bridge_to_remote])
         .expect("bridge connectivity records");
 
-    let mut host = RecordingVoterReachabilityHost {
+    let mut host = RecordingStateAuthorityReachabilityHost {
         reachable: BTreeSet::from([remote.clone()]),
         ..Default::default()
     };
 
     assert_eq!(
-        cluster_reachable_voter_count_with_host(
+        cluster_reachable_state_authority_count_with_host(
             &paths,
             &state,
             voter_reachability_test_options(),
@@ -10537,7 +10556,7 @@ fn cluster_voter_reachability_uses_command_timeout_for_relay_routed_voter() {
         ),
         2
     );
-    assert_eq!(host.probes, vec![(remote, Duration::from_secs(8))]);
+    assert_eq!(host.probes, vec![(remote, Duration::from_secs(2))]);
 }
 
 #[test]
@@ -10576,7 +10595,7 @@ fn cluster_voter_reachability_async_probes_remote_live_voters_until_quorum() {
         .enable_all()
         .build()
         .expect("runtime");
-    let mut host = RecordingVoterReachabilityHost {
+    let mut host = RecordingStateAuthorityReachabilityHost {
         reachable: BTreeSet::from([remote.clone()]),
         ..Default::default()
     };
@@ -10627,7 +10646,7 @@ fn cluster_raft_quorum_commit_driver_commits_after_remote_voter_ack() {
             value: b"committed".to_vec(),
             lease_id: None,
         }),
-        ClusterRaftQuorumCommitOptions {
+        ClusterKvRaftQuorumCommitOptions {
             timeout: Duration::from_secs(5),
         },
         &mut host,
@@ -10698,7 +10717,7 @@ fn cluster_raft_local_storage_quorum_helper_uses_callbacks_for_transport_and_fan
             value: b"committed".to_vec(),
             lease_id: None,
         }),
-        ClusterRaftQuorumCommitOptions {
+        ClusterKvRaftQuorumCommitOptions {
             timeout: Duration::from_secs(5),
         },
         ClusterControlPlaneTimeouts::default_daemon_transport(),
@@ -10822,9 +10841,8 @@ fn cluster_raft_leader_election_driver_sets_leader_after_remote_voter_grants() {
     assert_eq!(
         paths
             .kv_paths()
-            .raft_store()
-            .known_voter_leader_id(&state)
-            .expect("known leader"),
+            .known_raft_voter_leader_id(&state)
+            .expect("known state authority"),
         Some(local_node_id)
     );
     let expected_term = sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP + 1;
@@ -10835,7 +10853,7 @@ fn cluster_raft_leader_election_driver_sets_leader_after_remote_voter_grants() {
 }
 
 #[test]
-fn cluster_kv_txn_forward_driver_prefers_known_leader_and_fetches_snapshot() {
+fn cluster_kv_txn_forward_driver_uses_node_rpc_for_known_state_authority() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-kv-forward-direct");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -10860,17 +10878,13 @@ fn cluster_kv_txn_forward_driver_prefers_known_leader_and_fetches_snapshot() {
     let snapshot = forward_test_snapshot("/forward/direct", b"direct");
     let txn_response = forward_test_txn_response(snapshot.revision);
     let mut host = RecordingKvTxnForwardHost {
-        known_leader: Some(peer_node_id.clone()),
-        direct_error: false,
+        known_authority: Some(peer_node_id.clone()),
         snapshot: snapshot.clone(),
         txn_response: txn_response.clone(),
-        relay_peers: Vec::new(),
-        direct_sends: Vec::new(),
-        snapshot_fetches: Vec::new(),
-        relays: Vec::new(),
+        node_rpcs: Vec::new(),
     };
 
-    let result = forward_cluster_kv_txn_to_voter_with_host(
+    let result = forward_cluster_kv_txn_to_state_authority_with_host(
         &paths,
         &state,
         &KvTxn {
@@ -10890,21 +10904,86 @@ fn cluster_kv_txn_forward_driver_prefers_known_leader_and_fetches_snapshot() {
 
     assert_eq!(result.snapshot, snapshot);
     assert_eq!(result.txn_response, Some(txn_response));
-    assert_eq!(host.direct_sends, vec![peer_node_id.clone()]);
-    assert_eq!(host.snapshot_fetches, vec![peer_node_id]);
-    assert!(host.relays.is_empty());
+    assert_eq!(
+        host.node_rpcs,
+        vec![
+            (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
+            (peer_node_id, CLUSTER_KV_SNAPSHOT_ROUTE.to_string())
+        ]
+    );
 }
 
 #[test]
-fn cluster_kv_txn_forward_driver_relays_after_direct_voter_failure() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-forward-relay");
+fn cluster_node_blocks_leader_preference_when_local_probe_marks_member_unreachable() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-leader-preference-unreachable");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, local_node_id, peer_node_id) = cluster_raft_handler_test_state(
+        "cluster_leader_preference_unreachable",
+        "node_leader_preference_unreachable_local",
+        "node_leader_preference_unreachable_peer",
+    );
+    let peer_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.87:21353".to_string(), 10);
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == peer_node_id)
+        .expect("peer member")
+        .endpoints
+        .push(peer_endpoint.clone());
+    write_cluster_state(&paths, &state).expect("write state");
+    let now = OffsetDateTime::now_utc();
+    write_local_cluster_connectivity_records(
+        &paths,
+        &local_node_id,
+        &[ClusterConnectivityRecord {
+            cluster_id: state.cluster_id.clone(),
+            source_node_id: local_node_id.clone(),
+            target_node_id: peer_node_id.clone(),
+            endpoint_id: peer_endpoint.endpoint_id,
+            transport: peer_endpoint.transport,
+            address: peer_endpoint.address,
+            state: ClusterConnectivityState::Unreachable,
+            latency_ms: None,
+            consecutive_failures: 5,
+            last_success_at: None,
+            last_failure_at: Some("2026-05-04T00:10:00Z".to_string()),
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(300),
+        }],
+    )
+    .expect("write local connectivity");
+
+    assert!(
+        crate::endpoint_selector::cluster_node_blocks_leader_preference(
+            &paths,
+            &state,
+            &peer_node_id,
+        ),
+        "a peer the active probes cannot reach must not be preferred as leader"
+    );
+    assert_eq!(
+        ClusterEndpointSelector::new(&paths, &state)
+            .select_internal(
+                ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand
+            )
+            .len(),
+        1,
+        "an unreachable peer remains a voter while connectivity recovers"
+    );
+}
+
+#[test]
+fn cluster_kv_txn_forward_driver_uses_node_rpc_without_known_state_authority() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-forward-node-rpc");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
     let (mut state, _local_node_id, peer_node_id) = cluster_raft_handler_test_state(
-        "cluster_kv_forward_relay",
-        "node_kv_forward_relay_local",
-        "node_kv_forward_relay_voter",
+        "cluster_kv_forward_node_rpc",
+        "node_kv_forward_node_rpc_local",
+        "node_kv_forward_node_rpc_voter",
     );
     state
         .members
@@ -10918,22 +10997,16 @@ fn cluster_kv_txn_forward_driver_relays_after_direct_voter_failure() {
             10,
         ));
     write_cluster_state(&paths, &state).expect("write state");
-    let bridge_node_id = NodeId::from_legacy_named("node_kv_forward_relay_bridge").expect("bridge");
-    let bridge = daemon_lan_endpoint(&bridge_node_id, "10.0.0.86:21353".to_string(), 20);
-    let snapshot = forward_test_snapshot("/forward/relay", b"relay");
+    let snapshot = forward_test_snapshot("/forward/node-rpc", b"node-rpc");
     let txn_response = forward_test_txn_response(snapshot.revision);
     let mut host = RecordingKvTxnForwardHost {
-        known_leader: None,
-        direct_error: true,
+        known_authority: None,
         snapshot: snapshot.clone(),
         txn_response: txn_response.clone(),
-        relay_peers: vec![bridge.clone()],
-        direct_sends: Vec::new(),
-        snapshot_fetches: Vec::new(),
-        relays: Vec::new(),
+        node_rpcs: Vec::new(),
     };
 
-    let result = forward_cluster_kv_txn_to_voter_with_host(
+    let result = forward_cluster_kv_txn_to_state_authority_with_host(
         &paths,
         &state,
         &KvTxn {
@@ -10953,21 +11026,98 @@ fn cluster_kv_txn_forward_driver_relays_after_direct_voter_failure() {
 
     assert_eq!(result.snapshot, snapshot);
     assert_eq!(result.txn_response, Some(txn_response));
-    assert_eq!(host.direct_sends, vec![peer_node_id.clone()]);
-    assert!(host.snapshot_fetches.is_empty());
     assert_eq!(
-        host.relays,
+        host.node_rpcs,
         vec![
-            (
-                peer_node_id.clone(),
-                bridge_node_id.clone(),
-                CLUSTER_KV_TXN_ROUTE.to_string()
+            (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
+            (peer_node_id, CLUSTER_KV_SNAPSHOT_ROUTE.to_string())
+        ]
+    );
+}
+
+#[test]
+fn cluster_kv_txn_async_forward_driver_uses_object_rpc_client() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-async-forward-node-rpc");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, local_node_id, peer_node_id) = cluster_raft_handler_test_state(
+        "cluster_kv_async_forward_node_rpc",
+        "node_kv_async_forward_node_rpc_local",
+        "node_kv_async_forward_node_rpc_voter",
+    );
+    let peer_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.86:21353".to_string(), 10);
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == peer_node_id)
+        .expect("peer member")
+        .endpoints
+        .push(peer_endpoint.clone());
+    write_cluster_state(&paths, &state).expect("write state");
+    let now = OffsetDateTime::now_utc();
+    write_local_cluster_connectivity_records(
+        &paths,
+        &local_node_id,
+        &[ClusterConnectivityRecord {
+            cluster_id: state.cluster_id.clone(),
+            source_node_id: local_node_id.clone(),
+            target_node_id: peer_node_id.clone(),
+            endpoint_id: peer_endpoint.endpoint_id.clone(),
+            transport: peer_endpoint.transport,
+            address: peer_endpoint.address.clone(),
+            state: ClusterConnectivityState::Healthy,
+            latency_ms: Some(3),
+            consecutive_failures: 0,
+            last_success_at: Some("ok".to_string()),
+            last_failure_at: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(600),
+        }],
+    )
+    .expect("write healthy direct connectivity");
+    let snapshot = forward_test_snapshot("/forward/async-node-rpc", b"async-node-rpc");
+    let txn_response = forward_test_txn_response(snapshot.revision);
+    let mut host = RecordingKvTxnForwardHost {
+        known_authority: None,
+        snapshot: snapshot.clone(),
+        txn_response: txn_response.clone(),
+        node_rpcs: Vec::new(),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    let result = runtime
+        .block_on(
+            crate::kv_forward::forward_cluster_kv_txn_to_state_authority_async_with_host(
+                runtime.handle(),
+                &paths,
+                &state,
+                &KvTxn {
+                    compares: Vec::new(),
+                    success: Vec::new(),
+                    failure: Vec::new(),
+                },
+                ClusterKvTxnForwardOptions {
+                    timeout: Duration::from_secs(5),
+                    tcp_command_timeout: Duration::from_secs(5),
+                    iroh_command_timeout: Duration::from_secs(3),
+                },
+                &mut host,
             ),
-            (
-                peer_node_id,
-                bridge_node_id,
-                CLUSTER_KV_SNAPSHOT_ROUTE.to_string()
-            )
+        )
+        .expect("async forward")
+        .expect("targeted voter");
+
+    assert_eq!(result.snapshot, snapshot);
+    assert_eq!(result.txn_response, Some(txn_response));
+    assert_eq!(
+        host.node_rpcs,
+        vec![
+            (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
+            (peer_node_id, CLUSTER_KV_SNAPSHOT_ROUTE.to_string())
         ]
     );
 }
@@ -12085,26 +12235,6 @@ struct RecordingJoinRegistrationHost {
     remembered_targets: usize,
 }
 
-impl ClusterMembershipRpcForwardHost for RecordingJoinRegistrationHost {
-    fn send_membership_rpc(
-        &mut self,
-        _endpoint: &ClusterEndpointRecord,
-        _request: &ObjectRpcRequest,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        panic!("voter-local join registration should not forward membership RPCs")
-    }
-
-    fn relay_membership_rpc_to_voter_via_peer(
-        &mut self,
-        _state: &ClusterBootstrapState,
-        _voter: &ClusterEndpointRecord,
-        _peer: &ClusterEndpointRecord,
-        _request: &ObjectRpcRequest,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        panic!("voter-local join registration should not relay membership RPCs")
-    }
-}
-
 impl ClusterJoinRegistrationHost for RecordingJoinRegistrationHost {
     fn local_daemon_membership_observation(
         &mut self,
@@ -12113,6 +12243,15 @@ impl ClusterJoinRegistrationHost for RecordingJoinRegistrationHost {
     ) -> Result<Option<ClusterLocalDaemonMembershipObservation>, NetworkError> {
         self.observations += 1;
         Ok(self.observation.clone())
+    }
+
+    fn call_node_object_rpc(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        _target_node_id: &NodeId,
+        _request: &ObjectRpcRequest,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        panic!("voter-local join registration should not forward membership node RPCs")
     }
 
     fn commit_join_registration_state(
@@ -12135,25 +12274,12 @@ impl ClusterJoinRegistrationHost for RecordingJoinRegistrationHost {
     }
 }
 
-impl ClusterMembershipRpcAsyncForwardHost for RecordingJoinRegistrationHost {
-    fn send_membership_rpc_async<'a>(
+impl ClusterSignedEndpointRpcAsyncHost for RecordingJoinRegistrationHost {
+    fn sign_endpoint_rpc_request_async<'a>(
         &'a mut self,
-        _endpoint: &'a ClusterEndpointRecord,
         _request: &'a ObjectRpcRequest,
-    ) -> ClusterMembershipRpcFuture<'a, ObjectRpcResponse> {
-        Box::pin(async {
-            panic!("voter-local join registration should not forward membership RPCs")
-        })
-    }
-
-    fn relay_membership_rpc_to_voter_via_peer_async<'a>(
-        &'a mut self,
-        _state: &'a ClusterBootstrapState,
-        _voter: &'a ClusterEndpointRecord,
-        _peer: &'a ClusterEndpointRecord,
-        _request: &'a ObjectRpcRequest,
-    ) -> ClusterMembershipRpcFuture<'a, ObjectRpcResponse> {
-        Box::pin(async { panic!("voter-local join registration should not relay membership RPCs") })
+    ) -> ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
+        Box::pin(async { panic!("voter-local join registration should not forward object RPCs") })
     }
 }
 
@@ -12198,27 +12324,16 @@ struct RecordingJoinEndpointHost {
     remembered: Vec<ClusterEndpointRecord>,
 }
 
-impl ClusterMembershipRpcForwardHost for RecordingJoinEndpointHost {
-    fn send_membership_rpc(
-        &mut self,
-        _endpoint: &ClusterEndpointRecord,
-        _request: &ObjectRpcRequest,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        panic!("default target remembering should not send membership RPCs")
-    }
-
-    fn relay_membership_rpc_to_voter_via_peer(
+impl ClusterJoinRegistrationHost for RecordingJoinEndpointHost {
+    fn call_node_object_rpc(
         &mut self,
         _state: &ClusterBootstrapState,
-        _voter: &ClusterEndpointRecord,
-        _peer: &ClusterEndpointRecord,
+        _target_node_id: &NodeId,
         _request: &ObjectRpcRequest,
     ) -> Result<ObjectRpcResponse, NetworkError> {
-        panic!("default target remembering should not relay membership RPCs")
+        panic!("default target remembering should not send membership node RPCs")
     }
-}
 
-impl ClusterJoinRegistrationHost for RecordingJoinEndpointHost {
     fn commit_join_registration_state(
         &mut self,
         _paths: &ClusterPaths,
@@ -12948,35 +13063,30 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
     }
 
     impl ClusterControlPlaneTransport for RecordingJoinReconciliationTransport {
-        fn send_raft_append(
+        fn send_kv_replication(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterRaftAppendRequest,
+            _request: &sinomo_kv::ClusterKvReplicationRequest,
             _timeout: Duration,
-        ) -> Result<ClusterRaftAppendResponse, NetworkError> {
-            panic!("join reconciliation should not send raft append")
+        ) -> Result<sinomo_kv::ClusterKvReplicationResponse, NetworkError> {
+            panic!("join reconciliation should not send kv replication")
         }
 
-        fn send_raft_vote(
+        fn request_kv_state_authority_vote(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterRaftVoteRequest,
+            _request: &sinomo_kv::ClusterKvStateAuthorityVoteRequest,
             _timeout: Duration,
-        ) -> Result<ClusterRaftVoteResponse, NetworkError> {
-            panic!("join reconciliation should not send raft vote")
+        ) -> Result<sinomo_kv::ClusterKvStateAuthorityVoteResponse, NetworkError> {
+            panic!("join reconciliation should not send kv state authority vote")
         }
 
-        fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
+        fn probe_cluster_state_authority(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _timeout: Duration,
+        ) -> bool {
             panic!("join reconciliation should not probe voters")
-        }
-
-        fn send_cluster_kv_txn(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _txn: &KvTxn,
-            _timeout: Duration,
-        ) -> Result<KvTxnResponse, NetworkError> {
-            panic!("join reconciliation should not send kv txn")
         }
 
         fn fetch_cluster_kv_snapshot(
@@ -12991,16 +13101,7 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
             })
         }
 
-        fn send_cluster_member_publish(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterMemberPublishRequest,
-            _timeout: Duration,
-        ) -> Result<ClusterMemberPublishResponse, NetworkError> {
-            panic!("join reconciliation should not publish members")
-        }
-
-        fn send_cluster_membership_rpc(
+        fn call_endpoint_object_rpc(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
             request: &ObjectRpcRequest,
@@ -13037,15 +13138,14 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
             }
         }
 
-        fn relay_rpc_to_node(
+        fn call_node_object_rpc(
             &mut self,
             _state: &ClusterBootstrapState,
             _target_node_id: &NodeId,
-            _peer: &ClusterEndpointRecord,
             _request: &ObjectRpcRequest,
             _timeout: Duration,
         ) -> Result<ObjectRpcResponse, NetworkError> {
-            panic!("join reconciliation should not relay rpc")
+            panic!("join reconciliation should not send node rpc")
         }
 
         fn record_endpoint_command_connectivity(
@@ -13158,7 +13258,7 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
 }
 
 #[test]
-fn join_voter_targets_do_not_filter_offline_status_during_bootstrap() {
+fn join_state_authority_targets_do_not_filter_offline_status_during_bootstrap() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-join-targets-ignore-offline-status");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -13199,7 +13299,7 @@ fn join_voter_targets_do_not_filter_offline_status_during_bootstrap() {
         ClusterNodeStatusRecord {
             cluster_id,
             node_id: voter_node,
-            process: "daemon-main".to_string(),
+            process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
             availability: ClusterNodeAvailability::Offline,
             daemon_version: "0.1.0-test".to_string(),
             commit: None,
@@ -13217,11 +13317,16 @@ fn join_voter_targets_do_not_filter_offline_status_during_bootstrap() {
     .expect("sync offline node status");
 
     assert!(
-        cluster_raft_live_voter_targets(&paths, &state).is_empty(),
+        ClusterEndpointSelector::new(&paths, &state)
+            .select_internal(
+                ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand
+            )
+            .is_empty(),
         "ordinary live-voter routing should honor explicit offline status"
     );
     assert_eq!(
-        cluster_join_voter_targets(&paths, &state)
+        ClusterEndpointSelector::new(&paths, &state)
+            .select_internal(ClusterEndpointInternalSelectionPurpose::VoterCommand)
             .first()
             .map(|endpoint| &endpoint.endpoint_id),
         Some(&voter_endpoint.endpoint_id),
@@ -13230,34 +13335,19 @@ fn join_voter_targets_do_not_filter_offline_status_during_bootstrap() {
 }
 
 #[test]
-fn membership_forwarding_tries_voter_then_peer_relay() {
+fn membership_forwarding_uses_single_state_authority_node_rpc() {
     struct RecordingForwardHost {
-        direct: Vec<NodeId>,
-        relays: Vec<(NodeId, NodeId)>,
+        node_rpcs: Vec<NodeId>,
     }
 
     impl ClusterMembershipRpcForwardHost for RecordingForwardHost {
-        fn send_membership_rpc(
-            &mut self,
-            endpoint: &ClusterEndpointRecord,
-            _request: &ObjectRpcRequest,
-        ) -> Result<ObjectRpcResponse, NetworkError> {
-            self.direct.push(endpoint.node_id.clone());
-            Err(NetworkError::Io {
-                operation: "test direct membership rpc".to_string(),
-                detail: "offline".to_string(),
-            })
-        }
-
-        fn relay_membership_rpc_to_voter_via_peer(
+        fn call_node_object_rpc(
             &mut self,
             _state: &ClusterBootstrapState,
-            voter: &ClusterEndpointRecord,
-            peer: &ClusterEndpointRecord,
+            target_node_id: &NodeId,
             _request: &ObjectRpcRequest,
         ) -> Result<ObjectRpcResponse, NetworkError> {
-            self.relays
-                .push((voter.node_id.clone(), peer.node_id.clone()));
+            self.node_rpcs.push(target_node_id.clone());
             ObjectRpcResponse::encode_body(CLUSTER_JOIN_REGISTER_ROUTE, &())
         }
     }
@@ -13322,11 +13412,10 @@ fn membership_forwarding_tries_voter_then_peer_relay() {
     )
     .expect("encode request");
     let mut host = RecordingForwardHost {
-        direct: Vec::new(),
-        relays: Vec::new(),
+        node_rpcs: Vec::new(),
     };
 
-    forward_cluster_membership_rpc_to_voter_with_host(
+    forward_cluster_membership_rpc_to_state_authority_with_host(
         &paths,
         &state,
         &request,
@@ -13335,75 +13424,50 @@ fn membership_forwarding_tries_voter_then_peer_relay() {
     )
     .expect("forward response");
 
-    assert_eq!(host.direct, vec![voter_node.clone()]);
-    assert_eq!(host.relays, vec![(voter_node, peer_node)]);
+    assert_eq!(host.node_rpcs, vec![voter_node]);
+    assert_ne!(peer_node, state.local_node_id);
 }
 
 #[test]
-fn join_challenge_forwarding_uses_membership_voter_policy() {
+fn join_challenge_forwarding_uses_membership_state_authority_policy() {
     struct RecordingForwardHost {
-        direct: Vec<NodeId>,
-        relays: Vec<(NodeId, NodeId)>,
+        node_rpcs: Vec<NodeId>,
     }
 
     impl ClusterMembershipRpcForwardHost for RecordingForwardHost {
-        fn send_membership_rpc(
-            &mut self,
-            endpoint: &ClusterEndpointRecord,
-            request: &ObjectRpcRequest,
-        ) -> Result<ObjectRpcResponse, NetworkError> {
-            assert_eq!(request.route, CLUSTER_JOIN_CHALLENGE_ROUTE);
-            assert_eq!(request.category, CLUSTER_MEMBERSHIP_RPC_CATEGORY);
-            self.direct.push(endpoint.node_id.clone());
-            Err(NetworkError::Io {
-                operation: "test join challenge direct rpc".to_string(),
-                detail: "offline".to_string(),
-            })
-        }
-
-        fn relay_membership_rpc_to_voter_via_peer(
+        fn call_node_object_rpc(
             &mut self,
             _state: &ClusterBootstrapState,
-            voter: &ClusterEndpointRecord,
-            peer: &ClusterEndpointRecord,
+            target_node_id: &NodeId,
             request: &ObjectRpcRequest,
         ) -> Result<ObjectRpcResponse, NetworkError> {
             assert_eq!(request.route, CLUSTER_JOIN_CHALLENGE_ROUTE);
             assert_eq!(request.category, CLUSTER_MEMBERSHIP_RPC_CATEGORY);
-            self.relays
-                .push((voter.node_id.clone(), peer.node_id.clone()));
+            self.node_rpcs.push(target_node_id.clone());
             ObjectRpcResponse::encode_body(CLUSTER_JOIN_CHALLENGE_ROUTE, &"proof".to_string())
         }
     }
 
-    impl ClusterMembershipRpcAsyncForwardHost for RecordingForwardHost {
-        fn send_membership_rpc_async<'a>(
+    impl ClusterSignedEndpointRpcAsyncHost for RecordingForwardHost {
+        fn sign_endpoint_rpc_request_async<'a>(
             &'a mut self,
-            endpoint: &'a ClusterEndpointRecord,
             request: &'a ObjectRpcRequest,
-        ) -> ClusterMembershipRpcFuture<'a, ObjectRpcResponse> {
+        ) -> ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
             assert_eq!(request.route, CLUSTER_JOIN_CHALLENGE_ROUTE);
             assert_eq!(request.category, CLUSTER_MEMBERSHIP_RPC_CATEGORY);
-            self.direct.push(endpoint.node_id.clone());
-            Box::pin(async {
-                Err(NetworkError::Io {
-                    operation: "test join challenge direct rpc".to_string(),
-                    detail: "offline".to_string(),
-                })
-            })
+            Box::pin(async { Ok(b"test-signature".to_vec()) })
         }
 
-        fn relay_membership_rpc_to_voter_via_peer_async<'a>(
+        fn send_signed_endpoint_rpc_async<'a>(
             &'a mut self,
-            _state: &'a ClusterBootstrapState,
-            voter: &'a ClusterEndpointRecord,
-            peer: &'a ClusterEndpointRecord,
+            endpoint: &'a ClusterEndpointRecord,
+            _auth: &'a [u8],
             request: &'a ObjectRpcRequest,
-        ) -> ClusterMembershipRpcFuture<'a, ObjectRpcResponse> {
+            _timeouts: DaemonRpcTimeouts,
+        ) -> ClusterSignedEndpointRpcFuture<'a, ObjectRpcResponse> {
             assert_eq!(request.route, CLUSTER_JOIN_CHALLENGE_ROUTE);
             assert_eq!(request.category, CLUSTER_MEMBERSHIP_RPC_CATEGORY);
-            self.relays
-                .push((voter.node_id.clone(), peer.node_id.clone()));
+            self.node_rpcs.push(endpoint.node_id.clone());
             Box::pin(async {
                 ObjectRpcResponse::encode_body(CLUSTER_JOIN_CHALLENGE_ROUTE, &"proof".to_string())
             })
@@ -13465,39 +13529,39 @@ fn join_challenge_forwarding_uses_membership_voter_policy() {
 
     let request = cluster_join_challenge_rpc_request(&"challenge").expect("join challenge request");
     let mut host = RecordingForwardHost {
-        direct: Vec::new(),
-        relays: Vec::new(),
+        node_rpcs: Vec::new(),
     };
 
-    let response =
-        forward_cluster_join_challenge_rpc_to_voter_with_host(&paths, &request, &mut host)
-            .expect("forward join challenge");
+    let response = forward_cluster_join_challenge_rpc_to_state_authority_with_host(
+        &paths, &request, &mut host,
+    )
+    .expect("forward join challenge");
     let proof: String = response.decode_body().expect("proof body");
 
     assert_eq!(proof, "proof");
-    assert_eq!(host.direct, vec![voter_node.clone()]);
-    assert_eq!(host.relays, vec![(voter_node.clone(), peer_node.clone())]);
+    assert_eq!(host.node_rpcs, vec![voter_node.clone()]);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("runtime");
     let mut async_host = RecordingForwardHost {
-        direct: Vec::new(),
-        relays: Vec::new(),
+        node_rpcs: Vec::new(),
     };
     let async_response = runtime
-        .block_on(forward_cluster_join_challenge_rpc_to_voter_async_with_host(
-            runtime.handle(),
-            &paths,
-            &request,
-            &mut async_host,
-        ))
+        .block_on(
+            forward_cluster_join_challenge_rpc_to_state_authority_async_with_host(
+                runtime.handle(),
+                &paths,
+                &request,
+                &mut async_host,
+            ),
+        )
         .expect("async forward join challenge");
     let async_proof: String = async_response.decode_body().expect("async proof body");
     assert_eq!(async_proof, "proof");
-    assert_eq!(async_host.direct, vec![voter_node.clone()]);
-    assert_eq!(async_host.relays, vec![(voter_node, peer_node)]);
+    assert_eq!(async_host.node_rpcs, vec![voter_node]);
+    assert_ne!(peer_node, state.local_node_id);
 }
 
 #[test]
@@ -13917,8 +13981,7 @@ fn raft_append_request_omits_snapshot_for_up_to_date_compacted_follower() {
     // A caught-up follower (prev == snapshot index) gets a heartbeat, no snapshot.
     let heartbeat = paths
         .kv_paths()
-        .raft_store()
-        .build_cluster_raft_append_request_from_next_index(&state, last_log_index.saturating_add(1))
+        .build_raft_append_request_from_next_index(&state, last_log_index.saturating_add(1))
         .expect("build heartbeat");
     assert!(heartbeat.snapshot.is_none());
     assert!(heartbeat.append.entries.is_empty());
@@ -13928,8 +13991,7 @@ fn raft_append_request_omits_snapshot_for_up_to_date_compacted_follower() {
     // up with incremental entries — no snapshot install.
     let near = paths
         .kv_paths()
-        .raft_store()
-        .build_cluster_raft_append_request_from_next_index(&state, earliest_retained + 1)
+        .build_raft_append_request_from_next_index(&state, earliest_retained + 1)
         .expect("build near catchup");
     assert!(
         near.snapshot.is_none(),
@@ -13940,8 +14002,7 @@ fn raft_append_request_omits_snapshot_for_up_to_date_compacted_follower() {
     // A follower behind the retained tail still requires a full snapshot install.
     let far = paths
         .kv_paths()
-        .raft_store()
-        .build_cluster_raft_append_request_from_next_index(
+        .build_raft_append_request_from_next_index(
             &state,
             earliest_retained.saturating_sub(1).max(1),
         )
@@ -14103,7 +14164,7 @@ fn cluster_sync_targets_keep_lan_public_iroh_order_before_connectivity() {
     member_b.endpoints = vec![iroh.clone(), public.clone(), lan.clone()];
     state.members.push(member_b);
 
-    let targets = cluster_sync_targets(&state);
+    let targets = crate::cluster_sync_targets(&state);
     let ordered_endpoint_ids = targets
         .iter()
         .map(|endpoint| endpoint.endpoint_id.clone())
@@ -14149,7 +14210,8 @@ fn advertised_hostname_outranks_opportunistic_private_ip_for_docker_routes() {
     write_cluster_state(&paths, &state).expect("write state");
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
 
-    let probe_targets = cluster_network_probe_targets(&state);
+    let probe_targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::NetworkProbe);
     assert_eq!(
         probe_targets
             .iter()
@@ -14183,15 +14245,19 @@ fn advertised_hostname_outranks_opportunistic_private_ip_for_docker_routes() {
     )
     .expect("connectivity records");
 
-    let raft_targets = cluster_raft_command_targets(&paths, &state);
+    let selector = ClusterEndpointSelector::new(&paths, &state);
+    let raft_targets = selector.select(ClusterEndpointSelectionPurpose::ClusterStateCommand);
     assert_eq!(
         raft_targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&stable_hostname.endpoint_id),
         "KV/Raft command routing should not fall back to the stale private IP when the hostname is healthy"
     );
 
-    let status_targets =
-        cluster_member_daemon_status_targets_with_connectivity(&paths, &state, &member);
+    let status_targets = selector
+        .select(ClusterEndpointSelectionPurpose::MemberDaemonStatus)
+        .into_iter()
+        .filter(|endpoint| endpoint.node_id == member.node_id)
+        .collect::<Vec<_>>();
     assert_eq!(
         status_targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&stable_hostname.endpoint_id),
@@ -14200,7 +14266,7 @@ fn advertised_hostname_outranks_opportunistic_private_ip_for_docker_routes() {
 }
 
 #[test]
-fn dfs_protocol_targets_prefer_healthy_bridge_ip_over_degraded_hostname() {
+fn dfs_data_targets_prefer_healthy_bridge_ip_over_degraded_hostname() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-dfs-healthy-bridge-before-hostname");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -14259,7 +14325,8 @@ fn dfs_protocol_targets_prefer_healthy_bridge_ip_over_degraded_hostname() {
     )
     .expect("connectivity records");
 
-    let dfs_targets = cluster_dfs_protocol_targets(&paths, &state);
+    let dfs_targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::DfsData);
     let ordered_endpoint_ids = dfs_targets
         .iter()
         .filter(|endpoint| endpoint.node_id == bridge_ip.node_id)
@@ -14270,6 +14337,63 @@ fn dfs_protocol_targets_prefer_healthy_bridge_ip_over_degraded_hostname() {
         ordered_endpoint_ids,
         vec![bridge_ip.endpoint_id, stable_hostname.endpoint_id],
         "DFS should try the proven bridge path first, then retain the hostname fallback"
+    );
+}
+
+#[test]
+fn endpoint_transfer_profile_is_owned_by_network_endpoint_policy() {
+    let node = NodeId::from_legacy_named("node_endpoint_transfer_profile").expect("node");
+    let endpoint = |transport: ClusterTransportKind| {
+        let address = format!("{transport:?}");
+        ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::derived(
+                "sinomo.test.endpoint-transfer-profile",
+                address.clone(),
+            ),
+            node_id: node.clone(),
+            transport,
+            address,
+            source: ClusterEndpointSource::Observed,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 0,
+            last_observed_latency_ms: None,
+        }
+    };
+
+    let loopback = endpoint(ClusterTransportKind::Loopback);
+    let in_process = endpoint(ClusterTransportKind::InProcess);
+    let lan_tcp = endpoint(ClusterTransportKind::LanTcp);
+    let lan_quic = endpoint(ClusterTransportKind::LanQuic);
+    let iroh = endpoint(ClusterTransportKind::Iroh);
+    let relay = endpoint(ClusterTransportKind::HttpsRelay);
+
+    assert_eq!(
+        ClusterEndpointSelector::transfer_profile_for_endpoint(&loopback),
+        ClusterEndpointTransferProfile::Local
+    );
+    assert_eq!(
+        ClusterEndpointSelector::transfer_profile_for_endpoint(&in_process),
+        ClusterEndpointTransferProfile::Local
+    );
+    assert_eq!(
+        ClusterEndpointSelector::transfer_profile_for_endpoint(&lan_tcp),
+        ClusterEndpointTransferProfile::Lan
+    );
+    assert_eq!(
+        ClusterEndpointSelector::transfer_profile_for_endpoint(&lan_quic),
+        ClusterEndpointTransferProfile::Lan
+    );
+    assert_eq!(
+        ClusterEndpointSelector::transfer_profile_for_endpoint(&iroh),
+        ClusterEndpointTransferProfile::Conservative
+    );
+    assert_eq!(
+        ClusterEndpointSelector::transfer_profile_for_endpoints([&iroh, &lan_tcp]),
+        ClusterEndpointTransferProfile::Lan
+    );
+    assert_eq!(
+        ClusterEndpointSelector::transfer_profile_for_endpoints([&relay, &lan_tcp, &loopback]),
+        ClusterEndpointTransferProfile::Local
     );
 }
 
@@ -14417,7 +14541,8 @@ fn cluster_invite_publish_targets_prefer_tcp_voters_over_iroh_when_available() {
     ];
     state.members.push(voter);
 
-    let targets = cluster_invite_publish_targets(&paths, &state);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::InvitePublish);
 
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].transport, ClusterTransportKind::LanTcp);
@@ -14480,7 +14605,8 @@ fn cluster_invite_publish_targets_use_connectivity_graph_for_fallback() {
     write_cluster_state(&paths, &state).expect("write state");
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync kv");
 
-    let targets = cluster_invite_publish_targets(&paths, &state);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::InvitePublish);
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&lan.endpoint_id)
@@ -14502,7 +14628,8 @@ fn cluster_invite_publish_targets_use_connectivity_graph_for_fallback() {
         )],
     )
     .expect("connectivity records");
-    let targets = cluster_invite_publish_targets(&paths, &state);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::InvitePublish);
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&public.endpoint_id)
@@ -14537,7 +14664,8 @@ fn cluster_invite_publish_targets_use_connectivity_graph_for_fallback() {
         ],
     )
     .expect("connectivity records");
-    let targets = cluster_invite_publish_targets(&paths, &state);
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::InvitePublish);
     assert_eq!(
         targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&iroh.endpoint_id)
@@ -14634,7 +14762,12 @@ fn member_daemon_status_targets_use_connectivity_without_promoting_iroh() {
         ],
     )
     .expect("connectivity records");
-    let targets = cluster_member_daemon_status_targets_with_connectivity(&paths, &state, &member);
+    let selector = ClusterEndpointSelector::new(&paths, &state);
+    let targets = selector
+        .select(ClusterEndpointSelectionPurpose::MemberDaemonStatus)
+        .into_iter()
+        .filter(|endpoint| endpoint.node_id == member.node_id)
+        .collect::<Vec<_>>();
     assert_eq!(
         targets
             .iter()
@@ -14688,7 +14821,11 @@ fn member_daemon_status_targets_use_connectivity_without_promoting_iroh() {
         ],
     )
     .expect("connectivity records");
-    let targets = cluster_member_daemon_status_targets_with_connectivity(&paths, &state, &member);
+    let targets = selector
+        .select(ClusterEndpointSelectionPurpose::MemberDaemonStatus)
+        .into_iter()
+        .filter(|endpoint| endpoint.node_id == member.node_id)
+        .collect::<Vec<_>>();
     assert_eq!(targets[0].endpoint_id, public.endpoint_id);
     assert_eq!(targets[1].endpoint_id, iroh.endpoint_id);
 
@@ -14732,7 +14869,11 @@ fn member_daemon_status_targets_use_connectivity_without_promoting_iroh() {
         ],
     )
     .expect("connectivity records");
-    let targets = cluster_member_daemon_status_targets_with_connectivity(&paths, &state, &member);
+    let targets = selector
+        .select(ClusterEndpointSelectionPurpose::MemberDaemonStatus)
+        .into_iter()
+        .filter(|endpoint| endpoint.node_id == member.node_id)
+        .collect::<Vec<_>>();
     assert_eq!(targets[0].endpoint_id, iroh.endpoint_id);
 }
 
@@ -14781,8 +14922,9 @@ fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
     };
     let candidates = vec![iroh.clone(), public.clone(), lan.clone()];
 
-    let selected = cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &candidates)
-        .expect("rollout endpoint");
+    let selected =
+        first_cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &candidates)
+            .expect("rollout endpoint");
     assert_eq!(selected.endpoint_id, lan.endpoint_id);
 
     // A route must fail CLUSTER_CONNECTIVITY_UNAVAILABLE_AFTER_FAILURES (3)
@@ -14804,8 +14946,9 @@ fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
         )],
     )
     .expect("connectivity records");
-    let selected = cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &candidates)
-        .expect("rollout endpoint");
+    let selected =
+        first_cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &candidates)
+            .expect("rollout endpoint");
     assert_eq!(selected.endpoint_id, public.endpoint_id);
 
     sync_cluster_connectivity_records_to_kv(
@@ -14837,8 +14980,9 @@ fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
         ],
     )
     .expect("connectivity records");
-    let selected = cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &candidates)
-        .expect("rollout endpoint");
+    let selected =
+        first_cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &candidates)
+            .expect("rollout endpoint");
     assert_eq!(selected.endpoint_id, iroh.endpoint_id);
 }
 
@@ -14876,9 +15020,13 @@ fn rollout_target_selection_treats_hostname_tcp_as_direct_before_iroh() {
         last_observed_latency_ms: None,
     };
 
-    let selected =
-        cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &[iroh, hostname.clone()])
-            .expect("rollout endpoint");
+    let selected = first_cluster_rollout_target_endpoint_for_main(
+        &paths,
+        &state,
+        &main,
+        &[iroh, hostname.clone()],
+    )
+    .expect("rollout endpoint");
     assert_eq!(selected.endpoint_id, hostname.endpoint_id);
 }
 
@@ -15898,10 +16046,11 @@ impl ClusterMemberMutationAsyncHost for RecordingClusterMemberPublishHost {
 
 struct UnusedClusterJoinRegistrationHost;
 
-impl ClusterMembershipRpcForwardHost for UnusedClusterJoinRegistrationHost {
-    fn send_membership_rpc(
+impl ClusterJoinRegistrationHost for UnusedClusterJoinRegistrationHost {
+    fn call_node_object_rpc(
         &mut self,
-        _endpoint: &ClusterEndpointRecord,
+        _state: &ClusterBootstrapState,
+        _target_node_id: &NodeId,
         _request: &ObjectRpcRequest,
     ) -> Result<ObjectRpcResponse, NetworkError> {
         Err(NetworkError::InvalidClusterCommand {
@@ -15909,20 +16058,6 @@ impl ClusterMembershipRpcForwardHost for UnusedClusterJoinRegistrationHost {
         })
     }
 
-    fn relay_membership_rpc_to_voter_via_peer(
-        &mut self,
-        _state: &ClusterBootstrapState,
-        _voter: &ClusterEndpointRecord,
-        _peer: &ClusterEndpointRecord,
-        _request: &ObjectRpcRequest,
-    ) -> Result<ObjectRpcResponse, NetworkError> {
-        Err(NetworkError::InvalidClusterCommand {
-            detail: "unused membership relay host".to_string(),
-        })
-    }
-}
-
-impl ClusterJoinRegistrationHost for UnusedClusterJoinRegistrationHost {
     fn commit_join_registration_state(
         &mut self,
         _paths: &ClusterPaths,
@@ -16695,7 +16830,7 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
     let status = ClusterNodeStatusRecord {
         cluster_id: state.cluster_id.clone(),
         node_id: state.local_node_id.clone(),
-        process: "daemon-main".to_string(),
+        process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
         availability: ClusterNodeAvailability::Online,
         daemon_version: "0.1.0-test".to_string(),
         commit: None,
@@ -16776,7 +16911,7 @@ fn cluster_node_status_storage_keeps_processes_distinct_for_same_node() {
     let main_status = ClusterNodeStatusRecord {
         cluster_id: cluster_id.clone(),
         node_id: node_id.clone(),
-        process: DAEMON_MAIN_CLUSTER_ROLE.to_string(),
+        process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
         availability: ClusterNodeAvailability::Online,
         daemon_version: "0.1.0-test".to_string(),
         commit: None,
@@ -16791,7 +16926,7 @@ fn cluster_node_status_storage_keeps_processes_distinct_for_same_node() {
         observed_at: now,
     };
     let mut shadow_status = main_status.clone();
-    shadow_status.process = DAEMON_SHADOW_CLUSTER_ROLE.to_string();
+    shadow_status.process = sinomo_node::DAEMON_SHADOW_CLUSTER_ROLE.to_string();
     shadow_status.pid = Some(43);
     shadow_status.address = Some("127.0.0.1:21354".to_string());
     shadow_status.bind_address = Some("0.0.0.0:21354".to_string());
@@ -16823,9 +16958,23 @@ fn cluster_node_status_storage_keeps_processes_distinct_for_same_node() {
             .is_some(),
         "shadow status key should be present"
     );
-    assert!(stored_cluster_node_status_matches(&paths, &main_status).expect("main status match"));
+    let mut main_status_match_host = RecordingClusterNodeStatusPublishHost::default();
     assert!(
-        stored_cluster_node_status_matches(&paths, &shadow_status).expect("shadow status match")
+        cluster_node_status_publish_matches_with_host(
+            &paths,
+            &main_status,
+            &mut main_status_match_host,
+        )
+        .expect("main status match")
+    );
+    let mut shadow_status_match_host = RecordingClusterNodeStatusPublishHost::default();
+    assert!(
+        cluster_node_status_publish_matches_with_host(
+            &paths,
+            &shadow_status,
+            &mut shadow_status_match_host,
+        )
+        .expect("shadow status match")
     );
 
     let statuses = read_cluster_node_statuses_from_kv(&paths).expect("statuses");
@@ -16833,12 +16982,12 @@ fn cluster_node_status_storage_keeps_processes_distinct_for_same_node() {
     assert!(
         statuses
             .iter()
-            .any(|status| status.process == DAEMON_MAIN_CLUSTER_ROLE)
+            .any(|status| status.process == sinomo_node::DAEMON_MAIN_CLUSTER_ROLE)
     );
     assert!(
         statuses
             .iter()
-            .any(|status| status.process == DAEMON_SHADOW_CLUSTER_ROLE)
+            .any(|status| status.process == sinomo_node::DAEMON_SHADOW_CLUSTER_ROLE)
     );
 }
 
@@ -16866,8 +17015,7 @@ fn async_cluster_raft_append_request_builder_matches_sync_builder() {
 
     let sync_request = paths
         .kv_paths()
-        .raft_store()
-        .build_cluster_raft_append_request_from_next_index(&state, 1)
+        .build_raft_append_request_from_next_index(&state, 1)
         .expect("sync build");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -16877,16 +17025,14 @@ fn async_cluster_raft_append_request_builder_matches_sync_builder() {
         .block_on(
             paths
                 .kv_paths()
-                .raft_store()
-                .locked_build_cluster_raft_append_request_from_next_index_async(&state, 1),
+                .locked_build_raft_append_request_from_next_index_async(&state, 1),
         )
         .expect("async build");
     let last_log_index = runtime
         .block_on(
             paths
                 .kv_paths()
-                .raft_store()
-                .locked_last_log_index_async(&state.local_node_id),
+                .locked_last_raft_log_index_async(&state.local_node_id),
         )
         .expect("async last log index");
 
@@ -17008,15 +17154,18 @@ fn async_cluster_raft_append_replication_retries_from_rejected_match_index() {
             &state,
             &endpoint,
             &[],
-            ClusterRaftAppendReplicationOptions {
-                timeout: Duration::from_secs(5),
-                max_attempts: 3,
+            ClusterControlPlaneTimeouts {
+                max_raft_append_attempts: 3,
                 tcp_command_timeout: Duration::from_secs(1),
                 iroh_command_timeout: Duration::from_secs(1),
                 tcp_foreground_attempt_timeout: Duration::from_secs(1),
                 public_foreground_attempt_timeout: Duration::from_secs(1),
                 iroh_foreground_attempt_timeout: Duration::from_secs(1),
+                raft_append_timeout: Duration::from_secs(5),
+                rpc_timeout: Duration::from_secs(5),
+                membership_rpc_timeout: Duration::from_secs(5),
             },
+            Duration::from_secs(5),
             &mut host,
         ))
         .expect("async replicate");
@@ -17044,8 +17193,7 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
             Box::pin(async move {
                 paths
                     .kv_paths()
-                    .raft_store()
-                    .locked_last_log_index_async(&state.local_node_id)
+                    .locked_last_raft_log_index_async(&state.local_node_id)
                     .await
                     .map_err(Into::into)
             })
@@ -17060,10 +17208,7 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
             Box::pin(async move {
                 paths
                     .kv_paths()
-                    .raft_store()
-                    .locked_build_cluster_raft_append_request_from_next_index_async(
-                        state, next_index,
-                    )
+                    .locked_build_raft_append_request_from_next_index_async(state, next_index)
                     .await
                     .map_err(Into::into)
             })
@@ -17145,12 +17290,12 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
         now,
     );
     state.members[0].capabilities =
-        vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+        vec![CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
     state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
     let mut remote_member =
         ClusterMemberRecord::local_voter(cluster_id, remote.clone(), "remote", "pk-remote", now);
     remote_member.capabilities =
-        vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+        vec![CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
     remote_member.allowed_capabilities = remote_member.capabilities.clone();
     remote_member.endpoints = vec![daemon_lan_endpoint(
         &remote,
@@ -17172,29 +17317,31 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
         .build()
         .expect("runtime");
     let result = runtime
-        .block_on(commit_cluster_raft_command_with_quorum_async_with_host(
-            runtime.handle(),
-            &paths,
-            &mut state,
-            KvCommand::Op(KvOp::Put {
-                key: "/test/async-quorum".to_string(),
-                value: b"ok".to_vec(),
-                lease_id: None,
-            }),
-            ClusterRaftQuorumCommitOptions {
-                timeout: Duration::from_secs(5),
-            },
-            ClusterRaftAppendReplicationOptions {
-                timeout: Duration::from_secs(5),
-                max_attempts: 3,
-                tcp_command_timeout: Duration::from_secs(1),
-                iroh_command_timeout: Duration::from_secs(1),
-                tcp_foreground_attempt_timeout: Duration::from_secs(1),
-                public_foreground_attempt_timeout: Duration::from_secs(1),
-                iroh_foreground_attempt_timeout: Duration::from_secs(1),
-            },
-            &mut host,
-        ))
+        .block_on(
+            crate::raft_quorum::commit_cluster_raft_command_with_quorum_async_with_host(
+                runtime.handle(),
+                &paths,
+                &mut state,
+                KvCommand::Op(KvOp::Put {
+                    key: "/test/async-quorum".to_string(),
+                    value: b"ok".to_vec(),
+                    lease_id: None,
+                }),
+                ClusterKvRaftQuorumCommitOptions {
+                    timeout: Duration::from_secs(5),
+                },
+                ClusterRaftAppendReplicationOptions {
+                    timeout: Duration::from_secs(5),
+                    max_attempts: 3,
+                    tcp_command_timeout: Duration::from_secs(1),
+                    iroh_command_timeout: Duration::from_secs(1),
+                    tcp_foreground_attempt_timeout: Duration::from_secs(1),
+                    public_foreground_attempt_timeout: Duration::from_secs(1),
+                    iroh_foreground_attempt_timeout: Duration::from_secs(1),
+                },
+                &mut host,
+            ),
+        )
         .expect("async quorum commit");
 
     assert_eq!(
@@ -17267,7 +17414,7 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
         ClusterNodeStatusRecord {
             cluster_id: cluster_id.clone(),
             node_id: node_id.clone(),
-            process: DAEMON_MAIN_CLUSTER_ROLE.to_string(),
+            process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
             availability,
             daemon_version: "0.1.0-test".to_string(),
             commit: None,
@@ -17343,7 +17490,7 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
         now,
     );
     state.members[0].capabilities =
-        vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+        vec![CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
     state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
 
     let mut bridge = ClusterMemberRecord::local_voter(
@@ -17354,7 +17501,7 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
         now,
     );
     bridge.capabilities =
-        vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+        vec![CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
     bridge.allowed_capabilities = bridge.capabilities.clone();
     bridge.endpoints = vec![daemon_lan_endpoint(
         &bridge_node,
@@ -17370,7 +17517,7 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
         now,
     );
     target.capabilities =
-        vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+        vec![CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
     target.allowed_capabilities = target.capabilities.clone();
     target.endpoints = vec![daemon_lan_endpoint(
         &target_node,
@@ -17386,7 +17533,7 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
         now,
     );
     unknown.capabilities =
-        vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+        vec![CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
     unknown.allowed_capabilities = unknown.capabilities.clone();
 
     state.members.push(bridge.clone());
@@ -17636,7 +17783,7 @@ fn cluster_health_rows_select_member_process_status() {
         now,
     );
     state.members[0].capabilities =
-        vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+        vec![CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
     state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
     state.members[0].endpoints = vec![daemon_lan_endpoint(
         &node_id,
@@ -17649,7 +17796,7 @@ fn cluster_health_rows_select_member_process_status() {
     let shadow_status = ClusterNodeStatusRecord {
         cluster_id: cluster_id.clone(),
         node_id: node_id.clone(),
-        process: DAEMON_SHADOW_CLUSTER_ROLE.to_string(),
+        process: sinomo_node::DAEMON_SHADOW_CLUSTER_ROLE.to_string(),
         availability: ClusterNodeAvailability::Online,
         daemon_version: "0.1.0-test".to_string(),
         commit: None,
@@ -17683,7 +17830,8 @@ fn cluster_health_rows_select_member_process_status() {
         .find(|row| row.member.node_id == node_id)
         .expect("main member row");
     assert_eq!(
-        row.status.process, DAEMON_MAIN_CLUSTER_ROLE,
+        row.status.process,
+        sinomo_node::DAEMON_MAIN_CLUSTER_ROLE,
         "a shadow status must not occupy the main member row"
     );
     assert_eq!(
@@ -17705,7 +17853,10 @@ fn cluster_health_rows_select_member_process_status() {
         .iter()
         .find(|row| row.member.node_id == node_id)
         .expect("async main member row");
-    assert_eq!(async_row.status.process, DAEMON_MAIN_CLUSTER_ROLE);
+    assert_eq!(
+        async_row.status.process,
+        sinomo_node::DAEMON_MAIN_CLUSTER_ROLE
+    );
     assert_eq!(async_row.availability, ClusterNodeAvailability::Offline);
 }
 
@@ -17750,8 +17901,9 @@ fn cluster_health_and_doctor_ignore_legacy_shadow_members() {
         "main-public-key",
         now,
     );
-    state.members[0].capabilities =
-        vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("main capability")];
+    state.members[0].capabilities = vec![
+        CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY).expect("main capability"),
+    ];
     state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
     let mut legacy_shadow = ClusterMemberRecord::local_non_voting(
         cluster_id.clone(),
@@ -17760,8 +17912,10 @@ fn cluster_health_and_doctor_ignore_legacy_shadow_members() {
         "shadow-public-key",
         now,
     );
-    legacy_shadow.capabilities =
-        vec![CapabilityName::new(DAEMON_SHADOW_SUPERVISE_CAPABILITY).expect("shadow capability")];
+    legacy_shadow.capabilities = vec![
+        CapabilityName::new(sinomo_node::DAEMON_SHADOW_SUPERVISE_CAPABILITY)
+            .expect("shadow capability"),
+    ];
     legacy_shadow.allowed_capabilities = legacy_shadow.capabilities.clone();
     legacy_shadow.endpoints = vec![daemon_lan_endpoint(
         &shadow_node_id,
@@ -18069,6 +18223,45 @@ impl ClusterNetworkInfoPublishHost for RecordingClusterNetworkInfoPublishHost {
     }
 }
 
+impl ClusterNetworkInfoPublishAsyncHost for RecordingClusterNetworkInfoPublishHost {
+    type Error = NetworkError;
+
+    fn published_network_info_matches_async<'a>(
+        &'a mut self,
+        _paths: &'a ClusterPaths,
+        _info: &'a ClusterNetworkInfoRecord,
+    ) -> ClusterMembershipRpcFuture<'a, bool> {
+        Box::pin(async move {
+            self.cache_checks += 1;
+            Ok(self.cache_matches)
+        })
+    }
+
+    fn remember_published_network_info_async<'a>(
+        &'a mut self,
+        _paths: &'a ClusterPaths,
+        _info: &'a ClusterNetworkInfoRecord,
+    ) -> ClusterMembershipRpcFuture<'a, ()> {
+        Box::pin(async move {
+            self.remembers += 1;
+            Ok(())
+        })
+    }
+
+    fn commit_cluster_kv_txn_with_quorum_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> ClusterMembershipRpcFuture<'a, KvSnapshot> {
+        Box::pin(async move {
+            self.commits += 1;
+            self.last_txn = Some(txn.clone());
+            append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
+        })
+    }
+}
+
 #[derive(Default)]
 struct RecordingClusterNodeStatusPublishHost {
     cache_matches: bool,
@@ -18174,7 +18367,7 @@ fn node_status_quorum_publish_driver_delegates_and_cleans_rollout_sidecar() {
     let status = ClusterNodeStatusRecord {
         cluster_id,
         node_id: node_id.clone(),
-        process: "daemon-main".to_string(),
+        process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
         availability: ClusterNodeAvailability::Online,
         daemon_version: "0.1.0-test".to_string(),
         commit: None,
@@ -18253,7 +18446,7 @@ fn node_status_async_quorum_publish_driver_delegates() {
     let status = ClusterNodeStatusRecord {
         cluster_id,
         node_id: node_id.clone(),
-        process: "daemon-main".to_string(),
+        process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
         availability: ClusterNodeAvailability::Online,
         daemon_version: "0.1.0-test".to_string(),
         commit: None,
@@ -18370,6 +18563,67 @@ fn network_info_quorum_publish_driver_delegates_and_uses_publish_cache() {
 }
 
 #[test]
+fn network_info_async_quorum_publish_driver_delegates() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let root = sinomo_testdir::TestDir::new("sinomo-network-info-async-quorum-driver");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_info_async_quorum_driver").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_network_info_async_quorum_driver").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network info async quorum driver",
+        node_id.clone(),
+        "node",
+        "public-key",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let info = ClusterNetworkInfoRecord {
+        cluster_id,
+        node_id: node_id.clone(),
+        environment_id: "env_network_info_async_quorum_driver".to_string(),
+        observed_addresses: vec!["192.0.2.23".to_string()],
+        endpoints: Vec::new(),
+        observed_at: now,
+        expires_at: now + time::Duration::seconds(600),
+    };
+    let key = cluster_network_info_key(&node_id);
+
+    let mut host = RecordingClusterNetworkInfoPublishHost::default();
+    let result = runtime
+        .block_on(publish_cluster_network_info_to_quorum_async_with_host(
+            runtime.handle(),
+            &paths,
+            info,
+            &mut host,
+        ))
+        .expect("async network info publish");
+    assert!(result.is_some());
+    assert_eq!(host.cache_checks, 1);
+    assert_eq!(host.commits, 1);
+    assert_eq!(host.remembers, 1);
+    assert!(
+        host.last_txn
+            .as_ref()
+            .expect("committed txn")
+            .success
+            .iter()
+            .any(|op| matches!(op, KvOp::Put { key: put_key, .. } if put_key == &key)),
+        "async network driver should plan network-info publication"
+    );
+}
+
+#[test]
 fn stable_status_and_network_info_sync_do_not_append_raft_log_entries() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-stable-status-network-no-raft-append");
     let data_dir = SinomoDataDir::new(&root);
@@ -18395,7 +18649,7 @@ fn stable_status_and_network_info_sync_do_not_append_raft_log_entries() {
     let status = ClusterNodeStatusRecord {
         cluster_id: cluster_id.clone(),
         node_id: node_id.clone(),
-        process: "daemon-main".to_string(),
+        process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
         availability: ClusterNodeAvailability::Online,
         daemon_version: "0.1.0-test".to_string(),
         commit: None,
@@ -18885,13 +19139,6 @@ fn cluster_network_records_publish_overwrite_and_expire() {
         "expired connectivity should be ignored by read views"
     );
 
-    let partial_probe_ops =
-        cluster_connectivity_sync_ops(&paths, &node_a, &[]).expect("partial probe ops");
-    assert!(
-        partial_probe_ops.is_empty(),
-        "unprobed but unexpired connectivity records should be retained"
-    );
-
     expire_cluster_network_records(&paths, now + time::Duration::seconds(31))
         .expect("expire network");
     assert!(
@@ -18966,7 +19213,7 @@ fn expire_cluster_network_records_handles_prefix_larger_than_public_range_limit(
             _ => unreachable!("put_serde creates put op"),
         }
     }
-    let first_batch = crate::storage::cluster_network_expiry_delete_ops(
+    let first_batch = crate::control_plane_adapters::cluster_network_expiry_delete_ops(
         &store.snapshot(),
         now,
         sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
@@ -19771,8 +20018,13 @@ fn connectivity_sync_refreshes_stable_records_near_expiry() {
         .expect("stored connectivity");
     write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("cluster kv snapshot");
 
-    let ops = cluster_connectivity_sync_ops(&paths, &source_node_id, &[incoming.clone()])
-        .expect("connectivity sync ops");
+    let ops = cluster_connectivity_full_sync_batch_ops(
+        &paths,
+        &source_node_id,
+        &[incoming.clone()],
+        sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+    )
+    .expect("connectivity sync ops");
     assert_eq!(
         ops.len(),
         1,
@@ -19792,8 +20044,13 @@ fn connectivity_sync_refreshes_stable_records_near_expiry() {
         )
         .expect("fresh stored connectivity");
     write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("fresh cluster kv snapshot");
-    let ops =
-        cluster_connectivity_sync_ops(&paths, &source_node_id, &[incoming]).expect("fresh ops");
+    let ops = cluster_connectivity_full_sync_batch_ops(
+        &paths,
+        &source_node_id,
+        &[incoming],
+        sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+    )
+    .expect("fresh ops");
     assert!(
         ops.is_empty(),
         "fresh stable connectivity records should not be rewritten just to update timestamps"
@@ -19874,11 +20131,11 @@ fn cluster_kv_watch_event_log_is_bounded() {
         .collect::<Vec<_>>();
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, &events).expect("append watch events"),
+        append_cluster_kv_watch_events(&paths.kv_paths(), &events).expect("append watch events"),
         MAX_CLUSTER_KV_WATCH_EVENTS
     );
 
-    let retained = cluster_kv_watch_events(&paths).expect("read watch events");
+    let retained = cluster_kv_watch_events(&paths.kv_paths()).expect("read watch events");
     assert_eq!(retained.len(), MAX_CLUSTER_KV_WATCH_EVENTS);
     assert_eq!(
         retained.first().expect("first retained").revision,
@@ -19905,7 +20162,7 @@ fn cluster_kv_watch_events_append_log_suppresses_duplicate_batches() {
     };
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
             .expect("append watch event"),
         1
     );
@@ -19922,14 +20179,11 @@ fn cluster_kv_watch_events_append_log_suppresses_duplicate_batches() {
         .len();
 
     assert!(
-        crate::storage::cached_cluster_kv_watch_events_contain_all(
-            &paths,
-            std::slice::from_ref(&event)
-        ),
+        cached_cluster_kv_watch_events_contain_all(&paths.kv_paths(), std::slice::from_ref(&event)),
         "first append should seed the cache used for duplicate suppression"
     );
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
             .expect("duplicate watch event"),
         0
     );
@@ -19941,7 +20195,7 @@ fn cluster_kv_watch_events_append_log_suppresses_duplicate_batches() {
         "duplicate batches should not append more log bytes"
     );
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("read watch events"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("read watch events"),
         vec![event]
     );
 }
@@ -19966,7 +20220,7 @@ fn cluster_kv_watch_events_append_skips_missing_snapshot_probe() {
 
     reset_cluster_kv_cached_snapshot_reads_for_test(&paths);
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
             .expect("append watch event"),
         1
     );
@@ -19976,7 +20230,7 @@ fn cluster_kv_watch_events_append_skips_missing_snapshot_probe() {
         "watch appends without a materialized snapshot should not take the required snapshot read path"
     );
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("read watch events"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("read watch events"),
         vec![event]
     );
 }
@@ -20002,10 +20256,14 @@ fn cluster_kv_watch_event_fanout_skips_storage_without_active_watchers() {
     };
 
     reset_cluster_kv_cached_snapshot_reads_for_test(&paths);
-    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     assert_eq!(
-        append_cluster_kv_watch_events_for_active_watches(&paths, std::slice::from_ref(&event))
-            .expect("fanout without active watchers"),
+        append_cluster_kv_watch_events_for_active_watches(
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
+            std::slice::from_ref(&event)
+        )
+        .expect("fanout without active watchers"),
         0,
         "fanout events should not hit disk when no local watch can consume them"
     );
@@ -20015,7 +20273,7 @@ fn cluster_kv_watch_event_fanout_skips_storage_without_active_watchers() {
         "no-active-watch fanout should not probe the materialized snapshot"
     );
     assert_eq!(
-        cluster_kv_watch_dir_scans_for_test(&paths),
+        cluster_kv_watch_dir_scans_for_test(&paths.kv_paths()),
         0,
         "no-active-watch fanout should not scan a missing watch directory"
     );
@@ -20029,7 +20287,8 @@ fn cluster_kv_watch_event_fanout_skips_storage_without_active_watchers() {
     );
 
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/fanout-active/".to_string(),
             start_revision: KvRevision(1),
@@ -20045,8 +20304,12 @@ fn cluster_kv_watch_event_fanout_skips_storage_without_active_watchers() {
     };
     reset_cluster_kv_cached_snapshot_reads_for_test(&paths);
     assert_eq!(
-        append_cluster_kv_watch_events_for_active_watches(&paths, std::slice::from_ref(&unrelated))
-            .expect("fanout with no matching active watcher"),
+        append_cluster_kv_watch_events_for_active_watches(
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
+            std::slice::from_ref(&unrelated)
+        )
+        .expect("fanout with no matching active watcher"),
         0,
         "fanout events for unrelated prefixes should not be persisted just because some watch exists"
     );
@@ -20064,7 +20327,8 @@ fn cluster_kv_watch_event_fanout_skips_storage_without_active_watchers() {
         "unmatched active-watch fanout should avoid log appends"
     );
     let empty = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -20078,8 +20342,12 @@ fn cluster_kv_watch_event_fanout_skips_storage_without_active_watchers() {
     assert_eq!(empty.next_revision, KvRevision(1));
 
     assert_eq!(
-        append_cluster_kv_watch_events_for_active_watches(&paths, std::slice::from_ref(&event))
-            .expect("fanout with active watcher"),
+        append_cluster_kv_watch_events_for_active_watches(
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
+            std::slice::from_ref(&event)
+        )
+        .expect("fanout with active watcher"),
         1,
         "active local watchers still require omitted snapshot events to be stored"
     );
@@ -20088,7 +20356,8 @@ fn cluster_kv_watch_event_fanout_skips_storage_without_active_watchers() {
         "active watcher fanout should append to the watch log"
     );
     let drained = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -20132,10 +20401,11 @@ fn cluster_kv_watch_events_receiver_skips_storage_without_active_watchers() {
         },
     };
 
-    let response = handle_cluster_kv_watch_events(
-        &paths,
+    let response = sinomo_kv::handle_cluster_kv_watch_events(
+        &paths.kv_paths(),
+        &state,
         ClusterKvWatchEventsRequest {
-            state,
+            state: state.clone(),
             leader_id,
             events: vec![event],
         },
@@ -20164,7 +20434,8 @@ fn cluster_kv_watch_event_fanout_reuses_active_registration_cache() {
         .expect("write empty snapshot");
 
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/fanout-cache/".to_string(),
             start_revision: KvRevision(1),
@@ -20186,27 +20457,32 @@ fn cluster_kv_watch_event_fanout_reuses_active_registration_cache() {
         },
     };
 
-    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     assert_eq!(
-        append_cluster_kv_watch_events_for_active_watches(&paths, std::slice::from_ref(&unrelated))
-            .expect("first unrelated fanout"),
+        append_cluster_kv_watch_events_for_active_watches(
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
+            std::slice::from_ref(&unrelated)
+        )
+        .expect("first unrelated fanout"),
         0
     );
     assert_eq!(
-        cluster_kv_watch_dir_scans_for_test(&paths),
+        cluster_kv_watch_dir_scans_for_test(&paths.kv_paths()),
         1,
         "first active-watch fanout should scan registrations to build the cache"
     );
     assert_eq!(
         append_cluster_kv_watch_events_for_active_watches(
-            &paths,
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             std::slice::from_ref(&unrelated_two)
         )
         .expect("second unrelated fanout"),
         0
     );
     assert_eq!(
-        cluster_kv_watch_dir_scans_for_test(&paths),
+        cluster_kv_watch_dir_scans_for_test(&paths.kv_paths()),
         1,
         "repeated fanout should reuse cached active watch registrations"
     );
@@ -20219,17 +20495,22 @@ fn cluster_kv_watch_event_fanout_reuses_active_registration_cache() {
         },
     };
     assert_eq!(
-        append_cluster_kv_watch_events_for_active_watches(&paths, std::slice::from_ref(&matching))
-            .expect("matching fanout"),
+        append_cluster_kv_watch_events_for_active_watches(
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
+            std::slice::from_ref(&matching)
+        )
+        .expect("matching fanout"),
         1
     );
     assert_eq!(
-        cluster_kv_watch_dir_scans_for_test(&paths),
+        cluster_kv_watch_dir_scans_for_test(&paths.kv_paths()),
         1,
         "matching fanout should still use the cached registration list"
     );
     let drained = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -20246,10 +20527,11 @@ fn cluster_kv_watch_event_fanout_reuses_active_registration_cache() {
             value: b"old".to_vec(),
         },
     };
-    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     assert_eq!(
         append_cluster_kv_watch_events_for_active_watches(
-            &paths,
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             std::slice::from_ref(&old_matching)
         )
         .expect("old matching fanout"),
@@ -20257,7 +20539,7 @@ fn cluster_kv_watch_event_fanout_reuses_active_registration_cache() {
         "fanout filtering must observe the advanced watch cursor after a drain"
     );
     assert_eq!(
-        cluster_kv_watch_dir_scans_for_test(&paths),
+        cluster_kv_watch_dir_scans_for_test(&paths.kv_paths()),
         0,
         "draining a hot watch should refresh the cached registration cursor without rescanning the watch directory"
     );
@@ -20272,20 +20554,25 @@ fn cluster_kv_watch_event_fanout_reuses_active_registration_cache() {
             },
         })
         .collect::<Vec<_>>();
-    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     assert_eq!(
-        append_cluster_kv_watch_events_for_active_watches(&paths, &lag_events)
-            .expect("lag-bound matching fanout"),
+        append_cluster_kv_watch_events_for_active_watches(
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
+            &lag_events
+        )
+        .expect("lag-bound matching fanout"),
         lag_events.len(),
         "matching events should be persisted for the active watch"
     );
     assert_eq!(
-        cluster_kv_watch_dir_scans_for_test(&paths),
+        cluster_kv_watch_dir_scans_for_test(&paths.kv_paths()),
         0,
         "hot matching fanout should keep using the cached active registration list"
     );
     let drained = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -20302,17 +20589,18 @@ fn cluster_kv_watch_event_fanout_reuses_active_registration_cache() {
             value: b"stale".to_vec(),
         },
     };
-    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     assert_eq!(
         append_cluster_kv_watch_events_for_active_watches(
-            &paths,
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             std::slice::from_ref(&stale_after_flush)
         )
         .expect("stale fanout after durable cursor flush"),
         0,
         "fanout filtering must observe the durable cursor flush"
     );
-    let durable_flush_scans = cluster_kv_watch_dir_scans_for_test(&paths);
+    let durable_flush_scans = cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     assert!(
         (1..=2).contains(&durable_flush_scans),
         "durable cursor flush replaces the watch file, so the changed directory mark should force a bounded cache rebuild; got {durable_flush_scans} scans"
@@ -20325,7 +20613,7 @@ fn cluster_kv_watch_events_large_batch_checkpoints_without_log_append_write() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    reset_cluster_kv_watch_event_log_write_bytes_for_test(&paths);
+    reset_cluster_kv_watch_event_log_write_bytes_for_test(&paths.kv_paths());
     let event = KvEvent {
         revision: KvRevision(1),
         key: "/watch/large-direct-checkpoint".to_string(),
@@ -20335,7 +20623,7 @@ fn cluster_kv_watch_events_large_batch_checkpoints_without_log_append_write() {
     };
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
             .expect("append large watch event"),
         1
     );
@@ -20355,12 +20643,12 @@ fn cluster_kv_watch_events_large_batch_checkpoints_without_log_append_write() {
         "large batches should checkpoint directly instead of writing and truncating the append log"
     );
     assert_eq!(
-        cluster_kv_watch_event_log_write_bytes_for_test(&paths),
+        cluster_kv_watch_event_log_write_bytes_for_test(&paths.kv_paths()),
         0,
         "direct checkpoint should avoid the extra append-log write for large batches"
     );
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("read retained large event"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("read retained large event"),
         vec![event]
     );
 }
@@ -20380,7 +20668,7 @@ fn cluster_kv_watch_events_duplicate_checkpoint_append_does_not_create_empty_log
     };
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
             .expect("append large watch event"),
         1
     );
@@ -20391,7 +20679,7 @@ fn cluster_kv_watch_events_duplicate_checkpoint_append_does_not_create_empty_log
     let _ = std::fs::remove_file(&paths.kv_watch_events_log);
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
             .expect("duplicate checkpoint watch event"),
         0
     );
@@ -20400,7 +20688,7 @@ fn cluster_kv_watch_events_duplicate_checkpoint_append_does_not_create_empty_log
         "cold duplicate suppression should not create an empty append log"
     );
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("read retained large event"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("read retained large event"),
         vec![event]
     );
 }
@@ -20419,7 +20707,8 @@ fn cluster_kv_watch_events_duplicate_append_repairs_damaged_log() {
         },
     };
 
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event)).expect("append first");
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
+        .expect("append first");
     let mut log = std::fs::OpenOptions::new()
         .append(true)
         .open(&paths.kv_watch_events_log)
@@ -20431,12 +20720,12 @@ fn cluster_kv_watch_events_duplicate_append_repairs_damaged_log() {
     drop(log);
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
             .expect("append duplicate after partial tail"),
         0
     );
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("read repaired events"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("read repaired events"),
         vec![event]
     );
     let log = std::fs::read(&paths.kv_watch_events_log).expect("read repaired log");
@@ -20469,24 +20758,24 @@ fn cluster_kv_watch_events_append_log_uses_warm_cache_without_rescan() {
     };
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&first))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&first))
             .expect("append first watch event"),
         1
     );
-    reset_cluster_kv_watch_event_log_read_bytes_for_test(&paths);
+    reset_cluster_kv_watch_event_log_read_bytes_for_test(&paths.kv_paths());
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&second))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&second))
             .expect("append second watch event"),
         1
     );
     assert_eq!(
-        cluster_kv_watch_event_log_read_bytes_for_test(&paths),
+        cluster_kv_watch_event_log_read_bytes_for_test(&paths.kv_paths()),
         0,
         "a validated warm watch-event cache should let new appends avoid rescanning the existing log"
     );
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("read watch events"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("read watch events"),
         vec![first, second]
     );
 }
@@ -20508,11 +20797,11 @@ fn cluster_kv_watch_event_log_compacts_to_checkpoint_after_large_batch() {
         .collect::<Vec<_>>();
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, &events).expect("append watch events"),
+        append_cluster_kv_watch_events(&paths.kv_paths(), &events).expect("append watch events"),
         MAX_CLUSTER_KV_WATCH_EVENTS
     );
 
-    let retained = cluster_kv_watch_events(&paths).expect("read compacted watch events");
+    let retained = cluster_kv_watch_events(&paths.kv_paths()).expect("read compacted watch events");
     assert_eq!(retained.len(), MAX_CLUSTER_KV_WATCH_EVENTS);
     assert_eq!(
         retained.first().expect("first retained").revision,
@@ -20574,12 +20863,12 @@ fn cluster_kv_watch_event_log_repairs_overgrown_valid_log_before_append() {
     };
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&new_event))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&new_event))
             .expect("append after overgrown log"),
         1
     );
 
-    let retained = cluster_kv_watch_events(&paths).expect("read repaired events");
+    let retained = cluster_kv_watch_events(&paths.kv_paths()).expect("read repaired events");
     assert_eq!(retained.len(), MAX_CLUSTER_KV_WATCH_EVENTS);
     assert_eq!(
         retained.last().expect("last retained").revision,
@@ -20622,11 +20911,11 @@ fn cluster_kv_watch_event_log_keeps_complete_boundary_revision() {
     });
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, &events).expect("append watch events"),
+        append_cluster_kv_watch_events(&paths.kv_paths(), &events).expect("append watch events"),
         MAX_CLUSTER_KV_WATCH_EVENTS + 1
     );
 
-    let retained = cluster_kv_watch_events(&paths).expect("read retained events");
+    let retained = cluster_kv_watch_events(&paths.kv_paths()).expect("read retained events");
     assert_eq!(
         retained.first().expect("first retained").revision,
         KvRevision(11)
@@ -20657,7 +20946,7 @@ fn cluster_kv_watch_event_log_drops_delayed_events_older_than_retention_floor() 
             },
         })
         .collect::<Vec<_>>();
-    append_cluster_kv_watch_events(&paths, &events).expect("append watch events");
+    append_cluster_kv_watch_events(&paths.kv_paths(), &events).expect("append watch events");
     let log_len = std::fs::metadata(&paths.kv_watch_events_log)
         .expect("watch event log metadata")
         .len();
@@ -20670,7 +20959,7 @@ fn cluster_kv_watch_event_log_drops_delayed_events_older_than_retention_floor() 
     };
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&stale))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&stale))
             .expect("append stale watch event"),
         0
     );
@@ -20682,7 +20971,7 @@ fn cluster_kv_watch_event_log_drops_delayed_events_older_than_retention_floor() 
         "stale delayed events should not add write amplification"
     );
     assert!(
-        !cluster_kv_watch_events(&paths)
+        !cluster_kv_watch_events(&paths.kv_paths())
             .expect("read watch events")
             .contains(&stale)
     );
@@ -20703,7 +20992,7 @@ fn cluster_kv_watch_event_log_drops_large_stale_batches_without_rewrite() {
             },
         })
         .collect::<Vec<_>>();
-    append_cluster_kv_watch_events(&paths, &events).expect("append watch events");
+    append_cluster_kv_watch_events(&paths.kv_paths(), &events).expect("append watch events");
     let checkpoint_len = std::fs::metadata(&paths.kv_watch_events)
         .expect("watch event checkpoint metadata")
         .len();
@@ -20721,7 +21010,8 @@ fn cluster_kv_watch_event_log_drops_large_stale_batches_without_rewrite() {
         .collect::<Vec<_>>();
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, &stale).expect("append stale watch events"),
+        append_cluster_kv_watch_events(&paths.kv_paths(), &stale)
+            .expect("append stale watch events"),
         0
     );
     assert_eq!(
@@ -20761,7 +21051,8 @@ fn cluster_kv_watch_event_log_repairs_partial_tail_before_append() {
         },
     };
 
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&first)).expect("append first");
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&first))
+        .expect("append first");
     let mut log = std::fs::OpenOptions::new()
         .append(true)
         .open(&paths.kv_watch_events_log)
@@ -20773,12 +21064,12 @@ fn cluster_kv_watch_event_log_repairs_partial_tail_before_append() {
     drop(log);
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&second))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&second))
             .expect("append after partial tail"),
         1
     );
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("read repaired events"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("read repaired events"),
         vec![first, second]
     );
 }
@@ -20804,7 +21095,8 @@ fn cluster_kv_watch_event_log_repairs_oversized_tail_before_append() {
         },
     };
 
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&first)).expect("append first");
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&first))
+        .expect("append first");
     let mut log = std::fs::OpenOptions::new()
         .append(true)
         .open(&paths.kv_watch_events_log)
@@ -20816,12 +21108,12 @@ fn cluster_kv_watch_event_log_repairs_oversized_tail_before_append() {
     drop(log);
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&second))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&second))
             .expect("append after oversized tail"),
         1
     );
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("read repaired events"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("read repaired events"),
         vec![first, second]
     );
     let log = std::fs::read(&paths.kv_watch_events_log).expect("read repaired log");
@@ -20853,7 +21145,8 @@ fn cluster_kv_watch_event_log_repairs_unreadable_tail_before_append() {
         },
     };
 
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&first)).expect("append first");
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&first))
+        .expect("append first");
     let mut log = std::fs::OpenOptions::new()
         .append(true)
         .open(&paths.kv_watch_events_log)
@@ -20865,12 +21158,12 @@ fn cluster_kv_watch_event_log_repairs_unreadable_tail_before_append() {
     drop(log);
 
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&second))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&second))
             .expect("append after unreadable tail"),
         1
     );
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("read repaired events"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("read repaired events"),
         vec![first, second]
     );
 }
@@ -20897,7 +21190,7 @@ fn cluster_kv_watch_event_log_serializes_concurrent_duplicate_appends() {
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+                append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
                     .expect("append duplicate watch event")
             })
         })
@@ -20909,7 +21202,7 @@ fn cluster_kv_watch_event_log_serializes_concurrent_duplicate_appends() {
 
     assert_eq!(stored, 1);
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("read concurrent events"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("read concurrent events"),
         vec![event]
     );
 }
@@ -20946,7 +21239,8 @@ fn cluster_kv_watch_drain_reads_current_raft_view_when_snapshot_is_stale() {
         .expect("overwrite stale materialized snapshot");
 
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        node_id.clone(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/".to_string(),
             start_revision: KvRevision(1),
@@ -20954,7 +21248,8 @@ fn cluster_kv_watch_drain_reads_current_raft_view_when_snapshot_is_stale() {
     )
     .expect("create watch");
     let drained = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        node_id,
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -21070,7 +21365,7 @@ fn cluster_kv_metadata_reads_are_empty_without_materialized_snapshot() {
     let status = ClusterNodeStatusRecord {
         cluster_id: cluster_id.clone(),
         node_id: node_id.clone(),
-        process: "daemon-main".to_string(),
+        process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
         availability: ClusterNodeAvailability::Online,
         daemon_version: "0.1.0-test".to_string(),
         commit: None,
@@ -21084,8 +21379,10 @@ fn cluster_kv_metadata_reads_are_empty_without_materialized_snapshot() {
         daemon_started_at: Some("2026-05-04T00:00:00Z".to_string()),
         observed_at: now,
     };
+    let mut status_match_host = RecordingClusterNodeStatusPublishHost::default();
     assert!(
-        !stored_cluster_node_status_matches(&paths, &status).expect("missing status match"),
+        !cluster_node_status_publish_matches_with_host(&paths, &status, &mut status_match_host)
+            .expect("missing status match"),
         "missing materialized snapshots should make status no-op checks miss, not error"
     );
     let info = ClusterNetworkInfoRecord {
@@ -21097,8 +21394,14 @@ fn cluster_kv_metadata_reads_are_empty_without_materialized_snapshot() {
         observed_at: now,
         expires_at: now + time::Duration::seconds(300),
     };
+    let mut network_info_match_host = RecordingClusterNetworkInfoPublishHost::default();
     assert!(
-        !stored_cluster_network_info_matches(&paths, &info).expect("missing network-info match"),
+        !cluster_network_info_publish_matches_with_host(
+            &paths,
+            &info,
+            &mut network_info_match_host,
+        )
+        .expect("missing network-info match"),
         "missing materialized snapshots should make network-info no-op checks miss, not error"
     );
     assert_eq!(
@@ -21165,17 +21468,17 @@ fn cluster_kv_metadata_caches_retain_recent_entries_at_capacity() {
         let quiet_paths = ClusterPaths::new(&SinomoDataDir::new(
             root.join(format!("100-allocator-{index:04}")),
         ));
-        record_cluster_kv_watch_allocator_trust_for_test(&quiet_paths);
+        record_cluster_kv_watch_allocator_trust_for_test(&quiet_paths.kv_paths());
     }
-    record_cluster_kv_watch_allocator_trust_for_test(&hot_paths);
+    record_cluster_kv_watch_allocator_trust_for_test(&hot_paths.kv_paths());
     assert!(
-        refresh_cluster_kv_watch_allocator_trust_for_test(&hot_paths),
+        refresh_cluster_kv_watch_allocator_trust_for_test(&hot_paths.kv_paths()),
         "looking up hot allocator trust should refresh its recency"
     );
     let extra_paths = ClusterPaths::new(&SinomoDataDir::new(root.join("999-extra-allocator")));
-    record_cluster_kv_watch_allocator_trust_for_test(&extra_paths);
+    record_cluster_kv_watch_allocator_trust_for_test(&extra_paths.kv_paths());
     assert!(
-        cluster_kv_watch_allocator_trust_contains_for_test(&hot_paths),
+        cluster_kv_watch_allocator_trust_contains_for_test(&hot_paths.kv_paths()),
         "recent allocator trust should survive capacity churn"
     );
 
@@ -21198,7 +21501,7 @@ fn cluster_kv_metadata_caches_retain_recent_entries_at_capacity() {
         "recent reader node id should survive capacity churn"
     );
 
-    remove_cluster_kv_watch_allocator_trust_entries_under_root_for_test(&root);
+    remove_cluster_kv_watch_allocator_trust_entries_under_root_for_test(root.path());
     remove_cluster_kv_reader_node_id_cache_entries_under_root_for_test(&root);
 }
 
@@ -21211,7 +21514,8 @@ fn cluster_kv_watch_drain_waits_for_fanned_out_events() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/wait/".to_string(),
             start_revision: KvRevision(1),
@@ -21224,7 +21528,8 @@ fn cluster_kv_watch_drain_waits_for_fanned_out_events() {
         started_tx.send(()).expect("signal drain start");
         let started = Instant::now();
         let drained = drain_cluster_kv_watch(
-            &drain_paths,
+            &drain_paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             ClusterKvWatchDrainRequest {
                 watch_id: watch.watch_id,
                 wait_timeout_millis: 5_000,
@@ -21243,7 +21548,7 @@ fn cluster_kv_watch_drain_waits_for_fanned_out_events() {
         },
     };
 
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
         .expect("append fanout event");
     let (elapsed, drained) = handle.join().expect("wait drain thread");
 
@@ -21266,7 +21571,8 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/long-poll-a/".to_string(),
             start_revision: KvRevision(1),
@@ -21275,14 +21581,15 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
     .expect("create watch");
     let watch_id = watch.watch_id;
 
-    reset_cluster_kv_watch_drain_once_calls_for_test(&paths);
-    reset_cluster_kv_watch_unchanged_wakeups_for_test(&paths, watch_id);
+    reset_cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths());
+    reset_cluster_kv_watch_unchanged_wakeups_for_test(&paths.kv_paths(), watch_id);
     let drain_paths = paths.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let unrelated_handle = thread::spawn(move || {
         let started = Instant::now();
         let drained = drain_cluster_kv_watch(
-            &drain_paths,
+            &drain_paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             ClusterKvWatchDrainRequest {
                 watch_id,
                 wait_timeout_millis: 1_000,
@@ -21293,13 +21600,13 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
         (started.elapsed(), drained)
     });
     let wait_started = Instant::now();
-    while cluster_kv_watch_drain_once_calls_for_test(&paths) == 0
+    while cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths()) == 0
         && wait_started.elapsed() < Duration::from_secs(1)
     {
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(
-        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths()),
         1,
         "long poll should enter its first empty drain before the unrelated event is appended"
     );
@@ -21311,7 +21618,7 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
             value: b"unrelated".to_vec(),
         },
     };
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&unrelated))
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&unrelated))
         .expect("append unrelated watch event");
     thread::sleep(Duration::from_millis(75));
     assert!(
@@ -21322,12 +21629,12 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
         "unrelated prefix event should not wake the waiting watch"
     );
     assert_eq!(
-        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths()),
         1,
         "unrelated prefix event should not trigger another empty drain"
     );
     assert_eq!(
-        cluster_kv_watch_unchanged_wakeups_for_test(&paths, watch_id),
+        cluster_kv_watch_unchanged_wakeups_for_test(&paths.kv_paths(), watch_id),
         0,
         "unrelated prefix event should not wake the waiting watch"
     );
@@ -21340,17 +21647,18 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
     assert!(drained.events.is_empty());
     assert_eq!(drained.next_revision, KvRevision(1));
     assert_eq!(
-        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths()),
         1,
         "unrelated prefix timeout should not reread snapshot/log state"
     );
 
-    reset_cluster_kv_watch_drain_once_calls_for_test(&paths);
+    reset_cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths());
     let drain_paths = paths.clone();
     let matching_handle = thread::spawn(move || {
         let started = Instant::now();
         let drained = drain_cluster_kv_watch(
-            &drain_paths,
+            &drain_paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             ClusterKvWatchDrainRequest {
                 watch_id,
                 wait_timeout_millis: 5_000,
@@ -21360,13 +21668,13 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
         (started.elapsed(), drained)
     });
     let wait_started = Instant::now();
-    while cluster_kv_watch_drain_once_calls_for_test(&paths) == 0
+    while cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths()) == 0
         && wait_started.elapsed() < Duration::from_secs(1)
     {
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(
-        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths()),
         1,
         "matching long poll should enter its first empty drain"
     );
@@ -21378,7 +21686,7 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
             value: b"matching".to_vec(),
         },
     };
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&matching))
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&matching))
         .expect("append matching watch event");
     let (elapsed, drained) = matching_handle.join().expect("matching drain thread");
     assert!(
@@ -21401,7 +21709,8 @@ fn cluster_kv_watch_long_poll_ignores_other_matching_watch_notification() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let watch_a = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/targeted-a/".to_string(),
             start_revision: KvRevision(1),
@@ -21409,7 +21718,8 @@ fn cluster_kv_watch_long_poll_ignores_other_matching_watch_notification() {
     )
     .expect("create watch a");
     let _watch_b = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/targeted-b/".to_string(),
             start_revision: KvRevision(1),
@@ -21418,14 +21728,15 @@ fn cluster_kv_watch_long_poll_ignores_other_matching_watch_notification() {
     .expect("create watch b");
     let watch_a_id = watch_a.watch_id;
 
-    reset_cluster_kv_watch_drain_once_calls_for_test(&paths);
-    reset_cluster_kv_watch_unchanged_wakeups_for_test(&paths, watch_a_id);
+    reset_cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths());
+    reset_cluster_kv_watch_unchanged_wakeups_for_test(&paths.kv_paths(), watch_a_id);
     let drain_paths = paths.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let handle = thread::spawn(move || {
         let started = Instant::now();
         let drained = drain_cluster_kv_watch(
-            &drain_paths,
+            &drain_paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             ClusterKvWatchDrainRequest {
                 watch_id: watch_a_id,
                 wait_timeout_millis: 5_000,
@@ -21436,13 +21747,13 @@ fn cluster_kv_watch_long_poll_ignores_other_matching_watch_notification() {
         (started.elapsed(), drained)
     });
     let wait_started = Instant::now();
-    while cluster_kv_watch_drain_once_calls_for_test(&paths) == 0
+    while cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths()) == 0
         && wait_started.elapsed() < Duration::from_secs(1)
     {
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(
-        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths()),
         1,
         "watch a long poll should complete its first empty drain before unrelated fanout"
     );
@@ -21454,7 +21765,7 @@ fn cluster_kv_watch_long_poll_ignores_other_matching_watch_notification() {
             value: b"watch-b".to_vec(),
         },
     };
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&watch_b_event))
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&watch_b_event))
         .expect("append watch b event");
     thread::sleep(Duration::from_millis(75));
     assert!(
@@ -21465,12 +21776,12 @@ fn cluster_kv_watch_long_poll_ignores_other_matching_watch_notification() {
         "an event matching another active watch should not complete watch a's long poll"
     );
     assert_eq!(
-        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths()),
         1,
         "an event matching another active watch should not make watch a re-drain"
     );
     assert_eq!(
-        cluster_kv_watch_unchanged_wakeups_for_test(&paths, watch_a_id),
+        cluster_kv_watch_unchanged_wakeups_for_test(&paths.kv_paths(), watch_a_id),
         0,
         "an event matching another active watch should not wake watch a's waiter"
     );
@@ -21482,7 +21793,7 @@ fn cluster_kv_watch_long_poll_ignores_other_matching_watch_notification() {
             value: b"watch-a".to_vec(),
         },
     };
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&watch_a_event))
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&watch_a_event))
         .expect("append watch a event");
     let (elapsed, drained) = handle.join().expect("watch a drain thread");
     assert!(
@@ -21501,13 +21812,13 @@ fn cluster_kv_watch_notifier_retains_active_waiters_under_path_churn() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-watch-notifier-churn");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
-    touch_cluster_kv_watch_notifier_for_test(&paths);
-    let observed_generation = cluster_kv_watch_notifier_generation_for_test(&paths);
+    touch_cluster_kv_watch_notifier_for_test(&paths.kv_paths());
+    let observed_generation = cluster_kv_watch_generation(&paths.kv_paths());
     let wait_paths = paths.clone();
     let handle = thread::spawn(move || {
         let started = Instant::now();
-        let changed = wait_for_cluster_kv_watch_change_for_test(
-            &wait_paths,
+        let changed = wait_for_cluster_kv_watch_change(
+            &wait_paths.kv_paths(),
             observed_generation,
             Duration::from_secs(5),
         );
@@ -21515,13 +21826,13 @@ fn cluster_kv_watch_notifier_retains_active_waiters_under_path_churn() {
     });
 
     let wait_started = Instant::now();
-    while cluster_kv_watch_notifier_waiter_count_for_test(&paths) == 0
+    while cluster_kv_watch_notifier_waiter_count_for_test(&paths.kv_paths()) == 0
         && wait_started.elapsed() < Duration::from_secs(1)
     {
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(
-        cluster_kv_watch_notifier_waiter_count_for_test(&paths),
+        cluster_kv_watch_notifier_waiter_count_for_test(&paths.kv_paths()),
         1,
         "watch waiter should be registered before churning notifier roots"
     );
@@ -21529,16 +21840,16 @@ fn cluster_kv_watch_notifier_retains_active_waiters_under_path_churn() {
     for index in 0..=cluster_kv_watch_notifier_capacity_for_test() {
         let quiet_data_dir = SinomoDataDir::new(root.join(format!("quiet-{index}")));
         let quiet_paths = ClusterPaths::new(&quiet_data_dir);
-        touch_cluster_kv_watch_notifier_for_test(&quiet_paths);
+        touch_cluster_kv_watch_notifier_for_test(&quiet_paths.kv_paths());
     }
 
     assert!(
-        cluster_kv_watch_notifier_has_key_for_test(&paths),
+        cluster_kv_watch_notifier_has_key_for_test(&paths.kv_paths()),
         "active long-poll waiter should not be evicted by unrelated watch roots"
     );
-    touch_cluster_kv_watch_notifier_for_test(&paths);
+    touch_cluster_kv_watch_notifier_for_test(&paths.kv_paths());
     let (elapsed, changed) = handle.join().expect("waiter thread");
-    remove_cluster_kv_watch_notifier_entries_under_root_for_test(&root);
+    remove_cluster_kv_watch_notifier_entries_under_root_for_test(root.path());
 
     assert!(changed, "active waiter should observe the generation bump");
     assert!(
@@ -21553,7 +21864,7 @@ fn cluster_kv_watch_notifier_does_not_evict_active_waiters_at_capacity() {
         .lock()
         .expect("notifier mutex");
     let root = sinomo_testdir::TestDir::new("sinomo-network-watch-notifier-active-capacity");
-    remove_cluster_kv_watch_notifier_entries_under_root_for_test(&root);
+    remove_cluster_kv_watch_notifier_entries_under_root_for_test(root.path());
     let active_keys = (0..cluster_kv_watch_notifier_capacity_for_test())
         .map(|index| root.join(format!("active-{index:04}")))
         .collect::<Vec<_>>();
@@ -21563,7 +21874,7 @@ fn cluster_kv_watch_notifier_does_not_evict_active_waiters_at_capacity() {
 
     let extra_data_dir = SinomoDataDir::new(root.join("extra"));
     let extra_paths = ClusterPaths::new(&extra_data_dir);
-    touch_cluster_kv_watch_notifier_for_test(&extra_paths);
+    touch_cluster_kv_watch_notifier_for_test(&extra_paths.kv_paths());
 
     for key in &active_keys {
         assert!(
@@ -21572,7 +21883,7 @@ fn cluster_kv_watch_notifier_does_not_evict_active_waiters_at_capacity() {
             key.display()
         );
     }
-    remove_cluster_kv_watch_notifier_entries_under_root_for_test(&root);
+    remove_cluster_kv_watch_notifier_entries_under_root_for_test(root.path());
 }
 
 #[test]
@@ -21584,7 +21895,8 @@ fn cluster_kv_watch_drain_payload_limit_does_not_skip_events() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/payload/".to_string(),
             start_revision: KvRevision(1),
@@ -21605,12 +21917,13 @@ fn cluster_kv_watch_drain_payload_limit_does_not_skip_events() {
             value: vec![2_u8; 32],
         },
     };
-    append_cluster_kv_watch_events(&paths, &[first.clone(), second.clone()])
+    append_cluster_kv_watch_events(&paths.kv_paths(), &[first.clone(), second.clone()])
         .expect("append watch events");
 
     let max_payload_bytes = first.key.len() + 32;
     let drained = drain_cluster_kv_watch_once_limited_by_payload_bytes(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         watch.watch_id,
         max_payload_bytes,
     )
@@ -21619,7 +21932,8 @@ fn cluster_kv_watch_drain_payload_limit_does_not_skip_events() {
     assert_eq!(drained.next_revision, KvRevision(2));
 
     let drained = drain_cluster_kv_watch_once_limited_by_payload_bytes(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         watch.watch_id,
         max_payload_bytes,
     )
@@ -21637,7 +21951,8 @@ fn cluster_kv_watch_drain_payload_limit_keeps_revision_groups() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/revision-group/".to_string(),
             start_revision: KvRevision(1),
@@ -21665,12 +21980,16 @@ fn cluster_kv_watch_drain_payload_limit_keeps_revision_groups() {
             value: vec![3_u8; 32],
         },
     };
-    append_cluster_kv_watch_events(&paths, &[first.clone(), second.clone(), third.clone()])
-        .expect("append watch events");
+    append_cluster_kv_watch_events(
+        &paths.kv_paths(),
+        &[first.clone(), second.clone(), third.clone()],
+    )
+    .expect("append watch events");
 
     let max_payload_bytes = first.key.len() + 32;
     let drained = drain_cluster_kv_watch_once_limited_by_payload_bytes(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         watch.watch_id,
         max_payload_bytes,
     )
@@ -21679,7 +21998,8 @@ fn cluster_kv_watch_drain_payload_limit_keeps_revision_groups() {
     assert_eq!(drained.next_revision, KvRevision(2));
 
     let drained = drain_cluster_kv_watch_once_limited_by_payload_bytes(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         watch.watch_id,
         max_payload_bytes,
     )
@@ -21702,7 +22022,7 @@ fn cluster_kv_watch_drain_deduplicates_snapshot_and_fanout_events() {
     let duplicate = snapshot.events.first().expect("snapshot event").clone();
     write_cluster_kv_snapshot(&paths, &snapshot).expect("write snapshot");
     assert_eq!(
-        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&duplicate))
+        append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&duplicate))
             .expect("append duplicate fanout event"),
         0
     );
@@ -21715,7 +22035,8 @@ fn cluster_kv_watch_drain_deduplicates_snapshot_and_fanout_events() {
         "duplicate snapshot events should not append the watch log"
     );
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/dedup/".to_string(),
             start_revision: KvRevision(1),
@@ -21724,7 +22045,8 @@ fn cluster_kv_watch_drain_deduplicates_snapshot_and_fanout_events() {
     .expect("create watch");
 
     let drained = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -21748,7 +22070,8 @@ fn cluster_kv_watch_drain_long_poll_avoids_redundant_pre_wait_poll() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/empty-long-poll/".to_string(),
             start_revision: KvRevision(1),
@@ -21756,9 +22079,10 @@ fn cluster_kv_watch_drain_long_poll_avoids_redundant_pre_wait_poll() {
     )
     .expect("create watch");
 
-    reset_cluster_kv_watch_drain_once_calls_for_test(&paths);
+    reset_cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths());
     let drained = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 10,
@@ -21768,7 +22092,7 @@ fn cluster_kv_watch_drain_long_poll_avoids_redundant_pre_wait_poll() {
 
     assert!(drained.events.is_empty());
     assert_eq!(
-        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        cluster_kv_watch_drain_once_calls_for_test(&paths.kv_paths()),
         1,
         "empty long-poll timeout should not reread snapshot/log state when no watch generation changed"
     );
@@ -21783,7 +22107,8 @@ fn cluster_kv_watch_drain_zero_timeout_reuses_empty_result_until_change() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/empty-zero-timeout/".to_string(),
             start_revision: KvRevision(1),
@@ -21791,9 +22116,10 @@ fn cluster_kv_watch_drain_zero_timeout_reuses_empty_result_until_change() {
     )
     .expect("create watch");
 
-    reset_cluster_kv_current_snapshot_reads_for_test(&paths);
+    reset_cluster_kv_watch_drain_read_passes_for_test(&paths.kv_paths());
     let first = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -21803,13 +22129,14 @@ fn cluster_kv_watch_drain_zero_timeout_reuses_empty_result_until_change() {
     assert!(first.events.is_empty());
     assert_eq!(first.next_revision, KvRevision(1));
     assert_eq!(
-        cluster_kv_current_snapshot_reads_for_test(&paths),
+        cluster_kv_watch_drain_read_passes_for_test(&paths.kv_paths()),
         1,
-        "the first empty drain must inspect the current snapshot"
+        "the first empty drain must inspect current watch state"
     );
 
     let second = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -21819,9 +22146,9 @@ fn cluster_kv_watch_drain_zero_timeout_reuses_empty_result_until_change() {
     assert!(second.events.is_empty());
     assert_eq!(second.next_revision, KvRevision(1));
     assert_eq!(
-        cluster_kv_current_snapshot_reads_for_test(&paths),
+        cluster_kv_watch_drain_read_passes_for_test(&paths.kv_paths()),
         1,
-        "repeated empty zero-timeout drains should not reread current snapshot state"
+        "repeated empty zero-timeout drains should not reread current watch state"
     );
 
     let event = KvEvent {
@@ -21831,10 +22158,11 @@ fn cluster_kv_watch_drain_zero_timeout_reuses_empty_result_until_change() {
             value: b"one".to_vec(),
         },
     };
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
         .expect("append watch event");
     let changed = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -21844,7 +22172,7 @@ fn cluster_kv_watch_drain_zero_timeout_reuses_empty_result_until_change() {
     assert_eq!(changed.events, vec![event]);
     assert_eq!(changed.next_revision, KvRevision(2));
     assert_eq!(
-        cluster_kv_current_snapshot_reads_for_test(&paths),
+        cluster_kv_watch_drain_read_passes_for_test(&paths.kv_paths()),
         2,
         "watch event generation changes must invalidate the cached empty result"
     );
@@ -21859,7 +22187,8 @@ fn write_cluster_kv_snapshot_identical_does_not_wake_waiting_watch() {
     let snapshot = InProcessKvStore::new().snapshot();
     write_cluster_kv_snapshot(&paths, &snapshot).expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/identical-snapshot/".to_string(),
             start_revision: KvRevision(1),
@@ -21867,11 +22196,12 @@ fn write_cluster_kv_snapshot_identical_does_not_wake_waiting_watch() {
     )
     .expect("create watch");
 
-    reset_cluster_kv_watch_drain_once_calls_for_test(&paths);
+    reset_cluster_kv_watch_drain_read_passes_for_test(&paths.kv_paths());
     let drain_paths = paths.clone();
     let handle = thread::spawn(move || {
         drain_cluster_kv_watch(
-            &drain_paths,
+            &drain_paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             ClusterKvWatchDrainRequest {
                 watch_id: watch.watch_id,
                 wait_timeout_millis: 150,
@@ -21881,13 +22211,13 @@ fn write_cluster_kv_snapshot_identical_does_not_wake_waiting_watch() {
     });
 
     let started = Instant::now();
-    while cluster_kv_watch_drain_once_calls_for_test(&paths) == 0
+    while cluster_kv_watch_drain_read_passes_for_test(&paths.kv_paths()) == 0
         && started.elapsed() < Duration::from_secs(1)
     {
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(
-        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        cluster_kv_watch_drain_read_passes_for_test(&paths.kv_paths()),
         1,
         "watch drain should have completed its initial read pass"
     );
@@ -21897,7 +22227,7 @@ fn write_cluster_kv_snapshot_identical_does_not_wake_waiting_watch() {
 
     assert!(drained.events.is_empty());
     assert_eq!(
-        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        cluster_kv_watch_drain_read_passes_for_test(&paths.kv_paths()),
         1,
         "identical snapshot materialization should not wake quiet watchers"
     );
@@ -21912,7 +22242,8 @@ fn cluster_kv_watch_cancel_wakes_waiting_drain() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/cancel/wake/".to_string(),
             start_revision: KvRevision(1),
@@ -21926,7 +22257,8 @@ fn cluster_kv_watch_cancel_wakes_waiting_drain() {
         started_tx.send(()).expect("signal drain start");
         let started = Instant::now();
         let result = drain_cluster_kv_watch(
-            &drain_paths,
+            &drain_paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             ClusterKvWatchDrainRequest {
                 watch_id: expected_watch_id,
                 wait_timeout_millis: 5_000,
@@ -21938,7 +22270,7 @@ fn cluster_kv_watch_cancel_wakes_waiting_drain() {
     thread::sleep(Duration::from_millis(50));
 
     let cancelled = cancel_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
         ClusterKvWatchCancelRequest {
             watch_id: expected_watch_id,
         },
@@ -21953,7 +22285,7 @@ fn cluster_kv_watch_cancel_wakes_waiting_drain() {
     );
     assert!(matches!(
         result,
-        Err(NetworkError::Kv(KvError::UnknownWatch { watch_id }))
+        Err(KvError::UnknownWatch { watch_id })
             if watch_id == expected_watch_id
     ));
 }
@@ -21968,7 +22300,8 @@ fn cluster_kv_watch_drain_reports_unknown_watch_for_missing_registration() {
         .expect("write initial snapshot");
     let watch_id = WatchId(42);
     let error = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id,
             wait_timeout_millis: 0,
@@ -21977,7 +22310,7 @@ fn cluster_kv_watch_drain_reports_unknown_watch_for_missing_registration() {
     .expect_err("missing watch");
     assert!(matches!(
         error,
-        NetworkError::Kv(KvError::UnknownWatch { watch_id: returned }) if returned == watch_id
+        KvError::UnknownWatch { watch_id: returned } if returned == watch_id
     ));
 }
 
@@ -22002,7 +22335,8 @@ fn cluster_kv_watch_drain_waits_for_local_raft_commit() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        node_id.clone(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/wait/".to_string(),
             start_revision: KvRevision(1),
@@ -22011,11 +22345,13 @@ fn cluster_kv_watch_drain_waits_for_local_raft_commit() {
     .expect("create watch");
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let drain_paths = paths.clone();
+    let drain_node_id = node_id.clone();
     let handle = thread::spawn(move || {
         started_tx.send(()).expect("signal drain start");
         let started = Instant::now();
         let drained = drain_cluster_kv_watch(
-            &drain_paths,
+            &drain_paths.kv_paths(),
+            drain_node_id,
             ClusterKvWatchDrainRequest {
                 watch_id: watch.watch_id,
                 wait_timeout_millis: 5_000,
@@ -22068,7 +22404,8 @@ fn cluster_kv_watch_create_allocates_unique_ids_concurrently() {
             thread::spawn(move || {
                 barrier.wait();
                 create_cluster_kv_watch(
-                    &paths,
+                    &paths.kv_paths(),
+                    cluster_kv_watch_test_node_id(),
                     ClusterKvWatchPrefixRequest {
                         prefix: format!("/watch/concurrent/{index}/"),
                         start_revision: KvRevision(1),
@@ -22118,7 +22455,8 @@ fn cluster_kv_watch_cancel_removes_registration_without_reusing_id() {
         .expect("write initial snapshot");
 
     let first = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/cancel/".to_string(),
             start_revision: KvRevision(1),
@@ -22131,7 +22469,7 @@ fn cluster_kv_watch_cancel_removes_registration_without_reusing_id() {
     assert!(first_path.exists(), "first watch registration should exist");
 
     let cancelled = cancel_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
         ClusterKvWatchCancelRequest {
             watch_id: first.watch_id,
         },
@@ -22149,7 +22487,7 @@ fn cluster_kv_watch_cancel_removes_registration_without_reusing_id() {
         "cancelled watch registration should be removed"
     );
     let cancelled_again = cancel_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
         ClusterKvWatchCancelRequest {
             watch_id: first.watch_id,
         },
@@ -22158,7 +22496,8 @@ fn cluster_kv_watch_cancel_removes_registration_without_reusing_id() {
     assert!(!cancelled_again.cancelled);
 
     let second = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/cancel/".to_string(),
             start_revision: KvRevision(1),
@@ -22187,7 +22526,8 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
         .expect("write initial snapshot");
 
     let first = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/no-scan/first/".to_string(),
             start_revision: KvRevision(1),
@@ -22199,9 +22539,10 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
     assert_eq!(allocator.active_watch_count, Some(1));
     assert_eq!(allocator.pruned_compacted_revision, Some(KvRevision::ZERO));
 
-    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     let second = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/no-scan/second/".to_string(),
             start_revision: KvRevision(1),
@@ -22209,7 +22550,7 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
     )
     .expect("create second watch");
     assert_eq!(
-        cluster_kv_watch_dir_scans_for_test(&paths),
+        cluster_kv_watch_dir_scans_for_test(&paths.kv_paths()),
         0,
         "steady-state watch creation should use the durable allocator count"
     );
@@ -22219,7 +22560,7 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
     assert_eq!(allocator.next_watch_id, second.watch_id.0.saturating_add(1));
 
     cancel_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
         ClusterKvWatchCancelRequest {
             watch_id: first.watch_id,
         },
@@ -22229,9 +22570,10 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
         read_object_file(&paths.kv_watches_next_id).expect("read allocator after cancel");
     assert_eq!(allocator.active_watch_count, Some(1));
 
-    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     let replacement = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/no-scan/replacement/".to_string(),
             start_revision: KvRevision(1),
@@ -22239,7 +22581,7 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
     )
     .expect("create replacement watch");
     assert_eq!(
-        cluster_kv_watch_dir_scans_for_test(&paths),
+        cluster_kv_watch_dir_scans_for_test(&paths.kv_paths()),
         0,
         "replacement after a normal cancel should not need a directory scan"
     );
@@ -22262,7 +22604,8 @@ fn create_cluster_kv_watch_rescans_after_watch_directory_changes() {
         .expect("write initial snapshot");
 
     create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/rescan/first/".to_string(),
             start_revision: KvRevision(1),
@@ -22272,9 +22615,10 @@ fn create_cluster_kv_watch_rescans_after_watch_directory_changes() {
     let corrupt_path = paths.kv_watches.join("watch-99.sobj");
     std::fs::write(&corrupt_path, b"not-a-sinomo-object").expect("write corrupt watch");
 
-    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     let repaired = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/rescan/repaired/".to_string(),
             start_revision: KvRevision(1),
@@ -22282,7 +22626,7 @@ fn create_cluster_kv_watch_rescans_after_watch_directory_changes() {
     )
     .expect("create watch after external directory change");
     assert_eq!(
-        cluster_kv_watch_dir_scans_for_test(&paths),
+        cluster_kv_watch_dir_scans_for_test(&paths.kv_paths()),
         1,
         "watch-directory changes should invalidate allocator trust and force repair"
     );
@@ -22305,16 +22649,17 @@ fn create_cluster_kv_watch_rolls_back_registration_after_allocator_persist_failu
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
 
-    fail_next_cluster_kv_watch_allocator_persist_for_test(&paths);
+    fail_next_cluster_kv_watch_allocator_persist_for_test(&paths.kv_paths());
     let error = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/persist-failure/".to_string(),
             start_revision: KvRevision(1),
         },
     )
     .expect_err("allocator persist failure");
-    assert!(matches!(error, NetworkError::StorageIo { .. }));
+    assert!(matches!(error, KvError::Io { .. }));
     assert_eq!(
         std::fs::read_dir(&paths.kv_watches)
             .expect("watch registration directory")
@@ -22328,7 +22673,8 @@ fn create_cluster_kv_watch_rolls_back_registration_after_allocator_persist_failu
     );
 
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/persist-failure/retry/".to_string(),
             start_revision: KvRevision(1),
@@ -22352,7 +22698,8 @@ fn cluster_kv_watch_registration_cache_tracks_create_drain_and_cancel() {
         .expect("write initial snapshot");
 
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/cache-registration/".to_string(),
             start_revision: KvRevision(1),
@@ -22360,7 +22707,7 @@ fn cluster_kv_watch_registration_cache_tracks_create_drain_and_cancel() {
     )
     .expect("create watch");
     assert_eq!(
-        cached_cluster_kv_watch_registration_for_test(&paths, watch.watch_id),
+        cached_cluster_kv_watch_registration_for_test(&paths.kv_paths(), watch.watch_id),
         Some(watch.clone()),
         "watch creation should seed the registration cache"
     );
@@ -22372,10 +22719,11 @@ fn cluster_kv_watch_registration_cache_tracks_create_drain_and_cancel() {
             value: b"one".to_vec(),
         },
     };
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&event))
         .expect("append watch event");
     let drained = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -22385,7 +22733,7 @@ fn cluster_kv_watch_registration_cache_tracks_create_drain_and_cancel() {
     assert_eq!(drained.events, vec![event]);
     assert_eq!(drained.next_revision, KvRevision(2));
 
-    let cached = cached_cluster_kv_watch_registration_for_test(&paths, watch.watch_id)
+    let cached = cached_cluster_kv_watch_registration_for_test(&paths.kv_paths(), watch.watch_id)
         .expect("cached registration after drain");
     assert_eq!(
         cached.next_revision,
@@ -22394,14 +22742,14 @@ fn cluster_kv_watch_registration_cache_tracks_create_drain_and_cancel() {
     );
 
     cancel_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
         ClusterKvWatchCancelRequest {
             watch_id: watch.watch_id,
         },
     )
     .expect("cancel watch");
     assert!(
-        cached_cluster_kv_watch_registration_for_test(&paths, watch.watch_id).is_none(),
+        cached_cluster_kv_watch_registration_for_test(&paths.kv_paths(), watch.watch_id).is_none(),
         "cancel should invalidate the cached registration"
     );
 }
@@ -22416,7 +22764,8 @@ fn cluster_kv_watch_drain_defers_small_cursor_writes_until_lag_bound() {
         .expect("write initial snapshot");
 
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/deferred-cursor/".to_string(),
             start_revision: KvRevision(1),
@@ -22440,10 +22789,11 @@ fn cluster_kv_watch_drain_defers_small_cursor_writes_until_lag_bound() {
             value: b"one".to_vec(),
         },
     };
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&first))
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&first))
         .expect("append first watch event");
     let drained = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -22453,7 +22803,7 @@ fn cluster_kv_watch_drain_defers_small_cursor_writes_until_lag_bound() {
     assert_eq!(drained.events, vec![first]);
     assert_eq!(drained.next_revision, KvRevision(2));
     assert_eq!(
-        cached_cluster_kv_watch_registration_for_test(&paths, watch.watch_id)
+        cached_cluster_kv_watch_registration_for_test(&paths.kv_paths(), watch.watch_id)
             .expect("cached registration")
             .next_revision,
         KvRevision(2),
@@ -22477,9 +22827,10 @@ fn cluster_kv_watch_drain_defers_small_cursor_writes_until_lag_bound() {
             },
         })
         .collect::<Vec<_>>();
-    append_cluster_kv_watch_events(&paths, &events).expect("append lag-bound events");
+    append_cluster_kv_watch_events(&paths.kv_paths(), &events).expect("append lag-bound events");
     let drained = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -22508,7 +22859,8 @@ fn create_cluster_kv_watch_enforces_active_registration_limit() {
 
     for index in 0..MAX_CLUSTER_KV_ACTIVE_WATCHES {
         create_cluster_kv_watch(
-            &paths,
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             ClusterKvWatchPrefixRequest {
                 prefix: format!("/watch/limit/{index}/"),
                 start_revision: KvRevision(1),
@@ -22518,7 +22870,8 @@ fn create_cluster_kv_watch_enforces_active_registration_limit() {
     }
 
     let error = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/limit/overflow/".to_string(),
             start_revision: KvRevision(1),
@@ -22527,9 +22880,9 @@ fn create_cluster_kv_watch_enforces_active_registration_limit() {
     .expect_err("active watch limit");
     assert!(matches!(
         error,
-        NetworkError::Kv(KvError::WatchLimit {
+        KvError::WatchLimit {
             max: MAX_CLUSTER_KV_ACTIVE_WATCHES
-        })
+        }
     ));
     assert_eq!(
         std::fs::read_dir(&paths.kv_watches)
@@ -22552,7 +22905,8 @@ fn create_cluster_kv_watch_allows_replacement_after_cancel_at_limit() {
     let mut last_watch = None;
     for index in 0..MAX_CLUSTER_KV_ACTIVE_WATCHES {
         let watch = create_cluster_kv_watch(
-            &paths,
+            &paths.kv_paths(),
+            cluster_kv_watch_test_node_id(),
             ClusterKvWatchPrefixRequest {
                 prefix: format!("/watch/limit-cancel/{index}/"),
                 start_revision: KvRevision(1),
@@ -22566,7 +22920,7 @@ fn create_cluster_kv_watch_allows_replacement_after_cancel_at_limit() {
     let last_watch = last_watch.expect("last watch id");
 
     let cancelled = cancel_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
         ClusterKvWatchCancelRequest {
             watch_id: first_watch,
         },
@@ -22575,7 +22929,8 @@ fn create_cluster_kv_watch_allows_replacement_after_cancel_at_limit() {
     assert!(cancelled.cancelled);
 
     let replacement = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/limit-cancel/replacement/".to_string(),
             start_revision: KvRevision(1),
@@ -22604,7 +22959,8 @@ fn cluster_kv_watch_drain_removes_compacted_registration() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/".to_string(),
             start_revision: KvRevision(1),
@@ -22624,7 +22980,8 @@ fn cluster_kv_watch_drain_removes_compacted_registration() {
     write_cluster_kv_snapshot(&paths, &compacted.snapshot()).expect("write compacted snapshot");
 
     let error = drain_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
@@ -22633,10 +22990,10 @@ fn cluster_kv_watch_drain_removes_compacted_registration() {
     .expect_err("compacted watch");
     assert!(matches!(
         error,
-        NetworkError::Kv(KvError::Compacted {
+        KvError::Compacted {
             requested: KvRevision(1),
             compacted: KvRevision(1),
-        })
+        }
     ));
     assert!(
         !watch_path.exists(),
@@ -22653,7 +23010,8 @@ fn create_cluster_kv_watch_prunes_compacted_registrations() {
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
         .expect("write initial snapshot");
     let stale = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/".to_string(),
             start_revision: KvRevision(1),
@@ -22661,7 +23019,8 @@ fn create_cluster_kv_watch_prunes_compacted_registrations() {
     )
     .expect("create stale watch");
     let live = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/".to_string(),
             start_revision: KvRevision(2),
@@ -22685,7 +23044,8 @@ fn create_cluster_kv_watch_prunes_compacted_registrations() {
     write_cluster_kv_snapshot(&paths, &compacted.snapshot()).expect("write compacted snapshot");
 
     let newest = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/".to_string(),
             start_revision: KvRevision(2),
@@ -22724,7 +23084,8 @@ fn create_cluster_kv_watch_prunes_unreadable_registration_without_reusing_id() {
     std::fs::write(&corrupt_path, b"not-a-sinomo-object").expect("write corrupt watch");
 
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/unreadable/".to_string(),
             start_revision: KvRevision(1),
@@ -22762,7 +23123,8 @@ fn create_cluster_kv_watch_prunes_mismatched_registration_without_reusing_id() {
     .expect("write mismatched watch registration");
 
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/mismatched/".to_string(),
             start_revision: KvRevision(1),
@@ -22815,9 +23177,10 @@ fn create_cluster_kv_watch_prunes_and_allocates_with_one_directory_scan() {
     compacted.compact(KvRevision(1)).expect("compact store");
     write_cluster_kv_snapshot(&paths, &compacted.snapshot()).expect("write compacted snapshot");
 
-    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     let watch = create_cluster_kv_watch(
-        &paths,
+        &paths.kv_paths(),
+        cluster_kv_watch_test_node_id(),
         ClusterKvWatchPrefixRequest {
             prefix: "/watch/scan/new/".to_string(),
             start_revision: KvRevision(2),
@@ -22826,7 +23189,7 @@ fn create_cluster_kv_watch_prunes_and_allocates_with_one_directory_scan() {
     .expect("create watch after pruning");
 
     assert_eq!(
-        cluster_kv_watch_dir_scans_for_test(&paths),
+        cluster_kv_watch_dir_scans_for_test(&paths.kv_paths()),
         1,
         "watch creation should combine stale-pruning and max-id allocation in one directory scan"
     );
@@ -23007,7 +23370,7 @@ fn certificate(
     expires_at: time::OffsetDateTime,
 ) -> ClusterCertificate {
     ClusterCertificate {
-        certificate_id: ClusterCertificateId::generate(),
+        certificate_id: sinomo_core::Id::generate(),
         cluster_id,
         node_id,
         issuer_node_id,
@@ -23130,12 +23493,12 @@ fn node_endpoint_maps_iroh_transport() {
 }
 
 #[test]
-fn lan_quic_frame_codec_round_trips_network_frames_and_limits_size() {
+fn lan_quic_event_frame_codec_round_trips_event_frames_and_limits_size() {
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_b").expect("node");
     let event = fixture_event("evt_codec", node_a.clone());
-    let frame = NetworkFrame {
-        frame_id: NetworkFrameId(7),
+    let frame = EventFrame {
+        frame_id: EventFrameId(7),
         source_node_id: node_a.clone(),
         target_node_id: node_b.clone(),
         message: MeshMessage {
@@ -23148,7 +23511,7 @@ fn lan_quic_frame_codec_round_trips_network_frames_and_limits_size() {
             },
         },
     };
-    let codec = LanQuicFrameCodec {
+    let codec = LanQuicEventFrameCodec {
         max_frame_bytes: 16 * 1024,
     };
 
@@ -23158,44 +23521,9 @@ fn lan_quic_frame_codec_round_trips_network_frames_and_limits_size() {
     assert_eq!(&encoded[..4], sinomo_object::MAGIC);
     assert_eq!(decoded, frame);
     assert!(matches!(
-        LanQuicFrameCodec { max_frame_bytes: 1 }.encode(&frame),
+        LanQuicEventFrameCodec { max_frame_bytes: 1 }.encode(&frame),
         Err(NetworkError::FrameTooLarge { .. })
     ));
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-struct FixtureProtocolPayload {
-    path: String,
-    bytes: Vec<u8>,
-}
-
-#[test]
-fn protocol_and_stream_metadata_use_sinomo_object_payloads() {
-    let payload = FixtureProtocolPayload {
-        path: "/users/alice/readme.txt".to_string(),
-        bytes: vec![1, 2, 3, 4],
-    };
-
-    let message = ProtocolMessage::encode("fixture.protocol.v1", &payload).expect("payload");
-    assert_eq!(message.protocol, "fixture.protocol.v1");
-    assert_eq!(&message.payload[..4], sinomo_object::MAGIC);
-    assert_eq!(
-        message
-            .decode::<FixtureProtocolPayload>()
-            .expect("decode payload"),
-        payload
-    );
-
-    let open =
-        NetworkStreamOpen::encode_metadata(NetworkStreamId(42), "fixture.stream.v1", &payload)
-            .expect("metadata");
-    assert_eq!(open.stream_id, NetworkStreamId(42));
-    assert_eq!(&open.metadata[..4], sinomo_object::MAGIC);
-    assert_eq!(
-        open.decode_metadata::<FixtureProtocolPayload>()
-            .expect("decode metadata"),
-        payload
-    );
 }
 
 #[test]
@@ -24063,33 +24391,29 @@ fn refresh_local_iroh_endpoints_from_disk_updates_local_daemon_members() {
     );
     ensure_daemon_cluster_members(&mut state, Vec::new(), Vec::new(), now);
 
-    write_iroh_endpoint_record(
-        &paths,
-        &IrohEndpointRecord {
-            cluster_id: cluster_id.clone(),
-            node_id: local_node_id.clone(),
-            endpoint_public_key: "main_iroh_public_key".to_string(),
-            direct_addresses: vec!["203.0.113.21:21356".to_string()],
-            relay_url: None,
-            relay_mode: IrohRelayMode::Default,
-            expires_after_tick: 10,
-        },
-    )
+    IrohEndpointRecord {
+        cluster_id: cluster_id.clone(),
+        node_id: local_node_id.clone(),
+        endpoint_public_key: "main_iroh_public_key".to_string(),
+        direct_addresses: vec!["203.0.113.21:21356".to_string()],
+        relay_url: None,
+        relay_mode: IrohRelayMode::Default,
+        expires_after_tick: 10,
+    }
+    .write(&paths)
     .expect("write main iroh endpoint");
-    write_iroh_endpoint_record(
-        &paths,
-        &IrohEndpointRecord {
-            cluster_id,
-            node_id: shadow_node_id.clone(),
-            endpoint_public_key: "shadow_iroh_public_key".to_string(),
-            direct_addresses: Vec::new(),
-            relay_url: Some("https://relay.example/".to_string()),
-            relay_mode: IrohRelayMode::Custom {
-                relay_url: "https://relay.example/".to_string(),
-            },
-            expires_after_tick: 10,
+    IrohEndpointRecord {
+        cluster_id,
+        node_id: shadow_node_id.clone(),
+        endpoint_public_key: "shadow_iroh_public_key".to_string(),
+        direct_addresses: Vec::new(),
+        relay_url: Some("https://relay.example/".to_string()),
+        relay_mode: IrohRelayMode::Custom {
+            relay_url: "https://relay.example/".to_string(),
         },
-    )
+        expires_after_tick: 10,
+    }
+    .write(&paths)
     .expect("write shadow iroh endpoint");
 
     let mut async_state = state.clone();
@@ -24166,6 +24490,98 @@ fn refresh_local_iroh_endpoints_from_disk_updates_local_daemon_members() {
         .expect("async membership refresh");
     assert!(membership_refresh.iroh_endpoints_changed);
     assert!(membership_refresh.public_keys_changed);
+}
+
+#[test]
+fn refresh_local_daemon_membership_cleans_duplicate_iroh_endpoints() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-iroh-membership-cleanup");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let updated_at = now + time::Duration::seconds(1);
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_iroh_membership_cleanup").expect("cluster");
+    let local_node_id =
+        NodeId::from_legacy_named("node_iroh_membership_cleanup_local").expect("local node");
+    let remote_node_id =
+        NodeId::from_legacy_named("node_iroh_membership_cleanup_remote").expect("remote node");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "iroh membership cleanup",
+        local_node_id,
+        "local",
+        "local-public-key",
+        now,
+    );
+    let mut remote = ClusterMemberRecord::local_voter(
+        cluster_id,
+        remote_node_id.clone(),
+        "remote",
+        "remote-public-key",
+        now,
+    );
+    remote.endpoints = vec![
+        ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named(
+                "endpoint_iroh_membership_cleanup_old",
+            )
+            .expect("old endpoint"),
+            node_id: remote_node_id.clone(),
+            transport: ClusterTransportKind::Iroh,
+            address: "iroh://same_remote_key?direct=203.0.113.7:21353".to_string(),
+            source: ClusterEndpointSource::Rendezvous,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 20,
+            last_observed_latency_ms: None,
+        },
+        ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named(
+                "endpoint_iroh_membership_cleanup_new",
+            )
+            .expect("new endpoint"),
+            node_id: remote_node_id.clone(),
+            transport: ClusterTransportKind::Iroh,
+            address: "iroh://same_remote_key?direct=203.0.113.8:21353".to_string(),
+            source: ClusterEndpointSource::Rendezvous,
+            privacy: ClusterEndpointPrivacy::InternetDirect,
+            priority: 30,
+            last_observed_latency_ms: None,
+        },
+    ];
+    state.members.push(remote);
+
+    let refresh = refresh_local_daemon_membership_from_disk(
+        &paths,
+        &mut state,
+        ClusterLocalDaemonMembershipObservation {
+            main_endpoints: Vec::new(),
+            shadow_endpoints: Vec::new(),
+            main_public_key: "local-public-key".to_string(),
+            shadow_public_key: "shadow-public-key".to_string(),
+            timestamp: updated_at,
+        },
+    )
+    .expect("membership refresh");
+
+    assert!(refresh.iroh_endpoints_changed);
+    assert_eq!(state.updated_at, updated_at);
+    let remote = state
+        .members
+        .iter()
+        .find(|member| member.node_id == remote_node_id)
+        .expect("remote member");
+    let iroh_endpoints = remote
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.transport == ClusterTransportKind::Iroh)
+        .collect::<Vec<_>>();
+    assert_eq!(iroh_endpoints.len(), 1);
+    assert_eq!(
+        iroh_endpoints[0].endpoint_id,
+        stable_iroh_endpoint_id(&remote_node_id, "same_remote_key")
+    );
 }
 
 #[test]
@@ -24550,8 +24966,8 @@ fn in_process_transport_delivers_typed_frames() {
     let mut transport_b = network.add_node(node_b.clone());
     let event = fixture_event("evt_transport", node_a.clone());
 
-    let frame = NetworkFrame {
-        frame_id: NetworkFrameId(1),
+    let frame = EventFrame {
+        frame_id: EventFrameId(1),
         source_node_id: node_a.clone(),
         target_node_id: node_b.clone(),
         message: MeshMessage {
@@ -24573,6 +24989,47 @@ fn in_process_transport_delivers_typed_frames() {
     assert_eq!(inbound.len(), 1);
     assert_eq!(inbound[0].received_by, node_b);
     assert_eq!(inbound[0].frame, frame);
+}
+
+#[test]
+fn in_process_transport_delivers_object_rpc_requests_without_frames() {
+    let node_a = NodeId::from_legacy_named("node_object_rpc_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_object_rpc_b").expect("node");
+    let network = InProcessNetwork::new();
+    let mut transport_a = network.add_node(node_a.clone());
+    let mut transport_b = network.add_node(node_b.clone());
+    let request = ObjectRpcRequest::encode_body("/test/object-message", "test.object", &42_u64)
+        .expect("request");
+
+    transport_a
+        .send_object_rpc_request(&node_b, request.clone())
+        .expect("send object rpc request");
+
+    assert_eq!(
+        transport_b.pending_incoming_count().expect("frame count"),
+        Some(0),
+        "object-RPC delivery must not populate the legacy frame mailbox"
+    );
+    assert!(
+        transport_b
+            .wait_for_incoming_object_rpc_request(Duration::ZERO)
+            .expect("wait for object rpc request")
+    );
+    let inbound = transport_b
+        .drain_incoming_object_rpc_messages()
+        .expect("drain object rpc requests");
+
+    assert_eq!(inbound.len(), 1);
+    assert_eq!(inbound[0].received_by, node_b);
+    assert_eq!(inbound[0].message.source_node_id, node_a);
+    assert_eq!(inbound[0].message.target_node_id, node_b);
+    assert_eq!(inbound[0].message.request, request);
+    assert!(
+        transport_b
+            .drain_incoming()
+            .expect("drain frames after object rpc")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -24598,8 +25055,8 @@ fn in_process_transport_wait_for_incoming_wakes_on_send() {
     transport_a
         .send(
             &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(1),
+            EventFrame {
+                frame_id: EventFrameId(1),
                 source_node_id: node_a.clone(),
                 target_node_id: node_b.clone(),
                 message: MeshMessage {
@@ -24641,8 +25098,8 @@ fn in_process_transport_rejects_unknown_targets() {
     let error = transport_a
         .send(
             &node_missing,
-            NetworkFrame {
-                frame_id: NetworkFrameId(1),
+            EventFrame {
+                frame_id: EventFrameId(1),
                 source_node_id: node_a.clone(),
                 target_node_id: node_missing.clone(),
                 message: MeshMessage {
@@ -24688,7 +25145,7 @@ where
 async fn send_async_test_frame<T: AsyncNetworkTransport>(
     transport: &mut T,
     target_node_id: &NodeId,
-    frame: NetworkFrame,
+    frame: EventFrame,
 ) -> Result<(), NetworkError> {
     transport
         .send_async(target_node_id, frame, AsyncNetworkSendOptions::default())
@@ -24697,8 +25154,57 @@ async fn send_async_test_frame<T: AsyncNetworkTransport>(
 
 async fn drain_async_test_frames<T: AsyncNetworkTransport>(
     transport: &mut T,
-) -> Result<Vec<InboundFrame>, NetworkError> {
+) -> Result<Vec<InboundEventFrame>, NetworkError> {
     transport.drain_incoming_async(usize::MAX).await
+}
+
+#[tokio::test]
+async fn async_in_process_transport_delivers_object_rpc_requests_without_frames() {
+    let node_a = NodeId::from_legacy_named("node_async_object_rpc_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_async_object_rpc_b").expect("node");
+    let network = AsyncInProcessNetwork::new();
+    let mut transport_a = network.add_node(node_a.clone());
+    let mut transport_b = network.add_node(node_b.clone());
+    let request =
+        ObjectRpcRequest::encode_body("/test/async-object-message", "test.object", &7_u64)
+            .expect("request");
+
+    transport_a
+        .send_object_rpc_request_async(&node_b, request.clone(), AsyncNetworkSendOptions::default())
+        .await
+        .expect("send object rpc request");
+
+    assert_eq!(
+        transport_b
+            .pending_incoming_count_async()
+            .await
+            .expect("frame count"),
+        Some(0),
+        "object-RPC delivery must not populate the legacy async frame mailbox"
+    );
+    assert!(
+        transport_b
+            .wait_for_incoming_object_rpc_request(Duration::ZERO)
+            .await
+            .expect("wait for object rpc request")
+    );
+    let inbound = transport_b
+        .drain_incoming_object_rpc_messages(usize::MAX)
+        .await
+        .expect("drain object rpc requests");
+
+    assert_eq!(inbound.len(), 1);
+    assert_eq!(inbound[0].received_by, node_b);
+    assert_eq!(inbound[0].message.source_node_id, node_a);
+    assert_eq!(inbound[0].message.target_node_id, node_b);
+    assert_eq!(inbound[0].message.request, request);
+    assert!(
+        transport_b
+            .drain_incoming_async(usize::MAX)
+            .await
+            .expect("drain frames after object rpc")
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -24744,7 +25250,7 @@ async fn network_service_dropped_wait_command_releases_actor() {
         fn send_async<'a>(
             &'a mut self,
             target_node_id: &'a NodeId,
-            _frame: NetworkFrame,
+            _frame: EventFrame,
             _options: AsyncNetworkSendOptions,
         ) -> AsyncNetworkTransportFuture<'a, Result<(), NetworkError>> {
             Box::pin(async move {
@@ -24757,7 +25263,7 @@ async fn network_service_dropped_wait_command_releases_actor() {
         fn drain_incoming_async<'a>(
             &'a mut self,
             _max_frames: usize,
-        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
+        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundEventFrame>, NetworkError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
 
@@ -24848,8 +25354,8 @@ async fn network_service_dropped_pump_outbound_keeps_delivery_retryable() {
     send_async_test_frame(
         &mut transport_a,
         &node_b,
-        NetworkFrame {
-            frame_id: NetworkFrameId(1),
+        EventFrame {
+            frame_id: EventFrameId(1),
             source_node_id: node_a.clone(),
             target_node_id: node_b.clone(),
             message: MeshMessage {
@@ -24972,8 +25478,8 @@ async fn network_service_pump_outbound_does_not_block_healthy_targets_behind_ful
     send_async_test_frame(
         &mut filler,
         &node_b,
-        NetworkFrame {
-            frame_id: NetworkFrameId(1),
+        EventFrame {
+            frame_id: EventFrameId(1),
             source_node_id: node_filler.clone(),
             target_node_id: node_b.clone(),
             message: MeshMessage {
@@ -25078,8 +25584,8 @@ async fn network_service_dropped_heartbeat_send_releases_actor() {
     send_async_test_frame(
         &mut transport_a,
         &node_b,
-        NetworkFrame {
-            frame_id: NetworkFrameId(1),
+        EventFrame {
+            frame_id: EventFrameId(1),
             source_node_id: node_a.clone(),
             target_node_id: node_b.clone(),
             message: MeshMessage {
@@ -25253,8 +25759,8 @@ async fn async_in_process_transport_applies_bounded_mpsc_backpressure() {
     transport_a
         .send_async(
             &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(1),
+            EventFrame {
+                frame_id: EventFrameId(1),
                 source_node_id: node_a.clone(),
                 target_node_id: node_b.clone(),
                 message: MeshMessage {
@@ -25274,8 +25780,8 @@ async fn async_in_process_transport_applies_bounded_mpsc_backpressure() {
 
     let second = transport_a.send_async(
         &node_b,
-        NetworkFrame {
-            frame_id: NetworkFrameId(2),
+        EventFrame {
+            frame_id: EventFrameId(2),
             source_node_id: node_a.clone(),
             target_node_id: node_b.clone(),
             message: MeshMessage {
@@ -25334,8 +25840,8 @@ async fn async_in_process_transport_zero_wait_reports_queued_frames() {
     transport_a
         .send_async(
             &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(1),
+            EventFrame {
+                frame_id: EventFrameId(1),
                 source_node_id: node_a.clone(),
                 target_node_id: node_b.clone(),
                 message: MeshMessage {
@@ -25379,9 +25885,9 @@ async fn async_in_process_transport_zero_wait_reports_queued_frames() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn async_in_process_transport_limits_concurrent_sends_per_target() {
-    fn heartbeat_frame(source: &NodeId, target: &NodeId, frame_id: u64) -> NetworkFrame {
-        NetworkFrame {
-            frame_id: NetworkFrameId(frame_id),
+    fn heartbeat_frame(source: &NodeId, target: &NodeId, frame_id: u64) -> EventFrame {
+        EventFrame {
+            frame_id: EventFrameId(frame_id),
             source_node_id: source.clone(),
             target_node_id: target.clone(),
             message: MeshMessage {
@@ -25460,7 +25966,7 @@ async fn async_in_process_transport_limits_concurrent_sends_per_target() {
         .await
         .expect("drain first pending send");
     assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].frame.frame_id, NetworkFrameId(2));
+    assert_eq!(remaining[0].frame.frame_id, EventFrameId(2));
 }
 
 #[tokio::test]
@@ -25533,7 +26039,7 @@ async fn network_service_async_pump_timeout_cancels_in_flight_transport_send() {
         fn send_async<'a>(
             &'a mut self,
             _target_node_id: &'a NodeId,
-            _frame: NetworkFrame,
+            _frame: EventFrame,
             _options: AsyncNetworkSendOptions,
         ) -> AsyncNetworkTransportFuture<'a, Result<(), NetworkError>> {
             let send_entered = Arc::clone(&self.send_entered);
@@ -25546,7 +26052,7 @@ async fn network_service_async_pump_timeout_cancels_in_flight_transport_send() {
         fn drain_incoming_async<'a>(
             &'a mut self,
             _max_frames: usize,
-        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
+        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundEventFrame>, NetworkError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
 
@@ -25639,7 +26145,7 @@ async fn network_service_async_transport_timeout_uses_remaining_command_budget()
         fn send_async<'a>(
             &'a mut self,
             _target_node_id: &'a NodeId,
-            _frame: NetworkFrame,
+            _frame: EventFrame,
             options: AsyncNetworkSendOptions,
         ) -> AsyncNetworkTransportFuture<'a, Result<(), NetworkError>> {
             let sent_timeouts = Arc::clone(&self.sent_timeouts);
@@ -25655,7 +26161,7 @@ async fn network_service_async_transport_timeout_uses_remaining_command_budget()
         fn drain_incoming_async<'a>(
             &'a mut self,
             _max_frames: usize,
-        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
+        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundEventFrame>, NetworkError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
 
@@ -25823,8 +26329,8 @@ async fn network_service_async_command_timeout_bounds_waiting_for_actor_reply() 
     send_async_test_frame(
         &mut transport_a,
         &node_b,
-        NetworkFrame {
-            frame_id: NetworkFrameId(1),
+        EventFrame {
+            frame_id: EventFrameId(1),
             source_node_id: node_a.clone(),
             target_node_id: node_b.clone(),
             message: MeshMessage {
@@ -25862,7 +26368,7 @@ async fn network_service_actor_drops_timed_out_queued_commands_before_transport_
         fn send_async<'a>(
             &'a mut self,
             target_node_id: &'a NodeId,
-            _frame: NetworkFrame,
+            _frame: EventFrame,
             _options: AsyncNetworkSendOptions,
         ) -> AsyncNetworkTransportFuture<'a, Result<(), NetworkError>> {
             Box::pin(async move {
@@ -25875,7 +26381,7 @@ async fn network_service_actor_drops_timed_out_queued_commands_before_transport_
         fn drain_incoming_async<'a>(
             &'a mut self,
             _max_frames: usize,
-        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
+        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundEventFrame>, NetworkError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
 
@@ -26014,8 +26520,8 @@ async fn network_service_async_process_incoming_after_wait_wakes_on_send() {
     let event =
         fixture_event("evt_async_wait_receive", node_a.clone()).with_target_node(node_b.clone());
 
-    let frame = NetworkFrame {
-        frame_id: NetworkFrameId(1),
+    let frame = EventFrame {
+        frame_id: EventFrameId(1),
         source_node_id: node_a.clone(),
         target_node_id: node_b.clone(),
         message: MeshMessage {
@@ -26073,8 +26579,8 @@ async fn process_incoming_ignores_stale_ack_and_continues_batch() {
     send_async_test_frame(
         &mut transport_b,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(1),
+        EventFrame {
+            frame_id: EventFrameId(1),
             source_node_id: node_b.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26094,8 +26600,8 @@ async fn process_incoming_ignores_stale_ack_and_continues_batch() {
     send_async_test_frame(
         &mut transport_b,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(2),
+        EventFrame {
+            frame_id: EventFrameId(2),
             source_node_id: node_b.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26161,8 +26667,8 @@ async fn process_incoming_ignores_mismatched_ack_event_until_real_ack_arrives() 
     send_async_test_frame(
         &mut transport_b,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(99),
+        EventFrame {
+            frame_id: EventFrameId(99),
             source_node_id: node_b.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26259,8 +26765,8 @@ async fn process_incoming_ignores_wrong_source_ack_and_continues_batch() {
     send_async_test_frame(
         &mut transport_c,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(1),
+        EventFrame {
+            frame_id: EventFrameId(1),
             source_node_id: node_c.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26280,8 +26786,8 @@ async fn process_incoming_ignores_wrong_source_ack_and_continues_batch() {
     send_async_test_frame(
         &mut transport_c,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(2),
+        EventFrame {
+            frame_id: EventFrameId(2),
             source_node_id: node_c.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26363,8 +26869,8 @@ async fn process_incoming_ignores_mismatched_heartbeat_source_and_continues_batc
     send_async_test_frame(
         &mut transport_c,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(1),
+        EventFrame {
+            frame_id: EventFrameId(1),
             source_node_id: node_c.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26383,8 +26889,8 @@ async fn process_incoming_ignores_mismatched_heartbeat_source_and_continues_batc
     send_async_test_frame(
         &mut transport_c,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(2),
+        EventFrame {
+            frame_id: EventFrameId(2),
             source_node_id: node_c.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26465,8 +26971,8 @@ async fn process_incoming_ignores_message_target_mismatch_and_continues_batch() 
     send_async_test_frame(
         &mut transport_b,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(1),
+        EventFrame {
+            frame_id: EventFrameId(1),
             source_node_id: node_b.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26485,8 +26991,8 @@ async fn process_incoming_ignores_message_target_mismatch_and_continues_batch() 
     send_async_test_frame(
         &mut transport_b,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(2),
+        EventFrame {
+            frame_id: EventFrameId(2),
             source_node_id: node_b.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26572,8 +27078,8 @@ async fn process_incoming_ignores_message_origin_mismatch_and_continues_batch() 
     send_async_test_frame(
         &mut transport_b,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(1),
+        EventFrame {
+            frame_id: EventFrameId(1),
             source_node_id: node_b.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26592,8 +27098,8 @@ async fn process_incoming_ignores_message_origin_mismatch_and_continues_batch() 
     send_async_test_frame(
         &mut transport_b,
         &node_a,
-        NetworkFrame {
-            frame_id: NetworkFrameId(2),
+        EventFrame {
+            frame_id: EventFrameId(2),
             source_node_id: node_b.clone(),
             target_node_id: node_a.clone(),
             message: MeshMessage {
@@ -26672,8 +27178,8 @@ async fn process_incoming_ignores_event_origin_mismatch_and_continues_batch() {
         send_async_test_frame(
             &mut transport_a,
             &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(delivery_id.0),
+            EventFrame {
+                frame_id: EventFrameId(delivery_id.0),
                 source_node_id: node_a.clone(),
                 target_node_id: node_b.clone(),
                 message: MeshMessage {
@@ -26762,8 +27268,8 @@ async fn process_incoming_ignores_event_target_mismatch_and_continues_batch() {
         send_async_test_frame(
             &mut transport_a,
             &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(delivery_id.0),
+            EventFrame {
+                frame_id: EventFrameId(delivery_id.0),
                 source_node_id: node_a.clone(),
                 target_node_id: node_b.clone(),
                 message: MeshMessage {
@@ -26853,8 +27359,8 @@ async fn process_incoming_ignores_targetless_origin_only_events_and_continues_ba
         send_async_test_frame(
             &mut transport_a,
             &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(delivery_id.0),
+            EventFrame {
+                frame_id: EventFrameId(delivery_id.0),
                 source_node_id: node_a.clone(),
                 target_node_id: node_b.clone(),
                 message: MeshMessage {
@@ -26989,8 +27495,8 @@ async fn network_service_process_incoming_batches_large_mailboxes() {
         send_async_test_frame(
             &mut transport_a,
             &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(index as u64 + 1),
+            EventFrame {
+                frame_id: EventFrameId(index as u64 + 1),
                 source_node_id: node_a.clone(),
                 target_node_id: node_b.clone(),
                 message: MeshMessage {
@@ -27121,8 +27627,8 @@ async fn network_service_actor_options_bound_queue_and_batches() {
         send_async_test_frame(
             &mut transport_a,
             &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(index + 1),
+            EventFrame {
+                frame_id: EventFrameId(index + 1),
                 source_node_id: node_a.clone(),
                 target_node_id: node_b.clone(),
                 message: MeshMessage {
@@ -27183,7 +27689,7 @@ async fn network_service_process_incoming_skips_drain_when_transport_reports_emp
         fn send_async<'a>(
             &'a mut self,
             target_node_id: &'a NodeId,
-            _frame: NetworkFrame,
+            _frame: EventFrame,
             _options: AsyncNetworkSendOptions,
         ) -> AsyncNetworkTransportFuture<'a, Result<(), NetworkError>> {
             Box::pin(async move {
@@ -27196,7 +27702,7 @@ async fn network_service_process_incoming_skips_drain_when_transport_reports_emp
         fn drain_incoming_async<'a>(
             &'a mut self,
             _max_frames: usize,
-        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
+        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundEventFrame>, NetworkError>> {
             let drain_calls = Arc::clone(&self.drain_calls);
             Box::pin(async move {
                 *drain_calls.lock().expect("drain calls") += 1;
@@ -27330,8 +27836,8 @@ fn in_process_transport_rejects_full_mailbox() {
         transport_a
             .send(
                 &node_b,
-                NetworkFrame {
-                    frame_id: NetworkFrameId(index as u64 + 1),
+                EventFrame {
+                    frame_id: EventFrameId(index as u64 + 1),
                     source_node_id: node_a.clone(),
                     target_node_id: node_b.clone(),
                     message: MeshMessage {
@@ -27351,8 +27857,8 @@ fn in_process_transport_rejects_full_mailbox() {
     let error = transport_a
         .send(
             &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(999_999),
+            EventFrame {
+                frame_id: EventFrameId(999_999),
                 source_node_id: node_a.clone(),
                 target_node_id: node_b.clone(),
                 message: MeshMessage {
@@ -27398,8 +27904,8 @@ async fn inbound_duplicate_event_is_acked_without_duplicate_append() {
         fixture_event("evt_duplicate_inbound", node_a.clone()).with_target_node(node_b.clone());
 
     for frame_id in [1, 2] {
-        let frame = NetworkFrame {
-            frame_id: NetworkFrameId(frame_id),
+        let frame = EventFrame {
+            frame_id: EventFrameId(frame_id),
             source_node_id: node_a.clone(),
             target_node_id: node_b.clone(),
             message: MeshMessage {
@@ -27452,8 +27958,8 @@ async fn inbound_duplicate_event_after_cache_eviction_is_deduped_by_store() {
         send_async_test_frame(
             &mut transport_a,
             &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(delivery_id.0),
+            EventFrame {
+                frame_id: EventFrameId(delivery_id.0),
                 source_node_id: node_a.clone(),
                 target_node_id: node_b.clone(),
                 message: MeshMessage {
@@ -27478,8 +27984,8 @@ async fn inbound_duplicate_event_after_cache_eviction_is_deduped_by_store() {
     send_async_test_frame(
         &mut transport_a,
         &node_b,
-        NetworkFrame {
-            frame_id: NetworkFrameId(3),
+        EventFrame {
+            frame_id: EventFrameId(3),
             source_node_id: node_a.clone(),
             target_node_id: node_b.clone(),
             message: MeshMessage {
@@ -29650,34 +30156,34 @@ fn cluster_kv_watch_events_cache_reuses_unchanged_event_view() {
     drop(log);
 
     assert!(
-        cached_cluster_kv_watch_events_for_test(&paths).is_none(),
+        cached_cluster_kv_watch_events_for_test(&paths.kv_paths()).is_none(),
         "cold watch-event reads should start without a cache entry"
     );
 
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("first read"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("first read"),
         vec![first.clone()]
     );
     assert_eq!(
-        cached_cluster_kv_watch_events_for_test(&paths),
+        cached_cluster_kv_watch_events_for_test(&paths.kv_paths()),
         Some(vec![first.clone()]),
         "first read should cache the compacted watch-event view"
     );
 
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("cached read"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("cached read"),
         vec![first.clone()]
     );
 
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&second))
+    append_cluster_kv_watch_events(&paths.kv_paths(), std::slice::from_ref(&second))
         .expect("append second event");
     assert_eq!(
-        cached_cluster_kv_watch_events_for_test(&paths),
+        cached_cluster_kv_watch_events_for_test(&paths.kv_paths()),
         Some(vec![first.clone(), second.clone()]),
         "append should refresh the cache for the next drain"
     );
     assert_eq!(
-        cluster_kv_watch_events(&paths).expect("cached read after append"),
+        cluster_kv_watch_events(&paths.kv_paths()).expect("cached read after append"),
         vec![first, second]
     );
 }
@@ -29694,17 +30200,17 @@ fn cluster_kv_watch_caches_retain_recent_entries_at_capacity() {
         let quiet_paths = ClusterPaths::new(&SinomoDataDir::new(
             root.join(format!("100-event-{index:04}")),
         ));
-        record_cluster_kv_watch_event_cache_for_test(&quiet_paths);
+        record_cluster_kv_watch_event_cache_for_test(&quiet_paths.kv_paths());
     }
-    record_cluster_kv_watch_event_cache_for_test(&hot_event_paths);
+    record_cluster_kv_watch_event_cache_for_test(&hot_event_paths.kv_paths());
     assert!(
-        refresh_cluster_kv_watch_event_cache_for_test(&hot_event_paths),
+        refresh_cluster_kv_watch_event_cache_for_test(&hot_event_paths.kv_paths()),
         "looking up the hot watch-event cache entry should refresh its recency"
     );
     let extra_event_paths = ClusterPaths::new(&SinomoDataDir::new(root.join("999-extra-events")));
-    record_cluster_kv_watch_event_cache_for_test(&extra_event_paths);
+    record_cluster_kv_watch_event_cache_for_test(&extra_event_paths.kv_paths());
     assert!(
-        cluster_kv_watch_event_cache_contains_for_test(&hot_event_paths),
+        cluster_kv_watch_event_cache_contains_for_test(&hot_event_paths.kv_paths()),
         "recent watch-event cache entry should survive capacity churn"
     );
 
@@ -29725,8 +30231,8 @@ fn cluster_kv_watch_caches_retain_recent_entries_at_capacity() {
         "recent watch-registration cache entry should survive capacity churn"
     );
 
-    remove_cluster_kv_watch_event_cache_entries_under_root_for_test(&root);
-    remove_cluster_kv_watch_registration_cache_entries_under_root_for_test(&root);
+    remove_cluster_kv_watch_event_cache_entries_under_root_for_test(root.path());
+    remove_cluster_kv_watch_registration_cache_entries_under_root_for_test(root.path());
 }
 
 #[test]
@@ -29839,17 +30345,17 @@ fn read_optional_object_file_treats_only_missing_file_as_absent() {
 
     let missing = root.join("missing.sobj");
     assert_eq!(
-        crate::storage::read_optional_object_file::<OptionalObjectFixture>(&missing)
+        crate::object_file_store::read_optional_object_file::<OptionalObjectFixture>(&missing)
             .expect("missing optional object"),
         None,
         "a missing optional object should be absent without a pre-open exists probe"
     );
 
     let object = root.join("present.sobj");
-    crate::storage::write_object_file(&object, &OptionalObjectFixture { value: 42 })
+    crate::object_file_store::write_object_file(&object, &OptionalObjectFixture { value: 42 })
         .expect("write object");
     assert_eq!(
-        crate::storage::read_optional_object_file::<OptionalObjectFixture>(&object)
+        crate::object_file_store::read_optional_object_file::<OptionalObjectFixture>(&object)
             .expect("present optional object"),
         Some(OptionalObjectFixture { value: 42 })
     );
@@ -29857,7 +30363,8 @@ fn read_optional_object_file_treats_only_missing_file_as_absent() {
     let directory = root.join("directory.sobj");
     std::fs::create_dir_all(&directory).expect("directory");
     assert!(
-        crate::storage::read_optional_object_file::<OptionalObjectFixture>(&directory).is_err(),
+        crate::object_file_store::read_optional_object_file::<OptionalObjectFixture>(&directory)
+            .is_err(),
         "a directory at an optional object path is a storage error, not absence"
     );
 }
@@ -29873,9 +30380,9 @@ fn write_object_file_create_new_falls_back_when_hard_links_are_unsupported() {
     std::fs::create_dir_all(&root).expect("root");
     let path = root.join("object.sobj");
 
-    crate::storage::force_write_object_file_create_new_unsupported_link_for_test(&path);
+    crate::object_file_store::force_write_object_file_create_new_unsupported_link_for_test(&path);
     assert!(
-        crate::storage::write_object_file_create_new_serialized(
+        crate::object_file_store::write_object_file_create_new_serialized(
             &path,
             &CreateNewFixture { value: 42 },
         )
@@ -29883,11 +30390,12 @@ fn write_object_file_create_new_falls_back_when_hard_links_are_unsupported() {
         "missing target should be created when hard links are unsupported"
     );
     assert_eq!(
-        crate::storage::read_object_file::<CreateNewFixture>(&path).expect("read created object"),
+        crate::object_file_store::read_object_file::<CreateNewFixture>(&path)
+            .expect("read created object"),
         CreateNewFixture { value: 42 }
     );
     assert!(
-        !crate::storage::write_object_file_create_new_serialized(
+        !crate::object_file_store::write_object_file_create_new_serialized(
             &path,
             &CreateNewFixture { value: 7 },
         )
@@ -29895,7 +30403,8 @@ fn write_object_file_create_new_falls_back_when_hard_links_are_unsupported() {
         "existing target should not be replaced in the hard-link fallback"
     );
     assert_eq!(
-        crate::storage::read_object_file::<CreateNewFixture>(&path).expect("read original object"),
+        crate::object_file_store::read_object_file::<CreateNewFixture>(&path)
+            .expect("read original object"),
         CreateNewFixture { value: 42 }
     );
     assert!(
@@ -29906,7 +30415,7 @@ fn write_object_file_create_new_falls_back_when_hard_links_are_unsupported() {
             .all(|name| !name.contains(".create-new-tmp-")),
         "create-new fallback should not leave staged temp files behind"
     );
-    crate::storage::clear_write_object_file_create_new_unsupported_link_for_test(&path);
+    crate::object_file_store::clear_write_object_file_create_new_unsupported_link_for_test(&path);
 }
 
 #[test]
@@ -29920,14 +30429,14 @@ fn write_object_file_skips_identical_and_rewrites_after_external_change() {
     let path = root.join("obj.sobj");
 
     let value = "alpha".to_string();
-    crate::storage::write_object_file(&path, &value).expect("initial write");
+    crate::object_file_store::write_object_file(&path, &value).expect("initial write");
     let mtime_after_write = std::fs::metadata(&path)
         .expect("metadata")
         .modified()
         .expect("mtime");
 
     // An identical re-write takes the fast path and leaves the file untouched.
-    crate::storage::write_object_file(&path, &value).expect("identical re-write");
+    crate::object_file_store::write_object_file(&path, &value).expect("identical re-write");
     assert_eq!(
         std::fs::metadata(&path)
             .expect("metadata")
@@ -29947,7 +30456,8 @@ fn write_object_file_skips_identical_and_rewrites_after_external_change() {
 
     // Writing our content again must detect the change via the stat guard, fall
     // back to read + compare, and actually rewrite -- never falsely skip.
-    crate::storage::write_object_file(&path, &value).expect("rewrite after external change");
+    crate::object_file_store::write_object_file(&path, &value)
+        .expect("rewrite after external change");
     let restored: String = SinomoObjectCodec::default()
         .decode(&std::fs::read(&path).expect("read"))
         .expect("decode");
@@ -29989,7 +30499,7 @@ fn write_object_file_cleans_temp_file_after_replace_failure() {
     let path = root.join("obj.sobj");
     std::fs::create_dir(&path).expect("target directory");
 
-    let error = crate::storage::write_object_file(&path, &"alpha".to_string())
+    let error = crate::object_file_store::write_object_file(&path, &"alpha".to_string())
         .expect_err("replacing a directory should fail");
     assert!(
         error.to_string().contains("obj.sobj"),
@@ -30140,7 +30650,7 @@ fn local_member_publish_forced_sync_publishes_even_when_records_current() {
     // Seed the local snapshot so the local member records already match —
     // the historical short-circuit that froze learner snapshots forever.
     let mut seeded = InProcessKvStore::new();
-    for member in cluster_local_process_members(&state) {
+    for member in sinomo_node::cluster_local_process_members(&state) {
         let txn = KvTxn {
             compares: Vec::new(),
             success: vec![
@@ -30153,8 +30663,11 @@ fn local_member_publish_forced_sync_publishes_even_when_records_current() {
     }
     write_cluster_kv_snapshot(&paths, &seeded.snapshot()).expect("seed snapshot");
     assert!(
-        cluster_member_publish_matches_kv(&paths, &cluster_local_process_members(&state))
-            .expect("matches kv"),
+        cluster_member_publish_matches_kv(
+            &paths,
+            &sinomo_node::cluster_local_process_members(&state)
+        )
+        .expect("matches kv"),
         "fixture must reproduce the already-published state"
     );
 
@@ -30174,7 +30687,7 @@ fn local_member_publish_forced_sync_publishes_even_when_records_current() {
         }),
         ..Default::default()
     };
-    publish_local_members_via_voter_with_host(
+    publish_local_members_to_quorum_if_needed_with_host(
         &paths,
         &state,
         ClusterLocalMemberPublishOptions {
@@ -30198,7 +30711,7 @@ fn local_member_publish_forced_sync_publishes_even_when_records_current() {
         }),
         ..Default::default()
     };
-    publish_local_members_via_voter_with_host(
+    publish_local_members_to_quorum_if_needed_with_host(
         &paths,
         &state,
         ClusterLocalMemberPublishOptions {
@@ -30238,7 +30751,7 @@ fn local_member_publish_forced_sync_publishes_even_when_records_current() {
         }),
         ..Default::default()
     };
-    publish_local_members_via_voter_with_host(
+    publish_local_members_to_quorum_if_needed_with_host(
         &paths,
         &state,
         ClusterLocalMemberPublishOptions {
@@ -30257,15 +30770,14 @@ fn local_member_publish_forced_sync_publishes_even_when_records_current() {
 }
 
 #[derive(Default)]
-struct RelayOnlySnapshotRefreshHost {
-    relay_peer: Option<ClusterEndpointRecord>,
-    relay_snapshot: Option<KvSnapshot>,
+struct NodeOnlySnapshotRefreshHost {
+    node_snapshot: Option<KvSnapshot>,
     direct_fetches: usize,
-    relay_calls: usize,
+    node_calls: usize,
 }
 
-impl ClusterKvSnapshotRefreshHost for RelayOnlySnapshotRefreshHost {
-    fn known_raft_leader_id(
+impl ClusterKvSnapshotRefreshHost for NodeOnlySnapshotRefreshHost {
+    fn known_kv_state_authority_id(
         &mut self,
         _paths: &ClusterPaths,
         _state: &ClusterBootstrapState,
@@ -30285,7 +30797,7 @@ impl ClusterKvSnapshotRefreshHost for RelayOnlySnapshotRefreshHost {
         })
     }
 
-    fn restore_cluster_raft_from_snapshot_if_newer(
+    fn restore_cluster_kv_from_snapshot_if_newer(
         &mut self,
         _paths: &ClusterPaths,
         _local_node_id: &NodeId,
@@ -30294,26 +30806,18 @@ impl ClusterKvSnapshotRefreshHost for RelayOnlySnapshotRefreshHost {
         Ok(false)
     }
 
-    fn relay_peers(
-        &mut self,
-        _paths: &ClusterPaths,
-        _state: &ClusterBootstrapState,
-    ) -> Vec<ClusterEndpointRecord> {
-        self.relay_peer.iter().cloned().collect()
-    }
-
-    fn relay_rpc_to_node(
+    fn call_node_object_rpc(
         &mut self,
         _state: &ClusterBootstrapState,
-        _target_node_id: &NodeId,
-        _peer: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         request: &ObjectRpcRequest,
         _timeout: Duration,
     ) -> Result<ObjectRpcResponse, NetworkError> {
-        self.relay_calls += 1;
+        self.node_calls += 1;
+        assert!(!target_node_id.as_str().is_empty());
         assert_eq!(request.route, sinomo_kv::CLUSTER_KV_SNAPSHOT_ROUTE);
         let payload = sinomo_kv::cluster_kv_snapshot_response_rpc_payload(
-            self.relay_snapshot.as_ref().expect("relay snapshot"),
+            self.node_snapshot.as_ref().expect("node snapshot"),
         )?;
         Ok(ObjectRpcResponse::from_encoded_body(
             payload.route,
@@ -30323,8 +30827,8 @@ impl ClusterKvSnapshotRefreshHost for RelayOnlySnapshotRefreshHost {
 }
 
 #[test]
-fn refresh_current_cluster_kv_store_falls_back_to_relayed_snapshot_fetch() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-refresh-relay-fallback");
+fn refresh_current_cluster_kv_store_falls_back_to_node_snapshot_fetch() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-refresh-node-fallback");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -30333,7 +30837,6 @@ fn refresh_current_cluster_kv_store_falls_back_to_relayed_snapshot_fetch() {
         ClusterId::from_legacy_named("cluster_refresh_relay_fallback").expect("cluster");
     let local = NodeId::from_legacy_named("node_refresh_relay_fallback").expect("local");
     let voter = NodeId::from_legacy_named("node_refresh_relay_fallback_voter").expect("voter");
-    let bridge = NodeId::from_legacy_named("node_refresh_relay_fallback_bridge").expect("bridge");
     let mut state = ClusterBootstrapState::initialized_locally(
         cluster_id.clone(),
         "refresh relay fallback",
@@ -30362,17 +30865,12 @@ fn refresh_current_cluster_kv_store_falls_back_to_relayed_snapshot_fetch() {
     write_cluster_state(&paths, &state).expect("write state");
     write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot()).expect("empty snapshot");
 
-    let mut relayed_store = InProcessKvStore::new();
-    relayed_store
+    let mut node_store = InProcessKvStore::new();
+    node_store
         .put("/kv/relay/imported", b"ok".to_vec(), None)
         .expect("relayed marker");
-    let mut host = RelayOnlySnapshotRefreshHost {
-        relay_peer: Some(daemon_lan_endpoint(
-            &bridge,
-            "10.49.2.8:21353".to_string(),
-            10,
-        )),
-        relay_snapshot: Some(relayed_store.snapshot()),
+    let mut host = NodeOnlySnapshotRefreshHost {
+        node_snapshot: Some(node_store.snapshot()),
         ..Default::default()
     };
 
@@ -30385,7 +30883,7 @@ fn refresh_current_cluster_kv_store_falls_back_to_relayed_snapshot_fetch() {
     .expect("refresh with relay fallback");
 
     assert!(host.direct_fetches > 0, "direct fetch must be attempted");
-    assert_eq!(host.relay_calls, 1, "relay fallback must run exactly once");
+    assert_eq!(host.node_calls, 1, "node fallback must run exactly once");
     assert!(store.snapshot().get("/kv/relay/imported").is_some());
     assert!(
         read_cluster_kv_current_snapshot(&paths)

@@ -2,9 +2,11 @@
 
 mod daemon;
 mod identity;
+mod membership;
 
 pub use daemon::*;
 pub use identity::*;
+pub use membership::*;
 
 pub type NodeId = sinomo_core::Id;
 
@@ -165,7 +167,11 @@ pub enum NodeAvailability {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::NodeCapability;
+    use sinomo_core::{
+        ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
+        ClusterEndpointSource, ClusterMemberRecord, ClusterMemberState, ClusterNodeAvailability,
+        ClusterNodeStatusRecord, ClusterTransportKind, Id, NodeCapability,
+    };
 
     #[test]
     fn node_profile_round_trips_json() {
@@ -227,5 +233,318 @@ mod tests {
         let lan = daemon_lan_endpoint_id(&main_node, "192.168.1.5:21353");
         assert_eq!(lan, daemon_lan_endpoint_id(&main_node, "192.168.1.5:21353"));
         assert_eq!(lan.as_str().len(), 26);
+    }
+
+    #[test]
+    fn cluster_endpoint_stable_eq_treats_mdns_and_observed_as_same_source() {
+        let node_id = Id::from_legacy_named("node_endpoint_stable").expect("node");
+        let endpoint_id = Id::from_legacy_named("endpoint_stable").expect("endpoint");
+        let left = ClusterEndpointRecord {
+            endpoint_id: endpoint_id.clone(),
+            node_id,
+            transport: ClusterTransportKind::LanTcp,
+            address: "127.0.0.1:21353".to_string(),
+            source: ClusterEndpointSource::Mdns,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 10,
+            last_observed_latency_ms: Some(5),
+        };
+        let mut right = left.clone();
+        right.source = ClusterEndpointSource::Observed;
+
+        assert!(cluster_endpoint_stable_eq(&left, &right));
+
+        right.address = "127.0.0.1:21354".to_string();
+        assert!(!cluster_endpoint_stable_eq(&left, &right));
+    }
+
+    #[test]
+    fn cluster_state_stable_eq_ignores_endpoint_order() {
+        let timestamp = time::OffsetDateTime::parse(
+            "2026-05-02T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("timestamp");
+        let cluster_id = Id::from_legacy_named("cluster_state_stable").expect("cluster");
+        let node_id = Id::from_legacy_named("node_state_stable").expect("node");
+        let mut left = ClusterBootstrapState::initialized_locally(
+            cluster_id, "home", node_id, "desktop", "pk", timestamp,
+        );
+        let first = ClusterEndpointRecord::loopback(left.local_node_id.clone(), "127.0.0.1:21353");
+        let second = ClusterEndpointRecord::loopback(left.local_node_id.clone(), "127.0.0.1:21354");
+        left.members[0].endpoints = vec![first.clone(), second.clone()];
+        let mut right = left.clone();
+        right.members[0].endpoints = vec![second, first];
+
+        assert!(cluster_bootstrap_state_stable_eq(&left, &right));
+    }
+
+    #[test]
+    fn cluster_identity_record_stable_eq_ignores_revision_and_updated_at() {
+        let timestamp = time::OffsetDateTime::parse(
+            "2026-05-02T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("timestamp");
+        let cluster_id = Id::from_legacy_named("cluster_identity_stable").expect("cluster");
+        let node_id = Id::from_legacy_named("node_identity_stable").expect("node");
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id, "home", node_id, "desktop", "pk", timestamp,
+        );
+        let left = ClusterIdentityRecord::from(&state);
+        let mut right = left.clone();
+        right.kv_revision += 1;
+        right.updated_at = right.updated_at + time::Duration::minutes(1);
+
+        assert!(cluster_identity_record_stable_eq(&left, &right));
+
+        right.cluster_name = "other".to_string();
+        assert!(!cluster_identity_record_stable_eq(&left, &right));
+    }
+
+    #[test]
+    fn cluster_capability_policy_stable_eq_ignores_updated_at() {
+        let timestamp = time::OffsetDateTime::parse(
+            "2026-05-02T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("timestamp");
+        let cluster_id = Id::from_legacy_named("cluster_policy_stable").expect("cluster");
+        let node_id = Id::from_legacy_named("node_policy_stable").expect("node");
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            node_id,
+            "desktop",
+            "pk-policy",
+            timestamp,
+        );
+        member.capabilities = vec![CapabilityName::new("daemon.main.run").expect("capability")];
+        member.allowed_capabilities = member.capabilities.clone();
+        let left = ClusterCapabilityPolicyRecord::from(&member);
+        let mut right = left.clone();
+        right.updated_at = right.updated_at + time::Duration::minutes(1);
+
+        assert!(cluster_capability_policy_stable_eq(&left, &right));
+
+        right
+            .allowed_capabilities
+            .push(CapabilityName::new("cluster.kv.vote").expect("capability"));
+        assert!(!cluster_capability_policy_stable_eq(&left, &right));
+    }
+
+    #[test]
+    fn cluster_node_key_helpers_are_stable() {
+        let node_id = Id::from_legacy_named("node_policy_key").expect("node");
+        let invite_id = Id::from_legacy_named("invite_policy_key").expect("invite");
+        let observed_at = time::OffsetDateTime::parse(
+            "2026-05-02T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("timestamp");
+        let shadow_status = ClusterNodeStatusRecord {
+            cluster_id: Id::from_legacy_named("cluster_status_key").expect("cluster"),
+            node_id: node_id.clone(),
+            process: DAEMON_SHADOW_CLUSTER_ROLE.to_string(),
+            availability: ClusterNodeAvailability::Online,
+            daemon_version: "0.1.0-test".to_string(),
+            commit: Some("abcdef0".to_string()),
+            target_os: Some("linux".to_string()),
+            target_arch: Some("x86_64".to_string()),
+            pid: Some(42),
+            address: Some("127.0.0.1:21354".to_string()),
+            bind_address: Some("0.0.0.0:21354".to_string()),
+            executable: Some("/tmp/sinomo-shadow".to_string()),
+            rollout: None,
+            daemon_started_at: Some("2026-05-02T12:00:00Z".to_string()),
+            observed_at,
+        };
+
+        assert_eq!(cluster_identity_key(), "/cluster/config/identity");
+        assert_eq!(
+            cluster_capability_policy_key(&node_id),
+            format!("/cluster/policy/capabilities/{node_id}")
+        );
+        assert_eq!(
+            cluster_member_key(&node_id),
+            format!("/cluster/members/{node_id}")
+        );
+        assert_eq!(
+            cluster_invitation_key(&invite_id),
+            format!("/cluster/invitations/{invite_id}")
+        );
+        assert_eq!(
+            cluster_invitation_state_key(&invite_id),
+            format!("/cluster/invitations/{invite_id}/state")
+        );
+        assert_eq!(
+            cluster_node_status_key(&node_id),
+            format!("/cluster/node-status/{node_id}")
+        );
+        assert_eq!(
+            cluster_node_status_key_for_process(&node_id, DAEMON_MAIN_CLUSTER_ROLE),
+            cluster_node_status_key(&node_id)
+        );
+        assert_eq!(
+            cluster_node_status_key_for_record(&shadow_status),
+            format!("/cluster/node-status/{node_id}/daemon-shadow")
+        );
+        assert!(cluster_node_status_key_matches_record(
+            &cluster_node_status_key_for_record(&shadow_status),
+            &shadow_status
+        ));
+    }
+
+    #[test]
+    fn cluster_node_status_stable_eq_ignores_volatile_observation_fields() {
+        let timestamp = time::OffsetDateTime::parse(
+            "2026-05-02T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("timestamp");
+        let left = ClusterNodeStatusRecord {
+            cluster_id: Id::from_legacy_named("cluster_status_stable").expect("cluster"),
+            node_id: Id::from_legacy_named("node_status_stable").expect("node"),
+            process: DAEMON_MAIN_CLUSTER_ROLE.to_string(),
+            availability: ClusterNodeAvailability::Online,
+            daemon_version: "0.1.0-test".to_string(),
+            commit: Some("abcdef0".to_string()),
+            target_os: Some("linux".to_string()),
+            target_arch: Some("x86_64".to_string()),
+            pid: Some(100),
+            address: Some("127.0.0.1:21353".to_string()),
+            bind_address: Some("0.0.0.0:21353".to_string()),
+            executable: Some("/tmp/sinomo".to_string()),
+            rollout: None,
+            daemon_started_at: Some("2026-05-02T12:00:00Z".to_string()),
+            observed_at: timestamp,
+        };
+        let mut right = left.clone();
+        right.pid = Some(200);
+        right.observed_at = right.observed_at + time::Duration::minutes(1);
+
+        assert!(cluster_node_status_stable_eq(&left, &right));
+
+        right.address = Some("127.0.0.1:21354".to_string());
+        assert!(!cluster_node_status_stable_eq(&left, &right));
+    }
+
+    #[test]
+    fn cluster_invitation_state_stable_eq_ignores_updated_at() {
+        let timestamp = time::OffsetDateTime::parse(
+            "2026-05-02T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("timestamp");
+        let left = ClusterInvitationStateRecord {
+            cluster_id: Id::from_legacy_named("cluster_invitation_stable").expect("cluster"),
+            invite_id: Id::from_legacy_named("invite_stable").expect("invite"),
+            state: "active".to_string(),
+            issuer_node_id: Id::from_legacy_named("node_invitation_issuer").expect("node"),
+            expires_at: timestamp + time::Duration::hours(1),
+            updated_at: timestamp,
+        };
+        let mut right = left.clone();
+        right.updated_at = right.updated_at + time::Duration::minutes(1);
+
+        assert!(cluster_invitation_state_stable_eq(&left, &right));
+
+        right.state = "revoked".to_string();
+        assert!(!cluster_invitation_state_stable_eq(&left, &right));
+    }
+
+    #[test]
+    fn upsert_member_record_replaces_by_node_id() {
+        let timestamp = time::OffsetDateTime::parse(
+            "2026-05-02T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("timestamp");
+        let cluster_id = Id::from_legacy_named("cluster_member_upsert").expect("cluster");
+        let node_id = Id::from_legacy_named("node_member_upsert").expect("node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "home",
+            node_id.clone(),
+            "desktop",
+            "pk",
+            timestamp,
+        );
+        let mut replacement = ClusterMemberRecord::pending_learner(
+            state.cluster_id.clone(),
+            node_id,
+            "renamed",
+            "pk-renamed",
+            timestamp,
+        );
+        replacement.endpoints.push(ClusterEndpointRecord::loopback(
+            replacement.node_id.clone(),
+            "127.0.0.1:21355",
+        ));
+
+        upsert_member_record(&mut state, replacement);
+
+        assert_eq!(state.members.len(), 1);
+        assert_eq!(state.members[0].display_name, "renamed");
+        assert_eq!(state.members[0].endpoints.len(), 1);
+    }
+
+    #[test]
+    fn cluster_member_process_helpers_treat_main_and_shadow_as_local() {
+        let timestamp = time::OffsetDateTime::parse(
+            "2026-05-02T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("timestamp");
+        let cluster_id = Id::from_legacy_named("cluster_node_process_helpers").expect("cluster");
+        let local = Id::from_legacy_named("node_process_local").expect("node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "home",
+            local.clone(),
+            "desktop",
+            "pk-local",
+            timestamp,
+        );
+        state.members[0].capabilities = main_daemon_capabilities(&state.members[0].role);
+
+        let mut shadow = ClusterMemberRecord::local_non_voting(
+            cluster_id.clone(),
+            shadow_daemon_node_id(&local),
+            "desktop shadow",
+            "pk-shadow",
+            timestamp,
+        );
+        shadow.capabilities = shadow_daemon_capabilities();
+        state.members.push(shadow.clone());
+
+        assert_eq!(
+            cluster_member_expected_daemon_process(&state.members[0]),
+            Some(DAEMON_MAIN_CLUSTER_ROLE)
+        );
+        assert_eq!(
+            cluster_member_expected_daemon_process(&shadow),
+            Some(DAEMON_SHADOW_CLUSTER_ROLE)
+        );
+        assert!(cluster_member_is_legacy_shadow_daemon(&shadow));
+        assert_eq!(cluster_local_process_members(&state).len(), 2);
+        assert!(!cluster_has_remote_peers(&state));
+
+        let remote = Id::from_legacy_named("node_process_remote").expect("remote");
+        state.members.push(ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            timestamp,
+        ));
+        assert!(cluster_has_remote_peers(&state));
+
+        let remote_member = state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == remote)
+            .expect("remote member");
+        remote_member.state = ClusterMemberState::Removed;
+        assert!(!cluster_has_remote_peers(&state));
     }
 }

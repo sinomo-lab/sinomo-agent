@@ -9,7 +9,7 @@
 use crate::namespace::{initial_version, metadata_path, next_version, object_id_for_path};
 use crate::{
     DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest, DfsControlPlaneStore,
-    DfsDirectoryPage, DfsDirectoryPageCursor, DfsError, DfsFileSystem, DfsFrameTransport,
+    DfsDirectoryPage, DfsDirectoryPageCursor, DfsError, DfsFileSystem, DfsMessageTransport,
     DfsMetadataShardConfig, DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobRecord,
     DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNamespacePosixError, DfsNamespaceResult,
     DfsNamespaceTransaction, DfsNetworkMessage, DfsObjectKind, DfsObjectMetadata,
@@ -53,12 +53,6 @@ const POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT: usize = 3;
 const POSIX_READ_FRESHNESS_SYNC_TIMEOUT: Duration = Duration::from_secs(3);
 const POSIX_READ_FRESHNESS_SYNC_CACHE_TTL: Duration = Duration::from_secs(5);
 const POSIX_REMOTE_READ_IDLE_WAIT_MAX: Duration = Duration::from_millis(50);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PosixDistributedLookupFreshness {
-    LocalHitOk,
-    VerifyLocalHitWithPrimary,
-}
 
 #[derive(Clone, Debug)]
 struct PosixPendingBulkRead {
@@ -241,7 +235,7 @@ impl DfsWriteOptions {
     }
 }
 
-impl<T: DfsFrameTransport> NetworkedDfsService<T> {
+impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn settle_ready_write_outcome(
         &mut self,
         outcome: NetworkedDfsWriteOutcome,
@@ -263,6 +257,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 intent_id = next_intent_id.clone();
             }
             if !matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }) {
+                let (_, repair_events) = self.retry_pending_repairs_best_effort();
+                if !repair_events.is_empty() {
+                    events.extend(repair_events);
+                    self.last_events = events;
+                }
                 return Ok(outcome);
             }
             let (scheduled, repair_events) = self.retry_pending_repairs_best_effort();
@@ -357,6 +356,17 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         path: &str,
     ) -> Result<Option<DfsMetadataShardConfig>> {
         let shard = self.select_sifs_metadata_shard_for_path_fresh(path)?;
+        Ok(match shard {
+            Some(shard) if shard.primary_node_id != self.node_id => Some(shard),
+            _ => None,
+        })
+    }
+
+    fn routed_namespace_shard_for_path_cached(
+        &mut self,
+        path: &str,
+    ) -> Result<Option<DfsMetadataShardConfig>> {
+        let shard = self.select_sifs_metadata_shard_for_path_cached(path)?;
         Ok(match shard {
             Some(shard) if shard.primary_node_id != self.node_id => Some(shard),
             _ => None,
@@ -511,14 +521,13 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         &mut self,
         path: &str,
         follow_final: bool,
-        freshness: PosixDistributedLookupFreshness,
     ) -> Result<(String, Option<DfsObjectMetadata>)> {
         let mut resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
         // Non-replica mirrors can be stale in BOTH directions because they do
         // not receive the pushed journal stream. A bounded best-effort pull
         // remains available there, but configured replicas keep ordinary
         // reads free of local metadata writes.
-        if let Some(shard) = self.routed_namespace_shard_for_path(&resolved)?
+        if let Some(shard) = self.routed_namespace_shard_for_path_cached(&resolved)?
             && !self.is_local_metadata_replica_for_shard(&shard)
             && self.should_attempt_read_freshness_sync(&shard)
         {
@@ -536,42 +545,16 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
             }
         }
-        let mut hydrated_local_replica_miss = false;
         for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
             if let Some(object) = self.lookup_sifs_path(&resolved)?
                 && object.kind != DfsObjectKind::Tombstone
             {
-                if freshness == PosixDistributedLookupFreshness::VerifyLocalHitWithPrimary
-                    && let Some(shard) = self.routed_namespace_shard_for_path(&resolved)?
-                    && self.is_local_metadata_replica_for_shard(&shard)
-                    && shard.primary_node_id != self.node_id
-                {
-                    return self
-                        .route_namespace_lookup_path_to_metadata_primary(
-                            sifs_file_system_id(),
-                            shard.primary_node_id,
-                            resolved.clone(),
-                            POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
-                        )
-                        .map(|primary_object| {
-                            let object = primary_object
-                                .filter(|object| object.kind != DfsObjectKind::Tombstone);
-                            (resolved, object)
-                        })
-                        .map_err(DfsPosixError::from);
-                }
                 return Ok((resolved, Some(object)));
             }
-            let Some(shard) = self.routed_namespace_shard_for_path(&resolved)? else {
+            let Some(shard) = self.routed_namespace_shard_for_path_cached(&resolved)? else {
                 break;
             };
             if self.is_local_metadata_replica_for_shard(&shard) {
-                if !hydrated_local_replica_miss {
-                    self.hydrate_from_metadata_backend()?;
-                    hydrated_local_replica_miss = true;
-                    resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
-                    continue;
-                }
                 if shard.primary_node_id != self.node_id
                     && let Some(object) = self.route_namespace_lookup_path_to_metadata_primary(
                         sifs_file_system_id(),
@@ -2286,11 +2269,8 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 let parent = match self.lookup_sifs_path(&parent_touch.path)? {
                     Some(parent) if parent.kind != DfsObjectKind::Tombstone => parent,
                     _ => {
-                        let (_, parent) = self.lookup_sifs_path_distributed_synced(
-                            &parent_touch.path,
-                            false,
-                            PosixDistributedLookupFreshness::LocalHitOk,
-                        )?;
+                        let (_, parent) =
+                            self.lookup_sifs_path_distributed_synced(&parent_touch.path, false)?;
                         parent.ok_or_else(|| DfsPosixError::MissingParent {
                             path: parent_touch.path.clone(),
                         })?
@@ -3363,11 +3343,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     pub fn posix_read_file_distributed(&mut self, path: &str) -> Result<Vec<u8>> {
         let trace_started = Instant::now();
         let lookup_started = Instant::now();
-        let (path, object) = self.lookup_sifs_path_distributed_synced(
-            path,
-            true,
-            PosixDistributedLookupFreshness::LocalHitOk,
-        )?;
+        let (path, object) = self.lookup_sifs_path_distributed_synced(path, true)?;
         let lookup_elapsed_ms = lookup_started.elapsed().as_millis();
         let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         if object.kind == DfsObjectKind::Tombstone {
@@ -3529,11 +3505,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         input_path: &str,
         index: usize,
     ) -> Result<PosixBulkReadPlan> {
-        let (path, object) = self.lookup_sifs_path_distributed_synced(
-            input_path,
-            true,
-            PosixDistributedLookupFreshness::LocalHitOk,
-        )?;
+        let (path, object) = self.lookup_sifs_path_distributed_synced(input_path, true)?;
         let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path });
@@ -3719,11 +3691,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_read_file_update_access(&mut self, path: &str) -> Result<Vec<u8>> {
-        let (path, object) = self.lookup_sifs_path_distributed_synced(
-            path,
-            true,
-            PosixDistributedLookupFreshness::LocalHitOk,
-        )?;
+        let (path, object) = self.lookup_sifs_path_distributed_synced(path, true)?;
         let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path });
@@ -5040,11 +5008,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_lstat_distributed(&mut self, path: &str) -> Result<DfsStat> {
-        let (path, object) = self.lookup_sifs_path_distributed_synced(
-            path,
-            false,
-            PosixDistributedLookupFreshness::VerifyLocalHitWithPrimary,
-        )?;
+        let (path, object) = self.lookup_sifs_path_distributed_synced(path, false)?;
         let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path });

@@ -3,17 +3,15 @@ use crate::file_manager::{
     FileManagerBackend, FileManagerEntry, FileManagerEntryKind, FileManagerMetadata,
     FileManagerRead, validated_relative_child_path,
 };
-use sinomo_runtime::core::ClusterEndpointRecord;
 use sinomo_runtime::dfs::{
-    AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsDirectReadRequest, DfsDirectReadSender,
-    DfsEndpointTransport, DfsMetadataJournalBatchSender, DfsMetadataJournalReplicationOptions,
-    DfsMetadataPeerTransportError, DfsMetadataShardConfig, DfsMetadataSnapshotInstallSender,
-    DfsNodeAdvertisement, DfsObjectKind, DfsObjectRpcSendOptions, DfsPeerTransport,
-    DfsPeerTransportError, DfsPeerTransportFuture, DfsReadResponse, DfsStat, DfsWriteOptions,
-    LocalContentStore, NetworkedDfsService, content_services_prefix, default_dfs_metadata_root,
+    AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsEndpointTransport,
+    DfsMetadataJournalReplicationOptions, DfsMetadataShardConfig, DfsNodeAdvertisement,
+    DfsObjectKind, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
+    DfsPeerTransportFuture, DfsStat, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
+    cluster_dfs_data_endpoints, content_services_prefix, default_dfs_metadata_root,
     default_dfs_metadata_shards_root, fallback_dfs_node_id, metadata_shards_prefix,
     open_local_sharded_metadata_backend, open_root_local_metadata_backend,
-    publish_cluster_dfs_metadata_journal, sifs_file_system_id,
+    publish_cluster_dfs_metadata_journal_with_peer_transport, sifs_file_system_id,
 };
 use sinomo_runtime::kv::{self, KvError, KvOp, KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;
@@ -21,12 +19,16 @@ use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::NodeId;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const SIFS_ENDPOINT_TARGET_REFRESH_TTL: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub(crate) struct SifsFileManagerBackend {
     data_dir: SinomoDataDir,
-    _rpc_runtime: SifsRpcRuntime,
+    rpc_runtime: SifsRpcRuntime,
     service: Mutex<NetworkedDfsService<DfsEndpointTransport>>,
+    endpoint_targets_refreshed_at: Mutex<Option<Instant>>,
     replica_candidates: Vec<NodeId>,
 }
 
@@ -63,8 +65,9 @@ impl SifsFileManagerBackend {
         let replica_candidates = sifs_replica_candidates(data_dir, service.node_id());
         Ok(Self {
             data_dir: data_dir.clone(),
-            _rpc_runtime: rpc_runtime,
+            rpc_runtime,
             service: Mutex::new(service),
+            endpoint_targets_refreshed_at: Mutex::new(Some(Instant::now())),
             replica_candidates,
         })
     }
@@ -81,18 +84,35 @@ impl SifsFileManagerBackend {
         &self,
         service: &mut NetworkedDfsService<DfsEndpointTransport>,
     ) {
-        let cluster_paths = ClusterPaths::new(&self.data_dir);
-        if !cluster_paths.state.exists() {
+        let now = Instant::now();
+        if let Ok(mut refreshed_at) = self.endpoint_targets_refreshed_at.lock() {
+            if refreshed_at
+                .as_ref()
+                .is_some_and(|last| now.duration_since(*last) < SIFS_ENDPOINT_TARGET_REFRESH_TTL)
+            {
+                return;
+            }
+            if self.refresh_service_endpoint_targets_now(service) {
+                *refreshed_at = Some(now);
+            }
             return;
         }
+        let _ = self.refresh_service_endpoint_targets_now(service);
+    }
+
+    fn refresh_service_endpoint_targets_now(
+        &self,
+        service: &mut NetworkedDfsService<DfsEndpointTransport>,
+    ) -> bool {
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        if !cluster_paths.state.exists() {
+            return false;
+        }
         let Ok(state) = network::read_cluster_state_without_kv(&cluster_paths) else {
-            return;
+            return false;
         };
-        service.refresh_endpoint_targets(network::cluster_endpoint_targets(
-            &cluster_paths,
-            &state,
-            network::ClusterEndpointSelectionPurpose::DfsData,
-        ));
+        service.refresh_endpoint_targets(cluster_dfs_data_endpoints(&cluster_paths, &state));
+        true
     }
 
     pub(crate) fn publish_metadata_after_mutation(&self) {
@@ -103,7 +123,7 @@ impl SifsFileManagerBackend {
             let _ = service.flush_detached_transport_sends();
             let _ = service.process_incoming();
         }
-        let _ = publish_sifs_metadata_journal_from_data_dir(&self.data_dir);
+        let _ = publish_sifs_metadata_journal_from_data_dir(&self.data_dir, &self.rpc_runtime);
     }
 
     /// The node id objects written here are placed on (the local SIFS node).
@@ -455,6 +475,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn stat(&self, path: &str) -> Result<FileManagerMetadata, String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
         let stat = service
             .posix_stat_distributed(&path)
             .map_err(|error| format!("cannot inspect {path}: {error}"))?;
@@ -467,22 +488,17 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn list_dir(&self, path: &str) -> Result<Vec<FileManagerEntry>, String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
         let entries = service
             .posix_list_dir_distributed(&path)
             .map_err(|error| format!("cannot list {path}: {error}"))?;
         let mut results = Vec::new();
         for entry in entries {
-            let stat = service.posix_stat_distributed(&entry.path).ok();
-            let kind = stat
-                .as_ref()
-                .map(|stat| sifs_entry_kind(&stat.kind))
-                .unwrap_or_else(|| sifs_entry_kind(&entry.kind));
-            let size = stat.and_then(|stat| stat.size_bytes);
             results.push(FileManagerEntry {
                 name: entry.name,
                 path: entry.path,
-                kind,
-                size,
+                kind: sifs_entry_kind(&entry.kind),
+                size: None,
             });
         }
         Ok(results)
@@ -491,6 +507,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn read_file_prefix(&self, path: &str, max_bytes: u64) -> Result<FileManagerRead, String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
         let stat = service
             .posix_stat_distributed(&path)
             .map_err(|error| format!("cannot inspect {path}: {error}"))?;
@@ -513,10 +530,15 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn directory_entry_count(&self, path: &str) -> Result<usize, String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
         service
             .posix_list_dir_distributed(&path)
             .map(|entries| entries.len())
             .map_err(|error| error.to_string())
+    }
+
+    fn eager_preview_enabled(&self) -> bool {
+        false
     }
 
     fn create_file(&self, path: &str) -> Result<(), String> {
@@ -677,11 +699,7 @@ fn open_sifs_service_with_hydration(
     let (local_node_id, endpoints) = if cluster_paths.state.exists() {
         let state = network::read_cluster_state_without_kv(&cluster_paths)
             .map_err(|error| format!("cannot read local cluster state: {error}"))?;
-        let endpoints = network::cluster_endpoint_targets(
-            &cluster_paths,
-            &state,
-            network::ClusterEndpointSelectionPurpose::DfsData,
-        );
+        let endpoints = cluster_dfs_data_endpoints(&cluster_paths, &state);
         (state.local_node_id, endpoints)
     } else {
         (fallback_dfs_node_id(), Vec::new())
@@ -692,14 +710,12 @@ fn open_sifs_service_with_hydration(
     let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
     let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer_transport;
     let mut service = NetworkedDfsService::new(
-        DfsEndpointTransport::new_with_peer_senders(
+        DfsEndpointTransport::with_peer_transports(
             local_node_id,
             endpoints,
-            sinomo_runtime::dfs::dfs_protocol_frame_sender_from_peer_transport(sync_peer_transport),
-            sinomo_runtime::dfs::async_dfs_protocol_frame_sender_from_peer_transport(
-                async_peer_transport,
-            ),
-            sifs_direct_read_sender(rpc_runtime.clone()),
+            sinomo_runtime::dfs::DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+            sync_peer_transport,
+            async_peer_transport,
         ),
         content,
     );
@@ -836,14 +852,10 @@ fn sifs_replica_candidates(data_dir: &SinomoDataDir, local_node_id: &NodeId) -> 
     let Ok(state) = network::read_cluster_state_without_kv(&cluster_paths) else {
         return candidates;
     };
-    let routable_node_ids = network::cluster_endpoint_targets(
-        &cluster_paths,
-        &state,
-        network::ClusterEndpointSelectionPurpose::DfsData,
-    )
-    .into_iter()
-    .map(|endpoint| endpoint.node_id)
-    .collect::<BTreeSet<_>>();
+    let routable_node_ids = cluster_dfs_data_endpoints(&cluster_paths, &state)
+        .into_iter()
+        .map(|endpoint| endpoint.node_id)
+        .collect::<BTreeSet<_>>();
     let graph = network::ClusterConnectivityGraph::read_for_local(&cluster_paths, &state);
     let Ok(entries) =
         kv::read_cluster_kv_prefix_entries(&cluster_paths.kv_paths(), content_services_prefix())
@@ -909,12 +921,6 @@ fn sifs_replica_candidate_rank(
     (3, u64::MAX, node_id.to_string())
 }
 
-fn sifs_direct_read_sender(rpc_runtime: SifsRpcRuntime) -> DfsDirectReadSender {
-    Arc::new(move |endpoint, request, timeout| {
-        sifs_send_dfs_direct_read(&rpc_runtime, endpoint, request, timeout)
-    })
-}
-
 #[derive(Clone, Debug)]
 struct SifsDfsPeerTransport {
     rpc_runtime: SifsRpcRuntime,
@@ -929,25 +935,25 @@ impl SifsDfsPeerTransport {
 impl DfsPeerTransport for SifsDfsPeerTransport {
     fn call_object_rpc(
         &self,
-        endpoint: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         request: &network::ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> Result<network::ObjectRpcResponse, DfsPeerTransportError> {
-        sifs_send_dfs_object_rpc(&self.rpc_runtime, endpoint, request, options)
+        sifs_send_dfs_object_rpc(&self.rpc_runtime, target_node_id, request, options)
     }
 }
 
 impl AsyncDfsPeerTransport for SifsDfsPeerTransport {
     fn call_object_rpc_async<'a>(
         &'a self,
-        endpoint: &'a ClusterEndpointRecord,
+        target_node_id: &'a NodeId,
         request: &'a network::ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> DfsPeerTransportFuture<'a, Result<network::ObjectRpcResponse, DfsPeerTransportError>> {
         let handle = self.rpc_runtime.runtime.handle().clone();
         Box::pin(async move {
-            sinomo_runtime::daemon::send_dfs_object_rpc_to_endpoint_async(
-                endpoint,
+            sinomo_runtime::daemon::send_dfs_object_rpc_to_target_async(
+                target_node_id,
                 request,
                 options.connect_timeout,
                 &handle,
@@ -961,7 +967,7 @@ impl AsyncDfsPeerTransport for SifsDfsPeerTransport {
 
 fn sifs_send_dfs_object_rpc(
     rpc_runtime: &SifsRpcRuntime,
-    endpoint: &ClusterEndpointRecord,
+    target_node_id: &NodeId,
     request: &network::ObjectRpcRequest,
     options: DfsObjectRpcSendOptions,
 ) -> Result<network::ObjectRpcResponse, DfsPeerTransportError> {
@@ -972,8 +978,8 @@ fn sifs_send_dfs_object_rpc(
         ) {
             return tokio::task::block_in_place(|| {
                 handle.block_on(async {
-                    sinomo_runtime::daemon::send_dfs_object_rpc_to_endpoint_async(
-                        endpoint,
+                    sinomo_runtime::daemon::send_dfs_object_rpc_to_target_async(
+                        target_node_id,
                         request,
                         options.connect_timeout,
                         &handle,
@@ -991,8 +997,8 @@ fn sifs_send_dfs_object_rpc(
     rpc_runtime
         .runtime
         .block_on(async {
-            sinomo_runtime::daemon::send_dfs_object_rpc_to_endpoint_async(
-                endpoint,
+            sinomo_runtime::daemon::send_dfs_object_rpc_to_target_async(
+                target_node_id,
                 request,
                 options.connect_timeout,
                 rpc_runtime.runtime.handle(),
@@ -1003,73 +1009,17 @@ fn sifs_send_dfs_object_rpc(
         .map_err(|error| DfsPeerTransportError::new(error.to_string()))
 }
 
-fn sifs_send_dfs_direct_read(
-    rpc_runtime: &SifsRpcRuntime,
-    endpoint: &ClusterEndpointRecord,
-    request: &DfsDirectReadRequest,
-    timeout: std::time::Duration,
-) -> Result<DfsReadResponse, DfsPeerTransportError> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        if matches!(
-            handle.runtime_flavor(),
-            tokio::runtime::RuntimeFlavor::MultiThread
-        ) {
-            return tokio::task::block_in_place(|| {
-                handle.block_on(async {
-                    sinomo_runtime::daemon::send_dfs_direct_read_to_endpoint_async(
-                        endpoint, request, timeout, &handle,
-                    )
-                    .await
-                    .map_err(|error| DfsPeerTransportError::new(error.to_string()))
-                })
-            });
-        }
-        return Err(DfsPeerTransportError::new(
-            "SIFS direct read sync sender cannot run inside a current-thread Tokio runtime",
-        ));
-    }
-    rpc_runtime
-        .runtime
-        .block_on(async {
-            sinomo_runtime::daemon::send_dfs_direct_read_to_endpoint_async(
-                endpoint,
-                request,
-                timeout,
-                rpc_runtime.runtime.handle(),
-            )
-            .await
-        })
-        .map_err(|error| DfsPeerTransportError::new(error.to_string()))
-}
-
 fn publish_sifs_metadata_journal_from_data_dir(
     data_dir: &SinomoDataDir,
+    rpc_runtime: &SifsRpcRuntime,
 ) -> Result<(), sinomo_runtime::dfs::DfsError> {
     let cluster_paths = ClusterPaths::new(data_dir);
-    let sender: DfsMetadataJournalBatchSender = Arc::new(|endpoint, command, timeout| {
-        let request = sinomo_runtime::dfs::dfs_metadata_journal_batch_rpc_request(command)
-            .map_err(|error| DfsMetadataPeerTransportError::new(error.to_string()))?;
-        let response =
-            sinomo_runtime::daemon::send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
-                .map_err(|error| DfsMetadataPeerTransportError::new(error.to_string()))?;
-        sinomo_runtime::dfs::decode_dfs_metadata_journal_batch_rpc_response(&response)
-            .map_err(|error| DfsMetadataPeerTransportError::new(error.to_string()))
-    });
-    let snapshot_sender: DfsMetadataSnapshotInstallSender =
-        Arc::new(|endpoint, command, timeout| {
-            let request = sinomo_runtime::dfs::dfs_metadata_snapshot_install_rpc_request(command)
-                .map_err(|error| DfsMetadataPeerTransportError::new(error.to_string()))?;
-            let response =
-                sinomo_runtime::daemon::send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
-                    .map_err(|error| DfsMetadataPeerTransportError::new(error.to_string()))?;
-            sinomo_runtime::dfs::decode_dfs_metadata_snapshot_install_rpc_response(&response)
-                .map_err(|error| DfsMetadataPeerTransportError::new(error.to_string()))
-        });
-    publish_cluster_dfs_metadata_journal(
+    let peer_transport: Arc<dyn DfsPeerTransport> =
+        Arc::new(SifsDfsPeerTransport::new(rpc_runtime.clone()));
+    publish_cluster_dfs_metadata_journal_with_peer_transport(
         data_dir,
         &cluster_paths,
-        sender,
-        snapshot_sender,
+        peer_transport,
         DfsMetadataJournalReplicationOptions::default(),
     )?;
     Ok(())
@@ -1343,8 +1293,10 @@ mod tests {
     ) -> network::ClusterConnectivityRecord {
         let now = time::OffsetDateTime::now_utc();
         network::ClusterConnectivityRecord {
-            cluster_id: network::ClusterId::from_legacy_named("cluster_sifs_replica_rank")
-                .expect("cluster"),
+            cluster_id: sinomo_runtime::node::ClusterId::from_legacy_named(
+                "cluster_sifs_replica_rank",
+            )
+            .expect("cluster"),
             source_node_id: source.clone(),
             target_node_id: target.clone(),
             endpoint_id: network::ClusterEndpointId::from_legacy_named(format!(

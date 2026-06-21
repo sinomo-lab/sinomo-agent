@@ -1102,6 +1102,7 @@ struct TuiState {
     input_cursor: usize,
     messages: Vec<TuiMessage>,
     stream_message: Option<usize>,
+    suppress_structured_model_stream: bool,
     chat_selection: Option<TuiChatSelection>,
     completions: Option<TuiCompletionState>,
     status: String,
@@ -1135,6 +1136,7 @@ impl TuiState {
             input_cursor: 0,
             messages: Vec::new(),
             stream_message: None,
+            suppress_structured_model_stream: false,
             chat_selection: None,
             completions: None,
             status: "listening".to_string(),
@@ -2401,6 +2403,7 @@ impl TuiState {
         decision: AgentLoopDecision,
         stop_reason: sinomo_agent::AgentStopReason,
     ) {
+        self.suppress_structured_model_stream = false;
         let text = decision.text.trim();
         if text.is_empty() {
             return;
@@ -2436,6 +2439,7 @@ impl TuiState {
                 self.runtime_activity.active = true;
                 self.status = "streaming".to_string();
                 self.stream_message = None;
+                self.suppress_structured_model_stream = false;
                 self.push_message(
                     TuiMessageKind::System,
                     format!("model started: {provider}/{model} step {step_index}"),
@@ -2450,6 +2454,13 @@ impl TuiState {
             }
             AgentModelEvent::AssistantTextDelta { delta, .. } => {
                 self.runtime_activity.active = true;
+                if self.suppress_structured_model_stream
+                    || starts_structured_agent_json_delta(&delta)
+                {
+                    self.suppress_structured_model_stream = true;
+                    self.status = "streaming".to_string();
+                    return;
+                }
                 self.append_streamed_message(TuiMessageKind::Agent, &delta, "streaming");
             }
             AgentModelEvent::AssistantReasoningSummary { summary, .. } => {
@@ -2480,14 +2491,17 @@ impl TuiState {
             AgentModelEvent::Finished { .. } => {
                 self.status = "working".to_string();
                 self.stream_message = None;
+                self.suppress_structured_model_stream = false;
             }
             AgentModelEvent::Error { detail, .. } => {
                 self.stream_message = None;
+                self.suppress_structured_model_stream = false;
                 self.status = "model failed".to_string();
                 self.push_message(TuiMessageKind::Error, format!("model failed: {detail}"));
             }
             AgentModelEvent::Aborted { reason } => {
                 self.stream_message = None;
+                self.suppress_structured_model_stream = false;
                 self.status = "interrupt requested".to_string();
                 self.push_message(TuiMessageKind::System, format!("model aborted: {reason}"));
             }
@@ -4630,7 +4644,14 @@ mod tui_tests {
             Ok(sinomo_lm::LanguageModelResponse {
                 provider: request.provider.clone(),
                 model: request.model.clone(),
-                content: self.content.clone(),
+                content: serde_json::json!({
+                    "response_mode": "answer",
+                    "text": self.content.as_str(),
+                    "tool_calls": [],
+                    "background_handoff": null,
+                    "next_state": "listening"
+                })
+                .to_string(),
                 items: Vec::new(),
                 tool_calls: Vec::new(),
                 usage: Some(sinomo_lm::LanguageModelUsage {
@@ -4769,6 +4790,53 @@ mod tui_tests {
     }
 
     #[test]
+    fn tui_state_suppresses_structured_agent_json_model_delta() {
+        let mut state = fixture_tui_state();
+
+        state.apply_runtime_event(runtime_event(AgentRuntimeEventPayload::ModelProgress {
+            sequence: 1,
+            op_id: sinomo_agent::TaskId::generate(),
+            event: AgentModelEvent::AssistantTextDelta {
+                step_index: 0,
+                delta: serde_json::json!({
+                    "response_mode": "answer",
+                    "text": "ready",
+                    "tool_calls": [],
+                    "background_handoff": null,
+                    "next_state": "listening"
+                })
+                .to_string(),
+            },
+        }));
+        assert!(
+            !state
+                .messages
+                .iter()
+                .any(|message| message.text.contains("response_mode"))
+        );
+
+        state.apply_runtime_event(runtime_event(AgentRuntimeEventPayload::TurnFinalDecision {
+            sequence: 2,
+            op_id: sinomo_agent::TaskId::generate(),
+            decision: AgentLoopDecision {
+                response_mode: sinomo_agent::AgentLoopResponseMode::Answer,
+                text: "ready".to_string(),
+                tool_calls: Vec::new(),
+                background_handoff: None,
+                next_state: sinomo_agent::AgentInteractionState::Listening,
+            },
+            stop_reason: sinomo_agent::AgentStopReason::FinalDecision,
+        }));
+
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|message| message.kind == TuiMessageKind::Agent && message.text == "ready")
+        );
+    }
+
+    #[test]
     fn runtime_tui_handler_queues_chat_turn_and_streams_terminal_decision() {
         let session = InteractionSession::new(
             SessionId::generate(),
@@ -4807,7 +4875,7 @@ mod tui_tests {
             AgentRuntimeEventPayload::ModelProgress {
                 event: AgentModelEvent::AssistantTextDelta { delta, .. },
                 ..
-            } if delta == "runtime hello"
+            } if delta.contains("runtime hello")
         )));
         assert!(batch.events.iter().any(|event| matches!(
             &event.payload,
@@ -5954,15 +6022,6 @@ impl<S: EventStore, H: InteractionEventHandler> InteractionRuntime<S, H> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct ModelBackedInteractionHandler<M> {
-    model: M,
-    provider: String,
-    model_name: String,
-}
-
-pub type CliInteractionHandler = ModelBackedInteractionHandler<CliConversationModel>;
-
 pub(crate) enum DefaultMainAgentChatModel {
     #[cfg(feature = "native-models")]
     RustMiniCpmV46(RustMiniCpmV46ChatModel),
@@ -6204,8 +6263,7 @@ where
                 offset: 0,
                 last_event_id: None,
             },
-            agent_definition: AgentDefinition::main()
-                .with_output_format(sinomo_agent::AgentOutputFormat::Text),
+            agent_definition: AgentDefinition::main(),
             tool_registry: sinomo_agent::AgentToolRegistry::new(),
             thinking,
             provider: provider.into(),
@@ -6356,7 +6414,7 @@ where
     }
 
     fn set_agent_definition(&mut self, definition: AgentDefinition) -> Result<(), CliError> {
-        let mut definition = definition.with_output_format(sinomo_agent::AgentOutputFormat::Text);
+        let mut definition = definition;
         if definition.id.is_empty() {
             definition.id = definition.name.clone();
         }
@@ -6813,122 +6871,6 @@ fn default_main_agent_chat_model_id() -> &'static str {
     }
 }
 
-impl<M> ModelBackedInteractionHandler<M> {
-    pub fn new(model: M, provider: impl Into<String>, model_name: impl Into<String>) -> Self {
-        Self {
-            model,
-            provider: provider.into(),
-            model_name: model_name.into(),
-        }
-    }
-}
-
-impl CliInteractionHandler {
-    pub fn from_default_model() -> Result<Self, CliError> {
-        let model = CliConversationModel::from_defaults()?;
-        Ok(Self::new(
-            model.clone(),
-            model.provider.clone(),
-            model.model.clone(),
-        ))
-    }
-}
-
-impl<M: InteractionModel> InteractionEventHandler for ModelBackedInteractionHandler<M> {
-    fn handle_event<S: EventStore>(
-        &mut self,
-        store: &mut S,
-        session: &InteractionSession,
-        event: &EventEnvelope,
-    ) -> Result<Vec<InteractionOutput>, CliError> {
-        let text = event
-            .payload
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-
-        let Some(args) = parse_slash_command(text)? else {
-            let message = interaction_event(
-                session,
-                "interaction.message.received",
-                serde_json::json!({
-                    "input_event_id": event.event_id,
-                    "text": text,
-                    "state": "received",
-                    "delivery": "event-stream"
-                }),
-            )
-            .caused_by(&event.event_id);
-            store.append(message.clone())?;
-            let request = interaction_model_request(
-                store,
-                session,
-                &message.event_id,
-                text,
-                &self.provider,
-                &self.model_name,
-            )?;
-            let requested = interaction_event(
-                session,
-                "interaction.model.requested",
-                serde_json::json!({
-                    "message_event_id": message.event_id,
-                    "provider": request.provider,
-                    "model": request.model,
-                    "message_count": request.messages.len()
-                }),
-            )
-            .caused_by(&message.event_id);
-            store.append(requested.clone())?;
-
-            match self.model.complete(&request) {
-                Ok(response) => {
-                    let response_event = interaction_event(
-                        session,
-                        "interaction.model.responded",
-                        serde_json::json!({
-                            "message_event_id": message.event_id,
-                            "request_event_id": requested.event_id,
-                            "provider": response.provider,
-                            "model": response.model,
-                            "text": response.content,
-                            "usage": response.usage
-                        }),
-                    )
-                    .caused_by(&requested.event_id);
-                    store.append(response_event.clone())?;
-                    return Ok(vec![InteractionOutput::Line(format!(
-                        "sinomo: {}",
-                        response_event
-                            .payload
-                            .get("text")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default()
-                    ))]);
-                }
-                Err(error) => {
-                    let failure = interaction_event(
-                        session,
-                        "interaction.model.failed",
-                        serde_json::json!({
-                            "message_event_id": message.event_id,
-                            "request_event_id": requested.event_id,
-                            "provider": request.provider,
-                            "model": request.model,
-                            "error": error.to_string()
-                        }),
-                    )
-                    .caused_by(&requested.event_id);
-                    store.append(failure)?;
-                    return Err(CliError::LanguageModel(error));
-                }
-            }
-        };
-
-        execute_slash_command(store, session, event, args)
-    }
-}
-
 #[cfg(feature = "native-models")]
 pub struct RustMiniCpmV46ChatModel {
     model_dir: PathBuf,
@@ -7134,11 +7076,11 @@ impl ChatPromptRequest {
             .metadata
             .get("loop")
             .and_then(serde_json::Value::as_str)
-            != Some("main-agent")
+            != Some("agent")
         {
             return None;
         }
-        main_agent_chat_prompt_request(request, thinking)
+        agent_chat_prompt_request(request, thinking)
     }
 }
 
@@ -7176,74 +7118,40 @@ pub(crate) fn minicpm_main_agent_prompt(
     Some(MiniCpmV46PromptRenderer.render(&request))
 }
 
-fn main_agent_chat_prompt_request(
+fn agent_chat_prompt_request(
     request: &LanguageModelRequest,
     thinking: ThinkingMode,
 ) -> Option<ChatPromptRequest> {
-    let user_content = request
-        .messages
-        .iter()
-        .rev()
-        .find(|message| matches!(message.role, sinomo_lm::LanguageModelRole::User))?
-        .content
-        .as_str();
-    let input: serde_json::Value = serde_json::from_str(user_content).ok()?;
-    let user_text = input
-        .pointer("/latest_event/payload/text")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    if user_text.trim().is_empty() {
-        return None;
-    }
     let system_prompt = request
         .messages
         .iter()
-        .find(|message| matches!(message.role, sinomo_lm::LanguageModelRole::System))
+        .filter(|message| matches!(message.role, sinomo_lm::LanguageModelRole::System))
         .map(|message| message.content.as_str())
-        .unwrap_or("You are Sinomo, the user-facing main agent.")
-        .lines()
-        .take_while(|line| !line.trim_start().starts_with("Return only JSON"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let system_prompt = if system_prompt.trim().is_empty() {
+        "You are Sinomo, the user-facing main agent.".to_string()
+    } else {
+        system_prompt
+    };
+    let user_prompt = request
+        .messages
+        .iter()
+        .filter(|message| !matches!(message.role, sinomo_lm::LanguageModelRole::System))
+        .map(|message| {
+            let role = match message.role {
+                sinomo_lm::LanguageModelRole::System => "system",
+                sinomo_lm::LanguageModelRole::User => "user",
+                sinomo_lm::LanguageModelRole::Assistant => "assistant",
+            };
+            format!("{role}:\n{}", message.content.trim())
+        })
         .collect::<Vec<_>>()
         .join("\n");
-    let node_id = input
-        .pointer("/session/node_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    let cluster_summary = input
-        .pointer("/context/events")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|events| {
-            events.iter().rev().find_map(|event| {
-                let kind = event
-                    .get("kind")
-                    .or_else(|| event.pointer("/event/kind"))
-                    .and_then(serde_json::Value::as_str);
-                if kind != Some("interaction.cluster.context") {
-                    return None;
-                }
-                let payload = event
-                    .get("payload")
-                    .or_else(|| event.pointer("/event/payload"))?;
-                let daemon = payload.get("daemon")?;
-                let address = daemon
-                    .get("address")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
-                let cluster_id = daemon
-                    .get("cluster")
-                    .and_then(|cluster| cluster.get("cluster_id"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
-                Some(format!("cluster {cluster_id} through daemon {address}"))
-            })
-        })
-        .unwrap_or_else(|| "cluster context unavailable".to_string());
-    let tools = input
-        .get("tool_specs")
-        .and_then(serde_json::Value::as_array)
-        .map(|tools| chat_prompt_tools_from_agent_specs(tools))
-        .unwrap_or_default();
-    let user_prompt = format!("Node: {node_id}\nCluster: {cluster_summary}\n\n{user_text}");
+    if user_prompt.trim().is_empty() {
+        return None;
+    }
+    let tools = chat_prompt_tools_from_language_model_specs(&request.tools);
     Some(ChatPromptRequest {
         system_prompt,
         user_prompt,
@@ -7253,25 +7161,23 @@ fn main_agent_chat_prompt_request(
     })
 }
 
-fn chat_prompt_tools_from_agent_specs(tools: &[serde_json::Value]) -> Vec<ChatPromptTool> {
+fn chat_prompt_tools_from_language_model_specs(
+    tools: &[sinomo_lm::LanguageModelToolSpec],
+) -> Vec<ChatPromptTool> {
     tools
         .iter()
         .take(10)
         .map(|tool| ChatPromptTool {
-            name: tool
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown_tool")
-                .to_string(),
-            description: tool
-                .get("description")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "additionalProperties": true
-            }),
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+            parameters: if tool.input_schema.is_null() {
+                serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": true
+                })
+            } else {
+                tool.input_schema.clone()
+            },
         })
         .collect()
 }
@@ -7331,6 +7237,14 @@ fn finalize_minicpm_response(request: &ChatPromptRequest, content: &str) -> Stri
         return json;
     }
     trimmed
+}
+
+pub(crate) fn starts_structured_agent_json_delta(delta: &str) -> bool {
+    let trimmed = delta.trim_start();
+    trimmed.starts_with('{')
+        && (trimmed.contains("\"response_mode\"")
+            || trimmed.contains("\"tool_calls\"")
+            || trimmed.contains("\"next_state\""))
 }
 
 pub(crate) fn trim_generated_chat_turn(content: &str) -> String {
@@ -7602,49 +7516,6 @@ fn daemon_context_event(
             "routing": "daemon-cluster-status"
         }),
     )
-}
-
-#[derive(Clone, Debug)]
-pub struct CliConversationModel {
-    provider: String,
-    account: String,
-    model: String,
-    model_config: sinomo_lm::ModelConfig,
-    data_dir: SinomoDataDir,
-}
-
-impl CliConversationModel {
-    pub fn from_defaults() -> Result<Self, CliError> {
-        let data_dir = SinomoDataDir::from_env_or_home()?;
-        data_dir.ensure_root_layout()?;
-        let (model_config, _) = load_model_config_for_node(&data_dir)?;
-        let resolved = resolve_default_model(Some(&model_config), None)?;
-        Ok(Self {
-            provider: resolved.provider,
-            account: resolved.account,
-            model: resolved.model,
-            model_config,
-            data_dir,
-        })
-    }
-}
-
-impl InteractionModel for CliConversationModel {
-    fn complete(
-        &self,
-        request: &LanguageModelRequest,
-    ) -> Result<LanguageModelResponse, LanguageModelError> {
-        let account =
-            provider_account_config(&self.model_config, &self.provider, Some(&self.account));
-        complete_configured_model_request_with_account(
-            &self.data_dir,
-            &self.provider,
-            &self.model,
-            account,
-            env::current_dir().ok(),
-            request,
-        )
-    }
 }
 
 fn handle_thinking_command<S: EventStore>(

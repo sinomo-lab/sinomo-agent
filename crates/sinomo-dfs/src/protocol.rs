@@ -6,7 +6,6 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::{DfsWriteReceipt, DfsWriteRequest};
-use sinomo_network::NetworkFrame;
 use sinomo_node::NodeId;
 
 fn is_zero_u32(value: &u32) -> bool {
@@ -708,18 +707,6 @@ pub struct DfsMetadataSnapshotInstallResponse {
     pub shard_id: DfsMetadataShardId,
     pub next_after_sequence: u64,
     pub result: DfsMetadataSnapshotInstallResult,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct DfsProtocolFrameCommand {
-    pub request_id: String,
-    pub frame: NetworkFrame,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct DfsProtocolFrameResponse {
-    pub request_id: String,
-    pub outbound_frames: Vec<NetworkFrame>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

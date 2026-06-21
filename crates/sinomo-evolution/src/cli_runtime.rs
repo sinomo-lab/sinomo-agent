@@ -804,11 +804,10 @@ fn commit_registry_trust_cluster_txn(data_dir: &SinomoDataDir, txn: KvTxn) -> Re
     })?;
     paths
         .kv_paths()
-        .raft_store()
-        .append_command_with_response_and_publish(
+        .append_kv_command_with_response_and_publish(
             &state.local_node_id,
             sinomo_runtime::kv::KvCommand::Txn(txn),
-            network::cluster_kv_key_can_defer_materialized_snapshot,
+            sinomo_runtime::kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
         .map_err(network::NetworkError::from)?;
     Ok(())

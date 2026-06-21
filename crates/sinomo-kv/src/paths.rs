@@ -138,4 +138,324 @@ impl ClusterKvPaths {
     pub fn raft_store(&self) -> ClusterKvRaftStore {
         ClusterKvRaftStore::new(self.clone(), default_cluster_kv_raft_compaction_policy())
     }
+
+    pub fn append_kv_command_and_publish<F>(
+        &self,
+        node_id: &NodeId,
+        command: KvCommand,
+        key_can_defer_materialized_snapshot: F,
+    ) -> Result<KvSnapshot, KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.raft_store().append_command_and_publish(
+            node_id,
+            command,
+            key_can_defer_materialized_snapshot,
+        )
+    }
+
+    pub fn append_kv_command_with_response_and_publish<F>(
+        &self,
+        node_id: &NodeId,
+        command: KvCommand,
+        key_can_defer_materialized_snapshot: F,
+    ) -> Result<(KvSnapshot, Option<KvTxnResponse>), KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.raft_store()
+            .append_command_with_response_and_publish(
+                node_id,
+                command,
+                key_can_defer_materialized_snapshot,
+            )
+            .map(|result| (result.snapshot, result.txn_response))
+    }
+
+    pub fn append_kv_command_with_response_and_publish_report<F>(
+        &self,
+        node_id: &NodeId,
+        command: KvCommand,
+        key_can_defer_materialized_snapshot: F,
+    ) -> Result<(KvSnapshot, Option<KvTxnResponse>, bool), KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.raft_store()
+            .append_command_with_response_and_publish_report(
+                node_id,
+                command,
+                key_can_defer_materialized_snapshot,
+            )
+            .map(|(result, wrote)| (result.snapshot, result.txn_response, wrote))
+    }
+
+    pub fn current_snapshot_revision_for_node(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<KvRevision, KvError> {
+        read_cluster_kv_current_snapshot_for_node(self, node_id.clone())
+            .map(|snapshot| snapshot.revision)
+    }
+
+    pub fn imported_snapshot_advances_current_for_node(
+        &self,
+        node_id: &NodeId,
+        snapshot: &KvSnapshot,
+    ) -> bool {
+        match self.current_snapshot_revision_for_node(node_id) {
+            Ok(local_revision) => snapshot.revision > local_revision,
+            Err(_) => true,
+        }
+    }
+
+    pub fn apply_raft_append_with_response_and_publish_report<F>(
+        &self,
+        node_id: &NodeId,
+        snapshot: Option<RaftSnapshot>,
+        append: RaftAppendEntriesRequest,
+        key_can_defer_materialized_snapshot: F,
+    ) -> Result<(RaftAppendEntriesResponse, bool), KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.raft_store()
+            .apply_append_entries_with_optional_snapshot_and_publish(
+                node_id,
+                snapshot,
+                append,
+                key_can_defer_materialized_snapshot,
+            )
+            .map(|(outcome, wrote)| (outcome.response, wrote))
+    }
+
+    pub fn apply_raft_vote_response(
+        &self,
+        state: &ClusterBootstrapState,
+        vote: RaftRequestVoteRequest,
+    ) -> Result<ClusterRaftVoteResponse, KvError> {
+        self.raft_store().apply_vote_response(state, vote)
+    }
+
+    pub fn locked_apply_raft_vote(
+        &self,
+        node_id: &NodeId,
+        vote: RaftRequestVoteRequest,
+    ) -> Result<RaftRequestVoteResponse, KvError> {
+        self.raft_store().locked_apply_vote(node_id, vote)
+    }
+
+    pub fn raft_append_rejection_response(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<RaftAppendEntriesResponse, KvError> {
+        self.raft_store().append_entries_rejection_response(node_id)
+    }
+
+    pub fn raft_vote_rejection_response(
+        &self,
+        state: &ClusterBootstrapState,
+        detail: String,
+    ) -> Result<ClusterRaftVoteResponse, KvError> {
+        self.raft_store()
+            .cluster_raft_vote_rejection_response(state, detail)
+    }
+
+    pub fn known_raft_voter_leader_id(
+        &self,
+        state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, KvError> {
+        self.raft_store().known_voter_leader_id(state)
+    }
+
+    pub fn locked_known_raft_voter_leader_id(
+        &self,
+        state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, KvError> {
+        self.raft_store().locked_known_voter_leader_id(state)
+    }
+
+    pub fn locked_raft_local_is_leader(
+        &self,
+        state: &ClusterBootstrapState,
+    ) -> Result<bool, KvError> {
+        self.raft_store().locked_local_is_leader(state)
+    }
+
+    pub fn set_raft_leader_and_write_snapshot_if_changed(
+        &self,
+        node_id: &NodeId,
+        term: u64,
+    ) -> Result<KvSnapshot, KvError> {
+        self.raft_store()
+            .set_leader_and_write_snapshot_if_changed(node_id, term)
+    }
+
+    pub fn locked_set_raft_leader_and_write_snapshot_if_changed(
+        &self,
+        node_id: &NodeId,
+        term: u64,
+    ) -> Result<KvSnapshot, KvError> {
+        self.raft_store()
+            .locked_set_leader_and_write_snapshot_if_changed(node_id, term)
+    }
+
+    pub fn clear_raft_leader_and_write_snapshot_if_changed(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<KvSnapshot, KvError> {
+        self.raft_store()
+            .clear_leader_and_write_snapshot_if_changed(node_id)
+    }
+
+    pub fn locked_discard_raft_uncommitted_tail(&self, node_id: &NodeId) -> Result<bool, KvError> {
+        let _raft_guard = lock_cluster_kv_raft_operation_for_paths(self)?;
+        self.raft_store().discard_uncommitted_tail(node_id)
+    }
+
+    pub fn locked_observe_raft_term_and_write_snapshot_if_changed(
+        &self,
+        node_id: &NodeId,
+        term: u64,
+    ) -> Result<bool, KvError> {
+        self.raft_store()
+            .locked_observe_term_and_write_snapshot_if_changed(node_id, term)
+    }
+
+    pub fn locked_local_raft_vote_metadata(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<ClusterKvRaftLocalVoteMetadata, KvError> {
+        self.raft_store().locked_local_vote_metadata(node_id)
+    }
+
+    pub fn locked_last_raft_log_index(&self, node_id: &NodeId) -> Result<u64, KvError> {
+        self.raft_store().locked_last_log_index(node_id)
+    }
+
+    pub fn open_raft_node(&self, node_id: &NodeId) -> Result<DurableRaftKvNode, KvError> {
+        self.raft_store().open_node(node_id)
+    }
+
+    pub fn append_raft_command_uncommitted(
+        &self,
+        node_id: &NodeId,
+        command: KvCommand,
+    ) -> Result<KvLogEntry, KvError> {
+        self.raft_store()
+            .append_command_uncommitted(node_id, command)
+    }
+
+    pub fn local_raft_command_storage<F>(
+        &self,
+        node_id: NodeId,
+        key_can_defer_materialized_snapshot: F,
+    ) -> ClusterKvRaftLocalCommandStorage<F>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        ClusterKvRaftLocalCommandStorage::new(
+            self.raft_store(),
+            node_id,
+            key_can_defer_materialized_snapshot,
+        )
+    }
+
+    pub async fn open_raft_node_async(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<DurableRaftKvNode, KvError> {
+        self.raft_store().open_node_async(node_id).await
+    }
+
+    pub fn restore_raft_from_snapshot_if_newer_and_notify(
+        &self,
+        node_id: &NodeId,
+        snapshot: KvSnapshot,
+    ) -> Result<bool, KvError> {
+        self.raft_store()
+            .restore_from_snapshot_if_newer_and_notify(node_id, snapshot)
+    }
+
+    pub fn locked_restore_raft_from_snapshot_if_newer_and_notify(
+        &self,
+        node_id: &NodeId,
+        snapshot: KvSnapshot,
+    ) -> Result<bool, KvError> {
+        self.raft_store()
+            .locked_restore_from_snapshot_if_newer_and_notify(node_id, snapshot)
+    }
+
+    pub async fn locked_last_raft_log_index_async(&self, node_id: &NodeId) -> Result<u64, KvError> {
+        self.raft_store().locked_last_log_index_async(node_id).await
+    }
+
+    pub fn build_raft_append_request_from_next_index(
+        &self,
+        state: &ClusterBootstrapState,
+        next_index: u64,
+    ) -> Result<ClusterRaftAppendRequest, KvError> {
+        self.raft_store()
+            .build_cluster_raft_append_request_from_next_index(state, next_index)
+    }
+
+    pub fn locked_build_raft_append_request_from_next_index(
+        &self,
+        state: &ClusterBootstrapState,
+        next_index: u64,
+    ) -> Result<ClusterRaftAppendRequest, KvError> {
+        self.raft_store()
+            .locked_build_cluster_raft_append_request_from_next_index(state, next_index)
+    }
+
+    pub async fn locked_build_raft_append_request_from_next_index_async(
+        &self,
+        state: &ClusterBootstrapState,
+        next_index: u64,
+    ) -> Result<ClusterRaftAppendRequest, KvError> {
+        self.raft_store()
+            .locked_build_cluster_raft_append_request_from_next_index_async(state, next_index)
+            .await
+    }
+
+    pub fn append_kv_ops_in_batches_and_publish<F>(
+        &self,
+        node_id: &NodeId,
+        ops: Vec<KvOp>,
+        mut key_can_defer_materialized_snapshot: F,
+    ) -> Result<(KvSnapshot, bool), KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let mut ops = ops.into_iter();
+        let mut latest = None;
+        let mut wrote_any = false;
+        loop {
+            let chunk = ops
+                .by_ref()
+                .take(MAX_KV_MUTATION_EVENTS_PER_COMMAND)
+                .collect::<Vec<_>>();
+            if chunk.is_empty() {
+                break;
+            }
+            let (snapshot, _, wrote) = self.append_kv_command_with_response_and_publish_report(
+                node_id,
+                KvCommand::Txn(KvTxn {
+                    compares: Vec::new(),
+                    success: chunk,
+                    failure: Vec::new(),
+                }),
+                &mut key_can_defer_materialized_snapshot,
+            )?;
+            wrote_any |= wrote;
+            latest = Some(snapshot);
+        }
+        latest
+            .map(|snapshot| (snapshot, wrote_any))
+            .ok_or_else(|| KvError::Io {
+                path: self.snapshot.display().to_string(),
+                detail: "cannot append an empty batch of cluster kv operations".to_string(),
+            })
+    }
 }

@@ -40,6 +40,7 @@ use crate::tui::{
 type Handler = RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>;
 const APP_CHAT_RUNTIME_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 const APP_CHAT_RUNTIME_START_TIMEOUT: Duration = Duration::from_secs(5);
+const STRUCTURED_AGENT_JSON_STREAM: &str = "__sinomo_structured_agent_json_stream__";
 
 /// The active agent / model selection, as plain strings.
 #[derive(Clone, Debug, Default)]
@@ -600,7 +601,9 @@ fn runtime_event_to_chat(
         AgentRuntimeEventPayload::TurnFinalDecision { decision, .. } => {
             let text = decision.text.trim();
             if !text.is_empty() {
-                if streamed_text.trim().is_empty() {
+                if streamed_text == STRUCTURED_AGENT_JSON_STREAM || streamed_text.trim().is_empty()
+                {
+                    streamed_text.clear();
                     streamed_text.push_str(text);
                     on_event(ChatStreamEvent::Token(text.to_string()));
                 } else if text.starts_with(streamed_text.as_str()) {
@@ -609,6 +612,10 @@ fn runtime_event_to_chat(
                         streamed_text.push_str(suffix);
                         on_event(ChatStreamEvent::Token(suffix.to_string()));
                     }
+                } else if streamed_text.as_str() != text {
+                    streamed_text.clear();
+                    streamed_text.push_str(text);
+                    on_event(ChatStreamEvent::Token(text.to_string()));
                 }
             }
             RuntimeDrainState::Running
@@ -640,6 +647,13 @@ fn forward_model_event(
             on_event(ChatStreamEvent::Context(chat_context_snapshot(report)));
         }
         AgentModelEvent::AssistantTextDelta { delta, .. } => {
+            if streamed_text == STRUCTURED_AGENT_JSON_STREAM
+                || tui::starts_structured_agent_json_delta(&delta)
+            {
+                streamed_text.clear();
+                streamed_text.push_str(STRUCTURED_AGENT_JSON_STREAM);
+                return;
+            }
             for event in split_chunk(&delta) {
                 if let ChatStreamEvent::Token(token) = &event {
                     streamed_text.push_str(token);
@@ -1332,6 +1346,49 @@ mod tests {
         assert!(matches!(final_state, RuntimeDrainState::Running));
         assert_eq!(events, vec!["token:hello", "token: world"]);
         assert_eq!(streamed_text, "hello world");
+    }
+
+    #[test]
+    fn chat_mapper_suppresses_structured_agent_json_delta() {
+        let mut streamed_text = String::new();
+        let mut events = Vec::new();
+        let mut on_event = |event| events.push(chat_event_label(event));
+        let op_id = TaskId::generate();
+
+        let first = runtime_event_to_chat(
+            runtime_event(AgentRuntimeEventPayload::ModelProgress {
+                sequence: 1,
+                op_id: op_id.clone(),
+                event: AgentModelEvent::AssistantTextDelta {
+                    step_index: 0,
+                    delta: serde_json::json!({
+                        "response_mode": "answer",
+                        "text": "ready",
+                        "tool_calls": [],
+                        "background_handoff": null,
+                        "next_state": "listening"
+                    })
+                    .to_string(),
+                },
+            }),
+            &mut streamed_text,
+            &mut on_event,
+        );
+        let final_state = runtime_event_to_chat(
+            runtime_event(AgentRuntimeEventPayload::TurnFinalDecision {
+                sequence: 2,
+                op_id,
+                decision: final_decision("ready"),
+                stop_reason: AgentStopReason::FinalDecision,
+            }),
+            &mut streamed_text,
+            &mut on_event,
+        );
+
+        assert!(matches!(first, RuntimeDrainState::Running));
+        assert!(matches!(final_state, RuntimeDrainState::Running));
+        assert_eq!(events, vec!["token:ready"]);
+        assert_eq!(streamed_text, "ready");
     }
 
     #[test]

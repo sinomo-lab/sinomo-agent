@@ -5709,20 +5709,7 @@ impl LocalSobjMetadataBackend {
                 )?;
                 let normalized = normalized_namespace_transaction(transaction);
                 if self.tables.namespace_transactions.get(transaction_id) == Some(&normalized) {
-                    let mut objects_materialized = true;
-                    for object in &normalized.objects {
-                        if !self.object_is_materialized_or_compacted(object)? {
-                            objects_materialized = false;
-                            break;
-                        }
-                    }
-                    let versions_materialized = normalized.versions.iter().all(|version| {
-                        self.get_version(&version.object_id, &version.version)
-                            .is_ok_and(|stored| stored == Some(normalized_version_record(version)))
-                    });
-                    if objects_materialized && versions_materialized {
-                        return Ok(false);
-                    }
+                    return Ok(false);
                 }
                 self.materialize_local_journal_entry(entry)?;
                 Ok(true)
@@ -5970,20 +5957,7 @@ impl LocalSobjMetadataBackend {
                 )?;
                 let normalized = normalized_namespace_transaction(transaction);
                 if self.tables.namespace_transactions.get(transaction_id) == Some(&normalized) {
-                    let mut objects_materialized = true;
-                    for object in &normalized.objects {
-                        if !self.object_is_materialized_or_compacted(object)? {
-                            objects_materialized = false;
-                            break;
-                        }
-                    }
-                    let versions_materialized = normalized.versions.iter().all(|version| {
-                        self.get_version(&version.object_id, &version.version)
-                            .is_ok_and(|stored| stored == Some(normalized_version_record(version)))
-                    });
-                    if objects_materialized && versions_materialized {
-                        return Ok(false);
-                    }
+                    return Ok(false);
                 }
                 self.plan_namespace_transaction_table_ops(&normalized, table_ops, rollback)?;
                 Ok(true)
@@ -6158,7 +6132,7 @@ impl LocalSobjMetadataBackend {
     ) -> Result<DfsMetadataJournalEntry> {
         let sequence = self
             .next_sequence
-            .max(fast_next_journal_sequence(&self.root)?);
+            .max(current_next_journal_sequence(&self.root)?);
         let entry = DfsMetadataJournalEntry {
             shard_id: self.shard_id.clone(),
             sequence,
@@ -6181,7 +6155,7 @@ impl LocalSobjMetadataBackend {
         let sequence_started = Instant::now();
         let mut next_sequence = self
             .next_sequence
-            .max(fast_next_journal_sequence(&self.root)?);
+            .max(current_next_journal_sequence(&self.root)?);
         let sequence_ms = sequence_started.elapsed().as_millis();
         let build_started = Instant::now();
         let mut entries = Vec::with_capacity(mutations.len());
@@ -8579,14 +8553,7 @@ impl LocalSobjMetadataBackend {
             .cloned()
             .collect::<Vec<_>>()
         {
-            if self.materialize_namespace_transaction_for_recovery(&transaction)? {
-                self.write_journal_unlocked(DfsMetadataMutation::ApplyNamespaceTransaction {
-                    file_system_id: transaction.file_system_id.clone(),
-                    transaction_id: transaction.transaction_id.clone(),
-                    object_count: transaction.objects.len(),
-                    transaction: Some(transaction.clone()),
-                })?;
-            }
+            self.materialize_namespace_transaction_for_recovery(&transaction)?;
         }
         Ok(())
     }
@@ -8657,20 +8624,33 @@ impl LocalSobjMetadataBackend {
         transaction: &DfsNamespaceTransaction,
     ) -> Result<bool> {
         let sequence = self.next_sequence.saturating_sub(1);
+        let transaction_object_ids = transaction
+            .objects
+            .iter()
+            .map(|object| object.object_id.clone())
+            .collect::<BTreeSet<_>>();
         let mut changed = false;
         for object in transaction
             .objects
             .iter()
             .filter(|object| object.kind == DfsObjectKind::Tombstone)
         {
-            changed |= self.materialize_object_indexes_if_current(object, sequence)?;
+            changed |= self.materialize_object_indexes_if_current(
+                object,
+                sequence,
+                &transaction_object_ids,
+            )?;
         }
         for object in transaction
             .objects
             .iter()
             .filter(|object| object.kind != DfsObjectKind::Tombstone)
         {
-            changed |= self.materialize_object_indexes_if_current(object, sequence)?;
+            changed |= self.materialize_object_indexes_if_current(
+                object,
+                sequence,
+                &transaction_object_ids,
+            )?;
         }
         for version in &transaction.versions {
             let version = normalized_version_record(version);
@@ -8689,22 +8669,52 @@ impl LocalSobjMetadataBackend {
         &mut self,
         object: &DfsObjectMetadata,
         sequence: u64,
+        transaction_object_ids: &BTreeSet<DfsObjectId>,
     ) -> Result<bool> {
         if self.tables.compacted_tombstone_matches(object) {
             return Ok(false);
         }
         if let Some(current) = self.get_object(&object.object_id)? {
+            if self.object_path_has_external_owner(&current, transaction_object_ids) {
+                return Ok(false);
+            }
             if self.object_indexes_are_materialized(&current)? {
                 return Ok(false);
             }
             self.materialize_object_indexes(&current, sequence)?;
             return Ok(true);
         }
+        if self.object_path_has_external_owner(object, transaction_object_ids) {
+            return Ok(false);
+        }
         if self.object_indexes_are_materialized(object)? {
             return Ok(false);
         }
         self.materialize_object_indexes(object, sequence)?;
         Ok(true)
+    }
+
+    fn object_path_has_external_owner(
+        &self,
+        object: &DfsObjectMetadata,
+        transaction_object_ids: &BTreeSet<DfsObjectId>,
+    ) -> bool {
+        let path_record = path_record_for_object(object);
+        let owns_path = |object_id: &DfsObjectId| {
+            object_id == &object.object_id || transaction_object_ids.contains(object_id)
+        };
+        if self
+            .tables
+            .paths
+            .get(&(object.file_system_id.clone(), path_record.path.clone()))
+            .is_some_and(|record| !owns_path(&record.object_id))
+        {
+            return true;
+        }
+        self.tables
+            .dentries
+            .get(&dentry_key(&path_record))
+            .is_some_and(|record| !owns_path(&record.object_id))
     }
 
     fn object_indexes_are_materialized(&self, object: &DfsObjectMetadata) -> Result<bool> {
@@ -8750,14 +8760,6 @@ impl LocalSobjMetadataBackend {
                     && record.file_system_id == object.file_system_id
                     && record.path == path_record.path
             }))
-    }
-
-    fn object_is_materialized_or_compacted(&self, object: &DfsObjectMetadata) -> Result<bool> {
-        if self.tables.compacted_tombstone_matches(object) {
-            return Ok(true);
-        }
-        self.get_object(&object.object_id)
-            .map(|stored| stored == Some(normalized_object_metadata(object)))
     }
 
     fn tombstone_has_live_references(&self, object_id: &DfsObjectId) -> bool {
@@ -10540,18 +10542,24 @@ fn load_legacy_metadata_tables(root: &Path) -> Result<DfsMetadataTables> {
     Ok(tables)
 }
 
-fn fast_next_journal_sequence(root: &Path) -> Result<u64> {
+fn current_next_journal_sequence(root: &Path) -> Result<u64> {
     let journal_dir = root.join("journal");
     if !journal_dir.exists() {
         return Ok(1);
     }
-    if let Some(head) =
+    let head_next_sequence =
         read_sobj_optional::<DfsMetadataJournalHead>(&journal_dir.join("head.sobj"))?
-        && head.next_sequence > 0
-    {
-        return Ok(head.next_sequence);
+            .and_then(|head| (head.next_sequence > 0).then_some(head.next_sequence));
+    let mut max_sequence = head_next_sequence
+        .map(|next_sequence| next_sequence.saturating_sub(1))
+        .unwrap_or(0);
+
+    max_sequence = max_sequence.max(max_segmented_journal_sequence(root)?);
+    for (sequence, _, _) in legacy_journal_entry_paths_since(root, 0)? {
+        max_sequence = max_sequence.max(sequence);
     }
-    recover_next_journal_sequence(root)
+
+    Ok(max_sequence.saturating_add(1).max(1))
 }
 
 fn recover_next_journal_sequence(root: &Path) -> Result<u64> {

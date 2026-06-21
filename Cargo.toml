@@ -47,6 +47,7 @@ default-members = [
     "crates/sinomo-rollout",
     "crates/sinomo-runtime",
     "crates/sinomo-sandbox",
+    "crates/sinomo-sandbox-simple",
     "crates/sinomo-sandbox-wasix-api",
     "crates/sinomo-sandbox-wasix-host",
     "crates/sinomo-service",

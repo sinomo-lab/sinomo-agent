@@ -171,8 +171,7 @@ fn append_cluster_kv_command(
 ) -> Result<KvSnapshot, NetworkError> {
     paths
         .kv_paths()
-        .raft_store()
-        .append_command_and_publish(node_id, command, |_| false)
+        .append_kv_command_and_publish(node_id, command, |_| false)
         .map_err(Into::into)
 }
 
@@ -204,7 +203,7 @@ mod tests {
             now,
         );
         sinomo_network::write_cluster_state(&paths, &state).expect("write state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+        sinomo_network::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync state");
 
         let desired = ClusterRolloutDesiredRecord {

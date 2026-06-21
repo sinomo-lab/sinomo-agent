@@ -11,7 +11,7 @@ use crate::{DfsFileSystem, DfsSubtreePolicy, sifs_file_system_id};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_core::DfsObjectPolicy;
 use sinomo_kv::{
-    InProcessRaftKvCluster, KvCompare, KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse,
+    InProcessKvStore, KvCompare, KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse,
 };
 use sinomo_node::NodeId;
 use std::future::Future;
@@ -178,35 +178,25 @@ where
     }
 }
 
-impl DfsControlPlaneKvClient for InProcessRaftKvCluster {
+impl DfsControlPlaneKvClient for InProcessKvStore {
     fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
-        let leader = self
-            .store(self.leader_id())
-            .ok_or_else(|| KvError::UnknownNode {
-                node_id: self.leader_id().clone(),
-            })?;
-        Ok(leader.get(key).cloned())
+        Ok(self.get(key).cloned())
     }
 
     fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
-        let leader = self
-            .store(self.leader_id())
-            .ok_or_else(|| KvError::UnknownNode {
-                node_id: self.leader_id().clone(),
-            })?;
-        Ok(leader.range_prefix(prefix))
+        Ok(self.range_prefix(prefix))
     }
 
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
-        InProcessRaftKvCluster::put(self, key, value)
+        InProcessKvStore::put(self, key, value, None)
     }
 
     fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
-        InProcessRaftKvCluster::txn_response(self, txn)
+        InProcessKvStore::txn(self, txn)
     }
 }
 
-impl AsyncDfsControlPlaneKvClient for InProcessRaftKvCluster {
+impl AsyncDfsControlPlaneKvClient for InProcessKvStore {
     fn get_async<'a>(&'a self, key: &'a str) -> DfsControlPlaneKvFuture<'a, Option<KvEntry>> {
         Box::pin(async move { DfsControlPlaneKvClient::get(self, key) })
     }
@@ -223,11 +213,11 @@ impl AsyncDfsControlPlaneKvClient for InProcessRaftKvCluster {
         key: String,
         value: Vec<u8>,
     ) -> DfsControlPlaneKvFuture<'a, KvRevision> {
-        Box::pin(async move { InProcessRaftKvCluster::put(self, key, value) })
+        Box::pin(async move { InProcessKvStore::put(self, key, value, None) })
     }
 
     fn txn_async<'a>(&'a mut self, txn: KvTxn) -> DfsControlPlaneKvFuture<'a, KvTxnResponse> {
-        Box::pin(async move { InProcessRaftKvCluster::txn_response(self, txn) })
+        Box::pin(async move { InProcessKvStore::txn(self, txn) })
     }
 }
 
@@ -692,12 +682,7 @@ mod tests {
     fn store_puts_and_gets_only_control_plane_records() {
         let node_owner = node("node_owner");
         let node_replica = node("node_replica");
-        let mut kv = InProcessRaftKvCluster::new(vec![
-            node_owner.clone(),
-            node_replica.clone(),
-            node("node_witness"),
-        ])
-        .expect("kv cluster");
+        let mut kv = InProcessKvStore::new();
         let file_system = DfsFileSystem {
             file_system_id: file_system_id(),
             display_name: "repo".to_string(),
@@ -744,12 +729,7 @@ mod tests {
     fn metadata_shard_primary_transfer_uses_epoch_compare() {
         let node_owner = node("node_owner");
         let node_replica = node("node_replica");
-        let mut kv = InProcessRaftKvCluster::new(vec![
-            node_owner.clone(),
-            node_replica.clone(),
-            node("node_witness"),
-        ])
-        .expect("kv cluster");
+        let mut kv = InProcessKvStore::new();
         let file_system_id = file_system_id();
         let shard = DfsMetadataShardConfig {
             file_system_id: file_system_id.clone(),
@@ -781,8 +761,7 @@ mod tests {
     fn metadata_shard_selection_prefers_longest_path_prefix() {
         let node_owner = node("node_shard_select_owner");
         let node_replica = node("node_shard_select_replica");
-        let mut kv = InProcessRaftKvCluster::new(vec![node_owner.clone(), node_replica.clone()])
-            .expect("kv cluster");
+        let mut kv = InProcessKvStore::new();
         let file_system_id = file_system_id();
         let mut control = DfsControlPlaneStore::new(&mut kv);
         for shard in [
@@ -849,12 +828,7 @@ mod tests {
         let node_root = node("node_shard_partial_root");
         let node_services = node("node_shard_partial_services");
         let node_users = node("node_shard_partial_users");
-        let mut kv = InProcessRaftKvCluster::new(vec![
-            node_root.clone(),
-            node_services.clone(),
-            node_users.clone(),
-        ])
-        .expect("kv cluster");
+        let mut kv = InProcessKvStore::new();
         let file_system_id = sifs_file_system_id();
         let mut control = DfsControlPlaneStore::new(&mut kv);
         let root_shard = DfsMetadataShardConfig {
@@ -943,8 +917,7 @@ mod tests {
     fn metadata_shard_selection_uses_hash_range_before_root() {
         let node_owner = node("node_shard_hash_owner");
         let node_replica = node("node_shard_hash_replica");
-        let mut kv = InProcessRaftKvCluster::new(vec![node_owner.clone(), node_replica.clone()])
-            .expect("kv cluster");
+        let mut kv = InProcessKvStore::new();
         let file_system_id = file_system_id();
         let selected_path = "/users/alice/project";
         let hash = metadata_name_hash(selected_path);
@@ -992,7 +965,7 @@ mod tests {
     #[test]
     fn metadata_shard_selection_prefers_narrower_hash_range() {
         let node_owner = node("node_shard_hash_width_owner");
-        let mut kv = InProcessRaftKvCluster::new(vec![node_owner.clone()]).expect("kv cluster");
+        let mut kv = InProcessKvStore::new();
         let file_system_id = file_system_id();
         let selected_path = "/users/bob/project";
         let hash = metadata_name_hash(selected_path);
@@ -1038,7 +1011,7 @@ mod tests {
     #[test]
     fn metadata_shard_selection_rejects_nul_paths() {
         let node_owner = node("node_shard_invalid_owner");
-        let mut kv = InProcessRaftKvCluster::new(vec![node_owner.clone()]).expect("kv cluster");
+        let mut kv = InProcessKvStore::new();
         let file_system_id = file_system_id();
         let shard = DfsMetadataShardConfig {
             file_system_id: file_system_id.clone(),

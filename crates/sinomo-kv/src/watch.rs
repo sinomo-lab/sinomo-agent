@@ -13,6 +13,7 @@ pub use event_log::{
     read_cluster_kv_watch_events_with_observer, write_cluster_kv_watch_event_checkpoint,
 };
 #[cfg(test)]
+#[allow(unused_imports)]
 pub(crate) use event_log::{
     append_cluster_kv_watch_event_log_batch_to_file, decode_cluster_kv_watch_event_log_record,
     encode_cluster_kv_watch_event_log_batch, lock_cluster_kv_watch_event_log_for_append,
@@ -190,6 +191,12 @@ pub fn cluster_kv_events_can_defer_materialized_snapshot(
     mut key_can_defer: impl FnMut(&str) -> bool,
 ) -> bool {
     !events.is_empty() && events.iter().all(|event| key_can_defer(&event.key))
+}
+
+pub fn cluster_kv_key_can_defer_materialized_snapshot(key: &str) -> bool {
+    key.starts_with("/cluster/network/connectivity/")
+        || key.starts_with("/cluster/network/info/")
+        || key.starts_with("/cluster/node-status/")
 }
 
 pub fn cluster_kv_snapshot_delta_only_deferable(
@@ -890,8 +897,15 @@ pub fn cancel_cluster_kv_watch(
     request: ClusterKvWatchCancelRequest,
 ) -> Result<ClusterKvWatchCancelResponse, KvError> {
     let report = remove_cluster_kv_watch_registration_with_allocator(paths, request.watch_id)?;
+    #[cfg(any(test, feature = "test-support"))]
+    crate::watch_store::invalidate_cluster_kv_watch_registration_cache(&report.watch_path);
     if let Some(allocator) = report.allocator {
         write_cluster_kv_watch_allocator_state(paths, &allocator)?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::watch_store::record_current_cluster_kv_watch_allocator_trust(
+            paths,
+            allocator.active_watch_count,
+        );
     }
     if report.removed {
         notify_cluster_kv_watchers(paths);

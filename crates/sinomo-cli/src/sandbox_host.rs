@@ -212,6 +212,64 @@ impl sinomo_runtime::sandbox::SandboxCliHost for SinomoCliSandboxHost {
         )
     }
 
+    fn run_simple_native_toolchain_command(
+        &self,
+        store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
+        toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
+        sandbox_id: &sinomo_runtime::sandbox::SandboxId,
+        command_name: &str,
+        argv: Vec<String>,
+        stdin: Option<Vec<u8>>,
+        timeout_ms: u64,
+        execution_node_id: &NodeId,
+        policy: &sinomo_runtime::sandbox::SandboxPolicy,
+        output_sink: Option<Arc<dyn sinomo_runtime::sandbox::SandboxOutputSink>>,
+    ) -> Result<
+        sinomo_runtime::sandbox::SandboxLocalCommandOutcome,
+        sinomo_runtime::sandbox::SandboxCommandExecutionError,
+    > {
+        sinomo_runtime::sandbox_simple::SandboxSimpleNativeCommandRunner::from_env()?
+            .run_toolchain_command_with_stdin_policy_and_output_sink(
+                store,
+                toolchain_store,
+                sandbox_id,
+                command_name,
+                argv,
+                stdin,
+                timeout_ms,
+                execution_node_id,
+                policy,
+                output_sink,
+            )
+    }
+
+    fn run_simple_native_process_plan(
+        &self,
+        store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
+        toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
+        sandbox_id: &sinomo_runtime::sandbox::SandboxId,
+        plan: &sinomo_runtime::sandbox::SandboxProcessPlan,
+        timeout_ms: u64,
+        execution_node_id: &NodeId,
+        policy: &sinomo_runtime::sandbox::SandboxPolicy,
+        output_sink: Option<Arc<dyn sinomo_runtime::sandbox::SandboxOutputSink>>,
+    ) -> Result<
+        sinomo_runtime::sandbox::SandboxProcessPlanOutcome,
+        sinomo_runtime::sandbox::SandboxCommandExecutionError,
+    > {
+        sinomo_runtime::sandbox_simple::SandboxSimpleNativeCommandRunner::from_env()?
+            .run_process_plan_with_policy_and_output_sink(
+                store,
+                toolchain_store,
+                sandbox_id,
+                plan,
+                timeout_ms,
+                execution_node_id,
+                policy,
+                output_sink,
+            )
+    }
+
     #[cfg(feature = "sandbox")]
     fn verify_busybox_toolchain_fidelity(
         &self,

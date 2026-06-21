@@ -654,6 +654,7 @@ mod tests {
             "cluster.network.ping-benchmark",
             "cluster.migration.seed-source",
             "cluster.migration.verify-joined",
+            "cluster.dfs.lightweight-latency",
             "cluster.dfs.protocol-codec-baseline",
             "cluster.dfs.read-your-write",
             "cluster.dfs.invariants",

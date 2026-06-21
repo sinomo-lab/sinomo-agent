@@ -47,6 +47,7 @@ pub mod r1 {
     // execution is provided by `sandbox_wasix_host`, which loads an active
     // native-dylib module from content-addressed module cache.
     pub use sinomo_sandbox as sandbox;
+    pub use sinomo_sandbox_simple as sandbox_simple;
     pub use sinomo_sandbox_wasix_api as sandbox_wasix_api;
     #[cfg(feature = "sandbox")]
     pub use sinomo_sandbox_wasix_host as sandbox_wasix_host;
@@ -316,7 +317,7 @@ pub use r1::sandbox_wasix_host;
 pub use r1::{
     cli_registry, config, daemon, device, dfs, dfs_cloud_files_api, eval, events, kv, local,
     module, module_api, modules, network, network_module, node, observe, policy, registry, rollout,
-    sandbox, sandbox_wasix_api, service, storage, supervision, test,
+    sandbox, sandbox_simple, sandbox_wasix_api, service, storage, supervision, test,
 };
 
 #[cfg(test)]
@@ -401,9 +402,8 @@ mod tests {
     fn runtime_daemon_facade_exports_async_rpc_clients() {
         let _ = daemon::send_daemon_rpc_async;
         let _ = daemon::send_daemon_rpc_to_endpoint_async;
-        let _ = daemon::send_daemon_rpc_direct_to_endpoint_async;
         let _ = daemon::fetch_daemon_status_from_endpoint_async;
-        let _ = daemon::send_dfs_object_rpc_to_endpoint_async;
+        let _ = daemon::send_dfs_object_rpc_to_target_async;
         let _ = daemon::send_dfs_metadata_journal_batch_to_endpoint_async;
         let _ = daemon::send_dfs_metadata_snapshot_install_to_endpoint_async;
         let request =

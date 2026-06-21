@@ -14,6 +14,7 @@ use crate::{
     OptionalValue, Reader, Result, TypeId, Value, encode_element_type, patch_length,
     read_element_type, read_schema, write_bytes, write_length, write_string, write_u16,
 };
+use std::ops::Range;
 
 pub fn to_value<T: Serialize + ?Sized>(value: &T) -> Result<Value> {
     value.serialize(ValueSerializer)
@@ -39,25 +40,57 @@ pub fn to_bytes<T: Serialize + ?Sized>(
     // Stream the value straight into the document buffer rather than building a
     // `Value` tree first; see the "Streaming serde codec" section below.
     let mut out = Vec::new();
+    append_bytes(&mut out, value, version_id, length_mode)?;
+    Ok(out)
+}
+
+pub fn append_bytes<T: Serialize + ?Sized>(
+    out: &mut Vec<u8>,
+    value: &T,
+    version_id: u16,
+    length_mode: LengthMode,
+) -> Result<Range<usize>> {
+    let start = out.len();
+    if let Err(error) = append_bytes_inner(out, value, version_id, length_mode) {
+        out.truncate(start);
+        return Err(error);
+    }
+    Ok(start..out.len())
+}
+
+fn append_bytes_inner<T: Serialize + ?Sized>(
+    out: &mut Vec<u8>,
+    value: &T,
+    version_id: u16,
+    length_mode: LengthMode,
+) -> Result<()> {
+    let start = out.len();
     out.extend_from_slice(MAGIC);
-    write_u16(&mut out, version_id);
+    write_u16(out, version_id);
     out.push(length_mode.code());
     out.push(AlignmentHint::NotAligned.code());
     let length_offset = out.len();
-    write_length(&mut out, length_mode, 0)?; // document length, patched below
-    write_length(&mut out, length_mode, 0)?; // empty dynamic schema (0 types)
-    serialize_element_into(&mut out, length_mode, value)?;
-    let document_length = u64::try_from(out.len()).map_err(|_| Error::LengthTooLarge)?;
+    write_length(out, length_mode, 0)?; // document length, patched below
+    write_length(out, length_mode, 0)?; // empty dynamic schema (0 types)
+    serialize_element_into(out, length_mode, value)?;
+    let document_length = u64::try_from(out.len() - start).map_err(|_| Error::LengthTooLarge)?;
     length_mode.validate(document_length)?;
     patch_length(
         &mut out[length_offset..length_offset + length_mode.width()],
         length_mode,
         document_length,
     )?;
-    Ok(out)
+    Ok(())
 }
 
 pub fn from_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    from_borrowed_bytes(bytes)
+}
+
+pub fn from_borrowed_bytes<'de, T>(bytes: &'de [u8]) -> Result<T>
+where
+    T: serde::Deserialize<'de>,
+{
     // Stream the value straight out of the document buffer rather than parsing it
     // into an `ElementView`/`Value` tree first.
     let mut reader = Reader::new(bytes, LengthMode::U64);
@@ -1953,6 +1986,79 @@ mod streaming_tests {
     }
 
     #[test]
+    fn borrowed_decode_returns_str_and_bytes_from_document_buffer() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct BorrowedPacket<'a> {
+            label: &'a str,
+            payload: &'a [u8],
+            note: Option<&'a str>,
+        }
+
+        let document = Document::dynamic(
+            1,
+            LengthMode::U32,
+            Value::Object(Object::new(vec![
+                Field::new("label", Value::String("sensor-a".to_owned())),
+                Field::new("payload", Value::Bytes(vec![0, 1, 2, 250, 255])),
+                Field::new(
+                    "note",
+                    Value::optional(OptionalValue::some(
+                        ElementType::Builtin(TypeId::String),
+                        Value::String("warm".to_owned()),
+                    )),
+                ),
+            ])),
+        );
+        let bytes = document.to_bytes().expect("encode");
+
+        let decoded: BorrowedPacket<'_> = from_borrowed_bytes(&bytes).expect("borrowed decode");
+
+        assert_eq!(
+            decoded,
+            BorrowedPacket {
+                label: "sensor-a",
+                payload: &[0, 1, 2, 250, 255],
+                note: Some("warm"),
+            }
+        );
+        assert!(slice_is_borrowed_from(decoded.label.as_bytes(), &bytes));
+        assert!(slice_is_borrowed_from(decoded.payload, &bytes));
+        assert!(slice_is_borrowed_from(
+            decoded.note.expect("note").as_bytes(),
+            &bytes
+        ));
+    }
+
+    #[test]
+    fn append_bytes_preserves_existing_buffer_and_rolls_back_on_error() {
+        #[derive(Serialize)]
+        struct Unsupported {
+            values: (u8, u16),
+        }
+
+        let value = sample();
+        let expected = to_bytes(&value, 1, LengthMode::U32).expect("standalone");
+        let mut out = b"prefix".to_vec();
+        let range = append_bytes(&mut out, &value, 1, LengthMode::U32).expect("append");
+
+        assert_eq!(&out[..6], b"prefix");
+        assert_eq!(&out[range.clone()], expected.as_slice());
+        let decoded: Everything = from_bytes(&out[range]).expect("decode appended");
+        assert_eq!(decoded, value);
+
+        let before = out.clone();
+        let error = append_bytes(
+            &mut out,
+            &Unsupported { values: (1, 2) },
+            1,
+            LengthMode::U32,
+        )
+        .expect_err("heterogeneous tuple should fail");
+        assert_eq!(error, Error::TypeMismatch);
+        assert_eq!(out, before);
+    }
+
+    #[test]
     fn large_byte_list_round_trips_without_per_element_blowup() {
         // ~4 MiB list<uint8>. If each element materialized an ~80-byte Value this
         // would allocate hundreds of MiB; streaming keeps it ~O(data).
@@ -1964,5 +2070,13 @@ mod streaming_tests {
         );
         let decoded: Vec<u8> = from_bytes(&encoded).expect("decode");
         assert_eq!(decoded, data);
+    }
+
+    fn slice_is_borrowed_from(slice: &[u8], source: &[u8]) -> bool {
+        let source_start = source.as_ptr() as usize;
+        let source_end = source_start + source.len();
+        let slice_start = slice.as_ptr() as usize;
+        let slice_end = slice_start + slice.len();
+        slice_start >= source_start && slice_end <= source_end
     }
 }

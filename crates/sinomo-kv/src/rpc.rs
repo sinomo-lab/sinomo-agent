@@ -79,7 +79,7 @@ pub fn cluster_kv_range_prefix_rpc_payload(prefix: &str) -> Result<ClusterKvRpcP
     Ok(ClusterKvRpcPayload {
         route: CLUSTER_KV_RANGE_PREFIX_ROUTE,
         category: CLUSTER_KV_RPC_CATEGORY,
-        body: encode_cluster_kv_rpc_body(&prefix.to_string())?,
+        body: encode_cluster_kv_rpc_body(prefix)?,
     })
 }
 
@@ -127,6 +127,11 @@ pub struct ClusterRaftVoteResponse {
     pub state: ClusterBootstrapState,
     pub vote: RaftRequestVoteResponse,
 }
+
+pub type ClusterKvReplicationRequest = ClusterRaftAppendRequest;
+pub type ClusterKvReplicationResponse = ClusterRaftAppendResponse;
+pub type ClusterKvStateAuthorityVoteRequest = ClusterRaftVoteRequest;
+pub type ClusterKvStateAuthorityVoteResponse = ClusterRaftVoteResponse;
 
 pub fn cluster_kv_watch_events_noop_response(
     request: &ClusterKvWatchEventsRequest,

@@ -1,5 +1,7 @@
 use crate::error::NetworkError;
-use crate::object::{ObjectFrameIoOptions, SinomoObjectCodec};
+#[cfg(test)]
+use crate::object::ObjectFrameIoOptions;
+use crate::object::SinomoObjectCodec;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use sinomo_core::CapabilityName;
@@ -10,6 +12,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use time::OffsetDateTime;
+#[cfg(test)]
 use tokio::io::{AsyncRead, AsyncWrite};
 use tower_layer::Layer;
 use tower_service::Service;
@@ -32,6 +35,7 @@ pub const OBJECT_RPC_ERROR_DETAIL_METADATA_KEY: &str = "sinomo-error-detail";
 pub const OBJECT_RPC_OPERATION_ID_METADATA_KEY: &str = "sinomo-operation-id";
 pub const OBJECT_RPC_CANCELS_OPERATION_ID_METADATA_KEY: &str = "sinomo-cancels-operation-id";
 pub const OBJECT_RPC_RESPONSE_RETRY_SAFE_METADATA_KEY: &str = "sinomo-response-retry-safe";
+pub const OBJECT_RPC_RESPONDER_NODE_ID_METADATA_KEY: &str = "sinomo-responder-node-id";
 
 pub const CLUSTER_HEALTH_RPC_CATEGORY: &str = "cluster.health";
 pub const CLUSTER_HEALTH_ROUTE: &str = "/cluster/health";
@@ -107,6 +111,13 @@ impl ObjectRpcRequest {
 
     pub fn decode_body<T: serde::de::DeserializeOwned>(&self) -> Result<T, NetworkError> {
         SinomoObjectCodec::network_frame().decode(&self.body)
+    }
+
+    pub fn decode_body_borrowed<'de, T>(&'de self) -> Result<T, NetworkError>
+    where
+        T: serde::Deserialize<'de>,
+    {
+        SinomoObjectCodec::network_frame().decode_borrowed(&self.body)
     }
 
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
@@ -218,9 +229,29 @@ impl ObjectRpcResponse {
         })
     }
 
+    pub fn mark_responder_node_id(&mut self, node_id: impl Into<String>) {
+        self.metadata
+            .entry(OBJECT_RPC_RESPONDER_NODE_ID_METADATA_KEY.to_string())
+            .or_insert_with(|| node_id.into());
+    }
+
+    pub fn responder_node_id(&self) -> Option<&str> {
+        self.metadata
+            .get(OBJECT_RPC_RESPONDER_NODE_ID_METADATA_KEY)
+            .map(String::as_str)
+    }
+
     pub fn decode_body<T: serde::de::DeserializeOwned>(&self) -> Result<T, NetworkError> {
         self.error_detail()?;
         SinomoObjectCodec::network_frame().decode(&self.body)
+    }
+
+    pub fn decode_body_borrowed<'de, T>(&'de self) -> Result<T, NetworkError>
+    where
+        T: serde::Deserialize<'de>,
+    {
+        self.error_detail()?;
+        SinomoObjectCodec::network_frame().decode_borrowed(&self.body)
     }
 
     pub fn encode_error(
@@ -1217,7 +1248,8 @@ where
     }
 }
 
-pub async fn call_object_rpc_frame_async<IO>(
+#[cfg(test)]
+pub(crate) async fn call_object_rpc_frame_async<IO>(
     stream: &mut IO,
     request: &ObjectRpcRequest,
     max_response_bytes: usize,
@@ -1241,7 +1273,8 @@ where
     service.call(request).await
 }
 
-pub async fn serve_object_rpc_frame_async<IO, S>(
+#[cfg(test)]
+pub(crate) async fn serve_object_rpc_frame_async<IO, S>(
     stream: &mut IO,
     service: &mut S,
     max_request_bytes: usize,
@@ -1255,72 +1288,6 @@ where
         crate::read_object_frame_async(stream, max_request_bytes, frame_options).await?;
     let response = call_object_rpc_service_async(service, request).await?;
     crate::write_object_frame_async(stream, &response, frame_options).await
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ServiceCategoryLayer {
-    pub category: ServiceCategory,
-}
-
-impl ServiceCategoryLayer {
-    pub fn new(name: impl Into<String>, summary: impl Into<String>) -> Self {
-        Self {
-            category: ServiceCategory::new(name, summary),
-        }
-    }
-}
-
-impl<S> Layer<S> for ServiceCategoryLayer {
-    type Service = CategorizedService<S>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        CategorizedService {
-            category: self.category.clone(),
-            inner,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct CategorizedService<S> {
-    category: ServiceCategory,
-    inner: S,
-}
-
-impl<S> CategorizedService<S> {
-    pub fn category(&self) -> &ServiceCategory {
-        &self.category
-    }
-}
-
-impl<S> ObjectRpcRouteCatalog for CategorizedService<S>
-where
-    S: ObjectRpcRouteCatalog,
-{
-    fn object_rpc_route_descriptor(&self, route: &str) -> Option<ObjectRouteDescriptor> {
-        self.inner.object_rpc_route_descriptor(route)
-    }
-
-    fn object_rpc_route_readiness(&self, route: &str) -> Option<ObjectRpcRouteReadiness> {
-        self.inner.object_rpc_route_readiness(route)
-    }
-}
-
-impl<S> Service<ObjectRpcRequest> for CategorizedService<S>
-where
-    S: Service<ObjectRpcRequest>,
-{
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = S::Future;
-
-    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(context)
-    }
-
-    fn call(&mut self, request: ObjectRpcRequest) -> Self::Future {
-        self.inner.call(request)
-    }
 }
 
 fn validate_rpc_route(route: &str) -> Result<(), NetworkError> {
@@ -1386,4 +1353,71 @@ fn validate_no_control_chars(value: &str, context: &str) -> Result<(), NetworkEr
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Serialize)]
+    struct OwnedPayload<'a> {
+        name: &'a str,
+        #[serde(with = "serde_bytes")]
+        bytes: &'a [u8],
+    }
+
+    #[derive(Deserialize)]
+    struct BorrowedPayload<'a> {
+        name: &'a str,
+        #[serde(with = "serde_bytes")]
+        bytes: &'a [u8],
+    }
+
+    #[test]
+    fn rpc_body_borrowed_decode_uses_encoded_body_buffer() {
+        let bytes = [1_u8, 2, 3, 4, 5];
+        let request = ObjectRpcRequest::encode_body(
+            "/test/borrowed",
+            "test",
+            &OwnedPayload {
+                name: "payload",
+                bytes: &bytes,
+            },
+        )
+        .expect("request");
+        let decoded: BorrowedPayload<'_> = request.decode_body_borrowed().expect("decode request");
+        assert_eq!(decoded.name, "payload");
+        assert_eq!(decoded.bytes, bytes);
+        assert!(slice_is_borrowed_from(
+            decoded.name.as_bytes(),
+            &request.body
+        ));
+        assert!(slice_is_borrowed_from(decoded.bytes, &request.body));
+
+        let response = ObjectRpcResponse::encode_body(
+            "/test/borrowed",
+            &OwnedPayload {
+                name: "response",
+                bytes: &bytes,
+            },
+        )
+        .expect("response");
+        let decoded: BorrowedPayload<'_> =
+            response.decode_body_borrowed().expect("decode response");
+        assert_eq!(decoded.name, "response");
+        assert_eq!(decoded.bytes, bytes);
+        assert!(slice_is_borrowed_from(
+            decoded.name.as_bytes(),
+            &response.body
+        ));
+        assert!(slice_is_borrowed_from(decoded.bytes, &response.body));
+    }
+
+    fn slice_is_borrowed_from(slice: &[u8], source: &[u8]) -> bool {
+        let source_start = source.as_ptr() as usize;
+        let source_end = source_start + source.len();
+        let slice_start = slice.as_ptr() as usize;
+        let slice_end = slice_start + slice.len();
+        slice_start >= source_start && slice_end <= source_end
+    }
 }

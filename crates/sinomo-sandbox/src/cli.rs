@@ -334,6 +334,14 @@ fn unsupported_sandbox_wasix_error() -> crate::SandboxCommandExecutionError {
     .into()
 }
 
+fn unsupported_sandbox_simple_error() -> crate::SandboxCommandExecutionError {
+    crate::SandboxWasiError::Runtime {
+        detail: "simple-native sandbox execution support is not available in this CLI host"
+            .to_string(),
+    }
+    .into()
+}
+
 pub trait SandboxCliHost: Send + Sync {
     fn force_local_mode(&self) -> bool {
         false
@@ -424,6 +432,38 @@ pub trait SandboxCliHost: Send + Sync {
         _output_sink: Option<Arc<dyn crate::SandboxOutputSink>>,
     ) -> Result<crate::SandboxProcessPlanOutcome, crate::SandboxCommandExecutionError> {
         Err(unsupported_sandbox_wasix_error())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_simple_native_toolchain_command(
+        &self,
+        _store: &crate::LocalSandboxInstanceStore,
+        _toolchain_store: &crate::LocalSandboxToolchainStore,
+        _sandbox_id: &crate::SandboxId,
+        _command_name: &str,
+        _argv: Vec<String>,
+        _stdin: Option<Vec<u8>>,
+        _timeout_ms: u64,
+        _execution_node_id: &NodeId,
+        _policy: &crate::SandboxPolicy,
+        _output_sink: Option<Arc<dyn crate::SandboxOutputSink>>,
+    ) -> Result<crate::SandboxLocalCommandOutcome, crate::SandboxCommandExecutionError> {
+        Err(unsupported_sandbox_simple_error())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_simple_native_process_plan(
+        &self,
+        _store: &crate::LocalSandboxInstanceStore,
+        _toolchain_store: &crate::LocalSandboxToolchainStore,
+        _sandbox_id: &crate::SandboxId,
+        _plan: &crate::SandboxProcessPlan,
+        _timeout_ms: u64,
+        _execution_node_id: &NodeId,
+        _policy: &crate::SandboxPolicy,
+        _output_sink: Option<Arc<dyn crate::SandboxOutputSink>>,
+    ) -> Result<crate::SandboxProcessPlanOutcome, crate::SandboxCommandExecutionError> {
+        Err(unsupported_sandbox_simple_error())
     }
 
     fn verify_busybox_toolchain_fidelity(
@@ -604,11 +644,11 @@ fn sandbox_cli_help() -> CliCommandHelp {
             "      Create a sandbox instance.",
             "  sinomo sandbox status|config|logs|ls|cat|write <sandbox-id> ... [--daemon]",
             "      View and manage sandbox metadata and files.",
-            "  sinomo sandbox run <sandbox-id> [--daemon|--container-runtime docker|podman --container-image <image>] [--stdin] [--timeout-ms <ms>] <command> -- [args...]",
-            "      Run a pinned toolchain command, container command, or explicit WASI module.",
-            "  sinomo sandbox process-plan <sandbox-id> [--daemon|--container-runtime docker|podman --container-image <image>] <plan.json> [--timeout-ms <ms>]",
+            "  sinomo sandbox run <sandbox-id> [--daemon|--simple-native|--container-runtime docker|podman --container-image <image>] [--stdin] [--timeout-ms <ms>] <command> -- [args...]",
+            "      Run a pinned toolchain command, native host command, container command, or explicit WASI module.",
+            "  sinomo sandbox process-plan <sandbox-id> [--daemon|--simple-native|--container-runtime docker|podman --container-image <image>] <plan.json> [--timeout-ms <ms>]",
             "      Run a structured process plan.",
-            "  sinomo sandbox shell <sandbox-id> [--daemon|--container-runtime docker|podman --container-image <image>] [--timeout-ms <ms>] [-- <script>]",
+            "  sinomo sandbox shell <sandbox-id> [--daemon|--simple-native|--container-runtime docker|podman --container-image <image>] [--timeout-ms <ms>] [-- <script>]",
             "      Run the pinned real `sh` command.",
             "  sinomo sandbox toolchain ...",
             "      Manage toolchain commands, packages, plans, and verification.",
@@ -678,6 +718,7 @@ fn sandbox_cli_autocomplete() -> CliAutocompleteSpec {
                 "run sandbox command",
                 &[
                     "--daemon",
+                    "--simple-native",
                     "--container-runtime",
                     "--container-image",
                     "--docker",
@@ -694,6 +735,7 @@ fn sandbox_cli_autocomplete() -> CliAutocompleteSpec {
                 "run sandbox process plan",
                 &[
                     "--daemon",
+                    "--simple-native",
                     "--container-runtime",
                     "--container-image",
                     "--docker",
@@ -706,6 +748,7 @@ fn sandbox_cli_autocomplete() -> CliAutocompleteSpec {
                 "run sandbox shell",
                 &[
                     "--daemon",
+                    "--simple-native",
                     "--container-runtime",
                     "--container-image",
                     "--docker",
@@ -1109,6 +1152,7 @@ pub enum SandboxRunTarget {
 pub enum SandboxRunExecution {
     Local,
     Daemon,
+    SimpleNative,
     Container(crate::SandboxContainerBackendConfig),
 }
 
@@ -2163,6 +2207,12 @@ fn finalize_sandbox_run_execution(
                 .to_string(),
         });
     }
+    if matches!(&execution, SandboxRunExecution::SimpleNative) {
+        return Err(CliError::Parse {
+            detail: "container sandbox execution cannot be combined with --simple-native"
+                .to_string(),
+        });
+    }
     let runtime = container
         .runtime
         .unwrap_or(crate::SandboxContainerRuntime::Docker);
@@ -2191,6 +2241,10 @@ pub fn parse_sandbox_shell_options(args: &[String]) -> Result<SandboxShellOption
         match rest[index].as_str() {
             "--daemon" => {
                 execution = SandboxRunExecution::Daemon;
+                index += 1;
+            }
+            "--simple-native" => {
+                execution = SandboxRunExecution::SimpleNative;
                 index += 1;
             }
             "--container-runtime" => {
@@ -2264,6 +2318,10 @@ pub fn parse_sandbox_run_options(args: &[String]) -> Result<SandboxRunOptions, C
         match rest[index].as_str() {
             "--daemon" => {
                 execution = SandboxRunExecution::Daemon;
+                index += 1;
+            }
+            "--simple-native" => {
+                execution = SandboxRunExecution::SimpleNative;
                 index += 1;
             }
             "--container-runtime" => {
@@ -2365,6 +2423,14 @@ pub fn parse_sandbox_run_options(args: &[String]) -> Result<SandboxRunOptions, C
                 .to_string(),
         });
     }
+    if matches!(&execution, SandboxRunExecution::SimpleNative)
+        && matches!(target, SandboxRunTarget::WasmModule(_))
+    {
+        return Err(CliError::Parse {
+            detail: "simple-native sandbox execution runs host commands and does not accept --wasm"
+                .to_string(),
+        });
+    }
     if matches!(&execution, SandboxRunExecution::Daemon)
         && (allow_unsigned || !allowed_capabilities.is_empty())
     {
@@ -2379,6 +2445,15 @@ pub fn parse_sandbox_run_options(args: &[String]) -> Result<SandboxRunOptions, C
         return Err(CliError::Parse {
             detail: "--allow-unsigned and --allow-capability apply to WASIX toolchain execution, not container sandbox execution"
                 .to_string(),
+        });
+    }
+    if matches!(&execution, SandboxRunExecution::SimpleNative)
+        && (allow_unsigned || !allowed_capabilities.is_empty())
+    {
+        return Err(CliError::Parse {
+            detail:
+                "--allow-unsigned and --allow-capability apply to WASIX toolchain execution, not simple-native sandbox execution"
+                    .to_string(),
         });
     }
     if matches!(&target, SandboxRunTarget::WasmModule(_)) && !allowed_capabilities.is_empty() {
@@ -2438,6 +2513,10 @@ pub fn parse_sandbox_process_plan_options(
             }
             "--daemon" => {
                 execution = SandboxRunExecution::Daemon;
+                index += 1;
+            }
+            "--simple-native" => {
+                execution = SandboxRunExecution::SimpleNative;
                 index += 1;
             }
             "--container-runtime" => {
@@ -3258,14 +3337,14 @@ pub fn sandbox_run(options: SandboxRunOptions) -> Result<(), CliError> {
         None
     };
     match &options.execution {
-        SandboxRunExecution::Local | SandboxRunExecution::Container(_) => {
-            sandbox_run_with_stores_and_stdin(
-                options,
-                stdin,
-                &sandbox_store_from_data_dir(&data_dir),
-                &sandbox_toolchain_store_from_data_dir(&data_dir),
-            )
-        }
+        SandboxRunExecution::Local
+        | SandboxRunExecution::SimpleNative
+        | SandboxRunExecution::Container(_) => sandbox_run_with_stores_and_stdin(
+            options,
+            stdin,
+            &sandbox_store_from_data_dir(&data_dir),
+            &sandbox_toolchain_store_from_data_dir(&data_dir),
+        ),
         SandboxRunExecution::Daemon => sandbox_run_with_daemon_and_stdin(options, stdin),
     }
 }
@@ -3274,13 +3353,13 @@ pub fn sandbox_process_plan(options: SandboxProcessPlanOptions) -> Result<(), Cl
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_root_layout()?;
     match &options.execution {
-        SandboxRunExecution::Local | SandboxRunExecution::Container(_) => {
-            sandbox_process_plan_with_stores(
-                options,
-                &sandbox_store_from_data_dir(&data_dir),
-                &sandbox_toolchain_store_from_data_dir(&data_dir),
-            )
-        }
+        SandboxRunExecution::Local
+        | SandboxRunExecution::SimpleNative
+        | SandboxRunExecution::Container(_) => sandbox_process_plan_with_stores(
+            options,
+            &sandbox_store_from_data_dir(&data_dir),
+            &sandbox_toolchain_store_from_data_dir(&data_dir),
+        ),
         SandboxRunExecution::Daemon => sandbox_process_plan_with_daemon(options),
     }
 }
@@ -3300,14 +3379,14 @@ pub fn sandbox_shell(options: SandboxShellOptions) -> Result<(), CliError> {
         }
     };
     match &options.execution {
-        SandboxRunExecution::Local | SandboxRunExecution::Container(_) => {
-            sandbox_shell_with_stores(
-                options,
-                stdin,
-                &sandbox_store_from_data_dir(&data_dir),
-                &sandbox_toolchain_store_from_data_dir(&data_dir),
-            )
-        }
+        SandboxRunExecution::Local
+        | SandboxRunExecution::SimpleNative
+        | SandboxRunExecution::Container(_) => sandbox_shell_with_stores(
+            options,
+            stdin,
+            &sandbox_store_from_data_dir(&data_dir),
+            &sandbox_toolchain_store_from_data_dir(&data_dir),
+        ),
         SandboxRunExecution::Daemon => sandbox_shell_with_daemon(options, stdin),
     }
 }
@@ -6384,6 +6463,14 @@ pub fn sandbox_process_plan_with_stores(
     toolchain_store: &crate::LocalSandboxToolchainStore,
 ) -> Result<(), CliError> {
     let plan = read_sandbox_process_plan_file(&options.plan_path)?;
+    if sandbox_simple_native_for_execution(&options.execution)? {
+        return sandbox_process_plan_simple_native_with_stores(
+            options,
+            &plan,
+            store,
+            toolchain_store,
+        );
+    }
     if let Some(runner) = sandbox_container_runner_for_execution(&options.execution)? {
         let outcome = runner.run_process_plan_with_output_sink(
             store,
@@ -6410,6 +6497,31 @@ fn sandbox_process_plan_wasix_with_stores(
     let mut policy = crate::SandboxPolicy::default();
     policy.allow_unsigned_toolchains = true;
     let outcome = current_sandbox_cli_host().run_wasix_process_plan(
+        store,
+        toolchain_store,
+        &options.sandbox_id,
+        plan,
+        options.timeout_ms,
+        &execution_node_id,
+        &policy,
+        Some(sandbox_cli_streaming_output_sink()),
+    )?;
+    print_sandbox_process_plan_outcome(&outcome, false)
+}
+
+fn sandbox_process_plan_simple_native_with_stores(
+    options: SandboxProcessPlanOptions,
+    plan: &crate::SandboxProcessPlan,
+    store: &crate::LocalSandboxInstanceStore,
+    toolchain_store: &crate::LocalSandboxToolchainStore,
+) -> Result<(), CliError> {
+    let execution_node_id =
+        NodeId::from_legacy_named("sandbox_cli").map_err(|source| CliError::Parse {
+            detail: format!("invalid sandbox CLI node id: {source}"),
+        })?;
+    let mut policy = crate::SandboxPolicy::default();
+    policy.allow_unsigned_toolchains = true;
+    let outcome = current_sandbox_cli_host().run_simple_native_process_plan(
         store,
         toolchain_store,
         &options.sandbox_id,
@@ -6539,10 +6651,39 @@ pub fn sandbox_run_with_stores_and_stdin(
     store: &crate::LocalSandboxInstanceStore,
     toolchain_store: &crate::LocalSandboxToolchainStore,
 ) -> Result<(), CliError> {
+    if sandbox_simple_native_for_execution(&options.execution)? {
+        return sandbox_run_simple_native_with_stores_and_stdin(
+            options,
+            stdin,
+            store,
+            toolchain_store,
+        );
+    }
     if let Some(runner) = sandbox_container_runner_for_execution(&options.execution)? {
         return sandbox_run_container_with_store(options, stdin, store, runner);
     }
     sandbox_run_wasix_with_stores_and_stdin(options, stdin, store, toolchain_store)
+}
+
+fn sandbox_simple_native_for_execution(execution: &SandboxRunExecution) -> Result<bool, CliError> {
+    match execution {
+        SandboxRunExecution::SimpleNative => Ok(true),
+        SandboxRunExecution::Local => sandbox_simple_native_requested_from_env(),
+        SandboxRunExecution::Daemon | SandboxRunExecution::Container(_) => Ok(false),
+    }
+}
+
+fn sandbox_simple_native_requested_from_env() -> Result<bool, CliError> {
+    match std::env::var(crate::SINOMO_SANDBOX_BACKEND_ENV) {
+        Ok(value) => Ok(value.trim() == "simple-native"),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(_)) => Err(CliError::Parse {
+            detail: format!(
+                "invalid non-unicode sandbox backend environment variable `{}`",
+                crate::SINOMO_SANDBOX_BACKEND_ENV
+            ),
+        }),
+    }
 }
 
 fn sandbox_container_runner_for_execution(
@@ -6560,7 +6701,7 @@ fn sandbox_container_runner_for_execution(
             })?;
             Ok(config.map(crate::SandboxContainerCommandRunner::new))
         }
-        SandboxRunExecution::Daemon => Ok(None),
+        SandboxRunExecution::Daemon | SandboxRunExecution::SimpleNative => Ok(None),
     }
 }
 
@@ -6582,6 +6723,46 @@ fn sandbox_run_container_with_store(
         options.argv,
         stdin,
         options.timeout_ms,
+        Some(sandbox_cli_streaming_output_sink()),
+    )?;
+    print_sandbox_command_outcome(&outcome, false)
+}
+
+fn sandbox_run_simple_native_with_stores_and_stdin(
+    options: SandboxRunOptions,
+    stdin: Option<Vec<u8>>,
+    store: &crate::LocalSandboxInstanceStore,
+    toolchain_store: &crate::LocalSandboxToolchainStore,
+) -> Result<(), CliError> {
+    let SandboxRunTarget::ToolchainCommand(command_name) = &options.target else {
+        return Err(CliError::Parse {
+            detail: "simple-native sandbox execution requires a host command, not --wasm"
+                .to_string(),
+        });
+    };
+    let execution_node_id =
+        NodeId::from_legacy_named("sandbox_cli").map_err(|source| CliError::Parse {
+            detail: format!("invalid sandbox CLI node id: {source}"),
+        })?;
+    let mut policy = crate::SandboxPolicy::default();
+    policy.allow_unsigned_toolchains = true;
+    let request = crate::SandboxRunToolchainRequest {
+        sandbox_id: options.sandbox_id.clone(),
+        command_name: command_name.clone(),
+        argv: options.argv,
+        stdin,
+        timeout_ms: options.timeout_ms,
+    };
+    let outcome = current_sandbox_cli_host().run_simple_native_toolchain_command(
+        store,
+        toolchain_store,
+        &request.sandbox_id,
+        &request.command_name,
+        request.argv,
+        request.stdin,
+        request.timeout_ms,
+        &execution_node_id,
+        &policy,
         Some(sandbox_cli_streaming_output_sink()),
     )?;
     print_sandbox_command_outcome(&outcome, false)

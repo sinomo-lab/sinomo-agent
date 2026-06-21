@@ -1,18 +1,30 @@
+use crate::ClusterPaths;
 use crate::error::NetworkError;
+#[cfg(any(feature = "iroh-transport", test))]
+use crate::io_observer;
 use crate::object::DaemonRpcTimeouts;
+use crate::object_file_store::{read_object_file, write_object_file};
+#[cfg(feature = "iroh-transport")]
+use crate::object_file_store::{
+    read_optional_object_file, write_object_file_create_new_serialized,
+};
+#[cfg(test)]
 use crate::peer::{EndpointCandidateStatus, PeerEndpointCandidate};
 use crate::prelude::*;
-use crate::storage::{ClusterPaths, read_object_file, write_object_file};
-#[cfg(feature = "iroh-transport")]
-use crate::storage::{read_optional_object_file, write_object_file_create_new_serialized};
 #[cfg(feature = "iroh-transport")]
 use fs2::FileExt;
+#[cfg(test)]
+use sinomo_kv::KvEntry;
+#[cfg(feature = "iroh-transport")]
+use std::fs;
 
-pub const WEBRTC_SIGNALING_PROTOCOL: &str = "sinomo.webrtc-signaling.v1";
-pub const IROH_ROAMING_PROTOCOL: &str = "sinomo.iroh-roaming.v1";
+#[cfg(feature = "iroh-transport")]
+const IROH_ROAMING_PROTOCOL: &str = "sinomo.iroh-roaming.v1";
 pub const IROH_DAEMON_COMMAND_MAX_BYTES: usize = crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES;
-pub const IROH_DAEMON_ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
-pub const SINOMO_IROH_RELAY_URLS_ENV: &str = "SINOMO_IROH_RELAY_URLS";
+#[cfg(feature = "iroh-transport")]
+const IROH_DAEMON_ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(any(feature = "iroh-transport", test))]
+const SINOMO_IROH_RELAY_URLS_ENV: &str = "SINOMO_IROH_RELAY_URLS";
 #[cfg(any(feature = "iroh-transport", test))]
 pub(crate) const IROH_DAEMON_PROXY_RESTART_BACKOFF_MIN: Duration = Duration::from_secs(5);
 #[cfg(any(feature = "iroh-transport", test))]
@@ -46,6 +58,7 @@ pub(crate) const IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES: usize =
 pub(crate) const IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(any(feature = "iroh-transport", test))]
 pub(crate) const IROH_DAEMON_PROXY_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(any(feature = "iroh-transport", test))]
 const SINOMO_DEFAULT_IROH_RELAY_URLS: &[&str] = &[
     "https://use1-1.relay.n0.iroh-canary.iroh.link./",
     "https://usw1-1.relay.n0.iroh-canary.iroh.link./",
@@ -53,8 +66,9 @@ const SINOMO_DEFAULT_IROH_RELAY_URLS: &[&str] = &[
     "https://aps1-1.relay.n0.iroh-canary.iroh.link./",
 ];
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct WebRtcSignalingEnvelope {
+pub(crate) struct WebRtcSignalingEnvelope {
     pub cluster_id: ClusterId,
     pub exchange_id: String,
     pub source_node_id: NodeId,
@@ -64,6 +78,7 @@ pub struct WebRtcSignalingEnvelope {
     pub message: WebRtcSignalMessage,
 }
 
+#[cfg(test)]
 impl WebRtcSignalingEnvelope {
     pub fn offer(
         cluster_id: ClusterId,
@@ -104,17 +119,19 @@ impl WebRtcSignalingEnvelope {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-pub enum WebRtcSignalMessage {
+pub(crate) enum WebRtcSignalMessage {
     Offer { sdp: String },
     Answer { sdp: String },
     IceCandidate(IceCandidateRecord),
     EndOfCandidates,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct IceCandidateRecord {
+pub(crate) struct IceCandidateRecord {
     pub cluster_id: ClusterId,
     pub exchange_id: String,
     pub node_id: NodeId,
@@ -126,6 +143,7 @@ pub struct IceCandidateRecord {
     pub expires_after_tick: u64,
 }
 
+#[cfg(test)]
 impl IceCandidateRecord {
     pub fn endpoint(&self) -> ClusterEndpointRecord {
         let (transport, privacy, source_priority) = match self.candidate_type {
@@ -163,17 +181,20 @@ impl IceCandidateRecord {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-pub enum IceCandidateType {
+pub(crate) enum IceCandidateType {
     Host,
     ServerReflexive,
     PeerReflexive,
     Relay,
 }
 
-pub struct WebRtcKvExchange;
+#[cfg(test)]
+pub(crate) struct WebRtcKvExchange;
 
+#[cfg(test)]
 impl WebRtcKvExchange {
     pub fn signal_key(cluster_id: &ClusterId, exchange_id: &str, sequence: u64) -> String {
         format!("/webrtc/signals/{cluster_id}/{exchange_id}/{sequence:020}")
@@ -244,6 +265,28 @@ pub struct IrohEndpointRecord {
 }
 
 impl IrohEndpointRecord {
+    pub fn read(paths: &ClusterPaths, node_id: &NodeId) -> Result<Self, NetworkError> {
+        read_iroh_endpoint_record(paths, node_id)
+    }
+
+    pub fn from_relay_url(
+        cluster_id: ClusterId,
+        node_id: NodeId,
+        endpoint_public_key: impl Into<String>,
+        relay_url: impl Into<String>,
+    ) -> Self {
+        let relay_url = relay_url.into();
+        Self {
+            cluster_id,
+            node_id,
+            endpoint_public_key: endpoint_public_key.into(),
+            direct_addresses: Vec::new(),
+            relay_url: Some(relay_url.clone()),
+            relay_mode: IrohRelayMode::Custom { relay_url },
+            expires_after_tick: 0,
+        }
+    }
+
     pub fn endpoint(&self) -> ClusterEndpointRecord {
         let has_relay = self.relay_url.is_some();
         let address = if has_relay {
@@ -270,6 +313,10 @@ impl IrohEndpointRecord {
             priority: 90,
             last_observed_latency_ms: None,
         }
+    }
+
+    pub fn write(&self, paths: &ClusterPaths) -> Result<(), NetworkError> {
+        write_iroh_endpoint_record(paths, self)
     }
 }
 
@@ -318,7 +365,10 @@ impl Drop for IrohDaemonProxyHandle {
     }
 }
 
-pub fn stable_iroh_endpoint_id(node_id: &NodeId, endpoint_public_key: &str) -> ClusterEndpointId {
+pub(crate) fn stable_iroh_endpoint_id(
+    node_id: &NodeId,
+    endpoint_public_key: &str,
+) -> ClusterEndpointId {
     ClusterEndpointId::derived(
         "sinomo.iroh.endpoint",
         format!("{}\0{endpoint_public_key}", node_id.as_str()),
@@ -333,10 +383,12 @@ pub enum IrohRelayMode {
     Custom { relay_url: String },
 }
 
-pub fn default_sinomo_iroh_relay_urls() -> Vec<String> {
+#[cfg(test)]
+pub(crate) fn default_sinomo_iroh_relay_urls() -> Vec<String> {
     sinomo_iroh_relay_url_strings_from_env(std::env::var(SINOMO_IROH_RELAY_URLS_ENV).ok())
 }
 
+#[cfg(any(feature = "iroh-transport", test))]
 pub(crate) fn sinomo_iroh_relay_url_strings_from_env(value: Option<String>) -> Vec<String> {
     let Some(value) = value else {
         return SINOMO_DEFAULT_IROH_RELAY_URLS
@@ -387,36 +439,10 @@ fn sinomo_iroh_endpoint_builder() -> Result<iroh::endpoint::Builder, NetworkErro
     Ok(iroh::Endpoint::builder(iroh::endpoint::presets::N0).relay_mode(sinomo_iroh_relay_mode()?))
 }
 
-#[cfg(feature = "iroh-transport")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IrohEndpointDialConfig {
-    pub endpoint_public_key: iroh::PublicKey,
-    pub alpn: Vec<u8>,
-    pub relay_url: Option<String>,
-    pub direct_addresses: Vec<String>,
-}
+#[cfg(test)]
+pub(crate) struct IrohKvExchange;
 
-#[cfg(feature = "iroh-transport")]
-impl IrohEndpointDialConfig {
-    pub fn from_record(record: &IrohEndpointRecord) -> Result<Self, NetworkError> {
-        let endpoint_public_key =
-            record
-                .endpoint_public_key
-                .parse()
-                .map_err(|source| NetworkError::Serialization {
-                    detail: format!("invalid iroh public key: {source}"),
-                })?;
-        Ok(Self {
-            endpoint_public_key,
-            alpn: IROH_ROAMING_PROTOCOL.as_bytes().to_vec(),
-            relay_url: record.relay_url.clone(),
-            direct_addresses: record.direct_addresses.clone(),
-        })
-    }
-}
-
-pub struct IrohKvExchange;
-
+#[cfg(test)]
 impl IrohKvExchange {
     pub fn endpoint_key(cluster_id: &ClusterId, node_id: &NodeId) -> String {
         format!("/iroh/endpoints/{cluster_id}/{node_id}")
@@ -439,7 +465,8 @@ impl IrohKvExchange {
     }
 }
 
-pub fn iroh_endpoint_key_path(paths: &ClusterPaths, node_id: &NodeId) -> PathBuf {
+#[cfg(feature = "iroh-transport")]
+pub(crate) fn iroh_endpoint_key_path(paths: &ClusterPaths, node_id: &NodeId) -> PathBuf {
     paths.iroh.join(format!("{}.secret.sobj", node_id.as_str()))
 }
 
@@ -448,7 +475,7 @@ fn iroh_endpoint_key_lock_path(paths: &ClusterPaths, node_id: &NodeId) -> PathBu
     paths.iroh.join(format!("{}.secret.lock", node_id.as_str()))
 }
 
-pub fn iroh_endpoint_record_path(paths: &ClusterPaths, node_id: &NodeId) -> PathBuf {
+fn iroh_endpoint_record_path(paths: &ClusterPaths, node_id: &NodeId) -> PathBuf {
     paths
         .iroh
         .join(format!("{}.endpoint.sobj", node_id.as_str()))
@@ -527,7 +554,7 @@ fn file_lock_is_busy(source: &std::io::Error) -> bool {
 }
 
 #[cfg(feature = "iroh-transport")]
-pub fn load_or_create_iroh_secret_key(
+pub(crate) fn load_or_create_iroh_secret_key(
     paths: &ClusterPaths,
     node_id: &NodeId,
 ) -> Result<iroh::SecretKey, NetworkError> {
@@ -553,17 +580,6 @@ pub fn load_or_create_iroh_secret_key(
     }
 }
 
-#[cfg(not(feature = "iroh-transport"))]
-pub fn load_or_create_iroh_secret_key(
-    _paths: &ClusterPaths,
-    _node_id: &NodeId,
-) -> Result<(), NetworkError> {
-    Err(NetworkError::Io {
-        operation: "iroh secret key".to_string(),
-        detail: "sinomo-network was built without iroh-transport".to_string(),
-    })
-}
-
 async fn spawn_roaming_disk_task_on_runtime<T, F>(
     runtime: &tokio::runtime::Handle,
     operation: &'static str,
@@ -583,7 +599,7 @@ where
 }
 
 #[cfg(feature = "iroh-transport")]
-pub async fn load_or_create_iroh_secret_key_async(
+pub(crate) async fn load_or_create_iroh_secret_key_async(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     node_id: &NodeId,
@@ -596,58 +612,21 @@ pub async fn load_or_create_iroh_secret_key_async(
     .await
 }
 
-#[cfg(not(feature = "iroh-transport"))]
-pub async fn load_or_create_iroh_secret_key_async(
-    _runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    node_id: &NodeId,
-) -> Result<(), NetworkError> {
-    load_or_create_iroh_secret_key(paths, node_id)
-}
-
-#[cfg(feature = "iroh-transport")]
-pub fn iroh_public_key_for_node(
+#[cfg(all(feature = "iroh-transport", test))]
+pub(crate) async fn iroh_public_key_for_node_async(
+    runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     node_id: &NodeId,
 ) -> Result<String, NetworkError> {
-    Ok(load_or_create_iroh_secret_key(paths, node_id)?
-        .public()
-        .to_string())
+    Ok(
+        load_or_create_iroh_secret_key_async(runtime, paths, node_id)
+            .await?
+            .public()
+            .to_string(),
+    )
 }
 
-#[cfg(not(feature = "iroh-transport"))]
-pub fn iroh_public_key_for_node(
-    _paths: &ClusterPaths,
-    _node_id: &NodeId,
-) -> Result<String, NetworkError> {
-    Err(NetworkError::Io {
-        operation: "iroh public key".to_string(),
-        detail: "sinomo-network was built without iroh-transport".to_string(),
-    })
-}
-
-pub async fn iroh_public_key_for_node_async(
-    _runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    node_id: &NodeId,
-) -> Result<String, NetworkError> {
-    #[cfg(feature = "iroh-transport")]
-    {
-        return Ok(
-            load_or_create_iroh_secret_key_async(_runtime, paths, node_id)
-                .await?
-                .public()
-                .to_string(),
-        );
-    }
-
-    #[cfg(not(feature = "iroh-transport"))]
-    {
-        iroh_public_key_for_node(paths, node_id)
-    }
-}
-
-pub fn read_iroh_endpoint_record(
+pub(crate) fn read_iroh_endpoint_record(
     paths: &ClusterPaths,
     node_id: &NodeId,
 ) -> Result<IrohEndpointRecord, NetworkError> {
@@ -655,7 +634,7 @@ pub fn read_iroh_endpoint_record(
     read_object_file(&path)
 }
 
-pub async fn read_iroh_endpoint_record_async(
+pub(crate) async fn read_iroh_endpoint_record_async(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     node_id: &NodeId,
@@ -663,19 +642,20 @@ pub async fn read_iroh_endpoint_record_async(
     let paths = paths.clone();
     let node_id = node_id.clone();
     spawn_roaming_disk_task_on_runtime(runtime, "read iroh endpoint record", move || {
-        read_iroh_endpoint_record(&paths, &node_id)
+        IrohEndpointRecord::read(&paths, &node_id)
     })
     .await
 }
 
-pub fn write_iroh_endpoint_record(
+pub(crate) fn write_iroh_endpoint_record(
     paths: &ClusterPaths,
     record: &IrohEndpointRecord,
 ) -> Result<(), NetworkError> {
     write_object_file(&iroh_endpoint_record_path(paths, &record.node_id), record)
 }
 
-pub async fn write_iroh_endpoint_record_async(
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) async fn write_iroh_endpoint_record_async(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     record: &IrohEndpointRecord,
@@ -683,7 +663,7 @@ pub async fn write_iroh_endpoint_record_async(
     let paths = paths.clone();
     let record = record.clone();
     spawn_roaming_disk_task_on_runtime(runtime, "write iroh endpoint record", move || {
-        write_iroh_endpoint_record(&paths, &record)
+        record.write(&paths)
     })
     .await
 }
@@ -935,7 +915,7 @@ where
         "body",
     )
     .await?;
-    if let Some(observer) = crate::io_observer() {
+    if let Some(observer) = io_observer() {
         observer.on_net_recv(frame.len() as u64);
     }
     Ok((frame, permit))
@@ -992,7 +972,7 @@ where
         "body",
     )
     .await?;
-    if let Some(observer) = crate::io_observer() {
+    if let Some(observer) = io_observer() {
         observer.on_net_recv(frame.len() as u64);
     }
     Ok((frame, permit))
@@ -1453,7 +1433,8 @@ pub fn iroh_endpoint_record_from_addr(
     }
 }
 
-pub fn iroh_endpoint_record_from_cluster_endpoint(
+#[cfg(test)]
+pub(crate) fn iroh_endpoint_record_from_cluster_endpoint(
     endpoint: &ClusterEndpointRecord,
     cluster_id: &ClusterId,
 ) -> Result<IrohEndpointRecord, NetworkError> {
@@ -1466,7 +1447,8 @@ pub fn iroh_endpoint_record_from_cluster_endpoint(
     iroh_endpoint_record_from_address(&endpoint.address, cluster_id, &endpoint.node_id)
 }
 
-pub fn iroh_endpoint_record_from_address(
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) fn iroh_endpoint_record_from_address(
     address: &str,
     cluster_id: &ClusterId,
     node_id: &NodeId,
@@ -1989,57 +1971,23 @@ fn iroh_endpoint_addr_from_record(
     Ok(addr)
 }
 
-pub async fn send_daemon_rpc_to_cluster_endpoint_async(
+pub(crate) async fn send_daemon_rpc_to_cluster_endpoint_async(
     endpoint: &ClusterEndpointRecord,
-    auth: Option<&[u8]>,
-    request: &crate::ObjectRpcRequest,
-    timeouts: DaemonRpcTimeouts,
-) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    send_daemon_rpc_to_target_async(
-        DaemonControlTarget::ClusterEndpoint(endpoint),
-        auth,
-        request,
-        timeouts,
-    )
-    .await
-}
-
-pub async fn send_daemon_rpc_to_address_async(
-    address: &str,
-    auth: Option<&[u8]>,
-    request: &crate::ObjectRpcRequest,
-    timeouts: DaemonRpcTimeouts,
-) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    send_daemon_rpc_to_target_async(
-        DaemonControlTarget::Address(address),
-        auth,
-        request,
-        timeouts,
-    )
-    .await
-}
-
-enum DaemonControlTarget<'a> {
-    Address(&'a str),
-    ClusterEndpoint(&'a ClusterEndpointRecord),
-}
-
-async fn send_daemon_rpc_to_target_async(
-    target: DaemonControlTarget<'_>,
     auth: Option<&[u8]>,
     request: &crate::ObjectRpcRequest,
     timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::ObjectRpcResponse, NetworkError> {
     let control_request = daemon_rpc_control_request(auth, request);
     let response = if crate::object_rpc_request_expects_raw_daemon_response(request) {
-        send_daemon_control_rpc_request_raw_response_to_target_async(
-            target,
+        send_daemon_control_rpc_request_raw_response_to_cluster_endpoint_async(
+            endpoint,
             &control_request,
             timeouts,
         )
         .await?
     } else {
-        send_daemon_control_request_to_target_async(target, &control_request, timeouts).await?
+        send_daemon_control_request_to_cluster_endpoint_async(endpoint, &control_request, timeouts)
+            .await?
     };
     response.error_detail()?;
     Ok(response)
@@ -2055,68 +2003,50 @@ fn daemon_rpc_control_request(
     }
 }
 
-async fn send_daemon_control_request_to_target_async(
-    target: DaemonControlTarget<'_>,
+async fn send_daemon_control_request_to_cluster_endpoint_async(
+    endpoint: &ClusterEndpointRecord,
     request: &crate::DaemonControlRequest,
     timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::DaemonControlResponse, NetworkError> {
-    match target {
-        DaemonControlTarget::Address(address) => {
-            send_daemon_control_request_to_address_async(address, request, timeouts).await
-        }
-        DaemonControlTarget::ClusterEndpoint(endpoint) => match endpoint.transport {
-            ClusterTransportKind::Iroh => {
-                send_iroh_daemon_control_request_to_address_async(
-                    &endpoint.address,
-                    request,
-                    timeouts,
-                )
+    match endpoint.transport {
+        ClusterTransportKind::Iroh => {
+            send_iroh_daemon_control_request_to_address_async(&endpoint.address, request, timeouts)
                 .await
-            }
-            ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
-                send_daemon_control_request_to_address_async(&endpoint.address, request, timeouts)
-                    .await
-            }
-            _ => Err(NetworkError::Io {
-                operation: format!("send daemon rpc to {}", endpoint.address),
-                detail: format!("unsupported daemon rpc transport {:?}", endpoint.transport),
-            }),
-        },
+        }
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
+            send_daemon_control_request_to_address_async(&endpoint.address, request, timeouts).await
+        }
+        _ => Err(NetworkError::Io {
+            operation: format!("send daemon rpc to {}", endpoint.address),
+            detail: format!("unsupported daemon rpc transport {:?}", endpoint.transport),
+        }),
     }
 }
 
-async fn send_daemon_control_rpc_request_raw_response_to_target_async(
-    target: DaemonControlTarget<'_>,
+async fn send_daemon_control_rpc_request_raw_response_to_cluster_endpoint_async(
+    endpoint: &ClusterEndpointRecord,
     request: &crate::DaemonControlRequest,
     timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    match target {
-        DaemonControlTarget::Address(address) => {
-            send_daemon_control_rpc_request_raw_response_to_address_async(
-                address, request, timeouts,
+    match endpoint.transport {
+        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
+            crate::send_daemon_control_rpc_request_raw_response_async(
+                &endpoint.address,
+                request,
+                timeouts,
+                IROH_DAEMON_COMMAND_MAX_BYTES,
             )
             .await
         }
-        DaemonControlTarget::ClusterEndpoint(endpoint) => match endpoint.transport {
-            ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
-                crate::send_daemon_control_rpc_request_raw_response_async(
-                    &endpoint.address,
-                    request,
-                    timeouts,
-                    IROH_DAEMON_COMMAND_MAX_BYTES,
-                )
-                .await
-            }
-            ClusterTransportKind::Iroh => Err(NetworkError::Io {
-                operation: format!("send streamed daemon rpc to {}", endpoint.address),
-                detail: "streamed raw RPC responses are not supported over iroh proxy transport"
-                    .to_string(),
-            }),
-            _ => Err(NetworkError::Io {
-                operation: format!("send streamed daemon rpc to {}", endpoint.address),
-                detail: format!("unsupported daemon rpc transport {:?}", endpoint.transport),
-            }),
-        },
+        ClusterTransportKind::Iroh => Err(NetworkError::Io {
+            operation: format!("send streamed daemon rpc to {}", endpoint.address),
+            detail: "streamed raw RPC responses are not supported over iroh proxy transport"
+                .to_string(),
+        }),
+        _ => Err(NetworkError::Io {
+            operation: format!("send streamed daemon rpc to {}", endpoint.address),
+            detail: format!("unsupported daemon rpc transport {:?}", endpoint.transport),
+        }),
     }
 }
 
@@ -2129,28 +2059,6 @@ async fn send_daemon_control_request_to_address_async(
         send_iroh_daemon_control_request_to_address_async(address, request, timeouts).await
     } else {
         crate::send_daemon_control_request_async(
-            address,
-            request,
-            timeouts,
-            IROH_DAEMON_COMMAND_MAX_BYTES,
-        )
-        .await
-    }
-}
-
-async fn send_daemon_control_rpc_request_raw_response_to_address_async(
-    address: &str,
-    request: &crate::DaemonControlRequest,
-    timeouts: DaemonRpcTimeouts,
-) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    if daemon_rpc_address_uses_iroh(address) {
-        Err(NetworkError::Io {
-            operation: format!("send streamed daemon rpc to {address}"),
-            detail: "streamed raw RPC responses are not supported over iroh proxy transport"
-                .to_string(),
-        })
-    } else {
-        crate::send_daemon_control_rpc_request_raw_response_async(
             address,
             request,
             timeouts,
@@ -2277,19 +2185,22 @@ async fn forward_daemon_control_payload_async(
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ClusterAuthMaterial {
+pub(crate) struct ClusterAuthMaterial {
     pub cluster_id: ClusterId,
     pub node_id: NodeId,
     pub node_public_key: String,
     pub certificate: ClusterCertificate,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
-pub struct ClusterAuthVerifier {
+pub(crate) struct ClusterAuthVerifier {
     members: BTreeMap<NodeId, ClusterMemberRecord>,
 }
 
+#[cfg(test)]
 impl ClusterAuthVerifier {
     pub fn new(members: impl IntoIterator<Item = ClusterMemberRecord>) -> Self {
         Self {
@@ -2376,8 +2287,9 @@ impl ClusterAuthVerifier {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct AuthenticatedClusterSession {
+pub(crate) struct AuthenticatedClusterSession {
     pub cluster_id: ClusterId,
     pub local_node_id: NodeId,
     pub remote_node_id: NodeId,
@@ -2385,9 +2297,11 @@ pub struct AuthenticatedClusterSession {
     pub established_at: OffsetDateTime,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
-pub struct LanConnectionPlanner;
+pub(crate) struct LanConnectionPlanner;
 
+#[cfg(test)]
 impl LanConnectionPlanner {
     pub fn select_direct_candidate<'a>(
         candidates: &'a [PeerEndpointCandidate],
@@ -2414,17 +2328,20 @@ impl LanConnectionPlanner {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub enum RoamingPathSelection {
+pub(crate) enum RoamingPathSelection {
     Direct(PeerEndpointCandidate),
     Iroh(PeerEndpointCandidate),
     WebRtc(PeerEndpointCandidate),
     Relay(PeerEndpointCandidate),
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
-pub struct RoamingConnectionPlanner;
+pub(crate) struct RoamingConnectionPlanner;
 
+#[cfg(test)]
 impl RoamingConnectionPlanner {
     pub fn select_path(candidates: &[PeerEndpointCandidate]) -> Option<RoamingPathSelection> {
         if let Some(candidate) = LanConnectionPlanner::select_direct_candidate(candidates) {

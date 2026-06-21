@@ -17,21 +17,21 @@ use sinomo_runtime::config::{
     ConfigClusterMode, ConfigDefinition, ConfigError, ConfigRegistry, ConfigRegistryBuilder,
     ConfigStore, ConfigValueType, ConfigWriteTarget,
 };
-use sinomo_runtime::core::ClusterEndpointRecord;
 use sinomo_runtime::core::{EvaluationOutcome, EvaluationScorecard};
 use sinomo_runtime::dfs::{
-    DfsEndpointTransport, DfsMetadataJournalBatchSender, DfsMetadataJournalReplicationOptions,
-    DfsMetadataPeerTransportError, DfsMetadataShardConfig, DfsMetadataSnapshotInstallSender,
-    DfsPeerTransportError, DfsProtocolFrameCommand, DfsProtocolFrameResponse,
-    DfsProtocolFrameSender, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
-    default_dfs_metadata_root, default_dfs_metadata_shards_root, fallback_dfs_node_id,
-    metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
-    publish_cluster_dfs_metadata_journal, sifs_file_system_id,
+    AsyncDfsPeerTransport, DfsEndpointTransport, DfsMetadataJournalReplicationOptions,
+    DfsMetadataShardConfig, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
+    DfsPeerTransportFuture, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
+    cluster_dfs_data_endpoints, default_dfs_metadata_root, default_dfs_metadata_shards_root,
+    fallback_dfs_node_id, metadata_shards_prefix, open_local_sharded_metadata_backend,
+    open_root_local_metadata_backend, publish_cluster_dfs_metadata_journal_with_peer_transport,
+    sifs_file_system_id,
 };
 use sinomo_runtime::eval::CommandRunResult;
 use sinomo_runtime::kv::read_cluster_kv_prefix_entries;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
+use sinomo_runtime::node::NodeId;
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -2558,11 +2558,7 @@ fn open_evolution_sifs_service(
                 detail: source.to_string(),
             }
         })?;
-        let endpoints = network::cluster_endpoint_targets(
-            &cluster_paths,
-            &state,
-            network::ClusterEndpointSelectionPurpose::DfsData,
-        );
+        let endpoints = cluster_dfs_data_endpoints(&cluster_paths, &state);
         (state.local_node_id, endpoints)
     } else {
         (fallback_dfs_node_id(), Vec::new())
@@ -2573,11 +2569,16 @@ fn open_evolution_sifs_service(
             detail: source.to_string(),
         }
     })?;
+    let peer_transport = Arc::new(EvolutionSifsPeerTransport);
+    let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
+    let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer_transport;
     let service = NetworkedDfsService::new(
-        DfsEndpointTransport::new(
+        DfsEndpointTransport::with_peer_transports(
             local_node_id,
             endpoints,
-            evolution_sifs_protocol_frame_sender(),
+            sinomo_runtime::dfs::DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT,
+            sync_peer_transport,
+            async_peer_transport,
         ),
         content,
     );
@@ -2615,51 +2616,47 @@ fn open_evolution_sifs_service(
     Ok(service)
 }
 
-fn evolution_sifs_protocol_frame_sender() -> DfsProtocolFrameSender {
-    Arc::new(evolution_send_dfs_protocol_frame)
+struct EvolutionSifsPeerTransport;
+
+impl DfsPeerTransport for EvolutionSifsPeerTransport {
+    fn call_object_rpc(
+        &self,
+        target_node_id: &NodeId,
+        request: &network::ObjectRpcRequest,
+        options: DfsObjectRpcSendOptions,
+    ) -> Result<network::ObjectRpcResponse, DfsPeerTransportError> {
+        sinomo_runtime::daemon::send_dfs_object_rpc_to_target(
+            target_node_id,
+            request,
+            options.connect_timeout,
+            options.observe_connectivity,
+        )
+        .map_err(|error| DfsPeerTransportError::new(error.to_string()))
+    }
 }
 
-fn evolution_send_dfs_protocol_frame(
-    endpoint: &ClusterEndpointRecord,
-    command: &DfsProtocolFrameCommand,
-    timeout: std::time::Duration,
-) -> Result<DfsProtocolFrameResponse, DfsPeerTransportError> {
-    let request = sinomo_runtime::dfs::dfs_message_rpc_request_from_protocol_frame_command(command)
-        .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
-    let response = sinomo_runtime::daemon::send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
-        .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
-    sinomo_runtime::dfs::dfs_protocol_frame_response_from_message_rpc_response(&response)
-        .map_err(|error| DfsPeerTransportError::new(error.to_string()))
+impl AsyncDfsPeerTransport for EvolutionSifsPeerTransport {
+    fn call_object_rpc_async<'a>(
+        &'a self,
+        target_node_id: &'a NodeId,
+        request: &'a network::ObjectRpcRequest,
+        options: DfsObjectRpcSendOptions,
+    ) -> DfsPeerTransportFuture<'a, Result<network::ObjectRpcResponse, DfsPeerTransportError>> {
+        Box::pin(async move {
+            <Self as DfsPeerTransport>::call_object_rpc(self, target_node_id, request, options)
+        })
+    }
 }
 
 fn publish_evolution_sifs_metadata_journal(
     data_dir: &SinomoDataDir,
 ) -> Result<(), sinomo_runtime::dfs::DfsError> {
     let cluster_paths = ClusterPaths::new(data_dir);
-    let sender: DfsMetadataJournalBatchSender = Arc::new(|endpoint, command, timeout| {
-        let request = sinomo_runtime::dfs::dfs_metadata_journal_batch_rpc_request(command)
-            .map_err(|error| DfsMetadataPeerTransportError::new(error.to_string()))?;
-        let response =
-            sinomo_runtime::daemon::send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
-                .map_err(|error| DfsMetadataPeerTransportError::new(error.to_string()))?;
-        sinomo_runtime::dfs::decode_dfs_metadata_journal_batch_rpc_response(&response)
-            .map_err(|error| DfsMetadataPeerTransportError::new(error.to_string()))
-    });
-    let snapshot_sender: DfsMetadataSnapshotInstallSender =
-        Arc::new(|endpoint, command, timeout| {
-            let request = sinomo_runtime::dfs::dfs_metadata_snapshot_install_rpc_request(command)
-                .map_err(|error| DfsMetadataPeerTransportError::new(error.to_string()))?;
-            let response =
-                sinomo_runtime::daemon::send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
-                    .map_err(|error| DfsMetadataPeerTransportError::new(error.to_string()))?;
-            sinomo_runtime::dfs::decode_dfs_metadata_snapshot_install_rpc_response(&response)
-                .map_err(|error| DfsMetadataPeerTransportError::new(error.to_string()))
-        });
-    publish_cluster_dfs_metadata_journal(
+    let peer_transport: Arc<dyn DfsPeerTransport> = Arc::new(EvolutionSifsPeerTransport);
+    publish_cluster_dfs_metadata_journal_with_peer_transport(
         data_dir,
         &cluster_paths,
-        sender,
-        snapshot_sender,
+        peer_transport,
         DfsMetadataJournalReplicationOptions::default(),
     )?;
     Ok(())

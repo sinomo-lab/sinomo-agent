@@ -9,6 +9,8 @@
 //!   roundtrip; read-your-write must hold immediately on the writing node.
 //! - `cluster.dfs.invariants` — operational-metric sweep: no open conflicts,
 //!   no stuck routed namespace ops, no leaked cross-shard locks.
+//! - `cluster.dfs.lightweight-latency` — warmed SIFS stat/list/read-prefix
+//!   latency probe for file-browser-style lightweight operations.
 //! - `cluster.dfs.protocol-codec-baseline` — in-memory DFS typed message
 //!   object-RPC codec throughput for representative chunk messages, independent
 //!   of disk and live network conditions.
@@ -45,6 +47,7 @@ use sinomo_runtime::test::{
     SinomoTestContext, SinomoTestError, SinomoTestOutcome, SinomoTestRegistryBuilder,
     SinomoTestRequirement, SinomoTestResult,
 };
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -53,6 +56,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_EXPECT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_BULK_FILE_COUNT: usize = 128;
 const DEFAULT_BULK_FILE_BYTES: usize = 4 * 1024;
+const DEFAULT_LIGHTWEIGHT_LATENCY_ITERATIONS: usize = 128;
+const DEFAULT_LIGHTWEIGHT_LATENCY_WARMUP_ITERATIONS: usize = 16;
+const DEFAULT_LIGHTWEIGHT_LATENCY_PAYLOAD_BYTES: usize = 64;
 const DEFAULT_LARGE_FILE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_PROTOCOL_CODEC_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_PROTOCOL_CODEC_ITERATIONS: usize = 8;
@@ -65,6 +71,7 @@ pub fn register_dfs_cluster_test_cases(
     builder
         .register(dfs_read_your_write())
         .register(dfs_invariants())
+        .register(dfs_lightweight_latency())
         .register(dfs_protocol_codec_baseline())
         .register(dfs_write())
         .register(dfs_expect_file())
@@ -106,9 +113,21 @@ sinomo_runtime::test::sinomo_test_case! {
 }
 
 sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_lightweight_latency(ctx) {
+        id: "cluster.dfs.lightweight-latency",
+        summary: "Measure warmed SIFS stat/list/read-prefix latency for lightweight file-browser operations",
+        tags: ["cluster-dfs", "probe", "performance"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_lightweight_latency(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
     pub fn dfs_protocol_codec_baseline(ctx) {
         id: "cluster.dfs.protocol-codec-baseline",
-        summary: "Measure in-memory DFS protocol-frame object-RPC encode/decode throughput for chunk payloads",
+        summary: "Measure in-memory DFS data-plane object-RPC encode/decode throughput for chunk payloads",
         tags: ["cluster-dfs", "probe", "performance"],
         requirements: [],
         run: {
@@ -326,12 +345,13 @@ fn run_protocol_codec_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult 
     let encoded_samples = samples
         .iter()
         .map(|sample| {
-            let request = dfs::dfs_message_rpc_request(&sample.command).map_err(|error| {
-                SinomoTestError::failed(format!(
-                    "cannot encode {} DFS message request: {error}",
-                    sample.label
-                ))
-            })?;
+            let request = dfs::dfs_routed_message_rpc_request(&sample.command.routed_message)
+                .map_err(|error| {
+                    SinomoTestError::failed(format!(
+                        "cannot encode {} DFS message request: {error}",
+                        sample.label
+                    ))
+                })?;
             Ok(EncodedDfsProtocolCodecSample {
                 label: sample.label,
                 request_body_bytes: request.body.len(),
@@ -356,12 +376,13 @@ fn run_protocol_codec_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult 
     let mut encoded_request_body_bytes = 0_usize;
     for _ in 0..iterations {
         for sample in &samples {
-            let request = dfs::dfs_message_rpc_request(&sample.command).map_err(|error| {
-                SinomoTestError::failed(format!(
-                    "cannot encode {} DFS message request: {error}",
-                    sample.label
-                ))
-            })?;
+            let request = dfs::dfs_routed_message_rpc_request(&sample.command.routed_message)
+                .map_err(|error| {
+                    SinomoTestError::failed(format!(
+                        "cannot encode {} DFS message request: {error}",
+                        sample.label
+                    ))
+                })?;
             encoded_request_body_bytes =
                 encoded_request_body_bytes.saturating_add(request.body.len());
             std::hint::black_box(&request);
@@ -440,12 +461,12 @@ fn run_protocol_codec_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult 
 
     if min_encode_bytes_per_second > 0.0 && encode_bytes_per_second < min_encode_bytes_per_second {
         return Ok(SinomoTestOutcome::failed(format!(
-            "DFS protocol frame encode throughput {encode_bytes_per_second:.2} bytes/s is below required {min_encode_bytes_per_second:.2} bytes/s"
+            "DFS data-plane object-RPC encode throughput {encode_bytes_per_second:.2} bytes/s is below required {min_encode_bytes_per_second:.2} bytes/s"
         )));
     }
     if min_decode_bytes_per_second > 0.0 && decode_bytes_per_second < min_decode_bytes_per_second {
         return Ok(SinomoTestOutcome::failed(format!(
-            "DFS protocol frame decode throughput {decode_bytes_per_second:.2} bytes/s is below required {min_decode_bytes_per_second:.2} bytes/s"
+            "DFS data-plane object-RPC decode throughput {decode_bytes_per_second:.2} bytes/s is below required {min_decode_bytes_per_second:.2} bytes/s"
         )));
     }
 
@@ -511,6 +532,271 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         }
         std::thread::sleep(EXPECT_POLL_INTERVAL);
     }
+}
+
+fn run_lightweight_latency(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let base = ctx
+        .parameter("base")
+        .unwrap_or(DEFAULT_ROUNDTRIP_BASE)
+        .trim_end_matches('/')
+        .to_string();
+    let iterations =
+        optional_usize_parameter(ctx, "iterations", DEFAULT_LIGHTWEIGHT_LATENCY_ITERATIONS)?;
+    let warmup_iterations = optional_usize_parameter(
+        ctx,
+        "warmup-iterations",
+        DEFAULT_LIGHTWEIGHT_LATENCY_WARMUP_ITERATIONS,
+    )?;
+    let payload_bytes = optional_usize_parameter(
+        ctx,
+        "payload-bytes",
+        DEFAULT_LIGHTWEIGHT_LATENCY_PAYLOAD_BYTES,
+    )?;
+    let max_p50_us = optional_usize_parameter(ctx, "max-p50-us", 0)? as u64;
+    let max_p95_us = optional_usize_parameter(ctx, "max-p95-us", 0)? as u64;
+    let max_max_us = optional_usize_parameter(ctx, "max-max-us", 0)? as u64;
+    require_positive("iterations", iterations)?;
+    require_positive("payload-bytes", payload_bytes)?;
+
+    let backend_open_started = Instant::now();
+    let backend = open_backend(ctx)?;
+    let backend_open_elapsed = backend_open_started.elapsed();
+    let node = backend.node_label();
+    let nonce = probe_nonce();
+    let fixture_dir = format!("{base}/latency-{nonce}");
+    let file_name = "tiny.txt";
+    let file_path = format!("{fixture_dir}/{file_name}");
+    let payload = pattern_payload(
+        &format!("dfs-lightweight-latency-{node}-{nonce}"),
+        payload_bytes,
+    );
+
+    let setup_started = Instant::now();
+    backend
+        .create_dir_all(&fixture_dir)
+        .map_err(SinomoTestError::failed)?;
+    backend
+        .write_file(&file_path, &payload)
+        .map_err(SinomoTestError::failed)?;
+    let setup_elapsed = setup_started.elapsed();
+
+    for _ in 0..warmup_iterations {
+        run_lightweight_latency_operations(
+            &backend,
+            &fixture_dir,
+            &file_path,
+            file_name,
+            &payload,
+        )?;
+    }
+
+    let mut latency_us = BTreeMap::<&'static str, Vec<u64>>::new();
+    let measurement_started = Instant::now();
+    for _ in 0..iterations {
+        record_lightweight_operation_latency(&mut latency_us, "stat_file", || {
+            validate_lightweight_stat_file(&backend, &file_path, payload_bytes)
+        })?;
+        record_lightweight_operation_latency(&mut latency_us, "stat_dir", || {
+            validate_lightweight_stat_dir(&backend, &fixture_dir)
+        })?;
+        record_lightweight_operation_latency(&mut latency_us, "list_dir", || {
+            validate_lightweight_list_dir(&backend, &fixture_dir, file_name)
+        })?;
+        record_lightweight_operation_latency(&mut latency_us, "read_prefix", || {
+            validate_lightweight_read_prefix(&backend, &file_path, &payload)
+        })?;
+    }
+    let measurement_elapsed = measurement_started.elapsed();
+
+    ctx.record("node", &node);
+    ctx.record("base", &base);
+    ctx.record("fixture_dir", &fixture_dir);
+    ctx.record("file_path", &file_path);
+    ctx.record("iterations", iterations);
+    ctx.record("warmup_iterations", warmup_iterations);
+    ctx.record("payload_bytes", payload_bytes);
+    ctx.record("max_p50_us", max_p50_us);
+    ctx.record("max_p95_us", max_p95_us);
+    ctx.record("max_max_us", max_max_us);
+    ctx.record(
+        "backend_open_elapsed_ms",
+        backend_open_elapsed.as_millis() as u64,
+    );
+    ctx.record("setup_elapsed_ms", setup_elapsed.as_millis() as u64);
+    ctx.record(
+        "measurement_elapsed_ms",
+        measurement_elapsed.as_millis() as u64,
+    );
+
+    let mut operation_summaries = BTreeMap::new();
+    let mut worst_p50 = (String::new(), 0_u64);
+    let mut worst_p95 = (String::new(), 0_u64);
+    let mut worst_max = (String::new(), 0_u64);
+    for (operation, mut samples) in latency_us {
+        samples.sort_unstable();
+        let count = samples.len();
+        let min = samples.iter().copied().min().unwrap_or(0);
+        let p50 = percentile_value(&samples, 50);
+        let p95 = percentile_value(&samples, 95);
+        let max = samples.iter().copied().max().unwrap_or(0);
+        let mean = mean_value(&samples);
+        let operation_key = operation.to_string();
+        ctx.record(format!("{operation}_count"), count);
+        ctx.record(format!("{operation}_latency_min_us"), min);
+        ctx.record(format!("{operation}_latency_p50_us"), p50);
+        ctx.record(format!("{operation}_latency_p95_us"), p95);
+        ctx.record(format!("{operation}_latency_max_us"), max);
+        ctx.record(format!("{operation}_latency_mean_us"), mean);
+        operation_summaries.insert(
+            operation_key.clone(),
+            format!("count={count} min={min} mean={mean:.2} p50={p50} p95={p95} max={max}"),
+        );
+        if p50 > worst_p50.1 {
+            worst_p50 = (operation_key.clone(), p50);
+        }
+        if p95 > worst_p95.1 {
+            worst_p95 = (operation_key.clone(), p95);
+        }
+        if max > worst_max.1 {
+            worst_max = (operation_key, max);
+        }
+    }
+    ctx.record("operation_latency_us", operation_summaries);
+    ctx.record("worst_p50_operation", &worst_p50.0);
+    ctx.record("worst_p50_us", worst_p50.1);
+    ctx.record("worst_p95_operation", &worst_p95.0);
+    ctx.record("worst_p95_us", worst_p95.1);
+    ctx.record("worst_max_operation", &worst_max.0);
+    ctx.record("worst_max_us", worst_max.1);
+
+    if max_p50_us > 0 && worst_p50.1 > max_p50_us {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "DFS lightweight latency worst p50 {}={}us is above allowed {max_p50_us}us",
+            worst_p50.0, worst_p50.1
+        )));
+    }
+    if max_p95_us > 0 && worst_p95.1 > max_p95_us {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "DFS lightweight latency worst p95 {}={}us is above allowed {max_p95_us}us",
+            worst_p95.0, worst_p95.1
+        )));
+    }
+    if max_max_us > 0 && worst_max.1 > max_max_us {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "DFS lightweight latency worst max {}={}us is above allowed {max_max_us}us",
+            worst_max.0, worst_max.1
+        )));
+    }
+
+    Ok(SinomoTestOutcome::passed(format!(
+        "DFS lightweight latency on node {node}: worst p50 {}={}us, worst p95 {}={}us over {iterations} warmed iterations",
+        worst_p50.0, worst_p50.1, worst_p95.0, worst_p95.1
+    )))
+}
+
+fn run_lightweight_latency_operations(
+    backend: &SifsFileManagerBackend,
+    fixture_dir: &str,
+    file_path: &str,
+    file_name: &str,
+    payload: &[u8],
+) -> Result<(), SinomoTestError> {
+    validate_lightweight_stat_file(backend, file_path, payload.len())?;
+    validate_lightweight_stat_dir(backend, fixture_dir)?;
+    validate_lightweight_list_dir(backend, fixture_dir, file_name)?;
+    validate_lightweight_read_prefix(backend, file_path, payload)?;
+    Ok(())
+}
+
+fn record_lightweight_operation_latency<F>(
+    latency_us: &mut BTreeMap<&'static str, Vec<u64>>,
+    operation: &'static str,
+    run: F,
+) -> Result<(), SinomoTestError>
+where
+    F: FnOnce() -> Result<(), SinomoTestError>,
+{
+    let started = Instant::now();
+    run()?;
+    latency_us
+        .entry(operation)
+        .or_default()
+        .push(started.elapsed().as_micros() as u64);
+    Ok(())
+}
+
+fn validate_lightweight_stat_file(
+    backend: &SifsFileManagerBackend,
+    path: &str,
+    expected_bytes: usize,
+) -> Result<(), SinomoTestError> {
+    let metadata = backend.stat(path).map_err(SinomoTestError::failed)?;
+    if metadata.kind != crate::file_manager::FileManagerEntryKind::File {
+        return Err(SinomoTestError::failed(format!(
+            "{path} stat kind {:?}, expected file",
+            metadata.kind
+        )));
+    }
+    if metadata.size != Some(expected_bytes as u64) {
+        return Err(SinomoTestError::failed(format!(
+            "{path} stat size {:?}, expected {expected_bytes}",
+            metadata.size
+        )));
+    }
+    Ok(())
+}
+
+fn validate_lightweight_stat_dir(
+    backend: &SifsFileManagerBackend,
+    path: &str,
+) -> Result<(), SinomoTestError> {
+    let metadata = backend.stat(path).map_err(SinomoTestError::failed)?;
+    if metadata.kind != crate::file_manager::FileManagerEntryKind::Directory {
+        return Err(SinomoTestError::failed(format!(
+            "{path} stat kind {:?}, expected directory",
+            metadata.kind
+        )));
+    }
+    Ok(())
+}
+
+fn validate_lightweight_list_dir(
+    backend: &SifsFileManagerBackend,
+    path: &str,
+    expected_name: &str,
+) -> Result<(), SinomoTestError> {
+    let entries = backend.list_dir(path).map_err(SinomoTestError::failed)?;
+    if !entries.iter().any(|entry| {
+        entry.name == expected_name && entry.kind == crate::file_manager::FileManagerEntryKind::File
+    }) {
+        return Err(SinomoTestError::failed(format!(
+            "{path} listing did not include file {expected_name}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_lightweight_read_prefix(
+    backend: &SifsFileManagerBackend,
+    path: &str,
+    expected: &[u8],
+) -> Result<(), SinomoTestError> {
+    let read = backend
+        .read_file_prefix(path, expected.len() as u64)
+        .map_err(SinomoTestError::failed)?;
+    if read.truncated {
+        return Err(SinomoTestError::failed(format!(
+            "{path} read-prefix unexpectedly truncated"
+        )));
+    }
+    if read.bytes != expected {
+        return Err(SinomoTestError::failed(format!(
+            "{path} read-prefix returned {} bytes, expected {}",
+            read.bytes.len(),
+            expected.len()
+        )));
+    }
+    Ok(())
 }
 
 fn run_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
@@ -2142,6 +2428,22 @@ fn rate_per_second(count: f64, elapsed: Duration) -> f64 {
         return count;
     }
     count / seconds
+}
+
+fn percentile_value(sorted: &[u64], percentile: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = sorted.len().saturating_mul(percentile).saturating_add(99) / 100;
+    let index = rank.saturating_sub(1).min(sorted.len() - 1);
+    sorted[index]
+}
+
+fn mean_value(values: &[u64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.iter().copied().sum::<u64>() as f64 / values.len() as f64
 }
 
 #[derive(Clone, Copy, Debug, Default)]
