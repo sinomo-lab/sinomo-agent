@@ -17,7 +17,6 @@ use sinomo_runtime::config::{
     ConfigClusterMode, ConfigDefinition, ConfigError, ConfigRegistry, ConfigRegistryBuilder,
     ConfigStore, ConfigValueType, ConfigWriteTarget,
 };
-use sinomo_runtime::core::ClusterEndpointRecord;
 use sinomo_runtime::core::{EvaluationOutcome, EvaluationScorecard};
 use sinomo_runtime::dfs::{
     AsyncDfsPeerTransport, DfsEndpointTransport, DfsMetadataJournalReplicationOptions,
@@ -32,6 +31,7 @@ use sinomo_runtime::eval::CommandRunResult;
 use sinomo_runtime::kv::read_cluster_kv_prefix_entries;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
+use sinomo_runtime::node::NodeId;
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -2621,14 +2621,15 @@ struct EvolutionSifsPeerTransport;
 impl DfsPeerTransport for EvolutionSifsPeerTransport {
     fn call_object_rpc(
         &self,
-        endpoint: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         request: &network::ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> Result<network::ObjectRpcResponse, DfsPeerTransportError> {
-        sinomo_runtime::daemon::send_daemon_rpc_to_endpoint(
-            endpoint,
+        sinomo_runtime::daemon::send_dfs_object_rpc_to_target(
+            target_node_id,
             request,
             options.connect_timeout,
+            options.observe_connectivity,
         )
         .map_err(|error| DfsPeerTransportError::new(error.to_string()))
     }
@@ -2637,12 +2638,12 @@ impl DfsPeerTransport for EvolutionSifsPeerTransport {
 impl AsyncDfsPeerTransport for EvolutionSifsPeerTransport {
     fn call_object_rpc_async<'a>(
         &'a self,
-        endpoint: &'a ClusterEndpointRecord,
+        target_node_id: &'a NodeId,
         request: &'a network::ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> DfsPeerTransportFuture<'a, Result<network::ObjectRpcResponse, DfsPeerTransportError>> {
         Box::pin(async move {
-            <Self as DfsPeerTransport>::call_object_rpc(self, endpoint, request, options)
+            <Self as DfsPeerTransport>::call_object_rpc(self, target_node_id, request, options)
         })
     }
 }

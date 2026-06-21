@@ -316,8 +316,8 @@ pub use object::{
 pub(crate) use object::{
     DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY, DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE,
     DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY,
-    DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE, ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY,
-    ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE, object_rpc_request_accepts_streamed_daemon_response,
+    DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE,
+    object_rpc_request_accepts_streamed_daemon_response,
     object_rpc_request_expects_raw_daemon_response, send_daemon_control_request_async,
     send_daemon_control_rpc_request_raw_response_async,
 };
@@ -363,13 +363,13 @@ pub use roaming::{
 };
 pub use route::{
     CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY, CLUSTER_ROUTING_RPC_ROUTE_METADATA,
-    ClusterObjectRpcClient, ClusterObjectRpcNodeOptions, ClusterObjectRpcOptions,
-    ClusterRelayAsyncHost, ClusterRelayOptions, ClusterRelayStreamForwardAsyncHost,
-    ClusterRelayStreamForwardOutcome, ClusterRelayStreamRequestAction,
-    ClusterRelayStreamSendOutcome, ClusterSignedEndpointRpcAsyncHost,
-    ClusterSignedEndpointRpcFuture, ClusterSignedEndpointRpcObservation,
-    cluster_relay_stream_request_action, handle_cluster_relay_async_with_host,
-    handle_cluster_relay_stream_forward_async_with_host, relay_response_is_routing_error,
+    ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterRelayAsyncHost, ClusterRelayOptions,
+    ClusterRelayStreamForwardAsyncHost, ClusterRelayStreamForwardOutcome,
+    ClusterRelayStreamRequestAction, ClusterRelayStreamSendOutcome,
+    ClusterSignedEndpointRpcAsyncHost, ClusterSignedEndpointRpcFuture,
+    ClusterSignedEndpointRpcObservation, cluster_relay_stream_request_action,
+    handle_cluster_relay_async_with_host, handle_cluster_relay_stream_forward_async_with_host,
+    relay_response_is_routing_error,
 };
 pub use rpc::{
     CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_HEALTH_RPC_ROUTE_METADATA,

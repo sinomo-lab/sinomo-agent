@@ -3171,7 +3171,6 @@ pub fn open_mounted_sifs_service(
     let peer_transport = Arc::new(MountedSifsPeerTransport {
         data_dir: data_dir.clone(),
         cluster_paths: cluster_paths.clone(),
-        cluster_id: cluster_state.as_ref().map(|state| state.cluster_id.clone()),
     });
     let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
     let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer_transport;
@@ -3280,11 +3279,9 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
             })?;
         let mut host = MountedSifsObjectRpcHost {
             data_dir: self.data_dir.clone(),
-            cluster_id: Some(state.cluster_id.clone()),
             runtime: runtime.handle().clone(),
         };
-        let options = sinomo_network::ClusterObjectRpcNodeOptions::new(
-            sinomo_network::ClusterEndpointSelectionPurpose::MainDaemonCommand,
+        let options = sinomo_network::ClusterObjectRpcOptions::new(
             sinomo_network::DaemonRpcTimeouts::connect_and_idle(
                 MOUNTED_SIFS_CLUSTER_KV_TXN_TIMEOUT,
             ),
@@ -3295,7 +3292,7 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
             &self.cluster_paths,
         );
         let response_result = runtime
-            .block_on(client.call_node(&state, &state.local_node_id, &request, options))
+            .block_on(client.call_target(&state, &state.local_node_id, &request, options))
             .and_then(|response| {
                 response.error_detail()?;
                 Ok(response)
@@ -3325,27 +3322,27 @@ fn object_rpc_request_from_kv_payload(payload: sinomo_kv::ClusterKvRpcPayload) -
 struct MountedSifsPeerTransport {
     data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
-    cluster_id: Option<sinomo_node::ClusterId>,
 }
 
 impl MountedSifsPeerTransport {
     async fn call_object_rpc_async_inner(
         &self,
-        endpoint: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         request: &ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
         runtime: &tokio::runtime::Handle,
     ) -> Result<ObjectRpcResponse, NetworkError> {
+        let state = sinomo_network::read_cluster_state(&self.cluster_paths)?;
         let mut host = MountedSifsObjectRpcHost {
             data_dir: self.data_dir.clone(),
-            cluster_id: self.cluster_id.clone(),
             runtime: runtime.clone(),
         };
         let mut client =
             sinomo_network::ClusterObjectRpcClient::routed(&mut host, runtime, &self.cluster_paths);
         let response = client
-            .call_endpoint(
-                endpoint,
+            .call_target(
+                &state,
+                target_node_id,
                 request,
                 sinomo_network::ClusterObjectRpcOptions::new(
                     sinomo_network::DaemonRpcTimeouts::connect_and_idle(options.connect_timeout),
@@ -3360,7 +3357,7 @@ impl MountedSifsPeerTransport {
 impl DfsPeerTransport for MountedSifsPeerTransport {
     fn call_object_rpc(
         &self,
-        endpoint: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         request: &ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> Result<ObjectRpcResponse, DfsPeerTransportError> {
@@ -3370,9 +3367,12 @@ impl DfsPeerTransport for MountedSifsPeerTransport {
                 tokio::runtime::RuntimeFlavor::MultiThread
             ) {
                 let result = tokio::task::block_in_place(|| {
-                    handle.block_on(
-                        self.call_object_rpc_async_inner(endpoint, request, options, &handle),
-                    )
+                    handle.block_on(self.call_object_rpc_async_inner(
+                        target_node_id,
+                        request,
+                        options,
+                        &handle,
+                    ))
                 });
                 result.map_err(|source| DfsPeerTransportError::new(source.to_string()))
             } else {
@@ -3387,7 +3387,7 @@ impl DfsPeerTransport for MountedSifsPeerTransport {
             .build()
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
         let result = runtime.block_on(self.call_object_rpc_async_inner(
-            endpoint,
+            target_node_id,
             request,
             options,
             runtime.handle(),
@@ -3400,14 +3400,14 @@ impl DfsPeerTransport for MountedSifsPeerTransport {
 impl AsyncDfsPeerTransport for MountedSifsPeerTransport {
     fn call_object_rpc_async<'a>(
         &'a self,
-        endpoint: &'a ClusterEndpointRecord,
+        target_node_id: &'a NodeId,
         request: &'a ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResponse, DfsPeerTransportError>> {
         Box::pin(async move {
             let runtime = tokio::runtime::Handle::try_current()
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-            self.call_object_rpc_async_inner(endpoint, request, options, &runtime)
+            self.call_object_rpc_async_inner(target_node_id, request, options, &runtime)
                 .await
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))
         })
@@ -3416,7 +3416,6 @@ impl AsyncDfsPeerTransport for MountedSifsPeerTransport {
 
 struct MountedSifsObjectRpcHost {
     data_dir: SinomoDataDir,
-    cluster_id: Option<sinomo_node::ClusterId>,
     runtime: tokio::runtime::Handle,
 }
 
@@ -3439,14 +3438,6 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for MountedSifsObjectRpcH
                     detail: format!("endpoint signing task failed: {source}"),
                 })?
         })
-    }
-
-    fn endpoint_rpc_cluster_id_async<'a>(
-        &'a mut self,
-        _endpoint: &'a ClusterEndpointRecord,
-    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_node::ClusterId>> {
-        let cluster_id = self.cluster_id.clone();
-        Box::pin(async move { Ok(cluster_id) })
     }
 }
 
@@ -6672,7 +6663,7 @@ impl std::error::Error for DfsMetadataPeerTransportError {}
 
 pub type DfsMetadataJournalBatchSender = Arc<
     dyn Fn(
-            &ClusterEndpointRecord,
+            &NodeId,
             &DfsMetadataJournalBatchCommand,
             Duration,
         ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataPeerTransportError>
@@ -6682,7 +6673,7 @@ pub type DfsMetadataJournalBatchSender = Arc<
 
 pub type DfsMetadataSnapshotInstallSender = Arc<
     dyn Fn(
-            &ClusterEndpointRecord,
+            &NodeId,
             &DfsMetadataSnapshotInstallCommand,
             Duration,
         ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataPeerTransportError>
@@ -6725,7 +6716,7 @@ impl DfsMetadataEndpointTransport {
 }
 
 fn validate_dfs_metadata_journal_batch_response(
-    endpoint: &ClusterEndpointRecord,
+    target_node_id: &NodeId,
     command: &DfsMetadataJournalBatchCommand,
     response: &DfsMetadataJournalBatchResponse,
 ) -> Result<(), String> {
@@ -6734,8 +6725,7 @@ fn validate_dfs_metadata_journal_batch_response(
         || response.next_after_sequence != command.batch.next_after_sequence
     {
         return Err(format!(
-            "{} returned mismatched metadata journal response",
-            endpoint.address
+            "{target_node_id} returned mismatched metadata journal response"
         ));
     }
     Ok(())
@@ -6756,7 +6746,7 @@ fn validate_dfs_metadata_journal_replication_response(
 }
 
 fn validate_dfs_metadata_snapshot_install_response(
-    endpoint: &ClusterEndpointRecord,
+    target_node_id: &NodeId,
     command: &DfsMetadataSnapshotInstallCommand,
     response: &DfsMetadataSnapshotInstallResponse,
 ) -> Result<(), String> {
@@ -6765,8 +6755,7 @@ fn validate_dfs_metadata_snapshot_install_response(
         || response.next_after_sequence != command.next_after_sequence
     {
         return Err(format!(
-            "{} returned mismatched metadata snapshot install response",
-            endpoint.address
+            "{target_node_id} returned mismatched metadata snapshot install response"
         ));
     }
     Ok(())
@@ -6796,36 +6785,21 @@ impl DfsMetadataJournalReplicationTransport for DfsMetadataEndpointTransport {
         command: &DfsMetadataJournalBatchCommand,
         timeout: Duration,
     ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationTransportError> {
-        let endpoints = self.target_endpoints(target_node_id);
-        if endpoints.is_empty() {
+        if self.target_endpoints(target_node_id).is_empty() {
             return Err(DfsMetadataJournalReplicationTransportError::MissingEndpoint);
         }
-        let mut failures = Vec::new();
-        let started = Instant::now();
-        for endpoint in endpoints {
-            let Some(attempt_timeout) = timeout.checked_sub(started.elapsed()) else {
-                failures.push(format!(
-                    "metadata journal replication target deadline exceeded after {}ms",
-                    timeout.as_millis()
-                ));
-                break;
-            };
-            match (self.sender)(endpoint, command, attempt_timeout) {
-                Ok(response) => {
-                    if let Err(error) =
-                        validate_dfs_metadata_journal_batch_response(endpoint, command, &response)
-                    {
-                        failures.push(error);
-                        continue;
-                    }
-                    return Ok(response);
-                }
-                Err(error) => failures.push(format!("{} failed: {error}", endpoint.address)),
+        match (self.sender)(target_node_id, command, timeout) {
+            Ok(response) => {
+                validate_dfs_metadata_journal_batch_response(target_node_id, command, &response)
+                    .map_err(
+                        |reason| DfsMetadataJournalReplicationTransportError::Failed { reason },
+                    )?;
+                Ok(response)
             }
+            Err(error) => Err(DfsMetadataJournalReplicationTransportError::Failed {
+                reason: error.to_string(),
+            }),
         }
-        Err(DfsMetadataJournalReplicationTransportError::Failed {
-            reason: failures.join("; "),
-        })
     }
 
     fn send_metadata_snapshot_install(
@@ -6835,36 +6809,21 @@ impl DfsMetadataJournalReplicationTransport for DfsMetadataEndpointTransport {
         timeout: Duration,
     ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataJournalReplicationTransportError>
     {
-        let endpoints = self.target_endpoints(target_node_id);
-        if endpoints.is_empty() {
+        if self.target_endpoints(target_node_id).is_empty() {
             return Err(DfsMetadataJournalReplicationTransportError::MissingEndpoint);
         }
-        let mut failures = Vec::new();
-        let started = Instant::now();
-        for endpoint in endpoints {
-            let Some(attempt_timeout) = timeout.checked_sub(started.elapsed()) else {
-                failures.push(format!(
-                    "metadata snapshot install target deadline exceeded after {}ms",
-                    timeout.as_millis()
-                ));
-                break;
-            };
-            match (self.snapshot_sender)(endpoint, command, attempt_timeout) {
-                Ok(response) => {
-                    if let Err(error) = validate_dfs_metadata_snapshot_install_response(
-                        endpoint, command, &response,
-                    ) {
-                        failures.push(error);
-                        continue;
-                    }
-                    return Ok(response);
-                }
-                Err(error) => failures.push(format!("{} failed: {error}", endpoint.address)),
+        match (self.snapshot_sender)(target_node_id, command, timeout) {
+            Ok(response) => {
+                validate_dfs_metadata_snapshot_install_response(target_node_id, command, &response)
+                    .map_err(
+                        |reason| DfsMetadataJournalReplicationTransportError::Failed { reason },
+                    )?;
+                Ok(response)
             }
+            Err(error) => Err(DfsMetadataJournalReplicationTransportError::Failed {
+                reason: error.to_string(),
+            }),
         }
-        Err(DfsMetadataJournalReplicationTransportError::Failed {
-            reason: failures.join("; "),
-        })
     }
 }
 
@@ -6920,36 +6879,25 @@ impl AsyncDfsMetadataJournalReplicationTransport for AsyncDfsMetadataEndpointTra
         Result<DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationTransportError>,
     > {
         Box::pin(async move {
-            let endpoints = self.target_endpoints(target_node_id);
-            if endpoints.is_empty() {
+            if self.target_endpoints(target_node_id).is_empty() {
                 return Err(DfsMetadataJournalReplicationTransportError::MissingEndpoint);
             }
-            let mut failures = Vec::new();
-            let started = Instant::now();
-            for endpoint in endpoints {
-                let Some(attempt_timeout) = timeout.checked_sub(started.elapsed()) else {
-                    failures.push(format!(
-                        "metadata journal replication target deadline exceeded after {}ms",
-                        timeout.as_millis()
-                    ));
-                    break;
-                };
-                match (self.sender)(&endpoint, command, attempt_timeout).await {
-                    Ok(response) => {
-                        if let Err(error) = validate_dfs_metadata_journal_batch_response(
-                            &endpoint, command, &response,
-                        ) {
-                            failures.push(error);
-                            continue;
-                        }
-                        return Ok(response);
-                    }
-                    Err(error) => failures.push(format!("{} failed: {error}", endpoint.address)),
+            match (self.sender)(target_node_id, command, timeout).await {
+                Ok(response) => {
+                    validate_dfs_metadata_journal_batch_response(
+                        target_node_id,
+                        command,
+                        &response,
+                    )
+                    .map_err(|reason| {
+                        DfsMetadataJournalReplicationTransportError::Failed { reason }
+                    })?;
+                    Ok(response)
                 }
+                Err(error) => Err(DfsMetadataJournalReplicationTransportError::Failed {
+                    reason: error.to_string(),
+                }),
             }
-            Err(DfsMetadataJournalReplicationTransportError::Failed {
-                reason: failures.join("; "),
-            })
         })
     }
 
@@ -6963,36 +6911,25 @@ impl AsyncDfsMetadataJournalReplicationTransport for AsyncDfsMetadataEndpointTra
         Result<DfsMetadataSnapshotInstallResponse, DfsMetadataJournalReplicationTransportError>,
     > {
         Box::pin(async move {
-            let endpoints = self.target_endpoints(target_node_id);
-            if endpoints.is_empty() {
+            if self.target_endpoints(target_node_id).is_empty() {
                 return Err(DfsMetadataJournalReplicationTransportError::MissingEndpoint);
             }
-            let mut failures = Vec::new();
-            let started = Instant::now();
-            for endpoint in endpoints {
-                let Some(attempt_timeout) = timeout.checked_sub(started.elapsed()) else {
-                    failures.push(format!(
-                        "metadata snapshot install target deadline exceeded after {}ms",
-                        timeout.as_millis()
-                    ));
-                    break;
-                };
-                match (self.snapshot_sender)(&endpoint, command, attempt_timeout).await {
-                    Ok(response) => {
-                        if let Err(error) = validate_dfs_metadata_snapshot_install_response(
-                            &endpoint, command, &response,
-                        ) {
-                            failures.push(error);
-                            continue;
-                        }
-                        return Ok(response);
-                    }
-                    Err(error) => failures.push(format!("{} failed: {error}", endpoint.address)),
+            match (self.snapshot_sender)(target_node_id, command, timeout).await {
+                Ok(response) => {
+                    validate_dfs_metadata_snapshot_install_response(
+                        target_node_id,
+                        command,
+                        &response,
+                    )
+                    .map_err(|reason| {
+                        DfsMetadataJournalReplicationTransportError::Failed { reason }
+                    })?;
+                    Ok(response)
                 }
+                Err(error) => Err(DfsMetadataJournalReplicationTransportError::Failed {
+                    reason: error.to_string(),
+                }),
             }
-            Err(DfsMetadataJournalReplicationTransportError::Failed {
-                reason: failures.join("; "),
-            })
         })
     }
 }
@@ -8340,7 +8277,7 @@ impl std::error::Error for DfsPeerTransportError {}
 
 pub(crate) type DfsMessageSender = Arc<
     dyn Fn(
-            &ClusterEndpointRecord,
+            &NodeId,
             &DfsMessageCommand,
             Duration,
         ) -> Result<DfsMessageResponse, DfsPeerTransportError>
@@ -8350,7 +8287,7 @@ pub(crate) type DfsMessageSender = Arc<
 
 pub(crate) type DfsDirectReadSender = Arc<
     dyn Fn(
-            &ClusterEndpointRecord,
+            &NodeId,
             &DfsDirectReadRequest,
             Duration,
         ) -> Result<DfsReadResponse, DfsPeerTransportError>
@@ -8360,7 +8297,7 @@ pub(crate) type DfsDirectReadSender = Arc<
 
 pub(crate) type AsyncDfsDirectReadSender = Arc<
     dyn for<'a> Fn(
-            &'a ClusterEndpointRecord,
+            &'a NodeId,
             &'a DfsDirectReadRequest,
             Duration,
         )
@@ -8392,7 +8329,7 @@ impl DfsObjectRpcSendOptions {
 pub trait DfsPeerTransport: Send + Sync {
     fn call_object_rpc(
         &self,
-        endpoint: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         request: &ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> Result<ObjectRpcResponse, DfsPeerTransportError>;
@@ -8403,7 +8340,7 @@ pub type DfsPeerTransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send +
 pub trait AsyncDfsPeerTransport: Send + Sync {
     fn call_object_rpc_async<'a>(
         &'a self,
-        endpoint: &'a ClusterEndpointRecord,
+        target_node_id: &'a NodeId,
         request: &'a ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResponse, DfsPeerTransportError>>;
@@ -8411,7 +8348,7 @@ pub trait AsyncDfsPeerTransport: Send + Sync {
 
 pub(crate) type AsyncDfsMessageSender = Arc<
     dyn for<'a> Fn(
-            &'a ClusterEndpointRecord,
+            &'a NodeId,
             &'a DfsMessageCommand,
             Duration,
         )
@@ -8422,7 +8359,7 @@ pub(crate) type AsyncDfsMessageSender = Arc<
 
 pub type AsyncDfsMetadataJournalBatchSender = Arc<
     dyn for<'a> Fn(
-            &'a ClusterEndpointRecord,
+            &'a NodeId,
             &'a DfsMetadataJournalBatchCommand,
             Duration,
         ) -> DfsPeerTransportFuture<
@@ -8434,7 +8371,7 @@ pub type AsyncDfsMetadataJournalBatchSender = Arc<
 
 pub type AsyncDfsMetadataSnapshotInstallSender = Arc<
     dyn for<'a> Fn(
-            &'a ClusterEndpointRecord,
+            &'a NodeId,
             &'a DfsMetadataSnapshotInstallCommand,
             Duration,
         ) -> DfsPeerTransportFuture<
@@ -8447,14 +8384,14 @@ pub type AsyncDfsMetadataSnapshotInstallSender = Arc<
 pub(crate) fn async_dfs_message_sender_from_peer_transport(
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
 ) -> AsyncDfsMessageSender {
-    Arc::new(move |endpoint, command, connect_timeout| {
+    Arc::new(move |target_node_id, command, connect_timeout| {
         let peer_transport = Arc::clone(&peer_transport);
         Box::pin(async move {
             let request = dfs_message_rpc_request(command)
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
             let response = peer_transport
                 .call_object_rpc_async(
-                    endpoint,
+                    target_node_id,
                     &request,
                     DfsObjectRpcSendOptions::new(connect_timeout)
                         .with_observe_connectivity(!dfs_message_is_read_only_request(command)),
@@ -8469,14 +8406,14 @@ pub(crate) fn async_dfs_message_sender_from_peer_transport(
 fn async_dfs_direct_read_sender_from_peer_transport(
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
 ) -> AsyncDfsDirectReadSender {
-    Arc::new(move |endpoint, request, connect_timeout| {
+    Arc::new(move |target_node_id, request, connect_timeout| {
         let peer_transport = Arc::clone(&peer_transport);
         Box::pin(async move {
             let rpc_request = dfs_direct_read_rpc_request(request)
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
             let response = peer_transport
                 .call_object_rpc_async(
-                    endpoint,
+                    target_node_id,
                     &rpc_request,
                     DfsObjectRpcSendOptions::new(connect_timeout).with_observe_connectivity(false),
                 )
@@ -8490,14 +8427,14 @@ fn async_dfs_direct_read_sender_from_peer_transport(
 pub(crate) fn async_dfs_metadata_journal_batch_sender_from_peer_transport(
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
 ) -> AsyncDfsMetadataJournalBatchSender {
-    Arc::new(move |endpoint, command, connect_timeout| {
+    Arc::new(move |target_node_id, command, connect_timeout| {
         let peer_transport = Arc::clone(&peer_transport);
         Box::pin(async move {
             let request = dfs_metadata_journal_batch_rpc_request(command)
                 .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
             let response = peer_transport
                 .call_object_rpc_async(
-                    endpoint,
+                    target_node_id,
                     &request,
                     DfsObjectRpcSendOptions::new(connect_timeout),
                 )
@@ -8512,14 +8449,14 @@ pub(crate) fn async_dfs_metadata_journal_batch_sender_from_peer_transport(
 pub(crate) fn async_dfs_metadata_snapshot_install_sender_from_peer_transport(
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
 ) -> AsyncDfsMetadataSnapshotInstallSender {
-    Arc::new(move |endpoint, command, connect_timeout| {
+    Arc::new(move |target_node_id, command, connect_timeout| {
         let peer_transport = Arc::clone(&peer_transport);
         Box::pin(async move {
             let request = dfs_metadata_snapshot_install_rpc_request(command)
                 .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
             let response = peer_transport
                 .call_object_rpc_async(
-                    endpoint,
+                    target_node_id,
                     &request,
                     DfsObjectRpcSendOptions::new(connect_timeout),
                 )
@@ -8534,11 +8471,11 @@ pub(crate) fn async_dfs_metadata_snapshot_install_sender_from_peer_transport(
 pub(crate) fn dfs_message_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsMessageSender {
-    Arc::new(move |endpoint, command, connect_timeout| {
+    Arc::new(move |target_node_id, command, connect_timeout| {
         let request = dfs_message_rpc_request(command)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
         let response = peer_transport.call_object_rpc(
-            endpoint,
+            target_node_id,
             &request,
             DfsObjectRpcSendOptions::new(connect_timeout)
                 .with_observe_connectivity(!dfs_message_is_read_only_request(command)),
@@ -8551,11 +8488,11 @@ pub(crate) fn dfs_message_sender_from_peer_transport(
 fn dfs_direct_read_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsDirectReadSender {
-    Arc::new(move |endpoint, request, connect_timeout| {
+    Arc::new(move |target_node_id, request, connect_timeout| {
         let rpc_request = dfs_direct_read_rpc_request(request)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
         let response = peer_transport.call_object_rpc(
-            endpoint,
+            target_node_id,
             &rpc_request,
             DfsObjectRpcSendOptions::new(connect_timeout).with_observe_connectivity(false),
         )?;
@@ -8567,12 +8504,12 @@ fn dfs_direct_read_sender_from_peer_transport(
 pub(crate) fn dfs_metadata_journal_batch_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsMetadataJournalBatchSender {
-    Arc::new(move |endpoint, command, connect_timeout| {
+    Arc::new(move |target_node_id, command, connect_timeout| {
         let request = dfs_metadata_journal_batch_rpc_request(command)
             .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
         let response = peer_transport
             .call_object_rpc(
-                endpoint,
+                target_node_id,
                 &request,
                 DfsObjectRpcSendOptions::new(connect_timeout),
             )
@@ -8585,12 +8522,12 @@ pub(crate) fn dfs_metadata_journal_batch_sender_from_peer_transport(
 pub(crate) fn dfs_metadata_snapshot_install_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsMetadataSnapshotInstallSender {
-    Arc::new(move |endpoint, command, connect_timeout| {
+    Arc::new(move |target_node_id, command, connect_timeout| {
         let request = dfs_metadata_snapshot_install_rpc_request(command)
             .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
         let response = peer_transport
             .call_object_rpc(
-                endpoint,
+                target_node_id,
                 &request,
                 DfsObjectRpcSendOptions::new(connect_timeout),
             )
@@ -8602,7 +8539,6 @@ pub(crate) fn dfs_metadata_snapshot_install_sender_from_peer_transport(
 
 #[derive(Clone)]
 struct DeferredDfsEndpointSend {
-    endpoints: Vec<ClusterEndpointRecord>,
     sender: DfsMessageSender,
     connect_timeout: Duration,
     target_node_id: NodeId,
@@ -8861,16 +8797,14 @@ impl DfsEndpointTransport {
                 self.incoming_messages.push_back(routed_message);
                 continue;
             }
-            let endpoints = self.routed_message_endpoint_send_plan(
+            self.validate_routed_message_target(
                 &target_node_id,
                 &routed_message,
                 require_local_source,
             )?;
-            if let Some(returned_messages) = self.try_send_direct_read_message_to_endpoint(
-                endpoints.clone(),
-                &target_node_id,
-                &routed_message,
-            )? {
+            if let Some(returned_messages) =
+                self.try_send_direct_read_message_to_endpoint(&target_node_id, &routed_message)?
+            {
                 for returned_message in returned_messages {
                     pending.push_back((
                         returned_message.target_node_id.clone(),
@@ -8888,7 +8822,6 @@ impl DfsEndpointTransport {
                 });
             };
             let returned_messages = send_dfs_routed_message_to_endpoint(
-                endpoints,
                 sender,
                 self.connect_timeout,
                 target_node_id,
@@ -8907,7 +8840,6 @@ impl DfsEndpointTransport {
 
     fn try_send_direct_read_message_to_endpoint(
         &self,
-        endpoints: Vec<ClusterEndpointRecord>,
         target_node_id: &NodeId,
         routed_message: &DfsRoutedMessage,
     ) -> Result<Option<Vec<DfsRoutedMessage>>, NetworkError> {
@@ -8921,7 +8853,6 @@ impl DfsEndpointTransport {
             return Ok(None);
         };
         let response = send_dfs_direct_read_to_endpoint(
-            endpoints,
             sender,
             self.connect_timeout,
             target_node_id.clone(),
@@ -8936,7 +8867,6 @@ impl DfsEndpointTransport {
 
     async fn try_send_direct_read_message_to_endpoint_async(
         &self,
-        endpoints: Vec<ClusterEndpointRecord>,
         target_node_id: &NodeId,
         routed_message: &DfsRoutedMessage,
     ) -> Result<Option<Vec<DfsRoutedMessage>>, NetworkError> {
@@ -8950,7 +8880,6 @@ impl DfsEndpointTransport {
             return Ok(None);
         };
         let response = send_dfs_direct_read_to_endpoint_async(
-            endpoints,
             sender,
             self.connect_timeout,
             target_node_id.clone(),
@@ -8974,11 +8903,7 @@ impl DfsEndpointTransport {
             self.incoming_messages.push_back(routed_message);
             return Ok(());
         }
-        let endpoints = self.routed_message_endpoint_send_plan(
-            target_node_id,
-            &routed_message,
-            require_local_source,
-        )?;
+        self.validate_routed_message_target(target_node_id, &routed_message, require_local_source)?;
         let Some(sender) = self.sender.as_ref().cloned() else {
             return Err(NetworkError::Io {
                 operation: format!("send DFS message to {target_node_id}"),
@@ -8992,7 +8917,6 @@ impl DfsEndpointTransport {
                 detail: "detached send lock is poisoned".to_string(),
             })?
             .push(DeferredDfsEndpointSend {
-                endpoints,
                 sender,
                 connect_timeout: self.connect_timeout,
                 target_node_id: target_node_id.clone(),
@@ -9011,7 +8935,6 @@ impl DfsEndpointTransport {
         };
         for send in sends {
             let returned_messages = send_dfs_routed_message_to_endpoint(
-                send.endpoints,
                 send.sender,
                 send.connect_timeout,
                 send.target_node_id,
@@ -9025,12 +8948,12 @@ impl DfsEndpointTransport {
         Ok(())
     }
 
-    fn routed_message_endpoint_send_plan(
+    fn validate_routed_message_target(
         &self,
         target_node_id: &NodeId,
         routed_message: &DfsRoutedMessage,
         require_local_source: bool,
-    ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+    ) -> Result<(), NetworkError> {
         if require_local_source && routed_message.source_node_id != self.local_node_id {
             return Err(NetworkError::FrameSourceMismatch {
                 local_node_id: self.local_node_id.clone(),
@@ -9053,12 +8976,12 @@ impl DfsEndpointTransport {
                 frame_target_node_id: routed_message.target_node_id.clone(),
             });
         }
-        self.endpoints_by_node_id
-            .get(target_node_id)
-            .cloned()
-            .ok_or_else(|| NetworkError::UnknownNode {
+        if !self.endpoints_by_node_id.contains_key(target_node_id) {
+            return Err(NetworkError::UnknownNode {
                 node_id: target_node_id.clone(),
-            })
+            });
+        }
+        Ok(())
     }
 
     async fn send_routed_message_to_endpoint_async(
@@ -9075,17 +8998,13 @@ impl DfsEndpointTransport {
                 self.incoming_messages.push_back(routed_message);
                 continue;
             }
-            let endpoints = self.routed_message_endpoint_send_plan(
+            self.validate_routed_message_target(
                 &target_node_id,
                 &routed_message,
                 require_local_source,
             )?;
             if let Some(returned_messages) = self
-                .try_send_direct_read_message_to_endpoint_async(
-                    endpoints.clone(),
-                    &target_node_id,
-                    &routed_message,
-                )
+                .try_send_direct_read_message_to_endpoint_async(&target_node_id, &routed_message)
                 .await?
             {
                 for returned_message in returned_messages {
@@ -9106,7 +9025,6 @@ impl DfsEndpointTransport {
                 });
             };
             let returned_messages = send_dfs_routed_message_to_endpoint_async(
-                endpoints,
                 sender,
                 connect_timeout,
                 target_node_id,
@@ -9140,7 +9058,6 @@ fn dfs_direct_read_response_routed_message(
 }
 
 fn send_dfs_routed_message_to_endpoint(
-    endpoints: Vec<ClusterEndpointRecord>,
     sender: DfsMessageSender,
     connect_timeout: Duration,
     target_node_id: NodeId,
@@ -9153,136 +9070,115 @@ fn send_dfs_routed_message_to_endpoint(
         routed_message,
     };
     let request_body_bytes = dfs_message_request_body_bytes(&command)?;
-    let mut failures = Vec::new();
-    for endpoint in &endpoints {
-        let send_started = Instant::now();
-        match sender(endpoint, &command, connect_timeout) {
-            Ok(response) => {
-                let outbound_messages = response.outbound_messages;
-                let outbound_body_bytes =
-                    dfs_message_response_body_bytes(&command.request_id, &outbound_messages)?;
-                dfs_perf_trace(format_args!(
-                    "dfs-message-send local={} target={} endpoint={} request={} request_body_bytes={} outbound_messages={} outbound_body_bytes={} elapsed_ms={}",
-                    source_node_id,
-                    target_node_id,
-                    endpoint.address,
-                    command.request_id,
-                    request_body_bytes,
-                    outbound_messages.len(),
-                    outbound_body_bytes,
-                    send_started.elapsed().as_millis()
-                ));
-                return Ok(outbound_messages);
-            }
-            Err(error) => {
-                dfs_perf_trace(format_args!(
-                    "dfs-message-send-error local={} target={} endpoint={} request={} request_body_bytes={} elapsed_ms={} error={}",
-                    source_node_id,
-                    target_node_id,
-                    endpoint.address,
-                    command.request_id,
-                    request_body_bytes,
-                    send_started.elapsed().as_millis(),
-                    error
-                ));
-                failures.push(format!("{} failed: {error}", endpoint.address));
-            }
+    let send_started = Instant::now();
+    match sender(&target_node_id, &command, connect_timeout) {
+        Ok(response) => {
+            let outbound_messages = response.outbound_messages;
+            let outbound_body_bytes =
+                dfs_message_response_body_bytes(&command.request_id, &outbound_messages)?;
+            dfs_perf_trace(format_args!(
+                "dfs-message-send local={} target={} request={} request_body_bytes={} outbound_messages={} outbound_body_bytes={} elapsed_ms={}",
+                source_node_id,
+                target_node_id,
+                command.request_id,
+                request_body_bytes,
+                outbound_messages.len(),
+                outbound_body_bytes,
+                send_started.elapsed().as_millis()
+            ));
+            Ok(outbound_messages)
+        }
+        Err(error) => {
+            dfs_perf_trace(format_args!(
+                "dfs-message-send-error local={} target={} request={} request_body_bytes={} elapsed_ms={} error={}",
+                source_node_id,
+                target_node_id,
+                command.request_id,
+                request_body_bytes,
+                send_started.elapsed().as_millis(),
+                error
+            ));
+            Err(NetworkError::Io {
+                operation: format!("send DFS message to {target_node_id}"),
+                detail: error.to_string(),
+            })
         }
     }
-    Err(NetworkError::Io {
-        operation: format!("send DFS message to {target_node_id}"),
-        detail: failures.join("; "),
-    })
 }
 
 fn send_dfs_direct_read_to_endpoint(
-    endpoints: Vec<ClusterEndpointRecord>,
     sender: DfsDirectReadSender,
     connect_timeout: Duration,
     target_node_id: NodeId,
     request: &DfsDirectReadRequest,
 ) -> Result<DfsReadResponse, NetworkError> {
-    let mut failures = Vec::new();
-    for endpoint in &endpoints {
-        let send_started = Instant::now();
-        match sender(endpoint, request, connect_timeout) {
-            Ok(response) => {
-                dfs_perf_trace(format_args!(
-                    "direct-read-send local_request={} target={} endpoint={} request={} bytes={} elapsed_ms={}",
-                    request.object_id,
-                    target_node_id,
-                    endpoint.address,
-                    request.request_id,
-                    request.content_size_bytes,
-                    send_started.elapsed().as_millis()
-                ));
-                return Ok(response);
-            }
-            Err(error) => {
-                dfs_perf_trace(format_args!(
-                    "direct-read-send-error target={} endpoint={} request={} bytes={} elapsed_ms={} error={}",
-                    target_node_id,
-                    endpoint.address,
-                    request.request_id,
-                    request.content_size_bytes,
-                    send_started.elapsed().as_millis(),
-                    error
-                ));
-                failures.push(format!("{} failed: {error}", endpoint.address));
-            }
+    let send_started = Instant::now();
+    match sender(&target_node_id, request, connect_timeout) {
+        Ok(response) => {
+            dfs_perf_trace(format_args!(
+                "direct-read-send local_request={} target={} request={} bytes={} elapsed_ms={}",
+                request.object_id,
+                target_node_id,
+                request.request_id,
+                request.content_size_bytes,
+                send_started.elapsed().as_millis()
+            ));
+            Ok(response)
+        }
+        Err(error) => {
+            dfs_perf_trace(format_args!(
+                "direct-read-send-error target={} request={} bytes={} elapsed_ms={} error={}",
+                target_node_id,
+                request.request_id,
+                request.content_size_bytes,
+                send_started.elapsed().as_millis(),
+                error
+            ));
+            Err(NetworkError::Io {
+                operation: format!("direct DFS read from {target_node_id}"),
+                detail: error.to_string(),
+            })
         }
     }
-    Err(NetworkError::Io {
-        operation: format!("direct DFS read from {target_node_id}"),
-        detail: failures.join("; "),
-    })
 }
 
 async fn send_dfs_direct_read_to_endpoint_async(
-    endpoints: Vec<ClusterEndpointRecord>,
     sender: AsyncDfsDirectReadSender,
     connect_timeout: Duration,
     target_node_id: NodeId,
     request: &DfsDirectReadRequest,
 ) -> Result<DfsReadResponse, NetworkError> {
-    let mut failures = Vec::new();
-    for endpoint in &endpoints {
-        let send_started = Instant::now();
-        match sender(endpoint, request, connect_timeout).await {
-            Ok(response) => {
-                dfs_perf_trace(format_args!(
-                    "direct-read-send-async local_request={} target={} endpoint={} request={} bytes={} elapsed_ms={}",
-                    request.object_id,
-                    target_node_id,
-                    endpoint.address,
-                    request.request_id,
-                    request.content_size_bytes,
-                    send_started.elapsed().as_millis()
-                ));
-                return Ok(response);
-            }
-            Err(error) => {
-                dfs_perf_trace(format_args!(
-                    "direct-read-send-async-error target={} endpoint={} request={} bytes={} elapsed_ms={} error={}",
-                    target_node_id,
-                    endpoint.address,
-                    request.request_id,
-                    request.content_size_bytes,
-                    send_started.elapsed().as_millis(),
-                    error
-                ));
-                failures.push(format!("{} failed: {error}", endpoint.address));
-            }
+    let send_started = Instant::now();
+    match sender(&target_node_id, request, connect_timeout).await {
+        Ok(response) => {
+            dfs_perf_trace(format_args!(
+                "direct-read-send-async local_request={} target={} request={} bytes={} elapsed_ms={}",
+                request.object_id,
+                target_node_id,
+                request.request_id,
+                request.content_size_bytes,
+                send_started.elapsed().as_millis()
+            ));
+            Ok(response)
+        }
+        Err(error) => {
+            dfs_perf_trace(format_args!(
+                "direct-read-send-async-error target={} request={} bytes={} elapsed_ms={} error={}",
+                target_node_id,
+                request.request_id,
+                request.content_size_bytes,
+                send_started.elapsed().as_millis(),
+                error
+            ));
+            Err(NetworkError::Io {
+                operation: format!("direct DFS read from {target_node_id}"),
+                detail: error.to_string(),
+            })
         }
     }
-    Err(NetworkError::Io {
-        operation: format!("direct DFS read from {target_node_id}"),
-        detail: failures.join("; "),
-    })
 }
 
 async fn send_dfs_routed_message_to_endpoint_async(
-    endpoints: Vec<ClusterEndpointRecord>,
     sender: AsyncDfsMessageSender,
     connect_timeout: Duration,
     target_node_id: NodeId,
@@ -9295,46 +9191,40 @@ async fn send_dfs_routed_message_to_endpoint_async(
         routed_message,
     };
     let request_body_bytes = dfs_message_request_body_bytes(&command)?;
-    let mut failures = Vec::new();
-    for endpoint in &endpoints {
-        let send_started = Instant::now();
-        match sender(endpoint, &command, connect_timeout).await {
-            Ok(response) => {
-                let outbound_messages = response.outbound_messages;
-                let outbound_body_bytes =
-                    dfs_message_response_body_bytes(&command.request_id, &outbound_messages)?;
-                dfs_perf_trace(format_args!(
-                    "dfs-message-send-async local={} target={} endpoint={} request={} request_body_bytes={} outbound_messages={} outbound_body_bytes={} elapsed_ms={}",
-                    source_node_id,
-                    target_node_id,
-                    endpoint.address,
-                    command.request_id,
-                    request_body_bytes,
-                    outbound_messages.len(),
-                    outbound_body_bytes,
-                    send_started.elapsed().as_millis()
-                ));
-                return Ok(outbound_messages);
-            }
-            Err(error) => {
-                dfs_perf_trace(format_args!(
-                    "dfs-message-send-async-error local={} target={} endpoint={} request={} request_body_bytes={} elapsed_ms={} error={}",
-                    source_node_id,
-                    target_node_id,
-                    endpoint.address,
-                    command.request_id,
-                    request_body_bytes,
-                    send_started.elapsed().as_millis(),
-                    error
-                ));
-                failures.push(format!("{} failed: {error}", endpoint.address));
-            }
+    let send_started = Instant::now();
+    match sender(&target_node_id, &command, connect_timeout).await {
+        Ok(response) => {
+            let outbound_messages = response.outbound_messages;
+            let outbound_body_bytes =
+                dfs_message_response_body_bytes(&command.request_id, &outbound_messages)?;
+            dfs_perf_trace(format_args!(
+                "dfs-message-send-async local={} target={} request={} request_body_bytes={} outbound_messages={} outbound_body_bytes={} elapsed_ms={}",
+                source_node_id,
+                target_node_id,
+                command.request_id,
+                request_body_bytes,
+                outbound_messages.len(),
+                outbound_body_bytes,
+                send_started.elapsed().as_millis()
+            ));
+            Ok(outbound_messages)
+        }
+        Err(error) => {
+            dfs_perf_trace(format_args!(
+                "dfs-message-send-async-error local={} target={} request={} request_body_bytes={} elapsed_ms={} error={}",
+                source_node_id,
+                target_node_id,
+                command.request_id,
+                request_body_bytes,
+                send_started.elapsed().as_millis(),
+                error
+            ));
+            Err(NetworkError::Io {
+                operation: format!("send DFS message to {target_node_id}"),
+                detail: error.to_string(),
+            })
         }
     }
-    Err(NetworkError::Io {
-        operation: format!("send DFS message to {target_node_id}"),
-        detail: failures.join("; "),
-    })
 }
 
 fn dfs_message_request_body_bytes(command: &DfsMessageCommand) -> Result<usize, NetworkError> {
@@ -9739,7 +9629,7 @@ pub(crate) fn process_cluster_dfs_message_command(
     let message_sender: DfsMessageSender = Arc::new(|endpoint, command, _timeout| {
         Err(DfsPeerTransportError::new(format!(
             "unexpected DFS message hop to {} while processing test command {}",
-            endpoint.node_id, command.request_id
+            endpoint, command.request_id
         )))
     });
     let transport = DfsEndpointServedMessageTransport::new_with_message_sender(

@@ -151,7 +151,6 @@ fn run_network_ping_benchmark(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     request,
                     runtime: runtime_handle.clone(),
                     paths: cluster_paths.clone(),
-                    cluster_state: Arc::clone(&cluster_state),
                 });
             }
         }
@@ -435,7 +434,6 @@ struct NetworkPingJob {
     request: network::ObjectRpcRequest,
     runtime: tokio::runtime::Handle,
     paths: ClusterPaths,
-    cluster_state: Arc<ClusterBootstrapState>,
 }
 
 #[derive(Debug)]
@@ -467,9 +465,7 @@ async fn run_network_ping_job(job: NetworkPingJob) -> NetworkPingResult {
 }
 
 async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome {
-    let mut host = NetworkPingEndpointRpcHost {
-        cluster_state: Arc::clone(&job.cluster_state),
-    };
+    let mut host = NetworkPingEndpointRpcHost;
     let mut client = network::ClusterObjectRpcClient::routed(&mut host, &job.runtime, &job.paths);
     let response = match client
         .call_endpoint(
@@ -516,9 +512,7 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
     NetworkPingOutcome::Success
 }
 
-struct NetworkPingEndpointRpcHost {
-    cluster_state: Arc<ClusterBootstrapState>,
-}
+struct NetworkPingEndpointRpcHost;
 
 impl network::ClusterSignedEndpointRpcAsyncHost for NetworkPingEndpointRpcHost {
     fn sign_endpoint_rpc_request_async<'a>(
@@ -530,14 +524,6 @@ impl network::ClusterSignedEndpointRpcAsyncHost for NetworkPingEndpointRpcHost {
             sign_daemon_rpc_request_for_local_node(&request)
                 .map_err(|error| network_ping_network_error("cluster endpoint signing", error))
         })
-    }
-
-    fn endpoint_rpc_cluster_id_async<'a>(
-        &'a mut self,
-        _endpoint: &'a ClusterEndpointRecord,
-    ) -> network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_runtime::node::ClusterId>> {
-        let cluster_id = self.cluster_state.cluster_id.clone();
-        Box::pin(async move { Ok(Some(cluster_id)) })
     }
 }
 

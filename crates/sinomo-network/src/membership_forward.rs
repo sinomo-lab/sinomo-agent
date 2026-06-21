@@ -6,7 +6,7 @@ use crate::error::NetworkError;
 use crate::local_state_store::read_cluster_state;
 use crate::object::DaemonRpcTimeouts;
 use crate::route::{
-    ClusterObjectRpcClient, ClusterObjectRpcNodeOptions, ClusterSignedEndpointRpcAsyncHost,
+    ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterSignedEndpointRpcAsyncHost,
 };
 use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_core::ClusterBootstrapState;
@@ -73,16 +73,13 @@ pub async fn forward_cluster_membership_rpc_to_state_authority_async_with_host(
     let mut client = ClusterObjectRpcClient::routed(host, runtime, paths);
     for target in &state_authority_targets {
         match client
-            .call_node(
+            .call_target(
                 state,
                 &target.node_id,
                 request,
-                ClusterObjectRpcNodeOptions::internal(
-                    ClusterEndpointInternalSelectionPurpose::VoterCommand,
-                    DaemonRpcTimeouts::connect_and_idle(
-                        DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
-                    ),
-                ),
+                ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(
+                    DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
+                )),
             )
             .await
         {

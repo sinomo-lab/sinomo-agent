@@ -1199,15 +1199,20 @@ struct CliDfsPeerTransport;
 impl sinomo_runtime::dfs::DfsPeerTransport for CliDfsPeerTransport {
     fn call_object_rpc(
         &self,
-        endpoint: &sinomo_runtime::core::ClusterEndpointRecord,
+        target_node_id: &sinomo_runtime::node::NodeId,
         request: &sinomo_runtime::network::ObjectRpcRequest,
         options: sinomo_runtime::dfs::DfsObjectRpcSendOptions,
     ) -> Result<
         sinomo_runtime::network::ObjectRpcResponse,
         sinomo_runtime::dfs::DfsPeerTransportError,
     > {
-        daemon_send_daemon_rpc_to_endpoint(endpoint, request, options.connect_timeout)
-            .map_err(|error| sinomo_runtime::dfs::DfsPeerTransportError::new(error.to_string()))
+        sinomo_runtime::daemon::send_dfs_object_rpc_to_target(
+            target_node_id,
+            request,
+            options.connect_timeout,
+            options.observe_connectivity,
+        )
+        .map_err(|error| sinomo_runtime::dfs::DfsPeerTransportError::new(error.to_string()))
     }
 }
 
@@ -1632,14 +1637,13 @@ fn fetch_dfs_status_from_node_blocking(
     );
     let mut client =
         network::ClusterObjectRpcClient::routed(&mut host, runtime.handle(), cluster_paths);
-    let response = runtime.block_on(client.call_node(
+    let response = runtime.block_on(client.call_target(
         state,
         node_id,
         &rpc_request,
-        network::ClusterObjectRpcNodeOptions::new(
-            network::ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates,
-            network::DaemonRpcTimeouts::connect_and_idle(timeout),
-        ),
+        network::ClusterObjectRpcOptions::new(network::DaemonRpcTimeouts::connect_and_idle(
+            timeout,
+        )),
     ));
     if trace {
         let outcome = if response.is_ok() { "ok" } else { "error" };

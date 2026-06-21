@@ -1411,25 +1411,6 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonClusterJoinRegi
             .sign_endpoint_rpc_request_async(request)
     }
 
-    fn try_gateway_signed_rpc_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        gateway_request: &'a sinomo_network::ObjectRpcRequest,
-        timeouts: sinomo_network::DaemonRpcTimeouts,
-    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_network::ObjectRpcResponse>>
-    {
-        self.endpoint_rpc_host
-            .try_gateway_signed_rpc_async(endpoint, gateway_request, timeouts)
-    }
-
-    fn endpoint_rpc_cluster_id_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_node::ClusterId>> {
-        self.endpoint_rpc_host
-            .endpoint_rpc_cluster_id_async(endpoint)
-    }
-
     fn observe_signed_endpoint_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
@@ -1535,11 +1516,11 @@ pub(crate) async fn forward_cluster_invite_challenge_to_cluster_state_authority_
     let mut failures = Vec::new();
     for target in &authority_targets {
         match client
-            .call_node(
+            .call_target(
                 &state,
                 &target.node_id,
                 &rpc_request,
-                sinomo_network::ClusterObjectRpcNodeOptions::cluster_state_authority(
+                sinomo_network::ClusterObjectRpcOptions::new(
                     sinomo_network::DaemonRpcTimeouts::connect_and_idle(
                         sinomo_network::DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
                     ),
@@ -1580,11 +1561,11 @@ fn call_node_object_rpc_on_runtime(
     let mut client = sinomo_network::ClusterObjectRpcClient::routed(&mut host, runtime, &paths);
     block_on_cluster_network_future_on_owner_runtime(
         runtime,
-        client.call_node(
+        client.call_target(
             state,
             target_node_id,
             rpc_request,
-            sinomo_network::ClusterObjectRpcNodeOptions::cluster_state_authority(
+            sinomo_network::ClusterObjectRpcOptions::new(
                 sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
             ),
         ),
@@ -3627,34 +3608,6 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonClusterControlP
         Box::pin(async move {
             let mut host = DaemonSignedEndpointRpcAsyncHost::new(&runtime, true);
             host.sign_endpoint_rpc_request_async(&request).await
-        })
-    }
-
-    fn try_gateway_signed_rpc_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        gateway_request: &'a ObjectRpcRequest,
-        timeouts: sinomo_network::DaemonRpcTimeouts,
-    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<ObjectRpcResponse>> {
-        let runtime = self.rpc_mode.runtime().clone();
-        let endpoint = endpoint.clone();
-        let gateway_request = gateway_request.clone();
-        Box::pin(async move {
-            let mut host = DaemonSignedEndpointRpcAsyncHost::new(&runtime, true);
-            host.try_gateway_signed_rpc_async(&endpoint, &gateway_request, timeouts)
-                .await
-        })
-    }
-
-    fn endpoint_rpc_cluster_id_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_node::ClusterId>> {
-        let runtime = self.rpc_mode.runtime().clone();
-        let endpoint = endpoint.clone();
-        Box::pin(async move {
-            let mut host = DaemonSignedEndpointRpcAsyncHost::new(&runtime, true);
-            host.endpoint_rpc_cluster_id_async(&endpoint).await
         })
     }
 

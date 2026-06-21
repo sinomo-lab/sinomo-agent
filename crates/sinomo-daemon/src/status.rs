@@ -764,29 +764,6 @@ pub fn default_main_daemon_status(timeout: Duration) -> Result<Option<DaemonStat
     })
 }
 
-pub(crate) async fn default_main_daemon_status_with_timeouts_async(
-    timeouts: DaemonRpcTimeouts,
-    runtime: &tokio::runtime::Handle,
-) -> Result<Option<DaemonStatus>, DaemonError> {
-    let paths = runtime
-        .spawn_blocking(|| {
-            let data_dir = SinomoDataDir::from_env_or_home()?;
-            data_dir.ensure_root_layout()?;
-            Ok::<_, DaemonError>(DaemonPaths::new(&data_dir))
-        })
-        .await
-        .map_err(|source| DaemonError::Network {
-            address: "daemon status probe".to_string(),
-            detail: format!("daemon status path task failed: {source}"),
-        })??;
-    Ok(
-        match probe_daemon_status_with_timeouts_async(&paths, timeouts, runtime).await {
-            DaemonProbeStatus::Running(status) => Some(status),
-            DaemonProbeStatus::Locked { .. } | DaemonProbeStatus::NotRunning => None,
-        },
-    )
-}
-
 fn stale_daemon_lock_probe(paths: &DaemonPaths, status: Option<DaemonStatus>) -> DaemonProbeStatus {
     if !paths.lock.exists() {
         let _ = fs::remove_file(&paths.status);

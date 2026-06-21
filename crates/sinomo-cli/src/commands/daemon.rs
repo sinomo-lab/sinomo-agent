@@ -701,12 +701,12 @@ impl network::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
             Some(state.cluster_id.clone()),
             "cli endpoint rpc signing",
         );
-        let options = network::ClusterObjectRpcNodeOptions::cluster_state_authority(
+        let options = network::ClusterObjectRpcOptions::new(
             network::DaemonRpcTimeouts::connect_and_idle(timeout),
         );
         let mut client =
             network::ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &paths);
-        let result = runtime.block_on(client.call_node(state, target_node_id, request, options));
+        let result = runtime.block_on(client.call_target(state, target_node_id, request, options));
         runtime.shutdown_timeout(Duration::from_millis(250));
         result
     }

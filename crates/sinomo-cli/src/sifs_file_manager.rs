@@ -3,7 +3,6 @@ use crate::file_manager::{
     FileManagerBackend, FileManagerEntry, FileManagerEntryKind, FileManagerMetadata,
     FileManagerRead, validated_relative_child_path,
 };
-use sinomo_runtime::core::ClusterEndpointRecord;
 use sinomo_runtime::dfs::{
     AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsEndpointTransport,
     DfsMetadataJournalReplicationOptions, DfsMetadataShardConfig, DfsNodeAdvertisement,
@@ -916,25 +915,25 @@ impl SifsDfsPeerTransport {
 impl DfsPeerTransport for SifsDfsPeerTransport {
     fn call_object_rpc(
         &self,
-        endpoint: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         request: &network::ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> Result<network::ObjectRpcResponse, DfsPeerTransportError> {
-        sifs_send_dfs_object_rpc(&self.rpc_runtime, endpoint, request, options)
+        sifs_send_dfs_object_rpc(&self.rpc_runtime, target_node_id, request, options)
     }
 }
 
 impl AsyncDfsPeerTransport for SifsDfsPeerTransport {
     fn call_object_rpc_async<'a>(
         &'a self,
-        endpoint: &'a ClusterEndpointRecord,
+        target_node_id: &'a NodeId,
         request: &'a network::ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> DfsPeerTransportFuture<'a, Result<network::ObjectRpcResponse, DfsPeerTransportError>> {
         let handle = self.rpc_runtime.runtime.handle().clone();
         Box::pin(async move {
-            sinomo_runtime::daemon::send_dfs_object_rpc_to_endpoint_async(
-                endpoint,
+            sinomo_runtime::daemon::send_dfs_object_rpc_to_target_async(
+                target_node_id,
                 request,
                 options.connect_timeout,
                 &handle,
@@ -948,7 +947,7 @@ impl AsyncDfsPeerTransport for SifsDfsPeerTransport {
 
 fn sifs_send_dfs_object_rpc(
     rpc_runtime: &SifsRpcRuntime,
-    endpoint: &ClusterEndpointRecord,
+    target_node_id: &NodeId,
     request: &network::ObjectRpcRequest,
     options: DfsObjectRpcSendOptions,
 ) -> Result<network::ObjectRpcResponse, DfsPeerTransportError> {
@@ -959,8 +958,8 @@ fn sifs_send_dfs_object_rpc(
         ) {
             return tokio::task::block_in_place(|| {
                 handle.block_on(async {
-                    sinomo_runtime::daemon::send_dfs_object_rpc_to_endpoint_async(
-                        endpoint,
+                    sinomo_runtime::daemon::send_dfs_object_rpc_to_target_async(
+                        target_node_id,
                         request,
                         options.connect_timeout,
                         &handle,
@@ -978,8 +977,8 @@ fn sifs_send_dfs_object_rpc(
     rpc_runtime
         .runtime
         .block_on(async {
-            sinomo_runtime::daemon::send_dfs_object_rpc_to_endpoint_async(
-                endpoint,
+            sinomo_runtime::daemon::send_dfs_object_rpc_to_target_async(
+                target_node_id,
                 request,
                 options.connect_timeout,
                 rpc_runtime.runtime.handle(),
