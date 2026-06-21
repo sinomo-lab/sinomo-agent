@@ -79,6 +79,7 @@ impl ClusterConnectivityGraph {
             state.local_node_id.clone(),
             read_cluster_connectivity_graph_with_suppressed_local_source_and_query(
                 paths,
+                Some(&state.cluster_id),
                 Some(&state.local_node_id),
                 query,
             )
@@ -182,11 +183,12 @@ pub(crate) fn read_cluster_connectivity_graph_with_query<Q>(
 where
     Q: ClusterConnectivityRecordQuery + ?Sized,
 {
-    read_cluster_connectivity_graph_with_suppressed_local_source_and_query(paths, None, query)
+    read_cluster_connectivity_graph_with_suppressed_local_source_and_query(paths, None, None, query)
 }
 
 fn read_cluster_connectivity_graph_with_suppressed_local_source_and_query<Q>(
     paths: &ClusterPaths,
+    cluster_id: Option<&sinomo_node::ClusterId>,
     local_source_node_id: Option<&NodeId>,
     query: &Q,
 ) -> Result<Vec<ClusterConnectivityRecord>, NetworkError>
@@ -196,7 +198,10 @@ where
     let now = OffsetDateTime::now_utc();
     let local_records = read_local_cluster_connectivity_records(paths)?
         .into_iter()
-        .filter(|record| cluster_network_record_live(record.expires_at, now))
+        .filter(|record| {
+            cluster_id.is_none_or(|cluster_id| record.cluster_id == *cluster_id)
+                && cluster_network_record_live(record.expires_at, now)
+        })
         .collect::<Vec<_>>();
     // A node's own live probe results are authoritative for its outgoing edges. Drop any
     // KV-published edge whose source we hold local records for; when constructing the local
@@ -212,6 +217,9 @@ where
     let mut records_by_key =
         BTreeMap::<(NodeId, NodeId, ClusterEndpointId), ClusterConnectivityRecord>::new();
     for record in query.read_kv_connectivity_records(paths)? {
+        if cluster_id.is_some_and(|cluster_id| record.cluster_id != *cluster_id) {
+            continue;
+        }
         if local_sources.contains(&record.source_node_id) {
             continue;
         }
