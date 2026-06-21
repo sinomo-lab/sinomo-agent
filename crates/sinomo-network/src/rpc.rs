@@ -35,6 +35,7 @@ pub const OBJECT_RPC_ERROR_DETAIL_METADATA_KEY: &str = "sinomo-error-detail";
 pub const OBJECT_RPC_OPERATION_ID_METADATA_KEY: &str = "sinomo-operation-id";
 pub const OBJECT_RPC_CANCELS_OPERATION_ID_METADATA_KEY: &str = "sinomo-cancels-operation-id";
 pub const OBJECT_RPC_RESPONSE_RETRY_SAFE_METADATA_KEY: &str = "sinomo-response-retry-safe";
+pub const OBJECT_RPC_RESPONDER_NODE_ID_METADATA_KEY: &str = "sinomo-responder-node-id";
 
 pub const CLUSTER_HEALTH_RPC_CATEGORY: &str = "cluster.health";
 pub const CLUSTER_HEALTH_ROUTE: &str = "/cluster/health";
@@ -226,6 +227,18 @@ impl ObjectRpcResponse {
             metadata: BTreeMap::new(),
             body: SinomoObjectCodec::network_frame().encode(body)?,
         })
+    }
+
+    pub fn mark_responder_node_id(&mut self, node_id: impl Into<String>) {
+        self.metadata
+            .entry(OBJECT_RPC_RESPONDER_NODE_ID_METADATA_KEY.to_string())
+            .or_insert_with(|| node_id.into());
+    }
+
+    pub fn responder_node_id(&self) -> Option<&str> {
+        self.metadata
+            .get(OBJECT_RPC_RESPONDER_NODE_ID_METADATA_KEY)
+            .map(String::as_str)
     }
 
     pub fn decode_body<T: serde::de::DeserializeOwned>(&self) -> Result<T, NetworkError> {

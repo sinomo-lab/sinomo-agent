@@ -7,7 +7,7 @@ use crate::error::NetworkError;
 use crate::kv_local_store::locked_kv_state_authority_id_async;
 use crate::object::DaemonRpcTimeouts;
 use crate::route::{
-    ClusterObjectRpcClient, ClusterObjectRpcNodeOptions, ClusterSignedEndpointRpcAsyncHost,
+    ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterSignedEndpointRpcAsyncHost,
 };
 use crate::rpc::{ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_core::{ClusterBootstrapState, ClusterEndpointRecord, ClusterTransportKind};
@@ -248,14 +248,11 @@ where
     );
     let mut client = ClusterObjectRpcClient::routed(host, runtime, paths);
     let txn_response = client
-        .call_node(
+        .call_target(
             state,
             authority_node_id,
             &txn_request,
-            ClusterObjectRpcNodeOptions::internal(
-                ClusterEndpointInternalSelectionPurpose::VoterCommand,
-                DaemonRpcTimeouts::connect_and_idle(timeout),
-            ),
+            ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(timeout)),
         )
         .await?;
     txn_response.error_detail()?;
@@ -271,14 +268,11 @@ where
         snapshot_payload.body,
     );
     let snapshot_response = client
-        .call_node(
+        .call_target(
             state,
             authority_node_id,
             &snapshot_request,
-            ClusterObjectRpcNodeOptions::internal(
-                ClusterEndpointInternalSelectionPurpose::VoterCommand,
-                DaemonRpcTimeouts::connect_and_idle(snapshot_timeout),
-            ),
+            ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(snapshot_timeout)),
         )
         .await?;
     snapshot_response.error_detail()?;

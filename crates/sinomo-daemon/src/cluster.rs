@@ -16,7 +16,7 @@ use crate::{
     read_daemon_status, send_cluster_kv_watch_events_async, send_cluster_member_publish_async,
     send_cluster_raft_append_async, send_cluster_raft_append_on_runtime,
     send_cluster_raft_vote_async, send_cluster_raft_vote_on_runtime,
-    send_daemon_rpc_to_endpoint_async, send_daemon_rpc_to_endpoint_on_runtime, write_daemon_status,
+    send_daemon_rpc_to_endpoint_on_runtime, write_daemon_status,
 };
 use sinomo_core::{
     ClusterBootstrapState, ClusterEndpointRecord, ClusterMemberRecord, ClusterNodeRole,
@@ -1411,25 +1411,6 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonClusterJoinRegi
             .sign_endpoint_rpc_request_async(request)
     }
 
-    fn try_gateway_signed_rpc_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        gateway_request: &'a sinomo_network::ObjectRpcRequest,
-        timeouts: sinomo_network::DaemonRpcTimeouts,
-    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_network::ObjectRpcResponse>>
-    {
-        self.endpoint_rpc_host
-            .try_gateway_signed_rpc_async(endpoint, gateway_request, timeouts)
-    }
-
-    fn endpoint_rpc_cluster_id_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_node::ClusterId>> {
-        self.endpoint_rpc_host
-            .endpoint_rpc_cluster_id_async(endpoint)
-    }
-
     fn observe_signed_endpoint_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
@@ -1535,11 +1516,11 @@ pub(crate) async fn forward_cluster_invite_challenge_to_cluster_state_authority_
     let mut failures = Vec::new();
     for target in &authority_targets {
         match client
-            .call_node(
+            .call_target(
                 &state,
                 &target.node_id,
                 &rpc_request,
-                sinomo_network::ClusterObjectRpcNodeOptions::cluster_state_authority(
+                sinomo_network::ClusterObjectRpcOptions::new(
                     sinomo_network::DaemonRpcTimeouts::connect_and_idle(
                         sinomo_network::DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
                     ),
@@ -1580,11 +1561,11 @@ fn call_node_object_rpc_on_runtime(
     let mut client = sinomo_network::ClusterObjectRpcClient::routed(&mut host, runtime, &paths);
     block_on_cluster_network_future_on_owner_runtime(
         runtime,
-        client.call_node(
+        client.call_target(
             state,
             target_node_id,
             rpc_request,
-            sinomo_network::ClusterObjectRpcNodeOptions::cluster_state_authority(
+            sinomo_network::ClusterObjectRpcOptions::new(
                 sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
             ),
         ),
@@ -2832,41 +2813,30 @@ async fn fetch_local_cluster_health_rows_from_member_async(
     member: &ClusterMemberRecord,
     runtime: &tokio::runtime::Handle,
 ) -> Result<Option<Vec<ClusterHealthRow>>, DaemonError> {
-    let paths_for_targets = paths.clone();
-    let state_for_targets = state.clone();
-    let member_node_id = member.node_id.as_str().to_string();
-    let member_node_id_for_targets = member.node_id.clone();
-    let endpoints = runtime
-        .spawn_blocking(move || {
-            sinomo_network::ClusterEndpointSelector::new(&paths_for_targets, &state_for_targets)
-                .select(sinomo_network::ClusterEndpointSelectionPurpose::MemberDaemonStatus)
-                .into_iter()
-                .filter(|endpoint| endpoint.node_id == member_node_id_for_targets)
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|source| DaemonError::Network {
-            address: member_node_id,
-            detail: format!("cluster health peer target selection task failed: {source}"),
-        })?;
     let request = sinomo_network::cluster_local_health_rpc_request()?;
-    for endpoint in endpoints {
-        let Ok(response) = send_daemon_rpc_to_endpoint_async(
-            &endpoint,
-            &request,
-            sinomo_network::DaemonRpcTimeouts::connect_and_idle(CLUSTER_HEALTH_PEER_ROWS_TIMEOUT),
-            runtime,
-        )
-        .await
-        else {
-            continue;
-        };
-        let Ok(rows) = sinomo_network::decode_cluster_health_rpc_response(&response) else {
-            continue;
-        };
-        return Ok(Some(rows));
+    let Some(response) = call_member_object_rpc_target_async(
+        paths,
+        state,
+        member,
+        &request,
+        CLUSTER_HEALTH_PEER_ROWS_TIMEOUT,
+        runtime,
+        "cluster health peer rows",
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    match sinomo_network::decode_cluster_health_rpc_response(&response) {
+        Ok(rows) => Ok(Some(rows)),
+        Err(error) => {
+            eprintln!(
+                "sinomo daemon cluster health peer rows from {} failed to decode: {error}",
+                member.node_id
+            );
+            Ok(None)
+        }
     }
-    Ok(None)
 }
 
 pub(crate) struct DaemonClusterStatusProbe<'a> {
@@ -2926,96 +2896,101 @@ async fn probe_member_daemon_status_async(
     {
         return Ok(Some(status));
     }
-    let paths_for_targets = paths.clone();
-    let state_for_targets = state.clone();
-    let member_node_id = member.node_id.as_str().to_string();
-    let member_node_id_for_targets = member.node_id.clone();
-    let endpoints = tokio::task::spawn_blocking(move || {
-        sinomo_network::ClusterEndpointSelector::new(&paths_for_targets, &state_for_targets)
-            .select(sinomo_network::ClusterEndpointSelectionPurpose::MemberDaemonStatus)
-            .into_iter()
-            .filter(|endpoint| endpoint.node_id == member_node_id_for_targets)
-            .collect::<Vec<_>>()
-    })
-    .await
-    .map_err(|source| DaemonError::Network {
-        address: member_node_id,
-        detail: format!("cluster health target selection task failed: {source}"),
-    })?;
-    let mut probes = tokio::task::JoinSet::new();
-    for endpoint in endpoints {
-        probes.spawn(async move {
-            let result = fetch_daemon_status_from_endpoint_direct_async(
-                &endpoint,
-                CLUSTER_HEALTH_PROBE_TIMEOUT,
-            )
-            .await;
-            (endpoint, result)
-        });
-    }
-    while let Some(joined) = probes.join_next().await {
-        let (endpoint, status) = match joined {
-            Ok(probe) => probe,
-            Err(error) => {
-                eprintln!(
-                    "sinomo daemon cluster health probe task for {} failed: {error}",
-                    member.node_id
-                );
-                continue;
-            }
-        };
-        let status = match status {
-            Ok(status) => status,
-            Err(error) => {
-                eprintln!(
-                    "sinomo daemon cluster health probe of {} via {} failed: {error}",
-                    member.node_id, endpoint.address
-                );
-                continue;
-            }
-        };
-        let Some(cluster) = status.cluster.as_ref() else {
+    let request = sinomo_network::ObjectRpcRequest::encode_body(
+        crate::DAEMON_STATUS_ROUTE,
+        crate::DAEMON_RPC_CATEGORY,
+        &(),
+    )?;
+    let Some(response) = call_member_object_rpc_target_async(
+        paths,
+        state,
+        member,
+        &request,
+        CLUSTER_HEALTH_PROBE_TIMEOUT,
+        runtime,
+        "cluster health probe",
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let status: crate::DaemonStatus = match response.decode_body() {
+        Ok(status) => status,
+        Err(error) => {
             eprintln!(
-                "sinomo daemon cluster health probe of {} via {}: status has no cluster section",
-                member.node_id, endpoint.address
+                "sinomo daemon cluster health probe of {} failed to decode: {error}",
+                member.node_id
             );
-            continue;
-        };
-        let cluster_id_matches =
-            cluster.cluster_id == state.cluster_id || cluster.cluster_id == member.cluster_id;
-        if !cluster_id_matches || cluster.node_id != member.node_id {
-            eprintln!(
-                "sinomo daemon cluster health probe of {} via {}: identity mismatch (expected cluster {} or member cluster {}, responder cluster {} node {})",
-                member.node_id,
-                endpoint.address,
-                state.cluster_id,
-                member.cluster_id,
-                cluster.cluster_id,
-                cluster.node_id
-            );
-            continue;
+            return Ok(None);
         }
-        let status = cluster_node_status_from_daemon_status(
-            &status,
-            cluster,
-            None,
-            OffsetDateTime::now_utc(),
+    };
+    let Some(cluster) = status.cluster.as_ref() else {
+        eprintln!(
+            "sinomo daemon cluster health probe of {}: status has no cluster section",
+            member.node_id
         );
-        if cluster_member_expected_daemon_process(member)
-            .is_some_and(|process| status.process != process)
-        {
-            eprintln!(
-                "sinomo daemon cluster health probe of {} via {}: process mismatch (expected {}, responder {})",
-                member.node_id,
-                endpoint.address,
-                cluster_member_expected_daemon_process(member).unwrap_or("unknown"),
-                status.process
-            );
-            continue;
-        }
-        return Ok(Some(status));
+        return Ok(None);
+    };
+    let cluster_id_matches =
+        cluster.cluster_id == state.cluster_id || cluster.cluster_id == member.cluster_id;
+    if !cluster_id_matches || cluster.node_id != member.node_id {
+        eprintln!(
+            "sinomo daemon cluster health probe of {}: identity mismatch (expected cluster {} or member cluster {}, responder cluster {} node {})",
+            member.node_id,
+            state.cluster_id,
+            member.cluster_id,
+            cluster.cluster_id,
+            cluster.node_id
+        );
+        return Ok(None);
     }
-    Ok(None)
+    let status =
+        cluster_node_status_from_daemon_status(&status, cluster, None, OffsetDateTime::now_utc());
+    if cluster_member_expected_daemon_process(member)
+        .is_some_and(|process| status.process != process)
+    {
+        eprintln!(
+            "sinomo daemon cluster health probe of {}: process mismatch (expected {}, responder {})",
+            member.node_id,
+            cluster_member_expected_daemon_process(member).unwrap_or("unknown"),
+            status.process
+        );
+        return Ok(None);
+    }
+    Ok(Some(status))
+}
+
+async fn call_member_object_rpc_target_async(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+    request: &sinomo_network::ObjectRpcRequest,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+    operation: &str,
+) -> Result<Option<sinomo_network::ObjectRpcResponse>, DaemonError> {
+    let mut host = DaemonSignedEndpointRpcAsyncHost::new(runtime, true);
+    let mut client = sinomo_network::ClusterObjectRpcClient::routed(&mut host, runtime, paths);
+    match client
+        .call_target(
+            state,
+            &member.node_id,
+            request,
+            sinomo_network::ClusterObjectRpcOptions::new(
+                sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
+            ),
+        )
+        .await
+    {
+        Ok(response) => Ok(Some(response)),
+        Err(error) => {
+            eprintln!(
+                "sinomo daemon {operation} of {} failed: {error}",
+                member.node_id
+            );
+            Ok(None)
+        }
+    }
 }
 
 async fn probe_local_member_daemon_status_async(
@@ -3627,34 +3602,6 @@ impl sinomo_network::ClusterSignedEndpointRpcAsyncHost for DaemonClusterControlP
         Box::pin(async move {
             let mut host = DaemonSignedEndpointRpcAsyncHost::new(&runtime, true);
             host.sign_endpoint_rpc_request_async(&request).await
-        })
-    }
-
-    fn try_gateway_signed_rpc_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-        gateway_request: &'a ObjectRpcRequest,
-        timeouts: sinomo_network::DaemonRpcTimeouts,
-    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<ObjectRpcResponse>> {
-        let runtime = self.rpc_mode.runtime().clone();
-        let endpoint = endpoint.clone();
-        let gateway_request = gateway_request.clone();
-        Box::pin(async move {
-            let mut host = DaemonSignedEndpointRpcAsyncHost::new(&runtime, true);
-            host.try_gateway_signed_rpc_async(&endpoint, &gateway_request, timeouts)
-                .await
-        })
-    }
-
-    fn endpoint_rpc_cluster_id_async<'a>(
-        &'a mut self,
-        endpoint: &'a ClusterEndpointRecord,
-    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_node::ClusterId>> {
-        let runtime = self.rpc_mode.runtime().clone();
-        let endpoint = endpoint.clone();
-        Box::pin(async move {
-            let mut host = DaemonSignedEndpointRpcAsyncHost::new(&runtime, true);
-            host.endpoint_rpc_cluster_id_async(&endpoint).await
         })
     }
 

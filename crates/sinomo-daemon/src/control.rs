@@ -620,6 +620,7 @@ pub(crate) async fn handle_daemon_connection_async(
             let _ = write_daemon_rpc_response_frame_async_for_control_request(
                 &mut stream,
                 &stream_address,
+                &paths,
                 &request,
                 response,
             )
@@ -641,6 +642,7 @@ pub(crate) async fn handle_daemon_connection_async(
                     let _ = write_daemon_rpc_response_frame_async_for_control_request(
                         &mut stream,
                         &stream_address,
+                        &paths,
                         &request,
                         response,
                     )
@@ -655,6 +657,7 @@ pub(crate) async fn handle_daemon_connection_async(
                     let _ = write_daemon_rpc_response_frame_async_for_rpc_request(
                         &mut stream,
                         &stream_address,
+                        &paths,
                         &request,
                         response,
                     )
@@ -676,6 +679,7 @@ pub(crate) async fn handle_daemon_connection_async(
             write_daemon_rpc_response_frame_async_for_rpc_request(
                 &mut stream,
                 &stream_address,
+                &paths,
                 request,
                 response,
             )
@@ -714,6 +718,7 @@ pub(crate) async fn handle_daemon_connection_async(
             write_daemon_rpc_response_frame_async_for_rpc_request(
                 &mut stream,
                 &stream_address,
+                &paths,
                 request,
                 response,
             )
@@ -932,6 +937,7 @@ async fn dispatch_streamed_cluster_relay_local_request_async(
         write_daemon_rpc_response_frame_async_for_rpc_request(
             stream,
             stream_address,
+            paths,
             &request,
             response,
         )
@@ -945,6 +951,7 @@ async fn dispatch_streamed_cluster_relay_local_request_async(
             write_daemon_rpc_response_frame_async_for_rpc_request(
                 stream,
                 stream_address,
+                paths,
                 &request,
                 sinomo_network::ObjectRpcResponse::encode_error(
                     request.route.clone(),
@@ -1146,6 +1153,7 @@ async fn handle_authenticated_daemon_command_async(
         write_daemon_rpc_response_frame_async_for_rpc_request(
             &mut stream,
             &stream_address,
+            &paths,
             request,
             response,
         )
@@ -1184,6 +1192,7 @@ async fn handle_authenticated_daemon_command_async(
         write_daemon_rpc_response_frame_async_for_rpc_request(
             &mut stream,
             &stream_address,
+            &paths,
             request,
             response,
         )
@@ -1331,18 +1340,22 @@ async fn write_daemon_rpc_response_frame_async(
 async fn write_daemon_rpc_response_frame_async_for_control_request(
     stream: &mut sinomo_network::AsyncDaemonControlStream,
     address: &str,
+    paths: &DaemonPaths,
     _request: &sinomo_network::DaemonControlRequest,
-    response: sinomo_network::ObjectRpcResponse,
+    mut response: sinomo_network::ObjectRpcResponse,
 ) -> Result<(), DaemonError> {
+    crate::service_adapter::mark_daemon_rpc_response_responder(paths, &mut response);
     write_daemon_rpc_response_frame_async(stream, address, response).await
 }
 
 async fn write_daemon_rpc_response_frame_async_for_rpc_request(
     stream: &mut sinomo_network::AsyncDaemonControlStream,
     address: &str,
+    paths: &DaemonPaths,
     _request: &sinomo_network::ObjectRpcRequest,
-    response: sinomo_network::ObjectRpcResponse,
+    mut response: sinomo_network::ObjectRpcResponse,
 ) -> Result<(), DaemonError> {
+    crate::service_adapter::mark_daemon_rpc_response_responder(paths, &mut response);
     write_daemon_rpc_response_frame_async(stream, address, response).await
 }
 

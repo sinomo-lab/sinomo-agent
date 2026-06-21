@@ -5727,10 +5727,11 @@ fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
     let selector = ClusterEndpointSelector::new(&paths, &state);
     let candidates = selector.select(ClusterEndpointSelectionPurpose::MainDaemonCommandCandidates);
     let relay_hop_candidates = selector.select(ClusterEndpointSelectionPurpose::RelayHop);
-    let relay_hop_for_remote = selector.select_node(
-        ClusterEndpointSelectionPurpose::RelayHop.into(),
-        &main_endpoint.node_id,
-    );
+    let relay_hop_for_remote = relay_hop_candidates
+        .iter()
+        .filter(|endpoint| endpoint.node_id == main_endpoint.node_id)
+        .cloned()
+        .collect::<Vec<_>>();
     let dfs_targets = selector.select(ClusterEndpointSelectionPurpose::DfsData);
     assert_eq!(
         candidates
@@ -10447,7 +10448,7 @@ fn cluster_voter_reachability_probes_remote_live_voters_until_quorum() {
 }
 
 #[test]
-fn cluster_voter_reachability_uses_command_timeout_for_relay_routed_voter() {
+fn cluster_voter_reachability_uses_fair_timeout_even_when_relay_route_exists() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-voter-reachability-relay");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -10555,7 +10556,7 @@ fn cluster_voter_reachability_uses_command_timeout_for_relay_routed_voter() {
         ),
         2
     );
-    assert_eq!(host.probes, vec![(remote, Duration::from_secs(8))]);
+    assert_eq!(host.probes, vec![(remote, Duration::from_secs(2))]);
 }
 
 #[test]

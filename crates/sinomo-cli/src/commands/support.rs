@@ -1,19 +1,15 @@
 use super::*;
 
 pub(crate) struct CliSignedEndpointRpcHost {
-    cluster_id: Option<sinomo_runtime::node::ClusterId>,
     sign_operation: &'static str,
 }
 
 impl CliSignedEndpointRpcHost {
     pub(crate) fn new(
-        cluster_id: Option<sinomo_runtime::node::ClusterId>,
+        _cluster_id: Option<sinomo_runtime::node::ClusterId>,
         sign_operation: &'static str,
     ) -> Self {
-        Self {
-            cluster_id,
-            sign_operation,
-        }
+        Self { sign_operation }
     }
 }
 
@@ -31,13 +27,6 @@ impl network::ClusterSignedEndpointRpcAsyncHost for CliSignedEndpointRpcHost {
                 }
             })
         })
-    }
-
-    fn endpoint_rpc_cluster_id_async<'a>(
-        &'a mut self,
-        _endpoint: &'a ClusterEndpointRecord,
-    ) -> network::ClusterSignedEndpointRpcFuture<'a, Option<sinomo_runtime::node::ClusterId>> {
-        Box::pin(async move { Ok(self.cluster_id.clone()) })
     }
 }
 

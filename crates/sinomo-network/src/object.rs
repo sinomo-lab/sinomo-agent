@@ -27,8 +27,6 @@ pub(crate) const DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_VALUE: &str = "1";
 pub(crate) const DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_KEY: &str =
     "sinomo.daemon-control.streamed-rpc-response";
 pub(crate) const DAEMON_CONTROL_STREAMED_RPC_RESPONSE_METADATA_VALUE: &str = "raw-byte-chunks-v1";
-pub(crate) const ENDPOINT_RPC_RAW_DIRECT_METADATA_KEY: &str = "sinomo.endpoint-rpc.raw-direct";
-pub(crate) const ENDPOINT_RPC_RAW_DIRECT_METADATA_VALUE: &str = "1";
 const DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES: usize = 8;
 
 /// Timeout policy for daemon object-RPC transport.

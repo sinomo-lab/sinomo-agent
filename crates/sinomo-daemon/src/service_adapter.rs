@@ -623,6 +623,23 @@ pub(crate) fn cached_cluster_network_ping_node_id(
         .clone())
 }
 
+pub(crate) fn mark_daemon_rpc_response_responder(
+    paths: &DaemonPaths,
+    response: &mut ObjectRpcResponse,
+) {
+    if response.responder_node_id().is_some() {
+        return;
+    }
+    let Ok(data_dir_path) = daemon_data_dir_path(paths) else {
+        return;
+    };
+    let data_dir = SinomoDataDir::new(data_dir_path);
+    let Ok(node_id) = cached_cluster_network_ping_node_id(paths, &data_dir) else {
+        return;
+    };
+    response.mark_responder_node_id(node_id.to_string());
+}
+
 /// Daemon adapter for one-hop cluster relay routing. `sinomo-network` owns the relay
 /// decision; the daemon supplies local delivery by reinjecting through its control port.
 struct ClusterRelayService {
@@ -2623,7 +2640,7 @@ async fn dispatch_dfs_direct_read_stream_via_registry_async(
         });
     }
     let data_dir_path = daemon_data_dir_path(paths)?;
-    let stream_response = tokio::task::spawn_blocking(move || {
+    let mut stream_response = tokio::task::spawn_blocking(move || {
         let data_dir = SinomoDataDir::new(data_dir_path);
         sinomo_dfs::handle_dfs_direct_read_stream_rpc_request(&data_dir, request)
     })
@@ -2632,6 +2649,7 @@ async fn dispatch_dfs_direct_read_stream_via_registry_async(
         address: stream_address.to_string(),
         detail: format!("DFS direct-read stream task failed: {source}"),
     })??;
+    mark_daemon_rpc_response_responder(paths, &mut stream_response.response);
     stream
         .write_rpc_response(
             stream_address,
@@ -2811,6 +2829,9 @@ pub(crate) async fn dispatch_rpc_via_registry_to_response_async(
                 return Err(error.into());
             }
         };
+    if let Some(paths) = paths {
+        mark_daemon_rpc_response_responder(paths, &mut response);
+    }
     let stop = response
         .metadata
         .remove(DAEMON_SERVICE_DISPOSITION_METADATA_KEY)

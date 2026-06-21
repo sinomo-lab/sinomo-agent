@@ -1,7 +1,7 @@
 use crate::control::DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL;
 use crate::{
-    DaemonError, DaemonPaths, DaemonRunOptions, send_dfs_object_rpc_to_endpoint_async,
-    send_dfs_object_rpc_to_endpoint_on_runtime,
+    DaemonError, DaemonPaths, DaemonRunOptions, send_dfs_object_rpc_to_target_async,
+    send_dfs_object_rpc_to_target_on_runtime,
 };
 use sinomo_core::ClusterEndpointRecord;
 #[cfg(test)]
@@ -28,6 +28,7 @@ use sinomo_dfs::{
 use sinomo_kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_local::SinomoDataDir;
 use sinomo_network::ClusterPaths;
+use sinomo_node::NodeId;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, TryLockError};
@@ -44,8 +45,10 @@ const DAEMON_DFS_MESSAGE_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(
 const DAEMON_DFS_MESSAGE_ROUTE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DAEMON_DFS_REPAIR_MAX_JOBS_PER_TICK: usize = 8;
 const DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
-const DAEMON_DFS_METADATA_REPLICATION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
-const DAEMON_DFS_METADATA_REPLICATION_TARGET_TIMEOUT: Duration = Duration::from_secs(1);
+const DAEMON_DFS_METADATA_REPLICATION_ATTEMPT_TIMEOUT: Duration =
+    sinomo_dfs::DEFAULT_DFS_METADATA_REPLICATION_TIMEOUT;
+const DAEMON_DFS_METADATA_REPLICATION_TARGET_TIMEOUT: Duration =
+    sinomo_dfs::DEFAULT_DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT;
 const DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS: usize = 3;
 
 type DaemonDfsMessageService = NetworkedDfsService<DfsEndpointServedMessageTransport>;
@@ -346,7 +349,7 @@ fn daemon_dfs_unavailable_peer_transport_error() -> DfsPeerTransportError {
 impl DfsPeerTransport for DaemonDfsUnavailablePeerTransport {
     fn call_object_rpc(
         &self,
-        _endpoint: &ClusterEndpointRecord,
+        _target_node_id: &NodeId,
         _request: &sinomo_network::ObjectRpcRequest,
         _options: DfsObjectRpcSendOptions,
     ) -> Result<sinomo_network::ObjectRpcResponse, DfsPeerTransportError> {
@@ -357,7 +360,7 @@ impl DfsPeerTransport for DaemonDfsUnavailablePeerTransport {
 impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsUnavailablePeerTransport {
     fn call_object_rpc_async<'a>(
         &'a self,
-        _endpoint: &'a ClusterEndpointRecord,
+        _target_node_id: &'a NodeId,
         _request: &'a sinomo_network::ObjectRpcRequest,
         _options: DfsObjectRpcSendOptions,
     ) -> sinomo_dfs::DfsPeerTransportFuture<
@@ -371,12 +374,12 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsUnavailablePeerTransport {
 impl DfsPeerTransport for DaemonDfsBlockingPeerTransport {
     fn call_object_rpc(
         &self,
-        endpoint: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         request: &sinomo_network::ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> Result<sinomo_network::ObjectRpcResponse, DfsPeerTransportError> {
-        send_dfs_object_rpc_to_endpoint_on_runtime(
-            endpoint,
+        send_dfs_object_rpc_to_target_on_runtime(
+            target_node_id,
             request,
             options.connect_timeout,
             &self.runtime,
@@ -389,7 +392,7 @@ impl DfsPeerTransport for DaemonDfsBlockingPeerTransport {
 impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsAsyncPeerTransport {
     fn call_object_rpc_async<'a>(
         &'a self,
-        endpoint: &'a ClusterEndpointRecord,
+        target_node_id: &'a NodeId,
         request: &'a sinomo_network::ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> sinomo_dfs::DfsPeerTransportFuture<
@@ -398,8 +401,8 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsAsyncPeerTransport {
     > {
         let runtime = self.runtime.clone();
         Box::pin(async move {
-            send_dfs_object_rpc_to_endpoint_async(
-                endpoint,
+            send_dfs_object_rpc_to_target_async(
+                target_node_id,
                 request,
                 options.connect_timeout,
                 &runtime,
@@ -2710,10 +2713,10 @@ mod tests {
                 attempted_for_sender
                     .lock()
                     .expect("attempted lock")
-                    .push(endpoint.address.clone());
+                    .push(endpoint.to_string());
                 Err(DfsMetadataPeerTransportError::new(format!(
                     "{} simulated failure",
-                    endpoint.address
+                    endpoint
                 )))
             });
 
@@ -2726,8 +2729,8 @@ mod tests {
         ));
         assert_eq!(
             attempted.lock().expect("attempted lock").as_slice(),
-            &[lan_primary.address, public.address, iroh.address],
-            "metadata replication should try one LAN, one public TCP, and one iroh fallback instead of walking every stale endpoint"
+            &[remote.to_string()],
+            "metadata replication should make one target-level attempt"
         );
     }
 

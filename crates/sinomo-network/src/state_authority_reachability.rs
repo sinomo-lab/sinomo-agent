@@ -1,5 +1,4 @@
 use crate::endpoint_selector::{ClusterEndpointSelectionPurpose, ClusterEndpointSelector};
-use crate::route::{cluster_endpoint_prefers_relay_with_graph, cluster_route_next_hop};
 use crate::{ClusterConnectivityGraph, ClusterPaths, NetworkError};
 use sinomo_core::{
     ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
@@ -176,13 +175,8 @@ fn cluster_state_authority_probe_timeout(
     options: ClusterStateAuthorityReachabilityOptions,
     remaining: Duration,
 ) -> Duration {
-    if cluster_route_next_hop(graph, &state.local_node_id, &endpoint.node_id).is_some()
-        && cluster_endpoint_prefers_relay_with_graph(graph, state, endpoint)
-    {
-        options.command_timeout(endpoint, remaining)
-    } else {
-        options.fair_command_timeout(endpoint, remaining)
-    }
+    let _ = (graph, state);
+    options.fair_command_timeout(endpoint, remaining)
 }
 
 pub fn cluster_has_local_quorum_with_host(

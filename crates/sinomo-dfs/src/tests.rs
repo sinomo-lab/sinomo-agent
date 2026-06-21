@@ -132,7 +132,7 @@ fn process_dfs_message_command_for_test(
     let message_sender: DfsMessageSender = Arc::new(|endpoint, command, _timeout| {
         Err(DfsPeerTransportError::new(format!(
             "unexpected DFS message hop to {} while processing test command {}",
-            endpoint.node_id, command.request_id
+            endpoint, command.request_id
         )))
     });
     let transport = DfsEndpointServedMessageTransport::new_with_message_sender(
@@ -1206,7 +1206,7 @@ struct RecordingPeerTransport {
 impl DfsPeerTransport for RecordingPeerTransport {
     fn call_object_rpc(
         &self,
-        endpoint: &ClusterEndpointRecord,
+        target_node_id: &NodeId,
         request: &ObjectRpcRequest,
         _options: DfsObjectRpcSendOptions,
     ) -> Result<ObjectRpcResponse, DfsPeerTransportError> {
@@ -1217,7 +1217,7 @@ impl DfsPeerTransport for RecordingPeerTransport {
                     .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
                 self.calls.lock().expect("calls").push(format!(
                     "rpc:{}:{}:{}",
-                    request.route, endpoint.address, command.request_id
+                    request.route, target_node_id, command.request_id
                 ));
                 ObjectRpcResponse::encode_body(
                     route,
@@ -1234,7 +1234,7 @@ impl DfsPeerTransport for RecordingPeerTransport {
                     .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
                 self.calls.lock().expect("calls").push(format!(
                     "rpc:{}:{}:{}",
-                    request.route, endpoint.address, command.request_id
+                    request.route, target_node_id, command.request_id
                 ));
                 ObjectRpcResponse::encode_body(
                     DFS_METADATA_JOURNAL_BATCH_ROUTE,
@@ -1254,7 +1254,7 @@ impl DfsPeerTransport for RecordingPeerTransport {
                     .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
                 self.calls.lock().expect("calls").push(format!(
                     "rpc:{}:{}:{}",
-                    request.route, endpoint.address, command.request_id
+                    request.route, target_node_id, command.request_id
                 ));
                 ObjectRpcResponse::encode_body(
                     DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
@@ -1279,11 +1279,11 @@ impl DfsPeerTransport for RecordingPeerTransport {
 impl AsyncDfsPeerTransport for RecordingPeerTransport {
     fn call_object_rpc_async<'a>(
         &'a self,
-        endpoint: &'a ClusterEndpointRecord,
+        target_node_id: &'a NodeId,
         request: &'a ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResponse, DfsPeerTransportError>> {
-        Box::pin(async move { self.call_object_rpc(endpoint, request, options) })
+        Box::pin(async move { self.call_object_rpc(target_node_id, request, options) })
     }
 }
 
@@ -1303,7 +1303,6 @@ fn dfs_peer_transport_adapters_delegate_all_routes() {
     let snapshot_sender = dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport);
     let local = NodeId::from_legacy_named("node_dfs_peer_transport_local").expect("local");
     let remote = NodeId::from_legacy_named("node_dfs_peer_transport_remote").expect("remote");
-    let endpoint = test_endpoint(&remote, "10.95.0.2:21353");
     let routed_message = build_dfs_routed_message(
         &local,
         &remote,
@@ -1323,7 +1322,7 @@ fn dfs_peer_transport_adapters_delegate_all_routes() {
     );
 
     message_sender(
-        &endpoint,
+        &remote,
         &DfsMessageCommand {
             request_id: "protocol-1".to_string(),
             routed_message,
@@ -1334,7 +1333,7 @@ fn dfs_peer_transport_adapters_delegate_all_routes() {
 
     let shard_id = DfsMetadataShardId::new("root");
     journal_sender(
-        &endpoint,
+        &remote,
         &DfsMetadataJournalBatchCommand {
             request_id: "journal-1".to_string(),
             source_node_id: Some(local.clone()),
@@ -1353,7 +1352,7 @@ fn dfs_peer_transport_adapters_delegate_all_routes() {
         .expect("metadata backend")
         .export_table_snapshot();
     snapshot_sender(
-        &endpoint,
+        &remote,
         &DfsMetadataSnapshotInstallCommand {
             request_id: "snapshot-1".to_string(),
             source_node_id: local,
@@ -1369,9 +1368,9 @@ fn dfs_peer_transport_adapters_delegate_all_routes() {
     assert_eq!(
         peer.calls.lock().expect("calls").as_slice(),
         &[
-            "rpc:/dfs/data/read:10.95.0.2:21353:protocol-1".to_string(),
-            "rpc:/dfs/metadata/journal-batch:10.95.0.2:21353:journal-1".to_string(),
-            "rpc:/dfs/metadata/snapshot-install:10.95.0.2:21353:snapshot-1".to_string(),
+            format!("rpc:/dfs/data/read:{remote}:protocol-1"),
+            format!("rpc:/dfs/metadata/journal-batch:{remote}:journal-1"),
+            format!("rpc:/dfs/metadata/snapshot-install:{remote}:snapshot-1"),
         ]
     );
     std::fs::remove_dir_all(snapshot_root).ok();
@@ -1817,7 +1816,7 @@ fn endpoint_transport_sends_rpc_and_queues_returned_messages() {
         calls_for_sender
             .lock()
             .expect("calls lock")
-            .push((endpoint.node_id.clone(), command.routed_message.clone()));
+            .push((endpoint.clone(), command.routed_message.clone()));
         Ok(test_dfs_message_response_from_routed_messages(
             command.request_id.clone(),
             vec![test_dfs_lookup_routed_message(
@@ -2061,7 +2060,7 @@ fn endpoint_transport_async_send_requires_async_sender() {
             calls_for_sender
                 .lock()
                 .expect("calls lock")
-                .push((endpoint.node_id.clone(), command.routed_message.clone()));
+                .push((endpoint.clone(), command.routed_message.clone()));
             Ok(test_dfs_message_response_from_routed_messages(
                 command.request_id.clone(),
                 vec![test_dfs_lookup_routed_message(
@@ -2112,7 +2111,7 @@ fn endpoint_transport_async_sender_does_not_require_sync_sender() {
         let remote_for_sender = remote.clone();
         let sender: AsyncDfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
             let calls_for_sender = Arc::clone(&calls_for_sender);
-            let endpoint_node_id = endpoint.node_id.clone();
+            let endpoint_node_id = endpoint.clone();
             let request_id = command.request_id.clone();
             let routed_message = command.routed_message.clone();
             let local_for_sender = local_for_sender.clone();
@@ -2187,7 +2186,7 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
             sync_calls_for_sender
                 .lock()
                 .expect("sync calls lock")
-                .push((endpoint.node_id.clone(), command.routed_message.frame_id));
+                .push((endpoint.clone(), command.routed_message.frame_id));
             Ok(test_dfs_message_response_from_routed_messages(
                 command.request_id.clone(),
                 vec![test_dfs_lookup_routed_message(
@@ -2204,7 +2203,7 @@ fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
         let remote_for_async = remote.clone();
         let async_sender: AsyncDfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
             let async_calls_for_sender = Arc::clone(&async_calls_for_sender);
-            let endpoint_node_id = endpoint.node_id.clone();
+            let endpoint_node_id = endpoint.clone();
             let request_id = command.request_id.clone();
             let frame_id = command.routed_message.frame_id;
             let local_for_async = local_for_async.clone();
@@ -2282,7 +2281,7 @@ fn endpoint_transport_relays_remote_returned_messages_preserving_source() {
     let replica_for_sender = replica.clone();
     let sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
         calls_for_sender.lock().expect("calls lock").push((
-            endpoint.node_id.clone(),
+            endpoint.clone(),
             command.routed_message.source_node_id.clone(),
             command.routed_message.target_node_id.clone(),
         ));
@@ -2556,7 +2555,7 @@ fn served_message_drains_nested_stage_response_before_returning() {
     let stage_calls_for_sender = Arc::clone(&stage_calls);
     let replica_for_sender = replica.clone();
     let sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
-        assert_eq!(endpoint.node_id, replica_for_sender);
+        assert_eq!(endpoint, &replica_for_sender);
         let message = command.routed_message.message.clone();
         let DfsNetworkMessage::StageBlob(stage) = message else {
             return Ok(DfsMessageResponse {
@@ -2724,7 +2723,7 @@ fn served_non_foreground_write_does_not_retry_unrelated_repairs() {
     let repair_calls_for_sender = Arc::clone(&repair_calls);
     let replica_for_sender = replica.clone();
     let sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
-        assert_eq!(endpoint.node_id, replica_for_sender);
+        assert_eq!(endpoint, &replica_for_sender);
         if let message @ (DfsNetworkMessage::RepairReplica(_)
         | DfsNetworkMessage::RepairReplicaChunk(_)
         | DfsNetworkMessage::StageBlob(_)
@@ -4379,7 +4378,7 @@ fn cluster_smoke_opens_service_and_publishes_metadata() {
         sent_for_sender
             .lock()
             .expect("sent lock")
-            .push((endpoint.address.clone(), command.batch.entries.len()));
+            .push((endpoint.to_string(), command.batch.entries.len()));
         Ok(DfsMetadataJournalBatchResponse {
             request_id: command.request_id.clone(),
             shard_id: command.batch.shard_id.clone(),
@@ -6091,7 +6090,7 @@ fn cluster_metadata_journal_publish_reads_cluster_state_and_shards() {
         sent_for_sender
             .lock()
             .expect("sent lock")
-            .push((endpoint.address.clone(), command.batch.entries.len()));
+            .push((endpoint.to_string(), command.batch.entries.len()));
         Ok(DfsMetadataJournalBatchResponse {
             request_id: command.request_id.clone(),
             shard_id: command.batch.shard_id.clone(),
@@ -6380,7 +6379,7 @@ fn async_cluster_metadata_publish_repairs_sequence_conflict_with_snapshot() {
                     snapshot_installs
                         .lock()
                         .expect("snapshot installs")
-                        .push((endpoint.address.clone(), command.next_after_sequence));
+                        .push((endpoint.to_string(), command.next_after_sequence));
                     Ok(DfsMetadataSnapshotInstallResponse {
                         request_id: command.request_id.clone(),
                         shard_id: command.shard_id.clone(),
@@ -6436,7 +6435,7 @@ fn async_cluster_metadata_publish_repairs_sequence_conflict_with_snapshot() {
 }
 
 #[test]
-fn metadata_endpoint_transport_falls_back_across_bounded_target_endpoints() {
+fn metadata_endpoint_transport_sends_one_target_attempt() {
     let target = NodeId::from_legacy_named("node_meta_endpoint_fallback_target").expect("target");
     let mut endpoints = vec![
         test_endpoint(&target, "10.70.0.1:21353"),
@@ -6453,7 +6452,7 @@ fn metadata_endpoint_transport_falls_back_across_bounded_target_endpoints() {
         attempted_for_sender
             .lock()
             .expect("attempted lock")
-            .push(endpoint.address.clone());
+            .push(endpoint.to_string());
         Err(DfsMetadataPeerTransportError::new("simulated failure"))
     });
     let snapshot_sender: DfsMetadataSnapshotInstallSender =
@@ -6486,17 +6485,13 @@ fn metadata_endpoint_transport_falls_back_across_bounded_target_endpoints() {
     ));
     assert_eq!(
         attempted.lock().expect("attempted lock").as_slice(),
-        &[
-            "10.70.0.1:21353".to_string(),
-            "10.70.0.2:21353".to_string(),
-            "10.70.0.3:21353".to_string()
-        ],
-        "metadata transport should bound endpoint fallbacks per target"
+        &[target.to_string()],
+        "metadata transport should make one target-level attempt"
     );
 }
 
 #[test]
-fn metadata_endpoint_transport_retries_mismatched_journal_response() {
+fn metadata_endpoint_transport_rejects_mismatched_journal_response() {
     let target = NodeId::from_legacy_named("node_meta_endpoint_mismatch_target").expect("target");
     let endpoints = vec![
         test_endpoint(&target, "10.71.0.1:21353"),
@@ -6541,19 +6536,17 @@ fn metadata_endpoint_transport_retries_mismatched_journal_response() {
         },
     };
 
-    let response = transport
-        .send_metadata_journal_batch(&target, &command, Duration::from_secs(5))
-        .expect("second endpoint should return matching response");
+    let result = transport.send_metadata_journal_batch(&target, &command, Duration::from_secs(5));
 
-    assert_eq!(
-        response.next_after_sequence,
-        command.batch.next_after_sequence
-    );
-    assert_eq!(*attempts.lock().expect("attempts lock"), 2);
+    assert!(matches!(
+        result,
+        Err(DfsMetadataJournalReplicationTransportError::Failed { .. })
+    ));
+    assert_eq!(*attempts.lock().expect("attempts lock"), 1);
 }
 
 #[test]
-fn async_metadata_endpoint_transport_retries_mismatched_journal_response() {
+fn async_metadata_endpoint_transport_rejects_mismatched_journal_response() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -6568,7 +6561,7 @@ fn async_metadata_endpoint_transport_retries_mismatched_journal_response() {
         let attempts = Arc::new(Mutex::new(0usize));
         let attempts_for_sender = Arc::clone(&attempts);
         let sender: AsyncDfsMetadataJournalBatchSender =
-            Arc::new(move |_endpoint, command, _timeout| {
+            Arc::new(move |_target_node_id, command, _timeout| {
                 let attempts = Arc::clone(&attempts_for_sender);
                 Box::pin(async move {
                     let mut attempts = attempts.lock().expect("attempts lock");
@@ -6576,18 +6569,14 @@ fn async_metadata_endpoint_transport_retries_mismatched_journal_response() {
                     Ok(DfsMetadataJournalBatchResponse {
                         request_id: command.request_id.clone(),
                         shard_id: command.batch.shard_id.clone(),
-                        next_after_sequence: if *attempts == 1 {
-                            command.batch.next_after_sequence + 1
-                        } else {
-                            command.batch.next_after_sequence
-                        },
+                        next_after_sequence: command.batch.next_after_sequence + 1,
                         applied_entries: command.batch.entries.len(),
                         result: DfsMetadataJournalBatchResult::Applied,
                     })
                 })
             });
         let snapshot_sender: AsyncDfsMetadataSnapshotInstallSender =
-            Arc::new(move |_endpoint, command, _timeout| {
+            Arc::new(move |_target_node_id, command, _timeout| {
                 Box::pin(async move {
                     Ok(DfsMetadataSnapshotInstallResponse {
                         request_id: command.request_id.clone(),
@@ -6611,16 +6600,15 @@ fn async_metadata_endpoint_transport_retries_mismatched_journal_response() {
             },
         };
 
-        let response = transport
+        let result = transport
             .send_metadata_journal_batch_async(&target, &command, Duration::from_secs(5))
-            .await
-            .expect("second endpoint should return matching response");
+            .await;
 
-        assert_eq!(
-            response.next_after_sequence,
-            command.batch.next_after_sequence
-        );
-        assert_eq!(*attempts.lock().expect("attempts lock"), 2);
+        assert!(matches!(
+            result,
+            Err(DfsMetadataJournalReplicationTransportError::Failed { .. })
+        ));
+        assert_eq!(*attempts.lock().expect("attempts lock"), 1);
     });
 }
 
@@ -8658,7 +8646,7 @@ fn served_endpoint_reader_write_fetches_and_stages_before_completion() {
     let trace_for_replica_sender = Arc::clone(&trace);
     let staged_chunks_for_replica_sender = Arc::clone(&staged_chunks);
     let replica_sender: DfsMessageSender = Arc::new(move |endpoint, command, _timeout| {
-        assert_eq!(endpoint.node_id, replica_for_sender);
+        assert_eq!(endpoint, &replica_for_sender);
         let message = command.routed_message.message.clone();
         let response = match message {
             DfsNetworkMessage::StageBlob(stage) => {
