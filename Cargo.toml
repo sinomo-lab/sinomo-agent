@@ -1,10 +1,6 @@
 [workspace]
 resolver = "3"
 
-exclude = [
-    "crates/sinomo-app",
-]
-
 members = [
     "crates/*",
     "modules/*/*",
@@ -14,6 +10,7 @@ default-members = [
     "crates/sinomo",
     "crates/sinomo-actions",
     "crates/sinomo-agent",
+    "crates/sinomo-app",
     "crates/sinomo-audio",
     "crates/sinomo-cli",
     "crates/sinomo-cli-registry",
