@@ -38,6 +38,7 @@ sinomo-policy = { path = "../sinomo-policy" }
 sinomo-registry = { path = "../sinomo-registry" }
 sinomo-rollout = { path = "../sinomo-rollout" }
 sinomo-sandbox = { path = "../sinomo-sandbox" }
+sinomo-sandbox-simple = { path = "../sinomo-sandbox-simple" }
 sinomo-sandbox-wasix-api = { path = "../sinomo-sandbox-wasix-api" }
 sinomo-sandbox-wasix-host = { path = "../sinomo-sandbox-wasix-host", optional = true }
 sinomo-service = { path = "../sinomo-service" }

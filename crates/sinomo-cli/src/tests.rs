@@ -1138,6 +1138,32 @@ fn sandbox_run_parser_accepts_container_backend_options() {
 }
 
 #[test]
+fn sandbox_run_parser_accepts_simple_native_backend() {
+    let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
+    let command = parse_sandbox_command(&[
+        "run".to_string(),
+        sandbox_id.to_string(),
+        "--simple-native".to_string(),
+        "sh".to_string(),
+        "--".to_string(),
+        "-c".to_string(),
+        "pwd".to_string(),
+    ])
+    .expect("sandbox run");
+
+    let SandboxCliCommand::Run(options) = command else {
+        panic!("expected run");
+    };
+    assert_eq!(options.sandbox_id, sandbox_id);
+    assert_eq!(
+        options.target,
+        SandboxRunTarget::ToolchainCommand("sh".to_string())
+    );
+    assert_eq!(options.argv, vec!["sh", "-c", "pwd"]);
+    assert_eq!(options.execution, SandboxRunExecution::SimpleNative);
+}
+
+#[test]
 fn sandbox_run_parser_rejects_container_wasm_and_policy_overrides() {
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
     assert!(matches!(
@@ -1169,6 +1195,43 @@ fn sandbox_run_parser_rejects_container_wasm_and_policy_overrides() {
             sandbox_id.to_string(),
             "--daemon".to_string(),
             "--podman".to_string(),
+            "alpine:3.20".to_string(),
+            "sh".to_string(),
+        ]),
+        Err(SandboxCliError::Parse { .. })
+    ));
+}
+
+#[test]
+fn sandbox_run_parser_rejects_simple_native_wasm_and_policy_overrides() {
+    let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
+    assert!(matches!(
+        parse_sandbox_command(&[
+            "run".to_string(),
+            sandbox_id.to_string(),
+            "--simple-native".to_string(),
+            "--wasm".to_string(),
+            "/tmp/hello.wasm".to_string(),
+        ]),
+        Err(SandboxCliError::Parse { .. })
+    ));
+    assert!(matches!(
+        parse_sandbox_command(&[
+            "run".to_string(),
+            sandbox_id.to_string(),
+            "--simple-native".to_string(),
+            "--allow-capability".to_string(),
+            "wasix.unpinned-child-exec".to_string(),
+            "sh".to_string(),
+        ]),
+        Err(SandboxCliError::Parse { .. })
+    ));
+    assert!(matches!(
+        parse_sandbox_command(&[
+            "run".to_string(),
+            sandbox_id.to_string(),
+            "--simple-native".to_string(),
+            "--docker".to_string(),
             "alpine:3.20".to_string(),
             "sh".to_string(),
         ]),
@@ -1305,6 +1368,18 @@ fn sandbox_process_plan_parser_accepts_plan_path_and_timeout() {
         container_options.execution,
         SandboxRunExecution::Container(_)
     ));
+
+    let simple_command = parse_sandbox_command(&[
+        "process-plan".to_string(),
+        sandbox_id.to_string(),
+        "--simple-native".to_string(),
+        "/tmp/plan.json".to_string(),
+    ])
+    .expect("simple-native sandbox process plan");
+    let SandboxCliCommand::ProcessPlan(simple_options) = simple_command else {
+        panic!("expected process plan");
+    };
+    assert_eq!(simple_options.execution, SandboxRunExecution::SimpleNative);
 }
 
 #[test]
@@ -1345,6 +1420,19 @@ fn sandbox_shell_parser_accepts_script_and_timeout() {
         container_options.execution,
         SandboxRunExecution::Container(_)
     ));
+
+    let simple_command = parse_sandbox_command(&[
+        "shell".to_string(),
+        sandbox_id.to_string(),
+        "--simple-native".to_string(),
+        "--".to_string(),
+        "echo hi".to_string(),
+    ])
+    .expect("simple-native sandbox shell");
+    let SandboxCliCommand::Shell(simple_options) = simple_command else {
+        panic!("expected shell");
+    };
+    assert_eq!(simple_options.execution, SandboxRunExecution::SimpleNative);
 }
 
 #[test]

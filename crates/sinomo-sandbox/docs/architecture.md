@@ -88,6 +88,8 @@ WASIX is the production SIFS backend. It is required for policy-visible clustere
 
 Docker/Podman is a local backend for development and compatibility workloads. It runs commands from a configured image with network disabled by default, a read-only image root, dropped Linux capabilities, and writable sandbox mounts for the standard sandbox directories. Container mode treats the requested command name as an executable inside the image; it does not use WASIX module artifacts from the sandbox toolchain store.
 
+Simple-native is a Linux-first local backend for desktop workflows that should run host binaries at native speed. It exposes the host filesystem layout as-is and uses Landlock to allow reads from common system paths and writes only to the sandbox instance directories plus explicitly configured extra paths. This backend is for preventing accidental access to unapproved resources, not for containing hostile code. It does not provide SIFS-backed cluster execution, guest path virtualization, or WASIX toolchain provenance checks.
+
 Container mode can be selected explicitly:
 
 ```text
@@ -95,11 +97,32 @@ sinomo sandbox run <sandbox-id> --docker <image> sh -- -c 'echo hello'
 sinomo sandbox process-plan <sandbox-id> --podman <image> plan.json
 ```
 
-It can also be selected for local service routes and local CLI execution through:
+Simple-native mode can be selected explicitly:
+
+```text
+sinomo sandbox run <sandbox-id> --simple-native sh -- -c 'echo hello'
+sinomo sandbox process-plan <sandbox-id> --simple-native plan.json
+```
+
+Container mode can also be selected for local service routes and local CLI execution through:
 
 ```text
 SINOMO_SANDBOX_BACKEND=docker|podman
 SINOMO_SANDBOX_CONTAINER_IMAGE=<image>
+```
+
+Simple-native can also be selected for local CLI execution through:
+
+```text
+SINOMO_SANDBOX_BACKEND=simple-native
+```
+
+Simple-native path allowlists can be extended for local development with:
+
+```text
+SINOMO_SANDBOX_SIMPLE_READ_PATHS=/path/one:/path/two
+SINOMO_SANDBOX_SIMPLE_WRITE_PATHS=/path/out
+SINOMO_SANDBOX_SIMPLE_EXECUTE_PATHS=/opt/tool/bin
 ```
 
 WASIX runtime code is split under `src/runtime/`:
