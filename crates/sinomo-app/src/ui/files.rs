@@ -8,7 +8,8 @@
 //! the inspector, narrow list-only), each assembled from stock `Breadcrumb` /
 //! `IconButton` / `ListView` / `ScrollView` / `Separator` / `PanelSection` /
 //! `PropertyRow` / `Label` widgets. State lives entirely in [`FilesState`]; the
-//! data layer (the SIFS browser + navigation methods) is unchanged.
+//! interactive app lists SIFS on a background worker so tab layout never blocks
+//! on DFS metadata or network work.
 //!
 //! The one new wrinkle vs. Settings: the file *listing* changes on navigation, so
 //! the list/breadcrumb items aren't fixed at build time. `ListView::items()` takes
@@ -23,6 +24,9 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread;
+use std::time::Duration;
 
 use sui::{
     Alignment, ArrangeCtx, Breadcrumb, BreadcrumbItem, Constraints, DefaultTheme, Event, EventCtx,
@@ -45,13 +49,14 @@ const INSPECTOR_W: f32 = 340.0;
 const ROW_H: f32 = 34.0;
 const CONTENT_PAD: f32 = 16.0;
 const HEADER_H: f32 = 46.0;
+const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A shared closure that resolves the current widget theme — threaded into every control so the
 /// Appearance toggle restyles the whole tab live, with no rebuild. (Same pattern as `settings.rs`.)
 type ThemeReader = Rc<dyn Fn() -> DefaultTheme>;
 
 // ---------------------------------------------------------------------------
-// State (data layer) — UNCHANGED from the hand-painted version.
+// State (data layer) — SIFS-backed browser snapshot + async load worker.
 // ---------------------------------------------------------------------------
 
 /// State backing the files tab.
@@ -61,12 +66,19 @@ pub struct FilesState {
     pub error: Option<String>,
     pub clustered: bool,
     pub loaded: bool,
+    pub loading: bool,
     pub list_revision: u64,
     pub node_id: String,
     pub path: String,
     pub entries: Vec<SifsEntry>,
     pub selected: Option<usize>,
     pub scroll: f32,
+    worker_tx: Option<Sender<FilesWorkerCommand>>,
+    worker_rx: Option<Receiver<FilesWorkerResult>>,
+    worker_result_tx: Option<Sender<FilesWorkerResult>>,
+    worker_waker: Option<sui::UiHandle>,
+    next_request_id: u64,
+    pending_request_id: Option<u64>,
 }
 
 impl FilesState {
@@ -77,21 +89,40 @@ impl FilesState {
             error: None,
             clustered: backend.connection.is_clustered(),
             loaded: false,
+            loading: false,
             list_revision: 0,
             node_id: String::new(),
             path: "/".to_string(),
             entries: Vec::new(),
             selected: None,
             scroll: 0.0,
+            worker_tx: None,
+            worker_rx: None,
+            worker_result_tx: None,
+            worker_waker: None,
+            next_request_id: 0,
+            pending_request_id: None,
         }
     }
 
-    fn ensure_loaded(&mut self) {
+    fn ensure_loaded(&mut self, waker: Option<sui::UiHandle>) {
         if self.loaded {
+            self.pump_load();
             return;
         }
+        if let Some(waker) = waker {
+            self.ensure_worker(waker);
+            self.loaded = true;
+            self.reload();
+            return;
+        }
+        self.load_sync();
+    }
+
+    fn load_sync(&mut self) {
         self.loaded = true;
-        match SifsBrowser::open(&self.data_dir) {
+        self.loading = false;
+        match SifsBrowser::open_read_only(&self.data_dir) {
             Ok(browser) => {
                 self.node_id = browser.node_id().to_string();
                 self.browser = Some(browser);
@@ -107,10 +138,19 @@ impl FilesState {
     }
 
     fn reload(&mut self) {
+        if self.worker_tx.is_some() {
+            self.reload_async();
+            return;
+        }
+        self.reload_sync();
+    }
+
+    fn reload_sync(&mut self) {
         self.selected = None;
         self.scroll = 0.0;
+        self.loading = false;
         let path = self.path.clone();
-        let listing = self.browser.as_ref().map(|b| b.list(&path));
+        let listing = self.browser.as_ref().map(|b| b.list_shallow(&path));
         match listing {
             Some(Ok(entries)) => {
                 self.entries = entries;
@@ -125,18 +165,146 @@ impl FilesState {
         self.list_revision = self.list_revision.wrapping_add(1);
     }
 
+    fn reload_async(&mut self) {
+        let Some(tx) = self.worker_tx.clone() else {
+            return;
+        };
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        self.pending_request_id = Some(request_id);
+        self.selected = None;
+        self.scroll = 0.0;
+        self.loading = true;
+        self.error = None;
+        self.entries.clear();
+        self.list_revision = self.list_revision.wrapping_add(1);
+        let command = FilesWorkerCommand::List {
+            request_id,
+            path: self.path.clone(),
+        };
+        if tx.send(command).is_err() {
+            self.pending_request_id = None;
+            self.loading = false;
+            self.error = Some("SIFS browser worker stopped".to_string());
+            self.list_revision = self.list_revision.wrapping_add(1);
+            return;
+        }
+        if let Some(result_tx) = self.worker_result_tx.clone() {
+            let path = self.path.clone();
+            let waker = self.worker_waker.clone();
+            let _ = thread::Builder::new()
+                .name("sinomo-app-files-timeout".to_string())
+                .spawn(move || {
+                    thread::sleep(LOAD_TIMEOUT);
+                    let _ = result_tx.send(FilesWorkerResult {
+                        request_id,
+                        path,
+                        result: Err(format!(
+                            "SIFS listing did not finish within {} seconds",
+                            LOAD_TIMEOUT.as_secs()
+                        )),
+                    });
+                    if let Some(waker) = waker {
+                        waker.wake();
+                    }
+                });
+        }
+    }
+
+    fn ensure_worker(&mut self, waker: sui::UiHandle) {
+        if self.worker_tx.is_some() {
+            return;
+        }
+        let (command_tx, command_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let data_dir = self.data_dir.clone();
+        let timeout_tx = result_tx.clone();
+        let timeout_waker = waker.clone();
+        match thread::Builder::new()
+            .name("sinomo-app-files".to_string())
+            .spawn(move || files_worker_loop(data_dir, command_rx, result_tx, waker))
+        {
+            Ok(_) => {
+                self.worker_tx = Some(command_tx);
+                self.worker_rx = Some(result_rx);
+                self.worker_result_tx = Some(timeout_tx);
+                self.worker_waker = Some(timeout_waker);
+            }
+            Err(error) => {
+                self.loaded = true;
+                self.loading = false;
+                self.error = Some(format!("cannot start SIFS browser worker: {error}"));
+                self.list_revision = self.list_revision.wrapping_add(1);
+            }
+        }
+    }
+
+    pub fn pump_load(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            let result = match self.worker_rx.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(result)) => result,
+                Some(Err(TryRecvError::Empty)) | None => break,
+                Some(Err(TryRecvError::Disconnected)) => {
+                    if self.loading {
+                        self.loading = false;
+                        self.pending_request_id = None;
+                        self.error = Some("SIFS browser worker stopped".to_string());
+                        self.list_revision = self.list_revision.wrapping_add(1);
+                        changed = true;
+                    }
+                    self.worker_rx = None;
+                    self.worker_tx = None;
+                    self.worker_result_tx = None;
+                    self.worker_waker = None;
+                    break;
+                }
+            };
+            if self.apply_worker_result(result) {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn apply_worker_result(&mut self, result: FilesWorkerResult) -> bool {
+        if self.pending_request_id != Some(result.request_id) {
+            return false;
+        }
+        self.pending_request_id = None;
+        self.loading = false;
+        self.path = result.path;
+        match result.result {
+            Ok(listing) => {
+                self.node_id = listing.node_id;
+                self.entries = listing.entries;
+                self.error = None;
+            }
+            Err(error) => {
+                self.entries.clear();
+                self.error = Some(error);
+            }
+        }
+        self.list_revision = self.list_revision.wrapping_add(1);
+        true
+    }
+
     fn navigate(&mut self, path: String) {
         let normalized = self
             .browser
             .as_ref()
             .map(|b| b.normalize(&path))
-            .unwrap_or(path);
+            .unwrap_or_else(|| normalize_path(&path));
         self.path = normalized;
         self.reload();
     }
 
     fn go_up(&mut self) {
-        let parent = self.browser.as_ref().and_then(|b| b.parent(&self.path));
+        let parent = self
+            .browser
+            .as_ref()
+            .and_then(|b| b.parent(&self.path))
+            .or_else(|| parent_path(&self.path));
         if let Some(parent) = parent {
             self.navigate(parent);
         }
@@ -171,6 +339,98 @@ impl FilesState {
         }
         out
     }
+}
+
+struct FilesListing {
+    node_id: String,
+    entries: Vec<SifsEntry>,
+}
+
+struct FilesWorkerResult {
+    request_id: u64,
+    path: String,
+    result: Result<FilesListing, String>,
+}
+
+enum FilesWorkerCommand {
+    List { request_id: u64, path: String },
+}
+
+fn files_worker_loop(
+    data_dir: Arc<SinomoDataDir>,
+    command_rx: Receiver<FilesWorkerCommand>,
+    result_tx: Sender<FilesWorkerResult>,
+    waker: sui::UiHandle,
+) {
+    let mut browser: Option<SifsBrowser> = None;
+    let mut open_error: Option<String> = None;
+    while let Ok(command) = command_rx.recv() {
+        let FilesWorkerCommand::List { request_id, path } = command;
+        let requested_path = normalize_path(&path);
+        let (path, result) = if let Some(error) = &open_error {
+            (requested_path, Err(error.clone()))
+        } else {
+            if browser.is_none() {
+                match SifsBrowser::open_read_only(&data_dir) {
+                    Ok(opened) => browser = Some(opened),
+                    Err(error) => open_error = Some(error),
+                }
+            }
+            match (&browser, &open_error) {
+                (Some(browser), _) => {
+                    let path = browser.normalize(&requested_path);
+                    let result = browser.list_shallow(&path).map(|entries| FilesListing {
+                        node_id: browser.node_id().to_string(),
+                        entries,
+                    });
+                    (path, result)
+                }
+                (None, Some(error)) => (requested_path, Err(error.clone())),
+                (None, None) => (
+                    requested_path,
+                    Err("SIFS browser did not start".to_string()),
+                ),
+            }
+        };
+        let _ = result_tx.send(FilesWorkerResult {
+            request_id,
+            path,
+            result,
+        });
+        waker.wake();
+    }
+}
+
+fn normalize_path(path: &str) -> String {
+    let mut parts = Vec::new();
+    let path = path.replace('\\', "/");
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part.to_string()),
+        }
+    }
+    if parts.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", parts.join("/"))
+    }
+}
+
+fn parent_path(path: &str) -> Option<String> {
+    let path = normalize_path(path);
+    if path == "/" {
+        return None;
+    }
+    let (parent, _) = path.rsplit_once('/')?;
+    Some(if parent.is_empty() {
+        "/".to_string()
+    } else {
+        parent.to_string()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -298,15 +558,27 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 /// Build the file-list body for the *current* listing: an error/empty placeholder, or a `ListView`
 /// of the entries wrapped in a `ScrollView`. Directory rows navigate; file rows select.
 fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -> WidgetPod {
-    let (error, is_empty, entries): (Option<String>, bool, Vec<SifsEntry>) = {
+    let (loading, error, is_empty, entries): (bool, Option<String>, bool, Vec<SifsEntry>) = {
         let files = shared.files();
         (
+            files.loading,
             files.error.clone(),
             files.entries.is_empty(),
             files.entries.clone(),
         )
     };
 
+    if loading {
+        return WidgetPod::new(
+            centered_note(
+                shared,
+                "▤",
+                "Loading SIFS",
+                "Opening the distributed filesystem...",
+            )
+            .glyph(IconGlyph::Storage),
+        );
+    }
     if let Some(error) = error {
         return WidgetPod::new(
             centered_note(shared, "▤", "SIFS unavailable", format!("{error}"))
@@ -1034,7 +1306,8 @@ impl Widget for FilesView {
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        self.shared.files_mut().ensure_loaded();
+        let waker = { self.shared.borrow().waker.clone() };
+        self.shared.files_mut().ensure_loaded(waker);
         let use_wide = constraints.max.width >= WIDE_THRESHOLD;
         self.use_wide.set(use_wide);
         self.active_mut().measure(ctx, constraints)
@@ -1099,6 +1372,7 @@ mod tests {
         let state = FilesState::new(&backend);
 
         assert!(!state.loaded);
+        assert!(!state.loading);
         assert!(state.browser.is_none());
         assert!(state.error.is_none());
         assert!(state.entries.is_empty());
@@ -1150,5 +1424,78 @@ mod tests {
             state.selected_entry().map(|e| e.name.as_str()),
             Some("a.txt")
         );
+    }
+
+    #[test]
+    fn worker_result_updates_listing_snapshot() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.loading = true;
+        state.pending_request_id = Some(7);
+        state.path = "/".to_string();
+
+        let changed = state.apply_worker_result(FilesWorkerResult {
+            request_id: 7,
+            path: "/services".to_string(),
+            result: Ok(FilesListing {
+                node_id: "node-a".to_string(),
+                entries: vec![SifsEntry {
+                    name: "sinomo".to_string(),
+                    path: "/services/sinomo".to_string(),
+                    is_dir: true,
+                    is_link: false,
+                    size: None,
+                }],
+            }),
+        });
+
+        assert!(changed);
+        assert!(!state.loading);
+        assert_eq!(state.pending_request_id, None);
+        assert_eq!(state.path, "/services");
+        assert_eq!(state.node_id, "node-a");
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.list_revision, 1);
+    }
+
+    #[test]
+    fn worker_error_clears_loading_snapshot() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.loading = true;
+        state.pending_request_id = Some(9);
+        state.entries = vec![SifsEntry {
+            name: "old".to_string(),
+            path: "/old".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: Some(1),
+        }];
+
+        let changed = state.apply_worker_result(FilesWorkerResult {
+            request_id: 9,
+            path: "/".to_string(),
+            result: Err("timed out".to_string()),
+        });
+
+        assert!(changed);
+        assert!(!state.loading);
+        assert_eq!(state.pending_request_id, None);
+        assert_eq!(state.error.as_deref(), Some("timed out"));
+        assert!(state.entries.is_empty());
+    }
+
+    #[test]
+    fn path_normalization_keeps_sifs_paths_absolute() {
+        assert_eq!(
+            normalize_path("/users/../services/./sinomo"),
+            "/services/sinomo"
+        );
+        assert_eq!(normalize_path("users\\sinomo"), "/users/sinomo");
+        assert_eq!(
+            parent_path("/services/sinomo"),
+            Some("/services".to_string())
+        );
+        assert_eq!(parent_path("/"), None);
     }
 }
