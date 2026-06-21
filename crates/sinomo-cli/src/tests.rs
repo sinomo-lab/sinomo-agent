@@ -11,19 +11,18 @@ use super::{
     DebugCliCommand, DfsCliCommand, DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions,
     DfsMountOptions, DfsPinCliCommand, InstallLayout, InstallOptions, InteractionModel,
     InteractionRuntime, InteractionSession, InteractionSurface, InteractionSurfaceKind,
-    ModelBackedInteractionHandler, ModelOptionValueUpdate, ModelOptionsCliCommand,
-    ModelOptionsSetOptions, ModelOptionsTarget, ModelRuntimeCliCommand, ModelRuntimeSetOptions,
-    ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions, ProviderName,
-    RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation,
-    RolloutModuleNativeDylibOptions, RolloutOptions, RolloutProgressExpectation,
-    RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler, SelfRolloutPaths,
-    TestCliCommand, UninstallOptions, apply_cluster_node_role, apply_cluster_raft_role,
-    authenticate_daemon_control_request, build_cluster_raft_append_request_from_next_index,
-    cli_command_is_help, cli_command_requires_cluster_state,
-    cli_command_supports_degraded_local_mode, cli_invocation_force_local_mode,
-    cluster_doctor_findings, cluster_has_local_quorum, cluster_init_with_paths,
-    cluster_invite_with_paths, cluster_join_with_paths, cluster_kv_state_authority_id,
-    cluster_leave_with_paths, cluster_migration_plan_with_paths,
+    ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions, ModelOptionsTarget,
+    ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand,
+    ProviderCommandOptions, ProviderName, RolloutAdvanceOptions, RolloutCliCommand,
+    RolloutMainActivation, RolloutModuleNativeDylibOptions, RolloutOptions,
+    RolloutProgressExpectation, RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler,
+    SelfRolloutPaths, TestCliCommand, UninstallOptions, apply_cluster_node_role,
+    apply_cluster_raft_role, authenticate_daemon_control_request,
+    build_cluster_raft_append_request_from_next_index, cli_command_is_help,
+    cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
+    cli_invocation_force_local_mode, cluster_doctor_findings, cluster_has_local_quorum,
+    cluster_init_with_paths, cluster_invite_with_paths, cluster_join_with_paths,
+    cluster_kv_state_authority_id, cluster_leave_with_paths, cluster_migration_plan_with_paths,
     cluster_node_status_from_daemon_status, cluster_peer_members, cluster_state_sync_txn,
     compact_default_invite_introducers, daemon_advertised_endpoints_for_state,
     daemon_handle_daemon_sandbox_http_fetch, daemon_package_version,
@@ -64,8 +63,8 @@ use super::{
 use base64::Engine;
 use sinomo_agent::{AgentRuntimeControlHost, AgentSessionResumeRequest, AgentSessionSteerRequest};
 use sinomo_lm::{
-    LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
-    ProviderReasoningEffort, ProviderTextVerbosity,
+    LanguageModelError, LanguageModelRequest, LanguageModelResponse, ProviderReasoningEffort,
+    ProviderTextVerbosity,
 };
 use sinomo_runtime::cli_registry::{
     CliCommandContext, CliCommandError, CliCommandHandler, CliCommandHelp, CliCommandMetadata,
@@ -111,8 +110,7 @@ use std::io::{Cursor, Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Command;
-#[cfg(feature = "sandbox")]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -12290,47 +12288,6 @@ fn files_slash_command_is_tui_only() {
 }
 
 #[test]
-fn interaction_runtime_records_message_input_as_events() {
-    let session = InteractionSession::new(
-        SessionId::from_legacy_named("sess_cli_test").expect("session"),
-        NodeId::from_legacy_named("node_cli_test").expect("node"),
-        InteractionSurface::new("surface.test", InteractionSurfaceKind::CommandLine),
-    );
-    let mut runtime = InteractionRuntime::new(
-        InMemoryEventStore::new(),
-        fixture_handler("hello from fixture"),
-        session,
-    );
-
-    let outputs = runtime
-        .ingest_user_input("start a conversation")
-        .expect("input");
-
-    assert_eq!(outputs.len(), 1);
-    assert_eq!(
-        outputs[0],
-        super::InteractionOutput::Line("sinomo: hello from fixture".to_string())
-    );
-    let events = runtime.store().replay(ReplayQuery::all()).expect("replay");
-    assert_eq!(events.len(), 4);
-    assert_eq!(events[0].event.kind.as_str(), "interaction.input.received");
-    assert_eq!(
-        events[1].event.kind.as_str(),
-        "interaction.message.received"
-    );
-    assert_eq!(events[2].event.kind.as_str(), "interaction.model.requested");
-    assert_eq!(events[3].event.kind.as_str(), "interaction.model.responded");
-    assert_eq!(
-        events[1].event.links.caused_by,
-        vec![events[0].event.event_id.clone()]
-    );
-    assert_eq!(
-        events[3].event.links.caused_by,
-        vec![events[2].event.event_id.clone()]
-    );
-}
-
-#[test]
 fn main_agent_handler_routes_plain_input_through_agent_loop() {
     let session = InteractionSession::new(
         SessionId::from_legacy_named("sess_main_agent_cli_test").expect("session"),
@@ -12373,6 +12330,56 @@ fn main_agent_handler_routes_plain_input_through_agent_loop() {
         events[3].event.kind.as_str(),
         "interaction.main_agent.queued"
     );
+}
+
+#[test]
+fn main_agent_handler_sends_native_tools_through_agent_runtime() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-tui-agent-tools");
+    let data_dir = SinomoDataDir::new(&root);
+    let session = InteractionSession::new(
+        SessionId::from_legacy_named("sess_main_agent_tools_test").expect("session"),
+        NodeId::from_legacy_named("node_main_agent_tools_test").expect("node"),
+        InteractionSurface::new("surface.test", InteractionSurfaceKind::CommandLine),
+    );
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let handler = RuntimeMainAgentInteractionHandler::with_thinking(
+        CapturingMainAgentFixtureModel {
+            requests: requests.clone(),
+        },
+        "fixture-provider",
+        "fixture-model",
+        super::ThinkingControl::default(),
+    )
+    .with_tool_registry(main_agent_config_tool_registry(&data_dir).expect("tool registry"));
+    let mut runtime = InteractionRuntime::new(InMemoryEventStore::new(), handler, session);
+
+    let outputs = runtime
+        .ingest_user_input("what tools are available to you?")
+        .expect("input");
+
+    assert!(outputs.is_empty());
+    runtime.handler_mut().join_active_tui_turn().expect("join");
+    let requests = requests.lock().expect("captured requests");
+    let request = requests.first().expect("captured model request");
+    assert_eq!(request.metadata["loop"], "agent");
+    assert_eq!(
+        request.response_format,
+        sinomo_lm::LanguageModelResponseFormat::JsonObject
+    );
+    assert_eq!(
+        request.tool_choice,
+        Some(sinomo_lm::LanguageModelToolChoice::Auto)
+    );
+    assert!(!request.tools.is_empty());
+    let tool_names = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"tool_search"));
+    assert!(tool_names.contains(&"config_search"));
+    assert!(tool_names.contains(&"config_get"));
+    assert!(tool_names.contains(&"config_set"));
 }
 
 #[test]
@@ -12557,40 +12564,57 @@ fn minicpm_main_agent_prompt_uses_official_chat_template_shape() {
             sinomo_lm::LanguageModelMessage {
                 role: sinomo_lm::LanguageModelRole::User,
                 content: serde_json::json!({
-                    "session": {"node_id": "node_test"},
-                    "latest_event": {"payload": {"text": "hello"}},
-                    "context": {"events": [{
-                        "event": {
-                            "kind": "interaction.cluster.context",
-                            "payload": {
-                                "daemon": {
-                                    "address": "127.0.0.1:21353",
-                                    "cluster": {"cluster_id": "cluster_test"}
-                                }
-                            }
-                        }
-                    }]},
-                    "tool_specs": [{"name": "cluster_status", "description": "Summarize cluster health."}]
+                    "kind": "turn_context",
+                    "runtime": {
+                        "agent_output_format": "json-decision",
+                        "available_tool_count": 1
+                    },
+                    "context_report_id": "ctx_test"
+                })
+                .to_string(),
+            },
+            sinomo_lm::LanguageModelMessage {
+                role: sinomo_lm::LanguageModelRole::User,
+                content: serde_json::json!({
+                    "kind": "agent_loop_input",
+                    "input": {
+                        "session": {"node_id": "node_test"},
+                        "latest_event": {"payload": {"text": "hello"}}
+                    }
                 })
                 .to_string(),
             },
         ],
         items: Vec::new(),
-        tools: Vec::new(),
+        tools: vec![sinomo_lm::LanguageModelToolSpec {
+            name: "config_search".to_string(),
+            description: "Search registered Sinomo configuration keys.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"}
+                }
+            }),
+            output_schema: serde_json::Value::Null,
+            supports_parallel: false,
+            provider_specs: Vec::new(),
+        }],
         tool_choice: None,
         parallel_tool_calls: None,
         temperature: None,
         max_output_tokens: None,
         response_format: sinomo_lm::LanguageModelResponseFormat::JsonObject,
-        metadata: serde_json::json!({"loop": "main-agent"}),
+        metadata: serde_json::json!({"loop": "agent", "agent_name": "main-agent"}),
     };
 
     let prompt = super::minicpm_main_agent_prompt(&request, false).expect("prompt");
 
     assert!(prompt.contains("<|im_start|>system\n# Tools"));
     assert!(prompt.contains("<tools>"));
-    assert!(prompt.contains("<|im_start|>user\nNode: node_test"));
-    assert!(prompt.contains("Cluster: cluster cluster_test through daemon 127.0.0.1:21353"));
+    assert!(prompt.contains("\"name\":\"config_search\""));
+    assert!(prompt.contains("<|im_start|>user\nuser:"));
+    assert!(prompt.contains("\"kind\":\"turn_context\""));
+    assert!(prompt.contains("\"kind\":\"agent_loop_input\""));
     assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
 
     let prompt = super::minicpm_main_agent_prompt(&request, true).expect("prompt");
@@ -12762,18 +12786,14 @@ fn cui_loop_uses_connected_daemon_cluster_node_when_available() {
 }
 
 fn fixture_handler(
-    response: &'static str,
-) -> ModelBackedInteractionHandler<FixtureInteractionModel> {
-    ModelBackedInteractionHandler::new(
-        FixtureInteractionModel { response },
-        "fixture",
+    _response: &'static str,
+) -> RuntimeMainAgentInteractionHandler<MainAgentFixtureModel> {
+    RuntimeMainAgentInteractionHandler::with_thinking(
+        MainAgentFixtureModel,
+        "fixture-provider",
         "fixture-model",
+        super::ThinkingControl::default(),
     )
-}
-
-#[derive(Clone, Debug)]
-struct FixtureInteractionModel {
-    response: &'static str,
 }
 
 struct MainAgentFixtureModel;
@@ -12787,8 +12807,9 @@ impl InteractionModel for MainAgentFixtureModel {
         assert_eq!(request.model, "fixture-model");
         assert_eq!(
             request.response_format,
-            sinomo_lm::LanguageModelResponseFormat::Text
+            sinomo_lm::LanguageModelResponseFormat::JsonObject
         );
+        assert_eq!(request.metadata["loop"], "agent");
         assert!(
             request.messages[0]
                 .content
@@ -12800,14 +12821,24 @@ impl InteractionModel for MainAgentFixtureModel {
                 .iter()
                 .any(|message| message.content.contains("what is the cluster doing?"))
         );
-        Ok(LanguageModelResponse {
-            provider: request.provider.clone(),
-            model: request.model.clone(),
-            content: "cluster-aware reply".to_string(),
-            items: Vec::new(),
-            tool_calls: Vec::new(),
-            usage: None,
-        })
+        Ok(main_agent_fixture_response(request, "cluster-aware reply"))
+    }
+}
+
+struct CapturingMainAgentFixtureModel {
+    requests: Arc<Mutex<Vec<LanguageModelRequest>>>,
+}
+
+impl InteractionModel for CapturingMainAgentFixtureModel {
+    fn complete(
+        &self,
+        request: &LanguageModelRequest,
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        self.requests
+            .lock()
+            .expect("capture requests")
+            .push(request.clone());
+        Ok(main_agent_fixture_response(request, "tools captured"))
     }
 }
 
@@ -12839,32 +12870,17 @@ fn main_agent_fixture_response(
     LanguageModelResponse {
         provider: request.provider.clone(),
         model: request.model.clone(),
-        content: text.to_string(),
+        content: serde_json::json!({
+            "response_mode": "answer",
+            "text": text,
+            "tool_calls": [],
+            "background_handoff": null,
+            "next_state": "listening"
+        })
+        .to_string(),
         items: Vec::new(),
         tool_calls: Vec::new(),
         usage: None,
-    }
-}
-
-impl InteractionModel for FixtureInteractionModel {
-    fn complete(
-        &self,
-        request: &LanguageModelRequest,
-    ) -> Result<LanguageModelResponse, LanguageModelError> {
-        assert_eq!(request.provider, "fixture");
-        assert_eq!(request.model, "fixture-model");
-        assert!(request.messages[1].content.contains("start a conversation"));
-        Ok(LanguageModelResponse {
-            provider: request.provider.clone(),
-            model: request.model.clone(),
-            content: self.response.to_string(),
-            items: Vec::new(),
-            tool_calls: Vec::new(),
-            usage: Some(LanguageModelUsage {
-                input_tokens: Some(1),
-                output_tokens: Some(1),
-            }),
-        })
     }
 }
 

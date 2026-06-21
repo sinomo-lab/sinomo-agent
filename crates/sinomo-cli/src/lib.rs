@@ -44,7 +44,7 @@ use sinomo_agent::{
     AgentTaskTerminalResult, AgentToolProgressEvent, BoundedContextBuilder, ConfigAgentToolConfig,
     EventEnvelopeExt, FileAgentDefinitionStore, InteractionModel, InteractionOutput,
     InteractionSession, InteractionSurface, InteractionSurfaceKind, TaskId, interaction_event,
-    interaction_model_request, run_local_agent_readiness_gate, user_interaction_input_event,
+    run_local_agent_readiness_gate, user_interaction_input_event,
 };
 use sinomo_lm::{
     AnthropicProvider, CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, CurrentDefaultModel,
