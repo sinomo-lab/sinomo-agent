@@ -3,8 +3,8 @@
 use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 
-use sinomo_evolution::persistence::{EvolutionPaths, StoredEvolutionJob, list_job_records};
 use sinomo_evolution::EvolutionJobStatus;
+use sinomo_evolution::persistence::{EvolutionPaths, StoredEvolutionJob, list_job_records};
 use sinomo_runtime::local::SinomoDataDir;
 
 use crate::backend::Backend;
@@ -132,7 +132,8 @@ pub fn spawn_evolution_job(request: EvolutionStartRequest) -> Receiver<Evolution
             let _ = tx.send(EvolutionStartEvent::Started);
             let result = run_evolution_job(request).map_err(|error| error.to_string());
             let _ = tx.send(EvolutionStartEvent::Finished(result));
-        }) {
+        })
+    {
         let _ = failure_tx.send(EvolutionStartEvent::Finished(Err(format!(
             "failed to start evolution worker: {error}"
         ))));
@@ -191,7 +192,9 @@ fn summarize_record(record: StoredEvolutionJob) -> EvolutionJobSummary {
     let phase = phase_for_status(&job.status);
     let id = job.job_id.to_string();
     let short_id = short_id(&id, 12);
-    let created_at = bundle.created_at.format(&time::format_description::well_known::Rfc3339)
+    let created_at = bundle
+        .created_at
+        .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| bundle.created_at.to_string());
 
     EvolutionJobSummary {
@@ -236,7 +239,9 @@ fn summarize_record(record: StoredEvolutionJob) -> EvolutionJobSummary {
                 .unwrap_or_else(|_| decision.decided_at.to_string()),
             decided_by: decision.decided_by,
             note: decision.note,
-            preflight_passed: decision.approval_preflight.map(|preflight| preflight.passed),
+            preflight_passed: decision
+                .approval_preflight
+                .map(|preflight| preflight.passed),
         }),
     }
 }

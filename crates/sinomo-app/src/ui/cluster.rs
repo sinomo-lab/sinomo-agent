@@ -211,7 +211,11 @@ fn paint_header(
         title,
     );
 
-    let links = topology.edges.iter().filter(|edge| !edge.virtual_lan).count();
+    let links = topology
+        .edges
+        .iter()
+        .filter(|edge| !edge.virtual_lan)
+        .count();
     let subtitle = format!(
         "{} nodes · {} topology edges · {} LAN segments · {}",
         snapshot.nodes.len(),
@@ -222,11 +226,20 @@ fn paint_header(
     let style = pal.text_style(theme, 13.0, FontWeight::NORMAL, pal.text_muted);
     widgets::draw_text_in(
         ctx,
-        Rect::new(bounds.x() + PAD, bounds.y() + 44.0, bounds.width() - PAD * 2.0, 22.0),
+        Rect::new(
+            bounds.x() + PAD,
+            bounds.y() + 44.0,
+            bounds.width() - PAD * 2.0,
+            22.0,
+        ),
         &subtitle,
         style,
     );
-    widgets::hairline_bottom(ctx, Rect::new(bounds.x(), bounds.y(), bounds.width(), HEADER_H), pal.border);
+    widgets::hairline_bottom(
+        ctx,
+        Rect::new(bounds.x(), bounds.y(), bounds.width(), HEADER_H),
+        pal.border,
+    );
 }
 
 fn paint_empty(
@@ -322,14 +335,23 @@ fn paint_vertices(
         };
         ctx.fill(Path::circle(vertex.center, vertex.radius), fill);
         ctx.stroke(
-            Path::circle(vertex.center, vertex.radius + if selected_here { 4.0 } else { 1.0 }),
+            Path::circle(
+                vertex.center,
+                vertex.radius + if selected_here { 4.0 } else { 1.0 },
+            ),
             border,
             StrokeStyle::new(if selected_here { 2.2 } else { 1.1 }),
         );
 
         let label_style = pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text);
         let label_y = vertex.center.y + vertex.radius + 14.0;
-        widgets::draw_centered(ctx, &vertex.vertex.label, label_style, vertex.center.x, label_y);
+        widgets::draw_centered(
+            ctx,
+            &vertex.vertex.label,
+            label_style,
+            vertex.center.x,
+            label_y,
+        );
         let detail_style = pal.text_style(theme, 10.5, FontWeight::NORMAL, pal.text_faint);
         widgets::draw_centered(
             ctx,
@@ -386,7 +408,12 @@ fn paint_detail_panel(
     if let Some((title, rest)) = lines.split_first() {
         widgets::draw_text_in(
             ctx,
-            Rect::new(panel.x() + PANEL_PAD, cy, panel.width() - PANEL_PAD * 2.0, 22.0),
+            Rect::new(
+                panel.x() + PANEL_PAD,
+                cy,
+                panel.width() - PANEL_PAD * 2.0,
+                22.0,
+            ),
             title,
             title_style,
         );
@@ -417,7 +444,12 @@ fn paint_detail_panel(
             } else {
                 widgets::draw_text_in(
                     ctx,
-                    Rect::new(panel.x() + PANEL_PAD, cy, panel.width() - PANEL_PAD * 2.0, 18.0),
+                    Rect::new(
+                        panel.x() + PANEL_PAD,
+                        cy,
+                        panel.width() - PANEL_PAD * 2.0,
+                        18.0,
+                    ),
                     line,
                     value_style.clone(),
                 );
@@ -593,12 +625,18 @@ fn layout_vertices(topology: &Topology, rect: Rect) -> Vec<LayoutVertex> {
     if topology.vertices.len() == 1 {
         return vec![LayoutVertex {
             vertex: topology.vertices[0].clone(),
-            center: Point::new(rect.x() + rect.width() / 2.0, rect.y() + rect.height() / 2.0),
+            center: Point::new(
+                rect.x() + rect.width() / 2.0,
+                rect.y() + rect.height() / 2.0,
+            ),
             radius: NODE_R,
         }];
     }
 
-    let center = Point::new(rect.x() + rect.width() / 2.0, rect.y() + rect.height() / 2.0);
+    let center = Point::new(
+        rect.x() + rect.width() / 2.0,
+        rect.y() + rect.height() / 2.0,
+    );
     let outer = (rect.width().min(rect.height()) * 0.38).max(72.0);
     let inner = (outer * 0.42).max(36.0);
     let nodes = topology
@@ -619,7 +657,10 @@ fn layout_vertices(topology: &Topology, rect: Rect) -> Vec<LayoutVertex> {
         let angle = angle_for(index, nodes.len(), -std::f32::consts::FRAC_PI_2);
         out.push(LayoutVertex {
             vertex: vertex.clone(),
-            center: Point::new(center.x + angle.cos() * outer, center.y + angle.sin() * outer),
+            center: Point::new(
+                center.x + angle.cos() * outer,
+                center.y + angle.sin() * outer,
+            ),
             radius: NODE_R,
         });
     }
@@ -630,7 +671,10 @@ fn layout_vertices(topology: &Topology, rect: Rect) -> Vec<LayoutVertex> {
             center: if lans.len() == 1 {
                 center
             } else {
-                Point::new(center.x + angle.cos() * inner, center.y + angle.sin() * inner)
+                Point::new(
+                    center.x + angle.cos() * inner,
+                    center.y + angle.sin() * inner,
+                )
             },
             radius: LAN_R,
         });

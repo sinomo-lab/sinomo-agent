@@ -1139,6 +1139,12 @@ impl SifsBrowser {
         Ok(Self { backend, node_id })
     }
 
+    pub fn open_read_only(data_dir: &SinomoDataDir) -> Result<Self, String> {
+        let backend = SifsFileManagerBackend::open_read_only(data_dir)?;
+        let node_id = backend.node_label();
+        Ok(Self { backend, node_id })
+    }
+
     /// The node SIFS objects are placed on locally.
     pub fn node_id(&self) -> &str {
         &self.node_id
@@ -1149,6 +1155,27 @@ impl SifsBrowser {
         let mut entries: Vec<SifsEntry> = self
             .backend
             .list_dir(path)?
+            .into_iter()
+            .map(|entry| SifsEntry {
+                name: entry.name,
+                path: entry.path,
+                is_dir: matches!(entry.kind, FileManagerEntryKind::Directory),
+                is_link: matches!(entry.kind, FileManagerEntryKind::Symlink),
+                size: entry.size,
+            })
+            .collect();
+        entries.sort_by(|a, b| {
+            (b.is_dir as u8)
+                .cmp(&(a.is_dir as u8))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        Ok(entries)
+    }
+
+    pub fn list_shallow(&self, path: &str) -> Result<Vec<SifsEntry>, String> {
+        let mut entries: Vec<SifsEntry> = self
+            .backend
+            .list_dir_shallow(path)?
             .into_iter()
             .map(|entry| SifsEntry {
                 name: entry.name,

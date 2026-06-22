@@ -164,7 +164,8 @@ impl EvolutionState {
     }
 
     pub fn selected_job(&self) -> Option<&EvolutionJobSummary> {
-        self.selected.and_then(|index| self.dashboard.jobs.get(index))
+        self.selected
+            .and_then(|index| self.dashboard.jobs.get(index))
     }
 }
 
@@ -430,7 +431,9 @@ fn start_controls_layout(bounds: Rect) -> StartControlsLayout {
     } else {
         let row2_y = bounds.y() + CONTROL_H + CONTROL_GAP;
         let button_w = bounds.width().min(104.0);
-        let target_w = (bounds.width() - button_w - CONTROL_GAP).max(0.0).min(138.0);
+        let target_w = (bounds.width() - button_w - CONTROL_GAP)
+            .max(0.0)
+            .min(138.0);
         let scope_w = (bounds.width() - button_w - target_w - CONTROL_GAP * 2.0).max(0.0);
         let objective = Rect::new(bounds.x(), bounds.y(), bounds.width(), CONTROL_H);
         let scope = Rect::new(bounds.x(), row2_y, scope_w, CONTROL_H);
@@ -487,7 +490,12 @@ impl Widget for EvolutionView {
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let layout = layout_for(Rect::new(0.0, 0.0, constraints.max.width, constraints.max.height));
+        let layout = layout_for(Rect::new(
+            0.0,
+            0.0,
+            constraints.max.width,
+            constraints.max.height,
+        ));
         self.start
             .measure(ctx, Constraints::tight(rect_size(layout.start_controls)));
         constraints.max
@@ -567,12 +575,7 @@ fn layout_for(bounds: Rect) -> EvolutionLayout {
 
     if bounds.width() >= 980.0 {
         let queue = Rect::new(body.x(), body.y(), QUEUE_W, body.height());
-        let rail = Rect::new(
-            body.max_x() - RAIL_W,
-            body.y(),
-            RAIL_W,
-            body.height(),
-        );
+        let rail = Rect::new(body.max_x() - RAIL_W, body.y(), RAIL_W, body.height());
         let detail_x = queue.max_x() + GAP;
         let detail_w = (rail.x() - detail_x - GAP).max(220.0);
         let detail = Rect::new(detail_x, body.y(), detail_w, body.height());
@@ -670,7 +673,15 @@ fn paint_header(
         ];
         let mut x = rect.max_x() - PAD - 100.0 * metrics.len() as f32;
         for (label, value, color) in metrics {
-            paint_metric(ctx, theme, pal, Rect::new(x, rect.y() + 18.0, 88.0, 42.0), label, value, color);
+            paint_metric(
+                ctx,
+                theme,
+                pal,
+                Rect::new(x, rect.y() + 18.0, 88.0, 42.0),
+                label,
+                value,
+                color,
+            );
             x += 100.0;
         }
     }
@@ -688,7 +699,10 @@ fn paint_metric(
     color: Color,
 ) {
     widgets::round_panel(ctx, rect, pal.panel, pal.border, 7.0);
-    ctx.fill(Path::circle(widgets::point(rect.x() + 14.0, rect.y() + 15.0), 4.0), color);
+    ctx.fill(
+        Path::circle(widgets::point(rect.x() + 14.0, rect.y() + 15.0), 4.0),
+        color,
+    );
     widgets::draw_text_in(
         ctx,
         Rect::new(rect.x() + 24.0, rect.y() + 5.0, rect.width() - 30.0, 18.0),
@@ -724,10 +738,7 @@ fn paint_start_panel(
     let (status, status_color) = {
         let evolution = shared.evolution();
         if let Some(error) = &evolution.start_error {
-            (
-                format!("failed - {}", compact(error, 108)),
-                pal.bad,
-            )
+            (format!("failed - {}", compact(error, 108)), pal.bad)
         } else if let Some(status) = &evolution.start_status {
             (
                 compact(status, 108),
@@ -784,13 +795,23 @@ fn paint_queue(
     );
     widgets::draw_text_in(
         ctx,
-        Rect::new(rect.x() + PAD, rect.y() + 8.0, rect.width() - PAD * 2.0, 20.0),
+        Rect::new(
+            rect.x() + PAD,
+            rect.y() + 8.0,
+            rect.width() - PAD * 2.0,
+            20.0,
+        ),
         "Candidate queue",
         pal.text_style(theme, 14.0, FontWeight::SEMIBOLD, pal.text),
     );
     widgets::draw_text_in(
         ctx,
-        Rect::new(rect.x() + PAD, rect.y() + 27.0, rect.width() - PAD * 2.0, 18.0),
+        Rect::new(
+            rect.x() + PAD,
+            rect.y() + 27.0,
+            rect.width() - PAD * 2.0,
+            18.0,
+        ),
         "Observed through promoted lifecycle",
         pal.text_style(theme, 11.5, FontWeight::NORMAL, pal.text_faint),
     );
@@ -843,19 +864,31 @@ fn paint_queue_row(
     selected: bool,
 ) {
     let dot = tone_color(pal, job.phase);
-    ctx.fill(Path::circle(widgets::point(rect.x() + PAD, rect.y() + 18.0), 5.0), dot);
+    ctx.fill(
+        Path::circle(widgets::point(rect.x() + PAD, rect.y() + 18.0), 5.0),
+        dot,
+    );
     let objective = compact(
         &job.objective,
         ((rect.width() - 64.0) / 11.0).clamp(16.0, 34.0) as usize,
     );
     widgets::draw_text_in(
         ctx,
-        Rect::new(rect.x() + PAD + 16.0, rect.y() + 8.0, rect.width() - PAD * 2.0 - 16.0, 22.0),
+        Rect::new(
+            rect.x() + PAD + 16.0,
+            rect.y() + 8.0,
+            rect.width() - PAD * 2.0 - 16.0,
+            22.0,
+        ),
         &objective,
         pal.text_style(
             theme,
             13.0,
-            if selected { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM },
+            if selected {
+                FontWeight::SEMIBOLD
+            } else {
+                FontWeight::MEDIUM
+            },
             pal.text,
         ),
     );
@@ -865,8 +898,16 @@ fn paint_queue_row(
     );
     widgets::draw_text_in(
         ctx,
-        Rect::new(rect.x() + PAD + 16.0, rect.y() + 33.0, rect.width() - PAD * 2.0 - 16.0, 18.0),
-        &compact(&meta, ((rect.width() - 64.0) / 8.7).clamp(18.0, 38.0) as usize),
+        Rect::new(
+            rect.x() + PAD + 16.0,
+            rect.y() + 33.0,
+            rect.width() - PAD * 2.0 - 16.0,
+            18.0,
+        ),
+        &compact(
+            &meta,
+            ((rect.width() - 64.0) / 8.7).clamp(18.0, 38.0) as usize,
+        ),
         pal.text_style(theme, 11.5, FontWeight::NORMAL, pal.text_muted),
     );
     let target = job
@@ -876,7 +917,12 @@ fn paint_queue_row(
         .unwrap_or_else(|| job.target_ring.clone());
     widgets::draw_text_in(
         ctx,
-        Rect::new(rect.x() + PAD + 16.0, rect.y() + 53.0, rect.width() - PAD * 2.0 - 16.0, 18.0),
+        Rect::new(
+            rect.x() + PAD + 16.0,
+            rect.y() + 53.0,
+            rect.width() - PAD * 2.0 - 16.0,
+            18.0,
+        ),
         &compact(
             &target,
             ((rect.width() - 64.0) / 8.7).clamp(18.0, 38.0) as usize,
@@ -930,7 +976,13 @@ fn paint_detail(
     );
 
     let mut y = inner.y() + 72.0;
-    paint_lifecycle(ctx, theme, pal, Rect::new(inner.x(), y, inner.width(), 92.0), job);
+    paint_lifecycle(
+        ctx,
+        theme,
+        pal,
+        Rect::new(inner.x(), y, inner.width(), 92.0),
+        job,
+    );
     y += 104.0;
 
     let summary_h = 86.0;
@@ -941,27 +993,45 @@ fn paint_detail(
         pal.border,
         8.0,
     );
-    paint_kv_grid(ctx, theme, pal, Rect::new(inner.x() + 14.0, y + 12.0, inner.width() - 28.0, summary_h - 24.0), job);
+    paint_kv_grid(
+        ctx,
+        theme,
+        pal,
+        Rect::new(
+            inner.x() + 14.0,
+            y + 12.0,
+            inner.width() - 28.0,
+            summary_h - 24.0,
+        ),
+        job,
+    );
     y += summary_h + SECTION_GAP;
 
     paint_section_title(ctx, theme, pal, inner.x(), y, "Evidence");
     y += 28.0;
     let evidence = evidence_rows(job);
-    paint_rows(ctx, theme, pal, Rect::new(inner.x(), y, inner.width(), 112.0), &evidence);
+    paint_rows(
+        ctx,
+        theme,
+        pal,
+        Rect::new(inner.x(), y, inner.width(), 112.0),
+        &evidence,
+    );
     y += 126.0;
 
     paint_section_title(ctx, theme, pal, inner.x(), y, "Scope");
     y += 28.0;
     let scope = scope_rows(job);
-    paint_rows(ctx, theme, pal, Rect::new(inner.x(), y, inner.width(), 96.0), &scope);
+    paint_rows(
+        ctx,
+        theme,
+        pal,
+        Rect::new(inner.x(), y, inner.width(), 96.0),
+        &scope,
+    );
 }
 
-fn paint_detail_empty(
-    ctx: &mut PaintCtx,
-    theme: &sui::DefaultTheme,
-    pal: &Palette,
-    rect: Rect,
-) {
+fn paint_detail_empty(ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette, rect: Rect) {
     widgets::draw_centered(
         ctx,
         "No evolution job selected",
@@ -987,11 +1057,28 @@ fn paint_status_pill(
     phase: EvolutionPhase,
 ) {
     let color = tone_color(pal, phase);
-    widgets::round_panel(ctx, rect, pal.field, color.with_alpha(0.85), rect.height() / 2.0);
-    ctx.fill(Path::circle(widgets::point(rect.x() + 13.0, rect.y() + rect.height() / 2.0), 4.0), color);
+    widgets::round_panel(
+        ctx,
+        rect,
+        pal.field,
+        color.with_alpha(0.85),
+        rect.height() / 2.0,
+    );
+    ctx.fill(
+        Path::circle(
+            widgets::point(rect.x() + 13.0, rect.y() + rect.height() / 2.0),
+            4.0,
+        ),
+        color,
+    );
     widgets::draw_text_in(
         ctx,
-        Rect::new(rect.x() + 22.0, rect.y(), rect.width() - 26.0, rect.height()),
+        Rect::new(
+            rect.x() + 22.0,
+            rect.y(),
+            rect.width() - 26.0,
+            rect.height(),
+        ),
         &compact(label, 9),
         pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.text),
     );
@@ -1036,7 +1123,9 @@ fn paint_lifecycle(
             pal.border_strong.with_alpha(0.55)
         };
         let mut builder = sui::PathBuilder::new();
-        builder.move_to(widgets::point(x1, y)).line_to(widgets::point(x2, y));
+        builder
+            .move_to(widgets::point(x1, y))
+            .line_to(widgets::point(x2, y));
         ctx.stroke(builder.build(), color, StrokeStyle::new(2.0));
     }
     for (index, (_, label)) in stages.iter().enumerate() {
@@ -1339,7 +1428,12 @@ fn rollback_rows(job: &EvolutionJobSummary) -> Vec<(String, String)> {
     vec![
         ("Strategy".to_string(), job.recovery_strategy.clone()),
         ("Policy".to_string(), job.rollback_policy.clone()),
-        ("Revision".to_string(), job.source_revision.clone().unwrap_or_else(|| "unknown".to_string())),
+        (
+            "Revision".to_string(),
+            job.source_revision
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
         ("Note".to_string(), job.recovery_note.clone()),
     ]
 }

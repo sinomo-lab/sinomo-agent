@@ -151,6 +151,26 @@ impl SifsFileManagerBackend {
             .map_err(|error| format!("cannot inspect {path}: {error}"))
     }
 
+    pub(crate) fn list_dir_shallow(&self, path: &str) -> Result<Vec<FileManagerEntry>, String> {
+        let path = normalize_sifs_path(path)?;
+        let mut service = self.lock_service()?;
+        self.refresh_service_endpoint_targets(&mut service);
+        service
+            .posix_list_dir_distributed(&path)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| FileManagerEntry {
+                        name: entry.name,
+                        path: entry.path,
+                        kind: sifs_entry_kind(&entry.kind),
+                        size: None,
+                    })
+                    .collect()
+            })
+            .map_err(|error| format!("cannot list {path}: {error}"))
+    }
+
     pub(crate) fn debug_remove_local_loose_blob_for_path(
         &self,
         path: &str,

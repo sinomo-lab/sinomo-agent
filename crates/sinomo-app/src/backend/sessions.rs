@@ -317,13 +317,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    fn write_app_local_session(
-        root: &Path,
-        id: &str,
-        title: &str,
-        user: &str,
-        agent: &str,
-    ) {
+    fn write_app_local_session(root: &Path, id: &str, title: &str, user: &str, agent: &str) {
         let dir = root.join("app").join("sessions").join(id);
         fs::create_dir_all(&dir).expect("create stale local session dir");
         let meta = SessionMeta {

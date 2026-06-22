@@ -39,15 +39,16 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use sui::{
-    Alignment, ArrangeCtx, Color, Constraints, DefaultTheme, Event, EventCtx, FontWeight, IconButton,
-    IconGlyph, Insets, KeyState, Label, ListItem, ListView, MeasureCtx, PaintCtx, PointerEventKind,
-    Rect, ScrollDelta, SemanticsCtx, Separator, Size, SizedBox, Stack, Surface, SurfaceBorder,
-    SurfaceRole, TextArea, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, draw_glyph,
+    Alignment, ArrangeCtx, Color, Constraints, DefaultTheme, Event, EventCtx, FontWeight,
+    IconButton, IconGlyph, Insets, KeyState, Label, ListItem, ListView, MeasureCtx, PaintCtx,
+    PointerEventKind, Rect, ScrollDelta, SemanticsCtx, Separator, Size, SizedBox, Stack, Surface,
+    SurfaceBorder, SurfaceRole, TextArea, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    draw_glyph,
 };
 
 use sinomo_cli::app_api::{
-    AgentSummary, ChatContextSnapshot, ChatHistoryMessage, ChatProcessSnapshot, ChatToolCallSnapshot,
-    ChatTaskSnapshot, ChatUsageSnapshot, ProviderSummary, agent_summaries, reasoning_efforts,
+    AgentSummary, ChatContextSnapshot, ChatHistoryMessage, ChatProcessSnapshot, ChatTaskSnapshot,
+    ChatToolCallSnapshot, ChatUsageSnapshot, ProviderSummary, agent_summaries, reasoning_efforts,
 };
 use sinomo_runtime::local::SinomoDataDir;
 
@@ -313,11 +314,15 @@ impl ChatState {
 
     fn upsert_tool_activity_from_snapshot(&mut self, call: ChatToolCallSnapshot, status: &str) {
         let input_preview = call.input_preview.unwrap_or_default();
-        if let Some(existing) = self
-            .tool_calls
-            .iter_mut()
-            .find(|existing| tool_activity_matches(existing, call.step_index, call.call_index, call.call_id.as_deref(), Some(call.tool.as_str())))
-        {
+        if let Some(existing) = self.tool_calls.iter_mut().find(|existing| {
+            tool_activity_matches(
+                existing,
+                call.step_index,
+                call.call_index,
+                call.call_id.as_deref(),
+                Some(call.tool.as_str()),
+            )
+        }) {
             existing.tool = call.tool;
             if !input_preview.trim().is_empty() {
                 existing.input_preview = compact_line(&input_preview, 120);
@@ -546,10 +551,23 @@ impl ChatState {
     }
 
     fn current_model(&self) -> String {
-        self.current_provider()
-            .and_then(|p| p.models.get(self.model_idx))
-            .cloned()
-            .unwrap_or_else(|| self.info.model.clone())
+        let Some(provider) = self.current_provider() else {
+            return self.info.model.clone();
+        };
+        if let Some(model) = provider.models.get(self.model_idx) {
+            return model.clone();
+        }
+        let runtime_matches_provider = self.info.provider == provider.id
+            && self
+                .info
+                .account
+                .as_deref()
+                .is_none_or(|account| account == provider.account);
+        if runtime_matches_provider {
+            self.info.model.clone()
+        } else {
+            String::new()
+        }
     }
 
     /// Whether the reasoning-effort selector should be shown: only for models that take one.
@@ -615,16 +633,17 @@ impl ChatState {
                 tool,
                 arguments_delta,
             } => {
-                self.record_tool_delta(
-                    step_index,
-                    call_id.clone(),
-                    tool.clone(),
-                    &arguments_delta,
-                );
+                self.record_tool_delta(step_index, call_id.clone(), tool.clone(), &arguments_delta);
                 if !arguments_delta.trim().is_empty() {
                     self.push_activity(
-                        format!("tool input {}", tool.unwrap_or_else(|| "stream".to_string())),
-                        format!("step {step_index} · {}", compact_line(&arguments_delta, 120)),
+                        format!(
+                            "tool input {}",
+                            tool.unwrap_or_else(|| "stream".to_string())
+                        ),
+                        format!(
+                            "step {step_index} · {}",
+                            compact_line(&arguments_delta, 120)
+                        ),
                         ActivityTone::Neutral,
                     );
                 }
@@ -720,7 +739,10 @@ impl ChatState {
                 let mut updated_current = false;
                 for (idx, summary) in self.providers.iter_mut().enumerate() {
                     if summary.id == provider {
-                        summary.models = models.clone();
+                        let merged = merge_model_lists(&summary.models, &models);
+                        if !merged.is_empty() {
+                            summary.models = merged;
+                        }
                         updated_current |= idx == self.provider_idx;
                     }
                 }
@@ -748,18 +770,14 @@ impl ChatState {
     }
 
     fn sync_selection_from_info(&mut self) {
-        if let Some(idx) = self
-            .providers
-            .iter()
-            .position(|p| {
-                p.id == self.info.provider
-                    && self
-                        .info
-                        .account
-                        .as_deref()
-                        .is_none_or(|account| p.account == account)
-            })
-        {
+        let matched_provider = if let Some(idx) = self.providers.iter().position(|p| {
+            p.id == self.info.provider
+                && self
+                    .info
+                    .account
+                    .as_deref()
+                    .is_none_or(|account| p.account == account)
+        }) {
             self.provider_idx = idx;
             if let Some(midx) = self.providers[idx]
                 .models
@@ -768,7 +786,10 @@ impl ChatState {
             {
                 self.model_idx = midx;
             }
-        }
+            true
+        } else {
+            false
+        };
         if let Some(effort) = &self.info.effort
             && let Some(idx) = self.efforts.iter().position(|e| e == effort)
         {
@@ -778,6 +799,9 @@ impl ChatState {
         // yet, kick the async fetch now so the model picker populates for the default provider
         // (without waiting for the user to toggle providers).
         self.maybe_fetch_models();
+        if !matched_provider && !self.providers.is_empty() && !self.current_model().is_empty() {
+            self.push_model_selection();
+        }
     }
 
     fn submit(&mut self) {
@@ -790,7 +814,8 @@ impl ChatState {
             return;
         }
         if self.streaming {
-            self.handle.send_command(ChatCommand::FollowUp(text.clone()));
+            self.handle
+                .send_command(ChatCommand::FollowUp(text.clone()));
             self.messages.push(ChatMessage {
                 role: ChatRole::User,
                 text,
@@ -828,8 +853,9 @@ impl ChatState {
         if !self.streaming {
             return;
         }
-        self.handle
-            .send_command(ChatCommand::Interrupt("user interrupted from app chat".to_string()));
+        self.handle.send_command(ChatCommand::Interrupt(
+            "user interrupted from app chat".to_string(),
+        ));
         self.notice = Some("interrupting…".to_string());
     }
 
@@ -963,6 +989,17 @@ impl ChatState {
                 .send_command(ChatCommand::FetchModels { provider });
         }
     }
+}
+
+fn merge_model_lists(existing: &[String], fetched: &[String]) -> Vec<String> {
+    let mut models = Vec::with_capacity(existing.len() + fetched.len());
+    for model in existing.iter().chain(fetched.iter()) {
+        if model.trim().is_empty() || models.iter().any(|candidate| candidate == model) {
+            continue;
+        }
+        models.push(model.clone());
+    }
+    models
 }
 
 // ---------------------------------------------------------------------------
@@ -1247,12 +1284,7 @@ impl Widget for RuntimeOverview {
         } else {
             format!("{} / {}", chat.info.provider, chat.info.model)
         };
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(x, top, title_w, 18.0),
-            &runtime,
-            title_style,
-        );
+        widgets::draw_text_in(ctx, Rect::new(x, top, title_w, 18.0), &runtime, title_style);
 
         let usage = chat
             .usage
@@ -1291,7 +1323,12 @@ impl Widget for RuntimeOverview {
             meta_style,
         );
 
-        let bar = Rect::new(x, bounds.y() + 58.0, (bounds.width() - PAD * 2.0).max(0.0), 10.0);
+        let bar = Rect::new(
+            x,
+            bounds.y() + 58.0,
+            (bounds.width() - PAD * 2.0).max(0.0),
+            10.0,
+        );
         widgets::fill_round_rect(ctx, bar, pal.field, 5.0);
         if let Some(context) = &chat.context {
             let denominator = context
@@ -1315,7 +1352,12 @@ impl Widget for RuntimeOverview {
                         continue;
                     }
                     let segment = Rect::new(bar.x() + offset, bar.y(), lane_w, bar.height());
-                    widgets::fill_round_rect(ctx, segment, context_lane_color(&pal, lane.kind.as_str()), 5.0);
+                    widgets::fill_round_rect(
+                        ctx,
+                        segment,
+                        context_lane_color(&pal, lane.kind.as_str()),
+                        5.0,
+                    );
                     offset += lane_w;
                     if offset >= used_w {
                         break;
@@ -1589,12 +1631,7 @@ impl Widget for ActivityRail {
             return;
         }
 
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(x, y, w, 14.0),
-            "EVENTS",
-            heading_style,
-        );
+        widgets::draw_text_in(ctx, Rect::new(x, y, w, 14.0), "EVENTS", heading_style);
         y += 22.0;
         for entry in chat.activity.iter().rev().take(10) {
             if y + 48.0 > bounds.y() + bounds.height() {
@@ -2105,12 +2142,7 @@ fn wide_pod(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         ACTIVITY_RAIL_W,
         reader,
     );
-    let row = Split::left_fixed(
-        sidebar(shared, reader),
-        work_area,
-        SIDEBAR_W,
-        reader,
-    );
+    let row = Split::left_fixed(sidebar(shared, reader), work_area, SIDEBAR_W, reader);
     WidgetPod::new(Surface::window(row).fill().theme_when(clone_reader(reader)))
 }
 
@@ -2796,7 +2828,10 @@ mod tests {
         assert_eq!(state.messages[0].role, ChatRole::User);
         assert_eq!(state.messages[0].text, "queued");
         assert!(state.input.is_empty(), "the queued draft is cleared");
-        assert!(state.streaming, "queueing follow-up keeps active stream state");
+        assert!(
+            state.streaming,
+            "queueing follow-up keeps active stream state"
+        );
         assert_eq!(state.notice.as_deref(), Some("queued follow-up"));
     }
 
@@ -2894,11 +2929,11 @@ mod tests {
             included_count: 3,
             omitted_count: 1,
         }));
-        assert_eq!(state.context.as_ref().map(|ctx| ctx.total_bytes), Some(4096));
         assert_eq!(
-            state.notice.as_deref(),
-            Some("context assembled: 4.0 KB")
+            state.context.as_ref().map(|ctx| ctx.total_bytes),
+            Some(4096)
         );
+        assert_eq!(state.notice.as_deref(), Some("context assembled: 4.0 KB"));
 
         state.apply_event(ChatEvent::ToolCallCompleted(ChatToolCallSnapshot {
             step_index: 0,
@@ -2923,7 +2958,10 @@ mod tests {
             output_tokens: Some(18),
         }));
 
-        assert_eq!(state.usage.as_ref().and_then(|usage| usage.input_tokens), Some(120));
+        assert_eq!(
+            state.usage.as_ref().and_then(|usage| usage.input_tokens),
+            Some(120)
+        );
         assert!(
             state
                 .activity
@@ -2940,8 +2978,7 @@ mod tests {
             state
                 .activity
                 .iter()
-                .any(|entry| entry.title == "model usage"
-                    && entry.detail.contains("120 input"))
+                .any(|entry| entry.title == "model usage" && entry.detail.contains("120 input"))
         );
     }
 
@@ -2986,8 +3023,7 @@ mod tests {
     fn runtime_health_surfaces_degraded_cluster_and_persistence_state() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
-        state.notice =
-            Some("session save failed: DFS services shard replay delayed".to_string());
+        state.notice = Some("session save failed: DFS services shard replay delayed".to_string());
 
         let health = state.runtime_health();
         assert_eq!(health.label, "DEGRADED");
@@ -3045,10 +3081,7 @@ mod tests {
             context_lane_summary("recent turn tail", 2_048, 8_192),
             "recent turn tail · 2.0 KB · 25%"
         );
-        assert_eq!(
-            context_lane_summary("empty", 0, 0),
-            "empty · 0 B · 0%"
-        );
+        assert_eq!(context_lane_summary("empty", 0, 0), "empty · 0 B · 0%");
         let long = context_lane_summary(
             "very long prompt reference label that should compact",
             1_048_576,
@@ -3066,7 +3099,10 @@ mod tests {
         seed_default_provider(&mut state);
         assert!(state.can_send(), "a non-empty draft can send");
         state.streaming = true;
-        assert!(state.can_send(), "a non-empty draft can queue while streaming");
+        assert!(
+            state.can_send(),
+            "a non-empty draft can queue while streaming"
+        );
     }
 
     #[test]
@@ -3128,6 +3164,69 @@ mod tests {
         assert!(
             state.models_loading,
             "resolving the provider via RuntimeInfo re-kicks the model fetch when the list is empty"
+        );
+    }
+
+    #[test]
+    fn empty_model_fetch_preserves_seeded_provider_model() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.providers = vec![ProviderSummary {
+            id: "deepseek".to_string(),
+            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
+            name: "DeepSeek".to_string(),
+            models: vec!["deepseek-v4-flash".to_string()],
+        }];
+        state.provider_idx = 0;
+        state.model_idx = 0;
+        state.models_loading = true;
+
+        state.apply_event(ChatEvent::Models {
+            provider: "deepseek".to_string(),
+            models: Vec::new(),
+        });
+
+        assert_eq!(
+            state.current_models(),
+            vec!["deepseek-v4-flash".to_string()],
+            "failed model discovery must not wipe the configured/default model"
+        );
+        assert_eq!(state.current_model(), "deepseek-v4-flash");
+        assert!(!state.models_loading);
+    }
+
+    #[test]
+    fn hidden_runtime_provider_does_not_leak_into_visible_model_selection() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.providers = vec![ProviderSummary {
+            id: "deepseek".to_string(),
+            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
+            name: "DeepSeek".to_string(),
+            models: vec!["deepseek-v4-flash".to_string()],
+        }];
+        state.provider_idx = 0;
+        state.model_idx = 99;
+        state.models_loading = false;
+
+        state.apply_event(ChatEvent::RuntimeInfo(RuntimeInfo {
+            agent: "main".to_string(),
+            provider: "github-copilot".to_string(),
+            model: "gpt-5.4".to_string(),
+            account: Some(sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string()),
+            effort: None,
+        }));
+
+        assert_eq!(
+            state.current_model(),
+            "",
+            "an unlisted runtime provider must not supply the selected provider's model"
+        );
+        state.model_idx = 0;
+        assert_eq!(
+            state.current_model(),
+            "deepseek-v4-flash",
+            "the visible provider keeps its own configured model"
         );
     }
 
@@ -3221,11 +3320,7 @@ mod tests {
         }
     }
 
-    fn wait_for(
-        state: &mut ChatState,
-        timeout: Duration,
-        predicate: impl Fn(&ChatState) -> bool,
-    ) {
+    fn wait_for(state: &mut ChatState, timeout: Duration, predicate: impl Fn(&ChatState) -> bool) {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             let events = state.handle.drain();

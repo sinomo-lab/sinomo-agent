@@ -267,8 +267,15 @@ mod tests {
         let (client, _root) = test_client("disable-one-account");
         add_provider_account(&client, "openai", "work", "sk-work", "gpt-5", "")
             .expect("add work account");
-        add_provider_account(&client, "openai", "personal", "sk-personal", "gpt-5-mini", "")
-            .expect("add personal account");
+        add_provider_account(
+            &client,
+            "openai",
+            "personal",
+            "sk-personal",
+            "gpt-5-mini",
+            "",
+        )
+        .expect("add personal account");
 
         set_provider_enabled(&client, "openai", "work", false).expect("disable work");
 
@@ -305,7 +312,9 @@ pub fn provider_display_name(id: &str) -> String {
 
 pub fn provider_default_model(id: &str) -> String {
     normalize_model_provider(id)
-        .map(|provider| sinomo_lm::effective_model_name(&provider, sinomo_lm::PROVIDER_DEFAULT_MODEL))
+        .map(|provider| {
+            sinomo_lm::effective_model_name(&provider, sinomo_lm::PROVIDER_DEFAULT_MODEL)
+        })
         .unwrap_or_default()
 }
 
@@ -451,7 +460,9 @@ pub fn set_provider_enabled(
     account: &str,
     enabled: bool,
 ) -> Result<(), String> {
-    update_provider_account(client, provider, account, |account| account.enabled = enabled)
+    update_provider_account(client, provider, account, |account| {
+        account.enabled = enabled
+    })
 }
 
 /// Set a provider's default model in `lm.providers` (empty clears it).
@@ -653,7 +664,9 @@ fn normalize_configurable_provider(provider: &str) -> Result<String, String> {
     if CONFIGURABLE_PROVIDERS.contains(&provider.as_str()) {
         Ok(provider)
     } else {
-        Err(format!("provider `{provider}` is not configurable in the app"))
+        Err(format!(
+            "provider `{provider}` is not configurable in the app"
+        ))
     }
 }
 

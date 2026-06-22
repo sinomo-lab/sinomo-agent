@@ -153,12 +153,9 @@ impl Backend {
 
 fn fetch_health_rows(address: &str) -> Result<Vec<ClusterHealthRow>, String> {
     let request = network::cluster_health_rpc_request().map_err(|error| error.to_string())?;
-    let response = sinomo_runtime::daemon::send_daemon_rpc(
-        address,
-        &request,
-        CLUSTER_SNAPSHOT_RPC_TIMEOUT,
-    )
-    .map_err(|error| error.to_string())?;
+    let response =
+        sinomo_runtime::daemon::send_daemon_rpc(address, &request, CLUSTER_SNAPSHOT_RPC_TIMEOUT)
+            .map_err(|error| error.to_string())?;
     network::decode_cluster_health_rpc_response(&response).map_err(|error| error.to_string())
 }
 
@@ -169,7 +166,12 @@ fn rows_from_state(
     state
         .members
         .iter()
-        .filter(|member| !matches!(member.state, sinomo_runtime::core::ClusterMemberState::Removed))
+        .filter(|member| {
+            !matches!(
+                member.state,
+                sinomo_runtime::core::ClusterMemberState::Removed
+            )
+        })
         .map(|member| {
             let status = network::unknown_cluster_node_status(state, member, observed_at);
             ClusterHealthRow {
@@ -217,8 +219,7 @@ fn snapshot_from_parts(
                     endpoint_lookup
                         .iter()
                         .find(|((node_id, _, address), _)| {
-                            node_id == record.target_node_id.as_str()
-                                && address == &record.address
+                            node_id == record.target_node_id.as_str() && address == &record.address
                         })
                         .map(|(_, endpoint)| endpoint)
                 });
@@ -254,7 +255,8 @@ fn snapshot_from_parts(
                     let reachable = reachable_endpoint_ids.contains(&(
                         endpoint.node_id.to_string(),
                         endpoint.endpoint_id.to_string(),
-                    )) || (public_ip && row.availability == ClusterNodeAvailability::Online);
+                    )) || (public_ip
+                        && row.availability == ClusterNodeAvailability::Online);
                     ClusterEndpointInfo {
                         endpoint_id: endpoint.endpoint_id.to_string(),
                         transport: format_enum(&endpoint.transport),
@@ -319,9 +321,7 @@ fn snapshot_from_parts(
     }
 }
 
-fn reachable_endpoint_ids(
-    records: &[ClusterConnectivityRecord],
-) -> BTreeSet<(String, String)> {
+fn reachable_endpoint_ids(records: &[ClusterConnectivityRecord]) -> BTreeSet<(String, String)> {
     records
         .iter()
         .filter(|record| {

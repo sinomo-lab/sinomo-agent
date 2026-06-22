@@ -282,9 +282,22 @@ impl Widget for Shell {
                     ctx.request_semantics();
                 }
                 // Drain any in-progress provider device-login (Settings tab).
-                let device_changed =
-                    self.shared.is_ready() && self.shared.settings_mut().pump_device_login();
-                if changed || device_changed {
+                let device_changed = if self.shared.is_ready() {
+                    self.shared.settings_mut().pump_device_login()
+                } else {
+                    false
+                };
+                let files_changed = if self.shared.is_ready() {
+                    self.shared.files_mut().pump_load()
+                } else {
+                    false
+                };
+                if files_changed {
+                    ctx.request_measure();
+                    ctx.request_arrange();
+                    ctx.request_semantics();
+                }
+                if changed || device_changed || files_changed {
                     ctx.request_paint();
                 }
             }
