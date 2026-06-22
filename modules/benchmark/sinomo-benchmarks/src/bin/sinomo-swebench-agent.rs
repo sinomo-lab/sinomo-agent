@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sinomo_agent::{
-    Agent, AgentConfig, AgentContextBudget, AgentItem, AgentLoopInput, AgentModelEvent, AgentOp,
-    AgentRole, AgentRun, AgentRunModelMetrics, AgentSession, AgentSessionRuntime, AgentStopReason,
+    Agent, AgentConfig, AgentContextBudget, AgentLoopInput, AgentModelEvent, AgentOp, AgentRole,
+    AgentRun, AgentRunModelMetrics, AgentSession, AgentSessionRuntime, AgentStopReason,
     AgentStoragePaths, AgentToolPairIntegrity, AgentToolRegistry, AgentToolStatus,
     AgentToolSurface, BoundedContext, FileAgentTraceStore, InteractionModel, InteractionSession,
     InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig,
@@ -1161,7 +1161,7 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_agent::{AgentToolCall, AgentToolEvidence, TaskId};
+    use sinomo_agent::{AgentItem, AgentToolCall, AgentToolEvidence, TaskId};
 
     fn tool_call_item(item_id: TaskId, step_index: usize, call_index: usize) -> AgentItem {
         AgentItem::ToolCall {

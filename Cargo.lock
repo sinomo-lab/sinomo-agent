@@ -3597,6 +3597,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "metrics"
+version = "0.24.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89550ee9f79e88fef3119de263694973a8adb26c21d75322164fb8c493039fe2"
+dependencies = [
+ "portable-atomic",
+ "rapidhash",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4869,6 +4879,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rapidhash"
+version = "4.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5e48930979c155e2f33aa36ab3119b5ee81332beb6482199a8ecd6029b80b59"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "ratatui"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5834,6 +5853,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "fs2",
+ "metrics",
  "reqwest 0.12.28",
  "ring",
  "serde",
@@ -5864,6 +5884,7 @@ dependencies = [
  "tokio",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -5913,6 +5934,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -6122,6 +6144,7 @@ dependencies = [
  "fs2",
  "iroh",
  "local-ip-address",
+ "metrics",
  "ring",
  "serde",
  "serde_bytes",
@@ -6139,6 +6162,7 @@ dependencies = [
  "tokio",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -6179,6 +6203,7 @@ name = "sinomo-observe"
 version = "0.1.0"
 dependencies = [
  "fs2",
+ "metrics",
  "serde",
  "serde_json",
  "sinomo-cli-registry",
@@ -6192,6 +6217,8 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

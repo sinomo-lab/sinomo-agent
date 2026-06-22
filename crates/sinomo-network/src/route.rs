@@ -20,6 +20,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
+use time::OffsetDateTime;
 
 /// RPC category for routing/relay traffic.
 pub const CLUSTER_ROUTING_RPC_CATEGORY: &str = "cluster.routing";
@@ -34,7 +35,6 @@ const CLUSTER_RELAY_MAX_FAILURE_DETAILS: usize = 8;
 const CLUSTER_RELAY_FAILURE_DETAIL_MAX_CHARS: usize = 512;
 const CLUSTER_DELIVERY_UNOBSERVED_NEIGHBOR_COST: u64 = 75_000;
 const MAX_CLUSTER_DELIVERY_ROUTING_TABLE_CACHE_ENTRIES: usize = 128;
-const CLUSTER_DELIVERY_ROUTING_TABLE_CACHE_MAX_AGE: Duration = Duration::from_secs(1);
 
 static CLUSTER_DELIVERY_ROUTING_TABLE_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
 static CLUSTER_DELIVERY_ROUTING_TABLES: LazyLock<
@@ -255,15 +255,39 @@ struct ClusterDeliveryRoutePlan {
 }
 
 #[derive(Clone, Debug)]
+struct ClusterDeliveryRoutePath {
+    nodes: Vec<NodeId>,
+    cost: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ClusterDeliveryRouteCandidate {
+    plan: ClusterDeliveryRoutePlan,
+    path: Vec<NodeId>,
+    cost: u64,
+    complete: bool,
+}
+
+#[derive(Clone, Debug)]
 struct ClusterDeliveryRoutingTable {
     cluster_id: ClusterId,
     local_node_id: NodeId,
-    routes: BTreeMap<NodeId, ClusterDeliveryRoutePlan>,
+    routes: BTreeMap<NodeId, Vec<ClusterDeliveryRouteCandidate>>,
+    earliest_expires_at: Option<OffsetDateTime>,
 }
 
 impl ClusterDeliveryRoutingTable {
-    fn route_plan(&self, target_node_id: &NodeId) -> Option<ClusterDeliveryRoutePlan> {
-        self.routes.get(target_node_id).cloned()
+    fn route_plan(
+        &self,
+        target_node_id: &NodeId,
+        failed_edges: &BTreeSet<ClusterDeliveryFailedEdge>,
+        visited: &[NodeId],
+    ) -> Option<ClusterDeliveryRoutePlan> {
+        cluster_delivery_select_route_candidate(
+            self.routes.get(target_node_id)?,
+            failed_edges,
+            visited,
+        )
     }
 }
 
@@ -271,18 +295,17 @@ impl ClusterDeliveryRoutingTable {
 struct ClusterDeliveryRoutingTableCacheEntry {
     mark: ClusterDeliveryRoutingTableCacheMark,
     table: ClusterDeliveryRoutingTable,
-    cached_at: Instant,
     last_used: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ClusterDeliveryRoutingTableCacheMark {
     state: ClusterFileMark,
-    local_connectivity: ClusterFileMark,
     kv_snapshot: ClusterFileMark,
     local_connectivity_generation: u64,
 }
 
+#[cfg(test)]
 fn cluster_delivery_route_plan(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -293,21 +316,119 @@ fn cluster_delivery_route_plan(
 ) -> Option<ClusterDeliveryRoutePlan> {
     let graph =
         cluster_delivery_route_graph(paths, state, local_node_id, failed_edges, target_node_id);
-    let next_hop =
-        cluster_delivery_shortest_path_next_hop(&graph, local_node_id, target_node_id, visited)
-            .or_else(|| {
-                cluster_delivery_exploratory_next_hop(
-                    &graph,
-                    local_node_id,
-                    target_node_id,
-                    visited,
-                )
-            })?;
-    let endpoints = graph.endpoints_for_next_hop(local_node_id, &next_hop);
-    Some(ClusterDeliveryRoutePlan {
-        next_hop,
-        endpoints,
-    })
+    cluster_delivery_select_route_candidate(
+        &cluster_delivery_route_candidates(&graph, local_node_id, target_node_id),
+        failed_edges,
+        visited,
+    )
+}
+
+fn cluster_delivery_route_candidates(
+    graph: &ClusterDeliveryRouteGraph,
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+) -> Vec<ClusterDeliveryRouteCandidate> {
+    let mut next_hop_costs = BTreeMap::<NodeId, u64>::new();
+    for edge in graph.edges(local_node_id) {
+        if edge.target == *local_node_id {
+            continue;
+        }
+        next_hop_costs
+            .entry(edge.target.clone())
+            .and_modify(|cost| *cost = (*cost).min(edge.cost))
+            .or_insert(edge.cost);
+    }
+
+    let mut candidates = Vec::new();
+    for (next_hop, edge_cost) in next_hop_costs {
+        let endpoints = graph.endpoints_for_next_hop(local_node_id, &next_hop);
+        if endpoints.is_empty() {
+            continue;
+        }
+        if next_hop == *target_node_id {
+            candidates.push(ClusterDeliveryRouteCandidate {
+                plan: ClusterDeliveryRoutePlan {
+                    next_hop: next_hop.clone(),
+                    endpoints,
+                },
+                path: vec![local_node_id.clone(), next_hop],
+                cost: edge_cost,
+                complete: true,
+            });
+            continue;
+        }
+        if let Some(path) = cluster_delivery_shortest_path(graph, &next_hop, target_node_id, &[]) {
+            let mut nodes = Vec::with_capacity(path.nodes.len() + 1);
+            nodes.push(local_node_id.clone());
+            nodes.extend(path.nodes);
+            candidates.push(ClusterDeliveryRouteCandidate {
+                plan: ClusterDeliveryRoutePlan {
+                    next_hop: next_hop.clone(),
+                    endpoints,
+                },
+                path: nodes,
+                cost: edge_cost.saturating_add(path.cost),
+                complete: true,
+            });
+        } else {
+            candidates.push(ClusterDeliveryRouteCandidate {
+                plan: ClusterDeliveryRoutePlan {
+                    next_hop: next_hop.clone(),
+                    endpoints,
+                },
+                path: vec![local_node_id.clone(), next_hop],
+                cost: edge_cost,
+                complete: false,
+            });
+        }
+    }
+    candidates.sort_by_key(|candidate| {
+        (
+            if candidate.complete { 0 } else { 1 },
+            candidate.cost,
+            candidate.plan.next_hop.to_string(),
+        )
+    });
+    candidates
+}
+
+fn cluster_delivery_select_route_candidate(
+    candidates: &[ClusterDeliveryRouteCandidate],
+    failed_edges: &BTreeSet<ClusterDeliveryFailedEdge>,
+    visited: &[NodeId],
+) -> Option<ClusterDeliveryRoutePlan> {
+    let visited = visited.iter().collect::<BTreeSet<_>>();
+    candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.complete
+                && cluster_delivery_route_candidate_is_compatible(candidate, failed_edges, &visited)
+        })
+        .chain(candidates.iter().filter(|candidate| {
+            !candidate.complete
+                && cluster_delivery_route_candidate_is_compatible(candidate, failed_edges, &visited)
+        }))
+        .map(|candidate| candidate.plan.clone())
+        .next()
+}
+
+fn cluster_delivery_route_candidate_is_compatible(
+    candidate: &ClusterDeliveryRouteCandidate,
+    failed_edges: &BTreeSet<ClusterDeliveryFailedEdge>,
+    visited: &BTreeSet<&NodeId>,
+) -> bool {
+    if candidate
+        .path
+        .iter()
+        .skip(1)
+        .any(|node| visited.contains(node))
+    {
+        return false;
+    }
+    !candidate
+        .path
+        .windows(2)
+        .any(|edge| failed_edges.contains(&ClusterDeliveryFailedEdge::new(&edge[0], &edge[1])))
 }
 
 async fn cluster_delivery_route_plan_async(
@@ -319,60 +440,16 @@ async fn cluster_delivery_route_plan_async(
     failed_edges: BTreeSet<ClusterDeliveryFailedEdge>,
     visited: Vec<NodeId>,
 ) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
-    if failed_edges.is_empty()
-        && visited.is_empty()
-        && let Some(plan) = cluster_delivery_route_plan_from_routing_table_async(
-            runtime,
-            paths,
-            state,
-            local_node_id,
-            target_node_id,
-        )
-        .await?
-    {
-        return Ok(Some(plan));
-    }
-    cluster_delivery_route_plan_uncached_async(
+    cluster_delivery_route_plan_from_routing_table_async(
         runtime,
         paths,
         state,
         local_node_id,
         target_node_id,
-        failed_edges,
-        visited,
+        &failed_edges,
+        &visited,
     )
     .await
-}
-
-async fn cluster_delivery_route_plan_uncached_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    local_node_id: &NodeId,
-    target_node_id: &NodeId,
-    failed_edges: BTreeSet<ClusterDeliveryFailedEdge>,
-    visited: Vec<NodeId>,
-) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
-    let paths = paths.clone();
-    let state = state.clone();
-    let local_node_id = local_node_id.clone();
-    let target_node_id = target_node_id.clone();
-    runtime
-        .spawn_blocking(move || {
-            cluster_delivery_route_plan(
-                &paths,
-                &state,
-                &local_node_id,
-                &target_node_id,
-                &failed_edges,
-                &visited,
-            )
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster target route planning".to_string(),
-            detail: format!("target route planning task failed: {source}"),
-        })
 }
 
 async fn cluster_delivery_route_plan_from_routing_table_async(
@@ -381,34 +458,35 @@ async fn cluster_delivery_route_plan_from_routing_table_async(
     state: &ClusterBootstrapState,
     local_node_id: &NodeId,
     target_node_id: &NodeId,
+    failed_edges: &BTreeSet<ClusterDeliveryFailedEdge>,
+    visited: &[NodeId],
 ) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
     if let Some(plan) = cluster_delivery_route_plan_from_cached_routing_table(
         paths,
         state,
         local_node_id,
         target_node_id,
-        Instant::now(),
+        failed_edges,
+        visited,
+        OffsetDateTime::now_utc(),
     ) {
-        return Ok(Some(plan));
+        return Ok(plan);
     }
 
     let paths = paths.clone();
     let state = state.clone();
     let local_node_id = local_node_id.clone();
     let target_node_id = target_node_id.clone();
+    let failed_edges = failed_edges.clone();
+    let visited = visited.to_vec();
     runtime
         .spawn_blocking(move || {
             let before_mark = cluster_delivery_routing_table_cache_mark(&paths);
             let table = cluster_delivery_build_routing_table(&paths, &state, &local_node_id);
-            let plan = table.route_plan(&target_node_id);
+            let plan = table.route_plan(&target_node_id, &failed_edges, &visited);
             let after_mark = cluster_delivery_routing_table_cache_mark(&paths);
             if before_mark == after_mark {
-                store_cluster_delivery_routing_table_cache_entry(
-                    &paths,
-                    after_mark,
-                    table,
-                    Instant::now(),
-                );
+                store_cluster_delivery_routing_table_cache_entry(&paths, after_mark, table);
             }
             plan
         })
@@ -424,8 +502,10 @@ fn cluster_delivery_route_plan_from_cached_routing_table(
     state: &ClusterBootstrapState,
     local_node_id: &NodeId,
     target_node_id: &NodeId,
-    checked_at: Instant,
-) -> Option<ClusterDeliveryRoutePlan> {
+    failed_edges: &BTreeSet<ClusterDeliveryFailedEdge>,
+    visited: &[NodeId],
+    now: OffsetDateTime,
+) -> Option<Option<ClusterDeliveryRoutePlan>> {
     let mark = cluster_delivery_routing_table_cache_mark(paths)?;
     let mut cache = CLUSTER_DELIVERY_ROUTING_TABLES.lock().ok()?;
     let stale = {
@@ -433,8 +513,10 @@ fn cluster_delivery_route_plan_from_cached_routing_table(
         entry.mark != mark
             || entry.table.cluster_id != state.cluster_id
             || entry.table.local_node_id != *local_node_id
-            || checked_at.duration_since(entry.cached_at)
-                >= CLUSTER_DELIVERY_ROUTING_TABLE_CACHE_MAX_AGE
+            || entry
+                .table
+                .earliest_expires_at
+                .is_some_and(|expires_at| expires_at <= now)
     };
     if stale {
         cache.remove(&paths.root);
@@ -442,7 +524,11 @@ fn cluster_delivery_route_plan_from_cached_routing_table(
     }
     let entry = cache.get_mut(&paths.root)?;
     entry.last_used = cluster_delivery_routing_table_cache_tick();
-    entry.table.route_plan(target_node_id)
+    Some(
+        entry
+            .table
+            .route_plan(target_node_id, failed_edges, visited),
+    )
 }
 
 fn cluster_delivery_build_routing_table(
@@ -451,26 +537,49 @@ fn cluster_delivery_build_routing_table(
     local_node_id: &NodeId,
 ) -> ClusterDeliveryRoutingTable {
     let mut routes = BTreeMap::new();
+    let earliest_expires_at = cluster_delivery_routing_table_earliest_expires_at(paths, state);
     for member in &state.members {
         if member.node_id == *local_node_id || !member.state.is_authorized() {
             continue;
         }
-        if let Some(plan) = cluster_delivery_route_plan(
+        let graph = cluster_delivery_route_graph(
             paths,
             state,
             local_node_id,
-            &member.node_id,
             &BTreeSet::new(),
-            &[],
-        ) {
-            routes.insert(member.node_id.clone(), plan);
+            &member.node_id,
+        );
+        let candidates = cluster_delivery_route_candidates(&graph, local_node_id, &member.node_id);
+        if !candidates.is_empty() {
+            routes.insert(member.node_id.clone(), candidates);
         }
     }
     ClusterDeliveryRoutingTable {
         cluster_id: state.cluster_id.clone(),
         local_node_id: local_node_id.clone(),
         routes,
+        earliest_expires_at,
     }
+}
+
+fn cluster_delivery_routing_table_earliest_expires_at(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Option<OffsetDateTime> {
+    let now = OffsetDateTime::now_utc();
+    crate::connectivity_store::read_local_cluster_connectivity_records(paths)
+        .unwrap_or_default()
+        .into_iter()
+        .chain(
+            crate::route_graph_read_model::read_cluster_connectivity_graph(paths)
+                .unwrap_or_default(),
+        )
+        .filter(|record| {
+            record.cluster_id == state.cluster_id
+                && crate::connectivity_publish::cluster_network_record_live(record.expires_at, now)
+        })
+        .map(|record| record.expires_at)
+        .min()
 }
 
 fn cluster_delivery_routing_table_cache_mark(
@@ -478,10 +587,9 @@ fn cluster_delivery_routing_table_cache_mark(
 ) -> Option<ClusterDeliveryRoutingTableCacheMark> {
     Some(ClusterDeliveryRoutingTableCacheMark {
         state: cluster_file_mark(&paths.state)?,
-        local_connectivity: cluster_file_mark(&paths.connectivity_local)?,
         kv_snapshot: cluster_file_mark(&paths.kv_snapshot)?,
         local_connectivity_generation:
-            crate::connectivity_store::local_cluster_connectivity_content_generation(),
+            crate::connectivity_store::local_cluster_connectivity_content_generation(paths),
     })
 }
 
@@ -493,7 +601,6 @@ fn store_cluster_delivery_routing_table_cache_entry(
     paths: &ClusterPaths,
     mark: Option<ClusterDeliveryRoutingTableCacheMark>,
     table: ClusterDeliveryRoutingTable,
-    cached_at: Instant,
 ) {
     let Some(mark) = mark else {
         return;
@@ -507,7 +614,6 @@ fn store_cluster_delivery_routing_table_cache_entry(
         ClusterDeliveryRoutingTableCacheEntry {
             mark,
             table,
-            cached_at,
             last_used: cluster_delivery_routing_table_cache_tick(),
         },
     );
@@ -609,14 +715,28 @@ fn cluster_delivery_local_endpoint_is_usable(
     cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
 }
 
+#[cfg(test)]
 fn cluster_delivery_shortest_path_next_hop(
     graph: &ClusterDeliveryRouteGraph,
     local_node_id: &NodeId,
     target_node_id: &NodeId,
     visited: &[NodeId],
 ) -> Option<NodeId> {
+    cluster_delivery_shortest_path(graph, local_node_id, target_node_id, visited)
+        .and_then(|path| path.nodes.get(1).cloned())
+}
+
+fn cluster_delivery_shortest_path(
+    graph: &ClusterDeliveryRouteGraph,
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+    visited: &[NodeId],
+) -> Option<ClusterDeliveryRoutePath> {
     if local_node_id == target_node_id {
-        return Some(target_node_id.clone());
+        return Some(ClusterDeliveryRoutePath {
+            nodes: vec![local_node_id.clone()],
+            cost: 0,
+        });
     }
     let visited = visited.iter().collect::<BTreeSet<_>>();
     let mut distance = BTreeMap::<NodeId, u64>::from([(local_node_id.clone(), 0)]);
@@ -649,41 +769,19 @@ fn cluster_delivery_shortest_path_next_hop(
     if !distance.contains_key(target_node_id) {
         return None;
     }
+    let cost = *distance.get(target_node_id)?;
+    let mut reversed = vec![target_node_id.clone()];
     let mut current = target_node_id.clone();
-    while let Some(previous) = predecessor.get(&current) {
-        if previous == local_node_id {
-            return Some(current);
-        }
+    while current != *local_node_id {
+        let previous = predecessor.get(&current)?;
+        reversed.push(previous.clone());
         current = previous.clone();
     }
-    None
-}
-
-fn cluster_delivery_exploratory_next_hop(
-    graph: &ClusterDeliveryRouteGraph,
-    local_node_id: &NodeId,
-    target_node_id: &NodeId,
-    visited: &[NodeId],
-) -> Option<NodeId> {
-    let visited = visited.iter().collect::<BTreeSet<_>>();
-    graph
-        .edges(local_node_id)
-        .iter()
-        .filter(|edge| edge.target != *local_node_id && !visited.contains(&edge.target))
-        .min_by_key(|edge| {
-            (
-                if edge.target == *target_node_id {
-                    0
-                } else if graph.edges(&edge.target).is_empty() {
-                    2
-                } else {
-                    1
-                },
-                edge.cost,
-                edge.target.to_string(),
-            )
-        })
-        .map(|edge| edge.target.clone())
+    reversed.reverse();
+    Some(ClusterDeliveryRoutePath {
+        nodes: reversed,
+        cost,
+    })
 }
 
 fn cluster_delivery_local_endpoint_cost(
@@ -706,14 +804,9 @@ fn cluster_delivery_local_endpoint_cost(
             &record.state,
         )
         .map(|cost| cost + endpoint_priority),
-        None if endpoint.node_id == *target_node_id => {
-            cluster_delivery_unobserved_target_endpoint_cost(
-                endpoint,
-                path_cost,
-                endpoint_priority,
-                local_private_prefixes,
-            )
-        }
+        None if endpoint.node_id == *target_node_id => Some(
+            cluster_delivery_unobserved_target_endpoint_cost(path_cost, endpoint_priority),
+        ),
         None if cluster_delivery_endpoint_shares_local_private_prefix(
             endpoint,
             local_private_prefixes,
@@ -725,29 +818,8 @@ fn cluster_delivery_local_endpoint_cost(
     }
 }
 
-fn cluster_delivery_unobserved_target_endpoint_cost(
-    endpoint: &ClusterEndpointRecord,
-    path_cost: u64,
-    endpoint_priority: u64,
-    local_private_prefixes: &BTreeSet<ClusterDeliveryPrivatePrefix>,
-) -> Option<u64> {
-    let globally_routable = endpoint.privacy == ClusterEndpointPrivacy::InternetDirect
-        || endpoint.privacy == ClusterEndpointPrivacy::Relayed
-        || cluster_delivery_address_is_public(&endpoint.address)
-        || matches!(
-            endpoint.transport,
-            ClusterTransportKind::Iroh
-                | ClusterTransportKind::WebRtc
-                | ClusterTransportKind::TurnRelay
-                | ClusterTransportKind::HttpsRelay
-        );
-    if globally_routable
-        || cluster_delivery_endpoint_shares_local_private_prefix(endpoint, local_private_prefixes)
-    {
-        Some(path_cost + endpoint_priority)
-    } else {
-        None
-    }
+fn cluster_delivery_unobserved_target_endpoint_cost(path_cost: u64, endpoint_priority: u64) -> u64 {
+    path_cost + endpoint_priority
 }
 
 fn cluster_delivery_connectivity_record_cost(record: &ClusterConnectivityRecord) -> Option<u64> {
@@ -1200,12 +1272,13 @@ where
         let Some(remaining) = deadline.checked_remaining() else {
             return Err(deadline.timeout_error(endpoint));
         };
-        let request_auth = self.host.sign_endpoint_rpc_request_async(request).await?;
+        let request = request.clone().with_trace_context_if_missing();
+        let request_auth = self.host.sign_endpoint_rpc_request_async(&request).await?;
         self.host
             .send_signed_endpoint_rpc_async(
                 endpoint,
                 &request_auth,
-                request,
+                &request,
                 cluster_endpoint_transport_timeouts(options.timeouts, remaining),
             )
             .await
@@ -1220,21 +1293,37 @@ where
         request: &ObjectRpcRequest,
         options: ClusterObjectRpcOptions,
     ) -> Result<ObjectRpcResponse, NetworkError> {
-        let trace = cluster_object_rpc_trace_enabled();
+        let request = request.clone().with_trace_context_if_missing();
+        let traceparent = request.traceparent().unwrap_or_default().to_string();
         let call_started_at = Instant::now();
         let sign_started_at = Instant::now();
-        let request_auth = self.host.sign_endpoint_rpc_request_async(request).await?;
+        let request_auth = self.host.sign_endpoint_rpc_request_async(&request).await?;
         let request_sign_us = cluster_object_rpc_elapsed_us(sign_started_at);
+        metrics::histogram!(
+            "sinomo.object_rpc.sign.us",
+            "route" => request.route.clone(),
+            "category" => request.category.clone()
+        )
+        .record(request_sign_us as f64);
         let deadline = ClusterEndpointRpcDeadline::new(options.timeouts.connect_timeout);
         let mut failed_edges = BTreeSet::<ClusterDeliveryFailedEdge>::new();
         let mut failures = Vec::new();
         let max_route_attempts = state.members.len().saturating_mul(2).max(1) + 2;
-        if trace {
-            eprintln!(
-                "sinomo cluster object rpc: target={} route=start sign_us={}",
-                target_node_id, request_sign_us
-            );
-        }
+        metrics::counter!(
+            "sinomo.object_rpc.target.calls",
+            "route" => request.route.clone(),
+            "category" => request.category.clone()
+        )
+        .increment(1);
+        tracing::debug!(
+            target: "sinomo.network.object_rpc",
+            %traceparent,
+            route = %request.route,
+            category = %request.category,
+            %target_node_id,
+            sign_us = request_sign_us,
+            "cluster object rpc route start"
+        );
 
         for _ in 0..max_route_attempts {
             let plan_started_at = Instant::now();
@@ -1252,6 +1341,12 @@ where
                 break;
             };
             let plan_us = cluster_object_rpc_elapsed_us(plan_started_at);
+            metrics::histogram!(
+                "sinomo.object_rpc.route_plan.us",
+                "route" => request.route.clone(),
+                "category" => request.category.clone()
+            )
+            .record(plan_us as f64);
             if route_plan.endpoints.is_empty() {
                 failed_edges.insert(ClusterDeliveryFailedEdge::new(
                     &state.local_node_id,
@@ -1260,15 +1355,17 @@ where
                 failures.push(format!("{}: no usable endpoint", route_plan.next_hop));
                 continue;
             }
-            if trace {
-                eprintln!(
-                    "sinomo cluster object rpc: target={} next_hop={} plan_us={} endpoints={}",
-                    target_node_id,
-                    route_plan.next_hop,
-                    plan_us,
-                    cluster_object_rpc_endpoint_trace_list(&route_plan.endpoints)
-                );
-            }
+            tracing::trace!(
+                target: "sinomo.network.object_rpc",
+                %traceparent,
+                route = %request.route,
+                category = %request.category,
+                %target_node_id,
+                next_hop = %route_plan.next_hop,
+                plan_us,
+                endpoints = %cluster_object_rpc_endpoint_trace_list(&route_plan.endpoints),
+                "cluster object rpc route plan selected"
+            );
             for endpoint in route_plan.endpoints {
                 let attempt_started_at = Instant::now();
                 let Some(remaining) = deadline.checked_remaining() else {
@@ -1287,7 +1384,7 @@ where
                         .send_signed_endpoint_rpc_async(
                             &endpoint,
                             &request_auth,
-                            request,
+                            &request,
                             hop_timeouts,
                         )
                         .await;
@@ -1302,7 +1399,7 @@ where
                     let outer = relay_request_for_signed_rpc_with_max_hop_timeout(
                         &state.cluster_id,
                         target_node_id,
-                        request,
+                        &request,
                         request_auth.clone(),
                         std::iter::once(state.local_node_id.clone()),
                         options.timeouts.connect_timeout,
@@ -1330,6 +1427,24 @@ where
                 };
                 match response {
                     Ok(response) if relay_response_is_routing_error(&response) => {
+                        metrics::counter!(
+                            "sinomo.object_rpc.target.routing_errors",
+                            "route" => request.route.clone(),
+                            "category" => request.category.clone()
+                        )
+                        .increment(1);
+                        tracing::debug!(
+                            target: "sinomo.network.object_rpc",
+                            %traceparent,
+                            route = %request.route,
+                            category = %request.category,
+                            %target_node_id,
+                            next_hop = %route_plan.next_hop,
+                            endpoint = %endpoint.address,
+                            transport = ?endpoint.transport,
+                            final_hop,
+                            "cluster object rpc relay returned routing error"
+                        );
                         failures.push(format!(
                             "{} ({:?}) returned routing error",
                             endpoint.address, endpoint.transport
@@ -1339,25 +1454,33 @@ where
                         if let Some(responder_node_id) =
                             cluster_object_rpc_wrong_responder_node_id(&response, target_node_id)
                         {
-                            if trace {
-                                eprintln!(
-                                    "sinomo cluster object rpc: target={} next_hop={} endpoint={} transport={:?} final_hop={} responder_mismatch expected={} got={} sign_us={} plan_us={} outer_build_us={} outer_sign_us={} send_us={} attempt_us={} total_us={}",
-                                    target_node_id,
-                                    route_plan.next_hop,
-                                    endpoint.address,
-                                    endpoint.transport,
-                                    final_hop,
-                                    target_node_id,
-                                    responder_node_id,
-                                    request_sign_us,
-                                    plan_us,
-                                    outer_build_us,
-                                    outer_sign_us,
-                                    send_us,
-                                    cluster_object_rpc_elapsed_us(attempt_started_at),
-                                    cluster_object_rpc_elapsed_us(call_started_at)
-                                );
-                            }
+                            metrics::counter!(
+                                "sinomo.object_rpc.target.responder_mismatch",
+                                "route" => request.route.clone(),
+                                "category" => request.category.clone()
+                            )
+                            .increment(1);
+                            tracing::debug!(
+                                target: "sinomo.network.object_rpc",
+                                %traceparent,
+                                route = %request.route,
+                                category = %request.category,
+                                %target_node_id,
+                                next_hop = %route_plan.next_hop,
+                                endpoint = %endpoint.address,
+                                transport = ?endpoint.transport,
+                                final_hop,
+                                expected = %target_node_id,
+                                got = %responder_node_id,
+                                sign_us = request_sign_us,
+                                plan_us,
+                                outer_build_us,
+                                outer_sign_us,
+                                send_us,
+                                attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at),
+                                total_us = cluster_object_rpc_elapsed_us(call_started_at),
+                                "cluster object rpc responder mismatch"
+                            );
                             failures.push(format!(
                                 "{} ({:?}) responder mismatch: expected {}, got {}",
                                 endpoint.address,
@@ -1367,44 +1490,80 @@ where
                             ));
                             continue;
                         }
-                        if trace {
-                            eprintln!(
-                                "sinomo cluster object rpc: target={} next_hop={} endpoint={} transport={:?} final_hop={} ok sign_us={} plan_us={} outer_build_us={} outer_sign_us={} send_us={} attempt_us={} total_us={}",
-                                target_node_id,
-                                route_plan.next_hop,
-                                endpoint.address,
-                                endpoint.transport,
-                                final_hop,
-                                request_sign_us,
-                                plan_us,
-                                outer_build_us,
-                                outer_sign_us,
-                                send_us,
-                                cluster_object_rpc_elapsed_us(attempt_started_at),
-                                cluster_object_rpc_elapsed_us(call_started_at)
-                            );
-                        }
+                        let attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at);
+                        let total_us = cluster_object_rpc_elapsed_us(call_started_at);
+                        metrics::histogram!(
+                            "sinomo.object_rpc.target.attempt.us",
+                            "route" => request.route.clone(),
+                            "category" => request.category.clone(),
+                            "outcome" => "ok"
+                        )
+                        .record(attempt_us as f64);
+                        metrics::histogram!(
+                            "sinomo.object_rpc.target.total.us",
+                            "route" => request.route.clone(),
+                            "category" => request.category.clone(),
+                            "outcome" => "ok"
+                        )
+                        .record(total_us as f64);
+                        tracing::debug!(
+                            target: "sinomo.network.object_rpc",
+                            %traceparent,
+                            route = %request.route,
+                            category = %request.category,
+                            %target_node_id,
+                            next_hop = %route_plan.next_hop,
+                            endpoint = %endpoint.address,
+                            transport = ?endpoint.transport,
+                            final_hop,
+                            sign_us = request_sign_us,
+                            plan_us,
+                            outer_build_us,
+                            outer_sign_us,
+                            send_us,
+                            attempt_us,
+                            total_us,
+                            "cluster object rpc delivered"
+                        );
                         return Ok(response);
                     }
                     Err(error) => {
-                        if trace {
-                            eprintln!(
-                                "sinomo cluster object rpc: target={} next_hop={} endpoint={} transport={:?} final_hop={} error sign_us={} plan_us={} outer_build_us={} outer_sign_us={} send_us={} attempt_us={} total_us={} error={}",
-                                target_node_id,
-                                route_plan.next_hop,
-                                endpoint.address,
-                                endpoint.transport,
-                                final_hop,
-                                request_sign_us,
-                                plan_us,
-                                outer_build_us,
-                                outer_sign_us,
-                                send_us,
-                                cluster_object_rpc_elapsed_us(attempt_started_at),
-                                cluster_object_rpc_elapsed_us(call_started_at),
-                                error
-                            );
-                        }
+                        let attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at);
+                        let total_us = cluster_object_rpc_elapsed_us(call_started_at);
+                        metrics::histogram!(
+                            "sinomo.object_rpc.target.attempt.us",
+                            "route" => request.route.clone(),
+                            "category" => request.category.clone(),
+                            "outcome" => "error"
+                        )
+                        .record(attempt_us as f64);
+                        metrics::histogram!(
+                            "sinomo.object_rpc.target.total.us",
+                            "route" => request.route.clone(),
+                            "category" => request.category.clone(),
+                            "outcome" => "error"
+                        )
+                        .record(total_us as f64);
+                        tracing::debug!(
+                            target: "sinomo.network.object_rpc",
+                            %traceparent,
+                            route = %request.route,
+                            category = %request.category,
+                            %target_node_id,
+                            next_hop = %route_plan.next_hop,
+                            endpoint = %endpoint.address,
+                            transport = ?endpoint.transport,
+                            final_hop,
+                            sign_us = request_sign_us,
+                            plan_us,
+                            outer_build_us,
+                            outer_sign_us,
+                            send_us,
+                            attempt_us,
+                            total_us,
+                            error = %error,
+                            "cluster object rpc attempt failed"
+                        );
                         failures.push(format!(
                             "{} ({:?}): {error}",
                             endpoint.address, endpoint.transport
@@ -1430,10 +1589,6 @@ where
             ),
         })
     }
-}
-
-fn cluster_object_rpc_trace_enabled() -> bool {
-    std::env::var_os("SINOMO_TRACE_CLUSTER_OBJECT_RPC").is_some()
 }
 
 fn cluster_object_rpc_elapsed_us(started: Instant) -> u64 {
@@ -1469,6 +1624,27 @@ fn cluster_object_rpc_endpoint_trace_list(endpoints: &[ClusterEndpointRecord]) -
 }
 
 fn propagate_relay_response_metadata(inner: &ObjectRpcRequest, outer: &mut ObjectRpcRequest) {
+    if let Some(traceparent) = inner.traceparent() {
+        outer.metadata.insert(
+            crate::OBJECT_RPC_TRACEPARENT_METADATA_KEY.to_string(),
+            traceparent.to_string(),
+        );
+    }
+    if let Some(tracestate) = inner.tracestate() {
+        outer.metadata.insert(
+            crate::OBJECT_RPC_TRACESTATE_METADATA_KEY.to_string(),
+            tracestate.to_string(),
+        );
+    }
+    if inner
+        .metadata
+        .contains_key(crate::OBJECT_RPC_OBSERVE_SAMPLED_METADATA_KEY)
+    {
+        outer.metadata.insert(
+            crate::OBJECT_RPC_OBSERVE_SAMPLED_METADATA_KEY.to_string(),
+            inner.observe_sampled().to_string(),
+        );
+    }
     if crate::object_rpc_request_expects_raw_daemon_response(inner) {
         outer.metadata.insert(
             crate::DAEMON_CONTROL_RAW_RPC_RESPONSE_METADATA_KEY.to_string(),
@@ -1652,6 +1828,29 @@ async fn handle_cluster_relay_envelope_async_with_host(
     options: ClusterRelayOptions,
     host: &mut impl ClusterRelayAsyncHost,
 ) -> Result<ObjectRpcResponse, NetworkError> {
+    let relay_started_at = Instant::now();
+    let inner_route = envelope.inner.route.clone();
+    let inner_category = envelope.inner.category.clone();
+    let traceparent = envelope.inner.traceparent().unwrap_or_default().to_string();
+    metrics::counter!(
+        "sinomo.object_rpc.relay.calls",
+        "route" => inner_route.clone(),
+        "category" => inner_category.clone(),
+        "stream" => "false"
+    )
+    .increment(1);
+    tracing::debug!(
+        target: "sinomo.network.object_rpc.relay",
+        %traceparent,
+        route = %inner_route,
+        category = %inner_category,
+        %local_node_id,
+        target_node_id = %envelope.target_node_id,
+        ttl = envelope.ttl,
+        visited = envelope.visited.len(),
+        stream = false,
+        "cluster relay start"
+    );
     if sinomo_node::cluster_node_is_local_process(state, &envelope.target_node_id) {
         if let Some(response) = host
             .try_deliver_local_async(
@@ -1662,17 +1861,48 @@ async fn handle_cluster_relay_envelope_async_with_host(
             )
             .await?
         {
+            cluster_relay_record_total_us(
+                &inner_route,
+                &inner_category,
+                false,
+                "local",
+                relay_started_at,
+            );
+            tracing::debug!(
+                target: "sinomo.network.object_rpc.relay",
+                %traceparent,
+                route = %inner_route,
+                category = %inner_category,
+                %local_node_id,
+                target_node_id = %envelope.target_node_id,
+                total_us = cluster_object_rpc_elapsed_us(relay_started_at),
+                "cluster relay delivered locally"
+            );
             return Ok(response);
         }
     }
 
     if envelope.visited.iter().any(|node| node == local_node_id) {
+        cluster_relay_record_total_us(
+            &inner_route,
+            &inner_category,
+            false,
+            "loop",
+            relay_started_at,
+        );
         return ObjectRpcResponse::encode_error(
             CLUSTER_RELAY_ROUTE,
             format!("relay dropped: relay loop: {local_node_id} already on the path"),
         );
     }
     if envelope.ttl == 0 {
+        cluster_relay_record_total_us(
+            &inner_route,
+            &inner_category,
+            false,
+            "ttl_exhausted",
+            relay_started_at,
+        );
         return ObjectRpcResponse::encode_error(
             CLUSTER_RELAY_ROUTE,
             "relay dropped: relay ttl exhausted",
@@ -1683,6 +1913,7 @@ async fn handle_cluster_relay_envelope_async_with_host(
     let mut failed_edges = BTreeSet::<ClusterDeliveryFailedEdge>::new();
     let max_route_attempts = state.members.len().saturating_mul(2).max(1) + 2;
     for _ in 0..max_route_attempts {
+        let plan_started_at = Instant::now();
         let Some(route_plan) = cluster_relay_forward_plan(
             runtime,
             paths,
@@ -1695,6 +1926,14 @@ async fn handle_cluster_relay_envelope_async_with_host(
         else {
             break;
         };
+        let plan_us = cluster_object_rpc_elapsed_us(plan_started_at);
+        metrics::histogram!(
+            "sinomo.object_rpc.relay.route_plan.us",
+            "route" => inner_route.clone(),
+            "category" => inner_category.clone(),
+            "stream" => "false"
+        )
+        .record(plan_us as f64);
         if route_plan.endpoints.is_empty() {
             push_cluster_relay_failure(
                 &mut failures,
@@ -1709,7 +1948,21 @@ async fn handle_cluster_relay_envelope_async_with_host(
             ));
             continue;
         }
+        tracing::trace!(
+            target: "sinomo.network.object_rpc.relay",
+            %traceparent,
+            route = %inner_route,
+            category = %inner_category,
+            %local_node_id,
+            target_node_id = %envelope.target_node_id,
+            next_hop = %route_plan.next_hop,
+            plan_us,
+            endpoints = %cluster_object_rpc_endpoint_trace_list(&route_plan.endpoints),
+            stream = false,
+            "cluster relay route plan selected"
+        );
         for endpoint in route_plan.endpoints {
+            let attempt_started_at = Instant::now();
             let final_hop = &route_plan.next_hop == &envelope.target_node_id;
             let hop_timeouts = relay_envelope_hop_transport_timeouts(options.timeouts, &envelope);
             let response = if final_hop {
@@ -1725,6 +1978,27 @@ async fn handle_cluster_relay_envelope_async_with_host(
             };
             match response {
                 Ok(response) if relay_response_is_routing_error(&response) => {
+                    cluster_relay_record_attempt_us(
+                        &inner_route,
+                        &inner_category,
+                        false,
+                        "routing_error",
+                        attempt_started_at,
+                    );
+                    tracing::debug!(
+                        target: "sinomo.network.object_rpc.relay",
+                        %traceparent,
+                        route = %inner_route,
+                        category = %inner_category,
+                        %local_node_id,
+                        target_node_id = %envelope.target_node_id,
+                        next_hop = %route_plan.next_hop,
+                        endpoint = %endpoint.address,
+                        transport = ?endpoint.transport,
+                        final_hop,
+                        attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at),
+                        "cluster relay hop returned routing error"
+                    );
                     push_cluster_relay_failure(
                         &mut failures,
                         format!(
@@ -1733,14 +2007,69 @@ async fn handle_cluster_relay_envelope_async_with_host(
                         ),
                     );
                 }
-                Ok(response) => return Ok(response),
-                Err(error) => push_cluster_relay_failure(
-                    &mut failures,
-                    format!(
-                        "{} ({:?}) failed: {}",
-                        endpoint.address, endpoint.transport, error
-                    ),
-                ),
+                Ok(response) => {
+                    cluster_relay_record_attempt_us(
+                        &inner_route,
+                        &inner_category,
+                        false,
+                        "ok",
+                        attempt_started_at,
+                    );
+                    cluster_relay_record_total_us(
+                        &inner_route,
+                        &inner_category,
+                        false,
+                        "ok",
+                        relay_started_at,
+                    );
+                    tracing::debug!(
+                        target: "sinomo.network.object_rpc.relay",
+                        %traceparent,
+                        route = %inner_route,
+                        category = %inner_category,
+                        %local_node_id,
+                        target_node_id = %envelope.target_node_id,
+                        next_hop = %route_plan.next_hop,
+                        endpoint = %endpoint.address,
+                        transport = ?endpoint.transport,
+                        final_hop,
+                        attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at),
+                        total_us = cluster_object_rpc_elapsed_us(relay_started_at),
+                        "cluster relay forwarded"
+                    );
+                    return Ok(response);
+                }
+                Err(error) => {
+                    cluster_relay_record_attempt_us(
+                        &inner_route,
+                        &inner_category,
+                        false,
+                        "error",
+                        attempt_started_at,
+                    );
+                    tracing::debug!(
+                        target: "sinomo.network.object_rpc.relay",
+                        %traceparent,
+                        route = %inner_route,
+                        category = %inner_category,
+                        %local_node_id,
+                        target_node_id = %envelope.target_node_id,
+                        next_hop = %route_plan.next_hop,
+                        endpoint = %endpoint.address,
+                        transport = ?endpoint.transport,
+                        final_hop,
+                        attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at),
+                        error = %error,
+                        "cluster relay hop failed"
+                    );
+                    push_cluster_relay_failure(
+                        &mut failures,
+                        format!(
+                            "{} ({:?}) failed: {}",
+                            endpoint.address, endpoint.transport, error
+                        ),
+                    );
+                }
             }
         }
         failed_edges.insert(ClusterDeliveryFailedEdge::new(
@@ -1749,6 +2078,13 @@ async fn handle_cluster_relay_envelope_async_with_host(
         ));
     }
 
+    cluster_relay_record_total_us(
+        &inner_route,
+        &inner_category,
+        false,
+        "no_route",
+        relay_started_at,
+    );
     ObjectRpcResponse::encode_error(
         CLUSTER_RELAY_ROUTE,
         format!(
@@ -1805,7 +2141,37 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
     options: ClusterRelayOptions,
     host: &mut impl ClusterRelayStreamForwardAsyncHost,
 ) -> Result<ClusterRelayStreamForwardOutcome, NetworkError> {
+    let relay_started_at = Instant::now();
+    let inner_route = envelope.inner.route.clone();
+    let inner_category = envelope.inner.category.clone();
+    let traceparent = envelope.inner.traceparent().unwrap_or_default().to_string();
+    metrics::counter!(
+        "sinomo.object_rpc.relay.calls",
+        "route" => inner_route.clone(),
+        "category" => inner_category.clone(),
+        "stream" => "true"
+    )
+    .increment(1);
+    tracing::debug!(
+        target: "sinomo.network.object_rpc.relay",
+        %traceparent,
+        route = %inner_route,
+        category = %inner_category,
+        %local_node_id,
+        target_node_id = %envelope.target_node_id,
+        ttl = envelope.ttl,
+        visited = envelope.visited.len(),
+        stream = true,
+        "cluster stream relay start"
+    );
     if sinomo_node::cluster_node_is_local_process(state, &envelope.target_node_id) {
+        cluster_relay_record_total_us(
+            &inner_route,
+            &inner_category,
+            true,
+            "local_stream",
+            relay_started_at,
+        );
         return ObjectRpcResponse::encode_error(
             CLUSTER_RELAY_ROUTE,
             "stream relay local delivery must be handled by the daemon control loop",
@@ -1814,6 +2180,13 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
     }
 
     if envelope.visited.iter().any(|node| node == local_node_id) {
+        cluster_relay_record_total_us(
+            &inner_route,
+            &inner_category,
+            true,
+            "loop",
+            relay_started_at,
+        );
         return ObjectRpcResponse::encode_error(
             CLUSTER_RELAY_ROUTE,
             format!("relay dropped: relay loop: {local_node_id} already on the path"),
@@ -1821,6 +2194,13 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
         .map(ClusterRelayStreamForwardOutcome::ErrorResponse);
     }
     if envelope.ttl == 0 {
+        cluster_relay_record_total_us(
+            &inner_route,
+            &inner_category,
+            true,
+            "ttl_exhausted",
+            relay_started_at,
+        );
         return ObjectRpcResponse::encode_error(
             CLUSTER_RELAY_ROUTE,
             "relay dropped: relay ttl exhausted",
@@ -1832,6 +2212,7 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
     let mut failed_edges = BTreeSet::<ClusterDeliveryFailedEdge>::new();
     let max_route_attempts = state.members.len().saturating_mul(2).max(1) + 2;
     for _ in 0..max_route_attempts {
+        let plan_started_at = Instant::now();
         let Some(route_plan) = cluster_relay_forward_plan(
             runtime,
             paths,
@@ -1844,6 +2225,14 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
         else {
             break;
         };
+        let plan_us = cluster_object_rpc_elapsed_us(plan_started_at);
+        metrics::histogram!(
+            "sinomo.object_rpc.relay.route_plan.us",
+            "route" => inner_route.clone(),
+            "category" => inner_category.clone(),
+            "stream" => "true"
+        )
+        .record(plan_us as f64);
         if route_plan.endpoints.is_empty() {
             push_cluster_relay_failure(
                 &mut failures,
@@ -1858,7 +2247,21 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
             ));
             continue;
         }
+        tracing::trace!(
+            target: "sinomo.network.object_rpc.relay",
+            %traceparent,
+            route = %inner_route,
+            category = %inner_category,
+            %local_node_id,
+            target_node_id = %envelope.target_node_id,
+            next_hop = %route_plan.next_hop,
+            plan_us,
+            endpoints = %cluster_object_rpc_endpoint_trace_list(&route_plan.endpoints),
+            stream = true,
+            "cluster stream relay route plan selected"
+        );
         for endpoint in route_plan.endpoints {
+            let attempt_started_at = Instant::now();
             let mut forwarded = envelope.clone();
             forwarded.ttl = envelope.ttl.saturating_sub(1);
             forwarded.visited.push(local_node_id.clone());
@@ -1869,9 +2272,59 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
                 .await
             {
                 Ok(ClusterRelayStreamSendOutcome::Forwarded) => {
+                    cluster_relay_record_attempt_us(
+                        &inner_route,
+                        &inner_category,
+                        true,
+                        "ok",
+                        attempt_started_at,
+                    );
+                    cluster_relay_record_total_us(
+                        &inner_route,
+                        &inner_category,
+                        true,
+                        "ok",
+                        relay_started_at,
+                    );
+                    tracing::debug!(
+                        target: "sinomo.network.object_rpc.relay",
+                        %traceparent,
+                        route = %inner_route,
+                        category = %inner_category,
+                        %local_node_id,
+                        target_node_id = %envelope.target_node_id,
+                        next_hop = %route_plan.next_hop,
+                        endpoint = %endpoint.address,
+                        transport = ?endpoint.transport,
+                        attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at),
+                        total_us = cluster_object_rpc_elapsed_us(relay_started_at),
+                        stream = true,
+                        "cluster stream relay forwarded"
+                    );
                     return Ok(ClusterRelayStreamForwardOutcome::Forwarded);
                 }
                 Ok(ClusterRelayStreamSendOutcome::RoutingError(response)) => {
+                    cluster_relay_record_attempt_us(
+                        &inner_route,
+                        &inner_category,
+                        true,
+                        "routing_error",
+                        attempt_started_at,
+                    );
+                    tracing::debug!(
+                        target: "sinomo.network.object_rpc.relay",
+                        %traceparent,
+                        route = %inner_route,
+                        category = %inner_category,
+                        %local_node_id,
+                        target_node_id = %envelope.target_node_id,
+                        next_hop = %route_plan.next_hop,
+                        endpoint = %endpoint.address,
+                        transport = ?endpoint.transport,
+                        attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at),
+                        stream = true,
+                        "cluster stream relay hop returned routing error"
+                    );
                     push_cluster_relay_failure(
                         &mut failures,
                         format!(
@@ -1887,17 +2340,55 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
                     );
                 }
                 Ok(ClusterRelayStreamSendOutcome::StreamStartedThenFailed(error)) => {
+                    cluster_relay_record_attempt_us(
+                        &inner_route,
+                        &inner_category,
+                        true,
+                        "stream_started_failed",
+                        attempt_started_at,
+                    );
+                    cluster_relay_record_total_us(
+                        &inner_route,
+                        &inner_category,
+                        true,
+                        "stream_started_failed",
+                        relay_started_at,
+                    );
                     return Ok(ClusterRelayStreamForwardOutcome::StreamStartedThenFailed(
                         error,
                     ));
                 }
-                Err(error) => push_cluster_relay_failure(
-                    &mut failures,
-                    format!(
-                        "{} ({:?}) failed: {}",
-                        endpoint.address, endpoint.transport, error
-                    ),
-                ),
+                Err(error) => {
+                    cluster_relay_record_attempt_us(
+                        &inner_route,
+                        &inner_category,
+                        true,
+                        "error",
+                        attempt_started_at,
+                    );
+                    tracing::debug!(
+                        target: "sinomo.network.object_rpc.relay",
+                        %traceparent,
+                        route = %inner_route,
+                        category = %inner_category,
+                        %local_node_id,
+                        target_node_id = %envelope.target_node_id,
+                        next_hop = %route_plan.next_hop,
+                        endpoint = %endpoint.address,
+                        transport = ?endpoint.transport,
+                        attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at),
+                        error = %error,
+                        stream = true,
+                        "cluster stream relay hop failed"
+                    );
+                    push_cluster_relay_failure(
+                        &mut failures,
+                        format!(
+                            "{} ({:?}) failed: {}",
+                            endpoint.address, endpoint.transport, error
+                        ),
+                    );
+                }
             }
         }
         failed_edges.insert(ClusterDeliveryFailedEdge::new(
@@ -1906,6 +2397,13 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
         ));
     }
 
+    cluster_relay_record_total_us(
+        &inner_route,
+        &inner_category,
+        true,
+        "no_route",
+        relay_started_at,
+    );
     ObjectRpcResponse::encode_error(
         CLUSTER_RELAY_ROUTE,
         format!(
@@ -1919,6 +2417,44 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
         ),
     )
     .map(ClusterRelayStreamForwardOutcome::ErrorResponse)
+}
+
+fn cluster_relay_record_attempt_us(
+    route: &str,
+    category: &str,
+    stream: bool,
+    outcome: &str,
+    started: Instant,
+) {
+    metrics::histogram!(
+        "sinomo.object_rpc.relay.attempt.us",
+        "route" => route.to_string(),
+        "category" => category.to_string(),
+        "stream" => cluster_relay_stream_label(stream),
+        "outcome" => outcome.to_string()
+    )
+    .record(cluster_object_rpc_elapsed_us(started) as f64);
+}
+
+fn cluster_relay_record_total_us(
+    route: &str,
+    category: &str,
+    stream: bool,
+    outcome: &str,
+    started: Instant,
+) {
+    metrics::histogram!(
+        "sinomo.object_rpc.relay.total.us",
+        "route" => route.to_string(),
+        "category" => category.to_string(),
+        "stream" => cluster_relay_stream_label(stream),
+        "outcome" => outcome.to_string()
+    )
+    .record(cluster_object_rpc_elapsed_us(started) as f64);
+}
+
+fn cluster_relay_stream_label(stream: bool) -> &'static str {
+    if stream { "true" } else { "false" }
 }
 
 async fn cluster_relay_forward_plan(
@@ -2256,7 +2792,7 @@ mod tests {
     }
 
     #[test]
-    fn delivery_plan_ignores_unobserved_far_endpoint_for_observed_bridge() {
+    fn delivery_plan_treats_far_direct_target_as_candidate() {
         let (_root, paths) = test_paths("sinomo-network-delivery-plan-observed-bridge");
         let cluster_id = cid("cluster_delivery_plan_observed_bridge");
         let local = nid("node_delivery_plan_observed_local");
@@ -2264,11 +2800,12 @@ mod tests {
         let target = nid("node_delivery_plan_observed_target");
         let mut state = test_state(cluster_id, local.clone());
         add_local_endpoint(&mut state, endpoint(&local, "172.25.0.9:21353", 0));
+        let target_endpoint = endpoint(&target, "172.23.0.2:21353", 0);
         add_member(
             &mut state,
             target.clone(),
             "target",
-            vec![endpoint(&target, "172.23.0.2:21353", 0)],
+            vec![target_endpoint.clone()],
         );
         let bridge_endpoint = endpoint(&bridge, "172.25.0.2:21353", 0);
         add_member(
@@ -2283,8 +2820,9 @@ mod tests {
             cluster_delivery_route_plan(&paths, &state, &local, &target, &BTreeSet::new(), &[])
                 .expect("route plan");
 
-        assert_eq!(plan.next_hop, bridge);
+        assert_eq!(plan.next_hop, target);
         assert_eq!(plan.endpoints.len(), 1);
+        assert_eq!(plan.endpoints[0].address, target_endpoint.address);
     }
 
     #[test]
@@ -2334,7 +2872,7 @@ mod tests {
     }
 
     #[test]
-    fn delivery_plan_explores_unobserved_bridge_over_unobserved_target() {
+    fn delivery_plan_prefers_unobserved_direct_target_over_exploratory_bridge() {
         let (_root, paths) = test_paths("sinomo-network-delivery-plan-unobserved-bridge");
         let cluster_id = cid("cluster_delivery_plan_unobserved_bridge");
         let old_cluster_id = cid("cluster_delivery_plan_unobserved_bridge_old");
@@ -2388,9 +2926,9 @@ mod tests {
             cluster_delivery_route_plan(&paths, &state, &local, &target, &BTreeSet::new(), &[])
                 .expect("route plan");
 
-        assert_eq!(plan.next_hop, bridge);
+        assert_eq!(plan.next_hop, target);
         assert_eq!(plan.endpoints.len(), 1);
-        assert_eq!(plan.endpoints[0].address, bridge_endpoint.address);
+        assert_eq!(plan.endpoints[0].address, target_endpoint.address);
     }
 
     #[test]
@@ -2406,12 +2944,7 @@ mod tests {
         let target_endpoint = endpoint(&target, "172.23.0.2:21353", 0);
         let wrong_endpoint = endpoint(&wrong_neighbor, "172.23.0.4:21353", 0);
         let bridge_endpoint = endpoint(&bridge, "172.25.0.2:21353", 0);
-        add_member(
-            &mut state,
-            target.clone(),
-            "target",
-            vec![target_endpoint.clone()],
-        );
+        add_member(&mut state, target.clone(), "target", Vec::new());
         add_member(
             &mut state,
             wrong_neighbor.clone(),
@@ -2745,6 +3278,157 @@ mod tests {
         .expect("second plan")
         .expect("second route");
         assert_eq!(second.endpoints[0].address, new_endpoint.address);
+    }
+
+    #[tokio::test]
+    async fn delivery_routing_table_serves_relay_with_visited_origin() {
+        let (_root, paths) = test_paths("sinomo-network-delivery-routing-table-relay-visited");
+        let cluster_id = cid("cluster_delivery_routing_table_relay_visited");
+        let origin = nid("node_delivery_routing_table_relay_origin");
+        let local = nid("node_delivery_routing_table_relay_local");
+        let target = nid("node_delivery_routing_table_relay_target");
+        let target_endpoint = endpoint(&target, "10.90.7.10:21353", 0);
+        let mut state = test_state(cluster_id, local.clone());
+        add_member(&mut state, origin.clone(), "origin", Vec::new());
+        add_member(
+            &mut state,
+            target.clone(),
+            "target",
+            vec![target_endpoint.clone()],
+        );
+        mark_local_endpoints_healthy(&paths, &state, &[target_endpoint]);
+        let runtime = tokio::runtime::Handle::current();
+
+        let plan = cluster_delivery_route_plan_async(
+            &runtime,
+            &paths,
+            &state,
+            &local,
+            &target,
+            BTreeSet::new(),
+            vec![origin],
+        )
+        .await
+        .expect("relay route table plan")
+        .expect("route");
+
+        assert_eq!(plan.next_hop, target);
+        assert_eq!(plan.endpoints[0].address, "10.90.7.10:21353");
+    }
+
+    #[test]
+    fn delivery_routing_table_filters_failed_and_visited_candidates() {
+        let (_root, paths) = test_paths("sinomo-network-delivery-routing-table-candidates");
+        let cluster_id = cid("cluster_delivery_routing_table_candidates");
+        let local = nid("node_delivery_routing_table_candidates_local");
+        let bridge = nid("node_delivery_routing_table_candidates_bridge");
+        let target = nid("node_delivery_routing_table_candidates_target");
+        let mut state = test_state(cluster_id.clone(), local.clone());
+        add_local_endpoint(&mut state, endpoint(&local, "172.26.0.9:21353", 0));
+        let bridge_endpoint = endpoint(&bridge, "172.26.0.2:21353", 0);
+        let target_endpoint = endpoint(&target, "172.26.0.10:21353", 100);
+        add_member(
+            &mut state,
+            bridge.clone(),
+            "bridge",
+            vec![bridge_endpoint.clone()],
+        );
+        add_member(
+            &mut state,
+            target.clone(),
+            "target",
+            vec![target_endpoint.clone()],
+        );
+        mark_local_endpoints_healthy(
+            &paths,
+            &state,
+            &[bridge_endpoint.clone(), target_endpoint.clone()],
+        );
+        let bridge_to_target_record = connectivity_record_from_source(
+            &cluster_id,
+            &bridge,
+            &target_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+        );
+        crate::write_local_cluster_connectivity_records(
+            &paths,
+            &bridge,
+            std::slice::from_ref(&bridge_to_target_record),
+        )
+        .expect("write bridge record");
+
+        let table = cluster_delivery_build_routing_table(&paths, &state, &local);
+        let unconstrained = table
+            .route_plan(&target, &BTreeSet::new(), &[])
+            .expect("unconstrained route");
+        assert_eq!(unconstrained.next_hop, bridge);
+
+        let failed_bridge = BTreeSet::from([ClusterDeliveryFailedEdge::new(&local, &bridge)]);
+        let after_failed_bridge = table
+            .route_plan(&target, &failed_bridge, &[])
+            .expect("route after failed bridge");
+        assert_eq!(after_failed_bridge.next_hop, target);
+
+        let after_visited_bridge = table
+            .route_plan(&target, &BTreeSet::new(), std::slice::from_ref(&bridge))
+            .expect("route after visited bridge");
+        assert_eq!(after_visited_bridge.next_hop, target);
+    }
+
+    #[test]
+    fn stable_connectivity_refresh_does_not_bump_route_generation() {
+        let (_root, paths) = test_paths("sinomo-network-stable-connectivity-generation");
+        let cluster_id = cid("cluster_stable_connectivity_generation");
+        let local = nid("node_stable_connectivity_generation_local");
+        let target = nid("node_stable_connectivity_generation_target");
+        let mut state = test_state(cluster_id, local.clone());
+        let target_endpoint = endpoint(&target, "10.90.8.10:21353", 0);
+        add_member(&mut state, target, "target", vec![target_endpoint.clone()]);
+        let now = OffsetDateTime::now_utc();
+        let first = crate::cluster_connectivity_record(
+            &state,
+            &target_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            Some(now.to_string()),
+            None,
+            now,
+            crate::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        crate::write_local_cluster_connectivity_records(
+            &paths,
+            &local,
+            std::slice::from_ref(&first),
+        )
+        .expect("write first connectivity");
+        let generation_after_first =
+            crate::connectivity_store::local_cluster_connectivity_content_generation(&paths);
+
+        let later = now + time::Duration::seconds(1);
+        let stable_refresh = crate::cluster_connectivity_record(
+            &state,
+            &target_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(9),
+            0,
+            Some(later.to_string()),
+            None,
+            later,
+            crate::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        crate::write_local_cluster_connectivity_records(
+            &paths,
+            &local,
+            std::slice::from_ref(&stable_refresh),
+        )
+        .expect("write stable connectivity refresh");
+
+        assert_eq!(
+            crate::connectivity_store::local_cluster_connectivity_content_generation(&paths),
+            generation_after_first
+        );
     }
 
     #[derive(Default)]

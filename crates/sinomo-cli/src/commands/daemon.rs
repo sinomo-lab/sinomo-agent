@@ -258,7 +258,8 @@ pub(crate) fn run_daemon_with_paths(
                 .with_config_definitions(|builder| {
                     sinomo_lm::register_config_definitions(builder)
                         .map_err(|error| error.to_string())
-                }),
+                })
+                .with_observe_metric_exporters(sinomo_agent::register_observe_metric_exporters),
         ],
     )
     .map_err(Into::into)

@@ -990,7 +990,7 @@ where
     Ok(frame)
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(test)]
 pub fn encode_borrowed_object_frame_to_vec(
     document: &BorrowedDocumentBuilder<'_>,
 ) -> Result<Vec<u8>, NetworkError> {

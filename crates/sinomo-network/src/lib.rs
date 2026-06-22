@@ -377,12 +377,13 @@ pub use rpc::{
     CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY,
     CLUSTER_MEMBERSHIP_RPC_ROUTE_METADATA, CLUSTER_NETWORK_PING_ROUTE,
     CLUSTER_NETWORK_RPC_CATEGORY, CLUSTER_NETWORK_RPC_ROUTE_METADATA,
-    OBJECT_RPC_ERROR_DETAIL_METADATA_KEY, ObjectRouteDescriptor, ObjectRpcAuthorizationContext,
-    ObjectRpcAuthorizationLayer, ObjectRpcCancelRequest, ObjectRpcCancelResponse,
-    ObjectRpcCategoryDefinition, ObjectRpcRequest, ObjectRpcResponse, ObjectRpcRouteCatalog,
-    ObjectRpcRoutePolicyLayer, ObjectRpcRouteReadiness, ObjectRpcRouteRegistry,
-    ObjectRpcRouteRegistryBuilder, ObjectRpcRouter, ServiceCatalog, ServiceCatalogSnapshot,
-    ServiceCategory, call_object_rpc_service_async,
+    OBJECT_RPC_ERROR_DETAIL_METADATA_KEY, OBJECT_RPC_OBSERVE_SAMPLED_METADATA_KEY,
+    OBJECT_RPC_TRACEPARENT_METADATA_KEY, OBJECT_RPC_TRACESTATE_METADATA_KEY, ObjectRouteDescriptor,
+    ObjectRpcAuthorizationContext, ObjectRpcAuthorizationLayer, ObjectRpcCancelRequest,
+    ObjectRpcCancelResponse, ObjectRpcCategoryDefinition, ObjectRpcRequest, ObjectRpcResponse,
+    ObjectRpcRouteCatalog, ObjectRpcRoutePolicyLayer, ObjectRpcRouteReadiness,
+    ObjectRpcRouteRegistry, ObjectRpcRouteRegistryBuilder, ObjectRpcRouter, ServiceCatalog,
+    ServiceCatalogSnapshot, ServiceCategory, call_object_rpc_service_async,
 };
 #[cfg(test)]
 pub(crate) use rpc::{call_object_rpc_frame_async, serve_object_rpc_frame_async};

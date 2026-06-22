@@ -15,7 +15,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::{
@@ -44,23 +44,8 @@ use sinomo_service::{
 const DFS_DEFAULT_ROUTE_CONCURRENCY_LIMIT: usize = 8;
 const DFS_DATA_PLANE_ROUTE_CONCURRENCY_LIMIT: usize = 64;
 
-fn dfs_service_perf_trace_enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var("SINOMO_DFS_PERF_TRACE")
-            .ok()
-            .is_some_and(|value| {
-                value == "1"
-                    || value.eq_ignore_ascii_case("true")
-                    || value.eq_ignore_ascii_case("yes")
-            })
-    });
-    *ENABLED
-}
-
 fn dfs_service_perf_trace(args: std::fmt::Arguments<'_>) {
-    if dfs_service_perf_trace_enabled() {
-        eprintln!("[sinomo-dfs-perf] {args}");
-    }
+    tracing::trace!(target: "sinomo.dfs.perf", detail = %args, "dfs service perf");
 }
 
 /// DFS control-plane service. Host-agnostic: it derives everything from the request's

@@ -12,6 +12,7 @@ use sinomo_runtime::core::{
 };
 use sinomo_runtime::events::{EventId, EventStore, ReplayDirection, ReplayQuery, SessionId};
 use sinomo_runtime::node::NodeId;
+use sinomo_runtime::observe::{ObserveError, ObserveMetricRecord};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -71,6 +72,185 @@ pub fn register_storage_paths(
         "agents",
         "local user-defined agent definitions",
     )
+}
+
+pub fn register_observe_metric_exporters() {
+    sinomo_runtime::observe::register_observe_metric_exporter(
+        "sinomo-agent",
+        agent_observe_metrics,
+    );
+}
+
+fn agent_observe_metrics(
+    data_dir: &sinomo_runtime::local::SinomoDataDir,
+) -> Result<Vec<ObserveMetricRecord>, ObserveError> {
+    let paths = AgentStoragePaths::from_data_dir(data_dir);
+    let store = FileAgentSessionStore::new(paths.clone());
+    let mut session_dirs = 0_usize;
+    let mut session_snapshots = 0_usize;
+    let mut control_snapshots = 0_usize;
+    let mut active_turns = 0_usize;
+    let mut buffered_events = 0_usize;
+    let mut invalid_session_dirs = 0_usize;
+    let mut control_snapshot_read_errors = 0_usize;
+    let mut pending_tasks = 0_usize;
+    let mut running_tasks = 0_usize;
+    let mut completed_tasks = 0_usize;
+    let mut failed_tasks = 0_usize;
+    let mut cancelled_tasks = 0_usize;
+    let mut timed_out_tasks = 0_usize;
+
+    let entries = match fs::read_dir(&paths.sessions_dir) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(agent_metric_records(AgentMetricSnapshot::default()));
+        }
+        Err(source) => {
+            return Err(ObserveError::Runtime {
+                detail: format!(
+                    "agent snapshot metric export failed to read {}: {source}",
+                    paths.sessions_dir.display()
+                ),
+            });
+        }
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(|source| ObserveError::Runtime {
+            detail: format!(
+                "agent snapshot metric export failed to scan {}: {source}",
+                paths.sessions_dir.display()
+            ),
+        })?;
+        let file_type = entry.file_type().map_err(|source| ObserveError::Runtime {
+            detail: format!(
+                "agent snapshot metric export failed to inspect {}: {source}",
+                entry.path().display()
+            ),
+        })?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        session_dirs = session_dirs.saturating_add(1);
+        let session_name = entry.file_name().to_string_lossy().to_string();
+        let Ok(session_id) = session_name.parse::<SessionId>() else {
+            invalid_session_dirs = invalid_session_dirs.saturating_add(1);
+            continue;
+        };
+        if paths
+            .session_snapshot_path_for_session(&session_id)
+            .exists()
+        {
+            session_snapshots = session_snapshots.saturating_add(1);
+        }
+        match store.load_control_snapshot(&session_id) {
+            Ok(Some(snapshot)) => {
+                control_snapshots = control_snapshots.saturating_add(1);
+                if snapshot.active_turn.is_some() {
+                    active_turns = active_turns.saturating_add(1);
+                }
+                buffered_events = buffered_events.saturating_add(snapshot.buffered_event_count);
+                for task in snapshot.tasks {
+                    match task.status {
+                        AgentTaskLifecycleStatus::Pending => {
+                            pending_tasks = pending_tasks.saturating_add(1)
+                        }
+                        AgentTaskLifecycleStatus::Running => {
+                            running_tasks = running_tasks.saturating_add(1)
+                        }
+                        AgentTaskLifecycleStatus::Completed => {
+                            completed_tasks = completed_tasks.saturating_add(1)
+                        }
+                        AgentTaskLifecycleStatus::Failed => {
+                            failed_tasks = failed_tasks.saturating_add(1)
+                        }
+                        AgentTaskLifecycleStatus::Cancelled => {
+                            cancelled_tasks = cancelled_tasks.saturating_add(1)
+                        }
+                        AgentTaskLifecycleStatus::TimedOut => {
+                            timed_out_tasks = timed_out_tasks.saturating_add(1)
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                control_snapshot_read_errors = control_snapshot_read_errors.saturating_add(1);
+            }
+        }
+    }
+
+    Ok(agent_metric_records(AgentMetricSnapshot {
+        session_dirs,
+        session_snapshots,
+        control_snapshots,
+        active_turns,
+        buffered_events,
+        invalid_session_dirs,
+        control_snapshot_read_errors,
+        pending_tasks,
+        running_tasks,
+        completed_tasks,
+        failed_tasks,
+        cancelled_tasks,
+        timed_out_tasks,
+    }))
+}
+
+#[derive(Default)]
+struct AgentMetricSnapshot {
+    session_dirs: usize,
+    session_snapshots: usize,
+    control_snapshots: usize,
+    active_turns: usize,
+    buffered_events: usize,
+    invalid_session_dirs: usize,
+    control_snapshot_read_errors: usize,
+    pending_tasks: usize,
+    running_tasks: usize,
+    completed_tasks: usize,
+    failed_tasks: usize,
+    cancelled_tasks: usize,
+    timed_out_tasks: usize,
+}
+
+fn agent_metric_records(snapshot: AgentMetricSnapshot) -> Vec<ObserveMetricRecord> {
+    let mut records = vec![
+        agent_gauge("sinomo.agent.sessions", snapshot.session_dirs),
+        agent_gauge("sinomo.agent.session_snapshots", snapshot.session_snapshots),
+        agent_gauge("sinomo.agent.control_snapshots", snapshot.control_snapshots),
+        agent_gauge("sinomo.agent.active_turns", snapshot.active_turns),
+        agent_gauge("sinomo.agent.buffered_events", snapshot.buffered_events),
+        agent_gauge(
+            "sinomo.agent.invalid_session_dirs",
+            snapshot.invalid_session_dirs,
+        ),
+        agent_gauge(
+            "sinomo.agent.control_snapshot_read_errors",
+            snapshot.control_snapshot_read_errors,
+        ),
+    ];
+    for (status, count) in [
+        ("pending", snapshot.pending_tasks),
+        ("running", snapshot.running_tasks),
+        ("completed", snapshot.completed_tasks),
+        ("failed", snapshot.failed_tasks),
+        ("cancelled", snapshot.cancelled_tasks),
+        ("timed_out", snapshot.timed_out_tasks),
+    ] {
+        let mut labels = BTreeMap::new();
+        labels.insert("status".to_string(), status.to_string());
+        records.push(ObserveMetricRecord::gauge(
+            "sinomo.agent.tasks",
+            labels,
+            count as f64,
+        ));
+    }
+    records
+}
+
+fn agent_gauge(name: impl Into<String>, value: usize) -> ObserveMetricRecord {
+    ObserveMetricRecord::gauge(name, BTreeMap::new(), value as f64)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

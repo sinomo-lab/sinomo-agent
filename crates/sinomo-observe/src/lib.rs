@@ -1,6 +1,7 @@
 //! Operational events, logs, and object-RPC observation service.
 
 mod cli;
+mod runtime;
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -19,7 +20,17 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use time::OffsetDateTime;
 
-pub use cli::{ObserveCliCommandHandler, observe_cli_command_handler};
+pub use cli::{
+    ObserveCliCommandHandler, observe_cli_command_handler,
+    observe_cli_command_handler_with_cluster_rpc, observe_cli_command_handler_with_rpc,
+};
+pub use runtime::{
+    OBSERVE_DEFAULT_FILTER, ObserveControlRequest, ObserveControlResponse, ObserveMetricKind,
+    ObserveMetricRecord, ObserveMetricsRequest, ObserveMetricsResponse, ObserveRuntimeConfig,
+    ObserveTraceRecord, ObserveTracesRequest, ObserveTracesResponse, init_observe_runtime,
+    observe_control_snapshot, read_observe_metrics, read_observe_metrics_for_data_dir,
+    read_observe_traces, register_observe_metric_exporter, update_observe_control,
+};
 
 pub const OBSERVE_PROTOCOL: &str = "sinomo.observe.v1";
 pub const SINOMO_OBSERVE_MODULE_LEGACY_ID: &str = "module.observe";
@@ -28,7 +39,16 @@ pub const SINOMO_OBSERVE_NATIVE_REGISTRATION_KEY: &str = "sinomo-observe";
 pub const OBSERVE_RPC_CATEGORY: &str = "observe";
 pub const OBSERVE_EVENTS_ROUTE: &str = "/observe/events";
 pub const OBSERVE_LOGS_ROUTE: &str = "/observe/logs";
-pub const OBSERVE_OBJECT_RPC_ROUTES: &[&str] = &[OBSERVE_EVENTS_ROUTE, OBSERVE_LOGS_ROUTE];
+pub const OBSERVE_METRICS_ROUTE: &str = "/observe/metrics";
+pub const OBSERVE_TRACES_ROUTE: &str = "/observe/traces";
+pub const OBSERVE_CONTROL_ROUTE: &str = "/observe/control";
+pub const OBSERVE_OBJECT_RPC_ROUTES: &[&str] = &[
+    OBSERVE_EVENTS_ROUTE,
+    OBSERVE_LOGS_ROUTE,
+    OBSERVE_METRICS_ROUTE,
+    OBSERVE_TRACES_ROUTE,
+    OBSERVE_CONTROL_ROUTE,
+];
 
 pub const OPERATIONAL_EVENTS_RELATIVE_PATH: &str = "events/ops/operational-events.jsonl";
 pub const OPERATIONAL_LOG_RELATIVE_PATH: &str = "events/ops/logs/operational-log.jsonl";
@@ -37,7 +57,7 @@ pub const OPERATIONAL_LOG_LOCK_RELATIVE_PATH: &str = "events/ops/logs/operationa
 pub const OPERATIONAL_JSONL_MAX_BYTES: u64 = 16 * 1024 * 1024;
 pub const OPERATIONAL_JSONL_RETAINED_FILES: usize = 4;
 
-const OBSERVE_ROUTES: &[&str] = &[OBSERVE_EVENTS_ROUTE, OBSERVE_LOGS_ROUTE];
+const OBSERVE_ROUTES: &[&str] = OBSERVE_OBJECT_RPC_ROUTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct JsonlRotationConfig {
@@ -194,6 +214,8 @@ pub enum ObserveError {
     Parse { detail: String },
     #[error("observe module state error: {detail}")]
     ModuleState { detail: String },
+    #[error("observe runtime error: {detail}")]
+    Runtime { detail: String },
 }
 
 pub fn operational_events_path(data_dir: impl AsRef<Path>) -> PathBuf {
@@ -695,13 +717,31 @@ pub fn observe_module_surfaces() -> sinomo_module::ModuleSurfaces {
             OBSERVE_EVENTS_ROUTE,
             OBSERVE_RPC_CATEGORY,
             "observe.events.read",
-            ModuleRouteAuth::LocalCommand,
+            ModuleRouteAuth::LocalOrClusterMember,
         ))
         .with_object_rpc_route(ModuleObjectRpcRoute::new(
             OBSERVE_LOGS_ROUTE,
             OBSERVE_RPC_CATEGORY,
             "observe.logs.read",
-            ModuleRouteAuth::LocalCommand,
+            ModuleRouteAuth::LocalOrClusterMember,
+        ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            OBSERVE_METRICS_ROUTE,
+            OBSERVE_RPC_CATEGORY,
+            "observe.metrics.read",
+            ModuleRouteAuth::LocalOrClusterMember,
+        ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            OBSERVE_TRACES_ROUTE,
+            OBSERVE_RPC_CATEGORY,
+            "observe.traces.read",
+            ModuleRouteAuth::LocalOrClusterMember,
+        ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            OBSERVE_CONTROL_ROUTE,
+            OBSERVE_RPC_CATEGORY,
+            "observe.control.write",
+            ModuleRouteAuth::Admin,
         ))
         .with_event_kind_name("daemon.lifecycle.started")
         .with_event_kind_name("daemon.lifecycle.shutdown_requested")
@@ -725,6 +765,9 @@ pub fn observe_module_capabilities() -> sinomo_core::ModuleCapabilities {
         exports: vec![
             observe_capability("observe.events.read"),
             observe_capability("observe.logs.read"),
+            observe_capability("observe.metrics.read"),
+            observe_capability("observe.traces.read"),
+            observe_capability("observe.control.write"),
             observe_capability("observe.events.write"),
             observe_capability("observe.logs.write"),
         ],
@@ -840,6 +883,27 @@ impl Service for ObserveService {
                     sinomo_network::ObjectRpcResponse::encode_body(
                         OBSERVE_LOGS_ROUTE,
                         &ObserveLogsResponse { records },
+                    )?
+                }
+                OBSERVE_METRICS_ROUTE => {
+                    let request: ObserveMetricsRequest = request.decode_body()?;
+                    sinomo_network::ObjectRpcResponse::encode_body(
+                        OBSERVE_METRICS_ROUTE,
+                        &read_observe_metrics_for_data_dir(ctx.data_dir.as_ref(), &request),
+                    )?
+                }
+                OBSERVE_TRACES_ROUTE => {
+                    let request: ObserveTracesRequest = request.decode_body()?;
+                    sinomo_network::ObjectRpcResponse::encode_body(
+                        OBSERVE_TRACES_ROUTE,
+                        &read_observe_traces(&request),
+                    )?
+                }
+                OBSERVE_CONTROL_ROUTE => {
+                    let request: ObserveControlRequest = request.decode_body()?;
+                    sinomo_network::ObjectRpcResponse::encode_body(
+                        OBSERVE_CONTROL_ROUTE,
+                        &update_observe_control(request).map_err(service_error)?,
                     )?
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),

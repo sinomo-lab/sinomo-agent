@@ -33,6 +33,7 @@ pub struct DaemonServiceRegistryHook {
                 + Sync,
         >,
     >,
+    register_observe_metric_exporters: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl DaemonServiceRegistryHook {
@@ -47,6 +48,7 @@ impl DaemonServiceRegistryHook {
         Self {
             register: std::sync::Arc::new(register),
             register_config_definitions: None,
+            register_observe_metric_exporters: None,
         }
     }
 
@@ -60,6 +62,14 @@ impl DaemonServiceRegistryHook {
         + 'static,
     ) -> Self {
         self.register_config_definitions = Some(std::sync::Arc::new(register));
+        self
+    }
+
+    pub fn with_observe_metric_exporters(
+        mut self,
+        register: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        self.register_observe_metric_exporters = Some(std::sync::Arc::new(register));
         self
     }
 
@@ -78,6 +88,12 @@ impl DaemonServiceRegistryHook {
         builder: sinomo_service::ServiceRegistryBuilder,
     ) -> sinomo_service::ServiceRegistryBuilder {
         (self.register)(builder)
+    }
+
+    pub fn register_observe_metric_exporters(&self) {
+        if let Some(register) = &self.register_observe_metric_exporters {
+            register();
+        }
     }
 }
 

@@ -24,7 +24,9 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 const MAX_LOCAL_CLUSTER_CONNECTIVITY_CACHE_ENTRIES: usize = 128;
 
 static LOCAL_CLUSTER_CONNECTIVITY_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
-static LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATION_CLOCK: AtomicU64 = AtomicU64::new(1);
+static LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATIONS: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 static LOCAL_CLUSTER_CONNECTIVITY_RECORDS: LazyLock<
     Mutex<HashMap<PathBuf, LocalClusterConnectivityRecordCacheEntry>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -39,12 +41,19 @@ struct LocalClusterConnectivityRecordCacheEntry {
     last_used: u64,
 }
 
-pub(crate) fn local_cluster_connectivity_content_generation() -> u64 {
-    LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATION.load(Ordering::Acquire)
+pub(crate) fn local_cluster_connectivity_content_generation(paths: &ClusterPaths) -> u64 {
+    LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATIONS
+        .lock()
+        .ok()
+        .and_then(|generations| generations.get(&paths.root).copied())
+        .unwrap_or(0)
 }
 
-fn bump_local_cluster_connectivity_content_generation() {
-    LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATION.fetch_add(1, Ordering::AcqRel);
+fn bump_local_cluster_connectivity_content_generation(paths: &ClusterPaths) {
+    let next = LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATION_CLOCK.fetch_add(1, Ordering::AcqRel);
+    if let Ok(mut generations) = LOCAL_CLUSTER_CONNECTIVITY_CONTENT_GENERATIONS.lock() {
+        generations.insert(paths.root.clone(), next);
+    }
 }
 
 pub(crate) fn read_local_cluster_connectivity_records(
@@ -303,14 +312,21 @@ fn local_cluster_connectivity_persisted_records_stable(
     merged_records: &[ClusterConnectivityRecord],
     now: OffsetDateTime,
 ) -> bool {
+    local_cluster_connectivity_route_records_stable(existing_records, merged_records)
+        && existing_records
+            .iter()
+            .all(|record| !cluster_network_record_should_refresh(record.expires_at, now))
+}
+
+fn local_cluster_connectivity_route_records_stable(
+    existing_records: &[ClusterConnectivityRecord],
+    merged_records: &[ClusterConnectivityRecord],
+) -> bool {
     existing_records.len() == merged_records.len()
         && existing_records
             .iter()
             .zip(merged_records)
-            .all(|(existing, merged)| {
-                cluster_connectivity_stable_eq(existing, merged)
-                    && !cluster_network_record_should_refresh(existing.expires_at, now)
-            })
+            .all(|(existing, merged)| cluster_connectivity_stable_eq(existing, merged))
 }
 
 fn write_local_cluster_connectivity_records_inner(
@@ -366,7 +382,11 @@ fn write_local_cluster_connectivity_records_inner(
     }
     let mut merged = merged.into_values().collect::<Vec<_>>();
     sort_cluster_connectivity_records(&mut merged);
-    if !local_cluster_connectivity_persisted_records_stable(&existing_records, &merged, now) {
+    let route_records_stable =
+        local_cluster_connectivity_route_records_stable(&existing_records, &merged);
+    let persisted_records_stable = route_records_stable
+        && local_cluster_connectivity_persisted_records_stable(&existing_records, &merged, now);
+    if !persisted_records_stable {
         if merged.is_empty() {
             remove_optional_file(&paths.connectivity_local)?;
         } else {
@@ -385,7 +405,9 @@ fn write_local_cluster_connectivity_records_inner(
     } else {
         store_local_cluster_connectivity_cache_entry(&mut cache, paths.root.clone(), merged, now);
     }
-    bump_local_cluster_connectivity_content_generation();
+    if !route_records_stable {
+        bump_local_cluster_connectivity_content_generation(paths);
+    }
     Ok(())
 }
 

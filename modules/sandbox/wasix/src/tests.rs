@@ -143,11 +143,8 @@ fn sandbox_create_response_encodes_for_daemon_rpc() {
     )
     .expect("manifest");
     let response = SandboxCreateInstanceResponse { manifest };
-    let encoded = sinomo_network::ObjectRpcResponse::encode_body(
-        sinomo_network::SANDBOX_CREATE_ROUTE,
-        &response,
-    )
-    .expect("encode response");
+    let encoded = sinomo_network::ObjectRpcResponse::encode_body(SANDBOX_CREATE_ROUTE, &response)
+        .expect("encode response");
     let decoded: SandboxCreateInstanceResponse = encoded.decode_body().expect("decode response");
     assert_eq!(decoded.manifest.sandbox_id, response.manifest.sandbox_id);
 }

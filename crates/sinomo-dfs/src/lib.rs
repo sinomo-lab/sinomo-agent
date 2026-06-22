@@ -137,8 +137,8 @@ use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -5917,23 +5917,8 @@ const DFS_ROUTED_WRITE_INLINE_BYTES_LIMIT: u64 = DFS_BLOB_INLINE_LIMIT_BYTES as 
 const DFS_REMOTE_WRITE_RESPONSE_TTL: Duration = Duration::from_secs(60);
 const DFS_ROUTED_NAMESPACE_IDLE_WAIT: Duration = Duration::from_millis(10);
 
-fn dfs_perf_trace_enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var("SINOMO_DFS_PERF_TRACE")
-            .ok()
-            .is_some_and(|value| {
-                value == "1"
-                    || value.eq_ignore_ascii_case("true")
-                    || value.eq_ignore_ascii_case("yes")
-            })
-    });
-    *ENABLED
-}
-
 fn dfs_perf_trace(args: std::fmt::Arguments<'_>) {
-    if dfs_perf_trace_enabled() {
-        eprintln!("[sinomo-dfs-perf] {args}");
-    }
+    tracing::trace!(target: "sinomo.dfs.perf", detail = %args, "dfs perf");
 }
 
 fn dfs_network_message_trace_label(message: &DfsNetworkMessage) -> &'static str {

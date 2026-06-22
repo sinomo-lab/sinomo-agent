@@ -26,6 +26,8 @@ serde_bytes.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
+metrics.workspace = true
+tracing.workspace = true
 iroh = { version = "0.98.2", optional = true }
 local-ip-address.workspace = true
 tokio = { version = "1.44", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }

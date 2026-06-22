@@ -184,6 +184,15 @@ pub fn run_daemon_control_loop_with_services(
     } else {
         None
     };
+    if let Err(error) =
+        sinomo_observe::init_observe_runtime(sinomo_observe::ObserveRuntimeConfig::daemon(
+            label,
+            cluster.as_ref().map(|status| status.node_id.to_string()),
+        ))
+    {
+        eprintln!("sinomo {label} observe runtime initialization failed: {error}");
+    }
+    crate::observe::register_observe_metric_exporters(&service_hooks);
     if let Err(error) = prune_local_cluster_raft_uncommitted_tail(&paths) {
         eprintln!("sinomo {label} cluster raft startup repair skipped: {error}");
     }

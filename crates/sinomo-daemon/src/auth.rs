@@ -214,9 +214,19 @@ pub fn authorize_authenticated_daemon_command(
         }
         route
             if route == sinomo_observe::OBSERVE_EVENTS_ROUTE
-                || route == sinomo_observe::OBSERVE_LOGS_ROUTE =>
+                || route == sinomo_observe::OBSERVE_LOGS_ROUTE
+                || route == sinomo_observe::OBSERVE_METRICS_ROUTE
+                || route == sinomo_observe::OBSERVE_TRACES_ROUTE =>
         {
-            authenticated.signer.can_run_local_command()
+            matches!(
+                authenticated.signer,
+                DaemonSignerAuthority::Local
+                    | DaemonSignerAuthority::Voter
+                    | DaemonSignerAuthority::Member
+            )
+        }
+        route if route == sinomo_observe::OBSERVE_CONTROL_ROUTE => {
+            authenticated.signer.can_run_admin_command()
         }
         route if route == sinomo_dfs::DFS_EXPOSE_CONFIG_ROUTE => {
             authenticated.signer.can_run_local_command()
@@ -1004,6 +1014,49 @@ mod tests {
             }
             let authenticated =
                 authenticated_command(route.to_string(), DaemonSignerAuthority::JoinCandidate);
+            assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+        }
+    }
+
+    #[test]
+    fn observe_routes_split_cluster_read_from_admin_control() {
+        for route in [
+            sinomo_observe::OBSERVE_EVENTS_ROUTE,
+            sinomo_observe::OBSERVE_LOGS_ROUTE,
+            sinomo_observe::OBSERVE_METRICS_ROUTE,
+            sinomo_observe::OBSERVE_TRACES_ROUTE,
+        ] {
+            for signer in [
+                DaemonSignerAuthority::Local,
+                DaemonSignerAuthority::Voter,
+                DaemonSignerAuthority::Member,
+            ] {
+                let authenticated = authenticated_command(route.to_string(), signer);
+                authorize_authenticated_daemon_command(&authenticated)
+                    .expect("cluster members must be able to read observe data");
+            }
+            for signer in [
+                DaemonSignerAuthority::JoinCandidate,
+                DaemonSignerAuthority::StatusProbe,
+            ] {
+                let authenticated = authenticated_command(route.to_string(), signer);
+                assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+            }
+        }
+
+        for signer in [DaemonSignerAuthority::Local, DaemonSignerAuthority::Voter] {
+            let authenticated =
+                authenticated_command(sinomo_observe::OBSERVE_CONTROL_ROUTE.to_string(), signer);
+            authorize_authenticated_daemon_command(&authenticated)
+                .expect("observe control requires an admin signer");
+        }
+        for signer in [
+            DaemonSignerAuthority::Member,
+            DaemonSignerAuthority::JoinCandidate,
+            DaemonSignerAuthority::StatusProbe,
+        ] {
+            let authenticated =
+                authenticated_command(sinomo_observe::OBSERVE_CONTROL_ROUTE.to_string(), signer);
             assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
         }
     }
