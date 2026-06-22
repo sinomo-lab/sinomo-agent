@@ -59,6 +59,7 @@ pub(crate) struct DfsMountOptions {
     pub(crate) read_only: bool,
     pub(crate) allow_other: bool,
     pub(crate) foreground: bool,
+    pub(crate) sync_local_changes: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -351,6 +352,7 @@ pub(crate) fn parse_dfs_mount_options(args: &[String]) -> Result<DfsMountOptions
     let mut read_only = false;
     let mut allow_other = false;
     let mut foreground = true;
+    let mut sync_local_changes = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -366,6 +368,8 @@ pub(crate) fn parse_dfs_mount_options(args: &[String]) -> Result<DfsMountOptions
             "--allow-other" => allow_other = true,
             "--foreground" => foreground = true,
             "--background" => foreground = false,
+            "--sync-local-changes" => sync_local_changes = true,
+            "--no-sync-local-changes" => sync_local_changes = false,
             value if value.starts_with('-') => return Err(CliError::Usage),
             value => {
                 if mount_point.is_some() {
@@ -383,6 +387,7 @@ pub(crate) fn parse_dfs_mount_options(args: &[String]) -> Result<DfsMountOptions
         read_only,
         allow_other,
         foreground,
+        sync_local_changes,
     })
 }
 
@@ -1325,6 +1330,7 @@ fn run_dfs_cloud_files_mount_command(options: DfsMountOptions) -> Result<(), Cli
         root_path: options.root_path,
         data_dir_root: Some(data_dir_root),
         read_only: options.read_only,
+        sync_local_changes: options.sync_local_changes,
         provider_name: "Sinomo SIFS".to_string(),
         provider_version: env!("CARGO_PKG_VERSION").to_string(),
         prepopulate_depth: 1,

@@ -111,7 +111,9 @@ pub fn cloud_files_module_descriptor() -> NativeModuleDescriptor {
         capabilities: vec![
             "dfs.sifs.cloud-files.register-sync-root".to_string(),
             "dfs.sifs.cloud-files.placeholder-hydrate".to_string(),
+            "dfs.sifs.cloud-files.local-change-upload".to_string(),
             "dfs.sifs.read".to_string(),
+            "dfs.sifs.write".to_string(),
         ],
         surfaces: Default::default(),
     }

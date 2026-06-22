@@ -2330,7 +2330,9 @@ fn check_git_diff_large_output_disclosure_smoke() -> AgentReadinessCheck {
     }
 
     let registry = AgentToolRegistry::local_workspace_with_config(
-        LocalWorkspaceAgentConfig::new(&root).with_evidence_dir(&evidence_dir),
+        LocalWorkspaceAgentConfig::new(&root)
+            .using_local_process_commands()
+            .with_evidence_dir(&evidence_dir),
     );
     let plan = AgentToolPlanner::plan(
         registry.descriptors(),
@@ -2592,7 +2594,9 @@ fn check_version_control_active_cancellation_smoke() -> AgentReadinessCheck {
     }
     let fake_git_program = fake_git.display().to_string();
     let registry = AgentToolRegistry::local_workspace_with_config(
-        LocalWorkspaceAgentConfig::new(&workspace_root).with_git_program(fake_git_program.clone()),
+        LocalWorkspaceAgentConfig::new(&workspace_root)
+            .using_local_process_commands()
+            .with_git_program(fake_git_program.clone()),
     );
     let session = readiness_session();
     let cancellation_token = AgentCancellationToken::new();
@@ -5711,6 +5715,7 @@ fn check_coding_state_projection_bounds_smoke() -> AgentReadinessCheck {
         let model = ReadinessSequencedModel::new(responses);
         let config = LocalWorkspaceAgentConfig::new(&root)
             .allowing_file_writes(true)
+            .using_local_process_commands()
             .allowing_shell_commands(true)
             .with_evidence_dir(&evidence_dir);
         let agent = Agent::new(model, "readiness", "coding-projection-smoke")
@@ -5864,6 +5869,7 @@ fn check_coding_state_environment_validation_smoke() -> AgentReadinessCheck {
         let model = ReadinessSequencedModel::new([patch_turn, validation_turn]);
         let config = LocalWorkspaceAgentConfig::new(&root)
             .allowing_file_writes(true)
+            .using_local_process_commands()
             .allowing_shell_commands(true)
             .with_evidence_dir(&evidence_dir);
         let agent = Agent::new(model, "readiness", "coding-state-smoke")
@@ -5997,6 +6003,7 @@ fn check_coding_state_missing_dependency_validation_smoke() -> AgentReadinessChe
         let model = ReadinessSequencedModel::new([patch_turn, validation_turn]);
         let config = LocalWorkspaceAgentConfig::new(&root)
             .allowing_file_writes(true)
+            .using_local_process_commands()
             .allowing_shell_commands(true)
             .with_evidence_dir(&evidence_dir);
         let agent = Agent::new(model, "readiness", "coding-missing-dependency-smoke")
@@ -6128,6 +6135,7 @@ fn check_coding_state_terminal_blocker_smoke() -> AgentReadinessCheck {
         let model = ReadinessSequencedModel::new([patch_turn, validation_turn]);
         let config = LocalWorkspaceAgentConfig::new(&root)
             .allowing_file_writes(true)
+            .using_local_process_commands()
             .allowing_shell_commands(true)
             .with_evidence_dir(&evidence_dir);
         let agent = Agent::new(model, "readiness", "coding-terminal-blocker-smoke")
@@ -6220,6 +6228,7 @@ fn check_local_command_evidence_smoke(workspace_root: &Path) -> AgentReadinessCh
         std::env::temp_dir().join(format!("sinomo-agent-readiness-{}", TaskId::generate()));
     let mut config = LocalWorkspaceAgentConfig::new(workspace_root)
         .allowing_file_writes(true)
+        .using_local_process_commands()
         .allowing_shell_commands(true)
         .with_evidence_dir(&evidence_dir);
     config.max_command_output_bytes = 4;
@@ -6819,6 +6828,7 @@ fn check_sifs_command_evidence_smoke(workspace_root: &Path) -> AgentReadinessChe
     ));
     let sifs_mount = root.join("sifs-mount");
     let mut config = LocalWorkspaceAgentConfig::new(workspace_root)
+        .using_local_process_commands()
         .allowing_shell_commands(true)
         .with_sifs_evidence_mount(&sifs_mount, "readiness/agent/evidence");
     config.max_command_output_bytes = 4;
@@ -6995,6 +7005,7 @@ fn check_model_visible_evidence_redaction_smoke(_workspace_root: &Path) -> Agent
     let model = ReadinessSequencedModel::new([command_turn, final_turn]);
     let requests = Arc::clone(&model.requests);
     let mut config = LocalWorkspaceAgentConfig::new(&root)
+        .using_local_process_commands()
         .allowing_shell_commands(true)
         .with_sifs_evidence_mount(&sifs_mount, "readiness/agent/evidence/redaction");
     config.max_command_output_bytes = 9 * 1024;
@@ -7102,6 +7113,7 @@ fn check_model_visible_evidence_redaction_smoke(_workspace_root: &Path) -> Agent
 fn readiness_local_registry(workspace_root: &Path) -> AgentToolRegistry {
     AgentToolRegistry::local_workspace_with_config(
         LocalWorkspaceAgentConfig::new(workspace_root)
+            .using_local_process_commands()
             .allowing_file_writes(true)
             .allowing_shell_commands(true),
     )

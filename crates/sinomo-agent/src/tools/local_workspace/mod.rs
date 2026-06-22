@@ -14,12 +14,21 @@ use super::{
     AgentToolResult, AgentToolStatus,
 };
 use crate::{
-    AgentCancellationToken, AgentProcessLifecycleStatus, AgentProcessManager, AgentProcessStart,
-    AgentStoragePaths, AgentToolCall, AgentToolKind, AgentToolSpec, TaskId,
+    AgentCancellationToken, AgentProcessLifecycleStatus, AgentProcessManager, AgentProcessSnapshot,
+    AgentProcessStart, AgentStoragePaths, AgentToolCall, AgentToolKind, AgentToolSpec, TaskId,
     default_coding_agent_tools,
 };
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::node::NodeId;
+use sinomo_runtime::sandbox::{
+    LocalSandboxInstanceLayout, LocalSandboxInstanceStore, LocalSandboxToolchainStore,
+    SandboxCommandExecutionError, SandboxId, SandboxMount, SandboxMountMode, SandboxPath,
+    SandboxPolicy, SandboxStoreError, SandboxToolchainId, SandboxWasiError,
+};
+use sinomo_runtime::sandbox_simple::{SandboxSimpleNativeCommandRunner, SandboxSimpleNativeConfig};
+use std::collections::BTreeMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -30,12 +39,19 @@ const DEFAULT_LOCAL_MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 const DEFAULT_LOCAL_MAX_PATCH_BYTES: usize = 512 * 1024;
 const DEFAULT_LOCAL_MAX_SEARCH_MATCHES: usize = 100;
 const DEFAULT_LOCAL_MAX_LIST_ENTRIES: usize = 200;
+const AGENT_SANDBOX_TOOLCHAIN_ID: &str = "agent_tools";
+const AGENT_HOME_SIFS_ROOT: &str = "/sinomo/agents";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalWorkspaceAgentConfig {
     pub root: PathBuf,
     pub evidence_dir: Option<PathBuf>,
     pub sifs_evidence: Option<LocalWorkspaceSifsEvidenceConfig>,
+    pub command_runtime: LocalWorkspaceCommandRuntime,
+    pub sandbox_runtime_root: PathBuf,
+    pub agent_home_sifs_path: Option<String>,
+    pub agent_home_local_root: Option<PathBuf>,
+    pub sandbox_allow_unenforced: bool,
     pub allow_shell_commands: bool,
     pub allow_file_writes: bool,
     pub max_read_bytes: usize,
@@ -45,6 +61,12 @@ pub struct LocalWorkspaceAgentConfig {
     pub max_search_matches: usize,
     pub max_list_entries: usize,
     pub git_program: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalWorkspaceCommandRuntime {
+    SimpleSandbox,
+    LocalProcess,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,10 +98,17 @@ impl LocalWorkspaceSifsEvidenceConfig {
 
 impl LocalWorkspaceAgentConfig {
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let agent_home_sifs_path = Some(default_agent_home_sifs_path_for_root(&root));
         Self {
-            root: root.into(),
+            root,
             evidence_dir: None,
             sifs_evidence: None,
+            command_runtime: LocalWorkspaceCommandRuntime::SimpleSandbox,
+            sandbox_runtime_root: default_agent_sandbox_runtime_root(),
+            agent_home_sifs_path,
+            agent_home_local_root: None,
+            sandbox_allow_unenforced: false,
             allow_shell_commands: false,
             allow_file_writes: false,
             max_read_bytes: DEFAULT_LOCAL_MAX_READ_BYTES,
@@ -90,6 +119,50 @@ impl LocalWorkspaceAgentConfig {
             max_list_entries: DEFAULT_LOCAL_MAX_LIST_ENTRIES,
             git_program: "git".to_string(),
         }
+    }
+
+    pub fn with_command_runtime(mut self, command_runtime: LocalWorkspaceCommandRuntime) -> Self {
+        self.command_runtime = command_runtime;
+        self
+    }
+
+    pub fn using_simple_sandbox_commands(self) -> Self {
+        self.with_command_runtime(LocalWorkspaceCommandRuntime::SimpleSandbox)
+    }
+
+    pub fn using_local_process_commands(self) -> Self {
+        self.with_command_runtime(LocalWorkspaceCommandRuntime::LocalProcess)
+    }
+
+    pub fn with_sandbox_runtime_root(mut self, sandbox_runtime_root: impl Into<PathBuf>) -> Self {
+        self.sandbox_runtime_root = sandbox_runtime_root.into();
+        self
+    }
+
+    pub fn with_agent_home_sifs_path(mut self, agent_home_sifs_path: impl Into<String>) -> Self {
+        self.agent_home_sifs_path =
+            Some(normalize_agent_home_sifs_path(agent_home_sifs_path.into()));
+        self
+    }
+
+    pub fn without_agent_home_sifs_path(mut self) -> Self {
+        self.agent_home_sifs_path = None;
+        self
+    }
+
+    pub fn with_agent_home_local_root(mut self, agent_home_local_root: impl Into<PathBuf>) -> Self {
+        self.agent_home_local_root = Some(agent_home_local_root.into());
+        self
+    }
+
+    pub fn without_agent_home_local_root(mut self) -> Self {
+        self.agent_home_local_root = None;
+        self
+    }
+
+    pub fn allowing_unenforced_simple_sandbox(mut self, allow_unenforced: bool) -> Self {
+        self.sandbox_allow_unenforced = allow_unenforced;
+        self
     }
 
     pub fn allowing_shell_commands(mut self, allow_shell_commands: bool) -> Self {
@@ -123,11 +196,19 @@ impl LocalWorkspaceAgentConfig {
 
     pub fn with_agent_storage(mut self, paths: &AgentStoragePaths, session_id: &SessionId) -> Self {
         self.evidence_dir = Some(paths.evidence_dir_for_session(session_id));
+        self.agent_home_sifs_path = Some(default_agent_home_sifs_path_for_session(session_id));
         self
     }
 
-    pub fn with_data_dir_evidence(self, data_dir: &SinomoDataDir, session_id: &SessionId) -> Self {
-        self.with_agent_storage(&AgentStoragePaths::from_data_dir(data_dir), session_id)
+    pub fn with_data_dir_evidence(
+        mut self,
+        data_dir: &SinomoDataDir,
+        session_id: &SessionId,
+    ) -> Self {
+        self = self.with_agent_storage(&AgentStoragePaths::from_data_dir(data_dir), session_id);
+        self.sandbox_runtime_root = data_dir.root().join("sandbox").join("agent-tools");
+        self.agent_home_local_root = Some(data_dir.root().join("agents"));
+        self
     }
 }
 
@@ -237,7 +318,7 @@ fn local_shell_command_from_call(
             }
         };
     #[cfg(windows)]
-    let (program, args): (&str, Vec<String>) = ("cmd", vec!["/C".to_string(), command.clone()]);
+    let (program, args): (&str, Vec<String>) = ("cmd.exe", vec!["/C".to_string(), command.clone()]);
     #[cfg(not(windows))]
     let (program, args): (&str, Vec<String>) = local_shell_program_and_args(command.clone());
     run_local_command_with_options(
@@ -356,6 +437,40 @@ fn execute_local_command(
     cancellation_token: &AgentCancellationToken,
     progress_sink: AgentToolProgressSink,
 ) -> Result<LocalCommandExecution, AgentToolResult> {
+    match config.command_runtime {
+        LocalWorkspaceCommandRuntime::SimpleSandbox => execute_simple_sandbox_command(
+            config,
+            program,
+            args,
+            stdin,
+            timeout_ms,
+            cwd,
+            cancellation_token,
+            progress_sink,
+        ),
+        LocalWorkspaceCommandRuntime::LocalProcess => execute_local_process_command(
+            config,
+            program,
+            args,
+            stdin,
+            timeout_ms,
+            cwd,
+            cancellation_token,
+            progress_sink,
+        ),
+    }
+}
+
+fn execute_local_process_command(
+    config: &LocalWorkspaceAgentConfig,
+    program: &str,
+    args: &[String],
+    stdin: Option<&[u8]>,
+    timeout_ms: Option<u64>,
+    cwd: Option<&str>,
+    cancellation_token: &AgentCancellationToken,
+    progress_sink: AgentToolProgressSink,
+) -> Result<LocalCommandExecution, AgentToolResult> {
     let (root, cwd) = match resolve_workspace_cwd(config, cwd) {
         Ok(paths) => paths,
         Err(detail) => {
@@ -451,6 +566,814 @@ fn execute_local_command(
         cancelled,
         duration_ms: duration_ms_from_elapsed(started.elapsed()),
     })
+}
+
+fn execute_simple_sandbox_command(
+    config: &LocalWorkspaceAgentConfig,
+    program: &str,
+    args: &[String],
+    stdin: Option<&[u8]>,
+    timeout_ms: Option<u64>,
+    cwd: Option<&str>,
+    cancellation_token: &AgentCancellationToken,
+    progress_sink: AgentToolProgressSink,
+) -> Result<LocalCommandExecution, AgentToolResult> {
+    let (root, cwd) = match resolve_workspace_cwd(config, cwd) {
+        Ok(paths) => paths,
+        Err(detail) => {
+            return Err(AgentToolResult::blocked(
+                detail.clone(),
+                serde_json::json!({ "error": "workspace_root_not_allowed", "detail": detail }),
+            ));
+        }
+    };
+    let prepared = prepare_sandbox_command(program, args, &cwd)?;
+    let sandbox_cwd = sandbox_path_for_host_path(&cwd)?;
+    let sandbox_id = agent_sandbox_id(&root);
+    let toolchain_id =
+        SandboxToolchainId::from_legacy_named(AGENT_SANDBOX_TOOLCHAIN_ID).map_err(|source| {
+            AgentToolResult::failed(
+                format!("failed to prepare simple sandbox toolchain id: {source}"),
+                serde_json::json!({ "error": "sandbox_toolchain_id_invalid", "detail": source.to_string() }),
+            )
+        })?;
+    let store = LocalSandboxInstanceStore::new(&config.sandbox_runtime_root);
+    let agent_home_local = agent_home_local_mirror(config);
+    let (_manifest, layout) = prepare_agent_sandbox_manifest(
+        config,
+        &store,
+        &sandbox_id,
+        &toolchain_id,
+        sandbox_cwd,
+        &root,
+        &cwd,
+        &prepared.path_prefixes,
+    )?;
+    let runner = SandboxSimpleNativeCommandRunner::new(SandboxSimpleNativeConfig {
+        allow_unenforced: config.sandbox_allow_unenforced,
+        extra_read_paths: sandbox_extra_read_paths(
+            &root,
+            &cwd,
+            &prepared.path_prefixes,
+            agent_home_local.as_deref(),
+        ),
+        extra_write_paths: sandbox_extra_write_paths(&root, agent_home_local.as_deref()),
+        extra_execute_paths: sandbox_extra_execute_paths(&prepared.path_prefixes),
+    });
+    let toolchain_store = LocalSandboxToolchainStore::new(layout.toolchain_runtime_cache_root());
+    let node_id = NodeId::derived("sinomo-agent-simple-sandbox-node", sandbox_id.as_str());
+    let policy = agent_sandbox_policy();
+    let command_text = std::iter::once(program.to_string())
+        .chain(args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let process_id = TaskId::generate().to_string();
+    let started = Instant::now();
+    progress_sink.emit(AgentToolProgressEvent::ProcessStarted {
+        process: sandbox_process_snapshot(
+            &process_id,
+            &command_text,
+            program,
+            args,
+            &cwd,
+            AgentProcessLifecycleStatus::Running,
+            None,
+            false,
+            cancellation_token.is_cancelled(),
+            None,
+            started.elapsed(),
+            timeout_ms,
+            &[],
+            &[],
+            config.max_command_output_bytes,
+        ),
+    });
+    if cancellation_token.is_cancelled() {
+        let output = LocalCommandOutput {
+            stdout: Vec::new(),
+            stderr: b"command cancelled before sandbox start".to_vec(),
+            status_code: None,
+            success: false,
+        };
+        progress_sink.emit(AgentToolProgressEvent::ProcessCompleted {
+            process: sandbox_process_snapshot(
+                &process_id,
+                &command_text,
+                program,
+                args,
+                &cwd,
+                AgentProcessLifecycleStatus::Cancelled,
+                None,
+                false,
+                true,
+                Some("command cancelled before sandbox start".to_string()),
+                started.elapsed(),
+                timeout_ms,
+                &output.stdout,
+                &output.stderr,
+                config.max_command_output_bytes,
+            ),
+        });
+        return Ok(LocalCommandExecution {
+            root,
+            cwd,
+            output,
+            timed_out: false,
+            cancelled: true,
+            duration_ms: duration_ms_from_elapsed(started.elapsed()),
+        });
+    }
+
+    let outcome = runner.run_toolchain_command_with_stdin_policy_and_output_sink(
+        &store,
+        &toolchain_store,
+        &sandbox_id,
+        &prepared.command_name,
+        prepared.argv,
+        stdin.map(|bytes| bytes.to_vec()),
+        timeout_ms.unwrap_or(0),
+        &node_id,
+        &policy,
+        None,
+    );
+    match outcome {
+        Ok(outcome) => {
+            let status_code = Some(outcome.response.exit_status);
+            let success = outcome.response.exit_status == 0;
+            let status = if success {
+                AgentProcessLifecycleStatus::Completed
+            } else {
+                AgentProcessLifecycleStatus::Failed
+            };
+            if !outcome.stdout.is_empty() || !outcome.stderr.is_empty() {
+                progress_sink.emit(AgentToolProgressEvent::ProcessOutput {
+                    process: sandbox_process_snapshot(
+                        &process_id,
+                        &command_text,
+                        program,
+                        args,
+                        &cwd,
+                        status.clone(),
+                        status_code,
+                        false,
+                        false,
+                        None,
+                        started.elapsed(),
+                        timeout_ms,
+                        &outcome.stdout,
+                        &outcome.stderr,
+                        config.max_command_output_bytes,
+                    ),
+                });
+            }
+            progress_sink.emit(AgentToolProgressEvent::ProcessCompleted {
+                process: sandbox_process_snapshot(
+                    &process_id,
+                    &command_text,
+                    program,
+                    args,
+                    &cwd,
+                    status,
+                    status_code,
+                    false,
+                    false,
+                    None,
+                    started.elapsed(),
+                    timeout_ms,
+                    &outcome.stdout,
+                    &outcome.stderr,
+                    config.max_command_output_bytes,
+                ),
+            });
+            Ok(LocalCommandExecution {
+                root,
+                cwd,
+                output: LocalCommandOutput {
+                    stdout: outcome.stdout,
+                    stderr: outcome.stderr,
+                    status_code,
+                    success,
+                },
+                timed_out: false,
+                cancelled: false,
+                duration_ms: duration_ms_from_elapsed(started.elapsed()),
+            })
+        }
+        Err(SandboxCommandExecutionError::Wasi(SandboxWasiError::TimedOut { timeout_ms })) => {
+            let stderr = format!("sandbox command timed out after {timeout_ms} ms").into_bytes();
+            progress_sink.emit(AgentToolProgressEvent::ProcessCompleted {
+                process: sandbox_process_snapshot(
+                    &process_id,
+                    &command_text,
+                    program,
+                    args,
+                    &cwd,
+                    AgentProcessLifecycleStatus::Failed,
+                    None,
+                    true,
+                    false,
+                    Some(format!("command timed out after {timeout_ms} ms")),
+                    started.elapsed(),
+                    Some(timeout_ms),
+                    &[],
+                    &stderr,
+                    config.max_command_output_bytes,
+                ),
+            });
+            Ok(LocalCommandExecution {
+                root,
+                cwd,
+                output: LocalCommandOutput {
+                    stdout: Vec::new(),
+                    stderr,
+                    status_code: None,
+                    success: false,
+                },
+                timed_out: true,
+                cancelled: false,
+                duration_ms: duration_ms_from_elapsed(started.elapsed()),
+            })
+        }
+        Err(SandboxCommandExecutionError::Wasi(SandboxWasiError::Cancelled)) => {
+            let stderr = b"sandbox command was cancelled".to_vec();
+            progress_sink.emit(AgentToolProgressEvent::ProcessCompleted {
+                process: sandbox_process_snapshot(
+                    &process_id,
+                    &command_text,
+                    program,
+                    args,
+                    &cwd,
+                    AgentProcessLifecycleStatus::Cancelled,
+                    None,
+                    false,
+                    true,
+                    Some("sandbox command was cancelled".to_string()),
+                    started.elapsed(),
+                    timeout_ms,
+                    &[],
+                    &stderr,
+                    config.max_command_output_bytes,
+                ),
+            });
+            Ok(LocalCommandExecution {
+                root,
+                cwd,
+                output: LocalCommandOutput {
+                    stdout: Vec::new(),
+                    stderr,
+                    status_code: None,
+                    success: false,
+                },
+                timed_out: false,
+                cancelled: true,
+                duration_ms: duration_ms_from_elapsed(started.elapsed()),
+            })
+        }
+        Err(source) => Err(AgentToolResult::failed(
+            format!("failed to run {program} in simple sandbox: {source}"),
+            serde_json::json!({
+                "error": "simple_sandbox_command_failed",
+                "detail": source.to_string(),
+                "runtime": "simple_sandbox",
+            }),
+        )),
+    }
+}
+
+struct PreparedSandboxCommand {
+    command_name: String,
+    argv: Vec<String>,
+    path_prefixes: Vec<PathBuf>,
+}
+
+fn prepare_sandbox_command(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+) -> Result<PreparedSandboxCommand, AgentToolResult> {
+    let program_uses_path =
+        program.contains('/') || program.contains('\\') || Path::new(program).is_absolute();
+    if !program_uses_path {
+        return Ok(PreparedSandboxCommand {
+            command_name: program.to_string(),
+            argv: std::iter::once(program.to_string())
+                .chain(args.iter().cloned())
+                .collect(),
+            path_prefixes: Vec::new(),
+        });
+    }
+    let program_path = Path::new(program);
+    let command_name = program_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AgentToolResult::failed(
+                format!("failed to prepare sandbox command for {program}"),
+                serde_json::json!({
+                    "error": "sandbox_command_name_invalid",
+                    "detail": format!("program {program} has no valid file name"),
+                }),
+            )
+        })?
+        .to_string();
+    let mut path_prefixes = Vec::new();
+    if let Some(parent) = program_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        let parent = if parent.is_absolute() {
+            parent.to_path_buf()
+        } else {
+            cwd.join(parent)
+        };
+        path_prefixes.push(parent);
+    }
+    Ok(PreparedSandboxCommand {
+        command_name: command_name.clone(),
+        argv: std::iter::once(command_name)
+            .chain(args.iter().cloned())
+            .collect(),
+        path_prefixes,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_agent_sandbox_manifest(
+    config: &LocalWorkspaceAgentConfig,
+    store: &LocalSandboxInstanceStore,
+    sandbox_id: &SandboxId,
+    toolchain_id: &SandboxToolchainId,
+    sandbox_cwd: SandboxPath,
+    root: &Path,
+    cwd: &Path,
+    path_prefixes: &[PathBuf],
+) -> Result<
+    (
+        sinomo_runtime::sandbox::SandboxInstanceManifest,
+        LocalSandboxInstanceLayout,
+    ),
+    AgentToolResult,
+> {
+    fs::create_dir_all(&config.sandbox_runtime_root).map_err(|source| {
+        AgentToolResult::failed(
+            format!(
+                "failed to create sandbox runtime root {}: {source}",
+                config.sandbox_runtime_root.display()
+            ),
+            serde_json::json!({
+                "error": "sandbox_runtime_root_unavailable",
+                "detail": source.to_string(),
+                "path": config.sandbox_runtime_root,
+            }),
+        )
+    })?;
+    let now = time::OffsetDateTime::now_utc();
+    let (mut manifest, _layout) = match store.load(sandbox_id) {
+        Ok(loaded) => loaded,
+        Err(SandboxStoreError::NotFound { .. }) => store
+            .create(sandbox_id.clone(), toolchain_id.clone(), now)
+            .map_err(sandbox_store_failure("create simple sandbox instance"))?,
+        Err(source) => {
+            return Err(sandbox_store_failure("load simple sandbox instance")(
+                source,
+            ));
+        }
+    };
+    manifest.toolchain_id = toolchain_id.clone();
+    manifest.cwd = sandbox_cwd;
+    let agent_home_local = agent_home_local_mirror(config);
+    if let Some(home) = agent_home_local.as_deref() {
+        fs::create_dir_all(home).map_err(|source| {
+            AgentToolResult::failed(
+                format!(
+                    "failed to create sandbox agent home mirror {}: {source}",
+                    home.display()
+                ),
+                serde_json::json!({
+                    "error": "sandbox_agent_home_mirror_unavailable",
+                    "detail": source.to_string(),
+                    "path": home,
+                }),
+            )
+        })?;
+    }
+    manifest.env = sandbox_environment(
+        config,
+        root,
+        cwd,
+        path_prefixes,
+        agent_home_local.as_deref(),
+    );
+    manifest.mounts = agent_home_mounts(config)?;
+    manifest.updated_at = now;
+    let layout = store
+        .save_manifest(&manifest)
+        .map_err(sandbox_store_failure("save simple sandbox manifest"))?;
+    if let Some(home_sifs_path) = &config.agent_home_sifs_path {
+        fs::create_dir_all(&layout.home).map_err(|source| {
+            AgentToolResult::failed(
+                format!(
+                    "failed to create sandbox home {}: {source}",
+                    layout.home.display()
+                ),
+                serde_json::json!({
+                    "error": "sandbox_home_unavailable",
+                    "detail": source.to_string(),
+                    "path": layout.home,
+                }),
+            )
+        })?;
+        fs::create_dir_all(&layout.metadata).map_err(|source| {
+            AgentToolResult::failed(
+                format!(
+                    "failed to create sandbox metadata {}: {source}",
+                    layout.metadata.display()
+                ),
+                serde_json::json!({
+                    "error": "sandbox_metadata_unavailable",
+                    "detail": source.to_string(),
+                    "path": layout.metadata,
+                }),
+            )
+        })?;
+        let _ = fs::write(
+            layout.metadata.join("agent-home-sifs-path.txt"),
+            normalize_agent_home_sifs_path(home_sifs_path.clone()),
+        );
+        if let Some(home) = agent_home_local.as_deref() {
+            let _ = fs::write(
+                layout.metadata.join("agent-home-local-path.txt"),
+                home.display().to_string(),
+            );
+        }
+    }
+    Ok((manifest, layout))
+}
+
+fn sandbox_store_failure(
+    action: &'static str,
+) -> impl FnOnce(SandboxStoreError) -> AgentToolResult {
+    move |source| {
+        AgentToolResult::failed(
+            format!("{action} failed: {source}"),
+            serde_json::json!({
+                "error": "simple_sandbox_store_failed",
+                "action": action,
+                "detail": source.to_string(),
+            }),
+        )
+    }
+}
+
+fn agent_home_mounts(
+    config: &LocalWorkspaceAgentConfig,
+) -> Result<Vec<SandboxMount>, AgentToolResult> {
+    let Some(source_sifs_path) = &config.agent_home_sifs_path else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![SandboxMount {
+        source_sifs_path: normalize_agent_home_sifs_path(source_sifs_path.clone()),
+        mount_path: SandboxPath::new("/home").map_err(|source| {
+            AgentToolResult::failed(
+                format!("failed to prepare sandbox home mount: {source}"),
+                serde_json::json!({ "error": "sandbox_home_mount_invalid", "detail": source.to_string() }),
+            )
+        })?,
+        mode: SandboxMountMode::ReadWrite,
+    }])
+}
+
+fn agent_sandbox_policy() -> SandboxPolicy {
+    let mut policy = SandboxPolicy::default();
+    if !policy
+        .allowed_mount_prefixes
+        .iter()
+        .any(|prefix| prefix == AGENT_HOME_SIFS_ROOT)
+    {
+        policy
+            .allowed_mount_prefixes
+            .push(AGENT_HOME_SIFS_ROOT.to_string());
+    }
+    policy
+}
+
+fn sandbox_environment(
+    config: &LocalWorkspaceAgentConfig,
+    root: &Path,
+    cwd: &Path,
+    path_prefixes: &[PathBuf],
+    agent_home_local: Option<&Path>,
+) -> BTreeMap<String, String> {
+    let mut envs = BTreeMap::new();
+    if let Some(path) = sandbox_path_env(path_prefixes) {
+        envs.insert("PATH".to_string(), path);
+    }
+    envs.insert(
+        "SINOMO_AGENT_TOOL_RUNTIME".to_string(),
+        "simple_sandbox".to_string(),
+    );
+    envs.insert(
+        "SINOMO_WORKSPACE_ROOT".to_string(),
+        root.display().to_string(),
+    );
+    envs.insert(
+        "SINOMO_WORKSPACE_CWD".to_string(),
+        cwd.display().to_string(),
+    );
+    if let Some(home_sifs_path) = &config.agent_home_sifs_path {
+        envs.insert(
+            "SINOMO_AGENT_HOME_SIFS".to_string(),
+            normalize_agent_home_sifs_path(home_sifs_path.clone()),
+        );
+    }
+    if let Some(home) = agent_home_local {
+        let home = home.display().to_string();
+        envs.insert("HOME".to_string(), home.clone());
+        envs.insert("USERPROFILE".to_string(), home.clone());
+        envs.insert("SINOMO_AGENT_HOME_LOCAL".to_string(), home);
+    }
+    for name in [
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "RUSTC",
+        "RUSTDOC",
+        "RUSTC_WRAPPER",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    ] {
+        if let Ok(value) = env::var(name)
+            && !value.trim().is_empty()
+        {
+            envs.insert(name.to_string(), value);
+        }
+    }
+    if !envs.contains_key("CARGO_HOME")
+        && let Some(path) = user_home_path().map(|home| home.join(".cargo"))
+        && path.exists()
+    {
+        envs.insert("CARGO_HOME".to_string(), path.display().to_string());
+    }
+    if !envs.contains_key("RUSTUP_HOME")
+        && let Some(path) = user_home_path().map(|home| home.join(".rustup"))
+        && path.exists()
+    {
+        envs.insert("RUSTUP_HOME".to_string(), path.display().to_string());
+    }
+    envs
+}
+
+fn sandbox_extra_read_paths(
+    root: &Path,
+    cwd: &Path,
+    path_prefixes: &[PathBuf],
+    agent_home_local: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut paths = vec![root.to_path_buf(), cwd.to_path_buf()];
+    paths.extend(path_prefixes.iter().cloned());
+    if let Some(home) = agent_home_local {
+        paths.push(home.to_path_buf());
+    }
+    paths.extend(current_path_dirs());
+    paths.extend(toolchain_home_paths());
+    dedup_pathbufs(paths)
+}
+
+fn sandbox_extra_write_paths(root: &Path, agent_home_local: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = vec![root.to_path_buf()];
+    if let Some(home) = agent_home_local {
+        paths.push(home.to_path_buf());
+    }
+    dedup_pathbufs(paths)
+}
+
+fn sandbox_extra_execute_paths(path_prefixes: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    paths.extend(path_prefixes.iter().cloned());
+    paths.extend(current_path_dirs());
+    dedup_pathbufs(paths)
+}
+
+fn sandbox_path_env(path_prefixes: &[PathBuf]) -> Option<String> {
+    let mut entries = Vec::new();
+    entries.extend(path_prefixes.iter().cloned());
+    entries.extend(current_path_dirs());
+    let entries = dedup_pathbufs(entries);
+    env::join_paths(entries)
+        .ok()
+        .and_then(|value| value.into_string().ok())
+}
+
+fn current_path_dirs() -> Vec<PathBuf> {
+    env::var_os("PATH")
+        .map(|value| env::split_paths(&value).collect())
+        .unwrap_or_default()
+}
+
+fn toolchain_home_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for name in ["CARGO_HOME", "RUSTUP_HOME"] {
+        if let Some(path) = env::var_os(name).map(PathBuf::from)
+            && path.exists()
+        {
+            paths.push(path);
+        }
+    }
+    if let Some(home) = user_home_path() {
+        for child in [".cargo", ".rustup"] {
+            let path = home.join(child);
+            if path.exists() {
+                paths.push(path);
+            }
+        }
+    }
+    dedup_pathbufs(paths)
+}
+
+fn user_home_path() -> Option<PathBuf> {
+    env::var_os("USERPROFILE")
+        .or_else(|| env::var_os("HOME"))
+        .map(PathBuf::from)
+}
+
+fn dedup_pathbufs(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut unique = Vec::new();
+    for path in paths {
+        if !unique.iter().any(|existing| existing == &path) {
+            unique.push(path);
+        }
+    }
+    unique
+}
+
+fn agent_sandbox_id(root: &Path) -> SandboxId {
+    SandboxId::derived(
+        "sinomo-agent-local-workspace-sandbox",
+        root.to_string_lossy().as_bytes(),
+    )
+}
+
+fn default_agent_sandbox_runtime_root() -> PathBuf {
+    env::temp_dir().join("sinomo-agent").join("sandbox-runtime")
+}
+
+fn agent_home_local_mirror(config: &LocalWorkspaceAgentConfig) -> Option<PathBuf> {
+    let home_sifs_path = config
+        .agent_home_sifs_path
+        .as_ref()
+        .map(|path| normalize_agent_home_sifs_path(path.clone()))?;
+    let agent_id = home_sifs_path
+        .strip_prefix(&format!("{AGENT_HOME_SIFS_ROOT}/"))
+        .and_then(|path| path.strip_suffix("/home"))
+        .map(sanitize_agent_home_id)
+        .unwrap_or_else(|| "custom".to_string());
+    if let Some(root) = &config.agent_home_local_root {
+        return Some(root.join(agent_id).join("home"));
+    }
+    let digest = blake3::hash(home_sifs_path.as_bytes()).to_hex().to_string();
+    config
+        .sandbox_runtime_root
+        .join("agent-homes")
+        .join(format!("{agent_id}-{}", &digest[..16]))
+        .join("home")
+        .into()
+}
+
+fn default_agent_home_sifs_path_for_root(root: &Path) -> String {
+    let id = SandboxId::derived("sinomo-agent-home-root", root.to_string_lossy().as_bytes());
+    agent_home_sifs_path_for_id(&id.to_string())
+}
+
+fn default_agent_home_sifs_path_for_session(session_id: &SessionId) -> String {
+    agent_home_sifs_path_for_id(&session_id.to_string())
+}
+
+fn agent_home_sifs_path_for_id(agent_id: &str) -> String {
+    let agent_id = sanitize_agent_home_id(agent_id);
+    format!("{AGENT_HOME_SIFS_ROOT}/{agent_id}/home")
+}
+
+fn sanitize_agent_home_id(agent_id: &str) -> String {
+    let sanitized: String = agent_id
+        .trim()
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => ch,
+            _ => '-',
+        })
+        .collect();
+    let sanitized = sanitized.trim_matches('-').trim_matches('.').to_string();
+    if sanitized.is_empty() {
+        "default".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn normalize_agent_home_sifs_path(path: String) -> String {
+    let path = path
+        .trim()
+        .trim_start_matches("sifs://")
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .to_string();
+    if path.is_empty() {
+        agent_home_sifs_path_for_id("default")
+    } else {
+        format!("/{path}")
+    }
+}
+
+fn sandbox_path_for_host_path(path: &Path) -> Result<SandboxPath, AgentToolResult> {
+    SandboxPath::new(sandbox_path_string_for_host_path(path)?).map_err(|source| {
+        AgentToolResult::failed(
+            format!(
+                "failed to prepare sandbox cwd for {}: {source}",
+                path.display()
+            ),
+            serde_json::json!({
+                "error": "sandbox_cwd_invalid",
+                "detail": source.to_string(),
+                "path": path,
+            }),
+        )
+    })
+}
+
+#[cfg(windows)]
+fn sandbox_path_string_for_host_path(path: &Path) -> Result<String, AgentToolResult> {
+    let raw = path.display().to_string();
+    let raw = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    let normalized = raw.replace('\\', "/");
+    if normalized.as_bytes().get(1) == Some(&b':')
+        && normalized
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic)
+    {
+        Ok(format!("/{normalized}"))
+    } else {
+        Err(AgentToolResult::failed(
+            format!(
+                "sandbox cwd {} is not a supported Windows drive path",
+                path.display()
+            ),
+            serde_json::json!({
+                "error": "sandbox_cwd_unsupported",
+                "detail": "simple sandbox cwd supports local Windows drive paths only",
+                "path": path,
+            }),
+        ))
+    }
+}
+
+#[cfg(not(windows))]
+fn sandbox_path_string_for_host_path(path: &Path) -> Result<String, AgentToolResult> {
+    Ok(path.display().to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sandbox_process_snapshot(
+    process_id: &str,
+    command: &str,
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    status: AgentProcessLifecycleStatus,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    cancel_requested: bool,
+    error: Option<String>,
+    elapsed: Duration,
+    timeout_ms: Option<u64>,
+    stdout: &[u8],
+    stderr: &[u8],
+    max_output_bytes: usize,
+) -> AgentProcessSnapshot {
+    let stdout_text = truncate_utf8_lossy(stdout, max_output_bytes);
+    let stderr_text = truncate_utf8_lossy(stderr, max_output_bytes);
+    AgentProcessSnapshot {
+        process_id: process_id.to_string(),
+        command: command.to_string(),
+        program: program.to_string(),
+        args: args.to_vec(),
+        cwd: cwd.display().to_string(),
+        status,
+        exit_code,
+        timed_out,
+        cancel_requested,
+        error,
+        elapsed_ms: duration_ms_from_elapsed(elapsed),
+        timeout_ms,
+        stdout: stdout_text.text,
+        stderr: stderr_text.text,
+        stdout_offset: stdout.len().min(max_output_bytes),
+        stderr_offset: stderr.len().min(max_output_bytes),
+        stdout_total_bytes: stdout.len(),
+        stderr_total_bytes: stderr.len(),
+        stdout_truncated: stdout_text.truncated,
+        stderr_truncated: stderr_text.truncated,
+    }
 }
 
 fn duration_ms_from_elapsed(elapsed: Duration) -> u64 {
@@ -887,5 +1810,198 @@ fn truncate_utf8_lossy(bytes: &[u8], max_bytes: usize) -> TruncatedText {
     TruncatedText {
         text: String::from_utf8_lossy(&bytes[..bytes.len().min(max_bytes)]).to_string(),
         truncated,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_workspace_commands_default_to_simple_sandbox_with_agent_home() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-sandbox-default");
+        let config = LocalWorkspaceAgentConfig::new(&root);
+
+        assert_eq!(
+            config.command_runtime,
+            LocalWorkspaceCommandRuntime::SimpleSandbox
+        );
+        assert!(
+            config
+                .agent_home_sifs_path
+                .as_deref()
+                .is_some_and(|path| path.starts_with("/sinomo/agents/") && path.ends_with("/home"))
+        );
+    }
+
+    #[test]
+    fn simple_sandbox_manifest_mounts_agent_home_at_home() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-sandbox-home");
+        let runtime_root = root.join("sandbox-runtime");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let config = LocalWorkspaceAgentConfig::new(&workspace)
+            .with_sandbox_runtime_root(&runtime_root)
+            .with_agent_home_sifs_path("/sinomo/agents/test-agent/home");
+        let canonical_workspace = fs::canonicalize(&workspace).expect("canonical workspace");
+        let sandbox_id = agent_sandbox_id(&canonical_workspace);
+        let toolchain_id =
+            SandboxToolchainId::from_legacy_named(AGENT_SANDBOX_TOOLCHAIN_ID).expect("toolchain");
+        let store = LocalSandboxInstanceStore::new(&runtime_root);
+        let sandbox_cwd =
+            sandbox_path_for_host_path(&canonical_workspace).expect("sandbox cwd path");
+
+        let (_manifest, layout) = prepare_agent_sandbox_manifest(
+            &config,
+            &store,
+            &sandbox_id,
+            &toolchain_id,
+            sandbox_cwd,
+            &canonical_workspace,
+            &canonical_workspace,
+            &[],
+        )
+        .expect("manifest");
+        let (manifest, _layout) = store.load(&sandbox_id).expect("load manifest");
+
+        assert_eq!(manifest.mounts.len(), 1);
+        assert_eq!(
+            manifest.mounts[0].source_sifs_path,
+            "/sinomo/agents/test-agent/home"
+        );
+        assert_eq!(manifest.mounts[0].mount_path.as_str(), "/home");
+        assert_eq!(manifest.mounts[0].mode, SandboxMountMode::ReadWrite);
+        assert!(layout.home.exists());
+        let home_local = agent_home_local_mirror(&config).expect("local home mirror");
+        assert!(home_local.exists());
+        assert_eq!(
+            manifest.env.get("HOME").map(String::as_str),
+            Some(home_local.to_str().expect("utf8 home mirror"))
+        );
+        assert_eq!(
+            manifest.env.get("USERPROFILE").map(String::as_str),
+            Some(home_local.to_str().expect("utf8 home mirror"))
+        );
+        assert_eq!(
+            manifest
+                .env
+                .get("SINOMO_AGENT_HOME_LOCAL")
+                .map(String::as_str),
+            Some(home_local.to_str().expect("utf8 home mirror"))
+        );
+        assert_eq!(
+            fs::read_to_string(layout.metadata.join("agent-home-sifs-path.txt"))
+                .expect("home metadata"),
+            "/sinomo/agents/test-agent/home"
+        );
+        assert_eq!(
+            fs::read_to_string(layout.metadata.join("agent-home-local-path.txt"))
+                .expect("local home metadata"),
+            home_local.display().to_string()
+        );
+    }
+
+    #[test]
+    fn agent_home_local_mirror_roams_by_sifs_home_path() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-sandbox-home-roaming");
+        let runtime_root = root.join("sandbox-runtime");
+        let workspace_a = root.join("workspace-a");
+        let workspace_b = root.join("workspace-b");
+        fs::create_dir_all(&workspace_a).expect("workspace a");
+        fs::create_dir_all(&workspace_b).expect("workspace b");
+        let config_a = LocalWorkspaceAgentConfig::new(&workspace_a)
+            .with_sandbox_runtime_root(&runtime_root)
+            .with_agent_home_sifs_path("/sinomo/agents/test-agent/home");
+        let config_b = LocalWorkspaceAgentConfig::new(&workspace_b)
+            .with_sandbox_runtime_root(&runtime_root)
+            .with_agent_home_sifs_path("/sinomo/agents/test-agent/home");
+
+        assert_eq!(
+            agent_home_local_mirror(&config_a),
+            agent_home_local_mirror(&config_b)
+        );
+        assert!(
+            agent_home_local_mirror(&config_a)
+                .expect("local mirror")
+                .starts_with(runtime_root.join("agent-homes"))
+        );
+    }
+
+    #[test]
+    fn agent_home_local_mirror_uses_data_dir_agents_home_root() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-sandbox-home-data-dir");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let session_id = SessionId::from_legacy_named("sess-agent-home").expect("session");
+        let config = LocalWorkspaceAgentConfig::new(&workspace)
+            .with_data_dir_evidence(&data_dir, &session_id);
+        let agent_id = session_id.to_string();
+
+        assert_eq!(
+            config.agent_home_sifs_path.as_deref(),
+            Some(agent_home_sifs_path_for_id(&agent_id).as_str())
+        );
+        assert_eq!(
+            agent_home_local_mirror(&config),
+            Some(data_dir.root().join("agents").join(agent_id).join("home"))
+        );
+    }
+
+    #[test]
+    fn simple_sandbox_policy_allows_roaming_agent_home_prefix() {
+        let policy = agent_sandbox_policy();
+
+        assert!(
+            policy
+                .allowed_mount_prefixes
+                .iter()
+                .any(|prefix| prefix == "/sinomo/agents")
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn local_workspace_command_uses_simple_sandbox_on_windows() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-sandbox-command");
+        let runtime_root = root.join("sandbox-runtime");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let config = LocalWorkspaceAgentConfig::new(&workspace)
+            .with_sandbox_runtime_root(&runtime_root)
+            .allowing_shell_commands(true);
+        let args = vec![
+            "/C".to_string(),
+            "echo %SINOMO_AGENT_TOOL_RUNTIME% && echo %USERPROFILE% && echo roaming>%USERPROFILE%\\roaming.txt && type %USERPROFILE%\\roaming.txt".to_string(),
+        ];
+
+        let execution = execute_local_command(
+            &config,
+            "cmd.exe",
+            &args,
+            None,
+            Some(5000),
+            None,
+            &AgentCancellationToken::new(),
+            AgentToolProgressSink::default(),
+        )
+        .expect("sandbox command");
+
+        assert!(
+            execution.output.success,
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&execution.output.stdout),
+            String::from_utf8_lossy(&execution.output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&execution.output.stdout)
+                .to_ascii_lowercase()
+                .contains("simple_sandbox")
+        );
+        assert!(
+            String::from_utf8_lossy(&execution.output.stdout)
+                .to_ascii_lowercase()
+                .contains("roaming")
+        );
     }
 }

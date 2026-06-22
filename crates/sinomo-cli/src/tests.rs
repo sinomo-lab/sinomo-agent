@@ -7112,8 +7112,23 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
             read_only: true,
             allow_other: true,
             foreground: true,
+            sync_local_changes: false,
         })
     );
+    assert!(matches!(
+        parse_dfs_command(&[
+            "mount".to_string(),
+            "/mnt/agent-home".to_string(),
+            "--root".to_string(),
+            "/sinomo/agents/sess-agent/home".to_string(),
+            "--sync-local-changes".to_string(),
+        ])
+        .expect("dfs mount with local sync"),
+        DfsCliCommand::Mount(DfsMountOptions {
+            sync_local_changes: true,
+            ..
+        })
+    ));
     assert!(matches!(
         parse_dfs_command(&[
             "pin".to_string(),

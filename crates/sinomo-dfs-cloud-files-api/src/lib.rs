@@ -26,6 +26,8 @@ pub struct CloudFilesMountRequest {
     pub data_dir_root: Option<PathBuf>,
     #[serde(default)]
     pub read_only: bool,
+    #[serde(default)]
+    pub sync_local_changes: bool,
     #[serde(default = "default_provider_name")]
     pub provider_name: String,
     #[serde(default = "default_provider_version")]
@@ -45,6 +47,7 @@ impl CloudFilesMountRequest {
             root_path: "/".to_string(),
             data_dir_root: None,
             read_only: false,
+            sync_local_changes: false,
             provider_name: default_provider_name(),
             provider_version: default_provider_version(),
             prepopulate_depth: default_prepopulate_depth(),
@@ -112,5 +115,6 @@ mod tests {
         assert_eq!(request.provider_name, "Sinomo SIFS");
         assert_eq!(request.prepopulate_depth, 1);
         assert!(request.connect);
+        assert!(!request.sync_local_changes);
     }
 }

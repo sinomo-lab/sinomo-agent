@@ -2,8 +2,10 @@
 //!
 //! This runtime executes host binaries directly and exposes the host filesystem
 //! layout as-is. On Linux, it uses Landlock as a best-effort filesystem
-//! allowlist guard. This is intended to prevent accidental access to
-//! unapproved paths; it is not a hostile-code security boundary.
+//! allowlist guard. On Windows, it uses a restricted low-integrity token and
+//! labels configured write paths for low-integrity writes. This is intended to
+//! prevent accidental access to unapproved paths; it is not a hostile-code
+//! security boundary.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -606,6 +608,12 @@ fn resolve_native_cwd(
     match fs.host_path(cwd) {
         Ok(path) => Ok(path),
         Err(SandboxFsError::NotFound { .. }) => {
+            #[cfg(windows)]
+            if let Some(path) = windows_host_path_from_sandbox_path(cwd)
+                && path.exists()
+            {
+                return Ok(path);
+            }
             let path = PathBuf::from(cwd.as_str());
             if path.exists() {
                 Ok(path)
@@ -619,6 +627,20 @@ fn resolve_native_cwd(
         }
         Err(error) => Err(SandboxCommandExecutionError::Fs(error)),
     }
+}
+
+#[cfg(windows)]
+fn windows_host_path_from_sandbox_path(cwd: &SandboxPath) -> Option<PathBuf> {
+    let encoded = cwd.as_str().strip_prefix('/')?;
+    let bytes = encoded.as_bytes();
+    if bytes.len() < 2 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let mut host_path = String::with_capacity(encoded.len());
+    host_path.push(bytes[0] as char);
+    host_path.push(':');
+    host_path.push_str(&encoded[2..].replace('/', "\\"));
+    Some(PathBuf::from(host_path))
 }
 
 fn native_environment(
@@ -832,7 +854,7 @@ mod windows {
         config: &SandboxSimpleNativeConfig,
         limits: &SandboxResourceLimits,
     ) -> Result<NativeCommandOutput, SandboxWasiError> {
-        let low_integrity = match prepare_low_integrity_layout(layout) {
+        let low_integrity = match prepare_low_integrity_layout(layout, config) {
             Ok(()) => true,
             Err(error) if config.allow_unenforced => {
                 let _ = error;
@@ -1095,9 +1117,15 @@ mod windows {
 
     fn prepare_low_integrity_layout(
         layout: &LocalSandboxInstanceLayout,
+        config: &SandboxSimpleNativeConfig,
     ) -> Result<(), SandboxWasiError> {
         for dir in layout.required_dirs() {
             set_low_integrity_directory(dir)?;
+        }
+        for dir in &config.extra_write_paths {
+            if dir.exists() {
+                set_low_integrity_directory(dir)?;
+            }
         }
         Ok(())
     }
@@ -1876,6 +1904,163 @@ mod tests {
             &format!("printf no > {}", denied.display()),
             0,
         );
+        assert_ne!(outcome.response.exit_status, 0);
+        assert!(!denied.exists());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_sandbox_drive_path_decodes_to_host_path() {
+        let cwd = SandboxPath::new("/D:/Workspace/sinomo").expect("sandbox path");
+
+        let path = windows_host_path_from_sandbox_path(&cwd).expect("host path");
+
+        assert_eq!(path, PathBuf::from(r"D:\Workspace\sinomo"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn simple_native_windows_runs_restricted_cmd() {
+        let (_dir, store, sandbox_id) = create_store();
+        let node_id = NodeId::from_legacy_named("sandbox_simple_windows_test").expect("node");
+        let toolchain_store = sinomo_sandbox::LocalSandboxToolchainStore::new(std::env::temp_dir());
+
+        let outcome = runner()
+            .run_toolchain_command_with_stdin_policy_and_output_sink(
+                &store,
+                &toolchain_store,
+                &sandbox_id,
+                "cmd.exe",
+                vec![
+                    "cmd.exe".to_string(),
+                    "/C".to_string(),
+                    "echo ok".to_string(),
+                ],
+                None,
+                5000,
+                &node_id,
+                &SandboxPolicy::default(),
+                None,
+            )
+            .expect("simple-native Windows command");
+
+        assert_eq!(outcome.response.exit_status, 0);
+        assert!(
+            String::from_utf8_lossy(&outcome.stdout)
+                .to_ascii_lowercase()
+                .contains("ok")
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn simple_native_windows_allows_extra_write_paths() {
+        let (dir, store, sandbox_id) = create_store();
+        let allowed = dir.path().join("allowed-write");
+        fs::create_dir_all(&allowed).expect("allowed write dir");
+        let node_id = NodeId::from_legacy_named("sandbox_simple_windows_write_test").expect("node");
+        let toolchain_store = sinomo_sandbox::LocalSandboxToolchainStore::new(std::env::temp_dir());
+
+        let outcome = SandboxSimpleNativeCommandRunner::new(SandboxSimpleNativeConfig {
+            allow_unenforced: false,
+            extra_read_paths: vec![allowed.clone()],
+            extra_write_paths: vec![allowed.clone()],
+            extra_execute_paths: Vec::new(),
+        })
+        .run_toolchain_command_with_stdin_policy_and_output_sink(
+            &store,
+            &toolchain_store,
+            &sandbox_id,
+            "cmd.exe",
+            vec![
+                "cmd.exe".to_string(),
+                "/C".to_string(),
+                format!(
+                    "echo ok>{}\\out.txt && type {}\\out.txt",
+                    allowed.display(),
+                    allowed.display()
+                ),
+            ],
+            None,
+            5000,
+            &node_id,
+            &SandboxPolicy::default(),
+            None,
+        )
+        .expect("simple-native Windows command");
+
+        assert_eq!(
+            outcome.response.exit_status,
+            0,
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&outcome.stdout),
+            String::from_utf8_lossy(&outcome.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(allowed.join("out.txt")).expect("written file"),
+            "ok \r\n"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn simple_native_windows_blocks_unlabeled_host_read() {
+        let (dir, store, sandbox_id) = create_store();
+        let secret = dir.path().join("outside-sandbox-secret.txt");
+        fs::write(&secret, "outside-secret").expect("secret");
+        let node_id = NodeId::from_legacy_named("sandbox_simple_windows_read_gap").expect("node");
+        let toolchain_store = sinomo_sandbox::LocalSandboxToolchainStore::new(std::env::temp_dir());
+
+        let outcome = runner()
+            .run_toolchain_command_with_stdin_policy_and_output_sink(
+                &store,
+                &toolchain_store,
+                &sandbox_id,
+                "cmd.exe",
+                vec![
+                    "cmd.exe".to_string(),
+                    "/C".to_string(),
+                    format!("type \"{}\"", secret.display()),
+                ],
+                None,
+                5000,
+                &node_id,
+                &SandboxPolicy::default(),
+                None,
+            )
+            .expect("simple-native Windows host read command");
+
+        assert_ne!(outcome.response.exit_status, 0);
+        assert!(!String::from_utf8_lossy(&outcome.stdout).contains("outside-secret"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn simple_native_windows_blocks_unapproved_host_write() {
+        let (dir, store, sandbox_id) = create_store();
+        let denied = dir.path().join("denied.txt");
+        let node_id = NodeId::from_legacy_named("sandbox_simple_windows_write_gap").expect("node");
+        let toolchain_store = sinomo_sandbox::LocalSandboxToolchainStore::new(std::env::temp_dir());
+
+        let outcome = runner()
+            .run_toolchain_command_with_stdin_policy_and_output_sink(
+                &store,
+                &toolchain_store,
+                &sandbox_id,
+                "cmd.exe",
+                vec![
+                    "cmd.exe".to_string(),
+                    "/C".to_string(),
+                    format!("echo no>{}", denied.display()),
+                ],
+                None,
+                5000,
+                &node_id,
+                &SandboxPolicy::default(),
+                None,
+            )
+            .expect("simple-native Windows host write command");
+
         assert_ne!(outcome.response.exit_status, 0);
         assert!(!denied.exists());
     }

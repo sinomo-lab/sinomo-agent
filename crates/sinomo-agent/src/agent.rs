@@ -14235,7 +14235,9 @@ mod tests {
         fs::write(root.join("hello.txt"), "new\n").expect("modify file");
         fs::write(root.join("new.txt"), "untracked\n").expect("untracked file");
         let registry = AgentToolRegistry::local_workspace_with_config(
-            LocalWorkspaceAgentConfig::new(&root).with_evidence_dir(&evidence_dir),
+            LocalWorkspaceAgentConfig::new(&root)
+                .using_local_process_commands()
+                .with_evidence_dir(&evidence_dir),
         );
         let input = agent_input("inspect git state");
 
@@ -14308,7 +14310,9 @@ mod tests {
         fs::set_permissions(&fake_git, permissions).expect("chmod fake git");
         let fake_git_program = fake_git.display().to_string();
         let registry = AgentToolRegistry::local_workspace_with_config(
-            LocalWorkspaceAgentConfig::new(&root).with_git_program(fake_git_program.clone()),
+            LocalWorkspaceAgentConfig::new(&root)
+                .using_local_process_commands()
+                .with_git_program(fake_git_program.clone()),
         );
         let input = agent_input("cancel git status");
         let cancellation_token = AgentCancellationToken::new();
@@ -14380,7 +14384,9 @@ mod tests {
         let subdir = root.join("subdir");
         fs::create_dir_all(&subdir).expect("workspace");
         let registry = AgentToolRegistry::local_workspace_with_config(
-            LocalWorkspaceAgentConfig::new(&root).allowing_shell_commands(true),
+            LocalWorkspaceAgentConfig::new(&root)
+                .using_local_process_commands()
+                .allowing_shell_commands(true),
         );
         let input = agent_input("command timeout");
 
@@ -14427,7 +14433,9 @@ mod tests {
         }
         let root = sinomo_testdir::TestDir::new("sinomo-agent-command-pipefail");
         let registry = AgentToolRegistry::local_workspace_with_config(
-            LocalWorkspaceAgentConfig::new(&root).allowing_shell_commands(true),
+            LocalWorkspaceAgentConfig::new(&root)
+                .using_local_process_commands()
+                .allowing_shell_commands(true),
         );
         let input = agent_input("command pipefail");
 
@@ -14469,6 +14477,7 @@ mod tests {
         let data_dir = SinomoDataDir::new(&data_root);
         let input = agent_input("structured command output");
         let mut config = LocalWorkspaceAgentConfig::new(&root)
+            .using_local_process_commands()
             .allowing_shell_commands(true)
             .with_data_dir_evidence(&data_dir, &input.session.session_id);
         config.max_command_output_bytes = 4;
@@ -15361,6 +15370,7 @@ old
         let model = SequencedModel::new([patch_turn, validation_turn]);
         let config = LocalWorkspaceAgentConfig::new(&root)
             .allowing_file_writes(true)
+            .using_local_process_commands()
             .allowing_shell_commands(true)
             .with_evidence_dir(&evidence_dir);
         let agent = Agent::new(model, "fake", "fake")
@@ -16345,7 +16355,9 @@ old
         let agent_config = AgentConfig::new("fake", "fake")
             .with_task_ref(task.clone())
             .with_max_steps(4);
-        let workspace_config = LocalWorkspaceAgentConfig::new(&root).allowing_shell_commands(true);
+        let workspace_config = LocalWorkspaceAgentConfig::new(&root)
+            .using_local_process_commands()
+            .allowing_shell_commands(true);
         let agent = Agent::new(model, "fake", "fake")
             .with_config(agent_config)
             .with_tool_registry(AgentToolRegistry::local_workspace_with_config(

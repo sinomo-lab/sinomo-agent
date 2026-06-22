@@ -1,10 +1,15 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{OsStr, c_void};
 use std::fs;
+use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::os::windows::fs::MetadataExt;
+use std::path::{Component, Path, PathBuf};
 use std::ptr;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{
+    Arc, Mutex, MutexGuard,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,8 +20,8 @@ use sinomo_runtime::core::ClusterEndpointRecord;
 use sinomo_runtime::daemon;
 use sinomo_runtime::dfs::{
     self, DfsControlPlaneKvClient, DfsMessageCommand, DfsMessageResponse, DfsMessageTransport,
-    DfsObjectKind, DfsPosixError, DfsRoutedMessage, DfsTransportIdentity, LocalContentStore,
-    NetworkedDfsService,
+    DfsObjectKind, DfsPosixError, DfsRoutedMessage, DfsTransportIdentity, DfsWriteOptions,
+    LocalContentStore, NetworkedDfsService,
 };
 use sinomo_runtime::kv::{
     KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse, read_cluster_kv_entry,
@@ -26,8 +31,9 @@ use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, NetworkError};
 use sinomo_runtime::node::NodeId;
 use windows::Win32::Foundation::{
-    NTSTATUS, STATUS_FILE_IS_A_DIRECTORY, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
-    STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
+    CloseHandle, HANDLE, NTSTATUS, STATUS_FILE_IS_A_DIRECTORY, STATUS_NOT_A_DIRECTORY,
+    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_SUCCESS, STATUS_UNSUCCESSFUL, WAIT_FAILED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows::Win32::Storage::CloudFilters::{
     CF_CALLBACK_INFO, CF_CALLBACK_PARAMETERS, CF_CALLBACK_REGISTRATION,
@@ -46,16 +52,29 @@ use windows::Win32::Storage::CloudFilters::{
     CfDisconnectSyncRoot, CfExecute, CfRegisterSyncRoot,
 };
 use windows::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_BASIC_INFO,
+    CreateFileW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED,
+    FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+    FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_CREATION,
+    FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
+    FILE_NOTIFY_CHANGE_SIZE, FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING, ReadDirectoryChangesW,
 };
+use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::{GUID, PCWSTR};
 
 use crate::{host_is_cancelled, host_log};
 
 const DEFAULT_CLOUD_FILES_TIMEOUT: Duration = Duration::from_secs(3);
+const LOCAL_CHANGE_DEBOUNCE: Duration = Duration::from_millis(100);
+const LOCAL_CHANGE_WAIT_MS: u32 = 250;
+const LOCAL_CHANGE_BUFFER_U32S: usize = 16 * 1024;
 const WINDOWS_TICKS_PER_SECOND: u64 = 10_000_000;
 const UNIX_EPOCH_AS_WINDOWS_FILETIME: u64 = 116_444_736 * WINDOWS_TICKS_PER_SECOND;
 const CLOUD_FILES_PROVIDER_ID: GUID = GUID::from_u128(0xa318f9ce_140b_41bc_9e44_d0f154459584);
+const ERROR_IO_PENDING_HRESULT: i32 = 0x800703E5u32 as i32;
 
 type SifsService = NetworkedDfsService<DfsCloudFilesEndpointTransport>;
 
@@ -72,7 +91,7 @@ pub fn mount_sifs_cloud_files(
     })?;
 
     let opened = open_sifs_service(request.data_dir_root.clone())?;
-    let provider = Box::new(CloudFilesProvider::new(
+    let provider = Arc::new(CloudFilesProvider::new(
         opened.service,
         request.sync_root.clone(),
         request.root_path.clone(),
@@ -90,28 +109,22 @@ pub fn mount_sifs_cloud_files(
         });
     }
 
-    let provider_ptr = Box::into_raw(provider);
     let callback_table = callback_table();
     let sync_root_wide = wide_path(&request.sync_root);
     let connection = unsafe {
         CfConnectSyncRoot(
             PCWSTR(sync_root_wide.as_ptr()),
             callback_table.as_ptr(),
-            Some(provider_ptr.cast::<c_void>() as *const c_void),
+            Some(Arc::as_ptr(&provider).cast::<c_void>() as *const c_void),
             CF_CONNECT_FLAG_NONE,
         )
     }
-    .map_err(|source| {
-        unsafe {
-            drop(Box::from_raw(provider_ptr));
-        }
-        CloudFilesModuleError {
-            code: "connect-sync-root".to_string(),
-            detail: format!(
-                "connect Cloud Files sync root {}: {source}",
-                request.sync_root.display()
-            ),
-        }
+    .map_err(|source| CloudFilesModuleError {
+        code: "connect-sync-root".to_string(),
+        detail: format!(
+            "connect Cloud Files sync root {}: {source}",
+            request.sync_root.display()
+        ),
     })?;
 
     host_log(&format!(
@@ -119,6 +132,15 @@ pub fn mount_sifs_cloud_files(
         request.sync_root.display(),
         request.root_path
     ));
+    let local_sync_shutdown = Arc::new(AtomicBool::new(false));
+    let local_sync_thread = if request.sync_local_changes && !request.read_only {
+        Some(start_local_change_sync(
+            Arc::clone(&provider),
+            Arc::clone(&local_sync_shutdown),
+        ))
+    } else {
+        None
+    };
     let started = Instant::now();
     loop {
         if host_is_cancelled() {
@@ -131,9 +153,12 @@ pub fn mount_sifs_cloud_files(
         }
         thread::sleep(Duration::from_millis(250));
     }
+    local_sync_shutdown.store(true, Ordering::SeqCst);
+    if let Some(handle) = local_sync_thread {
+        let _ = handle.join();
+    }
     unsafe {
         let _ = CfDisconnectSyncRoot(connection);
-        drop(Box::from_raw(provider_ptr));
     }
     Ok(CloudFilesMountResponse {
         sync_root: request.sync_root,
@@ -355,6 +380,15 @@ impl CloudFilesProvider {
         self.dfs.lock().map_err(|_| STATUS_UNSUCCESSFUL)
     }
 
+    fn lock_dfs_for_local_sync(
+        &self,
+    ) -> Result<MutexGuard<'_, SifsService>, CloudFilesModuleError> {
+        self.dfs.lock().map_err(|_| CloudFilesModuleError {
+            code: "local-sync-lock".to_string(),
+            detail: "Cloud Files SIFS service lock is poisoned".to_string(),
+        })
+    }
+
     fn prepopulate(&self, depth: u32) -> Result<u64, CloudFilesModuleError> {
         if depth == 0 {
             return Ok(0);
@@ -429,6 +463,443 @@ impl CloudFilesProvider {
                 .map_err(ntstatus_for_posix_error)?
         };
         Ok(slice_bytes(&bytes, offset as usize, len))
+    }
+
+    fn apply_local_change(
+        &self,
+        change: &LocalChange,
+    ) -> Result<LocalSyncOutcome, CloudFilesModuleError> {
+        if self.read_only {
+            return Ok(LocalSyncOutcome::Skipped);
+        }
+        match change.action {
+            LocalChangeAction::Remove => self.remove_local_path_from_sifs(&change.relative_path),
+            LocalChangeAction::Upsert => self.upsert_local_path_to_sifs(&change.relative_path),
+        }
+    }
+
+    fn upsert_local_path_to_sifs(
+        &self,
+        relative_path: &Path,
+    ) -> Result<LocalSyncOutcome, CloudFilesModuleError> {
+        let local_path = self.sync_root.join(relative_path);
+        let metadata = match fs::symlink_metadata(&local_path) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return self.remove_local_path_from_sifs(relative_path);
+            }
+            Err(source) => {
+                return Err(CloudFilesModuleError {
+                    code: "local-sync-stat".to_string(),
+                    detail: format!("stat local changed path {}: {source}", local_path.display()),
+                });
+            }
+        };
+        if metadata.file_type().is_symlink() || is_cloud_files_recall_placeholder(&metadata) {
+            return Ok(LocalSyncOutcome::Skipped);
+        }
+        let sifs_path = local_relative_path_to_sifs(&self.root_path, relative_path)?;
+        if metadata.is_dir() {
+            let mut dfs = self.lock_dfs_for_local_sync()?;
+            dfs.posix_mkdir_all(&sifs_path)
+                .map_err(local_sync_posix_error("local-sync-mkdir", &sifs_path))?;
+            return Ok(LocalSyncOutcome::Uploaded);
+        }
+        if !metadata.is_file() {
+            return Ok(LocalSyncOutcome::Skipped);
+        }
+        let bytes = read_local_file_after_debounce(&local_path)?;
+        let parent = sifs_parent_path(&sifs_path);
+        let mut dfs = self.lock_dfs_for_local_sync()?;
+        if let Some(parent) = parent
+            && parent != "/"
+        {
+            dfs.posix_mkdir_all(parent)
+                .map_err(local_sync_posix_error("local-sync-parent", parent))?;
+        }
+        let options = DfsWriteOptions::replicated_eventual(vec![dfs.node_id().clone()]);
+        dfs.posix_write_file(&sifs_path, &bytes, options)
+            .map_err(local_sync_posix_error("local-sync-write", &sifs_path))?;
+        Ok(LocalSyncOutcome::Uploaded)
+    }
+
+    fn remove_local_path_from_sifs(
+        &self,
+        relative_path: &Path,
+    ) -> Result<LocalSyncOutcome, CloudFilesModuleError> {
+        let sifs_path = local_relative_path_to_sifs(&self.root_path, relative_path)?;
+        if sifs_path == self.root_path {
+            return Ok(LocalSyncOutcome::Skipped);
+        }
+        let mut dfs = self.lock_dfs_for_local_sync()?;
+        match dfs.posix_unlink(&sifs_path) {
+            Ok(_) | Err(DfsPosixError::NotFound { .. }) => Ok(LocalSyncOutcome::Uploaded),
+            Err(DfsPosixError::IsDirectory { .. }) => match dfs.posix_rmdir(&sifs_path) {
+                Ok(_) | Err(DfsPosixError::NotFound { .. }) => Ok(LocalSyncOutcome::Uploaded),
+                Err(DfsPosixError::DirectoryNotEmpty { .. }) => Ok(LocalSyncOutcome::Skipped),
+                Err(source) => Err(local_sync_posix_error("local-sync-rmdir", &sifs_path)(
+                    source,
+                )),
+            },
+            Err(source) => Err(local_sync_posix_error("local-sync-unlink", &sifs_path)(
+                source,
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalChangeAction {
+    Upsert,
+    Remove,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalChange {
+    action: LocalChangeAction,
+    relative_path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalSyncOutcome {
+    Uploaded,
+    Skipped,
+}
+
+struct OwnedHandle(HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+fn start_local_change_sync(
+    provider: Arc<CloudFilesProvider>,
+    shutdown: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        if let Err(error) = run_local_change_sync(provider, shutdown) {
+            host_log(&format!(
+                "Cloud Files local-change sync stopped: {}: {}",
+                error.code, error.detail
+            ));
+        }
+    })
+}
+
+fn run_local_change_sync(
+    provider: Arc<CloudFilesProvider>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), CloudFilesModuleError> {
+    let directory = open_local_sync_root(&provider.sync_root)?;
+    host_log(&format!(
+        "Cloud Files local-change sync watching {} -> {}",
+        provider.sync_root.display(),
+        provider.root_path
+    ));
+    let mut buffer = vec![0u32; LOCAL_CHANGE_BUFFER_U32S];
+    loop {
+        if shutdown.load(Ordering::SeqCst) || host_is_cancelled() {
+            return Ok(());
+        }
+        let event = create_local_sync_event()?;
+        let mut overlapped = OVERLAPPED {
+            hEvent: event.0,
+            ..Default::default()
+        };
+        let read_result = unsafe {
+            ReadDirectoryChangesW(
+                directory.0,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                (buffer.len() * std::mem::size_of::<u32>()) as u32,
+                true,
+                local_change_notify_filter(),
+                None,
+                Some(&mut overlapped),
+                None,
+            )
+        };
+        if let Err(source) = read_result
+            && source.code().0 != ERROR_IO_PENDING_HRESULT
+        {
+            return Err(CloudFilesModuleError {
+                code: "local-sync-watch".to_string(),
+                detail: format!(
+                    "watch local sync root {}: {source}",
+                    provider.sync_root.display()
+                ),
+            });
+        }
+        loop {
+            match unsafe { WaitForSingleObject(event.0, LOCAL_CHANGE_WAIT_MS) } {
+                WAIT_OBJECT_0 => break,
+                WAIT_TIMEOUT => {
+                    if shutdown.load(Ordering::SeqCst) || host_is_cancelled() {
+                        let _ = unsafe {
+                            CancelIoEx(directory.0, Some(&overlapped as *const OVERLAPPED))
+                        };
+                        return Ok(());
+                    }
+                }
+                WAIT_FAILED => {
+                    let _ =
+                        unsafe { CancelIoEx(directory.0, Some(&overlapped as *const OVERLAPPED)) };
+                    return Err(CloudFilesModuleError {
+                        code: "local-sync-wait".to_string(),
+                        detail: format!(
+                            "wait for local sync changes under {} failed",
+                            provider.sync_root.display()
+                        ),
+                    });
+                }
+                other => {
+                    let _ =
+                        unsafe { CancelIoEx(directory.0, Some(&overlapped as *const OVERLAPPED)) };
+                    return Err(CloudFilesModuleError {
+                        code: "local-sync-wait".to_string(),
+                        detail: format!("unexpected local sync wait result {other:?}"),
+                    });
+                }
+            }
+        }
+        let mut bytes_returned = 0;
+        if let Err(source) =
+            unsafe { GetOverlappedResult(directory.0, &overlapped, &mut bytes_returned, false) }
+        {
+            host_log(&format!(
+                "Cloud Files local-change sync read result failed for {}: {source}",
+                provider.sync_root.display()
+            ));
+            continue;
+        }
+        if bytes_returned == 0 {
+            continue;
+        }
+        let changes =
+            coalesce_local_changes(parse_local_changes(&buffer, bytes_returned as usize)?);
+        if changes.is_empty() {
+            continue;
+        }
+        thread::sleep(LOCAL_CHANGE_DEBOUNCE);
+        let mut uploaded = 0usize;
+        let mut skipped = 0usize;
+        for change in changes {
+            match provider.apply_local_change(&change) {
+                Ok(LocalSyncOutcome::Uploaded) => uploaded += 1,
+                Ok(LocalSyncOutcome::Skipped) => skipped += 1,
+                Err(error) => host_log(&format!(
+                    "Cloud Files local-change sync failed for {}: {}: {}",
+                    change.relative_path.display(),
+                    error.code,
+                    error.detail
+                )),
+            }
+        }
+        if uploaded > 0 {
+            host_log(&format!(
+                "Cloud Files local-change sync uploaded {uploaded} changes (skipped {skipped})"
+            ));
+        }
+    }
+}
+
+fn open_local_sync_root(path: &Path) -> Result<OwnedHandle, CloudFilesModuleError> {
+    let path_wide = wide_path(path);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path_wide.as_ptr()),
+            FILE_LIST_DIRECTORY.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+            None,
+        )
+    }
+    .map_err(|source| CloudFilesModuleError {
+        code: "local-sync-open".to_string(),
+        detail: format!("open local sync root {}: {source}", path.display()),
+    })?;
+    Ok(OwnedHandle(handle))
+}
+
+fn create_local_sync_event() -> Result<OwnedHandle, CloudFilesModuleError> {
+    let event = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }.map_err(|source| {
+        CloudFilesModuleError {
+            code: "local-sync-event".to_string(),
+            detail: format!("create local sync change event: {source}"),
+        }
+    })?;
+    Ok(OwnedHandle(event))
+}
+
+fn local_change_notify_filter() -> windows::Win32::Storage::FileSystem::FILE_NOTIFY_CHANGE {
+    FILE_NOTIFY_CHANGE_FILE_NAME
+        | FILE_NOTIFY_CHANGE_DIR_NAME
+        | FILE_NOTIFY_CHANGE_SIZE
+        | FILE_NOTIFY_CHANGE_LAST_WRITE
+        | FILE_NOTIFY_CHANGE_CREATION
+}
+
+fn parse_local_changes(
+    buffer: &[u32],
+    bytes_returned: usize,
+) -> Result<Vec<LocalChange>, CloudFilesModuleError> {
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            buffer.as_ptr().cast::<u8>(),
+            buffer.len() * size_of::<u32>(),
+        )
+    };
+    if bytes_returned > bytes.len() {
+        return Err(CloudFilesModuleError {
+            code: "local-sync-parse".to_string(),
+            detail: "local sync notification byte count exceeds buffer size".to_string(),
+        });
+    }
+    let mut offset = 0usize;
+    let mut changes = Vec::new();
+    while offset < bytes_returned {
+        let fixed_len = size_of::<FILE_NOTIFY_INFORMATION>() - size_of::<u16>();
+        if offset + fixed_len > bytes_returned {
+            return Err(CloudFilesModuleError {
+                code: "local-sync-parse".to_string(),
+                detail: "local sync notification buffer is truncated".to_string(),
+            });
+        }
+        let info = unsafe { &*(bytes.as_ptr().add(offset).cast::<FILE_NOTIFY_INFORMATION>()) };
+        let name_bytes = info.FileNameLength as usize;
+        if offset + fixed_len + name_bytes > bytes_returned {
+            return Err(CloudFilesModuleError {
+                code: "local-sync-parse".to_string(),
+                detail: "local sync notification name is truncated".to_string(),
+            });
+        }
+        let name_units = name_bytes / size_of::<u16>();
+        let name = unsafe { std::slice::from_raw_parts(info.FileName.as_ptr(), name_units) };
+        if let Some(action) = local_change_action(info.Action) {
+            changes.push(LocalChange {
+                action,
+                relative_path: PathBuf::from(String::from_utf16_lossy(name)),
+            });
+        }
+        if info.NextEntryOffset == 0 {
+            break;
+        }
+        offset = offset.saturating_add(info.NextEntryOffset as usize);
+    }
+    Ok(changes)
+}
+
+fn local_change_action(
+    action: windows::Win32::Storage::FileSystem::FILE_ACTION,
+) -> Option<LocalChangeAction> {
+    match action {
+        FILE_ACTION_ADDED | FILE_ACTION_MODIFIED | FILE_ACTION_RENAMED_NEW_NAME => {
+            Some(LocalChangeAction::Upsert)
+        }
+        FILE_ACTION_REMOVED | FILE_ACTION_RENAMED_OLD_NAME => Some(LocalChangeAction::Remove),
+        _ => None,
+    }
+}
+
+fn coalesce_local_changes(changes: Vec<LocalChange>) -> Vec<LocalChange> {
+    let mut by_path = BTreeMap::<PathBuf, LocalChange>::new();
+    for change in changes {
+        if change.relative_path.as_os_str().is_empty() {
+            continue;
+        }
+        by_path.insert(change.relative_path.clone(), change);
+    }
+    by_path.into_values().collect()
+}
+
+fn local_relative_path_to_sifs(
+    root_path: &str,
+    relative_path: &Path,
+) -> Result<String, CloudFilesModuleError> {
+    let root_path = normalize_sifs_root(root_path)?;
+    let mut path = if root_path == "/" {
+        String::new()
+    } else {
+        root_path.trim_end_matches('/').to_string()
+    };
+    for component in relative_path.components() {
+        let Component::Normal(part) = component else {
+            return Err(CloudFilesModuleError {
+                code: "local-sync-path".to_string(),
+                detail: format!(
+                    "local sync path `{}` contains a non-normal path component",
+                    relative_path.display()
+                ),
+            });
+        };
+        let Some(part) = part.to_str() else {
+            return Err(CloudFilesModuleError {
+                code: "local-sync-path".to_string(),
+                detail: format!(
+                    "local sync path `{}` is not valid UTF-8",
+                    relative_path.display()
+                ),
+            });
+        };
+        path.push('/');
+        path.push_str(part);
+    }
+    if path.is_empty() {
+        Ok("/".to_string())
+    } else {
+        Ok(path)
+    }
+}
+
+fn sifs_parent_path(path: &str) -> Option<&str> {
+    let normalized = path.trim_end_matches('/');
+    if normalized == "/" {
+        return None;
+    }
+    let index = normalized.rfind('/')?;
+    if index == 0 {
+        Some("/")
+    } else {
+        Some(&normalized[..index])
+    }
+}
+
+fn is_cloud_files_recall_placeholder(metadata: &fs::Metadata) -> bool {
+    let attributes = metadata.file_attributes();
+    attributes & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS.0 != 0
+        || attributes & FILE_ATTRIBUTE_RECALL_ON_OPEN.0 != 0
+}
+
+fn read_local_file_after_debounce(path: &Path) -> Result<Vec<u8>, CloudFilesModuleError> {
+    let mut last_error = None;
+    for _ in 0..3 {
+        match fs::read(path) {
+            Ok(bytes) => return Ok(bytes),
+            Err(source) => {
+                last_error = Some(source);
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    let source = last_error.expect("read attempted at least once");
+    Err(CloudFilesModuleError {
+        code: "local-sync-read".to_string(),
+        detail: format!("read changed local file {}: {source}", path.display()),
+    })
+}
+
+fn local_sync_posix_error<'a>(
+    code: &'static str,
+    path: &'a str,
+) -> impl FnOnce(DfsPosixError) -> CloudFilesModuleError + 'a {
+    move |source| CloudFilesModuleError {
+        code: code.to_string(),
+        detail: format!("{path}: {source}"),
     }
 }
 
@@ -953,5 +1424,46 @@ mod tests {
         assert!(is_visible_placeholder_kind(&DfsObjectKind::File));
         assert!(is_visible_placeholder_kind(&DfsObjectKind::Directory));
         assert!(!is_visible_placeholder_kind(&DfsObjectKind::Tombstone));
+    }
+
+    #[test]
+    fn local_relative_path_maps_under_sifs_root() {
+        assert_eq!(
+            local_relative_path_to_sifs(
+                "/sinomo/agents/sess-agent/home",
+                Path::new("nested").join("note.txt").as_path()
+            )
+            .expect("path"),
+            "/sinomo/agents/sess-agent/home/nested/note.txt"
+        );
+        assert_eq!(
+            local_relative_path_to_sifs("/", Path::new("users").join("a.txt").as_path())
+                .expect("root path"),
+            "/users/a.txt"
+        );
+    }
+
+    #[test]
+    fn local_relative_path_rejects_parent_components() {
+        assert!(
+            local_relative_path_to_sifs("/users", Path::new("..").join("x").as_path()).is_err()
+        );
+    }
+
+    #[test]
+    fn local_change_coalescing_keeps_last_action_for_path() {
+        let changes = coalesce_local_changes(vec![
+            LocalChange {
+                action: LocalChangeAction::Remove,
+                relative_path: PathBuf::from("note.txt"),
+            },
+            LocalChange {
+                action: LocalChangeAction::Upsert,
+                relative_path: PathBuf::from("note.txt"),
+            },
+        ]);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].action, LocalChangeAction::Upsert);
     }
 }
