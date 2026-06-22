@@ -6344,6 +6344,7 @@ dependencies = [
  "sinomo-sandbox",
  "sinomo-testdir",
  "time",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

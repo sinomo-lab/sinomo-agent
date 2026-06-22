@@ -40,7 +40,7 @@ pub const SINOMO_SANDBOX_SIMPLE_EXECUTE_PATHS_ENV: &str = "SINOMO_SANDBOX_SIMPLE
 
 const SIMPLE_NATIVE_WAIT_POLL_MS: u64 = 50;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SandboxSimpleNativeConfig {
     pub allow_unenforced: bool,
     pub extra_read_paths: Vec<PathBuf>,
@@ -56,17 +56,6 @@ impl SandboxSimpleNativeConfig {
             extra_write_paths: env_path_list(SINOMO_SANDBOX_SIMPLE_WRITE_PATHS_ENV),
             extra_execute_paths: env_path_list(SINOMO_SANDBOX_SIMPLE_EXECUTE_PATHS_ENV),
         })
-    }
-}
-
-impl Default for SandboxSimpleNativeConfig {
-    fn default() -> Self {
-        Self {
-            allow_unenforced: false,
-            extra_read_paths: Vec::new(),
-            extra_write_paths: Vec::new(),
-            extra_execute_paths: Vec::new(),
-        }
     }
 }
 
@@ -224,26 +213,26 @@ impl SandboxSimpleNativeCommandRunner {
         let timeout_ms =
             effective_sandbox_timeout_ms(request.timeout_ms, manifest.limits.wall_time_ms);
 
-        if let Some(stdin) = &request.stdin {
-            if stdin.len() as u64 > manifest.limits.max_input_bytes {
-                let error = SandboxWasiError::InputLimitExceeded {
-                    limit: manifest.limits.max_input_bytes.min(usize::MAX as u64) as usize,
-                };
-                persist_failed_command(
-                    store,
-                    manifest,
-                    layout,
-                    &command_id,
-                    &request,
-                    started_at,
-                    None,
-                    Vec::new(),
-                    Vec::new(),
-                    sandbox_command_record_status_for_wasi_error(&error),
-                    error.to_string(),
-                )?;
-                return Err(error.into());
-            }
+        if let Some(stdin) = &request.stdin
+            && stdin.len() as u64 > manifest.limits.max_input_bytes
+        {
+            let error = SandboxWasiError::InputLimitExceeded {
+                limit: manifest.limits.max_input_bytes.min(usize::MAX as u64) as usize,
+            };
+            persist_failed_command(
+                store,
+                manifest,
+                layout,
+                &command_id,
+                &request,
+                started_at,
+                None,
+                Vec::new(),
+                Vec::new(),
+                sandbox_command_record_status_for_wasi_error(&error),
+                error.to_string(),
+            )?;
+            return Err(error.into());
         }
 
         let sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
@@ -281,7 +270,7 @@ impl SandboxSimpleNativeCommandRunner {
         };
 
         let wall_time_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        let exit_status = exit_status_code(&output);
+        let exit_status = output.exit_status;
         let stdout = output.stdout;
         let stderr = output.stderr;
         let output_bytes = stdout.len().saturating_add(stderr.len()) as u64;
@@ -381,6 +370,13 @@ struct SandboxSimpleNativePolicy {
     execute_paths: Vec<PathBuf>,
 }
 
+#[derive(Debug)]
+struct NativeCommandOutput {
+    exit_status: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
 impl SandboxSimpleNativePolicy {
     fn for_layout(layout: &LocalSandboxInstanceLayout, config: &SandboxSimpleNativeConfig) -> Self {
         let mut read_paths = existing_paths([
@@ -454,7 +450,29 @@ fn execute_native_command(
     timeout_ms: u64,
     config: &SandboxSimpleNativeConfig,
     limits: &SandboxResourceLimits,
-) -> Result<Output, SandboxWasiError> {
+) -> Result<NativeCommandOutput, SandboxWasiError> {
+    #[cfg(windows)]
+    {
+        let _ = policy;
+        return windows::execute_native_command(request, layout, cwd, timeout_ms, config, limits);
+    }
+
+    #[cfg(not(windows))]
+    {
+        execute_native_command_std(request, layout, cwd, policy, timeout_ms, config, limits)
+    }
+}
+
+#[cfg(not(windows))]
+fn execute_native_command_std(
+    request: &SandboxCommandRequest,
+    layout: &LocalSandboxInstanceLayout,
+    cwd: &Path,
+    policy: &SandboxSimpleNativePolicy,
+    timeout_ms: u64,
+    config: &SandboxSimpleNativeConfig,
+    limits: &SandboxResourceLimits,
+) -> Result<NativeCommandOutput, SandboxWasiError> {
     let argv0 = request
         .argv
         .first()
@@ -516,9 +534,16 @@ fn execute_native_command(
     std::thread::spawn(move || {
         let _ = tx.send(child.wait_with_output());
     });
-    wait_for_native_output(child_pid, rx, timeout_ms, &SandboxCancellationToken::new())
+    let output =
+        wait_for_native_output(child_pid, rx, timeout_ms, &SandboxCancellationToken::new())?;
+    Ok(NativeCommandOutput {
+        exit_status: exit_status_code(&output),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
 }
 
+#[cfg(not(windows))]
 fn wait_for_native_output(
     child_pid: i32,
     rx: mpsc::Receiver<std::io::Result<Output>>,
@@ -609,7 +634,10 @@ fn native_environment(
         .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".to_string());
     envs.push(("PATH".to_string(), path));
     envs.push(("HOME".to_string(), layout.home.display().to_string()));
+    envs.push(("USERPROFILE".to_string(), layout.home.display().to_string()));
     envs.push(("TMPDIR".to_string(), layout.tmp.display().to_string()));
+    envs.push(("TEMP".to_string(), layout.tmp.display().to_string()));
+    envs.push(("TMP".to_string(), layout.tmp.display().to_string()));
     envs.push(("PWD".to_string(), cwd.display().to_string()));
     envs.push((
         "SINOMO_SANDBOX_ROOT".to_string(),
@@ -742,6 +770,699 @@ fn exit_status_code(output: &Output) -> i32 {
     output.status.code().unwrap_or(128)
 }
 
+#[cfg(windows)]
+mod windows {
+    use std::collections::BTreeMap;
+    use std::ffi::OsStr;
+    use std::mem;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr;
+    use std::thread;
+    use std::time::Instant;
+
+    use sinomo_sandbox::SANDBOX_UNLIMITED_SIZE_LIMIT;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_NO_DATA, GetLastError, HANDLE,
+        HANDLE_FLAG_INHERIT, HLOCAL, INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE, WAIT_FAILED,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
+        SetNamedSecurityInfoW,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE,
+        GetSecurityDescriptorSacl, LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT,
+        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+        TokenIntegrityLevel, WinLowLabelSid,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
+    };
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::SystemServices::{
+        SE_GROUP_INTEGRITY, SE_GROUP_INTEGRITY_ENABLED,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+        CreateProcessW, GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcessToken,
+        PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
+        WaitForSingleObject,
+    };
+
+    use super::{
+        LocalSandboxInstanceLayout, NativeCommandOutput, SandboxCommandRequest,
+        SandboxResourceLimits, SandboxSimpleNativeConfig, SandboxWasiError, native_environment,
+        native_wait_poll_duration,
+    };
+
+    const READ_BUFFER_SIZE: usize = 64 * 1024;
+    const SECURITY_MAX_SID_SIZE: usize = 68;
+
+    pub(super) fn execute_native_command(
+        request: &SandboxCommandRequest,
+        layout: &LocalSandboxInstanceLayout,
+        cwd: &Path,
+        timeout_ms: u64,
+        config: &SandboxSimpleNativeConfig,
+        limits: &SandboxResourceLimits,
+    ) -> Result<NativeCommandOutput, SandboxWasiError> {
+        let low_integrity = match prepare_low_integrity_layout(layout) {
+            Ok(()) => true,
+            Err(error) if config.allow_unenforced => {
+                let _ = error;
+                false
+            }
+            Err(error) => return Err(error),
+        };
+        let token = match create_restricted_token(low_integrity) {
+            Ok(token) => Some(token),
+            Err(error) if config.allow_unenforced => {
+                let _ = error;
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        match execute_with_windows_process(
+            request,
+            layout,
+            cwd,
+            timeout_ms,
+            limits,
+            token.as_ref(),
+        ) {
+            Ok(output) => Ok(output),
+            Err(error) if token.is_some() && config.allow_unenforced => {
+                execute_with_windows_process(request, layout, cwd, timeout_ms, limits, None)
+                    .map_err(|fallback_error| SandboxWasiError::Runtime {
+                        detail: format!(
+                            "simple-native restricted Windows process failed ({error}); unrestricted fallback failed ({fallback_error})"
+                        ),
+                    })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn execute_with_windows_process(
+        request: &SandboxCommandRequest,
+        layout: &LocalSandboxInstanceLayout,
+        cwd: &Path,
+        timeout_ms: u64,
+        limits: &SandboxResourceLimits,
+        token: Option<&OwnedHandle>,
+    ) -> Result<NativeCommandOutput, SandboxWasiError> {
+        let argv0 = request
+            .argv
+            .first()
+            .ok_or_else(|| SandboxWasiError::InvalidRequest {
+                detail: "simple-native command argv must include argv[0]".to_string(),
+            })?;
+        let job = create_job(limits)?;
+        let (stdin_read, stdin_write) = create_pipe_pair("stdin")?;
+        let (stdout_read, stdout_write) = create_pipe_pair("stdout")?;
+        let (stderr_read, stderr_write) = create_pipe_pair("stderr")?;
+        set_handle_non_inheritable(stdin_write.raw(), "stdin write pipe")?;
+        set_handle_non_inheritable(stdout_read.raw(), "stdout read pipe")?;
+        set_handle_non_inheritable(stderr_read.raw(), "stderr read pipe")?;
+
+        let startup = startup_info(stdin_read.raw(), stdout_write.raw(), stderr_write.raw());
+        let mut process_info: PROCESS_INFORMATION = unsafe { mem::zeroed() };
+        let mut command_line = wide_command_line(&request.argv)?;
+        let environment = wide_environment(request, layout, cwd)?;
+        let current_dir = wide_path(cwd)?;
+        let creation_flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
+
+        let created = unsafe {
+            match token {
+                Some(token) => CreateProcessAsUserW(
+                    token.raw(),
+                    ptr::null(),
+                    command_line.as_mut_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    1,
+                    creation_flags,
+                    environment.as_ptr().cast(),
+                    current_dir.as_ptr(),
+                    &startup,
+                    &mut process_info,
+                ),
+                None => CreateProcessW(
+                    ptr::null(),
+                    command_line.as_mut_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    1,
+                    creation_flags,
+                    environment.as_ptr().cast(),
+                    current_dir.as_ptr(),
+                    &startup,
+                    &mut process_info,
+                ),
+            }
+        };
+        if created == 0 {
+            return Err(last_error(format!(
+                "failed to start simple-native Windows command `{argv0}`"
+            )));
+        }
+
+        let process = OwnedHandle::new(process_info.hProcess, "process handle")?;
+        let thread = OwnedHandle::new(process_info.hThread, "thread handle")?;
+        if unsafe { AssignProcessToJobObject(job.raw(), process.raw()) } == 0 {
+            unsafe {
+                let _ = TerminateProcess(process.raw(), 1);
+            }
+            return Err(last_error("failed to assign simple-native process to job"));
+        }
+        if unsafe { ResumeThread(thread.raw()) } == u32::MAX {
+            unsafe {
+                let _ = TerminateJobObject(job.raw(), 1);
+            }
+            return Err(last_error("failed to resume simple-native Windows thread"));
+        }
+
+        drop(stdin_read);
+        drop(stdout_write);
+        drop(stderr_write);
+        let stdout_reader = spawn_pipe_reader(stdout_read, "stdout");
+        let stderr_reader = spawn_pipe_reader(stderr_read, "stderr");
+
+        let stdin_result = if let Some(stdin) = &request.stdin {
+            write_pipe_all(&stdin_write, stdin)
+        } else {
+            Ok(())
+        };
+        drop(stdin_write);
+        if let Err(error) = stdin_result {
+            terminate_job_and_wait(&job, &process);
+            let _ = join_pipe_reader(stdout_reader, "stdout");
+            let _ = join_pipe_reader(stderr_reader, "stderr");
+            return Err(error);
+        }
+
+        if let Err(error) = wait_for_process(&job, &process, timeout_ms) {
+            let _ = join_pipe_reader(stdout_reader, "stdout");
+            let _ = join_pipe_reader(stderr_reader, "stderr");
+            return Err(error);
+        }
+        let exit_status = process_exit_code(&process);
+        let stdout = join_pipe_reader(stdout_reader, "stdout");
+        let stderr = join_pipe_reader(stderr_reader, "stderr");
+        let exit_status = exit_status?;
+        let stdout = stdout?;
+        let stderr = stderr?;
+        Ok(NativeCommandOutput {
+            exit_status,
+            stdout,
+            stderr,
+        })
+    }
+
+    fn startup_info(stdin: HANDLE, stdout: HANDLE, stderr: HANDLE) -> STARTUPINFOW {
+        let mut startup: STARTUPINFOW = unsafe { mem::zeroed() };
+        startup.cb = mem::size_of::<STARTUPINFOW>() as u32;
+        startup.dwFlags = STARTF_USESTDHANDLES;
+        startup.hStdInput = stdin;
+        startup.hStdOutput = stdout;
+        startup.hStdError = stderr;
+        startup
+    }
+
+    fn create_job(limits: &SandboxResourceLimits) -> Result<OwnedHandle, SandboxWasiError> {
+        let job = OwnedHandle::new(
+            unsafe { CreateJobObjectW(ptr::null(), ptr::null()) },
+            "job object",
+        )?;
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if limits.memory_mb != SANDBOX_UNLIMITED_SIZE_LIMIT {
+            info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+            info.JobMemoryLimit = limits
+                .memory_mb
+                .saturating_mul(1024 * 1024)
+                .min(usize::MAX as u64) as usize;
+        }
+        if unsafe {
+            SetInformationJobObject(
+                job.raw(),
+                JobObjectExtendedLimitInformation,
+                (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } == 0
+        {
+            return Err(last_error("failed to configure simple-native job object"));
+        }
+        Ok(job)
+    }
+
+    fn create_restricted_token(low_integrity: bool) -> Result<OwnedHandle, SandboxWasiError> {
+        let mut current_token = ptr::null_mut();
+        let desired_access =
+            TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_ADJUST_DEFAULT | TOKEN_QUERY;
+        if unsafe { OpenProcessToken(GetCurrentProcess(), desired_access, &mut current_token) } == 0
+        {
+            return Err(last_error("failed to open current process token"));
+        }
+        let current_token = OwnedHandle::new(current_token, "current process token")?;
+        let mut restricted_token = ptr::null_mut();
+        if unsafe {
+            CreateRestrictedToken(
+                current_token.raw(),
+                DISABLE_MAX_PRIVILEGE,
+                0,
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                ptr::null(),
+                &mut restricted_token,
+            )
+        } == 0
+        {
+            return Err(last_error(
+                "failed to create restricted simple-native token",
+            ));
+        }
+        let restricted_token = OwnedHandle::new(restricted_token, "restricted token")?;
+        if low_integrity {
+            set_low_integrity_token(restricted_token.raw())?;
+        }
+        Ok(restricted_token)
+    }
+
+    fn set_low_integrity_token(token: HANDLE) -> Result<(), SandboxWasiError> {
+        let mut sid = [0u8; SECURITY_MAX_SID_SIZE];
+        let mut sid_size = sid.len() as u32;
+        if unsafe {
+            CreateWellKnownSid(
+                WinLowLabelSid,
+                ptr::null_mut(),
+                sid.as_mut_ptr().cast(),
+                &mut sid_size,
+            )
+        } == 0
+        {
+            return Err(last_error("failed to create low-integrity SID"));
+        }
+        let label = TOKEN_MANDATORY_LABEL {
+            Label: SID_AND_ATTRIBUTES {
+                Sid: sid.as_mut_ptr().cast(),
+                Attributes: (SE_GROUP_INTEGRITY | SE_GROUP_INTEGRITY_ENABLED) as u32,
+            },
+        };
+        let length = mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32 + sid_size;
+        if unsafe {
+            SetTokenInformation(
+                token,
+                TokenIntegrityLevel,
+                (&label as *const TOKEN_MANDATORY_LABEL).cast(),
+                length,
+            )
+        } == 0
+        {
+            return Err(last_error("failed to lower simple-native token integrity"));
+        }
+        Ok(())
+    }
+
+    fn prepare_low_integrity_layout(
+        layout: &LocalSandboxInstanceLayout,
+    ) -> Result<(), SandboxWasiError> {
+        for dir in layout.required_dirs() {
+            set_low_integrity_directory(dir)?;
+        }
+        Ok(())
+    }
+
+    fn set_low_integrity_directory(path: &Path) -> Result<(), SandboxWasiError> {
+        let sddl = wide_null("S:(ML;OICI;NW;;;LW)");
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(last_error(format!(
+                "failed to create low-integrity security descriptor for {}",
+                path.display()
+            )));
+        }
+        let _descriptor = LocalSecurityDescriptor(descriptor);
+        let mut sacl_present = 0;
+        let mut sacl_defaulted = 0;
+        let mut sacl: *mut ACL = ptr::null_mut();
+        if unsafe {
+            GetSecurityDescriptorSacl(
+                descriptor,
+                &mut sacl_present,
+                &mut sacl,
+                &mut sacl_defaulted,
+            )
+        } == 0
+        {
+            return Err(last_error(format!(
+                "failed to read low-integrity SACL for {}",
+                path.display()
+            )));
+        }
+        if sacl_present == 0 || sacl.is_null() {
+            return Err(SandboxWasiError::Runtime {
+                detail: format!(
+                    "low-integrity security descriptor did not contain a SACL for {}",
+                    path.display()
+                ),
+            });
+        }
+        let path = wide_path(path)?;
+        let error = unsafe {
+            SetNamedSecurityInfoW(
+                path.as_ptr(),
+                SE_FILE_OBJECT,
+                LABEL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null(),
+                sacl.cast_const(),
+            )
+        };
+        if error != 0 {
+            return Err(SandboxWasiError::Runtime {
+                detail: format!(
+                    "failed to mark sandbox directory low-integrity: Windows error {error}"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn create_pipe_pair(name: &str) -> Result<(OwnedHandle, OwnedHandle), SandboxWasiError> {
+        let mut security = SECURITY_ATTRIBUTES {
+            nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: ptr::null_mut(),
+            bInheritHandle: 1,
+        };
+        let mut read = ptr::null_mut();
+        let mut write = ptr::null_mut();
+        if unsafe { CreatePipe(&mut read, &mut write, &mut security, 0) } == 0 {
+            return Err(last_error(format!("failed to create {name} pipe")));
+        }
+        Ok((
+            OwnedHandle::new(read, format!("{name} read pipe"))?,
+            OwnedHandle::new(write, format!("{name} write pipe"))?,
+        ))
+    }
+
+    fn set_handle_non_inheritable(
+        handle: HANDLE,
+        name: impl AsRef<str>,
+    ) -> Result<(), SandboxWasiError> {
+        if unsafe {
+            windows_sys::Win32::Foundation::SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0)
+        } == 0
+        {
+            Err(last_error(format!(
+                "failed to clear inheritance on {}",
+                name.as_ref()
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn wait_for_process(
+        job: &OwnedHandle,
+        process: &OwnedHandle,
+        timeout_ms: u64,
+    ) -> Result<(), SandboxWasiError> {
+        let started = Instant::now();
+        loop {
+            let wait = match native_wait_poll_duration(started, timeout_ms) {
+                Ok(wait) => wait,
+                Err(SandboxWasiError::TimedOut { timeout_ms }) => {
+                    terminate_job_and_wait(job, process);
+                    return Err(SandboxWasiError::TimedOut { timeout_ms });
+                }
+                Err(error) => return Err(error),
+            };
+            let wait_ms = wait.as_millis().min(u128::from(u32::MAX)) as u32;
+            match unsafe { WaitForSingleObject(process.raw(), wait_ms) } {
+                WAIT_OBJECT_0 => return Ok(()),
+                WAIT_TIMEOUT => continue,
+                WAIT_FAILED => return Err(last_error("failed to wait for simple-native process")),
+                other => {
+                    return Err(SandboxWasiError::Runtime {
+                        detail: format!("unexpected Windows wait result {other}"),
+                    });
+                }
+            }
+        }
+    }
+
+    fn terminate_job_and_wait(job: &OwnedHandle, process: &OwnedHandle) {
+        unsafe {
+            let _ = TerminateJobObject(job.raw(), 1);
+            let _ = WaitForSingleObject(process.raw(), INFINITE);
+        }
+    }
+
+    fn process_exit_code(process: &OwnedHandle) -> Result<i32, SandboxWasiError> {
+        let mut exit_code = 0;
+        if unsafe { GetExitCodeProcess(process.raw(), &mut exit_code) } == 0 {
+            return Err(last_error("failed to get simple-native process exit code"));
+        }
+        if exit_code == STILL_ACTIVE as u32 {
+            return Err(SandboxWasiError::Runtime {
+                detail: "simple-native process is still active after wait".to_string(),
+            });
+        }
+        Ok(exit_code as i32)
+    }
+
+    fn spawn_pipe_reader(
+        handle: OwnedHandle,
+        stream: &'static str,
+    ) -> thread::JoinHandle<Result<Vec<u8>, String>> {
+        thread::spawn(move || {
+            read_pipe_to_end(handle)
+                .map_err(|error| format!("failed to read simple-native {stream}: {error}"))
+        })
+    }
+
+    fn join_pipe_reader(
+        reader: thread::JoinHandle<Result<Vec<u8>, String>>,
+        stream: &str,
+    ) -> Result<Vec<u8>, SandboxWasiError> {
+        reader
+            .join()
+            .map_err(|_| SandboxWasiError::Runtime {
+                detail: format!("simple-native {stream} reader panicked"),
+            })?
+            .map_err(|detail| SandboxWasiError::Runtime { detail })
+    }
+
+    fn read_pipe_to_end(handle: OwnedHandle) -> Result<Vec<u8>, String> {
+        let mut output = Vec::new();
+        let mut buffer = [0u8; READ_BUFFER_SIZE];
+        loop {
+            let mut bytes_read = 0;
+            let ok = unsafe {
+                ReadFile(
+                    handle.raw(),
+                    buffer.as_mut_ptr(),
+                    buffer.len() as u32,
+                    &mut bytes_read,
+                    ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                let error = unsafe { GetLastError() };
+                if matches!(error, ERROR_BROKEN_PIPE | ERROR_HANDLE_EOF | ERROR_NO_DATA) {
+                    break;
+                }
+                return Err(format!("Windows error {error}"));
+            }
+            if bytes_read == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..bytes_read as usize]);
+        }
+        Ok(output)
+    }
+
+    fn write_pipe_all(handle: &OwnedHandle, mut bytes: &[u8]) -> Result<(), SandboxWasiError> {
+        while !bytes.is_empty() {
+            let chunk_len = bytes.len().min(READ_BUFFER_SIZE);
+            let mut bytes_written = 0;
+            let ok = unsafe {
+                WriteFile(
+                    handle.raw(),
+                    bytes.as_ptr(),
+                    chunk_len as u32,
+                    &mut bytes_written,
+                    ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(last_error("failed to write simple-native stdin"));
+            }
+            if bytes_written == 0 {
+                return Err(SandboxWasiError::Runtime {
+                    detail: "failed to write simple-native stdin: zero-byte pipe write".to_string(),
+                });
+            }
+            bytes = &bytes[bytes_written as usize..];
+        }
+        Ok(())
+    }
+
+    fn wide_command_line(argv: &[String]) -> Result<Vec<u16>, SandboxWasiError> {
+        if argv.is_empty() {
+            return Err(SandboxWasiError::InvalidRequest {
+                detail: "simple-native command argv must include argv[0]".to_string(),
+            });
+        }
+        let mut pieces = Vec::with_capacity(argv.len());
+        for arg in argv {
+            if arg.contains('\0') {
+                return Err(SandboxWasiError::InvalidRequest {
+                    detail: "simple-native Windows argv contains NUL byte".to_string(),
+                });
+            }
+            pieces.push(quote_windows_arg(arg));
+        }
+        Ok(wide_null(&pieces.join(" ")))
+    }
+
+    fn quote_windows_arg(arg: &str) -> String {
+        if !arg.is_empty() && !arg.chars().any(|ch| ch.is_whitespace() || ch == '"') {
+            return arg.to_string();
+        }
+        let mut quoted = String::from("\"");
+        let mut backslashes = 0usize;
+        for ch in arg.chars() {
+            match ch {
+                '\\' => backslashes += 1,
+                '"' => {
+                    quoted.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
+                    quoted.push('"');
+                    backslashes = 0;
+                }
+                _ => {
+                    quoted.extend(std::iter::repeat('\\').take(backslashes));
+                    backslashes = 0;
+                    quoted.push(ch);
+                }
+            }
+        }
+        quoted.extend(std::iter::repeat('\\').take(backslashes * 2));
+        quoted.push('"');
+        quoted
+    }
+
+    fn wide_environment(
+        request: &SandboxCommandRequest,
+        layout: &LocalSandboxInstanceLayout,
+        cwd: &Path,
+    ) -> Result<Vec<u16>, SandboxWasiError> {
+        let mut envs = BTreeMap::new();
+        for (name, value) in native_environment(request, layout, cwd) {
+            if name.is_empty() || name.contains('=') || name.contains('\0') || value.contains('\0')
+            {
+                return Err(SandboxWasiError::InvalidRequest {
+                    detail: format!("invalid simple-native Windows environment variable `{name}`"),
+                });
+            }
+            envs.insert(name.to_ascii_uppercase(), (name, value));
+        }
+        let mut block = Vec::new();
+        for (_key, (name, value)) in envs {
+            block.extend(format!("{name}={value}").encode_utf16());
+            block.push(0);
+        }
+        block.push(0);
+        Ok(block)
+    }
+
+    fn wide_path(path: &Path) -> Result<Vec<u16>, SandboxWasiError> {
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if wide.contains(&0) {
+            return Err(SandboxWasiError::InvalidRequest {
+                detail: format!(
+                    "simple-native Windows path contains NUL byte: {}",
+                    path.display()
+                ),
+            });
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    fn wide_null(value: &str) -> Vec<u16> {
+        OsStr::new(value).encode_wide().chain(Some(0)).collect()
+    }
+
+    fn last_error(action: impl Into<String>) -> SandboxWasiError {
+        SandboxWasiError::Runtime {
+            detail: format!("{}: Windows error {}", action.into(), unsafe {
+                GetLastError()
+            }),
+        }
+    }
+
+    #[derive(Debug)]
+    struct OwnedHandle(HANDLE);
+
+    impl OwnedHandle {
+        fn new(handle: HANDLE, name: impl AsRef<str>) -> Result<Self, SandboxWasiError> {
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                Err(last_error(format!("failed to create {}", name.as_ref())))
+            } else {
+                Ok(Self(handle))
+            }
+        }
+
+        fn raw(&self) -> HANDLE {
+            self.0
+        }
+    }
+
+    unsafe impl Send for OwnedHandle {}
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+    impl Drop for LocalSecurityDescriptor {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    let _ = LocalFree(self.0 as HLOCAL);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::fs;
@@ -817,7 +1538,7 @@ mod linux {
                 let _ = error;
                 Ok(())
             }
-            Err(error) => Err(io::Error::new(io::ErrorKind::Other, error.to_string())),
+            Err(error) => Err(io::Error::other(error.to_string())),
         }
     }
 
