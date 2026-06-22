@@ -341,7 +341,7 @@ Start with a hybrid of Option A and Option B:
 1. Build the event bridge and hot-state packet contract first.
 2. Use modular local fast perception for safety, screen state, and structured events.
 3. Use a hosted realtime model for speech UX if speed matters immediately.
-4. Route ordinary turns to an interactive model through bounded context packets.
+4. Route ordinary turns through the agent runtime context assembler.
 5. Route hard/slow work to an async deliberation service.
 6. Later, test open omni models behind the same `sinomo-voice` / `sinomo-fusion` interfaces.
 
@@ -366,7 +366,8 @@ Add the bridge contract early in `sinomo-core`:
 - `HotStateSnapshot`
 - `ContextPacket`
 - `TriggerDecision`
-- `InteractiveTurn`
+- `AgentSession`
+- `TurnContext`
 - `DeliberationJob`
 - `ModelCapability`
 - `EvidenceRef`
@@ -379,7 +380,7 @@ Suggested service responsibilities:
 - `sinomo-video`: frame sampling/OCR/vision events.
 - `sinomo-fusion`: align audio, video, transcript, and screen events.
 - Future trigger policy service: timing policy and interrupt handling.
-- `sinomo-agent`: interactive loop over context packets.
+- `sinomo-agent`: package-driven agent loop over assembled turn context.
 - `sinomo-deliberation`: async slow LLM jobs.
 - `sinomo-voice`: realtime speech session, TTS, barge-in.
 - `sinomo-events`: canonical log and replay.

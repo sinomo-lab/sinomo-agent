@@ -6779,11 +6779,9 @@ where
         .caused_by(&event.event_id);
         store.append(message.clone())?;
 
-        let context = BoundedContextBuilder::new(12).build(store, session.session_id.clone())?;
         let input = AgentLoopInput {
             session: session.clone(),
             latest_event: message.clone(),
-            context,
             async_update: None,
             context_attachments: Vec::new(),
             tool_specs: Vec::new(),

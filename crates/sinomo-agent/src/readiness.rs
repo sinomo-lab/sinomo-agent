@@ -22,10 +22,10 @@ use crate::{
     AgentToolOrchestrator, AgentToolPairIntegrity, AgentToolPlanSource, AgentToolPlanner,
     AgentToolProgressEvent, AgentToolProgressSink, AgentToolRegistry, AgentToolRequest,
     AgentToolResult, AgentToolSpec, AgentToolStatus, AgentToolSurface, AgentTranscript,
-    AsyncTaskNextAction, AsyncTaskStatus, AsyncTaskUpdate, BoundedContext,
-    CodingCommandFailureKind, CodingPatchStatus, CodingStopDecision, CodingValidationStatus,
-    FileAgentDefinitionStore, FileAgentSessionStore, InteractionModel, InteractionSession,
-    InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig, TaskId, WorkspaceRef,
+    AsyncTaskNextAction, AsyncTaskStatus, AsyncTaskUpdate, CodingCommandFailureKind,
+    CodingPatchStatus, CodingStopDecision, CodingValidationStatus, FileAgentDefinitionStore,
+    FileAgentSessionStore, InteractionModel, InteractionSession, InteractionSurface,
+    InteractionSurfaceKind, LocalWorkspaceAgentConfig, TaskId, WorkspaceRef,
     parse_agent_loop_response, user_interaction_input_event,
 };
 use serde::de::DeserializeOwned;
@@ -37,7 +37,6 @@ use sinomo_lm::{
     LanguageModelToolCall, LanguageModelToolSpec, classify_language_model_error_detail,
     collect_language_model_tool_calls,
 };
-use sinomo_runtime::core::ContextPacket;
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{ObjectRpcCancelRequest, ObjectRpcRequest, ObjectRpcResponse};
@@ -7122,11 +7121,6 @@ fn readiness_agent_loop_input(prompt: &str) -> AgentLoopInput {
     AgentLoopInput {
         session: session.clone(),
         latest_event,
-        context: BoundedContext {
-            session_id: session.session_id,
-            events: Vec::new(),
-            packet: ContextPacket::default(),
-        },
         async_update: None,
         context_attachments: Vec::new(),
         tool_specs: Vec::new(),

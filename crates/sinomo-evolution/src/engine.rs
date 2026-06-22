@@ -25,10 +25,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sinomo_agent::{
     Agent, AgentConfig, AgentContextAttachment, AgentContextBudget, AgentItem, AgentLoopInput,
     AgentModelEvent, AgentOp, AgentRole, AgentSession, AgentSessionRuntime, AgentStoragePaths,
-    AgentToolPairIntegrity, AgentToolRegistry, AgentToolSurface, BoundedContext,
-    FileAgentTraceStore, InteractionModel, InteractionSession, InteractionSurface,
-    InteractionSurfaceKind, LocalWorkspaceAgentConfig, default_coding_agent_tools,
-    user_interaction_input_event,
+    AgentToolPairIntegrity, AgentToolRegistry, AgentToolSurface, FileAgentTraceStore,
+    InteractionModel, InteractionSession, InteractionSurface, InteractionSurfaceKind,
+    LocalWorkspaceAgentConfig, default_coding_agent_tools, user_interaction_input_event,
 };
 use sinomo_lm::{
     AnthropicConfig, AnthropicProvider, CLAUDE_CODE_DEFAULT_MODEL, CODEX_CLI_DEFAULT_MODEL,
@@ -42,8 +41,8 @@ use sinomo_lm::{
     normalize_model_provider,
 };
 use sinomo_runtime::core::{
-    ContextPacket, EvaluationGate, EvaluationMetric, EvaluationOutcome, EvaluationScorecard,
-    MetricValue, RollbackPolicy, TrustRing,
+    EvaluationGate, EvaluationMetric, EvaluationOutcome, EvaluationScorecard, MetricValue,
+    RollbackPolicy, TrustRing,
 };
 use sinomo_runtime::eval::{CommandRunResult, CommandRunner, ExecutingEvalHarness};
 use sinomo_runtime::events::{EventId, SessionId};
@@ -4551,11 +4550,6 @@ where
         let prompt = render_agent_mutation_prompt(packet, workspace);
         let latest_event = user_interaction_input_event(&session, &prompt);
         let input = AgentLoopInput {
-            context: BoundedContext {
-                session_id: session.session_id.clone(),
-                events: Vec::new(),
-                packet: ContextPacket::default(),
-            },
             session,
             latest_event,
             async_update: None,

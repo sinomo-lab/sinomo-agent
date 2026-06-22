@@ -10043,11 +10043,6 @@ mod tests {
         AgentLoopInput {
             session,
             latest_event,
-            context: crate::BoundedContext {
-                session_id: SessionId::from_legacy_named("sess_agent").expect("session"),
-                events: Vec::new(),
-                packet: sinomo_runtime::core::ContextPacket::default(),
-            },
             async_update: None,
             context_attachments: Vec::new(),
             tool_specs: default_coding_agent_tools(),

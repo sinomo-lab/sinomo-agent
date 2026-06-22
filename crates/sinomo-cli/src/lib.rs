@@ -41,9 +41,9 @@ use sinomo_agent::{
     AgentSessionProgressRequest, AgentSessionProgressResponse, AgentSessionResumeRequest,
     AgentSessionResumeResponse, AgentSessionRuntime, AgentSessionSteerRequest,
     AgentSessionTerminalResultsRequest, AgentSessionTerminalResultsResponse,
-    AgentTaskTerminalResult, AgentToolProgressEvent, BoundedContextBuilder, ConfigAgentToolConfig,
-    EventEnvelopeExt, FileAgentDefinitionStore, InteractionModel, InteractionOutput,
-    InteractionSession, InteractionSurface, InteractionSurfaceKind, TaskId, interaction_event,
+    AgentTaskTerminalResult, AgentToolProgressEvent, ConfigAgentToolConfig, EventEnvelopeExt,
+    FileAgentDefinitionStore, InteractionModel, InteractionOutput, InteractionSession,
+    InteractionSurface, InteractionSurfaceKind, TaskId, interaction_event,
     run_local_agent_readiness_gate, user_interaction_input_event,
 };
 use sinomo_lm::{
@@ -2938,14 +2938,10 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         NodeId::from_legacy_named("node_agent_cli").expect("legacy node id"),
         InteractionSurface::new("cli.agent", InteractionSurfaceKind::CommandLine),
     );
-    let mut store = InMemoryEventStore::new();
     let input_event = user_interaction_input_event(&session, &options.prompt);
-    store.append(input_event.clone())?;
-    let context = BoundedContextBuilder::new(12).build(&store, session.session_id.clone())?;
     let input = AgentLoopInput {
         session,
         latest_event: input_event,
-        context,
         async_update: None,
         context_attachments: Vec::new(),
         tool_specs: Vec::new(),
