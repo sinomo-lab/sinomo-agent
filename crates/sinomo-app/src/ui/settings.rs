@@ -21,10 +21,10 @@ use std::sync::mpsc::Receiver;
 
 use sui::{
     Alignment, ArrangeCtx, Constraints, DefaultTheme, Event, EventCtx, FieldGroup, FontWeight,
-    FormRow, FormSection, Label, ListItem, ListView, MeasureCtx, PaintCtx, Rect, ScrollState,
-    ScrollView, Select, SemanticsCtx, Separator, Size, SizedBox, Stack, Switch, SwitchView, TabBar,
-    TextInput, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
-    PointerEventKind,
+    FormRow, FormSection, Label, ListItem, ListView, MeasureCtx, PaintCtx, PointerEventKind, Rect,
+    ScrollState, ScrollView, Select, SemanticsCtx, Separator, Size, SizedBox, Stack, Switch,
+    SwitchView, TabBar, TextInput, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    WindowEvent,
 };
 
 use sinomo_runtime::config::ConfigClient;
@@ -441,7 +441,9 @@ impl SettingsState {
             ProviderField::ApiKey => {
                 set_provider_api_key(self.config.as_ref(), &provider, &account, raw)
             }
-            ProviderField::Model => set_provider_model(self.config.as_ref(), &provider, &account, raw),
+            ProviderField::Model => {
+                set_provider_model(self.config.as_ref(), &provider, &account, raw)
+            }
             ProviderField::BaseUrl => {
                 set_provider_base_url(self.config.as_ref(), &provider, &account, raw)
             }
@@ -757,18 +759,16 @@ fn apply_cluster_success(
     }
 }
 
-fn apply_cluster_invite_success(
-    shared: &Shared,
-    backend: &Backend,
-    invite: AppClusterInvite,
-) {
+fn apply_cluster_invite_success(shared: &Shared, backend: &Backend, invite: AppClusterInvite) {
     let status = backend.app_cluster_status();
     let snapshot = backend.cluster_snapshot();
     let mut app = shared.borrow_mut();
     if let Some(ready) = app.ready.as_mut() {
         ready.settings.apply_cluster_status(status);
         ready.settings.invite_result = Some(invite);
-        ready.settings.set_cluster_action_status("Invitation generated");
+        ready
+            .settings
+            .set_cluster_action_status("Invitation generated");
         ready.cluster.snapshot = snapshot;
     }
 }
@@ -845,14 +845,7 @@ fn section_node(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 }
 
 fn section_cluster(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (
-        clustered,
-        cluster_summary,
-        invite_result,
-        action_error,
-        action_status,
-        leave_confirming,
-    ) = {
+    let (clustered, cluster_summary, invite_result, action_error, action_status, leave_confirming) = {
         let settings = shared.settings();
         (
             settings.clustered,
@@ -908,12 +901,7 @@ fn section_cluster(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
                     invite.join_command,
                 ))
                 .with_child(value_row(shared, reader, "Expires", invite.expires_at))
-                .with_child(value_row(
-                    shared,
-                    reader,
-                    "Saved key",
-                    invite.persisted_key,
-                ));
+                .with_child(value_row(shared, reader, "Saved key", invite.persisted_key));
         }
 
         if leave_confirming {
@@ -1254,14 +1242,12 @@ fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
             .spacing(8.0)
             .with_child(muted_label(shared, "No provider accounts configured"))
     } else {
-        FieldGroup::new()
-            .spacing(8.0)
-            .with_child(value_row(
-                shared,
-                reader,
-                "Accounts",
-                shared.settings().provider_forms.len().to_string(),
-            ))
+        FieldGroup::new().spacing(8.0).with_child(value_row(
+            shared,
+            reader,
+            "Accounts",
+            shared.settings().provider_forms.len().to_string(),
+        ))
     };
     stack = stack.with_child(
         FormSection::new("Providers", body)

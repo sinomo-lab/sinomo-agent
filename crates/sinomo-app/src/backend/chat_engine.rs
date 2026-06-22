@@ -18,8 +18,8 @@ use sinomo_agent::{
 };
 use sinomo_cli::app_api::{
     AgentChat, ChatContextSnapshot, ChatControlState, ChatControlStatus, ChatHistoryMessage,
-    ChatProcessSnapshot, ChatRuntimeInfo, ChatStreamEvent, ChatToolCallSnapshot,
-    ChatTaskSnapshot, ChatUsageSnapshot,
+    ChatProcessSnapshot, ChatRuntimeInfo, ChatStreamEvent, ChatTaskSnapshot, ChatToolCallSnapshot,
+    ChatUsageSnapshot,
 };
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
@@ -305,7 +305,12 @@ fn chat_control_status(result: AgentSessionControlResult) -> ChatControlStatus {
         active_turn: result.snapshot.active_turn.is_some(),
         task_count: result.snapshot.tasks.len(),
         terminal_result_count: result.terminal_results().len(),
-        tasks: result.snapshot.tasks.iter().map(chat_task_snapshot).collect(),
+        tasks: result
+            .snapshot
+            .tasks
+            .iter()
+            .map(chat_task_snapshot)
+            .collect(),
     }
 }
 
@@ -615,7 +620,9 @@ mod tests {
             },
         };
 
-        handle.send_command(ChatCommand::FollowUp("also mention live controls".to_string()));
+        handle.send_command(ChatCommand::FollowUp(
+            "also mention live controls".to_string(),
+        ));
         let follow_up = wait_for_event(&handle, |event| {
             matches!(event, ChatEvent::ControlStatus(status) if status.session_id == session_id.to_string())
         })
@@ -760,10 +767,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "sinomo-app-{slug}-{}-{unique}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("sinomo-app-{slug}-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&path).expect("create temp data dir");
         SinomoDataDir::new(path)
     }
