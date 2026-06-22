@@ -31,7 +31,7 @@ use sinomo_network::ClusterPaths;
 use sinomo_node::NodeId;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex, OnceLock, TryLockError};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 #[cfg(test)]
 use time::OffsetDateTime;
@@ -511,23 +511,8 @@ fn daemon_dfs_network_error(source: sinomo_network::NetworkError) -> sinomo_dfs:
     }
 }
 
-fn daemon_dfs_perf_trace_enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var("SINOMO_DFS_PERF_TRACE")
-            .ok()
-            .is_some_and(|value| {
-                value == "1"
-                    || value.eq_ignore_ascii_case("true")
-                    || value.eq_ignore_ascii_case("yes")
-            })
-    });
-    *ENABLED
-}
-
 fn daemon_dfs_perf_trace(args: std::fmt::Arguments<'_>) {
-    if daemon_dfs_perf_trace_enabled() {
-        eprintln!("[sinomo-dfs-perf] {args}");
-    }
+    tracing::trace!(target: "sinomo.dfs.perf", detail = %args, "daemon dfs perf");
 }
 
 fn read_daemon_dfs_message_route_snapshot(

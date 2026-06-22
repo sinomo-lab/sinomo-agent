@@ -4,7 +4,7 @@ use crate::object::ObjectFrameIoOptions;
 use crate::object::SinomoObjectCodec;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
-use sinomo_core::CapabilityName;
+use sinomo_core::{CapabilityName, Id};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -36,6 +36,9 @@ pub const OBJECT_RPC_OPERATION_ID_METADATA_KEY: &str = "sinomo-operation-id";
 pub const OBJECT_RPC_CANCELS_OPERATION_ID_METADATA_KEY: &str = "sinomo-cancels-operation-id";
 pub const OBJECT_RPC_RESPONSE_RETRY_SAFE_METADATA_KEY: &str = "sinomo-response-retry-safe";
 pub const OBJECT_RPC_RESPONDER_NODE_ID_METADATA_KEY: &str = "sinomo-responder-node-id";
+pub const OBJECT_RPC_TRACEPARENT_METADATA_KEY: &str = "traceparent";
+pub const OBJECT_RPC_TRACESTATE_METADATA_KEY: &str = "tracestate";
+pub const OBJECT_RPC_OBSERVE_SAMPLED_METADATA_KEY: &str = "sinomo-observe-sampled";
 
 pub const CLUSTER_HEALTH_RPC_CATEGORY: &str = "cluster.health";
 pub const CLUSTER_HEALTH_ROUTE: &str = "/cluster/health";
@@ -142,6 +145,28 @@ impl ObjectRpcRequest {
         self.with_metadata(OBJECT_RPC_RESPONSE_RETRY_SAFE_METADATA_KEY, "true")
     }
 
+    pub fn with_traceparent(self, traceparent: impl Into<String>) -> Self {
+        self.with_metadata(OBJECT_RPC_TRACEPARENT_METADATA_KEY, traceparent)
+    }
+
+    pub fn with_tracestate(self, tracestate: impl Into<String>) -> Self {
+        self.with_metadata(OBJECT_RPC_TRACESTATE_METADATA_KEY, tracestate)
+    }
+
+    pub fn with_observe_sampled(self, sampled: bool) -> Self {
+        self.with_metadata(
+            OBJECT_RPC_OBSERVE_SAMPLED_METADATA_KEY,
+            if sampled { "true" } else { "false" },
+        )
+    }
+
+    pub fn with_trace_context_if_missing(mut self) -> Self {
+        self.metadata
+            .entry(OBJECT_RPC_TRACEPARENT_METADATA_KEY.to_string())
+            .or_insert_with(new_object_rpc_traceparent);
+        self
+    }
+
     pub fn operation_id(&self) -> Option<&str> {
         self.metadata
             .get(OBJECT_RPC_OPERATION_ID_METADATA_KEY)
@@ -159,6 +184,42 @@ impl ObjectRpcRequest {
             .get(OBJECT_RPC_RESPONSE_RETRY_SAFE_METADATA_KEY)
             .is_some_and(|value| value == "true")
     }
+
+    pub fn traceparent(&self) -> Option<&str> {
+        self.metadata
+            .get(OBJECT_RPC_TRACEPARENT_METADATA_KEY)
+            .map(String::as_str)
+    }
+
+    pub fn tracestate(&self) -> Option<&str> {
+        self.metadata
+            .get(OBJECT_RPC_TRACESTATE_METADATA_KEY)
+            .map(String::as_str)
+    }
+
+    pub fn observe_sampled(&self) -> bool {
+        self.metadata
+            .get(OBJECT_RPC_OBSERVE_SAMPLED_METADATA_KEY)
+            .is_some_and(|value| value == "true")
+    }
+}
+
+pub fn new_object_rpc_traceparent() -> String {
+    let seed = format!(
+        "{}:{}:{}",
+        Id::generate(),
+        OffsetDateTime::now_utc().unix_timestamp_nanos(),
+        std::process::id()
+    );
+    let trace_id = object_rpc_trace_hex("trace", &seed, 32);
+    let span_id = object_rpc_trace_hex("span", &seed, 16);
+    format!("00-{trace_id}-{span_id}-01")
+}
+
+fn object_rpc_trace_hex(label: &str, seed: &str, len: usize) -> String {
+    let hash = blake3::hash(format!("{label}:{seed}").as_bytes());
+    let hex = hash.to_hex().to_string();
+    hex[..len].to_string()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

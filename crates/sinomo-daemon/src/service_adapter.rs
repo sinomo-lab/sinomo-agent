@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use sinomo_config::{
@@ -2358,7 +2358,8 @@ fn daemon_service_object_rpc_route_registry_from_module_snapshot(
                     .await;
                 }
                 let route = request.route.clone();
-                let trace = daemon_service_rpc_trace_enabled_for_route(&route);
+                let category = request.category.clone();
+                let traceparent = request.traceparent().unwrap_or_default().to_string();
                 let started_at = Instant::now();
                 let signer = daemon_service_signer_from_request_metadata(&request)?;
                 let (data_dir, cluster) = tokio::task::spawn_blocking(move || {
@@ -2382,27 +2383,58 @@ fn daemon_service_object_rpc_route_registry_from_module_snapshot(
                     operation: format!("build daemon service context for {}", request.route),
                     detail: format!("daemon service context task failed: {source}"),
                 })??;
-                daemon_service_rpc_trace(
-                    trace,
-                    format_args!(
-                        "route={} context_ms={}",
-                        route,
-                        started_at.elapsed().as_millis()
-                    ),
+                let context_us = daemon_service_rpc_elapsed_us(started_at);
+                metrics::histogram!(
+                    "sinomo.daemon.service.context.us",
+                    "route" => route.clone(),
+                    "category" => category.clone()
+                )
+                .record(context_us as f64);
+                tracing::trace!(
+                    target: "sinomo.daemon.service_rpc",
+                    %traceparent,
+                    route = %route,
+                    category = %category,
+                    context_us,
+                    "daemon service context built"
                 );
                 let dispatch_started_at = Instant::now();
                 let result =
                     dispatch_service_registry_request(registry, data_dir, cluster, signer, request)
                         .await;
-                daemon_service_rpc_trace(
-                    trace,
-                    format_args!(
-                        "route={} dispatch_ms={} total_ms={} outcome={}",
-                        route,
-                        dispatch_started_at.elapsed().as_millis(),
-                        started_at.elapsed().as_millis(),
-                        if result.is_ok() { "ok" } else { "error" }
-                    ),
+                let outcome = if result.is_ok() { "ok" } else { "error" };
+                let dispatch_us = daemon_service_rpc_elapsed_us(dispatch_started_at);
+                let total_us = daemon_service_rpc_elapsed_us(started_at);
+                metrics::counter!(
+                    "sinomo.daemon.service.requests",
+                    "route" => route.clone(),
+                    "category" => category.clone(),
+                    "outcome" => outcome
+                )
+                .increment(1);
+                metrics::histogram!(
+                    "sinomo.daemon.service.dispatch.us",
+                    "route" => route.clone(),
+                    "category" => category.clone(),
+                    "outcome" => outcome
+                )
+                .record(dispatch_us as f64);
+                metrics::histogram!(
+                    "sinomo.daemon.service.total.us",
+                    "route" => route.clone(),
+                    "category" => category.clone(),
+                    "outcome" => outcome
+                )
+                .record(total_us as f64);
+                tracing::debug!(
+                    target: "sinomo.daemon.service_rpc",
+                    %traceparent,
+                    route = %route,
+                    category = %category,
+                    dispatch_us,
+                    total_us,
+                    outcome,
+                    "daemon service dispatched object rpc"
                 );
                 result
             }
@@ -2411,24 +2443,8 @@ fn daemon_service_object_rpc_route_registry_from_module_snapshot(
     builder.try_build()
 }
 
-fn daemon_service_rpc_trace_enabled_for_route(route: &str) -> bool {
-    static DAEMON_SERVICE_TRACE_ENABLED: LazyLock<bool> =
-        LazyLock::new(|| trace_env_enabled("SINOMO_TRACE_DAEMON_SERVICE_RPC"));
-    static DFS_PERF_TRACE_ENABLED: LazyLock<bool> =
-        LazyLock::new(|| trace_env_enabled("SINOMO_DFS_PERF_TRACE"));
-    *DAEMON_SERVICE_TRACE_ENABLED || (*DFS_PERF_TRACE_ENABLED && route.starts_with("/dfs/"))
-}
-
-fn trace_env_enabled(name: &str) -> bool {
-    std::env::var(name).ok().is_some_and(|value| {
-        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
-    })
-}
-
-fn daemon_service_rpc_trace(enabled: bool, args: std::fmt::Arguments<'_>) {
-    if enabled {
-        eprintln!("[sinomo-daemon-service-rpc] {args}");
-    }
+fn daemon_service_rpc_elapsed_us(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 fn daemon_error_to_network_error(error: DaemonError) -> NetworkError {

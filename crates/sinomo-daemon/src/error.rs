@@ -246,6 +246,7 @@ impl From<sinomo_observe::ObserveError> for DaemonError {
             sinomo_observe::ObserveError::Io { path, detail } => Self::Io { path, detail },
             sinomo_observe::ObserveError::Json { path, detail } => Self::Json { path, detail },
             sinomo_observe::ObserveError::Parse { detail }
+            | sinomo_observe::ObserveError::Runtime { detail }
             | sinomo_observe::ObserveError::ModuleState { detail } => Self::Parse { detail },
         }
     }

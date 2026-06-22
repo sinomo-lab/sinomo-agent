@@ -21,6 +21,7 @@ sandbox = ["dep:sinomo-sandbox-wasix-host"]
 base64 = "0.22"
 blake3.workspace = true
 fs2.workspace = true
+metrics.workspace = true
 ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde.workspace = true
@@ -50,6 +51,7 @@ time.workspace = true
 tokio = { version = "1.44", features = ["rt-multi-thread"] }
 tower-layer = "0.3"
 tower-service = "0.3"
+tracing.workspace = true
 
 [dev-dependencies]
 sinomo-testdir = { path = "../sinomo-testdir" }

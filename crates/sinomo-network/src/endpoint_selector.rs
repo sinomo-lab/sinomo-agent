@@ -675,13 +675,16 @@ fn cluster_endpoint_address_port(address: &str) -> Option<u16> {
 }
 
 fn cluster_endpoint_selector_trace_enabled() -> bool {
-    std::env::var_os("SINOMO_TRACE_CLUSTER_ENDPOINT_SELECTOR").is_some()
-        || std::env::var_os("SINOMO_TRACE_CLUSTER_OBJECT_RPC").is_some()
+    tracing::enabled!(target: "sinomo.network.endpoint_selector", tracing::Level::TRACE)
 }
 
 fn cluster_endpoint_selector_trace(enabled: bool, args: std::fmt::Arguments<'_>) {
     if enabled {
-        eprintln!("sinomo cluster endpoint selector: {args}");
+        tracing::trace!(
+            target: "sinomo.network.endpoint_selector",
+            detail = %args,
+            "cluster endpoint selector"
+        );
     }
 }
 

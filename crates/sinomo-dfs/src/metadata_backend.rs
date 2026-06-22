@@ -23,7 +23,7 @@ use std::io::Write;
 use std::io::{self, Seek, SeekFrom};
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -41,23 +41,8 @@ const LEGACY_METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 1;
 const METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 2;
 static METADATA_WRITE_PATH_LOCKS: OnceLock<(Mutex<BTreeSet<PathBuf>>, Condvar)> = OnceLock::new();
 
-fn metadata_backend_perf_trace_enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var("SINOMO_DFS_PERF_TRACE")
-            .ok()
-            .is_some_and(|value| {
-                value == "1"
-                    || value.eq_ignore_ascii_case("true")
-                    || value.eq_ignore_ascii_case("yes")
-            })
-    });
-    *ENABLED
-}
-
 fn metadata_backend_perf_trace(args: std::fmt::Arguments<'_>) {
-    if metadata_backend_perf_trace_enabled() {
-        eprintln!("[sinomo-dfs-perf] {args}");
-    }
+    tracing::trace!(target: "sinomo.dfs.perf", detail = %args, "dfs metadata backend perf");
 }
 
 #[derive(Debug, Error)]

@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, LazyLock, Mutex,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime};
@@ -30,23 +30,8 @@ const PACKED_BLOB_SMALL_LIMIT_BYTES: u64 = 16 * 1024;
 const PACKED_BLOB_SEGMENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const STREAMED_OBJECT_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
 
-fn content_store_perf_trace_enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var("SINOMO_DFS_PERF_TRACE")
-            .ok()
-            .is_some_and(|value| {
-                value == "1"
-                    || value.eq_ignore_ascii_case("true")
-                    || value.eq_ignore_ascii_case("yes")
-            })
-    });
-    *ENABLED
-}
-
 fn content_store_perf_trace(args: std::fmt::Arguments<'_>) {
-    if content_store_perf_trace_enabled() {
-        eprintln!("[sinomo-dfs-perf] {args}");
-    }
+    tracing::trace!(target: "sinomo.dfs.perf", detail = %args, "dfs content store perf");
 }
 
 #[derive(Debug, Error)]

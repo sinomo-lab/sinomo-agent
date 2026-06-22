@@ -13,6 +13,7 @@ ring = "r1"
 
 [dependencies]
 fs2.workspace = true
+metrics.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sinomo-cli-registry = { path = "../sinomo-cli-registry" }
@@ -24,6 +25,8 @@ sinomo-service = { path = "../sinomo-service" }
 sinomo-storage = { path = "../sinomo-storage" }
 thiserror.workspace = true
 time.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1.44", features = ["macros", "rt"] }

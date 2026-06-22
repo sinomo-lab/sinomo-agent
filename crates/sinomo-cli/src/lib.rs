@@ -131,6 +131,7 @@ use sinomo_runtime::daemon::{
     send_daemon_rpc_to_endpoint as daemon_send_daemon_rpc_to_endpoint,
     send_daemon_rpc_with_timeouts as daemon_send_daemon_rpc_with_timeouts,
     send_daemon_shutdown_request,
+    send_dfs_object_rpc_to_target as daemon_send_object_rpc_to_target,
     shadow_main_binary_from_env as daemon_shadow_main_binary_from_env,
     shadow_main_options_from_env as daemon_shadow_main_options_from_env,
     sign_daemon_rpc_request_for_local_node as daemon_sign_daemon_rpc_request_for_local_node,
@@ -231,6 +232,7 @@ use sinomo_runtime::rollout::{
     cluster_rollout_should_use_remote_build as daemon_cluster_rollout_should_use_remote_build,
 };
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::env;
 use std::fmt;
 use std::fs;
@@ -1183,7 +1185,12 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
         .register(sinomo_runtime::module::module_cli_command_handler(
             module_config,
         ))
-        .register(sinomo_runtime::observe::observe_cli_command_handler())
+        .register(
+            sinomo_runtime::observe::observe_cli_command_handler_with_cluster_rpc(
+                observe_cli_rpc,
+                observe_cli_cluster_targets,
+            ),
+        )
         .register(sinomo_runtime::sandbox::sandbox_cli_command_handler(
             Arc::new(SinomoCliSandboxHost),
         ))
@@ -1191,6 +1198,46 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
 
 fn cli_command_registry() -> &'static CliCommandRegistry {
     &cli_runtime_config().command_registry
+}
+
+fn observe_cli_rpc(
+    target_node_id: Option<&str>,
+    request: network::ObjectRpcRequest,
+) -> Result<network::ObjectRpcResponse, String> {
+    const OBSERVE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+    if let Some(target_node_id) = target_node_id {
+        let target_node_id = NodeId::new(target_node_id.to_string()).map_err(|source| {
+            format!("invalid observe target node id `{target_node_id}`: {source}")
+        })?;
+        return daemon_send_object_rpc_to_target(
+            &target_node_id,
+            &request,
+            OBSERVE_RPC_TIMEOUT,
+            true,
+        )
+        .map_err(|source| source.to_string());
+    }
+    let status = daemon_default_main_daemon_status(OBSERVE_RPC_TIMEOUT)
+        .map_err(|source| source.to_string())?
+        .ok_or_else(|| "observe live queries require the local daemon to be running".to_string())?;
+    daemon_send_daemon_rpc(&status.address, &request, OBSERVE_RPC_TIMEOUT)
+        .map_err(|source| source.to_string())
+}
+
+fn observe_cli_cluster_targets() -> Result<Vec<String>, String> {
+    let data_dir = SinomoDataDir::from_env_or_home().map_err(|source| source.to_string())?;
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let state = network::read_cluster_state_without_kv(&cluster_paths)
+        .map_err(|source| source.to_string())?;
+    let mut targets = BTreeSet::from([state.local_node_id.to_string()]);
+    targets.extend(
+        state
+            .members
+            .iter()
+            .filter(|member| member.state.is_authorized())
+            .map(|member| member.node_id.to_string()),
+    );
+    Ok(targets.into_iter().collect())
 }
 
 pub(crate) fn parse_cli_invocation(args: &[String]) -> Result<CliInvocation, CliError> {
