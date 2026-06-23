@@ -114,7 +114,7 @@ fn write_cluster_rollout_progress(
 
 fn publish_rollout_progress_to_cluster(daemon_paths: &DaemonPaths) {
     if let Err(error) = crate::cluster::refresh_daemon_node_status_in_kv(daemon_paths) {
-        eprintln!("sinomo daemon rollout progress publish failed: {error}");
+        tracing::warn!("sinomo daemon rollout progress publish failed: {error}");
     }
 }
 
@@ -528,7 +528,7 @@ pub fn run_shadow_daemon_supervision_loop(
     let listener = daemon_runtime.block_on(sinomo_network::AsyncDaemonControlListener::bind(
         &bind_address,
     ))?;
-    println!("sinomo shadow daemon listening on {bind_address}");
+    tracing::info!("sinomo shadow daemon listening on {bind_address}");
     crate::append_operational_event_best_effort(
         &shadow_paths,
         crate::OperationalSeverity::Info,
@@ -551,7 +551,7 @@ pub fn run_shadow_daemon_supervision_loop(
         daemon_runtime_handle.clone(),
         "shadow daemon",
     ) {
-        eprintln!("sinomo shadow daemon iroh proxy disabled: {error}");
+        tracing::warn!("sinomo shadow daemon iroh proxy disabled: {error}");
         crate::append_operational_log_best_effort(
             &shadow_paths,
             crate::OperationalSeverity::Warn,
@@ -566,7 +566,7 @@ pub fn run_shadow_daemon_supervision_loop(
     if let Err(error) =
         start_shadow_daemon_status_publisher(&shadow_paths, daemon_runtime_handle.clone())
     {
-        eprintln!("sinomo shadow daemon status publisher disabled: {error}");
+        tracing::warn!("sinomo shadow daemon status publisher disabled: {error}");
         crate::append_operational_log_best_effort(
             &shadow_paths,
             crate::OperationalSeverity::Warn,
@@ -579,7 +579,7 @@ pub fn run_shadow_daemon_supervision_loop(
         );
     }
     if let Err(error) = complete_pending_shadow_rollout_after_start(&shadow_paths, &rollout_paths) {
-        eprintln!("sinomo shadow daemon rollout finalization publish failed: {error}");
+        tracing::warn!("sinomo shadow daemon rollout finalization publish failed: {error}");
         crate::append_operational_log_best_effort(
             &shadow_paths,
             crate::OperationalSeverity::Warn,
@@ -764,7 +764,7 @@ pub fn run_shadow_daemon_supervision_loop(
                 }
                 ShadowMainStart::StartFailed { detail } => {
                     let delay = main_restart_backoff.schedule_after_failure(Instant::now());
-                    eprintln!(
+                    tracing::warn!(
                         "sinomo shadow daemon could not start supervised main: {detail}; retrying in {}ms",
                         delay.as_millis()
                     );
@@ -942,7 +942,7 @@ pub fn run_shadow_daemon_supervision_loop(
                         supervised_main = None;
                         supervised_main_started_at = None;
                         let delay = main_restart_backoff.schedule_after_failure(Instant::now());
-                        eprintln!(
+                        tracing::warn!(
                             "sinomo shadow daemon supervised main crashed; retrying in {}ms",
                             delay.as_millis()
                         );
@@ -996,7 +996,7 @@ pub fn run_shadow_daemon_supervision_loop(
         } else {
             env::current_exe().unwrap_or(installed_shadow_binary)
         };
-        eprintln!(
+        tracing::warn!(
             "sinomo shadow daemon re-executing supervisor binary {}",
             target.display()
         );
@@ -2275,7 +2275,7 @@ fn finalize_pending_shadow_rollout(
                     ));
                 }
                 Err(helper_error) => {
-                    eprintln!(
+                    tracing::warn!(
                         "sinomo shadow rollout finalize helper spawn failed: {helper_error}; attempting inline rollback"
                     );
                 }
@@ -2331,7 +2331,7 @@ fn finalize_pending_shadow_rollout(
                 detail = format!(
                     "candidate shadow failed ({error}) and rollback supervisor did not become healthy: {recovery_error}"
                 );
-                eprintln!("sinomo shadow rollout finalize: {detail}");
+                tracing::warn!("sinomo shadow rollout finalize: {detail}");
             }
         }
     }
@@ -2346,7 +2346,7 @@ pub fn handle_daemon_clear_rollout_status(paths: &DaemonPaths) -> Result<String,
     let rollout_paths = SelfRolloutPaths::new(&data_dir);
     let cleared = clear_rollout_status(&rollout_paths)?;
     if let Err(error) = crate::cluster::refresh_daemon_node_status_in_kv(paths) {
-        eprintln!("sinomo daemon rollout status clear publish failed: {error}");
+        tracing::warn!("sinomo daemon rollout status clear publish failed: {error}");
     }
     if cleared {
         Ok(format!(

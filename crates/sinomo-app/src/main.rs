@@ -12,7 +12,7 @@ fn main() -> ExitCode {
         return match sinomo_cli::run(args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("sinomo: {error}");
+                tracing::error!("sinomo: {error}");
                 ExitCode::FAILURE
             }
         };
@@ -21,7 +21,7 @@ fn main() -> ExitCode {
     match sinomo_app::run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("sinomo-app: {error}");
+            tracing::error!("sinomo-app: {error}");
             ExitCode::FAILURE
         }
     }

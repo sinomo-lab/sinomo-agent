@@ -195,7 +195,7 @@ pub fn append_operational_event_best_effort(
         .map_err(DaemonError::from)
     })();
     if let Err(error) = result {
-        eprintln!("sinomo daemon operational event append failed: {error}");
+        tracing::warn!("sinomo daemon operational event append failed: {error}");
     }
 }
 
@@ -221,7 +221,7 @@ pub fn append_operational_log_best_effort(
         .map_err(DaemonError::from)
     })();
     if let Err(error) = result {
-        eprintln!("sinomo daemon operational log append failed: {error}");
+        tracing::warn!("sinomo daemon operational log append failed: {error}");
     }
 }
 

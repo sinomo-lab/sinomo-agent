@@ -798,7 +798,7 @@ async fn handle_daemon_dfs_message_async(
             daemon_dfs_metadata_replication_options(),
             log_dfs_metadata_replication_report,
             |error| {
-                eprintln!("sinomo daemon DFS metadata publish after message mutation failed: {error}");
+                tracing::warn!("sinomo daemon DFS metadata publish after message mutation failed: {error}");
             },
         );
         schedule_daemon_dfs_message_deferred_work(message_cache_key);
@@ -840,7 +840,9 @@ fn handle_daemon_dfs_message_on_runtime(
         daemon_dfs_metadata_replication_options(),
         log_dfs_metadata_replication_report,
         |error| {
-            eprintln!("sinomo daemon DFS metadata publish after message mutation failed: {error}");
+            tracing::warn!(
+                "sinomo daemon DFS metadata publish after message mutation failed: {error}"
+            );
         },
     );
     Ok(message_response)
@@ -906,7 +908,7 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
         }
     }
     for line in observations.notice_lines {
-        eprintln!("sinomo daemon {line}");
+        tracing::warn!("sinomo daemon {line}");
     }
     Ok(())
 }
@@ -936,7 +938,7 @@ fn daemon_dfs_metadata_publish_schedule_options() -> DfsMetadataPublishScheduleO
 
 fn log_dfs_metadata_replication_report(report: DfsMetadataJournalReplicationReport) {
     for line in sinomo_dfs::dfs_metadata_replication_notice_lines(&report) {
-        eprintln!("sinomo daemon {line}");
+        tracing::warn!("sinomo daemon {line}");
     }
 }
 

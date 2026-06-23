@@ -789,7 +789,7 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
     label: &str,
 ) -> Result<(), DaemonError> {
     if sinomo_network::iroh_disabled_by_env() {
-        println!("sinomo {label} iroh disabled (SINOMO_DISABLE_IROH)");
+        tracing::info!("sinomo {label} iroh disabled (SINOMO_DISABLE_IROH)");
         return Ok(());
     }
     let paths = paths.clone();
@@ -799,7 +799,7 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
     let runtime = runtime.clone();
     runtime.clone().spawn(async move {
         let Some(data_dir) = paths.root.parent().map(|path| path.to_path_buf()) else {
-            eprintln!(
+            tracing::warn!(
                 "sinomo {label} iroh proxy disabled: daemon paths have no data directory parent"
             );
             return;
@@ -814,7 +814,7 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
                 .as_ref()
                 .is_some_and(sinomo_network::IrohDaemonProxyHandle::is_finished)
             {
-                eprintln!("sinomo {label} iroh proxy supervisor stopped, restarting");
+                tracing::warn!("sinomo {label} iroh proxy supervisor stopped, restarting");
                 proxy_handle = None;
             }
             if cluster.is_none() {
@@ -834,7 +834,7 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
                 })
                 .await;
                 let Ok((status, state_exists)) = status else {
-                    eprintln!("sinomo {label} iroh cluster status task failed");
+                    tracing::warn!("sinomo {label} iroh cluster status task failed");
                     tokio::time::sleep(DAEMON_CLUSTER_PUBLISH_INTERVAL).await;
                     continue;
                 };
@@ -879,15 +879,15 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
                         .await
                         {
                             Ok(Ok(())) => {
-                                println!("sinomo {label} iroh endpoint: {endpoint_address}");
+                                tracing::info!("sinomo {label} iroh endpoint: {endpoint_address}");
                             }
                             Ok(Err(error)) => {
-                                eprintln!(
+                                tracing::warn!(
                                     "sinomo {label} iroh endpoint advertisement failed: {error}"
                                 );
                             }
                             Err(error) => {
-                                eprintln!(
+                                tracing::warn!(
                                     "sinomo {label} iroh endpoint advertisement task failed: {error}"
                                 );
                             }
@@ -901,11 +901,11 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
                             );
                     }
                     Err(error) if error.to_string().contains("without iroh-transport") => {
-                        eprintln!("sinomo {label} iroh proxy disabled: {error}");
+                        tracing::warn!("sinomo {label} iroh proxy disabled: {error}");
                         break;
                     }
                     Err(error) => {
-                        eprintln!("sinomo {label} iroh proxy unavailable, retrying: {error}");
+                        tracing::warn!("sinomo {label} iroh proxy unavailable, retrying: {error}");
                         let retry_delay =
                             sinomo_network::cluster_iroh_proxy_start_retry_sleep_duration(
                                 proxy_start_failures,
@@ -939,10 +939,10 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
                     }
                     Ok((Ok(_), None)) => {}
                     Ok((Err(error), _)) => {
-                        eprintln!("sinomo {label} iroh repair route publish failed: {error}");
+                        tracing::warn!("sinomo {label} iroh repair route publish failed: {error}");
                     }
                     Err(error) => {
-                        eprintln!("sinomo {label} iroh repair route task failed: {error}");
+                        tracing::warn!("sinomo {label} iroh repair route task failed: {error}");
                     }
                 }
                 let publish_node = cluster
@@ -1000,7 +1000,7 @@ fn refresh_daemon_iroh_repair_route_with_runtime(
             Ok(true)
         }
         Err(error) => {
-            eprintln!(
+            tracing::warn!(
                 "sinomo {} iroh repair route unavailable: {error}",
                 cluster.process
             );
@@ -1030,7 +1030,7 @@ pub(crate) fn start_shadow_daemon_status_publisher(
                         if let Err(error) =
                             refresh_daemon_iroh_repair_route_on_runtime(&tick_paths, &tick_runtime)
                         {
-                            eprintln!(
+                            tracing::warn!(
                                 "sinomo shadow daemon iroh repair route tick failed: {error}"
                             );
                         }
@@ -1047,7 +1047,7 @@ pub(crate) fn start_shadow_daemon_status_publisher(
             })
             .await;
             let Ok((settled_solo, clustered, steady_publish_interval)) = tick else {
-                eprintln!("sinomo shadow daemon cluster status tick task failed");
+                tracing::warn!("sinomo shadow daemon cluster status tick task failed");
                 publish_interval = DAEMON_SHADOW_STATUS_STARTUP_RETRY_INTERVAL;
                 continue;
             };
@@ -1056,7 +1056,7 @@ pub(crate) fn start_shadow_daemon_status_publisher(
                 match refresh_daemon_node_status_in_kv_async(&status_paths, runtime.clone()).await {
                     Ok(outcome) => status_publish_outcome = Some(outcome),
                     Err(error) => {
-                        eprintln!("sinomo shadow daemon cluster status tick failed: {error}")
+                        tracing::warn!("sinomo shadow daemon cluster status tick failed: {error}")
                     }
                 }
             }
@@ -1131,7 +1131,7 @@ fn advertise_daemon_iroh_endpoint_with_runtime(
         if let Some(runtime) = runtime {
             if let Err(error) = sync_cluster_state_to_kv_on_runtime(&cluster_paths, &state, runtime)
             {
-                eprintln!("sinomo iroh endpoint cluster state publication failed: {error}");
+                tracing::warn!("sinomo iroh endpoint cluster state publication failed: {error}");
             }
             let publish_result = publish_local_members_to_quorum_if_needed_on_runtime(
                 &cluster_paths,
@@ -1139,7 +1139,7 @@ fn advertise_daemon_iroh_endpoint_with_runtime(
                 runtime,
             );
             if let Err(error) = publish_result {
-                eprintln!("sinomo iroh endpoint member publication failed: {error}");
+                tracing::warn!("sinomo iroh endpoint member publication failed: {error}");
             }
         }
     }
@@ -1810,7 +1810,7 @@ impl ClusterNetworkMaintenance {
             if publish_due {
                 self.last_publish = now;
                 if let Err(error) = self.reconcile_desired_rollout(paths, &cluster_paths, &state) {
-                    eprintln!("sinomo daemon desired rollout reconcile failed: {error}");
+                    tracing::warn!("sinomo daemon desired rollout reconcile failed: {error}");
                 }
             }
             if probe_due {
@@ -1886,7 +1886,7 @@ impl ClusterNetworkMaintenance {
                     )
                     .await
                 {
-                    eprintln!("sinomo daemon distributed DFS control publish failed: {error}");
+                    tracing::warn!("sinomo daemon distributed DFS control publish failed: {error}");
                     publish_failed = true;
                 }
                 if !sinomo_node::cluster_bootstrap_state_stable_eq(
@@ -1896,7 +1896,7 @@ impl ClusterNetworkMaintenance {
                     sync_cluster_state_to_kv_async_on_runtime(&cluster_paths, &state, &runtime)
                         .await
                 {
-                    eprintln!("sinomo daemon cluster state publish failed: {error}");
+                    tracing::warn!("sinomo daemon cluster state publish failed: {error}");
                     publish_failed = true;
                 }
                 self.idle_stats.incr_kv_publish_member();
@@ -1932,7 +1932,7 @@ impl ClusterNetworkMaintenance {
                     && let Err(error) =
                         self.reconcile_desired_rollout(paths, &cluster_paths, &state)
                 {
-                    eprintln!("sinomo daemon desired rollout reconcile failed: {error}");
+                    tracing::warn!("sinomo daemon desired rollout reconcile failed: {error}");
                 }
             } else if !sinomo_kv::cluster_kv_raft_local_is_voter(&state) {
                 self.idle_stats.incr_kv_publish_member();
@@ -2098,14 +2098,15 @@ impl ClusterNetworkMaintenance {
             },
         )?;
         if response.status == "accepted" {
-            eprintln!(
+            tracing::warn!(
                 "sinomo daemon desired rollout accepted: {}",
                 response.detail
             );
         } else {
-            eprintln!(
+            tracing::warn!(
                 "sinomo daemon desired rollout {}: {}",
-                response.status, response.detail
+                response.status,
+                response.detail
             );
         }
         Ok(())
@@ -2183,7 +2184,7 @@ impl ClusterNetworkMaintenance {
                 self.record_publish_success();
             }
             Err(error) => {
-                eprintln!("sinomo daemon {} publish failed: {error}", pending.label);
+                tracing::warn!("sinomo daemon {} publish failed: {error}", pending.label);
                 self.record_publish_failure();
             }
         }
@@ -2205,7 +2206,7 @@ impl ClusterNetworkMaintenance {
         match result {
             Ok(()) => self.record_publish_success(),
             Err(error) => {
-                eprintln!("sinomo daemon cluster member publish failed: {error}");
+                tracing::warn!("sinomo daemon cluster member publish failed: {error}");
                 self.record_publish_failure();
             }
         }
@@ -2265,7 +2266,7 @@ impl ClusterNetworkMaintenance {
             }
             Err(error) => {
                 self.connectivity_converged = true;
-                eprintln!("sinomo daemon cluster connectivity publish failed: {error}");
+                tracing::warn!("sinomo daemon cluster connectivity publish failed: {error}");
             }
         }
     }
@@ -2394,7 +2395,7 @@ fn connectivity_record_for_daemon_status_probe(
             sinomo_network::ClusterConnectivityProbeObservation::Healthy
         }
         Ok(status) => {
-            eprintln!(
+            tracing::warn!(
                 "sinomo daemon connectivity probe identity mismatch: endpoint {} expected node {}, responder reported cluster={:?} node={:?}",
                 entry.endpoint.address,
                 entry.endpoint.node_id,
@@ -2528,7 +2529,7 @@ pub(crate) fn refresh_daemon_node_status_in_kv_on_runtime(
         if let Err(error) =
             sync_cluster_network_info_to_kv_on_runtime(&cluster_paths, network_info, runtime)
         {
-            eprintln!("sinomo daemon network info publish failed: {error}");
+            tracing::warn!("sinomo daemon network info publish failed: {error}");
         } else {
             outcome.network_info_published = true;
         }
@@ -2830,7 +2831,7 @@ async fn fetch_local_cluster_health_rows_from_member_async(
     match sinomo_network::decode_cluster_health_rpc_response(&response) {
         Ok(rows) => Ok(Some(rows)),
         Err(error) => {
-            eprintln!(
+            tracing::warn!(
                 "sinomo daemon cluster health peer rows from {} failed to decode: {error}",
                 member.node_id
             );
@@ -2917,7 +2918,7 @@ async fn probe_member_daemon_status_async(
     let status: crate::DaemonStatus = match response.decode_body() {
         Ok(status) => status,
         Err(error) => {
-            eprintln!(
+            tracing::warn!(
                 "sinomo daemon cluster health probe of {} failed to decode: {error}",
                 member.node_id
             );
@@ -2925,7 +2926,7 @@ async fn probe_member_daemon_status_async(
         }
     };
     let Some(cluster) = status.cluster.as_ref() else {
-        eprintln!(
+        tracing::warn!(
             "sinomo daemon cluster health probe of {}: status has no cluster section",
             member.node_id
         );
@@ -2934,7 +2935,7 @@ async fn probe_member_daemon_status_async(
     let cluster_id_matches =
         cluster.cluster_id == state.cluster_id || cluster.cluster_id == member.cluster_id;
     if !cluster_id_matches || cluster.node_id != member.node_id {
-        eprintln!(
+        tracing::warn!(
             "sinomo daemon cluster health probe of {}: identity mismatch (expected cluster {} or member cluster {}, responder cluster {} node {})",
             member.node_id,
             state.cluster_id,
@@ -2949,7 +2950,7 @@ async fn probe_member_daemon_status_async(
     if cluster_member_expected_daemon_process(member)
         .is_some_and(|process| status.process != process)
     {
-        eprintln!(
+        tracing::warn!(
             "sinomo daemon cluster health probe of {}: process mismatch (expected {}, responder {})",
             member.node_id,
             cluster_member_expected_daemon_process(member).unwrap_or("unknown"),
@@ -2984,7 +2985,7 @@ async fn call_member_object_rpc_target_async(
     {
         Ok(response) => Ok(Some(response)),
         Err(error) => {
-            eprintln!(
+            tracing::warn!(
                 "sinomo daemon {operation} of {} failed: {error}",
                 member.node_id
             );
@@ -4377,7 +4378,7 @@ fn fan_out_committed_cluster_raft_command_on_runtime(
         );
     } else {
         let _ = (paths, state, events);
-        eprintln!(
+        tracing::warn!(
             "sinomo daemon cluster raft fanout skipped: {}",
             daemon_cluster_runtime_required_error(
                 "cluster raft fanout",

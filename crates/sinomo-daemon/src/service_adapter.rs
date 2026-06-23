@@ -824,7 +824,7 @@ impl Service for ClusterMembershipService {
                             {
                                 Ok(proof) => Ok(proof),
                                 Err(forward_error) => {
-                                    eprintln!(
+                                    tracing::warn!(
                                         "sinomo daemon join challenge for invite {} failed (local: {local_error}; forward-to-authority: {forward_error})",
                                         proof_challenge.invite_id
                                     );
@@ -836,7 +836,7 @@ impl Service for ClusterMembershipService {
                 })
                 .await
                 .unwrap_or_else(|_| {
-                    eprintln!(
+                    tracing::warn!(
                         "sinomo daemon join challenge for invite {} timed out after {}s",
                         challenge.invite_id,
                         CLUSTER_JOIN_CHALLENGE_BUDGET.as_secs()
@@ -871,7 +871,7 @@ impl Service for ClusterMembershipService {
                 )
                 .await
                 .map_err(|_| {
-                    eprintln!(
+                    tracing::warn!(
                         "sinomo daemon join registration timed out after {}s",
                         CLUSTER_JOIN_REGISTRATION_BUDGET.as_secs()
                     );
@@ -2547,7 +2547,7 @@ pub(crate) async fn try_dispatch_pre_auth_via_registry_async(
         }
         Ok(None) => Ok(false),
         Err(error) => {
-            eprintln!("sinomo daemon pre-auth join challenge ignored: {error}");
+            tracing::warn!("sinomo daemon pre-auth join challenge ignored: {error}");
             let _ = stream.shutdown_write(stream_address).await;
             Ok(true)
         }

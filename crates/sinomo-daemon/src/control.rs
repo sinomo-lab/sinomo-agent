@@ -190,11 +190,11 @@ pub fn run_daemon_control_loop_with_services(
             cluster.as_ref().map(|status| status.node_id.to_string()),
         ))
     {
-        eprintln!("sinomo {label} observe runtime initialization failed: {error}");
+        tracing::warn!("sinomo {label} observe runtime initialization failed: {error}");
     }
     crate::observe::register_observe_metric_exporters(&service_hooks);
     if let Err(error) = prune_local_cluster_raft_uncommitted_tail(&paths) {
-        eprintln!("sinomo {label} cluster raft startup repair skipped: {error}");
+        tracing::warn!("sinomo {label} cluster raft startup repair skipped: {error}");
     }
     if label == "daemon" && crate::dfs::default_distributed_dfs_enabled() {
         ensure_default_local_dfs_expose(&paths)?;
@@ -205,7 +205,7 @@ pub fn run_daemon_control_loop_with_services(
     let listener = daemon_runtime.block_on(sinomo_network::AsyncDaemonControlListener::bind(
         &bind_address,
     ))?;
-    println!("sinomo {label} listening on {bind_address}");
+    tracing::info!("sinomo {label} listening on {bind_address}");
     crate::append_operational_event_best_effort(
         &paths,
         crate::OperationalSeverity::Info,
@@ -227,7 +227,7 @@ pub fn run_daemon_control_loop_with_services(
         daemon_runtime_handle.clone(),
         label,
     ) {
-        eprintln!("sinomo {label} iroh proxy disabled: {error}");
+        tracing::warn!("sinomo {label} iroh proxy disabled: {error}");
         crate::append_operational_log_best_effort(
             &paths,
             crate::OperationalSeverity::Warn,
@@ -255,7 +255,9 @@ pub fn run_daemon_control_loop_with_services(
             )
             .await
             {
-                eprintln!("sinomo {bootstrap_label} distributed DFS bootstrap failed: {error}");
+                tracing::warn!(
+                    "sinomo {bootstrap_label} distributed DFS bootstrap failed: {error}"
+                );
             }
         });
     }
@@ -347,14 +349,18 @@ async fn run_daemon_background_maintenance_loop(
             .await
             {
                 Ok(Ok(response)) if !response.starts_with("no pending shadow rollout") => {
-                    print!("sinomo {label} rollout finalization: {response}");
+                    tracing::info!("sinomo {label} rollout finalization: {response}");
                 }
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => {
-                    eprintln!("sinomo {label} shadow rollout finalization tick failed: {error}");
+                    tracing::warn!(
+                        "sinomo {label} shadow rollout finalization tick failed: {error}"
+                    );
                 }
                 Err(error) => {
-                    eprintln!("sinomo {label} shadow rollout finalization task failed: {error}");
+                    tracing::warn!(
+                        "sinomo {label} shadow rollout finalization task failed: {error}"
+                    );
                 }
             }
         }
@@ -371,7 +377,7 @@ async fn run_daemon_background_maintenance_loop(
                 }
             }
             Err(error) => {
-                eprintln!("sinomo {label} cluster network tick failed: {error}");
+                tracing::warn!("sinomo {label} cluster network tick failed: {error}");
             }
         }
 
@@ -392,10 +398,10 @@ async fn run_daemon_background_maintenance_loop(
                 }
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => {
-                    eprintln!("sinomo {label} DFS maintenance probe failed: {error}");
+                    tracing::warn!("sinomo {label} DFS maintenance probe failed: {error}");
                 }
                 Err(error) => {
-                    eprintln!("sinomo {label} DFS maintenance probe task failed: {error}");
+                    tracing::warn!("sinomo {label} DFS maintenance probe task failed: {error}");
                 }
             }
         }
@@ -422,13 +428,13 @@ async fn run_daemon_background_maintenance_loop(
                         }
                         Ok(Err(error)) => {
                             dfs_triggered_maintenance_requested = false;
-                            eprintln!(
+                            tracing::warn!(
                                 "sinomo {label} DFS maintenance follow-up probe failed: {error}"
                             );
                         }
                         Err(error) => {
                             dfs_triggered_maintenance_requested = false;
-                            eprintln!(
+                            tracing::warn!(
                                 "sinomo {label} DFS maintenance follow-up probe task failed: {error}"
                             );
                         }
@@ -436,7 +442,7 @@ async fn run_daemon_background_maintenance_loop(
                 }
                 Err(error) => {
                     dfs_triggered_maintenance_requested = false;
-                    eprintln!("sinomo {label} DFS maintenance tick failed: {error}");
+                    tracing::warn!("sinomo {label} DFS maintenance tick failed: {error}");
                 }
             }
             last_dfs_maintenance = std::time::Instant::now();
@@ -451,16 +457,17 @@ async fn run_daemon_background_maintenance_loop(
             })
             .await
             {
-                Ok(Ok(Some(applied))) => println!(
+                Ok(Ok(Some(applied))) => tracing::info!(
                     "sinomo {label} rollout telemetry applied {:?} at {} bps",
-                    applied.transition.action, applied.transition.current_weight_bps
+                    applied.transition.action,
+                    applied.transition.current_weight_bps
                 ),
                 Ok(Ok(None)) => {}
                 Ok(Err(error)) => {
-                    eprintln!("sinomo {label} rollout telemetry tick failed: {error}");
+                    tracing::warn!("sinomo {label} rollout telemetry tick failed: {error}");
                 }
                 Err(error) => {
-                    eprintln!("sinomo {label} rollout telemetry task failed: {error}");
+                    tracing::warn!("sinomo {label} rollout telemetry task failed: {error}");
                 }
             }
             last_rollout_telemetry = std::time::Instant::now();
@@ -476,7 +483,7 @@ async fn run_daemon_background_maintenance_loop(
             {
                 Ok(due) => Some(due),
                 Err(error) => {
-                    eprintln!(
+                    tracing::warn!(
                         "sinomo {label} shadow rollout finalization due task failed: {error}"
                     );
                     None
@@ -583,7 +590,7 @@ pub(crate) async fn run_daemon_control_accept_loop(
                             let _ = client_shutdown_tx.send(true);
                         }
                         Ok(false) => {}
-                        Err(error) => eprintln!("sinomo {client_label} client error: {error}"),
+                        Err(error) => tracing::warn!("sinomo {client_label} client error: {error}"),
                     }
                 });
             }
@@ -643,7 +650,7 @@ pub(crate) async fn handle_daemon_connection_async(
             Ok(authenticated) => authenticated,
             Err(error) => {
                 if crate::auth::is_cluster_join_register_control_request(&request) {
-                    eprintln!("sinomo daemon client auth failed for {route}: {error}");
+                    tracing::warn!("sinomo daemon client auth failed for {route}: {error}");
                 }
                 if let Some(key) = replay_key.as_ref()
                     && let Some(response) = wait_for_daemon_dfs_message_replay(&paths, key).await
