@@ -13189,11 +13189,13 @@ fn main_agent_config_tool_registry_exposes_host_config_catalog() {
         "sandbox.policy",
         "lm.providers",
         "lm.runtime",
-        "lm.credentials.openai",
-        "lm.credentials.codex",
     ] {
         assert!(keys.iter().any(|key| key == &expected), "{expected}");
     }
+    assert!(
+        !keys.iter().any(|key| key.starts_with("lm.credentials.")),
+        "provider credentials are account data in lm.providers, not config catalog entries"
+    );
 }
 
 #[test]

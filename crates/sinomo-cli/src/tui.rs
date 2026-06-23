@@ -5234,7 +5234,11 @@ mod tui_tests {
 
         assert!(keys.iter().any(|key| *key == "dfs.expose"));
         assert!(keys.iter().any(|key| *key == "rollout.telemetry.gates"));
-        assert!(keys.iter().any(|key| *key == "lm.credentials.openai"));
+        assert!(keys.iter().any(|key| *key == "lm.providers"));
+        assert!(
+            !keys.iter().any(|key| key.starts_with("lm.credentials.")),
+            "provider credentials are account data in lm.providers, not catalog entries"
+        );
     }
 
     #[test]
