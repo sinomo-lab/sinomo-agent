@@ -1,5 +1,6 @@
 use crate::{CapabilityName, Id, TrustDomain};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct NodeCapability {
@@ -100,13 +101,110 @@ pub enum ActionStatus {
     Cancelled,
 }
 
+pub type MemoryId = Id;
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemoryScope {
+    Cluster,
+    Agent { agent_id: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemoryTier {
+    Warm,
+    Cold,
+    Procedural,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MemorySourceRef {
+    pub kind: String,
+    pub value: String,
+}
+
+impl MemorySourceRef {
+    pub fn new(kind: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            value: value.into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct MemoryRecord {
-    pub entity_id: Id,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_event_id: Option<Id>,
+    pub memory_id: MemoryId,
+    pub scope: MemoryScope,
+    pub tier: MemoryTier,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<MemorySourceRef>,
     pub visibility: TrustDomain,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+impl MemoryRecord {
+    pub fn new(
+        scope: MemoryScope,
+        tier: MemoryTier,
+        summary: impl Into<String>,
+        source_refs: Vec<MemorySourceRef>,
+        visibility: TrustDomain,
+        created_at: OffsetDateTime,
+    ) -> Self {
+        let summary = summary.into();
+        let memory_id = derive_memory_id(
+            &scope,
+            &tier,
+            &summary,
+            &source_refs,
+            &visibility,
+            created_at,
+        );
+        Self {
+            memory_id,
+            scope,
+            tier,
+            summary,
+            source_refs,
+            visibility,
+            created_at,
+        }
+    }
+}
+
+fn derive_memory_id(
+    scope: &MemoryScope,
+    tier: &MemoryTier,
+    summary: &str,
+    source_refs: &[MemorySourceRef],
+    visibility: &TrustDomain,
+    created_at: OffsetDateTime,
+) -> MemoryId {
+    #[derive(Serialize)]
+    struct MemoryFingerprint<'a> {
+        scope: &'a MemoryScope,
+        tier: &'a MemoryTier,
+        summary: &'a str,
+        source_refs: &'a [MemorySourceRef],
+        visibility: &'a TrustDomain,
+        #[serde(with = "time::serde::rfc3339")]
+        created_at: OffsetDateTime,
+    }
+
+    let fingerprint = MemoryFingerprint {
+        scope,
+        tier,
+        summary,
+        source_refs,
+        visibility,
+        created_at,
+    };
+    let bytes = serde_json::to_vec(&fingerprint).unwrap_or_default();
+    Id::derived("memory-record", bytes)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
