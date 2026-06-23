@@ -46,7 +46,8 @@ Important exported surfaces:
 - `AgentDefinition`, `AgentPackageDefinition`, `AgentPackageProvenance`, and
   `AgentCatalog`;
 - `AgentConfig`, `AgentLoopInput`, `AgentOutputFormat`, and `TurnContext`;
-- `ContextAssembler`, `ContextAssemblyReport`, and `ContextBudgetEstimate`;
+- `ContextAssembler`, `ContextBlock`, `ContextFrame`, `ContextDelta`,
+  `ContextAssemblyReport`, and `ContextBudgetEstimate`;
 - `AgentCompactor` and `AgentCompactionSummary`;
 - `AgentToolRegistry`, `AgentToolOrchestrator`, `AgentToolSurface`,
   `ToolAvailability`, `AgentToolEvidence`, and `AgentToolPairIntegrity`;
@@ -155,6 +156,15 @@ fixed prompt, current work, recent tail, retrieved memories, old summaries,
 prompt references, context attachments, async updates, and tool-surface
 availability.
 
+The context assembler also builds a content-addressed `ContextFrame` from typed
+`ContextBlock`s. Blocks carry stable keys, content hashes, source references,
+priority, byte estimates, and a cache policy (`stable_prefix`, `append_only`,
+`volatile_tail`, or `trace_only`). Each sampled frame records a `ContextDelta`
+against the previous sampled frame in the run, including kept, added, updated,
+removed, compressed, and externalized block refs plus reusable prefix bytes.
+This makes prompt contents inspectable and lets the UI explain which context
+changed without requiring the model-visible prompt to carry trace bookkeeping.
+
 Default model-visible bounds:
 
 - workspace instruction files: 64 KiB;
@@ -183,8 +193,8 @@ append-only audit trails.
 
 `AgentTraceStore` is the append-only observability boundary.
 `FileAgentTraceStore` writes run boundaries, context reports, model events,
-typed transcript items, tool outcomes, compactions, and emitted runtime events
-under `events/agent/traces/<session>.jsonl`.
+typed context frames and deltas, transcript items, tool outcomes, compactions,
+and emitted runtime events under `events/agent/traces/<session>.jsonl`.
 
 Full command and tool evidence can be written under
 `events/agent/evidence/<session>/...`. `LocalWorkspaceAgentConfig` wires local

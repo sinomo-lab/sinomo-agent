@@ -432,6 +432,10 @@ pub enum AgentTraceRecordKind {
     ContextReport {
         report: ContextAssemblyReport,
     },
+    ContextFrame {
+        frame: ContextFrame,
+        delta: ContextDelta,
+    },
     ModelEvent {
         event: AgentModelEvent,
     },
@@ -917,6 +921,8 @@ pub struct TurnContext {
     pub available_tool_specs: Vec<AgentToolDescriptor>,
     pub budget_estimate: ContextBudgetEstimate,
     pub report: ContextAssemblyReport,
+    pub context_frame: ContextFrame,
+    pub context_delta: ContextDelta,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -930,6 +936,20 @@ pub struct ContextAssemblyReport {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub omitted: Vec<ContextOmission>,
     pub budget_estimate: ContextBudgetEstimate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_frame_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_context_frame_id: Option<String>,
+    #[serde(default)]
+    pub context_block_count: usize,
+    #[serde(default)]
+    pub stable_prefix_bytes: usize,
+    #[serde(default)]
+    pub cache_reuse_prefix_bytes: usize,
+    #[serde(default)]
+    pub cache_reuse_prefix_block_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_changed_block_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -981,6 +1001,143 @@ pub struct ContextBudgetLane {
     pub label: String,
     pub bytes: usize,
     pub priority: u8,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextBlockKind {
+    SystemInstructions,
+    ToolSchemas,
+    ToolSurface,
+    WorkspaceFacts,
+    InstructionFile,
+    PromptReference,
+    SessionProjection,
+    TranscriptItem,
+    ContextAttachment,
+    AsyncUpdate,
+    RetrievedMemory,
+    BudgetEstimate,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCachePolicy {
+    StablePrefix,
+    AppendOnly,
+    VolatileTail,
+    TraceOnly,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ContextBlock {
+    pub block_id: String,
+    pub stable_key: String,
+    pub kind: ContextBlockKind,
+    pub priority: u8,
+    pub cache_policy: ContextCachePolicy,
+    pub source: ContextSource,
+    pub content_bytes: usize,
+    pub token_estimate: usize,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ContextFrameBlockRef {
+    pub block_id: String,
+    pub stable_key: String,
+    pub kind: ContextBlockKind,
+    pub cache_policy: ContextCachePolicy,
+    pub bytes: usize,
+    pub priority: u8,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ContextFrame {
+    pub frame_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_frame_id: Option<String>,
+    pub session_id: SessionId,
+    pub step_index: usize,
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<ContextBlock>,
+    pub total_bytes: usize,
+    pub stable_prefix_bytes: usize,
+    #[serde(default)]
+    pub cache_reuse_prefix_bytes: usize,
+    #[serde(default)]
+    pub cache_reuse_prefix_block_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_changed_block_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ContextDelta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_frame_id: Option<String>,
+    pub to_frame_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept: Vec<ContextFrameBlockRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added: Vec<ContextFrameBlockRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub updated: Vec<ContextBlockUpdate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compressed: Vec<ContextRetentionDecision>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<ContextFrameBlockRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub externalized: Vec<ContextRetentionDecision>,
+    #[serde(default)]
+    pub cache_reuse_prefix_bytes: usize,
+    #[serde(default)]
+    pub cache_reuse_prefix_block_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_changed_block_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ContextBlockUpdate {
+    pub stable_key: String,
+    pub previous_block_id: String,
+    pub new_block_id: String,
+    pub reason: ContextRetentionReason,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ContextRetentionDecision {
+    pub stable_key: String,
+    pub block_id: String,
+    pub action: ContextRetentionAction,
+    pub reason: ContextRetentionReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_block_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextRetentionAction {
+    Keep,
+    CompressInto,
+    Drop,
+    Externalize,
+    Defer,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextRetentionReason {
+    Unchanged,
+    Added,
+    SourceChanged,
+    Removed,
+    BudgetExceeded,
+    Superseded,
+    ToolResultTooLarge,
+    PromptReferenceMissing,
+    UserRequested,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1537,6 +1694,268 @@ fn serialized_option_value_bytes(value: &Option<serde_json::Value>) -> usize {
         .unwrap_or_default()
 }
 
+fn context_block(
+    kind: ContextBlockKind,
+    stable_key: impl Into<String>,
+    label: impl Into<String>,
+    priority: u8,
+    cache_policy: ContextCachePolicy,
+    payload: serde_json::Value,
+) -> ContextBlock {
+    let stable_key = stable_key.into();
+    let label = label.into();
+    let content_bytes = serde_json::to_vec(&payload)
+        .map(|bytes| bytes.len())
+        .unwrap_or_default();
+    let block_id = context_block_id(&kind, &stable_key, &payload);
+    ContextBlock {
+        block_id,
+        stable_key,
+        kind: kind.clone(),
+        priority,
+        cache_policy,
+        source: ContextSource {
+            kind: context_block_source_kind(&kind).to_string(),
+            label,
+            bytes: content_bytes,
+        },
+        content_bytes,
+        token_estimate: content_bytes.div_ceil(CONTEXT_ESTIMATE_BYTES_PER_TOKEN),
+        payload,
+    }
+}
+
+fn context_block_id(
+    kind: &ContextBlockKind,
+    stable_key: &str,
+    payload: &serde_json::Value,
+) -> String {
+    let fingerprint = serde_json::json!({
+        "schema": "sinomo.context_block.v1",
+        "kind": kind,
+        "stable_key": stable_key,
+        "payload": payload,
+    });
+    format!("ctxb_{}", blake3_hash_json(&fingerprint))
+}
+
+fn context_frame_id(provider: &str, model: &str, blocks: &[ContextBlock]) -> String {
+    let block_ids = blocks
+        .iter()
+        .map(|block| block.block_id.as_str())
+        .collect::<Vec<_>>();
+    let fingerprint = serde_json::json!({
+        "schema": "sinomo.context_frame.v1",
+        "provider": provider,
+        "model": model,
+        "blocks": block_ids,
+    });
+    format!("ctxf_{}", blake3_hash_json(&fingerprint))
+}
+
+fn blake3_hash_json(value: &serde_json::Value) -> String {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
+fn context_block_source_kind(kind: &ContextBlockKind) -> &'static str {
+    match kind {
+        ContextBlockKind::SystemInstructions => "system_instructions",
+        ContextBlockKind::ToolSchemas => "tool_schemas",
+        ContextBlockKind::ToolSurface => "agent_tool_surface",
+        ContextBlockKind::WorkspaceFacts => "workspace_facts",
+        ContextBlockKind::InstructionFile => "instruction_file",
+        ContextBlockKind::PromptReference => "prompt_reference",
+        ContextBlockKind::SessionProjection => "session_projection",
+        ContextBlockKind::TranscriptItem => "transcript_item",
+        ContextBlockKind::ContextAttachment => "context_attachment",
+        ContextBlockKind::AsyncUpdate => "async_update",
+        ContextBlockKind::RetrievedMemory => "retrieved_memory",
+        ContextBlockKind::BudgetEstimate => "context_budget",
+    }
+}
+
+fn context_frame(
+    session_id: SessionId,
+    step_index: usize,
+    provider: impl Into<String>,
+    model: impl Into<String>,
+    blocks: Vec<ContextBlock>,
+) -> ContextFrame {
+    let provider = provider.into();
+    let model = model.into();
+    let total_bytes = blocks
+        .iter()
+        .map(|block| block.content_bytes)
+        .sum::<usize>();
+    let stable_prefix_bytes = stable_prefix_bytes(&blocks);
+    let frame_id = context_frame_id(&provider, &model, &blocks);
+    ContextFrame {
+        frame_id,
+        parent_frame_id: None,
+        session_id,
+        step_index,
+        provider,
+        model,
+        blocks,
+        total_bytes,
+        stable_prefix_bytes,
+        cache_reuse_prefix_bytes: 0,
+        cache_reuse_prefix_block_count: 0,
+        first_changed_block_id: None,
+    }
+}
+
+fn refresh_context_frame(frame: &mut ContextFrame) {
+    frame.total_bytes = frame
+        .blocks
+        .iter()
+        .map(|block| block.content_bytes)
+        .sum::<usize>();
+    frame.stable_prefix_bytes = stable_prefix_bytes(&frame.blocks);
+    frame.frame_id = context_frame_id(&frame.provider, &frame.model, &frame.blocks);
+}
+
+fn stable_prefix_bytes(blocks: &[ContextBlock]) -> usize {
+    blocks
+        .iter()
+        .take_while(|block| block.cache_policy == ContextCachePolicy::StablePrefix)
+        .map(|block| block.content_bytes)
+        .sum()
+}
+
+fn context_block_ref(block: &ContextBlock) -> ContextFrameBlockRef {
+    ContextFrameBlockRef {
+        block_id: block.block_id.clone(),
+        stable_key: block.stable_key.clone(),
+        kind: block.kind.clone(),
+        cache_policy: block.cache_policy.clone(),
+        bytes: block.content_bytes,
+        priority: block.priority,
+    }
+}
+
+fn context_delta(parent: Option<&ContextFrame>, frame: &ContextFrame) -> ContextDelta {
+    let Some(parent) = parent else {
+        return ContextDelta {
+            from_frame_id: None,
+            to_frame_id: frame.frame_id.clone(),
+            added: frame.blocks.iter().map(context_block_ref).collect(),
+            first_changed_block_id: frame.blocks.first().map(|block| block.block_id.clone()),
+            ..ContextDelta::default()
+        };
+    };
+
+    let mut kept = Vec::new();
+    let mut added = Vec::new();
+    let mut updated = Vec::new();
+    let mut removed = Vec::new();
+    let (cache_reuse_prefix_bytes, cache_reuse_prefix_block_count, first_changed_block_id) =
+        context_cache_reuse(parent, frame);
+
+    for block in &frame.blocks {
+        match parent
+            .blocks
+            .iter()
+            .find(|previous| previous.stable_key == block.stable_key)
+        {
+            Some(previous) if previous.block_id == block.block_id => {
+                kept.push(context_block_ref(block))
+            }
+            Some(previous) => updated.push(ContextBlockUpdate {
+                stable_key: block.stable_key.clone(),
+                previous_block_id: previous.block_id.clone(),
+                new_block_id: block.block_id.clone(),
+                reason: ContextRetentionReason::SourceChanged,
+            }),
+            None => added.push(context_block_ref(block)),
+        }
+    }
+
+    for previous in &parent.blocks {
+        if !frame
+            .blocks
+            .iter()
+            .any(|block| block.stable_key == previous.stable_key)
+        {
+            removed.push(context_block_ref(previous));
+        }
+    }
+
+    ContextDelta {
+        from_frame_id: Some(parent.frame_id.clone()),
+        to_frame_id: frame.frame_id.clone(),
+        kept,
+        added,
+        updated,
+        removed,
+        cache_reuse_prefix_bytes,
+        cache_reuse_prefix_block_count,
+        first_changed_block_id,
+        compressed: Vec::new(),
+        externalized: Vec::new(),
+    }
+}
+
+fn context_cache_reuse(
+    parent: &ContextFrame,
+    frame: &ContextFrame,
+) -> (usize, usize, Option<String>) {
+    let mut bytes = 0usize;
+    let mut block_count = 0usize;
+    for (previous, current) in parent.blocks.iter().zip(frame.blocks.iter()) {
+        if previous.block_id != current.block_id {
+            return (bytes, block_count, Some(current.block_id.clone()));
+        }
+        bytes = bytes.saturating_add(current.content_bytes);
+        block_count = block_count.saturating_add(1);
+    }
+    if frame.blocks.len() > parent.blocks.len() {
+        return (
+            bytes,
+            block_count,
+            frame
+                .blocks
+                .get(block_count)
+                .map(|block| block.block_id.clone()),
+        );
+    }
+    if parent.blocks.len() > frame.blocks.len() {
+        return (bytes, block_count, None);
+    }
+    (bytes, block_count, None)
+}
+
+fn apply_context_parent(context: &mut TurnContext, parent: Option<&ContextFrame>) {
+    context.context_frame.parent_frame_id = parent.map(|frame| frame.frame_id.clone());
+    refresh_context_frame(&mut context.context_frame);
+    context.context_delta = context_delta(parent, &context.context_frame);
+    context.context_frame.cache_reuse_prefix_bytes = context.context_delta.cache_reuse_prefix_bytes;
+    context.context_frame.cache_reuse_prefix_block_count =
+        context.context_delta.cache_reuse_prefix_block_count;
+    context.context_frame.first_changed_block_id =
+        context.context_delta.first_changed_block_id.clone();
+    apply_context_frame_summary_to_report(
+        &mut context.report,
+        &context.context_frame,
+        &context.context_delta,
+    );
+}
+
+fn apply_context_frame_summary_to_report(
+    report: &mut ContextAssemblyReport,
+    frame: &ContextFrame,
+    delta: &ContextDelta,
+) {
+    report.context_frame_id = Some(frame.frame_id.clone());
+    report.parent_context_frame_id = frame.parent_frame_id.clone();
+    report.context_block_count = frame.blocks.len();
+    report.stable_prefix_bytes = frame.stable_prefix_bytes;
+    report.cache_reuse_prefix_bytes = delta.cache_reuse_prefix_bytes;
+    report.cache_reuse_prefix_block_count = delta.cache_reuse_prefix_block_count;
+    report.first_changed_block_id = delta.first_changed_block_id.clone();
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ContextAssembler;
 
@@ -1753,7 +2172,126 @@ impl ContextAssembler {
                 reason: "assembled context exceeds inferred model budget; compaction should run before provider rendering".to_string(),
             });
         }
-        let report = ContextAssemblyReport {
+        let mut context_blocks = vec![
+            context_block(
+                ContextBlockKind::SystemInstructions,
+                format!("agent/system/{}", config.definition.key()),
+                config.definition.name.clone(),
+                0,
+                ContextCachePolicy::StablePrefix,
+                serde_json::json!({
+                    "content": language_model_system_instructions(
+                        &config.provider,
+                        &config.model,
+                        &system_instructions,
+                        Some(agent_output_contract(&config.definition.output_format)),
+                    ),
+                }),
+            ),
+            context_block(
+                ContextBlockKind::ToolSchemas,
+                format!("agent/tools/{}", config.definition.key()),
+                format!("{} visible tool(s)", tool_descriptors.len()),
+                0,
+                ContextCachePolicy::StablePrefix,
+                serde_json::to_value(&tool_descriptors).unwrap_or(serde_json::Value::Null),
+            ),
+        ];
+        for instruction_file in &loaded_instruction_files {
+            context_blocks.push(context_block(
+                ContextBlockKind::InstructionFile,
+                format!("workspace/instruction/{}", instruction_file.path),
+                instruction_file.path.clone(),
+                0,
+                ContextCachePolicy::StablePrefix,
+                serde_json::to_value(instruction_file).unwrap_or(serde_json::Value::Null),
+            ));
+        }
+        for (index, item) in transcript.iter().enumerate() {
+            let stable_key = item
+                .tool_call_id
+                .as_ref()
+                .map(|call_id| format!("session/transcript/tool/{call_id}"))
+                .unwrap_or_else(|| {
+                    format!(
+                        "session/transcript/{index}/{:?}/{}",
+                        item.role, item.step_index
+                    )
+                });
+            context_blocks.push(context_block(
+                ContextBlockKind::TranscriptItem,
+                stable_key,
+                format!("{:?} transcript item {index}", item.role),
+                2,
+                ContextCachePolicy::AppendOnly,
+                serde_json::to_value(item).unwrap_or(serde_json::Value::Null),
+            ));
+        }
+        if let Some(projection) = &session_projection {
+            context_blocks.push(context_block(
+                ContextBlockKind::SessionProjection,
+                "session/projection/current",
+                "current work projection",
+                1,
+                ContextCachePolicy::VolatileTail,
+                serde_json::to_value(projection).unwrap_or(serde_json::Value::Null),
+            ));
+        }
+        for prompt_reference in &prompt_references {
+            context_blocks.push(context_block(
+                ContextBlockKind::PromptReference,
+                format!("workspace/prompt-reference/{}", prompt_reference.path),
+                prompt_reference.path.clone(),
+                1,
+                ContextCachePolicy::VolatileTail,
+                serde_json::to_value(prompt_reference).unwrap_or(serde_json::Value::Null),
+            ));
+        }
+        for (index, attachment) in context_attachments.iter().enumerate() {
+            context_blocks.push(context_block(
+                ContextBlockKind::ContextAttachment,
+                format!("context/attachment/{index}/{}", attachment.kind),
+                attachment.summary.clone(),
+                1,
+                ContextCachePolicy::VolatileTail,
+                serde_json::to_value(attachment).unwrap_or(serde_json::Value::Null),
+            ));
+        }
+        if let Some(update) = &async_update {
+            context_blocks.push(context_block(
+                ContextBlockKind::AsyncUpdate,
+                "async/latest-update",
+                "latest async task update",
+                1,
+                ContextCachePolicy::VolatileTail,
+                update.clone(),
+            ));
+        }
+        context_blocks.push(context_block(
+            ContextBlockKind::WorkspaceFacts,
+            "workspace/facts/latest-event",
+            "session surface and latest event",
+            2,
+            ContextCachePolicy::VolatileTail,
+            workspace_facts.clone(),
+        ));
+        context_blocks.push(context_block(
+            ContextBlockKind::BudgetEstimate,
+            "context/budget/estimate",
+            "context budget estimate",
+            3,
+            ContextCachePolicy::VolatileTail,
+            serde_json::to_value(&budget_estimate).unwrap_or(serde_json::Value::Null),
+        ));
+        let context_frame = context_frame(
+            input.session.session_id.clone(),
+            step_index,
+            config.provider.clone(),
+            config.model.clone(),
+            context_blocks,
+        );
+        let context_delta = context_delta(None, &context_frame);
+        let mut report = ContextAssemblyReport {
             report_id: TaskId::generate(),
             step_index,
             provider: config.provider.clone(),
@@ -1761,7 +2299,15 @@ impl ContextAssembler {
             included,
             omitted,
             budget_estimate: budget_estimate.clone(),
+            context_frame_id: None,
+            parent_context_frame_id: None,
+            context_block_count: 0,
+            stable_prefix_bytes: 0,
+            cache_reuse_prefix_bytes: 0,
+            cache_reuse_prefix_block_count: 0,
+            first_changed_block_id: None,
         };
+        apply_context_frame_summary_to_report(&mut report, &context_frame, &context_delta);
         Ok(TurnContext {
             session_id: input.session.session_id.clone(),
             role,
@@ -1784,6 +2330,8 @@ impl ContextAssembler {
             available_tool_specs: tool_descriptors,
             budget_estimate,
             report,
+            context_frame,
+            context_delta,
         })
     }
 }
@@ -7376,6 +7924,7 @@ impl<M: InteractionModel> Agent<M> {
         let mut step_index = 0usize;
         let mut latest_coding_state: Option<CodingRunState> = None;
         let mut repair_request_model_visible_bytes = 0usize;
+        let mut previous_context_frame: Option<ContextFrame> = None;
 
         'turn_loop: loop {
             if cancellation_token.is_cancelled() {
@@ -7481,11 +8030,19 @@ impl<M: InteractionModel> Agent<M> {
                     compactions.push(compaction);
                 }
             }
+            apply_context_parent(&mut turn_context, previous_context_frame.as_ref());
             context_reports.push(turn_context.report.clone());
             self.trace(
                 &input.session.session_id,
                 AgentTraceRecordKind::ContextReport {
                     report: turn_context.report.clone(),
+                },
+            )?;
+            self.trace(
+                &input.session.session_id,
+                AgentTraceRecordKind::ContextFrame {
+                    frame: turn_context.context_frame.clone(),
+                    delta: turn_context.context_delta.clone(),
                 },
             )?;
             model_progress_sink.emit(AgentModelEvent::ContextAssembled {
@@ -7503,6 +8060,7 @@ impl<M: InteractionModel> Agent<M> {
                 },
             )?;
             items.push(context_item);
+            previous_context_frame = Some(turn_context.context_frame.clone());
             let context_event = caused_by_latest_event(
                 agent_event(
                     &input.session,
@@ -8035,6 +8593,26 @@ impl<M: InteractionModel> Agent<M> {
             bytes: policy_bytes,
             priority: 0,
         });
+        let tool_surface_block = context_block(
+            ContextBlockKind::ToolSurface,
+            format!("agent/tool-surface/{}", self.tool_surface.surface_id),
+            self.tool_surface.surface_id.clone(),
+            0,
+            ContextCachePolicy::StablePrefix,
+            serde_json::to_value(&self.tool_surface).unwrap_or(serde_json::Value::Null),
+        );
+        let insertion_index = context
+            .context_frame
+            .blocks
+            .iter()
+            .position(|block| block.kind == ContextBlockKind::ToolSchemas)
+            .map(|index| index.saturating_add(1))
+            .unwrap_or(1)
+            .min(context.context_frame.blocks.len());
+        context
+            .context_frame
+            .blocks
+            .insert(insertion_index, tool_surface_block);
         context
             .report
             .omitted
@@ -8046,6 +8624,7 @@ impl<M: InteractionModel> Agent<M> {
         context.report.omitted.extend(policy_omissions);
         context.budget_estimate.total_bytes += policy_bytes;
         context.report.budget_estimate = context.budget_estimate.clone();
+        apply_context_parent(&mut context, None);
         Ok(context)
     }
 
@@ -8121,6 +8700,12 @@ impl<M: InteractionModel> Agent<M> {
                 "session_id": input.session.session_id,
                 "event_id": input.latest_event.event_id,
                 "context_report_id": turn_context.report.report_id,
+                "context_frame_id": turn_context.context_frame.frame_id,
+                "parent_context_frame_id": turn_context.context_frame.parent_frame_id,
+                "context_block_count": turn_context.context_frame.blocks.len(),
+                "context_cache_reuse_prefix_bytes": turn_context.context_frame.cache_reuse_prefix_bytes,
+                "context_cache_reuse_prefix_block_count": turn_context.context_frame.cache_reuse_prefix_block_count,
+                "context_first_changed_block_id": turn_context.context_frame.first_changed_block_id,
                 "context_budget_estimate": turn_context.budget_estimate,
                 "agent_tool_surface_id": self.tool_surface.surface_id.clone(),
                 "run_context": &turn_context.run_context,
@@ -8640,27 +9225,41 @@ fn render_turn_context_message(
 ) -> Result<String, AgentError> {
     serde_json::to_string_pretty(&serde_json::json!({
         "kind": "turn_context",
-        "step_index": turn_context.report.step_index,
-        "runtime": {
-            "provider": turn_context.provider,
-            "model": turn_context.model,
-            "agent_output_format": turn_context.output_format,
-            "response_format": turn_context.response_format,
-            "available_tool_count": turn_context.available_tool_specs.len(),
+        "stable_prefix": {
+            "runtime": {
+                "provider": turn_context.provider,
+                "model": turn_context.model,
+                "agent_output_format": turn_context.output_format,
+                "response_format": turn_context.response_format,
+                "available_tool_count": turn_context.available_tool_specs.len(),
+            },
+            "run_context": &turn_context.run_context,
+            "loaded_instruction_files": turn_context.loaded_instruction_files,
         },
-        "run_context": &turn_context.run_context,
-        "session_projection": turn_context.session_projection,
-        "current_work": turn_context
-            .session_projection
-            .as_ref()
-            .map(|projection| &projection.working_state),
-        "workspace_facts": turn_context.workspace_facts,
-        "loaded_instruction_files": turn_context.loaded_instruction_files,
-        "prompt_references": turn_context.prompt_references,
-        "context_attachments": turn_context.context_attachments,
-        "async_update": turn_context.async_update,
-        "context_budget_estimate": turn_context.budget_estimate,
-        "context_report_id": turn_context.report.report_id,
+        "session_context": {
+            "session_projection": turn_context.session_projection,
+            "current_work": turn_context
+                .session_projection
+                .as_ref()
+                .map(|projection| &projection.working_state),
+            "prompt_references": turn_context.prompt_references,
+            "context_attachments": turn_context.context_attachments,
+        },
+        "volatile_tail": {
+            "step_index": turn_context.report.step_index,
+            "workspace_facts": turn_context.workspace_facts,
+            "async_update": turn_context.async_update,
+            "context_budget_estimate": turn_context.budget_estimate,
+            "context_frame": {
+                "frame_id": turn_context.context_frame.frame_id,
+                "parent_frame_id": turn_context.context_frame.parent_frame_id,
+                "block_count": turn_context.context_frame.blocks.len(),
+                "stable_prefix_bytes": turn_context.context_frame.stable_prefix_bytes,
+                "cache_reuse_prefix_bytes": turn_context.context_frame.cache_reuse_prefix_bytes,
+                "cache_reuse_prefix_block_count": turn_context.context_frame.cache_reuse_prefix_block_count,
+                "first_changed_block_id": turn_context.context_frame.first_changed_block_id,
+            },
+        },
     }))
     .map_err(|source| AgentError::ModelRequest {
         detail: source.to_string(),
@@ -10967,6 +11566,80 @@ mod tests {
                 matches!(record.record, AgentTraceRecordKind::RunCompleted { .. })
             })
         );
+    }
+
+    #[test]
+    fn file_trace_store_records_context_frames_and_deltas() {
+        let trace_root = sinomo_testdir::TestDir::new("sinomo-agent-context-frame-trace");
+        let trace_path = trace_root.join("trace.jsonl");
+        let model = SequencedModel::new([
+            r#"{
+                "response_mode": "defer",
+                "text": "I will inspect the file.",
+                "tool_calls": [{
+                    "tool": "read_file",
+                    "input": {"path": "Cargo.toml"},
+                    "async": false,
+                    "summary": "Inspect workspace metadata."
+                }],
+                "background_handoff": null,
+                "next_state": "waiting"
+            }"#,
+            r#"{
+                "response_mode": "answer",
+                "text": "Done.",
+                "tool_calls": [],
+                "background_handoff": null,
+                "next_state": "listening"
+            }"#,
+        ]);
+        let agent = Agent::new(model, "fake", "fake")
+            .with_tool_registry(AgentToolRegistry::new().with_tool(EchoTool))
+            .with_trace_store(FileAgentTraceStore::new(&trace_path));
+
+        agent.run(&agent_input("inspect the repo")).expect("run");
+
+        let records: Vec<AgentTraceRecord> = fs::read_to_string(&trace_path)
+            .expect("trace")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("trace record"))
+            .collect();
+        let frames = records
+            .iter()
+            .filter_map(|record| match &record.record {
+                AgentTraceRecordKind::ContextFrame { frame, delta } => Some((frame, delta)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            frames[1].1.from_frame_id.as_deref(),
+            Some(frames[0].0.frame_id.as_str())
+        );
+        assert!(frames[1].1.cache_reuse_prefix_bytes > 0);
+        assert!(
+            frames[1]
+                .1
+                .kept
+                .iter()
+                .any(|block| block.kind == ContextBlockKind::SystemInstructions)
+        );
+        assert!(
+            frames[1]
+                .0
+                .blocks
+                .iter()
+                .any(|block| block.kind == ContextBlockKind::ToolSurface)
+        );
+        assert!(records.iter().any(|record| {
+            matches!(
+                &record.record,
+                AgentTraceRecordKind::ContextReport {
+                    report
+                } if report.context_frame_id.is_some()
+            )
+        }));
     }
 
     #[test]
@@ -13792,6 +14465,81 @@ mod tests {
             message.content.contains("\"loaded_instruction_files\"")
                 && message.content.contains("Prefer deterministic context")
         }));
+    }
+
+    #[test]
+    fn context_assembler_builds_cache_friendly_context_frame() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-context-frame");
+        fs::write(
+            root.join("AGENTS.md"),
+            "# Repo Instructions\n\nKeep stable context first.\n",
+        )
+        .expect("instructions");
+        let input = agent_input("inspect");
+        let transcript = vec![AgentTranscriptItem::user(0, "Earlier user request.")];
+        let config = AgentConfig::new("fake", "fake").with_workspace_root(&root);
+        let agent = Agent::new(
+            SequencedModel::new(std::iter::empty::<String>()),
+            "fake",
+            "fake",
+        )
+        .with_config(config);
+
+        let context = agent
+            .assemble_context(&input, &transcript, 0)
+            .expect("context");
+        let block_kinds = context
+            .context_frame
+            .blocks
+            .iter()
+            .map(|block| block.kind.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            context.report.context_frame_id.as_deref(),
+            Some(context.context_frame.frame_id.as_str())
+        );
+        assert!(context.context_frame.stable_prefix_bytes > 0);
+        assert!(block_kinds.starts_with(&[
+            ContextBlockKind::SystemInstructions,
+            ContextBlockKind::ToolSchemas,
+            ContextBlockKind::ToolSurface,
+            ContextBlockKind::InstructionFile,
+        ]));
+        assert!(
+            block_kinds
+                .iter()
+                .position(|kind| *kind == ContextBlockKind::TranscriptItem)
+                .expect("transcript block")
+                < block_kinds
+                    .iter()
+                    .position(|kind| *kind == ContextBlockKind::WorkspaceFacts)
+                    .expect("workspace facts block")
+        );
+
+        let repeated = agent
+            .assemble_context(&input, &transcript, 0)
+            .expect("repeated context");
+        assert_eq!(
+            context.context_frame.frame_id,
+            repeated.context_frame.frame_id
+        );
+
+        let request = agent.request(&input, &transcript, 0).expect("request");
+        let request_text = request
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            request_text
+                .find("\"stable_prefix\"")
+                .expect("stable prefix")
+                < request_text
+                    .find("\"volatile_tail\"")
+                    .expect("volatile tail")
+        );
     }
 
     #[test]
