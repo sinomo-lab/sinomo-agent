@@ -18,12 +18,12 @@ default = []
 sandbox = ["dep:sinomo-sandbox-wasix-host"]
 
 [dependencies]
-base64 = "0.22"
+base64.workspace = true
 blake3.workspace = true
 fs2.workspace = true
 metrics.workspace = true
 ring = "0.17"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls"] }
 serde.workspace = true
 serde_bytes.workspace = true
 serde_json.workspace = true
@@ -48,7 +48,7 @@ sinomo-service = { path = "../sinomo-service" }
 sinomo-storage = { path = "../sinomo-storage" }
 thiserror.workspace = true
 time.workspace = true
-tokio = { version = "1.44", features = ["rt-multi-thread"] }
+tokio.workspace = true
 tower-layer = "0.3"
 tower-service = "0.3"
 tracing.workspace = true

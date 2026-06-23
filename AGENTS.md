@@ -7,8 +7,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Before non-trivial work, skim these design docs — the architecture is invariant-heavy and not derivable from the code alone:
 
 - `docs/architecture.md` — distributed runtime, planes, event model, crate responsibilities, trust rings, MVP scope.
-- `docs/self-evolution-architecture.md` — R0–R5 trust rings, capsule format, evaluation/rollout/rollback model.
-- `docs/agent-system-architecture.md` — current agent package, tool surface, session, readiness, and compaction architecture.
 
 ## Workspace layout
 

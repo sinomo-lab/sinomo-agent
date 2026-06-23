@@ -29,5 +29,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1.44", features = ["macros", "rt"] }
+tokio.workspace = true
 sinomo-testdir = { path = "../sinomo-testdir" }

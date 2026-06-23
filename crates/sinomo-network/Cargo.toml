@@ -17,7 +17,7 @@ iroh-transport = ["dep:iroh"]
 
 [dependencies]
 arc-swap.workspace = true
-base64 = "0.22"
+base64.workspace = true
 blake3.workspace = true
 fs2.workspace = true
 ring = "0.17"
@@ -30,7 +30,7 @@ metrics.workspace = true
 tracing.workspace = true
 iroh = { version = "0.98.2", optional = true }
 local-ip-address.workspace = true
-tokio = { version = "1.44", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio.workspace = true
 tower-layer = "0.3"
 tower-service = "0.3"
 sinomo-core = { path = "../sinomo-core" }

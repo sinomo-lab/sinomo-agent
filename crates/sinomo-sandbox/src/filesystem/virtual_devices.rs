@@ -210,7 +210,7 @@ pub(super) fn read_sandbox_virtual_device(
                     reason: format!("range too large for {}", path),
                 })?;
             let mut bytes = vec![0; len];
-            getrandom::getrandom(&mut bytes).map_err(|error| SandboxFsError::Unavailable {
+            getrandom::fill(&mut bytes).map_err(|error| SandboxFsError::Unavailable {
                 reason: format!("random device unavailable for {}: {error}", path),
             })?;
             Ok(bytes)
