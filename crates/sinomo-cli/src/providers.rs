@@ -258,50 +258,35 @@ pub fn test_github_copilot() -> Result<(), CliError> {
 }
 
 pub fn auth_anthropic() -> Result<(), CliError> {
-    let (api_key, source) =
-        api_key_from_env_or_prompt("Anthropic", AnthropicProvider::PROVIDER_ID)?;
-    let result = save_provider_api_key(AnthropicProvider::PROVIDER_ID, &api_key, &source)?;
-    println!("Testing Anthropic provider connection...");
-    test_provider_credentials(AnthropicProvider::PROVIDER_ID)?;
-    println!(
-        "Anthropic credentials saved to {}",
-        result.credentials_path.display()
-    );
-    Ok(())
+    auth_api_key_provider(
+        "Anthropic",
+        AnthropicProvider::PROVIDER_ID,
+        DEFAULT_PROVIDER_ACCOUNT,
+    )
 }
 
 pub fn test_anthropic() -> Result<(), CliError> {
-    let result = test_provider_credentials(AnthropicProvider::PROVIDER_ID)?;
-    println!(
-        "Testing Anthropic credentials at {}",
-        result.credentials_path.display()
-    );
-    println!("Anthropic API key: ok");
-    println!("Anthropic provider connection: ok");
-    Ok(())
+    test_api_key_provider(
+        "Anthropic",
+        AnthropicProvider::PROVIDER_ID,
+        DEFAULT_PROVIDER_ACCOUNT,
+    )
 }
 
 pub fn auth_openai() -> Result<(), CliError> {
-    let (api_key, source) = api_key_from_env_or_prompt("OpenAI", OpenAiProvider::PROVIDER_ID)?;
-    let result = save_provider_api_key(OpenAiProvider::PROVIDER_ID, &api_key, &source)?;
-    println!("Testing OpenAI provider connection...");
-    test_provider_credentials(OpenAiProvider::PROVIDER_ID)?;
-    println!(
-        "OpenAI credentials saved to {}",
-        result.credentials_path.display()
-    );
-    Ok(())
+    auth_api_key_provider(
+        "OpenAI",
+        OpenAiProvider::PROVIDER_ID,
+        DEFAULT_PROVIDER_ACCOUNT,
+    )
 }
 
 pub fn test_openai() -> Result<(), CliError> {
-    let result = test_provider_credentials(OpenAiProvider::PROVIDER_ID)?;
-    println!(
-        "Testing OpenAI credentials at {}",
-        result.credentials_path.display()
-    );
-    println!("OpenAI API key: ok");
-    println!("OpenAI provider connection: ok");
-    Ok(())
+    test_api_key_provider(
+        "OpenAI",
+        OpenAiProvider::PROVIDER_ID,
+        DEFAULT_PROVIDER_ACCOUNT,
+    )
 }
 
 pub fn auth_codex() -> Result<(), CliError> {
@@ -322,49 +307,35 @@ pub fn test_codex() -> Result<(), CliError> {
 }
 
 pub fn auth_gemini() -> Result<(), CliError> {
-    let (api_key, source) = api_key_from_env_or_prompt("Gemini", GeminiProvider::PROVIDER_ID)?;
-    let result = save_provider_api_key(GeminiProvider::PROVIDER_ID, &api_key, &source)?;
-    println!("Testing Gemini provider connection...");
-    test_provider_credentials(GeminiProvider::PROVIDER_ID)?;
-    println!(
-        "Gemini credentials saved to {}",
-        result.credentials_path.display()
-    );
-    Ok(())
+    auth_api_key_provider(
+        "Gemini",
+        GeminiProvider::PROVIDER_ID,
+        DEFAULT_PROVIDER_ACCOUNT,
+    )
 }
 
 pub fn test_gemini() -> Result<(), CliError> {
-    let result = test_provider_credentials(GeminiProvider::PROVIDER_ID)?;
-    println!(
-        "Testing Gemini credentials at {}",
-        result.credentials_path.display()
-    );
-    println!("Gemini API key: ok");
-    println!("Gemini provider connection: ok");
-    Ok(())
+    test_api_key_provider(
+        "Gemini",
+        GeminiProvider::PROVIDER_ID,
+        DEFAULT_PROVIDER_ACCOUNT,
+    )
 }
 
 pub fn auth_nvidia() -> Result<(), CliError> {
-    let (api_key, source) = api_key_from_env_or_prompt("NVIDIA", NvidiaProvider::PROVIDER_ID)?;
-    let result = save_provider_api_key(NvidiaProvider::PROVIDER_ID, &api_key, &source)?;
-    println!("Testing NVIDIA provider connection...");
-    test_provider_credentials(NvidiaProvider::PROVIDER_ID)?;
-    println!(
-        "NVIDIA credentials saved to {}",
-        result.credentials_path.display()
-    );
-    Ok(())
+    auth_api_key_provider(
+        "NVIDIA",
+        NvidiaProvider::PROVIDER_ID,
+        DEFAULT_PROVIDER_ACCOUNT,
+    )
 }
 
 pub fn test_nvidia() -> Result<(), CliError> {
-    let result = test_provider_credentials(NvidiaProvider::PROVIDER_ID)?;
-    println!(
-        "Testing NVIDIA credentials at {}",
-        result.credentials_path.display()
-    );
-    println!("NVIDIA API key: ok");
-    println!("NVIDIA provider connection: ok");
-    Ok(())
+    test_api_key_provider(
+        "NVIDIA",
+        NvidiaProvider::PROVIDER_ID,
+        DEFAULT_PROVIDER_ACCOUNT,
+    )
 }
 
 fn auth_api_key_provider(
@@ -373,35 +344,23 @@ fn auth_api_key_provider(
     account: &str,
 ) -> Result<(), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
-    let uses_cluster = model_config_uses_cluster(&data_dir);
-    let (api_key, source) =
-        api_key_from_env_or_stored_or_prompt(provider_name, provider_id, uses_cluster)?;
-    if uses_cluster {
-        let (mut config, _) = load_model_config_for_node(&data_dir)?;
-        let account_info = save_provider_api_key_in_model_config(
-            &mut config,
-            provider_id,
-            Some(account),
-            &api_key,
-        )?;
-        println!("Testing {provider_name} provider connection...");
-        let account_config = provider_account_config(&config, provider_id, Some(account));
-        test_provider_account_credentials(provider_id, account_config)?;
-        let config_path = write_model_config_for_node(&data_dir, &config)?;
-        println!(
-            "{provider_name} account `{}` saved to cluster KV at {} ({})",
-            account_info.account,
-            config_path.display(),
-            LM_PROVIDER_CONFIG_KV_KEY
-        );
-        return Ok(());
-    }
-    let result = save_provider_api_key(provider_id, &api_key, &source)?;
+    let (api_key, source) = api_key_from_env_or_stored_or_prompt(provider_name, provider_id, true)?;
+    let (mut config, _) = load_model_config_for_node(&data_dir)?;
+    let account_info =
+        save_provider_api_key_in_model_config(&mut config, provider_id, Some(account), &api_key)?;
     println!("Testing {provider_name} provider connection...");
-    test_provider_credentials(provider_id)?;
+    let account_config = provider_account_config(&config, provider_id, Some(account));
+    test_provider_account_credentials(provider_id, account_config)?;
+    let config_path = write_model_config_for_node(&data_dir, &config)?;
+    let source_label = if model_config_uses_cluster(&data_dir) {
+        LM_PROVIDER_CONFIG_KV_KEY
+    } else {
+        LM_PROVIDER_CONFIG_KEY
+    };
     println!(
-        "{provider_name} account `{account}` credentials saved to {}",
-        result.credentials_path.display()
+        "{provider_name} account `{}` saved to {} ({source_label}; credential source: {source})",
+        account_info.account,
+        config_path.display(),
     );
     Ok(())
 }
@@ -412,39 +371,28 @@ fn test_api_key_provider(
     account: &str,
 ) -> Result<(), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
-    if model_config_uses_cluster(&data_dir) {
-        let (config, config_path) = load_model_config_for_node(&data_dir)?;
-        let account_config = provider_account_config(&config, provider_id, Some(account))
-            .ok_or_else(|| CliError::AuthProvider {
+    let (config, config_path) = load_model_config_for_node(&data_dir)?;
+    let account_config =
+        provider_account_config(&config, provider_id, Some(account)).ok_or_else(|| {
+            CliError::AuthProvider {
                 detail: format!(
-                    "{provider_name} account `{account}` is not configured in cluster KV"
+                    "{provider_name} account `{account}` is not configured in lm.providers"
                 ),
-            })?;
-        println!(
-            "Testing {provider_name} account `{account}` from {} ({})",
-            config_path.display(),
-            LM_PROVIDER_CONFIG_KV_KEY
-        );
-        test_provider_account_credentials(provider_id, Some(account_config))?;
-        println!("{provider_name} API key: ok");
-        println!("{provider_name} provider connection: ok");
-        return Ok(());
-    }
-    let result = test_provider_credentials(provider_id)?;
+            }
+        })?;
+    let source_label = if model_config_uses_cluster(&data_dir) {
+        LM_PROVIDER_CONFIG_KV_KEY
+    } else {
+        LM_PROVIDER_CONFIG_KEY
+    };
     println!(
-        "Testing {provider_name} account `{account}` credentials at {}",
-        result.credentials_path.display()
+        "Testing {provider_name} account `{account}` from {} ({source_label})",
+        config_path.display(),
     );
+    test_provider_account_credentials(provider_id, Some(account_config))?;
     println!("{provider_name} API key: ok");
     println!("{provider_name} provider connection: ok");
     Ok(())
-}
-
-fn api_key_from_env_or_prompt(
-    provider_name: &str,
-    provider_id: &str,
-) -> Result<(String, String), CliError> {
-    api_key_from_env_or_stored_or_prompt(provider_name, provider_id, false)
 }
 
 fn api_key_from_env_or_stored_or_prompt(

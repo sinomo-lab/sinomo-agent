@@ -1093,7 +1093,7 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         let auth = Stack::vertical()
             .spacing(6.0)
             .alignment(Alignment::Stretch)
-            .with_child(StatusReflector::new(shared.clone(), index))
+            .with_child(StatusReflector::new(shared.clone(), index, reader))
             .with_child(button);
         body = body.with_child(
             FormRow::new("Authentication", auth)
@@ -1867,14 +1867,25 @@ impl Widget for InsetX {
 struct StatusReflector {
     shared: Shared,
     index: usize,
+    link: WidgetPod,
     last_seen: RefCell<Option<String>>,
 }
 
 impl StatusReflector {
-    fn new(shared: Shared, index: usize) -> Self {
+    fn new(shared: Shared, index: usize, reader: &ThemeReader) -> Self {
+        let label_shared = shared.clone();
+        let url_shared = shared.clone();
+        let link = sui::Link::new("", "")
+            .label_when(move || device_login_prompt_url(&label_shared, index).unwrap_or_default())
+            .url_when(move || device_login_prompt_url(&url_shared, index).unwrap_or_default())
+            .semantic_name("Open login page")
+            .theme_when(clone_reader(reader))
+            .on_open(open_provider_login_url);
+
         Self {
             shared,
             index,
+            link: WidgetPod::new(link),
             last_seen: RefCell::new(None),
         }
     }
@@ -1885,14 +1896,12 @@ impl StatusReflector {
         let Some(form) = settings.provider_forms.get(self.index) else {
             return String::new();
         };
-        match settings
-            .device_login
-            .as_ref()
-            .filter(|d| d.provider == form.provider && d.account == form.account)
-            .map(|d| &d.status)
-        {
+        match device_login_status_for(&settings, self.index) {
             Some(DeviceLoginStatus::Starting) => "starting".to_string(),
-            Some(DeviceLoginStatus::Prompt { user_code, .. }) => format!("prompt:{user_code}"),
+            Some(DeviceLoginStatus::Prompt {
+                verification_uri,
+                user_code,
+            }) => format!("prompt:{user_code}:{verification_uri}"),
             Some(DeviceLoginStatus::Done) => "done".to_string(),
             Some(DeviceLoginStatus::Failed(error)) => format!("failed:{error}"),
             None => {
@@ -1911,12 +1920,7 @@ impl StatusReflector {
         let Some(form) = settings.provider_forms.get(self.index) else {
             return (String::new(), None);
         };
-        match settings
-            .device_login
-            .as_ref()
-            .filter(|d| d.provider == form.provider && d.account == form.account)
-            .map(|d| &d.status)
-        {
+        match device_login_status_for(&settings, self.index) {
             Some(DeviceLoginStatus::Starting) => ("Requesting code…".to_string(), None),
             Some(DeviceLoginStatus::Prompt {
                 verification_uri,
@@ -1935,6 +1939,79 @@ impl StatusReflector {
     }
 }
 
+fn device_login_status_for(settings: &SettingsState, index: usize) -> Option<&DeviceLoginStatus> {
+    let form = settings.provider_forms.get(index)?;
+    settings
+        .device_login
+        .as_ref()
+        .filter(|d| d.provider == form.provider && d.account == form.account)
+        .map(|d| &d.status)
+}
+
+fn device_login_prompt_url(shared: &Shared, index: usize) -> Option<String> {
+    let settings = shared.settings();
+    match device_login_status_for(&settings, index)? {
+        DeviceLoginStatus::Prompt {
+            verification_uri, ..
+        } => Some(verification_uri.clone()),
+        _ => None,
+    }
+}
+
+fn open_provider_login_url(url: &str) {
+    if let Err(error) = open_external_url(url) {
+        tracing::warn!(%url, %error, "failed to open provider device-login URL");
+    }
+}
+
+fn open_external_url(url: &str) -> Result<(), String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("URL is empty".to_string());
+    }
+    let scheme = url
+        .split_once(':')
+        .map(|(scheme, _)| scheme.to_ascii_lowercase())
+        .ok_or_else(|| "URL is missing a scheme".to_string())?;
+    if scheme != "https" && scheme != "http" {
+        return Err("only http and https URLs can be opened".to_string());
+    }
+    open_url_with_system_browser(url)
+}
+
+#[cfg(target_os = "windows")]
+fn open_url_with_system_browser(url: &str) -> Result<(), String> {
+    std::process::Command::new("rundll32.exe")
+        .arg("url.dll,FileProtocolHandler")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("failed to launch browser: {error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn open_url_with_system_browser(url: &str) -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("failed to launch browser: {error}"))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_url_with_system_browser(url: &str) -> Result<(), String> {
+    std::process::Command::new("xdg-open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("failed to launch browser: {error}"))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+fn open_url_with_system_browser(_url: &str) -> Result<(), String> {
+    Err("opening URLs is not supported on this platform".to_string())
+}
+
 const STATUS_LINE_H: f32 = 18.0;
 
 impl Widget for StatusReflector {
@@ -1946,30 +2023,50 @@ impl Widget for StatusReflector {
         let mut last = self.last_seen.borrow_mut();
         if last.as_deref() != Some(summary.as_str()) {
             *last = Some(summary);
+            ctx.request_measure();
+            ctx.request_arrange();
             ctx.request_paint();
+            ctx.request_semantics();
         }
     }
 
-    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let (_, sub) = self.lines();
-        let height = if sub.is_some() {
-            STATUS_LINE_H * 2.0
-        } else {
-            STATUS_LINE_H
-        };
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
         let width = if constraints.max.width.is_finite() {
             constraints.max.width
         } else {
             240.0
         };
+        let link_size = self.link.measure(
+            ctx,
+            Constraints::new(Size::ZERO, Size::new(width, STATUS_LINE_H)),
+        );
+        let height = STATUS_LINE_H
+            + if link_size.height > 0.0 {
+                link_size.height
+            } else {
+                0.0
+            };
         constraints.clamp(Size::new(width, height))
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let link_height = self.link.measured_size().height;
+        self.link.arrange(
+            ctx,
+            Rect::new(
+                bounds.x(),
+                bounds.y() + STATUS_LINE_H,
+                bounds.width(),
+                link_height,
+            ),
+        );
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
         let theme = self.shared.theme();
         let pal = palette(&self.shared);
         let bounds = ctx.bounds();
-        let (primary, sub) = self.lines();
+        let (primary, _sub) = self.lines();
 
         let primary_color = match self.lines_is_error() {
             true => pal.accent,
@@ -1982,36 +2079,27 @@ impl Widget for StatusReflector {
             &primary,
             primary_style,
         );
-        if let Some(sub) = sub {
-            let sub_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(
-                    bounds.x(),
-                    bounds.y() + STATUS_LINE_H,
-                    bounds.width(),
-                    STATUS_LINE_H,
-                ),
-                &sub,
-                sub_style,
-            );
-        }
+        self.link.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.link.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.link);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.link);
     }
 }
 
 impl StatusReflector {
     fn lines_is_error(&self) -> bool {
         let settings = self.shared.settings();
-        settings
-            .provider_forms
-            .get(self.index)
-            .and_then(|form| {
-                settings
-                    .device_login
-                    .as_ref()
-                    .filter(|d| d.provider == form.provider && d.account == form.account)
-                    .map(|d| matches!(d.status, DeviceLoginStatus::Failed(_)))
-            })
+        device_login_status_for(&settings, self.index)
+            .map(|status| matches!(status, DeviceLoginStatus::Failed(_)))
             .unwrap_or(false)
     }
 }
@@ -2247,6 +2335,15 @@ mod tests {
         let backend = Backend::local_fallback();
         let state = SettingsState::new(&backend);
         assert!(state.provider_add_api_key.is_empty());
+    }
+
+    #[test]
+    fn external_url_opener_rejects_non_web_urls() {
+        let error = open_external_url("file:///C:/Users/test/token.txt").unwrap_err();
+        assert!(error.contains("http"));
+
+        let error = open_external_url("codex://login").unwrap_err();
+        assert!(error.contains("http"));
     }
 
     #[test]

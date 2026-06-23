@@ -960,9 +960,9 @@ pub struct ProviderAccountInfo {
 pub const DEFAULT_PROVIDER_ACCOUNT: &str = "default";
 pub const LM_PROVIDER_CONFIG_KEY: &str = "lm.providers";
 pub const LM_RUNTIME_CONFIG_KEY: &str = "lm.runtime";
-pub const LM_CREDENTIALS_CONFIG_PREFIX: &str = "lm.credentials";
 pub const LM_PROVIDER_CONFIG_KV_KEY: &str = "/config/lm/providers";
 pub const LM_RUNTIME_CONFIG_KV_KEY: &str = "/config/lm/runtime";
+const LM_CREDENTIALS_DOCUMENT_PREFIX: &str = "lm.credentials";
 
 fn default_provider_account_name() -> String {
     DEFAULT_PROVIDER_ACCOUNT.to_string()
@@ -1189,78 +1189,21 @@ pub fn model_runtime_config_definition()
     Ok(definition)
 }
 
-pub fn provider_credentials_config_key(provider: &str) -> Result<String, LanguageModelError> {
+fn provider_credentials_document_key(provider: &str) -> Result<String, LanguageModelError> {
     let provider = normalize_model_provider(provider).unwrap_or_else(|| provider.to_string());
-    let key = format!("{LM_CREDENTIALS_CONFIG_PREFIX}.{provider}");
+    let key = format!("{LM_CREDENTIALS_DOCUMENT_PREFIX}.{provider}");
     sinomo_runtime::config::ConfigKey::new(key.clone()).map_err(map_lm_config_error)?;
     Ok(key)
-}
-
-pub fn provider_credentials_config_definition(
-    provider: &str,
-) -> Result<sinomo_runtime::config::ConfigDefinition, LanguageModelError> {
-    let provider = normalize_model_provider(provider).unwrap_or_else(|| provider.to_string());
-    let definition = sinomo_runtime::config::ConfigDefinition::new(
-        provider_credentials_config_key(&provider)?,
-        "sinomo-lm",
-        sinomo_runtime::config::ConfigValueType::Object {
-            schema_name: provider_credentials_schema_name(&provider).to_string(),
-        },
-        format!("Local-only credentials for the `{provider}` language-model provider."),
-        sinomo_runtime::config::ConfigClusterMode::LocalOnly,
-    )
-    .map_err(map_lm_config_error)?
-    .with_local_legacy_path(format!("providers/{provider}/credentials.json"));
-    debug_assert_eq!(
-        definition
-            .local_path(&SinomoDataDir::new("<root>"))
-            .strip_prefix("<root>")
-            .ok()
-            .map(|path| path.to_path_buf()),
-        Some(
-            PathBuf::from("configs")
-                .join("lm")
-                .join("credentials")
-                .join(format!("{provider}.json"))
-        )
-    );
-    Ok(definition)
-}
-
-fn provider_credentials_schema_name(provider: &str) -> &'static str {
-    match provider {
-        GitHubCopilotProvider::PROVIDER_ID => "GitHubCopilotCredential",
-        CODEX_PROVIDER_ID => "CodexChatGptCredential",
-        _ => "ApiKeyCredential",
-    }
-}
-
-fn managed_credentials_provider_ids() -> &'static [&'static str] {
-    &[
-        GitHubCopilotProvider::PROVIDER_ID,
-        CODEX_PROVIDER_ID,
-        AnthropicProvider::PROVIDER_ID,
-        OpenAiProvider::PROVIDER_ID,
-        DeepSeekProvider::PROVIDER_ID,
-        GeminiProvider::PROVIDER_ID,
-        NvidiaProvider::PROVIDER_ID,
-    ]
 }
 
 pub fn register_config_definitions(
     builder: sinomo_runtime::config::ConfigRegistryBuilder,
 ) -> Result<sinomo_runtime::config::ConfigRegistryBuilder, LanguageModelError> {
-    let mut builder = builder
+    builder
         .register(model_config_definition()?)
         .map_err(map_lm_config_error)?
         .register(model_runtime_config_definition()?)
-        .map_err(map_lm_config_error)?;
-    for provider in managed_credentials_provider_ids() {
-        builder = builder
-            .register(provider_credentials_config_definition(provider)?)
-            .map_err(map_lm_config_error)?;
-    }
-    Ok(builder)
+        .map_err(map_lm_config_error)
 }
 
 pub fn model_config_store() -> Result<sinomo_runtime::config::ConfigStore, LanguageModelError> {
@@ -1317,7 +1260,7 @@ pub(crate) fn write_provider_credentials_json_value(
     }
     let value = if credentials_path_is_config_document(provider, path) {
         serde_json::to_value(sinomo_runtime::config::ConfigDocument::new(
-            sinomo_runtime::config::ConfigKey::new(provider_credentials_config_key(provider)?)
+            sinomo_runtime::config::ConfigKey::new(provider_credentials_document_key(provider)?)
                 .map_err(map_lm_config_error)?,
             value,
         ))
@@ -1359,7 +1302,9 @@ fn read_provider_credentials_json_value_at(
         })?;
     let value =
         match serde_json::from_value::<sinomo_runtime::config::ConfigDocument>(raw_value.clone()) {
-            Ok(document) if document.key.as_str() == provider_credentials_config_key(provider)? => {
+            Ok(document)
+                if document.key.as_str() == provider_credentials_document_key(provider)? =>
+            {
                 document.value
             }
             _ => raw_value,
@@ -1649,8 +1594,9 @@ pub fn upsert_provider_account_config(
     Ok(())
 }
 
-/// Store an API-key credential for `provider` in the node-local credentials file
-/// (`lm.credentials.<provider>` — always local, never written to cluster config).
+/// Store an API-key credential for `provider` in the node-local credentials file. This is a
+/// daemonless migration/helper path; cluster-first provider accounts store API keys in
+/// [`LM_PROVIDER_CONFIG_KEY`].
 pub fn set_provider_api_key(
     data_dir: &SinomoDataDir,
     provider: &str,
@@ -3329,6 +3275,23 @@ mod tests {
     }
 
     #[test]
+    fn lm_config_registry_exposes_account_list_not_provider_credentials() {
+        let store = model_config_store().expect("config store");
+        let keys = store
+            .registry()
+            .definitions()
+            .map(|definition| definition.key.as_str().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(keys.iter().any(|key| key == LM_PROVIDER_CONFIG_KEY));
+        assert!(keys.iter().any(|key| key == LM_RUNTIME_CONFIG_KEY));
+        assert!(
+            !keys.iter().any(|key| key.starts_with("lm.credentials.")),
+            "provider credentials are represented by account entries in lm.providers"
+        );
+    }
+
+    #[test]
     fn provider_credentials_write_shared_config_document() {
         let root = sinomo_testdir::TestDir::new("sinomo-lm-credentials");
         let path = root
@@ -3355,7 +3318,7 @@ mod tests {
                 .expect("config document");
         assert_eq!(
             document.key.as_str(),
-            &provider_credentials_config_key(OpenAiProvider::PROVIDER_ID).expect("key")
+            &provider_credentials_document_key(OpenAiProvider::PROVIDER_ID).expect("key")
         );
         assert_eq!(document.value, payload);
         let value =
@@ -3403,7 +3366,7 @@ mod tests {
         .expect("config document");
         assert_eq!(
             document.key.as_str(),
-            &provider_credentials_config_key(OpenAiProvider::PROVIDER_ID).expect("key")
+            &provider_credentials_document_key(OpenAiProvider::PROVIDER_ID).expect("key")
         );
         assert_eq!(document.value["api_key"], "sk-legacy");
     }

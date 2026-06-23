@@ -361,7 +361,7 @@ pub struct ProviderForm {
     pub signed_in: bool,
 }
 
-/// Build the per-account configuration forms from `lm.providers` (+ legacy credential presence).
+/// Build the per-account configuration forms from `lm.providers`.
 pub fn provider_forms(client: &dyn ConfigClient) -> Vec<ProviderForm> {
     let config = load_provider_config(client).unwrap_or_default();
     let mut counts = std::collections::BTreeMap::<String, usize>::new();
@@ -385,9 +385,7 @@ pub fn provider_forms(client: &dyn ConfigClient) -> Vec<ProviderForm> {
             .api_key
             .as_deref()
             .is_some_and(|key| !key.trim().is_empty());
-        let has_legacy_api_key = account_name == DEFAULT_PROVIDER_ACCOUNT
-            && provider_has_legacy_api_key(client, &provider);
-        let has_api_key = has_inline_api_key || has_legacy_api_key;
+        let has_api_key = has_inline_api_key;
         let signed_in = if uses_device_login {
             sinomo_cli::provider_signed_in(&provider)
         } else {
@@ -433,24 +431,6 @@ pub fn run_provider_device_login(
         on_prompt(prompt.verification_uri, prompt.user_code)
     })
     .map_err(|e| e.to_string())
-}
-
-fn provider_credentials_key(provider: &str) -> String {
-    format!("lm.credentials.{provider}")
-}
-
-/// Whether a non-empty legacy provider-level API-key credential is stored for `provider`.
-fn provider_has_legacy_api_key(client: &dyn ConfigClient, provider: &str) -> bool {
-    client
-        .get(&provider_credentials_key(provider))
-        .ok()
-        .and_then(|res| {
-            res.value
-                .get("api_key")
-                .and_then(|v| v.as_str())
-                .map(|s| !s.trim().is_empty())
-        })
-        .unwrap_or(false)
 }
 
 /// Toggle a provider account enabled/disabled in `lm.providers`.
