@@ -40,6 +40,7 @@ use crate::tui::{
 type Handler = RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>;
 const APP_CHAT_RUNTIME_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 const APP_CHAT_RUNTIME_START_TIMEOUT: Duration = Duration::from_secs(5);
+const APP_CHAT_RUNTIME_SILENCE_TIMEOUT: Duration = Duration::from_secs(45);
 const STRUCTURED_AGENT_JSON_STREAM: &str = "__sinomo_structured_agent_json_stream__";
 
 /// The active agent / model selection, as plain strings.
@@ -523,25 +524,56 @@ fn drain_runtime_events(
     runtime: &mut InteractionRuntime<InMemoryEventStore, Handler>,
     on_event: &mut dyn FnMut(ChatStreamEvent),
 ) -> Result<(), CliError> {
+    drain_runtime_events_with_limits(
+        || runtime.handler_mut().drain_runtime_events(),
+        on_event,
+        APP_CHAT_RUNTIME_START_TIMEOUT,
+        APP_CHAT_RUNTIME_SILENCE_TIMEOUT,
+        APP_CHAT_RUNTIME_DRAIN_INTERVAL,
+    )
+}
+
+fn drain_runtime_events_with_limits(
+    mut drain_events: impl FnMut() -> Result<Vec<AgentRuntimeEvent>, CliError>,
+    on_event: &mut dyn FnMut(ChatStreamEvent),
+    start_timeout: Duration,
+    silence_timeout: Duration,
+    drain_interval: Duration,
+) -> Result<(), CliError> {
     let mut saw_worker = false;
     let mut terminal = false;
     let mut failure = None;
     let mut streamed_text = String::new();
-    let start_deadline = Instant::now() + APP_CHAT_RUNTIME_START_TIMEOUT;
+    let started_at = Instant::now();
+    let mut last_event_at = started_at;
 
     loop {
-        let events = runtime.handler_mut().drain_runtime_events()?;
+        let events = drain_events()?;
         if events.is_empty() {
             if saw_worker && !terminal {
-                thread::sleep(APP_CHAT_RUNTIME_DRAIN_INTERVAL);
+                if last_event_at.elapsed() >= silence_timeout {
+                    return Err(CliError::ExternalCommand {
+                        command: "agent runtime".to_string(),
+                        detail: format!(
+                            "did not produce a terminal event within {}s after the last progress event; the selected provider may be waiting for interactive authentication or be unavailable",
+                            silence_timeout.as_secs()
+                        ),
+                    });
+                }
+                if drain_interval > Duration::ZERO {
+                    thread::sleep(drain_interval);
+                }
                 continue;
             }
-            if !terminal && Instant::now() < start_deadline {
-                thread::sleep(APP_CHAT_RUNTIME_DRAIN_INTERVAL);
+            if !terminal && started_at.elapsed() < start_timeout {
+                if drain_interval > Duration::ZERO {
+                    thread::sleep(drain_interval);
+                }
                 continue;
             }
             break;
         }
+        last_event_at = Instant::now();
 
         for event in events {
             match runtime_event_to_chat(event, &mut streamed_text, on_event) {
@@ -570,7 +602,10 @@ fn drain_runtime_events(
     }
 
     if let Some(detail) = failure {
-        return Err(CliError::Parse { detail });
+        return Err(CliError::ExternalCommand {
+            command: "agent runtime".to_string(),
+            detail,
+        });
     }
     Ok(())
 }
@@ -1222,6 +1257,7 @@ mod tests {
     use sinomo_agent::{
         AgentInteractionState, AgentLoopDecision, AgentLoopResponseMode, AgentStopReason,
     };
+    use std::collections::VecDeque;
 
     fn chat_event_label(event: ChatStreamEvent) -> String {
         match event {
@@ -1425,5 +1461,67 @@ mod tests {
 
         assert_eq!(events, vec!["notice:waiting for configured model runtime"]);
         assert!(streamed_text.is_empty());
+    }
+
+    #[test]
+    fn app_api_runtime_drain_times_out_after_worker_progress_without_terminal_event() {
+        let op_id = TaskId::generate();
+        let mut batches = VecDeque::from([
+            vec![runtime_event(AgentRuntimeEventPayload::WorkerStarted {
+                sequence: 1,
+                op_id,
+                action: "start_turn".to_string(),
+                timeout_ms: None,
+            })],
+            Vec::new(),
+        ]);
+        let mut events = Vec::new();
+        let mut on_event = |event| events.push(chat_event_label(event));
+
+        let error = drain_runtime_events_with_limits(
+            || Ok(batches.pop_front().unwrap_or_default()),
+            &mut on_event,
+            Duration::from_secs(1),
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .expect_err("missing terminal event should time out");
+
+        assert!(
+            error
+                .to_string()
+                .contains("did not produce a terminal event"),
+            "timeout error should explain the stalled runtime: {error}"
+        );
+        assert_eq!(events, vec!["notice:agent task started: start_turn"]);
+    }
+
+    #[test]
+    fn app_chat_send_surfaces_missing_codex_auth() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-codex-auth");
+        let data_dir = SinomoDataDir::new(&root);
+        let mut chat = AgentChat::new(data_dir, false).expect("chat runtime");
+        chat.set_model(
+            sinomo_lm::CODEX_PROVIDER_ID,
+            "gpt-5.2-codex",
+            sinomo_lm::DEFAULT_PROVIDER_ACCOUNT,
+        )
+        .expect("switch to codex");
+
+        let mut events = Vec::new();
+        let mut on_event = |event| events.push(chat_event_label(event));
+        let error = chat
+            .send("hello", &mut on_event)
+            .expect_err("missing Codex auth should fail the turn");
+        let error = error.to_string();
+
+        assert!(
+            error.contains("authentication required for codex"),
+            "missing auth should be surfaced directly: {error}"
+        );
+        assert!(
+            error.contains("sinomo providers auth codex"),
+            "error should include the operator auth command: {error}"
+        );
     }
 }

@@ -652,6 +652,41 @@ fn capture_chat_dropdown() {
     println!("wrote {}", path.display());
 }
 
+#[test]
+fn new_chat_row_clears_visible_transcript() {
+    use sinomo_app::ui::chat::ChatMessage;
+    use sui::SemanticsRole;
+
+    let shared = boot(Tab::Sinomo);
+    {
+        let mut chat = shared.chat_mut();
+        chat.messages = vec![
+            ChatMessage::user("Keep this out of the next chat"),
+            ChatMessage::model("Old answer"),
+        ];
+        chat.input = "discarded draft".to_string();
+        chat.cursor = chat.input.len();
+        chat.notice = Some("old notice".to_string());
+    }
+
+    let runtime = build_runtime(shared.clone()).expect("build runtime");
+    let app = TestApp::from_runtime(runtime).expect("headless test app");
+    let window = app.main_window().expect("main window");
+    app.run_until_idle().expect("settle chat layout");
+
+    window
+        .get_by_role(SemanticsRole::ListItem)
+        .with_name("New chat")
+        .click()
+        .expect("click New chat row");
+    app.run_until_idle().expect("settle after New chat");
+
+    let chat = shared.chat();
+    assert!(chat.messages.is_empty(), "New chat clears visible messages");
+    assert!(chat.input.is_empty(), "New chat clears the composer draft");
+    assert!(chat.notice.is_none(), "New chat clears the visible notice");
+}
+
 /// The Providers settings section: per-provider cards (enabled toggle, API key, default model,
 /// base URL, reasoning effort).
 #[test]
@@ -881,7 +916,6 @@ fn capture_shell_chrome() {
 /// the public `ChatState.messages` field so the captures stay independent of any live model backend.
 #[test]
 fn capture_chat_composed() {
-    use sinomo_app::backend::chat_engine::ChatRole;
     use sinomo_app::theme::AppThemeMode;
     use sinomo_app::ui::chat::ChatMessage;
 
@@ -906,28 +940,17 @@ fn capture_chat_composed() {
     let seed_conversation = |shared: &sinomo_app::state::Shared| {
         let mut chat = shared.chat_mut();
         chat.messages = vec![
-            ChatMessage {
-                role: ChatRole::User,
-                text: "What is SIFS and how does replication work across cluster nodes?"
-                    .to_string(),
-            },
-            ChatMessage {
-                role: ChatRole::Agent,
-                text: "SIFS is Sinomo's distributed filesystem. Objects are content-addressed and \
+            ChatMessage::user("What is SIFS and how does replication work across cluster nodes?"),
+            ChatMessage::model(
+                "SIFS is Sinomo's distributed filesystem. Objects are content-addressed and \
                        placed on nodes by a placement policy; when you join a cluster, replicas are \
-                       spread across members so a single node failure never loses data."
-                    .to_string(),
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                text: "Can I tune the replication factor?".to_string(),
-            },
-            ChatMessage {
-                role: ChatRole::Agent,
-                text: "Yes — the replication factor is part of the placement policy and can be set \
-                       per-path once the node is clustered."
-                    .to_string(),
-            },
+                       spread across members so a single node failure never loses data.",
+            ),
+            ChatMessage::user("Can I tune the replication factor?"),
+            ChatMessage::model(
+                "Yes — the replication factor is part of the placement policy and can be set \
+                       per-path once the node is clustered.",
+            ),
         ];
         chat.stick_bottom = true;
         chat.scroll = f32::MAX;
@@ -1005,17 +1028,12 @@ fn capture_chat_composed() {
         {
             let mut chat = shared.chat_mut();
             chat.messages = vec![
-                ChatMessage {
-                    role: ChatRole::User,
-                    text: "Summarize how the placement policy chooses nodes.".to_string(),
-                },
-                ChatMessage {
-                    role: ChatRole::Agent,
-                    text: "The placement policy hashes the object key and walks the node ring, \
+                ChatMessage::user("Summarize how the placement policy chooses nodes."),
+                ChatMessage::model(
+                    "The placement policy hashes the object key and walks the node ring, \
                            selecting the first healthy members up to the replication factor. It \
-                           prefers"
-                        .to_string(),
-                },
+                           prefers",
+                ),
             ];
             chat.streaming = true;
             chat.notice = Some("thinking…".to_string());
@@ -1049,7 +1067,7 @@ fn capture_chat_composed() {
 /// active background-task counts, and the right-side activity rail.
 #[test]
 fn capture_chat_runtime_activity() {
-    use sinomo_app::backend::chat_engine::{ChatRole, RuntimeInfo};
+    use sinomo_app::backend::chat_engine::RuntimeInfo;
     use sinomo_app::theme::AppThemeMode;
     use sinomo_app::ui::chat::{ActivityTone, ChatActivityEntry, ChatMessage, ChatToolActivity};
     use sinomo_cli::app_api::{
@@ -1081,17 +1099,13 @@ fn capture_chat_runtime_activity() {
             effort: Some("medium".to_string()),
         };
         chat.messages = vec![
-            ChatMessage {
-                role: ChatRole::User,
-                text: "Audit the daemon startup path and keep running cluster checks in the background."
-                    .to_string(),
-            },
-            ChatMessage {
-                role: ChatRole::Agent,
-                text: "I am assembling context, checking the recent daemon events, and starting the \
-                       focused verification commands now."
-                    .to_string(),
-            },
+            ChatMessage::user(
+                "Audit the daemon startup path and keep running cluster checks in the background.",
+            ),
+            ChatMessage::model(
+                "I am assembling context, checking the recent daemon events, and starting the \
+                       focused verification commands now.",
+            ),
         ];
         chat.streaming = true;
         chat.notice = Some("session save failed: DFS services shard replay delayed".to_string());
@@ -1239,7 +1253,6 @@ fn capture_chat_runtime_activity() {
 ///   in the final shot, in dark + light.
 #[test]
 fn capture_final_polish() {
-    use sinomo_app::backend::chat_engine::ChatRole;
     use sinomo_app::theme::AppThemeMode;
     use sinomo_app::ui::chat::ChatMessage;
     use sinomo_app::ui::settings::SettingsSection;
@@ -1273,28 +1286,17 @@ fn capture_final_polish() {
     let seed_conversation = |shared: &sinomo_app::state::Shared| {
         let mut chat = shared.chat_mut();
         chat.messages = vec![
-            ChatMessage {
-                role: ChatRole::User,
-                text: "What is SIFS and how does replication work across cluster nodes?"
-                    .to_string(),
-            },
-            ChatMessage {
-                role: ChatRole::Agent,
-                text: "SIFS is Sinomo's distributed filesystem. Objects are content-addressed and \
+            ChatMessage::user("What is SIFS and how does replication work across cluster nodes?"),
+            ChatMessage::model(
+                "SIFS is Sinomo's distributed filesystem. Objects are content-addressed and \
                        placed on nodes by a placement policy; when you join a cluster, replicas are \
-                       spread across members so a single node failure never loses data."
-                    .to_string(),
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                text: "Can I tune the replication factor?".to_string(),
-            },
-            ChatMessage {
-                role: ChatRole::Agent,
-                text: "Yes — the replication factor is part of the placement policy and can be set \
-                       per-path once the node is clustered."
-                    .to_string(),
-            },
+                       spread across members so a single node failure never loses data.",
+            ),
+            ChatMessage::user("Can I tune the replication factor?"),
+            ChatMessage::model(
+                "Yes — the replication factor is part of the placement policy and can be set \
+                       per-path once the node is clustered.",
+            ),
         ];
         chat.stick_bottom = true;
         chat.scroll = f32::MAX;
@@ -1464,6 +1466,7 @@ fn enter_in_composer_sends_the_message() {
     };
 
     let shared = boot(Tab::Sinomo);
+    seed_chat_providers(&shared);
     let runtime = build_runtime(shared.clone()).expect("build runtime");
     let app = TestApp::from_runtime(runtime).expect("headless test app");
     let window = app.main_window().expect("main window");
@@ -1561,7 +1564,6 @@ fn shift_enter_in_composer_inserts_a_newline() {
 /// assert the composer pixels change across the streaming on/off transition.
 #[test]
 fn pump_relayouts_composer_when_streaming_flips() {
-    use sinomo_app::backend::chat_engine::ChatRole;
     use sinomo_app::ui::chat::ChatMessage;
     use sui::{Event, Point, PointerEvent, PointerEventKind};
 
@@ -1569,14 +1571,8 @@ fn pump_relayouts_composer_when_streaming_flips() {
     {
         let mut chat = shared.chat_mut();
         chat.messages = vec![
-            ChatMessage {
-                role: ChatRole::User,
-                text: "Hello?".to_string(),
-            },
-            ChatMessage {
-                role: ChatRole::Agent,
-                text: "Working on it".to_string(),
-            },
+            ChatMessage::user("Hello?"),
+            ChatMessage::model("Working on it"),
         ];
         chat.streaming = true;
         chat.notice = Some("thinking…".to_string());

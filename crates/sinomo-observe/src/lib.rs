@@ -25,10 +25,12 @@ pub use cli::{
     observe_cli_command_handler_with_cluster_rpc, observe_cli_command_handler_with_rpc,
 };
 pub use runtime::{
-    OBSERVE_DEFAULT_FILTER, ObserveControlRequest, ObserveControlResponse, ObserveMetricKind,
-    ObserveMetricRecord, ObserveMetricsRequest, ObserveMetricsResponse, ObserveRuntimeConfig,
-    ObserveTraceRecord, ObserveTracesRequest, ObserveTracesResponse, init_observe_runtime,
-    observe_control_snapshot, read_observe_metrics, read_observe_metrics_for_data_dir,
+    OBSERVE_BUILT_IN_QUIET_FILTER_DIRECTIVES, OBSERVE_DEFAULT_BASE_FILTER, OBSERVE_DEFAULT_FILTER,
+    OBSERVE_DEFAULT_QUIET_FILTER_DIRECTIVES, ObserveControlRequest, ObserveControlResponse,
+    ObserveMetricKind, ObserveMetricRecord, ObserveMetricsRequest, ObserveMetricsResponse,
+    ObserveRuntimeConfig, ObserveTraceRecord, ObserveTracesRequest, ObserveTracesResponse,
+    init_observe_runtime, observe_control_snapshot, observe_filter_with_builtin_quiet_directives,
+    observe_filter_with_quiet_directives, read_observe_metrics, read_observe_metrics_for_data_dir,
     read_observe_traces, register_observe_metric_exporter, update_observe_control,
 };
 

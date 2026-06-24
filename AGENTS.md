@@ -10,7 +10,7 @@ Before non-trivial work, skim these design docs — the architecture is invarian
 
 ## Workspace layout
 
-Cargo workspace, edition 2024, `rust-version = 1.90`, `resolver = "3"`. All crates live under `crates/`. `crates/sinomo` is the single shipped binary; everything else is a library crate. The binary is a one-line wrapper around `sinomo_cli::run` — all CLI surface lives in `crates/sinomo-cli/src/lib.rs`.
+Cargo workspace, all crates live under `crates/`. `crates/sinomo` is the cli binary, `crates/sinomo-app` is the GUI app; everything else is a library crate. The binary is a one-line wrapper around `sinomo_cli::run` — all CLI surface lives in `crates/sinomo-cli/src/lib.rs`.
 
 Common workflow:
 

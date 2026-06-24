@@ -62,6 +62,8 @@ impl Default for ObserveOptions {
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct ObserveControlOptions {
     filter: Option<String>,
+    quiet_filter_directives: Vec<String>,
+    clear_quiet_filter_directives: bool,
     reset: bool,
     target_node_id: Option<String>,
     target_all: bool,
@@ -227,7 +229,7 @@ fn observe_cli_help() -> CliCommandHelp {
             "      Read live runtime metrics.",
             "  sinomo observe traces [--target-prefix <prefix>] [--traceparent <id>] [--target <node-id> | --all] [--limit <n>] [--json]",
             "      Read live bounded trace events.",
-            "  sinomo observe control [--filter <directive> | --reset] [--target <node-id> | --all] [--json]",
+            "  sinomo observe control [--filter <directive>] [--quiet-filter <directive>...] [--clear-quiet-filters | --reset] [--target <node-id> | --all] [--json]",
             "      Read or update live trace filtering.",
         ],
     )
@@ -330,10 +332,16 @@ fn observe_cli_autocomplete() -> CliAutocompleteSpec {
                     CliAutocompleteValue::new("directive", "tracing filter directive", []),
                 ),
                 CliAutocompleteOption::with_value(
+                    "--quiet-filter",
+                    "default noise filter directive",
+                    CliAutocompleteValue::new("directive", "quiet filter directive", []),
+                ),
+                CliAutocompleteOption::with_value(
                     "--target",
                     "target node id",
                     CliAutocompleteValue::new("node-id", "target node id", []),
                 ),
+                CliAutocompleteOption::flag("--clear-quiet-filters", "clear quiet filters"),
                 CliAutocompleteOption::flag("--all", "query every cluster node"),
                 CliAutocompleteOption::flag("--reset", "reset trace filter"),
                 CliAutocompleteOption::flag("--json", "emit JSON"),
@@ -451,6 +459,8 @@ fn parse_observe_options(
 fn parse_observe_control_options(args: &[String]) -> Result<ObserveControlOptions, CliParseError> {
     let mut options = ObserveControlOptions {
         filter: None,
+        quiet_filter_directives: Vec::new(),
+        clear_quiet_filter_directives: false,
         reset: false,
         target_node_id: None,
         target_all: false,
@@ -465,6 +475,18 @@ fn parse_observe_control_options(args: &[String]) -> Result<ObserveControlOption
                     return Err(CliParseError::Usage);
                 };
                 options.filter = Some(non_empty_observe_value("--filter", filter)?);
+            }
+            "--quiet-filter" | "--quiet" => {
+                index += 1;
+                let Some(filter) = args.get(index) else {
+                    return Err(CliParseError::Usage);
+                };
+                options
+                    .quiet_filter_directives
+                    .push(non_empty_observe_value("--quiet-filter", filter)?);
+            }
+            "--clear-quiet-filters" | "--clear-quiet" | "--no-quiet-filters" => {
+                options.clear_quiet_filter_directives = true;
             }
             "--reset" => options.reset = true,
             "--target" | "--node" => {
@@ -481,6 +503,9 @@ fn parse_observe_control_options(args: &[String]) -> Result<ObserveControlOption
         index += 1;
     }
     if options.target_all && options.target_node_id.is_some() {
+        return Err(CliParseError::Usage);
+    }
+    if options.clear_quiet_filter_directives && !options.quiet_filter_directives.is_empty() {
         return Err(CliParseError::Usage);
     }
     Ok(options)
@@ -815,6 +840,9 @@ fn observe_control(
 ) -> Result<(), CliCommandError> {
     let request = ObserveControlRequest {
         filter: options.filter.clone(),
+        quiet_filter_directives: (!options.quiet_filter_directives.is_empty())
+            .then_some(options.quiet_filter_directives.clone()),
+        clear_quiet_filter_directives: options.clear_quiet_filter_directives,
         reset: options.reset,
     };
     if options.target_all {
@@ -838,7 +866,11 @@ fn observe_control(
             OBSERVE_CONTROL_ROUTE,
             &request,
         )?
-    } else if request.filter.is_some() || request.reset {
+    } else if request.filter.is_some()
+        || request.quiet_filter_directives.is_some()
+        || request.clear_quiet_filter_directives
+        || request.reset
+    {
         update_observe_control(request).map_err(command_error)?
     } else {
         observe_control_snapshot()
@@ -860,6 +892,16 @@ fn print_observe_control_response(
             response.active_filter,
             if response.changed { " (updated)" } else { "" }
         ))?;
+        context.stdout_line(format_args!(
+            "observe base filter: {}",
+            response.base_filter
+        ))?;
+        let quiet_filters = if response.quiet_filter_directives.is_empty() {
+            "<none>".to_string()
+        } else {
+            response.quiet_filter_directives.join(",")
+        };
+        context.stdout_line(format_args!("observe quiet filters: {quiet_filters}"))?;
     }
     Ok(())
 }
@@ -1124,6 +1166,10 @@ mod tests {
             "control".to_string(),
             "--filter".to_string(),
             "warn,sinomo_network=trace".to_string(),
+            "--quiet-filter".to_string(),
+            "iroh::net_report::report=error".to_string(),
+            "--quiet-filter".to_string(),
+            "hyper=error".to_string(),
             "--target".to_string(),
             "01hxy6qa9k0t9vr4g9n8d3q5d4".to_string(),
         ])
@@ -1131,6 +1177,13 @@ mod tests {
         match command {
             ObserveCliCommand::Control(options) => {
                 assert_eq!(options.filter.as_deref(), Some("warn,sinomo_network=trace"));
+                assert_eq!(
+                    options.quiet_filter_directives,
+                    vec![
+                        "iroh::net_report::report=error".to_string(),
+                        "hyper=error".to_string()
+                    ]
+                );
                 assert_eq!(
                     options.target_node_id.as_deref(),
                     Some("01hxy6qa9k0t9vr4g9n8d3q5d4")
@@ -1161,6 +1214,14 @@ mod tests {
             "--all".to_string(),
             "--target".to_string(),
             "01hxy6qa9k0t9vr4g9n8d3q5d4".to_string(),
+        ]);
+        assert_eq!(result, Err(CliParseError::Usage));
+
+        let result = parse_observe_command(&[
+            "control".to_string(),
+            "--clear-quiet-filters".to_string(),
+            "--quiet-filter".to_string(),
+            "hyper=error".to_string(),
         ]);
         assert_eq!(result, Err(CliParseError::Usage));
     }

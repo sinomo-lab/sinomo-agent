@@ -6251,6 +6251,53 @@ fn cluster_network_probe_targets_include_remote_shadow_endpoints() {
 }
 
 #[test]
+fn cluster_network_probe_targets_skip_iroh_endpoints() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-probe-skips-iroh");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_probe_skips_iroh").expect("cluster");
+    let local = NodeId::from_legacy_named("node_network_probe_skips_iroh_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_network_probe_skips_iroh_remote").expect("remote");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network probe skips iroh",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+    let tcp = daemon_lan_endpoint(&remote, "10.0.0.51:21353".to_string(), 10);
+    let iroh = IrohEndpointRecord::from_relay_url(
+        cluster_id.clone(),
+        remote.clone(),
+        "iroh_public_key_network_probe_skip",
+        "https://relay.example./",
+    )
+    .endpoint();
+    let mut member =
+        ClusterMemberRecord::local_voter(cluster_id, remote, "remote", "pk-remote", now);
+    member.capabilities = main_daemon_capabilities(&member.role);
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![iroh.clone(), tcp.clone()];
+    state.members.push(member);
+
+    let targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::NetworkProbe);
+    let endpoint_ids = targets
+        .into_iter()
+        .map(|endpoint| endpoint.endpoint_id)
+        .collect::<BTreeSet<_>>();
+
+    assert!(endpoint_ids.contains(&tcp.endpoint_id));
+    assert!(
+        !endpoint_ids.contains(&iroh.endpoint_id),
+        "Sinomo network probes must not force Iroh dials; Iroh maintains its own paths"
+    );
+}
+
+#[test]
 fn public_ip_endpoint_is_marked_internet_direct() {
     let node_id = NodeId::from_legacy_named("node_public_endpoint").expect("node");
     let endpoints = daemon_advertised_endpoints_from_static_addresses(

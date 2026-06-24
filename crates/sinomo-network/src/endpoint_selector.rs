@@ -1077,9 +1077,7 @@ pub(crate) fn cluster_network_probe_targets_impl(
                     endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
                         && matches!(
                             endpoint.transport,
-                            ClusterTransportKind::LanTcp
-                                | ClusterTransportKind::Loopback
-                                | ClusterTransportKind::Iroh
+                            ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
                         )
                         && endpoint_ids.insert(endpoint.endpoint_id.clone())
                 })

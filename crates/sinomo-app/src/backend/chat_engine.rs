@@ -56,12 +56,28 @@ impl From<ChatRuntimeInfo> for RuntimeInfo {
 /// Commands the UI issues to the chat worker.
 #[derive(Clone, Debug)]
 pub enum ChatCommand {
-    Send(String),
-    Steer(String),
-    FollowUp(String),
-    Interrupt(String),
-    ControlState,
-    NewSession,
+    Send {
+        session_id: String,
+        text: String,
+    },
+    Steer {
+        session_id: String,
+        message: String,
+    },
+    FollowUp {
+        session_id: String,
+        message: String,
+    },
+    Interrupt {
+        session_id: String,
+        reason: String,
+    },
+    ControlState {
+        session_id: String,
+    },
+    NewSession {
+        session_id: String,
+    },
     Resume {
         session_id: String,
         history: Vec<ChatHistoryMessage>,
@@ -87,20 +103,44 @@ pub enum ChatEvent {
         session_id: String,
         info: RuntimeInfo,
     },
-    Token(String),
-    Notice(String),
-    Context(ChatContextSnapshot),
-    ToolCallStarted(ChatToolCallSnapshot),
+    Token {
+        session_id: String,
+        text: String,
+    },
+    Notice {
+        session_id: String,
+        notice: String,
+    },
+    Context {
+        session_id: String,
+        context: ChatContextSnapshot,
+    },
+    ToolCallStarted {
+        session_id: String,
+        call: ChatToolCallSnapshot,
+    },
     ToolCallDelta {
+        session_id: String,
         step_index: usize,
         call_id: Option<String>,
         tool: Option<String>,
         arguments_delta: String,
     },
-    ToolCallCompleted(ChatToolCallSnapshot),
-    Process(ChatProcessSnapshot),
-    Usage(ChatUsageSnapshot),
-    TurnDone,
+    ToolCallCompleted {
+        session_id: String,
+        call: ChatToolCallSnapshot,
+    },
+    Process {
+        session_id: String,
+        process: ChatProcessSnapshot,
+    },
+    Usage {
+        session_id: String,
+        usage: ChatUsageSnapshot,
+    },
+    TurnDone {
+        session_id: String,
+    },
     ControlStatus(ChatControlStatus),
     ControlState(ChatControlState),
     RuntimeInfo(RuntimeInfo),
@@ -112,7 +152,39 @@ pub enum ChatEvent {
         provider: String,
         models: Vec<String>,
     },
-    Error(String),
+    Error {
+        session_id: Option<String>,
+        error: String,
+    },
+}
+
+impl ChatEvent {
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            ChatEvent::Token { session_id, .. }
+            | ChatEvent::Notice { session_id, .. }
+            | ChatEvent::Context { session_id, .. }
+            | ChatEvent::ToolCallStarted { session_id, .. }
+            | ChatEvent::ToolCallDelta { session_id, .. }
+            | ChatEvent::ToolCallCompleted { session_id, .. }
+            | ChatEvent::Process { session_id, .. }
+            | ChatEvent::Usage { session_id, .. }
+            | ChatEvent::TurnDone { session_id }
+            | ChatEvent::SessionReset { session_id } => Some(session_id),
+            ChatEvent::ControlStatus(status) => Some(&status.session_id),
+            ChatEvent::ControlState(state) => Some(&state.session_id),
+            ChatEvent::Error {
+                session_id: Some(session_id),
+                ..
+            } => Some(session_id),
+            ChatEvent::Ready { .. }
+            | ChatEvent::RuntimeInfo(_)
+            | ChatEvent::Models { .. }
+            | ChatEvent::Error {
+                session_id: None, ..
+            } => None,
+        }
+    }
 }
 
 /// Handle to the chat worker thread.
@@ -159,10 +231,20 @@ impl ChatHandle {
 
     pub fn send_command(&self, command: ChatCommand) {
         match command {
-            ChatCommand::Steer(message) => self.direct_control.steer(message),
-            ChatCommand::FollowUp(message) => self.direct_control.follow_up(message),
-            ChatCommand::Interrupt(reason) => self.direct_control.interrupt(reason),
-            ChatCommand::ControlState => self.direct_control.control_state(),
+            ChatCommand::Steer {
+                session_id,
+                message,
+            } => self.direct_control.steer(session_id, message),
+            ChatCommand::FollowUp {
+                session_id,
+                message,
+            } => self.direct_control.follow_up(session_id, message),
+            ChatCommand::Interrupt { session_id, reason } => {
+                self.direct_control.interrupt(session_id, reason)
+            }
+            ChatCommand::ControlState { session_id } => {
+                self.direct_control.control_state(session_id)
+            }
             command => {
                 let _ = self.tx.send(command);
             }
@@ -189,47 +271,64 @@ struct DirectControl {
 }
 
 impl DirectControl {
-    fn steer(&self, message: String) {
-        self.spawn("steer", move |registry, session_id| {
-            registry
-                .steer(AgentSessionSteerRequest {
-                    session_id,
-                    message,
-                })
-                .map(|result| ChatEvent::ControlStatus(chat_control_status(result)))
-        });
+    fn steer(&self, requested_session_id: String, message: String) {
+        self.spawn(
+            "steer",
+            requested_session_id,
+            move |registry, session_id| {
+                registry
+                    .steer(AgentSessionSteerRequest {
+                        session_id,
+                        message,
+                    })
+                    .map(|result| ChatEvent::ControlStatus(chat_control_status(result)))
+            },
+        );
     }
 
-    fn follow_up(&self, message: String) {
-        self.spawn("follow-up", move |registry, session_id| {
-            registry
-                .follow_up(AgentSessionFollowUpRequest {
-                    session_id,
-                    message,
-                })
-                .map(|result| ChatEvent::ControlStatus(chat_control_status(result)))
-        });
+    fn follow_up(&self, requested_session_id: String, message: String) {
+        self.spawn(
+            "follow-up",
+            requested_session_id,
+            move |registry, session_id| {
+                registry
+                    .follow_up(AgentSessionFollowUpRequest {
+                        session_id,
+                        message,
+                    })
+                    .map(|result| ChatEvent::ControlStatus(chat_control_status(result)))
+            },
+        );
     }
 
-    fn interrupt(&self, reason: String) {
-        self.spawn("interrupt", move |registry, session_id| {
-            registry
-                .interrupt(AgentSessionInterruptRequest { session_id, reason })
-                .map(|result| ChatEvent::ControlStatus(chat_control_status(result)))
-        });
+    fn interrupt(&self, requested_session_id: String, reason: String) {
+        self.spawn(
+            "interrupt",
+            requested_session_id,
+            move |registry, session_id| {
+                registry
+                    .interrupt(AgentSessionInterruptRequest { session_id, reason })
+                    .map(|result| ChatEvent::ControlStatus(chat_control_status(result)))
+            },
+        );
     }
 
-    fn control_state(&self) {
-        self.spawn("control state", move |registry, session_id| {
-            registry
-                .resume(AgentSessionResumeRequest { session_id })
-                .map(|response| ChatEvent::ControlState(chat_control_state(response)))
-        });
+    fn control_state(&self, requested_session_id: String) {
+        self.spawn(
+            "control state",
+            requested_session_id,
+            move |registry, session_id| {
+                registry
+                    .resume(AgentSessionResumeRequest { session_id })
+                    .map(|response| ChatEvent::ControlState(chat_control_state(response)))
+            },
+        );
     }
 
     fn spawn(
         &self,
         label: &'static str,
+        requested_session_id: String,
         action: impl FnOnce(
             AgentRuntimeControlRegistry,
             SessionId,
@@ -243,29 +342,46 @@ impl DirectControl {
         thread::Builder::new()
             .name("sinomo-chat-control".to_string())
             .spawn(move || {
-                let session_id = match active_session_id.lock() {
-                    Ok(guard) => guard.clone(),
-                    Err(_) => {
-                        let _ = tx.send(ChatEvent::Error(format!(
-                            "{label} failed: control lock poisoned"
-                        )));
-                        return;
+                let session_id = if requested_session_id.trim().is_empty() {
+                    match active_session_id.lock() {
+                        Ok(guard) => guard.clone(),
+                        Err(_) => {
+                            let _ = tx.send(ChatEvent::Error {
+                                session_id: None,
+                                error: format!("{label} failed: control lock poisoned"),
+                            });
+                            return;
+                        }
+                    }
+                } else {
+                    match SessionId::from_str(&requested_session_id) {
+                        Ok(session_id) => Some(session_id),
+                        Err(error) => {
+                            let _ = tx.send(ChatEvent::Error {
+                                session_id: Some(requested_session_id),
+                                error: format!("{label} failed: invalid session id: {error}"),
+                            });
+                            return;
+                        }
                     }
                 };
                 let Some(session_id) = session_id else {
-                    let _ = tx.send(ChatEvent::Error(format!(
-                        "{label} failed: no active chat session"
-                    )));
+                    let _ = tx.send(ChatEvent::Error {
+                        session_id: None,
+                        error: format!("{label} failed: no active chat session"),
+                    });
                     return;
                 };
+                let event_session_id = session_id.to_string();
                 match action(registry, session_id) {
                     Ok(event) => {
                         let _ = tx.send(event);
                     }
                     Err(error) => {
-                        let _ = tx.send(ChatEvent::Error(format!(
-                            "{label} failed: agent runtime control: {error}"
-                        )));
+                        let _ = tx.send(ChatEvent::Error {
+                            session_id: Some(event_session_id),
+                            error: format!("{label} failed: agent runtime control: {error}"),
+                        });
                     }
                 }
             })
@@ -283,15 +399,17 @@ fn set_active_session_id(
             if let Ok(mut active) = active_session_id.lock() {
                 *active = Some(session_id);
             } else {
-                let _ = evt_tx.send(ChatEvent::Error(
-                    "control state failed: control lock poisoned".to_string(),
-                ));
+                let _ = evt_tx.send(ChatEvent::Error {
+                    session_id: None,
+                    error: "control state failed: control lock poisoned".to_string(),
+                });
             }
         }
         Err(error) => {
-            let _ = evt_tx.send(ChatEvent::Error(format!(
-                "control state failed: invalid session id: {error}"
-            )));
+            let _ = evt_tx.send(ChatEvent::Error {
+                session_id: Some(session_id.as_ref().to_string()),
+                error: format!("control state failed: invalid session id: {error}"),
+            });
         }
     }
 }
@@ -392,7 +510,10 @@ fn worker(
     ) {
         Ok(chat) => chat,
         Err(error) => {
-            let _ = evt_tx.send(ChatEvent::Error(format!("chat unavailable: {error}")));
+            let _ = evt_tx.send(ChatEvent::Error {
+                session_id: None,
+                error: format!("chat unavailable: {error}"),
+            });
             return;
         }
     };
@@ -405,17 +526,49 @@ fn worker(
 
     while let Ok(command) = cmd_rx.recv() {
         match command {
-            ChatCommand::Send(text) => {
+            ChatCommand::Send { session_id, text } => {
+                let session_id = if session_id.trim().is_empty() {
+                    chat.session_id()
+                } else if chat.session_id() == session_id {
+                    session_id
+                } else {
+                    match chat.resume_session(&session_id, &[]) {
+                        Ok(()) => {
+                            set_active_session_id(&active_session_id, &evt_tx, &session_id);
+                            session_id
+                        }
+                        Err(error) => {
+                            let _ = evt_tx.send(ChatEvent::Error {
+                                session_id: Some(session_id),
+                                error: format!("resume failed before send: {error}"),
+                            });
+                            continue;
+                        }
+                    }
+                };
                 let tx = evt_tx.clone();
+                let event_session_id = session_id.clone();
                 let result = chat.send(&text, &mut |event| {
                     let mapped = match event {
-                        ChatStreamEvent::Token(token) => Some(ChatEvent::Token(token)),
+                        ChatStreamEvent::Token(text) => Some(ChatEvent::Token {
+                            session_id: event_session_id.clone(),
+                            text,
+                        }),
                         ChatStreamEvent::Notice(notice) if !notice.is_empty() => {
-                            Some(ChatEvent::Notice(notice))
+                            Some(ChatEvent::Notice {
+                                session_id: event_session_id.clone(),
+                                notice,
+                            })
                         }
-                        ChatStreamEvent::Context(context) => Some(ChatEvent::Context(context)),
+                        ChatStreamEvent::Context(context) => Some(ChatEvent::Context {
+                            session_id: event_session_id.clone(),
+                            context,
+                        }),
                         ChatStreamEvent::ToolCallStarted(call) => {
-                            Some(ChatEvent::ToolCallStarted(call))
+                            Some(ChatEvent::ToolCallStarted {
+                                session_id: event_session_id.clone(),
+                                call,
+                            })
                         }
                         ChatStreamEvent::ToolCallDelta {
                             step_index,
@@ -423,16 +576,26 @@ fn worker(
                             tool,
                             arguments_delta,
                         } => Some(ChatEvent::ToolCallDelta {
+                            session_id: event_session_id.clone(),
                             step_index,
                             call_id,
                             tool,
                             arguments_delta,
                         }),
                         ChatStreamEvent::ToolCallCompleted(call) => {
-                            Some(ChatEvent::ToolCallCompleted(call))
+                            Some(ChatEvent::ToolCallCompleted {
+                                session_id: event_session_id.clone(),
+                                call,
+                            })
                         }
-                        ChatStreamEvent::Process(process) => Some(ChatEvent::Process(process)),
-                        ChatStreamEvent::Usage(usage) => Some(ChatEvent::Usage(usage)),
+                        ChatStreamEvent::Process(process) => Some(ChatEvent::Process {
+                            session_id: event_session_id.clone(),
+                            process,
+                        }),
+                        ChatStreamEvent::Usage(usage) => Some(ChatEvent::Usage {
+                            session_id: event_session_id.clone(),
+                            usage,
+                        }),
                         ChatStreamEvent::Notice(_) => None,
                     };
                     if let Some(event) = mapped {
@@ -440,55 +603,77 @@ fn worker(
                     }
                 });
                 if let Err(error) = result {
-                    let _ = evt_tx.send(ChatEvent::Error(format!("turn failed: {error}")));
+                    let _ = evt_tx.send(ChatEvent::Error {
+                        session_id: Some(session_id.clone()),
+                        error: format!("turn failed: {error}"),
+                    });
                 }
-                let _ = evt_tx.send(ChatEvent::TurnDone);
+                let _ = evt_tx.send(ChatEvent::TurnDone { session_id });
             }
-            ChatCommand::Steer(message) => match chat.steer(message) {
+            ChatCommand::Steer { message, .. } => match chat.steer(message) {
                 Ok(status) => {
                     let _ = evt_tx.send(ChatEvent::ControlStatus(status));
                 }
                 Err(error) => {
-                    let _ = evt_tx.send(ChatEvent::Error(format!("steer failed: {error}")));
+                    let _ = evt_tx.send(ChatEvent::Error {
+                        session_id: Some(chat.session_id()),
+                        error: format!("steer failed: {error}"),
+                    });
                 }
             },
-            ChatCommand::FollowUp(message) => match chat.follow_up(message) {
+            ChatCommand::FollowUp { message, .. } => match chat.follow_up(message) {
                 Ok(status) => {
                     let _ = evt_tx.send(ChatEvent::ControlStatus(status));
                 }
                 Err(error) => {
-                    let _ = evt_tx.send(ChatEvent::Error(format!("follow-up failed: {error}")));
+                    let _ = evt_tx.send(ChatEvent::Error {
+                        session_id: Some(chat.session_id()),
+                        error: format!("follow-up failed: {error}"),
+                    });
                 }
             },
-            ChatCommand::Interrupt(reason) => match chat.interrupt(reason) {
+            ChatCommand::Interrupt { reason, .. } => match chat.interrupt(reason) {
                 Ok(status) => {
                     let _ = evt_tx.send(ChatEvent::ControlStatus(status));
                 }
                 Err(error) => {
-                    let _ = evt_tx.send(ChatEvent::Error(format!("interrupt failed: {error}")));
+                    let _ = evt_tx.send(ChatEvent::Error {
+                        session_id: Some(chat.session_id()),
+                        error: format!("interrupt failed: {error}"),
+                    });
                 }
             },
-            ChatCommand::ControlState => match chat.control_state() {
+            ChatCommand::ControlState { .. } => match chat.control_state() {
                 Ok(state) => {
                     let _ = evt_tx.send(ChatEvent::ControlState(state));
                 }
                 Err(error) => {
-                    let _ = evt_tx.send(ChatEvent::Error(format!("control state failed: {error}")));
+                    let _ = evt_tx.send(ChatEvent::Error {
+                        session_id: Some(chat.session_id()),
+                        error: format!("control state failed: {error}"),
+                    });
                 }
             },
-            ChatCommand::NewSession => {
-                chat.reset_session();
-                set_active_session_id(&active_session_id, &evt_tx, chat.session_id());
-                let _ = evt_tx.send(ChatEvent::SessionReset {
-                    session_id: chat.session_id(),
-                });
+            ChatCommand::NewSession { session_id } => {
+                if let Err(error) = chat.resume_session(&session_id, &[]) {
+                    let _ = evt_tx.send(ChatEvent::Error {
+                        session_id: Some(session_id),
+                        error: format!("new session failed: {error}"),
+                    });
+                } else {
+                    set_active_session_id(&active_session_id, &evt_tx, &session_id);
+                    let _ = evt_tx.send(ChatEvent::SessionReset { session_id });
+                }
             }
             ChatCommand::Resume {
                 session_id,
                 history,
             } => {
                 if let Err(error) = chat.resume_session(&session_id, &history) {
-                    let _ = evt_tx.send(ChatEvent::Error(format!("resume failed: {error}")));
+                    let _ = evt_tx.send(ChatEvent::Error {
+                        session_id: Some(session_id),
+                        error: format!("resume failed: {error}"),
+                    });
                 } else {
                     set_active_session_id(&active_session_id, &evt_tx, session_id);
                 }
@@ -502,7 +687,10 @@ fn worker(
                     let _ = evt_tx.send(ChatEvent::RuntimeInfo(info.into()));
                 }
                 Err(error) => {
-                    let _ = evt_tx.send(ChatEvent::Error(format!("model switch failed: {error}")));
+                    let _ = evt_tx.send(ChatEvent::Error {
+                        session_id: Some(chat.session_id()),
+                        error: format!("model switch failed: {error}"),
+                    });
                 }
             },
             ChatCommand::SetAgent(key) => match chat.set_agent(&key) {
@@ -510,7 +698,10 @@ fn worker(
                     let _ = evt_tx.send(ChatEvent::RuntimeInfo(info.into()));
                 }
                 Err(error) => {
-                    let _ = evt_tx.send(ChatEvent::Error(format!("agent switch failed: {error}")));
+                    let _ = evt_tx.send(ChatEvent::Error {
+                        session_id: Some(chat.session_id()),
+                        error: format!("agent switch failed: {error}"),
+                    });
                 }
             },
             ChatCommand::FetchModels { provider } => {
@@ -554,7 +745,9 @@ mod tests {
             1
         );
 
-        handle.send_command(ChatCommand::ControlState);
+        handle.send_command(ChatCommand::ControlState {
+            session_id: session_id.clone(),
+        });
         let initial = wait_for_event(&handle, |event| {
             matches!(event, ChatEvent::ControlState(state) if state.session_id == session_id)
         })
@@ -565,7 +758,10 @@ mod tests {
                 if state.steering_count == 0 && state.follow_up_count == 0
         ));
 
-        handle.send_command(ChatCommand::Steer("keep this constraint".to_string()));
+        handle.send_command(ChatCommand::Steer {
+            session_id: session_id.clone(),
+            message: "keep this constraint".to_string(),
+        });
         let steer = wait_for_event(&handle, |event| {
             matches!(event, ChatEvent::ControlStatus(status) if status.session_id == session_id)
         })
@@ -575,7 +771,10 @@ mod tests {
             ChatEvent::ControlStatus(status) if status.accepted
         ));
 
-        handle.send_command(ChatCommand::FollowUp("also mention tests".to_string()));
+        handle.send_command(ChatCommand::FollowUp {
+            session_id: session_id.clone(),
+            message: "also mention tests".to_string(),
+        });
         let follow_up = wait_for_event(&handle, |event| {
             matches!(event, ChatEvent::ControlStatus(status) if status.session_id == session_id)
         })
@@ -585,7 +784,9 @@ mod tests {
             ChatEvent::ControlStatus(status) if status.accepted
         ));
 
-        handle.send_command(ChatCommand::ControlState);
+        handle.send_command(ChatCommand::ControlState {
+            session_id: session_id.clone(),
+        });
         let state = wait_for_event(&handle, |event| {
             matches!(
                 event,
@@ -597,6 +798,21 @@ mod tests {
         })
         .expect("updated control state");
         assert!(matches!(state, ChatEvent::ControlState(_)));
+
+        let new_session_id = SessionId::from_legacy_named("sess_chat_new_session")
+            .expect("session id")
+            .to_string();
+        handle.send_command(ChatCommand::NewSession {
+            session_id: new_session_id.clone(),
+        });
+        let reset = wait_for_event(&handle, |event| {
+            matches!(event, ChatEvent::SessionReset { session_id } if session_id == &new_session_id)
+        })
+        .expect("new session reset");
+        assert!(matches!(
+            reset,
+            ChatEvent::SessionReset { session_id } if session_id == new_session_id
+        ));
     }
 
     #[test]
@@ -620,9 +836,10 @@ mod tests {
             },
         };
 
-        handle.send_command(ChatCommand::FollowUp(
-            "also mention live controls".to_string(),
-        ));
+        handle.send_command(ChatCommand::FollowUp {
+            session_id: session_id.to_string(),
+            message: "also mention live controls".to_string(),
+        });
         let follow_up = wait_for_event(&handle, |event| {
             matches!(event, ChatEvent::ControlStatus(status) if status.session_id == session_id.to_string())
         })
@@ -636,7 +853,9 @@ mod tests {
             vec!["also mention live controls".to_string()]
         );
 
-        handle.send_command(ChatCommand::ControlState);
+        handle.send_command(ChatCommand::ControlState {
+            session_id: session_id.to_string(),
+        });
         let state = wait_for_event(&handle, |event| {
             matches!(event, ChatEvent::ControlState(state) if state.session_id == session_id.to_string())
         })
@@ -753,7 +972,7 @@ mod tests {
                 if matches(&event) {
                     return Some(event);
                 }
-                if let ChatEvent::Error(error) = &event {
+                if let ChatEvent::Error { error, .. } = &event {
                     panic!("chat worker error: {error}");
                 }
             }

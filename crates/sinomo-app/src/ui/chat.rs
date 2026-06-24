@@ -50,7 +50,7 @@ use sinomo_cli::app_api::{
     AgentSummary, ChatContextSnapshot, ChatHistoryMessage, ChatProcessSnapshot, ChatTaskSnapshot,
     ChatToolCallSnapshot, ChatUsageSnapshot, ProviderSummary, agent_summaries, reasoning_efforts,
 };
-use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::{events::SessionId, local::SinomoDataDir};
 
 use crate::backend::Backend;
 use crate::backend::chat_engine::{ChatCommand, ChatEvent, ChatHandle, ChatRole, RuntimeInfo};
@@ -87,9 +87,151 @@ type ThemeReader = Rc<dyn Fn() -> DefaultTheme>;
 // ---------------------------------------------------------------------------
 
 /// One message in the visible transcript.
+#[derive(Clone, Debug)]
 pub struct ChatMessage {
     pub role: ChatRole,
     pub text: String,
+    pub source: ChatMessageSource,
+    pub kind: ChatMessageKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatMessageSource {
+    User,
+    Model,
+    System,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatMessageKind {
+    Message,
+    Info,
+    Error,
+}
+
+impl ChatMessage {
+    pub fn user(text: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::User,
+            text: text.into(),
+            source: ChatMessageSource::User,
+            kind: ChatMessageKind::Message,
+        }
+    }
+
+    pub fn model(text: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::Agent,
+            text: text.into(),
+            source: ChatMessageSource::Model,
+            kind: ChatMessageKind::Message,
+        }
+    }
+
+    pub fn system_info(text: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::Agent,
+            text: text.into(),
+            source: ChatMessageSource::System,
+            kind: ChatMessageKind::Info,
+        }
+    }
+
+    pub fn system_error(text: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::Agent,
+            text: text.into(),
+            source: ChatMessageSource::System,
+            kind: ChatMessageKind::Error,
+        }
+    }
+
+    fn from_stored(message: StoredMessage) -> Self {
+        let role = if message.role == "user" {
+            ChatRole::User
+        } else {
+            ChatRole::Agent
+        };
+        let source = ChatMessageSource::from_stored(message.source.as_deref(), &message.role);
+        let kind = ChatMessageKind::from_stored(message.kind.as_deref(), source);
+        Self {
+            role,
+            text: message.text,
+            source,
+            kind,
+        }
+    }
+
+    fn to_stored(&self) -> StoredMessage {
+        StoredMessage {
+            role: self.stored_role().to_string(),
+            text: self.text.clone(),
+            source: Some(self.source.stored().to_string()),
+            kind: Some(self.kind.stored().to_string()),
+        }
+    }
+
+    fn stored_role(&self) -> &'static str {
+        match self.role {
+            ChatRole::User => "user",
+            ChatRole::Agent => "agent",
+        }
+    }
+
+    fn history_role(&self) -> &'static str {
+        match self.source {
+            ChatMessageSource::User => "user",
+            ChatMessageSource::Model => "agent",
+            ChatMessageSource::System => "system",
+        }
+    }
+
+    fn is_model_placeholder(&self) -> bool {
+        self.role == ChatRole::Agent
+            && self.source == ChatMessageSource::Model
+            && self.text.trim().is_empty()
+    }
+}
+
+impl ChatMessageSource {
+    fn stored(self) -> &'static str {
+        match self {
+            ChatMessageSource::User => "user",
+            ChatMessageSource::Model => "model",
+            ChatMessageSource::System => "system",
+        }
+    }
+
+    fn from_stored(source: Option<&str>, role: &str) -> Self {
+        match source {
+            Some("user") => ChatMessageSource::User,
+            Some("model") => ChatMessageSource::Model,
+            Some("system") => ChatMessageSource::System,
+            _ if role == "user" => ChatMessageSource::User,
+            _ if role == "system" => ChatMessageSource::System,
+            _ => ChatMessageSource::Model,
+        }
+    }
+}
+
+impl ChatMessageKind {
+    fn stored(self) -> &'static str {
+        match self {
+            ChatMessageKind::Message => "message",
+            ChatMessageKind::Info => "info",
+            ChatMessageKind::Error => "error",
+        }
+    }
+
+    fn from_stored(kind: Option<&str>, source: ChatMessageSource) -> Self {
+        match kind {
+            Some("error") => ChatMessageKind::Error,
+            Some("info") => ChatMessageKind::Info,
+            Some("message") => ChatMessageKind::Message,
+            _ if source == ChatMessageSource::System => ChatMessageKind::Info,
+            _ => ChatMessageKind::Message,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,6 +311,7 @@ pub struct ChatState {
     /// True while a provider's model list is being fetched from sinomo-lm.
     pub models_loading: bool,
     pub sessions: Vec<SessionRef>,
+    pending_session_reset: Option<String>,
 }
 
 impl ChatState {
@@ -217,6 +360,7 @@ impl ChatState {
             effort_idx,
             models_loading: false,
             sessions,
+            pending_session_reset: None,
         };
         // Eagerly fetch the default/initial provider's models so the model picker is populated
         // without requiring a manual provider toggle. (Results arrive async via `ChatEvent::Models`;
@@ -225,9 +369,8 @@ impl ChatState {
         state
     }
 
-    /// Title derived from the first user message (for the sidebar).
-    fn derived_title(&self) -> String {
-        self.messages
+    fn title_from_messages(messages: &[ChatMessage]) -> String {
+        messages
             .iter()
             .find(|m| m.role == ChatRole::User)
             .map(|m| {
@@ -244,28 +387,30 @@ impl ChatState {
 
     /// Persist the current session and refresh the sidebar list.
     fn persist(&mut self) {
-        if self.session_id.is_empty() || self.messages.is_empty() {
+        let session_id = self.session_id.clone();
+        let messages = self.messages.clone();
+        self.persist_messages(&session_id, &messages, true);
+    }
+
+    fn persist_messages(
+        &mut self,
+        session_id: &str,
+        messages: &[ChatMessage],
+        report_visible_failures: bool,
+    ) {
+        if session_id.is_empty() || messages.is_empty() {
             return;
         }
-        let title = self.derived_title();
-        let stored: Vec<StoredMessage> = self
-            .messages
-            .iter()
-            .map(|m| StoredMessage {
-                role: match m.role {
-                    ChatRole::User => "user".to_string(),
-                    ChatRole::Agent => "agent".to_string(),
-                },
-                text: m.text.clone(),
-            })
-            .collect();
-        match sessions::save_with_report(&self.data_dir, &self.session_id, &title, &stored) {
+        let title = Self::title_from_messages(messages);
+        let stored: Vec<StoredMessage> = messages.iter().map(ChatMessage::to_stored).collect();
+        match sessions::save_with_report(&self.data_dir, session_id, &title, &stored) {
             Ok(_) => {}
-            Err(error) => {
+            Err(error) if report_visible_failures => {
                 let detail = error.to_string();
                 self.notice = Some(format!("session save failed: {detail}"));
                 self.push_activity("session save", detail, ActivityTone::Warn);
             }
+            Err(_) => {}
         }
         self.sessions = sessions::list(&self.data_dir)
             .into_iter()
@@ -502,6 +647,92 @@ impl ChatState {
             })
     }
 
+    fn event_belongs_to_visible_session(&self, session_id: &str) -> bool {
+        session_id.is_empty() || self.session_id.is_empty() || self.session_id == session_id
+    }
+
+    fn route_background_session_event(&mut self, session_id: &str, event: ChatEvent) -> bool {
+        if self.event_belongs_to_visible_session(session_id) {
+            return false;
+        }
+
+        let mut transcript =
+            sessions::load_transcript(&self.data_dir, session_id).unwrap_or_default();
+        let mut messages: Vec<ChatMessage> = transcript
+            .messages
+            .drain(..)
+            .map(ChatMessage::from_stored)
+            .collect();
+        let changed = match event {
+            ChatEvent::Token { text, .. } => {
+                Self::append_model_token(&mut messages, &text);
+                true
+            }
+            ChatEvent::TurnDone { .. } => Self::finish_turn_messages(&mut messages),
+            ChatEvent::Error { error, .. } => {
+                Self::apply_error_message(&mut messages, &error);
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.persist_messages(session_id, &messages, false);
+        }
+        true
+    }
+
+    fn append_model_token(messages: &mut Vec<ChatMessage>, token: &str) {
+        if let Some(last) = messages.last_mut()
+            && last.role == ChatRole::Agent
+            && last.source == ChatMessageSource::Model
+        {
+            last.text.push_str(token);
+            return;
+        }
+        messages.push(ChatMessage::model(token));
+    }
+
+    fn finish_turn_messages(messages: &mut [ChatMessage]) -> bool {
+        if matches!(messages.last(), Some(m) if m.is_model_placeholder())
+            && let Some(last) = messages.last_mut()
+        {
+            last.text = "(no response)".to_string();
+            last.source = ChatMessageSource::System;
+            last.kind = ChatMessageKind::Info;
+            return true;
+        }
+        false
+    }
+
+    fn apply_error_message(messages: &mut Vec<ChatMessage>, error: &str) {
+        let text = format!("Error: {error}");
+        if let Some(last) = messages.last_mut()
+            && last.is_model_placeholder()
+        {
+            last.text = text;
+            last.source = ChatMessageSource::System;
+            last.kind = ChatMessageKind::Error;
+        } else {
+            messages.push(ChatMessage::system_error(text));
+        }
+    }
+
+    fn reset_visible_session(&mut self, session_id: String) {
+        self.session_id = session_id;
+        self.messages.clear();
+        self.input.clear();
+        self.cursor = 0;
+        self.streaming = false;
+        self.notice = None;
+        self.context = None;
+        self.usage = None;
+        self.activity.clear();
+        self.tool_calls.clear();
+        self.control = ChatControlOverview::default();
+        self.scroll = 0.0;
+        self.stick_bottom = true;
+    }
+
     /// Open a stored session: load its transcript for display and tell the worker
     /// to continue under that id.
     fn open_session(&mut self, index: usize) {
@@ -510,26 +741,19 @@ impl ChatState {
         };
         let id = session.id.clone();
         let transcript = sessions::load_transcript(&self.data_dir, &id).unwrap_or_default();
-        let history: Vec<ChatHistoryMessage> = transcript
+        let messages: Vec<ChatMessage> = transcript
             .messages
+            .into_iter()
+            .map(ChatMessage::from_stored)
+            .collect();
+        let history: Vec<ChatHistoryMessage> = messages
             .iter()
             .map(|m| ChatHistoryMessage {
-                role: m.role.clone(),
+                role: m.history_role().to_string(),
                 text: m.text.clone(),
             })
             .collect();
-        self.messages = transcript
-            .messages
-            .into_iter()
-            .map(|m| ChatMessage {
-                role: if m.role == "user" {
-                    ChatRole::User
-                } else {
-                    ChatRole::Agent
-                },
-                text: m.text,
-            })
-            .collect();
+        self.messages = messages;
         self.session_id = id.clone();
         self.streaming = false;
         self.notice = None;
@@ -588,42 +812,35 @@ impl ChatState {
     }
 
     fn apply_event(&mut self, event: ChatEvent) -> bool {
+        if let Some(session_id) = event.session_id().map(str::to_string)
+            && self.route_background_session_event(&session_id, event.clone())
+        {
+            return false;
+        }
         match event {
             ChatEvent::Ready { session_id, info } => {
-                self.session_id = session_id;
                 self.info = info;
                 self.sync_selection_from_info();
-            }
-            ChatEvent::Token(token) => {
-                self.notice = None;
-                if let Some(last) = self.messages.last_mut() {
-                    if last.role == ChatRole::Agent {
-                        last.text.push_str(&token);
-                    } else {
-                        self.messages.push(ChatMessage {
-                            role: ChatRole::Agent,
-                            text: token,
-                        });
-                    }
-                } else {
-                    self.messages.push(ChatMessage {
-                        role: ChatRole::Agent,
-                        text: token,
-                    });
+                if self.session_id.is_empty() || self.session_id == session_id {
+                    self.session_id = session_id;
                 }
+            }
+            ChatEvent::Token { text, .. } => {
+                self.notice = None;
+                Self::append_model_token(&mut self.messages, &text);
                 if self.stick_bottom {
                     self.scroll = f32::MAX;
                 }
             }
-            ChatEvent::Notice(notice) => self.notice = Some(notice),
-            ChatEvent::Context(context) => {
+            ChatEvent::Notice { notice, .. } => self.notice = Some(notice),
+            ChatEvent::Context { context, .. } => {
                 self.notice = Some(format!(
                     "context assembled: {}",
                     format_bytes(context.total_bytes)
                 ));
                 self.context = Some(context);
             }
-            ChatEvent::ToolCallStarted(call) => {
+            ChatEvent::ToolCallStarted { call, .. } => {
                 self.record_tool_call("tool", call, "running", ActivityTone::Running);
                 self.notice = Some("tool call requested".to_string());
             }
@@ -632,6 +849,7 @@ impl ChatState {
                 call_id,
                 tool,
                 arguments_delta,
+                ..
             } => {
                 self.record_tool_delta(step_index, call_id.clone(), tool.clone(), &arguments_delta);
                 if !arguments_delta.trim().is_empty() {
@@ -648,13 +866,13 @@ impl ChatState {
                     );
                 }
             }
-            ChatEvent::ToolCallCompleted(call) => {
+            ChatEvent::ToolCallCompleted { call, .. } => {
                 self.record_tool_call("tool done", call, "completed", ActivityTone::Good);
             }
-            ChatEvent::Process(process) => {
+            ChatEvent::Process { process, .. } => {
                 self.record_process(process);
             }
-            ChatEvent::Usage(usage) => {
+            ChatEvent::Usage { usage, .. } => {
                 self.usage = Some(usage.clone());
                 let input = usage
                     .input_tokens
@@ -670,14 +888,11 @@ impl ChatState {
                     ActivityTone::Neutral,
                 );
             }
-            ChatEvent::TurnDone => {
+            ChatEvent::TurnDone { .. } => {
                 self.streaming = false;
+                self.control.active_turn = false;
                 self.notice = None;
-                if matches!(self.messages.last(), Some(m) if m.role == ChatRole::Agent && m.text.trim().is_empty())
-                    && let Some(last) = self.messages.last_mut()
-                {
-                    last.text = "(no response)".to_string();
-                }
+                Self::finish_turn_messages(&mut self.messages);
                 self.persist();
             }
             ChatEvent::ControlStatus(status) => {
@@ -724,6 +939,15 @@ impl ChatState {
                 self.sync_selection_from_info();
             }
             ChatEvent::SessionReset { session_id } => {
+                let acknowledged_pending =
+                    self.pending_session_reset.as_deref() == Some(session_id.as_str());
+                if acknowledged_pending {
+                    self.pending_session_reset = None;
+                    if !self.messages.is_empty() || self.streaming {
+                        self.session_id = session_id;
+                        return true;
+                    }
+                }
                 self.session_id = session_id;
                 self.messages.clear();
                 self.streaming = false;
@@ -756,14 +980,16 @@ impl ChatState {
                 }
                 self.models_loading = false;
             }
-            ChatEvent::Error(error) => {
+            ChatEvent::Error { error, .. } => {
                 self.streaming = false;
+                self.control.active_turn = false;
                 self.push_activity("agent error", error.clone(), ActivityTone::Bad);
-                self.messages.push(ChatMessage {
-                    role: ChatRole::Agent,
-                    text: format!("⚠ {error}"),
-                });
+                Self::apply_error_message(&mut self.messages, &error);
                 self.notice = None;
+                if self.stick_bottom {
+                    self.scroll = f32::MAX;
+                }
+                self.persist();
             }
         }
         true
@@ -814,27 +1040,21 @@ impl ChatState {
             return;
         }
         if self.streaming {
-            self.handle
-                .send_command(ChatCommand::FollowUp(text.clone()));
-            self.messages.push(ChatMessage {
-                role: ChatRole::User,
-                text,
+            self.handle.send_command(ChatCommand::FollowUp {
+                session_id: self.session_id.clone(),
+                message: text.clone(),
             });
+            self.messages.push(ChatMessage::user(text));
             self.input.clear();
             self.cursor = 0;
             self.notice = Some("queued follow-up".to_string());
             self.stick_bottom = true;
             self.scroll = f32::MAX;
+            self.persist();
             return;
         }
-        self.messages.push(ChatMessage {
-            role: ChatRole::User,
-            text: text.clone(),
-        });
-        self.messages.push(ChatMessage {
-            role: ChatRole::Agent,
-            text: String::new(),
-        });
+        self.messages.push(ChatMessage::user(text.clone()));
+        self.messages.push(ChatMessage::model(String::new()));
         self.context = None;
         self.usage = None;
         self.activity.clear();
@@ -846,16 +1066,21 @@ impl ChatState {
         self.stick_bottom = true;
         self.scroll = f32::MAX;
         self.notice = Some("thinking…".to_string());
-        self.handle.send_command(ChatCommand::Send(text));
+        self.persist();
+        self.handle.send_command(ChatCommand::Send {
+            session_id: self.session_id.clone(),
+            text,
+        });
     }
 
     fn interrupt_turn(&mut self) {
         if !self.streaming {
             return;
         }
-        self.handle.send_command(ChatCommand::Interrupt(
-            "user interrupted from app chat".to_string(),
-        ));
+        self.handle.send_command(ChatCommand::Interrupt {
+            session_id: self.session_id.clone(),
+            reason: "user interrupted from app chat".to_string(),
+        });
         self.notice = Some("interrupting…".to_string());
     }
 
@@ -919,7 +1144,19 @@ impl ChatState {
 
     /// Start a fresh session (the "New chat" sidebar row).
     fn new_session(&mut self) {
-        self.handle.send_command(ChatCommand::NewSession);
+        self.persist();
+        let interrupted_session_id = self.session_id.clone();
+        let session_id = SessionId::generate().to_string();
+        if self.streaming || self.control.active_turn {
+            self.handle.send_command(ChatCommand::Interrupt {
+                session_id: interrupted_session_id,
+                reason: "user started a new chat from app chat".to_string(),
+            });
+        }
+        self.reset_visible_session(session_id.clone());
+        self.pending_session_reset = Some(session_id.clone());
+        self.handle
+            .send_command(ChatCommand::NewSession { session_id });
     }
 
     /// Push the current provider/model selection to the worker.
@@ -1739,6 +1976,7 @@ impl Widget for TranscriptView {
         // `measure` borrow of `ctx` before drawing).
         struct Laid {
             is_user: bool,
+            kind: ChatMessageKind,
             lines: Vec<String>,
             bubble_w: f32,
             bubble_h: f32,
@@ -1765,6 +2003,7 @@ impl Widget for TranscriptView {
                 total += bubble_h + 12.0;
                 laid.push(Laid {
                     is_user,
+                    kind: msg.kind,
                     lines,
                     bubble_w,
                     bubble_h,
@@ -1784,6 +2023,7 @@ impl Widget for TranscriptView {
         // Draw pass: only mutable ctx ops here.
         let mut y = area.y() + PAD - scroll;
         for item in &laid {
+            let is_error = item.kind == ChatMessageKind::Error;
             let (bx, bubble_color, text_color, border) = if item.is_user {
                 (
                     area.x() + area.width() - PAD - item.bubble_w,
@@ -1791,6 +2031,8 @@ impl Widget for TranscriptView {
                     pal.on_accent,
                     None,
                 )
+            } else if is_error {
+                (area.x() + PAD, pal.panel, pal.text, Some(pal.bad))
             } else {
                 (area.x() + PAD, pal.panel, pal.text, Some(pal.border))
             };
@@ -2802,8 +3044,12 @@ mod tests {
         assert!(state.streaming, "submitting begins a streaming turn");
         assert_eq!(state.messages.len(), 2, "user message + agent placeholder");
         assert_eq!(state.messages[0].role, ChatRole::User);
+        assert_eq!(state.messages[0].source, ChatMessageSource::User);
+        assert_eq!(state.messages[0].kind, ChatMessageKind::Message);
         assert_eq!(state.messages[0].text, "hello there");
         assert_eq!(state.messages[1].role, ChatRole::Agent);
+        assert_eq!(state.messages[1].source, ChatMessageSource::Model);
+        assert_eq!(state.messages[1].kind, ChatMessageKind::Message);
         assert!(
             state.messages[1].text.is_empty(),
             "agent placeholder is blank"
@@ -2826,6 +3072,7 @@ mod tests {
         state.submit();
         assert_eq!(state.messages.len(), 1, "queued follow-up is echoed");
         assert_eq!(state.messages[0].role, ChatRole::User);
+        assert_eq!(state.messages[0].source, ChatMessageSource::User);
         assert_eq!(state.messages[0].text, "queued");
         assert!(state.input.is_empty(), "the queued draft is cleared");
         assert!(
@@ -2833,6 +3080,125 @@ mod tests {
             "queueing follow-up keeps active stream state"
         );
         assert_eq!(state.notice.as_deref(), Some("queued follow-up"));
+    }
+
+    #[test]
+    fn new_session_clears_visible_chat_immediately_and_routes_stale_turn_events() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        let old_session_id = SessionId::from_legacy_named("sess_old_chat")
+            .expect("session id")
+            .to_string();
+        state.session_id = old_session_id.clone();
+        state.messages = vec![
+            ChatMessage::user("old question"),
+            ChatMessage::model("partial answer"),
+        ];
+        state.input = "draft".to_string();
+        state.cursor = state.input.len();
+        state.streaming = true;
+        state.notice = Some("thinking…".to_string());
+        state.control.active_turn = true;
+
+        state.new_session();
+        let new_session_id = state.session_id.clone();
+
+        assert!(
+            state.messages.is_empty(),
+            "New chat clears the transcript immediately"
+        );
+        assert!(state.input.is_empty(), "New chat clears the composer draft");
+        assert!(!state.streaming, "New chat leaves the visible chat idle");
+        assert_eq!(
+            state.pending_session_reset.as_deref(),
+            Some(new_session_id.as_str())
+        );
+
+        state.apply_event(ChatEvent::Error {
+            session_id: Some(old_session_id.clone()),
+            error: "old provider failed".to_string(),
+        });
+        assert!(
+            state.messages.is_empty(),
+            "stale errors from the abandoned turn must not repopulate the new chat"
+        );
+        let old_transcript = sessions::load_transcript(&state.data_dir, &old_session_id)
+            .expect("old transcript remains persisted");
+        let old_error = old_transcript
+            .messages
+            .last()
+            .expect("old error message persisted");
+        assert_eq!(old_error.source.as_deref(), Some("system"));
+        assert_eq!(old_error.kind.as_deref(), Some("error"));
+        assert!(old_error.text.contains("old provider failed"));
+
+        state.set_draft("new question".to_string());
+        state.submit();
+        assert_eq!(state.messages.len(), 2);
+        assert_eq!(state.messages[0].text, "new question");
+        assert!(
+            state.streaming,
+            "sending is allowed while the worker reset ack is pending"
+        );
+
+        state.apply_event(ChatEvent::SessionReset {
+            session_id: new_session_id,
+        });
+        assert!(state.pending_session_reset.is_none());
+    }
+
+    #[test]
+    fn session_scoped_events_update_background_transcript_without_visible_mutation() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        let visible_session_id = SessionId::from_legacy_named("sess_visible_chat")
+            .expect("visible session id")
+            .to_string();
+        let background_session_id = SessionId::from_legacy_named("sess_background_chat")
+            .expect("background session id")
+            .to_string();
+        state.session_id = visible_session_id.clone();
+        state.messages = vec![
+            ChatMessage::user("visible question"),
+            ChatMessage::model(""),
+        ];
+        state.streaming = true;
+        state.control.active_turn = true;
+
+        let background_messages = vec![
+            ChatMessage::user("background question"),
+            ChatMessage::model(String::new()),
+        ];
+        state.persist_messages(&background_session_id, &background_messages, false);
+
+        state.apply_event(ChatEvent::Token {
+            session_id: background_session_id.clone(),
+            text: "background answer".to_string(),
+        });
+        state.apply_event(ChatEvent::TurnDone {
+            session_id: background_session_id.clone(),
+        });
+
+        assert_eq!(
+            state.session_id, visible_session_id,
+            "background events keep the visible session selected"
+        );
+        assert!(
+            state.streaming,
+            "background TurnDone must not end visible work"
+        );
+        assert_eq!(
+            state.messages[1].text, "",
+            "background tokens must not append to the visible placeholder"
+        );
+        let background = sessions::load_transcript(&state.data_dir, &background_session_id)
+            .expect("background transcript saved");
+        assert_eq!(background.messages.len(), 2);
+        assert_eq!(background.messages[1].text, "background answer");
+        assert_eq!(background.messages[1].source.as_deref(), Some("model"));
+        assert_eq!(background.messages[1].kind.as_deref(), Some("message"));
     }
 
     #[test]
@@ -2857,14 +3223,104 @@ mod tests {
         state.set_draft("hi".to_string());
         state.submit();
         // Tokens append to the trailing (empty) agent placeholder rather than pushing new bubbles.
-        state.apply_event(ChatEvent::Token("Hel".to_string()));
-        state.apply_event(ChatEvent::Token("lo".to_string()));
+        state.apply_event(ChatEvent::Token {
+            session_id: state.session_id.clone(),
+            text: "Hel".to_string(),
+        });
+        state.apply_event(ChatEvent::Token {
+            session_id: state.session_id.clone(),
+            text: "lo".to_string(),
+        });
         assert_eq!(state.messages.len(), 2, "tokens append, not push");
         assert_eq!(state.messages[1].text, "Hello");
         // TurnDone clears streaming and the notice.
-        state.apply_event(ChatEvent::TurnDone);
+        state.apply_event(ChatEvent::TurnDone {
+            session_id: state.session_id.clone(),
+        });
         assert!(!state.streaming, "TurnDone ends the stream");
+        assert!(
+            !state.control.active_turn,
+            "TurnDone clears the active turn marker"
+        );
         assert!(state.notice.is_none());
+    }
+
+    #[test]
+    fn stored_message_metadata_distinguishes_system_errors_from_model_text() {
+        let stored = ChatMessage::system_error("Error: provider unavailable").to_stored();
+
+        assert_eq!(stored.role, "agent");
+        assert_eq!(stored.source.as_deref(), Some("system"));
+        assert_eq!(stored.kind.as_deref(), Some("error"));
+
+        let restored = ChatMessage::from_stored(stored);
+        assert_eq!(restored.role, ChatRole::Agent);
+        assert_eq!(restored.source, ChatMessageSource::System);
+        assert_eq!(restored.kind, ChatMessageKind::Error);
+        assert_eq!(restored.history_role(), "system");
+    }
+
+    #[test]
+    fn empty_turn_done_marks_placeholder_as_system_info() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        state.set_draft("hi".to_string());
+        state.submit();
+
+        state.apply_event(ChatEvent::TurnDone {
+            session_id: state.session_id.clone(),
+        });
+
+        assert_eq!(state.messages.len(), 2);
+        assert_eq!(state.messages[1].text, "(no response)");
+        assert_eq!(state.messages[1].source, ChatMessageSource::System);
+        assert_eq!(state.messages[1].kind, ChatMessageKind::Info);
+    }
+
+    #[test]
+    fn turn_error_replaces_pending_agent_placeholder() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        state.set_draft("hi".to_string());
+        state.submit();
+
+        state.apply_event(ChatEvent::Error {
+            session_id: Some(state.session_id.clone()),
+            error: "authentication required for codex: no Sinomo Codex ChatGPT sign-in found; run `sinomo providers auth codex`"
+                .to_string(),
+        });
+
+        assert!(!state.streaming, "provider errors end the visible stream");
+        assert!(
+            !state.control.active_turn,
+            "provider errors clear the active turn marker"
+        );
+        assert_eq!(state.messages.len(), 2, "the placeholder is reused");
+        assert_eq!(state.messages[1].role, ChatRole::Agent);
+        assert_eq!(state.messages[1].source, ChatMessageSource::System);
+        assert_eq!(state.messages[1].kind, ChatMessageKind::Error);
+        assert!(
+            state.messages[1]
+                .text
+                .contains("authentication required for codex"),
+            "the provider setup error is visible in the transcript"
+        );
+        assert!(
+            state
+                .activity
+                .iter()
+                .any(|entry| entry.title == "agent error" && entry.tone == ActivityTone::Bad)
+        );
+
+        state.apply_event(ChatEvent::TurnDone {
+            session_id: state.session_id.clone(),
+        });
+        assert!(
+            !state.messages[1].text.contains("(no response)"),
+            "TurnDone must not overwrite an already-visible error"
+        );
     }
 
     #[test]
@@ -2912,51 +3368,64 @@ mod tests {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
         state.streaming = true;
+        let session_id = state.session_id.clone();
 
-        state.apply_event(ChatEvent::Context(ChatContextSnapshot {
-            step_index: 0,
-            provider: "codex".to_string(),
-            model: "gpt-5.5-codex".to_string(),
-            total_bytes: 4096,
-            max_context_bytes: Some(8192),
-            compaction_threshold_bytes: Some(7000),
-            lanes: vec![sinomo_cli::app_api::ChatContextLane {
-                kind: "recent_tail".to_string(),
-                label: "recent transcript".to_string(),
-                bytes: 1024,
-                priority: 2,
-            }],
-            included_count: 3,
-            omitted_count: 1,
-        }));
+        state.apply_event(ChatEvent::Context {
+            session_id: session_id.clone(),
+            context: ChatContextSnapshot {
+                step_index: 0,
+                provider: "codex".to_string(),
+                model: "gpt-5.5-codex".to_string(),
+                total_bytes: 4096,
+                max_context_bytes: Some(8192),
+                compaction_threshold_bytes: Some(7000),
+                lanes: vec![sinomo_cli::app_api::ChatContextLane {
+                    kind: "recent_tail".to_string(),
+                    label: "recent transcript".to_string(),
+                    bytes: 1024,
+                    priority: 2,
+                }],
+                included_count: 3,
+                omitted_count: 1,
+            },
+        });
         assert_eq!(
             state.context.as_ref().map(|ctx| ctx.total_bytes),
             Some(4096)
         );
         assert_eq!(state.notice.as_deref(), Some("context assembled: 4.0 KB"));
 
-        state.apply_event(ChatEvent::ToolCallCompleted(ChatToolCallSnapshot {
-            step_index: 0,
-            call_index: Some(0),
-            call_id: Some("call_1".to_string()),
-            tool: "run_command".to_string(),
-            input_preview: Some("{\"cmd\":\"date\"}".to_string()),
-        }));
-        state.apply_event(ChatEvent::Process(ChatProcessSnapshot {
-            process_id: "proc_1".to_string(),
-            command: "date".to_string(),
-            status: "completed".to_string(),
-            exit_code: Some(0),
-            elapsed_ms: 12,
-            stdout_tail: "Mon Jun 15".to_string(),
-            stderr_tail: String::new(),
-        }));
-        state.apply_event(ChatEvent::Usage(ChatUsageSnapshot {
-            provider: "codex".to_string(),
-            model: "gpt-5.5-codex".to_string(),
-            input_tokens: Some(120),
-            output_tokens: Some(18),
-        }));
+        state.apply_event(ChatEvent::ToolCallCompleted {
+            session_id: session_id.clone(),
+            call: ChatToolCallSnapshot {
+                step_index: 0,
+                call_index: Some(0),
+                call_id: Some("call_1".to_string()),
+                tool: "run_command".to_string(),
+                input_preview: Some("{\"cmd\":\"date\"}".to_string()),
+            },
+        });
+        state.apply_event(ChatEvent::Process {
+            session_id: session_id.clone(),
+            process: ChatProcessSnapshot {
+                process_id: "proc_1".to_string(),
+                command: "date".to_string(),
+                status: "completed".to_string(),
+                exit_code: Some(0),
+                elapsed_ms: 12,
+                stdout_tail: "Mon Jun 15".to_string(),
+                stderr_tail: String::new(),
+            },
+        });
+        state.apply_event(ChatEvent::Usage {
+            session_id: session_id.clone(),
+            usage: ChatUsageSnapshot {
+                provider: "codex".to_string(),
+                model: "gpt-5.5-codex".to_string(),
+                input_tokens: Some(120),
+                output_tokens: Some(18),
+            },
+        });
 
         assert_eq!(
             state.usage.as_ref().and_then(|usage| usage.input_tokens),
@@ -2986,18 +3455,23 @@ mod tests {
     fn tool_call_monitor_tracks_started_streaming_and_completed_calls() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
+        let session_id = state.session_id.clone();
 
-        state.apply_event(ChatEvent::ToolCallStarted(ChatToolCallSnapshot {
-            step_index: 0,
-            call_index: Some(0),
-            call_id: Some("call_1".to_string()),
-            tool: "run_command".to_string(),
-            input_preview: None,
-        }));
+        state.apply_event(ChatEvent::ToolCallStarted {
+            session_id: session_id.clone(),
+            call: ChatToolCallSnapshot {
+                step_index: 0,
+                call_index: Some(0),
+                call_id: Some("call_1".to_string()),
+                tool: "run_command".to_string(),
+                input_preview: None,
+            },
+        });
         assert_eq!(state.tool_calls.len(), 1);
         assert_eq!(state.tool_calls[0].status, "running");
 
         state.apply_event(ChatEvent::ToolCallDelta {
+            session_id: session_id.clone(),
             step_index: 0,
             call_id: Some("call_1".to_string()),
             tool: Some("run_command".to_string()),
@@ -3007,13 +3481,16 @@ mod tests {
         assert_eq!(state.tool_calls[0].status, "streaming");
         assert!(state.tool_calls[0].input_preview.contains("date"));
 
-        state.apply_event(ChatEvent::ToolCallCompleted(ChatToolCallSnapshot {
-            step_index: 0,
-            call_index: Some(0),
-            call_id: Some("call_1".to_string()),
-            tool: "run_command".to_string(),
-            input_preview: Some("{\"cmd\":\"date\"}".to_string()),
-        }));
+        state.apply_event(ChatEvent::ToolCallCompleted {
+            session_id: session_id.clone(),
+            call: ChatToolCallSnapshot {
+                step_index: 0,
+                call_index: Some(0),
+                call_id: Some("call_1".to_string()),
+                tool: "run_command".to_string(),
+                input_preview: Some("{\"cmd\":\"date\"}".to_string()),
+            },
+        });
         assert_eq!(state.tool_calls.len(), 1);
         assert_eq!(state.tool_calls[0].status, "completed");
         assert_eq!(state.tool_calls[0].tool, "run_command");
@@ -3063,7 +3540,10 @@ mod tests {
         assert!(health.detail.contains("cluster readiness gate"));
 
         state.control.tasks.clear();
-        state.apply_event(ChatEvent::Error("provider stream failed".to_string()));
+        state.apply_event(ChatEvent::Error {
+            session_id: Some(state.session_id.clone()),
+            error: "provider stream failed".to_string(),
+        });
         let health = state.runtime_health();
         assert_eq!(health.label, "ATTENTION");
         assert_eq!(health.tone, ActivityTone::Bad);
@@ -3102,6 +3582,11 @@ mod tests {
         assert!(
             state.can_send(),
             "a non-empty draft can queue while streaming"
+        );
+        state.pending_session_reset = Some(SessionId::generate().to_string());
+        assert!(
+            state.can_send(),
+            "a pending new-session ack must not disable the Send button"
         );
     }
 

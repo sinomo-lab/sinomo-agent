@@ -28,10 +28,43 @@ pub struct SessionMeta {
 }
 
 /// One stored message.
+///
+/// `role` is the presentation role used by older app builds (`user` or `agent`).
+/// `source` and `kind` distinguish model text from app-generated information
+/// and errors without feeding those system messages back as assistant history.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredMessage {
     pub role: String,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+impl StoredMessage {
+    pub fn new(
+        role: impl Into<String>,
+        text: impl Into<String>,
+        source: impl Into<String>,
+        kind: impl Into<String>,
+    ) -> Self {
+        Self {
+            role: role.into(),
+            text: text.into(),
+            source: Some(source.into()),
+            kind: Some(kind.into()),
+        }
+    }
+
+    pub fn legacy(role: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            text: text.into(),
+            source: None,
+            kind: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -248,14 +281,9 @@ mod tests {
         let data_dir = SinomoDataDir::new(&root);
         let id = "01hxy6qa9k0t9vr4g9n8d3q5d4";
         let messages = vec![
-            StoredMessage {
-                role: "user".to_string(),
-                text: "hello".to_string(),
-            },
-            StoredMessage {
-                role: "agent".to_string(),
-                text: "hi".to_string(),
-            },
+            StoredMessage::new("user", "hello", "user", "message"),
+            StoredMessage::new("agent", "hi", "model", "message"),
+            StoredMessage::new("agent", "Error: provider unavailable", "system", "error"),
         ];
 
         save(&data_dir, id, "hello", &messages).expect("save");
@@ -263,8 +291,10 @@ mod tests {
         let listed = list(&data_dir);
         assert!(listed.iter().any(|meta| meta.id == id));
         let transcript = load_transcript(&data_dir, id).expect("sifs transcript");
-        assert_eq!(transcript.messages.len(), 2);
+        assert_eq!(transcript.messages.len(), 3);
         assert_eq!(transcript.messages[1].text, "hi");
+        assert_eq!(transcript.messages[2].source.as_deref(), Some("system"));
+        assert_eq!(transcript.messages[2].kind.as_deref(), Some("error"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -275,14 +305,8 @@ mod tests {
         let data_dir = SinomoDataDir::new(&root);
         let id = "01hxy6qa9k0t9vr4g9n8d3q5d5";
         let sifs_messages = vec![
-            StoredMessage {
-                role: "user".to_string(),
-                text: "sifs question".to_string(),
-            },
-            StoredMessage {
-                role: "agent".to_string(),
-                text: "sifs answer".to_string(),
-            },
+            StoredMessage::new("user", "sifs question", "user", "message"),
+            StoredMessage::new("agent", "sifs answer", "model", "message"),
         ];
         save(&data_dir, id, "sifs", &sifs_messages).expect("save SIFS session");
         write_app_local_session(&root, id, "local", "local question", "local answer");
@@ -299,10 +323,7 @@ mod tests {
         let root = temp_data_dir("sifs-list");
         let data_dir = SinomoDataDir::new(&root);
         let id = "01hxy6qa9k0t9vr4g9n8d3q5d6";
-        let messages = vec![StoredMessage {
-            role: "user".to_string(),
-            text: "hello".to_string(),
-        }];
+        let messages = vec![StoredMessage::new("user", "hello", "user", "message")];
 
         save(&data_dir, id, "sifs title", &messages).expect("save SIFS session");
         write_app_local_session(&root, id, "local title", "local question", "local answer");
@@ -328,14 +349,8 @@ mod tests {
         };
         let transcript = StoredTranscript {
             messages: vec![
-                StoredMessage {
-                    role: "user".to_string(),
-                    text: user.to_string(),
-                },
-                StoredMessage {
-                    role: "agent".to_string(),
-                    text: agent.to_string(),
-                },
+                StoredMessage::legacy("user", user),
+                StoredMessage::legacy("agent", agent),
             ],
         };
         fs::write(

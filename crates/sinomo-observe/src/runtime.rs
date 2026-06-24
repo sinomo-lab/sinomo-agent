@@ -15,7 +15,10 @@ use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{Layer, Registry, fmt};
 
-pub const OBSERVE_DEFAULT_FILTER: &str = "warn,sinomo=info";
+pub const OBSERVE_DEFAULT_BASE_FILTER: &str = "warn,sinomo=info";
+pub const OBSERVE_DEFAULT_FILTER: &str = "warn,sinomo=info,iroh::net_report::report=error";
+pub const OBSERVE_DEFAULT_QUIET_FILTER_DIRECTIVES: &[&str] = &["iroh::net_report::report=error"];
+pub const OBSERVE_BUILT_IN_QUIET_FILTER_DIRECTIVES: &[&str] = &["iroh::net_report::report=error"];
 const TRACE_BUFFER_LIMIT: usize = 4096;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -23,17 +26,20 @@ pub struct ObserveRuntimeConfig {
     pub process_role: String,
     pub node_id: Option<String>,
     pub filter: String,
+    pub quiet_filter_directives: Vec<String>,
 }
 
 impl ObserveRuntimeConfig {
     pub fn daemon(label: impl Into<String>, node_id: Option<String>) -> Self {
+        let configured_filter = std::env::var("SINOMO_OBSERVE_FILTER")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| OBSERVE_DEFAULT_BASE_FILTER.to_string());
         Self {
             process_role: label.into(),
             node_id,
-            filter: std::env::var("SINOMO_OBSERVE_FILTER")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| OBSERVE_DEFAULT_FILTER.to_string()),
+            filter: configured_filter,
+            quiet_filter_directives: observe_quiet_filter_directives_from_env(),
         }
     }
 }
@@ -42,6 +48,10 @@ impl ObserveRuntimeConfig {
 pub struct ObserveControlRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiet_filter_directives: Option<Vec<String>>,
+    #[serde(default)]
+    pub clear_quiet_filter_directives: bool,
     #[serde(default)]
     pub reset: bool,
 }
@@ -49,6 +59,8 @@ pub struct ObserveControlRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ObserveControlResponse {
     pub active_filter: String,
+    pub base_filter: String,
+    pub quiet_filter_directives: Vec<String>,
     pub changed: bool,
 }
 
@@ -160,10 +172,17 @@ pub struct ObserveTraceRecord {
 #[derive(Clone)]
 struct ObserveRuntime {
     config: ObserveRuntimeConfig,
-    filter: Arc<Mutex<String>>,
+    filter: Arc<Mutex<ObserveFilterState>>,
     filter_handle: reload::Handle<EnvFilter, Registry>,
     metrics: Arc<ObserveMetricsRecorder>,
     traces: Arc<Mutex<VecDeque<ObserveTraceRecord>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObserveFilterState {
+    base_filter: String,
+    quiet_filter_directives: Vec<String>,
+    active_filter: String,
 }
 
 static OBSERVE_RUNTIME: OnceLock<ObserveRuntime> = OnceLock::new();
@@ -190,15 +209,23 @@ pub fn init_observe_runtime(config: ObserveRuntimeConfig) -> Result<(), ObserveE
         return Ok(());
     }
 
-    let filter =
-        EnvFilter::try_new(config.filter.as_str()).map_err(|source| ObserveError::Runtime {
-            detail: format!("invalid observe filter `{}`: {source}", config.filter),
-        })?;
+    let initial_state = ObserveFilterState::new(
+        config.filter.clone(),
+        config.quiet_filter_directives.clone(),
+    );
+    let filter = EnvFilter::try_new(initial_state.active_filter.as_str()).map_err(|source| {
+        ObserveError::Runtime {
+            detail: format!(
+                "invalid observe filter `{}`: {source}",
+                initial_state.active_filter
+            ),
+        }
+    })?;
     let (filter_layer, filter_handle) = reload::Layer::new(filter);
     let metrics = Arc::new(ObserveMetricsRecorder::default());
     let traces = Arc::new(Mutex::new(VecDeque::with_capacity(TRACE_BUFFER_LIMIT)));
     let runtime = ObserveRuntime {
-        filter: Arc::new(Mutex::new(config.filter.clone())),
+        filter: Arc::new(Mutex::new(initial_state)),
         filter_handle,
         metrics: Arc::clone(&metrics),
         traces: Arc::clone(&traces),
@@ -225,43 +252,119 @@ pub fn update_observe_control(
     let runtime = OBSERVE_RUNTIME.get().ok_or_else(|| ObserveError::Runtime {
         detail: "observe runtime is not initialized".to_string(),
     })?;
-    let next_filter = if request.reset {
-        OBSERVE_DEFAULT_FILTER.to_string()
-    } else if let Some(filter) = request.filter {
-        filter
-    } else {
-        return Ok(ObserveControlResponse {
-            active_filter: runtime.active_filter(),
-            changed: false,
+    if request.clear_quiet_filter_directives && request.quiet_filter_directives.is_some() {
+        return Err(ObserveError::Runtime {
+            detail: "observe control cannot both set and clear quiet filter directives".to_string(),
         });
+    }
+    if !request.changes_filter_state() {
+        return Ok(runtime.control_snapshot(false));
+    }
+
+    let next_state = {
+        let current = runtime.current_filter_state();
+        if request.reset {
+            ObserveFilterState::default()
+        } else {
+            let base_filter = request.filter.unwrap_or(current.base_filter);
+            let quiet_filter_directives = if request.clear_quiet_filter_directives {
+                Vec::new()
+            } else {
+                request
+                    .quiet_filter_directives
+                    .unwrap_or(current.quiet_filter_directives)
+            };
+            ObserveFilterState::new(base_filter, quiet_filter_directives)
+        }
     };
-    let parsed =
-        EnvFilter::try_new(next_filter.as_str()).map_err(|source| ObserveError::Runtime {
-            detail: format!("invalid observe filter `{next_filter}`: {source}"),
-        })?;
+    let parsed = EnvFilter::try_new(next_state.active_filter.as_str()).map_err(|source| {
+        ObserveError::Runtime {
+            detail: format!(
+                "invalid observe filter `{}`: {source}",
+                next_state.active_filter
+            ),
+        }
+    })?;
     runtime
         .filter_handle
         .modify(|filter| *filter = parsed)
         .map_err(|source| ObserveError::Runtime {
             detail: format!("failed to reload observe filter: {source}"),
         })?;
-    if let Ok(mut active_filter) = runtime.filter.lock() {
-        *active_filter = next_filter.clone();
+    if let Ok(mut filter) = runtime.filter.lock() {
+        *filter = next_state;
     }
-    Ok(ObserveControlResponse {
-        active_filter: next_filter,
-        changed: true,
-    })
+    Ok(runtime.control_snapshot(true))
+}
+
+pub fn observe_filter_with_builtin_quiet_directives(filter: &str) -> String {
+    observe_filter_with_quiet_directives(filter, OBSERVE_DEFAULT_QUIET_FILTER_DIRECTIVES)
+}
+
+pub fn observe_filter_with_quiet_directives(
+    filter: &str,
+    quiet_filter_directives: &[impl AsRef<str>],
+) -> String {
+    let trimmed = filter.trim();
+    let mut directives = Vec::new();
+    if !trimmed.is_empty() {
+        directives.push(trimmed.to_string());
+    }
+    for directive in quiet_filter_directives {
+        let directive = directive.as_ref().trim();
+        let Some(target) = observe_filter_directive_target(directive) else {
+            continue;
+        };
+        if !observe_filter_mentions_target(trimmed, target) {
+            directives.push(directive.to_string());
+        }
+    }
+    directives.join(",")
+}
+
+fn observe_filter_mentions_target(filter: &str, target: &str) -> bool {
+    filter
+        .split(',')
+        .filter_map(observe_filter_directive_target)
+        .any(|candidate| candidate == target)
+}
+
+fn observe_filter_directive_target(directive: &str) -> Option<&str> {
+    let directive = directive.trim();
+    if directive.is_empty() {
+        return None;
+    }
+    let target_and_spans = directive
+        .rsplit_once('=')
+        .map(|(target, _level)| target)
+        .unwrap_or(directive)
+        .trim();
+    if target_and_spans.is_empty() || is_filter_level(target_and_spans) {
+        return None;
+    }
+    let target = target_and_spans
+        .split_once('[')
+        .map(|(target, _spans)| target)
+        .unwrap_or(target_and_spans)
+        .trim();
+    if target.is_empty() || is_filter_level(target) {
+        None
+    } else {
+        Some(target)
+    }
+}
+
+fn is_filter_level(value: &str) -> bool {
+    ["off", "error", "warn", "info", "debug", "trace"]
+        .iter()
+        .any(|level| value.eq_ignore_ascii_case(level))
 }
 
 pub fn observe_control_snapshot() -> ObserveControlResponse {
-    ObserveControlResponse {
-        active_filter: OBSERVE_RUNTIME
-            .get()
-            .map(ObserveRuntime::active_filter)
-            .unwrap_or_else(|| OBSERVE_DEFAULT_FILTER.to_string()),
-        changed: false,
-    }
+    OBSERVE_RUNTIME
+        .get()
+        .map(|runtime| runtime.control_snapshot(false))
+        .unwrap_or_else(|| ObserveFilterState::default().to_control_response(false))
 }
 
 pub fn read_observe_metrics(request: &ObserveMetricsRequest) -> ObserveMetricsResponse {
@@ -364,12 +467,93 @@ pub fn read_observe_traces(request: &ObserveTracesRequest) -> ObserveTracesRespo
 }
 
 impl ObserveRuntime {
-    fn active_filter(&self) -> String {
+    fn current_filter_state(&self) -> ObserveFilterState {
         self.filter
             .lock()
             .map(|filter| filter.clone())
-            .unwrap_or_else(|_| self.config.filter.clone())
+            .unwrap_or_else(|_| {
+                ObserveFilterState::new(
+                    self.config.filter.clone(),
+                    self.config.quiet_filter_directives.clone(),
+                )
+            })
     }
+
+    fn control_snapshot(&self, changed: bool) -> ObserveControlResponse {
+        self.current_filter_state().to_control_response(changed)
+    }
+}
+
+impl ObserveFilterState {
+    fn new(base_filter: String, quiet_filter_directives: Vec<String>) -> Self {
+        let quiet_filter_directives = normalized_quiet_filter_directives(quiet_filter_directives);
+        let active_filter =
+            observe_filter_with_quiet_directives(&base_filter, &quiet_filter_directives);
+        Self {
+            base_filter,
+            quiet_filter_directives,
+            active_filter,
+        }
+    }
+
+    fn to_control_response(&self, changed: bool) -> ObserveControlResponse {
+        ObserveControlResponse {
+            active_filter: self.active_filter.clone(),
+            base_filter: self.base_filter.clone(),
+            quiet_filter_directives: self.quiet_filter_directives.clone(),
+            changed,
+        }
+    }
+}
+
+impl Default for ObserveFilterState {
+    fn default() -> Self {
+        Self::new(
+            OBSERVE_DEFAULT_BASE_FILTER.to_string(),
+            default_quiet_filter_directives(),
+        )
+    }
+}
+
+impl ObserveControlRequest {
+    fn changes_filter_state(&self) -> bool {
+        self.reset
+            || self.filter.is_some()
+            || self.quiet_filter_directives.is_some()
+            || self.clear_quiet_filter_directives
+    }
+}
+
+fn default_quiet_filter_directives() -> Vec<String> {
+    OBSERVE_DEFAULT_QUIET_FILTER_DIRECTIVES
+        .iter()
+        .map(|directive| (*directive).to_string())
+        .collect()
+}
+
+fn normalized_quiet_filter_directives(directives: Vec<String>) -> Vec<String> {
+    directives
+        .into_iter()
+        .map(|directive| directive.trim().to_string())
+        .filter(|directive| !directive.is_empty())
+        .collect()
+}
+
+fn observe_quiet_filter_directives_from_env() -> Vec<String> {
+    let Some(value) = std::env::var("SINOMO_OBSERVE_QUIET_FILTERS")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return default_quiet_filter_directives();
+    };
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "none" | "off"
+    ) {
+        return Vec::new();
+    }
+    normalized_quiet_filter_directives(value.split(',').map(ToString::to_string).collect())
 }
 
 #[derive(Clone)]
@@ -656,4 +840,104 @@ fn observe_metric_labels(key: &Key) -> BTreeMap<String, String> {
     key.labels()
         .map(|label| (label.key().to_string(), label.value().to_string()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tracing_subscriber::Registry;
+
+    #[test]
+    fn default_filter_includes_builtin_quiet_directives() {
+        assert_eq!(
+            observe_filter_with_builtin_quiet_directives(OBSERVE_DEFAULT_BASE_FILTER),
+            OBSERVE_DEFAULT_FILTER
+        );
+        EnvFilter::try_new(OBSERVE_DEFAULT_FILTER).expect("default observe filter parses");
+    }
+
+    #[test]
+    fn custom_filter_keeps_builtin_quiet_directives() {
+        assert_eq!(
+            observe_filter_with_builtin_quiet_directives("debug,sinomo_network=trace"),
+            "debug,sinomo_network=trace,iroh::net_report::report=error"
+        );
+    }
+
+    #[test]
+    fn quiet_directives_are_runtime_composable() {
+        assert_eq!(
+            observe_filter_with_quiet_directives("debug,sinomo_network=trace", &[] as &[&str]),
+            "debug,sinomo_network=trace"
+        );
+        assert_eq!(
+            observe_filter_with_quiet_directives(
+                "debug",
+                &["iroh::net_report::report=error", "hyper=error"]
+            ),
+            "debug,iroh::net_report::report=error,hyper=error"
+        );
+        assert_eq!(
+            ObserveFilterState::new("debug".to_string(), vec!["  ".to_string()])
+                .quiet_filter_directives,
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn exact_builtin_quiet_target_can_be_overridden() {
+        assert_eq!(
+            observe_filter_with_builtin_quiet_directives("debug,iroh::net_report::report=warn"),
+            "debug,iroh::net_report::report=warn"
+        );
+    }
+
+    #[test]
+    fn filter_target_parser_ignores_levels_and_keeps_targets() {
+        assert_eq!(observe_filter_directive_target("warn"), None);
+        assert_eq!(
+            observe_filter_directive_target("sinomo=info"),
+            Some("sinomo")
+        );
+        assert_eq!(
+            observe_filter_directive_target("iroh::net_report::report[span]=error"),
+            Some("iroh::net_report::report")
+        );
+    }
+
+    #[test]
+    fn builtin_quiet_directive_suppresses_iroh_net_report_warning() {
+        let observed = Arc::new(AtomicUsize::new(0));
+        let subscriber = Registry::default()
+            .with(EnvFilter::try_new(OBSERVE_DEFAULT_FILTER).expect("filter parses"))
+            .with(CountingLayer {
+                observed: Arc::clone(&observed),
+            });
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                target: "iroh::net_report::report",
+                "IPv4 address detected by QAD varies by destination"
+            );
+            tracing::error!(target: "iroh::net_report::report", "iroh net report error");
+            tracing::warn!(target: "iroh::endpoint", "other iroh warning");
+        });
+
+        assert_eq!(observed.load(Ordering::Relaxed), 2);
+    }
+
+    struct CountingLayer {
+        observed: Arc<AtomicUsize>,
+    }
+
+    impl<S> Layer<S> for CountingLayer
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, _event: &Event<'_>, _ctx: Context<'_, S>) {
+            self.observed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }

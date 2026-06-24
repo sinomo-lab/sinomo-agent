@@ -119,6 +119,7 @@ const PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS_PER_SOURCE: usize =
     sinomo_network::MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS;
 const PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS: usize =
     sinomo_kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
+static DAEMON_IROH_PROXY_STARTS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 
 #[cfg(test)]
 fn cluster_network_info_key(node_id: &NodeId) -> String {
@@ -792,6 +793,17 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
         tracing::info!("sinomo {label} iroh disabled (SINOMO_DISABLE_IROH)");
         return Ok(());
     }
+    if paths.root.parent().is_none() {
+        tracing::warn!(
+            "sinomo {label} iroh proxy disabled: daemon paths have no data directory parent"
+        );
+        return Ok(());
+    }
+    let proxy_key = daemon_iroh_proxy_start_key(paths, label);
+    if !claim_daemon_iroh_proxy_start(&proxy_key)? {
+        tracing::debug!("sinomo {label} iroh proxy already initialized");
+        return Ok(());
+    }
     let paths = paths.clone();
     let options = options.clone();
     let mut cluster = cluster.cloned();
@@ -963,6 +975,19 @@ pub(crate) fn start_daemon_iroh_proxy_if_clustered(
         }
     });
     Ok(())
+}
+
+fn daemon_iroh_proxy_start_key(paths: &DaemonPaths, label: &str) -> String {
+    format!("{}\0{label}", paths.root.display())
+}
+
+fn claim_daemon_iroh_proxy_start(key: &str) -> Result<bool, DaemonError> {
+    let starts = DAEMON_IROH_PROXY_STARTS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let mut starts = starts.lock().map_err(|error| DaemonError::Io {
+        path: "daemon iroh proxy start guard".to_string(),
+        detail: error.to_string(),
+    })?;
+    Ok(starts.insert(key.to_string()))
 }
 
 pub(crate) fn daemon_cluster_status_from_paths_on_runtime(
@@ -5174,6 +5199,28 @@ mod tests {
 
     fn unique_cluster_test_root(name: &str) -> sinomo_testdir::TestDir {
         sinomo_testdir::TestDir::new(name)
+    }
+
+    #[test]
+    fn daemon_iroh_proxy_start_guard_claims_each_process_once() {
+        let root = unique_cluster_test_root("sinomo-daemon-iroh-proxy-start-guard");
+        let main_paths = DaemonPaths::with_root(root.path().join("daemon"));
+        let shadow_paths = DaemonPaths::with_root(root.path().join("shadow-daemon"));
+        let main_key = daemon_iroh_proxy_start_key(&main_paths, "daemon");
+        let shadow_key = daemon_iroh_proxy_start_key(&shadow_paths, "shadow daemon");
+
+        assert!(
+            claim_daemon_iroh_proxy_start(&main_key).expect("first main claim"),
+            "first main daemon Iroh proxy start should be claimed"
+        );
+        assert!(
+            !claim_daemon_iroh_proxy_start(&main_key).expect("second main claim"),
+            "duplicate main daemon Iroh proxy start should be ignored"
+        );
+        assert!(
+            claim_daemon_iroh_proxy_start(&shadow_key).expect("shadow claim"),
+            "shadow daemon has a distinct Iroh proxy identity"
+        );
     }
 
     fn run_cluster_network_maintenance_tick_for_test(
