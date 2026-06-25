@@ -21,6 +21,8 @@ pub const AGENT_CHANNEL_APP_USER_ID: &str = "user.app.local";
 pub struct AgentChannel {
     pub channel_id: SessionId,
     pub title: String,
+    #[serde(default)]
+    pub channel_kind: AgentChannelKind,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -43,6 +45,7 @@ impl AgentChannel {
         Self {
             channel_id,
             title: title.into(),
+            channel_kind: AgentChannelKind::Chat,
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -55,6 +58,12 @@ impl AgentChannel {
 
     pub fn with_default_title(channel_id: SessionId) -> Self {
         Self::new(channel_id, "New chat")
+    }
+
+    pub fn new_channel(channel_id: SessionId, title: impl Into<String>) -> Self {
+        let mut channel = Self::new(channel_id, title);
+        channel.channel_kind = AgentChannelKind::Channel;
+        channel
     }
 
     pub fn is_deleted(&self) -> bool {
@@ -263,6 +272,14 @@ impl AgentChannel {
 
 fn default_next_channel_sequence() -> u64 {
     1
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentChannelKind {
+    #[default]
+    Chat,
+    Channel,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

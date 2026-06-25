@@ -9,10 +9,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use sinomo_agent::{
-    AGENT_CHANNEL_APP_USER_ID, AgentCatalog, AgentChannel, AgentChannelAuthor, AgentChannelMessage,
-    AgentChannelMessageKind, AgentChannelParticipant, AgentChannelSource, AgentChannelStore,
-    AgentChannelTurn, AgentChannelUser, AgentDefinition, AgentItem, AgentModelEvent,
-    AgentRuntimeControlHost, AgentRuntimeControlRegistry, AgentRuntimeEvent,
+    AGENT_CHANNEL_APP_USER_ID, AgentCatalog, AgentChannel, AgentChannelAuthor, AgentChannelKind,
+    AgentChannelMessage, AgentChannelMessageKind, AgentChannelParticipant, AgentChannelSource,
+    AgentChannelStore, AgentChannelTurn, AgentChannelUser, AgentDefinition, AgentItem,
+    AgentModelEvent, AgentRuntimeControlHost, AgentRuntimeControlRegistry, AgentRuntimeEvent,
     AgentRuntimeEventPayload, AgentSessionControlResult, AgentSessionFollowUpRequest,
     AgentSessionInterruptRequest, AgentSessionReattachState, AgentSessionResumeRequest,
     AgentSessionResumeResponse, AgentSessionSteerRequest, AgentTaskLifecycleStatus,
@@ -301,7 +301,8 @@ impl AgentChat {
         let channel_store = FileAgentChannelStore::for_data_dir(&data_dir);
         let mut channel = AgentChannel::with_default_title(session.session_id.clone());
         let info: ChatRuntimeInfo = tui::app_runtime_info(runtime.handler()).into();
-        ensure_primary_participant(&mut channel, &info, true);
+        let align_primary_session = should_align_primary_participant(&channel);
+        ensure_primary_participant(&mut channel, &info, align_primary_session);
         let _ = channel_store.save_channel(&channel);
         Ok(Self {
             data_dir,
@@ -345,7 +346,8 @@ impl AgentChat {
                 });
             }
         };
-        ensure_primary_participant(&mut channel, &info, true);
+        let align_primary_session = should_align_primary_participant(&channel);
+        ensure_primary_participant(&mut channel, &info, align_primary_session);
         self.runtime
             .replace_store_and_session(InMemoryEventStore::new(), session.clone());
         self.runtime
@@ -436,6 +438,7 @@ impl AgentChat {
         text: &str,
         on_event: &mut dyn FnMut(ChatStreamEvent),
     ) -> Result<(), CliError> {
+        self.reload_current_channel_best_effort();
         let speaker = self.primary_speaker();
         let user_message = self.channel.append_user_message(
             AGENT_CHANNEL_APP_USER_ID,
@@ -569,11 +572,15 @@ impl AgentChat {
             self.daemon_connected,
         )?;
         let info: ChatRuntimeInfo = info.into();
-        for participant in &mut self.channel.participants {
-            participant.enabled = false;
+        if self.channel.channel_kind == AgentChannelKind::Channel {
+            ensure_primary_participant(&mut self.channel, &info, false);
+        } else {
+            for participant in &mut self.channel.participants {
+                participant.enabled = false;
+            }
+            let align_primary_session = should_align_primary_participant(&self.channel);
+            ensure_primary_participant(&mut self.channel, &info, align_primary_session);
         }
-        let channel_is_empty = self.channel.transcript.is_empty();
-        ensure_primary_participant(&mut self.channel, &info, channel_is_empty);
         self.save_channel_best_effort();
         Ok(info)
     }
@@ -588,8 +595,8 @@ impl AgentChat {
 
     fn primary_speaker(&mut self) -> ChatSpeaker {
         let info = self.runtime_info();
-        let channel_is_empty = self.channel.transcript.is_empty();
-        ensure_primary_participant(&mut self.channel, &info, channel_is_empty);
+        let align_primary_session = should_align_primary_participant(&self.channel);
+        ensure_primary_participant(&mut self.channel, &info, align_primary_session);
         self.primary_participant()
             .map(|participant| chat_speaker(&self.channel.channel_id, participant))
             .unwrap_or_else(|| ChatSpeaker {
@@ -622,6 +629,12 @@ impl AgentChat {
 
     fn save_channel_best_effort(&self) {
         let _ = self.channel_store.save_channel(&self.channel);
+    }
+
+    fn reload_current_channel_best_effort(&mut self) {
+        if let Ok(Some(channel)) = self.channel_store.load_channel(&self.channel.channel_id) {
+            self.channel = channel;
+        }
     }
 }
 
@@ -833,6 +846,10 @@ fn ensure_primary_participant(
             participant.enabled = true;
         }
     }
+}
+
+fn should_align_primary_participant(channel: &AgentChannel) -> bool {
+    channel.channel_kind != AgentChannelKind::Channel && channel.transcript.is_empty()
 }
 
 fn chat_speaker(channel_id: &SessionId, participant: &AgentChannelParticipant) -> ChatSpeaker {
@@ -1874,6 +1891,38 @@ mod tests {
             "timeout error should explain the stalled runtime: {error}"
         );
         assert_eq!(events, vec!["notice:agent task started: start_turn"]);
+    }
+
+    #[test]
+    fn app_chat_resume_explicit_channel_preserves_participant_session_id() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-resume");
+        let data_dir = SinomoDataDir::new(&root);
+        let store = FileAgentChannelStore::for_data_dir(&data_dir);
+        let channel_id = SessionId::generate();
+        let mut channel = AgentChannel::new_channel(channel_id.clone(), "Team channel");
+        channel.ensure_user(AgentChannelUser::app_local());
+        let participant_id = channel.ensure_participant("main-agent", "main-agent");
+        let participant_session_id = channel
+            .participant(&participant_id)
+            .expect("participant")
+            .agent_session_id
+            .clone();
+        assert_ne!(participant_session_id, channel_id);
+        store.save_channel(&channel).expect("save channel");
+
+        let mut chat = AgentChat::new(data_dir, false).expect("chat runtime");
+        chat.resume_session(&channel_id.to_string(), &[])
+            .expect("resume explicit channel");
+
+        let participant = chat
+            .participants()
+            .into_iter()
+            .find(|participant| participant.agent_key == "main-agent")
+            .expect("main participant");
+        assert_eq!(
+            participant.agent_session_id,
+            participant_session_id.to_string()
+        );
     }
 
     #[test]

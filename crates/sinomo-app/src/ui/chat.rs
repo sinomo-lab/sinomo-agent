@@ -35,6 +35,7 @@
 //! a small signature of the selection state.
 
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -46,6 +47,10 @@ use sui::{
     WidgetPodVisitor, draw_glyph,
 };
 
+use sinomo_agent::{
+    AgentChannel, AgentChannelAuthor, AgentChannelKind, AgentChannelMessageKind, AgentChannelStore,
+    FileAgentChannelStore,
+};
 use sinomo_cli::app_api::{
     AgentSummary, ChatContextSnapshot, ChatHistoryMessage, ChatProcessSnapshot, ChatTaskSnapshot,
     ChatToolCallSnapshot, ChatUsageSnapshot, ProviderSummary, agent_summaries, reasoning_efforts,
@@ -278,10 +283,20 @@ struct RuntimeHealth {
     tone: ActivityTone,
 }
 
-/// A previously-created chat reference (sidebar list).
+/// A previously-created chat or channel reference (sidebar list).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionRef {
     pub id: String,
     pub title: String,
+    pub kind: ConversationKind,
+    pub updated_unix: i64,
+    pub participant_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConversationKind {
+    Chat,
+    Channel,
 }
 
 /// State backing the chat tab.
@@ -315,6 +330,8 @@ pub struct ChatState {
     session_rename_id: Option<String>,
     session_title_draft: String,
     session_delete_confirm_id: Option<String>,
+    channel_config_id: Option<String>,
+    channel_agent_idx: usize,
 }
 
 impl ChatState {
@@ -330,13 +347,7 @@ impl ChatState {
         let providers = crate::backend::config::cluster_provider_summaries(backend.config.as_ref());
         let efforts = reasoning_efforts();
         let effort_idx = efforts.iter().position(|e| e == "medium").unwrap_or(0);
-        let sessions = sessions::list(&backend.data_dir)
-            .into_iter()
-            .map(|meta| SessionRef {
-                id: meta.id,
-                title: meta.title,
-            })
-            .collect();
+        let sessions = list_conversations(&backend.data_dir);
 
         let mut state = Self {
             data_dir: backend.data_dir.clone(),
@@ -367,6 +378,8 @@ impl ChatState {
             session_rename_id: None,
             session_title_draft: String::new(),
             session_delete_confirm_id: None,
+            channel_config_id: None,
+            channel_agent_idx: 0,
         };
         // Eagerly fetch the default/initial provider's models so the model picker is populated
         // without requiring a manual provider toggle. (Results arrive async via `ChatEvent::Models`;
@@ -422,13 +435,62 @@ impl ChatState {
     }
 
     fn refresh_sessions(&mut self) {
-        self.sessions = sessions::list(&self.data_dir)
+        self.sessions = list_conversations(&self.data_dir);
+    }
+
+    fn rename_channel(&self, id: &str, title: &str) -> std::io::Result<()> {
+        let channel_id = parse_channel_id(id)?;
+        let store = FileAgentChannelStore::for_data_dir(&self.data_dir);
+        let mut channel = store
+            .load_channel(&channel_id)
+            .map_err(channel_store_io_error)?
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "channel not found")
+            })?;
+        channel.channel_kind = AgentChannelKind::Channel;
+        channel.rename(title);
+        store.save_channel(&channel).map_err(channel_store_io_error)
+    }
+
+    fn delete_channel_record(&self, id: &str) -> std::io::Result<()> {
+        let channel_id = parse_channel_id(id)?;
+        let store = FileAgentChannelStore::for_data_dir(&self.data_dir);
+        let mut channel = match store
+            .load_channel(&channel_id)
+            .map_err(channel_store_io_error)?
+        {
+            Some(channel) => channel,
+            None => return Ok(()),
+        };
+        channel.tombstone();
+        store.save_channel(&channel).map_err(channel_store_io_error)
+    }
+
+    fn load_channel_messages(&self, id: &str) -> Option<Vec<ChatMessage>> {
+        let channel_id = id.parse::<SessionId>().ok()?;
+        let channel = FileAgentChannelStore::for_data_dir(&self.data_dir)
+            .load_channel(&channel_id)
+            .ok()
+            .flatten()?;
+        Some(channel_messages(&channel))
+    }
+
+    fn channel_participant_labels(&self, id: &str) -> Vec<String> {
+        let Ok(channel_id) = id.parse::<SessionId>() else {
+            return Vec::new();
+        };
+        let Ok(Some(channel)) =
+            FileAgentChannelStore::for_data_dir(&self.data_dir).load_channel(&channel_id)
+        else {
+            return Vec::new();
+        };
+        let mut participants = channel.participants.clone();
+        participants.sort_by_key(|participant| participant.order);
+        participants
             .into_iter()
-            .map(|meta| SessionRef {
-                id: meta.id,
-                title: meta.title,
-            })
-            .collect();
+            .filter(|participant| participant.enabled)
+            .map(|participant| participant.agent_name)
+            .collect()
     }
 
     fn push_activity(
@@ -803,6 +865,7 @@ impl ChatState {
         self.session_rename_id = None;
         self.session_title_draft.clear();
         self.session_delete_confirm_id = None;
+        self.channel_config_id = None;
     }
 
     fn visible_session_has_started(&self) -> bool {
@@ -827,6 +890,11 @@ impl ChatState {
             .find(|session| session.id == self.session_id)
     }
 
+    fn current_is_channel(&self) -> bool {
+        self.current_session_ref()
+            .is_some_and(|session| session.kind == ConversationKind::Channel)
+    }
+
     fn begin_rename_current_session(&mut self) {
         let Some((session_id, title)) = self
             .current_session_ref()
@@ -837,6 +905,7 @@ impl ChatState {
         self.session_rename_id = Some(session_id);
         self.session_title_draft = title;
         self.session_delete_confirm_id = None;
+        self.channel_config_id = None;
     }
 
     fn cancel_rename_session(&mut self) {
@@ -865,12 +934,22 @@ impl ChatState {
         let Some(rename_id) = self.session_rename_id.clone() else {
             return;
         };
+        let kind = self
+            .sessions
+            .iter()
+            .find(|session| session.id == rename_id)
+            .map(|session| session.kind)
+            .unwrap_or(ConversationKind::Chat);
         let title = self.session_title_draft.trim().to_string();
         if title.is_empty() {
             self.notice = Some("chat title cannot be empty".to_string());
             return;
         }
-        match sessions::rename(&self.data_dir, &rename_id, &title) {
+        let result = match kind {
+            ConversationKind::Chat => sessions::rename(&self.data_dir, &rename_id, &title),
+            ConversationKind::Channel => self.rename_channel(&rename_id, &title),
+        };
+        match result {
             Ok(()) => {
                 self.session_rename_id = None;
                 self.session_title_draft.clear();
@@ -878,8 +957,13 @@ impl ChatState {
             }
             Err(error) => {
                 let detail = error.to_string();
-                self.notice = Some(format!("chat rename failed: {detail}"));
-                self.push_activity("chat rename", detail, ActivityTone::Warn);
+                let label = if kind == ConversationKind::Channel {
+                    "channel"
+                } else {
+                    "chat"
+                };
+                self.notice = Some(format!("{label} rename failed: {detail}"));
+                self.push_activity(format!("{label} rename"), detail, ActivityTone::Warn);
             }
         }
     }
@@ -889,12 +973,20 @@ impl ChatState {
             return;
         };
         if self.streaming || self.control.active_turn {
-            self.notice = Some("wait for the current turn before deleting this chat".to_string());
+            let label = if session.kind == ConversationKind::Channel {
+                "channel"
+            } else {
+                "chat"
+            };
+            self.notice = Some(format!(
+                "wait for the current turn before deleting this {label}"
+            ));
             return;
         }
         self.session_delete_confirm_id = Some(session.id.clone());
         self.session_rename_id = None;
         self.session_title_draft.clear();
+        self.channel_config_id = None;
     }
 
     fn cancel_delete_session(&mut self) {
@@ -905,15 +997,41 @@ impl ChatState {
         let Some(session_id) = self.session_delete_confirm_id.clone() else {
             return;
         };
+        let kind = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| session.kind)
+            .unwrap_or(ConversationKind::Chat);
         if self.streaming || self.control.active_turn {
-            self.notice = Some("wait for the current turn before deleting this chat".to_string());
+            let label = if kind == ConversationKind::Channel {
+                "channel"
+            } else {
+                "chat"
+            };
+            self.notice = Some(format!(
+                "wait for the current turn before deleting this {label}"
+            ));
             return;
         }
-        match sessions::delete(&self.data_dir, &session_id) {
+        let result = match kind {
+            ConversationKind::Chat => {
+                let result = sessions::delete(&self.data_dir, &session_id);
+                let _ = self.delete_channel_record(&session_id);
+                result
+            }
+            ConversationKind::Channel => {
+                let result = self.delete_channel_record(&session_id);
+                let _ = sessions::delete(&self.data_dir, &session_id);
+                result
+            }
+        };
+        match result {
             Ok(()) => {
                 self.session_delete_confirm_id = None;
                 self.session_rename_id = None;
                 self.session_title_draft.clear();
+                self.channel_config_id = None;
                 self.refresh_sessions();
                 if self.session_id == session_id {
                     let new_session_id = SessionId::generate().to_string();
@@ -926,8 +1044,13 @@ impl ChatState {
             }
             Err(error) => {
                 let detail = error.to_string();
-                self.notice = Some(format!("chat delete failed: {detail}"));
-                self.push_activity("chat delete", detail, ActivityTone::Warn);
+                let label = if kind == ConversationKind::Channel {
+                    "channel"
+                } else {
+                    "chat"
+                };
+                self.notice = Some(format!("{label} delete failed: {detail}"));
+                self.push_activity(format!("{label} delete"), detail, ActivityTone::Warn);
             }
         }
     }
@@ -935,16 +1058,26 @@ impl ChatState {
     /// Open a stored chat: load its transcript for display and tell the worker
     /// to continue under that id.
     fn open_session(&mut self, index: usize) {
-        let Some(session) = self.sessions.get(index) else {
+        let Some(session) = self.sessions.get(index).cloned() else {
             return;
         };
         let id = session.id.clone();
-        let transcript = sessions::load_transcript(&self.data_dir, &id).unwrap_or_default();
-        let messages: Vec<ChatMessage> = transcript
-            .messages
-            .into_iter()
-            .map(ChatMessage::from_stored)
-            .collect();
+        let messages: Vec<ChatMessage> = match session.kind {
+            ConversationKind::Chat => sessions::load_transcript(&self.data_dir, &id)
+                .unwrap_or_default()
+                .messages
+                .into_iter()
+                .map(ChatMessage::from_stored)
+                .collect(),
+            ConversationKind::Channel => self.load_channel_messages(&id).unwrap_or_else(|| {
+                sessions::load_transcript(&self.data_dir, &id)
+                    .unwrap_or_default()
+                    .messages
+                    .into_iter()
+                    .map(ChatMessage::from_stored)
+                    .collect()
+            }),
+        };
         let history: Vec<ChatHistoryMessage> = messages
             .iter()
             .map(|m| ChatHistoryMessage {
@@ -966,6 +1099,7 @@ impl ChatState {
         self.session_rename_id = None;
         self.session_title_draft.clear();
         self.session_delete_confirm_id = None;
+        self.channel_config_id = None;
         self.handle.send_command(ChatCommand::Resume {
             session_id: id,
             history,
@@ -1352,6 +1486,12 @@ impl ChatState {
         let Some(agent) = self.agents.get(index) else {
             return;
         };
+        if self.current_is_channel() {
+            self.channel_agent_idx = index;
+            self.begin_configure_current_channel();
+            self.notice = Some("use channel config to add agents".to_string());
+            return;
+        }
         if self.visible_session_has_started() {
             self.notice = Some("start a new chat before switching agents".to_string());
             return;
@@ -1390,6 +1530,117 @@ impl ChatState {
         self.pending_session_reset = Some(session_id.clone());
         self.handle
             .send_command(ChatCommand::NewSession { session_id });
+    }
+
+    /// Start a fresh explicit channel (the "New channel" sidebar row).
+    fn new_channel(&mut self) {
+        self.persist();
+        let interrupted_session_id = self.session_id.clone();
+        let session_id = SessionId::generate().to_string();
+        if self.streaming || self.control.active_turn {
+            self.handle.send_command(ChatCommand::Interrupt {
+                session_id: interrupted_session_id,
+                reason: "user started a new channel from app chat".to_string(),
+            });
+        }
+        let mut channel = AgentChannel::new_channel(
+            session_id
+                .parse::<SessionId>()
+                .unwrap_or_else(|_| SessionId::generate()),
+            "New channel",
+        );
+        channel.ensure_user(sinomo_agent::AgentChannelUser::app_local());
+        let (agent_key, agent_name) = self.default_channel_agent();
+        channel.ensure_participant(agent_key, agent_name);
+        match FileAgentChannelStore::for_data_dir(&self.data_dir).save_channel(&channel) {
+            Ok(()) => {
+                self.reset_visible_session(session_id.clone());
+                self.pending_session_reset = Some(session_id.clone());
+                self.channel_config_id = Some(session_id.clone());
+                self.refresh_sessions();
+                self.handle
+                    .send_command(ChatCommand::NewSession { session_id });
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                self.notice = Some(format!("channel create failed: {detail}"));
+                self.push_activity("channel create", detail, ActivityTone::Warn);
+            }
+        }
+    }
+
+    fn default_channel_agent(&self) -> (String, String) {
+        if let Some(agent) = self
+            .agents
+            .iter()
+            .find(|agent| agent.key == self.info.agent || agent.name == self.info.agent)
+            .or_else(|| self.agents.first())
+        {
+            return (agent.key.clone(), agent.name.clone());
+        }
+        let key = if self.info.agent.trim().is_empty() {
+            "main-agent".to_string()
+        } else {
+            self.info.agent.clone()
+        };
+        (key.clone(), key)
+    }
+
+    fn begin_configure_current_channel(&mut self) {
+        if !self.current_is_channel() {
+            return;
+        }
+        self.channel_config_id = Some(self.session_id.clone());
+        self.session_rename_id = None;
+        self.session_title_draft.clear();
+        self.session_delete_confirm_id = None;
+    }
+
+    fn close_channel_config(&mut self) {
+        self.channel_config_id = None;
+    }
+
+    fn set_channel_agent_idx(&mut self, index: usize) {
+        self.channel_agent_idx = index.min(self.agents.len().saturating_sub(1));
+    }
+
+    fn add_selected_agent_to_channel(&mut self) {
+        let Some(channel_id) = self.channel_config_id.clone() else {
+            return;
+        };
+        let Some(agent) = self.agents.get(self.channel_agent_idx) else {
+            return;
+        };
+        let agent_key = agent.key.clone();
+        let agent_name = agent.name.clone();
+        let store = FileAgentChannelStore::for_data_dir(&self.data_dir);
+        let Ok(parsed_channel_id) = channel_id.parse::<SessionId>() else {
+            self.notice = Some("channel config failed: invalid channel id".to_string());
+            return;
+        };
+        let mut channel = match store.load_channel(&parsed_channel_id) {
+            Ok(Some(channel)) => channel,
+            Ok(None) => AgentChannel::new_channel(parsed_channel_id, "New channel"),
+            Err(error) => {
+                let detail = error.to_string();
+                self.notice = Some(format!("channel config failed: {detail}"));
+                self.push_activity("channel config", detail, ActivityTone::Warn);
+                return;
+            }
+        };
+        channel.channel_kind = AgentChannelKind::Channel;
+        channel.ensure_participant(agent_key, agent_name.clone());
+        match store.save_channel(&channel) {
+            Ok(()) => {
+                self.refresh_sessions();
+                self.notice = Some(format!("added {agent_name} to channel"));
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                self.notice = Some(format!("channel config failed: {detail}"));
+                self.push_activity("channel config", detail, ActivityTone::Warn);
+            }
+        }
     }
 
     /// Push the current provider/model selection to the worker.
@@ -1459,6 +1710,102 @@ impl ChatState {
                 .send_command(ChatCommand::FetchModels { provider });
         }
     }
+}
+
+fn list_conversations(data_dir: &SinomoDataDir) -> Vec<SessionRef> {
+    let chat_metas = sessions::list(data_dir);
+    let mut conversations = chat_metas
+        .into_iter()
+        .map(|meta| SessionRef {
+            id: meta.id,
+            title: meta.title,
+            kind: ConversationKind::Chat,
+            updated_unix: meta.updated_unix,
+            participant_count: 1,
+        })
+        .collect::<Vec<_>>();
+
+    if let Ok(channels) = FileAgentChannelStore::for_data_dir(data_dir).list_channels() {
+        let mut seen_channel_ids = BTreeSet::new();
+        for channel in channels {
+            if channel.channel_kind != AgentChannelKind::Channel {
+                continue;
+            }
+            let id = channel.channel_id.to_string();
+            if !seen_channel_ids.insert(id.clone()) {
+                continue;
+            }
+            conversations.retain(|conversation| {
+                !(conversation.id == id && conversation.kind == ConversationKind::Chat)
+            });
+            conversations.push(SessionRef {
+                id,
+                title: if channel.title.trim().is_empty() {
+                    "New channel".to_string()
+                } else {
+                    channel.title
+                },
+                kind: ConversationKind::Channel,
+                updated_unix: channel.updated_at.unix_timestamp(),
+                participant_count: channel
+                    .participants
+                    .iter()
+                    .filter(|participant| participant.enabled)
+                    .count(),
+            });
+        }
+    }
+
+    conversations.sort_by(|left, right| {
+        right
+            .updated_unix
+            .cmp(&left.updated_unix)
+            .then_with(|| left.title.cmp(&right.title))
+    });
+    conversations
+}
+
+fn channel_messages(channel: &AgentChannel) -> Vec<ChatMessage> {
+    channel
+        .transcript
+        .iter()
+        .filter_map(|message| {
+            if message.content.trim().is_empty() {
+                return None;
+            }
+            match &message.author {
+                AgentChannelAuthor::User { .. } => Some(ChatMessage::user(message.content.clone())),
+                AgentChannelAuthor::Agent { agent_name, .. } => {
+                    let label = if agent_name.trim().is_empty() {
+                        "Agent"
+                    } else {
+                        agent_name
+                    };
+                    Some(ChatMessage::model(format!("{label}: {}", message.content)))
+                }
+                AgentChannelAuthor::System => {
+                    if message.message_kind == AgentChannelMessageKind::Error {
+                        Some(ChatMessage::system_error(message.content.clone()))
+                    } else {
+                        Some(ChatMessage::system_info(message.content.clone()))
+                    }
+                }
+            }
+        })
+        .collect()
+}
+
+fn parse_channel_id(id: &str) -> std::io::Result<SessionId> {
+    id.parse::<SessionId>().map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid channel id: {error}"),
+        )
+    })
+}
+
+fn channel_store_io_error(error: sinomo_agent::AgentChannelStoreError) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, error.to_string())
 }
 
 fn merge_model_lists(existing: &[String], fetched: &[String]) -> Vec<String> {
@@ -1639,17 +1986,23 @@ fn agents_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         })
 }
 
-/// Build the CHATS ListView: a "New chat" row followed by chat history. Selecting row 0
-/// starts a fresh chat; later rows open that stored chat.
+/// Build the CHATS ListView: new-chat/new-channel actions followed by stored chats/channels.
 fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let mut items = vec![ListItem::new("New chat").leading_text("+")];
-    items.extend(
-        shared
-            .chat()
-            .sessions
-            .iter()
-            .map(|session| ListItem::new(session.title.clone()).leading_text("◷")),
-    );
+    let mut items = vec![
+        ListItem::new("New chat").leading_text("+"),
+        ListItem::new("New channel").leading_text("#"),
+    ];
+    items.extend(shared.chat().sessions.iter().map(|session| {
+        let item = ListItem::new(session.title.clone()).leading_text(match session.kind {
+            ConversationKind::Chat => "◷",
+            ConversationKind::Channel => "#",
+        });
+        if session.kind == ConversationKind::Channel {
+            item.trailing(format!("{} agents", session.participant_count.max(1)))
+        } else {
+            item
+        }
+    }));
     let s = shared.clone();
     ListView::new("chat-sessions")
         .items(items)
@@ -1662,14 +2015,16 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             let mut chat = s.chat_mut();
             if index == 0 {
                 chat.new_session();
+            } else if index == 1 {
+                chat.new_channel();
             } else {
-                chat.open_session(index - 1);
+                chat.open_session(index - 2);
             }
         })
 }
 
 fn session_edit_panel(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
-    let (session_id, title, draft, renaming, confirming_delete) = {
+    let (session_id, title, draft, renaming, confirming_delete, is_channel, configuring) = {
         let chat = shared.chat();
         let session = chat.current_session_ref()?;
         (
@@ -1678,15 +2033,22 @@ fn session_edit_panel(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod
             chat.session_title_draft.clone(),
             chat.session_rename_id.as_deref() == Some(session.id.as_str()),
             chat.session_delete_confirm_id.as_deref() == Some(session.id.as_str()),
+            session.kind == ConversationKind::Channel,
+            chat.channel_config_id.as_deref() == Some(session.id.as_str()),
         )
     };
 
     if renaming {
+        let placeholder = if is_channel {
+            "Channel title"
+        } else {
+            "Chat title"
+        };
         let input = {
             let s = shared.clone();
             TextInput::new(format!("chat-session-title-{session_id}"))
                 .value(draft)
-                .placeholder("Session title")
+                .placeholder(placeholder)
                 .theme_when(clone_reader(reader))
                 .on_change(move |value| {
                     s.chat_mut().set_session_title_draft(value);
@@ -1724,6 +2086,82 @@ fn session_edit_panel(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod
             .alignment(Alignment::Stretch)
             .with_child(SizedBox::new().height(30.0).with_child(input))
             .with_child(controls);
+        return Some(WidgetPod::new(panel));
+    }
+
+    if is_channel && configuring {
+        let participants = shared.chat().channel_participant_labels(&session_id);
+        let mut panel = Stack::vertical()
+            .spacing(6.0)
+            .alignment(Alignment::Stretch)
+            .with_child(muted_label(shared, compact_line(&title, 30)))
+            .with_child(muted_label(
+                shared,
+                if participants.is_empty() {
+                    "No agents in channel".to_string()
+                } else {
+                    format!("Agents: {}", participants.join(", "))
+                },
+            ));
+
+        if !shared.chat().agents.is_empty() {
+            let agent_options = shared
+                .chat()
+                .agents
+                .iter()
+                .map(|agent| agent.name.clone())
+                .collect::<Vec<_>>();
+            let picker = {
+                let s = shared.clone();
+                sui::Select::new(format!("channel-agent-picker-{session_id}"))
+                    .options(agent_options)
+                    .placeholder("Agent")
+                    .theme_when(clone_reader(reader))
+                    .selected_when({
+                        let s = s.clone();
+                        move || {
+                            let chat = s.chat();
+                            (!chat.agents.is_empty()).then_some(
+                                chat.channel_agent_idx
+                                    .min(chat.agents.len().saturating_sub(1)),
+                            )
+                        }
+                    })
+                    .on_change(move |index, _label| {
+                        s.chat_mut().set_channel_agent_idx(index);
+                    })
+            };
+            panel = panel.with_child(SizedBox::new().height(SELECTOR_H).with_child(picker));
+        }
+
+        let add = {
+            let s = shared.clone();
+            sui::Button::new("Add agent")
+                .icon(IconGlyph::Add)
+                .theme_when(clone_reader(reader))
+                .enabled_when({
+                    let s = s.clone();
+                    move || !s.chat().agents.is_empty()
+                })
+                .on_press(move || {
+                    s.chat_mut().add_selected_agent_to_channel();
+                })
+        };
+        let done = {
+            let s = shared.clone();
+            sui::Button::new("Done")
+                .icon(IconGlyph::Check)
+                .theme_when(clone_reader(reader))
+                .on_press(move || {
+                    s.chat_mut().close_channel_config();
+                })
+        };
+        let controls = Stack::horizontal()
+            .spacing(6.0)
+            .alignment(Alignment::Start)
+            .with_child(add)
+            .with_child(done);
+        panel = panel.with_child(controls);
         return Some(WidgetPod::new(panel));
     }
 
@@ -1788,8 +2226,22 @@ fn session_edit_panel(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod
     let controls = Stack::horizontal()
         .spacing(6.0)
         .alignment(Alignment::Start)
-        .with_child(rename)
-        .with_child(delete);
+        .with_child(rename);
+    let controls = if is_channel {
+        let configure = {
+            let s = shared.clone();
+            sui::Button::new("Configure")
+                .icon(IconGlyph::MoreHorizontal)
+                .theme_when(clone_reader(reader))
+                .on_press(move || {
+                    s.chat_mut().begin_configure_current_channel();
+                })
+        };
+        controls.with_child(configure)
+    } else {
+        controls
+    }
+    .with_child(delete);
     let panel = Stack::vertical()
         .spacing(6.0)
         .alignment(Alignment::Stretch)
@@ -1833,7 +2285,7 @@ fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 
 /// A signature of the sidebar's list contents (agents are static; sessions + the active agent
 /// change). Used to drive the sidebar [`RebuildOnChange`].
-fn sidebar_signature(shared: &Shared) -> (String, String, String, String, String) {
+fn sidebar_signature(shared: &Shared) -> (String, String, String, String, String, String, usize) {
     let chat = shared.chat();
     let active = chat
         .agents
@@ -1845,7 +2297,7 @@ fn sidebar_signature(shared: &Shared) -> (String, String, String, String, String
     let sessions = chat
         .sessions
         .iter()
-        .map(|s| format!("{}:{}", s.id, s.title))
+        .map(|s| format!("{}:{:?}:{}:{}", s.id, s.kind, s.title, s.participant_count))
         .collect::<Vec<_>>()
         .join("\u{1f}");
     (
@@ -1854,6 +2306,8 @@ fn sidebar_signature(shared: &Shared) -> (String, String, String, String, String
         chat.session_id.clone(),
         chat.session_rename_id.clone().unwrap_or_default(),
         chat.session_delete_confirm_id.clone().unwrap_or_default(),
+        chat.channel_config_id.clone().unwrap_or_default(),
+        chat.channel_agent_idx,
     )
 }
 
@@ -3633,6 +4087,86 @@ mod tests {
         assert_eq!(
             state.pending_session_reset.as_deref(),
             Some(state.session_id.as_str())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn new_channel_creates_channel_entry_and_opens_config() {
+        let (mut state, root) = isolated_chat_state("new-channel");
+        seed_test_agents(&mut state);
+
+        state.new_channel();
+
+        let channel_id = state.session_id.clone();
+        assert!(
+            state.messages.is_empty(),
+            "new channel starts with an empty visible transcript"
+        );
+        assert_eq!(
+            state.channel_config_id.as_deref(),
+            Some(channel_id.as_str()),
+            "new channels open their config panel"
+        );
+        let listed = state
+            .sessions
+            .iter()
+            .find(|session| session.id == channel_id)
+            .expect("channel listed");
+        assert_eq!(listed.kind, ConversationKind::Channel);
+        assert_eq!(listed.participant_count, 1);
+
+        let parsed = channel_id.parse::<SessionId>().expect("channel id");
+        let channel = FileAgentChannelStore::for_data_dir(&state.data_dir)
+            .load_channel(&parsed)
+            .expect("load channel")
+            .expect("channel saved");
+        assert_eq!(channel.channel_kind, AgentChannelKind::Channel);
+        let participants = channel.enabled_participants_in_order();
+        assert_eq!(participants.len(), 1);
+        assert_eq!(participants[0].agent_key, "main-agent");
+        assert_ne!(
+            participants[0].agent_session_id, channel.channel_id,
+            "explicit channel participants keep their own agent sessions"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn channel_config_adds_selected_agent_and_updates_sidebar_count() {
+        let (mut state, root) = isolated_chat_state("channel-add-agent");
+        seed_test_agents(&mut state);
+        state.new_channel();
+        let channel_id = state.session_id.clone();
+
+        state.set_channel_agent_idx(1);
+        state.add_selected_agent_to_channel();
+
+        let parsed = channel_id.parse::<SessionId>().expect("channel id");
+        let channel = FileAgentChannelStore::for_data_dir(&state.data_dir)
+            .load_channel(&parsed)
+            .expect("load channel")
+            .expect("channel saved");
+        let participants = channel.enabled_participants_in_order();
+        assert_eq!(participants.len(), 2);
+        assert!(
+            participants
+                .iter()
+                .any(|participant| participant.agent_key == "coding-agent")
+        );
+        assert_eq!(
+            state
+                .sessions
+                .iter()
+                .find(|session| session.id == channel_id)
+                .map(|session| session.participant_count),
+            Some(2)
+        );
+        assert_eq!(
+            state.channel_participant_labels(&channel_id),
+            vec!["main-agent".to_string(), "coding-agent".to_string()]
         );
 
         let _ = fs::remove_dir_all(root);
