@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 mod agent;
+mod channel;
 mod compaction;
 mod process;
 mod readiness;
@@ -29,6 +30,7 @@ mod session_store;
 pub mod tools;
 
 pub use agent::*;
+pub use channel::*;
 pub use compaction::*;
 pub use process::*;
 pub use readiness::*;
@@ -64,7 +66,7 @@ pub fn register_storage_paths(
         "sinomo-agent",
         sinomo_runtime::storage::StorageRing::R2,
         "events/agent",
-        "agent sessions, traces, context assembly reports, model events, and tool evidence artifacts",
+        "agent sessions, channels, traces, context assembly reports, model events, and tool evidence artifacts",
     )?;
     layout.register_escape_path(
         "sinomo-agent",

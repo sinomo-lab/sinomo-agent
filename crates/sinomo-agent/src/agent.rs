@@ -470,6 +470,7 @@ pub trait AgentTraceStore: Send + Sync {
 pub struct AgentStoragePaths {
     pub root: PathBuf,
     pub sessions_dir: PathBuf,
+    pub channels_dir: PathBuf,
     pub traces_dir: PathBuf,
     pub evidence_dir: PathBuf,
 }
@@ -479,6 +480,7 @@ impl AgentStoragePaths {
         let root = root.into();
         Self {
             sessions_dir: root.join("sessions"),
+            channels_dir: root.join("channels"),
             traces_dir: root.join("traces"),
             evidence_dir: root.join("evidence"),
             root,
@@ -524,6 +526,25 @@ impl AgentStoragePaths {
     pub fn session_audio_segments_path_for_session(&self, session_id: &SessionId) -> PathBuf {
         self.session_audio_dir_for_session(session_id)
             .join("segments.jsonl")
+    }
+
+    pub fn channel_dir_for_channel(&self, channel_id: &SessionId) -> PathBuf {
+        self.channels_dir.join(channel_id.as_str())
+    }
+
+    pub fn channel_snapshot_path_for_channel(&self, channel_id: &SessionId) -> PathBuf {
+        self.channel_dir_for_channel(channel_id)
+            .join("snapshot.json")
+    }
+
+    pub fn channel_messages_path_for_channel(&self, channel_id: &SessionId) -> PathBuf {
+        self.channel_dir_for_channel(channel_id)
+            .join("messages.jsonl")
+    }
+
+    pub fn channel_events_path_for_channel(&self, channel_id: &SessionId) -> PathBuf {
+        self.channel_dir_for_channel(channel_id)
+            .join("events.jsonl")
     }
 
     pub fn evidence_dir_for_session(&self, session_id: &SessionId) -> PathBuf {

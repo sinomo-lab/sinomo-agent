@@ -1,0 +1,1716 @@
+use crate::{
+    AgentDefinition, AgentItem, AgentRole, AgentSession, AgentStoragePaths, InteractionModel,
+    TaskId,
+};
+use serde::{Deserialize, Serialize};
+use sinomo_lm::{
+    LanguageModelError, LanguageModelMessage, LanguageModelRequest, LanguageModelResponseFormat,
+    LanguageModelRole, LanguageModelToolChoice,
+};
+use sinomo_runtime::events::SessionId;
+use sinomo_runtime::local::SinomoDataDir;
+use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+
+pub const AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub const AGENT_CHANNEL_APP_USER_ID: &str = "user.app.local";
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentChannel {
+    pub channel_id: SessionId,
+    pub title: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub deleted_at: Option<time::OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub users: Vec<AgentChannelUser>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub participants: Vec<AgentChannelParticipant>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transcript: Vec<AgentChannelMessage>,
+    #[serde(default = "default_next_channel_sequence")]
+    pub next_sequence: u64,
+}
+
+impl AgentChannel {
+    pub fn new(channel_id: SessionId, title: impl Into<String>) -> Self {
+        let now = time::OffsetDateTime::now_utc();
+        Self {
+            channel_id,
+            title: title.into(),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            users: vec![AgentChannelUser::app_local()],
+            participants: Vec::new(),
+            transcript: Vec::new(),
+            next_sequence: 1,
+        }
+    }
+
+    pub fn with_default_title(channel_id: SessionId) -> Self {
+        Self::new(channel_id, "New chat")
+    }
+
+    pub fn is_deleted(&self) -> bool {
+        self.deleted_at.is_some()
+    }
+
+    pub fn rename(&mut self, title: impl Into<String>) {
+        self.title = title.into();
+        self.touch();
+    }
+
+    pub fn tombstone(&mut self) {
+        self.deleted_at = Some(time::OffsetDateTime::now_utc());
+        self.touch();
+    }
+
+    pub fn ensure_user(&mut self, user: AgentChannelUser) {
+        if !self
+            .users
+            .iter()
+            .any(|existing| existing.user_id == user.user_id)
+        {
+            self.users.push(user);
+            self.touch();
+        }
+    }
+
+    pub fn ensure_participant(
+        &mut self,
+        agent_key: impl Into<String>,
+        agent_name: impl Into<String>,
+    ) -> TaskId {
+        let agent_key = agent_key.into();
+        let agent_name = agent_name.into();
+        if let Some(index) = self
+            .participants
+            .iter()
+            .position(|participant| participant.agent_key == agent_key)
+        {
+            let participant_id = {
+                let participant = &mut self.participants[index];
+                participant.agent_name = agent_name;
+                participant.enabled = true;
+                participant.participant_id.clone()
+            };
+            self.touch();
+            return participant_id;
+        }
+
+        let order = self
+            .participants
+            .iter()
+            .map(|participant| participant.order)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let participant = AgentChannelParticipant {
+            participant_id: TaskId::generate(),
+            agent_key,
+            agent_name,
+            agent_session_id: SessionId::generate(),
+            enabled: true,
+            order,
+            observed_through_sequence: 0,
+        };
+        let participant_id = participant.participant_id.clone();
+        self.participants.push(participant);
+        self.touch();
+        participant_id
+    }
+
+    pub fn disable_participant(&mut self, participant_id: &TaskId) -> bool {
+        if let Some(participant) = self
+            .participants
+            .iter_mut()
+            .find(|participant| &participant.participant_id == participant_id)
+        {
+            participant.enabled = false;
+            self.touch();
+            return true;
+        }
+        false
+    }
+
+    pub fn enabled_participants_in_order(&self) -> Vec<AgentChannelParticipant> {
+        let mut participants = self
+            .participants
+            .iter()
+            .filter(|participant| participant.enabled)
+            .cloned()
+            .collect::<Vec<_>>();
+        participants.sort_by_key(|participant| participant.order);
+        participants
+    }
+
+    pub fn participant(&self, participant_id: &TaskId) -> Option<&AgentChannelParticipant> {
+        self.participants
+            .iter()
+            .find(|participant| &participant.participant_id == participant_id)
+    }
+
+    pub fn participant_mut(
+        &mut self,
+        participant_id: &TaskId,
+    ) -> Option<&mut AgentChannelParticipant> {
+        self.participants
+            .iter_mut()
+            .find(|participant| &participant.participant_id == participant_id)
+    }
+
+    pub fn append_user_message(
+        &mut self,
+        user_id: impl Into<String>,
+        display_name: impl Into<String>,
+        content: impl Into<String>,
+        source: AgentChannelSource,
+    ) -> AgentChannelMessage {
+        let message = self.next_message(
+            AgentChannelAuthor::User {
+                user_id: user_id.into(),
+                display_name: display_name.into(),
+            },
+            AgentChannelMessageKind::Normal,
+            content,
+            source,
+        );
+        self.transcript.push(message.clone());
+        self.touch();
+        message
+    }
+
+    pub fn append_agent_message(
+        &mut self,
+        participant: &AgentChannelParticipant,
+        content: impl Into<String>,
+        source: AgentChannelSource,
+    ) -> AgentChannelMessage {
+        let message = self.next_message(
+            AgentChannelAuthor::Agent {
+                participant_id: participant.participant_id.clone(),
+                agent_key: participant.agent_key.clone(),
+                agent_name: participant.agent_name.clone(),
+                agent_session_id: participant.agent_session_id.clone(),
+            },
+            AgentChannelMessageKind::Normal,
+            content,
+            source,
+        );
+        self.transcript.push(message.clone());
+        self.touch();
+        message
+    }
+
+    pub fn append_system_info(
+        &mut self,
+        content: impl Into<String>,
+        source: AgentChannelSource,
+    ) -> AgentChannelMessage {
+        self.append_system_message(AgentChannelMessageKind::Info, content, source)
+    }
+
+    pub fn append_system_error(
+        &mut self,
+        content: impl Into<String>,
+        source: AgentChannelSource,
+    ) -> AgentChannelMessage {
+        self.append_system_message(AgentChannelMessageKind::Error, content, source)
+    }
+
+    fn append_system_message(
+        &mut self,
+        message_kind: AgentChannelMessageKind,
+        content: impl Into<String>,
+        source: AgentChannelSource,
+    ) -> AgentChannelMessage {
+        let message = self.next_message(AgentChannelAuthor::System, message_kind, content, source);
+        self.transcript.push(message.clone());
+        self.touch();
+        message
+    }
+
+    fn next_message(
+        &mut self,
+        author: AgentChannelAuthor,
+        message_kind: AgentChannelMessageKind,
+        content: impl Into<String>,
+        source: AgentChannelSource,
+    ) -> AgentChannelMessage {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        AgentChannelMessage {
+            message_id: TaskId::generate(),
+            sequence,
+            author,
+            message_kind,
+            content: content.into(),
+            created_at: time::OffsetDateTime::now_utc(),
+            source,
+        }
+    }
+
+    fn touch(&mut self) {
+        self.updated_at = time::OffsetDateTime::now_utc();
+    }
+}
+
+fn default_next_channel_sequence() -> u64 {
+    1
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentChannelUser {
+    pub user_id: String,
+    pub display_name: String,
+    pub source: AgentChannelSource,
+}
+
+impl AgentChannelUser {
+    pub fn app_local() -> Self {
+        Self {
+            user_id: AGENT_CHANNEL_APP_USER_ID.to_string(),
+            display_name: "User".to_string(),
+            source: AgentChannelSource::app(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentChannelParticipant {
+    pub participant_id: TaskId,
+    pub agent_key: String,
+    pub agent_name: String,
+    pub agent_session_id: SessionId,
+    pub enabled: bool,
+    pub order: u32,
+    #[serde(default)]
+    pub observed_through_sequence: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentChannelMessage {
+    pub message_id: TaskId,
+    pub sequence: u64,
+    pub author: AgentChannelAuthor,
+    #[serde(default)]
+    pub message_kind: AgentChannelMessageKind,
+    pub content: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
+    pub source: AgentChannelSource,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentChannelAuthor {
+    User {
+        user_id: String,
+        display_name: String,
+    },
+    Agent {
+        participant_id: TaskId,
+        agent_key: String,
+        agent_name: String,
+        agent_session_id: SessionId,
+    },
+    System,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentChannelMessageKind {
+    #[default]
+    Normal,
+    Info,
+    Error,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentChannelSource {
+    pub adapter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_channel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
+}
+
+impl AgentChannelSource {
+    pub fn app() -> Self {
+        Self {
+            adapter: "sinomo-app".to_string(),
+            external_channel_id: None,
+            external_message_id: None,
+            external_user_id: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    pub fn system(metadata: serde_json::Value) -> Self {
+        Self {
+            adapter: "sinomo-agent".to_string(),
+            metadata,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentChannelTurn {
+    pub turn_id: TaskId,
+    pub channel_id: SessionId,
+    pub trigger_message_id: TaskId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decisions: Vec<AgentChannelSpeakDecision>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub response_message_ids: Vec<TaskId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_message_ids: Vec<TaskId>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentChannelSpeakDecision {
+    pub participant_id: TaskId,
+    pub agent_key: String,
+    pub agent_name: String,
+    pub agent_session_id: SessionId,
+    pub speak: bool,
+    pub reason: String,
+    pub confidence: f32,
+}
+
+impl AgentChannelSpeakDecision {
+    pub fn silent(
+        participant: &AgentChannelParticipant,
+        reason: impl Into<String>,
+        confidence: f32,
+    ) -> Self {
+        Self {
+            participant_id: participant.participant_id.clone(),
+            agent_key: participant.agent_key.clone(),
+            agent_name: participant.agent_name.clone(),
+            agent_session_id: participant.agent_session_id.clone(),
+            speak: false,
+            reason: reason.into(),
+            confidence,
+        }
+    }
+
+    pub fn speak(
+        participant: &AgentChannelParticipant,
+        reason: impl Into<String>,
+        confidence: f32,
+    ) -> Self {
+        Self {
+            participant_id: participant.participant_id.clone(),
+            agent_key: participant.agent_key.clone(),
+            agent_name: participant.agent_name.clone(),
+            agent_session_id: participant.agent_session_id.clone(),
+            speak: true,
+            reason: reason.into(),
+            confidence,
+        }
+    }
+}
+
+pub trait AgentChannelStore: Send + Sync {
+    fn save_channel(&self, channel: &AgentChannel) -> Result<(), AgentChannelStoreError>;
+    fn load_channel(
+        &self,
+        channel_id: &SessionId,
+    ) -> Result<Option<AgentChannel>, AgentChannelStoreError>;
+    fn list_channels(&self) -> Result<Vec<AgentChannel>, AgentChannelStoreError>;
+    fn append_message(
+        &self,
+        channel_id: &SessionId,
+        message: &AgentChannelMessage,
+    ) -> Result<(), AgentChannelStoreError>;
+    fn append_turn(
+        &self,
+        channel_id: &SessionId,
+        turn: &AgentChannelTurn,
+    ) -> Result<(), AgentChannelStoreError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileAgentChannelStore {
+    paths: AgentStoragePaths,
+}
+
+impl FileAgentChannelStore {
+    pub fn new(paths: AgentStoragePaths) -> Self {
+        Self { paths }
+    }
+
+    pub fn for_data_dir(data_dir: &SinomoDataDir) -> Self {
+        Self::new(AgentStoragePaths::from_data_dir(data_dir))
+    }
+
+    pub fn paths(&self) -> &AgentStoragePaths {
+        &self.paths
+    }
+
+    fn channel_dir(&self, channel_id: &SessionId) -> PathBuf {
+        self.paths.channel_dir_for_channel(channel_id)
+    }
+}
+
+impl AgentChannelStore for FileAgentChannelStore {
+    fn save_channel(&self, channel: &AgentChannel) -> Result<(), AgentChannelStoreError> {
+        let dir = self.channel_dir(&channel.channel_id);
+        fs::create_dir_all(&dir).map_err(|source| AgentChannelStoreError::Io {
+            path: dir.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let snapshot = AgentChannelSnapshot {
+            schema_version: AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION,
+            channel,
+        };
+        let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|source| {
+            AgentChannelStoreError::Serialization {
+                detail: source.to_string(),
+            }
+        })?;
+        let path = self
+            .paths
+            .channel_snapshot_path_for_channel(&channel.channel_id);
+        fs::write(&path, bytes).map_err(|source| AgentChannelStoreError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })
+    }
+
+    fn load_channel(
+        &self,
+        channel_id: &SessionId,
+    ) -> Result<Option<AgentChannel>, AgentChannelStoreError> {
+        let path = self.paths.channel_snapshot_path_for_channel(channel_id);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(AgentChannelStoreError::Io {
+                    path: path.display().to_string(),
+                    detail: source.to_string(),
+                });
+            }
+        };
+        let snapshot =
+            serde_json::from_slice::<OwnedAgentChannelSnapshot>(&bytes).map_err(|source| {
+                AgentChannelStoreError::Serialization {
+                    detail: source.to_string(),
+                }
+            })?;
+        if snapshot.schema_version != AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION {
+            return Err(AgentChannelStoreError::Serialization {
+                detail: format!(
+                    "unsupported agent channel snapshot schema version {}",
+                    snapshot.schema_version
+                ),
+            });
+        }
+        Ok(Some(snapshot.channel))
+    }
+
+    fn list_channels(&self) -> Result<Vec<AgentChannel>, AgentChannelStoreError> {
+        let entries = match fs::read_dir(&self.paths.channels_dir) {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(AgentChannelStoreError::Io {
+                    path: self.paths.channels_dir.display().to_string(),
+                    detail: source.to_string(),
+                });
+            }
+        };
+        let mut channels = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| AgentChannelStoreError::Io {
+                path: self.paths.channels_dir.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            let file_type = entry
+                .file_type()
+                .map_err(|source| AgentChannelStoreError::Io {
+                    path: entry.path().display().to_string(),
+                    detail: source.to_string(),
+                })?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Ok(channel_id) = name.parse::<SessionId>() else {
+                continue;
+            };
+            if let Some(channel) = self.load_channel(&channel_id)? {
+                if !channel.is_deleted() {
+                    channels.push(channel);
+                }
+            }
+        }
+        channels.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        Ok(channels)
+    }
+
+    fn append_message(
+        &self,
+        channel_id: &SessionId,
+        message: &AgentChannelMessage,
+    ) -> Result<(), AgentChannelStoreError> {
+        append_json_line(
+            self.paths.channel_messages_path_for_channel(channel_id),
+            message,
+        )
+    }
+
+    fn append_turn(
+        &self,
+        channel_id: &SessionId,
+        turn: &AgentChannelTurn,
+    ) -> Result<(), AgentChannelStoreError> {
+        append_json_line(self.paths.channel_events_path_for_channel(channel_id), turn)
+    }
+}
+
+#[derive(Serialize)]
+struct AgentChannelSnapshot<'a> {
+    schema_version: u32,
+    channel: &'a AgentChannel,
+}
+
+#[derive(Deserialize)]
+struct OwnedAgentChannelSnapshot {
+    schema_version: u32,
+    channel: AgentChannel,
+}
+
+fn append_json_line<T: Serialize>(path: PathBuf, value: &T) -> Result<(), AgentChannelStoreError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|source| AgentChannelStoreError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let line =
+        serde_json::to_string(value).map_err(|source| AgentChannelStoreError::Serialization {
+            detail: source.to_string(),
+        })?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|source| AgentChannelStoreError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    writeln!(file, "{line}").map_err(|source| AgentChannelStoreError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AgentChannelStoreError {
+    #[error("I/O error at {path}: {detail}")]
+    Io { path: String, detail: String },
+    #[error("failed to serialize agent channel: {detail}")]
+    Serialization { detail: String },
+}
+
+pub fn sync_participant_session(
+    channel: &AgentChannel,
+    participant: &mut AgentChannelParticipant,
+    session: &mut AgentSession,
+) {
+    let mut next_step = session.transcript.items.len();
+    let observed_start = participant.observed_through_sequence;
+    for message in channel
+        .transcript
+        .iter()
+        .filter(|message| message.sequence > observed_start)
+    {
+        if message.content.trim().is_empty() {
+            participant.observed_through_sequence =
+                participant.observed_through_sequence.max(message.sequence);
+            continue;
+        }
+        let item = match &message.author {
+            AgentChannelAuthor::User { display_name, .. } => AgentItem::UserMessage {
+                item_id: TaskId::generate(),
+                step_index: next_step,
+                content: format!("{display_name}: {}", message.content),
+                event_id: None,
+            },
+            AgentChannelAuthor::Agent {
+                participant_id,
+                agent_name,
+                ..
+            } if participant_id == &participant.participant_id => AgentItem::AssistantText {
+                item_id: TaskId::generate(),
+                step_index: next_step,
+                content: message.content.clone(),
+            },
+            AgentChannelAuthor::Agent { agent_name, .. } => AgentItem::UserMessage {
+                item_id: TaskId::generate(),
+                step_index: next_step,
+                content: format!("{agent_name}: {}", message.content),
+                event_id: None,
+            },
+            AgentChannelAuthor::System => AgentItem::UserMessage {
+                item_id: TaskId::generate(),
+                step_index: next_step,
+                content: format!("System: {}", message.content),
+                event_id: None,
+            },
+        };
+        session.transcript.push(item.clone());
+        session.raw_transcript.push(item);
+        next_step = next_step.saturating_add(1);
+        participant.observed_through_sequence =
+            participant.observed_through_sequence.max(message.sequence);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentChannelSpeakGate<'a, M> {
+    model: &'a M,
+    provider: String,
+    model_id: String,
+    max_recent_messages: usize,
+}
+
+impl<'a, M> AgentChannelSpeakGate<'a, M>
+where
+    M: InteractionModel,
+{
+    pub fn new(model: &'a M, provider: impl Into<String>, model_id: impl Into<String>) -> Self {
+        Self {
+            model,
+            provider: provider.into(),
+            model_id: model_id.into(),
+            max_recent_messages: 12,
+        }
+    }
+
+    pub fn with_max_recent_messages(mut self, max_recent_messages: usize) -> Self {
+        self.max_recent_messages = max_recent_messages;
+        self
+    }
+
+    pub fn evaluate(
+        &self,
+        channel: &AgentChannel,
+        participant: &AgentChannelParticipant,
+        latest_user_message: &AgentChannelMessage,
+    ) -> Result<AgentChannelSpeakDecision, AgentChannelSpeakGateError> {
+        let request = self.request(channel, participant, latest_user_message);
+        let response = self.model.complete(&request).map_err(|source| {
+            AgentChannelSpeakGateError::Provider {
+                detail: source.to_string(),
+            }
+        })?;
+        let contract =
+            serde_json::from_str::<SpeakGateContract>(&response.content).map_err(|source| {
+                AgentChannelSpeakGateError::Parse {
+                    detail: source.to_string(),
+                    raw: response.content.clone(),
+                }
+            })?;
+        Ok(AgentChannelSpeakDecision {
+            participant_id: participant.participant_id.clone(),
+            agent_key: participant.agent_key.clone(),
+            agent_name: participant.agent_name.clone(),
+            agent_session_id: participant.agent_session_id.clone(),
+            speak: contract.speak,
+            reason: contract.reason,
+            confidence: contract.confidence.clamp(0.0, 1.0),
+        })
+    }
+
+    pub fn request(
+        &self,
+        channel: &AgentChannel,
+        participant: &AgentChannelParticipant,
+        latest_user_message: &AgentChannelMessage,
+    ) -> LanguageModelRequest {
+        let recent = channel
+            .transcript
+            .iter()
+            .rev()
+            .take(self.max_recent_messages)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|message| render_gate_message(&message))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let latest = render_gate_message(latest_user_message);
+        LanguageModelRequest {
+            provider: self.provider.clone(),
+            model: self.model_id.clone(),
+            messages: vec![
+                LanguageModelMessage {
+                    role: LanguageModelRole::System,
+                    content: "You decide whether one named agent should speak in a shared channel. Return only JSON matching {\"speak\": boolean, \"reason\": string, \"confidence\": number}. Speak only when the agent can add useful, non-duplicative value.".to_string(),
+                },
+                LanguageModelMessage {
+                    role: LanguageModelRole::User,
+                    content: format!(
+                        "Channel title: {}\nParticipant: {} ({})\nLatest user message: {latest}\nRecent channel timeline:\n{recent}",
+                        channel.title, participant.agent_name, participant.agent_key
+                    ),
+                },
+            ],
+            items: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: Some(LanguageModelToolChoice::None),
+            parallel_tool_calls: Some(false),
+            temperature: Some(0.0),
+            max_output_tokens: Some(160),
+            response_format: LanguageModelResponseFormat::JsonObject,
+            metadata: serde_json::json!({
+                "channel_id": channel.channel_id,
+                "participant_id": participant.participant_id,
+                "agent_key": participant.agent_key,
+                "agent_session_id": participant.agent_session_id,
+                "purpose": "agent-channel-speak-gate"
+            }),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SpeakGateContract {
+    speak: bool,
+    reason: String,
+    confidence: f32,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AgentChannelSpeakGateError {
+    #[error("speak gate provider failed: {detail}")]
+    Provider { detail: String },
+    #[error("speak gate returned invalid JSON: {detail}; raw={raw}")]
+    Parse { detail: String, raw: String },
+}
+
+impl From<LanguageModelError> for AgentChannelSpeakGateError {
+    fn from(source: LanguageModelError) -> Self {
+        Self::Provider {
+            detail: source.to_string(),
+        }
+    }
+}
+
+fn render_gate_message(message: &AgentChannelMessage) -> String {
+    let author = match &message.author {
+        AgentChannelAuthor::User { display_name, .. } => display_name.as_str(),
+        AgentChannelAuthor::Agent { agent_name, .. } => agent_name.as_str(),
+        AgentChannelAuthor::System => "System",
+    };
+    format!("[{}] {author}: {}", message.sequence, message.content)
+}
+
+pub trait AgentChannelTurnExecutor {
+    fn decide_speak(
+        &mut self,
+        channel: &AgentChannel,
+        participant: &AgentChannelParticipant,
+        latest_user_message: &AgentChannelMessage,
+        session: &AgentSession,
+    ) -> Result<AgentChannelSpeakDecision, AgentChannelExecutorError>;
+
+    fn speak(
+        &mut self,
+        channel: &AgentChannel,
+        participant: &AgentChannelParticipant,
+        session: &mut AgentSession,
+        on_event: &mut dyn FnMut(AgentChannelRuntimeEvent),
+    ) -> Result<String, AgentChannelExecutorError>;
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentChannelRuntimeEvent {
+    Token {
+        channel_id: SessionId,
+        participant_id: TaskId,
+        agent_key: String,
+        agent_name: String,
+        agent_session_id: SessionId,
+        text: String,
+    },
+    System {
+        channel_id: SessionId,
+        message_id: TaskId,
+        message_kind: AgentChannelMessageKind,
+        text: String,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{detail}")]
+pub struct AgentChannelExecutorError {
+    pub detail: String,
+}
+
+impl AgentChannelExecutorError {
+    pub fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AgentChannelRuntimeError {
+    #[error("channel has been deleted")]
+    Deleted,
+    #[error("participant not found: {participant_id}")]
+    ParticipantNotFound { participant_id: TaskId },
+    #[error("agent channel store failed: {source}")]
+    Store {
+        #[from]
+        source: AgentChannelStoreError,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentChannelTurnReport {
+    pub turn: AgentChannelTurn,
+    pub latest_user_message: AgentChannelMessage,
+}
+
+pub struct AgentChannelRuntime<S, E>
+where
+    S: AgentChannelStore,
+    E: AgentChannelTurnExecutor,
+{
+    channel: AgentChannel,
+    store: S,
+    executor: E,
+    sessions: BTreeMap<TaskId, AgentSession>,
+}
+
+impl<S, E> AgentChannelRuntime<S, E>
+where
+    S: AgentChannelStore,
+    E: AgentChannelTurnExecutor,
+{
+    pub fn new(channel: AgentChannel, store: S, executor: E) -> Self {
+        let sessions = channel
+            .participants
+            .iter()
+            .map(|participant| {
+                (
+                    participant.participant_id.clone(),
+                    AgentSession::new(
+                        participant.agent_session_id.clone(),
+                        agent_role_for_key(&participant.agent_key),
+                    ),
+                )
+            })
+            .collect();
+        Self {
+            channel,
+            store,
+            executor,
+            sessions,
+        }
+    }
+
+    pub fn channel(&self) -> &AgentChannel {
+        &self.channel
+    }
+
+    pub fn channel_mut(&mut self) -> &mut AgentChannel {
+        &mut self.channel
+    }
+
+    pub fn participant_session(&self, participant_id: &TaskId) -> Option<&AgentSession> {
+        self.sessions.get(participant_id)
+    }
+
+    pub fn participant_session_mut(
+        &mut self,
+        participant_id: &TaskId,
+    ) -> Option<&mut AgentSession> {
+        self.sessions.get_mut(participant_id)
+    }
+
+    pub fn insert_participant_session(&mut self, participant_id: TaskId, session: AgentSession) {
+        self.sessions.insert(participant_id, session);
+    }
+
+    pub fn add_participant(
+        &mut self,
+        agent_key: impl Into<String>,
+        agent_name: impl Into<String>,
+    ) -> Result<TaskId, AgentChannelRuntimeError> {
+        let agent_key = agent_key.into();
+        let participant_id = self
+            .channel
+            .ensure_participant(agent_key.clone(), agent_name);
+        let participant = self
+            .channel
+            .participant(&participant_id)
+            .expect("participant just created")
+            .clone();
+        self.sessions
+            .entry(participant_id.clone())
+            .or_insert_with(|| {
+                AgentSession::new(
+                    participant.agent_session_id.clone(),
+                    agent_role_for_key(&agent_key),
+                )
+            });
+        self.store.save_channel(&self.channel)?;
+        Ok(participant_id)
+    }
+
+    pub fn remove_participant(
+        &mut self,
+        participant_id: &TaskId,
+    ) -> Result<bool, AgentChannelRuntimeError> {
+        let removed = self.channel.disable_participant(participant_id);
+        self.store.save_channel(&self.channel)?;
+        Ok(removed)
+    }
+
+    pub fn send_user_message(
+        &mut self,
+        content: impl Into<String>,
+        on_event: &mut dyn FnMut(AgentChannelRuntimeEvent),
+    ) -> Result<AgentChannelTurnReport, AgentChannelRuntimeError> {
+        self.send_user_message_from(
+            AGENT_CHANNEL_APP_USER_ID,
+            "User",
+            content,
+            AgentChannelSource::app(),
+            on_event,
+        )
+    }
+
+    pub fn send_user_message_from(
+        &mut self,
+        user_id: impl Into<String>,
+        display_name: impl Into<String>,
+        content: impl Into<String>,
+        source: AgentChannelSource,
+        on_event: &mut dyn FnMut(AgentChannelRuntimeEvent),
+    ) -> Result<AgentChannelTurnReport, AgentChannelRuntimeError> {
+        if self.channel.is_deleted() {
+            return Err(AgentChannelRuntimeError::Deleted);
+        }
+        let latest_user_message =
+            self.channel
+                .append_user_message(user_id, display_name, content, source);
+        self.store
+            .append_message(&self.channel.channel_id, &latest_user_message)?;
+        self.store.save_channel(&self.channel)?;
+
+        let mut decisions = Vec::new();
+        let mut response_message_ids = Vec::new();
+        let mut system_message_ids = Vec::new();
+        let participants = self.channel.enabled_participants_in_order();
+        for participant in participants {
+            let participant_id = participant.participant_id.clone();
+            self.ensure_session_for_participant(&participant);
+            self.sync_participant(&participant_id)?;
+            let current_participant = self
+                .channel
+                .participant(&participant_id)
+                .cloned()
+                .ok_or_else(|| AgentChannelRuntimeError::ParticipantNotFound {
+                    participant_id: participant_id.clone(),
+                })?;
+            let session = self.sessions.get(&participant_id).ok_or_else(|| {
+                AgentChannelRuntimeError::ParticipantNotFound {
+                    participant_id: participant_id.clone(),
+                }
+            })?;
+            let decision = match self.executor.decide_speak(
+                &self.channel,
+                &current_participant,
+                &latest_user_message,
+                session,
+            ) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    let decision = AgentChannelSpeakDecision::silent(
+                        &current_participant,
+                        format!("speak gate failed: {}", error.detail),
+                        0.0,
+                    );
+                    let system = self.channel.append_system_error(
+                        format!(
+                            "{} did not respond because its speak gate failed: {}",
+                            current_participant.agent_name, error.detail
+                        ),
+                        AgentChannelSource::system(serde_json::json!({
+                            "channel_id": self.channel.channel_id,
+                            "participant_id": current_participant.participant_id,
+                            "agent_key": current_participant.agent_key,
+                            "agent_session_id": current_participant.agent_session_id,
+                            "error_type": "speak_gate"
+                        })),
+                    );
+                    self.store
+                        .append_message(&self.channel.channel_id, &system)?;
+                    on_event(AgentChannelRuntimeEvent::System {
+                        channel_id: self.channel.channel_id.clone(),
+                        message_id: system.message_id.clone(),
+                        message_kind: system.message_kind.clone(),
+                        text: system.content.clone(),
+                    });
+                    system_message_ids.push(system.message_id);
+                    decision
+                }
+            };
+            decisions.push(decision.clone());
+            if !decision.speak {
+                continue;
+            }
+
+            let Some(session) = self.sessions.get_mut(&participant_id) else {
+                return Err(AgentChannelRuntimeError::ParticipantNotFound { participant_id });
+            };
+            let response =
+                match self
+                    .executor
+                    .speak(&self.channel, &current_participant, session, on_event)
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let system = self.channel.append_system_error(
+                            format!(
+                                "{} failed while responding: {}",
+                                current_participant.agent_name, error.detail
+                            ),
+                            AgentChannelSource::system(serde_json::json!({
+                                "channel_id": self.channel.channel_id,
+                                "participant_id": current_participant.participant_id,
+                                "agent_key": current_participant.agent_key,
+                                "agent_session_id": current_participant.agent_session_id,
+                                "error_type": "agent_response"
+                            })),
+                        );
+                        self.store
+                            .append_message(&self.channel.channel_id, &system)?;
+                        on_event(AgentChannelRuntimeEvent::System {
+                            channel_id: self.channel.channel_id.clone(),
+                            message_id: system.message_id.clone(),
+                            message_kind: system.message_kind.clone(),
+                            text: system.content.clone(),
+                        });
+                        system_message_ids.push(system.message_id);
+                        continue;
+                    }
+                };
+            if response.trim().is_empty() {
+                continue;
+            }
+            let message = self.channel.append_agent_message(
+                &current_participant,
+                response,
+                AgentChannelSource::app(),
+            );
+            self.store
+                .append_message(&self.channel.channel_id, &message)?;
+            response_message_ids.push(message.message_id.clone());
+            if let Some(participant) = self.channel.participant_mut(&participant_id) {
+                participant.observed_through_sequence =
+                    participant.observed_through_sequence.max(message.sequence);
+            }
+        }
+
+        if response_message_ids.is_empty() {
+            let system = self.channel.append_system_info(
+                "No agent responded.",
+                AgentChannelSource::system(serde_json::json!({
+                    "channel_id": self.channel.channel_id,
+                    "event_type": "no_agent_responded"
+                })),
+            );
+            self.store
+                .append_message(&self.channel.channel_id, &system)?;
+            on_event(AgentChannelRuntimeEvent::System {
+                channel_id: self.channel.channel_id.clone(),
+                message_id: system.message_id.clone(),
+                message_kind: system.message_kind.clone(),
+                text: system.content.clone(),
+            });
+            system_message_ids.push(system.message_id);
+        }
+
+        let turn = AgentChannelTurn {
+            turn_id: TaskId::generate(),
+            channel_id: self.channel.channel_id.clone(),
+            trigger_message_id: latest_user_message.message_id.clone(),
+            decisions,
+            response_message_ids,
+            system_message_ids,
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        self.store.append_turn(&self.channel.channel_id, &turn)?;
+        self.store.save_channel(&self.channel)?;
+        Ok(AgentChannelTurnReport {
+            turn,
+            latest_user_message,
+        })
+    }
+
+    fn ensure_session_for_participant(&mut self, participant: &AgentChannelParticipant) {
+        self.sessions
+            .entry(participant.participant_id.clone())
+            .or_insert_with(|| {
+                AgentSession::new(
+                    participant.agent_session_id.clone(),
+                    agent_role_for_key(&participant.agent_key),
+                )
+            });
+    }
+
+    fn sync_participant(
+        &mut self,
+        participant_id: &TaskId,
+    ) -> Result<(), AgentChannelRuntimeError> {
+        let channel = self.channel.clone();
+        let Some(participant) = self.channel.participant_mut(participant_id) else {
+            return Err(AgentChannelRuntimeError::ParticipantNotFound {
+                participant_id: participant_id.clone(),
+            });
+        };
+        let Some(session) = self.sessions.get_mut(participant_id) else {
+            return Err(AgentChannelRuntimeError::ParticipantNotFound {
+                participant_id: participant_id.clone(),
+            });
+        };
+        sync_participant_session(&channel, participant, session);
+        Ok(())
+    }
+}
+
+fn agent_role_for_key(agent_key: &str) -> AgentRole {
+    AgentDefinition::built_in(agent_key)
+        .map(|definition| definition.role)
+        .unwrap_or(AgentRole::Main)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_lm::{LanguageModelResponse, LanguageModelUsage};
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Clone, Default)]
+    struct MemoryChannelStore {
+        channels: Arc<Mutex<BTreeMap<SessionId, AgentChannel>>>,
+        messages: Arc<Mutex<Vec<AgentChannelMessage>>>,
+        turns: Arc<Mutex<Vec<AgentChannelTurn>>>,
+    }
+
+    impl AgentChannelStore for MemoryChannelStore {
+        fn save_channel(&self, channel: &AgentChannel) -> Result<(), AgentChannelStoreError> {
+            self.channels
+                .lock()
+                .expect("channels lock")
+                .insert(channel.channel_id.clone(), channel.clone());
+            Ok(())
+        }
+
+        fn load_channel(
+            &self,
+            channel_id: &SessionId,
+        ) -> Result<Option<AgentChannel>, AgentChannelStoreError> {
+            Ok(self
+                .channels
+                .lock()
+                .expect("channels lock")
+                .get(channel_id)
+                .cloned())
+        }
+
+        fn list_channels(&self) -> Result<Vec<AgentChannel>, AgentChannelStoreError> {
+            Ok(self
+                .channels
+                .lock()
+                .expect("channels lock")
+                .values()
+                .filter(|channel| !channel.is_deleted())
+                .cloned()
+                .collect())
+        }
+
+        fn append_message(
+            &self,
+            _channel_id: &SessionId,
+            message: &AgentChannelMessage,
+        ) -> Result<(), AgentChannelStoreError> {
+            self.messages
+                .lock()
+                .expect("messages lock")
+                .push(message.clone());
+            Ok(())
+        }
+
+        fn append_turn(
+            &self,
+            _channel_id: &SessionId,
+            turn: &AgentChannelTurn,
+        ) -> Result<(), AgentChannelStoreError> {
+            self.turns.lock().expect("turns lock").push(turn.clone());
+            Ok(())
+        }
+    }
+
+    struct ScriptExecutor {
+        decisions: BTreeMap<String, Result<bool, String>>,
+        responses: BTreeMap<String, Result<String, String>>,
+        seen_by_speaker: Arc<Mutex<Vec<(String, Vec<String>)>>>,
+    }
+
+    impl ScriptExecutor {
+        fn new() -> Self {
+            Self {
+                decisions: BTreeMap::new(),
+                responses: BTreeMap::new(),
+                seen_by_speaker: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn with_decision(mut self, agent_key: &str, speak: bool) -> Self {
+            self.decisions.insert(agent_key.to_string(), Ok(speak));
+            self
+        }
+
+        fn with_decision_error(mut self, agent_key: &str, detail: &str) -> Self {
+            self.decisions
+                .insert(agent_key.to_string(), Err(detail.to_string()));
+            self
+        }
+
+        fn with_response(mut self, agent_key: &str, response: &str) -> Self {
+            self.responses
+                .insert(agent_key.to_string(), Ok(response.to_string()));
+            self
+        }
+
+        fn seen_by_speaker(&self) -> Arc<Mutex<Vec<(String, Vec<String>)>>> {
+            self.seen_by_speaker.clone()
+        }
+    }
+
+    impl AgentChannelTurnExecutor for ScriptExecutor {
+        fn decide_speak(
+            &mut self,
+            _channel: &AgentChannel,
+            participant: &AgentChannelParticipant,
+            _latest_user_message: &AgentChannelMessage,
+            _session: &AgentSession,
+        ) -> Result<AgentChannelSpeakDecision, AgentChannelExecutorError> {
+            match self.decisions.get(&participant.agent_key) {
+                Some(Ok(true)) => Ok(AgentChannelSpeakDecision::speak(
+                    participant,
+                    "scripted",
+                    0.9,
+                )),
+                Some(Ok(false)) | None => Ok(AgentChannelSpeakDecision::silent(
+                    participant,
+                    "scripted silent",
+                    0.9,
+                )),
+                Some(Err(detail)) => Err(AgentChannelExecutorError::new(detail.clone())),
+            }
+        }
+
+        fn speak(
+            &mut self,
+            _channel: &AgentChannel,
+            participant: &AgentChannelParticipant,
+            session: &mut AgentSession,
+            on_event: &mut dyn FnMut(AgentChannelRuntimeEvent),
+        ) -> Result<String, AgentChannelExecutorError> {
+            let seen = session
+                .transcript
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    AgentItem::UserMessage { content, .. } => Some(content.clone()),
+                    AgentItem::AssistantText { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            self.seen_by_speaker
+                .lock()
+                .expect("seen lock")
+                .push((participant.agent_key.clone(), seen));
+            let response = self
+                .responses
+                .get(&participant.agent_key)
+                .cloned()
+                .unwrap_or_else(|| Ok(String::new()))
+                .map_err(AgentChannelExecutorError::new)?;
+            if !response.is_empty() {
+                on_event(AgentChannelRuntimeEvent::Token {
+                    channel_id: SessionId::generate(),
+                    participant_id: participant.participant_id.clone(),
+                    agent_key: participant.agent_key.clone(),
+                    agent_name: participant.agent_name.clone(),
+                    agent_session_id: participant.agent_session_id.clone(),
+                    text: response.clone(),
+                });
+                let item = AgentItem::AssistantText {
+                    item_id: TaskId::generate(),
+                    step_index: session.transcript.items.len(),
+                    content: response.clone(),
+                };
+                session.transcript.push(item.clone());
+                session.raw_transcript.push(item);
+            }
+            Ok(response)
+        }
+    }
+
+    #[test]
+    fn channel_creation_stores_distinct_agent_sessions() {
+        let mut channel = AgentChannel::with_default_title(SessionId::generate());
+        let first = channel.ensure_participant("main-agent", "Main");
+        let second = channel.ensure_participant("coding-agent", "Coding");
+        assert_ne!(first, second);
+        let first_session = channel
+            .participant(&first)
+            .expect("first participant")
+            .agent_session_id
+            .clone();
+        let second_session = channel
+            .participant(&second)
+            .expect("second participant")
+            .agent_session_id
+            .clone();
+        assert_ne!(first_session, second_session);
+    }
+
+    #[test]
+    fn remove_and_readd_preserves_participant_session_state() {
+        let mut channel = AgentChannel::with_default_title(SessionId::generate());
+        let participant_id = channel.ensure_participant("main-agent", "Main");
+        let session_id = channel
+            .participant(&participant_id)
+            .expect("participant")
+            .agent_session_id
+            .clone();
+        assert!(channel.disable_participant(&participant_id));
+        assert!(
+            !channel
+                .participant(&participant_id)
+                .expect("disabled participant")
+                .enabled
+        );
+        let readded_id = channel.ensure_participant("main-agent", "Main renamed");
+        let readded = channel
+            .participant(&readded_id)
+            .expect("readded participant");
+        assert_eq!(readded_id, participant_id);
+        assert_eq!(readded.agent_session_id, session_id);
+        assert!(readded.enabled);
+        assert_eq!(readded.agent_name, "Main renamed");
+    }
+
+    #[test]
+    fn sequential_orchestration_lets_later_agents_see_earlier_replies() {
+        let mut channel = AgentChannel::with_default_title(SessionId::generate());
+        channel.ensure_participant("main-agent", "Main");
+        channel.ensure_participant("coding-agent", "Coding");
+        let executor = ScriptExecutor::new()
+            .with_decision("main-agent", true)
+            .with_response("main-agent", "First reply")
+            .with_decision("coding-agent", true)
+            .with_response("coding-agent", "Second reply");
+        let seen = executor.seen_by_speaker();
+        let mut runtime =
+            AgentChannelRuntime::new(channel, MemoryChannelStore::default(), executor);
+        let mut events = Vec::new();
+        let report = runtime
+            .send_user_message("What should we do?", &mut |event| events.push(event))
+            .expect("send");
+        assert_eq!(report.turn.response_message_ids.len(), 2);
+
+        let seen = seen.lock().expect("seen lock").clone();
+        let coding_seen = seen
+            .iter()
+            .find(|(agent_key, _)| agent_key == "coding-agent")
+            .expect("coding speaker")
+            .1
+            .clone();
+        assert!(
+            coding_seen
+                .iter()
+                .any(|content| content.contains("Main: First reply")),
+            "later participant transcript should include earlier channel reply: {coding_seen:?}"
+        );
+        assert_eq!(
+            runtime
+                .channel()
+                .transcript
+                .iter()
+                .filter(|message| matches!(message.author, AgentChannelAuthor::Agent { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn speak_gate_false_and_error_paths_emit_channel_events() {
+        let mut channel = AgentChannel::with_default_title(SessionId::generate());
+        channel.ensure_participant("main-agent", "Main");
+        channel.ensure_participant("coding-agent", "Coding");
+        let executor = ScriptExecutor::new()
+            .with_decision("main-agent", false)
+            .with_decision_error("coding-agent", "provider not configured");
+        let mut runtime =
+            AgentChannelRuntime::new(channel, MemoryChannelStore::default(), executor);
+        let mut events = Vec::new();
+        let report = runtime
+            .send_user_message("Anyone?", &mut |event| events.push(event))
+            .expect("send");
+        assert!(report.turn.response_message_ids.is_empty());
+        assert_eq!(
+            report
+                .turn
+                .decisions
+                .iter()
+                .filter(|decision| decision.speak)
+                .count(),
+            0
+        );
+        assert!(
+            runtime.channel().transcript.iter().any(|message| {
+                message.message_kind == AgentChannelMessageKind::Error
+                    && message.content.contains("speak gate failed")
+            }),
+            "gate errors should be stored as system error messages"
+        );
+        assert!(
+            runtime.channel().transcript.iter().any(|message| {
+                message.message_kind == AgentChannelMessageKind::Info
+                    && message.content == "No agent responded."
+            }),
+            "no-speaker turns should store a system info message"
+        );
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentChannelRuntimeEvent::System {
+                    message_kind: AgentChannelMessageKind::Error,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn participant_session_sync_maps_channel_messages() {
+        let mut channel = AgentChannel::with_default_title(SessionId::generate());
+        let main_id = channel.ensure_participant("main-agent", "Main");
+        let coding_id = channel.ensure_participant("coding-agent", "Coding");
+        let main = channel.participant(&main_id).expect("main").clone();
+        let _user = channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "Alice",
+            "Please inspect this.",
+            AgentChannelSource::app(),
+        );
+        let _main_reply =
+            channel.append_agent_message(&main, "I will look first.", AgentChannelSource::app());
+        let _system = channel.append_system_error(
+            "Provider warning.",
+            AgentChannelSource::system(serde_json::json!({"error_type": "provider"})),
+        );
+        let mut coding = channel.participant(&coding_id).expect("coding").clone();
+        let mut session = AgentSession::new(coding.agent_session_id.clone(), AgentRole::Main);
+        sync_participant_session(&channel, &mut coding, &mut session);
+        let rendered = session
+            .transcript
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                AgentItem::UserMessage { content, .. } => Some(content.clone()),
+                AgentItem::AssistantText { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rendered,
+            vec![
+                "Alice: Please inspect this.".to_string(),
+                "Main: I will look first.".to_string(),
+                "System: Provider warning.".to_string(),
+            ]
+        );
+        assert_eq!(coding.observed_through_sequence, 3);
+    }
+
+    #[derive(Clone)]
+    struct GateModel {
+        response: Result<String, String>,
+        requests: Arc<Mutex<Vec<LanguageModelRequest>>>,
+    }
+
+    impl GateModel {
+        fn success(content: &str) -> Self {
+            Self {
+                response: Ok(content.to_string()),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn failure(detail: &str) -> Self {
+            Self {
+                response: Err(detail.to_string()),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl InteractionModel for GateModel {
+        fn complete(
+            &self,
+            request: &LanguageModelRequest,
+        ) -> Result<LanguageModelResponse, LanguageModelError> {
+            self.requests
+                .lock()
+                .expect("requests lock")
+                .push(request.clone());
+            match &self.response {
+                Ok(content) => Ok(LanguageModelResponse {
+                    provider: request.provider.clone(),
+                    model: request.model.clone(),
+                    content: content.clone(),
+                    items: Vec::new(),
+                    tool_calls: Vec::new(),
+                    usage: Some(LanguageModelUsage {
+                        input_tokens: Some(1),
+                        output_tokens: Some(1),
+                    }),
+                }),
+                Err(detail) => Err(LanguageModelError::ProviderInvocationFailed {
+                    provider: request.provider.clone(),
+                    model: request.model.clone(),
+                    detail: detail.clone(),
+                }),
+            }
+        }
+    }
+
+    #[test]
+    fn speak_gate_parses_json_contract_and_disables_tools() {
+        let mut channel = AgentChannel::with_default_title(SessionId::generate());
+        let participant_id = channel.ensure_participant("main-agent", "Main");
+        let latest = channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "User",
+            "Should you answer?",
+            AgentChannelSource::app(),
+        );
+        let participant = channel.participant(&participant_id).expect("participant");
+        let model = GateModel::success(r#"{"speak":true,"reason":"helpful","confidence":0.75}"#);
+        let gate = AgentChannelSpeakGate::new(&model, "fake", "fake-model");
+        let decision = gate
+            .evaluate(&channel, participant, &latest)
+            .expect("gate decision");
+        assert!(decision.speak);
+        assert_eq!(decision.reason, "helpful");
+        let requests = model.requests.lock().expect("requests lock");
+        let request = requests.first().expect("request");
+        assert!(request.tools.is_empty());
+        assert_eq!(request.tool_choice, Some(LanguageModelToolChoice::None));
+        assert_eq!(
+            request.response_format,
+            LanguageModelResponseFormat::JsonObject
+        );
+    }
+
+    #[test]
+    fn speak_gate_reports_parse_and_provider_errors() {
+        let mut channel = AgentChannel::with_default_title(SessionId::generate());
+        let participant_id = channel.ensure_participant("main-agent", "Main");
+        let latest = channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "User",
+            "Should you answer?",
+            AgentChannelSource::app(),
+        );
+        let participant = channel.participant(&participant_id).expect("participant");
+        let parse_model = GateModel::success("not json");
+        let parse_error = AgentChannelSpeakGate::new(&parse_model, "fake", "fake")
+            .evaluate(&channel, participant, &latest)
+            .expect_err("parse error");
+        assert!(matches!(
+            parse_error,
+            AgentChannelSpeakGateError::Parse { .. }
+        ));
+
+        let provider_model = GateModel::failure("not logged in");
+        let provider_error = AgentChannelSpeakGate::new(&provider_model, "fake", "fake")
+            .evaluate(&channel, participant, &latest)
+            .expect_err("provider error");
+        assert!(matches!(
+            provider_error,
+            AgentChannelSpeakGateError::Provider { .. }
+        ));
+    }
+
+    #[test]
+    fn file_channel_store_round_trips_and_lists_non_deleted_channels() {
+        let data_dir = temp_data_dir("agent-channel-store");
+        let store = FileAgentChannelStore::for_data_dir(&data_dir);
+        let mut channel = AgentChannel::new(SessionId::generate(), "Round trip");
+        let message =
+            channel.append_system_info("stored", AgentChannelSource::system(serde_json::json!({})));
+        store.save_channel(&channel).expect("save channel");
+        store
+            .append_message(&channel.channel_id, &message)
+            .expect("append message");
+        let loaded = store
+            .load_channel(&channel.channel_id)
+            .expect("load channel")
+            .expect("channel exists");
+        assert_eq!(loaded.title, "Round trip");
+        assert_eq!(loaded.transcript.len(), 1);
+        assert_eq!(store.list_channels().expect("list").len(), 1);
+
+        let mut deleted = loaded.clone();
+        deleted.tombstone();
+        store.save_channel(&deleted).expect("save tombstone");
+        assert!(store.list_channels().expect("list hidden").is_empty());
+    }
+
+    fn temp_data_dir(slug: &str) -> SinomoDataDir {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("sinomo-{slug}-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("create temp data dir");
+        SinomoDataDir::new(path)
+    }
+}

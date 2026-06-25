@@ -1,8 +1,8 @@
-//! Lightweight per-session persistence for the chat tab.
+//! Lightweight per-chat persistence for the chat tab.
 //!
-//! Sessions are stored in SIFS under `/services/sinomo-app/...`.
+//! Chats are stored in SIFS under `/services/sinomo-app/...`.
 //!
-//! The app must not treat `$DATA/app/sessions` as authoritative: sessions can be
+//! The app must not treat `$DATA/app/sessions` as authoritative: chats can be
 //! created or updated on another node, and DFS/SIFS owns caching. App-local files
 //! may exist from older builds, but reads and writes in this module use SIFS as
 //! the source of truth.
@@ -17,7 +17,7 @@ const SIFS_SESSION_FILE_PREFIX: &str = "/services/sinomo-app-chat-session-";
 const SIFS_SESSION_FILE_NAME_PREFIX: &str = "sinomo-app-chat-session-";
 const SIFS_SESSION_FILE_SUFFIX: &str = ".json";
 
-/// Sidebar metadata for a stored session.
+/// Sidebar metadata for a stored chat.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub id: String,
@@ -90,7 +90,7 @@ struct StoredSessionIndex {
     sessions: Vec<SessionMeta>,
 }
 
-/// Persist a session's metadata + transcript.
+/// Persist a chat's metadata + transcript.
 pub fn save(
     data_dir: &SinomoDataDir,
     id: &str,
@@ -100,8 +100,8 @@ pub fn save(
     save_with_report(data_dir, id, title, messages)
 }
 
-/// Persist a session to SIFS. SIFS is the source of truth; failure to write SIFS
-/// is a session-save failure.
+/// Persist a chat to SIFS. SIFS is the source of truth; failure to write SIFS
+/// is a chat-save failure.
 pub fn save_with_report(
     data_dir: &SinomoDataDir,
     id: &str,
@@ -114,7 +114,7 @@ pub fn save_with_report(
     if !valid_session_id(id) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "invalid session id",
+            "invalid chat id",
         ));
     }
     let existing = load_sifs_record(data_dir, id);
@@ -141,27 +141,27 @@ pub fn save_with_report(
     Ok(())
 }
 
-/// Rename a stored session without changing its transcript.
+/// Rename a stored chat without changing its transcript.
 pub fn rename(data_dir: &SinomoDataDir, id: &str, title: &str) -> std::io::Result<()> {
     if !valid_session_id(id) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "invalid session id",
+            "invalid chat id",
         ));
     }
     let title = title.trim();
     if title.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "session title cannot be empty",
+            "chat title cannot be empty",
         ));
     }
     let mut record = load_sifs_record(data_dir, id)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "session not found"))?;
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "chat not found"))?;
     if record.meta.deleted_unix.is_some() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "session not found",
+            "chat not found",
         ));
     }
     record.meta.title = title.chars().take(80).collect();
@@ -171,13 +171,13 @@ pub fn rename(data_dir: &SinomoDataDir, id: &str, title: &str) -> std::io::Resul
         .map_err(|detail| std::io::Error::new(std::io::ErrorKind::Other, detail))
 }
 
-/// Hide a session from listings and future loads. SIFS has no exposed unlink operation, so deletion
-/// is represented by a tombstone record at the session path.
+/// Hide a chat from listings and future loads. SIFS has no exposed unlink operation, so deletion
+/// is represented by a tombstone record at the chat path.
 pub fn delete(data_dir: &SinomoDataDir, id: &str) -> std::io::Result<()> {
     if !valid_session_id(id) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "invalid session id",
+            "invalid chat id",
         ));
     }
     let deleted_unix = now_unix();
@@ -202,14 +202,14 @@ pub fn delete(data_dir: &SinomoDataDir, id: &str) -> std::io::Result<()> {
         .map_err(|detail| std::io::Error::new(std::io::ErrorKind::Other, detail))
 }
 
-/// List stored sessions from SIFS (metadata only), newest first.
+/// List stored chats from SIFS (metadata only), newest first.
 pub fn list(data_dir: &SinomoDataDir) -> Vec<SessionMeta> {
     let mut metas = list_sifs(data_dir);
     metas.sort_by_key(|m| std::cmp::Reverse(m.updated_unix));
     metas
 }
 
-/// Load a session's transcript on demand.
+/// Load a chat's transcript on demand.
 pub fn load_transcript(data_dir: &SinomoDataDir, id: &str) -> Option<StoredTranscript> {
     if !valid_session_id(id) {
         return None;
@@ -358,7 +358,7 @@ fn load_legacy_sifs_record(browser: &SifsBrowser, id: &str) -> Option<StoredSess
 
 fn sifs_session_file(id: &str) -> Result<String, String> {
     if !valid_session_id(id) {
-        return Err("invalid session id".to_string());
+        return Err("invalid chat id".to_string());
     }
     Ok(format!(
         "{SIFS_SESSION_FILE_PREFIX}{id}{SIFS_SESSION_FILE_SUFFIX}"
@@ -367,7 +367,7 @@ fn sifs_session_file(id: &str) -> Result<String, String> {
 
 fn sifs_session_dir(id: &str) -> Result<String, String> {
     if !valid_session_id(id) {
-        return Err("invalid session id".to_string());
+        return Err("invalid chat id".to_string());
     }
     Ok(format!("{SIFS_SESSIONS_ROOT}/{id}"))
 }

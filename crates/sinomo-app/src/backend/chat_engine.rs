@@ -18,8 +18,8 @@ use sinomo_agent::{
 };
 use sinomo_cli::app_api::{
     AgentChat, ChatContextSnapshot, ChatControlState, ChatControlStatus, ChatHistoryMessage,
-    ChatProcessSnapshot, ChatRuntimeInfo, ChatStreamEvent, ChatTaskSnapshot, ChatToolCallSnapshot,
-    ChatUsageSnapshot,
+    ChatProcessSnapshot, ChatRuntimeInfo, ChatSpeaker, ChatStreamEvent, ChatTaskSnapshot,
+    ChatToolCallSnapshot, ChatUsageSnapshot,
 };
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
@@ -111,9 +111,19 @@ pub enum ChatEvent {
         session_id: String,
         text: String,
     },
+    AgentToken {
+        session_id: String,
+        speaker: ChatSpeaker,
+        text: String,
+    },
     Notice {
         session_id: String,
         notice: String,
+    },
+    SystemMessage {
+        session_id: String,
+        kind: String,
+        text: String,
     },
     Context {
         session_id: String,
@@ -166,7 +176,9 @@ impl ChatEvent {
     pub fn session_id(&self) -> Option<&str> {
         match self {
             ChatEvent::Token { session_id, .. }
+            | ChatEvent::AgentToken { session_id, .. }
             | ChatEvent::Notice { session_id, .. }
+            | ChatEvent::SystemMessage { session_id, .. }
             | ChatEvent::Context { session_id, .. }
             | ChatEvent::ToolCallStarted { session_id, .. }
             | ChatEvent::ToolCallDelta { session_id, .. }
@@ -558,12 +570,29 @@ fn worker(
                             session_id: event_session_id.clone(),
                             text,
                         }),
+                        ChatStreamEvent::AgentToken { speaker, text } => {
+                            Some(ChatEvent::AgentToken {
+                                session_id: speaker.channel_id.clone(),
+                                speaker,
+                                text,
+                            })
+                        }
                         ChatStreamEvent::Notice(notice) if !notice.is_empty() => {
                             Some(ChatEvent::Notice {
                                 session_id: event_session_id.clone(),
                                 notice,
                             })
                         }
+                        ChatStreamEvent::ChannelSystem {
+                            channel_id,
+                            kind,
+                            text,
+                            ..
+                        } => Some(ChatEvent::SystemMessage {
+                            session_id: channel_id,
+                            kind,
+                            text,
+                        }),
                         ChatStreamEvent::Context(context) => Some(ChatEvent::Context {
                             session_id: event_session_id.clone(),
                             context,

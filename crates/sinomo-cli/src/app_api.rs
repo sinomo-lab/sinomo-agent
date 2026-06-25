@@ -9,13 +9,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use sinomo_agent::{
-    AgentCatalog, AgentDefinition, AgentItem, AgentModelEvent, AgentRuntimeControlHost,
-    AgentRuntimeControlRegistry, AgentRuntimeEvent, AgentRuntimeEventPayload,
-    AgentSessionControlResult, AgentSessionFollowUpRequest, AgentSessionInterruptRequest,
-    AgentSessionReattachState, AgentSessionResumeRequest, AgentSessionResumeResponse,
-    AgentSessionSteerRequest, AgentTaskLifecycleStatus, AgentTaskSnapshot, AgentToolProgressEvent,
-    ContextAssemblyReport, InteractionOutput, InteractionSession, InteractionSurface,
-    InteractionSurfaceKind, TaskId,
+    AGENT_CHANNEL_APP_USER_ID, AgentCatalog, AgentChannel, AgentChannelAuthor, AgentChannelMessage,
+    AgentChannelMessageKind, AgentChannelParticipant, AgentChannelSource, AgentChannelStore,
+    AgentChannelTurn, AgentChannelUser, AgentDefinition, AgentItem, AgentModelEvent,
+    AgentRuntimeControlHost, AgentRuntimeControlRegistry, AgentRuntimeEvent,
+    AgentRuntimeEventPayload, AgentSessionControlResult, AgentSessionFollowUpRequest,
+    AgentSessionInterruptRequest, AgentSessionReattachState, AgentSessionResumeRequest,
+    AgentSessionResumeResponse, AgentSessionSteerRequest, AgentTaskLifecycleStatus,
+    AgentTaskSnapshot, AgentToolProgressEvent, ContextAssemblyReport, FileAgentChannelStore,
+    InteractionOutput, InteractionSession, InteractionSurface, InteractionSurfaceKind, TaskId,
 };
 use sinomo_lm::{
     AnthropicConfig, ClaudeCodeConfig, CodexCliConfig, GeminiConfig, GitHubCopilotConfig,
@@ -70,8 +72,17 @@ impl From<tui::AppRuntimeInfo> for ChatRuntimeInfo {
 pub enum ChatStreamEvent {
     /// A visible answer fragment.
     Token(String),
+    /// A visible answer fragment with channel participant metadata.
+    AgentToken { speaker: ChatSpeaker, text: String },
     /// A transient progress / status note (e.g. "waiting for model runtime").
     Notice(String),
+    /// A channel-scoped system information/error message.
+    ChannelSystem {
+        channel_id: String,
+        message_id: String,
+        kind: String,
+        text: String,
+    },
     /// A model-visible context budget report for the next sampling step.
     Context(ChatContextSnapshot),
     /// A native/model tool call started.
@@ -143,6 +154,27 @@ pub struct ChatUsageSnapshot {
     pub model: String,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+}
+
+/// Speaker metadata attached to channel-backed agent output.
+#[derive(Clone, Debug, Default)]
+pub struct ChatSpeaker {
+    pub channel_id: String,
+    pub participant_id: String,
+    pub agent_key: String,
+    pub agent_name: String,
+    pub agent_session_id: String,
+}
+
+/// A channel participant exposed to the app.
+#[derive(Clone, Debug, Default)]
+pub struct ChatParticipant {
+    pub participant_id: String,
+    pub agent_key: String,
+    pub agent_name: String,
+    pub agent_session_id: String,
+    pub enabled: bool,
+    pub order: u32,
 }
 
 /// Compact background task state for the app UI.
@@ -237,6 +269,8 @@ pub struct AppClusterInvite {
 pub struct AgentChat {
     data_dir: SinomoDataDir,
     daemon_connected: bool,
+    channel_store: FileAgentChannelStore,
+    channel: AgentChannel,
     runtime: InteractionRuntime<InMemoryEventStore, Handler>,
 }
 
@@ -264,14 +298,21 @@ impl AgentChat {
         runtime
             .handler_mut()
             .replace_agent_session(&session, agent_transcript_from_history(&[]))?;
+        let channel_store = FileAgentChannelStore::for_data_dir(&data_dir);
+        let mut channel = AgentChannel::with_default_title(session.session_id.clone());
+        let info: ChatRuntimeInfo = tui::app_runtime_info(runtime.handler()).into();
+        ensure_primary_participant(&mut channel, &info, true);
+        let _ = channel_store.save_channel(&channel);
         Ok(Self {
             data_dir,
             daemon_connected,
+            channel_store,
+            channel,
             runtime,
         })
     }
 
-    /// Begin a brand-new session (clears the in-memory transcript/context).
+    /// Begin a brand-new chat (clears the in-memory transcript/context).
     pub fn reset_session(&mut self) {
         let session = app_session(None);
         self.runtime
@@ -280,30 +321,59 @@ impl AgentChat {
             .runtime
             .handler_mut()
             .replace_agent_session(&session, agent_transcript_from_history(&[]));
+        self.channel = AgentChannel::with_default_title(session.session_id.clone());
+        let info = self.runtime_info();
+        ensure_primary_participant(&mut self.channel, &info, true);
+        let _ = self.channel_store.save_channel(&self.channel);
     }
 
-    /// Adopt an existing session id for continued turns (fresh in-memory context;
-    /// the visible transcript is restored by the caller from its own store).
+    /// Adopt an existing channel id for continued turns (fresh in-memory context;
+    /// legacy visible transcripts are imported as one-user/one-agent channels).
     pub fn resume_session(
         &mut self,
         session_id: &str,
         history: &[ChatHistoryMessage],
     ) -> Result<(), CliError> {
         let session = app_session(Some(session_id));
+        let info = self.runtime_info();
+        let mut channel = match self.channel_store.load_channel(&session.session_id) {
+            Ok(Some(channel)) => channel,
+            Ok(None) => legacy_channel_from_history(session.session_id.clone(), history, &info),
+            Err(error) => {
+                return Err(CliError::Parse {
+                    detail: format!("load chat channel failed: {error}"),
+                });
+            }
+        };
+        ensure_primary_participant(&mut channel, &info, true);
         self.runtime
             .replace_store_and_session(InMemoryEventStore::new(), session.clone());
         self.runtime
             .handler_mut()
-            .replace_agent_session(&session, agent_transcript_from_history(history))?;
+            .replace_agent_session(&session, agent_transcript_from_channel(&channel, history))?;
+        self.channel = channel;
+        self.save_channel_best_effort();
         Ok(())
     }
 
     pub fn session_id(&self) -> String {
-        self.runtime.session().session_id.to_string()
+        self.channel.channel_id.to_string()
     }
 
     pub fn runtime_info(&self) -> ChatRuntimeInfo {
         tui::app_runtime_info(self.runtime.handler()).into()
+    }
+
+    pub fn channel_id(&self) -> String {
+        self.channel.channel_id.to_string()
+    }
+
+    pub fn participants(&self) -> Vec<ChatParticipant> {
+        self.channel
+            .participants
+            .iter()
+            .map(chat_participant)
+            .collect()
     }
 
     /// Live control registry for this chat runtime's active agent sessions.
@@ -366,12 +436,105 @@ impl AgentChat {
         text: &str,
         on_event: &mut dyn FnMut(ChatStreamEvent),
     ) -> Result<(), CliError> {
-        let mut emit = |output: InteractionOutput| forward_output(output, on_event);
-        let trailing = self.runtime.ingest_user_input_streaming(text, &mut emit)?;
-        for output in trailing {
-            forward_output(output, on_event);
+        let speaker = self.primary_speaker();
+        let user_message = self.channel.append_user_message(
+            AGENT_CHANNEL_APP_USER_ID,
+            "User",
+            text,
+            AgentChannelSource::app(),
+        );
+        let _ = self
+            .channel_store
+            .append_message(&self.channel.channel_id, &user_message);
+        self.save_channel_best_effort();
+
+        let mut streamed_answer = String::new();
+        let mut wrapped_event = |event: ChatStreamEvent| match event {
+            ChatStreamEvent::Token(text) => {
+                streamed_answer.push_str(&text);
+                on_event(ChatStreamEvent::AgentToken {
+                    speaker: speaker.clone(),
+                    text,
+                });
+            }
+            ChatStreamEvent::AgentToken { speaker, text } => {
+                streamed_answer.push_str(&text);
+                on_event(ChatStreamEvent::AgentToken { speaker, text });
+            }
+            event => on_event(event),
+        };
+
+        let result = (|| {
+            let mut emit = |output: InteractionOutput| forward_output(output, &mut wrapped_event);
+            let trailing = self.runtime.ingest_user_input_streaming(text, &mut emit)?;
+            for output in trailing {
+                forward_output(output, &mut wrapped_event);
+            }
+            drain_runtime_events(&mut self.runtime, &mut wrapped_event)
+        })();
+
+        match result {
+            Ok(()) => {
+                let mut response_message_ids = Vec::new();
+                let mut system_message_ids = Vec::new();
+                if !streamed_answer.trim().is_empty() {
+                    let participant = self
+                        .primary_participant()
+                        .cloned()
+                        .unwrap_or_else(|| participant_from_speaker(&speaker));
+                    let message = self.channel.append_agent_message(
+                        &participant,
+                        streamed_answer,
+                        AgentChannelSource::app(),
+                    );
+                    response_message_ids.push(message.message_id.clone());
+                    let _ = self
+                        .channel_store
+                        .append_message(&self.channel.channel_id, &message);
+                } else {
+                    let message = self.channel.append_system_info(
+                        "No agent responded.",
+                        AgentChannelSource::system(serde_json::json!({
+                            "channel_id": self.channel.channel_id,
+                            "event_type": "no_agent_responded"
+                        })),
+                    );
+                    system_message_ids.push(message.message_id.clone());
+                    let _ = self
+                        .channel_store
+                        .append_message(&self.channel.channel_id, &message);
+                    emit_channel_system(&message, &self.channel.channel_id, on_event);
+                }
+                self.append_channel_turn(
+                    user_message.message_id,
+                    response_message_ids,
+                    system_message_ids,
+                );
+                self.save_channel_best_effort();
+            }
+            Err(error) => {
+                let message = self.channel.append_system_error(
+                    format!("Error: {error}"),
+                    AgentChannelSource::system(serde_json::json!({
+                        "channel_id": self.channel.channel_id,
+                        "participant_id": speaker.participant_id,
+                        "agent_key": speaker.agent_key,
+                        "agent_session_id": speaker.agent_session_id,
+                        "error_type": "agent_turn"
+                    })),
+                );
+                let _ = self
+                    .channel_store
+                    .append_message(&self.channel.channel_id, &message);
+                emit_channel_system(&message, &self.channel.channel_id, on_event);
+                self.append_channel_turn(
+                    user_message.message_id,
+                    Vec::new(),
+                    vec![message.message_id.clone()],
+                );
+                self.save_channel_best_effort();
+            }
         }
-        drain_runtime_events(&mut self.runtime, on_event)?;
         Ok(())
     }
 
@@ -405,7 +568,60 @@ impl AgentChat {
             definition,
             self.daemon_connected,
         )?;
-        Ok(info.into())
+        let info: ChatRuntimeInfo = info.into();
+        for participant in &mut self.channel.participants {
+            participant.enabled = false;
+        }
+        let channel_is_empty = self.channel.transcript.is_empty();
+        ensure_primary_participant(&mut self.channel, &info, channel_is_empty);
+        self.save_channel_best_effort();
+        Ok(info)
+    }
+
+    fn primary_participant(&self) -> Option<&AgentChannelParticipant> {
+        self.channel
+            .participants
+            .iter()
+            .filter(|participant| participant.enabled)
+            .min_by_key(|participant| participant.order)
+    }
+
+    fn primary_speaker(&mut self) -> ChatSpeaker {
+        let info = self.runtime_info();
+        let channel_is_empty = self.channel.transcript.is_empty();
+        ensure_primary_participant(&mut self.channel, &info, channel_is_empty);
+        self.primary_participant()
+            .map(|participant| chat_speaker(&self.channel.channel_id, participant))
+            .unwrap_or_else(|| ChatSpeaker {
+                channel_id: self.channel.channel_id.to_string(),
+                agent_key: info.agent.clone(),
+                agent_name: info.agent,
+                ..ChatSpeaker::default()
+            })
+    }
+
+    fn append_channel_turn(
+        &self,
+        trigger_message_id: TaskId,
+        response_message_ids: Vec<TaskId>,
+        system_message_ids: Vec<TaskId>,
+    ) {
+        let turn = AgentChannelTurn {
+            turn_id: TaskId::generate(),
+            channel_id: self.channel.channel_id.clone(),
+            trigger_message_id,
+            decisions: Vec::new(),
+            response_message_ids,
+            system_message_ids,
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        let _ = self
+            .channel_store
+            .append_turn(&self.channel.channel_id, &turn);
+    }
+
+    fn save_channel_best_effort(&self) {
+        let _ = self.channel_store.save_channel(&self.channel);
     }
 }
 
@@ -518,6 +734,164 @@ fn agent_transcript_from_history(history: &[ChatHistoryMessage]) -> sinomo_agent
         }
     }
     transcript
+}
+
+fn agent_transcript_from_channel(
+    channel: &AgentChannel,
+    fallback_history: &[ChatHistoryMessage],
+) -> sinomo_agent::AgentTranscript {
+    if channel.transcript.is_empty() {
+        return agent_transcript_from_history(fallback_history);
+    }
+    let mut transcript = sinomo_agent::AgentTranscript::new();
+    for (index, message) in channel.transcript.iter().enumerate() {
+        if message.content.trim().is_empty()
+            || message.message_kind != AgentChannelMessageKind::Normal
+        {
+            continue;
+        }
+        match &message.author {
+            AgentChannelAuthor::User { .. } => transcript.push(AgentItem::UserMessage {
+                item_id: TaskId::generate(),
+                step_index: index,
+                content: message.content.clone(),
+                event_id: None,
+            }),
+            AgentChannelAuthor::Agent { .. } => transcript.push(AgentItem::AssistantText {
+                item_id: TaskId::generate(),
+                step_index: index,
+                content: message.content.clone(),
+            }),
+            AgentChannelAuthor::System => {}
+        }
+    }
+    transcript
+}
+
+fn legacy_channel_from_history(
+    channel_id: SessionId,
+    history: &[ChatHistoryMessage],
+    info: &ChatRuntimeInfo,
+) -> AgentChannel {
+    let mut channel = AgentChannel::with_default_title(channel_id);
+    channel.ensure_user(AgentChannelUser::app_local());
+    ensure_primary_participant(&mut channel, info, true);
+    let participant = channel.participants.first().cloned();
+    for message in history {
+        if message.text.trim().is_empty() {
+            continue;
+        }
+        match message.role.as_str() {
+            "user" => {
+                channel.append_user_message(
+                    AGENT_CHANNEL_APP_USER_ID,
+                    "User",
+                    message.text.clone(),
+                    AgentChannelSource::app(),
+                );
+            }
+            "agent" | "assistant" => {
+                if let Some(participant) = participant.as_ref() {
+                    channel.append_agent_message(
+                        participant,
+                        message.text.clone(),
+                        AgentChannelSource::app(),
+                    );
+                }
+            }
+            "system" => {
+                channel.append_system_info(
+                    message.text.clone(),
+                    AgentChannelSource::system(serde_json::json!({
+                        "imported_from": "legacy_app_session"
+                    })),
+                );
+            }
+            _ => {}
+        }
+    }
+    channel
+}
+
+fn ensure_primary_participant(
+    channel: &mut AgentChannel,
+    info: &ChatRuntimeInfo,
+    align_session_to_channel: bool,
+) {
+    let agent_key = if info.agent.trim().is_empty() {
+        "main-agent"
+    } else {
+        info.agent.as_str()
+    };
+    let agent_name = agent_key;
+    let participant_id = channel.ensure_participant(agent_key, agent_name);
+    if align_session_to_channel {
+        let channel_id = channel.channel_id.clone();
+        if let Some(participant) = channel.participant_mut(&participant_id) {
+            participant.agent_session_id = channel_id;
+            participant.order = 1;
+            participant.enabled = true;
+        }
+    }
+}
+
+fn chat_speaker(channel_id: &SessionId, participant: &AgentChannelParticipant) -> ChatSpeaker {
+    ChatSpeaker {
+        channel_id: channel_id.to_string(),
+        participant_id: participant.participant_id.to_string(),
+        agent_key: participant.agent_key.clone(),
+        agent_name: participant.agent_name.clone(),
+        agent_session_id: participant.agent_session_id.to_string(),
+    }
+}
+
+fn chat_participant(participant: &AgentChannelParticipant) -> ChatParticipant {
+    ChatParticipant {
+        participant_id: participant.participant_id.to_string(),
+        agent_key: participant.agent_key.clone(),
+        agent_name: participant.agent_name.clone(),
+        agent_session_id: participant.agent_session_id.to_string(),
+        enabled: participant.enabled,
+        order: participant.order,
+    }
+}
+
+fn participant_from_speaker(speaker: &ChatSpeaker) -> AgentChannelParticipant {
+    let participant_id = speaker
+        .participant_id
+        .parse::<TaskId>()
+        .unwrap_or_else(|_| TaskId::generate());
+    let agent_session_id = speaker
+        .agent_session_id
+        .parse::<SessionId>()
+        .unwrap_or_else(|_| SessionId::generate());
+    AgentChannelParticipant {
+        participant_id,
+        agent_key: speaker.agent_key.clone(),
+        agent_name: speaker.agent_name.clone(),
+        agent_session_id,
+        enabled: true,
+        order: 1,
+        observed_through_sequence: 0,
+    }
+}
+
+fn emit_channel_system(
+    message: &AgentChannelMessage,
+    channel_id: &SessionId,
+    on_event: &mut dyn FnMut(ChatStreamEvent),
+) {
+    on_event(ChatStreamEvent::ChannelSystem {
+        channel_id: channel_id.to_string(),
+        message_id: message.message_id.to_string(),
+        kind: match &message.message_kind {
+            AgentChannelMessageKind::Normal => "message",
+            AgentChannelMessageKind::Info => "info",
+            AgentChannelMessageKind::Error => "error",
+        }
+        .to_string(),
+        text: message.content.clone(),
+    });
 }
 
 fn drain_runtime_events(
@@ -1262,7 +1636,13 @@ mod tests {
     fn chat_event_label(event: ChatStreamEvent) -> String {
         match event {
             ChatStreamEvent::Token(token) => format!("token:{token}"),
+            ChatStreamEvent::AgentToken { speaker, text } => {
+                format!("agent-token:{}:{text}", speaker.agent_key)
+            }
             ChatStreamEvent::Notice(notice) => format!("notice:{notice}"),
+            ChatStreamEvent::ChannelSystem { kind, text, .. } => {
+                format!("system:{kind}:{text}")
+            }
             ChatStreamEvent::Context(context) => {
                 format!("context:{}:{}", context.step_index, context.total_bytes)
             }
@@ -1510,10 +1890,13 @@ mod tests {
 
         let mut events = Vec::new();
         let mut on_event = |event| events.push(chat_event_label(event));
-        let error = chat
-            .send("hello", &mut on_event)
-            .expect_err("missing Codex auth should fail the turn");
-        let error = error.to_string();
+        chat.send("hello", &mut on_event)
+            .expect("missing Codex auth is emitted as a channel system error");
+        let error = events
+            .iter()
+            .find(|event| event.starts_with("system:error:"))
+            .cloned()
+            .expect("missing Codex auth should emit a system error");
 
         assert!(
             error.contains("authentication required for codex"),

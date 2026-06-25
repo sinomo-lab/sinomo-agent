@@ -2,7 +2,7 @@
 //!
 //! Like the Settings and Files tabs, this is a fully *composed* `sui-widgets`
 //! tree: [`view`] returns a responsive host ([`ChatView`]) over pre-built pods
-//! (wide split with the agents/sessions sidebar, narrow transcript-only), each
+//! (wide split with the agents/chats sidebar, narrow transcript-only), each
 //! assembled from stock `ListView` / `ScrollView` / `Select` / `TextArea` /
 //! `Button` / `Separator` / `Label` widgets, plus a small set of
 //! bespoke painters for the parts whose *shape* changes live.
@@ -28,7 +28,7 @@
 //!   the worker each frame, applies events to `ChatState`, and re-requests an
 //!   animation frame — the same wiring the old `ChatView::pump` had.
 //!
-//! The agents/sessions sidebar and the composer's provider/model/effort
+//! The agents/chats sidebar and the composer's provider/model/effort
 //! selectors are stock widgets. The model `Select` (and the effort selector's
 //! visibility) depend on the current provider + fetched model list, which change
 //! at runtime, so the composer row is wrapped in a [`RebuildOnChange`] keyed on
@@ -278,7 +278,7 @@ struct RuntimeHealth {
     tone: ActivityTone,
 }
 
-/// A previously-created in-session reference (sidebar list).
+/// A previously-created chat reference (sidebar list).
 pub struct SessionRef {
     pub id: String,
     pub title: String,
@@ -391,7 +391,7 @@ impl ChatState {
             .unwrap_or_else(|| "New chat".to_string())
     }
 
-    /// Persist the current session and refresh the sidebar list.
+    /// Persist the current chat and refresh the sidebar list.
     fn persist(&mut self) {
         let session_id = self.session_id.clone();
         let messages = self.messages.clone();
@@ -413,8 +413,8 @@ impl ChatState {
             Ok(_) => {}
             Err(error) if report_visible_failures => {
                 let detail = error.to_string();
-                self.notice = Some(format!("session save failed: {detail}"));
-                self.push_activity("session save", detail, ActivityTone::Warn);
+                self.notice = Some(format!("chat save failed: {detail}"));
+                self.push_activity("chat save", detail, ActivityTone::Warn);
             }
             Err(_) => {}
         }
@@ -678,6 +678,14 @@ impl ChatState {
                 Self::append_model_token(&mut messages, &text);
                 true
             }
+            ChatEvent::AgentToken { speaker, text, .. } => {
+                Self::append_model_token_from_speaker(&mut messages, &speaker.agent_name, &text);
+                true
+            }
+            ChatEvent::SystemMessage { kind, text, .. } => {
+                Self::apply_system_message(&mut messages, &kind, &text);
+                true
+            }
             ChatEvent::TurnDone { .. } => Self::finish_turn_messages(&mut messages),
             ChatEvent::Error { error, .. } => {
                 Self::apply_error_message(&mut messages, &error);
@@ -702,6 +710,31 @@ impl ChatState {
         messages.push(ChatMessage::model(token));
     }
 
+    fn append_model_token_from_speaker(
+        messages: &mut Vec<ChatMessage>,
+        speaker: &str,
+        token: &str,
+    ) {
+        let speaker = if speaker.trim().is_empty() {
+            "Agent"
+        } else {
+            speaker.trim()
+        };
+        let prefix = format!("{speaker}: ");
+        if let Some(last) = messages.last_mut()
+            && last.role == ChatRole::Agent
+            && last.source == ChatMessageSource::Model
+            && (last.text.is_empty() || last.text.starts_with(&prefix))
+        {
+            if last.text.is_empty() {
+                last.text.push_str(&prefix);
+            }
+            last.text.push_str(token);
+            return;
+        }
+        messages.push(ChatMessage::model(format!("{prefix}{token}")));
+    }
+
     fn finish_turn_messages(messages: &mut [ChatMessage]) -> bool {
         if matches!(messages.last(), Some(m) if m.is_model_placeholder())
             && let Some(last) = messages.last_mut()
@@ -712,6 +745,25 @@ impl ChatState {
             return true;
         }
         false
+    }
+
+    fn apply_system_message(messages: &mut Vec<ChatMessage>, kind: &str, text: &str) {
+        let message_kind = if kind == "error" {
+            ChatMessageKind::Error
+        } else {
+            ChatMessageKind::Info
+        };
+        if let Some(last) = messages.last_mut()
+            && last.is_model_placeholder()
+        {
+            last.text = text.to_string();
+            last.source = ChatMessageSource::System;
+            last.kind = message_kind;
+        } else if message_kind == ChatMessageKind::Error {
+            messages.push(ChatMessage::system_error(text));
+        } else {
+            messages.push(ChatMessage::system_info(text));
+        }
     }
 
     fn apply_error_message(messages: &mut Vec<ChatMessage>, error: &str) {
@@ -815,7 +867,7 @@ impl ChatState {
         };
         let title = self.session_title_draft.trim().to_string();
         if title.is_empty() {
-            self.notice = Some("session title cannot be empty".to_string());
+            self.notice = Some("chat title cannot be empty".to_string());
             return;
         }
         match sessions::rename(&self.data_dir, &rename_id, &title) {
@@ -826,8 +878,8 @@ impl ChatState {
             }
             Err(error) => {
                 let detail = error.to_string();
-                self.notice = Some(format!("session rename failed: {detail}"));
-                self.push_activity("session rename", detail, ActivityTone::Warn);
+                self.notice = Some(format!("chat rename failed: {detail}"));
+                self.push_activity("chat rename", detail, ActivityTone::Warn);
             }
         }
     }
@@ -874,13 +926,13 @@ impl ChatState {
             }
             Err(error) => {
                 let detail = error.to_string();
-                self.notice = Some(format!("session delete failed: {detail}"));
-                self.push_activity("session delete", detail, ActivityTone::Warn);
+                self.notice = Some(format!("chat delete failed: {detail}"));
+                self.push_activity("chat delete", detail, ActivityTone::Warn);
             }
         }
     }
 
-    /// Open a stored session: load its transcript for display and tell the worker
+    /// Open a stored chat: load its transcript for display and tell the worker
     /// to continue under that id.
     fn open_session(&mut self, index: usize) {
         let Some(session) = self.sessions.get(index) else {
@@ -984,7 +1036,25 @@ impl ChatState {
                     self.scroll = f32::MAX;
                 }
             }
+            ChatEvent::AgentToken { speaker, text, .. } => {
+                self.notice = None;
+                Self::append_model_token_from_speaker(
+                    &mut self.messages,
+                    &speaker.agent_name,
+                    &text,
+                );
+                if self.stick_bottom {
+                    self.scroll = f32::MAX;
+                }
+            }
             ChatEvent::Notice { notice, .. } => self.notice = Some(notice),
+            ChatEvent::SystemMessage { kind, text, .. } => {
+                Self::apply_system_message(&mut self.messages, &kind, &text);
+                self.notice = None;
+                if self.stick_bottom {
+                    self.scroll = f32::MAX;
+                }
+            }
             ChatEvent::Context { context, .. } => {
                 self.notice = Some(format!(
                     "context assembled: {}",
@@ -1519,7 +1589,7 @@ fn text_mentions_runtime_problem(text: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-/// A small uppercase section heading `Label` (AGENTS / SESSIONS), color tracking the theme.
+/// A small uppercase section heading `Label` (AGENTS / CHATS), color tracking the theme.
 fn heading(shared: &Shared, text: &str) -> Label {
     let s = shared.clone();
     Label::new(text)
@@ -1569,8 +1639,8 @@ fn agents_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         })
 }
 
-/// Build the SESSIONS ListView: a "New chat" row followed by session history. Selecting row 0
-/// starts a fresh session; later rows open that stored session.
+/// Build the CHATS ListView: a "New chat" row followed by chat history. Selecting row 0
+/// starts a fresh chat; later rows open that stored chat.
 fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let mut items = vec![ListItem::new("New chat").leading_text("+")];
     items.extend(
@@ -1728,9 +1798,9 @@ fn session_edit_panel(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod
     Some(WidgetPod::new(panel))
 }
 
-/// The sidebar column: AGENTS heading + list, then SESSIONS heading + list. Wrapped in a
-/// [`RebuildOnChange`] keyed on the agent/session signature so it rebuilds when those lists change
-/// (e.g. a new session is persisted) but not on every token.
+/// The sidebar column: AGENTS heading + list, then CHATS heading + list. Wrapped in a
+/// [`RebuildOnChange`] keyed on the agent/chat signature so it rebuilds when those lists change
+/// (e.g. a new chat is persisted) but not on every token.
 fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let s = shared.clone();
     let r = Rc::clone(reader);
@@ -1748,7 +1818,7 @@ fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 .with_child(SizedBox::new().height(2.0))
                 .with_child(InsetX::new(agents_list(&s, &r), 8.0))
                 .with_child(SizedBox::new().height(16.0))
-                .with_child(InsetX::new(heading(&s, "SESSIONS"), 18.0))
+                .with_child(InsetX::new(heading(&s, "CHATS"), 18.0))
                 .with_child(SizedBox::new().height(2.0))
                 .with_child(InsetX::new(sessions_list(&s, &r), 8.0));
             if let Some(panel) = session_edit_panel(&s, &r) {
@@ -4011,13 +4081,13 @@ mod tests {
     fn runtime_health_surfaces_degraded_cluster_and_persistence_state() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
-        state.notice = Some("session save failed: DFS services shard replay delayed".to_string());
+        state.notice = Some("chat save failed: DFS services shard replay delayed".to_string());
 
         let health = state.runtime_health();
         assert_eq!(health.label, "DEGRADED");
         assert_eq!(health.tone, ActivityTone::Warn);
         assert!(
-            health.detail.contains("session save failed"),
+            health.detail.contains("chat save failed"),
             "health detail should preserve the operator-relevant degraded signal"
         );
 
@@ -4304,13 +4374,13 @@ mod tests {
         );
 
         if let Some(notice) = state.notice.as_deref()
-            && notice.contains("session save failed")
+            && notice.contains("chat save failed")
         {
             assert!(
                 state
                     .activity
                     .iter()
-                    .any(|entry| entry.title == "session save" && entry.tone == ActivityTone::Warn),
+                    .any(|entry| entry.title == "chat save" && entry.tone == ActivityTone::Warn),
                 "SIFS save failures should be visible as degraded app-layer activity"
             );
         }
