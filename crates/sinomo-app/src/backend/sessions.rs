@@ -14,6 +14,7 @@ use sinomo_runtime::local::SinomoDataDir;
 pub const SIFS_SESSIONS_ROOT: &str = "/services/sinomo-app/chat/sessions";
 const SIFS_SESSIONS_INDEX: &str = "/services/sinomo-app-chat-sessions-index.json";
 const SIFS_SESSION_FILE_PREFIX: &str = "/services/sinomo-app-chat-session-";
+const SIFS_SESSION_FILE_NAME_PREFIX: &str = "sinomo-app-chat-session-";
 const SIFS_SESSION_FILE_SUFFIX: &str = ".json";
 
 /// Sidebar metadata for a stored session.
@@ -25,6 +26,10 @@ pub struct SessionMeta {
     pub updated_unix: i64,
     #[serde(default)]
     pub message_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_unix: Option<i64>,
 }
 
 /// One stored message.
@@ -112,11 +117,21 @@ pub fn save_with_report(
             "invalid session id",
         ));
     }
+    let existing = load_sifs_record(data_dir, id);
+    let (title, title_source) = match existing.as_ref().map(|record| &record.meta) {
+        Some(meta) if meta.deleted_unix.is_some() => return Ok(()),
+        Some(meta) if meta.title_source.as_deref() == Some("user") => {
+            (meta.title.clone(), Some("user".to_string()))
+        }
+        _ => (title.to_string(), Some("auto".to_string())),
+    };
     let meta = SessionMeta {
         id: id.to_string(),
-        title: title.to_string(),
+        title,
         updated_unix: now_unix(),
         message_count: messages.len(),
+        title_source,
+        deleted_unix: None,
     };
     let transcript = StoredTranscript {
         messages: messages.to_vec(),
@@ -124,6 +139,67 @@ pub fn save_with_report(
     save_sifs(data_dir, id, &meta, &transcript)
         .map_err(|detail| std::io::Error::new(std::io::ErrorKind::Other, detail))?;
     Ok(())
+}
+
+/// Rename a stored session without changing its transcript.
+pub fn rename(data_dir: &SinomoDataDir, id: &str, title: &str) -> std::io::Result<()> {
+    if !valid_session_id(id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid session id",
+        ));
+    }
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "session title cannot be empty",
+        ));
+    }
+    let mut record = load_sifs_record(data_dir, id)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "session not found"))?;
+    if record.meta.deleted_unix.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "session not found",
+        ));
+    }
+    record.meta.title = title.chars().take(80).collect();
+    record.meta.title_source = Some("user".to_string());
+    record.meta.updated_unix = now_unix();
+    save_sifs(data_dir, id, &record.meta, &record.transcript)
+        .map_err(|detail| std::io::Error::new(std::io::ErrorKind::Other, detail))
+}
+
+/// Hide a session from listings and future loads. SIFS has no exposed unlink operation, so deletion
+/// is represented by a tombstone record at the session path.
+pub fn delete(data_dir: &SinomoDataDir, id: &str) -> std::io::Result<()> {
+    if !valid_session_id(id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid session id",
+        ));
+    }
+    let deleted_unix = now_unix();
+    let mut record = load_sifs_record(data_dir, id).unwrap_or_else(|| StoredSessionRecord {
+        meta: SessionMeta {
+            id: id.to_string(),
+            title: "Deleted chat".to_string(),
+            updated_unix: deleted_unix,
+            message_count: 0,
+            title_source: None,
+            deleted_unix: None,
+        },
+        transcript: StoredTranscript::default(),
+    });
+    record.meta.updated_unix = deleted_unix;
+    record.meta.title = "Deleted chat".to_string();
+    record.meta.message_count = 0;
+    record.meta.title_source = None;
+    record.meta.deleted_unix = Some(deleted_unix);
+    record.transcript = StoredTranscript::default();
+    save_sifs(data_dir, id, &record.meta, &record.transcript)
+        .map_err(|detail| std::io::Error::new(std::io::ErrorKind::Other, detail))
 }
 
 /// List stored sessions from SIFS (metadata only), newest first.
@@ -138,7 +214,9 @@ pub fn load_transcript(data_dir: &SinomoDataDir, id: &str) -> Option<StoredTrans
     if !valid_session_id(id) {
         return None;
     }
-    load_sifs_record(data_dir, id).map(|record| record.transcript)
+    load_sifs_record(data_dir, id)
+        .filter(|record| record.meta.deleted_unix.is_none())
+        .map(|record| record.transcript)
 }
 
 fn now_unix() -> i64 {
@@ -168,10 +246,9 @@ fn save_sifs(
     index
         .sessions
         .sort_by_key(|meta| std::cmp::Reverse(meta.updated_unix));
-    browser.write_file(
-        SIFS_SESSIONS_INDEX,
-        &serde_json::to_vec(&index).map_err(|error| error.to_string())?,
-    )
+    let index_bytes = serde_json::to_vec(&index).map_err(|error| error.to_string())?;
+    let _ = browser.write_file(SIFS_SESSIONS_INDEX, &index_bytes);
+    Ok(())
 }
 
 fn list_sifs(data_dir: &SinomoDataDir) -> Vec<SessionMeta> {
@@ -181,14 +258,44 @@ fn list_sifs(data_dir: &SinomoDataDir) -> Vec<SessionMeta> {
     let mut metas = read_sifs_index(&browser)
         .map(|index| index.sessions)
         .unwrap_or_default();
-    for meta in list_legacy_sifs(&browser) {
-        match metas.iter_mut().find(|existing| existing.id == meta.id) {
-            Some(existing) if meta.updated_unix > existing.updated_unix => *existing = meta,
-            Some(_) => {}
-            None => metas.push(meta),
-        }
+    for meta in list_flat_sifs_records(&browser)
+        .into_iter()
+        .chain(list_legacy_sifs(&browser))
+    {
+        merge_session_meta(&mut metas, meta);
     }
+    metas.retain(|meta| meta.deleted_unix.is_none());
     metas
+}
+
+fn merge_session_meta(metas: &mut Vec<SessionMeta>, meta: SessionMeta) {
+    match metas.iter_mut().find(|existing| existing.id == meta.id) {
+        Some(existing) if meta.updated_unix >= existing.updated_unix => *existing = meta,
+        Some(_) => {}
+        None => metas.push(meta),
+    }
+}
+
+fn list_flat_sifs_records(browser: &SifsBrowser) -> Vec<SessionMeta> {
+    let Ok(entries) = browser.list("/services") else {
+        return Vec::new();
+    };
+    entries
+        .into_iter()
+        .filter(|entry| !entry.is_dir)
+        .filter_map(|entry| {
+            let id = entry
+                .name
+                .strip_prefix(SIFS_SESSION_FILE_NAME_PREFIX)?
+                .strip_suffix(SIFS_SESSION_FILE_SUFFIX)?;
+            if !valid_session_id(id) {
+                return None;
+            }
+            let bytes = browser.read_file(&entry.path).ok()?;
+            let record = serde_json::from_slice::<StoredSessionRecord>(&bytes).ok()?;
+            (record.meta.id == id).then_some(record.meta)
+        })
+        .collect()
 }
 
 fn list_legacy_sifs(browser: &SifsBrowser) -> Vec<SessionMeta> {
@@ -205,7 +312,9 @@ fn list_legacy_sifs(browser: &SifsBrowser) -> Vec<SessionMeta> {
             let bytes = browser
                 .read_file(&format!("{}/meta.json", entry.path.trim_end_matches('/')))
                 .ok()?;
-            serde_json::from_slice::<SessionMeta>(&bytes).ok()
+            serde_json::from_slice::<SessionMeta>(&bytes)
+                .ok()
+                .filter(|meta| meta.deleted_unix.is_none())
         })
         .collect()
 }
@@ -241,6 +350,8 @@ fn load_legacy_sifs_record(browser: &SifsBrowser, id: &str) -> Option<StoredSess
             title: "New chat".to_string(),
             updated_unix: 0,
             message_count: transcript.messages.len(),
+            title_source: None,
+            deleted_unix: None,
         });
     Some(StoredSessionRecord { meta, transcript })
 }
@@ -300,6 +411,44 @@ mod tests {
     }
 
     #[test]
+    fn sifs_listing_recovers_flat_session_records_without_index() {
+        let root = temp_data_dir("sifs-flat-listing");
+        let data_dir = SinomoDataDir::new(&root);
+        let id = "01hxy6qa9k0t9vr4g9n8d3q5d5";
+        let meta = SessionMeta {
+            id: id.to_string(),
+            title: "flat record".to_string(),
+            updated_unix: 42,
+            message_count: 1,
+            title_source: Some("auto".to_string()),
+            deleted_unix: None,
+        };
+        let record = StoredSessionRecord {
+            meta: meta.clone(),
+            transcript: StoredTranscript {
+                messages: vec![StoredMessage::new("user", "hello", "user", "message")],
+            },
+        };
+        let browser = SifsBrowser::open(&data_dir).expect("open sifs");
+        browser
+            .write_file(
+                &sifs_session_file(id).expect("session path"),
+                &serde_json::to_vec(&record).expect("record json"),
+            )
+            .expect("write flat record");
+
+        let listed = list(&data_dir);
+        assert!(
+            listed
+                .iter()
+                .any(|session| session.id == meta.id && session.title == meta.title),
+            "flat session records should be listed even when the index is absent"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn sifs_transcript_wins_over_stale_app_local_files() {
         let root = temp_data_dir("sifs-first");
         let data_dir = SinomoDataDir::new(&root);
@@ -338,6 +487,58 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn rename_preserves_transcript_and_user_title_across_auto_saves() {
+        let root = temp_data_dir("sifs-rename");
+        let data_dir = SinomoDataDir::new(&root);
+        let id = "01hxy6qa9k0t9vr4g9n8d3q5d7";
+        let messages = vec![
+            StoredMessage::new("user", "original prompt", "user", "message"),
+            StoredMessage::new("agent", "answer", "model", "message"),
+        ];
+        save(&data_dir, id, "original prompt", &messages).expect("save");
+
+        rename(&data_dir, id, "Renamed session").expect("rename");
+        save(&data_dir, id, "auto title should not win", &messages).expect("resave");
+
+        let listed = list(&data_dir);
+        let meta = listed
+            .iter()
+            .find(|meta| meta.id == id)
+            .expect("renamed session listed");
+        assert_eq!(meta.title, "Renamed session");
+        assert_eq!(meta.title_source.as_deref(), Some("user"));
+        let transcript = load_transcript(&data_dir, id).expect("transcript still loads");
+        assert_eq!(transcript.messages[0].text, "original prompt");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_hides_session_from_listing_and_loading() {
+        let root = temp_data_dir("sifs-delete");
+        let data_dir = SinomoDataDir::new(&root);
+        let id = "01hxy6qa9k0t9vr4g9n8d3q5d8";
+        let messages = vec![StoredMessage::new("user", "remove me", "user", "message")];
+        save(&data_dir, id, "remove me", &messages).expect("save");
+
+        delete(&data_dir, id).expect("delete");
+
+        assert!(
+            list(&data_dir).iter().all(|meta| meta.id != id),
+            "deleted sessions are hidden from the sidebar list"
+        );
+        assert!(
+            load_transcript(&data_dir, id).is_none(),
+            "deleted sessions do not reopen"
+        );
+        let tombstone = load_sifs_record(&data_dir, id).expect("delete writes tombstone");
+        assert!(tombstone.meta.deleted_unix.is_some());
+        assert!(tombstone.transcript.messages.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn write_app_local_session(root: &Path, id: &str, title: &str, user: &str, agent: &str) {
         let dir = root.join("app").join("sessions").join(id);
         fs::create_dir_all(&dir).expect("create stale local session dir");
@@ -346,6 +547,8 @@ mod tests {
             title: title.to_string(),
             updated_unix: i64::MAX,
             message_count: 2,
+            title_source: Some("auto".to_string()),
+            deleted_unix: None,
         };
         let transcript = StoredTranscript {
             messages: vec![

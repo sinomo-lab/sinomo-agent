@@ -87,7 +87,11 @@ pub enum ChatCommand {
         model: String,
         account: String,
     },
-    SetAgent(String),
+    SetAgent {
+        session_id: String,
+        key: String,
+        history: Vec<ChatHistoryMessage>,
+    },
     /// Ask sinomo-lm for the provider's available models (fetched off the worker so the
     /// blocking API call never stalls chat turns); the result arrives as [`ChatEvent::Models`].
     FetchModels {
@@ -693,17 +697,35 @@ fn worker(
                     });
                 }
             },
-            ChatCommand::SetAgent(key) => match chat.set_agent(&key) {
-                Ok(info) => {
-                    let _ = evt_tx.send(ChatEvent::RuntimeInfo(info.into()));
+            ChatCommand::SetAgent {
+                session_id,
+                key,
+                history,
+            } => {
+                let resume_result = if session_id.trim().is_empty() {
+                    Ok(())
+                } else {
+                    chat.resume_session(&session_id, &history)
+                };
+                match resume_result.and_then(|_| chat.set_agent(&key)) {
+                    Ok(info) => {
+                        if !session_id.trim().is_empty() {
+                            set_active_session_id(&active_session_id, &evt_tx, &session_id);
+                        }
+                        let _ = evt_tx.send(ChatEvent::RuntimeInfo(info.into()));
+                    }
+                    Err(error) => {
+                        let _ = evt_tx.send(ChatEvent::Error {
+                            session_id: Some(if session_id.trim().is_empty() {
+                                chat.session_id()
+                            } else {
+                                session_id
+                            }),
+                            error: format!("agent switch failed: {error}"),
+                        });
+                    }
                 }
-                Err(error) => {
-                    let _ = evt_tx.send(ChatEvent::Error {
-                        session_id: Some(chat.session_id()),
-                        error: format!("agent switch failed: {error}"),
-                    });
-                }
-            },
+            }
             ChatCommand::FetchModels { provider } => {
                 // Fetch off-thread: the provider API call blocks, and chat turns must not.
                 let tx = evt_tx.clone();
@@ -812,6 +834,41 @@ mod tests {
         assert!(matches!(
             reset,
             ChatEvent::SessionReset { session_id } if session_id == new_session_id
+        ));
+    }
+
+    #[test]
+    fn chat_worker_switches_agent_for_requested_new_session() {
+        let data_dir = temp_data_dir("chat-worker-agent-switch");
+        let runtime_control = AgentRuntimeControlRegistry::new();
+        let handle = ChatHandle::spawn(data_dir, false, runtime_control);
+        wait_for_event(&handle, |event| matches!(event, ChatEvent::Ready { .. }))
+            .expect("ready event");
+
+        let new_session_id = SessionId::from_legacy_named("sess_chat_agent_switch")
+            .expect("session id")
+            .to_string();
+        handle.send_command(ChatCommand::NewSession {
+            session_id: new_session_id.clone(),
+        });
+        wait_for_event(&handle, |event| {
+            matches!(event, ChatEvent::SessionReset { session_id } if session_id == &new_session_id)
+        })
+        .expect("new session reset");
+
+        handle.send_command(ChatCommand::SetAgent {
+            session_id: new_session_id,
+            key: "coding-agent".to_string(),
+            history: Vec::new(),
+        });
+        let info = wait_for_event(
+            &handle,
+            |event| matches!(event, ChatEvent::RuntimeInfo(info) if info.agent == "coding-agent"),
+        )
+        .expect("agent switch runtime info");
+        assert!(matches!(
+            info,
+            ChatEvent::RuntimeInfo(info) if info.agent == "coding-agent"
         ));
     }
 

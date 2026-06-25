@@ -42,8 +42,8 @@ use sui::{
     Alignment, ArrangeCtx, Color, Constraints, DefaultTheme, Event, EventCtx, FontWeight,
     IconButton, IconGlyph, Insets, KeyState, Label, ListItem, ListView, MeasureCtx, PaintCtx,
     PointerEventKind, Rect, ScrollDelta, SemanticsCtx, Separator, Size, SizedBox, Stack, Surface,
-    SurfaceBorder, SurfaceRole, TextArea, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    draw_glyph,
+    SurfaceBorder, SurfaceRole, TextArea, TextInput, Widget, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, draw_glyph,
 };
 
 use sinomo_cli::app_api::{
@@ -312,6 +312,9 @@ pub struct ChatState {
     pub models_loading: bool,
     pub sessions: Vec<SessionRef>,
     pending_session_reset: Option<String>,
+    session_rename_id: Option<String>,
+    session_title_draft: String,
+    session_delete_confirm_id: Option<String>,
 }
 
 impl ChatState {
@@ -361,6 +364,9 @@ impl ChatState {
             models_loading: false,
             sessions,
             pending_session_reset: None,
+            session_rename_id: None,
+            session_title_draft: String::new(),
+            session_delete_confirm_id: None,
         };
         // Eagerly fetch the default/initial provider's models so the model picker is populated
         // without requiring a manual provider toggle. (Results arrive async via `ChatEvent::Models`;
@@ -412,6 +418,10 @@ impl ChatState {
             }
             Err(_) => {}
         }
+        self.refresh_sessions();
+    }
+
+    fn refresh_sessions(&mut self) {
         self.sessions = sessions::list(&self.data_dir)
             .into_iter()
             .map(|meta| SessionRef {
@@ -717,6 +727,13 @@ impl ChatState {
         }
     }
 
+    fn ensure_visible_session_id(&mut self) -> String {
+        if self.session_id.is_empty() {
+            self.session_id = SessionId::generate().to_string();
+        }
+        self.session_id.clone()
+    }
+
     fn reset_visible_session(&mut self, session_id: String) {
         self.session_id = session_id;
         self.messages.clear();
@@ -731,6 +748,136 @@ impl ChatState {
         self.control = ChatControlOverview::default();
         self.scroll = 0.0;
         self.stick_bottom = true;
+        self.session_rename_id = None;
+        self.session_title_draft.clear();
+        self.session_delete_confirm_id = None;
+    }
+
+    fn visible_session_has_started(&self) -> bool {
+        self.messages
+            .iter()
+            .any(|message| message.role == ChatRole::User)
+    }
+
+    fn current_history(&self) -> Vec<ChatHistoryMessage> {
+        self.messages
+            .iter()
+            .map(|message| ChatHistoryMessage {
+                role: message.history_role().to_string(),
+                text: message.text.clone(),
+            })
+            .collect()
+    }
+
+    fn current_session_ref(&self) -> Option<&SessionRef> {
+        self.sessions
+            .iter()
+            .find(|session| session.id == self.session_id)
+    }
+
+    fn begin_rename_current_session(&mut self) {
+        let Some((session_id, title)) = self
+            .current_session_ref()
+            .map(|session| (session.id.clone(), session.title.clone()))
+        else {
+            return;
+        };
+        self.session_rename_id = Some(session_id);
+        self.session_title_draft = title;
+        self.session_delete_confirm_id = None;
+    }
+
+    fn cancel_rename_session(&mut self) {
+        self.session_rename_id = None;
+        self.session_title_draft.clear();
+    }
+
+    fn set_session_title_draft(&mut self, title: String) {
+        self.session_title_draft = title;
+    }
+
+    fn can_save_session_title(&self) -> bool {
+        let Some(rename_id) = self.session_rename_id.as_deref() else {
+            return false;
+        };
+        let title = self.session_title_draft.trim();
+        !title.is_empty()
+            && self
+                .sessions
+                .iter()
+                .find(|session| session.id == rename_id)
+                .is_some_and(|session| session.title != title)
+    }
+
+    fn save_session_title(&mut self) {
+        let Some(rename_id) = self.session_rename_id.clone() else {
+            return;
+        };
+        let title = self.session_title_draft.trim().to_string();
+        if title.is_empty() {
+            self.notice = Some("session title cannot be empty".to_string());
+            return;
+        }
+        match sessions::rename(&self.data_dir, &rename_id, &title) {
+            Ok(()) => {
+                self.session_rename_id = None;
+                self.session_title_draft.clear();
+                self.refresh_sessions();
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                self.notice = Some(format!("session rename failed: {detail}"));
+                self.push_activity("session rename", detail, ActivityTone::Warn);
+            }
+        }
+    }
+
+    fn request_delete_current_session(&mut self) {
+        let Some(session) = self.current_session_ref() else {
+            return;
+        };
+        if self.streaming || self.control.active_turn {
+            self.notice = Some("wait for the current turn before deleting this chat".to_string());
+            return;
+        }
+        self.session_delete_confirm_id = Some(session.id.clone());
+        self.session_rename_id = None;
+        self.session_title_draft.clear();
+    }
+
+    fn cancel_delete_session(&mut self) {
+        self.session_delete_confirm_id = None;
+    }
+
+    fn confirm_delete_session(&mut self) {
+        let Some(session_id) = self.session_delete_confirm_id.clone() else {
+            return;
+        };
+        if self.streaming || self.control.active_turn {
+            self.notice = Some("wait for the current turn before deleting this chat".to_string());
+            return;
+        }
+        match sessions::delete(&self.data_dir, &session_id) {
+            Ok(()) => {
+                self.session_delete_confirm_id = None;
+                self.session_rename_id = None;
+                self.session_title_draft.clear();
+                self.refresh_sessions();
+                if self.session_id == session_id {
+                    let new_session_id = SessionId::generate().to_string();
+                    self.reset_visible_session(new_session_id.clone());
+                    self.pending_session_reset = Some(new_session_id.clone());
+                    self.handle.send_command(ChatCommand::NewSession {
+                        session_id: new_session_id,
+                    });
+                }
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                self.notice = Some(format!("session delete failed: {detail}"));
+                self.push_activity("session delete", detail, ActivityTone::Warn);
+            }
+        }
     }
 
     /// Open a stored session: load its transcript for display and tell the worker
@@ -764,6 +911,9 @@ impl ChatState {
         self.control = ChatControlOverview::default();
         self.scroll = f32::MAX;
         self.stick_bottom = true;
+        self.session_rename_id = None;
+        self.session_title_draft.clear();
+        self.session_delete_confirm_id = None;
         self.handle.send_command(ChatCommand::Resume {
             session_id: id,
             history,
@@ -812,10 +962,12 @@ impl ChatState {
     }
 
     fn apply_event(&mut self, event: ChatEvent) -> bool {
-        if let Some(session_id) = event.session_id().map(str::to_string)
-            && self.route_background_session_event(&session_id, event.clone())
-        {
-            return false;
+        if let Some(session_id) = event.session_id().map(str::to_string) {
+            if self.session_id.is_empty() {
+                self.session_id = session_id.clone();
+            } else if self.route_background_session_event(&session_id, event.clone()) {
+                return false;
+            }
         }
         match event {
             ChatEvent::Ready { session_id, info } => {
@@ -1039,9 +1191,10 @@ impl ChatState {
             self.notice = Some("set up a provider before sending".to_string());
             return;
         }
+        let session_id = self.ensure_visible_session_id();
         if self.streaming {
             self.handle.send_command(ChatCommand::FollowUp {
-                session_id: self.session_id.clone(),
+                session_id: session_id.clone(),
                 message: text.clone(),
             });
             self.messages.push(ChatMessage::user(text));
@@ -1067,10 +1220,8 @@ impl ChatState {
         self.scroll = f32::MAX;
         self.notice = Some("thinking…".to_string());
         self.persist();
-        self.handle.send_command(ChatCommand::Send {
-            session_id: self.session_id.clone(),
-            text,
-        });
+        self.handle
+            .send_command(ChatCommand::Send { session_id, text });
     }
 
     fn interrupt_turn(&mut self) {
@@ -1128,10 +1279,22 @@ impl ChatState {
 
     /// Select an agent by sidebar index and tell the worker to switch.
     fn select_agent(&mut self, index: usize) {
-        if let Some(agent) = self.agents.get(index) {
-            let key = agent.key.clone();
-            self.handle.send_command(ChatCommand::SetAgent(key));
+        let Some(agent) = self.agents.get(index) else {
+            return;
+        };
+        if self.visible_session_has_started() {
+            self.notice = Some("start a new chat before switching agents".to_string());
+            return;
         }
+        let key = agent.key.clone();
+        let session_id = self.ensure_visible_session_id();
+        let history = self.current_history();
+        self.info.agent = key.clone();
+        self.handle.send_command(ChatCommand::SetAgent {
+            session_id,
+            key,
+            history,
+        });
     }
 
     /// Whether `index` is the currently-active agent (matched by key or display name).
@@ -1372,6 +1535,11 @@ fn heading(shared: &Shared, text: &str) -> Label {
         .color_when(move || palette(&s).text_faint)
 }
 
+fn muted_label(shared: &Shared, text: impl Into<String>) -> Label {
+    let s = shared.clone();
+    Label::new(text).color_when(move || palette(&s).text_muted)
+}
+
 // ---------------------------------------------------------------------------
 // Sidebar — agents + sessions ListViews (rebuilt when the lists change).
 // ---------------------------------------------------------------------------
@@ -1430,6 +1598,136 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         })
 }
 
+fn session_edit_panel(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
+    let (session_id, title, draft, renaming, confirming_delete) = {
+        let chat = shared.chat();
+        let session = chat.current_session_ref()?;
+        (
+            session.id.clone(),
+            session.title.clone(),
+            chat.session_title_draft.clone(),
+            chat.session_rename_id.as_deref() == Some(session.id.as_str()),
+            chat.session_delete_confirm_id.as_deref() == Some(session.id.as_str()),
+        )
+    };
+
+    if renaming {
+        let input = {
+            let s = shared.clone();
+            TextInput::new(format!("chat-session-title-{session_id}"))
+                .value(draft)
+                .placeholder("Session title")
+                .theme_when(clone_reader(reader))
+                .on_change(move |value| {
+                    s.chat_mut().set_session_title_draft(value);
+                })
+        };
+        let save = {
+            let s = shared.clone();
+            sui::Button::new("Save")
+                .icon(IconGlyph::Check)
+                .theme_when(clone_reader(reader))
+                .enabled_when({
+                    let s = s.clone();
+                    move || s.chat().can_save_session_title()
+                })
+                .on_press(move || {
+                    s.chat_mut().save_session_title();
+                })
+        };
+        let cancel = {
+            let s = shared.clone();
+            sui::Button::new("Cancel")
+                .icon(IconGlyph::Close)
+                .theme_when(clone_reader(reader))
+                .on_press(move || {
+                    s.chat_mut().cancel_rename_session();
+                })
+        };
+        let controls = Stack::horizontal()
+            .spacing(6.0)
+            .alignment(Alignment::Start)
+            .with_child(save)
+            .with_child(cancel);
+        let panel = Stack::vertical()
+            .spacing(6.0)
+            .alignment(Alignment::Stretch)
+            .with_child(SizedBox::new().height(30.0).with_child(input))
+            .with_child(controls);
+        return Some(WidgetPod::new(panel));
+    }
+
+    if confirming_delete {
+        let title = compact_line(&title, 24);
+        let confirm = {
+            let s = shared.clone();
+            sui::Button::new("Delete")
+                .icon(IconGlyph::Trash)
+                .theme_when(clone_reader(reader))
+                .on_press(move || {
+                    s.chat_mut().confirm_delete_session();
+                })
+        };
+        let cancel = {
+            let s = shared.clone();
+            sui::Button::new("Cancel")
+                .icon(IconGlyph::Close)
+                .theme_when(clone_reader(reader))
+                .on_press(move || {
+                    s.chat_mut().cancel_delete_session();
+                })
+        };
+        let controls = Stack::horizontal()
+            .spacing(6.0)
+            .alignment(Alignment::Start)
+            .with_child(confirm)
+            .with_child(cancel);
+        let panel = Stack::vertical()
+            .spacing(6.0)
+            .alignment(Alignment::Stretch)
+            .with_child(muted_label(shared, format!("Delete \"{title}\"?")))
+            .with_child(controls);
+        return Some(WidgetPod::new(panel));
+    }
+
+    let title = compact_line(&title, 30);
+    let rename = {
+        let s = shared.clone();
+        sui::Button::new("Rename")
+            .theme_when(clone_reader(reader))
+            .on_press(move || {
+                s.chat_mut().begin_rename_current_session();
+            })
+    };
+    let delete = {
+        let s = shared.clone();
+        sui::Button::new("Delete")
+            .icon(IconGlyph::Trash)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || {
+                    let chat = s.chat();
+                    !chat.streaming && !chat.control.active_turn
+                }
+            })
+            .on_press(move || {
+                s.chat_mut().request_delete_current_session();
+            })
+    };
+    let controls = Stack::horizontal()
+        .spacing(6.0)
+        .alignment(Alignment::Start)
+        .with_child(rename)
+        .with_child(delete);
+    let panel = Stack::vertical()
+        .spacing(6.0)
+        .alignment(Alignment::Stretch)
+        .with_child(muted_label(shared, title))
+        .with_child(controls);
+    Some(WidgetPod::new(panel))
+}
+
 /// The sidebar column: AGENTS heading + list, then SESSIONS heading + list. Wrapped in a
 /// [`RebuildOnChange`] keyed on the agent/session signature so it rebuilds when those lists change
 /// (e.g. a new session is persisted) but not on every token.
@@ -1442,7 +1740,7 @@ fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             move || sidebar_signature(&s)
         },
         move |_sig| {
-            let column = Stack::vertical()
+            let mut column = Stack::vertical()
                 .spacing(4.0)
                 .alignment(Alignment::Stretch)
                 .with_child(SizedBox::new().height(18.0))
@@ -1453,6 +1751,11 @@ fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 .with_child(InsetX::new(heading(&s, "SESSIONS"), 18.0))
                 .with_child(SizedBox::new().height(2.0))
                 .with_child(InsetX::new(sessions_list(&s, &r), 8.0));
+            if let Some(panel) = session_edit_panel(&s, &r) {
+                column = column
+                    .with_child(SizedBox::new().height(8.0))
+                    .with_child(InsetX::from_pod(panel, 12.0));
+            }
             WidgetPod::new(Surface::sidebar(column).fill().theme_when(clone_reader(&r)))
         },
     )
@@ -1460,7 +1763,7 @@ fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 
 /// A signature of the sidebar's list contents (agents are static; sessions + the active agent
 /// change). Used to drive the sidebar [`RebuildOnChange`].
-fn sidebar_signature(shared: &Shared) -> (String, String) {
+fn sidebar_signature(shared: &Shared) -> (String, String, String, String, String) {
     let chat = shared.chat();
     let active = chat
         .agents
@@ -1472,10 +1775,16 @@ fn sidebar_signature(shared: &Shared) -> (String, String) {
     let sessions = chat
         .sessions
         .iter()
-        .map(|s| s.title.as_str())
+        .map(|s| format!("{}:{}", s.id, s.title))
         .collect::<Vec<_>>()
         .join("\u{1f}");
-    (active, sessions)
+    (
+        active,
+        sessions,
+        chat.session_id.clone(),
+        chat.session_rename_id.clone().unwrap_or_default(),
+        chat.session_delete_confirm_id.clone().unwrap_or_default(),
+    )
 }
 
 struct RuntimeOverview {
@@ -2958,6 +3267,13 @@ impl InsetX {
             pad: pad.max(0.0),
         }
     }
+
+    fn from_pod(child: WidgetPod, pad: f32) -> Self {
+        Self {
+            child,
+            pad: pad.max(0.0),
+        }
+    }
 }
 
 impl Widget for InsetX {
@@ -3007,7 +3323,11 @@ pub fn view(shared: Shared) -> impl Widget {
 mod tests {
     use super::*;
     use crate::backend::Backend;
-    use std::time::{Duration, Instant};
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
 
     fn seed_default_provider(state: &mut ChatState) {
         if state.providers.is_empty() {
@@ -3019,6 +3339,44 @@ mod tests {
             });
         }
         state.models_loading = false;
+    }
+
+    fn seed_test_agents(state: &mut ChatState) {
+        state.agents = vec![
+            AgentSummary {
+                key: "main-agent".to_string(),
+                name: "main-agent".to_string(),
+                description: String::new(),
+            },
+            AgentSummary {
+                key: "coding-agent".to_string(),
+                name: "coding-agent".to_string(),
+                description: String::new(),
+            },
+        ];
+        state.info.agent = "main-agent".to_string();
+    }
+
+    fn isolated_chat_state(slug: &str) -> (ChatState, PathBuf) {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let root = temp_chat_data_dir(slug);
+        state.data_dir = Arc::new(SinomoDataDir::new(&root));
+        state.sessions.clear();
+        (state, root)
+    }
+
+    fn temp_chat_data_dir(slug: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-app-chat-{slug}-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        root
     }
 
     #[test]
@@ -3055,6 +3413,159 @@ mod tests {
             "agent placeholder is blank"
         );
         assert!(state.input.is_empty(), "the draft is cleared on submit");
+    }
+
+    #[test]
+    fn submit_before_ready_assigns_session_id_and_indexes_session() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        state.session_id.clear();
+
+        state.set_draft("persist me before ready".to_string());
+        state.submit();
+
+        let session_id = state.session_id.clone();
+        assert!(
+            !session_id.is_empty(),
+            "submitting before Ready must still create a visible session id"
+        );
+        let transcript =
+            sessions::load_transcript(&state.data_dir, &session_id).expect("transcript saved");
+        assert_eq!(transcript.messages.len(), 2);
+        assert_eq!(transcript.messages[0].text, "persist me before ready");
+        assert!(
+            state
+                .sessions
+                .iter()
+                .any(|session| session.id == session_id),
+            "new conversation should appear in the sessions list after submit"
+        );
+
+        state.apply_event(ChatEvent::Ready {
+            session_id: SessionId::generate().to_string(),
+            info: RuntimeInfo::default(),
+        });
+        assert_eq!(
+            state.session_id, session_id,
+            "a late initial Ready event must not move the visible conversation to another id"
+        );
+    }
+
+    #[test]
+    fn agent_switch_is_blocked_after_start_but_allowed_after_new_chat() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_test_agents(&mut state);
+        state.session_id = SessionId::generate().to_string();
+        state.messages = vec![ChatMessage::user("already started")];
+
+        state.select_agent(1);
+
+        assert_eq!(
+            state.info.agent, "main-agent",
+            "started sessions keep their original agent"
+        );
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("start a new chat before switching agents")
+        );
+
+        state.new_session();
+        state.select_agent(1);
+
+        assert!(
+            state.messages.is_empty(),
+            "new chat creates an empty switchable session"
+        );
+        assert_eq!(
+            state.info.agent, "coding-agent",
+            "agent selection is allowed again in a fresh chat"
+        );
+    }
+
+    #[test]
+    fn session_rename_updates_sidebar_metadata_and_preserves_title() {
+        let (mut state, root) = isolated_chat_state("rename");
+        let session_id = SessionId::generate().to_string();
+        state.session_id = session_id.clone();
+        state.messages = vec![
+            ChatMessage::user("original prompt"),
+            ChatMessage::model("original answer"),
+        ];
+        state.persist();
+
+        state.begin_rename_current_session();
+        assert_eq!(
+            state.session_rename_id.as_deref(),
+            Some(session_id.as_str())
+        );
+        state.set_session_title_draft("Renamed chat".to_string());
+        assert!(state.can_save_session_title());
+        state.save_session_title();
+
+        assert!(state.session_rename_id.is_none());
+        assert_eq!(
+            state
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .map(|session| session.title.as_str()),
+            Some("Renamed chat")
+        );
+        let transcript =
+            sessions::load_transcript(&state.data_dir, &session_id).expect("transcript preserved");
+        assert_eq!(transcript.messages[0].text, "original prompt");
+        assert_eq!(transcript.messages[1].text, "original answer");
+
+        state.persist();
+        let meta = sessions::list(&state.data_dir)
+            .into_iter()
+            .find(|meta| meta.id == session_id)
+            .expect("renamed session listed");
+        assert_eq!(meta.title, "Renamed chat");
+        assert_eq!(meta.title_source.as_deref(), Some("user"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_delete_hides_session_and_resets_visible_chat() {
+        let (mut state, root) = isolated_chat_state("delete");
+        let session_id = SessionId::generate().to_string();
+        state.session_id = session_id.clone();
+        state.messages = vec![
+            ChatMessage::user("delete this prompt"),
+            ChatMessage::model("delete this answer"),
+        ];
+        state.persist();
+
+        state.request_delete_current_session();
+        assert_eq!(
+            state.session_delete_confirm_id.as_deref(),
+            Some(session_id.as_str())
+        );
+        state.confirm_delete_session();
+
+        assert!(
+            state
+                .sessions
+                .iter()
+                .all(|session| session.id != session_id),
+            "deleted sessions leave the sidebar list"
+        );
+        assert!(
+            sessions::load_transcript(&state.data_dir, &session_id).is_none(),
+            "deleted sessions cannot be reopened"
+        );
+        assert!(state.messages.is_empty());
+        assert_ne!(state.session_id, session_id);
+        assert_eq!(
+            state.pending_session_reset.as_deref(),
+            Some(state.session_id.as_str())
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
