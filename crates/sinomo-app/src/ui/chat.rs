@@ -38,13 +38,16 @@ use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 
 use sui::{
-    Alignment, ArrangeCtx, Color, Constraints, DefaultTheme, Event, EventCtx, FontWeight,
-    IconButton, IconGlyph, Insets, KeyState, Label, ListItem, ListView, MeasureCtx, PaintCtx,
-    PointerEventKind, Rect, ScrollDelta, SemanticsCtx, Separator, Size, SizedBox, Stack, Surface,
-    SurfaceBorder, SurfaceRole, TextArea, TextInput, Widget, WidgetPod, WidgetPodMutVisitor,
-    WidgetPodVisitor, draw_glyph,
+    Alignment, ArrangeCtx, Color, Constraints, DefaultTheme, Event, EventCtx, Flex, FlexItem,
+    FontWeight, IconButton, IconGlyph, Insets, KeyState, Label, ListItem, ListView, MeasureCtx,
+    PaintCtx, Point, PointerButton, PointerEventKind, Rect, ScrollDelta, ScrollView,
+    SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, Separator, Size, SizedBox, Stack,
+    StackHostOptions, Surface, SurfaceBorder, SurfaceRole, TextArea, TextInput, Widget, WidgetPod,
+    WidgetPodMutVisitor, WidgetPodVisitor, draw_glyph,
 };
 
 use sinomo_agent::{
@@ -299,6 +302,13 @@ pub enum ConversationKind {
     Channel,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChannelAgentRef {
+    participant_id: String,
+    agent_name: String,
+    agent_key: String,
+}
+
 /// State backing the chat tab.
 pub struct ChatState {
     pub data_dir: Arc<SinomoDataDir>,
@@ -327,11 +337,18 @@ pub struct ChatState {
     pub models_loading: bool,
     pub sessions: Vec<SessionRef>,
     pending_session_reset: Option<String>,
-    session_rename_id: Option<String>,
+    session_edit_id: Option<String>,
     session_title_draft: String,
     session_delete_confirm_id: Option<String>,
-    channel_config_id: Option<String>,
+    pending_delete_id: Option<String>,
+    delete_rx: Option<Receiver<DeleteWorkerResult>>,
     channel_agent_idx: usize,
+}
+
+struct DeleteWorkerResult {
+    session: SessionRef,
+    kind: ConversationKind,
+    result: Result<(), String>,
 }
 
 impl ChatState {
@@ -375,10 +392,11 @@ impl ChatState {
             models_loading: false,
             sessions,
             pending_session_reset: None,
-            session_rename_id: None,
+            session_edit_id: None,
             session_title_draft: String::new(),
             session_delete_confirm_id: None,
-            channel_config_id: None,
+            pending_delete_id: None,
+            delete_rx: None,
             channel_agent_idx: 0,
         };
         // Eagerly fetch the default/initial provider's models so the model picker is populated
@@ -452,20 +470,6 @@ impl ChatState {
         store.save_channel(&channel).map_err(channel_store_io_error)
     }
 
-    fn delete_channel_record(&self, id: &str) -> std::io::Result<()> {
-        let channel_id = parse_channel_id(id)?;
-        let store = FileAgentChannelStore::for_data_dir(&self.data_dir);
-        let mut channel = match store
-            .load_channel(&channel_id)
-            .map_err(channel_store_io_error)?
-        {
-            Some(channel) => channel,
-            None => return Ok(()),
-        };
-        channel.tombstone();
-        store.save_channel(&channel).map_err(channel_store_io_error)
-    }
-
     fn load_channel_messages(&self, id: &str) -> Option<Vec<ChatMessage>> {
         let channel_id = id.parse::<SessionId>().ok()?;
         let channel = FileAgentChannelStore::for_data_dir(&self.data_dir)
@@ -475,7 +479,7 @@ impl ChatState {
         Some(channel_messages(&channel))
     }
 
-    fn channel_participant_labels(&self, id: &str) -> Vec<String> {
+    fn channel_agent_refs(&self, id: &str) -> Vec<ChannelAgentRef> {
         let Ok(channel_id) = id.parse::<SessionId>() else {
             return Vec::new();
         };
@@ -489,7 +493,11 @@ impl ChatState {
         participants
             .into_iter()
             .filter(|participant| participant.enabled)
-            .map(|participant| participant.agent_name)
+            .map(|participant| ChannelAgentRef {
+                participant_id: participant.participant_id.to_string(),
+                agent_name: participant.agent_name,
+                agent_key: participant.agent_key,
+            })
             .collect()
     }
 
@@ -862,10 +870,9 @@ impl ChatState {
         self.control = ChatControlOverview::default();
         self.scroll = 0.0;
         self.stick_bottom = true;
-        self.session_rename_id = None;
+        self.session_edit_id = None;
         self.session_title_draft.clear();
         self.session_delete_confirm_id = None;
-        self.channel_config_id = None;
     }
 
     fn visible_session_has_started(&self) -> bool {
@@ -895,22 +902,31 @@ impl ChatState {
             .is_some_and(|session| session.kind == ConversationKind::Channel)
     }
 
-    fn begin_rename_current_session(&mut self) {
-        let Some((session_id, title)) = self
-            .current_session_ref()
-            .map(|session| (session.id.clone(), session.title.clone()))
+    fn begin_edit_session(&mut self, session_id: &str) {
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
         else {
             return;
         };
-        self.session_rename_id = Some(session_id);
-        self.session_title_draft = title;
+        self.session_edit_id = Some(session.id);
+        self.session_title_draft = session.title;
         self.session_delete_confirm_id = None;
-        self.channel_config_id = None;
     }
 
-    fn cancel_rename_session(&mut self) {
-        self.session_rename_id = None;
+    fn begin_edit_current_session(&mut self) {
+        let Some(session_id) = self.current_session_ref().map(|session| session.id.clone()) else {
+            return;
+        };
+        self.begin_edit_session(&session_id);
+    }
+
+    fn close_session_edit(&mut self) {
+        self.session_edit_id = None;
         self.session_title_draft.clear();
+        self.session_delete_confirm_id = None;
     }
 
     fn set_session_title_draft(&mut self, title: String) {
@@ -918,7 +934,7 @@ impl ChatState {
     }
 
     fn can_save_session_title(&self) -> bool {
-        let Some(rename_id) = self.session_rename_id.as_deref() else {
+        let Some(edit_id) = self.session_edit_id.as_deref() else {
             return false;
         };
         let title = self.session_title_draft.trim();
@@ -926,18 +942,18 @@ impl ChatState {
             && self
                 .sessions
                 .iter()
-                .find(|session| session.id == rename_id)
+                .find(|session| session.id == edit_id)
                 .is_some_and(|session| session.title != title)
     }
 
     fn save_session_title(&mut self) {
-        let Some(rename_id) = self.session_rename_id.clone() else {
+        let Some(edit_id) = self.session_edit_id.clone() else {
             return;
         };
         let kind = self
             .sessions
             .iter()
-            .find(|session| session.id == rename_id)
+            .find(|session| session.id == edit_id)
             .map(|session| session.kind)
             .unwrap_or(ConversationKind::Chat);
         let title = self.session_title_draft.trim().to_string();
@@ -946,13 +962,12 @@ impl ChatState {
             return;
         }
         let result = match kind {
-            ConversationKind::Chat => sessions::rename(&self.data_dir, &rename_id, &title),
-            ConversationKind::Channel => self.rename_channel(&rename_id, &title),
+            ConversationKind::Chat => sessions::rename(&self.data_dir, &edit_id, &title),
+            ConversationKind::Channel => self.rename_channel(&edit_id, &title),
         };
         match result {
             Ok(()) => {
-                self.session_rename_id = None;
-                self.session_title_draft.clear();
+                self.session_title_draft = title;
                 self.refresh_sessions();
             }
             Err(error) => {
@@ -968,10 +983,19 @@ impl ChatState {
         }
     }
 
-    fn request_delete_current_session(&mut self) {
-        let Some(session) = self.current_session_ref() else {
+    fn request_delete_session(&mut self, session_id: &str) {
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+        else {
             return;
         };
+        if self.pending_delete_id.is_some() {
+            self.notice = Some("wait for the current delete to finish".to_string());
+            return;
+        }
         if self.streaming || self.control.active_turn {
             let label = if session.kind == ConversationKind::Channel {
                 "channel"
@@ -983,26 +1007,31 @@ impl ChatState {
             ));
             return;
         }
-        self.session_delete_confirm_id = Some(session.id.clone());
-        self.session_rename_id = None;
-        self.session_title_draft.clear();
-        self.channel_config_id = None;
+        self.session_edit_id = Some(session.id.clone());
+        self.session_title_draft = session.title;
+        self.session_delete_confirm_id = Some(session.id);
     }
 
     fn cancel_delete_session(&mut self) {
         self.session_delete_confirm_id = None;
     }
 
-    fn confirm_delete_session(&mut self) {
+    fn confirm_delete_session(&mut self, waker: Option<sui::UiHandle>) {
         let Some(session_id) = self.session_delete_confirm_id.clone() else {
             return;
         };
-        let kind = self
+        let Some(session) = self
             .sessions
             .iter()
             .find(|session| session.id == session_id)
-            .map(|session| session.kind)
-            .unwrap_or(ConversationKind::Chat);
+            .cloned()
+        else {
+            self.session_delete_confirm_id = None;
+            self.session_edit_id = None;
+            self.session_title_draft.clear();
+            return;
+        };
+        let kind = session.kind;
         if self.streaming || self.control.active_turn {
             let label = if kind == ConversationKind::Channel {
                 "channel"
@@ -1014,45 +1043,124 @@ impl ChatState {
             ));
             return;
         }
-        let result = match kind {
-            ConversationKind::Chat => {
-                let result = sessions::delete(&self.data_dir, &session_id);
-                let _ = self.delete_channel_record(&session_id);
-                result
-            }
-            ConversationKind::Channel => {
-                let result = self.delete_channel_record(&session_id);
-                let _ = sessions::delete(&self.data_dir, &session_id);
-                result
-            }
-        };
-        match result {
-            Ok(()) => {
-                self.session_delete_confirm_id = None;
-                self.session_rename_id = None;
-                self.session_title_draft.clear();
-                self.channel_config_id = None;
-                self.refresh_sessions();
-                if self.session_id == session_id {
-                    let new_session_id = SessionId::generate().to_string();
-                    self.reset_visible_session(new_session_id.clone());
-                    self.pending_session_reset = Some(new_session_id.clone());
-                    self.handle.send_command(ChatCommand::NewSession {
-                        session_id: new_session_id,
-                    });
+        if self.pending_delete_id.is_some() {
+            self.notice = Some("wait for the current delete to finish".to_string());
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let data_dir = self.data_dir.clone();
+        let worker_session_id = session_id.clone();
+        let worker_session = session.clone();
+        let worker_waker = waker.clone();
+        let spawn_result = thread::Builder::new()
+            .name("sinomo-app-chat-delete".to_string())
+            .spawn(move || {
+                let result = delete_conversation_records(&data_dir, &worker_session_id, kind)
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(DeleteWorkerResult {
+                    session: worker_session,
+                    kind,
+                    result,
+                });
+                if let Some(waker) = worker_waker {
+                    waker.wake();
                 }
+            });
+
+        if let Err(error) = spawn_result {
+            let label = if kind == ConversationKind::Channel {
+                "channel"
+            } else {
+                "chat"
+            };
+            self.notice = Some(format!("{label} delete failed: {error}"));
+            self.push_activity(
+                format!("{label} delete"),
+                error.to_string(),
+                ActivityTone::Warn,
+            );
+            return;
+        }
+
+        self.delete_rx = Some(rx);
+        self.pending_delete_id = Some(session_id.clone());
+        self.session_delete_confirm_id = None;
+        self.session_edit_id = None;
+        self.session_title_draft.clear();
+        self.sessions.retain(|session| session.id != session_id);
+        if self.session_id == session_id {
+            let new_session_id = SessionId::generate().to_string();
+            self.reset_visible_session(new_session_id.clone());
+            self.pending_session_reset = Some(new_session_id.clone());
+            self.handle.send_command(ChatCommand::NewSession {
+                session_id: new_session_id,
+            });
+        }
+        let label = if kind == ConversationKind::Channel {
+            "channel"
+        } else {
+            "chat"
+        };
+        self.notice = Some(format!("deleted {label}"));
+    }
+
+    pub fn pump_delete(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            let result = match self.delete_rx.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(result)) => result,
+                Some(Err(TryRecvError::Empty)) | None => break,
+                Some(Err(TryRecvError::Disconnected)) => {
+                    if let Some(session_id) = self.pending_delete_id.take() {
+                        self.notice = Some("chat delete failed: worker stopped".to_string());
+                        self.push_activity(
+                            "chat delete",
+                            format!("worker stopped before deleting {session_id}"),
+                            ActivityTone::Warn,
+                        );
+                        changed = true;
+                    }
+                    self.delete_rx = None;
+                    break;
+                }
+            };
+            if self.apply_delete_result(result) {
+                changed = true;
             }
-            Err(error) => {
-                let detail = error.to_string();
-                let label = if kind == ConversationKind::Channel {
-                    "channel"
-                } else {
-                    "chat"
-                };
+        }
+        changed
+    }
+
+    fn apply_delete_result(&mut self, result: DeleteWorkerResult) -> bool {
+        if self.pending_delete_id.as_deref() != Some(result.session.id.as_str()) {
+            return false;
+        }
+        self.pending_delete_id = None;
+        self.delete_rx = None;
+        let label = if result.kind == ConversationKind::Channel {
+            "channel"
+        } else {
+            "chat"
+        };
+        match result.result {
+            Ok(()) => {
+                self.push_activity(format!("{label} delete"), "completed", ActivityTone::Good);
+            }
+            Err(detail) => {
+                if !self
+                    .sessions
+                    .iter()
+                    .any(|session| session.id == result.session.id)
+                {
+                    self.sessions.push(result.session);
+                    sort_conversations(&mut self.sessions);
+                }
                 self.notice = Some(format!("{label} delete failed: {detail}"));
                 self.push_activity(format!("{label} delete"), detail, ActivityTone::Warn);
             }
         }
+        true
     }
 
     /// Open a stored chat: load its transcript for display and tell the worker
@@ -1096,10 +1204,9 @@ impl ChatState {
         self.control = ChatControlOverview::default();
         self.scroll = f32::MAX;
         self.stick_bottom = true;
-        self.session_rename_id = None;
+        self.session_edit_id = None;
         self.session_title_draft.clear();
         self.session_delete_confirm_id = None;
-        self.channel_config_id = None;
         self.handle.send_command(ChatCommand::Resume {
             session_id: id,
             history,
@@ -1488,7 +1595,7 @@ impl ChatState {
         };
         if self.current_is_channel() {
             self.channel_agent_idx = index;
-            self.begin_configure_current_channel();
+            self.begin_edit_current_session();
             self.notice = Some("use channel config to add agents".to_string());
             return;
         }
@@ -1556,8 +1663,8 @@ impl ChatState {
             Ok(()) => {
                 self.reset_visible_session(session_id.clone());
                 self.pending_session_reset = Some(session_id.clone());
-                self.channel_config_id = Some(session_id.clone());
                 self.refresh_sessions();
+                self.begin_edit_session(&session_id);
                 self.handle
                     .send_command(ChatCommand::NewSession { session_id });
             }
@@ -1586,28 +1693,21 @@ impl ChatState {
         (key.clone(), key)
     }
 
-    fn begin_configure_current_channel(&mut self) {
-        if !self.current_is_channel() {
-            return;
-        }
-        self.channel_config_id = Some(self.session_id.clone());
-        self.session_rename_id = None;
-        self.session_title_draft.clear();
-        self.session_delete_confirm_id = None;
-    }
-
-    fn close_channel_config(&mut self) {
-        self.channel_config_id = None;
-    }
-
     fn set_channel_agent_idx(&mut self, index: usize) {
         self.channel_agent_idx = index.min(self.agents.len().saturating_sub(1));
     }
 
     fn add_selected_agent_to_channel(&mut self) {
-        let Some(channel_id) = self.channel_config_id.clone() else {
+        let Some(channel_id) = self.session_edit_id.clone() else {
             return;
         };
+        if !self
+            .sessions
+            .iter()
+            .any(|session| session.id == channel_id && session.kind == ConversationKind::Channel)
+        {
+            return;
+        }
         let Some(agent) = self.agents.get(self.channel_agent_idx) else {
             return;
         };
@@ -1634,6 +1734,46 @@ impl ChatState {
             Ok(()) => {
                 self.refresh_sessions();
                 self.notice = Some(format!("added {agent_name} to channel"));
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                self.notice = Some(format!("channel config failed: {detail}"));
+                self.push_activity("channel config", detail, ActivityTone::Warn);
+            }
+        }
+    }
+
+    fn remove_channel_agent(&mut self, channel_id: &str, participant_id: &str) {
+        let Ok(parsed_channel_id) = channel_id.parse::<SessionId>() else {
+            self.notice = Some("channel config failed: invalid channel id".to_string());
+            return;
+        };
+        let Ok(parsed_participant_id) = participant_id.parse::<sinomo_agent::TaskId>() else {
+            self.notice = Some("channel config failed: invalid participant id".to_string());
+            return;
+        };
+        let store = FileAgentChannelStore::for_data_dir(&self.data_dir);
+        let mut channel = match store.load_channel(&parsed_channel_id) {
+            Ok(Some(channel)) => channel,
+            Ok(None) => {
+                self.notice = Some("channel config failed: channel not found".to_string());
+                return;
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                self.notice = Some(format!("channel config failed: {detail}"));
+                self.push_activity("channel config", detail, ActivityTone::Warn);
+                return;
+            }
+        };
+        if !channel.disable_participant(&parsed_participant_id) {
+            self.notice = Some("channel config failed: agent not found".to_string());
+            return;
+        }
+        match store.save_channel(&channel) {
+            Ok(()) => {
+                self.refresh_sessions();
+                self.notice = Some("removed agent from channel".to_string());
             }
             Err(error) => {
                 let detail = error.to_string();
@@ -1756,13 +1896,50 @@ fn list_conversations(data_dir: &SinomoDataDir) -> Vec<SessionRef> {
         }
     }
 
+    sort_conversations(&mut conversations);
+    conversations
+}
+
+fn sort_conversations(conversations: &mut [SessionRef]) {
     conversations.sort_by(|left, right| {
         right
             .updated_unix
             .cmp(&left.updated_unix)
             .then_with(|| left.title.cmp(&right.title))
     });
-    conversations
+}
+
+fn delete_conversation_records(
+    data_dir: &SinomoDataDir,
+    id: &str,
+    kind: ConversationKind,
+) -> std::io::Result<()> {
+    match kind {
+        ConversationKind::Chat => {
+            let result = sessions::delete(data_dir, id);
+            let _ = delete_channel_record_in(data_dir, id);
+            result
+        }
+        ConversationKind::Channel => {
+            let result = delete_channel_record_in(data_dir, id);
+            let _ = sessions::delete(data_dir, id);
+            result
+        }
+    }
+}
+
+fn delete_channel_record_in(data_dir: &SinomoDataDir, id: &str) -> std::io::Result<()> {
+    let channel_id = parse_channel_id(id)?;
+    let store = FileAgentChannelStore::for_data_dir(data_dir);
+    let mut channel = match store
+        .load_channel(&channel_id)
+        .map_err(channel_store_io_error)?
+    {
+        Some(channel) => channel,
+        None => return Ok(()),
+    };
+    channel.tombstone();
+    store.save_channel(&channel).map_err(channel_store_io_error)
 }
 
 fn channel_messages(channel: &AgentChannel) -> Vec<ChatMessage> {
@@ -1992,23 +2169,23 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         ListItem::new("New chat").leading_text("+"),
         ListItem::new("New channel").leading_text("#"),
     ];
-    items.extend(shared.chat().sessions.iter().map(|session| {
-        let item = ListItem::new(session.title.clone()).leading_text(match session.kind {
-            ConversationKind::Chat => "◷",
-            ConversationKind::Channel => "#",
-        });
-        if session.kind == ConversationKind::Channel {
-            item.trailing(format!("{} agents", session.participant_count.max(1)))
-        } else {
-            item
-        }
+    items.extend(shared.chat().sessions.iter().cloned().map(|session| {
+        ListItem::new(session.title.clone())
+            .with_child(ChatSessionRow::new(shared.clone(), session))
     }));
     let s = shared.clone();
     ListView::new("chat-sessions")
         .items(items)
-        // The session list is a drill-in action list, not a persistent selection: never keep a
-        // row highlighted (mirrors the Settings narrow menu).
-        .selected_when(|| None::<usize>)
+        .selected_when({
+            let s = s.clone();
+            move || {
+                let chat = s.chat();
+                chat.sessions
+                    .iter()
+                    .position(|session| session.id == chat.session_id)
+                    .map(|index| index + 2)
+            }
+        })
         .row_height(SIDEBAR_ROW_H)
         .theme_when(clone_reader(reader))
         .on_change(move |index, _label| {
@@ -2023,231 +2200,277 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         })
 }
 
-fn session_edit_panel(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
-    let (session_id, title, draft, renaming, confirming_delete, is_channel, configuring) = {
-        let chat = shared.chat();
-        let session = chat.current_session_ref()?;
-        (
-            session.id.clone(),
-            session.title.clone(),
-            chat.session_title_draft.clone(),
-            chat.session_rename_id.as_deref() == Some(session.id.as_str()),
-            chat.session_delete_confirm_id.as_deref() == Some(session.id.as_str()),
-            session.kind == ConversationKind::Channel,
-            chat.channel_config_id.as_deref() == Some(session.id.as_str()),
-        )
-    };
+fn sessions_scroll(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    ScrollView::vertical(sessions_list(shared, reader))
+        .name("chat-sessions-scroll")
+        .theme(shared.theme())
+}
 
-    if renaming {
-        let placeholder = if is_channel {
-            "Channel title"
-        } else {
-            "Chat title"
-        };
-        let input = {
-            let s = shared.clone();
-            TextInput::new(format!("chat-session-title-{session_id}"))
-                .value(draft)
-                .placeholder(placeholder)
-                .theme_when(clone_reader(reader))
-                .on_change(move |value| {
-                    s.chat_mut().set_session_title_draft(value);
-                })
-        };
-        let save = {
-            let s = shared.clone();
-            sui::Button::new("Save")
-                .icon(IconGlyph::Check)
-                .theme_when(clone_reader(reader))
-                .enabled_when({
-                    let s = s.clone();
-                    move || s.chat().can_save_session_title()
-                })
-                .on_press(move || {
-                    s.chat_mut().save_session_title();
-                })
-        };
-        let cancel = {
-            let s = shared.clone();
-            sui::Button::new("Cancel")
-                .icon(IconGlyph::Close)
-                .theme_when(clone_reader(reader))
-                .on_press(move || {
-                    s.chat_mut().cancel_rename_session();
-                })
-        };
-        let controls = Stack::horizontal()
-            .spacing(6.0)
-            .alignment(Alignment::Start)
-            .with_child(save)
-            .with_child(cancel);
-        let panel = Stack::vertical()
-            .spacing(6.0)
-            .alignment(Alignment::Stretch)
-            .with_child(SizedBox::new().height(30.0).with_child(input))
-            .with_child(controls);
-        return Some(WidgetPod::new(panel));
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChatSessionRowHit {
+    Row,
+    Edit,
+}
+
+struct ChatSessionRow {
+    shared: Shared,
+    session: SessionRef,
+    hovered: bool,
+    pressed: Option<ChatSessionRowHit>,
+}
+
+impl ChatSessionRow {
+    fn new(shared: Shared, session: SessionRef) -> Self {
+        Self {
+            shared,
+            session,
+            hovered: false,
+            pressed: None,
+        }
     }
 
-    if is_channel && configuring {
-        let participants = shared.chat().channel_participant_labels(&session_id);
-        let mut panel = Stack::vertical()
-            .spacing(6.0)
-            .alignment(Alignment::Stretch)
-            .with_child(muted_label(shared, compact_line(&title, 30)))
-            .with_child(muted_label(
-                shared,
-                if participants.is_empty() {
-                    "No agents in channel".to_string()
-                } else {
-                    format!("Agents: {}", participants.join(", "))
-                },
-            ));
+    fn active(&self) -> bool {
+        self.shared.chat().session_id == self.session.id
+    }
 
-        if !shared.chat().agents.is_empty() {
-            let agent_options = shared
-                .chat()
-                .agents
-                .iter()
-                .map(|agent| agent.name.clone())
-                .collect::<Vec<_>>();
-            let picker = {
-                let s = shared.clone();
-                sui::Select::new(format!("channel-agent-picker-{session_id}"))
-                    .options(agent_options)
-                    .placeholder("Agent")
-                    .theme_when(clone_reader(reader))
-                    .selected_when({
-                        let s = s.clone();
-                        move || {
-                            let chat = s.chat();
-                            (!chat.agents.is_empty()).then_some(
-                                chat.channel_agent_idx
-                                    .min(chat.agents.len().saturating_sub(1)),
-                            )
+    fn editing(&self) -> bool {
+        self.shared.chat().session_edit_id.as_deref() == Some(self.session.id.as_str())
+    }
+
+    fn show_edit_button(&self) -> bool {
+        self.hovered || self.active() || self.editing()
+    }
+
+    fn edit_rect(&self, bounds: Rect) -> Rect {
+        let side = 22.0_f32.min(bounds.height()).max(0.0);
+        Rect::new(
+            bounds.max_x() - side - 2.0,
+            bounds.y() + (bounds.height() - side) * 0.5,
+            side,
+            side,
+        )
+    }
+
+    fn hit_at(&self, bounds: Rect, position: Point) -> Option<ChatSessionRowHit> {
+        if !bounds.contains(position) {
+            return None;
+        }
+        if self.edit_rect(bounds).contains(position) {
+            Some(ChatSessionRowHit::Edit)
+        } else {
+            Some(ChatSessionRowHit::Row)
+        }
+    }
+}
+
+impl Widget for ChatSessionRow {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        match event {
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
+                let hovered = ctx.bounds().contains(pointer.position);
+                if self.hovered != hovered {
+                    self.hovered = hovered;
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Down
+                    && pointer.button == Some(PointerButton::Primary) =>
+            {
+                let Some(hit) = self.hit_at(ctx.bounds(), pointer.position) else {
+                    return;
+                };
+                self.pressed = Some(hit);
+                ctx.request_focus();
+                ctx.request_pointer_capture(pointer.pointer_id);
+                ctx.request_paint();
+                ctx.set_handled();
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Up
+                    && pointer.button == Some(PointerButton::Primary) =>
+            {
+                let hit = self.hit_at(ctx.bounds(), pointer.position);
+                if let (Some(pressed), Some(hit)) = (self.pressed.take(), hit)
+                    && pressed == hit
+                {
+                    match hit {
+                        ChatSessionRowHit::Row => {
+                            let index = {
+                                let chat = self.shared.chat();
+                                chat.sessions
+                                    .iter()
+                                    .position(|session| session.id == self.session.id)
+                            };
+                            if let Some(index) = index {
+                                self.shared.chat_mut().open_session(index);
+                            }
                         }
-                    })
-                    .on_change(move |index, _label| {
-                        s.chat_mut().set_channel_agent_idx(index);
-                    })
-            };
-            panel = panel.with_child(SizedBox::new().height(SELECTOR_H).with_child(picker));
+                        ChatSessionRowHit::Edit => {
+                            self.shared.chat_mut().begin_edit_session(&self.session.id);
+                        }
+                    }
+                    ctx.request_measure();
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
+                ctx.release_pointer_capture(pointer.pointer_id);
+                ctx.set_handled();
+            }
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Leave => {
+                if self.hovered {
+                    self.hovered = false;
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
+            }
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Cancel => {
+                if self.pressed.take().is_some() {
+                    ctx.release_pointer_capture(pointer.pointer_id);
+                    ctx.request_paint();
+                    ctx.set_handled();
+                }
+                if self.hovered {
+                    self.hovered = false;
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
+            }
+            Event::Keyboard(key)
+                if ctx.is_focused()
+                    && key.state == KeyState::Pressed
+                    && matches!(key.key.as_str(), "Enter" | " ") =>
+            {
+                let index = {
+                    let chat = self.shared.chat();
+                    chat.sessions
+                        .iter()
+                        .position(|session| session.id == self.session.id)
+                };
+                if let Some(index) = index {
+                    self.shared.chat_mut().open_session(index);
+                    ctx.request_measure();
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                    ctx.set_handled();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        constraints.clamp(Size::new(
+            if constraints.max.width.is_finite() {
+                constraints.max.width
+            } else {
+                210.0
+            },
+            24.0,
+        ))
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let theme = self.shared.theme();
+        let pal = palette(&self.shared);
+        let bounds = ctx.bounds();
+        let active = self.active();
+        let show_edit = self.show_edit_button();
+        let edit = self.edit_rect(bounds);
+        let icon_color = if active { pal.accent } else { pal.text_faint };
+        let label_color = if active { pal.text } else { pal.text_muted };
+        let title_style = pal.text_style(&theme, 12.5, FontWeight::MEDIUM, label_color);
+        let meta_style = pal.text_style(&theme, 10.5, FontWeight::NORMAL, pal.text_faint);
+
+        let leading = Rect::new(bounds.x() + 2.0, bounds.y(), 18.0, bounds.height());
+        match self.session.kind {
+            ConversationKind::Chat => {
+                let side = 14.0;
+                draw_glyph(
+                    ctx,
+                    IconGlyph::Chat,
+                    Rect::new(
+                        leading.x() + 1.0,
+                        leading.y() + (leading.height() - side) * 0.5,
+                        side,
+                        side,
+                    ),
+                    icon_color,
+                );
+            }
+            ConversationKind::Channel => {
+                widgets::draw_text_in(ctx, leading, "#", title_style.clone());
+            }
         }
 
-        let add = {
-            let s = shared.clone();
-            sui::Button::new("Add agent")
-                .icon(IconGlyph::Add)
-                .theme_when(clone_reader(reader))
-                .enabled_when({
-                    let s = s.clone();
-                    move || !s.chat().agents.is_empty()
-                })
-                .on_press(move || {
-                    s.chat_mut().add_selected_agent_to_channel();
-                })
-        };
-        let done = {
-            let s = shared.clone();
-            sui::Button::new("Done")
-                .icon(IconGlyph::Check)
-                .theme_when(clone_reader(reader))
-                .on_press(move || {
-                    s.chat_mut().close_channel_config();
-                })
-        };
-        let controls = Stack::horizontal()
-            .spacing(6.0)
-            .alignment(Alignment::Start)
-            .with_child(add)
-            .with_child(done);
-        panel = panel.with_child(controls);
-        return Some(WidgetPod::new(panel));
+        if show_edit {
+            let fill = if self.pressed == Some(ChatSessionRowHit::Edit) {
+                pal.selected
+            } else if self.editing() {
+                pal.field
+            } else {
+                pal.hover
+            };
+            widgets::fill_round_rect(ctx, edit, fill, 6.0);
+            draw_glyph(
+                ctx,
+                IconGlyph::MoreHorizontal,
+                edit.inflate(-4.0, -4.0),
+                if self.editing() {
+                    pal.accent
+                } else {
+                    pal.text_muted
+                },
+            );
+        }
+
+        let edit_gap = if show_edit { 28.0 } else { 0.0 };
+        let participant_text = (self.session.kind == ConversationKind::Channel)
+            .then(|| format!("{} agents", self.session.participant_count));
+        let participant_w = participant_text.as_ref().map(|_| 50.0).unwrap_or(0.0);
+        if let Some(text) = participant_text {
+            let rect = Rect::new(
+                (bounds.max_x() - edit_gap - participant_w).max(bounds.x()),
+                bounds.y(),
+                participant_w,
+                bounds.height(),
+            );
+            widgets::draw_text_in(ctx, rect, &text, meta_style);
+        }
+
+        let title_x = leading.max_x() + 5.0;
+        let title_right = bounds.max_x() - edit_gap - participant_w - 5.0;
+        let title_rect = Rect::new(
+            title_x,
+            bounds.y(),
+            (title_right - title_x).max(0.0),
+            bounds.height(),
+        );
+        ctx.push_clip_rect(title_rect);
+        widgets::draw_text_in(ctx, title_rect, &self.session.title, title_style);
+        ctx.pop_clip();
     }
 
-    if confirming_delete {
-        let title = compact_line(&title, 24);
-        let confirm = {
-            let s = shared.clone();
-            sui::Button::new("Delete")
-                .icon(IconGlyph::Trash)
-                .theme_when(clone_reader(reader))
-                .on_press(move || {
-                    s.chat_mut().confirm_delete_session();
-                })
-        };
-        let cancel = {
-            let s = shared.clone();
-            sui::Button::new("Cancel")
-                .icon(IconGlyph::Close)
-                .theme_when(clone_reader(reader))
-                .on_press(move || {
-                    s.chat_mut().cancel_delete_session();
-                })
-        };
-        let controls = Stack::horizontal()
-            .spacing(6.0)
-            .alignment(Alignment::Start)
-            .with_child(confirm)
-            .with_child(cancel);
-        let panel = Stack::vertical()
-            .spacing(6.0)
-            .alignment(Alignment::Stretch)
-            .with_child(muted_label(shared, format!("Delete \"{title}\"?")))
-            .with_child(controls);
-        return Some(WidgetPod::new(panel));
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let mut node = SemanticsNode::new(ctx.widget_id(), SemanticsRole::ListItem, ctx.bounds());
+        node.name = Some(self.session.title.clone());
+        node.description = Some(match self.session.kind {
+            ConversationKind::Chat => "Chat".to_string(),
+            ConversationKind::Channel => {
+                format!("Channel, {} agents", self.session.participant_count)
+            }
+        });
+        node.state.focused = ctx.is_focused();
+        node.state.hovered = self.hovered;
+        node.state.selected = self.active();
+        node.actions = vec![SemanticsAction::Focus, SemanticsAction::Activate];
+        ctx.push(node);
     }
 
-    let title = compact_line(&title, 30);
-    let rename = {
-        let s = shared.clone();
-        sui::Button::new("Rename")
-            .theme_when(clone_reader(reader))
-            .on_press(move || {
-                s.chat_mut().begin_rename_current_session();
-            })
-    };
-    let delete = {
-        let s = shared.clone();
-        sui::Button::new("Delete")
-            .icon(IconGlyph::Trash)
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || {
-                    let chat = s.chat();
-                    !chat.streaming && !chat.control.active_turn
-                }
-            })
-            .on_press(move || {
-                s.chat_mut().request_delete_current_session();
-            })
-    };
-    let controls = Stack::horizontal()
-        .spacing(6.0)
-        .alignment(Alignment::Start)
-        .with_child(rename);
-    let controls = if is_channel {
-        let configure = {
-            let s = shared.clone();
-            sui::Button::new("Configure")
-                .icon(IconGlyph::MoreHorizontal)
-                .theme_when(clone_reader(reader))
-                .on_press(move || {
-                    s.chat_mut().begin_configure_current_channel();
-                })
-        };
-        controls.with_child(configure)
-    } else {
-        controls
+    fn accepts_focus(&self) -> bool {
+        true
     }
-    .with_child(delete);
-    let panel = Stack::vertical()
-        .spacing(6.0)
-        .alignment(Alignment::Stretch)
-        .with_child(muted_label(shared, title))
-        .with_child(controls);
-    Some(WidgetPod::new(panel))
 }
 
 /// The sidebar column: AGENTS heading + list, then CHATS heading + list. Wrapped in a
@@ -2262,9 +2485,9 @@ fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             move || sidebar_signature(&s)
         },
         move |_sig| {
-            let mut column = Stack::vertical()
-                .spacing(4.0)
-                .alignment(Alignment::Stretch)
+            let column = Flex::vertical()
+                .main_gap(4.0)
+                .align_items(Alignment::Stretch)
                 .with_child(SizedBox::new().height(18.0))
                 .with_child(InsetX::new(heading(&s, "AGENTS"), 18.0))
                 .with_child(SizedBox::new().height(2.0))
@@ -2272,12 +2495,10 @@ fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 .with_child(SizedBox::new().height(16.0))
                 .with_child(InsetX::new(heading(&s, "CHATS"), 18.0))
                 .with_child(SizedBox::new().height(2.0))
-                .with_child(InsetX::new(sessions_list(&s, &r), 8.0));
-            if let Some(panel) = session_edit_panel(&s, &r) {
-                column = column
-                    .with_child(SizedBox::new().height(8.0))
-                    .with_child(InsetX::from_pod(panel, 12.0));
-            }
+                .with_item(
+                    InsetX::new(sessions_scroll(&s, &r), 8.0),
+                    FlexItem::flex(1.0).min_height(0.0),
+                );
             WidgetPod::new(Surface::sidebar(column).fill().theme_when(clone_reader(&r)))
         },
     )
@@ -2285,7 +2506,7 @@ fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 
 /// A signature of the sidebar's list contents (agents are static; sessions + the active agent
 /// change). Used to drive the sidebar [`RebuildOnChange`].
-fn sidebar_signature(shared: &Shared) -> (String, String, String, String, String, String, usize) {
+fn sidebar_signature(shared: &Shared) -> (String, String, String, String, String, usize) {
     let chat = shared.chat();
     let active = chat
         .agents
@@ -2304,11 +2525,609 @@ fn sidebar_signature(shared: &Shared) -> (String, String, String, String, String
         active,
         sessions,
         chat.session_id.clone(),
-        chat.session_rename_id.clone().unwrap_or_default(),
+        chat.session_edit_id.clone().unwrap_or_default(),
         chat.session_delete_confirm_id.clone().unwrap_or_default(),
-        chat.channel_config_id.clone().unwrap_or_default(),
         chat.channel_agent_idx,
     )
+}
+
+fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
+    let (session, draft, confirming_delete, participants, agent_options) = {
+        let chat = shared.chat();
+        let edit_id = chat.session_edit_id.as_deref()?;
+        let session = chat
+            .sessions
+            .iter()
+            .find(|session| session.id == edit_id)
+            .cloned()?;
+        let participants = if session.kind == ConversationKind::Channel {
+            chat.channel_agent_refs(&session.id)
+        } else {
+            Vec::new()
+        };
+        let agent_options = chat
+            .agents
+            .iter()
+            .map(|agent| agent.name.clone())
+            .collect::<Vec<_>>();
+        (
+            session,
+            chat.session_title_draft.clone(),
+            chat.session_delete_confirm_id.as_deref() == Some(edit_id),
+            participants,
+            agent_options,
+        )
+    };
+    let session_id = session.id.clone();
+    let is_channel = session.kind == ConversationKind::Channel;
+    let title = if is_channel {
+        "Edit channel"
+    } else {
+        "Edit chat"
+    };
+    let placeholder = if is_channel {
+        "Channel title"
+    } else {
+        "Chat title"
+    };
+
+    let input = {
+        let s = shared.clone();
+        TextInput::new(format!("chat-session-title-{session_id}"))
+            .value(draft)
+            .placeholder(placeholder)
+            .theme_when(clone_reader(reader))
+            .on_change(move |value| {
+                s.chat_mut().set_session_title_draft(value);
+            })
+    };
+    let save = {
+        let s = shared.clone();
+        sui::Button::new("Save")
+            .icon(IconGlyph::Check)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || s.chat().can_save_session_title()
+            })
+            .on_press_with_ctx(move |ctx| {
+                s.chat_mut().save_session_title();
+                ctx.request_measure();
+                ctx.request_paint();
+            })
+    };
+    let done = {
+        let s = shared.clone();
+        sui::Button::new("Done")
+            .icon(IconGlyph::Close)
+            .theme_when(clone_reader(reader))
+            .on_press_with_ctx(move |ctx| {
+                s.chat_mut().close_session_edit();
+                ctx.request_measure();
+                ctx.request_paint();
+            })
+    };
+
+    let mut body = Stack::vertical()
+        .spacing(10.0)
+        .alignment(Alignment::Stretch)
+        .with_child(SizedBox::new().height(32.0).with_child(input))
+        .with_child(
+            Stack::horizontal()
+                .spacing(6.0)
+                .alignment(Alignment::Start)
+                .with_child(save)
+                .with_child(done),
+        );
+
+    if is_channel {
+        body = body
+            .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
+            .with_child(channel_agents_editor(
+                shared,
+                reader,
+                session_id.clone(),
+                participants,
+                agent_options,
+            ));
+    }
+
+    body = body.with_child(Separator::horizontal().theme_when(clone_reader(reader)));
+    if confirming_delete {
+        let confirm_title = compact_line(&session.title, 34);
+        let confirm = {
+            let s = shared.clone();
+            sui::Button::new("Delete")
+                .icon(IconGlyph::Trash)
+                .theme_when(clone_reader(reader))
+                .on_press_with_ctx(move |ctx| {
+                    let waker = s.borrow().waker.clone();
+                    s.chat_mut().confirm_delete_session(waker);
+                    ctx.request_measure();
+                    ctx.request_paint();
+                })
+        };
+        let cancel = {
+            let s = shared.clone();
+            sui::Button::new("Cancel")
+                .icon(IconGlyph::Close)
+                .theme_when(clone_reader(reader))
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().cancel_delete_session();
+                    ctx.request_measure();
+                    ctx.request_paint();
+                })
+        };
+        body = body
+            .with_child(muted_label(shared, format!("Delete \"{confirm_title}\"?")))
+            .with_child(
+                Stack::horizontal()
+                    .spacing(6.0)
+                    .alignment(Alignment::Start)
+                    .with_child(confirm)
+                    .with_child(cancel),
+            );
+    } else {
+        let delete_session_id = session.id.clone();
+        let delete = {
+            let s = shared.clone();
+            sui::Button::new("Delete")
+                .icon(IconGlyph::Trash)
+                .theme_when(clone_reader(reader))
+                .enabled_when({
+                    let s = s.clone();
+                    move || {
+                        let chat = s.chat();
+                        !chat.streaming
+                            && !chat.control.active_turn
+                            && chat.pending_delete_id.is_none()
+                    }
+                })
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().request_delete_session(&delete_session_id);
+                    ctx.request_measure();
+                    ctx.request_paint();
+                })
+        };
+        body = body.with_child(
+            Stack::horizontal()
+                .spacing(6.0)
+                .alignment(Alignment::Start)
+                .with_child(delete),
+        );
+    }
+
+    let s = shared.clone();
+    Some(WidgetPod::new(
+        SessionEditPopup::new(title, body, shared.theme()).on_dismiss(move || {
+            s.chat_mut().close_session_edit();
+        }),
+    ))
+}
+
+fn channel_agents_editor(
+    shared: &Shared,
+    reader: &ThemeReader,
+    channel_id: String,
+    participants: Vec<ChannelAgentRef>,
+    agent_options: Vec<String>,
+) -> impl Widget + use<> {
+    let theme = shared.theme();
+    let pal = palette(shared);
+    let mut list = Stack::vertical()
+        .spacing(4.0)
+        .alignment(Alignment::Stretch)
+        .with_child(
+            Label::new("Agents")
+                .style(pal.text_style(&theme, 12.0, FontWeight::SEMIBOLD, pal.text_muted))
+                .color_when({
+                    let s = shared.clone();
+                    move || palette(&s).text_muted
+                }),
+        );
+
+    if participants.is_empty() {
+        list = list.with_child(muted_label(shared, "No agents"));
+    } else {
+        for participant in participants {
+            let row_channel_id = channel_id.clone();
+            let participant_id = participant.participant_id.clone();
+            let label = if participant.agent_key == participant.agent_name {
+                participant.agent_name
+            } else {
+                format!("{} ({})", participant.agent_name, participant.agent_key)
+            };
+            let remove = {
+                let s = shared.clone();
+                IconButton::new(IconGlyph::Trash, format!("Remove {label}"))
+                    .size(26.0)
+                    .icon_size(14.0)
+                    .theme_when(clone_reader(reader))
+                    .on_press_with_ctx(move |ctx| {
+                        s.chat_mut()
+                            .remove_channel_agent(&row_channel_id, &participant_id);
+                        ctx.request_measure();
+                        ctx.request_paint();
+                    })
+            };
+            let text = {
+                let s = shared.clone();
+                Label::new(label).color_when(move || palette(&s).text)
+            };
+            list = list.with_child(
+                SizedBox::new().height(28.0).with_child(
+                    Flex::horizontal()
+                        .gap(6.0)
+                        .align_items(Alignment::Center)
+                        .with_item(text, FlexItem::flex(1.0).min_width(0.0))
+                        .with_item(remove, FlexItem::fixed(26.0)),
+                ),
+            );
+        }
+    }
+
+    let picker = {
+        let s = shared.clone();
+        sui::Select::new(format!("channel-agent-picker-{channel_id}"))
+            .options(agent_options)
+            .placeholder("Agent")
+            .theme_when(clone_reader(reader))
+            .selected_when({
+                let s = s.clone();
+                move || {
+                    let chat = s.chat();
+                    (!chat.agents.is_empty()).then_some(
+                        chat.channel_agent_idx
+                            .min(chat.agents.len().saturating_sub(1)),
+                    )
+                }
+            })
+            .on_change(move |index, _label| {
+                s.chat_mut().set_channel_agent_idx(index);
+            })
+    };
+    let add = {
+        let s = shared.clone();
+        sui::Button::new("Add agent")
+            .icon(IconGlyph::Add)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || !s.chat().agents.is_empty()
+            })
+            .on_press_with_ctx(move |ctx| {
+                s.chat_mut().add_selected_agent_to_channel();
+                ctx.request_measure();
+                ctx.request_paint();
+            })
+    };
+
+    Stack::vertical()
+        .spacing(8.0)
+        .alignment(Alignment::Stretch)
+        .with_child(list)
+        .with_child(SizedBox::new().height(SELECTOR_H).with_child(picker))
+        .with_child(
+            Stack::horizontal()
+                .spacing(6.0)
+                .alignment(Alignment::Start)
+                .with_child(add),
+        )
+}
+
+struct SessionEditPopup {
+    theme: Box<DefaultTheme>,
+    title: String,
+    body: WidgetPod,
+    panel_rect: Rect,
+    body_rect: Rect,
+    on_dismiss: Option<Box<dyn FnMut()>>,
+}
+
+impl SessionEditPopup {
+    const OUTER_MARGIN: f32 = 24.0;
+    const PANEL_MAX_WIDTH: f32 = 460.0;
+    const PANEL_MIN_WIDTH: f32 = 300.0;
+    const PANEL_PADDING: f32 = 16.0;
+    const TITLE_HEIGHT: f32 = 26.0;
+    const BODY_GAP: f32 = 12.0;
+    const CORNER_RADIUS: f32 = 10.0;
+
+    fn new<W>(title: impl Into<String>, body: W, theme: DefaultTheme) -> Self
+    where
+        W: Widget + 'static,
+    {
+        Self {
+            theme: Box::new(theme),
+            title: title.into(),
+            body: WidgetPod::new(body),
+            panel_rect: Rect::ZERO,
+            body_rect: Rect::ZERO,
+            on_dismiss: None,
+        }
+    }
+
+    fn on_dismiss<F>(mut self, on_dismiss: F) -> Self
+    where
+        F: FnMut() + 'static,
+    {
+        self.on_dismiss = Some(Box::new(on_dismiss));
+        self
+    }
+
+    fn dismiss(&mut self, ctx: &mut EventCtx) {
+        if let Some(on_dismiss) = &mut self.on_dismiss {
+            on_dismiss();
+        }
+        ctx.request_measure();
+        ctx.request_paint();
+        ctx.request_semantics();
+        ctx.set_handled();
+    }
+
+    fn title_style(&self) -> sui::TextStyle {
+        sui::TextStyle {
+            font_size: self.theme.metrics.dialog_title_font_size,
+            line_height: self.theme.metrics.dialog_title_line_height,
+            color: self.theme.palette.text,
+            ..self.theme.body_text_style()
+        }
+    }
+}
+
+impl Widget for SessionEditPopup {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        match event {
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Down
+                    && pointer.button == Some(PointerButton::Primary)
+                    && !self.panel_rect.contains(pointer.position) =>
+            {
+                self.dismiss(ctx);
+            }
+            Event::Keyboard(key) if key.state == KeyState::Pressed && key.key == "Escape" => {
+                self.dismiss(ctx);
+            }
+            _ => {}
+        }
+    }
+
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let viewport = constraints.clamp(Size::new(
+            if constraints.max.width.is_finite() {
+                constraints.max.width
+            } else {
+                920.0
+            },
+            if constraints.max.height.is_finite() {
+                constraints.max.height
+            } else {
+                640.0
+            },
+        ));
+        let available_width = (viewport.width - Self::OUTER_MARGIN * 2.0).max(0.0);
+        let fallback_min = available_width.min(Self::PANEL_MIN_WIDTH);
+        let panel_width = available_width
+            .min(Self::PANEL_MAX_WIDTH)
+            .max(fallback_min)
+            .max(0.0);
+        let body_width = (panel_width - Self::PANEL_PADDING * 2.0).max(0.0);
+        let body_max_height = (viewport.height
+            - Self::OUTER_MARGIN * 2.0
+            - Self::PANEL_PADDING * 2.0
+            - Self::TITLE_HEIGHT
+            - Self::BODY_GAP)
+            .max(0.0);
+        let body_size = self.body.measure(
+            ctx,
+            Constraints::new(Size::ZERO, Size::new(body_width, body_max_height)),
+        );
+        let panel_height =
+            Self::PANEL_PADDING * 2.0 + Self::TITLE_HEIGHT + Self::BODY_GAP + body_size.height;
+        let panel_x = ((viewport.width - panel_width) * 0.5).max(0.0);
+        let panel_y = ((viewport.height - panel_height) * 0.5).max(Self::OUTER_MARGIN);
+        self.panel_rect = Rect::new(panel_x, panel_y, panel_width, panel_height);
+        self.body_rect = Rect::new(
+            panel_x + Self::PANEL_PADDING,
+            panel_y + Self::PANEL_PADDING + Self::TITLE_HEIGHT + Self::BODY_GAP,
+            body_width,
+            body_size.height,
+        );
+        viewport
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let panel_width = self.panel_rect.width().min(bounds.width().max(0.0));
+        let panel_height = self.panel_rect.height().min(bounds.height().max(0.0));
+        let panel_x = bounds.x() + ((bounds.width() - panel_width) * 0.5).max(0.0);
+        let panel_y = bounds.y()
+            + ((bounds.height() - panel_height) * 0.5)
+                .max(Self::OUTER_MARGIN.min(bounds.height().max(0.0)));
+        self.panel_rect = Rect::new(panel_x, panel_y, panel_width, panel_height);
+        let body_size = self.body.measured_size();
+        self.body_rect = Rect::new(
+            panel_x + Self::PANEL_PADDING,
+            panel_y + Self::PANEL_PADDING + Self::TITLE_HEIGHT + Self::BODY_GAP,
+            body_size.width,
+            body_size.height,
+        );
+        self.body.arrange(ctx, self.body_rect);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let panel = self.panel_rect;
+        sui::paint_theme_shadow(
+            ctx,
+            panel,
+            [Self::CORNER_RADIUS; 4],
+            &self.theme.shadows.box_shadow.xl,
+        );
+        widgets::fill_round_rect(ctx, panel, self.theme.palette.border, Self::CORNER_RADIUS);
+        widgets::fill_round_rect(
+            ctx,
+            panel.inflate(-1.0, -1.0),
+            self.theme.palette.surface_raised,
+            (Self::CORNER_RADIUS - 1.0).max(0.0),
+        );
+
+        let title_rect = Rect::new(
+            panel.x() + Self::PANEL_PADDING,
+            panel.y() + Self::PANEL_PADDING,
+            (panel.width() - Self::PANEL_PADDING * 2.0).max(0.0),
+            Self::TITLE_HEIGHT,
+        );
+        widgets::draw_text_in(ctx, title_rect, &self.title, self.title_style());
+        self.body.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let mut node = SemanticsNode::new(ctx.widget_id(), SemanticsRole::Dialog, self.panel_rect);
+        node.name = Some(self.title.clone());
+        ctx.push(node);
+        self.body.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.body);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.body);
+    }
+}
+
+fn session_edit_dialog_signature(shared: &Shared) -> String {
+    let chat = shared.chat();
+    let Some(edit_id) = chat.session_edit_id.as_deref() else {
+        return String::new();
+    };
+    let sessions = chat
+        .sessions
+        .iter()
+        .map(|session| {
+            format!(
+                "{}:{:?}:{}:{}",
+                session.id, session.kind, session.title, session.participant_count
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\u{1f}");
+    format!(
+        "{}|{}|{}|{}|{}",
+        edit_id,
+        chat.session_delete_confirm_id
+            .as_deref()
+            .unwrap_or_default(),
+        chat.channel_agent_idx,
+        chat.agents.len(),
+        sessions
+    )
+}
+
+struct ChatDialogHost {
+    shared: Shared,
+    reader: ThemeReader,
+    body: WidgetPod,
+    dialog: Option<WidgetPod>,
+    dialog_signature: String,
+}
+
+impl ChatDialogHost {
+    fn new<W>(body: W, shared: Shared, reader: ThemeReader) -> Self
+    where
+        W: Widget + 'static,
+    {
+        let mut host = Self {
+            shared,
+            reader,
+            body: WidgetPod::new(body),
+            dialog: None,
+            dialog_signature: String::new(),
+        };
+        host.sync_dialog();
+        host
+    }
+
+    fn sync_dialog(&mut self) {
+        let signature = session_edit_dialog_signature(&self.shared);
+        if signature == self.dialog_signature {
+            return;
+        }
+        self.dialog_signature = signature;
+        self.dialog = session_edit_dialog(&self.shared, &self.reader);
+    }
+}
+
+impl Widget for ChatDialogHost {
+    fn event(&mut self, ctx: &mut EventCtx, _event: &Event) {
+        let signature = session_edit_dialog_signature(&self.shared);
+        if signature != self.dialog_signature {
+            ctx.request_measure();
+            ctx.request_paint();
+            ctx.request_semantics();
+        }
+    }
+
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.sync_dialog();
+        let size = constraints.clamp(Size::new(
+            if constraints.max.width.is_finite() {
+                constraints.max.width
+            } else {
+                920.0
+            },
+            if constraints.max.height.is_finite() {
+                constraints.max.height
+            } else {
+                640.0
+            },
+        ));
+        let tight = Constraints::tight(size);
+        self.body.measure(ctx, tight);
+        if let Some(dialog) = &mut self.dialog {
+            dialog.measure(ctx, tight);
+        }
+        size
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.body.arrange(ctx, bounds);
+        if let Some(dialog) = &mut self.dialog {
+            dialog.arrange(ctx, bounds);
+        }
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.body.paint(ctx);
+        if let Some(dialog) = &self.dialog {
+            dialog.paint(ctx);
+        }
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.body.semantics(ctx);
+        if let Some(dialog) = &self.dialog {
+            dialog.semantics(ctx);
+        }
+    }
+
+    fn stack_host_options(&self) -> Option<StackHostOptions> {
+        Some(StackHostOptions::default())
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.body);
+        if let Some(dialog) = &self.dialog {
+            visitor.visit(dialog);
+        }
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.body);
+        if let Some(dialog) = &mut self.dialog {
+            visitor.visit(dialog);
+        }
+    }
 }
 
 struct RuntimeOverview {
@@ -3218,7 +4037,12 @@ fn wide_pod(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         reader,
     );
     let row = Split::left_fixed(sidebar(shared, reader), work_area, SIDEBAR_W, reader);
-    WidgetPod::new(Surface::window(row).fill().theme_when(clone_reader(reader)))
+    let dialog_host = ChatDialogHost::new(row, shared.clone(), Rc::clone(reader));
+    WidgetPod::new(
+        Surface::window(dialog_host)
+            .fill()
+            .theme_when(clone_reader(reader)),
+    )
 }
 
 fn narrow_pod(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
@@ -3328,13 +4152,15 @@ impl ChatView {
     fn pump(&self, ctx: &mut EventCtx) {
         self.pump_alive.set(false);
         let events = self.shared.chat().handle.drain();
-        let had = !events.is_empty();
-        if had {
+        let had_events = !events.is_empty();
+        let delete_changed = {
             let mut chat = self.shared.chat_mut();
             for event in events {
                 chat.apply_event(event);
             }
-        }
+            chat.pump_delete()
+        };
+        let had = had_events || delete_changed;
         let streaming = self.shared.chat().streaming;
 
         // Recompute the coarse signature each tick: a worker event (RuntimeInfo / Models / TurnDone,
@@ -3791,13 +4617,6 @@ impl InsetX {
             pad: pad.max(0.0),
         }
     }
-
-    fn from_pod(child: WidgetPod, pad: f32) -> Self {
-        Self {
-            child,
-            pad: pad.max(0.0),
-        }
-    }
 }
 
 impl Widget for InsetX {
@@ -3847,6 +4666,7 @@ pub fn view(shared: Shared) -> impl Widget {
 mod tests {
     use super::*;
     use crate::backend::Backend;
+    use crate::state::AppState;
     use std::{
         fs,
         path::PathBuf,
@@ -4019,16 +4839,13 @@ mod tests {
         ];
         state.persist();
 
-        state.begin_rename_current_session();
-        assert_eq!(
-            state.session_rename_id.as_deref(),
-            Some(session_id.as_str())
-        );
+        state.begin_edit_current_session();
+        assert_eq!(state.session_edit_id.as_deref(), Some(session_id.as_str()));
         state.set_session_title_draft("Renamed chat".to_string());
         assert!(state.can_save_session_title());
         state.save_session_title();
 
-        assert!(state.session_rename_id.is_none());
+        assert_eq!(state.session_edit_id.as_deref(), Some(session_id.as_str()));
         assert_eq!(
             state
                 .sessions
@@ -4064,12 +4881,12 @@ mod tests {
         ];
         state.persist();
 
-        state.request_delete_current_session();
+        state.request_delete_session(&session_id);
         assert_eq!(
             state.session_delete_confirm_id.as_deref(),
             Some(session_id.as_str())
         );
-        state.confirm_delete_session();
+        state.confirm_delete_session(None);
 
         assert!(
             state
@@ -4078,15 +4895,24 @@ mod tests {
                 .all(|session| session.id != session_id),
             "deleted sessions leave the sidebar list"
         );
-        assert!(
-            sessions::load_transcript(&state.data_dir, &session_id).is_none(),
-            "deleted sessions cannot be reopened"
-        );
         assert!(state.messages.is_empty());
         assert_ne!(state.session_id, session_id);
         assert_eq!(
             state.pending_session_reset.as_deref(),
             Some(state.session_id.as_str())
+        );
+        assert_eq!(
+            state.pending_delete_id.as_deref(),
+            Some(session_id.as_str()),
+            "SIFS tombstoning continues in the background"
+        );
+
+        wait_for(&mut state, Duration::from_secs(20), |state| {
+            state.pending_delete_id.is_none()
+        });
+        assert!(
+            sessions::load_transcript(&state.data_dir, &session_id).is_none(),
+            "deleted sessions cannot be reopened"
         );
 
         let _ = fs::remove_dir_all(root);
@@ -4105,9 +4931,9 @@ mod tests {
             "new channel starts with an empty visible transcript"
         );
         assert_eq!(
-            state.channel_config_id.as_deref(),
+            state.session_edit_id.as_deref(),
             Some(channel_id.as_str()),
-            "new channels open their config panel"
+            "new channels open their edit popup"
         );
         let listed = state
             .sessions
@@ -4165,11 +4991,218 @@ mod tests {
             Some(2)
         );
         assert_eq!(
-            state.channel_participant_labels(&channel_id),
+            state
+                .channel_agent_refs(&channel_id)
+                .into_iter()
+                .map(|participant| participant.agent_name)
+                .collect::<Vec<_>>(),
             vec!["main-agent".to_string(), "coding-agent".to_string()]
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn channel_config_removes_agent_and_updates_sidebar_count() {
+        let (mut state, root) = isolated_chat_state("channel-remove-agent");
+        seed_test_agents(&mut state);
+        state.new_channel();
+        let channel_id = state.session_id.clone();
+        state.set_channel_agent_idx(1);
+        state.add_selected_agent_to_channel();
+
+        let coding_participant_id = state
+            .channel_agent_refs(&channel_id)
+            .into_iter()
+            .find(|participant| participant.agent_key == "coding-agent")
+            .map(|participant| participant.participant_id)
+            .expect("coding participant listed");
+
+        state.remove_channel_agent(&channel_id, &coding_participant_id);
+
+        let parsed = channel_id.parse::<SessionId>().expect("channel id");
+        let channel = FileAgentChannelStore::for_data_dir(&state.data_dir)
+            .load_channel(&parsed)
+            .expect("load channel")
+            .expect("channel saved");
+        let participants = channel.enabled_participants_in_order();
+        assert_eq!(participants.len(), 1);
+        assert!(
+            participants
+                .iter()
+                .all(|participant| participant.agent_key != "coding-agent")
+        );
+        assert_eq!(
+            state
+                .sessions
+                .iter()
+                .find(|session| session.id == channel_id)
+                .map(|session| session.participant_count),
+            Some(1)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_edit_dialog_done_button_closes_in_rendered_view() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let root = temp_chat_data_dir("dialog-close");
+        let session_id = SessionId::generate().to_string();
+        {
+            let mut chat = shared.chat_mut();
+            chat.data_dir = Arc::new(SinomoDataDir::new(&root));
+            chat.sessions = vec![SessionRef {
+                id: session_id.clone(),
+                title: "Dialog chat".to_string(),
+                kind: ConversationKind::Chat,
+                updated_unix: 1,
+                participant_count: 1,
+            }];
+            chat.session_id = session_id.clone();
+            chat.session_edit_id = Some(session_id.clone());
+            chat.session_title_draft = "Dialog chat".to_string();
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat dialog")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Done")
+            .click()?;
+
+        assert!(
+            shared.chat().session_edit_id.is_none(),
+            "Done should close the edit dialog"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn clicking_rendered_chat_row_opens_session_without_refcell_panic() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let root = temp_chat_data_dir("row-open");
+        let first_id = SessionId::generate().to_string();
+        let second_id = SessionId::generate().to_string();
+        {
+            let mut chat = shared.chat_mut();
+            chat.data_dir = Arc::new(SinomoDataDir::new(&root));
+            chat.sessions = vec![
+                SessionRef {
+                    id: first_id.clone(),
+                    title: "Current chat".to_string(),
+                    kind: ConversationKind::Chat,
+                    updated_unix: 1,
+                    participant_count: 1,
+                },
+                SessionRef {
+                    id: second_id.clone(),
+                    title: "Target chat".to_string(),
+                    kind: ConversationKind::Chat,
+                    updated_unix: 2,
+                    participant_count: 1,
+                },
+            ];
+            chat.session_id = first_id;
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat rows")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::ListItem)
+            .with_name("Target chat")
+            .with_description("Chat")
+            .click()?;
+
+        assert_eq!(shared.chat().session_id, second_id);
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_chat_sessions_scroll_with_sui_scroll_view() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let root = temp_chat_data_dir("sessions-scroll");
+        let sessions = (0..48)
+            .map(|index| SessionRef {
+                id: SessionId::generate().to_string(),
+                title: format!("Scrollable chat {index:02}"),
+                kind: ConversationKind::Chat,
+                updated_unix: index,
+                participant_count: 1,
+            })
+            .collect::<Vec<_>>();
+        let active_id = sessions[0].id.clone();
+        {
+            let mut chat = shared.chat_mut();
+            chat.data_dir = Arc::new(SinomoDataDir::new(&root));
+            chat.sessions = sessions;
+            chat.session_id = active_id;
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat sessions scroll")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let list_y = || -> sui::Result<f32> {
+            let snapshot = window.snapshot()?;
+            Ok(snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.role == SemanticsRole::List
+                        && node.name.as_deref() == Some("chat-sessions")
+                })
+                .expect("chat sessions list semantics node")
+                .bounds
+                .y())
+        };
+
+        let before_y = list_y()?;
+        window
+            .get_by_role(SemanticsRole::ScrollView)
+            .with_name("chat-sessions-scroll")
+            .scroll_pixels(sui::Vector::new(0.0, -260.0))?;
+        let after_y = list_y()?;
+
+        assert!(
+            after_y < before_y - 100.0,
+            "sessions list should move when the SUI ScrollView scrolls: before={before_y}, after={after_y}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]
@@ -4927,6 +5960,7 @@ mod tests {
             for event in events {
                 state.apply_event(event);
             }
+            state.pump_delete();
             if predicate(state) {
                 return;
             }
