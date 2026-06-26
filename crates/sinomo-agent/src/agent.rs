@@ -1850,8 +1850,14 @@ fn memory_context_block(record: &MemoryRecord) -> ContextBlock {
 
 fn memory_cache_policy(scope: &MemoryScope) -> ContextCachePolicy {
     match scope {
-        MemoryScope::Cluster => ContextCachePolicy::StablePrefix,
-        MemoryScope::Agent { .. } => ContextCachePolicy::AppendOnly,
+        MemoryScope::Cluster | MemoryScope::User { .. } | MemoryScope::Workspace { .. } => {
+            ContextCachePolicy::StablePrefix
+        }
+        MemoryScope::Agent { .. }
+        | MemoryScope::Chat { .. }
+        | MemoryScope::Channel { .. }
+        | MemoryScope::Task { .. }
+        | MemoryScope::Team { .. } => ContextCachePolicy::AppendOnly,
     }
 }
 
@@ -8763,6 +8769,7 @@ impl<M: InteractionModel> Agent<M> {
                 task_hint: memory_task_hint(input),
                 max_records: DEFAULT_RETRIEVED_MEMORY_RECORDS,
                 max_bytes: DEFAULT_RETRIEVED_MEMORY_BYTES,
+                ..MemoryQuery::default()
             };
             match provider.retrieve(&query) {
                 Ok(retrieval) => apply_memory_retrieval_to_context(&mut context, retrieval),

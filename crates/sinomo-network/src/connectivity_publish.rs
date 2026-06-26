@@ -570,6 +570,7 @@ pub(crate) fn cluster_connectivity_stable_eq(
         && left.transport == right.transport
         && left.address == right.address
         && left.state == right.state
+        && left.failure_reason == right.failure_reason
 }
 
 #[cfg(test)]

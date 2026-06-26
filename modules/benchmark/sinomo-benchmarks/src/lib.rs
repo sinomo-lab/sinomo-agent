@@ -157,6 +157,7 @@ pub fn benchmark_module_catalog() -> BenchmarkModuleCatalog {
         plans: vec![
             swebench_verified_10_plan(),
             agent_compaction_quality_plan(),
+            agent_memory_quality_plan(),
             terminalbench_harbor_plan(),
             mcu_minestudio_plan(),
             minestudio_plan(),
@@ -183,6 +184,7 @@ pub fn benchmarks_module_descriptor() -> NativeModuleDescriptor {
             "benchmark.catalog.read".to_string(),
             "benchmark.agent.cancel-probe".to_string(),
             "benchmark.agent.compaction.plan".to_string(),
+            "benchmark.agent.memory.plan".to_string(),
             "benchmark.swebench.plan".to_string(),
             "benchmark.minestudio.plan".to_string(),
             "benchmark.terminalbench.plan".to_string(),
@@ -256,6 +258,38 @@ pub fn agent_compaction_quality_plan() -> BenchmarkHarnessPlan {
             "This is a live/model eval harness for compaction quality, not a normal Rust unit test.".to_string(),
             "The checked-in plan covers long-session resume, constraint retention, coding after compaction, and cluster-ops after compaction.".to_string(),
             "Default plan/fixture modes are deterministic; --mode run calls the configured Sinomo agent and scores marker retention in generated summaries and post-compaction probes.".to_string(),
+        ],
+    }
+}
+
+pub fn agent_memory_quality_plan() -> BenchmarkHarnessPlan {
+    BenchmarkHarnessPlan {
+        name: "agent-memory-quality".to_string(),
+        setup_commands: vec![
+            "cargo build -p sinomo".to_string(),
+            format!(
+                "python3 {} --mode plan",
+                benchmark_module_path("agent/run_memory_eval.py")
+            ),
+            format!(
+                "python3 {} --mode fixture --summary-out benchmark-results/agent-memory/fixture-summary.json",
+                benchmark_module_path("agent/run_memory_eval.py")
+            ),
+        ],
+        run_command: format!(
+            "python3 {} --mode run --provider codex --model gpt-5.2-codex --summary-out benchmark-results/agent-memory/summary.json --progress-out benchmark-results/agent-memory/progress.jsonl",
+            benchmark_module_path("agent/run_memory_eval.py")
+        ),
+        required_tools: default_main_agent_tools()
+            .into_iter()
+            .filter(|tool| matches!(tool.kind, AgentToolKind::RunShellCommand))
+            .map(|tool| tool.kind)
+            .collect(),
+        notes: vec![
+            "This is a live/model eval harness for long-horizon memory quality, not a Rust unit test.".to_string(),
+            "The checked-in scenarios cover information extraction, multi-session reasoning, knowledge updates, temporal reasoning, scope-boundary abstention, and procedural workflow recall.".to_string(),
+            "The axes are inspired by LongMemEval, LoCoMo, BEAM, MemoryAgentBench, MemoryArena, LongMemEval-V2, and RAGAS retrieval metrics.".to_string(),
+            "Default plan/fixture modes are deterministic; --mode run calls the configured Sinomo agent and scores marker use, citations, forbidden leakage, source coverage, and cache churn.".to_string(),
         ],
     }
 }
@@ -1098,6 +1132,48 @@ mod tests {
     }
 
     #[test]
+    fn agent_memory_quality_plan_is_live_eval_not_unit_gate() {
+        let plan = agent_memory_quality_plan();
+        assert_eq!(plan.name, "agent-memory-quality");
+        assert!(
+            plan.setup_commands
+                .iter()
+                .any(|command| command.contains("agent/run_memory_eval.py --mode plan"))
+        );
+        assert!(
+            plan.setup_commands
+                .iter()
+                .any(|command| command.contains("agent/run_memory_eval.py --mode fixture"))
+        );
+        assert!(
+            plan.run_command
+                .contains("agent/run_memory_eval.py --mode run")
+        );
+        assert!(
+            plan.required_tools
+                .contains(&AgentToolKind::RunShellCommand)
+        );
+        assert!(plan.notes.iter().any(|note| note.contains("LongMemEval")));
+        let runner = include_str!("../agent/run_memory_eval.py");
+        assert!(runner.contains("information-extraction"));
+        assert!(runner.contains("multi-session-reasoning"));
+        assert!(runner.contains("knowledge-update-supersession"));
+        assert!(runner.contains("temporal-reasoning"));
+        assert!(runner.contains("scope-boundary-abstention"));
+        assert!(runner.contains("workflow-gotcha"));
+        assert!(runner.contains("retrieval-quality"));
+        assert!(runner.contains("downstream-model-usefulness"));
+        assert!(runner.contains("governance-and-scope-correctness"));
+        assert!(runner.contains("operational-cache-efficiency"));
+        assert!(runner.contains("marker_aliases"));
+        assert!(runner.contains("marker_aliases_score_equivalent_phrasing"));
+        assert!(runner.contains("forbidden_marker_violations"));
+        assert!(runner.contains("required_source_ref_hit_count"));
+        assert!(runner.contains("cache_churn_records"));
+        assert!(runner.contains("RAGAS context precision"));
+    }
+
+    #[test]
     fn minestudio_plan_keeps_vision_path_explicit() {
         let plan = minestudio_plan();
         assert!(plan.required_tools.contains(&AgentToolKind::ObserveVision));
@@ -1218,6 +1294,11 @@ mod tests {
                 .capabilities
                 .contains(&"benchmark.agent.compaction.plan".to_string())
         );
+        assert!(
+            descriptor
+                .capabilities
+                .contains(&"benchmark.agent.memory.plan".to_string())
+        );
         assert!(descriptor.surfaces.object_rpc_routes.iter().any(|route| {
             route.route == SINOMO_BENCHMARKS_CANCEL_PROBE_ROUTE
                 && route.category == SINOMO_BENCHMARKS_RPC_CATEGORY
@@ -1249,6 +1330,12 @@ mod tests {
                 .plans
                 .iter()
                 .any(|plan| plan.name == "agent-compaction-quality")
+        );
+        assert!(
+            catalog
+                .plans
+                .iter()
+                .any(|plan| plan.name == "agent-memory-quality")
         );
         assert!(
             catalog

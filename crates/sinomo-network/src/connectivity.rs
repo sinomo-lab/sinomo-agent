@@ -22,6 +22,12 @@ pub enum ClusterConnectivityState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClusterConnectivityFailureReason {
+    IdentityMismatch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterConnectivityRecord {
     pub cluster_id: ClusterId,
     pub source_node_id: NodeId,
@@ -37,6 +43,8 @@ pub struct ClusterConnectivityRecord {
     pub last_success_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_failure_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<ClusterConnectivityFailureReason>,
     #[serde(with = "time::serde::rfc3339")]
     pub observed_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -317,6 +325,7 @@ fn try_clone_connectivity_record(
             record.last_failure_at.as_ref(),
             operation,
         )?,
+        failure_reason: record.failure_reason.clone(),
         observed_at: record.observed_at,
         expires_at: record.expires_at,
     })
@@ -688,7 +697,7 @@ pub(crate) fn cluster_connectivity_record_for_identity_mismatch(
     timestamp: &str,
     now: OffsetDateTime,
 ) -> ClusterConnectivityRecord {
-    cluster_connectivity_record(
+    let mut record = cluster_connectivity_record(
         state,
         endpoint,
         ClusterConnectivityState::Unreachable,
@@ -698,7 +707,9 @@ pub(crate) fn cluster_connectivity_record_for_identity_mismatch(
         Some(timestamp.to_string()),
         now,
         CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
-    )
+    );
+    record.failure_reason = Some(ClusterConnectivityFailureReason::IdentityMismatch);
+    record
 }
 
 pub(crate) fn cluster_connectivity_record_for_hard_failure(
@@ -785,6 +796,9 @@ pub fn cluster_connectivity_probe_due_with_startup_settle(
     local_node_role: &ClusterNodeRole,
     startup_settle_active: bool,
 ) -> bool {
+    if cluster_connectivity_failure_reason_is_identity_mismatch(record) {
+        return record.expires_at <= refresh_deadline;
+    }
     if startup_settle_active && record.state != ClusterConnectivityState::Healthy {
         return true;
     }
@@ -823,6 +837,9 @@ pub fn cluster_connectivity_probe_due_with_graph(
     local_node_id: &NodeId,
     startup_settle_active: bool,
 ) -> bool {
+    if record.transport != endpoint.transport || record.address != endpoint.address {
+        return true;
+    }
     if !cluster_connectivity_probe_due_with_startup_settle(
         record,
         now,
@@ -841,12 +858,22 @@ pub fn cluster_connectivity_probe_due_with_graph(
     if record.state == ClusterConnectivityState::Healthy {
         return true;
     }
-    // A due non-healthy record re-probes even when a relay route exists:
-    // a healed DIRECT endpoint always beats relaying, and the route may
-    // itself traverse stale edges. The slow degraded cadence in the base
-    // check keeps the probe volume negligible.
-    let _ = (graph, local_node_id, endpoint);
+    // When the target is already reachable through the current healthy-edge route graph,
+    // a failed direct endpoint is not load-bearing. Let the record refresh near expiry
+    // instead of burning a probe every role interval and churning local connectivity state.
+    if crate::route::cluster_route_next_hop(graph, local_node_id, &endpoint.node_id).is_some() {
+        return false;
+    }
     true
+}
+
+pub fn cluster_connectivity_failure_reason_is_identity_mismatch(
+    record: &ClusterConnectivityRecord,
+) -> bool {
+    matches!(
+        record.failure_reason,
+        Some(ClusterConnectivityFailureReason::IdentityMismatch)
+    )
 }
 
 #[cfg(test)]
@@ -883,6 +910,7 @@ pub fn cluster_connectivity_record(
         consecutive_failures,
         last_success_at,
         last_failure_at,
+        failure_reason: None,
         observed_at,
         expires_at: observed_at + time::Duration::seconds(ttl_seconds),
     }

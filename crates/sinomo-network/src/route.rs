@@ -33,6 +33,8 @@ pub const CLUSTER_ROUTING_RPC_ROUTE_METADATA: &[(&str, &str)] =
 const CLUSTER_RELAY_DEFAULT_TTL: u8 = 8;
 const CLUSTER_RELAY_MAX_FAILURE_DETAILS: usize = 8;
 const CLUSTER_RELAY_FAILURE_DETAIL_MAX_CHARS: usize = 512;
+const CLUSTER_DELIVERY_DEGRADED_LINK_COST: u64 = 50_000;
+const CLUSTER_DELIVERY_UNOBSERVED_TARGET_COST: u64 = CLUSTER_DELIVERY_DEGRADED_LINK_COST / 2;
 const CLUSTER_DELIVERY_UNOBSERVED_NEIGHBOR_COST: u64 = 75_000;
 const MAX_CLUSTER_DELIVERY_ROUTING_TABLE_CACHE_ENTRIES: usize = 128;
 
@@ -1240,7 +1242,7 @@ fn cluster_delivery_local_endpoint_cost(
 }
 
 fn cluster_delivery_unobserved_target_endpoint_cost(path_cost: u64, endpoint_priority: u64) -> u64 {
-    path_cost + endpoint_priority
+    CLUSTER_DELIVERY_UNOBSERVED_TARGET_COST + path_cost + endpoint_priority
 }
 
 fn cluster_delivery_connectivity_record_cost(record: &ClusterConnectivityRecord) -> Option<u64> {
@@ -1261,9 +1263,11 @@ fn cluster_delivery_connectivity_state_cost(
 ) -> Option<u64> {
     match state {
         ClusterConnectivityState::Healthy => Some(path_cost + latency_ms.unwrap_or(0).min(10_000)),
-        ClusterConnectivityState::Degraded => {
-            Some(path_cost + 50_000 + u64::from(consecutive_failures) * 1_000)
-        }
+        ClusterConnectivityState::Degraded => Some(
+            path_cost
+                + CLUSTER_DELIVERY_DEGRADED_LINK_COST
+                + u64::from(consecutive_failures) * 1_000,
+        ),
         ClusterConnectivityState::Unreachable => None,
     }
 }
@@ -1912,6 +1916,7 @@ where
                             "{} ({:?}) returned routing error",
                             endpoint.address, endpoint.transport
                         ));
+                        break;
                     }
                     Ok(response) => {
                         if let Some(responder_node_id) =
@@ -2474,6 +2479,7 @@ async fn handle_cluster_relay_envelope_async_with_host(
                             endpoint.address, endpoint.transport
                         ),
                     );
+                    break;
                 }
                 Ok(response) => {
                     cluster_relay_record_attempt_us(
@@ -2800,6 +2806,7 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
                                 .unwrap_or_else(|| "routing error".to_string())
                         ),
                     );
+                    break;
                 }
                 Ok(ClusterRelayStreamSendOutcome::StreamStartedThenFailed(error)) => {
                     cluster_relay_record_attempt_us(
@@ -3072,6 +3079,7 @@ mod tests {
             consecutive_failures: 0,
             last_success_at: Some(now.to_string()),
             last_failure_at: None,
+            failure_reason: None,
             observed_at: now,
             expires_at: now + time::Duration::seconds(crate::CLUSTER_CONNECTIVITY_TTL_SECONDS),
         }
@@ -3131,7 +3139,7 @@ mod tests {
     }
 
     #[test]
-    fn delivery_plan_treats_unobserved_direct_target_as_normal_edge() {
+    fn delivery_plan_prefers_healthy_multihop_over_unobserved_direct_target() {
         let (_root, paths) = test_paths("sinomo-network-delivery-plan-direct-unobserved");
         let cluster_id = cid("cluster_delivery_plan_direct_unobserved");
         let local = nid("node_delivery_plan_direct_unobserved_local");
@@ -3178,9 +3186,9 @@ mod tests {
         )
         .expect("route plan");
 
-        assert_eq!(plan.next_hop, target);
+        assert_eq!(plan.next_hop, bridge);
         assert_eq!(plan.endpoints.len(), 1);
-        assert_eq!(plan.endpoints[0].address, target_endpoint.address);
+        assert_eq!(plan.endpoints[0].address, bridge_endpoint.address);
     }
 
     #[test]

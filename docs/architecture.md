@@ -6,9 +6,9 @@ Sinomo is a distributed, real-time multimodal AI entity runtime built around con
 
 The foundation is a network of cooperating nodes. Each node may have one or more devices attached, and each node can host perception, memory, control, and action components close to where the relevant signal or action happens. A single workstation deployment should be a special case of the same node graph, not a separate architecture.
 
-The initial architecture favors a Rust workspace with small, focused crates that can run together on one machine first, then distribute across desktops, phones, small servers, and LAN devices as workload, privacy, latency, and hardware needs grow.
+The architecture favors a Rust workspace with small, focused crates that can run together on one machine and distribute across desktops, phones, small servers, and LAN devices as workload, privacy, latency, and hardware needs require.
 
-The detailed cluster bootstrap, discovery, roaming transport, membership, and distributed KV design lives in [clustering-architecture.md](clustering-architecture.md). The detailed distributed filesystem design lives in [dfs-architecture.md](dfs-architecture.md). Runtime logging, metrics, tracing, and cluster observation are described in [observability-architecture.md](observability-architecture.md). The SIFS-backed WASM sandbox design and implementation status lives in the sandbox crate's [architecture](../crates/sinomo-sandbox/docs/architecture.md) and [implementation notes](../crates/sinomo-sandbox/docs/implementation-notes.md). The binary communication and serialization format is specified in [sinomo-object-format.md](sinomo-object-format.md). Rollout operator procedures and examples are documented in [rollout-operations.md](rollout-operations.md). The user-facing main agent, local core model, async deliberation, cluster-aware tooling, background agent, and training-data flow are described in [agent-system-architecture.md](agent-system-architecture.md).
+The detailed cluster bootstrap, discovery, roaming transport, membership, and distributed KV design lives in [clustering-architecture.md](clustering-architecture.md). The detailed distributed filesystem design lives in [dfs-architecture.md](dfs-architecture.md). Runtime logging, metrics, tracing, and cluster observation are described in [observability-architecture.md](observability-architecture.md). Long-horizon agent memory, memory storage, consolidation, and multi-agent memory governance are described in [memory-architecture.md](memory-architecture.md). The SIFS-backed WASM sandbox design lives in the sandbox crate's [architecture](../crates/sinomo-sandbox/docs/architecture.md). The binary communication and serialization format is specified in [sinomo-object-format.md](sinomo-object-format.md). Rollout operator procedures and examples are documented in [rollout-operations.md](rollout-operations.md). The user-facing main agent, local core model, async deliberation, cluster-aware tooling, background agent, and training-data flow are described in [agent-system-architecture.md](agent-system-architecture.md).
 
 Self-evolution is treated as controlled live mutation: Sinomo should be able to change running behavior autonomously without bringing down the system. The detailed design for sandboxed mutation, evaluation, hot-swap, progressive rollout, and rollback lives in [self-evolution-architecture.md](self-evolution-architecture.md).
 
@@ -21,7 +21,7 @@ Self-evolution is treated as controlled live mutation: Sinomo should be able to 
 5. **Memory is hierarchical.** Hot, warm, cold, and procedural memory are managed explicitly instead of relying on a single large context window.
 6. **Safety is enforced by the runtime.** Sandboxes, policy enforcement, resource limits, and observability guard actions without putting human approval on the hot path.
 7. **Locality is a first-class policy.** Computation should happen as close as practical to the device, signal, data, or action it affects.
-8. **Distribution is native.** Nodes, devices, sessions, events, world-state, and memory must be identity-aware and synchronization-aware from the beginning.
+8. **Distribution is native.** Nodes, devices, internal model sessions, events, world-state, and memory must be identity-aware and synchronization-aware from the beginning.
 9. **Workspaces are distributed objects.** Agent workspaces, staging areas, and artifacts should be local-first but addressable across nodes through explicit ownership, replication, and write policies.
 10. **Evolution is live and continuity-preserving.** Self-evolution must move through scoped workspaces, evaluation gates, signed artifacts, node-local policy checks, hot-swap, progressive rollout, and rollback without requiring human approval or stopping the system.
 
@@ -63,7 +63,7 @@ Node examples:
 
 ### Local Daemon / Service Mode
 
-The initial local service entry point is `sinomo daemon`. It is intentionally small: a foreground service command plus CLI controls that can be wrapped by systemd, launchd, a shell supervisor, or a future Sinomo-owned service manager.
+The local service entry point is `sinomo daemon`. It is intentionally small: a foreground service command plus CLI controls that can be wrapped by systemd, launchd, a shell supervisor, or a Sinomo-owned service manager.
 
 - `sinomo daemon run` runs the daemon in the foreground.
 - `sinomo daemon start` launches a detached local background process.
@@ -81,11 +81,11 @@ Daemon lifecycle is local infrastructure and is allowed before cluster registrat
 
 The default `sinomo` command is daemon-first. When the local main daemon is running and registered with a cluster, the CLI treats that daemon as the local cluster runtime for the cluster-state guard and starts the TUI session under the daemon's cluster node identity. If no daemon is reachable, the CLI falls back to the local cluster state and reports bootstrap guidance when neither path exists. Explicit lifecycle commands such as `sinomo daemon run`, `sinomo daemon start`, and `sinomo install` remain opt-in process-management operations.
 
-The architectural direction is cluster-based node operation. A machine that starts alone is represented as a single-node cluster, and later adoption into another cluster is handled as cluster migration. `sinomo cluster migrate plan <invite>` validates the source cluster and target invite without mutating local state. `sinomo cluster join <invite>` on an already initialized settled solo node now starts the single-node migration path directly: it writes a migration record, quarantines old cluster state/KV/Raft storage under `$SINOMO_DATA_DIR/cluster/migrations/<migration_id>/source/`, moves existing DFS metadata under the import namespace `/sinomo/imports/<source_cluster_id>/...`, and then records the target-cluster join with the preserved local node identity. Target cluster KV wins after the join; source cluster KV is kept as evidence/import source only, cluster-level config is skipped, and only node-local `/config/nodes/<source_node_id>/...` config may be reapplied to target KV as normal KV operations. Shared DFS data import remains deferred. `sinomo cluster leave` is the reverse lifecycle edge for an installed node: it leaves the current cluster by quarantining old cluster state/KV/Raft/watch storage under `$SINOMO_DATA_DIR/cluster/migrations/<leave_id>/leave-source/`, then creates a fresh single-node cluster with the preserved local node identity. The left cluster's KV remains archived evidence and is not imported into the new single-node cluster.
+Node operation is cluster-based. A machine that starts alone is represented as a single-node cluster, and adoption into another cluster is handled as cluster migration. `sinomo cluster migrate plan <invite>` validates the source cluster and target invite without mutating local state. `sinomo cluster join <invite>` on an initialized solo node uses the single-node migration path: it writes a migration record, quarantines old cluster state/KV/Raft storage under `$SINOMO_DATA_DIR/cluster/migrations/<migration_id>/source/`, moves existing DFS metadata under the import namespace `/sinomo/imports/<source_cluster_id>/...`, and records the target-cluster join with the preserved local node identity. Target cluster KV wins after the join; source cluster KV is kept as evidence/import source only, cluster-level config is skipped, and only node-local `/config/nodes/<source_node_id>/...` config may be reapplied to target KV as normal KV operations. Shared DFS data import is a separate policy-governed operation. `sinomo cluster leave` is the reverse lifecycle edge for an installed node: it leaves the current cluster by quarantining old cluster state/KV/Raft/watch storage under `$SINOMO_DATA_DIR/cluster/migrations/<leave_id>/leave-source/`, then creates a fresh single-node cluster with the preserved local node identity. The left cluster's KV remains archived evidence and is not imported into the new single-node cluster.
 
-The global `--local` process flag has been removed from the CLI surface. Local degraded-mode helpers remain internal fallback plumbing for commands that can read local state when the daemon or quorum is unavailable, but user-facing node operations are cluster-centered and daemon-owned.
+User-facing node operations are cluster-centered and daemon-owned. Local degraded-mode helpers remain internal fallback plumbing for commands that can read local state when the daemon or quorum is unavailable.
 
-The daemon hosts the first internal cluster KV service adapter. The service is not exposed as a public API; Sinomo components use binary object RPC routes to read snapshots, submit KV transactions, range over prefixes, and create/drain local prefix watches. `sinomo-kv` owns KV storage semantics, Raft participant state, leader/election state, term/vote/log/snapshot behavior, and durable KV files under `$SINOMO_DATA_DIR/cluster/kv-raft/<node_id>/` plus the materialized snapshot at `$SINOMO_DATA_DIR/cluster/kv-snapshot.sobj`. `sinomo-network` owns the cluster network and routing layer: routes, endpoint selection, connectivity graph interpretation, relay decisions, and peer transport selection. The coupling between them is intentionally narrow: KV replication and KV RPC traffic are transmitted over network-selected routes, and network routing reads the connectivity graph persisted in KV through a small query surface. Connectivity records are network-domain facts stored in KV; KV stores and serves them, but network interprets them for routing. Neither crate should absorb the other's domain rules. The daemon supplies host-local authentication, process identity, and peer transport callbacks for those crates. Cluster init, daemon registration, and join registration store cluster identity, Raft role config, member records, endpoint records, capability policy, invitations, and rollout desired/node state under the `/cluster/...` keyspace, so `sinomo cluster status` and `sinomo cluster peers` can report the KV-backed view rather than only the local state file. Cluster maintenance sends Raft append heartbeats from the current leader, asks authorized voters for votes when the leader is unreachable, persists a new leader only after quorum, clears local leadership when quorum is lost, and fans out committed watch events with signed daemon messages. Daemons also publish runtime heartbeats under `/cluster/node-status/<node_id>`. Those records include online observation time, daemon version, platform, PID, control address, executable path, and the latest rollout state summary from `$SINOMO_DATA_DIR/rollout/state.sobj`.
+The daemon hosts an internal cluster KV service adapter. The service is not exposed as a public API; Sinomo components use binary object RPC routes to read snapshots, submit KV transactions, range over prefixes, and create/drain local prefix watches. `sinomo-kv` owns KV storage semantics, Raft participant state, leader/election state, term/vote/log/snapshot behavior, and durable KV files under `$SINOMO_DATA_DIR/cluster/kv-raft/<node_id>/` plus the materialized snapshot at `$SINOMO_DATA_DIR/cluster/kv-snapshot.sobj`. `sinomo-network` owns the cluster network and routing layer: routes, endpoint selection, connectivity graph interpretation, relay decisions, and peer transport selection. The coupling between them is intentionally narrow: KV replication and KV RPC traffic are transmitted over network-selected routes, and network routing reads the connectivity graph persisted in KV through a small query surface. Connectivity records are network-domain facts stored in KV; KV stores and serves them, but network interprets them for routing. Neither crate should absorb the other's domain rules. The daemon supplies host-local authentication, process identity, and peer transport callbacks for those crates. Cluster init, daemon registration, and join registration store cluster identity, Raft role config, member records, endpoint records, capability policy, invitations, and rollout desired/node state under the `/cluster/...` keyspace, so cluster status and peer views can report the KV-backed view rather than only local state. Cluster maintenance sends Raft append heartbeats from the current leader, asks authorized voters for votes when the leader is unreachable, persists a new leader only after quorum, clears local leadership when quorum is lost, and fans out committed watch events with signed daemon messages. Daemons also publish runtime heartbeats under `/cluster/node-status/<node_id>`. Those records include online observation time, daemon version, platform, PID, control address, executable path, and rollout state summary.
 
 `sinomo cluster health` reads the KV-backed member and node-status records, then probes reachable daemon endpoints for a fresh live view. The report shows each cluster member with online/offline/unknown health, version, platform, PID, address, last-seen time, and rollout status. Shadow reachability is represented through the main member's alternate daemon endpoints rather than a separate member row. `sinomo cluster status` includes online/offline counts from the same health rows. A node is treated as offline when it has a probeable endpoint but its last online heartbeat is stale; nodes without a usable endpoint remain unknown rather than falsely offline.
 
@@ -98,11 +98,11 @@ Each local daemon has an Ed25519 identity under `$SINOMO_DATA_DIR/identity/`. Th
 
 Install creates `$SINOMO_DATA_DIR`, copies the current executable to `$SINOMO_DATA_DIR/bin/sinomo`, exposes that binary as `~/.local/bin/sinomo` on Unix-like systems, deploys the current checkout into the managed source repo, builds installable native-dylib modules from that source, activates their content-addressed loader state, writes a boot entry for the main daemon and a boot entry for the shadow daemon, and starts both daemons unless `--no-start` is set. When an installed binary already exists and the command is run from a different executable, `sinomo install` acts as an update command: it stops the installed shadow daemon and main daemon, waits for their locks to clear, replaces the installed binary, rewrites boot entries, refreshes the user-bin symlink, and restarts both daemons unless `--no-start` is set. It also restarts already-running installed daemons when their bind host or port does not match the requested install options. The install default bind host is `0.0.0.0` so a freshly installed node can accept LAN cluster traffic; explicit operators can use `--host 127.0.0.1` for local-only installs. Daemon status reports both the bind address and the local control address; a wildcard bind uses `127.0.0.1:<port>` as the local CLI control address while still listening on the wildcard bind.
 
-On Windows the boot entries are per-user Startup `.cmd` files because the binary does not yet implement the Windows Service Control Manager protocol and service registration commonly requires elevated privileges. On Unix-like systems the boot entries are systemd user service files when a user systemd config directory is available; install best-effort enables those user units, and uninstall best-effort disables them. `sinomo uninstall` removes only those boot entries and optionally stops the daemons; it intentionally retains `$SINOMO_DATA_DIR` and the installed binary so cluster identity, KV state, and local metadata survive reinstall.
+On Windows the boot entries are per-user Startup `.cmd` files because service registration commonly requires elevated privileges. On Unix-like systems the boot entries are systemd user service files when a user systemd config directory is available. `sinomo uninstall` removes only those boot entries and optionally stops the daemons; it intentionally retains `$SINOMO_DATA_DIR` and the installed binary so cluster identity, KV state, and local metadata survive reinstall.
 
 ### Self-Rollout Source and Shadow Daemon
 
-The first self-rollout path treats Sinomo's own source as durable node-local state. `sinomo rollout init-source` creates `$SINOMO_DATA_DIR/source/sinomo` from the current repository unless a different `--repo` is supplied. The managed source is a local git repository with external remotes removed, so rollout and self-evolution do not depend on GitHub, GitLab, or any upstream service outside the Sinomo cluster. Later imports merge external checkout changes into the managed source instead of replacing it, so self-evolution commits made inside the managed source are preserved. When `sinomo evolve propose` does not receive an explicit `--repo` or configured repo, it uses this data-directory source repository so approved self-evolution work lands in Sinomo's maintained source rather than the operator's checkout.
+Self-rollout treats Sinomo's own source as durable node-local state. `sinomo rollout init-source` creates `$SINOMO_DATA_DIR/source/sinomo` from the current repository unless a different `--repo` is supplied. The managed source is a local git repository with external remotes removed, so rollout and self-evolution do not depend on GitHub, GitLab, or any upstream service outside the Sinomo cluster. Imports merge external checkout changes into the managed source instead of replacing it, so self-evolution commits made inside the managed source are preserved. When `sinomo evolve propose` does not receive an explicit `--repo` or configured repo, it uses this data-directory source repository so approved self-evolution work lands in Sinomo's maintained source rather than the operator's checkout.
 
 Approved evolution decisions commit the candidate worktree and fast-forward the source repository. Rollout is then an explicit local operation:
 
@@ -122,7 +122,7 @@ The shadow daemon owns separate state under `$SINOMO_DATA_DIR/shadow-daemon/` so
 
 Cluster rollout supports both supervised and main-only activation. The running main daemon stages candidate main and shadow binaries, replies to the rollout request, and exits. If a local shadow daemon is running, the existing shadow stays alive, switches only the supervised main to the candidate, and waits for the main daemon to answer health probes. If the candidate cannot execute or exits before becoming healthy, the shadow records rollout failure in `$SINOMO_DATA_DIR/rollout/state.sobj`, restores the previous main binary, and keeps supervising. Only after the candidate main is healthy does the main daemon finalize `$SINOMO_DATA_DIR/rollout/pending-shadow-rollout.sobj` by replacing the shadow daemon. If no local shadow daemon is running, the main daemon starts a staged self-restart candidate before it exits; that candidate installs itself as the stable main binary and records rollout success without requiring shadow participation. If candidate shadow startup fails after a supervised main activation, the healthy main daemon attempts to restart the previous shadow binary and records the recovery result.
 
-For development cluster rollout, explicit `--target <host:port>` is the practical path until full membership reconciliation is online. Cluster metadata endpoints are also used when present, but a node that has only recorded a local pending join may not yet be visible to the initiating node. `sinomo install` deploys the current git checkout into the managed source repo at `~/.sinomo/source/sinomo`, merging the external checkout on later installs so daemon-backed remote build works without a separate `rollout init-source` step. The remote daemon stages candidate bytes under its rollout directory, then activates them into stable `bin/sinomo` and `bin/sinomo-shadow` executables one process at a time so firewall rules can target stable binary paths while Windows file locking is still respected. Binary rollout is platform-specific: daemon status advertises target OS/architecture, the rollout client skips incompatible or unknown remote platforms for binary pushes, and the target daemon rejects mismatched artifacts before stopping its running processes. Compatible binary-push rollout carries matching native-dylib module bytes in the rollout request. Remote-build rollout builds and activates module artifacts on the target from the same managed source used for the daemon binary. When the rollout source is a repo and a remote target is incompatible or unknown, the CLI uses daemon-backed remote build from the target's managed source repo instead of shipping the local binary. Target rollout activation and build do not require git remotes or internet access.
+Development cluster rollout may target an explicit `--target <host:port>` or cluster metadata endpoints. `sinomo install` deploys the source checkout into the managed source repo at `~/.sinomo/source/sinomo`, merging the external checkout on subsequent installs so daemon-backed remote build works without a separate `rollout init-source` step. The remote daemon stages candidate bytes under its rollout directory, then activates them into stable `bin/sinomo` and `bin/sinomo-shadow` executables one process at a time so firewall rules can target stable binary paths while Windows file locking is respected. Binary rollout is platform-specific: daemon status advertises target OS/architecture, the rollout client skips incompatible or unknown remote platforms for binary pushes, and the target daemon rejects mismatched artifacts before stopping its running processes. Compatible binary-push rollout carries matching native-dylib module bytes in the rollout request. Remote-build rollout builds and activates module artifacts on the target from the same managed source used for the daemon binary. When the rollout source is a repo and a remote target is incompatible or unknown, the CLI uses daemon-backed remote build from the target's managed source repo instead of shipping the local binary. Target rollout activation and build do not require git remotes or internet access.
 
 ### Device Model
 
@@ -146,8 +146,9 @@ State should be split by locality and durability.
 | State | Locality | Sync behavior |
 |---|---|---|
 | Hot state | Local node first | Replicate only selected summaries, active routing state, and handoff metadata |
-| Session state | Multi-node | Synchronize session timeline, participants, active devices, and current task state |
-| Event log | Partitioned by origin node/session | Replicate durable event envelopes and evidence references according to policy |
+| Chat/channel state | Multi-node | Synchronize user-visible timelines, participants, active devices, and current conversation/task state |
+| Model session state | Local node first, with durable traces | Preserve the internal model-turn timeline, context projection, compaction state, and handoff metadata |
+| Event log | Partitioned by origin node/internal session | Replicate durable event envelopes and evidence references according to policy |
 | World-state | Federated | Merge entity, task, environment, and attention updates from multiple nodes |
 | Warm memory | Durable home node plus caches | Replicate relevant summaries and retrieval hints to participating nodes |
 | Cold memory | Durable storage node first | Retrieve remotely or cache selected shards |
@@ -178,19 +179,42 @@ Examples:
 - Server node performs memory consolidation, long deliberation, and large retrieval jobs.
 - Any node can request help from another node when local confidence, capability, or resources are insufficient.
 
-### Session Handoff
+### Chats, Channels, and Model Sessions
 
-Sessions should not belong to a single device. A session is a distributed activity with participating nodes and devices.
+Chats and channels are the user-facing collaboration surfaces. They own
+participants, visible timelines, active user interaction surfaces, and
+cross-device continuity.
 
-Session responsibilities:
+Model sessions are internal execution units used by `sinomo-agent` to drive
+model turns. A model session owns the model-facing projection transcript,
+context assembly state, compaction state, queued steering/follow-up input, and
+turn traces. It is not the participant model, and it should not be treated as a
+user-visible conversation object.
 
+Within one model session, everything the model sees is a context-assembly
+decision. The memory system may contribute retrieved blocks, but it does not own
+same-session persistence, maintain the active projection, or decide what
+same-session information remains visible. Same-session continuity is context
+management.
+
+Memory retrieval becomes authoritative only at boundaries: crossing model
+sessions, resuming older work, moving between chats/channels, or bringing
+durable task, workspace, user, or cluster memory into a fresh context.
+
+Chat/channel responsibilities:
+
+- Track participants and user-visible conversation state.
 - Track active user interaction surfaces.
 - Track active action targets.
 - Preserve conversational continuity across devices.
 - Route commands to the node closest to the action target.
-- Allow a node to join, leave, sleep, reconnect, or fail without losing the session timeline.
+- Allow a node to join, leave, sleep, reconnect, or fail without losing the chat
+  or channel timeline.
 
-For example, when a user speaks on mobile and asks Sinomo to change something on the desktop, the mobile node can publish a speech/intent event into the session. The desktop node can subscribe because it owns the relevant screen and input devices, then execute or negotiate the action locally.
+For example, when a user speaks on mobile and asks Sinomo to change something
+on the desktop, the mobile node can publish a speech/intent event into the chat
+or channel timeline. A desktop-side model session can be created or resumed to
+handle that turn because the desktop owns the relevant screen and input devices.
 
 ### Distributed Event Routing
 
@@ -200,7 +224,7 @@ Routing rules should consider:
 
 - Event family and salience.
 - Producing node and device.
-- Session membership.
+- Chat/channel membership or internal model-session lineage.
 - Target entity, task, device, or node.
 - Privacy classification.
 - Required latency.
@@ -225,7 +249,7 @@ Core use cases:
 - Cross-device handoff where one node edits, another builds/tests, and another reviews.
 - Recovery after node sleep, disconnect, or restart.
 
-The DFS is not meant to replace Git, PostgreSQL, or local filesystems. It provides a policy-aware workspace layer above local storage and below agent actions.
+The DFS is not meant to replace Git, optional external databases, or local filesystems. It provides a policy-aware workspace layer above local storage and below agent actions.
 
 #### Filesystem Object Model
 
@@ -279,7 +303,7 @@ Rules:
 
 - `local-owned` writes are routed to `owner_node_id`; remote nodes submit write requests instead of mutating cached copies.
 - `replicated-confirmed` writes are coordinated by the owner or elected coordinator and are visible after required confirmations.
-- `replicated-eventual` writes are locally accepted with version metadata and reconciled later.
+- `replicated-eventual` writes are locally accepted with version metadata and reconciled asynchronously.
 - `append-only` writes create new immutable versions or chunks.
 - `ephemeral-local` writes are never synchronized unless promoted by an explicit event.
 
@@ -343,7 +367,7 @@ R0 should remain tiny and continuity-focused. R1 should be boring in behavior bu
 
 The crate graph now makes this trust-ring cut explicit. Each workspace crate declares `[package.metadata.sinomo] ring = "..."` in its `Cargo.toml`, and `sinomo-runtime` is the R0/R1 boundary facade. R0/R1 crates must not depend on R2 services or application crates. R2 services and application crates must cross the foundation boundary through the `sinomo-runtime` facade instead of depending directly on R0/R1 crates.
 
-Self-evolution is intentionally above this foundation. `sinomo-evolution` is an R2 service that owns evolution jobs, mutation packets, candidate bundles, approval records, and campaign state. R0/R1 crates expose generic primitives such as events, artifacts, scorecards, registry evidence, rollout plans, sandbox workloads, and module loader state; they do not know whether those primitives were produced by self-evolution, an operator, or another future delivery system.
+Self-evolution is intentionally above this foundation. `sinomo-evolution` is an R2 service that owns evolution jobs, mutation packets, candidate bundles, approval records, and campaign state. R0/R1 crates expose generic primitives such as events, artifacts, scorecards, registry evidence, rollout plans, sandbox workloads, and module loader state; they do not know whether those primitives were produced by self-evolution, an operator, or another delivery system.
 
 Initial crate ownership:
 
@@ -394,16 +418,16 @@ Capsule contents:
 
 The manifest is part of the artifact. A candidate cannot grant itself new powers by editing code; capability requests are manifest changes and must pass policy.
 
-### R1 Support Requirements
+### R1 Support Contracts
 
-The initial foundation should support these R1 requirements even if their first implementation is skeletal:
+The foundation plane must provide these R1 contracts:
 
 - Stable trust ring metadata on modules, jobs, policies, and artifacts.
 - Module manifest and artifact identity types in `sinomo-core`.
 - An explicit `sinomo-runtime` facade that aggregates only R0/R1 crates and gives R2 services a stable foundation import boundary.
 - Workspace architecture tests that reject missing ring metadata, R0/R1 dependencies on R2/application crates, and direct R2/application dependencies on R0/R1 crates outside `sinomo-runtime`.
 - A policy decision boundary that candidate code cannot bypass.
-- An artifact registry model backed by PostgreSQL metadata and DFS/local content storage.
+- An artifact registry model backed by Sinomo durable metadata and DFS/local content storage, with optional PostgreSQL deployment backends.
 - Node-local module loader state with current, previous, shadow, and candidate versions.
 - Hot-swap state with activation, drain, quiesce, and rollback checkpoints.
 - Rollout desired-state records that can be evaluated per node.
@@ -412,7 +436,8 @@ The initial foundation should support these R1 requirements even if their first 
 - Sandboxed mutation workspaces using DFS snapshots and object policies.
 - Event families for `evolution.*`, `module.*`, `artifact.*`, `eval.*`, and `rollout.*`.
 
-R1 services may be implemented as ordinary Rust crates at first, but their contracts should assume they are trusted runtime components that must support autonomous live replacement without taking down the node.
+R1 services are trusted runtime components. Their contracts must support
+autonomous live replacement without taking down the node.
 
 ## Runtime Planes
 
@@ -440,13 +465,14 @@ Shared stores:
 
 ### Distributed Foundation Plane
 
-Provides the runtime substrate for nodes, devices, sessions, routing, and synchronization.
+Provides the runtime substrate for nodes, devices, chats/channels, internal
+model-session handoff, routing, and synchronization.
 
 Responsibilities:
 
 - Node identity and registration.
 - Device identity and capability advertisement.
-- Session membership and handoff.
+- Chat/channel membership and model-session handoff.
 - Local and cross-node event routing.
 - State synchronization policies.
 - Distributed workspace and file-object policies.
@@ -466,7 +492,7 @@ Responsibilities:
 - Attach node and device identity.
 - Chunk streams into bounded units.
 - Apply buffering, backpressure, and fan-out.
-- Preserve raw evidence references for later replay.
+- Preserve raw evidence references for replay.
 
 Primary crate: `sinomo-gateway`.
 
@@ -490,7 +516,7 @@ Builds the system's working model of reality.
 Responsibilities:
 
 - Persist canonical events.
-- Maintain entity graph and session state.
+- Maintain entity graph, chat/channel state, and internal model-session state.
 - Track active tasks, hypotheses, unresolved questions, and attention queues.
 - Provide replayable decision traces.
 - Feed relevant context to memory and control loops.
@@ -543,9 +569,10 @@ Responsibilities:
 
 Primary crates: `sinomo-actions`, `sinomo-voice`, `sinomo-api`.
 
-## Initial Workspace Layout
+## Workspace Crate Layout
 
-The repository should evolve from the current single binary into a Rust workspace with shared contracts and focused service crates.
+The repository is organized as a Rust workspace with shared contracts and
+focused service crates.
 
 ```text
 sinomo-agent/
@@ -586,8 +613,6 @@ sinomo-agent/
   modules/
     remote/management/    # Self-contained trusted native-dylib shell, filesystem, and system-info module
 ```
-
-The current `crates/sinomo` binary can either be renamed to `sinomo-app` or kept temporarily as the bootstrap binary while the crate layout is introduced.
 
 ## Crate Responsibilities
 
@@ -672,7 +697,7 @@ Responsibilities:
 - Route events, commands, and state updates.
 - Support local network operation first.
 - Own the Sinomo Object wire codec for cluster communication.
-- Provide message and streaming abstractions over direct peer links, home-node sync APIs, or future protocols.
+- Provide message and streaming abstractions over direct peer links, home-node sync APIs, or additional protocols.
 
 ### `sinomo-dfs`
 
@@ -681,7 +706,7 @@ Local-first distributed filesystem for agent workspaces and task staging.
 Responsibilities:
 
 - Manage workspaces, mounts, paths, object IDs, and versions.
-- Store file/object metadata in PostgreSQL.
+- Store file/object metadata in Sinomo durable storage, with optional external database backends.
 - Store content on local node filesystems.
 - Apply object-level ownership, replication, retention, and write policies.
 - Route writes to owning nodes when required.
@@ -852,7 +877,8 @@ Responsibilities:
 
 ### `sinomo-memory`
 
-Memory service and retrieval policy.
+Memory service, storage, retrieval policy, and consolidation. The detailed
+design lives in [memory-architecture.md](memory-architecture.md).
 
 Responsibilities:
 
@@ -861,6 +887,7 @@ Responsibilities:
 - Maintain semantic/cold memory records and embeddings.
 - Manage procedural memory references.
 - Return bounded context packages to control loops.
+- Preserve memory provenance, retrieval traces, and policy decisions.
 
 ### `sinomo-agent`
 
@@ -942,7 +969,9 @@ Events are the canonical contract between services.
   "target_node_id": "node_desktop_main",
   "target_device_id": "device_desktop_main_screen",
   "source": "audio.mic.frontdesk",
-  "session_id": "sess_01...",
+  "chat_id": "chat_01...",
+  "channel_id": "channel_ops",
+  "internal_session_id": "sess_01...",
   "kind": "speech.transcript.final",
   "span": {
     "start_ms": 1710,
@@ -962,7 +991,7 @@ Events are the canonical contract between services.
     "related_to": ["task_abc"]
   },
   "routing": {
-    "scope": "session",
+    "scope": "chat",
     "latency_class": "interactive",
     "privacy": "derived",
     "hints": ["target:desktop", "requires:screen-control"]
@@ -999,7 +1028,7 @@ Distributed event fields:
 - `origin_device_id`: device that produced the event, when applicable.
 - `target_node_id`: preferred or required node for handling the event, when known.
 - `target_device_id`: preferred or required action target, when known.
-- `routing.scope`: local, session, trusted-network, or durable-global.
+- `routing.scope`: local, chat, channel, trusted-network, or durable-global.
 - `routing.latency_class`: reactive, interactive, background, or archive.
 - `routing.privacy`: raw, derived, private, redacted, or public.
 - `routing.hints`: capability and placement hints for routers and schedulers.
@@ -1010,31 +1039,55 @@ Evolution-related events should include trust ring, target module, artifact ID, 
 
 ## Memory Architecture
 
-| Tier | Purpose | Expected storage |
-|---|---|---|
-| Hot memory | Immediate live context, active speaker state, recent observations, open jobs | In-process bounded buffers with selective PostgreSQL checkpoints |
-| Warm episodic memory | Session-scale continuity, important events, task transitions, unresolved questions | PostgreSQL |
-| Cold semantic memory | Long-term summaries, embeddings, cross-session facts, document knowledge | PostgreSQL |
-| Procedural memory | Reusable workflows, skills, recovery procedures, policies | Versioned files or managed skill store |
+The detailed design lives in [memory-architecture.md](memory-architecture.md).
+Sinomo memory is hierarchical and explicit: hot in-process state, immutable
+episodic `MemoryRecord`s, derived semantic memory, and versioned procedural
+memory. Memory is exposed to model turns through bounded context providers, not
+hidden mutable state.
 
-Memory writes should be selective. Events should be promoted when they are salient, repeated, unresolved, user-important, needed for future planning, or linked to task success/failure.
+Memory storage uses Sinomo-native durable storage: append-only SOBJ memory
+logs, compact snapshots, materialized indexes, and scope-partitioned SIFS
+replication plans. PostgreSQL, vector databases, graph databases, and other
+external services are optional provider backends rather than requirements of
+the base memory architecture.
+
+Memory writes should be selective. Events should be promoted when they are
+salient, repeated, unresolved, user-important, needed for future planning,
+linked to task success/failure, or required for safety and auditability.
+
+Memory evaluation is layered. `sinomo-memory` tests cover deterministic store,
+scope, replay, supersession, consolidation, and replication invariants. Cheap
+cluster sanity checks should exercise configured memory visibility without
+expensive provider calls. Expensive live/model evaluation belongs in
+`sinomo-benchmarks`; the optional `agent-memory-quality` plan runs
+`modules/benchmark/sinomo-benchmarks/agent/run_memory_eval.py` to score
+retrieval quality, model usefulness, governance/scope behavior, and
+cache-friendly context stability against real models.
 
 ## Storage, Routing, and Sync
 
-The only required external stateful dependency should be PostgreSQL. Early deployments should avoid requiring message brokers, distributed caches, dedicated search/vector databases, or separate object storage services.
+The base runtime should avoid required external stateful dependencies. Early
+deployments should avoid requiring message brokers, distributed caches,
+dedicated search/vector databases, PostgreSQL, or separate object storage
+services.
 
-Application services may still use in-process channels, local files, direct peer connections, HTTP/WebSocket APIs, or operating-system primitives, but PostgreSQL is the durable coordination point for event logging, state management, jobs, and memory.
+Application services may still use in-process channels, local files, direct peer
+connections, HTTP/WebSocket APIs, operating-system primitives, or optional
+external databases. Durable coordination should be owned by Sinomo services and
+storage contracts first, with optional external stores hidden behind crate-level
+abstractions.
 
 ### PostgreSQL
 
-Use PostgreSQL as the primary durable state store.
+PostgreSQL is an optional deployment backend, not a required base-runtime
+dependency.
 
-Use cases:
+Possible use cases:
 
 - Event log and replay.
-- Session and task state.
+- Internal model-session and task state.
 - Entity/world-state tables.
-- Memory records.
+- Optional memory indexes or archives behind `sinomo-memory` provider traits.
 - DFS workspace, object, version, and policy metadata.
 - Module manifests, artifact registry metadata, provenance, signatures, and attestations.
 - Evolution jobs, evaluation scorecards, policy decisions, rollout desired state, and rollback records.
@@ -1044,29 +1097,34 @@ Use cases:
 - Supervision and policy state.
 - Semantic retrieval metadata and embedding storage.
 
-In distributed deployments, PostgreSQL should initially live on one durable home node or small server node. Other nodes should cache local hot state and selected warm state. The architecture should not require mobile or lightweight nodes to host the full durable database.
+If a deployment uses PostgreSQL, it should live on one durable home node or
+small server node. Other nodes should cache local hot state and selected warm
+state. The architecture must not require mobile or lightweight nodes to host a
+full durable database.
 
-PostgreSQL should be used as a durable event and coordination substrate, not as the real-time hot path for every local decision. Fast reactive loops should use local in-memory state and append durable events asynchronously when possible.
+PostgreSQL should not be the real-time hot path for every local decision. Fast
+reactive loops should use local in-memory state and append durable events
+asynchronously when possible.
 
 ### Event Routing Without a Broker
 
-Without a broker dependency, cross-node routing should use a small application-level routing layer backed by PostgreSQL durability.
+Without a broker dependency, cross-node routing should use a small application-level routing layer backed by Sinomo durable storage.
 
 Recommended pattern:
 
 - Local services communicate through in-process queues for hot paths.
-- Each node writes durable events to an append-only PostgreSQL event log when connected.
-- Cross-node deliveries are represented in routing inbox/outbox tables.
+- Each node writes durable events to an append-only event log when connected.
+- Cross-node deliveries are represented in routing inbox/outbox records.
 - Workers use polling with leases for durable work and delivery.
-- PostgreSQL `LISTEN`/`NOTIFY` can be used as an optimization for wakeups, not as the durable source of truth.
+- PostgreSQL `LISTEN`/`NOTIFY` or equivalent backend-specific notifications can be used as an optimization for wakeups, not as the durable source of truth.
 - Disconnected nodes buffer selected events locally and sync when reconnected.
-- Direct peer links or home-node sync APIs can move events between devices while PostgreSQL remains the durable ledger.
+- Direct peer links or home-node sync APIs can move events between devices while Sinomo durable storage remains the durable ledger.
 
 ### Distributed Workspace Filesystem
 
-Use PostgreSQL for DFS metadata and local node filesystems for content.
+DFS metadata is owned by `sinomo-dfs`; content stays on local node filesystems by default.
 
-PostgreSQL tables should track:
+Durable DFS metadata should track:
 
 - Workspaces and mounts.
 - Objects, paths, and tombstones.
@@ -1076,7 +1134,7 @@ PostgreSQL tables should track:
 - Write intents, leases, receipts, and conflicts.
 - Retention and cleanup state.
 
-Content should remain on local node storage by default. Replication copies content between nodes according to object policy, while PostgreSQL records what should exist and what has been confirmed.
+Content should remain on local node storage by default. Replication copies content between nodes according to object policy, while durable metadata records what should exist and what has been confirmed.
 
 The DFS should expose a small API to the rest of the runtime:
 
@@ -1093,9 +1151,9 @@ For coding tasks, the DFS should support repository workspaces that can be mount
 
 ### Artifact Registry and Provenance
 
-Use PostgreSQL for registry metadata and DFS/local content storage for artifact bytes.
+Use Sinomo durable storage for registry metadata and DFS/local content storage for artifact bytes.
 
-PostgreSQL tables should track:
+Registry metadata should track:
 
 - Module manifests and API versions.
 - Artifact IDs, content hashes, signatures, and compatibility constraints.
@@ -1110,9 +1168,13 @@ The registry is R1 infrastructure. Higher-level systems may produce candidate bu
 
 ### Semantic Retrieval
 
-Store embeddings and semantic memory metadata in PostgreSQL from the beginning. The first implementation can use simple SQL filtering plus in-process ranking over bounded candidate sets.
+Semantic retrieval is owned by `sinomo-memory`; see
+[memory-architecture.md](memory-architecture.md). Retrieval uses local
+materialized indexes plus in-process ranking over bounded candidate sets.
 
-An optional PostgreSQL extension can be introduced later if vector search quality or scale requires it, but it should not be required by the initial architecture.
+Embedding, graph, full-text, PostgreSQL, or vector-store providers are optional
+backends. They must be rebuildable from source memory records and must not be
+required by the base architecture.
 
 ### Hot State
 
@@ -1131,13 +1193,14 @@ Storage:
 
 - In-process bounded buffers.
 - Local ephemeral files when needed.
-- Selective PostgreSQL checkpoints for recovery or handoff.
+- Selective durable checkpoints for recovery or handoff.
 
-A future distributed cache should be introduced only behind a `sinomo-memory` abstraction rather than leaking into core contracts.
+Distributed caches belong behind `sinomo-memory` abstractions rather than
+leaking into core contracts.
 
 ### Media and Evidence Storage
 
-Avoid requiring separate object storage in the base architecture. Store media and large evidence locally on the node that captured or generated it, with PostgreSQL holding metadata, hashes, retention policy, and evidence references.
+Avoid requiring separate object storage in the base architecture. Store media and large evidence locally on the node that captured or generated it, with Sinomo durable metadata holding hashes, retention policy, and evidence references.
 
 Use cases:
 
@@ -1147,7 +1210,7 @@ Use cases:
 - Generated media.
 - Evidence attached to events.
 
-Evidence references must include enough locality information to support local-only evidence, replicated evidence, and redacted evidence handles. A future object store can be added as an implementation detail when scale requires it, but it should not be part of the initial dependency set.
+Evidence references must include enough locality information to support local-only evidence, replicated evidence, and redacted evidence handles. Object stores are optional implementation details for deployments that need them, not part of the required dependency set.
 
 ## Synchronization Strategy
 
@@ -1159,8 +1222,9 @@ Replicate durable event envelopes according to routing and privacy policy.
 
 Default behavior:
 
-- Reactive local events stay local unless they affect a shared session or remote action target.
-- Session events replicate to active session participants.
+- Reactive local events stay local unless they affect a shared chat/channel or remote action target.
+- Chat/channel events replicate to active chat/channel participants.
+- Internal model-session events replicate only as needed for traces, handoff, or recovery.
 - Raw media references replicate only as evidence handles unless policy allows raw transfer.
 - Summaries, embeddings, and derived observations can move more freely than raw streams.
 - Blocked actions and safety incidents replicate to the supervision home node.
@@ -1169,7 +1233,7 @@ Default behavior:
 
 ### World-State Merge
 
-World-state should be federated. Each node can maintain local reducers for the entities and devices it observes. A future session synchronization service should merge updates into a shared session view once that design is concrete.
+World-state should be federated. Each node can maintain local reducers for the entities and devices it observes. Future chat/channel synchronization should merge updates into shared user-visible views once that design is concrete.
 
 Merge guidance:
 
@@ -1200,7 +1264,7 @@ Workspace synchronization should be policy-driven per object or subtree.
 Default behavior:
 
 - Local scratch files stay on the node that created them.
-- Durable workspace metadata is recorded in PostgreSQL.
+- Durable workspace metadata is recorded in Sinomo durable storage.
 - `local-owned` objects route writes to the owner node.
 - `replicated-confirmed` objects require configured write receipts before becoming the visible current version.
 - `replicated-eventual` objects may be visible immediately with pending replica state.
@@ -1256,7 +1320,7 @@ Capability discovery allows Sinomo to defer exact placement decisions while keep
 
 1. `sinomo-gateway` receives microphone audio.
 2. `sinomo-audio` emits VAD and transcript events.
-3. A future trigger policy sees a high-salience interruption cue.
+3. A trigger policy sees a high-salience interruption cue.
 4. The fast reactive loop decides whether to interrupt, acknowledge, alert, or wait.
 5. `sinomo-agent` retrieves recent context and produces a short response.
 6. If ambiguity remains, `sinomo-deliberation` receives a follow-up job.
@@ -1267,12 +1331,12 @@ Capability discovery allows Sinomo to defer exact placement decisions while keep
 
 1. The user speaks to the mobile frontend.
 2. The mobile node runs VAD, wake policy, and lightweight audio perception locally.
-3. The mobile node publishes a session event with transcript, embeddings, intent hints, and mobile device provenance.
+3. The mobile node publishes a chat/channel event with transcript, embeddings, intent hints, and mobile device provenance.
 4. `sinomo-network` routes the event to the desktop node because the desktop owns the target screen/action devices.
-5. The desktop node retrieves local screen/UI state and relevant shared session context.
+5. The desktop node retrieves local screen/UI state and relevant shared chat/channel context.
 6. A local fast reactive or interactive controller decides whether the action is safe and executable.
 7. `sinomo-actions` executes the desktop action locally.
-8. Action results, screen changes, and any blocked-policy events are published back into the session timeline.
+8. Action results, screen changes, and any blocked-policy events are published back into the chat/channel timeline.
 9. The mobile node receives a compact status update for user feedback.
 
 ### Long-Running Generation
@@ -1295,7 +1359,7 @@ Capability discovery allows Sinomo to defer exact placement decisions while keep
 5. The desktop node applies edits locally, runs formatting/tests, and emits `dfs.write.committed`, `tool.*`, and `agent.*` events.
 6. Important generated artifacts use `replicated-confirmed` policy so another node can review or continue work.
 7. Scratch build outputs remain `ephemeral-local` and are garbage collected by policy.
-8. If a node disconnects mid-task, PostgreSQL metadata and DFS version state allow another capable node to resume from the latest confirmed workspace state.
+8. If a node disconnects mid-task, durable metadata and DFS version state allow another capable node to resume from the latest confirmed workspace state.
 
 ### R3 Module Evolution With R1 Rollout
 
@@ -1350,7 +1414,7 @@ Distributed safety requirements:
 - Capability advertisements must distinguish observable capability from permitted capability.
 - Secrets and raw sensitive data should remain on the owning node unless policy explicitly allows transfer.
 - Incident events should include origin node, requesting node, target node, target device, and policy decision.
-- Emergency stop and cancellation must propagate across active session participants.
+- Emergency stop and cancellation must propagate across active chat/channel participants and any backing model sessions.
 
 Self-evolution safety requirements:
 
@@ -1384,133 +1448,3 @@ Track at minimum:
 The system should support event replay, decision trace inspection, memory promotion audits, trigger decision audits, and branch comparison for deliberative jobs.
 
 For self-evolution, observability must also support artifact provenance inspection, manifest diff review, capability diff review, evaluation scorecard comparison, rollout timeline inspection, and rollback evidence review.
-
-## MVP Scope
-
-The first useful MVP should prove the event-centric, three-speed runtime without overbuilding the full future system.
-
-Build first:
-
-- `sinomo-core` event and domain contracts.
-- `sinomo-node`, `sinomo-device`, `sinomo-network`, and `sinomo-dfs` foundation contracts.
-- R0/R1 trust ring contracts, module manifests, artifact IDs, policy decisions, evaluation scorecards, and rollout plan placeholders.
-- `sinomo-events` persistence and replay.
-- DFS metadata tables and local content storage for one-node and simulated two-node workspaces.
-- `sinomo-gateway` for text plus one audio input and one screen/video input.
-- Basic `sinomo-audio` and `sinomo-video` event producers.
-- Trigger decision contracts and placeholder timing policy hooks.
-- `sinomo-agent` interactive loop with bounded retrieval and limited tool use.
-- One `sinomo-deliberation` worker for asynchronous jobs.
-- Minimal `sinomo-api` health, debug, and event inspection endpoints.
-- A two-node local development mode that simulates mobile-to-desktop routing on one machine.
-- A coding workspace simulation where writes route to the owning node.
-- An autonomous live evolution harness shape: scoped candidate workspace, scorecard record, policy decision, registry metadata, shadow activation, hot-swap state, and automatic rollback.
-
-Defer:
-
-- General multi-camera fusion.
-- End-to-end omni-model training.
-- Highly autonomous background actioning.
-- Large-scale distributed retrieval infrastructure.
-- Sophisticated multi-agent societies.
-- Fully automatic placement optimization.
-- Complex cross-internet federation.
-- Cross-fleet high-speed R1 rollout.
-- Mutation of the continuity root without a standby/dual-root mechanism.
-- Full Wasm component conversion for all modules.
-
-## Implementation Phases
-
-### Phase 1: Contracts and Event Backbone
-
-- Create `sinomo-core`.
-- Define shared IDs, node/device IDs, event envelope, domain types, routing metadata, trust rings, module/artifact IDs, policy decisions, scorecards, rollout placeholders, and serialization.
-- Create `sinomo-node` and `sinomo-device`.
-- Define node/device capability contracts.
-- Create `sinomo-events`.
-- Add event validation, persistence interfaces, and replay scaffolding.
-- Add a basic `sinomo-app` binary to wire local services.
-
-### Phase 2: Distributed Runtime Skeleton
-
-- Create `sinomo-network`.
-- Create `sinomo-dfs`.
-- Create skeletons for `sinomo-policy`, `sinomo-registry`, and `sinomo-module`.
-- Add local peer registry and static node configuration.
-- Support routing events between simulated nodes in one process or one workstation.
-- Add session membership and basic handoff metadata.
-- Add workspace/object metadata, policy definitions, and local content storage.
-- Support owner-routed writes in simulated nodes.
-- Add manifest, artifact, policy, and loader-state metadata with no dynamic loading yet.
-
-### Phase 3: Ingestion and Perception Skeletons
-
-- Create `sinomo-gateway`.
-- Add input adapter traits.
-- Create `sinomo-audio`, `sinomo-video`, and `sinomo-fusion` skeletons.
-- Emit synthetic and fixture-backed perception events for testing.
-- Attach node/device provenance to all produced events.
-
-### Phase 4: Trigger and Interactive Loop
-
-- Implement trigger policy decisions once the session/attention design is concrete.
-- Create `sinomo-agent`.
-- Add bounded context retrieval and simple action requests.
-- Route action requests to the node that owns the target device.
-
-### Phase 5: Memory and Deliberation
-
-- Create `sinomo-memory`.
-- Implement hot and warm memory policies.
-- Create `sinomo-deliberation`.
-- Add async job model, cancellation, summaries, and memory consolidation hooks.
-- Add context packet synchronization between participating nodes.
-- Connect task context to DFS workspace snapshots.
-
-### Phase 6: Actions, Voice, API, and Supervision
-
-- Create `sinomo-actions`.
-- Add sandbox-aware action execution events.
-- Create `sinomo-voice`.
-- Create `sinomo-api`.
-- Add health checks, replay endpoints, policy incident views, and operator controls.
-- Add distributed incident traces across requesting and executing nodes.
-- Add DFS policy violation events and workspace audit views.
-- Add module policy violation events and artifact/rollout audit views.
-
-### Phase 7: Self-Evolution Harness
-
-- Create `sinomo-evolution`.
-- Create `sinomo-eval`.
-- Create `sinomo-sandbox`.
-- Create `sinomo-rollout`.
-- Add autonomous evolution jobs scoped to DFS snapshots.
-- Add local command-based scorecards and replay fixture references.
-- Add registry candidate records and provenance metadata.
-- Add policy decisions that allow, deny, defer, quarantine, or request more evidence.
-- Add shadow, hot-swap, canary, and rollback state models with automatic promotion for low-risk modules and guarded R1 trials.
-
-## Near-Term Repository Setup
-
-The next structural step should be to add the crates in dependency order:
-
-1. `sinomo-core`
-2. `sinomo-node`
-3. `sinomo-device`
-4. `sinomo-events`
-5. `sinomo-network`
-6. `sinomo-dfs`
-7. `sinomo-policy`
-8. `sinomo-registry`
-9. `sinomo-module`
-11. `sinomo-gateway`
-12. `sinomo-agent`
-13. `sinomo-memory`
-14. `sinomo-eval`
-15. `sinomo-sandbox`
-17. `sinomo-evolution`
-18. `sinomo-rollout`
-19. perception/action/support crates as skeletons
-20. `sinomo-app`
-
-Start with compileable crate skeletons, shared workspace dependencies, and lightweight tests around the event schema, node/device provenance, routing metadata, DFS object policy behavior, trust-ring classification, module manifest validation, policy decision shapes, and rollout state transitions. Avoid introducing external services beyond PostgreSQL until the contracts and in-process distributed flow are stable.
