@@ -8924,7 +8924,7 @@ mod tests {
     }
 
     #[test]
-    fn connectivity_probe_retries_rerouted_unhealthy_endpoint() {
+    fn connectivity_probe_suppresses_rerouted_unhealthy_endpoint() {
         let now = OffsetDateTime::now_utc();
         let due_at =
             now + time::Duration::seconds(DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL.as_secs() as i64);
@@ -8977,13 +8977,10 @@ mod tests {
             ],
         );
 
-        // A healthy alternate route must NOT suppress re-probing a due
-        // non-healthy direct endpoint: a healed direct dial always beats
-        // relaying, and during cold formation the "route" can itself traverse
-        // stale edges — suppression used to pin late joiners as degraded until
-        // record expiry.
+        // A healthy alternate route means the direct endpoint is no longer load-bearing.
+        // Suppress normal-cadence re-probes and let near-expiry refresh handle recovery.
         assert!(
-            sinomo_network::cluster_connectivity_probe_due_with_graph(
+            !sinomo_network::cluster_connectivity_probe_due_with_graph(
                 &unreachable_direct,
                 &target_endpoint,
                 due_at,
@@ -8993,10 +8990,10 @@ mod tests {
                 &local,
                 false,
             ),
-            "a due unreachable direct endpoint should be reprobed even while a healthy alternate route exists"
+            "a due unreachable direct endpoint should not be reprobed while a healthy alternate route exists"
         );
         assert!(
-            sinomo_network::cluster_connectivity_probe_due_with_graph(
+            !sinomo_network::cluster_connectivity_probe_due_with_graph(
                 &degraded_direct,
                 &target_endpoint,
                 due_at,
@@ -9006,7 +9003,7 @@ mod tests {
                 &local,
                 false,
             ),
-            "a due degraded direct endpoint should be reprobed even while a healthy alternate route exists"
+            "a due degraded direct endpoint should not be reprobed while a healthy alternate route exists"
         );
     }
 

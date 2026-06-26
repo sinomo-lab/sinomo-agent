@@ -3995,10 +3995,9 @@ fn cluster_connectivity_probe_policy_honors_role_cadence_startup_and_routes() {
     };
     let routed_graph =
         ClusterConnectivityGraph::from_records(local.clone(), [healthy_route_record]);
-    // A due non-healthy record re-probes even when a relay route exists: the
-    // old suppression froze degraded direct endpoints behind (possibly stale)
-    // relay routes, wedging cold formation until record expiry.
-    assert!(cluster_connectivity_probe_due_with_graph(
+    // A due non-healthy endpoint does not re-probe on the normal cadence when
+    // the current healthy-edge route graph already reaches the target.
+    assert!(!cluster_connectivity_probe_due_with_graph(
         &record,
         &endpoint,
         now,
