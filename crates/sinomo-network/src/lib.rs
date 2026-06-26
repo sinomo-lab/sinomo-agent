@@ -67,8 +67,8 @@ mod status_publish;
 
 pub use connectivity::{
     CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD, CLUSTER_CONNECTIVITY_TTL_SECONDS,
-    CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS, ClusterConnectivityGraph,
-    ClusterConnectivityProbeBatch, ClusterConnectivityProbeBatchEntry,
+    CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS, ClusterConnectivityFailureReason,
+    ClusterConnectivityGraph, ClusterConnectivityProbeBatch, ClusterConnectivityProbeBatchEntry,
     ClusterConnectivityProbeObservation, ClusterConnectivityProbeState, ClusterConnectivityRecord,
     ClusterConnectivityRecordQuery, ClusterConnectivityState,
     apply_cluster_connectivity_probe_results, cluster_connectivity_probe_due_with_graph,

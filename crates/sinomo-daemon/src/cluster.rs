@@ -2020,6 +2020,20 @@ impl ClusterNetworkMaintenance {
         sinomo_network::cluster_network_maintenance_next_due_duration(now, &self.schedule())
     }
 
+    pub(crate) fn request_network_environment_refresh(&mut self, now: Instant) {
+        self.connectivity_converged = false;
+        self.startup_settle_until = now.checked_add(DAEMON_CLUSTER_STARTUP_SETTLE_DURATION);
+        let publish_interval =
+            sinomo_network::cluster_network_publish_interval_for_role(&self.local_node_role);
+        let probe_interval =
+            sinomo_network::cluster_network_probe_interval_for_role(&self.local_node_role);
+        let discovery_interval =
+            sinomo_network::cluster_network_discovery_interval_for_role(&self.local_node_role);
+        self.last_publish = now.checked_sub(publish_interval).unwrap_or(now);
+        self.last_probe = now.checked_sub(probe_interval).unwrap_or(now);
+        self.last_discovery = now.checked_sub(discovery_interval).unwrap_or(now);
+    }
+
     fn reconcile_desired_rollout(
         &mut self,
         paths: &DaemonPaths,
@@ -5982,6 +5996,7 @@ mod tests {
             consecutive_failures: 0,
             last_success_at: Some("ok".to_string()),
             last_failure_at: None,
+            failure_reason: None,
             observed_at: now,
             expires_at: now + time::Duration::seconds(300),
         };
@@ -6002,6 +6017,7 @@ mod tests {
             consecutive_failures: 0,
             last_success_at: Some("ok".to_string()),
             last_failure_at: None,
+            failure_reason: None,
             observed_at: now,
             expires_at: now + time::Duration::seconds(300),
         };
@@ -6338,6 +6354,58 @@ mod tests {
             maintenance.next_due_duration(now),
             DAEMON_CLUSTER_CONVERGENCE_TICK_INTERVAL,
             "unconverged connectivity should keep startup settling below the one-second gate"
+        );
+    }
+
+    #[test]
+    fn cluster_network_maintenance_network_environment_refresh_forces_reactive_tick() {
+        let now = Instant::now();
+        let mut maintenance = ClusterNetworkMaintenance {
+            discovery: None,
+            discovery_cache: MdnsDiscoveryCache::new(),
+            connectivity: std::collections::BTreeMap::new(),
+            connectivity_cursor: 0,
+            connectivity_converged: true,
+            environment_id: Some("old-environment".to_string()),
+            local_node_role: ClusterNodeRole::Mobile,
+            last_desired_rollout_attempt: None,
+            solo_cluster_idle: false,
+
+            startup_settle_until: None,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: now,
+            tick: 7,
+            last_publish: now,
+            last_discovery: now,
+            last_probe: now,
+            idle_stats: Arc::new(IdleStatsAtomics::new()),
+        };
+
+        assert!(
+            !sinomo_network::cluster_network_maintenance_due(now, &maintenance.schedule())
+                .publish_due,
+            "test setup should start from an idle mobile cadence"
+        );
+
+        maintenance.request_network_environment_refresh(now);
+
+        let due = sinomo_network::cluster_network_maintenance_due(now, &maintenance.schedule());
+        assert!(due.publish_due);
+        assert!(due.probe_due);
+        assert!(!due.discovery_due, "no discovery socket means no mDNS wake");
+        assert!(
+            !maintenance.connectivity_converged,
+            "connectivity should re-enter convergence after a local network change"
+        );
+        assert_eq!(
+            maintenance.environment_id.as_deref(),
+            Some("old-environment"),
+            "the next maintenance pass needs the previous environment id to detect and clear stale local probes"
+        );
+        assert_eq!(
+            maintenance.next_due_duration(now),
+            Duration::ZERO,
+            "the event-triggered maintenance tick should be due immediately"
         );
     }
 
@@ -8041,6 +8109,7 @@ mod tests {
             consecutive_failures: 0,
             last_success_at: Some("ok".to_string()),
             last_failure_at: None,
+            failure_reason: None,
             observed_at: now,
             expires_at: now + time::Duration::seconds(300),
         };
@@ -8123,6 +8192,7 @@ mod tests {
             } else {
                 Some("failed".to_string())
             },
+            failure_reason: None,
             observed_at: now,
             expires_at: now + time::Duration::seconds(CLUSTER_CONNECTIVITY_TTL_SECONDS),
         }
@@ -9232,6 +9302,10 @@ mod tests {
         assert!(
             record.last_success_at.is_none(),
             "identity failures must not retain stale successful reachability"
+        );
+        assert_eq!(
+            record.failure_reason,
+            Some(sinomo_network::ClusterConnectivityFailureReason::IdentityMismatch)
         );
         let targets = sinomo_network::ClusterEndpointSelector::new(&paths, &state)
             .select(sinomo_network::ClusterEndpointSelectionPurpose::ClusterStateCommand);
@@ -10598,6 +10672,7 @@ mod tests {
                 consecutive_failures: 5,
                 last_success_at: None,
                 last_failure_at: Some("2026-05-04T00:10:00Z".to_string()),
+                failure_reason: None,
                 observed_at: now,
                 expires_at: now + time::Duration::seconds(300),
             }],

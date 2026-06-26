@@ -3079,6 +3079,7 @@ mod tests {
             consecutive_failures: 0,
             last_success_at: Some(now.to_string()),
             last_failure_at: None,
+            failure_reason: None,
             observed_at: now,
             expires_at: now + time::Duration::seconds(crate::CLUSTER_CONNECTIVITY_TTL_SECONDS),
         }

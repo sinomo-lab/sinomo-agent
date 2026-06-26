@@ -95,6 +95,45 @@ fn background_dfs_maintenance_enabled_for(value: Option<&str>) -> bool {
     )
 }
 
+async fn daemon_optional_notify(notify: Option<Arc<tokio::sync::Notify>>) {
+    if let Some(notify) = notify {
+        notify.notified().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+async fn start_daemon_network_environment_watch(label: &str) -> Option<Arc<tokio::sync::Notify>> {
+    let mut watch = match netwatcher::watch_interfaces_async::<netwatcher::async_adapter::Tokio>() {
+        Ok(watch) => watch,
+        Err(error) => {
+            tracing::warn!("sinomo {label} network environment watcher unavailable: {error}");
+            return None;
+        }
+    };
+    let initial = watch.changed().await;
+    tracing::debug!(
+        "sinomo {label} network environment watcher initialized with {} interface(s)",
+        initial.interfaces.len()
+    );
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let task_notify = Arc::clone(&notify);
+    let task_label = label.to_string();
+    tokio::spawn(async move {
+        loop {
+            let update = watch.changed().await;
+            tracing::debug!(
+                "sinomo {task_label} network environment changed: +{} -{} ~{}",
+                update.diff.added.len(),
+                update.diff.removed.len(),
+                update.diff.modified.len()
+            );
+            task_notify.notify_one();
+        }
+    });
+    Some(notify)
+}
+
 #[cfg(feature = "sandbox")]
 #[derive(Debug)]
 struct SandboxActiveExecutionGuard {
@@ -338,6 +377,11 @@ async fn run_daemon_background_maintenance_loop(
         .checked_sub(DAEMON_ROLLOUT_TELEMETRY_INTERVAL)
         .unwrap_or(maintenance_started);
     let dfs_maintenance_notify = daemon_dfs_maintenance_notify();
+    let network_environment_notify = if label == "daemon" {
+        start_daemon_network_environment_watch(&label).await
+    } else {
+        None
+    };
     let mut dfs_triggered_maintenance_requested = false;
 
     loop {
@@ -524,15 +568,20 @@ async fn run_daemon_background_maintenance_loop(
             dfs_maintenance_probe_due,
             shadow_finalization_due,
         );
-        if dfs_maintenance_enabled && label == "daemon" {
-            let notify = Arc::clone(&dfs_maintenance_notify);
+        if (dfs_maintenance_enabled && label == "daemon") || network_environment_notify.is_some() {
+            let dfs_notify = (dfs_maintenance_enabled && label == "daemon")
+                .then(|| Arc::clone(&dfs_maintenance_notify));
+            let network_notify = network_environment_notify.as_ref().map(Arc::clone);
             tokio::select! {
                 _ = tokio::time::sleep(sleep_duration) => {}
-                _ = notify.notified() => {
+                _ = daemon_optional_notify(dfs_notify) => {
                     dfs_triggered_maintenance_requested = true;
                     last_dfs_maintenance = Instant::now()
                         .checked_sub(DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL)
                         .unwrap_or(last_dfs_maintenance);
+                }
+                _ = daemon_optional_notify(network_notify) => {
+                    cluster_network.request_network_environment_refresh(Instant::now());
                 }
             }
         } else {

@@ -3527,6 +3527,7 @@ fn connectivity_graph_indexes_equivalent_endpoint_addresses() {
             consecutive_failures: 3,
             last_success_at: None,
             last_failure_at: Some("failed".to_string()),
+            failure_reason: None,
             observed_at: now,
             expires_at: now + time::Duration::seconds(30),
         }],
@@ -3578,6 +3579,7 @@ fn connectivity_graph_indexes_best_healthy_endpoint_by_pair() {
             consecutive_failures: 0,
             last_success_at: Some("ok".to_string()),
             last_failure_at: None,
+            failure_reason: None,
             observed_at: now,
             expires_at: now + time::Duration::seconds(30),
         },
@@ -3593,6 +3595,7 @@ fn connectivity_graph_indexes_best_healthy_endpoint_by_pair() {
             consecutive_failures: 0,
             last_success_at: Some("ok".to_string()),
             last_failure_at: None,
+            failure_reason: None,
             observed_at: now,
             expires_at: now + time::Duration::seconds(30),
         },
@@ -3608,6 +3611,7 @@ fn connectivity_graph_indexes_best_healthy_endpoint_by_pair() {
             consecutive_failures: 0,
             last_success_at: Some("ok".to_string()),
             last_failure_at: None,
+            failure_reason: None,
             observed_at: now,
             expires_at: now + time::Duration::seconds(30),
         },
@@ -3959,6 +3963,7 @@ fn cluster_connectivity_probe_policy_honors_role_cadence_startup_and_routes() {
         consecutive_failures: CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD,
         last_success_at: None,
         last_failure_at: Some("failed".to_string()),
+        failure_reason: None,
         observed_at,
         expires_at: now + time::Duration::seconds(600),
     };
@@ -4256,8 +4261,50 @@ fn cluster_connectivity_identity_mismatch_bypasses_transient_failure_grace() {
     assert!(mismatch.last_success_at.is_none());
     assert_eq!(mismatch.latency_ms, None);
     assert_eq!(
+        mismatch.failure_reason,
+        Some(ClusterConnectivityFailureReason::IdentityMismatch)
+    );
+    assert_eq!(
         (mismatch.expires_at - mismatch.observed_at).whole_seconds(),
         CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS
+    );
+    assert!(
+        !cluster_connectivity_probe_due_with_startup_settle(
+            &mismatch,
+            now + time::Duration::seconds(100),
+            now + time::Duration::seconds(400),
+            &ClusterNodeRole::Workstation,
+            true,
+        ),
+        "identity-mismatched endpoints should remain quarantined during startup settling"
+    );
+    assert!(
+        cluster_connectivity_probe_due_with_startup_settle(
+            &mismatch,
+            mismatch.expires_at - time::Duration::seconds(1),
+            mismatch.expires_at,
+            &ClusterNodeRole::Workstation,
+            false,
+        ),
+        "quarantine still refreshes when the record is near expiry"
+    );
+    let changed_endpoint = ClusterEndpointRecord {
+        address: "10.0.0.93:21353".to_string(),
+        ..endpoint.clone()
+    };
+    let graph = ClusterConnectivityGraph::from_records(state.local_node_id.clone(), []);
+    assert!(
+        cluster_connectivity_probe_due_with_graph(
+            &mismatch,
+            &changed_endpoint,
+            now + time::Duration::seconds(100),
+            now + time::Duration::seconds(400),
+            &ClusterNodeRole::Workstation,
+            &graph,
+            &state.local_node_id,
+            true,
+        ),
+        "fresh endpoint addresses must bypass quarantine for the stale address"
     );
 }
 
@@ -10262,6 +10309,7 @@ fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
         consecutive_failures: 0,
         last_success_at: Some("ok".to_string()),
         last_failure_at: None,
+        failure_reason: None,
         observed_at: now,
         expires_at: now + time::Duration::seconds(600),
     }];
@@ -11127,6 +11175,7 @@ fn cluster_node_blocks_leader_preference_when_local_probe_marks_member_unreachab
             consecutive_failures: 5,
             last_success_at: None,
             last_failure_at: Some("2026-05-04T00:10:00Z".to_string()),
+            failure_reason: None,
             observed_at: now,
             expires_at: now + time::Duration::seconds(300),
         }],
@@ -11249,6 +11298,7 @@ fn cluster_kv_txn_async_forward_driver_uses_object_rpc_client() {
             consecutive_failures: 0,
             last_success_at: Some("ok".to_string()),
             last_failure_at: None,
+            failure_reason: None,
             observed_at: now,
             expires_at: now + time::Duration::seconds(600),
         }],
@@ -18257,6 +18307,7 @@ fn doctor_connectivity_record(
         } else {
             Some("failed".to_string())
         },
+        failure_reason: None,
         observed_at: now,
         expires_at: now + time::Duration::seconds(900),
     }
@@ -19281,6 +19332,7 @@ fn cluster_network_records_publish_overwrite_and_expire() {
             consecutive_failures: 0,
             last_success_at: Some("now".to_string()),
             last_failure_at: None,
+            failure_reason: None,
             observed_at: now,
             expires_at: now + time::Duration::seconds(30),
         }],
@@ -19318,6 +19370,7 @@ fn cluster_network_records_publish_overwrite_and_expire() {
             consecutive_failures: 0,
             last_success_at: Some("expired".to_string()),
             last_failure_at: None,
+            failure_reason: None,
             observed_at: now - time::Duration::seconds(60),
             expires_at: now - time::Duration::seconds(1),
         }],
@@ -19392,6 +19445,7 @@ fn expire_cluster_network_records_handles_prefix_larger_than_public_range_limit(
             consecutive_failures: 0,
             last_success_at: Some("expired".to_string()),
             last_failure_at: None,
+            failure_reason: None,
             observed_at: now - time::Duration::seconds(120),
             expires_at: now - time::Duration::seconds(1),
         };
@@ -19481,6 +19535,7 @@ fn expire_cluster_network_record_ops_returns_bounded_compare_batches() {
             consecutive_failures: 0,
             last_success_at: Some("expired".to_string()),
             last_failure_at: None,
+            failure_reason: None,
             observed_at: now - time::Duration::seconds(7200),
             expires_at: now - time::Duration::seconds(7200),
         };
@@ -19586,6 +19641,7 @@ fn expire_cluster_network_records_with_host_delegates_commit() {
         consecutive_failures: 0,
         last_success_at: Some("expired".to_string()),
         last_failure_at: None,
+        failure_reason: None,
         observed_at: now - time::Duration::seconds(7200),
         expires_at: now - time::Duration::seconds(7200),
     };
@@ -20138,6 +20194,7 @@ fn connectivity_full_sync_batches_large_stale_deletions() {
             consecutive_failures: 0,
             last_success_at: Some("stale".to_string()),
             last_failure_at: None,
+            failure_reason: None,
             observed_at: now,
             expires_at: now + time::Duration::seconds(600),
         };
@@ -20201,6 +20258,7 @@ fn connectivity_sync_refreshes_stable_records_near_expiry() {
         consecutive_failures: 0,
         last_success_at: Some("2026-05-06T00:00:00Z".to_string()),
         last_failure_at: None,
+        failure_reason: None,
         observed_at: now - time::Duration::seconds(300),
         expires_at: now + time::Duration::seconds(30),
     };
