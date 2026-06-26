@@ -19,7 +19,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sinomo_config::{
     ConfigRegistry, ConfigRegistryBuilder, register_services as register_config_services,
@@ -114,7 +114,12 @@ use crate::rollout::{
     handle_daemon_rollout_binary_upload_finalize_request, handle_daemon_rollout_build_request,
     handle_daemon_rollout_native_dylib_module_request,
 };
-use crate::{DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE};
+use crate::{
+    DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE, DAEMON_DFS_BROWSER_LIST_ROUTE,
+    DAEMON_DFS_BROWSER_READ_FILE_ROUTE, DAEMON_DFS_BROWSER_ROUTES, DAEMON_DFS_BROWSER_STATUS_ROUTE,
+    DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
+    DAEMON_STATUS_ROUTE,
+};
 
 static DAEMON_CLUSTER_NETWORK_PING_NODE_IDS: OnceLock<
     Mutex<HashMap<PathBuf, sinomo_node::NodeId>>,
@@ -1080,6 +1085,418 @@ impl Service for RolloutBinaryService {
     }
 }
 
+struct DaemonDfsBrowserService {
+    runtime: Option<tokio::runtime::Handle>,
+}
+
+struct DaemonDfsBrowserBackend {
+    data_dir: SinomoDataDir,
+    service: Mutex<sinomo_dfs::MountedSifsService>,
+    replica_candidates: Vec<sinomo_node::NodeId>,
+    endpoint_targets_refreshed_at: Mutex<Option<Instant>>,
+}
+
+static DAEMON_DFS_BROWSER_BACKENDS: OnceLock<
+    Mutex<HashMap<PathBuf, Arc<DaemonDfsBrowserBackend>>>,
+> = OnceLock::new();
+
+impl DaemonDfsBrowserBackend {
+    fn open(data_dir: SinomoDataDir) -> Result<Self, ServiceError> {
+        let opened = sinomo_dfs::open_mounted_sifs_service(Some(data_dir.root()))
+            .map_err(dfs_browser_service_error)?;
+        Ok(Self {
+            data_dir,
+            service: Mutex::new(opened.service),
+            replica_candidates: opened.replica_candidates,
+            endpoint_targets_refreshed_at: Mutex::new(Some(Instant::now())),
+        })
+    }
+
+    fn for_data_dir(data_dir: Arc<SinomoDataDir>) -> Result<Arc<Self>, ServiceError> {
+        let root = data_dir.root();
+        let cache = DAEMON_DFS_BROWSER_BACKENDS.get_or_init(|| Mutex::new(HashMap::new()));
+        {
+            let guard = cache.lock().map_err(|source| {
+                ServiceError::Service(format!("DFS browser backend cache lock failed: {source}"))
+            })?;
+            if let Some(backend) = guard.get(&root) {
+                return Ok(Arc::clone(backend));
+            }
+        }
+
+        let backend = Arc::new(Self::open((*data_dir).clone())?);
+        let mut guard = cache.lock().map_err(|source| {
+            ServiceError::Service(format!("DFS browser backend cache lock failed: {source}"))
+        })?;
+        Ok(Arc::clone(
+            guard.entry(root).or_insert_with(|| Arc::clone(&backend)),
+        ))
+    }
+
+    fn lock_service(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, sinomo_dfs::MountedSifsService>, ServiceError> {
+        self.service.lock().map_err(|source| {
+            ServiceError::Service(format!("DFS browser service lock failed: {source}"))
+        })
+    }
+
+    fn refresh_endpoint_targets(&self, service: &mut sinomo_dfs::MountedSifsService) {
+        let now = Instant::now();
+        if let Ok(mut refreshed_at) = self.endpoint_targets_refreshed_at.lock() {
+            if refreshed_at
+                .as_ref()
+                .is_some_and(|last| now.duration_since(*last) < Duration::from_secs(1))
+            {
+                return;
+            }
+            if self.refresh_endpoint_targets_now(service) {
+                *refreshed_at = Some(now);
+            }
+            return;
+        }
+        let _ = self.refresh_endpoint_targets_now(service);
+    }
+
+    fn refresh_endpoint_targets_now(&self, service: &mut sinomo_dfs::MountedSifsService) -> bool {
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        let Ok(state) = sinomo_network::read_cluster_state_without_kv(&cluster_paths) else {
+            return false;
+        };
+        service.refresh_endpoint_targets(sinomo_dfs::cluster_dfs_data_endpoints(
+            &cluster_paths,
+            &state,
+        ));
+        true
+    }
+
+    fn node_id(&self) -> Result<String, ServiceError> {
+        Ok(self.lock_service()?.node_id().to_string())
+    }
+
+    fn list(
+        &self,
+        request: crate::DaemonDfsBrowserListRequest,
+    ) -> Result<crate::DaemonDfsBrowserListResponse, ServiceError> {
+        let path = normalize_sifs_browser_path(&request.path)?;
+        let mut service = self.lock_service()?;
+        self.refresh_endpoint_targets(&mut service);
+        let entries = match service.posix_list_dir_distributed(&path) {
+            Ok(entries) => entries,
+            Err(sinomo_dfs::DfsPosixError::NotFound { .. }) if request.missing_is_empty => {
+                Vec::new()
+            }
+            Err(error) => return Err(dfs_browser_service_error(error)),
+        }
+        .into_iter()
+        .map(|entry| crate::DaemonDfsBrowserEntry {
+            name: entry.name,
+            path: entry.path,
+            kind: entry.kind,
+            size: None,
+        })
+        .collect();
+        Ok(crate::DaemonDfsBrowserListResponse {
+            node_id: service.node_id().to_string(),
+            entries,
+        })
+    }
+
+    fn read_file(
+        &self,
+        request: crate::DaemonDfsBrowserReadFileRequest,
+    ) -> Result<crate::DaemonDfsBrowserReadFileResponse, ServiceError> {
+        let path = normalize_sifs_browser_path(&request.path)?;
+        let mut service = self.lock_service()?;
+        self.refresh_endpoint_targets(&mut service);
+        let bytes = service
+            .posix_read_file_distributed(&path)
+            .map_err(dfs_browser_service_error)?;
+        Ok(crate::DaemonDfsBrowserReadFileResponse { bytes })
+    }
+
+    fn write_file(
+        &self,
+        request: crate::DaemonDfsBrowserWriteFileRequest,
+    ) -> Result<crate::DaemonDfsBrowserWriteFileResponse, ServiceError> {
+        let path = normalize_sifs_browser_path(&request.path)?;
+        let mut service = self.lock_service()?;
+        if let Some(parent) = parent_sifs_browser_path(&path) {
+            service
+                .posix_mkdir_all(&parent)
+                .map_err(dfs_browser_service_error)?;
+        }
+        let options = sifs_browser_write_options(&service, &self.replica_candidates);
+        service
+            .posix_write_file(&path, &request.bytes, options)
+            .map_err(dfs_browser_service_error)?;
+        self.flush_after_mutation(&mut service)?;
+        Ok(crate::DaemonDfsBrowserWriteFileResponse)
+    }
+
+    fn create_dir_all(
+        &self,
+        request: crate::DaemonDfsBrowserCreateDirAllRequest,
+    ) -> Result<crate::DaemonDfsBrowserCreateDirAllResponse, ServiceError> {
+        let path = normalize_sifs_browser_path(&request.path)?;
+        let mut service = self.lock_service()?;
+        service
+            .posix_mkdir_all(&path)
+            .map_err(dfs_browser_service_error)?;
+        self.flush_after_mutation(&mut service)?;
+        Ok(crate::DaemonDfsBrowserCreateDirAllResponse)
+    }
+
+    fn flush_after_mutation(
+        &self,
+        service: &mut sinomo_dfs::MountedSifsService,
+    ) -> Result<(), ServiceError> {
+        service
+            .flush_deferred_content_durability()
+            .map_err(dfs_browser_service_error)?;
+        service
+            .flush_detached_transport_sends()
+            .map_err(dfs_browser_service_error)?;
+        service
+            .process_incoming()
+            .map_err(dfs_browser_service_error)?;
+        Ok(())
+    }
+}
+
+impl Service for DaemonDfsBrowserService {
+    fn name(&self) -> &'static str {
+        "dfs-browser"
+    }
+
+    fn routes(&self) -> &'static [&'static str] {
+        DAEMON_DFS_BROWSER_ROUTES
+    }
+
+    fn route_categories(&self) -> Vec<ServiceRoute> {
+        self.routes()
+            .iter()
+            .copied()
+            .map(|route| {
+                ServiceRoute::new(route, DAEMON_RPC_CATEGORY)
+                    .with_auth_scope("local-command")
+                    .require_capability("daemon.dfs.browser")
+                    .with_concurrency_limit(4)
+                    .with_timeout(Duration::from_secs(60))
+            })
+            .collect()
+    }
+
+    fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            let route = request.route.clone();
+            let data_dir = Arc::clone(&ctx.data_dir);
+            let response = match route.as_str() {
+                DAEMON_DFS_BROWSER_STATUS_ROUTE => {
+                    let _: crate::DaemonDfsBrowserStatusRequest = request.decode_body()?;
+                    let backend =
+                        run_blocking_service_task(route.clone(), "DFS browser status", move || {
+                            DaemonDfsBrowserBackend::for_data_dir(data_dir)
+                        })
+                        .await?;
+                    ObjectRpcResponse::encode_body(
+                        DAEMON_DFS_BROWSER_STATUS_ROUTE,
+                        &crate::DaemonDfsBrowserStatusResponse {
+                            node_id: backend.node_id()?,
+                        },
+                    )?
+                }
+                DAEMON_DFS_BROWSER_LIST_ROUTE => {
+                    let payload = request.decode_body()?;
+                    let result =
+                        run_blocking_service_task(route.clone(), "DFS browser list", move || {
+                            DaemonDfsBrowserBackend::for_data_dir(data_dir)?.list(payload)
+                        })
+                        .await?;
+                    ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_LIST_ROUTE, &result)?
+                }
+                DAEMON_DFS_BROWSER_READ_FILE_ROUTE => {
+                    let payload = request.decode_body()?;
+                    let result = run_blocking_service_task(
+                        route.clone(),
+                        "DFS browser read file",
+                        move || DaemonDfsBrowserBackend::for_data_dir(data_dir)?.read_file(payload),
+                    )
+                    .await?;
+                    ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_READ_FILE_ROUTE, &result)?
+                }
+                DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE => {
+                    let payload = request.decode_body()?;
+                    let backend_data_dir = Arc::clone(&data_dir);
+                    let publish_data_dir = Arc::clone(&data_dir);
+                    let result = run_blocking_service_task(
+                        route.clone(),
+                        "DFS browser write file",
+                        move || {
+                            DaemonDfsBrowserBackend::for_data_dir(backend_data_dir)?
+                                .write_file(payload)
+                        },
+                    )
+                    .await?;
+                    publish_daemon_sifs_metadata(publish_data_dir.as_ref(), runtime.as_ref())
+                        .await?;
+                    ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, &result)?
+                }
+                DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE => {
+                    let payload = request.decode_body()?;
+                    let backend_data_dir = Arc::clone(&data_dir);
+                    let publish_data_dir = Arc::clone(&data_dir);
+                    let result = run_blocking_service_task(
+                        route.clone(),
+                        "DFS browser create dir all",
+                        move || {
+                            DaemonDfsBrowserBackend::for_data_dir(backend_data_dir)?
+                                .create_dir_all(payload)
+                        },
+                    )
+                    .await?;
+                    publish_daemon_sifs_metadata(publish_data_dir.as_ref(), runtime.as_ref())
+                        .await?;
+                    ObjectRpcResponse::encode_body(
+                        DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
+                        &result,
+                    )?
+                }
+                other => return Err(ServiceError::UnknownRoute(other.to_string())),
+            };
+            ctx.respond(response)?;
+            Ok(ServiceDisposition::Continue)
+        })
+    }
+}
+
+async fn publish_daemon_sifs_metadata(
+    data_dir: &SinomoDataDir,
+    runtime: Option<&tokio::runtime::Handle>,
+) -> Result<(), ServiceError> {
+    let runtime = require_service_runtime(runtime, "DFS browser metadata publish")?.clone();
+    let batch_runtime = runtime.clone();
+    let batch_sender: sinomo_dfs::AsyncDfsMetadataJournalBatchSender =
+        Arc::new(move |target_node_id, command, connect_timeout| {
+            let runtime = batch_runtime.clone();
+            Box::pin(async move {
+                let request = sinomo_dfs::dfs_metadata_journal_batch_rpc_request(command).map_err(
+                    |source| sinomo_dfs::DfsMetadataPeerTransportError::new(source.to_string()),
+                )?;
+                let response = crate::client::send_dfs_object_rpc_to_target_async(
+                    target_node_id,
+                    &request,
+                    connect_timeout,
+                    &runtime,
+                    false,
+                )
+                .await
+                .map_err(|source| {
+                    sinomo_dfs::DfsMetadataPeerTransportError::new(source.to_string())
+                })?;
+                sinomo_dfs::decode_dfs_metadata_journal_batch_rpc_response(&response).map_err(
+                    |source| sinomo_dfs::DfsMetadataPeerTransportError::new(source.to_string()),
+                )
+            })
+        });
+    let snapshot_runtime = runtime;
+    let snapshot_sender: sinomo_dfs::AsyncDfsMetadataSnapshotInstallSender =
+        Arc::new(move |target_node_id, command, connect_timeout| {
+            let runtime = snapshot_runtime.clone();
+            Box::pin(async move {
+                let request = sinomo_dfs::dfs_metadata_snapshot_install_rpc_request(command)
+                    .map_err(|source| {
+                        sinomo_dfs::DfsMetadataPeerTransportError::new(source.to_string())
+                    })?;
+                let response = crate::client::send_dfs_object_rpc_to_target_async(
+                    target_node_id,
+                    &request,
+                    connect_timeout,
+                    &runtime,
+                    false,
+                )
+                .await
+                .map_err(|source| {
+                    sinomo_dfs::DfsMetadataPeerTransportError::new(source.to_string())
+                })?;
+                sinomo_dfs::decode_dfs_metadata_snapshot_install_rpc_response(&response).map_err(
+                    |source| sinomo_dfs::DfsMetadataPeerTransportError::new(source.to_string()),
+                )
+            })
+        });
+    let cluster_paths = ClusterPaths::new(data_dir);
+    sinomo_dfs::publish_cluster_dfs_metadata_journal_async(
+        data_dir,
+        &cluster_paths,
+        batch_sender,
+        snapshot_sender,
+        sinomo_dfs::DfsMetadataJournalReplicationOptions::default(),
+    )
+    .await
+    .map(|_| ())
+    .map_err(dfs_browser_service_error)
+}
+
+fn sifs_browser_write_options(
+    service: &sinomo_dfs::MountedSifsService,
+    replica_candidates: &[sinomo_node::NodeId],
+) -> sinomo_dfs::DfsWriteOptions {
+    let mut candidates = replica_candidates.to_vec();
+    if !candidates.contains(service.node_id()) {
+        candidates.insert(0, service.node_id().clone());
+    }
+    let mut options = sinomo_dfs::DfsWriteOptions::replicated_eventual(candidates);
+    options.foreground_replica_repair = false;
+    options
+}
+
+fn dfs_browser_service_error(error: impl std::fmt::Display) -> ServiceError {
+    ServiceError::Service(error.to_string())
+}
+
+fn normalize_sifs_browser_path(path: &str) -> Result<String, ServiceError> {
+    let path = path.trim();
+    let path = if path.is_empty() {
+        "/".to_string()
+    } else if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    if path.bytes().any(|byte| byte == 0) {
+        return Err(ServiceError::Service(format!("invalid DFS path: {path}")));
+    }
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            value => parts.push(value),
+        }
+    }
+    if parts.is_empty() {
+        Ok("/".to_string())
+    } else {
+        Ok(format!("/{}", parts.join("/")))
+    }
+}
+
+fn parent_sifs_browser_path(path: &str) -> Option<String> {
+    let path = normalize_sifs_browser_path(path).ok()?;
+    if path == "/" {
+        return None;
+    }
+    let (parent, _) = path.rsplit_once('/')?;
+    Some(if parent.is_empty() {
+        "/".to_string()
+    } else {
+        parent.to_string()
+    })
+}
+
 /// Maps a daemon error from a wrapped sandbox handler into the host-agnostic backend
 /// error (the message is preserved; the seam re-maps it to `DaemonError` on the way out).
 fn daemon_sandbox_error(error: DaemonError) -> SandboxBackendError {
@@ -1365,6 +1782,9 @@ fn daemon_service_registry(
         })
         .register(RolloutBinaryService {
             paths: paths.clone(),
+        })
+        .register(DaemonDfsBrowserService {
+            runtime: service_runtime.cloned(),
         });
     let builder = if let Some(runtime) = service_runtime {
         sinomo_dfs::register_data_plane_services(
@@ -4001,6 +4421,21 @@ mod tests {
             dfs_direct_read.required_capabilities,
             vec!["dfs.object.transfer".to_string()]
         );
+        for route in crate::DAEMON_DFS_BROWSER_ROUTES {
+            let dfs_browser = route_metadata
+                .iter()
+                .find(|metadata| metadata.route == *route)
+                .unwrap_or_else(|| panic!("daemon DFS browser service route metadata for {route}"));
+            assert_eq!(dfs_browser.category, DAEMON_RPC_CATEGORY);
+            assert_eq!(
+                dfs_browser.auth_scope.as_deref(),
+                Some(sinomo_module::ModuleRouteAuth::LocalCommand.as_scope())
+            );
+            assert_eq!(
+                dfs_browser.required_capabilities,
+                vec!["daemon.dfs.browser".to_string()]
+            );
+        }
         let rollout_module_routes = rollout_module_surfaces()
             .object_rpc_route_descriptors()
             .expect("rollout module surfaces")

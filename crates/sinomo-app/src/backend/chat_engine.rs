@@ -9,6 +9,8 @@ use std::str::FromStr;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
+#[cfg(test)]
+use std::thread::JoinHandle;
 
 use sinomo_agent::{
     AgentRuntimeControlHost, AgentRuntimeControlRegistry, AgentSessionControlResult,
@@ -208,6 +210,8 @@ pub struct ChatHandle {
     tx: Sender<ChatCommand>,
     rx: Receiver<ChatEvent>,
     direct_control: DirectControl,
+    #[cfg(test)]
+    worker: Option<JoinHandle<()>>,
 }
 
 impl ChatHandle {
@@ -225,7 +229,7 @@ impl ChatHandle {
             active_session_id: active_session_id.clone(),
             evt_tx: evt_tx.clone(),
         };
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("sinomo-chat".to_string())
             .spawn(move || {
                 worker(
@@ -238,10 +242,14 @@ impl ChatHandle {
                 )
             })
             .expect("spawn chat worker");
+        #[cfg(not(test))]
+        let _ = worker;
         Self {
             tx: cmd_tx,
             rx: evt_rx,
             direct_control,
+            #[cfg(test)]
+            worker: Some(worker),
         }
     }
 
@@ -276,6 +284,10 @@ impl ChatHandle {
 impl Drop for ChatHandle {
     fn drop(&mut self) {
         let _ = self.tx.send(ChatCommand::Shutdown);
+        #[cfg(test)]
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -775,15 +787,16 @@ fn worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn chat_worker_routes_runtime_control_commands() {
-        let data_dir = temp_data_dir("chat-worker-control");
+        let temp = TempDataDir::new("chat-worker-control");
         let runtime_control = AgentRuntimeControlRegistry::new();
-        let handle = ChatHandle::spawn(data_dir, false, runtime_control.clone());
+        let handle = ChatHandle::spawn(temp.data_dir.clone(), false, runtime_control.clone());
         let ready = wait_for_event(&handle, |event| matches!(event, ChatEvent::Ready { .. }))
             .expect("ready event");
         let ChatEvent::Ready { session_id, .. } = ready else {
@@ -868,9 +881,9 @@ mod tests {
 
     #[test]
     fn chat_worker_switches_agent_for_requested_new_session() {
-        let data_dir = temp_data_dir("chat-worker-agent-switch");
+        let temp = TempDataDir::new("chat-worker-agent-switch");
         let runtime_control = AgentRuntimeControlRegistry::new();
-        let handle = ChatHandle::spawn(data_dir, false, runtime_control);
+        let handle = ChatHandle::spawn(temp.data_dir.clone(), false, runtime_control);
         wait_for_event(&handle, |event| matches!(event, ChatEvent::Ready { .. }))
             .expect("ready event");
 
@@ -920,6 +933,7 @@ mod tests {
                 active_session_id: Arc::new(Mutex::new(Some(session_id.clone()))),
                 evt_tx,
             },
+            worker: None,
         };
 
         handle.send_command(ChatCommand::FollowUp {
@@ -1067,14 +1081,33 @@ mod tests {
         None
     }
 
-    fn temp_data_dir(slug: &str) -> SinomoDataDir {
+    struct TempDataDir {
+        data_dir: SinomoDataDir,
+        path: PathBuf,
+    }
+
+    impl TempDataDir {
+        fn new(slug: &str) -> Self {
+            let path = temp_data_dir_path(slug);
+            std::fs::create_dir_all(&path).expect("create temp data dir");
+            Self {
+                data_dir: SinomoDataDir::new(&path),
+                path,
+            }
+        }
+    }
+
+    impl Drop for TempDataDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn temp_data_dir_path(slug: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("sinomo-app-{slug}-{}-{unique}", std::process::id()));
-        std::fs::create_dir_all(&path).expect("create temp data dir");
-        SinomoDataDir::new(path)
+        std::env::temp_dir().join(format!("sinomo-app-{slug}-{}-{unique}", std::process::id()))
     }
 }

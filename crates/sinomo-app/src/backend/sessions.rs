@@ -12,10 +12,24 @@ use sinomo_cli::app_api::SifsBrowser;
 use sinomo_runtime::local::SinomoDataDir;
 
 pub const SIFS_SESSIONS_ROOT: &str = "/services/sinomo-app/chat/sessions";
-const SIFS_SESSIONS_INDEX: &str = "/services/sinomo-app-chat-sessions-index.json";
 const SIFS_SESSION_FILE_PREFIX: &str = "/services/sinomo-app-chat-session-";
 const SIFS_SESSION_FILE_NAME_PREFIX: &str = "sinomo-app-chat-session-";
 const SIFS_SESSION_FILE_SUFFIX: &str = ".json";
+
+#[derive(Clone)]
+pub struct SifsDaemonAccess {
+    address: String,
+    runtime: tokio::runtime::Handle,
+}
+
+impl SifsDaemonAccess {
+    pub fn new(address: impl Into<String>, runtime: &tokio::runtime::Handle) -> Self {
+        Self {
+            address: address.into(),
+            runtime: runtime.clone(),
+        }
+    }
+}
 
 /// Sidebar metadata for a stored chat.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -84,12 +98,6 @@ struct StoredSessionRecord {
     transcript: StoredTranscript,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct StoredSessionIndex {
-    #[serde(default)]
-    sessions: Vec<SessionMeta>,
-}
-
 /// Persist a chat's metadata + transcript.
 pub fn save(
     data_dir: &SinomoDataDir,
@@ -108,6 +116,27 @@ pub fn save_with_report(
     title: &str,
     messages: &[StoredMessage],
 ) -> std::io::Result<()> {
+    save_with_report_using(data_dir, None, id, title, messages)
+}
+
+pub fn save_with_report_via_daemon(
+    data_dir: &SinomoDataDir,
+    daemon: Option<&SifsDaemonAccess>,
+    id: &str,
+    title: &str,
+    messages: &[StoredMessage],
+) -> std::io::Result<()> {
+    let daemon = daemon.ok_or_else(daemon_required_error)?;
+    save_with_report_using(data_dir, Some(daemon), id, title, messages)
+}
+
+fn save_with_report_using(
+    data_dir: &SinomoDataDir,
+    daemon: Option<&SifsDaemonAccess>,
+    id: &str,
+    title: &str,
+    messages: &[StoredMessage],
+) -> std::io::Result<()> {
     if id.is_empty() {
         return Ok(());
     }
@@ -117,7 +146,7 @@ pub fn save_with_report(
             "invalid chat id",
         ));
     }
-    let existing = load_sifs_record(data_dir, id);
+    let existing = load_sifs_record_using(data_dir, daemon, id);
     let (title, title_source) = match existing.as_ref().map(|record| &record.meta) {
         Some(meta) if meta.deleted_unix.is_some() => return Ok(()),
         Some(meta) if meta.title_source.as_deref() == Some("user") => {
@@ -136,13 +165,32 @@ pub fn save_with_report(
     let transcript = StoredTranscript {
         messages: messages.to_vec(),
     };
-    save_sifs(data_dir, id, &meta, &transcript)
+    save_sifs(data_dir, daemon, id, &meta, &transcript)
         .map_err(|detail| std::io::Error::new(std::io::ErrorKind::Other, detail))?;
     Ok(())
 }
 
 /// Rename a stored chat without changing its transcript.
 pub fn rename(data_dir: &SinomoDataDir, id: &str, title: &str) -> std::io::Result<()> {
+    rename_using(data_dir, None, id, title)
+}
+
+pub fn rename_via_daemon(
+    data_dir: &SinomoDataDir,
+    daemon: Option<&SifsDaemonAccess>,
+    id: &str,
+    title: &str,
+) -> std::io::Result<()> {
+    let daemon = daemon.ok_or_else(daemon_required_error)?;
+    rename_using(data_dir, Some(daemon), id, title)
+}
+
+fn rename_using(
+    data_dir: &SinomoDataDir,
+    daemon: Option<&SifsDaemonAccess>,
+    id: &str,
+    title: &str,
+) -> std::io::Result<()> {
     if !valid_session_id(id) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -156,7 +204,7 @@ pub fn rename(data_dir: &SinomoDataDir, id: &str, title: &str) -> std::io::Resul
             "chat title cannot be empty",
         ));
     }
-    let mut record = load_sifs_record(data_dir, id)
+    let mut record = load_sifs_record_using(data_dir, daemon, id)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "chat not found"))?;
     if record.meta.deleted_unix.is_some() {
         return Err(std::io::Error::new(
@@ -167,20 +215,37 @@ pub fn rename(data_dir: &SinomoDataDir, id: &str, title: &str) -> std::io::Resul
     record.meta.title = title.chars().take(80).collect();
     record.meta.title_source = Some("user".to_string());
     record.meta.updated_unix = now_unix();
-    save_sifs(data_dir, id, &record.meta, &record.transcript)
+    save_sifs(data_dir, daemon, id, &record.meta, &record.transcript)
         .map_err(|detail| std::io::Error::new(std::io::ErrorKind::Other, detail))
 }
 
 /// Hide a chat from listings and future loads. SIFS has no exposed unlink operation, so deletion
 /// is represented by a tombstone record at the chat path.
 pub fn delete(data_dir: &SinomoDataDir, id: &str) -> std::io::Result<()> {
+    delete_using(data_dir, None, id)
+}
+
+pub fn delete_via_daemon(
+    data_dir: &SinomoDataDir,
+    daemon: Option<&SifsDaemonAccess>,
+    id: &str,
+) -> std::io::Result<()> {
+    let daemon = daemon.ok_or_else(daemon_required_error)?;
+    delete_using(data_dir, Some(daemon), id)
+}
+
+fn delete_using(
+    data_dir: &SinomoDataDir,
+    daemon: Option<&SifsDaemonAccess>,
+    id: &str,
+) -> std::io::Result<()> {
     if !valid_session_id(id) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "invalid chat id",
         ));
     }
-    let browser = SifsBrowser::open(data_dir)
+    let browser = open_sifs_browser(data_dir, daemon)
         .map_err(|detail| std::io::Error::new(std::io::ErrorKind::Other, detail))?;
     let deleted_unix = now_unix();
     let meta = SessionMeta {
@@ -198,17 +263,57 @@ pub fn delete(data_dir: &SinomoDataDir, id: &str) -> std::io::Result<()> {
 
 /// List stored chats from SIFS (metadata only), newest first.
 pub fn list(data_dir: &SinomoDataDir) -> Vec<SessionMeta> {
-    let mut metas = list_sifs(data_dir);
+    let mut metas = list_sifs(data_dir, None).unwrap_or_default();
     metas.sort_by_key(|m| std::cmp::Reverse(m.updated_unix));
     metas
 }
 
+pub fn list_via_daemon(
+    data_dir: &SinomoDataDir,
+    daemon: Option<&SifsDaemonAccess>,
+) -> Vec<SessionMeta> {
+    let Some(daemon) = daemon else {
+        return Vec::new();
+    };
+    let mut metas = list_sifs(data_dir, Some(daemon)).unwrap_or_default();
+    metas.sort_by_key(|m| std::cmp::Reverse(m.updated_unix));
+    metas
+}
+
+pub fn list_with_report_via_daemon(
+    data_dir: &SinomoDataDir,
+    daemon: Option<&SifsDaemonAccess>,
+) -> Result<Vec<SessionMeta>, String> {
+    let daemon =
+        daemon.ok_or_else(|| "chat persistence requires a daemon connection".to_string())?;
+    let mut metas = list_sifs(data_dir, Some(daemon))?;
+    metas.sort_by_key(|m| std::cmp::Reverse(m.updated_unix));
+    Ok(metas)
+}
+
 /// Load a chat's transcript on demand.
 pub fn load_transcript(data_dir: &SinomoDataDir, id: &str) -> Option<StoredTranscript> {
+    load_transcript_using(data_dir, None, id)
+}
+
+pub fn load_transcript_via_daemon(
+    data_dir: &SinomoDataDir,
+    daemon: Option<&SifsDaemonAccess>,
+    id: &str,
+) -> Option<StoredTranscript> {
+    let daemon = daemon?;
+    load_transcript_using(data_dir, Some(daemon), id)
+}
+
+fn load_transcript_using(
+    data_dir: &SinomoDataDir,
+    daemon: Option<&SifsDaemonAccess>,
+    id: &str,
+) -> Option<StoredTranscript> {
     if !valid_session_id(id) {
         return None;
     }
-    load_sifs_record(data_dir, id)
+    load_sifs_record_using(data_dir, daemon, id)
         .filter(|record| record.meta.deleted_unix.is_none())
         .map(|record| record.transcript)
 }
@@ -219,11 +324,12 @@ fn now_unix() -> i64 {
 
 fn save_sifs(
     data_dir: &SinomoDataDir,
+    daemon: Option<&SifsDaemonAccess>,
     id: &str,
     meta: &SessionMeta,
     transcript: &StoredTranscript,
 ) -> Result<(), String> {
-    let browser = SifsBrowser::open(data_dir)?;
+    let browser = open_sifs_browser(data_dir, daemon)?;
     save_sifs_with_browser(&browser, id, meta, transcript)
 }
 
@@ -241,26 +347,15 @@ fn save_sifs_with_browser(
         &sifs_session_file(id)?,
         &serde_json::to_vec(&record).map_err(|error| error.to_string())?,
     )?;
-    let mut index = read_sifs_index(&browser).unwrap_or_default();
-    match index.sessions.iter_mut().find(|existing| existing.id == id) {
-        Some(existing) => *existing = meta.clone(),
-        None => index.sessions.push(meta.clone()),
-    }
-    index
-        .sessions
-        .sort_by_key(|meta| std::cmp::Reverse(meta.updated_unix));
-    let index_bytes = serde_json::to_vec(&index).map_err(|error| error.to_string())?;
-    let _ = browser.write_file(SIFS_SESSIONS_INDEX, &index_bytes);
     Ok(())
 }
 
-fn list_sifs(data_dir: &SinomoDataDir) -> Vec<SessionMeta> {
-    let Ok(browser) = SifsBrowser::open(data_dir) else {
-        return Vec::new();
-    };
-    let mut metas = read_sifs_index(&browser)
-        .map(|index| index.sessions)
-        .unwrap_or_default();
+fn list_sifs(
+    data_dir: &SinomoDataDir,
+    daemon: Option<&SifsDaemonAccess>,
+) -> Result<Vec<SessionMeta>, String> {
+    let browser = open_sifs_browser(data_dir, daemon)?;
+    let mut metas = Vec::new();
     for meta in list_flat_sifs_records(&browser)
         .into_iter()
         .chain(list_legacy_sifs(&browser))
@@ -268,7 +363,7 @@ fn list_sifs(data_dir: &SinomoDataDir) -> Vec<SessionMeta> {
         merge_session_meta(&mut metas, meta);
     }
     metas.retain(|meta| meta.deleted_unix.is_none());
-    metas
+    Ok(metas)
 }
 
 fn merge_session_meta(metas: &mut Vec<SessionMeta>, meta: SessionMeta) {
@@ -280,7 +375,7 @@ fn merge_session_meta(metas: &mut Vec<SessionMeta>, meta: SessionMeta) {
 }
 
 fn list_flat_sifs_records(browser: &SifsBrowser) -> Vec<SessionMeta> {
-    let Ok(entries) = browser.list("/services") else {
+    let Ok(entries) = browser.list_if_exists("/services") else {
         return Vec::new();
     };
     entries
@@ -302,7 +397,7 @@ fn list_flat_sifs_records(browser: &SifsBrowser) -> Vec<SessionMeta> {
 }
 
 fn list_legacy_sifs(browser: &SifsBrowser) -> Vec<SessionMeta> {
-    let Ok(entries) = browser.list(SIFS_SESSIONS_ROOT) else {
+    let Ok(entries) = browser.list_if_exists(SIFS_SESSIONS_ROOT) else {
         return Vec::new();
     };
     entries
@@ -322,9 +417,45 @@ fn list_legacy_sifs(browser: &SifsBrowser) -> Vec<SessionMeta> {
         .collect()
 }
 
+#[cfg(test)]
 fn load_sifs_record(data_dir: &SinomoDataDir, id: &str) -> Option<StoredSessionRecord> {
-    let browser = SifsBrowser::open(data_dir).ok()?;
+    load_sifs_record_using(data_dir, None, id)
+}
+
+fn load_sifs_record_using(
+    data_dir: &SinomoDataDir,
+    daemon: Option<&SifsDaemonAccess>,
+    id: &str,
+) -> Option<StoredSessionRecord> {
+    let browser = open_sifs_browser(data_dir, daemon).ok()?;
     load_sifs_record_from_browser(&browser, id)
+}
+
+fn open_sifs_browser(
+    data_dir: &SinomoDataDir,
+    daemon: Option<&SifsDaemonAccess>,
+) -> Result<SifsBrowser, String> {
+    match daemon {
+        Some(daemon) => SifsBrowser::open_daemon_on_runtime(&daemon.address, &daemon.runtime),
+        None => open_local_sifs_browser_for_tests(data_dir),
+    }
+}
+
+#[cfg(test)]
+fn open_local_sifs_browser_for_tests(data_dir: &SinomoDataDir) -> Result<SifsBrowser, String> {
+    SifsBrowser::open(data_dir)
+}
+
+#[cfg(not(test))]
+fn open_local_sifs_browser_for_tests(_data_dir: &SinomoDataDir) -> Result<SifsBrowser, String> {
+    Err("SIFS access requires a daemon connection".to_string())
+}
+
+fn daemon_required_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotConnected,
+        "chat persistence requires a daemon connection",
+    )
 }
 
 fn load_sifs_record_from_browser(browser: &SifsBrowser, id: &str) -> Option<StoredSessionRecord> {
@@ -332,11 +463,6 @@ fn load_sifs_record_from_browser(browser: &SifsBrowser, id: &str) -> Option<Stor
         return Some(record);
     }
     load_legacy_sifs_record(browser, id)
-}
-
-fn read_sifs_index(browser: &SifsBrowser) -> Result<StoredSessionIndex, String> {
-    let bytes = browser.read_file(SIFS_SESSIONS_INDEX)?;
-    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 
 fn load_flat_sifs_record(browser: &SifsBrowser, id: &str) -> Option<StoredSessionRecord> {

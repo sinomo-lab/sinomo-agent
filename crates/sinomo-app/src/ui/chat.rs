@@ -312,6 +312,7 @@ struct ChannelAgentRef {
 /// State backing the chat tab.
 pub struct ChatState {
     pub data_dir: Arc<SinomoDataDir>,
+    sifs_daemon: Option<sessions::SifsDaemonAccess>,
     pub handle: ChatHandle,
     pub session_id: String,
     pub info: RuntimeInfo,
@@ -364,10 +365,16 @@ impl ChatState {
         let providers = crate::backend::config::cluster_provider_summaries(backend.config.as_ref());
         let efforts = reasoning_efforts();
         let effort_idx = efforts.iter().position(|e| e == "medium").unwrap_or(0);
-        let sessions = list_conversations(&backend.data_dir);
+        let sifs_daemon = backend
+            .connection
+            .daemon_address()
+            .map(|address| sessions::SifsDaemonAccess::new(address, backend.app_runtime.handle()));
+        let (sessions, session_list_error) =
+            list_conversations_with_error(&backend.data_dir, sifs_daemon.as_ref());
 
         let mut state = Self {
             data_dir: backend.data_dir.clone(),
+            sifs_daemon,
             handle,
             session_id: String::new(),
             info: RuntimeInfo::default(),
@@ -399,6 +406,10 @@ impl ChatState {
             delete_rx: None,
             channel_agent_idx: 0,
         };
+        if let Some(detail) = session_list_error {
+            state.notice = Some(format!("chat list failed: {detail}"));
+            state.push_activity("chat list", detail, ActivityTone::Warn);
+        }
         // Eagerly fetch the default/initial provider's models so the model picker is populated
         // without requiring a manual provider toggle. (Results arrive async via `ChatEvent::Models`;
         // a no-op if there is no provider or the list is already populated.)
@@ -440,7 +451,7 @@ impl ChatState {
         }
         let title = Self::title_from_messages(messages);
         let stored: Vec<StoredMessage> = messages.iter().map(ChatMessage::to_stored).collect();
-        match sessions::save_with_report(&self.data_dir, session_id, &title, &stored) {
+        match self.save_chat_record(session_id, &title, &stored) {
             Ok(_) => {}
             Err(error) if report_visible_failures => {
                 let detail = error.to_string();
@@ -453,7 +464,48 @@ impl ChatState {
     }
 
     fn refresh_sessions(&mut self) {
-        self.sessions = list_conversations(&self.data_dir);
+        let (sessions, error) =
+            list_conversations_with_error(&self.data_dir, self.sifs_daemon.as_ref());
+        self.sessions = sessions;
+        if let Some(detail) = error {
+            self.notice = Some(format!("chat list failed: {detail}"));
+            self.push_activity("chat list", detail, ActivityTone::Warn);
+        }
+    }
+
+    fn save_chat_record(
+        &self,
+        session_id: &str,
+        title: &str,
+        stored: &[StoredMessage],
+    ) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.sifs_daemon.is_none() {
+            return sessions::save_with_report(&self.data_dir, session_id, title, stored);
+        }
+        sessions::save_with_report_via_daemon(
+            &self.data_dir,
+            self.sifs_daemon.as_ref(),
+            session_id,
+            title,
+            stored,
+        )
+    }
+
+    fn load_chat_transcript(&self, session_id: &str) -> Option<sessions::StoredTranscript> {
+        #[cfg(test)]
+        if self.sifs_daemon.is_none() {
+            return sessions::load_transcript(&self.data_dir, session_id);
+        }
+        sessions::load_transcript_via_daemon(&self.data_dir, self.sifs_daemon.as_ref(), session_id)
+    }
+
+    fn rename_chat_record(&self, session_id: &str, title: &str) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.sifs_daemon.is_none() {
+            return sessions::rename(&self.data_dir, session_id, title);
+        }
+        sessions::rename_via_daemon(&self.data_dir, self.sifs_daemon.as_ref(), session_id, title)
     }
 
     fn rename_channel(&self, id: &str, title: &str) -> std::io::Result<()> {
@@ -736,8 +788,7 @@ impl ChatState {
             return false;
         }
 
-        let mut transcript =
-            sessions::load_transcript(&self.data_dir, session_id).unwrap_or_default();
+        let mut transcript = self.load_chat_transcript(session_id).unwrap_or_default();
         let mut messages: Vec<ChatMessage> = transcript
             .messages
             .drain(..)
@@ -962,7 +1013,7 @@ impl ChatState {
             return;
         }
         let result = match kind {
-            ConversationKind::Chat => sessions::rename(&self.data_dir, &edit_id, &title),
+            ConversationKind::Chat => self.rename_chat_record(&edit_id, &title),
             ConversationKind::Channel => self.rename_channel(&edit_id, &title),
         };
         match result {
@@ -1050,14 +1101,20 @@ impl ChatState {
 
         let (tx, rx) = mpsc::channel();
         let data_dir = self.data_dir.clone();
+        let sifs_daemon = self.sifs_daemon.clone();
         let worker_session_id = session_id.clone();
         let worker_session = session.clone();
         let worker_waker = waker.clone();
         let spawn_result = thread::Builder::new()
             .name("sinomo-app-chat-delete".to_string())
             .spawn(move || {
-                let result = delete_conversation_records(&data_dir, &worker_session_id, kind)
-                    .map_err(|error| error.to_string());
+                let result = delete_conversation_records(
+                    &data_dir,
+                    sifs_daemon.as_ref(),
+                    &worker_session_id,
+                    kind,
+                )
+                .map_err(|error| error.to_string());
                 let _ = tx.send(DeleteWorkerResult {
                     session: worker_session,
                     kind,
@@ -1171,14 +1228,15 @@ impl ChatState {
         };
         let id = session.id.clone();
         let messages: Vec<ChatMessage> = match session.kind {
-            ConversationKind::Chat => sessions::load_transcript(&self.data_dir, &id)
+            ConversationKind::Chat => self
+                .load_chat_transcript(&id)
                 .unwrap_or_default()
                 .messages
                 .into_iter()
                 .map(ChatMessage::from_stored)
                 .collect(),
             ConversationKind::Channel => self.load_channel_messages(&id).unwrap_or_else(|| {
-                sessions::load_transcript(&self.data_dir, &id)
+                self.load_chat_transcript(&id)
                     .unwrap_or_default()
                     .messages
                     .into_iter()
@@ -1852,8 +1910,11 @@ impl ChatState {
     }
 }
 
-fn list_conversations(data_dir: &SinomoDataDir) -> Vec<SessionRef> {
-    let chat_metas = sessions::list(data_dir);
+fn list_conversations_with_error(
+    data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+) -> (Vec<SessionRef>, Option<String>) {
+    let (chat_metas, chat_error) = list_chat_metas_with_error(data_dir, sifs_daemon);
     let mut conversations = chat_metas
         .into_iter()
         .map(|meta| SessionRef {
@@ -1897,7 +1958,21 @@ fn list_conversations(data_dir: &SinomoDataDir) -> Vec<SessionRef> {
     }
 
     sort_conversations(&mut conversations);
-    conversations
+    (conversations, chat_error)
+}
+
+fn list_chat_metas_with_error(
+    data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+) -> (Vec<sessions::SessionMeta>, Option<String>) {
+    #[cfg(test)]
+    if sifs_daemon.is_none() {
+        return (sessions::list(data_dir), None);
+    }
+    match sessions::list_with_report_via_daemon(data_dir, sifs_daemon) {
+        Ok(metas) => (metas, None),
+        Err(error) => (Vec::new(), Some(error)),
+    }
 }
 
 fn sort_conversations(conversations: &mut [SessionRef]) {
@@ -1911,21 +1986,34 @@ fn sort_conversations(conversations: &mut [SessionRef]) {
 
 fn delete_conversation_records(
     data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
     id: &str,
     kind: ConversationKind,
 ) -> std::io::Result<()> {
     match kind {
         ConversationKind::Chat => {
-            let result = sessions::delete(data_dir, id);
+            let result = delete_chat_record(data_dir, sifs_daemon, id);
             let _ = delete_channel_record_in(data_dir, id);
             result
         }
         ConversationKind::Channel => {
             let result = delete_channel_record_in(data_dir, id);
-            let _ = sessions::delete(data_dir, id);
+            let _ = delete_chat_record(data_dir, sifs_daemon, id);
             result
         }
     }
+}
+
+fn delete_chat_record(
+    data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+    id: &str,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    if sifs_daemon.is_none() {
+        return sessions::delete(data_dir, id);
+    }
+    sessions::delete_via_daemon(data_dir, sifs_daemon, id)
 }
 
 fn delete_channel_record_in(data_dir: &SinomoDataDir, id: &str) -> std::io::Result<()> {
@@ -4687,11 +4775,7 @@ mod tests {
     use super::*;
     use crate::backend::Backend;
     use crate::state::AppState;
-    use std::{
-        fs,
-        path::PathBuf,
-        time::{Duration, Instant},
-    };
+    use std::time::{Duration, Instant};
 
     fn seed_default_provider(state: &mut ChatState) {
         if state.providers.is_empty() {
@@ -4721,26 +4805,11 @@ mod tests {
         state.info.agent = "main-agent".to_string();
     }
 
-    fn isolated_chat_state(slug: &str) -> (ChatState, PathBuf) {
+    fn isolated_chat_state(_slug: &str) -> (Backend, ChatState) {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
-        let root = temp_chat_data_dir(slug);
-        state.data_dir = Arc::new(SinomoDataDir::new(&root));
         state.sessions.clear();
-        (state, root)
-    }
-
-    fn temp_chat_data_dir(slug: &str) -> PathBuf {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-app-chat-{slug}-{}-{unique}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        root
+        (backend, state)
     }
 
     fn chat_sessions_list_y(window: &sui_testing::TestWindow) -> sui::Result<f32> {
@@ -4864,7 +4933,7 @@ mod tests {
 
     #[test]
     fn session_rename_updates_sidebar_metadata_and_preserves_title() {
-        let (mut state, root) = isolated_chat_state("rename");
+        let (_backend, mut state) = isolated_chat_state("rename");
         let session_id = SessionId::generate().to_string();
         state.session_id = session_id.clone();
         state.messages = vec![
@@ -4900,13 +4969,11 @@ mod tests {
             .expect("renamed session listed");
         assert_eq!(meta.title, "Renamed chat");
         assert_eq!(meta.title_source.as_deref(), Some("user"));
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn session_delete_hides_session_and_resets_visible_chat() {
-        let (mut state, root) = isolated_chat_state("delete");
+        let (_backend, mut state) = isolated_chat_state("delete");
         let session_id = SessionId::generate().to_string();
         state.session_id = session_id.clone();
         state.messages = vec![
@@ -4948,16 +5015,17 @@ mod tests {
             sessions::load_transcript(&state.data_dir, &session_id).is_none(),
             "deleted sessions cannot be reopened"
         );
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn new_channel_creates_channel_entry_and_opens_config() {
-        let (mut state, root) = isolated_chat_state("new-channel");
+        let (_backend, mut state) = isolated_chat_state("new-channel");
         seed_test_agents(&mut state);
 
         state.new_channel();
+        wait_for(&mut state, Duration::from_secs(5), |state| {
+            state.pending_session_reset.is_none()
+        });
 
         let channel_id = state.session_id.clone();
         assert!(
@@ -4990,15 +5058,16 @@ mod tests {
             participants[0].agent_session_id, channel.channel_id,
             "explicit channel participants keep their own agent sessions"
         );
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn channel_config_adds_selected_agent_and_updates_sidebar_count() {
-        let (mut state, root) = isolated_chat_state("channel-add-agent");
+        let (_backend, mut state) = isolated_chat_state("channel-add-agent");
         seed_test_agents(&mut state);
         state.new_channel();
+        wait_for(&mut state, Duration::from_secs(5), |state| {
+            state.pending_session_reset.is_none()
+        });
         let channel_id = state.session_id.clone();
 
         state.set_channel_agent_idx(1);
@@ -5032,15 +5101,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["main-agent".to_string(), "coding-agent".to_string()]
         );
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn channel_config_removes_agent_and_updates_sidebar_count() {
-        let (mut state, root) = isolated_chat_state("channel-remove-agent");
+        let (_backend, mut state) = isolated_chat_state("channel-remove-agent");
         seed_test_agents(&mut state);
         state.new_channel();
+        wait_for(&mut state, Duration::from_secs(5), |state| {
+            state.pending_session_reset.is_none()
+        });
         let channel_id = state.session_id.clone();
         state.set_channel_agent_idx(1);
         state.add_selected_agent_to_channel();
@@ -5074,19 +5144,15 @@ mod tests {
                 .map(|session| session.participant_count),
             Some(1)
         );
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn session_edit_dialog_done_button_closes_in_rendered_view() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
-        let root = temp_chat_data_dir("dialog-close");
         let session_id = SessionId::generate().to_string();
         {
             let mut chat = shared.chat_mut();
-            chat.data_dir = Arc::new(SinomoDataDir::new(&root));
             chat.sessions = vec![SessionRef {
                 id: session_id.clone(),
                 title: "Dialog chat".to_string(),
@@ -5120,7 +5186,6 @@ mod tests {
             "Done should close the edit dialog"
         );
 
-        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 
@@ -5128,12 +5193,10 @@ mod tests {
     fn clicking_rendered_chat_row_opens_session_without_refcell_panic() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
-        let root = temp_chat_data_dir("row-open");
         let first_id = SessionId::generate().to_string();
         let second_id = SessionId::generate().to_string();
         {
             let mut chat = shared.chat_mut();
-            chat.data_dir = Arc::new(SinomoDataDir::new(&root));
             chat.sessions = vec![
                 SessionRef {
                     id: first_id.clone(),
@@ -5172,7 +5235,6 @@ mod tests {
 
         assert_eq!(shared.chat().session_id, second_id);
 
-        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 
@@ -5180,7 +5242,6 @@ mod tests {
     fn rendered_chat_sessions_scroll_with_sui_scroll_view() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
-        let root = temp_chat_data_dir("sessions-scroll");
         let sessions = (0..48)
             .map(|index| SessionRef {
                 id: SessionId::generate().to_string(),
@@ -5193,7 +5254,6 @@ mod tests {
         let active_id = sessions[0].id.clone();
         {
             let mut chat = shared.chat_mut();
-            chat.data_dir = Arc::new(SinomoDataDir::new(&root));
             chat.sessions = sessions;
             chat.session_id = active_id;
             chat.models_loading = false;
@@ -5234,7 +5294,6 @@ mod tests {
             "selecting a chat rebuilds the sidebar but should preserve scroll position: before_select={after_y}, after_select={selected_y}"
         );
 
-        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 
@@ -5242,10 +5301,8 @@ mod tests {
     fn chat_sessions_scroll_state_clamps_after_list_shrinks() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
-        let root = temp_chat_data_dir("sessions-scroll-clamp");
         {
             let mut chat = shared.chat_mut();
-            chat.data_dir = Arc::new(SinomoDataDir::new(&root));
             chat.sessions = (0..48)
                 .map(|index| SessionRef {
                     id: SessionId::generate().to_string(),
@@ -5327,7 +5384,6 @@ mod tests {
             "shrinking the chat list should not reset scroll to the top while content still overflows"
         );
 
-        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 
