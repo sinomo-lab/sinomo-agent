@@ -114,6 +114,7 @@ impl AgentTool for ApplyPatchTool {
 pub(super) fn descriptor() -> AgentToolDescriptor {
     AgentToolDescriptor::new(spec_for_kind(AgentToolKind::ApplyPatch))
         .with_capabilities([AgentToolCapability::WriteWorkspace])
+        .with_toolsets(["provider_specific", "coding_advanced"])
         .with_input_schema(serde_json::json!({
             "type": "object",
             "anyOf": [
@@ -165,6 +166,125 @@ fn patch_too_large(bytes: usize, max_bytes: usize) -> AgentToolResult {
     )
 }
 
+pub(super) fn apply_edit_file_change(
+    config: &LocalWorkspaceAgentConfig,
+    tool_name: &str,
+    path: String,
+    old_text: String,
+    new_text: String,
+    replace_all: bool,
+    expected_occurrences: Option<usize>,
+    cancellation_token: &AgentCancellationToken,
+) -> AgentToolResult {
+    let expected_occurrences = if replace_all {
+        expected_occurrences
+    } else {
+        Some(expected_occurrences.unwrap_or(1))
+    };
+    let changes = vec![StructuredPatchChange::ReplaceText {
+        path,
+        old: old_text,
+        new: new_text,
+        replace_all,
+        expected_occurrences,
+    }];
+    apply_structured_changes(
+        config,
+        changes,
+        None,
+        tool_name,
+        tool_name,
+        cancellation_token,
+    )
+}
+
+pub(super) fn apply_write_file_change(
+    config: &LocalWorkspaceAgentConfig,
+    tool_name: &str,
+    path: String,
+    content: String,
+    overwrite: bool,
+    create_parents: bool,
+    cancellation_token: &AgentCancellationToken,
+) -> AgentToolResult {
+    if let Err(detail) = ensure_local_tool_not_cancelled(cancellation_token, tool_name) {
+        return local_tool_cancelled_result(tool_name, detail);
+    }
+    let root = match canonical_workspace_root(config) {
+        Ok(root) => root,
+        Err(detail) => {
+            return workspace_edit_preflight_failed(
+                tool_name,
+                "workspace_root_not_allowed",
+                detail,
+            );
+        }
+    };
+    let target = match resolve_virtual_write_path(&root, &path) {
+        Ok(target) => target,
+        Err(detail) => {
+            return workspace_edit_preflight_failed(tool_name, "path_not_allowed", detail);
+        }
+    };
+    let exists = target.symlink_metadata().is_ok();
+    if exists && !overwrite {
+        return workspace_edit_preflight_failed(
+            tool_name,
+            "target_exists",
+            format!("write_file target `{path}` already exists; pass overwrite=true to replace it"),
+        );
+    }
+    if !create_parents
+        && let Some(parent) = target.parent()
+        && !parent.exists()
+    {
+        return workspace_edit_preflight_failed(
+            tool_name,
+            "parent_missing",
+            format!(
+                "parent directory for `{path}` does not exist; pass create_parents=true to create it"
+            ),
+        );
+    }
+
+    let change = if exists {
+        StructuredPatchChange::Replace { path, content }
+    } else {
+        StructuredPatchChange::Add { path, content }
+    };
+    apply_structured_changes(
+        config,
+        vec![change],
+        None,
+        tool_name,
+        tool_name,
+        cancellation_token,
+    )
+}
+
+fn workspace_edit_preflight_failed(
+    tool_name: &str,
+    error: &str,
+    detail: impl Into<String>,
+) -> AgentToolResult {
+    let detail = detail.into();
+    let summary = format!("{tool_name} verification failed: {detail}");
+    let payload = serde_json::json!({
+        "error": error,
+        "detail": detail,
+        "message": summary,
+        "changed_files": [],
+        "operations": [],
+    });
+    let evidence = AgentToolEvidence::availability_only(true, "workspace edit preflight failed")
+        .with_output_value(&payload, false)
+        .with_record(
+            AGENT_CODING_EVIDENCE_KIND,
+            &AgentCodingToolEvidence::default(),
+        );
+    AgentToolResult::failed(summary, payload).with_evidence(evidence)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum StructuredPatchChange {
     Add {
@@ -191,6 +311,13 @@ enum StructuredPatchChange {
         path: String,
         old: String,
         new: String,
+    },
+    ReplaceText {
+        path: String,
+        old: String,
+        new: String,
+        replace_all: bool,
+        expected_occurrences: Option<usize>,
     },
     ReplaceRange {
         path: String,
@@ -220,7 +347,7 @@ fn apply_freeform_patch(
     let changes = match parse_freeform_patch(patch) {
         Ok(changes) => changes,
         Err(detail) => {
-            let summary = format_patch_failure_summary(&detail);
+            let summary = format_patch_failure_summary("apply_patch", &detail);
             return with_patch_evidence(
                 AgentToolResult::failed(
                     summary.clone(),
@@ -236,7 +363,14 @@ fn apply_freeform_patch(
             );
         }
     };
-    apply_structured_changes(config, changes, patch_ref, "freeform", cancellation_token)
+    apply_structured_changes(
+        config,
+        changes,
+        patch_ref,
+        "freeform",
+        "apply_patch",
+        cancellation_token,
+    )
 }
 
 fn apply_structured_json_changes(
@@ -342,7 +476,7 @@ fn apply_structured_json_changes(
             }
             other => {
                 let detail = format!("unsupported structured patch action `{other}`");
-                let summary = format_patch_failure_summary(&detail);
+                let summary = format_patch_failure_summary("apply_patch", &detail);
                 return with_patch_evidence(
                     AgentToolResult::failed(
                         summary.clone(),
@@ -360,11 +494,18 @@ fn apply_structured_json_changes(
         };
         changes.push(change);
     }
-    apply_structured_changes(config, changes, patch_ref, "structured", cancellation_token)
+    apply_structured_changes(
+        config,
+        changes,
+        patch_ref,
+        "structured",
+        "apply_patch",
+        cancellation_token,
+    )
 }
 
 fn structured_patch_change_error(detail: String, patch_ref: Option<String>) -> AgentToolResult {
-    let summary = format_patch_failure_summary(&detail);
+    let summary = format_patch_failure_summary("apply_patch", &detail);
     with_patch_evidence(
         AgentToolResult::failed(
             summary.clone(),
@@ -431,15 +572,16 @@ fn apply_structured_changes(
     changes: Vec<StructuredPatchChange>,
     patch_ref: Option<String>,
     patch_format: &str,
+    tool_name: &str,
     cancellation_token: &AgentCancellationToken,
 ) -> AgentToolResult {
-    if let Err(detail) = ensure_local_tool_not_cancelled(cancellation_token, "apply_patch") {
-        return local_tool_cancelled_result("apply_patch", detail);
+    if let Err(detail) = ensure_local_tool_not_cancelled(cancellation_token, tool_name) {
+        return local_tool_cancelled_result(tool_name, detail);
     }
     let root = match canonical_workspace_root(config) {
         Ok(root) => root,
         Err(detail) => {
-            let summary = format_patch_failure_summary(&detail);
+            let summary = format_patch_failure_summary(tool_name, &detail);
             return with_patch_evidence(
                 AgentToolResult::blocked(
                     summary.clone(),
@@ -455,47 +597,54 @@ fn apply_structured_changes(
             );
         }
     };
-    let plan =
-        match plan_structured_changes(&root, config, changes, patch_format, cancellation_token) {
-            Ok(plan) => plan,
-            Err(detail) => {
-                if cancellation_token.is_cancelled() {
-                    return local_tool_cancelled_result("apply_patch", detail);
-                }
-                return with_patch_evidence(
-                    patch_failure_result(
-                        patch_format,
-                        &root,
-                        "structured apply_patch preflight failed",
-                        &detail,
-                    ),
-                    patch_ref,
-                    None,
-                    format_patch_failure_summary(&detail),
-                );
+    let plan = match plan_structured_changes(
+        &root,
+        config,
+        changes,
+        patch_format,
+        tool_name,
+        cancellation_token,
+    ) {
+        Ok(plan) => plan,
+        Err(detail) => {
+            if cancellation_token.is_cancelled() {
+                return local_tool_cancelled_result(tool_name, detail);
             }
-        };
-    if let Err(detail) = ensure_local_tool_not_cancelled(cancellation_token, "apply_patch") {
-        return local_tool_cancelled_result("apply_patch", detail);
+            return with_patch_evidence(
+                patch_failure_result(
+                    tool_name,
+                    patch_format,
+                    &root,
+                    &format!("{tool_name} preflight failed"),
+                    &detail,
+                ),
+                patch_ref,
+                None,
+                format_patch_failure_summary(tool_name, &detail),
+            );
+        }
+    };
+    if let Err(detail) = ensure_local_tool_not_cancelled(cancellation_token, tool_name) {
+        return local_tool_cancelled_result(tool_name, detail);
     }
-    let diff_ref =
-        write_local_evidence(config, "apply_patch", "diff", plan.unified_diff.as_bytes());
-    if let Err(detail) = apply_planned_patch(config, &plan, cancellation_token) {
+    let diff_ref = write_local_evidence(config, tool_name, "diff", plan.unified_diff.as_bytes());
+    if let Err(detail) = apply_planned_patch(config, &plan, tool_name, cancellation_token) {
         if cancellation_token.is_cancelled() {
-            return local_tool_cancelled_result("apply_patch", detail);
+            return local_tool_cancelled_result(tool_name, detail);
         }
         return with_patch_evidence(
             patch_result(
                 AgentToolStatus::Failed,
-                format_patch_failure_summary(&detail),
+                format_patch_failure_summary(tool_name, &detail),
+                config,
                 &plan,
                 &root,
-                "structured apply_patch failed during mutation",
+                &format!("{tool_name} failed during mutation"),
                 diff_ref.clone(),
             ),
             patch_ref,
             diff_ref,
-            format_patch_failure_summary(&detail),
+            format_patch_failure_summary(tool_name, &detail),
         );
     }
     let summary = format_patch_success_summary(&plan.file_diffs);
@@ -503,6 +652,7 @@ fn apply_structured_changes(
         patch_result(
             AgentToolStatus::Succeeded,
             summary.clone(),
+            config,
             &plan,
             &root,
             "structured patch applied inside workspace root",
@@ -598,6 +748,13 @@ impl<'a> PatchPreflight<'a> {
             StructuredPatchChange::ReplaceExact { path, old, new } => {
                 self.replace_exact(path, old, new)
             }
+            StructuredPatchChange::ReplaceText {
+                path,
+                old,
+                new,
+                replace_all,
+                expected_occurrences,
+            } => self.replace_text(path, old, new, replace_all, expected_occurrences),
             StructuredPatchChange::ReplaceRange {
                 path,
                 start_line,
@@ -803,6 +960,42 @@ impl<'a> PatchPreflight<'a> {
         Ok(())
     }
 
+    fn replace_text(
+        &mut self,
+        path: String,
+        old: String,
+        new: String,
+        replace_all: bool,
+        expected_occurrences: Option<usize>,
+    ) -> Result<(), String> {
+        let (target, old_state) = self.virtual_existing_file(&path)?;
+        let (content, matches) = replace_text_content(
+            &old_state.content,
+            &old,
+            &new,
+            replace_all,
+            expected_occurrences,
+            &path,
+        )?;
+        self.files.insert(
+            target,
+            Some(VirtualFileState {
+                content,
+                display_path: path.clone(),
+                mode_source: old_state.mode_source,
+            }),
+        );
+        self.operations.push(serde_json::json!({
+            "action": "replace_text",
+            "path": path,
+            "old_bytes": old.len(),
+            "new_bytes": new.len(),
+            "matches": matches,
+            "replace_all": replace_all,
+        }));
+        Ok(())
+    }
+
     fn replace_range(
         &mut self,
         path: String,
@@ -907,11 +1100,12 @@ fn plan_structured_changes(
     config: &LocalWorkspaceAgentConfig,
     changes: Vec<StructuredPatchChange>,
     patch_format: &str,
+    tool_name: &str,
     cancellation_token: &AgentCancellationToken,
 ) -> Result<PlannedPatch, String> {
     let mut preflight = PatchPreflight::new(root, config);
     for change in changes {
-        ensure_local_tool_not_cancelled(cancellation_token, "apply_patch")?;
+        ensure_local_tool_not_cancelled(cancellation_token, tool_name)?;
         preflight.apply_change(change)?;
     }
     Ok(preflight.finish(patch_format))
@@ -920,9 +1114,10 @@ fn plan_structured_changes(
 fn apply_planned_patch(
     config: &LocalWorkspaceAgentConfig,
     plan: &PlannedPatch,
+    tool_name: &str,
     cancellation_token: &AgentCancellationToken,
 ) -> Result<(), String> {
-    ensure_local_tool_not_cancelled(cancellation_token, "apply_patch")?;
+    ensure_local_tool_not_cancelled(cancellation_token, tool_name)?;
     let root = canonical_workspace_root(config)?;
     if root != plan.root {
         return Err(format!(
@@ -931,12 +1126,13 @@ fn apply_planned_patch(
             root.display()
         ));
     }
+    validate_planned_patch_sandbox_access(config, &root, plan)?;
     for change in plan
         .file_changes
         .iter()
         .filter(|change| change.new_content.is_some())
     {
-        ensure_local_tool_not_cancelled(cancellation_token, "apply_patch")?;
+        ensure_local_tool_not_cancelled(cancellation_token, tool_name)?;
         prepare_write_target(&root, change)?;
     }
     for change in plan
@@ -944,7 +1140,7 @@ fn apply_planned_patch(
         .iter()
         .filter(|change| change.new_content.is_none())
     {
-        ensure_local_tool_not_cancelled(cancellation_token, "apply_patch")?;
+        ensure_local_tool_not_cancelled(cancellation_token, tool_name)?;
         prepare_delete_target(&root, change)?;
     }
     for change in plan
@@ -952,7 +1148,7 @@ fn apply_planned_patch(
         .iter()
         .filter(|change| change.new_content.is_some())
     {
-        ensure_local_tool_not_cancelled(cancellation_token, "apply_patch")?;
+        ensure_local_tool_not_cancelled(cancellation_token, tool_name)?;
         let content = change.new_content.as_ref().expect("filtered");
         atomic_write_text_file(&change.path, content, change.mode_source.as_deref())
             .map_err(|source| format!("write `{}`: {source}", change.display_path))?;
@@ -962,9 +1158,37 @@ fn apply_planned_patch(
         .iter()
         .filter(|change| change.new_content.is_none())
     {
-        ensure_local_tool_not_cancelled(cancellation_token, "apply_patch")?;
+        ensure_local_tool_not_cancelled(cancellation_token, tool_name)?;
         fs::remove_file(&change.path)
             .map_err(|source| format!("delete `{}`: {source}", change.display_path))?;
+    }
+    Ok(())
+}
+
+fn validate_planned_patch_sandbox_access(
+    config: &LocalWorkspaceAgentConfig,
+    root: &Path,
+    plan: &PlannedPatch,
+) -> Result<(), String> {
+    for change in &plan.file_changes {
+        if change.old_content.is_some() {
+            validate_local_workspace_file_access(
+                config,
+                root,
+                &change.path,
+                LocalWorkspaceFileAccess::Read,
+                &change.display_path,
+            )?;
+        }
+        if change.new_content.is_some() || change.status == PatchFileStatus::Deleted {
+            validate_local_workspace_file_access(
+                config,
+                root,
+                &change.path,
+                LocalWorkspaceFileAccess::Write,
+                &change.display_path,
+            )?;
+        }
     }
     Ok(())
 }
@@ -1098,34 +1322,35 @@ fn read_existing_patch_file(
     config: &LocalWorkspaceAgentConfig,
     path: &Path,
 ) -> Result<VirtualFileState, PatchFileReadError> {
-    ensure_path_stays_under_root(root, path, &display_workspace_path(config, path))
-        .map_err(PatchFileReadError::Invalid)?;
+    let display_path = display_workspace_path(config, path);
+    ensure_path_stays_under_root(root, path, &display_path).map_err(PatchFileReadError::Invalid)?;
+    validate_local_workspace_file_access(
+        config,
+        root,
+        path,
+        LocalWorkspaceFileAccess::Read,
+        &display_path,
+    )
+    .map_err(PatchFileReadError::Invalid)?;
     if !path.exists() {
         return Err(PatchFileReadError::NotFound);
     }
-    ensure_no_symlink_components(root, path, true, &display_workspace_path(config, path))
+    ensure_no_symlink_components(root, path, true, &display_path)
         .map_err(PatchFileReadError::Invalid)?;
     let metadata = fs::metadata(path).map_err(|source| {
-        PatchFileReadError::Invalid(format!(
-            "inspect `{}`: {source}",
-            display_workspace_path(config, path)
-        ))
+        PatchFileReadError::Invalid(format!("inspect `{display_path}`: {source}"))
     })?;
     if metadata.is_dir() {
         return Err(PatchFileReadError::Invalid(format!(
-            "path `{}` is a directory",
-            display_workspace_path(config, path)
+            "path `{display_path}` is a directory"
         )));
     }
     let content = fs::read_to_string(path).map_err(|source| {
-        PatchFileReadError::Invalid(format!(
-            "read `{}`: {source}",
-            display_workspace_path(config, path)
-        ))
+        PatchFileReadError::Invalid(format!("read `{display_path}`: {source}"))
     })?;
     Ok(VirtualFileState {
         content,
-        display_path: display_workspace_path(config, path),
+        display_path,
         mode_source: Some(path.to_path_buf()),
     })
 }
@@ -1255,6 +1480,53 @@ fn replace_exact_content(
     Ok(content)
 }
 
+fn replace_text_content(
+    old_content: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+    expected_occurrences: Option<usize>,
+    path: &str,
+) -> Result<(String, usize), String> {
+    let normalized_original = normalize_line_endings(old_content);
+    let (had_bom, normalized_content) = strip_utf8_bom(&normalized_original);
+    let old = normalize_line_endings(old);
+    if old.is_empty() {
+        return Err(format!("edit_file old_text for `{path}` must not be empty"));
+    }
+    let new = normalize_line_endings(new);
+    let matches = normalized_content.match_indices(&old).count();
+    if matches == 0 {
+        return Err(format!(
+            "edit_file expected at least one match for `{path}`, found 0"
+        ));
+    }
+    if let Some(expected) = expected_occurrences
+        && matches != expected
+    {
+        return Err(format!(
+            "edit_file expected {expected} match(es) for `{path}`, found {matches}"
+        ));
+    }
+    if !replace_all && matches != 1 {
+        return Err(format!(
+            "edit_file expected one match for `{path}`, found {matches}; provide more context or set replace_all=true"
+        ));
+    }
+    let mut content = if replace_all {
+        normalized_content.replace(&old, &new)
+    } else {
+        normalized_content.replacen(&old, &new, 1)
+    };
+    if preferred_line_ending(old_content) == "\r\n" {
+        content = content.replace('\n', "\r\n");
+    }
+    if had_bom {
+        content.insert(0, '\u{feff}');
+    }
+    Ok((content, matches))
+}
+
 fn replace_line_range_content(
     old_content: &str,
     start_line: usize,
@@ -1382,20 +1654,21 @@ fn format_patch_success_summary(files: &[PatchFileDiff]) -> String {
     summary
 }
 
-fn format_patch_failure_summary(detail: &str) -> String {
-    format!("apply_patch verification failed: {detail}")
+fn format_patch_failure_summary(tool_name: &str, detail: &str) -> String {
+    format!("{tool_name} verification failed: {detail}")
 }
 
 fn patch_failure_result(
+    tool_name: &str,
     patch_format: &str,
     root: &Path,
     evidence_reason: &str,
     detail: &str,
 ) -> AgentToolResult {
-    let summary = format_patch_failure_summary(detail);
+    let summary = format_patch_failure_summary(tool_name, detail);
     let payload = serde_json::json!({
         "format": patch_format,
-        "error": "apply_patch_verification_failed",
+        "error": format!("{tool_name}_verification_failed"),
         "detail": detail,
         "message": summary,
         "changed_files": [],
@@ -1414,6 +1687,7 @@ fn patch_failure_result(
 fn patch_result(
     status: AgentToolStatus,
     summary: String,
+    config: &LocalWorkspaceAgentConfig,
     plan: &PlannedPatch,
     root: &Path,
     evidence_reason: &str,
@@ -1440,6 +1714,10 @@ fn patch_result(
                 }),
             )
             .with_output_value(&payload, false)
+            .with_metadata(serde_json::json!({
+                "workspace_root": root.display().to_string(),
+                "sandbox": local_workspace_sandbox_metadata(config),
+            }))
             .with_record(
                 AGENT_CODING_EVIDENCE_KIND,
                 &AgentCodingToolEvidence {

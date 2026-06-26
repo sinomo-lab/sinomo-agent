@@ -35,7 +35,7 @@ use sinomo_agent::{
     AgentDefinition, AgentDefinitionStore, AgentEventPayload, AgentLoopDecision, AgentLoopInput,
     AgentModelEvent, AgentOp, AgentPackageProvenance, AgentPackageSource,
     AgentReadinessCheckStatus, AgentReadinessReport, AgentRole, AgentRuntimeEvent,
-    AgentRuntimeEventCursor, AgentRuntimeEventPayload, AgentSession,
+    AgentRuntimeEventCursor, AgentRuntimeEventPayload, AgentRuntimeStorage, AgentSession,
     AgentSessionControlEventCursor, AgentSessionControlResponse, AgentSessionFollowUpRequest,
     AgentSessionInspectRequest, AgentSessionInspectResponse, AgentSessionInterruptRequest,
     AgentSessionProgressRequest, AgentSessionProgressResponse, AgentSessionResumeRequest,
@@ -3066,9 +3066,10 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         .with_tool_surface(sinomo_agent::AgentToolSurface::default_for_role(
             AgentRole::Main,
         ));
-    let runtime = AgentSessionRuntime::new(
+    let runtime = AgentSessionRuntime::with_data_dir_storage(
         agent,
         AgentSession::new(input.session.session_id.clone(), AgentRole::Main),
+        &data_dir,
     );
     let op = AgentOp::start_turn(input);
     let op_id = op.op_id.clone();

@@ -28,8 +28,8 @@ use sinomo_lm::{
     inferred_model_context_window_tokens, language_model_system_instructions,
 };
 use sinomo_memory::{
-    MemoryContextProvider, MemoryPolicy, MemoryQuery, MemoryRecordStore, MemoryRetrievalReport,
-    MemoryRetrievalResult,
+    DurableMemoryStore, MemoryContextProvider, MemoryPolicy, MemoryQuery, MemoryRecordStore,
+    MemoryRetrievalReport, MemoryRetrievalResult,
 };
 use sinomo_runtime::core::{
     Confidence, EventEnvelope, EventKind, LatencyClass, MemoryRecord, MemoryScope, MemorySourceRef,
@@ -4018,7 +4018,8 @@ impl AgentConfig {
         let provider = provider.into();
         let model = model.into();
         let definition = AgentDefinition::main();
-        let visible_toolsets = default_visible_toolsets_for_role(&definition.role);
+        let visible_toolsets =
+            default_visible_toolsets_for_role_and_provider(&definition.role, &provider);
         Self {
             provider,
             model,
@@ -4048,6 +4049,8 @@ impl AgentConfig {
 
     pub fn with_agent_definition(mut self, definition: AgentDefinition) -> Self {
         let previous_default_toolsets = default_visible_toolsets_for_role(&self.definition.role);
+        let previous_provider_default_toolsets =
+            default_visible_toolsets_for_role_and_provider(&self.definition.role, &self.provider);
         self.temperature = definition
             .temperature
             .or(definition.model_policy.temperature);
@@ -4056,8 +4059,11 @@ impl AgentConfig {
             .or(definition.model_policy.max_output_tokens);
         if !definition.tool_surface.visible_toolsets.is_empty() {
             self.visible_toolsets = definition.tool_surface.visible_toolsets.clone();
-        } else if self.visible_toolsets == previous_default_toolsets {
-            self.visible_toolsets = default_visible_toolsets_for_role(&definition.role);
+        } else if self.visible_toolsets == previous_default_toolsets
+            || self.visible_toolsets == previous_provider_default_toolsets
+        {
+            self.visible_toolsets =
+                default_visible_toolsets_for_role_and_provider(&definition.role, &self.provider);
         }
         if !self.max_steps_explicit_override {
             self.max_steps = definition.runtime_limits.max_steps;
@@ -4207,6 +4213,29 @@ fn default_visible_toolsets_for_role(role: &crate::AgentRole) -> Vec<String> {
         }
     };
     toolsets.iter().copied().map(str::to_string).collect()
+}
+
+fn default_visible_toolsets_for_role_and_provider(
+    role: &crate::AgentRole,
+    provider: &str,
+) -> Vec<String> {
+    let mut toolsets = default_visible_toolsets_for_role(role);
+    if is_openai_provider(provider)
+        && matches!(
+            role,
+            crate::AgentRole::Deliberation | crate::AgentRole::Evolution
+        )
+    {
+        push_unique(&mut toolsets, "provider_specific".to_string());
+    }
+    toolsets
+}
+
+fn is_openai_provider(provider: &str) -> bool {
+    matches!(
+        provider.to_ascii_lowercase().as_str(),
+        "openai" | "openai-api"
+    )
 }
 
 fn default_workspace_instruction_files() -> Vec<PathBuf> {
@@ -5488,6 +5517,51 @@ where
     }
 }
 
+#[derive(Clone, Default)]
+pub struct AgentRuntimeStorage {
+    memory_record_store: Option<Arc<dyn MemoryRecordStore>>,
+}
+
+impl AgentRuntimeStorage {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_data_dir(data_dir: &SinomoDataDir) -> Self {
+        Self::new().with_memory_record_store(DurableMemoryStore::from_data_dir(data_dir))
+    }
+
+    pub fn with_memory_record_store<T>(mut self, store: T) -> Self
+    where
+        T: MemoryRecordStore + 'static,
+    {
+        self.memory_record_store = Some(Arc::new(store));
+        self
+    }
+
+    pub fn with_shared_memory_record_store(mut self, store: Arc<dyn MemoryRecordStore>) -> Self {
+        self.memory_record_store = Some(store);
+        self
+    }
+
+    pub fn memory_record_store(&self) -> Option<Arc<dyn MemoryRecordStore>> {
+        self.memory_record_store.clone()
+    }
+
+    fn apply_to_agent<M>(&self, agent: Agent<M>) -> Agent<M>
+    where
+        M: InteractionModel,
+    {
+        match (
+            agent.memory_record_store.is_some() || agent.memory_context_provider.is_some(),
+            &self.memory_record_store,
+        ) {
+            (false, Some(store)) => agent.with_shared_memory_store(store.clone()),
+            _ => agent,
+        }
+    }
+}
+
 struct AgentSessionRuntimeState {
     control: AgentSessionControlPlane,
     runtime_events: Vec<AgentRuntimeEvent>,
@@ -5501,6 +5575,22 @@ where
 {
     pub fn new(agent: Agent<M>, session: AgentSession) -> Self {
         Self::from_arc(Arc::new(agent), session)
+    }
+
+    pub fn with_storage(
+        agent: Agent<M>,
+        session: AgentSession,
+        storage: AgentRuntimeStorage,
+    ) -> Self {
+        Self::new(storage.apply_to_agent(agent), session)
+    }
+
+    pub fn with_data_dir_storage(
+        agent: Agent<M>,
+        session: AgentSession,
+        data_dir: &SinomoDataDir,
+    ) -> Self {
+        Self::with_storage(agent, session, AgentRuntimeStorage::from_data_dir(data_dir))
     }
 
     pub fn from_arc(agent: Arc<Agent<M>>, session: AgentSession) -> Self {
@@ -7385,6 +7475,11 @@ impl<M: InteractionModel> Agent<M> {
         T: MemoryRecordStore + 'static,
     {
         let store = Arc::new(store);
+        self = self.with_shared_memory_store(store);
+        self
+    }
+
+    pub fn with_shared_memory_store(mut self, store: Arc<dyn MemoryRecordStore>) -> Self {
         self.memory_context_provider = Some(store.clone());
         self.memory_record_store = Some(store);
         self
@@ -10273,8 +10368,10 @@ fn repair_request_for_model_response(
 
 fn patch_snapshot_item_from_tool_outcome(outcome: &AgentToolOutcome) -> Option<AgentItem> {
     let coding = coding_evidence_from_tool_outcome(outcome);
-    if outcome.call.tool != "apply_patch"
-        || (coding.patch_ref.is_none() && coding.changed_files.is_empty())
+    if !matches!(
+        outcome.call.tool.as_str(),
+        "apply_patch" | "edit_file" | "write_file"
+    ) || (coding.patch_ref.is_none() && coding.changed_files.is_empty())
     {
         return None;
     }
@@ -14428,8 +14525,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!default_tool_names.contains(&"changed_files".to_string()));
         assert!(!default_tool_names.contains(&"git_diff".to_string()));
+        assert!(!default_tool_names.contains(&"apply_patch".to_string()));
         assert!(!default_tool_names.contains(&"replace_exact".to_string()));
         assert!(!default_tool_names.contains(&"replace_range".to_string()));
+        assert!(default_tool_names.contains(&"edit_file".to_string()));
+        assert!(default_tool_names.contains(&"write_file".to_string()));
 
         let descriptors = default_agent_tool_descriptors();
         let names: Vec<_> = descriptors
@@ -14441,6 +14541,8 @@ mod tests {
             "read_file",
             "list_files",
             "search",
+            "edit_file",
+            "write_file",
             "apply_patch",
             "changed_files",
             "git_diff",
@@ -14452,6 +14554,17 @@ mod tests {
 
         assert!(!names.contains(&"replace_exact"));
         assert!(!names.contains(&"replace_range"));
+
+        let apply_patch = descriptors
+            .iter()
+            .find(|descriptor| descriptor.spec.name == "apply_patch")
+            .expect("apply_patch descriptor");
+        assert!(
+            apply_patch
+                .toolsets
+                .contains(&"provider_specific".to_string())
+        );
+        assert!(!apply_patch.toolsets.contains(&"core".to_string()));
 
         for expected_hidden in ["changed_files", "git_diff"] {
             let descriptor = descriptors
@@ -14509,6 +14622,70 @@ mod tests {
                 .iter()
                 .any(|source| source.kind == "agent_tool_surface")
         );
+    }
+
+    #[test]
+    fn openai_coding_tool_surface_exposes_apply_patch() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-openai-apply-patch-surface");
+        let openai_config = AgentConfig::new("openai", "gpt-5.2-codex")
+            .with_agent_definition(AgentDefinition::coding())
+            .with_workspace_root(&root);
+        let openai_agent = Agent::new(
+            SequencedModel::new(std::iter::empty::<String>()),
+            "openai",
+            "gpt-5.2-codex",
+        )
+        .with_config(openai_config)
+        .with_tool_registry(AgentToolRegistry::local_workspace_with_config(
+            LocalWorkspaceAgentConfig::new(&root),
+        ));
+
+        let openai_context = openai_agent
+            .assemble_context(&agent_input("inspect"), &[], 0)
+            .expect("openai context");
+        let openai_tools: Vec<_> = openai_context
+            .available_tool_specs
+            .iter()
+            .map(|descriptor| descriptor.spec.name.as_str())
+            .collect();
+        assert!(openai_tools.contains(&"edit_file"));
+        assert!(openai_tools.contains(&"write_file"));
+        assert!(openai_tools.contains(&"apply_patch"));
+        let apply_patch = openai_context
+            .available_tool_specs
+            .iter()
+            .find(|descriptor| descriptor.spec.name == "apply_patch")
+            .expect("openai apply_patch descriptor");
+        assert!(apply_patch.provider_specs.iter().any(|spec| {
+            spec.provider == "openai"
+                && spec.custom.as_ref().is_some_and(|custom| {
+                    matches!(&custom.format, AgentToolCustomFormat::Grammar { .. })
+                })
+        }));
+
+        let fake_config = AgentConfig::new("fake", "fake")
+            .with_agent_definition(AgentDefinition::coding())
+            .with_workspace_root(&root);
+        let fake_agent = Agent::new(
+            SequencedModel::new(std::iter::empty::<String>()),
+            "fake",
+            "fake",
+        )
+        .with_config(fake_config)
+        .with_tool_registry(AgentToolRegistry::local_workspace_with_config(
+            LocalWorkspaceAgentConfig::new(&root),
+        ));
+        let fake_context = fake_agent
+            .assemble_context(&agent_input("inspect"), &[], 0)
+            .expect("fake context");
+        let fake_tools: Vec<_> = fake_context
+            .available_tool_specs
+            .iter()
+            .map(|descriptor| descriptor.spec.name.as_str())
+            .collect();
+        assert!(fake_tools.contains(&"edit_file"));
+        assert!(fake_tools.contains(&"write_file"));
+        assert!(!fake_tools.contains(&"apply_patch"));
     }
 
     #[test]
@@ -14926,6 +15103,57 @@ mod tests {
                 .record
                 .summary
                 .contains("Remembered outcome.")
+        );
+    }
+
+    #[test]
+    fn agent_session_runtime_injects_default_memory_store() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-runtime-memory");
+        let data_dir = SinomoDataDir::new(root.to_path_buf());
+        let model = SequencedModel::new([r#"{
+            "response_mode": "answer",
+            "text": "Runtime memory outcome.",
+            "tool_calls": [],
+            "background_handoff": null,
+            "next_state": "listening"
+        }"#]);
+        let agent =
+            Agent::new(model, "fake", "fake").with_agent_definition(AgentDefinition::main());
+        let input = agent_input("remember runtime storage");
+        let session = AgentSession::new(input.session.session_id.clone(), AgentRole::Main);
+        let runtime = AgentSessionRuntime::with_data_dir_storage(agent, session, &data_dir);
+        let op = AgentOp::start_turn(input.clone());
+        let op_id = op.op_id.clone();
+
+        let submit = runtime.submit_op(op).expect("submit");
+        assert!(submit.accepted);
+        runtime.join_active_turn().expect("join");
+        let outcome = runtime
+            .turn_result(&op_id)
+            .expect("turn result")
+            .expect("outcome");
+        assert_eq!(
+            outcome.run.as_ref().expect("run").final_decision.text,
+            "Runtime memory outcome."
+        );
+
+        let store = DurableMemoryStore::from_data_dir(&data_dir);
+        let result = sinomo_memory::MemoryContextProvider::retrieve(
+            &store,
+            &sinomo_memory::MemoryQuery {
+                session_id: Some(input.session.session_id.clone()),
+                agent_id: Some("main-agent".to_string()),
+                task_hint: Some("runtime storage".to_string()),
+                ..sinomo_memory::MemoryQuery::default()
+            },
+        )
+        .expect("retrieve memory");
+        assert_eq!(result.records.len(), 1);
+        assert!(
+            result.records[0]
+                .record
+                .summary
+                .contains("Runtime memory outcome.")
         );
     }
 
@@ -15514,6 +15742,56 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
+    fn local_workspace_run_command_uses_simple_sandbox_by_default() {
+        if !sinomo_runtime::sandbox_simple::SandboxSimpleNativeCommandRunner::landlock_supported() {
+            return;
+        }
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-command-simple-sandbox");
+        let registry = AgentToolRegistry::local_workspace_with_config(
+            LocalWorkspaceAgentConfig::new(&root)
+                .without_agent_home_sifs_path()
+                .allowing_shell_commands(true),
+        );
+        let input = agent_input("simple sandbox command");
+
+        let outcome = registry.execute(
+            &input.session,
+            0,
+            0,
+            &AgentToolCall {
+                call_id: None,
+                tool: "run_command".to_string(),
+                input: serde_json::json!({ "command": "printf ok > inside.txt" }),
+                r#async: false,
+                summary: "run sandboxed command".to_string(),
+            },
+        );
+
+        assert_eq!(outcome.status, AgentToolStatus::Succeeded);
+        assert_eq!(
+            fs::read_to_string(root.join("inside.txt")).expect("inside file"),
+            "ok"
+        );
+        assert_eq!(
+            outcome
+                .evidence
+                .metadata
+                .pointer("/sandbox/runtime")
+                .and_then(serde_json::Value::as_str),
+            Some("simple_sandbox")
+        );
+        assert_eq!(
+            outcome
+                .evidence
+                .metadata
+                .pointer("/sandbox/checked")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
     fn local_workspace_run_command_honors_timeout_and_cwd() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-command-timeout");
         let subdir = root.join("subdir");
@@ -15732,6 +16010,146 @@ mod tests {
             Some("file_writes_disabled")
         );
         assert!(!outcome.evidence.availability.allowed);
+    }
+
+    #[test]
+    fn local_workspace_registry_applies_edit_file_when_file_writes_enabled() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-edit-file");
+        let evidence_dir = root.join("evidence");
+        fs::write(root.join("hello.txt"), "old\n").expect("seed file");
+        let config = LocalWorkspaceAgentConfig::new(&root)
+            .allowing_file_writes(true)
+            .with_evidence_dir(&evidence_dir);
+        let registry = AgentToolRegistry::local_workspace_with_config(config);
+        let input = agent_input("edit file");
+
+        let outcome = registry.execute(
+            &input.session,
+            0,
+            0,
+            &AgentToolCall {
+                call_id: None,
+                tool: "edit_file".to_string(),
+                input: serde_json::json!({
+                    "path": "hello.txt",
+                    "old_text": "old\n",
+                    "new_text": "new\n"
+                }),
+                r#async: false,
+                summary: "edit file".to_string(),
+            },
+        );
+
+        assert_eq!(outcome.status, AgentToolStatus::Succeeded);
+        assert_eq!(
+            fs::read_to_string(root.join("hello.txt")).expect("edited file"),
+            "new\n"
+        );
+        assert_eq!(
+            outcome
+                .output
+                .get("format")
+                .and_then(serde_json::Value::as_str),
+            Some("edit_file")
+        );
+        assert_eq!(
+            coding_evidence(&outcome.evidence).changed_files,
+            vec!["hello.txt".to_string()]
+        );
+        assert!(
+            coding_evidence(&outcome.evidence)
+                .diff_ref
+                .as_deref()
+                .is_some_and(|path| Path::new(path).exists())
+        );
+        assert_eq!(
+            outcome
+                .evidence
+                .metadata
+                .pointer("/sandbox/runtime")
+                .and_then(serde_json::Value::as_str),
+            Some("simple_sandbox")
+        );
+        assert_eq!(
+            outcome
+                .evidence
+                .metadata
+                .pointer("/sandbox/checked")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn local_workspace_registry_write_file_requires_overwrite_for_existing_file() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-write-file-overwrite");
+        fs::write(root.join("hello.txt"), "old\n").expect("seed file");
+        let config = LocalWorkspaceAgentConfig::new(&root).allowing_file_writes(true);
+        let registry = AgentToolRegistry::local_workspace_with_config(config);
+        let input = agent_input("write file");
+
+        let blocked = registry.execute(
+            &input.session,
+            0,
+            0,
+            &AgentToolCall {
+                call_id: None,
+                tool: "write_file".to_string(),
+                input: serde_json::json!({
+                    "path": "hello.txt",
+                    "content": "new\n"
+                }),
+                r#async: false,
+                summary: "write file without overwrite".to_string(),
+            },
+        );
+
+        assert_eq!(blocked.status, AgentToolStatus::Failed);
+        assert_eq!(
+            blocked
+                .output
+                .get("error")
+                .and_then(serde_json::Value::as_str),
+            Some("target_exists")
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("hello.txt")).expect("unchanged file"),
+            "old\n"
+        );
+
+        let overwritten = registry.execute(
+            &input.session,
+            0,
+            1,
+            &AgentToolCall {
+                call_id: None,
+                tool: "write_file".to_string(),
+                input: serde_json::json!({
+                    "path": "hello.txt",
+                    "content": "new\n",
+                    "overwrite": true
+                }),
+                r#async: false,
+                summary: "overwrite file".to_string(),
+            },
+        );
+
+        assert_eq!(overwritten.status, AgentToolStatus::Succeeded);
+        assert_eq!(
+            fs::read_to_string(root.join("hello.txt")).expect("overwritten file"),
+            "new\n"
+        );
+        assert_eq!(
+            overwritten
+                .output
+                .get("format")
+                .and_then(serde_json::Value::as_str),
+            Some("write_file")
+        );
+        assert_eq!(
+            coding_evidence(&overwritten.evidence).changed_files,
+            vec!["hello.txt".to_string()]
+        );
     }
 
     #[test]
@@ -16400,20 +16818,23 @@ old
     }
 
     #[test]
-    fn agent_records_patch_snapshot_items_for_apply_patch() {
+    fn agent_records_patch_snapshot_items_for_edit_file() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-loop-patch");
         let evidence_dir = root.join("evidence");
         fs::create_dir_all(&root).expect("workspace");
         fs::write(root.join("hello.txt"), "old\n").expect("seed file");
-        let patch = "*** Begin Patch\n*** Update File: hello.txt\n@@\n-old\n+new\n*** End Patch";
         let tool_turn = serde_json::json!({
             "response_mode": "defer",
-            "text": "I will patch the file.",
+            "text": "I will edit the file.",
             "tool_calls": [{
-                "tool": "apply_patch",
-                "input": {"patch": patch},
+                "tool": "edit_file",
+                "input": {
+                    "path": "hello.txt",
+                    "old_text": "old\n",
+                    "new_text": "new\n"
+                },
                 "async": false,
-                "summary": "Patch hello.txt."
+                "summary": "Edit hello.txt."
             }],
             "background_handoff": null,
             "next_state": "waiting"
@@ -16461,11 +16882,79 @@ old
             .expect("patch snapshot");
         assert_eq!(patch_snapshot.0, &AgentToolStatus::Succeeded);
         assert_eq!(patch_snapshot.1, &vec!["hello.txt".to_string()]);
-        let patch_ref = patch_snapshot.2.as_deref().expect("patch ref");
+        assert!(patch_snapshot.2.is_none());
+    }
+
+    #[test]
+    fn openai_coding_agent_executes_apply_patch_without_disclosure() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-openai-apply-patch-run");
+        let evidence_dir = root.join("evidence");
+        fs::create_dir_all(&root).expect("workspace");
+        fs::write(root.join("hello.txt"), "old\n").expect("seed file");
+        let patch = "*** Begin Patch\n*** Update File: hello.txt\n@@\n-old\n+new\n*** End Patch";
+        let tool_turn = serde_json::json!({
+            "response_mode": "defer",
+            "text": "I will patch the file.",
+            "tool_calls": [{
+                "tool": "apply_patch",
+                "input": {"patch": patch},
+                "async": false,
+                "summary": "Patch hello.txt."
+            }],
+            "background_handoff": null,
+            "next_state": "waiting"
+        })
+        .to_string();
+        let model = SequencedModel::new([
+            tool_turn,
+            r#"{
+                "response_mode": "answer",
+                "text": "Patched.",
+                "tool_calls": [],
+                "background_handoff": null,
+                "next_state": "listening"
+            }"#
+            .to_string(),
+        ]);
+        let agent_config = AgentConfig::new("openai", "gpt-5.2-codex")
+            .with_agent_definition(AgentDefinition::coding())
+            .with_workspace_root(&root);
+        let workspace_config = LocalWorkspaceAgentConfig::new(&root)
+            .allowing_file_writes(true)
+            .with_evidence_dir(&evidence_dir);
+        let agent = Agent::new(model, "openai", "gpt-5.2-codex")
+            .with_config(agent_config)
+            .with_tool_registry(AgentToolRegistry::local_workspace_with_config(
+                workspace_config,
+            ));
+
+        let run = agent.run(&agent_input("patch file")).expect("run");
+
+        assert_eq!(
+            fs::read_to_string(root.join("hello.txt")).expect("file"),
+            "new\n"
+        );
+        assert_eq!(run.tool_results.len(), 1);
+        assert_eq!(run.tool_results[0].status, AgentToolStatus::Succeeded);
+        assert_eq!(run.tool_results[0].call.tool, "apply_patch");
+        let orchestration = run.tool_results[0]
+            .evidence
+            .metadata
+            .get("tool_orchestration")
+            .expect("tool orchestration metadata");
+        assert_eq!(
+            orchestration
+                .get("descriptor_visible")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
         assert!(
-            fs::read_to_string(patch_ref)
-                .expect("patch evidence")
-                .contains("+new")
+            orchestration
+                .get("visible_toolsets")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|toolsets| toolsets
+                    .iter()
+                    .any(|toolset| toolset.as_str() == Some("provider_specific")))
         );
     }
 
@@ -16475,15 +16964,18 @@ old
         let evidence_dir = root.join("evidence");
         fs::create_dir_all(&root).expect("workspace");
         fs::write(root.join("hello.txt"), "old\n").expect("seed file");
-        let patch = "*** Begin Patch\n*** Update File: hello.txt\n@@\n-old\n+new\n*** End Patch";
         let patch_turn = serde_json::json!({
             "response_mode": "defer",
-            "text": "I will patch the file.",
+            "text": "I will edit the file.",
             "tool_calls": [{
-                "tool": "apply_patch",
-                "input": {"patch": patch},
+                "tool": "edit_file",
+                "input": {
+                    "path": "hello.txt",
+                    "old_text": "old\n",
+                    "new_text": "new\n"
+                },
                 "async": false,
-                "summary": "Patch hello.txt."
+                "summary": "Edit hello.txt."
             }],
             "background_handoff": null,
             "next_state": "waiting"
@@ -16755,16 +17247,19 @@ old
         let evidence_dir = root.join("evidence");
         fs::create_dir_all(&root).expect("workspace");
         fs::write(root.join("hello.txt"), "old\n").expect("seed file");
-        let patch = "*** Begin Patch\n*** Update File: hello.txt\n@@\n-old\n+new\n*** End Patch";
         let tool_turn = serde_json::json!({
             "response_mode": "defer",
-            "text": "I will patch the file.",
+            "text": "I will edit the file.",
             "tool_calls": [
                 {
-                    "tool": "apply_patch",
-                    "input": {"patch": patch},
+                    "tool": "edit_file",
+                    "input": {
+                        "path": "hello.txt",
+                        "old_text": "old\n",
+                        "new_text": "new\n"
+                    },
                     "async": false,
-                    "summary": "Patch hello.txt."
+                    "summary": "Edit hello.txt."
                 }
             ],
             "background_handoff": null,
