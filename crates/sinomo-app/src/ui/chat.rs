@@ -44,7 +44,7 @@ use std::thread;
 use sui::{
     Alignment, ArrangeCtx, Color, Constraints, DefaultTheme, Event, EventCtx, Flex, FlexItem,
     FontWeight, IconButton, IconGlyph, Insets, KeyState, Label, ListItem, ListView, MeasureCtx,
-    PaintCtx, Point, PointerButton, PointerEventKind, Rect, ScrollDelta, ScrollView,
+    PaintCtx, Point, PointerButton, PointerEventKind, Rect, ScrollDelta, ScrollState, ScrollView,
     SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, Separator, Size, SizedBox, Stack,
     StackHostOptions, Surface, SurfaceBorder, SurfaceRole, TextArea, TextInput, Widget, WidgetPod,
     WidgetPodMutVisitor, WidgetPodVisitor, draw_glyph,
@@ -2200,9 +2200,14 @@ fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         })
 }
 
-fn sessions_scroll(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+fn sessions_scroll(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll_state: &ScrollState,
+) -> impl Widget + use<> {
     ScrollView::vertical(sessions_list(shared, reader))
         .name("chat-sessions-scroll")
+        .state(scroll_state.clone())
         .theme(shared.theme())
 }
 
@@ -2476,9 +2481,14 @@ impl Widget for ChatSessionRow {
 /// The sidebar column: AGENTS heading + list, then CHATS heading + list. Wrapped in a
 /// [`RebuildOnChange`] keyed on the agent/chat signature so it rebuilds when those lists change
 /// (e.g. a new chat is persisted) but not on every token.
-fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+fn sidebar(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll_state: &ScrollState,
+) -> impl Widget + use<> {
     let s = shared.clone();
     let r = Rc::clone(reader);
+    let sessions_scroll_state = scroll_state.clone();
     RebuildOnChange::new(
         {
             let s = s.clone();
@@ -2496,7 +2506,7 @@ fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 .with_child(InsetX::new(heading(&s, "CHATS"), 18.0))
                 .with_child(SizedBox::new().height(2.0))
                 .with_item(
-                    InsetX::new(sessions_scroll(&s, &r), 8.0),
+                    InsetX::new(sessions_scroll(&s, &r, &sessions_scroll_state), 8.0),
                     FlexItem::flex(1.0).min_height(0.0),
                 );
             WidgetPod::new(Surface::sidebar(column).fill().theme_when(clone_reader(&r)))
@@ -4029,14 +4039,23 @@ fn main_column(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .bottom(COMPOSER_H, composer(shared, reader))
 }
 
-fn wide_pod(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+fn wide_pod(
+    shared: &Shared,
+    reader: &ThemeReader,
+    sessions_scroll_state: &ScrollState,
+) -> WidgetPod {
     let work_area = Split::right_fixed(
         main_column(shared, reader),
         ActivityRail::new(shared.clone()),
         ACTIVITY_RAIL_W,
         reader,
     );
-    let row = Split::left_fixed(sidebar(shared, reader), work_area, SIDEBAR_W, reader);
+    let row = Split::left_fixed(
+        sidebar(shared, reader, sessions_scroll_state),
+        work_area,
+        SIDEBAR_W,
+        reader,
+    );
     let dialog_host = ChatDialogHost::new(row, shared.clone(), Rc::clone(reader));
     WidgetPod::new(
         Surface::window(dialog_host)
@@ -4091,7 +4110,8 @@ impl ChatView {
             let s = shared.clone();
             Rc::new(move || s.theme())
         };
-        let wide = wide_pod(&shared, &theme_reader);
+        let sessions_scroll_state = ScrollState::new();
+        let wide = wide_pod(&shared, &theme_reader, &sessions_scroll_state);
         let narrow = narrow_pod(&shared, &theme_reader);
         let last_sig = Cell::new(view_signature(&shared));
         Self {
@@ -4723,6 +4743,20 @@ mod tests {
         root
     }
 
+    fn chat_sessions_list_y(window: &sui_testing::TestWindow) -> sui::Result<f32> {
+        let snapshot = window.snapshot()?;
+        Ok(snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::List && node.name.as_deref() == Some("chat-sessions")
+            })
+            .expect("chat sessions list semantics node")
+            .bounds
+            .y())
+    }
+
     #[test]
     fn composer_control_reader_keeps_footer_text_compact() {
         let reader: ThemeReader = Rc::new(DefaultTheme::default);
@@ -5174,31 +5208,123 @@ mod tests {
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
-        let list_y = || -> sui::Result<f32> {
-            let snapshot = window.snapshot()?;
-            Ok(snapshot
-                .accessibility
-                .nodes
-                .iter()
-                .find(|node| {
-                    node.role == SemanticsRole::List
-                        && node.name.as_deref() == Some("chat-sessions")
-                })
-                .expect("chat sessions list semantics node")
-                .bounds
-                .y())
-        };
 
-        let before_y = list_y()?;
+        let before_y = chat_sessions_list_y(&window)?;
         window
             .get_by_role(SemanticsRole::ScrollView)
             .with_name("chat-sessions-scroll")
             .scroll_pixels(sui::Vector::new(0.0, -260.0))?;
-        let after_y = list_y()?;
+        let after_y = chat_sessions_list_y(&window)?;
 
         assert!(
             after_y < before_y - 100.0,
             "sessions list should move when the SUI ScrollView scrolls: before={before_y}, after={after_y}"
+        );
+
+        let selected_id = shared.chat().sessions[10].id.clone();
+        window
+            .get_by_role(SemanticsRole::ListItem)
+            .with_name("Scrollable chat 10")
+            .with_description("Chat")
+            .click()?;
+        let selected_y = chat_sessions_list_y(&window)?;
+        assert_eq!(shared.chat().session_id, selected_id);
+        assert!(
+            (selected_y - after_y).abs() < 2.0,
+            "selecting a chat rebuilds the sidebar but should preserve scroll position: before_select={after_y}, after_select={selected_y}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn chat_sessions_scroll_state_clamps_after_list_shrinks() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let root = temp_chat_data_dir("sessions-scroll-clamp");
+        {
+            let mut chat = shared.chat_mut();
+            chat.data_dir = Arc::new(SinomoDataDir::new(&root));
+            chat.sessions = (0..48)
+                .map(|index| SessionRef {
+                    id: SessionId::generate().to_string(),
+                    title: format!("Clamp chat {index:02}"),
+                    kind: ConversationKind::Chat,
+                    updated_unix: index,
+                    participant_count: 1,
+                })
+                .collect();
+            chat.session_id = chat.sessions[0].id.clone();
+            chat.models_loading = false;
+        }
+
+        let theme_reader: ThemeReader = {
+            let s = shared.clone();
+            Rc::new(move || s.theme())
+        };
+        let scroll_state = ScrollState::new();
+        let shrink = {
+            let s = shared.clone();
+            sui::Button::new("Shrink")
+                .theme_when(clone_reader(&theme_reader))
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().sessions.truncate(18);
+                    use sui::{InvalidationKind, InvalidationRequest, InvalidationTarget};
+                    let window = InvalidationTarget::Window(ctx.window_id());
+                    ctx.request(InvalidationRequest::new(window, InvalidationKind::Measure));
+                    ctx.request(InvalidationRequest::new(window, InvalidationKind::Arrange));
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                })
+        };
+        let root_widget = Flex::horizontal()
+            .align_items(Alignment::Stretch)
+            .with_item(
+                sidebar(&shared, &theme_reader, &scroll_state),
+                FlexItem::fixed(SIDEBAR_W),
+            )
+            .with_item(shrink, FlexItem::fixed(120.0));
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat sessions scroll clamp")
+                    .root(root_widget),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::ScrollView)
+            .with_name("chat-sessions-scroll")
+            .scroll_pixels(sui::Vector::new(0.0, -2000.0))?;
+        let before_offset = scroll_state.current_offset().y;
+        let before_max = scroll_state.max_offset().y;
+        assert!(
+            before_offset > 100.0,
+            "test setup should start scrolled away from the top"
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Shrink")
+            .click()?;
+        let after_offset = scroll_state.current_offset().y;
+        let after_max = scroll_state.max_offset().y;
+
+        assert!(
+            after_max < before_max,
+            "shrinking the chat list should reduce the maximum offset"
+        );
+        assert!(
+            after_offset <= after_max + 1.0,
+            "scroll offset should clamp to the shorter list: offset={after_offset}, max={after_max}"
+        );
+        assert!(
+            after_offset > 0.0,
+            "shrinking the chat list should not reset scroll to the top while content still overflows"
         );
 
         let _ = fs::remove_dir_all(root);
