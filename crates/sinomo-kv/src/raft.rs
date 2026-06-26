@@ -85,7 +85,11 @@ pub struct RaftAppendEntriesRequest {
     pub leader_id: NodeId,
     pub prev_log_index: u64,
     pub prev_log_term: u64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_fallible_vec"
+    )]
     pub entries: Vec<KvLogEntry>,
     pub leader_commit: u64,
 }
@@ -145,14 +149,104 @@ pub struct ClusterKvRaftConfigRecord {
     pub cluster_id: Id,
     pub term: u64,
     pub kv_revision: u64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_fallible_vec"
+    )]
     pub voters: Vec<NodeId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_fallible_vec"
+    )]
     pub learners: Vec<NodeId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_fallible_vec"
+    )]
     pub non_voting: Vec<NodeId>,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RaftNodeIdSet {
+    node_ids: BTreeSet<NodeId>,
+}
+
+impl RaftNodeIdSet {
+    fn from_iter(
+        node_ids: impl IntoIterator<Item = NodeId>,
+        operation: &str,
+    ) -> Result<Self, KvError> {
+        let mut set = Self::default();
+        for node_id in node_ids {
+            set.try_insert_owned(node_id, operation)?;
+        }
+        Ok(set)
+    }
+
+    fn len(&self) -> usize {
+        self.node_ids.len()
+    }
+
+    fn contains(&self, node_id: &NodeId) -> bool {
+        self.node_ids.contains(node_id)
+    }
+
+    fn try_insert_owned(&mut self, node_id: NodeId, operation: &str) -> Result<bool, KvError> {
+        let _ = operation;
+        Ok(self.node_ids.insert(node_id))
+    }
+
+    fn try_insert_clone(&mut self, node_id: &NodeId, operation: &str) -> Result<bool, KvError> {
+        Ok(self
+            .node_ids
+            .insert(try_clone_kv_node_id(node_id, operation)?))
+    }
+}
+
+fn node_id_slice_contains(node_ids: &[NodeId], node_id: &NodeId) -> bool {
+    node_ids.iter().any(|candidate| candidate == node_id)
+}
+
+fn unique_node_id_count(node_ids: &[NodeId]) -> usize {
+    let mut count = 0;
+    for (index, node_id) in node_ids.iter().enumerate() {
+        if node_id_slice_contains(&node_ids[..index], node_id) {
+            continue;
+        }
+        count += 1;
+    }
+    count
+}
+
+fn unique_node_id_overlap_count(left: &[NodeId], right: &[NodeId]) -> usize {
+    let mut count = 0;
+    for (index, node_id) in left.iter().enumerate() {
+        if node_id_slice_contains(&left[..index], node_id) {
+            continue;
+        }
+        if node_id_slice_contains(right, node_id) {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn try_push_unique_node_id(
+    node_ids: &mut Vec<NodeId>,
+    node_id: &NodeId,
+    operation: &str,
+) -> Result<(), KvError> {
+    if node_id_slice_contains(node_ids, node_id) {
+        return Ok(());
+    }
+    try_reserve_kv_items(node_ids, 1, operation)?;
+    node_ids.push(try_clone_kv_node_id(node_id, operation)?);
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -224,17 +318,36 @@ pub fn cluster_kv_raft_local_is_voter(state: &ClusterBootstrapState) -> bool {
     cluster_kv_raft_node_is_voter(state, &state.local_node_id)
 }
 
-pub fn cluster_kv_raft_voter_ids(state: &ClusterBootstrapState) -> BTreeSet<NodeId> {
-    state
+pub fn cluster_kv_raft_voter_ids(state: &ClusterBootstrapState) -> Result<Vec<NodeId>, KvError> {
+    let voter_count = state
         .members
         .iter()
         .filter(|member| cluster_kv_raft_node_is_voter(state, &member.node_id))
-        .map(|member| member.node_id.clone())
-        .collect()
+        .count();
+    let mut voters = Vec::new();
+    try_reserve_kv_items(&mut voters, voter_count, "collect cluster raft voters")?;
+    for member in state
+        .members
+        .iter()
+        .filter(|member| cluster_kv_raft_node_is_voter(state, &member.node_id))
+    {
+        voters.push(try_clone_kv_node_id(
+            &member.node_id,
+            "collect cluster raft voters",
+        )?);
+    }
+    voters.sort_unstable();
+    voters.dedup();
+    Ok(voters)
 }
 
 pub fn cluster_kv_raft_quorum_size_for_state(state: &ClusterBootstrapState) -> usize {
-    cluster_kv_raft_quorum_size(cluster_kv_raft_voter_ids(state).len())
+    let voter_count = state
+        .members
+        .iter()
+        .filter(|member| cluster_kv_raft_node_is_voter(state, &member.node_id))
+        .count();
+    cluster_kv_raft_quorum_size(voter_count)
 }
 
 pub fn cluster_kv_raft_config_key() -> String {
@@ -294,20 +407,19 @@ pub fn validate_cluster_kv_raft_config_transition(
             ),
         });
     }
-    let current_voters = current.voters.iter().cloned().collect::<BTreeSet<_>>();
-    let next_voters = next.voters.iter().cloned().collect::<BTreeSet<_>>();
-    let removed_voters = current_voters
-        .difference(&next_voters)
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut removed_voters = Vec::new();
+    for voter in current
+        .voters
+        .iter()
+        .filter(|voter| !node_id_slice_contains(&next.voters, voter))
+    {
+        try_push_unique_node_id(&mut removed_voters, voter, "validate raft removed voters")?;
+    }
     if !removed_voters.is_empty() {
-        let retained_voters = current_voters
-            .intersection(&next_voters)
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let current_quorum = cluster_kv_raft_quorum_size(current_voters.len());
-        let next_quorum = cluster_kv_raft_quorum_size(next_voters.len());
-        if retained_voters.len() < current_quorum || retained_voters.len() < next_quorum {
+        let retained_voters = unique_node_id_overlap_count(&current.voters, &next.voters);
+        let current_quorum = cluster_kv_raft_quorum_size(unique_node_id_count(&current.voters));
+        let next_quorum = cluster_kv_raft_quorum_size(unique_node_id_count(&next.voters));
+        if retained_voters < current_quorum || retained_voters < next_quorum {
             return Err(KvError::InvalidRaftConfigTransition {
                 detail: format!(
                     "raft voter removal requires overlapping old/new quorum; refusing to remove {}",
@@ -320,10 +432,14 @@ pub fn validate_cluster_kv_raft_config_transition(
             });
         }
     }
-    let added_voters = next_voters
-        .difference(&current_voters)
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut added_voters = Vec::new();
+    for voter in next
+        .voters
+        .iter()
+        .filter(|voter| !node_id_slice_contains(&current.voters, voter))
+    {
+        try_push_unique_node_id(&mut added_voters, voter, "validate raft added voters")?;
+    }
     if added_voters.len() > 1 {
         return Err(KvError::InvalidRaftConfigTransition {
             detail: format!(
@@ -333,12 +449,12 @@ pub fn validate_cluster_kv_raft_config_transition(
         });
     }
     if let Some(added_voter) = added_voters.first() {
-        let current_learners = current
+        if !current
             .learners
             .iter()
             .chain(current.non_voting.iter())
-            .collect::<BTreeSet<_>>();
-        if !current_learners.contains(added_voter) {
+            .any(|node_id| node_id == added_voter)
+        {
             return Err(KvError::InvalidRaftConfigTransition {
                 detail: format!(
                     "raft voter `{added_voter}` must already be a committed learner or non-voting member before promotion"
@@ -359,15 +475,19 @@ pub fn elect_cluster_kv_raft_leader_with_host<H>(
 where
     H: ClusterKvRaftLeaderElectionHost,
 {
-    let voter_ids = voter_ids.into_iter().collect::<BTreeSet<_>>();
+    let voter_ids = RaftNodeIdSet::from_iter(voter_ids, "collect raft election voters")?;
     if !voter_ids.contains(local_node_id) {
         return Ok(false);
     }
     let quorum_size = cluster_kv_raft_quorum_size(voter_ids.len());
-    let remote_vote_targets = remote_vote_targets
-        .into_iter()
-        .filter(|voter_id| voter_id != local_node_id && voter_ids.contains(voter_id))
-        .collect::<Vec<_>>();
+    let mut remote_vote_targets_vec = Vec::new();
+    for voter_id in remote_vote_targets {
+        if voter_id != *local_node_id && voter_ids.contains(&voter_id) {
+            try_reserve_kv_items(&mut remote_vote_targets_vec, 1, "collect raft vote targets")?;
+            remote_vote_targets_vec.push(voter_id);
+        }
+    }
+    let remote_vote_targets = remote_vote_targets_vec;
 
     for _ in 0..options.max_attempts {
         host.begin_election_attempt()?;
@@ -377,15 +497,23 @@ where
             .saturating_add(CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP);
         let vote_request = RaftRequestVoteRequest {
             term: election_term,
-            candidate_id: local_node_id.clone(),
+            candidate_id: try_clone_kv_node_id(local_node_id, "build raft election vote request")?,
             last_log_index: metadata.last_log_index,
             last_log_term: metadata.last_log_term,
         };
-        let local_vote = host.apply_local_vote(vote_request.clone())?;
+        let local_vote = host.apply_local_vote(RaftRequestVoteRequest {
+            term: vote_request.term,
+            candidate_id: try_clone_kv_node_id(
+                &vote_request.candidate_id,
+                "apply local raft vote",
+            )?,
+            last_log_index: vote_request.last_log_index,
+            last_log_term: vote_request.last_log_term,
+        })?;
         let mut highest_observed_term = local_vote.term.max(election_term);
-        let mut granted = BTreeSet::new();
+        let mut granted = RaftNodeIdSet::default();
         if local_vote.vote_granted {
-            granted.insert(local_node_id.clone());
+            granted.try_insert_clone(local_node_id, "record local raft vote")?;
         }
 
         for (target_index, voter_id) in remote_vote_targets.iter().enumerate() {
@@ -401,7 +529,7 @@ where
             };
             highest_observed_term = highest_observed_term.max(response.term);
             if response.vote_granted {
-                granted.insert(voter_id.clone());
+                granted.try_insert_clone(voter_id, "record remote raft vote")?;
             }
         }
 
@@ -464,15 +592,23 @@ pub async fn elect_cluster_kv_raft_leader_async_with_host<H>(
 where
     H: ClusterKvRaftLeaderElectionAsyncHost,
 {
-    let voter_ids = voter_ids.into_iter().collect::<BTreeSet<_>>();
+    let voter_ids = RaftNodeIdSet::from_iter(voter_ids, "collect async raft election voters")?;
     if !voter_ids.contains(local_node_id) {
         return Ok(false);
     }
     let quorum_size = cluster_kv_raft_quorum_size(voter_ids.len());
-    let remote_vote_targets = remote_vote_targets
-        .into_iter()
-        .filter(|voter_id| voter_id != local_node_id && voter_ids.contains(voter_id))
-        .collect::<Vec<_>>();
+    let mut remote_vote_targets_vec = Vec::new();
+    for voter_id in remote_vote_targets {
+        if voter_id != *local_node_id && voter_ids.contains(&voter_id) {
+            try_reserve_kv_items(
+                &mut remote_vote_targets_vec,
+                1,
+                "collect async raft vote targets",
+            )?;
+            remote_vote_targets_vec.push(voter_id);
+        }
+    }
+    let remote_vote_targets = remote_vote_targets_vec;
 
     for _ in 0..options.max_attempts {
         host.begin_election_attempt_async().await?;
@@ -482,15 +618,28 @@ where
             .saturating_add(CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP);
         let vote_request = RaftRequestVoteRequest {
             term: election_term,
-            candidate_id: local_node_id.clone(),
+            candidate_id: try_clone_kv_node_id(
+                local_node_id,
+                "build async raft election vote request",
+            )?,
             last_log_index: metadata.last_log_index,
             last_log_term: metadata.last_log_term,
         };
-        let local_vote = host.apply_local_vote_async(vote_request.clone()).await?;
+        let local_vote = host
+            .apply_local_vote_async(RaftRequestVoteRequest {
+                term: vote_request.term,
+                candidate_id: try_clone_kv_node_id(
+                    &vote_request.candidate_id,
+                    "apply local async raft vote",
+                )?,
+                last_log_index: vote_request.last_log_index,
+                last_log_term: vote_request.last_log_term,
+            })
+            .await?;
         let mut highest_observed_term = local_vote.term.max(election_term);
-        let mut granted = BTreeSet::new();
+        let mut granted = RaftNodeIdSet::default();
         if local_vote.vote_granted {
-            granted.insert(local_node_id.clone());
+            granted.try_insert_clone(local_node_id, "record local async raft vote")?;
         }
 
         for (target_index, voter_id) in remote_vote_targets.iter().enumerate() {
@@ -508,7 +657,7 @@ where
             };
             highest_observed_term = highest_observed_term.max(response.term);
             if response.vote_granted {
-                granted.insert(voter_id.clone());
+                granted.try_insert_clone(voter_id, "record remote async raft vote")?;
             }
         }
 
@@ -957,9 +1106,9 @@ where
         }
     };
 
-    let mut voter_acks = BTreeSet::new();
+    let mut voter_acks = RaftNodeIdSet::default();
     if cluster_kv_raft_local_is_voter(state) {
-        voter_acks.insert(state.local_node_id.clone());
+        voter_acks.try_insert_clone(&state.local_node_id, "record local raft commit ack")?;
     }
     let quorum_size = cluster_kv_raft_quorum_size_for_state(state);
     let mut failures = Vec::new();
@@ -988,7 +1137,10 @@ where
                     ClusterKvRaftTargetReplicationStatus::Accepted,
                     Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
                 )?;
-                voter_acks.insert(host.target_node_id(target).clone());
+                voter_acks.try_insert_clone(
+                    host.target_node_id(target),
+                    "record remote raft commit ack",
+                )?;
                 host.observe_accepted_append_state(state, target, response.state)?;
             }
             Ok(response) => {
@@ -1074,9 +1226,9 @@ where
         }
     };
 
-    let mut voter_acks = BTreeSet::new();
+    let mut voter_acks = RaftNodeIdSet::default();
     if cluster_kv_raft_local_is_voter(state) {
-        voter_acks.insert(state.local_node_id.clone());
+        voter_acks.try_insert_clone(&state.local_node_id, "record local async raft commit ack")?;
     }
     let quorum_size = cluster_kv_raft_quorum_size_for_state(state);
     let mut failures = Vec::new();
@@ -1109,7 +1261,10 @@ where
                     Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
                 )
                 .await?;
-                voter_acks.insert(host.target_node_id(target).clone());
+                voter_acks.try_insert_clone(
+                    host.target_node_id(target),
+                    "record remote async raft commit ack",
+                )?;
                 host.observe_accepted_append_state_async(state, target, response.state)
                     .await?;
             }
@@ -1555,27 +1710,29 @@ impl ClusterKvRaftStore {
             || earliest_log_index.is_some_and(|first| prev_log_index >= first);
         let include_snapshot = node.snapshot_index() > 0 && !prev_log_resolvable;
         let (snapshot, prev_log_index, entries) = if include_snapshot {
-            let mut kv = node.store().snapshot();
+            let mut kv = node.store().try_snapshot()?;
             compact_kv_snapshot_event_history(&mut kv, MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS);
             let snapshot = RaftSnapshot {
                 last_included_index: node.applied_index(),
                 last_included_term: node.term_at(node.applied_index()).unwrap_or(1),
                 kv,
             };
-            let entries = node
+            let mut entries = Vec::new();
+            for entry in node
                 .log()
                 .iter()
                 .filter(|entry| entry.index > snapshot.last_included_index)
-                .cloned()
-                .collect::<Vec<_>>();
+            {
+                try_reserve_kv_items(&mut entries, 1, "build raft append snapshot tail")?;
+                entries.push(entry.clone());
+            }
             (Some(snapshot), node.applied_index(), entries)
         } else {
-            let entries = node
-                .log()
-                .iter()
-                .filter(|entry| entry.index >= next_index)
-                .cloned()
-                .collect::<Vec<_>>();
+            let mut entries = Vec::new();
+            for entry in node.log().iter().filter(|entry| entry.index >= next_index) {
+                try_reserve_kv_items(&mut entries, 1, "build raft append tail")?;
+                entries.push(entry.clone());
+            }
             (None, prev_log_index, entries)
         };
         let prev_log_term = node.term_at(prev_log_index).unwrap_or(0);
@@ -1864,7 +2021,11 @@ impl ClusterKvRaftStore {
         let mut node = self.open_node(node_id)?;
         let changed = node.observe_term(term)?;
         self.compact_node_if_needed(&mut node)?;
-        Ok(changed.then(|| node.store().snapshot()))
+        if changed {
+            Ok(Some(node.store().try_snapshot()?))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn observe_term_and_write_snapshot_if_changed(
@@ -1896,7 +2057,7 @@ impl ClusterKvRaftStore {
         let mut node = self.open_node(node_id)?;
         node.become_leader(term)?;
         self.compact_node_if_needed(&mut node)?;
-        Ok(node.store().snapshot())
+        node.store().try_snapshot()
     }
 
     pub fn set_leader_and_write_snapshot_if_changed(
@@ -1924,7 +2085,7 @@ impl ClusterKvRaftStore {
         let mut node = self.open_node(node_id)?;
         node.clear_known_leader()?;
         self.compact_node_if_needed(&mut node)?;
-        Ok(node.store().snapshot())
+        node.store().try_snapshot()
     }
 
     pub fn clear_leader_and_write_snapshot_if_changed(
@@ -1965,8 +2126,8 @@ impl ClusterKvRaftStore {
         node.commit_to(entry.index)?;
         let txn_response = node.txn_response_at(entry.index).cloned();
         self.compact_node_if_needed(&mut node)?;
-        let snapshot = node.store().snapshot();
-        let events = Self::events_after_revision(&snapshot, before_revision);
+        let snapshot = node.store().try_snapshot()?;
+        let events = Self::events_after_revision(&snapshot, before_revision)?;
         Ok(ClusterKvRaftCommitResult {
             snapshot,
             txn_response,
@@ -2161,7 +2322,7 @@ impl ClusterKvRaftStore {
         node.discard_uncommitted_tail()?;
         node.clear_known_leader()?;
         self.compact_node_if_needed(&mut node)?;
-        Ok(node.store().snapshot())
+        node.store().try_snapshot()
     }
 
     pub fn discard_uncommitted_tail_and_clear_leader_and_publish_report(
@@ -2191,8 +2352,8 @@ impl ClusterKvRaftStore {
         node.commit_to(commit_index)?;
         let txn_response = node.txn_response_at(commit_index).cloned();
         self.compact_node_if_needed(&mut node)?;
-        let snapshot = node.store().snapshot();
-        let events = Self::events_after_revision(&snapshot, before_revision);
+        let snapshot = node.store().try_snapshot()?;
+        let events = Self::events_after_revision(&snapshot, before_revision)?;
         Ok(ClusterKvRaftCommitResult {
             snapshot,
             txn_response,
@@ -2249,7 +2410,7 @@ impl ClusterKvRaftStore {
         match command {
             KvCommand::Op(op) => {
                 if node.store().op_response_if_no_effect(op)?.is_some() {
-                    return Ok(Some((node.store().snapshot(), None)));
+                    return Ok(Some((node.store().try_snapshot()?, None)));
                 }
             }
             KvCommand::Txn(txn) => {
@@ -2257,20 +2418,27 @@ impl ClusterKvRaftStore {
                     .store()
                     .txn_response_if_selected_branch_no_effect(txn)?
                 {
-                    return Ok(Some((node.store().snapshot(), Some(response))));
+                    return Ok(Some((node.store().try_snapshot()?, Some(response))));
                 }
             }
         }
         Ok(None)
     }
 
-    fn events_after_revision(snapshot: &KvSnapshot, before_revision: KvRevision) -> Vec<KvEvent> {
-        snapshot
+    fn events_after_revision(
+        snapshot: &KvSnapshot,
+        before_revision: KvRevision,
+    ) -> Result<Vec<KvEvent>, KvError> {
+        let mut events = Vec::new();
+        for event in snapshot
             .events
             .iter()
             .filter(|event| event.revision > before_revision)
-            .cloned()
-            .collect()
+        {
+            try_reserve_kv_items(&mut events, 1, "collect committed raft events")?;
+            events.push(event.clone());
+        }
+        Ok(events)
     }
 }
 
@@ -2414,9 +2582,9 @@ impl DurableRaftKvNode {
                 applied_index: 0,
                 snapshot_index: 0,
                 snapshot_term: 0,
-                txn_responses: BTreeMap::new(),
+                txn_responses: KvTxnResponseIndex::default(),
             };
-            node.install_snapshot(snapshot);
+            node.install_snapshot(snapshot)?;
             node.hard_state.current_term = hard_state.current_term;
             node.hard_state.voted_for = hard_state.voted_for;
             node.hard_state.leader_id = hard_state.leader_id;
@@ -2431,7 +2599,7 @@ impl DurableRaftKvNode {
                 applied_index: 0,
                 snapshot_index: 0,
                 snapshot_term: 0,
-                txn_responses: BTreeMap::new(),
+                txn_responses: KvTxnResponseIndex::default(),
             }
         };
         let committed_index = node.hard_state.commit_index.max(node.applied_index);
@@ -2603,7 +2771,7 @@ impl DurableRaftKvNode {
     }
 
     pub fn txn_response_at(&self, index: u64) -> Option<&KvTxnResponse> {
-        self.node.txn_responses.get(&index)
+        self.node.txn_responses.get(index)
     }
 
     pub fn append_entries(
@@ -2724,16 +2892,20 @@ impl DurableRaftKvNode {
             }
         }
         let response = self.append_entries(append)?;
-        let snapshot = self.store().snapshot();
+        let snapshot = self.store().try_snapshot()?;
         let committed_events = if snapshot_restored || snapshot.revision == before_revision {
             Vec::new()
         } else {
-            snapshot
+            let mut events = Vec::new();
+            for event in snapshot
                 .events
                 .iter()
                 .filter(|event| event.revision > before_revision)
-                .cloned()
-                .collect()
+            {
+                try_reserve_kv_items(&mut events, 1, "collect append committed events")?;
+                events.push(event.clone());
+            }
+            events
         };
         Ok(RaftAppendEntriesApplyOutcome {
             response,
@@ -2898,7 +3070,7 @@ impl DurableRaftKvNode {
                 .node
                 .term_at(self.node.applied_index)
                 .unwrap_or(self.node.snapshot_term),
-            kv: self.node.store.snapshot(),
+            kv: self.node.store.try_snapshot()?,
         };
         write_object_file(&self.paths.snapshot, &snapshot)?;
         // Local compaction keeps a tail of recent committed entries in memory for
@@ -2920,7 +3092,7 @@ impl DurableRaftKvNode {
         let node_before = self.node.clone();
         let hard_state_before = node_before.hard_state.clone();
         write_object_file(&self.paths.snapshot, &snapshot)?;
-        self.node.install_snapshot(snapshot);
+        self.node.install_snapshot(snapshot)?;
         if let Err(error) = rewrite_wal_entries(&self.paths.wal, &self.node.log) {
             self.node = node_before;
             return Err(error);
@@ -2948,7 +3120,7 @@ impl DurableRaftKvNode {
         node_before: Option<ReplicatedKvNode>,
         hard_state_before: RaftHardState,
         log_before: Vec<KvLogEntry>,
-        txn_responses_before: BTreeMap<u64, KvTxnResponse>,
+        txn_responses_before: KvTxnResponseIndex,
         applied_index_before: u64,
     ) {
         if let Some(node_before) = node_before {

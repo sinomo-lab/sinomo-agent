@@ -12,7 +12,8 @@ use std::fmt::Write;
 use crate::{
     AlignmentHint, Array, ArrayView, Document, DocumentView, ElementType, ElementView, Error,
     Field, LengthMode, List, ListView, Metadata, Object, ObjectView, OptionalValue, OptionalView,
-    Payload, PayloadView, Schema, SchemaField, SchemaType, TypeId, Value,
+    Payload, PayloadView, Schema, SchemaField, SchemaType, TypeId, Value, try_box, try_push_vec,
+    try_string_from_str, try_vec_with_capacity,
 };
 
 pub fn value_to_text(value: &Value) -> String {
@@ -397,6 +398,16 @@ fn length_mode_name(mode: LengthMode) -> &'static str {
     }
 }
 
+fn push_string_char(out: &mut String, ch: char, context: &'static str) -> crate::Result<()> {
+    out.try_reserve(ch.len_utf8())
+        .map_err(|_| Error::ResourceExhausted {
+            context,
+            requested_bytes: out.len().saturating_add(ch.len_utf8()),
+        })?;
+    out.push(ch);
+    Ok(())
+}
+
 struct Parser<'a> {
     input: &'a str,
     pos: usize,
@@ -513,9 +524,9 @@ impl<'a> Parser<'a> {
             "float" | "f32" => self.parse_call_f64().map(|v| Value::Float(v as f32)),
             "double" | "f64" => self.parse_call_f64().map(Value::Double),
             "bytes" => self.parse_bytes_call().map(Value::Bytes),
-            "list" => self.parse_list_after_name().map(Value::list),
-            "array" => self.parse_array_after_name().map(Value::array),
-            "optional" => self.parse_optional_after_name().map(Value::optional),
+            "list" => Value::try_list(self.parse_list_after_name()?),
+            "array" => Value::try_array(self.parse_array_after_name()?),
+            "optional" => Value::try_optional(self.parse_optional_after_name()?),
             _ => Err(self.error("expected value")),
         }
     }
@@ -530,7 +541,7 @@ impl<'a> Parser<'a> {
             let key = self.parse_string()?;
             self.expect_char(':')?;
             let value = self.parse_value()?;
-            fields.push(Field::new(key, value));
+            try_push_vec(&mut fields, Field::new(key, value), "text object fields")?;
             if self.consume_char('}') {
                 break;
             }
@@ -549,7 +560,8 @@ impl<'a> Parser<'a> {
             return Ok(List::new(element_type, values));
         }
         loop {
-            values.push(self.parse_value()?);
+            let value = self.parse_value()?;
+            try_push_vec(&mut values, value, "text list values")?;
             if self.consume_char(']') {
                 break;
             }
@@ -591,7 +603,7 @@ impl<'a> Parser<'a> {
         let value = if self.consume_keyword("none") {
             None
         } else {
-            Some(Box::new(self.parse_value()?))
+            Some(try_box(self.parse_value()?, "text optional inner value")?)
         };
         self.expect_char(')')?;
         if let Some(value) = value.as_deref() {
@@ -630,12 +642,16 @@ impl<'a> Parser<'a> {
             self.expect_char('=')?;
             let fields = self.parse_schema_fields()?;
             self.expect_char(')')?;
-            types.push(SchemaType {
-                id,
-                name,
-                payload_size,
-                fields,
-            });
+            try_push_vec(
+                &mut types,
+                SchemaType {
+                    id,
+                    name,
+                    payload_size,
+                    fields,
+                },
+                "text schema types",
+            )?;
             if self.consume_char(']') {
                 break;
             }
@@ -654,7 +670,11 @@ impl<'a> Parser<'a> {
             let name = self.parse_string()?;
             self.expect_char(':')?;
             let element_type = self.parse_element_type()?;
-            fields.push(SchemaField { name, element_type });
+            try_push_vec(
+                &mut fields,
+                SchemaField { name, element_type },
+                "text schema fields",
+            )?;
             if self.consume_char(']') {
                 break;
             }
@@ -712,19 +732,25 @@ impl<'a> Parser<'a> {
                 self.expect_char('<')?;
                 let inner = self.parse_element_type()?;
                 self.expect_char('>')?;
-                Ok(ElementType::List(Box::new(inner)))
+                Ok(ElementType::List(try_box(inner, "text list element type")?))
             }
             "array" => {
                 self.expect_char('<')?;
                 let inner = self.parse_element_type()?;
                 self.expect_char('>')?;
-                Ok(ElementType::Array(Box::new(inner)))
+                Ok(ElementType::Array(try_box(
+                    inner,
+                    "text array element type",
+                )?))
             }
             "optional" => {
                 self.expect_char('<')?;
                 let inner = self.parse_element_type()?;
                 self.expect_char('>')?;
-                Ok(ElementType::Optional(Box::new(inner)))
+                Ok(ElementType::Optional(try_box(
+                    inner,
+                    "text optional element type",
+                )?))
             }
             "extension" => {
                 self.expect_char('(')?;
@@ -732,7 +758,7 @@ impl<'a> Parser<'a> {
                 self.expect_char(',')?;
                 let data = self.parse_hex_bytes()?;
                 self.expect_char(')')?;
-                Ok(ElementType::extension(id, data))
+                ElementType::try_extension(id, data)
             }
             _ => Err(self.error("expected element type")),
         }
@@ -793,7 +819,8 @@ impl<'a> Parser<'a> {
             return Ok(dimensions);
         }
         loop {
-            dimensions.push(self.parse_u64()?);
+            let dimension = self.parse_u64()?;
+            try_push_vec(&mut dimensions, dimension, "text array dimensions")?;
             if self.consume_char(']') {
                 break;
             }
@@ -816,21 +843,21 @@ impl<'a> Parser<'a> {
                         .next_char()
                         .ok_or_else(|| self.error("unterminated escape"))?;
                     match escaped {
-                        '"' => out.push('"'),
-                        '\\' => out.push('\\'),
-                        'n' => out.push('\n'),
-                        'r' => out.push('\r'),
-                        't' => out.push('\t'),
+                        '"' => push_string_char(&mut out, '"', "text string")?,
+                        '\\' => push_string_char(&mut out, '\\', "text string")?,
+                        'n' => push_string_char(&mut out, '\n', "text string")?,
+                        'r' => push_string_char(&mut out, '\r', "text string")?,
+                        't' => push_string_char(&mut out, '\t', "text string")?,
                         'u' => {
                             let code = self.parse_fixed_hex_u32(4)?;
                             let ch = char::from_u32(code)
                                 .ok_or_else(|| self.error("invalid unicode escape"))?;
-                            out.push(ch);
+                            push_string_char(&mut out, ch, "text string")?;
                         }
                         other => return Err(self.error_at(format!("invalid escape `{other}`"))),
                     }
                 }
-                other => out.push(other),
+                other => push_string_char(&mut out, other, "text string")?,
             }
         }
     }
@@ -875,7 +902,20 @@ impl<'a> Parser<'a> {
         if self.pos == start {
             return Err(self.error("expected number"));
         }
-        Ok(self.input[start..self.pos].replace('_', ""))
+        let raw = &self.input[start..self.pos];
+        if !raw.as_bytes().contains(&b'_') {
+            return try_string_from_str(raw, "text number");
+        }
+        let mut out = String::new();
+        out.try_reserve(raw.len())
+            .map_err(|_| Error::ResourceExhausted {
+                context: "text number",
+                requested_bytes: raw.len(),
+            })?;
+        for ch in raw.chars().filter(|ch| *ch != '_') {
+            push_string_char(&mut out, ch, "text number")?;
+        }
+        Ok(out)
     }
 
     fn parse_hex_u8(&mut self) -> crate::Result<u8> {
@@ -900,15 +940,22 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let raw = self.input[start..self.pos].replace('_', "");
-        if raw.len() % 2 != 0 {
+        let raw = &self.input[start..self.pos];
+        let hex_digits = raw.chars().filter(|ch| *ch != '_').count();
+        if hex_digits % 2 != 0 {
             return Err(self.error("hex byte string must have even length"));
         }
-        let mut bytes = Vec::with_capacity(raw.len() / 2);
-        for index in (0..raw.len()).step_by(2) {
-            let byte = u8::from_str_radix(&raw[index..index + 2], 16)
-                .map_err(|_| self.error("invalid hex byte"))?;
-            bytes.push(byte);
+        let mut bytes = try_vec_with_capacity(hex_digits / 2, "text hex bytes")?;
+        let mut high = None;
+        for ch in raw.chars().filter(|ch| *ch != '_') {
+            let nibble = ch
+                .to_digit(16)
+                .ok_or_else(|| self.error("invalid hex byte"))? as u8;
+            if let Some(high_nibble) = high.take() {
+                try_push_vec(&mut bytes, (high_nibble << 4) | nibble, "text hex bytes")?;
+            } else {
+                high = Some(nibble);
+            }
         }
         Ok(bytes)
     }
@@ -944,7 +991,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        Ok(self.input[start..self.pos].to_owned())
+        try_string_from_str(&self.input[start..self.pos], "text identifier")
     }
 
     fn expect_keyword(&mut self, keyword: &str) -> crate::Result<()> {

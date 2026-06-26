@@ -148,9 +148,19 @@ fn create_new_link_or_unsupported_for_test(
 }
 
 fn network_durable_file_error(error: durable_file::DurableFileError) -> NetworkError {
-    NetworkError::StorageIo {
-        path: error.path().to_string(),
-        detail: error.detail().to_string(),
+    match error {
+        durable_file::DurableFileError::ResourceExhausted {
+            operation,
+            requested_bytes,
+            ..
+        } => NetworkError::ResourceExhausted {
+            operation,
+            requested_bytes,
+        },
+        error => NetworkError::StorageIo {
+            path: error.path().to_string(),
+            detail: error.detail().to_string(),
+        },
     }
 }
 

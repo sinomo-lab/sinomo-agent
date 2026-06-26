@@ -4534,7 +4534,8 @@ fn connectivity_noop_handles_prefix_larger_than_public_range_limit() {
             )
             .expect("seed connectivity");
     }
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("write snapshot");
 
     assert!(
         !cluster_connectivity_sync_is_noop(&paths, &node_a, &[]).expect("noop check"),
@@ -8231,7 +8232,10 @@ fn cluster_member_removal_txns_bound_large_endpoint_prefix_cleanup() {
     assert!(store.get(&member_key).is_none(), "member should be removed");
     assert!(store.get(&policy_key).is_none(), "policy should be removed");
     assert!(
-        store.range_prefix(&endpoint_prefix).is_empty(),
+        store
+            .range_prefix(&endpoint_prefix)
+            .expect("range prefix")
+            .is_empty(),
         "endpoint records should be removed"
     );
 }
@@ -8260,7 +8264,7 @@ fn cleanup_legacy_shadow_daemon_members_removes_only_shadow_only_records() {
         ) -> Result<KvSnapshot, NetworkError> {
             self.commits += 1;
             self.store.txn(txn)?;
-            Ok(self.store.snapshot())
+            Ok(self.store.snapshot().expect("snapshot"))
         }
     }
 
@@ -9350,7 +9354,7 @@ impl ClusterKvTxnQuorumHost for RecordingKvTxnQuorumHost {
 fn forward_test_snapshot(key: &str, value: &[u8]) -> KvSnapshot {
     let mut store = InProcessKvStore::new();
     store.put(key, value.to_vec(), None).expect("seed snapshot");
-    store.snapshot()
+    store.snapshot().expect("snapshot")
 }
 
 fn forward_test_txn_response(revision: KvRevision) -> KvTxnResponse {
@@ -10170,19 +10174,19 @@ fn cluster_kv_snapshot_refresh_driver_prefers_known_state_authority_and_imports_
     let local_snapshot =
         sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("seed local snapshot");
 
-    let mut first_store = InProcessKvStore::restore(local_snapshot.clone());
+    let mut first_store = InProcessKvStore::restore(local_snapshot.clone()).expect("restore");
     first_store
         .put("/refresh/first-peer", b"first".to_vec(), None)
         .expect("first peer snapshot put");
-    let first_snapshot = first_store.snapshot();
-    let mut authority_store = InProcessKvStore::restore(local_snapshot);
+    let first_snapshot = first_store.snapshot().expect("snapshot");
+    let mut authority_store = InProcessKvStore::restore(local_snapshot).expect("restore");
     authority_store
         .put("/refresh/authority/one", b"authority-one".to_vec(), None)
         .expect("authority snapshot put one");
     authority_store
         .put("/refresh/authority/two", b"authority-two".to_vec(), None)
         .expect("authority snapshot put two");
-    let authority_snapshot = authority_store.snapshot();
+    let authority_snapshot = authority_store.snapshot().expect("snapshot");
 
     let mut host = RecordingKvSnapshotRefreshHost {
         known_authority: Some(authority_id.clone()),
@@ -10249,11 +10253,11 @@ fn cluster_kv_snapshot_refresh_local_driver_owns_local_raft_storage() {
     write_cluster_state(&paths, &state).expect("write state");
     let local_snapshot =
         sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("seed local snapshot");
-    let mut remote_store = InProcessKvStore::restore(local_snapshot);
+    let mut remote_store = InProcessKvStore::restore(local_snapshot).expect("restore");
     remote_store
         .put("/refresh/local-driver", b"local-driver".to_vec(), None)
         .expect("remote snapshot put");
-    let remote_snapshot = remote_store.snapshot();
+    let remote_snapshot = remote_store.snapshot().expect("snapshot");
     let mut fetches = Vec::new();
 
     let refreshed = refresh_current_cluster_kv_store_with_local_storage_and_transport(
@@ -11320,7 +11324,7 @@ fn cluster_raft_append_request_only_fans_out_watch_events_missing_from_snapshot(
         "incremental appends already apply and wake the follower's local watch state"
     );
 
-    let mut snapshot = InProcessKvStore::new().snapshot();
+    let mut snapshot = InProcessKvStore::new().snapshot().expect("snapshot");
     snapshot.events = vec![first.clone()];
     request.snapshot = Some(RaftSnapshot {
         last_included_index: 1,
@@ -11351,7 +11355,8 @@ fn cluster_kv_store_reads_materialized_snapshot_without_opening_raft() {
     snapshot_store
         .put("/snapshot-only", b"snapshot".to_vec(), None)
         .expect("seed snapshot store");
-    write_cluster_kv_snapshot(&paths, &snapshot_store.snapshot()).expect("write snapshot");
+    write_cluster_kv_snapshot(&paths, &snapshot_store.snapshot().expect("snapshot"))
+        .expect("write snapshot");
 
     let store = read_cluster_kv_store(&paths).expect("read cluster kv store");
     assert!(store.get("/snapshot-only").is_some());
@@ -11373,7 +11378,8 @@ fn cluster_kv_prefix_range_limited_rejects_large_external_ranges() {
     ] {
         store.put(key, key.as_bytes().to_vec(), None).expect("put");
     }
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("write snapshot");
 
     let entries = read_cluster_kv_prefix_entries_limited(&paths, "/external/range/", 2)
         .expect("within limit");
@@ -11430,7 +11436,8 @@ fn cluster_kv_prefix_range_default_reader_is_bounded() {
             .put(format!("/external/default/{index:05}"), Vec::new(), None)
             .expect("put");
     }
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("write snapshot");
 
     let error =
         read_cluster_kv_prefix_entries(&paths, "/external/default/").expect_err("range limit");
@@ -11479,7 +11486,8 @@ fn cluster_kv_read_views_reject_oversized_internal_prefixes() {
     ] {
         seed_raw_prefix_over_default_limit(&mut store, prefix);
     }
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("write snapshot");
 
     assert_default_range_limit(
         read_cluster_members_from_kv(&paths).expect_err("member range limit"),
@@ -11513,7 +11521,8 @@ fn cluster_kv_prefix_values_reader_is_bounded() {
 
     let mut store = InProcessKvStore::new();
     seed_raw_prefix_over_default_limit(&mut store, "/typed/default/");
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("write snapshot");
 
     let error =
         read_cluster_kv_prefix_entries(&paths, "/typed/default/").expect_err("typed range limit");
@@ -11554,7 +11563,8 @@ fn cluster_kv_store_prefers_local_raft_over_stale_materialized_snapshot() {
     stale_store
         .put("/stale-cache-only", b"cache".to_vec(), None)
         .expect("seed stale cache");
-    write_cluster_kv_snapshot(&paths, &stale_store.snapshot()).expect("write stale snapshot");
+    write_cluster_kv_snapshot(&paths, &stale_store.snapshot().expect("snapshot"))
+        .expect("write stale snapshot");
 
     let snapshot = read_cluster_kv_current_snapshot(&paths).expect("read current snapshot");
     assert!(
@@ -11578,7 +11588,7 @@ fn cluster_kv_store_prefers_local_raft_over_stale_materialized_snapshot() {
     let materialized = read_cluster_kv_snapshot(&paths).expect("read materialized cache");
     assert_eq!(
         materialized.revision,
-        stale_store.snapshot().revision,
+        stale_store.snapshot().expect("snapshot").revision,
         "current reads should not rewrite the materialized cache as a side effect"
     );
     assert!(
@@ -11646,7 +11656,7 @@ fn telemetry_kv_read_views_prefer_newer_materialized_snapshot() {
             None,
         )
         .expect("cache connectivity");
-    let imported_snapshot = imported.snapshot();
+    let imported_snapshot = imported.snapshot().expect("snapshot");
     assert!(
         imported_snapshot.revision > current.revision,
         "test requires a materialized snapshot newer than local raft"
@@ -11720,8 +11730,11 @@ fn telemetry_kv_read_views_keep_current_raft_over_stale_materialized_snapshot() 
         }),
     )
     .expect("seed current raft");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write stale imported snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write stale imported snapshot");
 
     let graph = read_cluster_connectivity_graph_from_kv(&paths).expect("read connectivity graph");
     assert!(
@@ -11900,12 +11913,13 @@ fn imported_volatile_snapshot_delta_defers_materialized_snapshot_until_structura
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync structural state");
     let materialized_baseline = read_cluster_kv_snapshot(&paths).expect("baseline materialized");
 
-    let mut imported_store = InProcessKvStore::restore(materialized_baseline.clone());
+    let mut imported_store =
+        InProcessKvStore::restore(materialized_baseline.clone()).expect("restore");
     let info = build_cluster_network_info_record(&state, &local_node, now, 600);
     imported_store
         .put_serde(cluster_network_info_key(&local_node), &info, None)
         .expect("imported network info");
-    let volatile_snapshot = imported_store.snapshot();
+    let volatile_snapshot = imported_store.snapshot().expect("snapshot");
     assert!(
         volatile_snapshot.revision > materialized_baseline.revision,
         "imported volatile snapshot should advance revision"
@@ -11929,7 +11943,7 @@ fn imported_volatile_snapshot_delta_defers_materialized_snapshot_until_structura
     imported_store
         .put_serde(cluster_member_key(&local_node), &renamed_local, None)
         .expect("imported member update");
-    let structural_snapshot = imported_store.snapshot();
+    let structural_snapshot = imported_store.snapshot().expect("snapshot");
     assert!(
         write_imported_cluster_kv_snapshot_if_changed(&paths, &structural_snapshot)
             .expect("import structural snapshot"),
@@ -12085,8 +12099,11 @@ fn cluster_invitation_read_prefers_raft_over_stale_materialized_snapshot() {
         signature: String::new(),
     };
     sync_cluster_invitation_to_kv(&paths, &invite).expect("sync invitation");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("overwrite stale materialized snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("overwrite stale materialized snapshot");
 
     assert_eq!(
         read_cluster_invitation_from_kv(&paths, &invite.invite_id).expect("read invitation"),
@@ -12724,10 +12741,13 @@ fn accepted_cluster_join_state_from_snapshot_recovers_identityless_invite() {
         signature: String::new(),
     };
 
-    let recovered =
-        accepted_cluster_join_state_from_kv_snapshot(&pending, &invite, &store.snapshot())
-            .expect("read snapshot")
-            .expect("accepted state");
+    let recovered = accepted_cluster_join_state_from_kv_snapshot(
+        &pending,
+        &invite,
+        &store.snapshot().expect("snapshot"),
+    )
+    .expect("read snapshot")
+    .expect("accepted state");
 
     assert_eq!(recovered.cluster_id, actual_cluster);
     let mut reconciled = pending;
@@ -13854,8 +13874,11 @@ fn stable_cluster_invitation_sync_does_not_append_raft_log_entries() {
     let wal_len_after_first = std::fs::metadata(&wal_path)
         .expect("wal after first invite")
         .len();
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("overwrite stale materialized snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("overwrite stale materialized snapshot");
 
     thread::sleep(Duration::from_millis(5));
     let txn = cluster_invitation_publish_txn_from_kv(&paths, &invite).expect("invite txn");
@@ -13911,7 +13934,7 @@ fn stale_cluster_kv_restore_refreshes_materialized_cache_from_raft() {
     .expect("seed raft");
     let current = read_cluster_kv_snapshot(&paths).expect("current snapshot");
 
-    let stale = InProcessKvStore::new().snapshot();
+    let stale = InProcessKvStore::new().snapshot().expect("snapshot");
     write_cluster_kv_snapshot(&paths, &stale).expect("write stale cache");
     assert_eq!(
         read_cluster_kv_snapshot(&paths)
@@ -13928,6 +13951,7 @@ fn stale_cluster_kv_restore_refreshes_materialized_cache_from_raft() {
     assert_eq!(refreshed.revision, current.revision);
     assert!(
         InProcessKvStore::restore(refreshed)
+            .expect("restore")
             .get("/current")
             .is_some()
     );
@@ -15135,7 +15159,7 @@ fn sync_cluster_state_to_kv_with_host_prepares_commits_and_skips_noop() {
             _state: &ClusterBootstrapState,
         ) -> Result<InProcessKvStore, NetworkError> {
             read_cluster_kv_snapshot(paths)
-                .map(InProcessKvStore::restore)
+                .map(|snapshot| InProcessKvStore::restore(snapshot).expect("restore"))
                 .map_err(Into::into)
         }
 
@@ -15232,7 +15256,8 @@ fn cluster_state_sync_txn_diffs_member_endpoint_records() {
     store
         .put_serde(stale_key.clone(), &stale, None)
         .expect("stale endpoint");
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("seed endpoint snapshot");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("seed endpoint snapshot");
 
     let txn = cluster_state_sync_txn(&paths, &state).expect("cluster state sync txn");
     assert!(
@@ -15412,7 +15437,8 @@ fn cluster_state_sync_txn_deletes_replaced_member_identity_records() {
     store
         .put_serde(old_endpoint_key.clone(), &old_endpoint, None)
         .expect("old endpoint");
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("seed duplicate identity");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("seed duplicate identity");
 
     let txn = cluster_state_sync_txn(&paths, &state).expect("cluster state sync txn");
 
@@ -15523,7 +15549,8 @@ fn read_cluster_members_from_kv_allows_large_aggregate_endpoint_sets() {
         member_count * endpoints_per_member > CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
         "fixture should exceed the aggregate endpoint range cap"
     );
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("write snapshot");
 
     let members = read_cluster_members_from_kv(&paths).expect("read members");
     assert_eq!(members.len(), member_count);
@@ -15590,7 +15617,8 @@ fn cluster_state_sync_txn_rejects_oversized_member_endpoint_prefix() {
     );
     let mut store = InProcessKvStore::new();
     seed_member_endpoint_prefix_over_limit(&mut store, &node_id, "sync_limit");
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("seed endpoint snapshot");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("seed endpoint snapshot");
 
     let error = cluster_state_sync_txn(&paths, &state).expect_err("endpoint prefix range limit");
     assert!(matches!(
@@ -15661,8 +15689,9 @@ fn cluster_member_publish_txn_from_snapshot_diffs_endpoint_records() {
         .put_serde(stale_key.clone(), &stale, None)
         .expect("stale endpoint");
 
-    let txn = cluster_member_publish_txn_from_snapshot(&store.snapshot(), &[member])
-        .expect("member publish txn");
+    let txn =
+        cluster_member_publish_txn_from_snapshot(&store.snapshot().expect("snapshot"), &[member])
+            .expect("member publish txn");
 
     assert!(
         txn.success.iter().all(|op| !matches!(
@@ -15714,7 +15743,8 @@ fn cluster_member_publish_matches_kv_rejects_oversized_member_endpoint_prefix() 
         .put_serde(cluster_member_key(&node_id), &member, None)
         .expect("seed member");
     seed_member_endpoint_prefix_over_limit(&mut store, &node_id, "publish_match_limit");
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("seed endpoint snapshot");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("seed endpoint snapshot");
 
     let error = cluster_member_publish_matches_kv(&paths, &[member])
         .expect_err("endpoint prefix range limit");
@@ -15743,8 +15773,9 @@ fn cluster_member_publish_txn_from_snapshot_rejects_oversized_member_endpoint_pr
     let mut store = InProcessKvStore::new();
     seed_member_endpoint_prefix_over_limit(&mut store, &node_id, "publish_txn_limit");
 
-    let error = cluster_member_publish_txn_from_snapshot(&store.snapshot(), &[member])
-        .expect_err("endpoint prefix range limit");
+    let error =
+        cluster_member_publish_txn_from_snapshot(&store.snapshot().expect("snapshot"), &[member])
+            .expect_err("endpoint prefix range limit");
     assert!(matches!(
         error,
         NetworkError::Kv(KvError::RangeLimit {
@@ -15800,7 +15831,7 @@ fn cluster_member_publish_txn_from_snapshot_skips_stable_member_records() {
         )
         .expect("endpoint record");
 
-    let snapshot = store.snapshot();
+    let snapshot = store.snapshot().expect("snapshot");
     let stable = cluster_member_publish_txn_from_snapshot(&snapshot, &[member.clone()])
         .expect("stable member publish txn");
     assert!(
@@ -15905,7 +15936,7 @@ fn cluster_member_publish_treats_mdns_and_observed_sources_as_stable() {
             None,
         )
         .expect("endpoint record");
-    let snapshot = store.snapshot();
+    let snapshot = store.snapshot().expect("snapshot");
     write_cluster_kv_snapshot(&paths, &snapshot).expect("seed snapshot");
 
     assert!(
@@ -15984,7 +16015,7 @@ fn cluster_member_publish_ignores_stable_endpoint_order() {
             .put_serde(cluster_endpoint_key(&node_id, endpoint), endpoint, None)
             .expect("endpoint record");
     }
-    let snapshot = store.snapshot();
+    let snapshot = store.snapshot().expect("snapshot");
     write_cluster_kv_snapshot(&paths, &snapshot).expect("seed snapshot");
 
     assert!(
@@ -16112,7 +16143,7 @@ impl ClusterLocalMemberPublishHost for RecordingClusterLocalMemberPublishHost {
         self.commits += 1;
         let mut store = read_cluster_kv_store(paths)?;
         store.txn(txn)?;
-        let snapshot = store.snapshot();
+        let snapshot = store.snapshot().expect("snapshot");
         write_cluster_kv_snapshot(paths, &snapshot)?;
         Ok(snapshot)
     }
@@ -16381,7 +16412,11 @@ fn local_member_publish_with_host_commits_when_local_voter_has_quorum() {
     state.members[0].capabilities = sinomo_node::main_daemon_capabilities(&state.members[0].role);
     state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
     write_cluster_state(&paths, &state).expect("write state");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot()).expect("empty snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("empty snapshot");
 
     let mut host = RecordingClusterLocalMemberPublishHost {
         has_quorum: true,
@@ -16428,7 +16463,11 @@ fn local_member_publish_async_with_host_commits_when_local_voter_has_quorum() {
     state.members[0].capabilities = sinomo_node::main_daemon_capabilities(&state.members[0].role);
     state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
     write_cluster_state(&paths, &state).expect("write state");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot()).expect("empty snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("empty snapshot");
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -16498,7 +16537,11 @@ fn local_member_publish_with_host_forwards_when_local_commit_is_unavailable() {
     )];
     state.members.push(remote);
     write_cluster_state(&paths, &state).expect("write state");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot()).expect("empty snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("empty snapshot");
     let mut imported_store = InProcessKvStore::new();
     imported_store
         .put("/member/published/by/voter", b"ok".to_vec(), None)
@@ -16510,7 +16553,7 @@ fn local_member_publish_with_host_forwards_when_local_commit_is_unavailable() {
             accepted: true,
             detail: "published".to_string(),
             state: state.clone(),
-            kv_snapshot: Some(imported_store.snapshot()),
+            kv_snapshot: Some(imported_store.snapshot().expect("snapshot")),
         }),
         ..Default::default()
     };
@@ -16579,7 +16622,11 @@ fn local_member_publish_async_with_host_forwards_when_local_commit_is_unavailabl
     )];
     state.members.push(remote);
     write_cluster_state(&paths, &state).expect("write state");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot()).expect("empty snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("empty snapshot");
     let mut imported_store = InProcessKvStore::new();
     imported_store
         .put("/member/async/published/by/voter", b"ok".to_vec(), None)
@@ -16595,7 +16642,7 @@ fn local_member_publish_async_with_host_forwards_when_local_commit_is_unavailabl
             accepted: true,
             detail: "published".to_string(),
             state: state.clone(),
-            kv_snapshot: Some(imported_store.snapshot()),
+            kv_snapshot: Some(imported_store.snapshot().expect("snapshot")),
         }),
         ..Default::default()
     };
@@ -18823,28 +18870,6 @@ fn cluster_state_read_rejects_prefixed_or_truncated_file_bytes() {
 }
 
 #[test]
-fn cluster_state_read_rejects_oversized_object_file_before_reading() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-cluster-state-oversized");
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-    std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&paths.state)
-        .expect("open oversized state")
-        .set_len(MAX_OBJECT_FILE_READ_BYTES + 1)
-        .expect("make sparse oversized state");
-
-    let error = read_cluster_state(&paths).expect_err("oversized object file should be rejected");
-    assert!(
-        matches!(error, NetworkError::StorageIo { ref detail, .. } if detail.contains("max is")),
-        "unexpected error for oversized state: {error}"
-    );
-}
-
-#[test]
 fn cluster_state_load_preserves_newer_local_member_records() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-cluster-state-merge");
     let data_dir = SinomoDataDir::new(&root);
@@ -19214,7 +19239,7 @@ fn expire_cluster_network_records_handles_prefix_larger_than_public_range_limit(
         }
     }
     let first_batch = crate::control_plane_adapters::cluster_network_expiry_delete_ops(
-        &store.snapshot(),
+        &store.snapshot().expect("snapshot"),
         now,
         sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
     );
@@ -19223,7 +19248,8 @@ fn expire_cluster_network_records_handles_prefix_larger_than_public_range_limit(
         sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
         "expiry planning should return one bounded mutation batch"
     );
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write large snapshot");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("write large snapshot");
 
     read_cluster_kv_prefix_entries(&paths, "/cluster/network/connectivity/")
         .expect_err("public range reader should reject the oversized prefix");
@@ -19301,7 +19327,8 @@ fn expire_cluster_network_record_ops_returns_bounded_compare_batches() {
             _ => unreachable!("put_serde creates put op"),
         }
     }
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write large snapshot");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("write large snapshot");
 
     let (compares, success) =
         expire_cluster_network_record_ops(&paths, &state, now).expect("expire ops");
@@ -19344,7 +19371,7 @@ impl ClusterNetworkRecordExpiryHost for RecordingNetworkRecordExpiryHost {
         self.last_txn = Some(txn.clone());
         let mut store = read_cluster_kv_store(paths)?;
         store.txn(txn)?;
-        let snapshot = store.snapshot();
+        let snapshot = store.snapshot().expect("snapshot");
         write_cluster_kv_snapshot(paths, &snapshot)?;
         Ok(snapshot)
     }
@@ -19393,7 +19420,8 @@ fn expire_cluster_network_records_with_host_delegates_commit() {
     store
         .put_serde(key.clone(), &record, None)
         .expect("seed connectivity record");
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("write snapshot");
 
     let mut host = RecordingNetworkRecordExpiryHost::default();
     let expired =
@@ -19467,7 +19495,8 @@ fn connectivity_full_sync_batch_skips_exact_expired_noop() {
             None,
         )
         .expect("seed expired connectivity");
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("write snapshot");
 
     let ops = cluster_connectivity_full_sync_batch_ops(
         &paths,
@@ -19531,7 +19560,8 @@ fn connectivity_full_sync_plans_bounded_batches() {
             .expect("seed stale connectivity");
         stale_keys.push(key);
     }
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("write snapshot");
 
     let incoming_target =
         NodeId::from_legacy_named("node_connectivity_bounded_target_incoming").expect("target");
@@ -19790,7 +19820,7 @@ impl ClusterConnectivityPublishAsyncHost for ForwardingOnlyConnectivityPublishAs
             if self.apply_commits {
                 self.voter_store.txn(txn).map_err(NetworkError::from)?;
             }
-            Ok(self.voter_store.snapshot())
+            Ok(self.voter_store.snapshot().expect("snapshot"))
         })
     }
 }
@@ -19954,7 +19984,8 @@ fn connectivity_full_sync_batches_large_stale_deletions() {
             _ => unreachable!("put_serde creates put op"),
         }
     }
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write large snapshot");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("write large snapshot");
 
     sync_cluster_connectivity_records_to_kv(&paths, &source_node, Vec::new())
         .expect("batch stale connectivity deletes");
@@ -20016,7 +20047,8 @@ fn connectivity_sync_refreshes_stable_records_near_expiry() {
             None,
         )
         .expect("stored connectivity");
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("cluster kv snapshot");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("cluster kv snapshot");
 
     let ops = cluster_connectivity_full_sync_batch_ops(
         &paths,
@@ -20043,7 +20075,8 @@ fn connectivity_sync_refreshes_stable_records_near_expiry() {
             None,
         )
         .expect("fresh stored connectivity");
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("fresh cluster kv snapshot");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("fresh cluster kv snapshot");
     let ops = cluster_connectivity_full_sync_batch_ops(
         &paths,
         &source_node_id,
@@ -20241,8 +20274,11 @@ fn cluster_kv_watch_event_fanout_skips_storage_without_active_watchers() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write empty snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write empty snapshot");
     assert!(
         !paths.kv_watches.exists(),
         "test setup should not have any watch registrations"
@@ -20375,8 +20411,11 @@ fn cluster_kv_watch_events_receiver_skips_storage_without_active_watchers() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write empty snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write empty snapshot");
     let cluster_id =
         ClusterId::from_legacy_named("cluster_network_watch_events_receiver").expect("cluster");
     let leader_id =
@@ -20430,8 +20469,11 @@ fn cluster_kv_watch_event_fanout_reuses_active_registration_cache() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write empty snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write empty snapshot");
 
     let watch = create_cluster_kv_watch(
         &paths.kv_paths(),
@@ -21235,8 +21277,11 @@ fn cluster_kv_watch_drain_reads_current_raft_view_when_snapshot_is_stale() {
         }),
     )
     .expect("append current raft value");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("overwrite stale materialized snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("overwrite stale materialized snapshot");
 
     let watch = create_cluster_kv_watch(
         &paths.kv_paths(),
@@ -21511,8 +21556,11 @@ fn cluster_kv_watch_drain_waits_for_fanned_out_events() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
         &paths.kv_paths(),
         cluster_kv_watch_test_node_id(),
@@ -21568,8 +21616,11 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
         &paths.kv_paths(),
         cluster_kv_watch_test_node_id(),
@@ -21706,8 +21757,11 @@ fn cluster_kv_watch_long_poll_ignores_other_matching_watch_notification() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
     let watch_a = create_cluster_kv_watch(
         &paths.kv_paths(),
         cluster_kv_watch_test_node_id(),
@@ -21892,8 +21946,11 @@ fn cluster_kv_watch_drain_payload_limit_does_not_skip_events() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
         &paths.kv_paths(),
         cluster_kv_watch_test_node_id(),
@@ -21948,8 +22005,11 @@ fn cluster_kv_watch_drain_payload_limit_keeps_revision_groups() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
         &paths.kv_paths(),
         cluster_kv_watch_test_node_id(),
@@ -22018,7 +22078,7 @@ fn cluster_kv_watch_drain_deduplicates_snapshot_and_fanout_events() {
     store
         .put("/watch/dedup/one", b"one".to_vec(), None)
         .expect("put watched value");
-    let snapshot = store.snapshot();
+    let snapshot = store.snapshot().expect("snapshot");
     let duplicate = snapshot.events.first().expect("snapshot event").clone();
     write_cluster_kv_snapshot(&paths, &snapshot).expect("write snapshot");
     assert_eq!(
@@ -22067,8 +22127,11 @@ fn cluster_kv_watch_drain_long_poll_avoids_redundant_pre_wait_poll() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
         &paths.kv_paths(),
         cluster_kv_watch_test_node_id(),
@@ -22104,8 +22167,11 @@ fn cluster_kv_watch_drain_zero_timeout_reuses_empty_result_until_change() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
         &paths.kv_paths(),
         cluster_kv_watch_test_node_id(),
@@ -22184,7 +22250,7 @@ fn write_cluster_kv_snapshot_identical_does_not_wake_waiting_watch() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    let snapshot = InProcessKvStore::new().snapshot();
+    let snapshot = InProcessKvStore::new().snapshot().expect("snapshot");
     write_cluster_kv_snapshot(&paths, &snapshot).expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
         &paths.kv_paths(),
@@ -22239,8 +22305,11 @@ fn cluster_kv_watch_cancel_wakes_waiting_drain() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
         &paths.kv_paths(),
         cluster_kv_watch_test_node_id(),
@@ -22296,8 +22365,11 @@ fn cluster_kv_watch_drain_reports_unknown_watch_for_missing_registration() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
     let watch_id = WatchId(42);
     let error = drain_cluster_kv_watch(
         &paths.kv_paths(),
@@ -22332,8 +22404,11 @@ fn cluster_kv_watch_drain_waits_for_local_raft_commit() {
         now,
     );
     write_cluster_state(&paths, &state).expect("write state");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
         &paths.kv_paths(),
         node_id.clone(),
@@ -22393,8 +22468,11 @@ fn cluster_kv_watch_create_allocates_unique_ids_concurrently() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
     let threads = 16;
     let barrier = Arc::new(Barrier::new(threads));
     let handles = (0..threads)
@@ -22451,8 +22529,11 @@ fn cluster_kv_watch_cancel_removes_registration_without_reusing_id() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
 
     let first = create_cluster_kv_watch(
         &paths.kv_paths(),
@@ -22522,8 +22603,11 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
 
     let first = create_cluster_kv_watch(
         &paths.kv_paths(),
@@ -22600,8 +22684,11 @@ fn create_cluster_kv_watch_rescans_after_watch_directory_changes() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
 
     create_cluster_kv_watch(
         &paths.kv_paths(),
@@ -22646,8 +22733,11 @@ fn create_cluster_kv_watch_rolls_back_registration_after_allocator_persist_failu
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
 
     fail_next_cluster_kv_watch_allocator_persist_for_test(&paths.kv_paths());
     let error = create_cluster_kv_watch(
@@ -22694,8 +22784,11 @@ fn cluster_kv_watch_registration_cache_tracks_create_drain_and_cancel() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
 
     let watch = create_cluster_kv_watch(
         &paths.kv_paths(),
@@ -22760,8 +22853,11 @@ fn cluster_kv_watch_drain_defers_small_cursor_writes_until_lag_bound() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
 
     let watch = create_cluster_kv_watch(
         &paths.kv_paths(),
@@ -22854,8 +22950,11 @@ fn create_cluster_kv_watch_enforces_active_registration_limit() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
 
     for index in 0..MAX_CLUSTER_KV_ACTIVE_WATCHES {
         create_cluster_kv_watch(
@@ -22898,8 +22997,11 @@ fn create_cluster_kv_watch_allows_replacement_after_cancel_at_limit() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
 
     let mut first_watch = None;
     let mut last_watch = None;
@@ -22956,8 +23058,11 @@ fn cluster_kv_watch_drain_removes_compacted_registration() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
     let watch = create_cluster_kv_watch(
         &paths.kv_paths(),
         cluster_kv_watch_test_node_id(),
@@ -22977,7 +23082,8 @@ fn cluster_kv_watch_drain_removes_compacted_registration() {
         .put("/watch/old", b"old".to_vec(), None)
         .expect("put compacted value");
     compacted.compact(KvRevision(1)).expect("compact store");
-    write_cluster_kv_snapshot(&paths, &compacted.snapshot()).expect("write compacted snapshot");
+    write_cluster_kv_snapshot(&paths, &compacted.snapshot().expect("snapshot"))
+        .expect("write compacted snapshot");
 
     let error = drain_cluster_kv_watch(
         &paths.kv_paths(),
@@ -23007,8 +23113,11 @@ fn create_cluster_kv_watch_prunes_compacted_registrations() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
     let stale = create_cluster_kv_watch(
         &paths.kv_paths(),
         cluster_kv_watch_test_node_id(),
@@ -23041,7 +23150,8 @@ fn create_cluster_kv_watch_prunes_compacted_registrations() {
         .put("/watch/old", b"old".to_vec(), None)
         .expect("put compacted value");
     compacted.compact(KvRevision(1)).expect("compact store");
-    write_cluster_kv_snapshot(&paths, &compacted.snapshot()).expect("write compacted snapshot");
+    write_cluster_kv_snapshot(&paths, &compacted.snapshot().expect("snapshot"))
+        .expect("write compacted snapshot");
 
     let newest = create_cluster_kv_watch(
         &paths.kv_paths(),
@@ -23077,8 +23187,11 @@ fn create_cluster_kv_watch_prunes_unreadable_registration_without_reusing_id() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
     std::fs::create_dir_all(&paths.kv_watches).expect("watch dir");
     let corrupt_path = paths.kv_watches.join("watch-99.sobj");
     std::fs::write(&corrupt_path, b"not-a-sinomo-object").expect("write corrupt watch");
@@ -23108,8 +23221,11 @@ fn create_cluster_kv_watch_prunes_mismatched_registration_without_reusing_id() {
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-        .expect("write initial snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("write initial snapshot");
     std::fs::create_dir_all(&paths.kv_watches).expect("watch dir");
     let mismatched_path = paths.kv_watches.join("watch-99.sobj");
     write_object_file(
@@ -23175,7 +23291,8 @@ fn create_cluster_kv_watch_prunes_and_allocates_with_one_directory_scan() {
         .put("/watch/scan/old", b"old".to_vec(), None)
         .expect("put compacted value");
     compacted.compact(KvRevision(1)).expect("compact store");
-    write_cluster_kv_snapshot(&paths, &compacted.snapshot()).expect("write compacted snapshot");
+    write_cluster_kv_snapshot(&paths, &compacted.snapshot().expect("snapshot"))
+        .expect("write compacted snapshot");
 
     reset_cluster_kv_watch_dir_scans_for_test(&paths.kv_paths());
     let watch = create_cluster_kv_watch(
@@ -23228,7 +23345,8 @@ fn cluster_kv_materialized_snapshot_event_history_is_bounded() {
             .expect("put event");
     }
 
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("write snapshot");
 
     let stored = read_cluster_kv_snapshot(&paths).expect("read snapshot");
     assert_eq!(
@@ -24056,11 +24174,15 @@ fn webrtc_kv_exchange_round_trips_offer_answer_and_ice_candidates() {
         ))
         .expect("put candidate");
 
-    let signals = store.range_prefix(&WebRtcKvExchange::signal_prefix(&cluster_id, exchange_id));
-    let candidates = store.range_prefix(&WebRtcKvExchange::candidate_prefix(
-        &cluster_id,
-        exchange_id,
-    ));
+    let signals = store
+        .range_prefix(&WebRtcKvExchange::signal_prefix(&cluster_id, exchange_id))
+        .expect("range prefix");
+    let candidates = store
+        .range_prefix(&WebRtcKvExchange::candidate_prefix(
+            &cluster_id,
+            exchange_id,
+        ))
+        .expect("range prefix");
     let parsed_offer = WebRtcKvExchange::signal_from_entry(&signals[0]).expect("offer");
     let parsed_candidate =
         WebRtcKvExchange::candidate_from_entry(&candidates[0]).expect("candidate");
@@ -24097,7 +24219,9 @@ fn iroh_kv_exchange_round_trips_endpoint_records() {
         ))
         .expect("put endpoint");
 
-    let entries = store.range_prefix(&IrohKvExchange::endpoint_prefix(&cluster_id));
+    let entries = store
+        .range_prefix(&IrohKvExchange::endpoint_prefix(&cluster_id))
+        .expect("range prefix");
     let parsed = IrohKvExchange::endpoint_from_entry(&entries[0]).expect("endpoint");
     let cluster_endpoint = parsed.endpoint();
 
@@ -24644,7 +24768,8 @@ fn read_cluster_members_from_kv_collapses_duplicate_iroh_endpoint_records() {
     store
         .put_serde(cluster_endpoint_key(&node_id, &stable), &stable, None)
         .expect("put stable endpoint");
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+        .expect("write snapshot");
 
     let members = read_cluster_members_from_kv(&paths).expect("members");
     let iroh: Vec<_> = members[0]
@@ -29828,10 +29953,10 @@ fn handle_localhost_kv_request(
             entry: store.get(&key).cloned(),
         },
         LocalhostKvRequest::Snapshot => LocalhostKvResponse::Snapshot {
-            snapshot: store.snapshot(),
+            snapshot: store.snapshot().expect("snapshot"),
         },
         LocalhostKvRequest::InstallSnapshot { snapshot } => {
-            *store = InProcessKvStore::restore(snapshot);
+            *store = InProcessKvStore::restore(snapshot).expect("restore");
             LocalhostKvResponse::Ok
         }
         LocalhostKvRequest::Stop => LocalhostKvResponse::Ok,
@@ -30306,8 +30431,8 @@ fn write_object_file_skips_compare_read_when_length_differs() {
         .truncate(true)
         .open(&paths.state)
         .expect("open sparse state")
-        .set_len(MAX_OBJECT_FILE_READ_BYTES + 1)
-        .expect("make sparse oversized state");
+        .set_len(1_048_576)
+        .expect("make sparse length-mismatched state");
 
     let cluster_id = ClusterId::from_legacy_named("cluster_sparse_rewrite").expect("cluster id");
     let node = NodeId::from_legacy_named("node_sparse_rewrite").expect("node id");
@@ -30325,9 +30450,9 @@ fn write_object_file_skips_compare_read_when_length_differs() {
     let read_bytes = observer
         .disk_read_bytes
         .load(std::sync::atomic::Ordering::Relaxed);
-    assert!(
-        read_bytes < MAX_OBJECT_FILE_READ_BYTES,
-        "length-mismatched object files should not be read back before rewrite; observed {read_bytes} bytes"
+    assert_eq!(
+        read_bytes, 0,
+        "length-mismatched object files should not be read back before rewrite"
     );
 
     let _ = set_io_observer(previous);
@@ -30661,7 +30786,8 @@ fn local_member_publish_forced_sync_publishes_even_when_records_current() {
         };
         seeded.txn(txn).expect("seed member");
     }
-    write_cluster_kv_snapshot(&paths, &seeded.snapshot()).expect("seed snapshot");
+    write_cluster_kv_snapshot(&paths, &seeded.snapshot().expect("snapshot"))
+        .expect("seed snapshot");
     assert!(
         cluster_member_publish_matches_kv(
             &paths,
@@ -30683,7 +30809,7 @@ fn local_member_publish_forced_sync_publishes_even_when_records_current() {
             accepted: true,
             detail: "published".to_string(),
             state: state.clone(),
-            kv_snapshot: Some(imported_store.snapshot()),
+            kv_snapshot: Some(imported_store.snapshot().expect("snapshot")),
         }),
         ..Default::default()
     };
@@ -30707,7 +30833,7 @@ fn local_member_publish_forced_sync_publishes_even_when_records_current() {
             accepted: true,
             detail: "published".to_string(),
             state: state.clone(),
-            kv_snapshot: Some(imported_store.snapshot()),
+            kv_snapshot: Some(imported_store.snapshot().expect("snapshot")),
         }),
         ..Default::default()
     };
@@ -30739,7 +30865,7 @@ fn local_member_publish_forced_sync_publishes_even_when_records_current() {
     stale_store
         .put("/kv/forced-sync/stale-marker", b"old".to_vec(), None)
         .expect("stale marker");
-    let stale_snapshot = stale_store.snapshot();
+    let stale_snapshot = stale_store.snapshot().expect("snapshot");
     assert!(stale_snapshot.revision < local_revision_before);
     let mut stale_host = RecordingClusterLocalMemberPublishHost {
         has_quorum: false,
@@ -30863,14 +30989,18 @@ fn refresh_current_cluster_kv_store_falls_back_to_node_snapshot_fetch() {
     )];
     state.members.push(remote);
     write_cluster_state(&paths, &state).expect("write state");
-    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot()).expect("empty snapshot");
+    write_cluster_kv_snapshot(
+        &paths,
+        &InProcessKvStore::new().snapshot().expect("snapshot"),
+    )
+    .expect("empty snapshot");
 
     let mut node_store = InProcessKvStore::new();
     node_store
         .put("/kv/relay/imported", b"ok".to_vec(), None)
         .expect("relayed marker");
     let mut host = NodeOnlySnapshotRefreshHost {
-        node_snapshot: Some(node_store.snapshot()),
+        node_snapshot: Some(node_store.snapshot().expect("snapshot")),
         ..Default::default()
     };
 
@@ -30884,7 +31014,13 @@ fn refresh_current_cluster_kv_store_falls_back_to_node_snapshot_fetch() {
 
     assert!(host.direct_fetches > 0, "direct fetch must be attempted");
     assert_eq!(host.node_calls, 1, "node fallback must run exactly once");
-    assert!(store.snapshot().get("/kv/relay/imported").is_some());
+    assert!(
+        store
+            .snapshot()
+            .expect("snapshot")
+            .get("/kv/relay/imported")
+            .is_some()
+    );
     assert!(
         read_cluster_kv_current_snapshot(&paths)
             .expect("imported snapshot")

@@ -131,15 +131,17 @@ pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState,
         }
     };
     if !kv_members.is_empty() {
-        let local_process_members = state
-            .members
-            .iter()
-            .filter(|member| {
-                cluster_node_is_local_process(&state, &member.node_id)
-                    && member.state.is_authorized()
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut local_process_members = Vec::new();
+        for member in state.members.iter().filter(|member| {
+            cluster_node_is_local_process(&state, &member.node_id) && member.state.is_authorized()
+        }) {
+            crate::object::try_reserve_vec(
+                &mut local_process_members,
+                1,
+                "collect local process members",
+            )?;
+            local_process_members.push(member.clone());
+        }
         state.members = kv_members;
         preserve_locally_learned_remote_route_endpoints(&mut state, local_remote_route_endpoints);
         for local_member in local_process_members {

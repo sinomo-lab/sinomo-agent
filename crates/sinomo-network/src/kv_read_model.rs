@@ -73,10 +73,12 @@ pub(crate) fn read_cluster_endpoints_from_kv(
     let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
         return Ok(Vec::new());
     };
-    let mut endpoints = read_cluster_endpoints_from_snapshot(&snapshot)?
-        .into_values()
-        .flatten()
-        .collect::<Vec<_>>();
+    let endpoint_map = read_cluster_endpoints_from_snapshot(&snapshot)?;
+    let mut endpoints = Vec::new();
+    for endpoint in endpoint_map.into_values().flatten() {
+        crate::object::try_reserve_vec(&mut endpoints, 1, "collect cluster endpoints from kv")?;
+        endpoints.push(endpoint);
+    }
     endpoints.sort_by(|left, right| {
         (
             left.node_id.as_str(),

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 #[cfg(test)]
 use std::net::TcpStream;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -14,9 +14,6 @@ pub const SINOMO_NETWORK_OBJECT_VERSION: u16 = 1;
 pub const OBJECT_STREAM_DEFAULT_CHUNK_BYTES: usize = 1024 * 1024;
 pub const OBJECT_STREAM_MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 pub const OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL: u32 = u32::MAX;
-#[cfg(target_pointer_width = "64")]
-pub const DAEMON_CONTROL_RPC_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024 * 1024;
-#[cfg(not(target_pointer_width = "64"))]
 pub const DAEMON_CONTROL_RPC_MAX_FRAME_BYTES: usize = usize::MAX;
 pub(crate) const DAEMON_CONTROL_REUSE_STREAM_METADATA_KEY: &str =
     "sinomo.daemon-control.reuse-stream";
@@ -110,6 +107,138 @@ impl ObjectFrameIoOptions {
 
 pub type DaemonControlRequest = crate::ObjectRpcRequest;
 pub type DaemonControlResponse = crate::ObjectRpcResponse;
+
+static OBJECT_FRAME_BYTE_BUDGET: LazyLock<ObjectFrameByteBudget> =
+    LazyLock::new(ObjectFrameByteBudget::available_memory);
+
+#[derive(Clone, Debug)]
+pub(crate) struct ObjectFrameByteBudget {
+    inner: Arc<Mutex<ObjectFrameByteBudgetState>>,
+    limit: ObjectFrameByteBudgetLimit,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ObjectFrameByteBudgetLimit {
+    AvailableMemory,
+    #[cfg(test)]
+    Fixed(usize),
+}
+
+#[derive(Debug, Default)]
+struct ObjectFrameByteBudgetState {
+    in_flight_bytes: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct ObjectFrameByteBudgetPermit {
+    budget: ObjectFrameByteBudget,
+    bytes: usize,
+}
+
+impl ObjectFrameByteBudget {
+    fn available_memory() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ObjectFrameByteBudgetState::default())),
+            limit: ObjectFrameByteBudgetLimit::AvailableMemory,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixed(max_bytes: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ObjectFrameByteBudgetState::default())),
+            limit: ObjectFrameByteBudgetLimit::Fixed(max_bytes),
+        }
+    }
+
+    pub(crate) fn try_acquire(
+        &self,
+        frame_bytes: usize,
+    ) -> Result<ObjectFrameByteBudgetPermit, NetworkError> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let available_memory_bytes = match self.limit {
+            ObjectFrameByteBudgetLimit::AvailableMemory => current_available_memory_bytes(),
+            #[cfg(test)]
+            ObjectFrameByteBudgetLimit::Fixed(max_bytes) => {
+                Some(max_bytes.saturating_sub(state.in_flight_bytes))
+            }
+        };
+        let would_use = state.in_flight_bytes.checked_add(frame_bytes).ok_or(
+            NetworkError::ObjectFrameMemoryUnavailable {
+                frame_bytes,
+                in_flight_bytes: state.in_flight_bytes,
+                available_memory_bytes,
+            },
+        )?;
+        if let Some(available) = available_memory_bytes {
+            let max_in_flight = state
+                .in_flight_bytes
+                .checked_add(available)
+                .unwrap_or(usize::MAX);
+            if frame_bytes > available || would_use > max_in_flight {
+                return Err(NetworkError::ObjectFrameMemoryUnavailable {
+                    frame_bytes,
+                    in_flight_bytes: state.in_flight_bytes,
+                    available_memory_bytes: Some(available),
+                });
+            }
+        }
+        state.in_flight_bytes = would_use;
+        Ok(ObjectFrameByteBudgetPermit {
+            budget: self.clone(),
+            bytes: frame_bytes,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_flight_bytes(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .in_flight_bytes
+    }
+}
+
+impl Drop for ObjectFrameByteBudgetPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .budget
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.in_flight_bytes = state.in_flight_bytes.saturating_sub(self.bytes);
+    }
+}
+
+fn object_frame_byte_budget() -> &'static ObjectFrameByteBudget {
+    &OBJECT_FRAME_BYTE_BUDGET
+}
+
+#[cfg(target_os = "linux")]
+fn current_available_memory_bytes() -> Option<usize> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open("/proc/meminfo").ok()?;
+    let mut buf = [0_u8; 4096];
+    let len = file.read(&mut buf).ok()?;
+    let text = std::str::from_utf8(&buf[..len]).ok()?;
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("MemAvailable:") else {
+            continue;
+        };
+        let kb = rest.split_whitespace().next()?.parse::<usize>().ok()?;
+        return kb.checked_mul(1024);
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_available_memory_bytes() -> Option<usize> {
+    None
+}
 
 #[derive(Debug)]
 pub struct AsyncDaemonControlListener {
@@ -965,7 +1094,7 @@ where
     T: serde::Serialize + ?Sized,
 {
     let mut frame = Vec::new();
-    frame.extend_from_slice(&0_u32.to_be_bytes());
+    try_extend_from_slice(&mut frame, &0_u32.to_be_bytes(), "object frame length")?;
     let body = SinomoObjectCodec::network_frame().append_to_vec(&mut frame, value)?;
     let body_len = body.len();
     if body_len >= OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL as usize {
@@ -980,6 +1109,8 @@ where
                 actual_bytes: usize::MAX,
                 max_bytes: usize::MAX,
             })?;
+        let additional_bytes = frame_len.saturating_sub(frame.len());
+        try_reserve_vec(&mut frame, additional_bytes, "object frame extended length")?;
         frame.resize(frame_len, 0);
         frame.copy_within(4..body.end, 12);
         frame[..4].copy_from_slice(&OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL.to_be_bytes());
@@ -1005,10 +1136,17 @@ pub fn encode_borrowed_object_frame_to_vec(
                 actual_bytes: usize::MAX,
                 max_bytes: usize::MAX,
             })?;
-    let mut frame = Vec::with_capacity(frame_bytes);
-    frame.extend_from_slice(len_prefix.as_slice());
+    let mut frame = Vec::new();
+    frame
+        .try_reserve_exact(frame_bytes)
+        .map_err(|_| network_allocation_error("encode borrowed object frame", frame_bytes))?;
+    try_extend_from_slice(
+        &mut frame,
+        len_prefix.as_slice(),
+        "encode borrowed object frame length",
+    )?;
     for slice in parts.as_slices() {
-        frame.extend_from_slice(slice);
+        try_extend_from_slice(&mut frame, slice, "encode borrowed object frame body")?;
     }
     Ok(frame)
 }
@@ -1108,6 +1246,74 @@ pub(crate) fn object_frame_len_from_prefix(
     }
 }
 
+pub(crate) fn network_allocation_error(operation: &str, requested_bytes: usize) -> NetworkError {
+    NetworkError::ResourceExhausted {
+        operation: operation.to_string(),
+        requested_bytes,
+    }
+}
+
+pub(crate) fn try_reserve_vec<T>(
+    vec: &mut Vec<T>,
+    additional: usize,
+    operation: &str,
+) -> Result<(), NetworkError> {
+    let requested_items = vec
+        .len()
+        .checked_add(additional)
+        .ok_or(NetworkError::FrameTooLarge {
+            actual_bytes: usize::MAX,
+            max_bytes: usize::MAX,
+        })?;
+    let requested_bytes = requested_items
+        .checked_mul(std::mem::size_of::<T>().max(1))
+        .ok_or(NetworkError::FrameTooLarge {
+            actual_bytes: usize::MAX,
+            max_bytes: usize::MAX,
+        })?;
+    vec.try_reserve(additional)
+        .map_err(|_| network_allocation_error(operation, requested_bytes))
+}
+
+pub(crate) fn try_zeroed_vec(len: usize, operation: &str) -> Result<Vec<u8>, NetworkError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| network_allocation_error(operation, len))?;
+    bytes.resize(len, 0);
+    Ok(bytes)
+}
+
+#[allow(dead_code)]
+pub(crate) fn try_extend_from_slice(
+    vec: &mut Vec<u8>,
+    bytes: &[u8],
+    operation: &str,
+) -> Result<(), NetworkError> {
+    try_reserve_vec(vec, bytes.len(), operation)?;
+    vec.extend_from_slice(bytes);
+    Ok(())
+}
+
+pub(crate) fn try_clone_string(value: &str, operation: &str) -> Result<String, NetworkError> {
+    let mut cloned = String::new();
+    cloned
+        .try_reserve(value.len())
+        .map_err(|_| network_allocation_error(operation, value.len()))?;
+    cloned.push_str(value);
+    Ok(cloned)
+}
+
+pub(crate) fn try_clone_id(
+    id: &sinomo_core::Id,
+    operation: &str,
+) -> Result<sinomo_core::Id, NetworkError> {
+    let value = try_clone_string(id.as_str(), operation)?;
+    sinomo_core::Id::new(value).map_err(|error| NetworkError::Serialization {
+        detail: error.to_string(),
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn write_object_frame_blocking<W, T>(
     writer: &mut W,
@@ -1141,8 +1347,22 @@ where
     R: Read,
     T: serde::de::DeserializeOwned,
 {
+    read_object_frame_blocking_with_budget(reader, max_bytes, object_frame_byte_budget())
+}
+
+#[cfg(test)]
+fn read_object_frame_blocking_with_budget<R, T>(
+    reader: &mut R,
+    max_bytes: usize,
+    budget: &ObjectFrameByteBudget,
+) -> Result<T, NetworkError>
+where
+    R: Read,
+    T: serde::de::DeserializeOwned,
+{
     let (len, prefix_bytes) = read_object_frame_len_blocking(reader, max_bytes)?;
-    let mut bytes = vec![0_u8; len];
+    let _permit = budget.try_acquire(len)?;
+    let mut bytes = try_zeroed_vec(len, "read object frame body")?;
     read_exact_blocking_frame(reader, &mut bytes, "read object frame body", "body")?;
     if let Some(observer) = io_observer() {
         observer.on_net_recv(prefix_bytes as u64 + bytes.len() as u64);
@@ -1287,9 +1507,24 @@ where
     R: AsyncRead + Unpin,
     T: serde::de::DeserializeOwned,
 {
+    read_object_frame_async_with_budget(reader, max_bytes, options, object_frame_byte_budget())
+        .await
+}
+
+async fn read_object_frame_async_with_budget<R, T>(
+    reader: &mut R,
+    max_bytes: usize,
+    options: ObjectFrameIoOptions,
+    budget: &ObjectFrameByteBudget,
+) -> Result<T, NetworkError>
+where
+    R: AsyncRead + Unpin,
+    T: serde::de::DeserializeOwned,
+{
     let (len, prefix_bytes) =
         read_object_frame_len_async(reader, max_bytes, options.idle_timeout).await?;
-    let mut bytes = vec![0_u8; len];
+    let _permit = budget.try_acquire(len)?;
+    let mut bytes = try_zeroed_vec(len, "read async object frame body")?;
     read_exact_async_frame(
         reader,
         &mut bytes,
@@ -1439,6 +1674,7 @@ where
                 actual_bytes: usize::MAX,
                 max_bytes: usize::MAX,
             })?;
+        try_reserve_vec(output, len_usize, "read raw byte stream chunks")?;
         output.resize(end, 0);
         read_exact_async_frame(
             reader,
@@ -1467,7 +1703,7 @@ where
 {
     let chunk_bytes = validate_raw_byte_stream_chunk_options(options)?;
     let copy_buffer_bytes = chunk_bytes.min(OBJECT_STREAM_DEFAULT_CHUNK_BYTES).max(1);
-    let mut buffer = vec![0_u8; copy_buffer_bytes];
+    let mut buffer = try_zeroed_vec(copy_buffer_bytes, "forward raw byte stream buffer")?;
     let mut total = 0_u64;
     loop {
         let mut len_bytes = [0_u8; DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES];
@@ -2090,6 +2326,123 @@ mod serde_bytes_tests {
         );
     }
 
+    #[test]
+    fn daemon_control_default_frame_limit_is_pointer_sized() {
+        assert_eq!(super::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES, usize::MAX);
+    }
+
+    #[test]
+    fn object_frame_byte_budget_releases_in_flight_permits() {
+        let budget = super::ObjectFrameByteBudget::fixed(10);
+        let first = budget.try_acquire(6).expect("first frame budget");
+        assert_eq!(budget.in_flight_bytes(), 6);
+
+        assert_eq!(
+            budget.try_acquire(5).expect_err("budget exceeded"),
+            NetworkError::ObjectFrameMemoryUnavailable {
+                frame_bytes: 5,
+                in_flight_bytes: 6,
+                available_memory_bytes: Some(4),
+            }
+        );
+
+        drop(first);
+        assert_eq!(budget.in_flight_bytes(), 0);
+        let second = budget.try_acquire(10).expect("replacement frame budget");
+        assert_eq!(budget.in_flight_bytes(), 10);
+        drop(second);
+        assert_eq!(budget.in_flight_bytes(), 0);
+    }
+
+    #[test]
+    fn blocking_object_frame_budget_rejects_before_body_read() {
+        let budget = super::ObjectFrameByteBudget::fixed(4);
+        let mut frame = 8_u32.to_be_bytes().to_vec();
+        frame.extend_from_slice(b"abcdefgh");
+        let mut cursor = Cursor::new(frame);
+
+        let error = super::read_object_frame_blocking_with_budget::<_, BundleRecord>(
+            &mut cursor,
+            1024,
+            &budget,
+        )
+        .expect_err("frame exceeds available in-flight budget");
+
+        assert_eq!(
+            error,
+            NetworkError::ObjectFrameMemoryUnavailable {
+                frame_bytes: 8,
+                in_flight_bytes: 0,
+                available_memory_bytes: Some(4),
+            }
+        );
+        assert_eq!(
+            cursor.position(),
+            4,
+            "budget rejection should happen before reading the frame body"
+        );
+        assert_eq!(budget.in_flight_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn async_object_frame_budget_rejects_before_body_read() {
+        let budget = super::ObjectFrameByteBudget::fixed(4);
+        let mut frame = 8_u32.to_be_bytes().to_vec();
+        frame.extend_from_slice(b"abcdefgh");
+        let mut cursor = Cursor::new(frame);
+
+        let error = super::read_object_frame_async_with_budget::<_, BundleRecord>(
+            &mut cursor,
+            1024,
+            ObjectFrameIoOptions::none(),
+            &budget,
+        )
+        .await
+        .expect_err("frame exceeds available in-flight budget");
+
+        assert_eq!(
+            error,
+            NetworkError::ObjectFrameMemoryUnavailable {
+                frame_bytes: 8,
+                in_flight_bytes: 0,
+                available_memory_bytes: Some(4),
+            }
+        );
+        assert_eq!(
+            cursor.position(),
+            4,
+            "budget rejection should happen before reading the frame body"
+        );
+        assert_eq!(budget.in_flight_bytes(), 0);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn blocking_object_frame_reports_resource_exhaustion_before_huge_body_read() {
+        let mut frame = super::OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL
+            .to_be_bytes()
+            .to_vec();
+        frame.extend_from_slice(&u64::MAX.to_be_bytes());
+        let mut cursor = Cursor::new(frame);
+
+        let error = read_object_frame_blocking::<_, BundleRecord>(&mut cursor, usize::MAX)
+            .expect_err("huge frame body cannot be allocated");
+
+        assert!(
+            matches!(
+                error,
+                NetworkError::ResourceExhausted { .. }
+                    | NetworkError::ObjectFrameMemoryUnavailable { .. }
+            ),
+            "unexpected error for huge frame body: {error:?}"
+        );
+        assert_eq!(
+            cursor.position(),
+            12,
+            "frame reader should fail allocation before reading the declared body"
+        );
+    }
+
     #[tokio::test]
     async fn async_object_frame_reads_extended_length_prefix_with_idle_timeout() {
         let record = BundleRecord {
@@ -2687,6 +3040,73 @@ mod serde_bytes_tests {
         assert_eq!(forwarded_total, 8);
         assert_eq!(read, 8);
         assert_eq!(forwarded, b"abcdefgh");
+    }
+
+    #[tokio::test]
+    async fn raw_byte_stream_reader_rejects_oversized_chunk_before_body_read() {
+        let mut frame = 9_u64.to_be_bytes().to_vec();
+        frame.extend_from_slice(b"ignored body");
+        let mut cursor = Cursor::new(frame);
+        let mut output = Vec::new();
+
+        let error = read_raw_byte_stream_chunks_to_vec_async(
+            &mut cursor,
+            &mut output,
+            RawByteStreamChunkOptions {
+                chunk_bytes: 8,
+                max_total_bytes: None,
+                idle_timeout: None,
+            },
+        )
+        .await
+        .expect_err("oversized raw stream chunk");
+
+        assert_eq!(
+            error,
+            NetworkError::FrameTooLarge {
+                actual_bytes: 9,
+                max_bytes: 8,
+            }
+        );
+        assert_eq!(
+            cursor.position(),
+            super::DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64,
+            "oversized chunk rejection should happen before reading the body"
+        );
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn raw_byte_stream_forwarder_rejects_oversized_chunk_before_body_read() {
+        let mut frame = 9_u64.to_be_bytes().to_vec();
+        frame.extend_from_slice(b"ignored body");
+        let mut source = Cursor::new(frame);
+        let mut sink = tokio::io::sink();
+
+        let error = forward_raw_byte_stream_chunks_async(
+            &mut source,
+            &mut sink,
+            RawByteStreamChunkOptions {
+                chunk_bytes: 8,
+                max_total_bytes: None,
+                idle_timeout: None,
+            },
+        )
+        .await
+        .expect_err("oversized raw stream chunk");
+
+        assert_eq!(
+            error,
+            NetworkError::FrameTooLarge {
+                actual_bytes: 9,
+                max_bytes: 8,
+            }
+        );
+        assert_eq!(
+            source.position(),
+            super::DAEMON_CONTROL_RAW_BYTE_STREAM_CHUNK_HEADER_BYTES as u64,
+            "oversized forwarded chunk rejection should happen before reading the body"
+        );
     }
 
     #[test]

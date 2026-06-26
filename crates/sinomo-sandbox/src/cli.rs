@@ -4207,11 +4207,15 @@ fn sandbox_policy_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, C
 #[cfg(test)]
 fn commit_sandbox_policy_cluster_txn(data_dir: &SinomoDataDir, txn: KvTxn) -> Result<(), CliError> {
     let paths = ClusterPaths::new(data_dir);
-    let snapshot = sinomo_kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
-        .unwrap_or_else(|_| sinomo_kv::InProcessKvStore::new().snapshot());
-    let mut store = sinomo_kv::InProcessKvStore::restore(snapshot);
+    let snapshot =
+        sinomo_kv::read_cluster_kv_cached_snapshot(&paths.kv_paths()).unwrap_or_else(|_| {
+            sinomo_kv::InProcessKvStore::new()
+                .snapshot()
+                .expect("snapshot")
+        });
+    let mut store = sinomo_kv::InProcessKvStore::restore(snapshot)?;
     let _: KvTxnResponse = store.txn(txn)?;
-    sinomo_kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot())
+    sinomo_kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot().expect("snapshot"))
         .map_err(network::NetworkError::from)?;
     Ok(())
 }

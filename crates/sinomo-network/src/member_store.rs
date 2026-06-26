@@ -526,7 +526,10 @@ fn cluster_member_connectivity_delete_keys_from_store(
             keys.insert(entry.key.clone());
         }
     }
-    Ok(keys.into_iter().collect())
+    let mut retained = Vec::new();
+    crate::object::try_reserve_vec(&mut retained, keys.len(), "collect member cleanup keys")?;
+    retained.extend(keys);
+    Ok(retained)
 }
 
 pub(crate) fn cluster_legacy_shadow_orphan_artifact_node_ids_from_store(

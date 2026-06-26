@@ -140,8 +140,8 @@ pub async fn cluster_reachable_state_authority_count_async_with_host(
     }
     let deadline = Instant::now() + options.timeout;
     let targets = ClusterEndpointSelector::new(paths, state)
-        .select(ClusterEndpointSelectionPurpose::AvailableClusterStateAuthority);
-    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
+        .try_select(ClusterEndpointSelectionPurpose::AvailableClusterStateAuthority)?;
+    let graph = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
     for (index, endpoint) in targets.iter().enumerate() {
         let remaining = deadline
             .checked_duration_since(Instant::now())

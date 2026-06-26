@@ -84,7 +84,11 @@ impl ClusterKvWatchDrainRequest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterKvWatchDrainResponse {
     pub watch_id: WatchId,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_fallible_vec"
+    )]
     pub events: Vec<KvEvent>,
     pub next_revision: KvRevision,
 }
@@ -105,15 +109,14 @@ pub fn collect_cluster_kv_watch_drain_events(
     snapshot: &KvSnapshot,
     registration: &ClusterKvWatchRegistration,
     max_payload_bytes: usize,
-) -> Vec<KvEvent> {
-    let mut events = persisted_events
-        .iter()
-        .chain(snapshot.events.iter())
-        .filter(|event| {
-            event.revision >= registration.next_revision
-                && event.key.starts_with(&registration.prefix)
-        })
-        .collect::<Vec<_>>();
+) -> Result<Vec<KvEvent>, KvError> {
+    let mut events = Vec::new();
+    for event in persisted_events.iter().chain(snapshot.events.iter()).filter(|event| {
+        event.revision >= registration.next_revision && event.key.starts_with(&registration.prefix)
+    }) {
+        try_reserve_kv_items(&mut events, 1, "collect watch drain events")?;
+        events.push(event);
+    }
     events.sort_by(|left, right| {
         (left.revision, left.key.as_str()).cmp(&(right.revision, right.key.as_str()))
     });
@@ -126,7 +129,7 @@ pub fn collect_cluster_kv_watch_drain_events(
 pub(crate) fn limit_cluster_kv_watch_drain_events(
     events: Vec<&KvEvent>,
     max_payload_bytes: usize,
-) -> Vec<KvEvent> {
+) -> Result<Vec<KvEvent>, KvError> {
     let mut limited = Vec::new();
     let mut payload_bytes = 0_usize;
     let mut events = events.into_iter().peekable();
@@ -143,6 +146,7 @@ pub(crate) fn limit_cluster_kv_watch_drain_events(
             }
         }
         payload_bytes = next_payload_bytes;
+        try_reserve_kv_items(&mut limited, 1, "limit watch drain events")?;
         limited.push(event.clone());
         if payload_bytes >= max_payload_bytes {
             let current_revision = event.revision;
@@ -154,7 +158,7 @@ pub(crate) fn limit_cluster_kv_watch_drain_events(
             }
         }
     }
-    limited
+    Ok(limited)
 }
 
 pub fn cluster_kv_watch_registration_cursor_should_persist(
@@ -745,7 +749,7 @@ pub fn drain_cluster_kv_watch_registration(
         snapshot,
         &registration,
         max_payload_bytes,
-    );
+    )?;
     let cursor_action = if let Some(last) = events.last() {
         registration.next_revision = KvRevision(last.revision.0.saturating_add(1));
         if cluster_kv_watch_registration_cursor_should_persist(
@@ -933,10 +937,16 @@ pub fn append_cluster_kv_watch_events_for_active_watches_for_node(
         return Ok(0);
     }
     let registrations = if let Some(scan) = active.scan {
-        scan.retained_registrations
-            .into_iter()
-            .map(|retained| retained.registration)
-            .collect::<Vec<_>>()
+        let mut registrations = Vec::new();
+        try_reserve_kv_items(
+            &mut registrations,
+            scan.retained_registrations.len(),
+            "collect active watch registrations",
+        )?;
+        for retained in scan.retained_registrations {
+            registrations.push(retained.registration);
+        }
+        registrations
     } else {
         list_cluster_kv_watch_registrations(paths)?
     };

@@ -1396,6 +1396,7 @@ fn service_registry_snapshot(registry: ServiceRegistry) -> Arc<ServiceRegistrySn
 
 #[derive(Clone)]
 pub(crate) struct DaemonServiceRegistryHost {
+    paths: DaemonPaths,
     router: ObjectRpcRouter,
     route_policy: ObjectRpcRoutePolicyLayer,
 }
@@ -1451,7 +1452,7 @@ impl DaemonServiceRegistryHost {
         let route_registry = daemon_service_object_rpc_route_registry(
             service_snapshot,
             &module_snapshots,
-            paths,
+            paths.clone(),
             service_runtime,
         )
         .map_err(|source| DaemonError::Network {
@@ -1471,6 +1472,7 @@ impl DaemonServiceRegistryHost {
             }
         })?;
         Ok(Self {
+            paths,
             router,
             route_policy,
         })
@@ -2563,6 +2565,15 @@ pub(crate) async fn dispatch_pre_auth_via_registry_to_response_async(
     {
         return Ok(None);
     }
+    if request.auth.is_some()
+        && crate::auth::authenticate_daemon_control_request_without_nonce(
+            &service_host.paths,
+            request,
+        )
+        .is_ok()
+    {
+        return Ok(None);
+    }
 
     let authenticated = AuthenticatedDaemonCommand {
         route: request.route.clone(),
@@ -3207,6 +3218,70 @@ mod tests {
     }
 
     #[test]
+    fn non_member_signed_join_challenge_dispatches_as_join_candidate() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-signed-candidate-join-challenge");
+        let registry = ServiceRegistry::builder()
+            .register(TestJoinChallengeService)
+            .build();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let host = test_service_host(&root, registry);
+        let request = ObjectRpcRequest::encode_body(
+            CLUSTER_JOIN_CHALLENGE_ROUTE,
+            CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+            &(),
+        )
+        .expect("join challenge rpc")
+        .with_auth(b"signed-member-request".to_vec());
+
+        let response = runtime
+            .block_on(dispatch_pre_auth_via_registry_to_response_async(
+                &request, &host,
+            ))
+            .expect("pre-auth dispatch")
+            .expect("pre-auth response");
+        let (signer_authority, signer_node_id): (String, String) =
+            response.decode_body().expect("decode response");
+
+        assert_eq!(signer_authority, "join-candidate");
+        assert_eq!(signer_node_id, "");
+    }
+
+    #[test]
+    fn local_signed_join_challenge_skips_pre_auth_dispatch() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-local-signed-join-challenge");
+        let registry = ServiceRegistry::builder()
+            .register(TestJoinChallengeService)
+            .build();
+        sinomo_node::load_or_create_main_node_identity(root.path()).expect("main identity");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let host = test_service_host(&root, registry);
+        let data_dir = SinomoDataDir::new(root.path());
+        let request = ObjectRpcRequest::encode_body(
+            CLUSTER_JOIN_CHALLENGE_ROUTE,
+            CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+            &(),
+        )
+        .expect("join challenge rpc");
+        let auth =
+            crate::auth::sign_daemon_rpc_request_from_data_dir(&data_dir, &request).expect("auth");
+        let request = request.with_auth(auth);
+
+        let response = runtime
+            .block_on(dispatch_pre_auth_via_registry_to_response_async(
+                &request, &host,
+            ))
+            .expect("pre-auth dispatch");
+
+        assert!(response.is_none());
+    }
+
+    #[test]
     fn daemon_service_registry_host_reports_live_service_route_readiness() {
         struct HoldingService {
             entered: Arc<tokio::sync::Notify>,
@@ -3356,8 +3431,11 @@ mod tests {
         store
             .put("/service/snapshot", b"async".to_vec(), None)
             .expect("put snapshot entry");
-        sinomo_kv::write_cluster_kv_snapshot(&cluster_paths.kv_paths(), &store.snapshot())
-            .expect("write cluster kv snapshot");
+        sinomo_kv::write_cluster_kv_snapshot(
+            &cluster_paths.kv_paths(),
+            &store.snapshot().expect("snapshot"),
+        )
+        .expect("write cluster kv snapshot");
 
         let registry = ServiceRegistry::builder()
             .register(ClusterKvService {
@@ -3677,7 +3755,7 @@ mod tests {
         store
             .put("/snapshot/small", b"ok".to_vec(), None)
             .expect("small put");
-        let snapshot = store.snapshot();
+        let snapshot = store.snapshot().expect("snapshot");
 
         let response =
             encode_cluster_kv_snapshot_response_limited(&snapshot, usize::MAX).expect("encode ok");

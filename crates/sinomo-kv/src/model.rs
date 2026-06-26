@@ -1,17 +1,435 @@
 use crate::internal::*;
 
+const KV_FALLIBLE_VEC_RESOURCE_EXHAUSTED_PREFIX: &str = "resource exhausted while allocating ";
+const KV_FALLIBLE_VEC_RESOURCE_EXHAUSTED_SEPARATOR: &str = " bytes for ";
+
 pub fn encode_kv_value<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, KvError> {
-    sinomo_object_serde::to_bytes(value, KV_OBJECT_VERSION_ID, LengthMode::U32).map_err(|source| {
-        KvError::Serialization {
-            detail: source.to_string(),
-        }
-    })
+    sinomo_object_serde::to_bytes(value, KV_OBJECT_VERSION_ID, LengthMode::U32)
+        .map_err(kv_object_error)
 }
 
 pub fn decode_kv_value<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, KvError> {
-    sinomo_object_serde::from_bytes(bytes).map_err(|source| KvError::Serialization {
-        detail: source.to_string(),
+    sinomo_object_serde::from_bytes(bytes).map_err(kv_object_error)
+}
+
+pub(crate) fn kv_object_error(source: sinomo_object::Error) -> KvError {
+    match source {
+        sinomo_object::Error::ResourceExhausted {
+            context,
+            requested_bytes,
+        } => KvError::ResourceExhausted {
+            operation: context.to_string(),
+            requested_bytes,
+        },
+        sinomo_object::Error::Serde(detail) => {
+            if let Some((operation, requested_bytes)) =
+                parse_kv_fallible_vec_resource_exhaustion(&detail)
+            {
+                KvError::ResourceExhausted {
+                    operation,
+                    requested_bytes,
+                }
+            } else {
+                KvError::Serialization { detail }
+            }
+        }
+        source => KvError::Serialization {
+            detail: source.to_string(),
+        },
+    }
+}
+
+fn parse_kv_fallible_vec_resource_exhaustion(detail: &str) -> Option<(String, usize)> {
+    let rest = detail.strip_prefix(KV_FALLIBLE_VEC_RESOURCE_EXHAUSTED_PREFIX)?;
+    let (requested_bytes, operation) =
+        rest.split_once(KV_FALLIBLE_VEC_RESOURCE_EXHAUSTED_SEPARATOR)?;
+    Some((operation.to_string(), requested_bytes.parse().ok()?))
+}
+
+fn kv_fallible_vec_requested_bytes<T>(items: usize) -> usize {
+    items
+        .checked_mul(std::mem::size_of::<T>().max(1))
+        .unwrap_or(usize::MAX)
+}
+
+fn kv_fallible_vec_resource_exhausted(context: &str, requested_bytes: usize) -> String {
+    format!(
+        "{KV_FALLIBLE_VEC_RESOURCE_EXHAUSTED_PREFIX}{requested_bytes}{KV_FALLIBLE_VEC_RESOURCE_EXHAUSTED_SEPARATOR}{context}"
+    )
+}
+
+fn try_reserve_kv_vec<T, E>(vec: &mut Vec<T>, additional: usize, context: &str) -> Result<(), E>
+where
+    E: serde::de::Error,
+{
+    let requested_items = vec.len().checked_add(additional).unwrap_or(usize::MAX);
+    let requested_bytes = kv_fallible_vec_requested_bytes::<T>(requested_items);
+    vec.try_reserve(additional)
+        .map_err(|_| E::custom(kv_fallible_vec_resource_exhausted(context, requested_bytes)))
+}
+
+pub(crate) fn try_reserve_kv_items<T>(
+    vec: &mut Vec<T>,
+    additional: usize,
+    operation: &str,
+) -> Result<(), KvError> {
+    let requested_items = vec.len().checked_add(additional).unwrap_or(usize::MAX);
+    let requested_bytes = kv_fallible_vec_requested_bytes::<T>(requested_items);
+    vec.try_reserve(additional)
+        .map_err(|_| KvError::ResourceExhausted {
+            operation: operation.to_string(),
+            requested_bytes,
+        })
+}
+
+pub(crate) fn try_clone_kv_bytes(bytes: &[u8], operation: &str) -> Result<Vec<u8>, KvError> {
+    let mut cloned = Vec::new();
+    cloned
+        .try_reserve(bytes.len())
+        .map_err(|_| KvError::ResourceExhausted {
+            operation: operation.to_string(),
+            requested_bytes: bytes.len(),
+        })?;
+    cloned.extend_from_slice(bytes);
+    Ok(cloned)
+}
+
+pub(crate) fn try_clone_kv_string(value: &str, operation: &str) -> Result<String, KvError> {
+    let mut cloned = String::new();
+    cloned
+        .try_reserve(value.len())
+        .map_err(|_| KvError::ResourceExhausted {
+            operation: operation.to_string(),
+            requested_bytes: value.len(),
+        })?;
+    cloned.push_str(value);
+    Ok(cloned)
+}
+
+pub(crate) fn try_clone_kv_node_id(node_id: &NodeId, operation: &str) -> Result<NodeId, KvError> {
+    let value = try_clone_kv_string(node_id.as_str(), operation)?;
+    NodeId::new(value).map_err(|error| KvError::Serialization {
+        detail: error.to_string(),
     })
+}
+
+pub(crate) fn try_clone_kv_event(event: &KvEvent, operation: &str) -> Result<KvEvent, KvError> {
+    Ok(KvEvent {
+        revision: event.revision,
+        key: try_clone_kv_string(&event.key, operation)?,
+        kind: match &event.kind {
+            KvEventKind::Put { value } => KvEventKind::Put {
+                value: try_clone_kv_bytes(value, operation)?,
+            },
+            KvEventKind::Delete => KvEventKind::Delete,
+        },
+    })
+}
+
+pub(crate) fn try_clone_kv_entry(entry: &KvEntry, operation: &str) -> Result<KvEntry, KvError> {
+    Ok(KvEntry {
+        key: try_clone_kv_string(&entry.key, operation)?,
+        value: try_clone_kv_bytes(&entry.value, operation)?,
+        create_revision: entry.create_revision,
+        modify_revision: entry.modify_revision,
+        version: entry.version,
+        lease_id: entry.lease_id,
+    })
+}
+
+pub(crate) fn try_clone_kv_compare(
+    compare: &KvCompare,
+    operation: &str,
+) -> Result<KvCompare, KvError> {
+    Ok(match compare {
+        KvCompare::Exists { key } => KvCompare::Exists {
+            key: try_clone_kv_string(key, operation)?,
+        },
+        KvCompare::Missing { key } => KvCompare::Missing {
+            key: try_clone_kv_string(key, operation)?,
+        },
+        KvCompare::ValueEquals { key, value } => KvCompare::ValueEquals {
+            key: try_clone_kv_string(key, operation)?,
+            value: try_clone_kv_bytes(value, operation)?,
+        },
+        KvCompare::VersionEquals { key, version } => KvCompare::VersionEquals {
+            key: try_clone_kv_string(key, operation)?,
+            version: *version,
+        },
+        KvCompare::CreateRevisionEquals { key, revision } => KvCompare::CreateRevisionEquals {
+            key: try_clone_kv_string(key, operation)?,
+            revision: *revision,
+        },
+        KvCompare::ModifyRevisionEquals { key, revision } => KvCompare::ModifyRevisionEquals {
+            key: try_clone_kv_string(key, operation)?,
+            revision: *revision,
+        },
+        KvCompare::LeaseEquals { key, lease_id } => KvCompare::LeaseEquals {
+            key: try_clone_kv_string(key, operation)?,
+            lease_id: *lease_id,
+        },
+    })
+}
+
+pub(crate) fn try_clone_kv_op(op: &KvOp, operation: &str) -> Result<KvOp, KvError> {
+    Ok(match op {
+        KvOp::Put {
+            key,
+            value,
+            lease_id,
+        } => KvOp::Put {
+            key: try_clone_kv_string(key, operation)?,
+            value: try_clone_kv_bytes(value, operation)?,
+            lease_id: *lease_id,
+        },
+        KvOp::Delete { key } => KvOp::Delete {
+            key: try_clone_kv_string(key, operation)?,
+        },
+        KvOp::DeletePrefix { prefix } => KvOp::DeletePrefix {
+            prefix: try_clone_kv_string(prefix, operation)?,
+        },
+        KvOp::LeaseGrant {
+            lease_id,
+            ttl_ticks,
+        } => KvOp::LeaseGrant {
+            lease_id: *lease_id,
+            ttl_ticks: *ttl_ticks,
+        },
+        KvOp::LeaseKeepAlive { lease_id } => KvOp::LeaseKeepAlive {
+            lease_id: *lease_id,
+        },
+        KvOp::LeaseRevoke { lease_id } => KvOp::LeaseRevoke {
+            lease_id: *lease_id,
+        },
+    })
+}
+
+pub(crate) fn try_clone_kv_txn(txn: &KvTxn, operation: &str) -> Result<KvTxn, KvError> {
+    let mut compares = Vec::new();
+    try_reserve_kv_items(&mut compares, txn.compares.len(), operation)?;
+    for compare in &txn.compares {
+        compares.push(try_clone_kv_compare(compare, operation)?);
+    }
+
+    let mut success = Vec::new();
+    try_reserve_kv_items(&mut success, txn.success.len(), operation)?;
+    for op in &txn.success {
+        success.push(try_clone_kv_op(op, operation)?);
+    }
+
+    let mut failure = Vec::new();
+    try_reserve_kv_items(&mut failure, txn.failure.len(), operation)?;
+    for op in &txn.failure {
+        failure.push(try_clone_kv_op(op, operation)?);
+    }
+
+    Ok(KvTxn {
+        compares,
+        success,
+        failure,
+    })
+}
+
+pub(crate) fn try_clone_kv_command(
+    command: &KvCommand,
+    operation: &str,
+) -> Result<KvCommand, KvError> {
+    Ok(match command {
+        KvCommand::Op(op) => KvCommand::Op(try_clone_kv_op(op, operation)?),
+        KvCommand::Txn(txn) => KvCommand::Txn(try_clone_kv_txn(txn, operation)?),
+    })
+}
+
+pub(crate) fn try_clone_kv_op_response(
+    response: &KvOpResponse,
+    operation: &str,
+) -> Result<KvOpResponse, KvError> {
+    Ok(match response {
+        KvOpResponse::Put { key, revision } => KvOpResponse::Put {
+            key: try_clone_kv_string(key, operation)?,
+            revision: *revision,
+        },
+        KvOpResponse::Delete { key, deleted } => KvOpResponse::Delete {
+            key: try_clone_kv_string(key, operation)?,
+            deleted: *deleted,
+        },
+        KvOpResponse::DeletePrefix {
+            prefix,
+            deleted_count,
+        } => KvOpResponse::DeletePrefix {
+            prefix: try_clone_kv_string(prefix, operation)?,
+            deleted_count: *deleted_count,
+        },
+        KvOpResponse::LeaseGrant { lease_id } => KvOpResponse::LeaseGrant {
+            lease_id: *lease_id,
+        },
+        KvOpResponse::LeaseKeepAlive { lease_id } => KvOpResponse::LeaseKeepAlive {
+            lease_id: *lease_id,
+        },
+        KvOpResponse::LeaseRevoke {
+            lease_id,
+            deleted_count,
+        } => KvOpResponse::LeaseRevoke {
+            lease_id: *lease_id,
+            deleted_count: *deleted_count,
+        },
+    })
+}
+
+pub(crate) fn try_clone_kv_txn_response(
+    response: &KvTxnResponse,
+    operation: &str,
+) -> Result<KvTxnResponse, KvError> {
+    let mut responses = Vec::new();
+    try_reserve_kv_items(&mut responses, response.responses.len(), operation)?;
+    for op_response in &response.responses {
+        responses.push(try_clone_kv_op_response(op_response, operation)?);
+    }
+    Ok(KvTxnResponse {
+        succeeded: response.succeeded,
+        revision: response.revision,
+        responses,
+    })
+}
+
+pub(crate) fn deserialize_fallible_vec<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    deserializer.deserialize_seq(FallibleVecVisitor {
+        context: "kv vector",
+        marker: std::marker::PhantomData,
+    })
+}
+
+struct FallibleVecVisitor<T> {
+    context: &'static str,
+    marker: std::marker::PhantomData<T>,
+}
+
+impl<'de, T> serde::de::Visitor<'de> for FallibleVecVisitor<T>
+where
+    T: Deserialize<'de>,
+{
+    type Value = Vec<T>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a sequence")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        if let Some(size_hint) = seq.size_hint() {
+            try_reserve_kv_vec(&mut values, size_hint, self.context)?;
+        }
+        while let Some(value) = seq.next_element()? {
+            try_reserve_kv_vec(&mut values, 1, self.context)?;
+            values.push(value);
+        }
+        Ok(values)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct HugeSizeHintDeserializer;
+
+    impl<'de> serde::Deserializer<'de> for HugeSizeHintDeserializer {
+        type Error = sinomo_object::Error;
+
+        fn deserialize_any<V>(self, visitor: V) -> std::result::Result<V::Value, Self::Error>
+        where
+            V: serde::de::Visitor<'de>,
+        {
+            visitor.visit_seq(HugeSizeHintSeqAccess)
+        }
+
+        fn deserialize_seq<V>(self, visitor: V) -> std::result::Result<V::Value, Self::Error>
+        where
+            V: serde::de::Visitor<'de>,
+        {
+            visitor.visit_seq(HugeSizeHintSeqAccess)
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes
+            byte_buf option unit unit_struct newtype_struct tuple tuple_struct map
+            struct enum identifier ignored_any
+        }
+    }
+
+    struct HugeSizeHintSeqAccess;
+
+    impl<'de> serde::de::SeqAccess<'de> for HugeSizeHintSeqAccess {
+        type Error = sinomo_object::Error;
+
+        fn next_element_seed<T>(
+            &mut self,
+            _seed: T,
+        ) -> std::result::Result<Option<T::Value>, Self::Error>
+        where
+            T: serde::de::DeserializeSeed<'de>,
+        {
+            Ok(None)
+        }
+
+        fn size_hint(&self) -> Option<usize> {
+            Some(usize::MAX)
+        }
+    }
+
+    #[test]
+    fn object_resource_exhaustion_maps_to_kv_resource_exhaustion() {
+        let error = kv_object_error(sinomo_object::Error::ResourceExhausted {
+            context: "decode kv snapshot",
+            requested_bytes: 4096,
+        });
+
+        assert_eq!(
+            error,
+            KvError::ResourceExhausted {
+                operation: "decode kv snapshot".to_string(),
+                requested_bytes: 4096,
+            }
+        );
+    }
+
+    #[test]
+    fn fallible_vec_deserializer_rejects_huge_size_hint_before_collecting() {
+        let error = deserialize_fallible_vec::<_, u8>(HugeSizeHintDeserializer)
+            .expect_err("huge size hint should fail fallibly");
+
+        assert_eq!(
+            kv_object_error(error),
+            KvError::ResourceExhausted {
+                operation: "kv vector".to_string(),
+                requested_bytes: usize::MAX,
+            }
+        );
+    }
+
+    #[test]
+    fn kv_fallible_vec_resource_exhaustion_maps_to_kv_resource_exhaustion() {
+        let error = kv_object_error(sinomo_object::Error::Serde(
+            kv_fallible_vec_resource_exhausted("kv vector", 8192),
+        ));
+
+        assert_eq!(
+            error,
+            KvError::ResourceExhausted {
+                operation: "kv vector".to_string(),
+                requested_bytes: 8192,
+            }
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
@@ -237,6 +655,16 @@ pub fn push_bounded_txn_success_op(ops: &mut Vec<KvOp>, op: KvOp) -> Result<(), 
             max_ops_per_branch: MAX_KV_TXN_OPS_PER_BRANCH,
         });
     }
+    let requested_bytes = ops
+        .len()
+        .checked_add(1)
+        .and_then(|items| items.checked_mul(std::mem::size_of::<KvOp>().max(1)))
+        .unwrap_or(usize::MAX);
+    ops.try_reserve(1)
+        .map_err(|_| KvError::ResourceExhausted {
+            operation: "kv transaction success ops".to_string(),
+            requested_bytes,
+        })?;
     ops.push(op);
     Ok(())
 }
@@ -253,11 +681,23 @@ pub(crate) fn validate_kv_command_payload(command: &KvCommand) -> Result<(), KvE
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct KvTxn {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_fallible_vec"
+    )]
     pub compares: Vec<KvCompare>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_fallible_vec"
+    )]
     pub success: Vec<KvOp>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_fallible_vec"
+    )]
     pub failure: Vec<KvOp>,
 }
 
@@ -265,7 +705,11 @@ pub struct KvTxn {
 pub struct KvTxnResponse {
     pub succeeded: bool,
     pub revision: KvRevision,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_fallible_vec"
+    )]
     pub responses: Vec<KvOpResponse>,
 }
 
@@ -322,9 +766,15 @@ pub struct KvWatch {
 pub struct KvSnapshot {
     pub revision: KvRevision,
     pub compacted_revision: KvRevision,
+    #[serde(deserialize_with = "deserialize_fallible_vec")]
     pub entries: Vec<KvEntry>,
+    #[serde(deserialize_with = "deserialize_fallible_vec")]
     pub leases: Vec<KvLease>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_fallible_vec"
+    )]
     pub events: Vec<KvEvent>,
 }
 
@@ -412,6 +862,11 @@ pub enum KvError {
         observed_events: usize,
         max_events: usize,
     },
+    #[error("kv snapshot contains {observed_events} retained events; max is {max_events}")]
+    SnapshotEventLimit {
+        observed_events: usize,
+        max_events: usize,
+    },
     #[error("lease {lease_id:?} would have {observed_keys} attached keys; max is {max_keys}")]
     LeaseKeyLimit {
         lease_id: LeaseId,
@@ -427,6 +882,11 @@ pub enum KvError {
     CommandPayloadTooLarge {
         actual_bytes: usize,
         max_bytes: usize,
+    },
+    #[error("kv resource exhausted during {operation}: requested {requested_bytes} bytes")]
+    ResourceExhausted {
+        operation: String,
+        requested_bytes: usize,
     },
     #[error("serialization error: {detail}")]
     Serialization { detail: String },

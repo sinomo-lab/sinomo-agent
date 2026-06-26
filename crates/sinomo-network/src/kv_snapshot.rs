@@ -196,7 +196,7 @@ pub fn refresh_current_cluster_kv_store_with_host(
         })?;
     write_imported_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
     host.restore_cluster_kv_from_snapshot_if_newer(paths, &state.local_node_id, snapshot.clone())?;
-    Ok(InProcessKvStore::restore(snapshot))
+    InProcessKvStore::restore(snapshot).map_err(Into::into)
 }
 
 fn fetch_cluster_kv_snapshot_from_state_authority_node(

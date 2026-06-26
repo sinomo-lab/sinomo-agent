@@ -186,7 +186,7 @@ fn daemon_clear_cluster_raft_leader(
 const CLUSTER_CONNECTIVITY_PROBE_CONCURRENCY: usize = 16;
 
 struct ClusterConnectivityProbePlan {
-    active_keys: BTreeSet<String>,
+    active_keys: Vec<String>,
     entries: Vec<sinomo_network::ClusterConnectivityProbeBatchEntry>,
     timestamp: String,
     now: time::OffsetDateTime,
@@ -4691,6 +4691,60 @@ impl sinomo_network::ClusterRelayAsyncHost for DaemonClusterRelayAsyncHost<'_> {
             result
         })
     }
+
+    fn send_target_request_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        request: &'a sinomo_network::ObjectRpcRequest,
+        timeouts: sinomo_network::DaemonRpcTimeouts,
+    ) -> DaemonClusterRelayFuture<'a, sinomo_network::ObjectRpcResponse> {
+        let paths = self.paths.clone();
+        let runtime = self.runtime.clone();
+        let endpoint = endpoint.clone();
+        let request = request.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result =
+                send_cluster_relay_target_request_to_next_hop_async(&endpoint, &request, timeouts)
+                    .await
+                    .map_err(|error| daemon_host_network_error("cluster relay target", error));
+            match &result {
+                Ok(_) => {
+                    let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    remember_relay_endpoint_command_connectivity_async(
+                        paths,
+                        runtime,
+                        endpoint,
+                        sinomo_network::ClusterConnectivityState::Healthy,
+                        Some(latency_ms),
+                    )
+                    .await;
+                }
+                Err(sinomo_network::NetworkError::Io { .. }) => {
+                    remember_relay_endpoint_command_connectivity_async(
+                        paths,
+                        runtime,
+                        endpoint,
+                        sinomo_network::ClusterConnectivityState::Degraded,
+                        None,
+                    )
+                    .await;
+                }
+                Err(sinomo_network::NetworkError::AuthDenied) => {
+                    remember_relay_endpoint_command_connectivity_without_failure_grace_async(
+                        paths,
+                        runtime,
+                        endpoint,
+                        sinomo_network::ClusterConnectivityState::Degraded,
+                        None,
+                    )
+                    .await;
+                }
+                Err(_) => {}
+            }
+            result
+        })
+    }
 }
 
 struct DaemonClusterRelayStreamForwardHost<'a> {
@@ -4832,6 +4886,44 @@ async fn send_cluster_relay_request_to_next_hop_async(
         )
         .await
         .map_err(DaemonError::from)
+}
+
+async fn send_cluster_relay_target_request_to_next_hop_async(
+    endpoint: &ClusterEndpointRecord,
+    request: &sinomo_network::ObjectRpcRequest,
+    timeouts: sinomo_network::DaemonRpcTimeouts,
+) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
+    let mut host = DaemonClusterRelayPresignedEndpointRpcHost;
+    let mut client = sinomo_network::ClusterObjectRpcClient::endpoint_only(&mut host);
+    client
+        .call_endpoint(
+            endpoint,
+            request,
+            sinomo_network::ClusterObjectRpcOptions::new(timeouts),
+        )
+        .await
+        .map_err(DaemonError::from)
+}
+
+struct DaemonClusterRelayPresignedEndpointRpcHost;
+
+impl sinomo_network::ClusterSignedEndpointRpcAsyncHost
+    for DaemonClusterRelayPresignedEndpointRpcHost
+{
+    fn sign_endpoint_rpc_request_async<'a>(
+        &'a mut self,
+        request: &'a sinomo_network::ObjectRpcRequest,
+    ) -> sinomo_network::ClusterSignedEndpointRpcFuture<'a, Vec<u8>> {
+        Box::pin(async move {
+            request
+                .auth
+                .clone()
+                .ok_or_else(|| sinomo_network::NetworkError::Io {
+                    operation: "cluster relay target signing".to_string(),
+                    detail: "relayed target request is missing origin auth".to_string(),
+                })
+        })
+    }
 }
 
 enum ClusterRelayStreamForwardResult {
@@ -5749,7 +5841,7 @@ mod tests {
         let recovered = sinomo_network::accepted_cluster_join_state_from_kv_snapshot(
             &pending,
             &invite,
-            &store.snapshot(),
+            &store.snapshot().expect("snapshot"),
         )
         .expect("read snapshot")
         .expect("accepted state");
@@ -7296,7 +7388,7 @@ mod tests {
         .expect("commit should wait for the in-process raft operation");
         holder.join().expect("join raft holder");
 
-        let store = InProcessKvStore::restore(snapshot);
+        let store = InProcessKvStore::restore(snapshot).expect("restore");
         assert_eq!(
             store.get("/test/local-lock-wait").expect("committed").value,
             b"ok"
@@ -7436,7 +7528,7 @@ mod tests {
             )
             .expect("async local leader commit");
 
-        let store = InProcessKvStore::restore(snapshot);
+        let store = InProcessKvStore::restore(snapshot).expect("restore");
         assert_eq!(
             store
                 .get("/test/async-local-leader")
@@ -7836,8 +7928,11 @@ mod tests {
         store
             .put_serde(cluster_member_key(&remote_node), &remote_member, None)
             .expect("seed kv-only member");
-        sinomo_kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot())
-            .expect("write kv snapshot");
+        sinomo_kv::write_cluster_kv_snapshot(
+            &paths.kv_paths(),
+            &store.snapshot().expect("snapshot"),
+        )
+        .expect("write kv snapshot");
 
         let with_kv = read_local_cluster_state(&paths).expect("read local state with kv");
         assert!(
@@ -8202,8 +8297,11 @@ mod tests {
         store
             .put_serde(cluster_network_info_key(&local_node), &info, None)
             .expect("seed network info");
-        sinomo_kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot())
-            .expect("write matching snapshot");
+        sinomo_kv::write_cluster_kv_snapshot(
+            &paths.kv_paths(),
+            &store.snapshot().expect("snapshot"),
+        )
+        .expect("write matching snapshot");
 
         assert!(
             sync_cluster_network_info_to_kv(&paths, info.clone())
@@ -8254,7 +8352,7 @@ mod tests {
 
         sinomo_kv::write_cluster_kv_snapshot(
             &paths.kv_paths(),
-            &InProcessKvStore::new().snapshot(),
+            &InProcessKvStore::new().snapshot().expect("snapshot"),
         )
         .expect("install stale materialized cache");
         let stale_materialized = sinomo_kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
@@ -10614,7 +10712,7 @@ mod tests {
             snapshot: Some(sinomo_kv::RaftSnapshot {
                 last_included_index: 1,
                 last_included_term: 1,
-                kv: InProcessKvStore::new().snapshot(),
+                kv: InProcessKvStore::new().snapshot().expect("snapshot"),
             }),
             append: sinomo_kv::RaftAppendEntriesRequest {
                 term: 1,

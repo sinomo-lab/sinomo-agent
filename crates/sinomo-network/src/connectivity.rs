@@ -46,16 +46,185 @@ pub struct ClusterConnectivityRecord {
 #[derive(Clone, Debug)]
 pub struct ClusterConnectivityGraph {
     source_node_id: NodeId,
-    records: BTreeMap<ClusterConnectivityRecordKey, ClusterConnectivityRecord>,
-    records_by_address: BTreeMap<ClusterConnectivityAddressKey, ClusterConnectivityRecordKey>,
-    healthy_records_by_pair: BTreeMap<(NodeId, NodeId), BTreeSet<(u64, ClusterEndpointId)>>,
-    reachable_records_by_pair: BTreeMap<(NodeId, NodeId), BTreeSet<(u8, u64, ClusterEndpointId)>>,
-    reachable_targets_by_source: BTreeMap<NodeId, BTreeSet<NodeId>>,
-    healthy_targets_by_source: BTreeMap<NodeId, BTreeSet<NodeId>>,
+    records: ClusterConnectivityRecordIndex,
+    records_by_address: ClusterConnectivityAddressIndex,
+    healthy_records_by_pair: ClusterConnectivityPairIndex<(u64, ClusterEndpointId)>,
+    reachable_records_by_pair: ClusterConnectivityPairIndex<(u8, u64, ClusterEndpointId)>,
+    reachable_targets_by_source: ClusterConnectivityTargetIndex,
+    healthy_targets_by_source: ClusterConnectivityTargetIndex,
 }
 
-type ClusterConnectivityRecordKey = (NodeId, NodeId, ClusterEndpointId);
-type ClusterConnectivityAddressKey = (NodeId, NodeId, String);
+#[derive(Clone, Debug, Default)]
+struct ClusterConnectivityRecordIndex {
+    records: BTreeMap<(NodeId, NodeId, ClusterEndpointId), ClusterConnectivityRecord>,
+}
+
+impl ClusterConnectivityRecordIndex {
+    fn try_insert(
+        &mut self,
+        record: ClusterConnectivityRecord,
+        operation: &str,
+    ) -> Result<(), NetworkError> {
+        let key = (
+            try_clone_connectivity_id(&record.source_node_id, operation)?,
+            try_clone_connectivity_id(&record.target_node_id, operation)?,
+            try_clone_connectivity_id(&record.endpoint_id, operation)?,
+        );
+        self.records.insert(key, record);
+        Ok(())
+    }
+
+    fn get(
+        &self,
+        source_node_id: &NodeId,
+        target_node_id: &NodeId,
+        endpoint_id: &ClusterEndpointId,
+    ) -> Option<&ClusterConnectivityRecord> {
+        self.records.get(&(
+            source_node_id.clone(),
+            target_node_id.clone(),
+            endpoint_id.clone(),
+        ))
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &ClusterConnectivityRecord> {
+        self.records.values()
+    }
+
+    fn clear(&mut self) {
+        self.records.clear();
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ClusterConnectivityAddressIndex {
+    entries: BTreeMap<(NodeId, NodeId, String), ClusterEndpointId>,
+}
+
+impl ClusterConnectivityAddressIndex {
+    fn try_insert(
+        &mut self,
+        source_node_id: &NodeId,
+        target_node_id: &NodeId,
+        address_key: &str,
+        endpoint_id: &ClusterEndpointId,
+        operation: &str,
+    ) -> Result<(), NetworkError> {
+        self.entries
+            .entry((
+                try_clone_connectivity_id(source_node_id, operation)?,
+                try_clone_connectivity_id(target_node_id, operation)?,
+                try_clone_connectivity_string(address_key, operation)?,
+            ))
+            .or_insert(try_clone_connectivity_id(endpoint_id, operation)?);
+        Ok(())
+    }
+
+    fn endpoint_id(
+        &self,
+        source_node_id: &NodeId,
+        target_node_id: &NodeId,
+        address_key: &str,
+    ) -> Option<&ClusterEndpointId> {
+        self.entries.get(&(
+            source_node_id.clone(),
+            target_node_id.clone(),
+            address_key.to_string(),
+        ))
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ClusterConnectivityPairIndex<T> {
+    entries: BTreeMap<(NodeId, NodeId), BTreeSet<T>>,
+}
+
+impl<T> Default for ClusterConnectivityPairIndex<T> {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+impl<T> ClusterConnectivityPairIndex<T>
+where
+    T: Ord,
+{
+    fn try_insert(
+        &mut self,
+        source_node_id: &NodeId,
+        target_node_id: &NodeId,
+        value: T,
+        operation: &str,
+    ) -> Result<(), NetworkError> {
+        self.entries
+            .entry((
+                try_clone_connectivity_id(source_node_id, operation)?,
+                try_clone_connectivity_id(target_node_id, operation)?,
+            ))
+            .or_default()
+            .insert(value);
+        Ok(())
+    }
+
+    fn get(&self, source_node_id: &NodeId, target_node_id: &NodeId) -> Option<&BTreeSet<T>> {
+        self.entries
+            .get(&(source_node_id.clone(), target_node_id.clone()))
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ClusterConnectivityTargetIndex {
+    entries: BTreeMap<NodeId, BTreeSet<NodeId>>,
+}
+
+impl ClusterConnectivityTargetIndex {
+    fn try_insert(
+        &mut self,
+        source_node_id: &NodeId,
+        target_node_id: &NodeId,
+        operation: &str,
+    ) -> Result<(), NetworkError> {
+        self.entries
+            .entry(try_clone_connectivity_id(source_node_id, operation)?)
+            .or_default()
+            .insert(try_clone_connectivity_id(target_node_id, operation)?);
+        Ok(())
+    }
+
+    fn get(&self, source_node_id: &NodeId) -> Option<&BTreeSet<NodeId>> {
+        self.entries.get(source_node_id)
+    }
+
+    fn try_cloned_targets(
+        &self,
+        source_node_id: &NodeId,
+        operation: &str,
+    ) -> Result<Vec<NodeId>, NetworkError> {
+        let Some(targets) = self.get(source_node_id) else {
+            return Ok(Vec::new());
+        };
+        let mut cloned = Vec::new();
+        crate::object::try_reserve_vec(&mut cloned, targets.len(), operation)?;
+        for target in targets {
+            cloned.push(try_clone_connectivity_id(target, operation)?);
+        }
+        Ok(cloned)
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
 
 pub trait ClusterConnectivityRecordQuery {
     fn read_kv_connectivity_records(
@@ -78,7 +247,7 @@ pub struct ClusterConnectivityProbeBatchEntry {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterConnectivityProbeBatch {
-    pub active_keys: BTreeSet<String>,
+    pub active_keys: Vec<String>,
     pub entries: Vec<ClusterConnectivityProbeBatchEntry>,
     pub next_cursor: usize,
 }
@@ -90,6 +259,126 @@ pub enum ClusterConnectivityProbeObservation {
     Failed,
 }
 
+fn try_clone_connectivity_id(
+    id: &sinomo_core::Id,
+    operation: &str,
+) -> Result<sinomo_core::Id, NetworkError> {
+    crate::object::try_clone_id(id, operation)
+}
+
+fn try_clone_connectivity_string(value: &str, operation: &str) -> Result<String, NetworkError> {
+    crate::object::try_clone_string(value, operation)
+}
+
+fn try_clone_connectivity_string_option(
+    value: Option<&String>,
+    operation: &str,
+) -> Result<Option<String>, NetworkError> {
+    value
+        .map(|value| try_clone_connectivity_string(value, operation))
+        .transpose()
+}
+
+fn try_clone_connectivity_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    operation: &str,
+) -> Result<ClusterEndpointRecord, NetworkError> {
+    Ok(ClusterEndpointRecord {
+        endpoint_id: try_clone_connectivity_id(&endpoint.endpoint_id, operation)?,
+        node_id: try_clone_connectivity_id(&endpoint.node_id, operation)?,
+        transport: endpoint.transport.clone(),
+        address: try_clone_connectivity_string(&endpoint.address, operation)?,
+        source: endpoint.source.clone(),
+        privacy: endpoint.privacy.clone(),
+        priority: endpoint.priority,
+        last_observed_latency_ms: endpoint.last_observed_latency_ms,
+    })
+}
+
+fn try_clone_connectivity_record(
+    record: &ClusterConnectivityRecord,
+    operation: &str,
+) -> Result<ClusterConnectivityRecord, NetworkError> {
+    Ok(ClusterConnectivityRecord {
+        cluster_id: try_clone_connectivity_id(&record.cluster_id, operation)?,
+        source_node_id: try_clone_connectivity_id(&record.source_node_id, operation)?,
+        target_node_id: try_clone_connectivity_id(&record.target_node_id, operation)?,
+        endpoint_id: try_clone_connectivity_id(&record.endpoint_id, operation)?,
+        transport: record.transport.clone(),
+        address: try_clone_connectivity_string(&record.address, operation)?,
+        state: record.state.clone(),
+        latency_ms: record.latency_ms,
+        consecutive_failures: record.consecutive_failures,
+        last_success_at: try_clone_connectivity_string_option(
+            record.last_success_at.as_ref(),
+            operation,
+        )?,
+        last_failure_at: try_clone_connectivity_string_option(
+            record.last_failure_at.as_ref(),
+            operation,
+        )?,
+        observed_at: record.observed_at,
+        expires_at: record.expires_at,
+    })
+}
+
+fn try_cluster_connectivity_probe_key_parts(
+    source_node_id: &NodeId,
+    target_node_id: &NodeId,
+    endpoint_id: &ClusterEndpointId,
+) -> Result<String, NetworkError> {
+    let requested_bytes = source_node_id
+        .as_str()
+        .len()
+        .saturating_add(target_node_id.as_str().len())
+        .saturating_add(endpoint_id.as_str().len())
+        .saturating_add(2);
+    let mut key = String::new();
+    key.try_reserve(requested_bytes)
+        .map_err(|_| NetworkError::ResourceExhausted {
+            operation: "build connectivity probe key".to_string(),
+            requested_bytes,
+        })?;
+    key.push_str(source_node_id.as_str());
+    key.push(':');
+    key.push_str(target_node_id.as_str());
+    key.push(':');
+    key.push_str(endpoint_id.as_str());
+    Ok(key)
+}
+
+fn try_cluster_connectivity_probe_key(
+    source_node_id: &NodeId,
+    endpoint: &ClusterEndpointRecord,
+) -> Result<String, NetworkError> {
+    try_cluster_connectivity_probe_key_parts(
+        source_node_id,
+        &endpoint.node_id,
+        &endpoint.endpoint_id,
+    )
+}
+
+fn sorted_string_slice_contains(values: &[String], value: &str) -> bool {
+    values
+        .binary_search_by(|stored| stored.as_str().cmp(value))
+        .is_ok()
+}
+
+fn try_insert_sorted_string(
+    values: &mut Vec<String>,
+    value: String,
+    operation: &str,
+) -> Result<bool, NetworkError> {
+    match values.binary_search_by(|stored| stored.as_str().cmp(value.as_str())) {
+        Ok(_) => Ok(false),
+        Err(index) => {
+            crate::object::try_reserve_vec(values, 1, operation)?;
+            values.insert(index, value);
+            Ok(true)
+        }
+    }
+}
+
 pub fn select_cluster_connectivity_probe_batch(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -99,14 +388,44 @@ pub fn select_cluster_connectivity_probe_batch(
     startup_settle_active: bool,
     now: OffsetDateTime,
 ) -> ClusterConnectivityProbeBatch {
+    try_select_cluster_connectivity_probe_batch(
+        paths,
+        state,
+        connectivity,
+        connectivity_cursor,
+        local_node_role,
+        startup_settle_active,
+        now,
+    )
+    .unwrap_or_else(|_| ClusterConnectivityProbeBatch {
+        active_keys: Vec::new(),
+        entries: Vec::new(),
+        next_cursor: 0,
+    })
+}
+
+pub fn try_select_cluster_connectivity_probe_batch(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    connectivity: &mut BTreeMap<String, ClusterConnectivityProbeState>,
+    connectivity_cursor: usize,
+    local_node_role: &ClusterNodeRole,
+    startup_settle_active: bool,
+    now: OffsetDateTime,
+) -> Result<ClusterConnectivityProbeBatch, NetworkError> {
     let refresh_deadline =
         now + time::Duration::seconds(CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS);
     let targets = ClusterEndpointSelector::new(paths, state)
-        .select(ClusterEndpointSelectionPurpose::NetworkProbe);
-    let active_keys = targets
-        .iter()
-        .map(|endpoint| cluster_connectivity_probe_key(&state.local_node_id, endpoint))
-        .collect::<BTreeSet<_>>();
+        .try_select(ClusterEndpointSelectionPurpose::NetworkProbe)?;
+    let mut active_keys = Vec::new();
+    for endpoint in &targets {
+        let key = try_cluster_connectivity_probe_key(&state.local_node_id, endpoint)?;
+        try_insert_sorted_string(
+            &mut active_keys,
+            key,
+            "collect active connectivity probe keys",
+        )?;
+    }
 
     // Seed the in-memory probe cache from the merged graph (KV + the local probe store,
     // local-authoritative for our own edges). A learner cannot commit its connectivity
@@ -119,50 +438,58 @@ pub fn select_cluster_connectivity_probe_batch(
         {
             // Must match `cluster_connectivity_probe_key` ("src:tgt:endpoint"),
             // not the KV key, or the seed never lands in the probe cache.
-            let key = format!(
-                "{}:{}:{}",
-                record.source_node_id, record.target_node_id, record.endpoint_id
+            let key = try_cluster_connectivity_probe_key_parts(
+                &record.source_node_id,
+                &record.target_node_id,
+                &record.endpoint_id,
             );
-            if active_keys.contains(&key) {
+            let key = key?;
+            if sorted_string_slice_contains(&active_keys, &key) {
                 connectivity.insert(key, ClusterConnectivityProbeState { record });
             }
         }
     }
 
-    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
-    let mut probe_entries = targets
-        .iter()
-        .filter_map(|endpoint| {
-            let key = cluster_connectivity_probe_key(&state.local_node_id, endpoint);
-            let previous = connectivity.get(&key).map(|probe| probe.record.clone());
-            let due = previous.as_ref().is_none_or(|record| {
-                cluster_connectivity_probe_due_with_graph(
-                    record,
-                    endpoint,
-                    now,
-                    refresh_deadline,
-                    local_node_role,
-                    &graph,
-                    &state.local_node_id,
-                    startup_settle_active,
-                )
-            });
-            due.then(|| ClusterConnectivityProbeBatchEntry {
-                key,
-                endpoint: endpoint.clone(),
-                previous,
+    let graph = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
+    let mut probe_entries = Vec::new();
+    for endpoint in &targets {
+        let key = try_cluster_connectivity_probe_key(&state.local_node_id, endpoint)?;
+        let previous = connectivity
+            .get(&key)
+            .map(|probe| {
+                try_clone_connectivity_record(&probe.record, "clone previous connectivity record")
             })
-        })
-        .collect::<Vec<_>>();
-    probe_entries.sort_by_key(|entry| {
-        (
-            cluster_connectivity_probe_expiry_rank(entry.previous.as_ref()),
-            cluster_connectivity_probe_state_rank(entry.previous.as_ref()),
-            entry.endpoint.node_id.clone(),
-            entry.endpoint.priority,
-            entry.endpoint.address.clone(),
-        )
-    });
+            .transpose()?;
+        let due = previous.as_ref().is_none_or(|record| {
+            cluster_connectivity_probe_due_with_graph(
+                record,
+                endpoint,
+                now,
+                refresh_deadline,
+                local_node_role,
+                &graph,
+                &state.local_node_id,
+                startup_settle_active,
+            )
+        });
+        if !due {
+            continue;
+        }
+        crate::object::try_reserve_vec(
+            &mut probe_entries,
+            1,
+            "collect connectivity probe entries",
+        )?;
+        probe_entries.push(ClusterConnectivityProbeBatchEntry {
+            key,
+            endpoint: try_clone_connectivity_endpoint(
+                endpoint,
+                "clone connectivity probe endpoint",
+            )?,
+            previous,
+        });
+    }
+    probe_entries.sort_by(|left, right| cluster_connectivity_probe_entry_cmp(left, right));
     let probe_count =
         probe_entries
             .len()
@@ -171,13 +498,33 @@ pub fn select_cluster_connectivity_probe_batch(
             ));
     let _ = connectivity_cursor;
     let next_cursor = 0;
-    let entries = probe_entries.into_iter().take(probe_count).collect();
+    probe_entries.truncate(probe_count);
 
-    ClusterConnectivityProbeBatch {
+    Ok(ClusterConnectivityProbeBatch {
         active_keys,
-        entries,
+        entries: probe_entries,
         next_cursor,
-    }
+    })
+}
+
+fn cluster_connectivity_probe_entry_cmp(
+    left: &ClusterConnectivityProbeBatchEntry,
+    right: &ClusterConnectivityProbeBatchEntry,
+) -> std::cmp::Ordering {
+    (
+        cluster_connectivity_probe_expiry_rank(left.previous.as_ref()),
+        cluster_connectivity_probe_state_rank(left.previous.as_ref()),
+        &left.endpoint.node_id,
+        left.endpoint.priority,
+        left.endpoint.address.as_str(),
+    )
+        .cmp(&(
+            cluster_connectivity_probe_expiry_rank(right.previous.as_ref()),
+            cluster_connectivity_probe_state_rank(right.previous.as_ref()),
+            &right.endpoint.node_id,
+            right.endpoint.priority,
+            right.endpoint.address.as_str(),
+        ))
 }
 
 fn cluster_connectivity_probe_expiry_rank(
@@ -399,18 +746,36 @@ pub(crate) fn cluster_connectivity_record_for_hard_failure(
 
 pub fn apply_cluster_connectivity_probe_results(
     connectivity: &mut BTreeMap<String, ClusterConnectivityProbeState>,
-    active_keys: &BTreeSet<String>,
+    active_keys: &[String],
     probed: Vec<(String, ClusterConnectivityRecord)>,
 ) -> Vec<ClusterConnectivityRecord> {
+    try_apply_cluster_connectivity_probe_results(connectivity, active_keys, probed)
+        .unwrap_or_default()
+}
+
+pub fn try_apply_cluster_connectivity_probe_results(
+    connectivity: &mut BTreeMap<String, ClusterConnectivityProbeState>,
+    active_keys: &[String],
+    probed: Vec<(String, ClusterConnectivityRecord)>,
+) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
     for (key, record) in probed {
         connectivity.insert(key, ClusterConnectivityProbeState { record });
     }
 
-    connectivity.retain(|key, _state| active_keys.contains(key));
-    connectivity
-        .values()
-        .map(|state| state.record.clone())
-        .collect()
+    connectivity.retain(|key, _state| sorted_string_slice_contains(active_keys, key));
+    let mut records = Vec::new();
+    for state in connectivity.values() {
+        crate::object::try_reserve_vec(
+            &mut records,
+            1,
+            "collect connectivity probe result records",
+        )?;
+        records.push(try_clone_connectivity_record(
+            &state.record,
+            "collect connectivity probe result records",
+        )?);
+    }
+    Ok(records)
 }
 
 pub fn cluster_connectivity_probe_due_with_startup_settle(
@@ -484,14 +849,12 @@ pub fn cluster_connectivity_probe_due_with_graph(
     true
 }
 
+#[cfg(test)]
 pub(crate) fn cluster_connectivity_probe_key(
     source_node_id: &NodeId,
     endpoint: &ClusterEndpointRecord,
 ) -> String {
-    format!(
-        "{}:{}:{}",
-        source_node_id, endpoint.node_id, endpoint.endpoint_id
-    )
+    try_cluster_connectivity_probe_key(source_node_id, endpoint).unwrap_or_default()
 }
 
 pub fn cluster_connectivity_record(
@@ -530,82 +893,119 @@ impl ClusterConnectivityGraph {
         source_node_id: NodeId,
         records: impl IntoIterator<Item = ClusterConnectivityRecord>,
     ) -> Self {
-        let records: BTreeMap<_, _> = records
-            .into_iter()
-            .map(|record| {
-                (
-                    (
-                        record.source_node_id.clone(),
-                        record.target_node_id.clone(),
-                        record.endpoint_id.clone(),
-                    ),
-                    record,
-                )
-            })
-            .collect();
-        let mut reachable_targets_by_source = BTreeMap::<NodeId, BTreeSet<NodeId>>::new();
-        let mut healthy_targets_by_source = BTreeMap::<NodeId, BTreeSet<NodeId>>::new();
-        let mut records_by_address =
-            BTreeMap::<ClusterConnectivityAddressKey, ClusterConnectivityRecordKey>::new();
-        let mut healthy_records_by_pair =
-            BTreeMap::<(NodeId, NodeId), BTreeSet<(u64, ClusterEndpointId)>>::new();
-        let mut reachable_records_by_pair =
-            BTreeMap::<(NodeId, NodeId), BTreeSet<(u8, u64, ClusterEndpointId)>>::new();
-        for record in records.values() {
-            let record_key = (
-                record.source_node_id.clone(),
-                record.target_node_id.clone(),
-                record.endpoint_id.clone(),
-            );
-            for address_key in cluster_endpoint_address_lookup_keys(&record.address) {
-                records_by_address
-                    .entry((
-                        record.source_node_id.clone(),
-                        record.target_node_id.clone(),
-                        address_key,
-                    ))
-                    .or_insert_with(|| record_key.clone());
+        let mut graph = Self::empty(source_node_id);
+        if graph.try_replace_records(records).is_err() {
+            graph.clear_indexes();
+        }
+        graph
+    }
+
+    pub fn try_from_records(
+        source_node_id: NodeId,
+        records: impl IntoIterator<Item = ClusterConnectivityRecord>,
+    ) -> Result<Self, NetworkError> {
+        let mut graph = Self::empty(source_node_id);
+        graph.try_replace_records(records)?;
+        Ok(graph)
+    }
+
+    fn empty(source_node_id: NodeId) -> Self {
+        Self {
+            source_node_id,
+            records: ClusterConnectivityRecordIndex::default(),
+            records_by_address: ClusterConnectivityAddressIndex::default(),
+            healthy_records_by_pair: ClusterConnectivityPairIndex::default(),
+            reachable_records_by_pair: ClusterConnectivityPairIndex::default(),
+            reachable_targets_by_source: ClusterConnectivityTargetIndex::default(),
+            healthy_targets_by_source: ClusterConnectivityTargetIndex::default(),
+        }
+    }
+
+    fn clear_indexes(&mut self) {
+        self.records.clear();
+        self.records_by_address.clear();
+        self.healthy_records_by_pair.clear();
+        self.reachable_records_by_pair.clear();
+        self.reachable_targets_by_source.clear();
+        self.healthy_targets_by_source.clear();
+    }
+
+    fn try_replace_records(
+        &mut self,
+        records: impl IntoIterator<Item = ClusterConnectivityRecord>,
+    ) -> Result<(), NetworkError> {
+        let mut record_index = ClusterConnectivityRecordIndex::default();
+        for record in records {
+            record_index.try_insert(record, "index connectivity records")?;
+        }
+
+        let mut records_by_address = ClusterConnectivityAddressIndex::default();
+        let mut healthy_records_by_pair = ClusterConnectivityPairIndex::default();
+        let mut reachable_records_by_pair = ClusterConnectivityPairIndex::default();
+        let mut reachable_targets_by_source = ClusterConnectivityTargetIndex::default();
+        let mut healthy_targets_by_source = ClusterConnectivityTargetIndex::default();
+
+        for record in record_index.iter() {
+            for address_key in try_cluster_endpoint_address_lookup_keys(&record.address)? {
+                records_by_address.try_insert(
+                    &record.source_node_id,
+                    &record.target_node_id,
+                    &address_key,
+                    &record.endpoint_id,
+                    "index connectivity records by address",
+                )?;
             }
             if record.target_node_id == record.source_node_id {
                 continue;
             }
             if record.state != ClusterConnectivityState::Unreachable {
-                reachable_targets_by_source
-                    .entry(record.source_node_id.clone())
-                    .or_default()
-                    .insert(record.target_node_id.clone());
-                reachable_records_by_pair
-                    .entry((record.source_node_id.clone(), record.target_node_id.clone()))
-                    .or_default()
-                    .insert((
+                reachable_targets_by_source.try_insert(
+                    &record.source_node_id,
+                    &record.target_node_id,
+                    "index reachable connectivity targets",
+                )?;
+                reachable_records_by_pair.try_insert(
+                    &record.source_node_id,
+                    &record.target_node_id,
+                    (
                         cluster_route_connectivity_quality_rank(Some(&record.state)),
                         record.latency_ms.unwrap_or(u64::MAX),
-                        record.endpoint_id.clone(),
-                    ));
+                        try_clone_connectivity_id(
+                            &record.endpoint_id,
+                            "index reachable connectivity records",
+                        )?,
+                    ),
+                    "index reachable connectivity records",
+                )?;
             }
             if record.state == ClusterConnectivityState::Healthy {
-                healthy_targets_by_source
-                    .entry(record.source_node_id.clone())
-                    .or_default()
-                    .insert(record.target_node_id.clone());
-                healthy_records_by_pair
-                    .entry((record.source_node_id.clone(), record.target_node_id.clone()))
-                    .or_default()
-                    .insert((
+                healthy_targets_by_source.try_insert(
+                    &record.source_node_id,
+                    &record.target_node_id,
+                    "index healthy connectivity targets",
+                )?;
+                healthy_records_by_pair.try_insert(
+                    &record.source_node_id,
+                    &record.target_node_id,
+                    (
                         record.latency_ms.unwrap_or(u64::MAX),
-                        record.endpoint_id.clone(),
-                    ));
+                        try_clone_connectivity_id(
+                            &record.endpoint_id,
+                            "index healthy connectivity records",
+                        )?,
+                    ),
+                    "index healthy connectivity records",
+                )?;
             }
         }
-        Self {
-            source_node_id,
-            records,
-            records_by_address,
-            healthy_records_by_pair,
-            reachable_records_by_pair,
-            reachable_targets_by_source,
-            healthy_targets_by_source,
-        }
+
+        self.records = record_index;
+        self.records_by_address = records_by_address;
+        self.healthy_records_by_pair = healthy_records_by_pair;
+        self.reachable_records_by_pair = reachable_records_by_pair;
+        self.reachable_targets_by_source = reachable_targets_by_source;
+        self.healthy_targets_by_source = healthy_targets_by_source;
+        Ok(())
     }
 
     pub(crate) fn source_node_id(&self) -> &NodeId {
@@ -617,11 +1017,11 @@ impl ClusterConnectivityGraph {
         endpoint: &ClusterEndpointRecord,
     ) -> Option<&ClusterConnectivityRecord> {
         self.records
-            .get(&(
-                self.source_node_id.clone(),
-                endpoint.node_id.clone(),
-                endpoint.endpoint_id.clone(),
-            ))
+            .get(
+                &self.source_node_id,
+                &endpoint.node_id,
+                &endpoint.endpoint_id,
+            )
             .or_else(|| {
                 // Fall back to matching on (source, target, address): the network address is
                 // the stable identity of an endpoint. The same address can be derived with a
@@ -633,12 +1033,14 @@ impl ClusterConnectivityGraph {
                     .into_iter()
                     .find_map(|address_key| {
                         self.records_by_address
-                            .get(&(
-                                self.source_node_id.clone(),
-                                endpoint.node_id.clone(),
-                                address_key,
-                            ))
-                            .and_then(|record_key| self.records.get(record_key))
+                            .endpoint_id(&self.source_node_id, &endpoint.node_id, &address_key)
+                            .and_then(|endpoint_id| {
+                                self.records.get(
+                                    &self.source_node_id,
+                                    &endpoint.node_id,
+                                    endpoint_id,
+                                )
+                            })
                     })
             })
     }
@@ -662,10 +1064,9 @@ impl ClusterConnectivityGraph {
     /// Node ids directly reachable from `source` per a non-`Unreachable` connectivity
     /// record (over any endpoint), excluding `source` itself. This is the adjacency the
     /// multi-hop route discovery in [`crate::route`] walks over the cluster-wide graph.
-    pub fn reachable_targets(&self, source: &NodeId) -> BTreeSet<NodeId> {
+    pub fn reachable_targets(&self, source: &NodeId) -> Vec<NodeId> {
         self.reachable_targets_by_source
-            .get(source)
-            .cloned()
+            .try_cloned_targets(source, "clone reachable connectivity targets")
             .unwrap_or_default()
     }
 
@@ -674,10 +1075,9 @@ impl ClusterConnectivityGraph {
     /// first hop must be a link we can dial reliably *now*, so a never-reachable peer that is
     /// merely mid-convergence (transiently `Degraded`) is not treated as a direct hop. This is
     /// the adjacency multi-hop route discovery in [`crate::route`] walks.
-    pub fn healthy_targets(&self, source: &NodeId) -> BTreeSet<NodeId> {
+    pub fn healthy_targets(&self, source: &NodeId) -> Vec<NodeId> {
         self.healthy_targets_by_source
-            .get(source)
-            .cloned()
+            .try_cloned_targets(source, "clone healthy connectivity targets")
             .unwrap_or_default()
     }
 
@@ -712,13 +1112,10 @@ impl ClusterConnectivityGraph {
         mut predicate: impl FnMut(&ClusterEndpointRecord) -> bool,
     ) -> Option<ClusterEndpointRecord> {
         self.healthy_records_by_pair
-            .get(&(source.clone(), target.clone()))
+            .get(source, target)
             .into_iter()
             .flat_map(|records| records.iter())
-            .filter_map(|(_, endpoint_id)| {
-                self.records
-                    .get(&(source.clone(), target.clone(), endpoint_id.clone()))
-            })
+            .filter_map(|(_, endpoint_id)| self.records.get(source, target, endpoint_id))
             .map(cluster_endpoint_record_for_connectivity_record)
             .find(|endpoint| predicate(endpoint))
     }
@@ -742,19 +1139,16 @@ impl ClusterConnectivityGraph {
         mut predicate: impl FnMut(&ClusterEndpointRecord) -> bool,
     ) -> Option<ClusterEndpointRecord> {
         self.reachable_records_by_pair
-            .get(&(source.clone(), target.clone()))
+            .get(source, target)
             .into_iter()
             .flat_map(|records| records.iter())
-            .filter_map(|(_, _, endpoint_id)| {
-                self.records
-                    .get(&(source.clone(), target.clone(), endpoint_id.clone()))
-            })
+            .filter_map(|(_, _, endpoint_id)| self.records.get(source, target, endpoint_id))
             .map(cluster_endpoint_record_for_connectivity_record)
             .find(|endpoint| predicate(endpoint))
     }
 
     pub(crate) fn earliest_expires_at(&self) -> Option<OffsetDateTime> {
-        self.records.values().map(|record| record.expires_at).min()
+        self.records.iter().map(|record| record.expires_at).min()
     }
 }
 
@@ -780,11 +1174,68 @@ fn cluster_endpoint_record_for_connectivity_record(
 /// connectivity-record lookup, where the same address may be derived slightly differently
 /// across code paths (probe targets vs command targets).
 fn cluster_endpoint_address_lookup_keys(address: &str) -> Vec<String> {
-    let mut keys = vec![format!("raw:{address}")];
+    try_cluster_endpoint_address_lookup_keys(address).unwrap_or_default()
+}
+
+fn try_cluster_endpoint_address_lookup_keys(address: &str) -> Result<Vec<String>, NetworkError> {
+    let mut keys = Vec::new();
+    crate::object::try_reserve_vec(&mut keys, 1, "build endpoint address lookup keys")?;
+    keys.push(try_prefixed_connectivity_string(
+        "raw:",
+        address,
+        "build endpoint address lookup keys",
+    )?);
     if let Ok(socket_addr) = address.parse::<SocketAddr>() {
-        keys.push(format!("socket:{socket_addr}"));
+        crate::object::try_reserve_vec(&mut keys, 1, "build endpoint address lookup keys")?;
+        keys.push(try_socket_address_lookup_key(
+            socket_addr,
+            "build endpoint address lookup keys",
+        )?);
     }
-    keys
+    Ok(keys)
+}
+
+fn try_prefixed_connectivity_string(
+    prefix: &str,
+    value: &str,
+    operation: &str,
+) -> Result<String, NetworkError> {
+    let requested_bytes = prefix.len().saturating_add(value.len());
+    let mut output = String::new();
+    output
+        .try_reserve(requested_bytes)
+        .map_err(|_| NetworkError::ResourceExhausted {
+            operation: operation.to_string(),
+            requested_bytes,
+        })?;
+    output.push_str(prefix);
+    output.push_str(value);
+    Ok(output)
+}
+
+fn try_socket_address_lookup_key(
+    socket_addr: SocketAddr,
+    operation: &str,
+) -> Result<String, NetworkError> {
+    use std::fmt::Write as _;
+
+    const SOCKET_ADDR_DISPLAY_MAX_BYTES: usize = 64;
+    let requested_bytes = "socket:"
+        .len()
+        .saturating_add(SOCKET_ADDR_DISPLAY_MAX_BYTES);
+    let mut output = String::new();
+    output
+        .try_reserve(requested_bytes)
+        .map_err(|_| NetworkError::ResourceExhausted {
+            operation: operation.to_string(),
+            requested_bytes,
+        })?;
+    output.push_str("socket:");
+    write!(&mut output, "{socket_addr}").map_err(|_| NetworkError::ResourceExhausted {
+        operation: operation.to_string(),
+        requested_bytes,
+    })?;
+    Ok(output)
 }
 
 fn cluster_route_unavailability_rank(connectivity: Option<&ClusterConnectivityRecord>) -> u8 {
