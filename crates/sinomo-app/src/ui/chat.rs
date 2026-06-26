@@ -52,11 +52,11 @@ use sui::{
 
 use sinomo_agent::{
     AgentChannel, AgentChannelAuthor, AgentChannelKind, AgentChannelMessageKind, AgentChannelStore,
-    FileAgentChannelStore,
 };
 use sinomo_cli::app_api::{
-    AgentSummary, ChatContextSnapshot, ChatHistoryMessage, ChatProcessSnapshot, ChatTaskSnapshot,
-    ChatToolCallSnapshot, ChatUsageSnapshot, ProviderSummary, agent_summaries, reasoning_efforts,
+    AgentChatSifsStorage, AgentSummary, ChatContextSnapshot, ChatHistoryMessage,
+    ChatProcessSnapshot, ChatTaskSnapshot, ChatToolCallSnapshot, ChatUsageSnapshot,
+    ProviderSummary, SifsAgentChannelStore, agent_summaries, reasoning_efforts,
 };
 use sinomo_runtime::{events::SessionId, local::SinomoDataDir};
 
@@ -355,19 +355,22 @@ struct DeleteWorkerResult {
 impl ChatState {
     pub fn new(backend: &Backend) -> Self {
         let daemon_connected = backend.connection.is_daemon();
+        let daemon_address = backend.connection.daemon_address().map(str::to_string);
+        let sifs_storage = daemon_address
+            .as_deref()
+            .map(|address| AgentChatSifsStorage::new(address, backend.app_runtime.handle()));
         let handle = ChatHandle::spawn(
             (*backend.data_dir).clone(),
             daemon_connected,
             backend.agent_runtime_control.clone(),
+            sifs_storage,
         );
 
         let agents = agent_summaries(&backend.data_dir);
         let providers = crate::backend::config::cluster_provider_summaries(backend.config.as_ref());
         let efforts = reasoning_efforts();
         let effort_idx = efforts.iter().position(|e| e == "medium").unwrap_or(0);
-        let sifs_daemon = backend
-            .connection
-            .daemon_address()
+        let sifs_daemon = daemon_address
             .map(|address| sessions::SifsDaemonAccess::new(address, backend.app_runtime.handle()));
         let (sessions, session_list_error) =
             list_conversations_with_error(&backend.data_dir, sifs_daemon.as_ref());
@@ -502,15 +505,38 @@ impl ChatState {
 
     fn rename_chat_record(&self, session_id: &str, title: &str) -> std::io::Result<()> {
         #[cfg(test)]
-        if self.sifs_daemon.is_none() {
-            return sessions::rename(&self.data_dir, session_id, title);
+        let sifs_result = if self.sifs_daemon.is_none() {
+            sessions::rename(&self.data_dir, session_id, title)
+        } else {
+            sessions::rename_via_daemon(
+                &self.data_dir,
+                self.sifs_daemon.as_ref(),
+                session_id,
+                title,
+            )
+        };
+        #[cfg(not(test))]
+        let sifs_result = sessions::rename_via_daemon(
+            &self.data_dir,
+            self.sifs_daemon.as_ref(),
+            session_id,
+            title,
+        );
+        let channel_result =
+            rename_chat_channel(&self.data_dir, self.sifs_daemon.as_ref(), session_id, title);
+        match (sifs_result, channel_result) {
+            (Ok(()), _) | (_, Ok(())) => Ok(()),
+            (Err(error), Err(_)) => Err(error),
         }
-        sessions::rename_via_daemon(&self.data_dir, self.sifs_daemon.as_ref(), session_id, title)
+    }
+
+    fn agent_channel_store(&self) -> std::io::Result<SifsAgentChannelStore> {
+        open_agent_channel_store(&self.data_dir, self.sifs_daemon.as_ref())
     }
 
     fn rename_channel(&self, id: &str, title: &str) -> std::io::Result<()> {
         let channel_id = parse_channel_id(id)?;
-        let store = FileAgentChannelStore::for_data_dir(&self.data_dir);
+        let store = self.agent_channel_store()?;
         let mut channel = store
             .load_channel(&channel_id)
             .map_err(channel_store_io_error)?
@@ -524,7 +550,9 @@ impl ChatState {
 
     fn load_channel_messages(&self, id: &str) -> Option<Vec<ChatMessage>> {
         let channel_id = id.parse::<SessionId>().ok()?;
-        let channel = FileAgentChannelStore::for_data_dir(&self.data_dir)
+        let channel = self
+            .agent_channel_store()
+            .ok()?
             .load_channel(&channel_id)
             .ok()
             .flatten()?;
@@ -535,9 +563,10 @@ impl ChatState {
         let Ok(channel_id) = id.parse::<SessionId>() else {
             return Vec::new();
         };
-        let Ok(Some(channel)) =
-            FileAgentChannelStore::for_data_dir(&self.data_dir).load_channel(&channel_id)
-        else {
+        let Ok(store) = self.agent_channel_store() else {
+            return Vec::new();
+        };
+        let Ok(Some(channel)) = store.load_channel(&channel_id) else {
             return Vec::new();
         };
         let mut participants = channel.participants.clone();
@@ -1717,7 +1746,16 @@ impl ChatState {
         channel.ensure_user(sinomo_agent::AgentChannelUser::app_local());
         let (agent_key, agent_name) = self.default_channel_agent();
         channel.ensure_participant(agent_key, agent_name);
-        match FileAgentChannelStore::for_data_dir(&self.data_dir).save_channel(&channel) {
+        let store = match self.agent_channel_store() {
+            Ok(store) => store,
+            Err(error) => {
+                let detail = error.to_string();
+                self.notice = Some(format!("channel create failed: {detail}"));
+                self.push_activity("channel create", detail, ActivityTone::Warn);
+                return;
+            }
+        };
+        match store.save_channel(&channel) {
             Ok(()) => {
                 self.reset_visible_session(session_id.clone());
                 self.pending_session_reset = Some(session_id.clone());
@@ -1771,7 +1809,15 @@ impl ChatState {
         };
         let agent_key = agent.key.clone();
         let agent_name = agent.name.clone();
-        let store = FileAgentChannelStore::for_data_dir(&self.data_dir);
+        let store = match self.agent_channel_store() {
+            Ok(store) => store,
+            Err(error) => {
+                let detail = error.to_string();
+                self.notice = Some(format!("channel config failed: {detail}"));
+                self.push_activity("channel config", detail, ActivityTone::Warn);
+                return;
+            }
+        };
         let Ok(parsed_channel_id) = channel_id.parse::<SessionId>() else {
             self.notice = Some("channel config failed: invalid channel id".to_string());
             return;
@@ -1810,7 +1856,15 @@ impl ChatState {
             self.notice = Some("channel config failed: invalid participant id".to_string());
             return;
         };
-        let store = FileAgentChannelStore::for_data_dir(&self.data_dir);
+        let store = match self.agent_channel_store() {
+            Ok(store) => store,
+            Err(error) => {
+                let detail = error.to_string();
+                self.notice = Some(format!("channel config failed: {detail}"));
+                self.push_activity("channel config", detail, ActivityTone::Warn);
+                return;
+            }
+        };
         let mut channel = match store.load_channel(&parsed_channel_id) {
             Ok(Some(channel)) => channel,
             Ok(None) => {
@@ -1926,39 +1980,48 @@ fn list_conversations_with_error(
         })
         .collect::<Vec<_>>();
 
-    if let Ok(channels) = FileAgentChannelStore::for_data_dir(data_dir).list_channels() {
-        let mut seen_channel_ids = BTreeSet::new();
-        for channel in channels {
-            if channel.channel_kind != AgentChannelKind::Channel {
-                continue;
+    let channel_result = open_agent_channel_store(data_dir, sifs_daemon)
+        .and_then(|store| store.list_channels().map_err(channel_store_io_error));
+    let channel_error = match channel_result {
+        Ok(channels) => {
+            let mut seen_channel_ids = BTreeSet::new();
+            for channel in channels {
+                if channel.channel_kind != AgentChannelKind::Channel {
+                    continue;
+                }
+                let id = channel.channel_id.to_string();
+                if !seen_channel_ids.insert(id.clone()) {
+                    continue;
+                }
+                conversations.retain(|conversation| {
+                    !(conversation.id == id && conversation.kind == ConversationKind::Chat)
+                });
+                conversations.push(SessionRef {
+                    id,
+                    title: if channel.title.trim().is_empty() {
+                        "New channel".to_string()
+                    } else {
+                        channel.title
+                    },
+                    kind: ConversationKind::Channel,
+                    updated_unix: channel.updated_at.unix_timestamp(),
+                    participant_count: channel
+                        .participants
+                        .iter()
+                        .filter(|participant| participant.enabled)
+                        .count(),
+                });
             }
-            let id = channel.channel_id.to_string();
-            if !seen_channel_ids.insert(id.clone()) {
-                continue;
-            }
-            conversations.retain(|conversation| {
-                !(conversation.id == id && conversation.kind == ConversationKind::Chat)
-            });
-            conversations.push(SessionRef {
-                id,
-                title: if channel.title.trim().is_empty() {
-                    "New channel".to_string()
-                } else {
-                    channel.title
-                },
-                kind: ConversationKind::Channel,
-                updated_unix: channel.updated_at.unix_timestamp(),
-                participant_count: channel
-                    .participants
-                    .iter()
-                    .filter(|participant| participant.enabled)
-                    .count(),
-            });
+            None
         }
-    }
+        Err(error) => Some(error.to_string()),
+    };
 
     sort_conversations(&mut conversations);
-    (conversations, chat_error)
+    let error = chat_error
+        .filter(|_| conversations.is_empty())
+        .or_else(|| channel_error.filter(|_| conversations.is_empty()));
+    (conversations, error)
 }
 
 fn list_chat_metas_with_error(
@@ -1992,12 +2055,15 @@ fn delete_conversation_records(
 ) -> std::io::Result<()> {
     match kind {
         ConversationKind::Chat => {
-            let result = delete_chat_record(data_dir, sifs_daemon, id);
-            let _ = delete_channel_record_in(data_dir, id);
-            result
+            let chat_result = delete_chat_record(data_dir, sifs_daemon, id);
+            let channel_result = tombstone_channel_record_in(data_dir, sifs_daemon, id);
+            match (chat_result, channel_result) {
+                (Ok(()), _) | (_, Ok(true)) => Ok(()),
+                (Err(error), Ok(false)) | (Err(error), Err(_)) => Err(error),
+            }
         }
         ConversationKind::Channel => {
-            let result = delete_channel_record_in(data_dir, id);
+            let result = tombstone_channel_record_in(data_dir, sifs_daemon, id).map(|_| ());
             let _ = delete_chat_record(data_dir, sifs_daemon, id);
             result
         }
@@ -2016,17 +2082,46 @@ fn delete_chat_record(
     sessions::delete_via_daemon(data_dir, sifs_daemon, id)
 }
 
-fn delete_channel_record_in(data_dir: &SinomoDataDir, id: &str) -> std::io::Result<()> {
+fn tombstone_channel_record_in(
+    data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+    id: &str,
+) -> std::io::Result<bool> {
     let channel_id = parse_channel_id(id)?;
-    let store = FileAgentChannelStore::for_data_dir(data_dir);
+    let store = open_agent_channel_store(data_dir, sifs_daemon)?;
     let mut channel = match store
         .load_channel(&channel_id)
         .map_err(channel_store_io_error)?
     {
         Some(channel) => channel,
-        None => return Ok(()),
+        None => return Ok(false),
     };
     channel.tombstone();
+    store
+        .save_channel(&channel)
+        .map_err(channel_store_io_error)?;
+    Ok(true)
+}
+
+fn rename_chat_channel(
+    data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+    id: &str,
+    title: &str,
+) -> std::io::Result<()> {
+    let channel_id = parse_channel_id(id)?;
+    let store = open_agent_channel_store(data_dir, sifs_daemon)?;
+    let mut channel = store
+        .load_channel(&channel_id)
+        .map_err(channel_store_io_error)?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "chat not found"))?;
+    if channel.channel_kind != AgentChannelKind::Chat {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "chat not found",
+        ));
+    }
+    channel.rename(title);
     store.save_channel(&channel).map_err(channel_store_io_error)
 }
 
@@ -2058,6 +2153,37 @@ fn channel_messages(channel: &AgentChannel) -> Vec<ChatMessage> {
             }
         })
         .collect()
+}
+
+fn open_agent_channel_store(
+    data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&sessions::SifsDaemonAccess>,
+) -> std::io::Result<SifsAgentChannelStore> {
+    match sifs_daemon {
+        Some(daemon) => daemon
+            .open_browser()
+            .map(SifsAgentChannelStore::from_browser)
+            .map_err(|detail| std::io::Error::new(std::io::ErrorKind::Other, detail)),
+        None => open_local_agent_channel_store_for_tests(data_dir),
+    }
+}
+
+#[cfg(test)]
+fn open_local_agent_channel_store_for_tests(
+    data_dir: &SinomoDataDir,
+) -> std::io::Result<SifsAgentChannelStore> {
+    SifsAgentChannelStore::open(data_dir)
+        .map_err(|detail| std::io::Error::new(std::io::ErrorKind::Other, detail))
+}
+
+#[cfg(not(test))]
+fn open_local_agent_channel_store_for_tests(
+    _data_dir: &SinomoDataDir,
+) -> std::io::Result<SifsAgentChannelStore> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotConnected,
+        "agent channel persistence requires a daemon connection",
+    ))
 }
 
 fn parse_channel_id(id: &str) -> std::io::Result<SessionId> {
@@ -5046,7 +5172,9 @@ mod tests {
         assert_eq!(listed.participant_count, 1);
 
         let parsed = channel_id.parse::<SessionId>().expect("channel id");
-        let channel = FileAgentChannelStore::for_data_dir(&state.data_dir)
+        let channel = state
+            .agent_channel_store()
+            .expect("channel store")
             .load_channel(&parsed)
             .expect("load channel")
             .expect("channel saved");
@@ -5074,7 +5202,9 @@ mod tests {
         state.add_selected_agent_to_channel();
 
         let parsed = channel_id.parse::<SessionId>().expect("channel id");
-        let channel = FileAgentChannelStore::for_data_dir(&state.data_dir)
+        let channel = state
+            .agent_channel_store()
+            .expect("channel store")
             .load_channel(&parsed)
             .expect("load channel")
             .expect("channel saved");
@@ -5125,7 +5255,9 @@ mod tests {
         state.remove_channel_agent(&channel_id, &coding_participant_id);
 
         let parsed = channel_id.parse::<SessionId>().expect("channel id");
-        let channel = FileAgentChannelStore::for_data_dir(&state.data_dir)
+        let channel = state
+            .agent_channel_store()
+            .expect("channel store")
             .load_channel(&parsed)
             .expect("load channel")
             .expect("channel saved");

@@ -19,9 +19,9 @@ use sinomo_agent::{
     AgentTaskSnapshot,
 };
 use sinomo_cli::app_api::{
-    AgentChat, ChatContextSnapshot, ChatControlState, ChatControlStatus, ChatHistoryMessage,
-    ChatProcessSnapshot, ChatRuntimeInfo, ChatSpeaker, ChatStreamEvent, ChatTaskSnapshot,
-    ChatToolCallSnapshot, ChatUsageSnapshot,
+    AgentChat, AgentChatSifsStorage, ChatContextSnapshot, ChatControlState, ChatControlStatus,
+    ChatHistoryMessage, ChatProcessSnapshot, ChatRuntimeInfo, ChatSpeaker, ChatStreamEvent,
+    ChatTaskSnapshot, ChatToolCallSnapshot, ChatUsageSnapshot,
 };
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
@@ -220,6 +220,7 @@ impl ChatHandle {
         data_dir: SinomoDataDir,
         daemon_connected: bool,
         runtime_control_registry: AgentRuntimeControlRegistry,
+        sifs_storage: Option<AgentChatSifsStorage>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = channel::<ChatCommand>();
         let (evt_tx, evt_rx) = channel::<ChatEvent>();
@@ -236,6 +237,7 @@ impl ChatHandle {
                     data_dir,
                     daemon_connected,
                     runtime_control_registry,
+                    sifs_storage,
                     active_session_id,
                     cmd_rx,
                     evt_tx,
@@ -527,15 +529,25 @@ fn worker(
     data_dir: SinomoDataDir,
     daemon_connected: bool,
     runtime_control_registry: AgentRuntimeControlRegistry,
+    sifs_storage: Option<AgentChatSifsStorage>,
     active_session_id: Arc<Mutex<Option<SessionId>>>,
     cmd_rx: Receiver<ChatCommand>,
     evt_tx: Sender<ChatEvent>,
 ) {
-    let mut chat = match AgentChat::with_runtime_control_registry(
-        data_dir,
-        daemon_connected,
-        runtime_control_registry,
-    ) {
+    let chat_result = match sifs_storage {
+        Some(storage) => AgentChat::with_runtime_control_registry_and_sifs(
+            data_dir,
+            daemon_connected,
+            runtime_control_registry,
+            storage,
+        ),
+        None => AgentChat::with_runtime_control_registry(
+            data_dir,
+            daemon_connected,
+            runtime_control_registry,
+        ),
+    };
+    let mut chat = match chat_result {
         Ok(chat) => chat,
         Err(error) => {
             let _ = evt_tx.send(ChatEvent::Error {
@@ -796,7 +808,7 @@ mod tests {
     fn chat_worker_routes_runtime_control_commands() {
         let temp = TempDataDir::new("chat-worker-control");
         let runtime_control = AgentRuntimeControlRegistry::new();
-        let handle = ChatHandle::spawn(temp.data_dir.clone(), false, runtime_control.clone());
+        let handle = ChatHandle::spawn(temp.data_dir.clone(), false, runtime_control.clone(), None);
         let ready = wait_for_event(&handle, |event| matches!(event, ChatEvent::Ready { .. }))
             .expect("ready event");
         let ChatEvent::Ready { session_id, .. } = ready else {
@@ -883,7 +895,7 @@ mod tests {
     fn chat_worker_switches_agent_for_requested_new_session() {
         let temp = TempDataDir::new("chat-worker-agent-switch");
         let runtime_control = AgentRuntimeControlRegistry::new();
-        let handle = ChatHandle::spawn(temp.data_dir.clone(), false, runtime_control);
+        let handle = ChatHandle::spawn(temp.data_dir.clone(), false, runtime_control, None);
         wait_for_event(&handle, |event| matches!(event, ChatEvent::Ready { .. }))
             .expect("ready event");
 

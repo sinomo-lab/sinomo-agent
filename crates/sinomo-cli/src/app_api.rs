@@ -5,19 +5,21 @@
 //! crate-internal handler types. Everything here returns plain data so the app
 //! never depends on `tui` internals.
 
+use serde::{Deserialize, Serialize};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use sinomo_agent::{
-    AGENT_CHANNEL_APP_USER_ID, AgentCatalog, AgentChannel, AgentChannelAuthor, AgentChannelKind,
-    AgentChannelMessage, AgentChannelMessageKind, AgentChannelParticipant, AgentChannelSource,
-    AgentChannelStore, AgentChannelTurn, AgentChannelUser, AgentDefinition, AgentItem,
-    AgentModelEvent, AgentRuntimeControlHost, AgentRuntimeControlRegistry, AgentRuntimeEvent,
+    AGENT_CHANNEL_APP_USER_ID, AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION, AgentCatalog, AgentChannel,
+    AgentChannelAuthor, AgentChannelKind, AgentChannelMessage, AgentChannelMessageKind,
+    AgentChannelParticipant, AgentChannelSource, AgentChannelStore, AgentChannelStoreError,
+    AgentChannelTurn, AgentChannelUser, AgentDefinition, AgentItem, AgentModelEvent,
+    AgentRuntimeControlHost, AgentRuntimeControlRegistry, AgentRuntimeEvent,
     AgentRuntimeEventPayload, AgentSessionControlResult, AgentSessionFollowUpRequest,
     AgentSessionInterruptRequest, AgentSessionReattachState, AgentSessionResumeRequest,
     AgentSessionResumeResponse, AgentSessionSteerRequest, AgentTaskLifecycleStatus,
-    AgentTaskSnapshot, AgentToolProgressEvent, ContextAssemblyReport, FileAgentChannelStore,
-    InteractionOutput, InteractionSession, InteractionSurface, InteractionSurfaceKind, TaskId,
+    AgentTaskSnapshot, AgentToolProgressEvent, ContextAssemblyReport, InteractionOutput,
+    InteractionSession, InteractionSurface, InteractionSurfaceKind, TaskId,
 };
 use sinomo_lm::{
     AnthropicConfig, ClaudeCodeConfig, CodexCliConfig, GeminiConfig, GitHubCopilotConfig,
@@ -44,6 +46,7 @@ const APP_CHAT_RUNTIME_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 const APP_CHAT_RUNTIME_START_TIMEOUT: Duration = Duration::from_secs(5);
 const APP_CHAT_RUNTIME_SILENCE_TIMEOUT: Duration = Duration::from_secs(45);
 const STRUCTURED_AGENT_JSON_STREAM: &str = "__sinomo_structured_agent_json_stream__";
+pub const SIFS_AGENT_CHANNELS_ROOT: &str = "/services/sinomo-agent/channels";
 
 /// The active agent / model selection, as plain strings.
 #[derive(Clone, Debug, Default)]
@@ -265,11 +268,205 @@ pub struct AppClusterInvite {
     pub persisted_key: String,
 }
 
+/// Daemon-backed SIFS access for app agent-channel persistence.
+#[derive(Clone)]
+pub struct AgentChatSifsStorage {
+    address: String,
+    runtime: tokio::runtime::Handle,
+}
+
+impl AgentChatSifsStorage {
+    pub fn new(address: impl Into<String>, runtime: &tokio::runtime::Handle) -> Self {
+        Self {
+            address: address.into(),
+            runtime: runtime.clone(),
+        }
+    }
+
+    pub fn open_channel_store(&self) -> Result<SifsAgentChannelStore, String> {
+        SifsAgentChannelStore::open_daemon_on_runtime(&self.address, &self.runtime)
+    }
+}
+
+/// SIFS-backed channel store used by the app chat runtime.
+pub struct SifsAgentChannelStore {
+    browser: SifsBrowser,
+}
+
+impl SifsAgentChannelStore {
+    pub fn open(data_dir: &SinomoDataDir) -> Result<Self, String> {
+        SifsBrowser::open(data_dir).map(Self::from_browser)
+    }
+
+    pub fn open_daemon_on_runtime(
+        address: impl Into<String>,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<Self, String> {
+        SifsBrowser::open_daemon_on_runtime(address, runtime).map(Self::from_browser)
+    }
+
+    pub fn from_browser(browser: SifsBrowser) -> Self {
+        Self { browser }
+    }
+
+    fn channel_dir(channel_id: &SessionId) -> String {
+        format!("{}/{}", SIFS_AGENT_CHANNELS_ROOT, channel_id.as_str())
+    }
+
+    fn snapshot_path(channel_id: &SessionId) -> String {
+        format!("{}/snapshot.json", Self::channel_dir(channel_id))
+    }
+
+    fn messages_path(channel_id: &SessionId) -> String {
+        format!("{}/messages.jsonl", Self::channel_dir(channel_id))
+    }
+
+    fn turns_path(channel_id: &SessionId) -> String {
+        format!("{}/events.jsonl", Self::channel_dir(channel_id))
+    }
+
+    fn ensure_parent(&self, path: &str) -> Result<(), AgentChannelStoreError> {
+        if let Some(parent) = self.browser.parent(path) {
+            self.browser
+                .create_dir_all(&parent)
+                .map_err(|detail| channel_store_io(path, detail))?;
+        }
+        Ok(())
+    }
+
+    fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), AgentChannelStoreError> {
+        self.ensure_parent(path)?;
+        self.browser
+            .write_file(path, bytes)
+            .map_err(|detail| channel_store_io(path, detail))
+    }
+
+    fn append_json_line<T: Serialize>(
+        &self,
+        path: &str,
+        value: &T,
+    ) -> Result<(), AgentChannelStoreError> {
+        let mut bytes = match self.browser.read_file(path) {
+            Ok(bytes) => bytes,
+            Err(detail) if sifs_error_is_not_found(&detail) => Vec::new(),
+            Err(detail) => return Err(channel_store_io(path, detail)),
+        };
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+            bytes.push(b'\n');
+        }
+        let line = serde_json::to_string(value).map_err(|source| {
+            AgentChannelStoreError::Serialization {
+                detail: source.to_string(),
+            }
+        })?;
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+        self.write_file(path, &bytes)
+    }
+}
+
+impl AgentChannelStore for SifsAgentChannelStore {
+    fn save_channel(&self, channel: &AgentChannel) -> Result<(), AgentChannelStoreError> {
+        let snapshot = SifsAgentChannelSnapshot {
+            schema_version: AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION,
+            channel,
+        };
+        let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|source| {
+            AgentChannelStoreError::Serialization {
+                detail: source.to_string(),
+            }
+        })?;
+        self.write_file(&Self::snapshot_path(&channel.channel_id), &bytes)
+    }
+
+    fn load_channel(
+        &self,
+        channel_id: &SessionId,
+    ) -> Result<Option<AgentChannel>, AgentChannelStoreError> {
+        let path = Self::snapshot_path(channel_id);
+        let bytes = match self.browser.read_file(&path) {
+            Ok(bytes) => bytes,
+            Err(detail) if sifs_error_is_not_found(&detail) => return Ok(None),
+            Err(detail) => return Err(channel_store_io(&path, detail)),
+        };
+        let snapshot =
+            serde_json::from_slice::<OwnedSifsAgentChannelSnapshot>(&bytes).map_err(|source| {
+                AgentChannelStoreError::Serialization {
+                    detail: source.to_string(),
+                }
+            })?;
+        if snapshot.schema_version != AGENT_CHANNEL_SNAPSHOT_SCHEMA_VERSION {
+            return Err(AgentChannelStoreError::Serialization {
+                detail: format!(
+                    "unsupported agent channel snapshot schema version {}",
+                    snapshot.schema_version
+                ),
+            });
+        }
+        Ok(Some(snapshot.channel))
+    }
+
+    fn list_channels(&self) -> Result<Vec<AgentChannel>, AgentChannelStoreError> {
+        let entries = self
+            .browser
+            .list_if_exists(SIFS_AGENT_CHANNELS_ROOT)
+            .map_err(|detail| channel_store_io(SIFS_AGENT_CHANNELS_ROOT, detail))?;
+        let mut channels = Vec::new();
+        for entry in entries.into_iter().filter(|entry| entry.is_dir) {
+            let Ok(channel_id) = entry.name.parse::<SessionId>() else {
+                continue;
+            };
+            if let Some(channel) = self.load_channel(&channel_id)? {
+                if !channel.is_deleted() {
+                    channels.push(channel);
+                }
+            }
+        }
+        channels.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        Ok(channels)
+    }
+
+    fn append_message(
+        &self,
+        channel_id: &SessionId,
+        message: &AgentChannelMessage,
+    ) -> Result<(), AgentChannelStoreError> {
+        self.append_json_line(&Self::messages_path(channel_id), message)
+    }
+
+    fn append_turn(
+        &self,
+        channel_id: &SessionId,
+        turn: &AgentChannelTurn,
+    ) -> Result<(), AgentChannelStoreError> {
+        self.append_json_line(&Self::turns_path(channel_id), turn)
+    }
+}
+
+#[derive(Serialize)]
+struct SifsAgentChannelSnapshot<'a> {
+    schema_version: u32,
+    channel: &'a AgentChannel,
+}
+
+#[derive(Deserialize)]
+struct OwnedSifsAgentChannelSnapshot {
+    schema_version: u32,
+    channel: AgentChannel,
+}
+
+fn channel_store_io(path: &str, detail: String) -> AgentChannelStoreError {
+    AgentChannelStoreError::Io {
+        path: path.to_string(),
+        detail,
+    }
+}
+
 /// One running chat conversation backed by the main-agent runtime.
 pub struct AgentChat {
     data_dir: SinomoDataDir,
     daemon_connected: bool,
-    channel_store: FileAgentChannelStore,
+    channel_store: Box<dyn AgentChannelStore>,
     channel: AgentChannel,
     runtime: InteractionRuntime<InMemoryEventStore, Handler>,
 }
@@ -290,6 +487,43 @@ impl AgentChat {
         daemon_connected: bool,
         runtime_control_registry: AgentRuntimeControlRegistry,
     ) -> Result<Self, CliError> {
+        let channel_store =
+            SifsAgentChannelStore::open(&data_dir).map_err(|detail| CliError::Parse {
+                detail: format!("open agent channel SIFS store failed: {detail}"),
+            })?;
+        Self::with_runtime_control_registry_and_channel_store(
+            data_dir,
+            daemon_connected,
+            runtime_control_registry,
+            Box::new(channel_store),
+        )
+    }
+
+    pub fn with_runtime_control_registry_and_sifs(
+        data_dir: SinomoDataDir,
+        daemon_connected: bool,
+        runtime_control_registry: AgentRuntimeControlRegistry,
+        storage: AgentChatSifsStorage,
+    ) -> Result<Self, CliError> {
+        let channel_store = storage
+            .open_channel_store()
+            .map_err(|detail| CliError::Parse {
+                detail: format!("open agent channel SIFS store failed: {detail}"),
+            })?;
+        Self::with_runtime_control_registry_and_channel_store(
+            data_dir,
+            daemon_connected,
+            runtime_control_registry,
+            Box::new(channel_store),
+        )
+    }
+
+    fn with_runtime_control_registry_and_channel_store(
+        data_dir: SinomoDataDir,
+        daemon_connected: bool,
+        runtime_control_registry: AgentRuntimeControlRegistry,
+        channel_store: Box<dyn AgentChannelStore>,
+    ) -> Result<Self, CliError> {
         let handler = tui::app_build_chat_handler(&data_dir, None)?
             .with_runtime_control_registry(runtime_control_registry);
         let session = app_session(None);
@@ -298,7 +532,6 @@ impl AgentChat {
         runtime
             .handler_mut()
             .replace_agent_session(&session, agent_transcript_from_history(&[]))?;
-        let channel_store = FileAgentChannelStore::for_data_dir(&data_dir);
         let mut channel = AgentChannel::with_default_title(session.session_id.clone());
         let info: ChatRuntimeInfo = tui::app_runtime_info(runtime.handler()).into();
         let align_primary_session = should_align_primary_participant(&channel);
@@ -2111,7 +2344,7 @@ mod tests {
     fn app_chat_resume_explicit_channel_preserves_participant_session_id() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-resume");
         let data_dir = SinomoDataDir::new(&root);
-        let store = FileAgentChannelStore::for_data_dir(&data_dir);
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel = AgentChannel::new_channel(channel_id.clone(), "Team channel");
         channel.ensure_user(AgentChannelUser::app_local());

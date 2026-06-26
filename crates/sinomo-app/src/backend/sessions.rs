@@ -29,6 +29,10 @@ impl SifsDaemonAccess {
             runtime: runtime.clone(),
         }
     }
+
+    pub fn open_browser(&self) -> Result<SifsBrowser, String> {
+        SifsBrowser::open_daemon_on_runtime(&self.address, &self.runtime)
+    }
 }
 
 /// Sidebar metadata for a stored chat.
@@ -436,7 +440,7 @@ fn open_sifs_browser(
     daemon: Option<&SifsDaemonAccess>,
 ) -> Result<SifsBrowser, String> {
     match daemon {
-        Some(daemon) => SifsBrowser::open_daemon_on_runtime(&daemon.address, &daemon.runtime),
+        Some(daemon) => daemon.open_browser(),
         None => open_local_sifs_browser_for_tests(data_dir),
     }
 }
