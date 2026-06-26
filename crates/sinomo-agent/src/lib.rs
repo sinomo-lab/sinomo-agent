@@ -289,6 +289,7 @@ pub enum AgentToolKind {
     RunShellCommand,
     ReadFile,
     ListFiles,
+    EditFile,
     WriteFile,
     SearchFiles,
     ApplyPatch,
@@ -1567,9 +1568,15 @@ pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
             false,
         ),
         AgentToolSpec::new(
-            AgentToolKind::ApplyPatch,
-            "apply_patch",
-            "Edit workspace files with a scoped patch. This is the only source-editing tool: use raw `*** Begin Patch` hunks, or JSON `changes` entries such as `replace_exact` and one-based `replace_range` for small edits. Do not use git unified range headers.",
+            AgentToolKind::EditFile,
+            "edit_file",
+            "Edit one workspace text file by replacing exact text. Use old_text/new_text for targeted changes; old_text must be unique unless replace_all is true.",
+            true,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::WriteFile,
+            "write_file",
+            "Create a workspace text file or intentionally replace a whole file. Existing files require overwrite=true.",
             true,
         ),
         AgentToolSpec::new(
@@ -1658,27 +1665,17 @@ command blindly. If validation is blocked by missing dependencies or host setup,
 inspect the current diff and finish with the blocker rather than looping on
 environment setup unless the task is dependency setup.
 
-Use apply_patch as the only source-editing tool. Keep patches small and
-source-focused. Do not revert or overwrite user changes you did not make. The
-tool accepts raw patch text; JSON-only providers may pass an object with a
-patch string or a `changes` array. For small edits, prefer structured
-`replace_exact` or one-based inclusive `replace_range` entries inside
-`apply_patch` over fragile full-file replacements. Patch failures mean the
-patch was not applied.
-
-Patch format:
-*** Begin Patch
-*** Update File: src/example.rs
-@@ fn example()
- let before = true;
--let value = old_value();
-+let value = new_value();
- keep_this_line();
-*** End Patch
-
-Use Add File, Update File, Delete File, and Move to hunks as needed. Do not use
-git unified range headers. Formatting commands and generated output may use the
-normal project tools through run_command.
+Use edit_file for targeted source edits and write_file only for intentional
+new-file creation or whole-file replacement. Keep edits small and
+source-focused. Do not revert or overwrite user changes you did not make.
+edit_file requires exact old_text/new_text; when old_text matches multiple
+places, provide more surrounding context or explicitly set replace_all.
+write_file refuses to replace existing files unless overwrite=true. Formatting
+commands and generated output may use the normal project tools through
+run_command. If apply_patch is visible in your tool list, you may use it for
+scoped patch edits; otherwise discover provider-specific editing tools through
+tool_search only when the selected model/provider has a reliable native patch
+capability.
 
 When the next step is clear and no more tools are needed, return an empty
 tool_calls array. If a tool fails or is blocked, recover from the model-visible

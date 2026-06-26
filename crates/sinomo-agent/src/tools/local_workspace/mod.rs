@@ -1,11 +1,13 @@
 mod apply_patch;
 mod changed_files;
+mod edit_file;
 mod git_diff;
 mod list_files;
 mod read_file;
 mod request_user_input;
 mod run_command;
 mod search;
+mod write_file;
 
 use super::{
     AGENT_CODING_EVIDENCE_KIND, AgentCodingToolEvidence, AgentCommandOutput, AgentTool,
@@ -217,6 +219,8 @@ pub fn registry(config: LocalWorkspaceAgentConfig) -> AgentToolRegistry {
         .with_tool(read_file::ReadFileTool::new(config.clone()))
         .with_tool(list_files::ListFilesTool::new(config.clone()))
         .with_tool(search::SearchFilesTool::new(config.clone()))
+        .with_tool(edit_file::EditFileTool::new(config.clone()))
+        .with_tool(write_file::WriteFileTool::new(config.clone()))
         .with_tool(apply_patch::ApplyPatchTool::new(config.clone()))
         .with_tool(changed_files::ChangedFilesTool::new(config.clone()))
         .with_tool(git_diff::GitDiffTool::new(config.clone()))
@@ -229,6 +233,8 @@ pub fn default_local_workspace_tool_descriptors() -> Vec<AgentToolDescriptor> {
         read_file::descriptor(),
         list_files::descriptor(),
         search::descriptor(),
+        edit_file::descriptor(),
+        write_file::descriptor(),
         apply_patch::descriptor(),
         changed_files::descriptor(),
         git_diff::descriptor(),
@@ -247,6 +253,12 @@ fn spec_for_kind(kind: AgentToolKind) -> AgentToolSpec {
 
 fn hidden_local_workspace_tool_specs() -> Vec<AgentToolSpec> {
     vec![
+        AgentToolSpec::new(
+            AgentToolKind::ApplyPatch,
+            "apply_patch",
+            "Edit workspace files with a scoped provider-specific patch. Use only when the selected model/provider reliably supports the patch grammar or structured patch calls.",
+            true,
+        ),
         AgentToolSpec::new(
             AgentToolKind::ChangedFiles,
             "changed_files",

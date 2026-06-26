@@ -91,6 +91,7 @@ fn default_toolsets_for_kind(kind: &crate::AgentToolKind) -> Vec<&'static str> {
         AgentToolKind::ReadFile
         | AgentToolKind::ListFiles
         | AgentToolKind::SearchFiles
+        | AgentToolKind::EditFile
         | AgentToolKind::WriteFile
         | AgentToolKind::ApplyPatch
         | AgentToolKind::RunShellCommand => vec!["core", "coding", "local"],

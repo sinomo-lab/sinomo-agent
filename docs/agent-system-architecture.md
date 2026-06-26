@@ -260,9 +260,18 @@ command, and user-input tools.
 Important behavior:
 
 - `read_file`, `list_files`, and `search` bound model-visible output.
-- `apply_patch` is the source-editing tool and supports raw patch text plus
-  structured small-edit forms such as exact replacement and one-based range
-  replacement.
+- `edit_file` is the provider-neutral targeted source-editing tool. It accepts
+  structured exact text replacement inputs, requires one match by default, and
+  can explicitly replace all matches when requested.
+- `write_file` is the provider-neutral whole-file creation/replacement tool.
+  Existing files require `overwrite=true`; missing parent directories require
+  `create_parents=true`.
+- `apply_patch` remains available as an advanced/provider-specific source
+  editing tool and supports raw patch text plus structured small-edit forms such
+  as exact replacement and one-based range replacement. It is not the
+  provider-neutral default model-visible editing surface. OpenAI deliberation
+  and evolution agents expose it by default because the OpenAI tool adapter has
+  a custom grammar path for this tool.
 - `changed_files` and `git_diff` are version-control helpers. `git_diff` is
   normally hidden behind progressive disclosure and preserves durable full-diff
   artifacts while returning a bounded preview.

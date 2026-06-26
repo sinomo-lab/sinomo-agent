@@ -5664,16 +5664,19 @@ fn check_coding_state_projection_bounds_smoke() -> AgentReadinessCheck {
     let result = (|| -> Result<_, String> {
         fs::create_dir_all(&root).map_err(|error| error.to_string())?;
         fs::write(root.join("hello.txt"), "old\n").map_err(|error| error.to_string())?;
-        let patch = "*** Begin Patch\n*** Update File: hello.txt\n@@\n-old\n+new\n*** End Patch";
         let mut responses = vec![
             serde_json::json!({
                 "response_mode": "defer",
-                "text": "I will patch the file.",
+                "text": "I will edit the file.",
                 "tool_calls": [{
-                    "tool": "apply_patch",
-                    "input": {"patch": patch},
+                    "tool": "edit_file",
+                    "input": {
+                        "path": "hello.txt",
+                        "old_text": "old\n",
+                        "new_text": "new\n"
+                    },
                     "async": false,
-                    "summary": "Patch hello.txt."
+                    "summary": "Edit hello.txt."
                 }],
                 "background_handoff": null,
                 "next_state": "waiting"
@@ -5839,15 +5842,18 @@ fn check_coding_state_environment_validation_smoke() -> AgentReadinessCheck {
     let result = (|| -> Result<_, String> {
         fs::create_dir_all(&root).map_err(|error| error.to_string())?;
         fs::write(root.join("hello.txt"), "old\n").map_err(|error| error.to_string())?;
-        let patch = "*** Begin Patch\n*** Update File: hello.txt\n@@\n-old\n+new\n*** End Patch";
         let patch_turn = serde_json::json!({
             "response_mode": "defer",
-            "text": "I will patch the file.",
+            "text": "I will edit the file.",
             "tool_calls": [{
-                "tool": "apply_patch",
-                "input": {"patch": patch},
+                "tool": "edit_file",
+                "input": {
+                    "path": "hello.txt",
+                    "old_text": "old\n",
+                    "new_text": "new\n"
+                },
                 "async": false,
-                "summary": "Patch hello.txt."
+                "summary": "Edit hello.txt."
             }],
             "background_handoff": null,
             "next_state": "waiting"
@@ -5968,15 +5974,18 @@ fn check_coding_state_missing_dependency_validation_smoke() -> AgentReadinessChe
     let result = (|| -> Result<_, String> {
         fs::create_dir_all(&root).map_err(|error| error.to_string())?;
         fs::write(root.join("hello.txt"), "old\n").map_err(|error| error.to_string())?;
-        let patch = "*** Begin Patch\n*** Update File: hello.txt\n@@\n-old\n+new\n*** End Patch";
         let patch_turn = serde_json::json!({
             "response_mode": "defer",
-            "text": "I will patch the file.",
+            "text": "I will edit the file.",
             "tool_calls": [{
-                "tool": "apply_patch",
-                "input": {"patch": patch},
+                "tool": "edit_file",
+                "input": {
+                    "path": "hello.txt",
+                    "old_text": "old\n",
+                    "new_text": "new\n"
+                },
                 "async": false,
-                "summary": "Patch hello.txt."
+                "summary": "Edit hello.txt."
             }],
             "background_handoff": null,
             "next_state": "waiting"
@@ -6100,15 +6109,18 @@ fn check_coding_state_terminal_blocker_smoke() -> AgentReadinessCheck {
     let result = (|| -> Result<_, String> {
         fs::create_dir_all(&root).map_err(|error| error.to_string())?;
         fs::write(root.join("hello.txt"), "old\n").map_err(|error| error.to_string())?;
-        let patch = "*** Begin Patch\n*** Update File: hello.txt\n@@\n-old\n+new\n*** End Patch";
         let patch_turn = serde_json::json!({
             "response_mode": "defer",
-            "text": "I will patch the file.",
+            "text": "I will edit the file.",
             "tool_calls": [{
-                "tool": "apply_patch",
-                "input": {"patch": patch},
+                "tool": "edit_file",
+                "input": {
+                    "path": "hello.txt",
+                    "old_text": "old\n",
+                    "new_text": "new\n"
+                },
                 "async": false,
-                "summary": "Patch hello.txt."
+                "summary": "Edit hello.txt."
             }],
             "background_handoff": null,
             "next_state": "waiting"
