@@ -841,11 +841,12 @@ pub fn cluster_connectivity_probe_due_with_graph(
     if record.state == ClusterConnectivityState::Healthy {
         return true;
     }
-    // A due non-healthy record re-probes even when a relay route exists:
-    // a healed DIRECT endpoint always beats relaying, and the route may
-    // itself traverse stale edges. The slow degraded cadence in the base
-    // check keeps the probe volume negligible.
-    let _ = (graph, local_node_id, endpoint);
+    // When the target is already reachable through the current healthy-edge route graph,
+    // a failed direct endpoint is not load-bearing. Let the record refresh near expiry
+    // instead of burning a probe every role interval and churning local connectivity state.
+    if crate::route::cluster_route_next_hop(graph, local_node_id, &endpoint.node_id).is_some() {
+        return false;
+    }
     true
 }
 
