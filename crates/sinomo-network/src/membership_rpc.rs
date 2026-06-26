@@ -20,6 +20,7 @@ use sinomo_kv::KvRevision;
 pub struct ClusterJoinRegistrationRequest {
     pub invite: ClusterJoinInvite,
     pub invitation_secret: String,
+    #[serde(deserialize_with = "crate::fallible_serde::deserialize_vec")]
     pub members: Vec<ClusterMemberRecord>,
 }
 
@@ -47,6 +48,7 @@ pub struct ClusterInvitePublishResponse {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterMemberPublishRequest {
+    #[serde(deserialize_with = "crate::fallible_serde::deserialize_vec")]
     pub members: Vec<ClusterMemberRecord>,
     /// The publisher's local cluster KV snapshot revision. When present, the
     /// voter includes its current KV snapshot in the response only if the

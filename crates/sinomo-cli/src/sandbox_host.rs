@@ -66,11 +66,18 @@ impl sinomo_runtime::sandbox::SandboxCliHost for SinomoCliSandboxHost {
         let paths = sinomo_runtime::network::ClusterPaths::new(data_dir);
         let result = (|| {
             let snapshot = sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
-                .unwrap_or_else(|_| sinomo_runtime::kv::InProcessKvStore::new().snapshot());
-            let mut store = sinomo_runtime::kv::InProcessKvStore::restore(snapshot);
+                .unwrap_or_else(|_| {
+                    sinomo_runtime::kv::InProcessKvStore::new()
+                        .snapshot()
+                        .expect("snapshot")
+                });
+            let mut store = sinomo_runtime::kv::InProcessKvStore::restore(snapshot)?;
             let _: sinomo_runtime::kv::KvTxnResponse = store.txn(txn.clone())?;
-            sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot())
-                .map_err(sinomo_runtime::network::NetworkError::from)?;
+            sinomo_runtime::kv::write_cluster_kv_snapshot(
+                &paths.kv_paths(),
+                &store.snapshot().expect("snapshot"),
+            )
+            .map_err(sinomo_runtime::network::NetworkError::from)?;
             Ok(())
         })();
         Some(result)

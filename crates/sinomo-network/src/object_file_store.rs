@@ -98,6 +98,22 @@ pub(crate) fn write_object_file<T: Serialize>(
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn write_object_file_compare_read_bytes_for_test<T: Serialize>(
+    path: &PathBuf,
+    value: &T,
+) -> Result<Option<u64>, NetworkError> {
+    let desired = SinomoObjectCodec::default().encode(value)?;
+    durable_file::write_object_file_bytes_if_changed(
+        path,
+        &desired,
+        &LAST_WRITTEN_OBJECT_FILES,
+        durable_file::DurableObjectFileOptions::new("sobj", "tmp"),
+    )
+    .map(|result| result.compare_read_bytes)
+    .map_err(network_durable_file_error)
+}
+
 /// Write a fully encoded object and publish it only if `path` is absent.
 ///
 /// The normal path stages the object in a same-directory temp file, fsyncs it,
@@ -148,9 +164,19 @@ fn create_new_link_or_unsupported_for_test(
 }
 
 fn network_durable_file_error(error: durable_file::DurableFileError) -> NetworkError {
-    NetworkError::StorageIo {
-        path: error.path().to_string(),
-        detail: error.detail().to_string(),
+    match error {
+        durable_file::DurableFileError::ResourceExhausted {
+            operation,
+            requested_bytes,
+            ..
+        } => NetworkError::ResourceExhausted {
+            operation,
+            requested_bytes,
+        },
+        error => NetworkError::StorageIo {
+            path: error.path().to_string(),
+            detail: error.detail().to_string(),
+        },
     }
 }
 

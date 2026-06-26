@@ -10,17 +10,12 @@ pub struct ClusterKvRpcPayload {
 pub(crate) fn encode_cluster_kv_rpc_body<T: Serialize + ?Sized>(
     value: &T,
 ) -> Result<Vec<u8>, KvError> {
-    sinomo_object_serde::to_bytes(value, KV_OBJECT_VERSION_ID, LengthMode::U32).map_err(|source| {
-        KvError::Serialization {
-            detail: source.to_string(),
-        }
-    })
+    sinomo_object_serde::to_bytes(value, KV_OBJECT_VERSION_ID, LengthMode::U32)
+        .map_err(kv_object_error)
 }
 
 pub(crate) fn decode_cluster_kv_rpc_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, KvError> {
-    sinomo_object_serde::from_bytes(body).map_err(|source| KvError::Serialization {
-        detail: source.to_string(),
-    })
+    sinomo_object_serde::from_bytes(body).map_err(kv_object_error)
 }
 
 pub fn cluster_kv_snapshot_rpc_payload() -> Result<ClusterKvRpcPayload, KvError> {
@@ -46,7 +41,9 @@ pub fn cluster_kv_snapshot_response_rpc_payload(
 }
 
 pub fn decode_cluster_kv_snapshot_rpc_body(body: &[u8]) -> Result<KvSnapshot, KvError> {
-    decode_cluster_kv_rpc_body(body)
+    let snapshot: KvSnapshot = decode_cluster_kv_rpc_body(body)?;
+    snapshot.validate_resource_bounds()?;
+    Ok(snapshot)
 }
 
 pub fn cluster_kv_txn_rpc_payload(txn: &KvTxn) -> Result<ClusterKvRpcPayload, KvError> {
@@ -87,7 +84,11 @@ pub fn cluster_kv_range_prefix_rpc_payload(prefix: &str) -> Result<ClusterKvRpcP
 pub struct ClusterKvWatchEventsRequest {
     pub state: ClusterBootstrapState,
     pub leader_id: NodeId,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_fallible_vec"
+    )]
     pub events: Vec<KvEvent>,
 }
 

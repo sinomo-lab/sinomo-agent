@@ -34,7 +34,8 @@ pub(crate) fn cluster_semantic_txn_no_effect_response(
     } else {
         txn.failure.as_slice()
     };
-    let mut responses = Vec::with_capacity(ops.len());
+    let mut responses = Vec::new();
+    crate::object::try_reserve_vec(&mut responses, ops.len(), "build semantic kv txn response")?;
     for op in ops {
         let Some(response) = cluster_semantic_op_no_effect_response(&snapshot, op, now)? else {
             return Ok(None);

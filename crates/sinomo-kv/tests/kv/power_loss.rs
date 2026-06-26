@@ -237,7 +237,7 @@ fn snapshot_wal_compaction_ignores_leftover_artifacts_after_reopen() {
         &RaftSnapshot {
             last_included_index: command_count + 99,
             last_included_term: 9,
-            kv: stale_store.snapshot(),
+            kv: stale_store.snapshot().expect("snapshot"),
         },
     )
     .expect("write leftover snapshot temp");
@@ -280,7 +280,7 @@ fn materialized_snapshot_paths_ignore_stale_or_corrupt_cache_and_recover_corrupt
     stale_store
         .put("/power-loss/materialized/stale", b"stale".to_vec(), None)
         .expect("build stale materialized snapshot");
-    write_cluster_kv_snapshot(&paths, &stale_store.snapshot())
+    write_cluster_kv_snapshot(&paths, &stale_store.snapshot().expect("snapshot"))
         .expect("write stale materialized snapshot");
 
     let live = read_cluster_kv_current_snapshot_for_node(&paths, local.clone())
@@ -423,7 +423,7 @@ fn hard_state_commit_replay_applies_txn_with_lease_atomically_after_reopen() {
     assert_eq!(entry.value, b"leased");
     assert_eq!(entry.lease_id, Some(lease_id));
 
-    let snapshot = recovered.store().snapshot();
+    let snapshot = recovered.store().snapshot().expect("snapshot");
     let lease = snapshot
         .leases
         .iter()

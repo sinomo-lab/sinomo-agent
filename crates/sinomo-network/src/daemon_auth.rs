@@ -26,13 +26,24 @@ struct CachedDaemonSigningIdentity {
 pub struct SignedDaemonCommand {
     pub protocol: String,
     pub node_id: String,
-    #[serde(with = "serde_bytes")]
+    #[serde(
+        serialize_with = "crate::fallible_serde::serialize_bytes",
+        deserialize_with = "crate::fallible_serde::deserialize_bytes"
+    )]
     pub public_key: Vec<u8>,
     pub timestamp: String,
     pub nonce: String,
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::fallible_serde::serialize_optional_bytes",
+        deserialize_with = "crate::fallible_serde::deserialize_optional_bytes"
+    )]
     pub rpc_body_sha256: Option<Vec<u8>>,
-    #[serde(with = "serde_bytes")]
+    #[serde(
+        serialize_with = "crate::fallible_serde::serialize_bytes",
+        deserialize_with = "crate::fallible_serde::deserialize_bytes"
+    )]
     pub signature: Vec<u8>,
 }
 

@@ -12,7 +12,7 @@ use crate::kv_read_model::KvBackedClusterConnectivityRecordQuery;
 use crate::{ClusterEndpointId, ClusterPaths};
 use sinomo_core::ClusterBootstrapState;
 use sinomo_node::NodeId;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -39,7 +39,74 @@ struct ClusterRouteGraphCacheMark {
     local_connectivity_generation: u64,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ClusterRouteGraphSourceSet {
+    sources: BTreeSet<NodeId>,
+}
+
+impl ClusterRouteGraphSourceSet {
+    fn try_insert_clone(
+        &mut self,
+        source_node_id: &NodeId,
+        operation: &str,
+    ) -> Result<bool, NetworkError> {
+        Ok(self
+            .sources
+            .insert(crate::object::try_clone_id(source_node_id, operation)?))
+    }
+
+    fn contains(&self, source_node_id: &NodeId) -> bool {
+        self.sources.contains(source_node_id)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ClusterRouteGraphRecordIndex {
+    records: BTreeMap<(NodeId, NodeId, ClusterEndpointId), ClusterConnectivityRecord>,
+}
+
+impl ClusterRouteGraphRecordIndex {
+    fn try_insert(
+        &mut self,
+        record: ClusterConnectivityRecord,
+        operation: &str,
+    ) -> Result<(), NetworkError> {
+        let key = (
+            crate::object::try_clone_id(&record.source_node_id, operation)?,
+            crate::object::try_clone_id(&record.target_node_id, operation)?,
+            crate::object::try_clone_id(&record.endpoint_id, operation)?,
+        );
+        self.records.insert(key, record);
+        Ok(())
+    }
+
+    fn into_records(self) -> Vec<ClusterConnectivityRecord> {
+        self.records.into_values().collect()
+    }
+}
+
 impl ClusterConnectivityGraph {
+    pub fn try_read_for_local(
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<Self, NetworkError> {
+        let now = OffsetDateTime::now_utc();
+        let before_mark = cluster_route_graph_cache_mark(paths);
+        if let Some(graph) = read_cluster_route_graph_from_cache(paths, state, before_mark, now) {
+            return Ok(graph);
+        }
+        let graph = Self::try_read_for_local_with_query(
+            paths,
+            state,
+            &KvBackedClusterConnectivityRecordQuery,
+        )?;
+        let after_mark = cluster_route_graph_cache_mark(paths);
+        if before_mark == after_mark {
+            store_cluster_route_graph_cache_entry(paths, after_mark, graph.clone(), now);
+        }
+        Ok(graph)
+    }
+
     pub fn read_for_local(paths: &ClusterPaths, state: &ClusterBootstrapState) -> Self {
         let now = OffsetDateTime::now_utc();
         let before_mark = cluster_route_graph_cache_mark(paths);
@@ -72,6 +139,27 @@ impl ClusterConnectivityGraph {
                 query,
             )
             .unwrap_or_default(),
+        )
+    }
+
+    pub fn try_read_for_local_with_query<Q>(
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        query: &Q,
+    ) -> Result<Self, NetworkError>
+    where
+        Q: ClusterConnectivityRecordQuery + ?Sized,
+    {
+        let source_node_id =
+            crate::object::try_clone_id(&state.local_node_id, "build local connectivity graph")?;
+        Self::try_from_records(
+            source_node_id,
+            read_cluster_connectivity_graph_with_suppressed_local_source_and_query(
+                paths,
+                Some(&state.cluster_id),
+                Some(&state.local_node_id),
+                query,
+            )?,
         )
     }
 }
@@ -126,6 +214,9 @@ fn store_cluster_route_graph_cache_entry(
         return;
     };
     evict_cluster_route_graph_cache_entry_if_needed(&mut cache, &paths.root);
+    if !cache.contains_key(&paths.root) && cache.try_reserve(1).is_err() {
+        return;
+    }
     cache.insert(
         paths.root.clone(),
         ClusterRouteGraphCacheEntry {
@@ -180,26 +271,33 @@ where
     Q: ClusterConnectivityRecordQuery + ?Sized,
 {
     let now = OffsetDateTime::now_utc();
-    let local_records = read_local_cluster_connectivity_records(paths)?
+    let mut local_records = Vec::new();
+    for record in read_local_cluster_connectivity_records(paths)?
         .into_iter()
         .filter(|record| {
             cluster_id.is_none_or(|cluster_id| record.cluster_id == *cluster_id)
                 && cluster_network_record_live(record.expires_at, now)
         })
-        .collect::<Vec<_>>();
+    {
+        crate::object::try_reserve_vec(&mut local_records, 1, "collect local route graph records")?;
+        local_records.push(record);
+    }
     // A node's own live probe results are authoritative for its outgoing edges. Drop any
     // KV-published edge whose source we hold local records for; when constructing the local
     // route graph, also drop KV-published edges for this node even if the in-process cache is
     // empty after restart/network change. Self-published KV edges can be stale (e.g. healthy
     // before roaming, or unreachable before reconnecting), while other sources' edges are the
     // remote topology we still need for relay planning.
-    let local_sources = local_records
-        .iter()
-        .map(|record| record.source_node_id.clone())
-        .chain(local_source_node_id.cloned())
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut records_by_key =
-        BTreeMap::<(NodeId, NodeId, ClusterEndpointId), ClusterConnectivityRecord>::new();
+    let mut local_sources = ClusterRouteGraphSourceSet::default();
+    for record in &local_records {
+        local_sources
+            .try_insert_clone(&record.source_node_id, "collect local route graph sources")?;
+    }
+    if let Some(local_source_node_id) = local_source_node_id {
+        local_sources
+            .try_insert_clone(local_source_node_id, "collect local route graph sources")?;
+    }
+    let mut records_by_key = ClusterRouteGraphRecordIndex::default();
     for record in query.read_kv_connectivity_records(paths)? {
         if cluster_id.is_some_and(|cluster_id| record.cluster_id != *cluster_id) {
             continue;
@@ -207,26 +305,12 @@ where
         if local_sources.contains(&record.source_node_id) {
             continue;
         }
-        records_by_key.insert(
-            (
-                record.source_node_id.clone(),
-                record.target_node_id.clone(),
-                record.endpoint_id.clone(),
-            ),
-            record,
-        );
+        records_by_key.try_insert(record, "index kv route graph records")?;
     }
     for record in local_records {
-        records_by_key.insert(
-            (
-                record.source_node_id.clone(),
-                record.target_node_id.clone(),
-                record.endpoint_id.clone(),
-            ),
-            record,
-        );
+        records_by_key.try_insert(record, "index local route graph records")?;
     }
-    let mut records = records_by_key.into_values().collect::<Vec<_>>();
+    let mut records = records_by_key.into_records();
     sort_cluster_connectivity_records(&mut records);
     Ok(records)
 }

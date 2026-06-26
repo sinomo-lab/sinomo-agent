@@ -26,7 +26,7 @@ pub fn read_cluster_kv_store_for_node(
     paths: &ClusterKvPaths,
     node_id: NodeId,
 ) -> Result<InProcessKvStore, KvError> {
-    read_cluster_kv_current_snapshot_for_node(paths, node_id).map(InProcessKvStore::restore)
+    read_cluster_kv_current_snapshot_for_node(paths, node_id).and_then(InProcessKvStore::restore)
 }
 
 pub fn write_cluster_kv_snapshot(
@@ -156,6 +156,41 @@ pub fn read_cluster_kv_prefix_entries_limited_by_payload_bytes(
 }
 
 impl KvSnapshot {
+    /// Validates externally decoded snapshot resource semantics without imposing
+    /// a fixed total snapshot size. Individual values, lease cardinality, and
+    /// retained event history already have KV-domain limits; total payload bytes
+    /// are only checked for arithmetic overflow.
+    pub fn validate_resource_bounds(&self) -> Result<(), KvError> {
+        if self.leases.len() > MAX_ACTIVE_LEASES {
+            return Err(KvError::LeaseLimit {
+                max: MAX_ACTIVE_LEASES,
+            });
+        }
+        if self.events.len() > MAX_RETAINED_EVENTS {
+            return Err(KvError::SnapshotEventLimit {
+                observed_events: self.events.len(),
+                max_events: MAX_RETAINED_EVENTS,
+            });
+        }
+
+        let mut payload_bytes = 0_usize;
+        for entry in &self.entries {
+            validate_kv_value_len(entry.value.len())?;
+            payload_bytes = checked_snapshot_payload_bytes(
+                payload_bytes,
+                entry.key.len().saturating_add(entry.value.len()),
+            )?;
+        }
+        for event in &self.events {
+            payload_bytes = checked_snapshot_payload_bytes(payload_bytes, event.key.len())?;
+            if let KvEventKind::Put { value } = &event.kind {
+                validate_kv_value_len(value.len())?;
+                payload_bytes = checked_snapshot_payload_bytes(payload_bytes, value.len())?;
+            }
+        }
+        Ok(())
+    }
+
     /// Returns a snapshot with stable key/lease ordering and duplicate records
     /// collapsed to the same last-record-wins state as `InProcessKvStore::restore`.
     ///
@@ -194,8 +229,18 @@ impl KvSnapshot {
     }
 
     /// Returns all entries under `prefix` from a canonical snapshot.
-    pub fn range_prefix(&self, prefix: &str) -> Vec<KvEntry> {
-        self.prefix_entries(prefix).cloned().collect()
+    pub fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+        self.try_range_prefix(prefix)
+    }
+
+    /// Fallibly returns all entries under `prefix` from a canonical snapshot.
+    pub fn try_range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+        let mut entries = Vec::new();
+        for entry in self.prefix_entries(prefix) {
+            try_reserve_kv_items(&mut entries, 1, "collect snapshot prefix range")?;
+            entries.push(try_clone_kv_entry(entry, "collect snapshot prefix range")?);
+        }
+        Ok(entries)
     }
 
     /// Iterates entries under `prefix` from a canonical snapshot without cloning.
@@ -241,7 +286,11 @@ impl KvSnapshot {
                     max_bytes: max_payload_bytes,
                 });
             }
-            entries.push(entry.clone());
+            try_reserve_kv_items(&mut entries, 1, "collect limited snapshot prefix range")?;
+            entries.push(try_clone_kv_entry(
+                entry,
+                "collect limited snapshot prefix range",
+            )?);
         }
         Ok(entries)
     }
@@ -252,10 +301,17 @@ impl KvSnapshot {
         max_entries: usize,
         max_payload_bytes: usize,
     ) -> Result<Vec<T>, KvError> {
-        self.range_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes)?
-            .iter()
-            .map(KvEntry::decode)
-            .collect()
+        let entries = self.range_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes)?;
+        let mut values = Vec::new();
+        try_reserve_kv_items(
+            &mut values,
+            entries.len(),
+            "decode limited snapshot prefix range",
+        )?;
+        for entry in entries {
+            values.push(entry.decode()?);
+        }
+        Ok(values)
     }
 
     fn is_canonical(&self) -> bool {
@@ -267,6 +323,15 @@ impl KvSnapshot {
                 .windows(2)
                 .all(|window| window[0].lease_id < window[1].lease_id)
     }
+}
+
+fn checked_snapshot_payload_bytes(current: usize, additional: usize) -> Result<usize, KvError> {
+    current
+        .checked_add(additional)
+        .ok_or_else(|| KvError::ResourceExhausted {
+            operation: "validate kv snapshot payload".to_string(),
+            requested_bytes: usize::MAX,
+        })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -308,7 +373,9 @@ impl KvMaterializedCache {
         {
             return Ok(cached);
         }
-        let snapshot = Arc::new(read_object_file::<KvSnapshot>(&self.path)?.canonicalized());
+        let snapshot = read_object_file::<KvSnapshot>(&self.path)?;
+        snapshot.validate_resource_bounds()?;
+        let snapshot = Arc::new(snapshot.canonicalized());
         if let Some(identity) = identity {
             cache_store_snapshot(&self.path, identity, snapshot.clone());
         }
@@ -330,8 +397,9 @@ impl KvMaterializedCache {
         let Some(bytes) = read_optional_object_file_bytes(&self.path)? else {
             return Ok(None);
         };
-        let snapshot =
-            Arc::new(decode_object_file::<KvSnapshot>(&self.path, &bytes)?.canonicalized());
+        let snapshot = decode_object_file::<KvSnapshot>(&self.path, &bytes)?;
+        snapshot.validate_resource_bounds()?;
+        let snapshot = Arc::new(snapshot.canonicalized());
         if let Some(identity) = cache_identity {
             cache_store_snapshot(&self.path, identity, snapshot.clone());
         }
@@ -383,7 +451,7 @@ impl KvMaterializedCache {
                     }
                     Err(error) => return Err(error),
                 };
-            let snapshot = node.store().snapshot().canonicalized();
+            let snapshot = node.store().try_snapshot()?.canonicalized();
             if refresh_materialized {
                 self.write_snapshot_if_changed(&snapshot)?;
             }
@@ -396,12 +464,12 @@ impl KvMaterializedCache {
         if let Some(snapshot) = self.read_snapshot_arc_if_present()? {
             return Ok(snapshot);
         }
-        let snapshot = Arc::new(InProcessKvStore::new().snapshot().canonicalized());
+        let snapshot = Arc::new(InProcessKvStore::new().try_snapshot()?.canonicalized());
         Ok(snapshot)
     }
 
     pub fn read_store(&self) -> Result<InProcessKvStore, KvError> {
-        self.read_snapshot().map(InProcessKvStore::restore)
+        self.read_snapshot().and_then(InProcessKvStore::restore)
     }
 
     /// Returns the snapshot that should actually be persisted: the input with its
@@ -434,6 +502,7 @@ impl KvMaterializedCache {
         &self,
         snapshot: KvSnapshot,
     ) -> Result<bool, KvError> {
+        snapshot.validate_resource_bounds()?;
         let wrote = write_object_file_if_changed(&self.path, &snapshot)?;
         if let Some(identity) = file_identity(&self.path) {
             cache_store_snapshot(&self.path, identity, Arc::new(snapshot));
@@ -478,7 +547,7 @@ impl KvMaterializedCache {
         paths: KvWalPaths,
     ) -> Result<InProcessKvStore, KvError> {
         self.read_snapshot_with_raft_view(node_id, paths)
-            .map(|snapshot| InProcessKvStore::restore((*snapshot).clone()))
+            .and_then(|snapshot| InProcessKvStore::restore((*snapshot).clone()))
     }
 }
 
@@ -539,7 +608,7 @@ impl KvLocalCache {
         let snapshot = self
             .materialized
             .read_snapshot_with_raft_view(node_id.clone(), self.raft_wal_paths(&node_id))?;
-        Ok(snapshot.range_prefix(prefix))
+        snapshot.try_range_prefix(prefix)
     }
 
     pub fn current_range_prefix_limited(
@@ -575,10 +644,12 @@ impl KvLocalCache {
         let snapshot = self
             .materialized
             .read_snapshot_with_raft_view(node_id.clone(), self.raft_wal_paths(&node_id))?;
-        snapshot
-            .prefix_entries(prefix)
-            .map(|entry| entry.decode())
-            .collect()
+        let mut values = Vec::new();
+        for entry in snapshot.prefix_entries(prefix) {
+            try_reserve_kv_items(&mut values, 1, "decode snapshot prefix range")?;
+            values.push(entry.decode()?);
+        }
+        Ok(values)
     }
 
     pub fn current_range_prefix_serde_limited_by_payload_bytes<T: DeserializeOwned>(
@@ -664,7 +735,7 @@ impl KvLocalCache {
         )?;
         if snapshot.revision <= node.store().revision() {
             self.materialized
-                .write_snapshot_if_changed(&node.store().snapshot())?;
+                .write_snapshot_if_changed(&node.store().try_snapshot()?)?;
             return Ok(false);
         }
         self.materialized.write_snapshot_if_changed(&snapshot)?;
@@ -778,31 +849,32 @@ pub(crate) fn compact_shared_event_history(
     *compacted_revision = (*compacted_revision).max(compacted);
 }
 
-pub(crate) fn build_lease_key_index(
-    entries: &BTreeMap<String, KvEntry>,
-) -> BTreeMap<LeaseId, BTreeSet<String>> {
-    let mut lease_keys = BTreeMap::<LeaseId, BTreeSet<String>>::new();
-    for (key, entry) in entries {
+pub(crate) fn build_lease_key_index<'a>(
+    entries: impl IntoIterator<Item = &'a KvEntry>,
+) -> Result<KvLeaseKeyIndex, KvError> {
+    let mut lease_keys = KvLeaseKeyIndex::default();
+    for entry in entries {
         if let Some(lease_id) = entry.lease_id {
-            lease_keys.entry(lease_id).or_default().insert(key.clone());
+            lease_keys.try_add_key(
+                lease_id,
+                try_clone_kv_string(&entry.key, "build lease key index")?,
+                "build lease key index",
+            )?;
         }
     }
-    lease_keys
+    Ok(lease_keys)
 }
 
 pub(crate) fn build_lease_deadline_index(
-    leases: &BTreeMap<LeaseId, KvLease>,
+    leases: &KvLeaseIndex,
     lease_clock: u64,
-) -> (BTreeMap<LeaseId, u64>, BTreeMap<u64, BTreeSet<LeaseId>>) {
-    let mut deadline_by_id = BTreeMap::new();
-    let mut deadlines = BTreeMap::<u64, BTreeSet<LeaseId>>::new();
+) -> Result<(KvLeaseDeadlineByIdIndex, KvLeaseDeadlineIndex), KvError> {
+    let mut deadline_by_id = KvLeaseDeadlineByIdIndex::default();
+    let mut deadlines = KvLeaseDeadlineIndex::default();
     for lease in leases.values() {
         let deadline = lease_clock.saturating_add(lease.remaining_ticks);
-        deadline_by_id.insert(lease.lease_id, deadline);
-        deadlines
-            .entry(deadline)
-            .or_default()
-            .insert(lease.lease_id);
+        deadline_by_id.try_insert(lease.lease_id, deadline, "build lease deadline index")?;
+        deadlines.try_insert(deadline, lease.lease_id, "build lease deadline index")?;
     }
-    (deadline_by_id, deadlines)
+    Ok((deadline_by_id, deadlines))
 }

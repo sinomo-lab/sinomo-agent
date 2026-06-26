@@ -432,10 +432,11 @@ impl ClusterKvPaths {
         let mut latest = None;
         let mut wrote_any = false;
         loop {
-            let chunk = ops
-                .by_ref()
-                .take(MAX_KV_MUTATION_EVENTS_PER_COMMAND)
-                .collect::<Vec<_>>();
+            let mut chunk = Vec::new();
+            for op in ops.by_ref().take(MAX_KV_MUTATION_EVENTS_PER_COMMAND) {
+                try_reserve_kv_items(&mut chunk, 1, "batch kv ops for publish")?;
+                chunk.push(op);
+            }
             if chunk.is_empty() {
                 break;
             }

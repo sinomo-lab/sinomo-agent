@@ -765,8 +765,12 @@ fn registry_trusted_signer_cluster_entries(
 ) -> Result<Vec<KvEntry>, CliError> {
     let paths = ClusterPaths::new(data_dir);
     let snapshot = registry_trust_cluster_snapshot(&paths)?;
-    let store = InProcessKvStore::restore(snapshot);
-    Ok(store.range_prefix(sinomo_runtime::registry::CLUSTER_TRUSTED_ARTIFACT_SIGNER_PREFIX))
+    let store =
+        InProcessKvStore::restore(snapshot).map_err(sinomo_runtime::network::NetworkError::from)?;
+    store
+        .range_prefix(sinomo_runtime::registry::CLUSTER_TRUSTED_ARTIFACT_SIGNER_PREFIX)
+        .map_err(sinomo_runtime::network::NetworkError::from)
+        .map_err(Into::into)
 }
 
 fn registry_trust_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, CliError> {

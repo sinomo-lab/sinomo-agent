@@ -322,7 +322,7 @@ pub fn build_cluster_join_invite(
 
 pub fn random_url_secret(byte_len: usize) -> Result<String, NetworkError> {
     let rng = SystemRandom::new();
-    let mut bytes = vec![0_u8; byte_len];
+    let mut bytes = crate::object::try_zeroed_vec(byte_len, "generate cluster invite secret")?;
     rng.fill(&mut bytes)
         .map_err(|_| NetworkError::Serialization {
             detail: "failed to generate secure random URL secret".to_string(),
@@ -896,10 +896,12 @@ fn join_invite_parts(parts: &[String]) -> String {
 }
 
 fn split_invite_parts(value: &str) -> Result<Vec<String>, NetworkError> {
-    value
-        .split(',')
-        .map(percent_decode_invite_value)
-        .collect::<Result<Vec<_>, _>>()
+    let mut decoded = Vec::new();
+    for part in value.split(',') {
+        crate::object::try_reserve_vec(&mut decoded, 1, "decode cluster invite parts")?;
+        decoded.push(percent_decode_invite_value(part)?);
+    }
+    Ok(decoded)
 }
 
 fn percent_encode_invite_value(value: &str) -> String {
@@ -916,7 +918,12 @@ fn percent_encode_invite_value(value: &str) -> String {
 
 fn percent_decode_invite_value(value: &str) -> Result<String, NetworkError> {
     let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut decoded = Vec::new();
+    crate::object::try_reserve_vec(
+        &mut decoded,
+        bytes.len(),
+        "decode cluster invite percent value",
+    )?;
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' {

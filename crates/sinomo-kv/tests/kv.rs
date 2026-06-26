@@ -547,7 +547,7 @@ mod tests {
             store.put(key, value, None).expect("put");
         }
         cache
-            .write_snapshot(&store.snapshot())
+            .write_snapshot(&store.snapshot().expect("snapshot"))
             .expect("write materialized snapshot");
 
         let entries = read_cluster_kv_prefix_entries(&paths, "/apps/").expect("read prefix");
@@ -610,7 +610,8 @@ mod tests {
             &snapshot,
             &registration,
             usize::MAX,
-        );
+        )
+        .expect("collect watch drain events");
 
         assert_eq!(
             events
@@ -641,7 +642,8 @@ mod tests {
             &snapshot,
             &registration,
             max_payload_bytes,
-        );
+        )
+        .expect("collect watch drain events");
 
         assert_eq!(
             drained
@@ -805,15 +807,17 @@ mod tests {
         store
             .put("/deferred/a", b"old".to_vec(), None)
             .expect("write deferred seed");
-        write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write initial snapshot");
+        write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+            .expect("write initial snapshot");
 
-        let mut imported_store = InProcessKvStore::restore(store.snapshot());
+        let mut imported_store =
+            InProcessKvStore::restore(store.snapshot().expect("snapshot")).expect("restore");
         imported_store
             .put("/deferred/a", b"new".to_vec(), None)
             .expect("write deferred import");
         let wrote = write_imported_cluster_kv_snapshot_if_changed(
             &paths,
-            &imported_store.snapshot(),
+            &imported_store.snapshot().expect("snapshot"),
             key_can_defer,
         )
         .expect("write imported deferred snapshot");
@@ -828,13 +832,13 @@ mod tests {
             b"old"
         );
 
-        let mut durable_store = InProcessKvStore::restore(cached);
+        let mut durable_store = InProcessKvStore::restore(cached).expect("restore");
         durable_store
             .put("/durable/a", b"new".to_vec(), None)
             .expect("write durable import");
         let wrote = write_imported_cluster_kv_snapshot_if_changed(
             &paths,
-            &durable_store.snapshot(),
+            &durable_store.snapshot().expect("snapshot"),
             key_can_defer,
         )
         .expect("write imported durable snapshot");
@@ -858,7 +862,7 @@ mod tests {
         let mut kv = InProcessKvStore::new();
         kv.put("/kv/a", b"a".to_vec(), None)
             .expect("write commit entry");
-        let snapshot = kv.snapshot();
+        let snapshot = kv.snapshot().expect("snapshot");
         let result = ClusterKvRaftCommitResult {
             snapshot: snapshot.clone(),
             txn_response: None,
@@ -986,7 +990,7 @@ mod tests {
             &request,
             std::slice::from_ref(&first),
         ));
-        let mut fanout_snapshot = InProcessKvStore::new().snapshot();
+        let mut fanout_snapshot = InProcessKvStore::new().snapshot().expect("snapshot");
         fanout_snapshot.events = vec![first.clone()];
         request.snapshot = Some(RaftSnapshot {
             last_included_index: 1,
@@ -1733,7 +1737,8 @@ mod tests {
         store
             .put("/watch/lifecycle/a", b"a".to_vec(), None)
             .expect("seed snapshot event");
-        write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+        write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+            .expect("write snapshot");
 
         let watch = create_cluster_kv_watch_for_node(
             &paths,
@@ -1829,8 +1834,11 @@ mod tests {
     fn cluster_kv_watch_event_handler_skips_storage_without_active_watchers() {
         let root = temp_raft_root("sinomo-kv-watch-fanout-no-active-watchers");
         let paths = ClusterKvPaths::new(root.to_path_buf());
-        write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
-            .expect("write empty snapshot");
+        write_cluster_kv_snapshot(
+            &paths,
+            &InProcessKvStore::new().snapshot().expect("snapshot"),
+        )
+        .expect("write empty snapshot");
         let cluster_id =
             Id::from_legacy_named("cluster_kv_watch_fanout_no_active").expect("cluster");
         let leader_id =
@@ -1993,7 +2001,7 @@ mod tests {
             prefix: "/svc/".to_string(),
             next_revision: KvRevision(1),
         };
-        let snapshot = InProcessKvStore::new().snapshot();
+        let snapshot = InProcessKvStore::new().snapshot().expect("snapshot");
         let events = vec![
             KvEvent {
                 revision: KvRevision(1),
@@ -2060,7 +2068,7 @@ mod tests {
         store
             .put("/svc/one", b"one".to_vec(), None)
             .expect("put snapshot event");
-        let snapshot = store.snapshot();
+        let snapshot = store.snapshot().expect("snapshot");
 
         let report = drain_cluster_kv_watch_registration(
             registration.clone(),
@@ -2085,7 +2093,7 @@ mod tests {
                 registration,
                 KvRevision(1),
                 &[],
-                &store.snapshot(),
+                &store.snapshot().expect("snapshot"),
                 MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES,
                 true,
                 Some(Duration::ZERO),
@@ -2648,33 +2656,6 @@ mod tests {
     }
 
     #[test]
-    fn read_object_file_rejects_oversized_object_before_reading() {
-        let root = sinomo_testdir::TestDir::new("sinomo-kv-objfile-oversized");
-        let path = root.join("snapshot.sobj");
-        OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&path)
-            .expect("create sparse object")
-            .set_len(MAX_OBJECT_FILE_READ_BYTES + 1)
-            .expect("make sparse object oversized");
-
-        let error = read_object_file::<KvSnapshot>(&path).expect_err("oversized object");
-        let expected_path = path.display().to_string();
-        assert!(
-            matches!(
-                &error,
-                KvError::Io { path: error_path, detail }
-                    if error_path == &expected_path
-                        && detail.contains("object file is")
-                        && detail.contains("max is")
-            ),
-            "unexpected error for oversized object: {error:?}"
-        );
-    }
-
-    #[test]
     fn serde_values_use_sinomo_object() {
         let mut store = InProcessKvStore::new();
         let record = TestRecord {
@@ -2708,7 +2689,7 @@ mod tests {
             store.put(key, key.as_bytes().to_vec(), None).expect("put");
         }
 
-        let entries = store.range_prefix("/apps/service/");
+        let entries = store.range_prefix("/apps/service/").expect("range prefix");
         assert_eq!(
             entries
                 .iter()
@@ -2814,6 +2795,7 @@ mod tests {
         assert_eq!(
             sorted
                 .range_prefix("/apps/service/")
+                .expect("range prefix")
                 .into_iter()
                 .map(|entry| entry.key)
                 .collect::<Vec<_>>(),
@@ -2852,6 +2834,7 @@ mod tests {
         assert_eq!(
             unsorted
                 .range_prefix("/apps/service/")
+                .expect("range prefix")
                 .into_iter()
                 .map(|entry| entry.key)
                 .collect::<Vec<_>>(),
@@ -2864,6 +2847,89 @@ mod tests {
             KvError::RangeLimit {
                 prefix: "/apps/service/".to_string(),
                 max_entries: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_resource_validation_rejects_oversized_entry_values() {
+        let snapshot = KvSnapshot {
+            revision: KvRevision(1),
+            compacted_revision: KvRevision::ZERO,
+            entries: vec![KvEntry {
+                key: "/snapshot/large-entry".to_string(),
+                value: vec![0_u8; MAX_KV_VALUE_BYTES + 1],
+                create_revision: KvRevision(1),
+                modify_revision: KvRevision(1),
+                version: KvVersion(1),
+                lease_id: None,
+            }],
+            leases: Vec::new(),
+            events: Vec::new(),
+        };
+
+        assert_eq!(
+            snapshot
+                .validate_resource_bounds()
+                .expect_err("entry value limit"),
+            KvError::ValueTooLarge {
+                actual_bytes: MAX_KV_VALUE_BYTES + 1,
+                max_bytes: MAX_KV_VALUE_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_resource_validation_rejects_oversized_event_values() {
+        let value = vec![0_u8; MAX_KV_VALUE_BYTES + 1];
+        let snapshot = test_kv_snapshot_with_events(vec![test_kv_put_event(
+            1,
+            "/snapshot/large-event",
+            &value,
+        )]);
+
+        assert_eq!(
+            snapshot
+                .validate_resource_bounds()
+                .expect_err("event value limit"),
+            KvError::ValueTooLarge {
+                actual_bytes: MAX_KV_VALUE_BYTES + 1,
+                max_bytes: MAX_KV_VALUE_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_resource_validation_rejects_over_retained_event_limit() {
+        let events = (0..=MAX_RETAINED_EVENTS)
+            .map(|index| test_kv_delete_event(index as u64 + 1, "/snapshot/event"))
+            .collect::<Vec<_>>();
+        let snapshot = test_kv_snapshot_with_events(events);
+
+        assert_eq!(
+            snapshot
+                .validate_resource_bounds()
+                .expect_err("retained event limit"),
+            KvError::SnapshotEventLimit {
+                observed_events: MAX_RETAINED_EVENTS + 1,
+                max_events: MAX_RETAINED_EVENTS,
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_rpc_decode_rejects_over_retained_event_limit() {
+        let events = (0..=MAX_RETAINED_EVENTS)
+            .map(|index| test_kv_delete_event(index as u64 + 1, "/snapshot/rpc-event"))
+            .collect::<Vec<_>>();
+        let snapshot = test_kv_snapshot_with_events(events);
+        let body = encode_cluster_kv_rpc_body(&snapshot).expect("encode snapshot body");
+
+        assert_eq!(
+            decode_cluster_kv_snapshot_rpc_body(&body).expect_err("snapshot event limit"),
+            KvError::SnapshotEventLimit {
+                observed_events: MAX_RETAINED_EVENTS + 1,
+                max_events: MAX_RETAINED_EVENTS,
             }
         );
     }
@@ -3163,7 +3229,12 @@ mod tests {
             KvRevision(revision_before.0 + MAX_KV_MUTATION_EVENTS_PER_COMMAND as u64)
         );
         assert_eq!(store.get("/config/a").expect("stable entry").value, b"old");
-        assert!(store.range_prefix("/huge/").is_empty());
+        assert!(
+            store
+                .range_prefix("/huge/")
+                .expect("range prefix")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3205,7 +3276,12 @@ mod tests {
             store.revision(),
             KvRevision(revision_before.0 + MAX_KV_MUTATION_EVENTS_PER_COMMAND as u64)
         );
-        assert!(store.range_prefix("/huge/").is_empty());
+        assert!(
+            store
+                .range_prefix("/huge/")
+                .expect("range prefix")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4045,7 +4121,8 @@ mod tests {
                 granted_at: OffsetDateTime::now_utc(),
             }],
             events: Vec::new(),
-        });
+        })
+        .expect("restore");
         let revision_before = store.revision();
 
         let error = store
@@ -4203,7 +4280,7 @@ mod tests {
     }
 
     #[test]
-    fn matching_watch_queues_share_event_payloads() {
+    fn matching_watch_queues_receive_equivalent_event_payloads() {
         let mut store = InProcessKvStore::new();
         let first = store
             .watch_prefix("/services/", KvRevision(1))
@@ -4234,19 +4311,8 @@ mod tests {
                 .expect("second pending event");
             let history_event = store.events.last().expect("history event");
 
-            assert!(
-                Arc::ptr_eq(first_event, second_event),
-                "matching watch queues should share the same event allocation"
-            );
-            assert!(
-                Arc::ptr_eq(first_event, history_event),
-                "watch queues and event history should share the same event allocation"
-            );
-            assert_eq!(
-                Arc::strong_count(history_event),
-                3,
-                "one history entry plus two pending watch entries should reference one event"
-            );
+            assert_eq!(first_event, second_event);
+            assert_eq!(first_event, history_event);
         }
 
         let drained = store.drain_watch(first).expect("drain first watch");
@@ -4360,7 +4426,7 @@ mod tests {
                 .expect("put event");
         }
 
-        let snapshot = store.snapshot();
+        let snapshot = store.snapshot().expect("snapshot");
         assert_eq!(snapshot.events.len(), MAX_RETAINED_EVENTS);
         assert_eq!(snapshot.compacted_revision, KvRevision(10));
         assert_eq!(
@@ -4420,6 +4486,7 @@ mod tests {
         assert!(store.get("/lease/short").is_none());
         let remaining = store
             .snapshot()
+            .expect("snapshot")
             .leases
             .into_iter()
             .find(|lease| lease.lease_id == LeaseId(1))
@@ -4446,6 +4513,7 @@ mod tests {
             .expect("keepalive");
         let refreshed = store
             .snapshot()
+            .expect("snapshot")
             .leases
             .into_iter()
             .find(|lease| lease.lease_id == LeaseId(1))
@@ -4475,7 +4543,8 @@ mod tests {
             Vec::<LeaseId>::new()
         );
 
-        let mut restored = InProcessKvStore::restore(store.snapshot());
+        let mut restored =
+            InProcessKvStore::restore(store.snapshot().expect("snapshot")).expect("restore");
         assert_eq!(
             restored.tick_leases(2).expect("not expired yet"),
             Vec::<LeaseId>::new()
@@ -4520,7 +4589,12 @@ mod tests {
             vec![LeaseId(2)]
         );
         assert!(!store.leases.contains_key(&LeaseId(2)));
-        assert!(store.range_prefix("/lease/").is_empty());
+        assert!(
+            store
+                .range_prefix("/lease/")
+                .expect("range prefix")
+                .is_empty()
+        );
         assert_eq!(store.revision(), KvRevision(revision_before.0 + 6000));
     }
 
@@ -4548,7 +4622,8 @@ mod tests {
                 granted_at: OffsetDateTime::now_utc(),
             }],
             events: Vec::new(),
-        });
+        })
+        .expect("restore");
         let revision_before = store.revision();
 
         assert_eq!(
@@ -4571,7 +4646,12 @@ mod tests {
 
         assert_eq!(store.tick_leases(0).expect("finish expiry"), vec![lease_id]);
         assert!(!store.leases.contains_key(&lease_id));
-        assert!(store.range_prefix("/lease/restored/").is_empty());
+        assert!(
+            store
+                .range_prefix("/lease/restored/")
+                .expect("range prefix")
+                .is_empty()
+        );
         assert_eq!(
             store.revision(),
             KvRevision(revision_before.0 + MAX_KV_MUTATION_EVENTS_PER_COMMAND as u64 + 1)
@@ -4621,7 +4701,8 @@ mod tests {
                 .lease_keys
                 .get(&LeaseId(2))
                 .expect("lease two keys")
-                .contains("/lease/a")
+                .iter()
+                .any(|key| key == "/lease/a")
         );
 
         let response = store
@@ -4655,13 +4736,15 @@ mod tests {
             .put("/lease/restored", b"value".to_vec(), Some(LeaseId(7)))
             .expect("leased value");
 
-        let mut restored = InProcessKvStore::restore(store.snapshot());
+        let mut restored =
+            InProcessKvStore::restore(store.snapshot().expect("snapshot")).expect("restore");
         assert!(
             restored
                 .lease_keys
                 .get(&LeaseId(7))
                 .expect("restored lease keys")
-                .contains("/lease/restored")
+                .iter()
+                .any(|key| key == "/lease/restored")
         );
 
         restored
@@ -4710,9 +4793,9 @@ mod tests {
         store
             .put("/dfs/workspaces/w1", b"meta".to_vec(), None)
             .expect("put");
-        let snapshot = store.snapshot();
+        let snapshot = store.snapshot().expect("snapshot");
 
-        let restored = InProcessKvStore::restore(snapshot);
+        let restored = InProcessKvStore::restore(snapshot).expect("restore");
 
         assert_eq!(restored.revision(), KvRevision(1));
         assert_eq!(
@@ -4733,13 +4816,13 @@ mod tests {
         assert!(!cache.exists());
         assert!(
             cache
-                .write_snapshot_if_changed(&store.snapshot())
+                .write_snapshot_if_changed(&store.snapshot().expect("snapshot"))
                 .expect("write cache")
         );
         assert!(cache.exists());
         assert!(
             !cache
-                .write_snapshot_if_changed(&store.snapshot())
+                .write_snapshot_if_changed(&store.snapshot().expect("snapshot"))
                 .expect("skip unchanged cache")
         );
         let restored = cache.read_store().expect("read cache");
@@ -4758,7 +4841,7 @@ mod tests {
         reset_required_object_file_reads_for_test(cache.path());
         assert!(
             cache
-                .write_snapshot_if_changed(&store.snapshot())
+                .write_snapshot_if_changed(&store.snapshot().expect("snapshot"))
                 .expect("initial write")
         );
         assert_eq!(
@@ -4784,7 +4867,7 @@ mod tests {
             .put("alpha", b"one".to_vec(), None)
             .expect("seed cache");
         cache
-            .write_snapshot(&store.snapshot())
+            .write_snapshot(&store.snapshot().expect("snapshot"))
             .expect("write materialized snapshot");
         let snapshot = cache
             .read_snapshot_arc_if_present()
@@ -4862,14 +4945,14 @@ mod tests {
         store.put("alpha", b"one".to_vec(), None).expect("seed");
         assert!(
             cache
-                .write_snapshot_if_changed(&store.snapshot())
+                .write_snapshot_if_changed(&store.snapshot().expect("snapshot"))
                 .expect("initial write")
         );
 
         // Re-put the identical value: modify_revision/version advance and an event is
         // appended, but the durable key/value state is unchanged -> no rewrite.
         store.put("alpha", b"one".to_vec(), None).expect("re-put");
-        let snap = store.snapshot();
+        let snap = store.snapshot().expect("snapshot");
         assert!(snap.revision.0 > 1, "revision should have advanced");
         assert!(
             !cache
@@ -4882,7 +4965,7 @@ mod tests {
         store.put("alpha", b"two".to_vec(), None).expect("change");
         assert!(
             cache
-                .write_snapshot_if_changed(&store.snapshot())
+                .write_snapshot_if_changed(&store.snapshot().expect("snapshot"))
                 .expect("changed write"),
             "a real value change must rewrite the snapshot"
         );
@@ -4960,7 +5043,7 @@ mod tests {
             .expect("put leased");
         assert!(
             cache
-                .write_snapshot_if_changed(&store.snapshot())
+                .write_snapshot_if_changed(&store.snapshot().expect("snapshot"))
                 .expect("initial write")
         );
 
@@ -4968,6 +5051,7 @@ mod tests {
         assert_eq!(
             store
                 .snapshot()
+                .expect("snapshot")
                 .leases
                 .iter()
                 .find(|lease| lease.lease_id == LeaseId(1))
@@ -4977,7 +5061,7 @@ mod tests {
         );
         assert!(
             cache
-                .write_snapshot_if_changed(&store.snapshot())
+                .write_snapshot_if_changed(&store.snapshot().expect("snapshot"))
                 .expect("lease decay write"),
             "lease countdown state is restart-visible and must be persisted"
         );
@@ -4986,6 +5070,7 @@ mod tests {
         assert_eq!(
             restored
                 .snapshot()
+                .expect("snapshot")
                 .leases
                 .iter()
                 .find(|lease| lease.lease_id == LeaseId(1))
@@ -5001,7 +5086,7 @@ mod tests {
         let cache = KvMaterializedCache::new(root.join("kv-cache.sobj"));
         let mut store = InProcessKvStore::new();
         store.put("alpha", b"one".to_vec(), None).expect("seed");
-        let initial = store.snapshot();
+        let initial = store.snapshot().expect("snapshot");
 
         assert!(
             cache
@@ -5016,7 +5101,7 @@ mod tests {
         );
 
         store.put("alpha", b"one".to_vec(), None).expect("re-put");
-        let event_only_change = store.snapshot();
+        let event_only_change = store.snapshot().expect("snapshot");
         assert!(
             kv_snapshot_durable_eq(&initial, &event_only_change),
             "test setup should differ only in revision/event metadata"
@@ -5044,10 +5129,10 @@ mod tests {
                 .put(format!("k{index}"), vec![index as u8], None)
                 .expect("seed");
         }
-        assert!(store.snapshot().events.len() > 4);
+        assert!(store.snapshot().expect("snapshot").events.len() > 4);
         assert!(
             cache
-                .write_snapshot_if_changed(&store.snapshot())
+                .write_snapshot_if_changed(&store.snapshot().expect("snapshot"))
                 .expect("write cache")
         );
         let persisted = cache.read_snapshot().expect("read cache");
@@ -5061,7 +5146,7 @@ mod tests {
         // Re-writing the same store is a no-op (compaction is deterministic).
         assert!(
             !cache
-                .write_snapshot_if_changed(&store.snapshot())
+                .write_snapshot_if_changed(&store.snapshot().expect("snapshot"))
                 .expect("skip unchanged")
         );
     }
@@ -5091,7 +5176,7 @@ mod tests {
             .put("/cache", b"cache".to_vec(), None)
             .expect("seed cache");
         cache
-            .write_snapshot(&cache_store.snapshot())
+            .write_snapshot(&cache_store.snapshot().expect("snapshot"))
             .expect("write cache");
 
         let node = DurableRaftKvNode::open_with_materialized_cache(node_id, wal_paths, &cache)
@@ -5113,7 +5198,7 @@ mod tests {
             .put("/cached", b"available".to_vec(), None)
             .expect("seed cache");
         cache
-            .write_snapshot(&store.snapshot())
+            .write_snapshot(&store.snapshot().expect("snapshot"))
             .expect("write materialized cache");
 
         let snapshot = cache
@@ -5257,7 +5342,7 @@ mod tests {
             .put("/cache-only", b"stale".to_vec(), None)
             .expect("seed stale cache");
         cache
-            .write_snapshot(&stale_store.snapshot())
+            .write_snapshot(&stale_store.snapshot().expect("snapshot"))
             .expect("write stale cache");
 
         let current = cache.current_store(node_id).expect("read current store");
@@ -5286,7 +5371,7 @@ mod tests {
             .put("/cached", b"available".to_vec(), None)
             .expect("seed cache");
         cache
-            .write_snapshot(&cached_store.snapshot())
+            .write_snapshot(&cached_store.snapshot().expect("snapshot"))
             .expect("write cache");
         let _held_node = cache
             .open_raft_node(node_id.clone())
@@ -5333,7 +5418,7 @@ mod tests {
             .put("/cache-only", b"stale".to_vec(), None)
             .expect("seed stale cache");
         cache
-            .write_snapshot(&stale_store.snapshot())
+            .write_snapshot(&stale_store.snapshot().expect("snapshot"))
             .expect("write stale materialized cache");
         let _held_node = cache
             .open_raft_node(node_id.clone())
@@ -5390,7 +5475,7 @@ mod tests {
             .put("/apps/service/stale", b"stale".to_vec(), None)
             .expect("seed stale cache");
         cache
-            .write_snapshot(&stale_store.snapshot())
+            .write_snapshot(&stale_store.snapshot().expect("snapshot"))
             .expect("write stale materialized cache");
         let _held_node = cache
             .open_raft_node(node_id.clone())
@@ -5519,7 +5604,7 @@ mod tests {
             .put_serde("/dfs/services/content/b", &"node-b", None)
             .expect("put b");
         cache
-            .write_snapshot(&store.snapshot())
+            .write_snapshot(&store.snapshot().expect("snapshot"))
             .expect("write cache snapshot");
 
         assert_eq!(
@@ -5551,7 +5636,7 @@ mod tests {
             store.put_serde(key, &key.to_string(), None).expect("put");
         }
         cache
-            .write_snapshot(&store.snapshot())
+            .write_snapshot(&store.snapshot().expect("snapshot"))
             .expect("write cache snapshot");
 
         let error = cache
@@ -5634,8 +5719,8 @@ mod tests {
         let mut cluster =
             InProcessRaftKvCluster::new(vec![node_a.clone(), node_b.clone(), node_c.clone()])
                 .expect("cluster");
-        cluster.set_node_online(&node_b, false);
-        cluster.set_node_online(&node_c, false);
+        cluster.set_node_online(&node_b, false).unwrap();
+        cluster.set_node_online(&node_c, false).unwrap();
 
         let error = cluster
             .put("/cluster/meta", b"no".to_vec())
@@ -5747,7 +5832,7 @@ mod tests {
                 store.put(key, value, lease_id)?;
             }
             Ok(ClusterKvRaftCommitResult {
-                snapshot: store.snapshot(),
+                snapshot: store.snapshot().expect("snapshot"),
                 txn_response: None,
                 events: vec![test_kv_put_event(1, "/kv/quorum/fanout", b"ok")],
             })
@@ -5968,7 +6053,7 @@ mod tests {
             let mut store = InProcessKvStore::new();
             let txn_response = store.txn(txn)?;
             Ok(ClusterKvRaftQuorumCommitResult {
-                snapshot: store.snapshot(),
+                snapshot: store.snapshot().expect("snapshot"),
                 txn_response: Some(txn_response),
             })
         }
@@ -6134,7 +6219,7 @@ mod tests {
         let total = 2 * COMMITS_PER_THREAD;
         assert_eq!(node.applied_index(), total);
         assert_eq!(node.last_log_index(), total);
-        let snapshot = node.store().snapshot();
+        let snapshot = node.store().snapshot().expect("snapshot");
         for writer in 0..2 {
             for index in 0..COMMITS_PER_THREAD {
                 assert!(
@@ -6212,7 +6297,7 @@ mod tests {
             })
             .expect("seed forwarded response");
         let forwarded = ClusterKvTxnCommitResult {
-            snapshot: store.snapshot(),
+            snapshot: store.snapshot().expect("snapshot"),
             txn_response: Some(txn_response),
         };
         let mut host = TxnQuorumDriverTestHost {
@@ -6545,7 +6630,11 @@ mod tests {
         let mut cluster =
             InProcessRaftKvCluster::new(vec![node_a.clone(), node_b.clone()]).expect("cluster");
         cluster.put("/policy/a", b"allow".to_vec()).expect("put");
-        let snapshot = cluster.store(&node_a).expect("leader store").snapshot();
+        let snapshot = cluster
+            .store(&node_a)
+            .expect("leader store")
+            .snapshot()
+            .expect("snapshot");
 
         cluster
             .add_learner_from_snapshot(learner.clone(), snapshot)
@@ -6571,7 +6660,7 @@ mod tests {
             InProcessRaftKvCluster::new(vec![node_a.clone(), node_b.clone(), node_c.clone()])
                 .expect("cluster");
 
-        cluster.set_node_online(&node_c, false);
+        cluster.set_node_online(&node_c, false).unwrap();
         cluster.put("/config/a", b"one".to_vec()).expect("put");
         assert!(
             cluster
@@ -6581,7 +6670,7 @@ mod tests {
                 .is_none()
         );
 
-        cluster.set_node_online(&node_c, true);
+        cluster.set_node_online(&node_c, true).unwrap();
 
         assert_eq!(
             cluster
@@ -6613,7 +6702,7 @@ mod tests {
             .put("/config/epoch", b"one".to_vec())
             .expect("initial put");
 
-        cluster.set_node_online(&node_a, false);
+        cluster.set_node_online(&node_a, false).unwrap();
         let isolated_write = cluster.put("/config/minority", b"blocked".to_vec());
         assert!(matches!(
             isolated_write,
@@ -6634,7 +6723,7 @@ mod tests {
                 .is_none()
         );
 
-        cluster.set_node_online(&node_a, true);
+        cluster.set_node_online(&node_a, true).unwrap();
 
         assert_eq!(
             cluster
@@ -6666,7 +6755,7 @@ mod tests {
             .put("/config/a", b"one".to_vec())
             .expect("initial write");
 
-        cluster.set_node_online(&node_a, false);
+        cluster.set_node_online(&node_a, false).unwrap();
 
         assert!(
             cluster
@@ -6693,7 +6782,7 @@ mod tests {
                 .is_none()
         );
 
-        cluster.set_node_online(&node_a, true);
+        cluster.set_node_online(&node_a, true).unwrap();
 
         assert_eq!(
             cluster
@@ -6714,8 +6803,8 @@ mod tests {
         let mut cluster =
             InProcessRaftKvCluster::new(vec![node_a.clone(), node_b.clone(), node_c.clone()])
                 .expect("cluster");
-        cluster.set_node_online(&node_a, false);
-        cluster.set_node_online(&node_c, false);
+        cluster.set_node_online(&node_a, false).unwrap();
+        cluster.set_node_online(&node_c, false).unwrap();
 
         assert!(
             !cluster
@@ -8052,7 +8141,7 @@ mod tests {
             applied_index: 0,
             snapshot_index: 0,
             snapshot_term: 0,
-            txn_responses: BTreeMap::new(),
+            txn_responses: KvTxnResponseIndex::default(),
         };
 
         let error = node.commit_to(3).expect_err("missing middle entry");
@@ -8095,7 +8184,7 @@ mod tests {
             applied_index: 0,
             snapshot_index: 0,
             snapshot_term: 0,
-            txn_responses: BTreeMap::new(),
+            txn_responses: KvTxnResponseIndex::default(),
         };
 
         assert!(
@@ -8132,7 +8221,7 @@ mod tests {
             applied_index: 0,
             snapshot_index: 0,
             snapshot_term: 0,
-            txn_responses: BTreeMap::new(),
+            txn_responses: KvTxnResponseIndex::default(),
         };
 
         let error = node
@@ -8746,8 +8835,8 @@ mod tests {
     fn snapshot_restore_preserves_watchable_event_history() {
         let mut store = InProcessKvStore::new();
         store.put("/watch/a", b"one".to_vec(), None).expect("put");
-        let snapshot = store.snapshot();
-        let mut restored = InProcessKvStore::restore(snapshot);
+        let snapshot = store.snapshot().expect("snapshot");
+        let mut restored = InProcessKvStore::restore(snapshot).expect("restore");
 
         let watch_id = restored
             .watch_prefix("/watch/", KvRevision(1))
@@ -9202,7 +9291,7 @@ mod tests {
         // (temp + atomic rename), so it must miss rather than serve a stale parse.
         let root = temp_raft_root("kv-snapshot-cache-identity");
         let path = root.join("snap.sobj");
-        let snapshot = Arc::new(InProcessKvStore::new().snapshot());
+        let snapshot = Arc::new(InProcessKvStore::new().snapshot().expect("snapshot"));
         let mtime = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000));
         let id = FileIdentity {
             mtime,
@@ -9265,7 +9354,7 @@ mod tests {
         hard_state_cache().lock().expect("hard-state cache").clear();
         KV_READ_CACHE_CLOCK.store(1, Ordering::Relaxed);
 
-        let snapshot = Arc::new(InProcessKvStore::new().snapshot());
+        let snapshot = Arc::new(InProcessKvStore::new().snapshot().expect("snapshot"));
         let hard_state = RaftHardState::default();
         let mtime = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2_000));
         for index in 0..FILE_CACHE_CAPACITY.saturating_sub(1) {

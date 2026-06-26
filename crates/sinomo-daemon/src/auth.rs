@@ -138,12 +138,29 @@ pub fn authenticate_daemon_control_request(
     paths: &DaemonPaths,
     request: &sinomo_network::DaemonControlRequest,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
+    authenticate_daemon_control_request_inner(paths, request, true)
+}
+
+pub(crate) fn authenticate_daemon_control_request_without_nonce(
+    paths: &DaemonPaths,
+    request: &sinomo_network::DaemonControlRequest,
+) -> Result<AuthenticatedDaemonCommand, DaemonError> {
+    authenticate_daemon_control_request_inner(paths, request, false)
+}
+
+fn authenticate_daemon_control_request_inner(
+    paths: &DaemonPaths,
+    request: &sinomo_network::DaemonControlRequest,
+    remember_nonce: bool,
+) -> Result<AuthenticatedDaemonCommand, DaemonError> {
     let auth = request.auth.as_deref().ok_or(DaemonError::AuthDenied)?;
     let envelope: SignedDaemonCommand =
         sinomo_network::SinomoObjectCodec::default().decode(auth)?;
     verify_daemon_rpc_body_binding(&envelope, request)?;
     let signer = verify_signed_daemon_command(paths, &envelope, request)?;
-    remember_daemon_auth_nonce(paths, &envelope)?;
+    if remember_nonce {
+        remember_daemon_auth_nonce(paths, &envelope)?;
+    }
     let signer_public_key = sinomo_network::daemon_auth_encode_public_key(&envelope.public_key);
     let authenticated = AuthenticatedDaemonCommand {
         route: request.route.clone(),
@@ -306,6 +323,14 @@ pub fn authorize_authenticated_daemon_command(
             )
         }
         route if is_local_sandbox_rpc_route(route) => authenticated.signer.can_run_local_command(),
+        route if route == sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE => {
+            matches!(
+                authenticated.signer,
+                DaemonSignerAuthority::Local
+                    | DaemonSignerAuthority::Voter
+                    | DaemonSignerAuthority::Member
+            )
+        }
         route if route == sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE => {
             matches!(
                 authenticated.signer,

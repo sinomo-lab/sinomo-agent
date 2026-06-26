@@ -1,6 +1,26 @@
 use crate::peer::RouteDeliveryId;
 use crate::prelude::*;
 
+pub(crate) const NETWORK_FALLIBLE_VEC_RESOURCE_EXHAUSTED_PREFIX: &str =
+    "network resource exhausted while allocating ";
+pub(crate) const NETWORK_FALLIBLE_VEC_RESOURCE_EXHAUSTED_SEPARATOR: &str = " bytes for ";
+
+pub(crate) fn network_fallible_vec_resource_exhausted(
+    operation: &str,
+    requested_bytes: usize,
+) -> String {
+    format!(
+        "{NETWORK_FALLIBLE_VEC_RESOURCE_EXHAUSTED_PREFIX}{requested_bytes}{NETWORK_FALLIBLE_VEC_RESOURCE_EXHAUSTED_SEPARATOR}{operation}"
+    )
+}
+
+fn parse_network_fallible_vec_resource_exhaustion(detail: &str) -> Option<(String, usize)> {
+    let rest = detail.strip_prefix(NETWORK_FALLIBLE_VEC_RESOURCE_EXHAUSTED_PREFIX)?;
+    let (requested_bytes, operation) =
+        rest.split_once(NETWORK_FALLIBLE_VEC_RESOURCE_EXHAUSTED_SEPARATOR)?;
+    Some((operation.to_string(), requested_bytes.parse().ok()?))
+}
+
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
 pub enum NetworkError {
     #[error("network authorization was denied")]
@@ -45,6 +65,14 @@ pub enum NetworkError {
         frame_bytes: usize,
         in_flight_bytes: usize,
         max_in_flight_bytes: usize,
+    },
+    #[error(
+        "object frame in-flight memory unavailable: requested {frame_bytes} bytes with {in_flight_bytes} already active and {available_memory_bytes:?} bytes available"
+    )]
+    ObjectFrameMemoryUnavailable {
+        frame_bytes: usize,
+        in_flight_bytes: usize,
+        available_memory_bytes: Option<usize>,
     },
     #[error("unknown object rpc route: {route}")]
     UnknownRoute { route: String },
@@ -109,6 +137,11 @@ pub enum NetworkError {
         actual_bytes: usize,
         max_bytes: usize,
     },
+    #[error("network resource exhausted during {operation}: requested {requested_bytes} bytes")]
+    ResourceExhausted {
+        operation: String,
+        requested_bytes: usize,
+    },
     #[error("network serialization error: {detail}")]
     Serialization { detail: String },
     #[error("cluster JSON error at {path}: {detail}")]
@@ -125,8 +158,29 @@ pub enum NetworkError {
 
 impl NetworkError {
     pub(crate) fn object(error: sinomo_object::Error) -> Self {
-        Self::Serialization {
-            detail: error.to_string(),
+        match error {
+            sinomo_object::Error::ResourceExhausted {
+                context,
+                requested_bytes,
+            } => Self::ResourceExhausted {
+                operation: context.to_string(),
+                requested_bytes,
+            },
+            sinomo_object::Error::Serde(detail) => {
+                if let Some((operation, requested_bytes)) =
+                    parse_network_fallible_vec_resource_exhaustion(&detail)
+                {
+                    Self::ResourceExhausted {
+                        operation,
+                        requested_bytes,
+                    }
+                } else {
+                    Self::Serialization { detail }
+                }
+            }
+            error => Self::Serialization {
+                detail: error.to_string(),
+            },
         }
     }
 }

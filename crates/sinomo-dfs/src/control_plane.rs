@@ -184,7 +184,7 @@ impl DfsControlPlaneKvClient for InProcessKvStore {
     }
 
     fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
-        Ok(self.range_prefix(prefix))
+        self.range_prefix(prefix)
     }
 
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {

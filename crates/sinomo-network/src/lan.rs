@@ -917,7 +917,11 @@ pub struct MdnsDiscoveryAdvertisement {
     pub protocol: String,
     pub cluster_id: ClusterId,
     pub node_id: NodeId,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::fallible_serde::deserialize_vec"
+    )]
     pub endpoints: Vec<ClusterEndpointRecord>,
     pub advertised_tick: u64,
     pub ttl_ticks: u64,

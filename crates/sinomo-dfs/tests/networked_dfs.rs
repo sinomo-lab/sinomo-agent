@@ -2465,6 +2465,7 @@ fn networked_dfs_uses_kv_only_for_control_plane_file_system_config() {
         );
         let dfs_keys: Vec<_> = kv
             .range_prefix("/dfs/")
+            .expect("dfs range")
             .into_iter()
             .map(|entry| entry.key)
             .collect();
@@ -2508,6 +2509,7 @@ fn distributed_sifs_bootstrap_exposes_cluster_root_users_and_services_in_metadat
             .expect("content advertisement");
         let dfs_keys: Vec<_> = kv
             .range_prefix("/dfs/")
+            .expect("dfs range")
             .into_iter()
             .map(|entry| entry.key)
             .collect();

@@ -41,6 +41,8 @@ pub enum Error {
     LengthTooLarge,
     #[error("duplicate object key `{0}`")]
     DuplicateKey(String),
+    #[error("duplicate schema type id {0}")]
+    DuplicateSchemaTypeId(u16),
     #[error("value does not match declared type")]
     TypeMismatch,
     #[error("array element size is zero")]
@@ -53,6 +55,11 @@ pub enum Error {
     UnsupportedFixedLayoutEndian,
     #[error("integer overflow while calculating size")]
     SizeOverflow,
+    #[error("resource exhausted while allocating {requested_bytes} bytes for {context}")]
+    ResourceExhausted {
+        context: &'static str,
+        requested_bytes: usize,
+    },
     #[error("text format error: {0}")]
     Text(String),
     #[cfg(feature = "serde")]
@@ -235,6 +242,13 @@ impl ElementType {
     pub fn extension(id: u8, data: Vec<u8>) -> Self {
         Self::Extension(Box::new(ExtensionType { id, data }))
     }
+
+    pub fn try_extension(id: u8, data: Vec<u8>) -> Result<Self> {
+        Ok(Self::Extension(try_box(
+            ExtensionType { id, data },
+            "extension element type",
+        )?))
+    }
 }
 
 /// Payload of an [`ElementType::Extension`]: a length-delimited extension id and
@@ -243,6 +257,96 @@ impl ElementType {
 pub struct ExtensionType {
     pub id: u8,
     pub data: Vec<u8>,
+}
+
+fn allocation_bytes<T>(items: usize) -> Result<usize> {
+    items
+        .checked_mul(std::mem::size_of::<T>().max(1))
+        .ok_or(Error::SizeOverflow)
+}
+
+fn try_reserve_vec<T>(vec: &mut Vec<T>, additional: usize, context: &'static str) -> Result<()> {
+    let requested_items = vec
+        .len()
+        .checked_add(additional)
+        .ok_or(Error::SizeOverflow)?;
+    let requested_bytes = allocation_bytes::<T>(requested_items)?;
+    vec.try_reserve(additional)
+        .map_err(|_| Error::ResourceExhausted {
+            context,
+            requested_bytes,
+        })
+}
+
+fn try_vec_with_capacity<T>(capacity: usize, context: &'static str) -> Result<Vec<T>> {
+    let mut vec = Vec::new();
+    let requested_bytes = allocation_bytes::<T>(capacity)?;
+    vec.try_reserve(capacity)
+        .map_err(|_| Error::ResourceExhausted {
+            context,
+            requested_bytes,
+        })?;
+    Ok(vec)
+}
+
+fn try_hashset_with_capacity<T>(capacity: usize, context: &'static str) -> Result<HashSet<T>>
+where
+    T: Eq + std::hash::Hash,
+{
+    let mut set = HashSet::new();
+    let requested_bytes = allocation_bytes::<T>(capacity)?;
+    set.try_reserve(capacity)
+        .map_err(|_| Error::ResourceExhausted {
+            context,
+            requested_bytes,
+        })?;
+    Ok(set)
+}
+
+fn try_push_vec<T>(vec: &mut Vec<T>, value: T, context: &'static str) -> Result<()> {
+    try_reserve_vec(vec, 1, context)?;
+    vec.push(value);
+    Ok(())
+}
+
+fn try_extend_from_slice(vec: &mut Vec<u8>, value: &[u8], context: &'static str) -> Result<()> {
+    try_reserve_vec(vec, value.len(), context)?;
+    vec.extend_from_slice(value);
+    Ok(())
+}
+
+fn try_string_from_str(value: &str, context: &'static str) -> Result<String> {
+    let mut out = String::new();
+    out.try_reserve(value.len())
+        .map_err(|_| Error::ResourceExhausted {
+            context,
+            requested_bytes: value.len(),
+        })?;
+    out.push_str(value);
+    Ok(out)
+}
+
+pub(crate) fn try_box<T>(value: T, context: &'static str) -> Result<Box<T>> {
+    let requested_bytes = std::mem::size_of::<T>().max(1);
+    if std::mem::size_of::<T>() == 0 {
+        return Ok(Box::new(value));
+    }
+    let layout = std::alloc::Layout::new::<T>();
+    // SAFETY: `alloc` returns a pointer suitable for `T` or null. On success we
+    // initialize it exactly once and hand ownership to `Box`, which will use the
+    // same global allocator to deallocate it.
+    let ptr = unsafe { std::alloc::alloc(layout) as *mut T };
+    if ptr.is_null() {
+        return Err(Error::ResourceExhausted {
+            context,
+            requested_bytes,
+        });
+    }
+    // SAFETY: `ptr` points to valid, writable memory for one `T`.
+    unsafe {
+        ptr.write(value);
+        Ok(Box::from_raw(ptr))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -263,10 +367,18 @@ impl Document {
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
-        out.extend_from_slice(MAGIC);
-        write_u16(&mut out, self.metadata.version_id);
-        out.push(self.metadata.length_mode.code());
-        out.push(self.metadata.alignment_hint.code());
+        try_extend_from_slice(&mut out, MAGIC, "document magic")?;
+        write_u16(&mut out, self.metadata.version_id)?;
+        try_push_vec(
+            &mut out,
+            self.metadata.length_mode.code(),
+            "document length mode",
+        )?;
+        try_push_vec(
+            &mut out,
+            self.metadata.alignment_hint.code(),
+            "document alignment hint",
+        )?;
         let length_offset = out.len();
         write_length(&mut out, self.metadata.length_mode, 0)?;
         self.schema.encode(&mut out, self.metadata.length_mode)?;
@@ -307,7 +419,7 @@ impl<'a> BorrowedDocumentBuilder<'a> {
         Ok(Self {
             metadata: Metadata::new(version_id, length_mode),
             schema: Schema::default(),
-            payload: BorrowedPayload::Dynamic(BorrowedValue::array(array)),
+            payload: BorrowedPayload::Dynamic(BorrowedValue::try_array(array)?),
         })
     }
 
@@ -358,15 +470,23 @@ impl<'a> BorrowedDocumentBuilder<'a> {
     }
 
     pub fn to_vec(&self) -> Result<Vec<u8>> {
-        self.to_parts().map(BorrowedDocumentParts::to_vec)
+        self.to_parts().and_then(BorrowedDocumentParts::to_vec)
     }
 
     pub fn to_parts(&self) -> Result<BorrowedDocumentParts<'a>> {
         let mut prefix = Vec::new();
-        prefix.extend_from_slice(MAGIC);
-        write_u16(&mut prefix, self.metadata.version_id);
-        prefix.push(self.metadata.length_mode.code());
-        prefix.push(self.metadata.alignment_hint.code());
+        try_extend_from_slice(&mut prefix, MAGIC, "borrowed document magic")?;
+        write_u16(&mut prefix, self.metadata.version_id)?;
+        try_push_vec(
+            &mut prefix,
+            self.metadata.length_mode.code(),
+            "borrowed document length mode",
+        )?;
+        try_push_vec(
+            &mut prefix,
+            self.metadata.alignment_hint.code(),
+            "borrowed document alignment hint",
+        )?;
         let length_offset = prefix.len();
         write_length(&mut prefix, self.metadata.length_mode, 0)?;
         self.schema.encode(&mut prefix, self.metadata.length_mode)?;
@@ -401,7 +521,7 @@ impl<'a> BorrowedDocumentBuilder<'a> {
                     *root_count,
                     data.len(),
                 )?;
-                write_u16(out, *root_schema_type_id);
+                write_u16(out, *root_schema_type_id)?;
                 write_length(out, self.metadata.length_mode, *root_count)?;
                 Ok(data)
             }
@@ -427,11 +547,12 @@ impl<'a> BorrowedDocumentParts<'a> {
         [self.prefix.as_slice(), self.payload]
     }
 
-    pub fn to_vec(self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.prefix.len() + self.payload.len());
-        out.extend_from_slice(&self.prefix);
-        out.extend_from_slice(self.payload);
-        out
+    pub fn to_vec(self) -> Result<Vec<u8>> {
+        let total = self.document_len()?;
+        let mut out = try_vec_with_capacity(total, "borrowed document")?;
+        try_extend_from_slice(&mut out, &self.prefix, "borrowed document prefix")?;
+        try_extend_from_slice(&mut out, self.payload, "borrowed document payload")?;
+        Ok(out)
     }
 }
 
@@ -456,6 +577,10 @@ impl<'a> BorrowedValue<'a> {
         Self::Array(Box::new(value))
     }
 
+    pub fn try_array(value: BorrowedArray<'a>) -> Result<Self> {
+        Ok(Self::Array(try_box(value, "borrowed array value")?))
+    }
+
     pub const fn type_id(&self) -> TypeId {
         match self {
             Self::Bytes(_) => TypeId::Bytes,
@@ -464,7 +589,7 @@ impl<'a> BorrowedValue<'a> {
     }
 
     fn encode_element_prefix(&self, out: &mut Vec<u8>, mode: LengthMode) -> Result<&'a [u8]> {
-        out.push(self.type_id().byte());
+        try_push_vec(out, self.type_id().byte(), "borrowed value type id")?;
         self.encode_value_prefix(out, mode)
     }
 
@@ -508,7 +633,11 @@ impl<'a> BorrowedArray<'a> {
         self.validate()?;
         encode_element_type(out, mode, &self.element_type)?;
         write_length(out, mode, self.element_size)?;
-        out.push(u8::try_from(self.dimensions.len()).map_err(|_| Error::LengthTooLarge)?);
+        try_push_vec(
+            out,
+            u8::try_from(self.dimensions.len()).map_err(|_| Error::LengthTooLarge)?,
+            "borrowed array rank",
+        )?;
         for dimension in &self.dimensions {
             write_length(out, mode, *dimension)?;
         }
@@ -544,9 +673,9 @@ impl Payload {
                 root_count,
                 data,
             } => {
-                write_u16(out, *root_schema_type_id);
+                write_u16(out, *root_schema_type_id)?;
                 write_length(out, mode, *root_count)?;
-                out.extend_from_slice(data);
+                try_extend_from_slice(out, data, "schema payload")?;
                 Ok(())
             }
         }
@@ -582,14 +711,26 @@ impl Value {
         Self::List(Box::new(value))
     }
 
+    pub fn try_list(value: List) -> Result<Self> {
+        Ok(Self::List(try_box(value, "list value")?))
+    }
+
     /// Wraps an array value (boxed; see [`Value::list`]).
     pub fn array(value: Array) -> Self {
         Self::Array(Box::new(value))
     }
 
+    pub fn try_array(value: Array) -> Result<Self> {
+        Ok(Self::Array(try_box(value, "array value")?))
+    }
+
     /// Wraps an optional value (boxed; see [`Value::list`]).
     pub fn optional(value: OptionalValue) -> Self {
         Self::Optional(Box::new(value))
+    }
+
+    pub fn try_optional(value: OptionalValue) -> Result<Self> {
+        Ok(Self::Optional(try_box(value, "optional value")?))
     }
 
     pub const fn type_id(&self) -> TypeId {
@@ -615,23 +756,23 @@ impl Value {
     }
 
     fn encode_element(&self, out: &mut Vec<u8>, mode: LengthMode) -> Result<()> {
-        out.push(self.type_id().byte());
+        try_push_vec(out, self.type_id().byte(), "value type id")?;
         self.encode_value(out, mode)
     }
 
     fn encode_value(&self, out: &mut Vec<u8>, mode: LengthMode) -> Result<()> {
         match self {
-            Self::Boolean(value) => out.push(u8::from(*value)),
-            Self::Uint8(value) => out.push(*value),
-            Self::Int8(value) => out.push(*value as u8),
-            Self::Uint16(value) => write_u16(out, *value),
-            Self::Int16(value) => out.extend_from_slice(&value.to_le_bytes()),
-            Self::Uint32(value) => out.extend_from_slice(&value.to_le_bytes()),
-            Self::Int32(value) => out.extend_from_slice(&value.to_le_bytes()),
-            Self::Uint64(value) => out.extend_from_slice(&value.to_le_bytes()),
-            Self::Int64(value) => out.extend_from_slice(&value.to_le_bytes()),
-            Self::Float(value) => out.extend_from_slice(&value.to_le_bytes()),
-            Self::Double(value) => out.extend_from_slice(&value.to_le_bytes()),
+            Self::Boolean(value) => try_push_vec(out, u8::from(*value), "bool")?,
+            Self::Uint8(value) => try_push_vec(out, *value, "u8")?,
+            Self::Int8(value) => try_push_vec(out, *value as u8, "i8")?,
+            Self::Uint16(value) => write_u16(out, *value)?,
+            Self::Int16(value) => try_extend_from_slice(out, &value.to_le_bytes(), "i16")?,
+            Self::Uint32(value) => try_extend_from_slice(out, &value.to_le_bytes(), "u32")?,
+            Self::Int32(value) => try_extend_from_slice(out, &value.to_le_bytes(), "i32")?,
+            Self::Uint64(value) => try_extend_from_slice(out, &value.to_le_bytes(), "u64")?,
+            Self::Int64(value) => try_extend_from_slice(out, &value.to_le_bytes(), "i64")?,
+            Self::Float(value) => try_extend_from_slice(out, &value.to_le_bytes(), "f32")?,
+            Self::Double(value) => try_extend_from_slice(out, &value.to_le_bytes(), "f64")?,
             Self::Object(value) => value.encode(out, mode)?,
             Self::List(value) => value.encode(out, mode)?,
             Self::Array(value) => value.encode(out, mode)?,
@@ -732,11 +873,15 @@ impl Array {
         self.validate()?;
         encode_element_type(out, mode, &self.element_type)?;
         write_length(out, mode, self.element_size)?;
-        out.push(u8::try_from(self.dimensions.len()).map_err(|_| Error::LengthTooLarge)?);
+        try_push_vec(
+            out,
+            u8::try_from(self.dimensions.len()).map_err(|_| Error::LengthTooLarge)?,
+            "array rank",
+        )?;
         for dimension in &self.dimensions {
             write_length(out, mode, *dimension)?;
         }
-        out.extend_from_slice(&self.data);
+        try_extend_from_slice(out, &self.data, "array data")?;
         Ok(())
     }
 
@@ -764,6 +909,13 @@ impl OptionalValue {
         }
     }
 
+    pub fn try_some(element_type: ElementType, value: Value) -> Result<Self> {
+        Ok(Self {
+            element_type,
+            value: Some(try_box(value, "optional inner value")?),
+        })
+    }
+
     pub fn none(element_type: ElementType) -> Self {
         Self {
             element_type,
@@ -775,11 +927,11 @@ impl OptionalValue {
         encode_element_type(out, mode, &self.element_type)?;
         match &self.value {
             Some(value) => {
-                out.push(1);
+                try_push_vec(out, 1, "optional presence")?;
                 encode_typed_value(out, mode, &self.element_type, value)
             }
             None => {
-                out.push(0);
+                try_push_vec(out, 0, "optional presence")?;
                 Ok(())
             }
         }
@@ -794,10 +946,10 @@ pub struct Schema {
 impl Schema {
     fn encode(&self, out: &mut Vec<u8>, mode: LengthMode) -> Result<()> {
         write_length(out, mode, self.types.len() as u64)?;
-        let mut ids = HashSet::new();
+        let mut ids = try_hashset_with_capacity(self.types.len(), "schema type ids")?;
         for schema_type in &self.types {
             if !ids.insert(schema_type.id) {
-                return Err(Error::DuplicateKey(schema_type.id.to_string()));
+                return Err(Error::DuplicateSchemaTypeId(schema_type.id));
             }
             schema_type.encode(out, mode)?;
         }
@@ -815,7 +967,7 @@ pub struct SchemaType {
 
 impl SchemaType {
     fn encode(&self, out: &mut Vec<u8>, mode: LengthMode) -> Result<()> {
-        write_u16(out, self.id);
+        write_u16(out, self.id)?;
         write_string(out, mode, &self.name)?;
         write_length(out, mode, self.payload_size)?;
         write_length(out, mode, self.fields.len() as u64)?;
@@ -1333,18 +1485,18 @@ pub enum ElementView<'a> {
 impl<'a> ElementView<'a> {
     /// Wraps a list view (boxed to keep `ElementView` small; mirrors
     /// [`Value::list`]).
-    fn list(value: ListView<'a>) -> Self {
-        Self::List(Box::new(value))
+    fn list(value: ListView<'a>) -> Result<Self> {
+        Ok(Self::List(try_box(value, "list view")?))
     }
 
     /// Wraps an array view (boxed; see [`ElementView::list`]).
-    fn array(value: ArrayView<'a>) -> Self {
-        Self::Array(Box::new(value))
+    fn array(value: ArrayView<'a>) -> Result<Self> {
+        Ok(Self::Array(try_box(value, "array view")?))
     }
 
     /// Wraps an optional view (boxed; see [`ElementView::list`]).
-    fn optional(value: OptionalView<'a>) -> Self {
-        Self::Optional(Box::new(value))
+    fn optional(value: OptionalView<'a>) -> Result<Self> {
+        Ok(Self::Optional(try_box(value, "optional view")?))
     }
 }
 
@@ -1513,26 +1665,26 @@ impl<'a> Reader<'a> {
                 self.take(8)?.try_into().map_err(|_| Error::UnexpectedEof)?,
             ))),
             TypeId::Object => self.read_object().map(ElementView::Object),
-            TypeId::List => self.read_list().map(ElementView::list),
-            TypeId::Array => self.read_array().map(ElementView::array),
+            TypeId::List => self.read_list().and_then(ElementView::list),
+            TypeId::Array => self.read_array().and_then(ElementView::array),
             TypeId::String => self.read_string().map(ElementView::String),
             TypeId::Bytes => self.read_bytes().map(ElementView::Bytes),
-            TypeId::Optional => self.read_optional().map(ElementView::optional),
+            TypeId::Optional => self.read_optional().and_then(ElementView::optional),
             TypeId::Padding | TypeId::Document => Err(Error::UnsupportedTypeId(type_id.byte())),
         }
     }
 
     fn read_object(&mut self) -> Result<ObjectView<'a>> {
         let len = self.read_len_usize()?;
-        let mut keys = HashSet::with_capacity(len);
-        let mut fields = Vec::with_capacity(len);
+        let mut keys = try_hashset_with_capacity(len, "object keys")?;
+        let mut fields = try_vec_with_capacity(len, "object fields")?;
         for _ in 0..len {
             let key = self.read_string()?;
             if !keys.insert(key) {
-                return Err(Error::DuplicateKey(key.to_owned()));
+                return duplicate_key_error(key);
             }
             let value = self.read_element()?;
-            fields.push(FieldView { key, value });
+            try_push_vec(&mut fields, FieldView { key, value }, "object fields")?;
         }
         Ok(ObjectView { fields })
     }
@@ -1540,9 +1692,10 @@ impl<'a> Reader<'a> {
     fn read_list(&mut self) -> Result<ListView<'a>> {
         let element_type = read_element_type(self)?;
         let len = self.read_len_usize()?;
-        let mut values = Vec::with_capacity(len);
+        let mut values = try_vec_with_capacity(len, "list values")?;
         for _ in 0..len {
-            values.push(self.read_typed_value(&element_type)?);
+            let value = self.read_typed_value(&element_type)?;
+            try_push_vec(&mut values, value, "list values")?;
         }
         Ok(ListView {
             element_type,
@@ -1557,9 +1710,10 @@ impl<'a> Reader<'a> {
             return Err(Error::ZeroArrayElementSize);
         }
         let rank = self.read_u8()? as usize;
-        let mut dimensions = Vec::with_capacity(rank);
+        let mut dimensions = try_vec_with_capacity(rank, "array dimensions")?;
         for _ in 0..rank {
-            dimensions.push(self.read_length()?);
+            let dimension = self.read_length()?;
+            try_push_vec(&mut dimensions, dimension, "array dimensions")?;
         }
         let count = product(&dimensions)?;
         let byte_len_u64 = count.checked_mul(element_size).ok_or(Error::SizeOverflow)?;
@@ -1585,7 +1739,10 @@ impl<'a> Reader<'a> {
         let present = self.read_u8()?;
         let value = match present {
             0 => None,
-            1 => Some(Box::new(self.read_typed_value(&element_type)?)),
+            1 => Some(try_box(
+                self.read_typed_value(&element_type)?,
+                "optional view inner value",
+            )?),
             other => return Err(Error::InvalidBoolean(other)),
         };
         Ok(OptionalView {
@@ -1603,26 +1760,29 @@ impl<'a> Reader<'a> {
                 if list.element_type != **inner {
                     return Err(Error::TypeMismatch);
                 }
-                Ok(ElementView::list(list))
+                ElementView::list(list)
             }
             ElementType::Array(inner) => {
                 let array = self.read_array()?;
                 if array.element_type != **inner {
                     return Err(Error::TypeMismatch);
                 }
-                Ok(ElementView::array(array))
+                ElementView::array(array)
             }
             ElementType::Optional(inner) => {
                 let present = self.read_u8()?;
                 let value = match present {
                     0 => None,
-                    1 => Some(Box::new(self.read_typed_value(inner)?)),
+                    1 => Some(try_box(
+                        self.read_typed_value(inner)?,
+                        "optional typed view inner value",
+                    )?),
                     other => return Err(Error::InvalidBoolean(other)),
                 };
-                Ok(ElementView::optional(OptionalView {
+                ElementView::optional(OptionalView {
                     element_type: (**inner).clone(),
                     value,
-                }))
+                })
             }
             ElementType::SchemaRef(_) | ElementType::Extension(_) => {
                 Err(Error::UnsupportedTypeId(0x40))
@@ -1757,11 +1917,11 @@ fn skip_typed_value(reader: &mut Reader<'_>, element_type: &ElementType) -> Resu
 
 fn skip_object(reader: &mut Reader<'_>) -> Result<()> {
     let len = reader.read_len_usize()?;
-    let mut keys = HashSet::with_capacity(len);
+    let mut keys = try_hashset_with_capacity(len, "object keys")?;
     for _ in 0..len {
         let key = reader.read_string()?;
         if !keys.insert(key) {
-            return Err(Error::DuplicateKey(key.to_owned()));
+            return duplicate_key_error(key);
         }
         read_element_cursor(reader)?;
     }
@@ -1838,11 +1998,11 @@ fn encode_typed_value(
                     (actual, ElementType::Optional(expected)) if actual == expected.as_ref() => {
                         match &optional.value {
                             Some(value) => {
-                                out.push(1);
+                                try_push_vec(out, 1, "optional presence")?;
                                 encode_typed_value(out, mode, expected, value)
                             }
                             None => {
-                                out.push(0);
+                                try_push_vec(out, 0, "optional presence")?;
                                 Ok(())
                             }
                         }
@@ -1859,28 +2019,36 @@ fn encode_typed_value(
 
 fn read_schema(reader: &mut Reader<'_>) -> Result<Schema> {
     let type_count = reader.read_len_usize()?;
-    let mut types = Vec::with_capacity(type_count);
-    let mut ids = HashSet::with_capacity(type_count);
+    let mut types = try_vec_with_capacity(type_count, "schema types")?;
+    let mut ids = try_hashset_with_capacity(type_count, "schema type ids")?;
     for _ in 0..type_count {
         let id = reader.read_u16()?;
         if !ids.insert(id) {
-            return Err(Error::DuplicateKey(id.to_string()));
+            return Err(Error::DuplicateSchemaTypeId(id));
         }
-        let name = reader.read_string()?.to_owned();
+        let name = try_string_from_str(reader.read_string()?, "schema type name")?;
         let payload_size = reader.read_length()?;
         let field_count = reader.read_len_usize()?;
-        let mut fields = Vec::with_capacity(field_count);
+        let mut fields = try_vec_with_capacity(field_count, "schema fields")?;
         for _ in 0..field_count {
-            let name = reader.read_string()?.to_owned();
+            let name = try_string_from_str(reader.read_string()?, "schema field name")?;
             let element_type = read_element_type(reader)?;
-            fields.push(SchemaField { name, element_type });
+            try_push_vec(
+                &mut fields,
+                SchemaField { name, element_type },
+                "schema fields",
+            )?;
         }
-        types.push(SchemaType {
-            id,
-            name,
-            payload_size,
-            fields,
-        });
+        try_push_vec(
+            &mut types,
+            SchemaType {
+                id,
+                name,
+                payload_size,
+                fields,
+            },
+            "schema types",
+        )?;
     }
     Ok(Schema { types })
 }
@@ -1891,26 +2059,26 @@ fn encode_element_type(
     element_type: &ElementType,
 ) -> Result<()> {
     match element_type {
-        ElementType::Builtin(type_id) => out.push(type_id.byte()),
+        ElementType::Builtin(type_id) => try_push_vec(out, type_id.byte(), "element type")?,
         ElementType::SchemaRef(id) => {
-            out.push(0x40);
-            write_u16(out, *id);
+            try_push_vec(out, 0x40, "schema element type")?;
+            write_u16(out, *id)?;
         }
         ElementType::List(inner) => {
-            out.push(0x41);
+            try_push_vec(out, 0x41, "list element type")?;
             encode_element_type(out, mode, inner)?;
         }
         ElementType::Array(inner) => {
-            out.push(0x42);
+            try_push_vec(out, 0x42, "array element type")?;
             encode_element_type(out, mode, inner)?;
         }
-        ElementType::Object => out.push(0x43),
+        ElementType::Object => try_push_vec(out, 0x43, "object element type")?,
         ElementType::Optional(inner) => {
-            out.push(0x44);
+            try_push_vec(out, 0x44, "optional element type")?;
             encode_element_type(out, mode, inner)?;
         }
         ElementType::Extension(ext) if ext.id >= 0x80 => {
-            out.push(ext.id);
+            try_push_vec(out, ext.id, "extension element type")?;
             write_bytes(out, mode, &ext.data)?;
         }
         ElementType::Extension(ext) => return Err(Error::InvalidTypeId(ext.id)),
@@ -1923,13 +2091,24 @@ fn read_element_type(reader: &mut Reader<'_>) -> Result<ElementType> {
     match byte {
         0x01..=0x0B | 0x24 | 0x25 => Ok(ElementType::Builtin(TypeId::from_byte(byte)?)),
         0x40 => Ok(ElementType::SchemaRef(reader.read_u16()?)),
-        0x41 => Ok(ElementType::List(Box::new(read_element_type(reader)?))),
-        0x42 => Ok(ElementType::Array(Box::new(read_element_type(reader)?))),
+        0x41 => Ok(ElementType::List(try_box(
+            read_element_type(reader)?,
+            "list element type",
+        )?)),
+        0x42 => Ok(ElementType::Array(try_box(
+            read_element_type(reader)?,
+            "array element type",
+        )?)),
         0x43 => Ok(ElementType::Object),
-        0x44 => Ok(ElementType::Optional(Box::new(read_element_type(reader)?))),
+        0x44 => Ok(ElementType::Optional(try_box(
+            read_element_type(reader)?,
+            "optional element type",
+        )?)),
         0x80..=0xFF => {
-            let data = reader.read_bytes()?.to_vec();
-            Ok(ElementType::extension(byte, data))
+            let raw = reader.read_bytes()?;
+            let mut data = try_vec_with_capacity(raw.len(), "extension element type data")?;
+            try_extend_from_slice(&mut data, raw, "extension element type data")?;
+            ElementType::try_extension(byte, data)
         }
         other => Err(Error::InvalidTypeId(other)),
     }
@@ -1941,20 +2120,20 @@ fn write_string(out: &mut Vec<u8>, mode: LengthMode, value: &str) -> Result<()> 
 
 fn write_bytes(out: &mut Vec<u8>, mode: LengthMode, value: &[u8]) -> Result<()> {
     write_length(out, mode, value.len() as u64)?;
-    out.extend_from_slice(value);
+    try_extend_from_slice(out, value, "bytes payload")?;
     Ok(())
 }
 
-fn write_u16(out: &mut Vec<u8>, value: u16) {
-    out.extend_from_slice(&value.to_le_bytes());
+fn write_u16(out: &mut Vec<u8>, value: u16) -> Result<()> {
+    try_extend_from_slice(out, &value.to_le_bytes(), "u16")
 }
 
 fn write_length(out: &mut Vec<u8>, mode: LengthMode, value: u64) -> Result<()> {
     mode.validate(value)?;
     match mode {
-        LengthMode::U16 => out.extend_from_slice(&(value as u16).to_le_bytes()),
-        LengthMode::U32 => out.extend_from_slice(&(value as u32).to_le_bytes()),
-        LengthMode::U64 => out.extend_from_slice(&value.to_le_bytes()),
+        LengthMode::U16 => try_extend_from_slice(out, &(value as u16).to_le_bytes(), "length")?,
+        LengthMode::U32 => try_extend_from_slice(out, &(value as u32).to_le_bytes(), "length")?,
+        LengthMode::U64 => try_extend_from_slice(out, &value.to_le_bytes(), "length")?,
     }
     Ok(())
 }
@@ -2039,11 +2218,26 @@ fn validate_schema_payload_data(
 fn validate_unique_keys<'a>(keys: impl Iterator<Item = &'a str>) -> Result<()> {
     let mut seen = HashSet::new();
     for key in keys {
+        let requested_items = seen.len().checked_add(1).ok_or(Error::SizeOverflow)?;
+        let requested_bytes = requested_items
+            .checked_mul(std::mem::size_of::<&str>().max(1))
+            .ok_or(Error::SizeOverflow)?;
+        seen.try_reserve(1).map_err(|_| Error::ResourceExhausted {
+            context: "object keys",
+            requested_bytes,
+        })?;
         if !seen.insert(key) {
-            return Err(Error::DuplicateKey(key.to_owned()));
+            return duplicate_key_error(key);
         }
     }
     Ok(())
+}
+
+fn duplicate_key_error<T>(key: &str) -> Result<T> {
+    Err(Error::DuplicateKey(try_string_from_str(
+        key,
+        "duplicate object key",
+    )?))
 }
 
 #[cfg(test)]
@@ -2201,6 +2395,28 @@ mod tests {
             document.to_bytes(),
             Err(Error::DuplicateKey(key)) if key == "same"
         ));
+    }
+
+    #[test]
+    fn dynamic_object_with_impossible_field_count_fails_before_allocation() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.push(LengthMode::U64.code());
+        bytes.push(AlignmentHint::NotAligned.code());
+        bytes.extend_from_slice(&33_u64.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.push(TypeId::Object.byte());
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+
+        let error = DocumentView::parse(&bytes).expect_err("impossible field count");
+        assert!(
+            matches!(
+                error,
+                Error::LengthTooLarge | Error::SizeOverflow | Error::ResourceExhausted { .. }
+            ),
+            "unexpected error for impossible object length: {error:?}"
+        );
     }
 
     #[test]
@@ -2418,7 +2634,7 @@ mod tests {
         let parts = builder.to_parts().unwrap();
         assert_eq!(parts.payload.as_ptr(), records.as_ptr().cast::<u8>());
 
-        let bytes = parts.to_vec();
+        let bytes = parts.to_vec().unwrap();
         let view = DocumentView::parse(&bytes).unwrap();
         let PayloadView::Schema {
             root_schema_type_id,
