@@ -4703,6 +4703,181 @@ fn local_connectivity_records_persist_across_cache_loss_without_rewrite() {
 }
 
 #[test]
+fn near_expiry_local_connectivity_refresh_stays_in_memory_without_rewrite() {
+    let _guard = OBJECT_FILE_WRITE_MARK_CACHE_TEST_MUTEX
+        .lock()
+        .expect("object mark cache mutex");
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-near-expiry-refresh");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_conn_near_expiry").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_conn_near_expiry_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_conn_near_expiry_b").expect("node b");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "connectivity near expiry",
+        node_a.clone(),
+        "node a",
+        "pk-a",
+        now,
+    );
+    let endpoint_b = daemon_lan_endpoint(&node_b, "10.0.0.62:21353".to_string(), 10);
+    let near_expiry = cluster_connectivity_record(
+        &state,
+        &endpoint_b,
+        ClusterConnectivityState::Healthy,
+        Some(4),
+        0,
+        Some("ok".to_string()),
+        None,
+        now - time::Duration::seconds(570),
+        600,
+    );
+    write_local_cluster_connectivity_records(&paths, &node_a, std::slice::from_ref(&near_expiry))
+        .expect("write near-expiry local connectivity");
+    let mtime_after_write = std::fs::metadata(&paths.connectivity_local)
+        .expect("local connectivity metadata")
+        .modified()
+        .expect("local connectivity mtime");
+
+    thread::sleep(Duration::from_millis(25));
+    let refreshed = cluster_connectivity_record(
+        &state,
+        &endpoint_b,
+        ClusterConnectivityState::Healthy,
+        Some(4),
+        0,
+        Some("ok".to_string()),
+        None,
+        now,
+        600,
+    );
+    write_local_cluster_connectivity_records(&paths, &node_a, std::slice::from_ref(&refreshed))
+        .expect("refresh near-expiry local connectivity");
+    assert_eq!(
+        std::fs::metadata(&paths.connectivity_local)
+            .expect("local connectivity metadata after refresh")
+            .modified()
+            .expect("local connectivity mtime after refresh"),
+        mtime_after_write,
+        "near-expiry stable route refreshes should update memory without rewriting local connectivity"
+    );
+    assert_eq!(
+        read_local_cluster_connectivity_records(&paths).expect("read cached local connectivity"),
+        vec![refreshed],
+        "the current process should keep the refreshed volatile record in memory"
+    );
+
+    remove_local_cluster_connectivity_record_cache_entries_under_root_for_test(&root);
+    assert_eq!(
+        read_local_cluster_connectivity_records(&paths).expect("cold-read local connectivity"),
+        vec![near_expiry],
+        "durable local connectivity should keep the last structural route record"
+    );
+}
+
+#[test]
+fn expired_stable_source_routes_do_not_force_local_connectivity_rewrite() {
+    let _guard = OBJECT_FILE_WRITE_MARK_CACHE_TEST_MUTEX
+        .lock()
+        .expect("object mark cache mutex");
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-expiry-stable-set");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_conn_expiry_stable").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_conn_expiry_stable_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_conn_expiry_stable_b").expect("node b");
+    let node_c = NodeId::from_legacy_named("node_conn_expiry_stable_c").expect("node c");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "connectivity expiry stable",
+        node_a.clone(),
+        "node a",
+        "pk-a",
+        now,
+    );
+    let endpoint_b = daemon_lan_endpoint(&node_b, "10.0.0.72:21353".to_string(), 10);
+    let endpoint_c = daemon_lan_endpoint(&node_c, "10.0.0.73:21353".to_string(), 10);
+    let expiring_b = cluster_connectivity_record(
+        &state,
+        &endpoint_b,
+        ClusterConnectivityState::Healthy,
+        Some(4),
+        0,
+        Some("ok".to_string()),
+        None,
+        now,
+        1,
+    );
+    let expiring_c = cluster_connectivity_record(
+        &state,
+        &endpoint_c,
+        ClusterConnectivityState::Healthy,
+        Some(5),
+        0,
+        Some("ok".to_string()),
+        None,
+        now,
+        1,
+    );
+    write_local_cluster_connectivity_record_set(
+        &paths,
+        &node_a,
+        &[expiring_b.clone(), expiring_c.clone()],
+    )
+    .expect("write expiring local connectivity set");
+    let mtime_after_write = std::fs::metadata(&paths.connectivity_local)
+        .expect("local connectivity metadata")
+        .modified()
+        .expect("local connectivity mtime");
+
+    thread::sleep(Duration::from_millis(1_100));
+    let refreshed_b_at = OffsetDateTime::now_utc();
+    let refreshed_b = cluster_connectivity_record(
+        &state,
+        &endpoint_b,
+        ClusterConnectivityState::Healthy,
+        Some(4),
+        0,
+        Some("ok".to_string()),
+        None,
+        refreshed_b_at,
+        600,
+    );
+    write_local_cluster_connectivity_record_set(
+        &paths,
+        &node_a,
+        &[refreshed_b.clone(), expiring_c],
+    )
+    .expect("refresh mixed live and expired local connectivity set");
+    assert_eq!(
+        std::fs::metadata(&paths.connectivity_local)
+            .expect("local connectivity metadata after refresh")
+            .modified()
+            .expect("local connectivity mtime after refresh"),
+        mtime_after_write,
+        "expiry-only stable source-set refreshes should update memory without rewriting local connectivity"
+    );
+    assert_eq!(
+        read_local_cluster_connectivity_records(&paths).expect("read cached local connectivity"),
+        vec![refreshed_b],
+        "the current process should keep only live refreshed connectivity in memory"
+    );
+
+    remove_local_cluster_connectivity_record_cache_entries_under_root_for_test(&root);
+    assert!(
+        read_local_cluster_connectivity_records(&paths)
+            .expect("cold-read expired durable connectivity")
+            .is_empty(),
+        "cold durable reads should still filter expired connectivity"
+    );
+}
+
+#[test]
 fn local_route_graph_uses_persisted_self_connectivity_after_cache_loss() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-local-kv-stale");
     let data_dir = SinomoDataDir::new(&root);
@@ -30458,6 +30633,58 @@ fn write_cluster_state_observer_counts_actual_then_skipped() {
 
     // Restore the previous observer so we don't poison sibling tests.
     let _ = set_io_observer(previous);
+}
+
+#[test]
+fn write_cluster_state_skips_member_timestamp_only_refresh() {
+    let _guard = OBJECT_FILE_WRITE_MARK_CACHE_TEST_MUTEX
+        .lock()
+        .expect("object mark cache mutex");
+    let root = sinomo_testdir::TestDir::new("sinomo-network-state-stable-timestamp");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_state_stable_timestamp").expect("cluster id");
+    let node = NodeId::from_legacy_named("node_state_stable_timestamp").expect("node id");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "state stable timestamp",
+        node,
+        "node",
+        "pk",
+        now,
+    );
+    state.members[0].updated_at = now;
+
+    write_cluster_state(&paths, &state).expect("initial cluster state write");
+    let mtime_after_write = std::fs::metadata(&paths.state)
+        .expect("cluster state metadata")
+        .modified()
+        .expect("cluster state mtime");
+
+    thread::sleep(Duration::from_millis(25));
+    let mut refreshed = state.clone();
+    refreshed.members[0].updated_at = now + time::Duration::seconds(30);
+    write_cluster_state(&paths, &refreshed).expect("timestamp-only cluster state refresh");
+    assert_eq!(
+        std::fs::metadata(&paths.state)
+            .expect("cluster state metadata after refresh")
+            .modified()
+            .expect("cluster state mtime after refresh"),
+        mtime_after_write,
+        "member timestamp-only refreshes should not rewrite cluster/state.sobj"
+    );
+    assert_eq!(
+        read_cluster_state_without_kv(&paths)
+            .expect("read durable state")
+            .members[0]
+            .updated_at,
+        now,
+        "durable cluster state should keep the last structural member record"
+    );
 }
 
 #[test]

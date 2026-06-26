@@ -1,4 +1,3 @@
-use crate::ClusterPaths;
 use crate::connectivity::{
     ClusterConnectivityRecord, ClusterConnectivityState,
     cluster_connectivity_record_for_hard_failure,
@@ -7,13 +6,13 @@ use crate::connectivity::{
 };
 use crate::connectivity_publish::{
     MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, cluster_connectivity_stable_eq,
-    cluster_network_record_live, cluster_network_record_should_refresh,
-    validate_cluster_connectivity_records_for_source,
+    cluster_network_record_live, validate_cluster_connectivity_records_for_source,
 };
 use crate::error::NetworkError;
 use crate::object_file_store::{
     read_optional_object_file, remove_optional_file, write_object_file,
 };
+use crate::{ClusterEndpointId, ClusterPaths};
 use sinomo_node::NodeId;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -320,12 +319,31 @@ fn store_local_cluster_connectivity_cache_entry(
 fn local_cluster_connectivity_persisted_records_stable(
     existing_records: &[ClusterConnectivityRecord],
     merged_records: &[ClusterConnectivityRecord],
-    now: OffsetDateTime,
 ) -> bool {
     local_cluster_connectivity_route_records_stable(existing_records, merged_records)
-        && existing_records
-            .iter()
-            .all(|record| !cluster_network_record_should_refresh(record.expires_at, now))
+}
+
+fn local_cluster_connectivity_raw_persisted_records_stable(
+    existing_records: &[ClusterConnectivityRecord],
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+    replace_source_records: bool,
+) -> bool {
+    let mut candidate = existing_records
+        .iter()
+        .map(|record| (cluster_connectivity_record_key(record), record.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if replace_source_records {
+        candidate.retain(|(_, candidate_source_node_id, _), _| {
+            candidate_source_node_id != source_node_id
+        });
+    }
+    for record in records {
+        candidate.insert(cluster_connectivity_record_key(record), record.clone());
+    }
+    let mut candidate = candidate.into_values().collect::<Vec<_>>();
+    sort_cluster_connectivity_records(&mut candidate);
+    local_cluster_connectivity_route_records_stable(existing_records, &candidate)
 }
 
 fn local_cluster_connectivity_route_records_stable(
@@ -337,6 +355,16 @@ fn local_cluster_connectivity_route_records_stable(
             .iter()
             .zip(merged_records)
             .all(|(existing, merged)| cluster_connectivity_stable_eq(existing, merged))
+}
+
+fn cluster_connectivity_record_key(
+    record: &ClusterConnectivityRecord,
+) -> (NodeId, NodeId, ClusterEndpointId) {
+    (
+        record.source_node_id.clone(),
+        record.target_node_id.clone(),
+        record.endpoint_id.clone(),
+    )
 }
 
 fn write_local_cluster_connectivity_records_inner(
@@ -354,29 +382,13 @@ fn write_local_cluster_connectivity_records_inner(
             cluster_network_record_live(record.expires_at, now)
                 && (!replace_source_records || record.source_node_id != *source_node_id)
         })
-        .map(|record| {
-            (
-                (
-                    record.source_node_id.clone(),
-                    record.target_node_id.clone(),
-                    record.endpoint_id.clone(),
-                ),
-                record.clone(),
-            )
-        })
+        .map(|record| (cluster_connectivity_record_key(record), record.clone()))
         .collect::<BTreeMap<_, _>>();
     for record in records {
         if record.source_node_id == *source_node_id
             && cluster_network_record_live(record.expires_at, now)
         {
-            merged.insert(
-                (
-                    record.source_node_id.clone(),
-                    record.target_node_id.clone(),
-                    record.endpoint_id.clone(),
-                ),
-                record.clone(),
-            );
+            merged.insert(cluster_connectivity_record_key(record), record.clone());
         }
     }
     let retained_source_records = merged
@@ -401,8 +413,22 @@ fn write_local_cluster_connectivity_records_inner(
     sort_cluster_connectivity_records(&mut merged);
     let route_records_stable =
         local_cluster_connectivity_route_records_stable(&existing_records, &merged);
-    let persisted_records_stable = route_records_stable
-        && local_cluster_connectivity_persisted_records_stable(&existing_records, &merged, now);
+    let mut persisted_records_stable = route_records_stable
+        && local_cluster_connectivity_persisted_records_stable(&existing_records, &merged);
+    let explicit_source_clear = replace_source_records && records.is_empty();
+    if !persisted_records_stable
+        && !explicit_source_clear
+        && let Some(mut raw_existing_records) =
+            read_optional_object_file::<Vec<ClusterConnectivityRecord>>(&paths.connectivity_local)?
+    {
+        sort_cluster_connectivity_records(&mut raw_existing_records);
+        persisted_records_stable = local_cluster_connectivity_raw_persisted_records_stable(
+            &raw_existing_records,
+            source_node_id,
+            records,
+            replace_source_records,
+        );
+    }
     if !persisted_records_stable {
         if merged.is_empty() {
             remove_optional_file(&paths.connectivity_local)?;
