@@ -143,6 +143,7 @@ pub(crate) fn send_daemon_rpc_raw_with_timeouts(
 pub struct RemoteConfigClient {
     address: String,
     timeout: Duration,
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl RemoteConfigClient {
@@ -150,6 +151,19 @@ impl RemoteConfigClient {
         Self {
             address: address.into(),
             timeout,
+            runtime: None,
+        }
+    }
+
+    pub fn new_on_runtime(
+        address: impl Into<String>,
+        timeout: Duration,
+        runtime: &tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            address: address.into(),
+            timeout,
+            runtime: Some(runtime.clone()),
         }
     }
 
@@ -161,8 +175,14 @@ impl RemoteConfigClient {
         let client_error = |detail: String| ConfigError::Client { detail };
         let request = ObjectRpcRequest::encode_body(route, CONFIG_RPC_CATEGORY, body)
             .map_err(|error| client_error(error.to_string()))?;
-        let response = send_daemon_rpc(&self.address, &request, self.timeout)
-            .map_err(|error| client_error(error.to_string()))?;
+        let response = match &self.runtime {
+            Some(runtime) => {
+                send_daemon_rpc_on_runtime(&self.address, &request, self.timeout, runtime)
+                    .map_err(|error| client_error(error.to_string()))?
+            }
+            None => send_daemon_rpc(&self.address, &request, self.timeout)
+                .map_err(|error| client_error(error.to_string()))?,
+        };
         response
             .decode_body()
             .map_err(|error| client_error(error.to_string()))

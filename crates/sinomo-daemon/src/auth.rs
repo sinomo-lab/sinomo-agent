@@ -248,6 +248,9 @@ pub fn authorize_authenticated_daemon_command(
         route if route == sinomo_dfs::DFS_EXPOSE_CONFIG_ROUTE => {
             authenticated.signer.can_run_local_command()
         }
+        route if crate::DAEMON_DFS_BROWSER_ROUTES.contains(&route) => {
+            authenticated.signer.can_run_local_command()
+        }
         route if is_config_rpc_route(route) => authenticated.signer.can_run_local_command(),
         route if route == sinomo_dfs::DFS_STATUS_ROUTE => matches!(
             authenticated.signer,
@@ -1334,6 +1337,26 @@ mod tests {
             let authenticated =
                 authenticated_command(sinomo_dfs::DFS_SMOKE_ROUTE.to_string(), signer);
             assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+        }
+    }
+
+    #[test]
+    fn daemon_dfs_browser_routes_authorize_only_local_signer() {
+        for route in crate::DAEMON_DFS_BROWSER_ROUTES {
+            authorize_authenticated_daemon_command(&authenticated_command(
+                (*route).to_string(),
+                DaemonSignerAuthority::Local,
+            ))
+            .expect("local app clients must be able to use daemon DFS browser routes");
+            for signer in [
+                DaemonSignerAuthority::Voter,
+                DaemonSignerAuthority::Member,
+                DaemonSignerAuthority::JoinCandidate,
+                DaemonSignerAuthority::StatusProbe,
+            ] {
+                let authenticated = authenticated_command((*route).to_string(), signer);
+                assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+            }
         }
     }
 

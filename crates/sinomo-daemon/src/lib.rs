@@ -16,6 +16,76 @@ mod status;
 pub const DAEMON_RPC_CATEGORY: &str = "daemon";
 pub const DAEMON_STATUS_ROUTE: &str = "/daemon/status";
 pub const DAEMON_SHUTDOWN_ROUTE: &str = "/daemon/shutdown";
+pub const DAEMON_DFS_BROWSER_STATUS_ROUTE: &str = "/daemon/dfs/browser/status";
+pub const DAEMON_DFS_BROWSER_LIST_ROUTE: &str = "/daemon/dfs/browser/list";
+pub const DAEMON_DFS_BROWSER_READ_FILE_ROUTE: &str = "/daemon/dfs/browser/read-file";
+pub const DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE: &str = "/daemon/dfs/browser/write-file";
+pub const DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE: &str = "/daemon/dfs/browser/create-dir-all";
+pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
+    DAEMON_DFS_BROWSER_STATUS_ROUTE,
+    DAEMON_DFS_BROWSER_LIST_ROUTE,
+    DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+    DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
+    DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
+];
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserStatusRequest;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserStatusResponse {
+    pub node_id: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserListRequest {
+    pub path: String,
+    #[serde(default)]
+    pub shallow: bool,
+    #[serde(default)]
+    pub missing_is_empty: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserListResponse {
+    pub node_id: String,
+    pub entries: Vec<DaemonDfsBrowserEntry>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserEntry {
+    pub name: String,
+    pub path: String,
+    pub kind: sinomo_dfs::DfsObjectKind,
+    pub size: Option<u64>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserReadFileRequest {
+    pub path: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserReadFileResponse {
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserWriteFileRequest {
+    pub path: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserWriteFileResponse;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserCreateDirAllRequest {
+    pub path: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserCreateDirAllResponse;
 
 #[derive(Clone)]
 pub struct DaemonServiceRegistryHook {

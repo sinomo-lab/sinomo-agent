@@ -7470,6 +7470,7 @@ dependencies = [
  "sui",
  "sui-testing",
  "time",
+ "tokio",
  "tracing",
 ]
 

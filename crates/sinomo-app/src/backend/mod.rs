@@ -15,6 +15,8 @@ pub mod evolution;
 pub mod sessions;
 pub mod sifs;
 
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -82,6 +84,7 @@ impl Connection {
 #[derive(Clone)]
 pub struct Backend {
     pub data_dir: Arc<SinomoDataDir>,
+    pub app_runtime: Arc<tokio::runtime::Runtime>,
     pub node: NodeProfile,
     pub connection: Connection,
     /// The configuration service the app reads/writes through — always RPC to a daemon (the
@@ -91,6 +94,8 @@ pub struct Backend {
     pub agent_runtime_control: sinomo_agent::AgentRuntimeControlRegistry,
     /// Keeps an app-started in-process daemon alive; `None` when attached to an external one.
     _daemon: Option<Arc<InProcessDaemon>>,
+    #[cfg(test)]
+    _test_data_dir_cleanup: Option<Arc<TestDataDirCleanup>>,
 }
 
 impl Backend {
@@ -103,6 +108,7 @@ impl Backend {
         // Best-effort: a missing layout shouldn't stop the app from opening.
         let _ = data_dir.ensure_root_layout();
         let data_dir = Arc::new(data_dir);
+        let app_runtime = build_app_runtime();
 
         let mut node = NodeProfile::local("Sinomo App")
             .unwrap_or_else(|_| panic!("local node profile uses a valid trust domain"));
@@ -137,15 +143,18 @@ impl Backend {
         let connection =
             ensure_app_cluster(connection, &paths, data_dir.as_ref(), &node, &progress);
         progress("Loading workspace…");
-        let config = build_config_client(&connection, &data_dir);
+        let config = build_config_client(&connection, &data_dir, app_runtime.handle());
 
         Backend {
             data_dir,
+            app_runtime,
             node,
             connection,
             config,
             agent_runtime_control,
             _daemon: daemon,
+            #[cfg(test)]
+            _test_data_dir_cleanup: None,
         }
     }
 
@@ -153,24 +162,28 @@ impl Backend {
     /// visual tests, which render the UI without the async connection (and without standing up a
     /// real daemon).
     pub fn local_fallback() -> Self {
-        let data_dir = app_config::default_data_dir();
+        let (data_dir, _test_data_dir_cleanup) = local_fallback_data_dir();
         let _ = data_dir.ensure_root_layout();
         let data_dir = Arc::new(data_dir);
+        let app_runtime = build_app_runtime();
 
         let mut node = NodeProfile::local("Sinomo App")
             .unwrap_or_else(|_| panic!("local node profile uses a valid trust domain"));
         node.role = NodeRole::Mobile;
 
         let connection = Connection::LocalFallback;
-        let config = build_config_client(&connection, &data_dir);
+        let config = build_config_client(&connection, &data_dir, app_runtime.handle());
 
         Backend {
             data_dir,
+            app_runtime,
             node,
             connection,
             config,
             agent_runtime_control: sinomo_agent::AgentRuntimeControlRegistry::new(),
             _daemon: None,
+            #[cfg(test)]
+            _test_data_dir_cleanup: _test_data_dir_cleanup,
         }
     }
 
@@ -231,6 +244,38 @@ impl Backend {
     }
 }
 
+#[cfg(not(test))]
+fn local_fallback_data_dir() -> (SinomoDataDir, ()) {
+    (app_config::default_data_dir(), ())
+}
+
+#[cfg(test)]
+fn local_fallback_data_dir() -> (SinomoDataDir, Option<Arc<TestDataDirCleanup>>) {
+    let path = std::env::temp_dir().join(format!(
+        "sinomo-app-local-fallback-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&path);
+    let cleanup = Arc::new(TestDataDirCleanup { path: path.clone() });
+    (SinomoDataDir::new(path), Some(cleanup))
+}
+
+#[cfg(test)]
+struct TestDataDirCleanup {
+    path: PathBuf,
+}
+
+#[cfg(test)]
+impl Drop for TestDataDirCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 fn ensure_app_cluster(
     connection: Connection,
     paths: &DaemonPaths,
@@ -270,11 +315,13 @@ fn ensure_app_cluster(
 fn build_config_client(
     connection: &Connection,
     data_dir: &Arc<SinomoDataDir>,
+    app_runtime: &tokio::runtime::Handle,
 ) -> Arc<dyn ConfigClient> {
     match connection.daemon_address() {
-        Some(address) => Arc::new(RemoteConfigClient::new(
+        Some(address) => Arc::new(RemoteConfigClient::new_on_runtime(
             address.to_string(),
             DAEMON_RPC_TIMEOUT,
+            app_runtime,
         )),
         None => {
             let store = config::build_config_store()
@@ -283,6 +330,17 @@ fn build_config_client(
             Arc::new(LocalConfigClient::new(store, (**data_dir).clone(), None))
         }
     }
+}
+
+fn build_app_runtime() -> Arc<tokio::runtime::Runtime> {
+    Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .thread_name("sinomo-app-runtime")
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("sinomo-app Tokio runtime should start"),
+    )
 }
 
 /// Start an in-process daemon (mobile node) on a background thread and wait for it to become
@@ -342,6 +400,32 @@ fn agent_runtime_control_service_hook(
 mod tests {
     use super::*;
     use sinomo_runtime::service::ServiceRegistry;
+
+    #[test]
+    fn test_local_fallback_uses_temp_data_dir_and_cleans_up() {
+        let default_root = app_config::default_data_dir().root();
+        let backend = Backend::local_fallback();
+        let root = backend.data_dir.root();
+
+        assert_ne!(
+            root, default_root,
+            "unit-test fallback backends must not touch the operator data dir"
+        );
+        assert!(
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("sinomo-app-local-fallback-test-")),
+            "unit-test fallback data dir should be visibly test-scoped: {root:?}"
+        );
+        assert!(root.exists(), "fallback test data dir should be created");
+
+        drop(backend);
+
+        assert!(
+            !root.exists(),
+            "fallback test data dir should be removed when the backend drops"
+        );
+    }
 
     #[test]
     fn app_agent_runtime_control_hook_registers_read_and_control_routes() {

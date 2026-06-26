@@ -25,7 +25,7 @@ use sinomo_lm::{
 };
 use sinomo_runtime::events::{InMemoryEventStore, SessionId};
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::network::ClusterPaths;
+use sinomo_runtime::network::{ClusterPaths, ObjectRpcRequest};
 use sinomo_runtime::node::NodeId;
 use time::format_description::well_known::Rfc3339;
 
@@ -1550,25 +1550,72 @@ pub struct SifsEntry {
     pub size: Option<u64>,
 }
 
-/// A handle to browse SIFS (the distributed filesystem). Degraded fallback can
-/// read local content store metadata, while daemon-backed operation spans the
-/// cluster.
+/// A handle to browse SIFS (the distributed filesystem).
 pub struct SifsBrowser {
-    backend: SifsFileManagerBackend,
+    backend: SifsBrowserBackend,
     node_id: String,
+}
+
+enum SifsBrowserBackend {
+    Local(SifsFileManagerBackend),
+    Remote(RemoteSifsBrowser),
+}
+
+struct RemoteSifsBrowser {
+    address: String,
+    timeout: Duration,
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl SifsBrowser {
     pub fn open(data_dir: &SinomoDataDir) -> Result<Self, String> {
         let backend = SifsFileManagerBackend::open(data_dir)?;
         let node_id = backend.node_label();
-        Ok(Self { backend, node_id })
+        Ok(Self {
+            backend: SifsBrowserBackend::Local(backend),
+            node_id,
+        })
     }
 
     pub fn open_read_only(data_dir: &SinomoDataDir) -> Result<Self, String> {
         let backend = SifsFileManagerBackend::open_read_only(data_dir)?;
         let node_id = backend.node_label();
-        Ok(Self { backend, node_id })
+        Ok(Self {
+            backend: SifsBrowserBackend::Local(backend),
+            node_id,
+        })
+    }
+
+    pub fn open_daemon(address: impl Into<String>) -> Result<Self, String> {
+        let backend = RemoteSifsBrowser {
+            address: address.into(),
+            timeout: Duration::from_secs(30),
+            runtime: None,
+        };
+        Self::open_remote_backend(backend)
+    }
+
+    pub fn open_daemon_on_runtime(
+        address: impl Into<String>,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<Self, String> {
+        let backend = RemoteSifsBrowser {
+            address: address.into(),
+            timeout: Duration::from_secs(30),
+            runtime: Some(runtime.clone()),
+        };
+        Self::open_remote_backend(backend)
+    }
+
+    fn open_remote_backend(backend: RemoteSifsBrowser) -> Result<Self, String> {
+        let status: sinomo_runtime::daemon::DaemonDfsBrowserStatusResponse = backend.rpc(
+            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_STATUS_ROUTE,
+            &sinomo_runtime::daemon::DaemonDfsBrowserStatusRequest,
+        )?;
+        Ok(Self {
+            backend: SifsBrowserBackend::Remote(backend),
+            node_id: status.node_id,
+        })
     }
 
     /// The node SIFS objects are placed on locally.
@@ -1578,68 +1625,235 @@ impl SifsBrowser {
 
     /// List a directory (directories first, then files, name-sorted).
     pub fn list(&self, path: &str) -> Result<Vec<SifsEntry>, String> {
-        let mut entries: Vec<SifsEntry> = self
-            .backend
-            .list_dir(path)?
-            .into_iter()
-            .map(|entry| SifsEntry {
-                name: entry.name,
-                path: entry.path,
-                is_dir: matches!(entry.kind, FileManagerEntryKind::Directory),
-                is_link: matches!(entry.kind, FileManagerEntryKind::Symlink),
-                size: entry.size,
-            })
-            .collect();
-        entries.sort_by(|a, b| {
-            (b.is_dir as u8)
-                .cmp(&(a.is_dir as u8))
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
-        Ok(entries)
+        let entries = match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend
+                .list_dir(path)?
+                .into_iter()
+                .map(sifs_entry_from_file_manager)
+                .collect(),
+            SifsBrowserBackend::Remote(remote) => remote.list(path, false, false)?,
+        };
+        Ok(sort_sifs_entries(entries))
+    }
+
+    pub fn list_if_exists(&self, path: &str) -> Result<Vec<SifsEntry>, String> {
+        let entries = match &self.backend {
+            SifsBrowserBackend::Local(backend) => match backend.list_dir(path) {
+                Ok(entries) => entries
+                    .into_iter()
+                    .map(sifs_entry_from_file_manager)
+                    .collect(),
+                Err(error) if sifs_error_is_not_found(&error) => Vec::new(),
+                Err(error) => return Err(error),
+            },
+            SifsBrowserBackend::Remote(remote) => remote.list(path, false, true)?,
+        };
+        Ok(sort_sifs_entries(entries))
     }
 
     pub fn list_shallow(&self, path: &str) -> Result<Vec<SifsEntry>, String> {
-        let mut entries: Vec<SifsEntry> = self
-            .backend
-            .list_dir_shallow(path)?
-            .into_iter()
-            .map(|entry| SifsEntry {
-                name: entry.name,
-                path: entry.path,
-                is_dir: matches!(entry.kind, FileManagerEntryKind::Directory),
-                is_link: matches!(entry.kind, FileManagerEntryKind::Symlink),
-                size: entry.size,
-            })
-            .collect();
-        entries.sort_by(|a, b| {
-            (b.is_dir as u8)
-                .cmp(&(a.is_dir as u8))
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
-        Ok(entries)
+        let entries = match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend
+                .list_dir_shallow(path)?
+                .into_iter()
+                .map(sifs_entry_from_file_manager)
+                .collect(),
+            SifsBrowserBackend::Remote(remote) => remote.list(path, true, false)?,
+        };
+        Ok(sort_sifs_entries(entries))
     }
 
     pub fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
-        self.backend.read_file(path)
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend.read_file(path),
+            SifsBrowserBackend::Remote(remote) => remote.read_file(path),
+        }
     }
 
     pub fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
-        self.backend.write_file(path, bytes)
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend.write_file(path, bytes),
+            SifsBrowserBackend::Remote(remote) => remote.write_file(path, bytes),
+        }
     }
 
     pub fn create_dir_all(&self, path: &str) -> Result<(), String> {
-        self.backend.create_dir_all(path)
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend.create_dir_all(path),
+            SifsBrowserBackend::Remote(remote) => remote.create_dir_all(path),
+        }
     }
 
     pub fn parent(&self, path: &str) -> Option<String> {
-        self.backend.parent_path(path)
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend.parent_path(path),
+            SifsBrowserBackend::Remote(_) => parent_sifs_browser_path(path),
+        }
     }
 
     pub fn normalize(&self, path: &str) -> String {
-        self.backend
-            .normalize_path(path)
-            .unwrap_or_else(|_| "/".to_string())
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend
+                .normalize_path(path)
+                .unwrap_or_else(|_| "/".to_string()),
+            SifsBrowserBackend::Remote(_) => {
+                normalize_sifs_browser_path(path).unwrap_or_else(|_| "/".to_string())
+            }
+        }
     }
+}
+
+impl RemoteSifsBrowser {
+    fn rpc<Req, Resp>(&self, route: &str, body: &Req) -> Result<Resp, String>
+    where
+        Req: serde::Serialize + ?Sized,
+        Resp: serde::de::DeserializeOwned,
+    {
+        let request =
+            ObjectRpcRequest::encode_body(route, sinomo_runtime::daemon::DAEMON_RPC_CATEGORY, body)
+                .map_err(|error| error.to_string())?;
+        let response = if let Some(runtime) = &self.runtime {
+            runtime
+                .block_on(sinomo_runtime::daemon::send_daemon_rpc_async(
+                    &self.address,
+                    &request,
+                    sinomo_runtime::network::DaemonRpcTimeouts::connect_and_idle(self.timeout),
+                    runtime,
+                ))
+                .map_err(|error| error.to_string())?
+        } else {
+            sinomo_runtime::daemon::send_daemon_rpc(&self.address, &request, self.timeout)
+                .map_err(|error| error.to_string())?
+        };
+        response.decode_body().map_err(|error| error.to_string())
+    }
+
+    fn list(
+        &self,
+        path: &str,
+        shallow: bool,
+        missing_is_empty: bool,
+    ) -> Result<Vec<SifsEntry>, String> {
+        let response: sinomo_runtime::daemon::DaemonDfsBrowserListResponse = self.rpc(
+            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_LIST_ROUTE,
+            &sinomo_runtime::daemon::DaemonDfsBrowserListRequest {
+                path: path.to_string(),
+                shallow,
+                missing_is_empty,
+            },
+        )?;
+        Ok(response
+            .entries
+            .into_iter()
+            .map(sifs_entry_from_rpc)
+            .collect())
+    }
+
+    fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+        let response: sinomo_runtime::daemon::DaemonDfsBrowserReadFileResponse = self.rpc(
+            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+            &sinomo_runtime::daemon::DaemonDfsBrowserReadFileRequest {
+                path: path.to_string(),
+            },
+        )?;
+        Ok(response.bytes)
+    }
+
+    fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
+        let _: sinomo_runtime::daemon::DaemonDfsBrowserWriteFileResponse = self.rpc(
+            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
+            &sinomo_runtime::daemon::DaemonDfsBrowserWriteFileRequest {
+                path: path.to_string(),
+                bytes: bytes.to_vec(),
+            },
+        )?;
+        Ok(())
+    }
+
+    fn create_dir_all(&self, path: &str) -> Result<(), String> {
+        let _: sinomo_runtime::daemon::DaemonDfsBrowserCreateDirAllResponse = self.rpc(
+            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
+            &sinomo_runtime::daemon::DaemonDfsBrowserCreateDirAllRequest {
+                path: path.to_string(),
+            },
+        )?;
+        Ok(())
+    }
+}
+
+fn sifs_entry_from_file_manager(entry: crate::file_manager::FileManagerEntry) -> SifsEntry {
+    SifsEntry {
+        name: entry.name,
+        path: entry.path,
+        is_dir: matches!(entry.kind, FileManagerEntryKind::Directory),
+        is_link: matches!(entry.kind, FileManagerEntryKind::Symlink),
+        size: entry.size,
+    }
+}
+
+fn sifs_entry_from_rpc(entry: sinomo_runtime::daemon::DaemonDfsBrowserEntry) -> SifsEntry {
+    SifsEntry {
+        name: entry.name,
+        path: entry.path,
+        is_dir: matches!(entry.kind, sinomo_runtime::dfs::DfsObjectKind::Directory),
+        is_link: matches!(entry.kind, sinomo_runtime::dfs::DfsObjectKind::Symlink),
+        size: entry.size,
+    }
+}
+
+fn sort_sifs_entries(mut entries: Vec<SifsEntry>) -> Vec<SifsEntry> {
+    entries.sort_by(|a, b| {
+        (b.is_dir as u8)
+            .cmp(&(a.is_dir as u8))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    entries
+}
+
+fn sifs_error_is_not_found(error: &str) -> bool {
+    error.contains("not found:")
+}
+
+fn normalize_sifs_browser_path(path: &str) -> Result<String, String> {
+    let path = path.trim();
+    let path = if path.is_empty() {
+        "/".to_string()
+    } else if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    if path.bytes().any(|byte| byte == 0) {
+        return Err(format!("invalid SIFS path: {path}"));
+    }
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            value => parts.push(value),
+        }
+    }
+    if parts.is_empty() {
+        Ok("/".to_string())
+    } else {
+        Ok(format!("/{}", parts.join("/")))
+    }
+}
+
+fn parent_sifs_browser_path(path: &str) -> Option<String> {
+    let path = normalize_sifs_browser_path(path).ok()?;
+    if path == "/" {
+        return None;
+    }
+    let (parent, _) = path.rsplit_once('/')?;
+    Some(if parent.is_empty() {
+        "/".to_string()
+    } else {
+        parent.to_string()
+    })
 }
 
 #[cfg(test)]

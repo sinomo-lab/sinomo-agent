@@ -62,6 +62,8 @@ type ThemeReader = Rc<dyn Fn() -> DefaultTheme>;
 /// State backing the files tab.
 pub struct FilesState {
     pub data_dir: Arc<SinomoDataDir>,
+    daemon_address: Option<String>,
+    app_runtime: tokio::runtime::Handle,
     pub browser: Option<SifsBrowser>,
     pub error: Option<String>,
     pub clustered: bool,
@@ -85,6 +87,8 @@ impl FilesState {
     pub fn new(backend: &Backend) -> Self {
         Self {
             data_dir: backend.data_dir.clone(),
+            daemon_address: backend.connection.daemon_address().map(str::to_string),
+            app_runtime: backend.app_runtime.handle().clone(),
             browser: None,
             error: None,
             clustered: backend.connection.is_clustered(),
@@ -122,7 +126,12 @@ impl FilesState {
     fn load_sync(&mut self) {
         self.loaded = true;
         self.loading = false;
-        match SifsBrowser::open_read_only(&self.data_dir) {
+        let result = self
+            .daemon_address
+            .as_deref()
+            .ok_or_else(|| "SIFS browsing requires a daemon connection".to_string())
+            .and_then(|address| SifsBrowser::open_daemon_on_runtime(address, &self.app_runtime));
+        match result {
             Ok(browser) => {
                 self.node_id = browser.node_id().to_string();
                 self.browser = Some(browser);
@@ -218,12 +227,22 @@ impl FilesState {
         let (command_tx, command_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
         let data_dir = self.data_dir.clone();
+        let daemon_address = self.daemon_address.clone();
+        let app_runtime = self.app_runtime.clone();
         let timeout_tx = result_tx.clone();
         let timeout_waker = waker.clone();
         match thread::Builder::new()
             .name("sinomo-app-files".to_string())
-            .spawn(move || files_worker_loop(data_dir, command_rx, result_tx, waker))
-        {
+            .spawn(move || {
+                files_worker_loop(
+                    data_dir,
+                    daemon_address,
+                    app_runtime,
+                    command_rx,
+                    result_tx,
+                    waker,
+                )
+            }) {
             Ok(_) => {
                 self.worker_tx = Some(command_tx);
                 self.worker_rx = Some(result_rx);
@@ -358,12 +377,16 @@ enum FilesWorkerCommand {
 
 fn files_worker_loop(
     data_dir: Arc<SinomoDataDir>,
+    daemon_address: Option<String>,
+    app_runtime: tokio::runtime::Handle,
     command_rx: Receiver<FilesWorkerCommand>,
     result_tx: Sender<FilesWorkerResult>,
     waker: sui::UiHandle,
 ) {
     let mut browser: Option<SifsBrowser> = None;
-    let mut open_error: Option<String> = None;
+    let mut open_error: Option<String> = daemon_address
+        .is_none()
+        .then(|| "SIFS browsing requires a daemon connection".to_string());
     while let Ok(command) = command_rx.recv() {
         let FilesWorkerCommand::List { request_id, path } = command;
         let requested_path = normalize_path(&path);
@@ -371,9 +394,17 @@ fn files_worker_loop(
             (requested_path, Err(error.clone()))
         } else {
             if browser.is_none() {
-                match SifsBrowser::open_read_only(&data_dir) {
-                    Ok(opened) => browser = Some(opened),
-                    Err(error) => open_error = Some(error),
+                match daemon_address.as_deref() {
+                    Some(address) => {
+                        match SifsBrowser::open_daemon_on_runtime(address, &app_runtime) {
+                            Ok(opened) => browser = Some(opened),
+                            Err(error) => open_error = Some(error),
+                        }
+                    }
+                    None => {
+                        let _ = &data_dir;
+                        open_error = Some("SIFS browsing requires a daemon connection".to_string());
+                    }
                 }
             }
             match (&browser, &open_error) {
