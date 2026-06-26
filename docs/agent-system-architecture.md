@@ -4,13 +4,14 @@
 
 This document is the single source of truth for the current Sinomo agent system.
 It describes the architecture that is implemented now: agent packages,
-provider-neutral model requests, runtime-owned tool execution, durable session
-state, readiness gates, live session control, command evidence, cancellation,
-and compaction evaluation boundaries.
+provider-neutral model requests, runtime-owned tool execution, durable internal
+session state, readiness gates, live session control, command evidence,
+cancellation, and compaction evaluation boundaries.
 
 It complements the distributed runtime in [architecture.md](architecture.md),
 the cluster control plane in [clustering-architecture.md](clustering-architecture.md),
-the cluster root filesystem in [sifs.md](sifs.md), and controlled mutation in
+long-horizon memory in [memory-architecture.md](memory-architecture.md), the
+cluster root filesystem in [sifs.md](sifs.md), and controlled mutation in
 [self-evolution-architecture.md](self-evolution-architecture.md). The agent loop
 is generic R2 infrastructure; self-evolution is one caller of it, not a separate
 agent runtime layer.
@@ -18,17 +19,17 @@ agent runtime layer.
 ## Design Position
 
 Sinomo should feel like one continuous agent to users, but the implementation is
-a cluster-aware runtime around model turns, durable session state, tool
+a cluster-aware runtime around model turns, durable internal session state, tool
 orchestration, and async task control. The main agent must not block live
 interaction just because slow work is in progress. Tool calls, command
 execution, research, coding, maintenance, and background work are represented as
-typed session activity with evidence.
+typed internal session activity with evidence.
 
 The runtime owns security and execution. Prompts describe behavior, but they are
 not the authority for tools, filesystem access, sandboxing, cancellation,
 storage, rollout, or cluster placement. If a tool is visible to the model, it is
-available in that session surface; hidden tools can be searched and described
-through progressive disclosure, but guessed direct calls are rejected.
+available in that model-session tool surface; hidden tools can be searched and
+described through progressive disclosure, but guessed direct calls are rejected.
 
 Provider-specific behavior belongs in `sinomo-lm`. `sinomo-agent` builds a
 provider-neutral `LanguageModelRequest`; `sinomo-lm` renders provider protocol
@@ -135,7 +136,10 @@ runtime policy.
 
 ## Session and Turn Model
 
-The generic agent loop has a session/turn split:
+The generic agent loop has a session/turn split. A session is an internal
+model-turn execution unit, not the user-facing conversation or participant
+model. Chats and channels own visible timelines and participants; sessions drive
+model context, compaction, tool state, traces, steering, and follow-up input.
 
 - `Agent::run` remains the compatibility helper for one-shot calls.
 - `Agent::start_turn`, `continue_turn`, `steer`, `follow_up`, `compact`, and
@@ -149,6 +153,14 @@ Every model step assembles a `TurnContext` containing runtime facts, workspace
 facts, current session projection, working state, async updates, workspace
 instruction files such as `AGENTS.md`, prompt-reference expansions, generic
 context attachments, available tools, and budget estimates.
+
+Within one session, everything the model sees is owned by the context
+assembler. Memory may contribute retrieved blocks, but memory does not manage
+same-session persistence, maintain the active projection, or decide which
+same-session information remains visible. Memory retrieval decides visibility
+only at session boundaries, such as starting a new model session, resuming older
+work, or bringing durable chat, channel, task, workspace, user, or cluster
+context into a new model turn.
 
 The context assembler writes a `ContextAssemblyReport` for each turn. The report
 records included sources, omitted sources, byte estimates, and budget lanes for
@@ -305,7 +317,8 @@ pretending persisted metadata can restore process handles.
 
 The app chat worker and app-started in-process daemon share an
 `AgentRuntimeControlRegistry`, so GUI calls can steer, queue follow-ups,
-interrupt, and inspect active chat sessions owned by the app process.
+interrupt, and inspect active model sessions backing chats owned by the app
+process.
 
 ## Cancellation
 

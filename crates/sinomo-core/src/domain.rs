@@ -108,6 +108,12 @@ pub type MemoryId = Id;
 pub enum MemoryScope {
     Cluster,
     Agent { agent_id: String },
+    Chat { chat_id: String },
+    Channel { channel_id: String },
+    Task { task_id: String },
+    Workspace { workspace_id: String },
+    User { user_id: String },
+    Team { team_id: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

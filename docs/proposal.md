@@ -37,7 +37,7 @@ Model providers and module implementations can change over time. The event contr
 3. **Timing and content are separate decisions.** The system decides when to speak, interrupt, alert, wait, or escalate separately from what to say or do.
 4. **Reasoning runs at multiple speeds.** Fast reactive behavior, ordinary interaction, and slow deliberation should be separate cooperating loops.
 5. **Memory is hierarchical.** Hot, warm, cold, and procedural memory are managed explicitly, with selective promotion from events.
-6. **Distribution is native.** Nodes, devices, sessions, workspaces, events, and memory should carry identity and locality from the beginning.
+6. **Distribution is native.** Nodes, devices, internal model sessions, workspaces, events, and memory should carry identity and locality from the beginning.
 7. **Safety is enforced by the runtime.** Sandboxes, policy checks, resource limits, and incident events protect action paths without putting human approval on the hot path.
 8. **Evolution is evidence-gated.** Self-evolution moves through scoped workspaces, manifests, scorecards, policy decisions, signed artifacts, shadow/canary rollout, and rollback.
 9. **Implementation stays local-first.** Early versions should avoid unnecessary infrastructure and prove the contracts before adding heavier distributed services.
@@ -89,11 +89,14 @@ The fast path should stay small and deterministic. The interactive path should b
 Sinomo should not rely on one giant context window. The event log provides the replayable timeline, while memory tiers provide different working sets:
 
 - **hot memory** for immediate live context,
-- **warm episodic memory** for session continuity,
+- **warm episodic memory** for continuity when crossing model-session, chat, channel, and task boundaries,
 - **cold semantic memory** for long-term knowledge and summaries,
 - **procedural memory** for reusable skills, workflows, policies, and recovery patterns.
 
 Memory writes should be selective. Promote events when they are salient, repeated, unresolved, user-important, linked to task outcomes, or needed for future planning.
+
+The detailed long-horizon memory design is maintained in
+[memory-architecture.md](memory-architecture.md).
 
 ## Safety Direction
 
