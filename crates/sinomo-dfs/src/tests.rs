@@ -685,7 +685,7 @@ fn dfs_protocol_binary_payloads_use_native_bytes_codec() {
 }
 
 #[test]
-fn dfs_message_read_only_classifier_routes_lookup_path_to_read_lane() {
+fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
     let local = NodeId::from_legacy_named("node_read_classifier_local").expect("local");
     let remote = NodeId::from_legacy_named("node_read_classifier_remote").expect("remote");
     let file_system_id = sifs_file_system_id();
@@ -723,10 +723,10 @@ fn dfs_message_read_only_classifier_routes_lookup_path_to_read_lane() {
             },
         }),
     );
-    assert!(dfs_message_is_read_only_request(&lookup));
+    assert!(!dfs_message_is_read_only_request(&lookup));
     assert!(
         dfs_message_requires_fresh_metadata(&lookup),
-        "lookup requests must hydrate daemon read lanes before answering primary path checks"
+        "lookup requests still require fresh daemon metadata before answering primary path checks"
     );
 
     let lookup_paths = test_dfs_message_command_from_message(
@@ -747,10 +747,10 @@ fn dfs_message_read_only_classifier_routes_lookup_path_to_read_lane() {
             },
         }),
     );
-    assert!(dfs_message_is_read_only_request(&lookup_paths));
+    assert!(!dfs_message_is_read_only_request(&lookup_paths));
     assert!(
         dfs_message_requires_fresh_metadata(&lookup_paths),
-        "batched lookup requests must hydrate daemon read lanes before answering primary path checks"
+        "batched lookup requests still require fresh daemon metadata before answering primary path checks"
     );
 
     let sync = test_dfs_message_command_from_message(
@@ -1201,6 +1201,7 @@ fn endpoint_transport_transfer_profile_tracks_best_endpoint_kind() {
 #[derive(Default)]
 struct RecordingPeerTransport {
     calls: Mutex<Vec<String>>,
+    options: Mutex<Vec<(String, bool)>>,
 }
 
 impl DfsPeerTransport for RecordingPeerTransport {
@@ -1208,8 +1209,12 @@ impl DfsPeerTransport for RecordingPeerTransport {
         &self,
         target_node_id: &NodeId,
         request: &ObjectRpcRequest,
-        _options: DfsObjectRpcSendOptions,
+        options: DfsObjectRpcSendOptions,
     ) -> Result<ObjectRpcResponse, DfsPeerTransportError> {
+        self.options
+            .lock()
+            .expect("options")
+            .push((request.route.clone(), options.observe_connectivity));
         match request.route.as_str() {
             route if dfs_route_is_message_data_plane(route) => {
                 let command: DfsMessageCommand = request
@@ -1226,6 +1231,26 @@ impl DfsPeerTransport for RecordingPeerTransport {
                         outbound_messages: Vec::new(),
                     },
                 )
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+            }
+            DFS_DIRECT_READ_ROUTE => {
+                let command: DfsDirectReadRequest = request
+                    .decode_body()
+                    .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+                self.calls.lock().expect("calls").push(format!(
+                    "rpc:{}:{}:{}",
+                    request.route, target_node_id, command.request_id
+                ));
+                dfs_direct_read_rpc_response(DfsReadResponse {
+                    request_id: command.request_id,
+                    object_id: command.object_id.clone(),
+                    result: DfsReadResult::Found(DfsReadData {
+                        object_id: command.object_id,
+                        version: command.version,
+                        content_hash: Some(command.content_hash),
+                        bytes: vec![1, 2, 3],
+                    }),
+                })
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))
             }
             DFS_METADATA_JOURNAL_BATCH_ROUTE => {
@@ -1374,6 +1399,43 @@ fn dfs_peer_transport_adapters_delegate_all_routes() {
         ]
     );
     std::fs::remove_dir_all(snapshot_root).ok();
+}
+
+#[test]
+fn dfs_direct_read_peer_transport_adapters_observe_connectivity() {
+    let remote = NodeId::from_legacy_named("node_dfs_direct_read_observe_remote").expect("remote");
+    let request = DfsDirectReadRequest {
+        request_id: "direct-observe-1".to_string(),
+        object_id: DfsObjectId::generate(),
+        version: DfsVersion::generate(),
+        content_hash: "blake3:direct-observe".to_string(),
+        content_size_bytes: 3,
+    };
+
+    let peer = Arc::new(RecordingPeerTransport::default());
+    let peer_transport: Arc<dyn DfsPeerTransport> = peer.clone();
+    let direct_sender = dfs_direct_read_sender_from_peer_transport(peer_transport);
+    direct_sender(&remote, &request, Duration::from_secs(1)).expect("direct read send");
+    assert_eq!(
+        peer.options.lock().expect("options").as_slice(),
+        &[(DFS_DIRECT_READ_ROUTE.to_string(), true)]
+    );
+
+    let async_peer = Arc::new(RecordingPeerTransport::default());
+    let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = async_peer.clone();
+    let async_direct_sender =
+        async_dfs_direct_read_sender_from_peer_transport(async_peer_transport);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    runtime
+        .block_on(async { async_direct_sender(&remote, &request, Duration::from_secs(1)).await })
+        .expect("async direct read send");
+    assert_eq!(
+        async_peer.options.lock().expect("options").as_slice(),
+        &[(DFS_DIRECT_READ_ROUTE.to_string(), true)]
+    );
 }
 
 impl DfsTransportIdentity for CountingEmptyTransport {

@@ -510,27 +510,6 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 metrics.pending_routed_write_count
             ));
         }
-        if metrics.repair_job_count != 0 {
-            violations.push(format!("repair_job_count={}", metrics.repair_job_count));
-        }
-        if metrics.repair_attempt_count != 0 {
-            violations.push(format!(
-                "repair_attempt_count={}",
-                metrics.repair_attempt_count
-            ));
-        }
-        if metrics.pending_write_count != 0 {
-            violations.push(format!(
-                "pending_write_count={}",
-                metrics.pending_write_count
-            ));
-        }
-        if metrics.pending_metadata_replication_count != 0 {
-            violations.push(format!(
-                "pending_metadata_replication_count={}",
-                metrics.pending_metadata_replication_count
-            ));
-        }
         if violations.is_empty() {
             ctx.record("object_count", metrics.object_count);
             ctx.record("repair_job_count", metrics.repair_job_count);

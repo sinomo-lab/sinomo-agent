@@ -512,11 +512,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .unwrap_or(0))
     }
 
-    /// Distributed path lookup with bounded mirror catch-up. Configured shard
-    /// replicas never pull metadata on ordinary reads; they serve local hits
-    /// directly and use a read-only primary lookup for local misses. Nodes
-    /// outside a shard's replica set may still use the SyncPath fallback
-    /// because they have no pushed metadata stream.
+    /// Distributed path lookup with bounded mirror catch-up. Reads serve local
+    /// hits directly and use a read-only primary lookup for local misses.
+    /// Nodes outside a shard's replica set only use the SyncPath fallback when
+    /// the read-only lookup cannot answer, keeping ordinary cold reads from
+    /// materializing metadata locally.
     fn lookup_sifs_path_distributed_synced(
         &mut self,
         path: &str,
@@ -554,18 +554,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let Some(shard) = self.routed_namespace_shard_for_path_cached(&resolved)? else {
                 break;
             };
-            if self.is_local_metadata_replica_for_shard(&shard) {
-                if shard.primary_node_id != self.node_id
-                    && let Some(object) = self.route_namespace_lookup_path_to_metadata_primary(
-                        sifs_file_system_id(),
-                        shard.primary_node_id.clone(),
-                        resolved.clone(),
-                        POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
-                    )?
-                    && object.kind != DfsObjectKind::Tombstone
-                {
-                    return Ok((resolved, Some(object)));
+            if shard.primary_node_id != self.node_id {
+                match self.route_namespace_lookup_path_to_metadata_primary(
+                    sifs_file_system_id(),
+                    shard.primary_node_id.clone(),
+                    resolved.clone(),
+                    POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                ) {
+                    Ok(Some(object)) if object.kind != DfsObjectKind::Tombstone => {
+                        return Ok((resolved, Some(object)));
+                    }
+                    Ok(_) if self.is_local_metadata_replica_for_shard(&shard) => break,
+                    Ok(_) => break,
+                    Err(error) if self.is_local_metadata_replica_for_shard(&shard) => {
+                        return Err(error.into());
+                    }
+                    Err(_) => {}
                 }
+            }
+            if self.is_local_metadata_replica_for_shard(&shard) {
                 break;
             }
             let cursor_before = self.metadata_shard_cursor_for_path(&resolved)?;
@@ -3490,6 +3497,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
             ) {
                 returned_objects = returned_objects.saturating_add(objects.len());
+                for object in objects {
+                    let _ = self.metadata.add_object(object);
+                }
             }
         }
         crate::dfs_perf_trace(format_args!(

@@ -606,13 +606,7 @@ fn dfs_message_route_for_network_message(message: &DfsNetworkMessage) -> &'stati
 fn dfs_network_message_is_read_only_request(message: &DfsNetworkMessage) -> bool {
     matches!(
         message,
-        DfsNetworkMessage::ReadRequest(_)
-            | DfsNetworkMessage::BulkReadRequest(_)
-            | DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
-                operation: DfsNamespaceOperation::LookupPath { .. }
-                    | DfsNamespaceOperation::LookupPaths { .. },
-                ..
-            })
+        DfsNetworkMessage::ReadRequest(_) | DfsNetworkMessage::BulkReadRequest(_)
     )
 }
 
@@ -8770,7 +8764,7 @@ fn async_dfs_direct_read_sender_from_peer_transport(
                 .call_object_rpc_async(
                     target_node_id,
                     &rpc_request,
-                    DfsObjectRpcSendOptions::new(connect_timeout).with_observe_connectivity(false),
+                    DfsObjectRpcSendOptions::new(connect_timeout),
                 )
                 .await?;
             dfs_direct_read_response_from_rpc_response(response)
@@ -8849,7 +8843,7 @@ fn dfs_direct_read_sender_from_peer_transport(
         let response = peer_transport.call_object_rpc(
             target_node_id,
             &rpc_request,
-            DfsObjectRpcSendOptions::new(connect_timeout).with_observe_connectivity(false),
+            DfsObjectRpcSendOptions::new(connect_timeout),
         )?;
         dfs_direct_read_response_from_rpc_response(response)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))
