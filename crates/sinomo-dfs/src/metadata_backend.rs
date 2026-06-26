@@ -8464,8 +8464,11 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         next_after_sequence: u64,
     ) -> Result<()> {
         let _lock = self.begin_metadata_write()?;
-        let next_after_sequence =
-            next_after_sequence.max(self.metadata_replication_cursor(target_node_id, shard_id)?);
+        let current_sequence = self.metadata_replication_cursor(target_node_id, shard_id)?;
+        let next_after_sequence = next_after_sequence.max(current_sequence);
+        if next_after_sequence == current_sequence {
+            return Ok(());
+        }
         write_sobj_atomic(
             &self.metadata_replication_cursor_path(target_node_id, shard_id),
             &DfsMetadataReplayCursor {
@@ -16515,9 +16518,28 @@ mod tests {
         backend
             .put_metadata_replication_cursor(&target_node_id, &shard_id, 42)
             .expect("write cursor");
+        let cursor_path = backend.metadata_replication_cursor_path(&target_node_id, &shard_id);
+        let metadata_before_stale_ack = fs::metadata(&cursor_path).expect("cursor metadata");
+        let modified_before_stale_ack = metadata_before_stale_ack
+            .modified()
+            .expect("cursor modified time");
+        std::thread::sleep(Duration::from_millis(25));
         backend
             .put_metadata_replication_cursor(&target_node_id, &shard_id, 7)
             .expect("stale cursor");
+        let metadata_after_stale_ack = fs::metadata(&cursor_path).expect("cursor metadata");
+        assert_eq!(
+            metadata_after_stale_ack.len(),
+            metadata_before_stale_ack.len(),
+            "stale acknowledgements should not rewrite the durable replication cursor"
+        );
+        assert_eq!(
+            metadata_after_stale_ack
+                .modified()
+                .expect("cursor modified time"),
+            modified_before_stale_ack,
+            "stale acknowledgements should leave the durable replication cursor untouched"
+        );
         let reopened =
             LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("reopen");
 

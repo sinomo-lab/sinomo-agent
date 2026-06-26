@@ -10,6 +10,19 @@ use std::sync::Condvar;
 #[cfg(test)]
 use std::time::Instant;
 
+fn try_reserve_vec_deque<T>(
+    queue: &mut VecDeque<T>,
+    additional: usize,
+    operation: &str,
+) -> Result<(), NetworkError> {
+    queue
+        .try_reserve(additional)
+        .map_err(|_| NetworkError::ResourceExhausted {
+            operation: operation.to_string(),
+            requested_bytes: additional.saturating_mul(std::mem::size_of::<T>()),
+        })
+}
+
 #[derive(Clone, Debug, Default)]
 #[cfg(test)]
 pub struct PeerRegistry {
@@ -843,6 +856,7 @@ impl InProcessTransport {
             });
         }
 
+        try_reserve_vec_deque(mailbox, 1, "enqueue in-process event frame")?;
         mailbox.push_back(InboundEventFrame {
             received_by: target_node_id.clone(),
             frame,
@@ -877,6 +891,7 @@ impl InProcessTransport {
             });
         }
 
+        try_reserve_vec_deque(mailbox, 1, "enqueue in-process object rpc message")?;
         mailbox.push_back(InboundObjectRpcMessage {
             received_by: target_node_id.clone(),
             message: InProcessObjectRpcMessage {
@@ -906,7 +921,14 @@ impl InProcessTransport {
                 node_id: self.local_node_id.clone(),
             })?;
 
-        Ok(mailbox.drain(..).collect())
+        let mut frames = Vec::new();
+        crate::object::try_reserve_vec(
+            &mut frames,
+            mailbox.len(),
+            "drain in-process event frames",
+        )?;
+        frames.extend(mailbox.drain(..));
+        Ok(frames)
     }
 
     pub(crate) fn drain_incoming_object_rpc_messages(
@@ -926,17 +948,30 @@ impl InProcessTransport {
                 node_id: self.local_node_id.clone(),
             })?;
 
-        Ok(mailbox.drain(..).collect())
+        let mut messages = Vec::new();
+        crate::object::try_reserve_vec(
+            &mut messages,
+            mailbox.len(),
+            "drain in-process object rpc messages",
+        )?;
+        messages.extend(mailbox.drain(..));
+        Ok(messages)
     }
 
     pub fn drain_incoming_object_rpc_requests(
         &mut self,
     ) -> Result<Vec<ObjectRpcRequest>, NetworkError> {
-        Ok(self
-            .drain_incoming_object_rpc_messages()?
-            .into_iter()
-            .map(|inbound| inbound.message.request)
-            .collect())
+        let messages = self.drain_incoming_object_rpc_messages()?;
+        let mut requests = Vec::new();
+        crate::object::try_reserve_vec(
+            &mut requests,
+            messages.len(),
+            "drain in-process object rpc requests",
+        )?;
+        for inbound in messages {
+            requests.push(inbound.message.request);
+        }
+        Ok(requests)
     }
 
     #[cfg(test)]
@@ -1251,11 +1286,18 @@ impl AsyncInProcessTransport {
         max_messages: usize,
     ) -> Result<Vec<InboundObjectRpcMessage>, NetworkError> {
         let take = max_messages.max(1);
-        let mut messages = self.object_rpc_pending.drain(..).collect::<Vec<_>>();
-        if messages.len() > take {
-            let retained = messages.split_off(take);
-            self.object_rpc_pending.extend(retained);
-            return Ok(messages);
+        let mut messages = Vec::new();
+        let queued = self.pending_object_rpc_count();
+        crate::object::try_reserve_vec(
+            &mut messages,
+            take.min(queued),
+            "drain pending object rpc messages",
+        )?;
+        while messages.len() < take {
+            let Some(message) = self.object_rpc_pending.pop_front() else {
+                break;
+            };
+            messages.push(message);
         }
         while messages.len() < take {
             let Ok(message) = self.object_rpc_incoming.try_recv() else {
@@ -1270,12 +1312,19 @@ impl AsyncInProcessTransport {
         &mut self,
         max_messages: usize,
     ) -> Result<Vec<ObjectRpcRequest>, NetworkError> {
-        Ok(self
+        let messages = self
             .drain_incoming_object_rpc_messages(max_messages)
-            .await?
-            .into_iter()
-            .map(|inbound| inbound.message.request)
-            .collect())
+            .await?;
+        let mut requests = Vec::new();
+        crate::object::try_reserve_vec(
+            &mut requests,
+            messages.len(),
+            "drain pending object rpc requests",
+        )?;
+        for inbound in messages {
+            requests.push(inbound.message.request);
+        }
+        Ok(requests)
     }
 
     pub async fn pending_incoming_object_rpc_request_count(
@@ -1296,6 +1345,11 @@ impl AsyncInProcessTransport {
         }
         match tokio::time::timeout(timeout, self.object_rpc_incoming.recv()).await {
             Ok(Some(message)) => {
+                try_reserve_vec_deque(
+                    &mut self.object_rpc_pending,
+                    1,
+                    "queue pending object rpc message",
+                )?;
                 self.object_rpc_pending.push_back(message);
                 Ok(true)
             }
@@ -1333,11 +1387,18 @@ impl AsyncNetworkTransport for AsyncInProcessTransport {
     ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundEventFrame>, NetworkError>> {
         Box::pin(async move {
             let take = max_frames.max(1);
-            let mut frames = self.pending.drain(..).collect::<Vec<_>>();
-            if frames.len() > take {
-                let retained = frames.split_off(take);
-                self.pending.extend(retained);
-                return Ok(frames);
+            let mut frames = Vec::new();
+            let queued = self.pending.len().saturating_add(self.incoming.len());
+            crate::object::try_reserve_vec(
+                &mut frames,
+                take.min(queued),
+                "drain pending event frames",
+            )?;
+            while frames.len() < take {
+                let Some(frame) = self.pending.pop_front() else {
+                    break;
+                };
+                frames.push(frame);
             }
             while frames.len() < take {
                 let Ok(frame) = self.incoming.try_recv() else {
@@ -1368,6 +1429,7 @@ impl AsyncNetworkTransport for AsyncInProcessTransport {
             }
             match tokio::time::timeout(timeout, self.incoming.recv()).await {
                 Ok(Some(frame)) => {
+                    try_reserve_vec_deque(&mut self.pending, 1, "queue pending event frame")?;
                     self.pending.push_back(frame);
                     Ok(true)
                 }
@@ -1675,7 +1737,12 @@ impl<T: AsyncNetworkTransport> NetworkService<T> {
             .transport
             .drain_incoming_async(max_inbound_frames)
             .await?;
-        let mut outcomes = Vec::with_capacity(inbound_frames.len());
+        let mut outcomes = Vec::new();
+        crate::object::try_reserve_vec(
+            &mut outcomes,
+            inbound_frames.len(),
+            "process incoming network outcomes",
+        )?;
         let local_node_id = AsyncNetworkTransport::local_node_id(&self.transport).clone();
 
         for inbound in inbound_frames {
@@ -2213,12 +2280,18 @@ impl<T: AsyncNetworkTransport + Send + 'static> NetworkService<T> {
                             .send(service.record_missed_heartbeat_async(&target_node_id, policy));
                     }
                     AsyncNetworkServiceCommand::LedgerRecords { reply } => {
-                        let _ = reply.send(Ok(service
-                            .ledger()
-                            .records()
-                            .into_iter()
-                            .cloned()
-                            .collect()));
+                        let records = service.ledger().records();
+                        let mut cloned = Vec::new();
+                        let result = crate::object::try_reserve_vec(
+                            &mut cloned,
+                            records.len(),
+                            "collect delivery ledger records",
+                        )
+                        .map(|_| {
+                            cloned.extend(records.into_iter().cloned());
+                            cloned
+                        });
+                        let _ = reply.send(result);
                     }
                     AsyncNetworkServiceCommand::NextOutboundWakeAt { reply } => {
                         let _ = reply.send(Ok(service.next_outbound_wake_at()));

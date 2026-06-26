@@ -177,14 +177,16 @@ pub fn sync_cluster_state_to_local_kv_unchecked(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<KvSnapshot, NetworkError> {
-    let initial_snapshot = open_cluster_raft_kv_node(paths, &state.local_node_id)
-        .map(|node| node.store().snapshot())
-        .or_else(|error| {
+    let initial_snapshot = match open_cluster_raft_kv_node(paths, &state.local_node_id) {
+        Ok(node) => node.store().try_snapshot()?,
+        Err(error) => {
             eprintln!("warning: replacing unreadable cluster kv raft state: {error}");
-            write_cluster_kv_snapshot(paths, &InProcessKvStore::new().snapshot())?;
-            Ok::<KvSnapshot, NetworkError>(InProcessKvStore::new().snapshot())
-        })?;
-    let store = InProcessKvStore::restore(initial_snapshot.clone());
+            let snapshot = InProcessKvStore::new().try_snapshot()?;
+            write_cluster_kv_snapshot(paths, &snapshot)?;
+            snapshot
+        }
+    };
+    let store = InProcessKvStore::restore(initial_snapshot.clone())?;
     let txn = cluster_state_sync_txn_from_store(&store, state, false)?;
     if txn.success.is_empty() {
         return Ok(initial_snapshot);
@@ -258,7 +260,7 @@ pub fn cluster_state_sync_txn_with_current_snapshot(
     state: &ClusterBootstrapState,
 ) -> Result<(KvSnapshot, KvTxn), NetworkError> {
     let snapshot = read_cluster_kv_current_snapshot(paths)?;
-    let store = InProcessKvStore::restore(snapshot.clone());
+    let store = InProcessKvStore::restore(snapshot.clone())?;
     cluster_state_sync_txn_from_store(&store, state, true).map(|txn| (snapshot, txn))
 }
 
@@ -415,7 +417,7 @@ pub fn cleanup_legacy_shadow_daemon_members_with_host(
     host: &mut impl ClusterMemberMutationHost,
 ) -> Result<ClusterMemberRemoval, NetworkError> {
     let store = host.current_cluster_kv_store(paths, &state)?;
-    let snapshot = store.snapshot();
+    let snapshot = store.try_snapshot()?;
     let policies = read_cluster_capability_policies_from_snapshot(&snapshot)?;
     let mut current_member_ids = BTreeSet::new();
     let mut removed = Vec::new();

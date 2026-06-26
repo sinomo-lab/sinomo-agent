@@ -274,8 +274,10 @@ pub(crate) fn read_cluster_kv_latest_observed_snapshot_arc_if_present(
 pub(crate) fn read_cluster_kv_current_or_empty_snapshot_arc(
     paths: &ClusterPaths,
 ) -> Result<Arc<KvSnapshot>, NetworkError> {
-    read_cluster_kv_current_or_cached_snapshot_arc_if_present(paths)
-        .map(|snapshot| snapshot.unwrap_or_else(|| Arc::new(InProcessKvStore::new().snapshot())))
+    match read_cluster_kv_current_or_cached_snapshot_arc_if_present(paths)? {
+        Some(snapshot) => Ok(snapshot),
+        None => Ok(Arc::new(InProcessKvStore::new().try_snapshot()?)),
+    }
 }
 
 pub(crate) fn read_cluster_kv_entry(

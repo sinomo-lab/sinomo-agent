@@ -182,7 +182,10 @@ pub const MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CLUSTER_KV_ACTIVE_WATCHES: usize = 1024;
 pub const MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES: usize = MAX_KV_COMMAND_PAYLOAD_BYTES;
 pub const MAX_CLUSTER_KV_WATCH_DRAIN_WAIT: Duration = Duration::from_secs(30);
-pub const CLUSTER_KV_SNAPSHOT_RPC_MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+/// Compatibility constant for snapshot RPC callers. Snapshot payloads do not
+/// have a fixed byte ceiling; frame reads and SOBJ decode fail through fallible
+/// allocation when the host cannot provide the requested memory.
+pub const CLUSTER_KV_SNAPSHOT_RPC_MAX_PAYLOAD_BYTES: usize = usize::MAX;
 pub const CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES: usize = 4096;
 pub const CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES: usize = MAX_KV_COMMAND_PAYLOAD_BYTES;
 pub const MAX_CLUSTER_KV_MATERIALIZED_EVENTS: usize = 64;

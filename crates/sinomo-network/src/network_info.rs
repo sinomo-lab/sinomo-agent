@@ -8,9 +8,17 @@ pub struct ClusterNetworkInfoRecord {
     pub cluster_id: ClusterId,
     pub node_id: NodeId,
     pub environment_id: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::fallible_serde::deserialize_vec"
+    )]
     pub observed_addresses: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::fallible_serde::deserialize_vec"
+    )]
     pub endpoints: Vec<ClusterEndpointRecord>,
     #[serde(with = "time::serde::rfc3339")]
     pub observed_at: OffsetDateTime,

@@ -13,7 +13,7 @@ use crate::{
     ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityState, ClusterPaths,
     DaemonControlRequest, DaemonRpcTimeouts, NetworkError, ObjectRpcRequest, ObjectRpcResponse,
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -49,6 +49,194 @@ pub(crate) struct ClusterRoute {
     pub path: Vec<NodeId>,
 }
 
+fn try_clone_route_node_id(node_id: &NodeId, operation: &str) -> Result<NodeId, NetworkError> {
+    crate::object::try_clone_id(node_id, operation)
+}
+
+fn try_clone_route_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    operation: &str,
+) -> Result<ClusterEndpointRecord, NetworkError> {
+    Ok(ClusterEndpointRecord {
+        endpoint_id: crate::object::try_clone_id(&endpoint.endpoint_id, operation)?,
+        node_id: try_clone_route_node_id(&endpoint.node_id, operation)?,
+        transport: endpoint.transport.clone(),
+        address: crate::object::try_clone_string(&endpoint.address, operation)?,
+        source: endpoint.source.clone(),
+        privacy: endpoint.privacy.clone(),
+        priority: endpoint.priority,
+        last_observed_latency_ms: endpoint.last_observed_latency_ms,
+    })
+}
+
+fn try_clone_route_node_ids(
+    node_ids: &[NodeId],
+    operation: &str,
+) -> Result<Vec<NodeId>, NetworkError> {
+    let mut cloned = Vec::new();
+    crate::object::try_reserve_vec(&mut cloned, node_ids.len(), operation)?;
+    for node_id in node_ids {
+        cloned.push(try_clone_route_node_id(node_id, operation)?);
+    }
+    Ok(cloned)
+}
+
+#[derive(Clone, Debug, Default)]
+struct RouteNodeSet {
+    nodes: Vec<NodeId>,
+}
+
+impl RouteNodeSet {
+    fn try_insert_clone(
+        &mut self,
+        node_id: &NodeId,
+        operation: &str,
+    ) -> Result<bool, NetworkError> {
+        match self.position(node_id) {
+            Ok(_) => Ok(false),
+            Err(index) => {
+                let node_id = try_clone_route_node_id(node_id, operation)?;
+                crate::object::try_reserve_vec(&mut self.nodes, 1, operation)?;
+                self.nodes.insert(index, node_id);
+                Ok(true)
+            }
+        }
+    }
+
+    fn remove(&mut self, node_id: &NodeId) -> bool {
+        let Ok(index) = self.position(node_id) else {
+            return false;
+        };
+        self.nodes.remove(index);
+        true
+    }
+
+    fn min_by_distance(
+        &self,
+        distance: &RouteDistanceIndex,
+    ) -> Result<Option<NodeId>, NetworkError> {
+        let Some(node_id) = self.nodes.iter().min_by(|left, right| {
+            let left_distance = distance.get(left).unwrap_or(u64::MAX);
+            let right_distance = distance.get(right).unwrap_or(u64::MAX);
+            (left_distance, left.as_str()).cmp(&(right_distance, right.as_str()))
+        }) else {
+            return Ok(None);
+        };
+        Ok(Some(try_clone_route_node_id(
+            node_id,
+            "select cluster delivery route node",
+        )?))
+    }
+
+    fn position(&self, node_id: &NodeId) -> Result<usize, usize> {
+        self.nodes.binary_search(node_id)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RoutePredecessorIndex {
+    entries: Vec<(NodeId, NodeId)>,
+}
+
+impl RoutePredecessorIndex {
+    fn get(&self, node_id: &NodeId) -> Option<&NodeId> {
+        self.position(node_id)
+            .ok()
+            .and_then(|index| self.entries.get(index).map(|(_, previous)| previous))
+    }
+
+    fn try_insert_clone(
+        &mut self,
+        node_id: &NodeId,
+        previous: &NodeId,
+        operation: &str,
+    ) -> Result<(), NetworkError> {
+        match self.position(node_id) {
+            Ok(index) => {
+                self.entries[index].1 = try_clone_route_node_id(previous, operation)?;
+            }
+            Err(index) => {
+                let node_id = try_clone_route_node_id(node_id, operation)?;
+                let previous = try_clone_route_node_id(previous, operation)?;
+                crate::object::try_reserve_vec(&mut self.entries, 1, operation)?;
+                self.entries.insert(index, (node_id, previous));
+            }
+        }
+        Ok(())
+    }
+
+    fn position(&self, node_id: &NodeId) -> Result<usize, usize> {
+        self.entries
+            .binary_search_by(|(stored, _)| stored.cmp(node_id))
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RouteDistanceIndex {
+    entries: Vec<(NodeId, u64)>,
+}
+
+impl RouteDistanceIndex {
+    fn get(&self, node_id: &NodeId) -> Option<u64> {
+        self.position(node_id)
+            .ok()
+            .and_then(|index| self.entries.get(index).map(|(_, distance)| *distance))
+    }
+
+    fn contains_key(&self, node_id: &NodeId) -> bool {
+        self.position(node_id).is_ok()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&NodeId, u64)> {
+        self.entries
+            .iter()
+            .map(|(node_id, distance)| (node_id, *distance))
+    }
+
+    fn try_insert_or_update(
+        &mut self,
+        node_id: &NodeId,
+        distance: u64,
+        operation: &str,
+    ) -> Result<(), NetworkError> {
+        match self.position(node_id) {
+            Ok(index) => {
+                self.entries[index].1 = distance;
+            }
+            Err(index) => {
+                let node_id = try_clone_route_node_id(node_id, operation)?;
+                crate::object::try_reserve_vec(&mut self.entries, 1, operation)?;
+                self.entries.insert(index, (node_id, distance));
+            }
+        }
+        Ok(())
+    }
+
+    fn try_insert_min(
+        &mut self,
+        node_id: &NodeId,
+        distance: u64,
+        operation: &str,
+    ) -> Result<(), NetworkError> {
+        match self.position(node_id) {
+            Ok(index) => {
+                self.entries[index].1 = self.entries[index].1.min(distance);
+            }
+            Err(index) => {
+                let node_id = try_clone_route_node_id(node_id, operation)?;
+                crate::object::try_reserve_vec(&mut self.entries, 1, operation)?;
+                self.entries.insert(index, (node_id, distance));
+            }
+        }
+        Ok(())
+    }
+
+    fn position(&self, node_id: &NodeId) -> Result<usize, usize> {
+        self.entries
+            .binary_search_by(|(stored, _)| stored.cmp(node_id))
+    }
+}
+
 /// Breadth-first search the connectivity graph for a shortest path from `local` to
 /// `target` over reachable edges (records whose state is not `Unreachable`), returning the
 /// first hop along it. Returns `None` when `target == local` or no reachable path exists.
@@ -57,6 +245,16 @@ pub(crate) fn cluster_route_next_hop(
     local: &NodeId,
     target: &NodeId,
 ) -> Option<ClusterRoute> {
+    cluster_route_next_hop_fallible(graph, local, target)
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn cluster_route_next_hop_fallible(
+    graph: &ClusterConnectivityGraph,
+    local: &NodeId,
+    target: &NodeId,
+) -> Result<Option<ClusterRoute>, NetworkError> {
     cluster_route_next_hop_excluding(graph, local, target, &[])
 }
 
@@ -65,48 +263,65 @@ fn cluster_route_next_hop_excluding(
     local: &NodeId,
     target: &NodeId,
     excluded: &[NodeId],
-) -> Option<ClusterRoute> {
+) -> Result<Option<ClusterRoute>, NetworkError> {
     if local == target {
-        return None;
+        return Ok(None);
     }
-    let mut seen: BTreeSet<NodeId> = BTreeSet::new();
-    seen.extend(excluded.iter().cloned());
-    seen.insert(local.clone());
-    let mut predecessor = BTreeMap::<NodeId, NodeId>::new();
-    let mut queue = VecDeque::from([local.clone()]);
+    let mut seen = RouteNodeSet::default();
+    for excluded_node in excluded {
+        seen.try_insert_clone(excluded_node, "cluster route excluded nodes")?;
+    }
+    seen.try_insert_clone(local, "cluster route seen nodes")?;
+    let mut predecessor = RoutePredecessorIndex::default();
+    let mut queue = VecDeque::new();
+    queue
+        .try_reserve(1)
+        .map_err(|_| crate::object::network_allocation_error("cluster route queue", 1))?;
+    queue.push_back(try_clone_route_node_id(local, "cluster route queue")?);
     while let Some(current) = queue.pop_front() {
         for next in graph.healthy_target_refs(&current) {
-            if !seen.insert(next.clone()) {
+            if !seen.try_insert_clone(next, "cluster route seen nodes")? {
                 continue;
             }
-            predecessor.insert(next.clone(), current.clone());
+            predecessor.try_insert_clone(next, &current, "cluster route predecessors")?;
             if next == target {
-                return route_from_predecessors(local, target, predecessor);
+                return route_from_predecessors(local, target, &predecessor);
             }
-            queue.push_back(next.clone());
+            queue
+                .try_reserve(1)
+                .map_err(|_| crate::object::network_allocation_error("cluster route queue", 1))?;
+            queue.push_back(try_clone_route_node_id(next, "cluster route queue")?);
         }
     }
-    None
+    Ok(None)
 }
 
 fn route_from_predecessors(
     local: &NodeId,
     target: &NodeId,
-    predecessor: BTreeMap<NodeId, NodeId>,
-) -> Option<ClusterRoute> {
-    let mut reversed = vec![target.clone()];
+    predecessor: &RoutePredecessorIndex,
+) -> Result<Option<ClusterRoute>, NetworkError> {
+    let mut reversed = Vec::new();
+    crate::object::try_reserve_vec(&mut reversed, 1, "cluster route path")?;
+    reversed.push(try_clone_route_node_id(target, "cluster route path")?);
     let mut current = target;
     while current != local {
-        let previous = predecessor.get(current)?;
-        reversed.push(previous.clone());
+        let Some(previous) = predecessor.get(current) else {
+            return Ok(None);
+        };
+        crate::object::try_reserve_vec(&mut reversed, 1, "cluster route path")?;
+        reversed.push(try_clone_route_node_id(previous, "cluster route path")?);
         current = previous;
     }
     reversed.reverse();
-    let next_hop = reversed.get(1).cloned()?;
-    Some(ClusterRoute {
+    let Some(next_hop) = reversed.get(1) else {
+        return Ok(None);
+    };
+    let next_hop = try_clone_route_node_id(next_hop, "cluster route next hop")?;
+    Ok(Some(ClusterRoute {
         next_hop,
         path: reversed,
-    })
+    }))
 }
 
 /// An inner cluster RPC wrapped for hop-by-hop delivery toward `target_node_id`.
@@ -115,7 +330,11 @@ pub(crate) struct RelayEnvelope {
     pub(crate) cluster_id: ClusterId,
     pub(crate) target_node_id: NodeId,
     pub(crate) ttl: u8,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::fallible_serde::deserialize_vec"
+    )]
     pub(crate) visited: Vec<NodeId>,
     /// Maximum per-hop transport timeout, in milliseconds, inherited from the
     /// originating caller. Intermediate relays must not expand this budget.
@@ -175,31 +394,61 @@ struct ClusterDeliveryRouteEdge {
 
 #[derive(Clone, Debug, Default)]
 struct ClusterDeliveryRouteGraph {
-    edges_by_source: BTreeMap<NodeId, Vec<ClusterDeliveryRouteEdge>>,
+    edges_by_source: Vec<(NodeId, Vec<ClusterDeliveryRouteEdge>)>,
 }
 
 impl ClusterDeliveryRouteGraph {
-    fn push_edge(
+    fn push_edge_clone(
         &mut self,
-        source: NodeId,
-        target: NodeId,
-        endpoint: Option<ClusterEndpointRecord>,
+        source: &NodeId,
+        target: &NodeId,
+        endpoint: Option<&ClusterEndpointRecord>,
         cost: u64,
-    ) {
-        self.edges_by_source
-            .entry(source)
-            .or_default()
-            .push(ClusterDeliveryRouteEdge {
-                target,
-                endpoint,
-                cost,
-            });
+    ) -> Result<(), NetworkError> {
+        let edge = ClusterDeliveryRouteEdge {
+            target: try_clone_route_node_id(target, "cluster delivery route edge")?,
+            endpoint: endpoint
+                .map(|endpoint| try_clone_route_endpoint(endpoint, "cluster delivery route edge"))
+                .transpose()?,
+            cost,
+        };
+        match self.position(source) {
+            Ok(index) => {
+                crate::object::try_reserve_vec(
+                    &mut self.edges_by_source[index].1,
+                    1,
+                    "cluster delivery route graph edges",
+                )?;
+                self.edges_by_source[index].1.push(edge);
+            }
+            Err(index) => {
+                let source = try_clone_route_node_id(source, "cluster delivery route source")?;
+                let mut edges = Vec::new();
+                crate::object::try_reserve_vec(
+                    &mut edges,
+                    1,
+                    "cluster delivery route graph edges",
+                )?;
+                edges.push(edge);
+                crate::object::try_reserve_vec(
+                    &mut self.edges_by_source,
+                    1,
+                    "cluster delivery route graph sources",
+                )?;
+                self.edges_by_source.insert(index, (source, edges));
+            }
+        }
+        Ok(())
     }
 
     fn edges(&self, source: &NodeId) -> &[ClusterDeliveryRouteEdge] {
-        self.edges_by_source
-            .get(source)
-            .map(Vec::as_slice)
+        self.position(source)
+            .ok()
+            .and_then(|index| {
+                self.edges_by_source
+                    .get(index)
+                    .map(|(_, edges)| edges.as_slice())
+            })
             .unwrap_or(&[])
     }
 
@@ -207,29 +456,56 @@ impl ClusterDeliveryRouteGraph {
         &self,
         source: &NodeId,
         next_hop: &NodeId,
-    ) -> Vec<ClusterEndpointRecord> {
-        let mut seen = BTreeSet::new();
-        let mut endpoints = self
+    ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+        let mut endpoints = Vec::new();
+        for edge in self
             .edges(source)
             .iter()
             .filter(|edge| edge.target == *next_hop)
-            .filter_map(|edge| edge.endpoint.as_ref().map(|endpoint| (edge.cost, endpoint)))
-            .filter(|(_, endpoint)| {
-                seen.insert((endpoint.endpoint_id.clone(), endpoint.address.clone()))
-            })
-            .collect::<Vec<_>>();
-        endpoints.sort_by_key(|(cost, endpoint)| {
-            (
-                *cost,
-                endpoint.priority,
-                format!("{:?}", endpoint.transport),
-                endpoint.address.clone(),
-            )
+        {
+            let Some(endpoint) = edge.endpoint.as_ref() else {
+                continue;
+            };
+            if endpoints
+                .iter()
+                .any(|(_, retained): &(u64, ClusterEndpointRecord)| {
+                    retained.endpoint_id == endpoint.endpoint_id
+                        && retained.address == endpoint.address
+                })
+            {
+                continue;
+            }
+            crate::object::try_reserve_vec(&mut endpoints, 1, "cluster delivery route endpoints")?;
+            endpoints.push((
+                edge.cost,
+                try_clone_route_endpoint(endpoint, "cluster delivery route endpoints")?,
+            ));
+        }
+        endpoints.sort_by(|(left_cost, left), (right_cost, right)| {
+            left_cost
+                .cmp(right_cost)
+                .then_with(|| left.priority.cmp(&right.priority))
+                .then_with(|| {
+                    cluster_delivery_transport_sort_rank(&left.transport)
+                        .cmp(&cluster_delivery_transport_sort_rank(&right.transport))
+                })
+                .then_with(|| left.address.cmp(&right.address))
         });
-        endpoints
-            .into_iter()
-            .map(|(_, endpoint)| endpoint.clone())
-            .collect()
+        let mut ordered = Vec::new();
+        crate::object::try_reserve_vec(
+            &mut ordered,
+            endpoints.len(),
+            "cluster delivery route endpoints",
+        )?;
+        for (_, endpoint) in endpoints {
+            ordered.push(endpoint);
+        }
+        Ok(ordered)
+    }
+
+    fn position(&self, source: &NodeId) -> Result<usize, usize> {
+        self.edges_by_source
+            .binary_search_by(|(stored, _)| stored.cmp(source))
     }
 }
 
@@ -240,11 +516,58 @@ struct ClusterDeliveryFailedEdge {
 }
 
 impl ClusterDeliveryFailedEdge {
-    fn new(source: &NodeId, target: &NodeId) -> Self {
-        Self {
-            source: source.clone(),
-            target: target.clone(),
+    fn try_new(source: &NodeId, target: &NodeId) -> Result<Self, NetworkError> {
+        Ok(Self {
+            source: try_clone_route_node_id(source, "cluster delivery failed edge")?,
+            target: try_clone_route_node_id(target, "cluster delivery failed edge")?,
+        })
+    }
+
+    fn matches(&self, source: &NodeId, target: &NodeId) -> bool {
+        self.source == *source && self.target == *target
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ClusterDeliveryFailedEdges {
+    edges: Vec<ClusterDeliveryFailedEdge>,
+}
+
+impl ClusterDeliveryFailedEdges {
+    fn contains(&self, source: &NodeId, target: &NodeId) -> bool {
+        self.edges.iter().any(|edge| edge.matches(source, target))
+    }
+
+    fn try_insert(&mut self, source: &NodeId, target: &NodeId) -> Result<bool, NetworkError> {
+        if self.contains(source, target) {
+            return Ok(false);
         }
+        let edge = ClusterDeliveryFailedEdge::try_new(source, target)?;
+        let index = self
+            .edges
+            .binary_search_by(|stored| {
+                (&stored.source, &stored.target).cmp(&(&edge.source, &edge.target))
+            })
+            .unwrap_or_else(|index| index);
+        crate::object::try_reserve_vec(&mut self.edges, 1, "cluster delivery failed edges")?;
+        self.edges.insert(index, edge);
+        Ok(true)
+    }
+
+    fn try_clone(&self) -> Result<Self, NetworkError> {
+        let mut cloned = Vec::new();
+        crate::object::try_reserve_vec(
+            &mut cloned,
+            self.edges.len(),
+            "clone cluster delivery failed edges",
+        )?;
+        for edge in &self.edges {
+            cloned.push(ClusterDeliveryFailedEdge::try_new(
+                &edge.source,
+                &edge.target,
+            )?);
+        }
+        Ok(Self { edges: cloned })
     }
 }
 
@@ -268,11 +591,54 @@ struct ClusterDeliveryRouteCandidate {
     complete: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ClusterDeliveryRouteIndex {
+    routes: Vec<(NodeId, Vec<ClusterDeliveryRouteCandidate>)>,
+}
+
+impl ClusterDeliveryRouteIndex {
+    fn get(&self, target_node_id: &NodeId) -> Option<&[ClusterDeliveryRouteCandidate]> {
+        self.position(target_node_id).ok().and_then(|index| {
+            self.routes
+                .get(index)
+                .map(|(_, candidates)| candidates.as_slice())
+        })
+    }
+
+    fn try_insert(
+        &mut self,
+        target_node_id: &NodeId,
+        candidates: Vec<ClusterDeliveryRouteCandidate>,
+    ) -> Result<(), NetworkError> {
+        match self.position(target_node_id) {
+            Ok(index) => {
+                self.routes[index].1 = candidates;
+            }
+            Err(index) => {
+                let target_node_id =
+                    try_clone_route_node_id(target_node_id, "cluster delivery routing table")?;
+                crate::object::try_reserve_vec(
+                    &mut self.routes,
+                    1,
+                    "cluster delivery routing table",
+                )?;
+                self.routes.insert(index, (target_node_id, candidates));
+            }
+        }
+        Ok(())
+    }
+
+    fn position(&self, target_node_id: &NodeId) -> Result<usize, usize> {
+        self.routes
+            .binary_search_by(|(stored, _)| stored.cmp(target_node_id))
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ClusterDeliveryRoutingTable {
     cluster_id: ClusterId,
     local_node_id: NodeId,
-    routes: BTreeMap<NodeId, Vec<ClusterDeliveryRouteCandidate>>,
+    routes: ClusterDeliveryRouteIndex,
     earliest_expires_at: Option<OffsetDateTime>,
 }
 
@@ -280,14 +646,17 @@ impl ClusterDeliveryRoutingTable {
     fn route_plan(
         &self,
         target_node_id: &NodeId,
-        failed_edges: &BTreeSet<ClusterDeliveryFailedEdge>,
+        failed_edges: &ClusterDeliveryFailedEdges,
         visited: &[NodeId],
-    ) -> Option<ClusterDeliveryRoutePlan> {
-        cluster_delivery_select_route_candidate(
-            self.routes.get(target_node_id)?,
+    ) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
+        let Some(candidates) = self.routes.get(target_node_id) else {
+            return Ok(None);
+        };
+        Ok(cluster_delivery_select_route_candidate(
+            candidates,
             failed_edges,
             visited,
-        )
+        ))
     }
 }
 
@@ -311,13 +680,16 @@ fn cluster_delivery_route_plan(
     state: &ClusterBootstrapState,
     local_node_id: &NodeId,
     target_node_id: &NodeId,
-    failed_edges: &BTreeSet<ClusterDeliveryFailedEdge>,
+    failed_edges: &ClusterDeliveryFailedEdges,
     visited: &[NodeId],
 ) -> Option<ClusterDeliveryRoutePlan> {
     let graph =
-        cluster_delivery_route_graph(paths, state, local_node_id, failed_edges, target_node_id);
+        cluster_delivery_route_graph(paths, state, local_node_id, failed_edges, target_node_id)
+            .ok()?;
     cluster_delivery_select_route_candidate(
-        &cluster_delivery_route_candidates(&graph, local_node_id, target_node_id),
+        &cluster_delivery_route_candidates(&graph, local_node_id, target_node_id)
+            .ok()
+            .unwrap_or_default(),
         failed_edges,
         visited,
     )
@@ -327,43 +699,62 @@ fn cluster_delivery_route_candidates(
     graph: &ClusterDeliveryRouteGraph,
     local_node_id: &NodeId,
     target_node_id: &NodeId,
-) -> Vec<ClusterDeliveryRouteCandidate> {
-    let mut next_hop_costs = BTreeMap::<NodeId, u64>::new();
+) -> Result<Vec<ClusterDeliveryRouteCandidate>, NetworkError> {
+    let mut next_hop_costs = RouteDistanceIndex::default();
     for edge in graph.edges(local_node_id) {
         if edge.target == *local_node_id {
             continue;
         }
-        next_hop_costs
-            .entry(edge.target.clone())
-            .and_modify(|cost| *cost = (*cost).min(edge.cost))
-            .or_insert(edge.cost);
+        next_hop_costs.try_insert_min(
+            &edge.target,
+            edge.cost,
+            "cluster delivery next-hop costs",
+        )?;
     }
 
     let mut candidates = Vec::new();
-    for (next_hop, edge_cost) in next_hop_costs {
-        let endpoints = graph.endpoints_for_next_hop(local_node_id, &next_hop);
+    for (next_hop, edge_cost) in next_hop_costs.iter() {
+        let endpoints = graph.endpoints_for_next_hop(local_node_id, &next_hop)?;
         if endpoints.is_empty() {
             continue;
         }
-        if next_hop == *target_node_id {
+        if *next_hop == *target_node_id {
+            crate::object::try_reserve_vec(
+                &mut candidates,
+                1,
+                "cluster delivery route candidates",
+            )?;
             candidates.push(ClusterDeliveryRouteCandidate {
                 plan: ClusterDeliveryRoutePlan {
-                    next_hop: next_hop.clone(),
+                    next_hop: try_clone_route_node_id(next_hop, "cluster delivery next hop")?,
                     endpoints,
                 },
-                path: vec![local_node_id.clone(), next_hop],
+                path: cluster_delivery_two_node_path(local_node_id, next_hop)?,
                 cost: edge_cost,
                 complete: true,
             });
             continue;
         }
-        if let Some(path) = cluster_delivery_shortest_path(graph, &next_hop, target_node_id, &[]) {
-            let mut nodes = Vec::with_capacity(path.nodes.len() + 1);
-            nodes.push(local_node_id.clone());
+        if let Some(path) = cluster_delivery_shortest_path(graph, &next_hop, target_node_id, &[])? {
+            let mut nodes = Vec::new();
+            crate::object::try_reserve_vec(
+                &mut nodes,
+                path.nodes.len().saturating_add(1),
+                "cluster delivery route path",
+            )?;
+            nodes.push(try_clone_route_node_id(
+                local_node_id,
+                "cluster delivery route path",
+            )?);
             nodes.extend(path.nodes);
+            crate::object::try_reserve_vec(
+                &mut candidates,
+                1,
+                "cluster delivery route candidates",
+            )?;
             candidates.push(ClusterDeliveryRouteCandidate {
                 plan: ClusterDeliveryRoutePlan {
-                    next_hop: next_hop.clone(),
+                    next_hop: try_clone_route_node_id(next_hop, "cluster delivery next hop")?,
                     endpoints,
                 },
                 path: nodes,
@@ -371,12 +762,17 @@ fn cluster_delivery_route_candidates(
                 complete: true,
             });
         } else {
+            crate::object::try_reserve_vec(
+                &mut candidates,
+                1,
+                "cluster delivery route candidates",
+            )?;
             candidates.push(ClusterDeliveryRouteCandidate {
                 plan: ClusterDeliveryRoutePlan {
-                    next_hop: next_hop.clone(),
+                    next_hop: try_clone_route_node_id(next_hop, "cluster delivery next hop")?,
                     endpoints,
                 },
-                path: vec![local_node_id.clone(), next_hop],
+                path: cluster_delivery_two_node_path(local_node_id, next_hop)?,
                 cost: edge_cost,
                 complete: false,
             });
@@ -389,24 +785,40 @@ fn cluster_delivery_route_candidates(
             candidate.plan.next_hop.to_string(),
         )
     });
-    candidates
+    Ok(candidates)
+}
+
+fn cluster_delivery_two_node_path(
+    local_node_id: &NodeId,
+    next_hop: &NodeId,
+) -> Result<Vec<NodeId>, NetworkError> {
+    let mut path = Vec::new();
+    crate::object::try_reserve_vec(&mut path, 2, "cluster delivery route path")?;
+    path.push(try_clone_route_node_id(
+        local_node_id,
+        "cluster delivery route path",
+    )?);
+    path.push(try_clone_route_node_id(
+        next_hop,
+        "cluster delivery route path",
+    )?);
+    Ok(path)
 }
 
 fn cluster_delivery_select_route_candidate(
     candidates: &[ClusterDeliveryRouteCandidate],
-    failed_edges: &BTreeSet<ClusterDeliveryFailedEdge>,
+    failed_edges: &ClusterDeliveryFailedEdges,
     visited: &[NodeId],
 ) -> Option<ClusterDeliveryRoutePlan> {
-    let visited = visited.iter().collect::<BTreeSet<_>>();
     candidates
         .iter()
         .filter(|candidate| {
             candidate.complete
-                && cluster_delivery_route_candidate_is_compatible(candidate, failed_edges, &visited)
+                && cluster_delivery_route_candidate_is_compatible(candidate, failed_edges, visited)
         })
         .chain(candidates.iter().filter(|candidate| {
             !candidate.complete
-                && cluster_delivery_route_candidate_is_compatible(candidate, failed_edges, &visited)
+                && cluster_delivery_route_candidate_is_compatible(candidate, failed_edges, visited)
         }))
         .map(|candidate| candidate.plan.clone())
         .next()
@@ -414,21 +826,21 @@ fn cluster_delivery_select_route_candidate(
 
 fn cluster_delivery_route_candidate_is_compatible(
     candidate: &ClusterDeliveryRouteCandidate,
-    failed_edges: &BTreeSet<ClusterDeliveryFailedEdge>,
-    visited: &BTreeSet<&NodeId>,
+    failed_edges: &ClusterDeliveryFailedEdges,
+    visited: &[NodeId],
 ) -> bool {
     if candidate
         .path
         .iter()
         .skip(1)
-        .any(|node| visited.contains(node))
+        .any(|node| visited.iter().any(|visited| visited == node))
     {
         return false;
     }
     !candidate
         .path
         .windows(2)
-        .any(|edge| failed_edges.contains(&ClusterDeliveryFailedEdge::new(&edge[0], &edge[1])))
+        .any(|edge| failed_edges.contains(&edge[0], &edge[1]))
 }
 
 async fn cluster_delivery_route_plan_async(
@@ -437,7 +849,7 @@ async fn cluster_delivery_route_plan_async(
     state: &ClusterBootstrapState,
     local_node_id: &NodeId,
     target_node_id: &NodeId,
-    failed_edges: BTreeSet<ClusterDeliveryFailedEdge>,
+    failed_edges: ClusterDeliveryFailedEdges,
     visited: Vec<NodeId>,
 ) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
     cluster_delivery_route_plan_from_routing_table_async(
@@ -458,7 +870,7 @@ async fn cluster_delivery_route_plan_from_routing_table_async(
     state: &ClusterBootstrapState,
     local_node_id: &NodeId,
     target_node_id: &NodeId,
-    failed_edges: &BTreeSet<ClusterDeliveryFailedEdge>,
+    failed_edges: &ClusterDeliveryFailedEdges,
     visited: &[NodeId],
 ) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
     if let Some(plan) = cluster_delivery_route_plan_from_cached_routing_table(
@@ -470,31 +882,33 @@ async fn cluster_delivery_route_plan_from_routing_table_async(
         visited,
         OffsetDateTime::now_utc(),
     ) {
-        return Ok(plan);
+        return plan;
     }
 
     let paths = paths.clone();
     let state = state.clone();
-    let local_node_id = local_node_id.clone();
-    let target_node_id = target_node_id.clone();
-    let failed_edges = failed_edges.clone();
-    let visited = visited.to_vec();
+    let local_node_id =
+        try_clone_route_node_id(local_node_id, "cluster delivery route local node")?;
+    let target_node_id =
+        try_clone_route_node_id(target_node_id, "cluster delivery route target node")?;
+    let failed_edges = failed_edges.try_clone()?;
+    let visited = try_clone_route_node_ids(visited, "cluster delivery route visited nodes")?;
     runtime
         .spawn_blocking(move || {
             let before_mark = cluster_delivery_routing_table_cache_mark(&paths);
-            let table = cluster_delivery_build_routing_table(&paths, &state, &local_node_id);
-            let plan = table.route_plan(&target_node_id, &failed_edges, &visited);
+            let table = cluster_delivery_build_routing_table(&paths, &state, &local_node_id)?;
+            let plan = table.route_plan(&target_node_id, &failed_edges, &visited)?;
             let after_mark = cluster_delivery_routing_table_cache_mark(&paths);
             if before_mark == after_mark {
                 store_cluster_delivery_routing_table_cache_entry(&paths, after_mark, table);
             }
-            plan
+            Ok(plan)
         })
         .await
         .map_err(|source| NetworkError::Io {
             operation: "cluster delivery routing table".to_string(),
             detail: format!("routing table task failed: {source}"),
-        })
+        })?
 }
 
 fn cluster_delivery_route_plan_from_cached_routing_table(
@@ -502,10 +916,10 @@ fn cluster_delivery_route_plan_from_cached_routing_table(
     state: &ClusterBootstrapState,
     local_node_id: &NodeId,
     target_node_id: &NodeId,
-    failed_edges: &BTreeSet<ClusterDeliveryFailedEdge>,
+    failed_edges: &ClusterDeliveryFailedEdges,
     visited: &[NodeId],
     now: OffsetDateTime,
-) -> Option<Option<ClusterDeliveryRoutePlan>> {
+) -> Option<Result<Option<ClusterDeliveryRoutePlan>, NetworkError>> {
     let mark = cluster_delivery_routing_table_cache_mark(paths)?;
     let mut cache = CLUSTER_DELIVERY_ROUTING_TABLES.lock().ok()?;
     let stale = {
@@ -535,8 +949,8 @@ fn cluster_delivery_build_routing_table(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     local_node_id: &NodeId,
-) -> ClusterDeliveryRoutingTable {
-    let mut routes = BTreeMap::new();
+) -> Result<ClusterDeliveryRoutingTable, NetworkError> {
+    let mut routes = ClusterDeliveryRouteIndex::default();
     let earliest_expires_at = cluster_delivery_routing_table_earliest_expires_at(paths, state);
     for member in &state.members {
         if member.node_id == *local_node_id || !member.state.is_authorized() {
@@ -546,20 +960,20 @@ fn cluster_delivery_build_routing_table(
             paths,
             state,
             local_node_id,
-            &BTreeSet::new(),
+            &ClusterDeliveryFailedEdges::default(),
             &member.node_id,
-        );
-        let candidates = cluster_delivery_route_candidates(&graph, local_node_id, &member.node_id);
+        )?;
+        let candidates = cluster_delivery_route_candidates(&graph, local_node_id, &member.node_id)?;
         if !candidates.is_empty() {
-            routes.insert(member.node_id.clone(), candidates);
+            routes.try_insert(&member.node_id, candidates)?;
         }
     }
-    ClusterDeliveryRoutingTable {
-        cluster_id: state.cluster_id.clone(),
-        local_node_id: local_node_id.clone(),
+    Ok(ClusterDeliveryRoutingTable {
+        cluster_id: crate::object::try_clone_id(&state.cluster_id, "cluster delivery table id")?,
+        local_node_id: try_clone_route_node_id(local_node_id, "cluster delivery table local node")?,
         routes,
         earliest_expires_at,
-    }
+    })
 }
 
 fn cluster_delivery_routing_table_earliest_expires_at(
@@ -642,11 +1056,11 @@ fn cluster_delivery_route_graph(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     local_node_id: &NodeId,
-    failed_edges: &BTreeSet<ClusterDeliveryFailedEdge>,
+    failed_edges: &ClusterDeliveryFailedEdges,
     target_node_id: &NodeId,
-) -> ClusterDeliveryRouteGraph {
-    let local_connectivity = ClusterConnectivityGraph::read_for_local(paths, state);
-    let local_private_prefixes = cluster_delivery_local_private_prefixes(state, local_node_id);
+) -> Result<ClusterDeliveryRouteGraph, NetworkError> {
+    let local_connectivity = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
+    let local_private_prefixes = cluster_delivery_local_private_prefixes(state, local_node_id)?;
     let mut graph = ClusterDeliveryRouteGraph::default();
     for member in &state.members {
         if !member.state.is_authorized() {
@@ -656,10 +1070,7 @@ fn cluster_delivery_route_graph(
             if !cluster_delivery_local_endpoint_is_usable(local_node_id, endpoint) {
                 continue;
             }
-            if failed_edges.contains(&ClusterDeliveryFailedEdge::new(
-                local_node_id,
-                &endpoint.node_id,
-            )) {
+            if failed_edges.contains(local_node_id, &endpoint.node_id) {
                 continue;
             }
             let Some(cost) = cluster_delivery_local_endpoint_cost(
@@ -670,12 +1081,7 @@ fn cluster_delivery_route_graph(
             ) else {
                 continue;
             };
-            graph.push_edge(
-                local_node_id.clone(),
-                endpoint.node_id.clone(),
-                Some(endpoint.clone()),
-                cost,
-            );
+            graph.push_edge_clone(local_node_id, &endpoint.node_id, Some(endpoint), cost)?;
         }
     }
 
@@ -685,24 +1091,16 @@ fn cluster_delivery_route_graph(
         if record.cluster_id != state.cluster_id
             || record.source_node_id == record.target_node_id
             || record.source_node_id == *local_node_id
-            || failed_edges.contains(&ClusterDeliveryFailedEdge::new(
-                &record.source_node_id,
-                &record.target_node_id,
-            ))
+            || failed_edges.contains(&record.source_node_id, &record.target_node_id)
         {
             continue;
         }
         let Some(cost) = cluster_delivery_connectivity_record_cost(&record) else {
             continue;
         };
-        graph.push_edge(
-            record.source_node_id.clone(),
-            record.target_node_id.clone(),
-            None,
-            cost,
-        );
+        graph.push_edge_clone(&record.source_node_id, &record.target_node_id, None, cost)?;
     }
-    graph
+    Ok(graph)
 }
 
 fn cluster_delivery_local_endpoint_is_usable(
@@ -723,6 +1121,8 @@ fn cluster_delivery_shortest_path_next_hop(
     visited: &[NodeId],
 ) -> Option<NodeId> {
     cluster_delivery_shortest_path(graph, local_node_id, target_node_id, visited)
+        .ok()
+        .flatten()
         .and_then(|path| path.nodes.get(1).cloned())
 }
 
@@ -731,64 +1131,85 @@ fn cluster_delivery_shortest_path(
     local_node_id: &NodeId,
     target_node_id: &NodeId,
     visited: &[NodeId],
-) -> Option<ClusterDeliveryRoutePath> {
+) -> Result<Option<ClusterDeliveryRoutePath>, NetworkError> {
     if local_node_id == target_node_id {
-        return Some(ClusterDeliveryRoutePath {
-            nodes: vec![local_node_id.clone()],
-            cost: 0,
-        });
+        let mut nodes = Vec::new();
+        crate::object::try_reserve_vec(&mut nodes, 1, "cluster delivery shortest path")?;
+        nodes.push(try_clone_route_node_id(
+            local_node_id,
+            "cluster delivery shortest path",
+        )?);
+        return Ok(Some(ClusterDeliveryRoutePath { nodes, cost: 0 }));
     }
-    let visited = visited.iter().collect::<BTreeSet<_>>();
-    let mut distance = BTreeMap::<NodeId, u64>::from([(local_node_id.clone(), 0)]);
-    let mut predecessor = BTreeMap::<NodeId, NodeId>::new();
-    let mut unsettled = BTreeSet::<NodeId>::from([local_node_id.clone()]);
-    while let Some(current) = unsettled
-        .iter()
-        .min_by_key(|node| (*distance.get(*node).unwrap_or(&u64::MAX), node.to_string()))
-        .cloned()
-    {
+    let mut distance = RouteDistanceIndex::default();
+    distance.try_insert_or_update(local_node_id, 0, "cluster delivery shortest path distance")?;
+    let mut predecessor = RoutePredecessorIndex::default();
+    let mut unsettled = RouteNodeSet::default();
+    unsettled.try_insert_clone(local_node_id, "cluster delivery unsettled nodes")?;
+    while let Some(current) = unsettled.min_by_distance(&distance)? {
         unsettled.remove(&current);
         if current == *target_node_id {
             break;
         }
-        let Some(current_distance) = distance.get(&current).copied() else {
+        let Some(current_distance) = distance.get(&current) else {
             continue;
         };
         for edge in graph.edges(&current) {
-            if visited.contains(&edge.target) {
+            if visited.iter().any(|visited| visited == &edge.target) {
                 continue;
             }
             let candidate_distance = current_distance.saturating_add(edge.cost);
-            if candidate_distance < *distance.get(&edge.target).unwrap_or(&u64::MAX) {
-                distance.insert(edge.target.clone(), candidate_distance);
-                predecessor.insert(edge.target.clone(), current.clone());
-                unsettled.insert(edge.target.clone());
+            if candidate_distance < distance.get(&edge.target).unwrap_or(u64::MAX) {
+                distance.try_insert_or_update(
+                    &edge.target,
+                    candidate_distance,
+                    "cluster delivery shortest path distance",
+                )?;
+                predecessor.try_insert_clone(
+                    &edge.target,
+                    &current,
+                    "cluster delivery shortest path predecessor",
+                )?;
+                unsettled.try_insert_clone(&edge.target, "cluster delivery unsettled nodes")?;
             }
         }
     }
     if !distance.contains_key(target_node_id) {
-        return None;
+        return Ok(None);
     }
-    let cost = *distance.get(target_node_id)?;
-    let mut reversed = vec![target_node_id.clone()];
-    let mut current = target_node_id.clone();
+    let Some(cost) = distance.get(target_node_id) else {
+        return Ok(None);
+    };
+    let mut reversed = Vec::new();
+    crate::object::try_reserve_vec(&mut reversed, 1, "cluster delivery shortest path")?;
+    reversed.push(try_clone_route_node_id(
+        target_node_id,
+        "cluster delivery shortest path",
+    )?);
+    let mut current = try_clone_route_node_id(target_node_id, "cluster delivery shortest path")?;
     while current != *local_node_id {
-        let previous = predecessor.get(&current)?;
-        reversed.push(previous.clone());
-        current = previous.clone();
+        let Some(previous) = predecessor.get(&current) else {
+            return Ok(None);
+        };
+        crate::object::try_reserve_vec(&mut reversed, 1, "cluster delivery shortest path")?;
+        reversed.push(try_clone_route_node_id(
+            previous,
+            "cluster delivery shortest path",
+        )?);
+        current = try_clone_route_node_id(previous, "cluster delivery shortest path")?;
     }
     reversed.reverse();
-    Some(ClusterDeliveryRoutePath {
+    Ok(Some(ClusterDeliveryRoutePath {
         nodes: reversed,
         cost,
-    })
+    }))
 }
 
 fn cluster_delivery_local_endpoint_cost(
     graph: &ClusterConnectivityGraph,
     endpoint: &ClusterEndpointRecord,
     target_node_id: &NodeId,
-    local_private_prefixes: &BTreeSet<ClusterDeliveryPrivatePrefix>,
+    local_private_prefixes: &ClusterDeliveryPrivatePrefixes,
 ) -> Option<u64> {
     let path_cost = cluster_delivery_endpoint_path_cost(
         &endpoint.transport,
@@ -880,6 +1301,19 @@ fn cluster_delivery_record_path_cost(transport: &ClusterTransportKind, address: 
     cluster_delivery_endpoint_path_cost(transport, address, &privacy)
 }
 
+fn cluster_delivery_transport_sort_rank(transport: &ClusterTransportKind) -> u8 {
+    match transport {
+        ClusterTransportKind::InProcess => 0,
+        ClusterTransportKind::Loopback => 1,
+        ClusterTransportKind::LanTcp => 2,
+        ClusterTransportKind::LanQuic => 3,
+        ClusterTransportKind::Iroh => 4,
+        ClusterTransportKind::WebRtc => 5,
+        ClusterTransportKind::TurnRelay => 6,
+        ClusterTransportKind::HttpsRelay => 7,
+    }
+}
+
 fn cluster_delivery_address_is_public(address: &str) -> bool {
     let host = cluster_delivery_address_ip(address);
     let Some(host) = host else {
@@ -902,6 +1336,32 @@ fn cluster_delivery_address_is_public(address: &str) -> bool {
 enum ClusterDeliveryPrivatePrefix {
     V4([u8; 3]),
     V6([u16; 4]),
+}
+
+#[derive(Clone, Debug, Default)]
+struct ClusterDeliveryPrivatePrefixes {
+    prefixes: Vec<ClusterDeliveryPrivatePrefix>,
+}
+
+impl ClusterDeliveryPrivatePrefixes {
+    fn try_insert(&mut self, prefix: ClusterDeliveryPrivatePrefix) -> Result<(), NetworkError> {
+        match self.prefixes.binary_search(&prefix) {
+            Ok(_) => Ok(()),
+            Err(index) => {
+                crate::object::try_reserve_vec(
+                    &mut self.prefixes,
+                    1,
+                    "cluster delivery private prefixes",
+                )?;
+                self.prefixes.insert(index, prefix);
+                Ok(())
+            }
+        }
+    }
+
+    fn contains(&self, prefix: &ClusterDeliveryPrivatePrefix) -> bool {
+        self.prefixes.binary_search(prefix).is_ok()
+    }
 }
 
 fn cluster_delivery_address_ip(address: &str) -> Option<std::net::IpAddr> {
@@ -950,19 +1410,25 @@ fn cluster_delivery_private_prefix_for_address(
 fn cluster_delivery_local_private_prefixes(
     state: &ClusterBootstrapState,
     local_node_id: &NodeId,
-) -> BTreeSet<ClusterDeliveryPrivatePrefix> {
-    state
+) -> Result<ClusterDeliveryPrivatePrefixes, NetworkError> {
+    let mut prefixes = ClusterDeliveryPrivatePrefixes::default();
+    for endpoint in state
         .members
         .iter()
         .filter(|member| member.node_id == *local_node_id)
         .flat_map(|member| member.endpoints.iter())
-        .filter_map(|endpoint| cluster_delivery_private_prefix_for_address(&endpoint.address))
-        .collect()
+    {
+        let Some(prefix) = cluster_delivery_private_prefix_for_address(&endpoint.address) else {
+            continue;
+        };
+        prefixes.try_insert(prefix)?;
+    }
+    Ok(prefixes)
 }
 
 fn cluster_delivery_endpoint_shares_local_private_prefix(
     endpoint: &ClusterEndpointRecord,
-    local_private_prefixes: &BTreeSet<ClusterDeliveryPrivatePrefix>,
+    local_private_prefixes: &ClusterDeliveryPrivatePrefixes,
 ) -> bool {
     cluster_delivery_private_prefix_for_address(&endpoint.address)
         .is_some_and(|prefix| local_private_prefixes.contains(&prefix))
@@ -1306,7 +1772,7 @@ where
         )
         .record(request_sign_us as f64);
         let deadline = ClusterEndpointRpcDeadline::new(options.timeouts.connect_timeout);
-        let mut failed_edges = BTreeSet::<ClusterDeliveryFailedEdge>::new();
+        let mut failed_edges = ClusterDeliveryFailedEdges::default();
         let mut failures = Vec::new();
         let max_route_attempts = state.members.len().saturating_mul(2).max(1) + 2;
         metrics::counter!(
@@ -1333,7 +1799,7 @@ where
                 state,
                 &state.local_node_id,
                 target_node_id,
-                failed_edges.clone(),
+                failed_edges.try_clone()?,
                 Vec::new(),
             )
             .await?
@@ -1348,10 +1814,7 @@ where
             )
             .record(plan_us as f64);
             if route_plan.endpoints.is_empty() {
-                failed_edges.insert(ClusterDeliveryFailedEdge::new(
-                    &state.local_node_id,
-                    &route_plan.next_hop,
-                ));
+                failed_edges.try_insert(&state.local_node_id, &route_plan.next_hop)?;
                 failures.push(format!("{}: no usable endpoint", route_plan.next_hop));
                 continue;
             }
@@ -1481,13 +1944,24 @@ where
                                 total_us = cluster_object_rpc_elapsed_us(call_started_at),
                                 "cluster object rpc responder mismatch"
                             );
-                            failures.push(format!(
-                                "{} ({:?}) responder mismatch: expected {}, got {}",
-                                endpoint.address,
-                                endpoint.transport,
-                                target_node_id,
-                                responder_node_id
-                            ));
+                            let failure = if final_hop {
+                                format!(
+                                    "{} ({:?}) responder mismatch: expected {}, got {}",
+                                    endpoint.address,
+                                    endpoint.transport,
+                                    target_node_id,
+                                    responder_node_id
+                                )
+                            } else {
+                                format!(
+                                    "{} ({:?}) relay responder mismatch: expected final {}, got {}",
+                                    endpoint.address,
+                                    endpoint.transport,
+                                    target_node_id,
+                                    responder_node_id
+                                )
+                            };
+                            failures.push(failure);
                             continue;
                         }
                         let attempt_us = cluster_object_rpc_elapsed_us(attempt_started_at);
@@ -1571,10 +2045,7 @@ where
                     }
                 }
             }
-            failed_edges.insert(ClusterDeliveryFailedEdge::new(
-                &state.local_node_id,
-                &route_plan.next_hop,
-            ));
+            failed_edges.try_insert(&state.local_node_id, &route_plan.next_hop)?;
         }
 
         Err(NetworkError::Io {
@@ -1910,7 +2381,7 @@ async fn handle_cluster_relay_envelope_async_with_host(
     }
 
     let mut failures = Vec::new();
-    let mut failed_edges = BTreeSet::<ClusterDeliveryFailedEdge>::new();
+    let mut failed_edges = ClusterDeliveryFailedEdges::default();
     let max_route_attempts = state.members.len().saturating_mul(2).max(1) + 2;
     for _ in 0..max_route_attempts {
         let plan_started_at = Instant::now();
@@ -1920,7 +2391,7 @@ async fn handle_cluster_relay_envelope_async_with_host(
             state,
             local_node_id,
             &envelope,
-            failed_edges.clone(),
+            failed_edges.try_clone()?,
         )
         .await?
         else {
@@ -1942,10 +2413,7 @@ async fn handle_cluster_relay_envelope_async_with_host(
                     route_plan.next_hop
                 ),
             );
-            failed_edges.insert(ClusterDeliveryFailedEdge::new(
-                local_node_id,
-                &route_plan.next_hop,
-            ));
+            failed_edges.try_insert(local_node_id, &route_plan.next_hop)?;
             continue;
         }
         tracing::trace!(
@@ -2072,10 +2540,7 @@ async fn handle_cluster_relay_envelope_async_with_host(
                 }
             }
         }
-        failed_edges.insert(ClusterDeliveryFailedEdge::new(
-            local_node_id,
-            &route_plan.next_hop,
-        ));
+        failed_edges.try_insert(local_node_id, &route_plan.next_hop)?;
     }
 
     cluster_relay_record_total_us(
@@ -2209,7 +2674,7 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
     }
 
     let mut failures = Vec::new();
-    let mut failed_edges = BTreeSet::<ClusterDeliveryFailedEdge>::new();
+    let mut failed_edges = ClusterDeliveryFailedEdges::default();
     let max_route_attempts = state.members.len().saturating_mul(2).max(1) + 2;
     for _ in 0..max_route_attempts {
         let plan_started_at = Instant::now();
@@ -2219,7 +2684,7 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
             state,
             local_node_id,
             &envelope,
-            failed_edges.clone(),
+            failed_edges.try_clone()?,
         )
         .await?
         else {
@@ -2241,10 +2706,7 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
                     route_plan.next_hop
                 ),
             );
-            failed_edges.insert(ClusterDeliveryFailedEdge::new(
-                local_node_id,
-                &route_plan.next_hop,
-            ));
+            failed_edges.try_insert(local_node_id, &route_plan.next_hop)?;
             continue;
         }
         tracing::trace!(
@@ -2391,10 +2853,7 @@ async fn handle_cluster_relay_stream_forward_envelope_async_with_host(
                 }
             }
         }
-        failed_edges.insert(ClusterDeliveryFailedEdge::new(
-            local_node_id,
-            &route_plan.next_hop,
-        ));
+        failed_edges.try_insert(local_node_id, &route_plan.next_hop)?;
     }
 
     cluster_relay_record_total_us(
@@ -2463,7 +2922,7 @@ async fn cluster_relay_forward_plan(
     state: &ClusterBootstrapState,
     local_node_id: &NodeId,
     envelope: &RelayEnvelope,
-    failed_edges: BTreeSet<ClusterDeliveryFailedEdge>,
+    failed_edges: ClusterDeliveryFailedEdges,
 ) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
     cluster_delivery_route_plan_async(
         runtime,
@@ -2472,7 +2931,7 @@ async fn cluster_relay_forward_plan(
         local_node_id,
         &envelope.target_node_id,
         failed_edges,
-        envelope.visited.clone(),
+        try_clone_route_node_ids(&envelope.visited, "cluster relay visited nodes")?,
     )
     .await
 }
@@ -2624,9 +3083,15 @@ mod tests {
         let bridge = nid("node_delivery_cost_bridge");
         let target = nid("node_delivery_cost_target");
         let mut graph = ClusterDeliveryRouteGraph::default();
-        graph.push_edge(local.clone(), target.clone(), None, 50);
-        graph.push_edge(local.clone(), bridge.clone(), None, 10);
-        graph.push_edge(bridge.clone(), target.clone(), None, 10);
+        graph
+            .push_edge_clone(&local, &target, None, 50)
+            .expect("direct edge");
+        graph
+            .push_edge_clone(&local, &bridge, None, 10)
+            .expect("bridge edge");
+        graph
+            .push_edge_clone(&bridge, &target, None, 10)
+            .expect("target edge");
 
         assert_eq!(
             cluster_delivery_shortest_path_next_hop(&graph, &local, &target, &[]),
@@ -2651,9 +3116,15 @@ mod tests {
         );
         mark_local_endpoints_healthy(&paths, &state, &[slow, fast.clone()]);
 
-        let plan =
-            cluster_delivery_route_plan(&paths, &state, &local, &target, &BTreeSet::new(), &[])
-                .expect("route plan");
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local,
+            &target,
+            &ClusterDeliveryFailedEdges::default(),
+            &[],
+        )
+        .expect("route plan");
 
         assert_eq!(plan.next_hop, target);
         assert_eq!(plan.endpoints[0].address, fast.address);
@@ -2697,9 +3168,15 @@ mod tests {
         )
         .expect("write bridge record");
 
-        let plan =
-            cluster_delivery_route_plan(&paths, &state, &local, &target, &BTreeSet::new(), &[])
-                .expect("route plan");
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local,
+            &target,
+            &ClusterDeliveryFailedEdges::default(),
+            &[],
+        )
+        .expect("route plan");
 
         assert_eq!(plan.next_hop, target);
         assert_eq!(plan.endpoints.len(), 1);
@@ -2744,9 +3221,15 @@ mod tests {
         )
         .expect("write bridge record");
 
-        let plan =
-            cluster_delivery_route_plan(&paths, &state, &local, &target, &BTreeSet::new(), &[])
-                .expect("route plan");
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local,
+            &target,
+            &ClusterDeliveryFailedEdges::default(),
+            &[],
+        )
+        .expect("route plan");
 
         assert_eq!(plan.next_hop, bridge);
         assert_eq!(plan.endpoints.len(), 1);
@@ -2781,8 +3264,10 @@ mod tests {
             .cloned()
             .expect("bridge endpoint");
         mark_local_endpoints_healthy(&paths, &state, &[bridge_endpoint]);
-        let mut failed_edges = BTreeSet::new();
-        failed_edges.insert(ClusterDeliveryFailedEdge::new(&local, &target));
+        let mut failed_edges = ClusterDeliveryFailedEdges::default();
+        failed_edges
+            .try_insert(&local, &target)
+            .expect("failed direct edge");
 
         let plan = cluster_delivery_route_plan(&paths, &state, &local, &target, &failed_edges, &[])
             .expect("route plan");
@@ -2816,9 +3301,15 @@ mod tests {
         );
         mark_local_endpoints_healthy(&paths, &state, &[bridge_endpoint]);
 
-        let plan =
-            cluster_delivery_route_plan(&paths, &state, &local, &target, &BTreeSet::new(), &[])
-                .expect("route plan");
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local,
+            &target,
+            &ClusterDeliveryFailedEdges::default(),
+            &[],
+        )
+        .expect("route plan");
 
         assert_eq!(plan.next_hop, target);
         assert_eq!(plan.endpoints.len(), 1);
@@ -2862,9 +3353,15 @@ mod tests {
         .expect("write degraded target record");
         mark_local_endpoints_healthy(&paths, &state, &[bridge_endpoint]);
 
-        let plan =
-            cluster_delivery_route_plan(&paths, &state, &local, &target, &BTreeSet::new(), &[])
-                .expect("route plan");
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local,
+            &target,
+            &ClusterDeliveryFailedEdges::default(),
+            &[],
+        )
+        .expect("route plan");
 
         assert_eq!(plan.next_hop, target);
         assert_eq!(plan.endpoints.len(), 1);
@@ -2922,9 +3419,15 @@ mod tests {
         )
         .expect("write remote bridge record");
 
-        let plan =
-            cluster_delivery_route_plan(&paths, &state, &local, &target, &BTreeSet::new(), &[])
-                .expect("route plan");
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local,
+            &target,
+            &ClusterDeliveryFailedEdges::default(),
+            &[],
+        )
+        .expect("route plan");
 
         assert_eq!(plan.next_hop, target);
         assert_eq!(plan.endpoints.len(), 1);
@@ -2984,9 +3487,15 @@ mod tests {
         )
         .expect("write bridge record");
 
-        let plan =
-            cluster_delivery_route_plan(&paths, &state, &local, &target, &BTreeSet::new(), &[])
-                .expect("route plan");
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local,
+            &target,
+            &ClusterDeliveryFailedEdges::default(),
+            &[],
+        )
+        .expect("route plan");
 
         assert_eq!(plan.next_hop, bridge);
         assert_eq!(plan.endpoints.len(), 1);
@@ -3227,7 +3736,7 @@ mod tests {
             &state,
             &local,
             &target,
-            BTreeSet::new(),
+            ClusterDeliveryFailedEdges::default(),
             Vec::new(),
         )
         .await
@@ -3271,7 +3780,7 @@ mod tests {
             &state,
             &local,
             &target,
-            BTreeSet::new(),
+            ClusterDeliveryFailedEdges::default(),
             Vec::new(),
         )
         .await
@@ -3305,7 +3814,7 @@ mod tests {
             &state,
             &local,
             &target,
-            BTreeSet::new(),
+            ClusterDeliveryFailedEdges::default(),
             vec![origin],
         )
         .await
@@ -3358,20 +3867,30 @@ mod tests {
         )
         .expect("write bridge record");
 
-        let table = cluster_delivery_build_routing_table(&paths, &state, &local);
+        let table = cluster_delivery_build_routing_table(&paths, &state, &local).expect("table");
         let unconstrained = table
-            .route_plan(&target, &BTreeSet::new(), &[])
+            .route_plan(&target, &ClusterDeliveryFailedEdges::default(), &[])
+            .expect("route allocation")
             .expect("unconstrained route");
         assert_eq!(unconstrained.next_hop, bridge);
 
-        let failed_bridge = BTreeSet::from([ClusterDeliveryFailedEdge::new(&local, &bridge)]);
+        let mut failed_bridge = ClusterDeliveryFailedEdges::default();
+        failed_bridge
+            .try_insert(&local, &bridge)
+            .expect("failed bridge edge");
         let after_failed_bridge = table
             .route_plan(&target, &failed_bridge, &[])
+            .expect("route allocation")
             .expect("route after failed bridge");
         assert_eq!(after_failed_bridge.next_hop, target);
 
         let after_visited_bridge = table
-            .route_plan(&target, &BTreeSet::new(), std::slice::from_ref(&bridge))
+            .route_plan(
+                &target,
+                &ClusterDeliveryFailedEdges::default(),
+                std::slice::from_ref(&bridge),
+            )
+            .expect("route allocation")
             .expect("route after visited bridge");
         assert_eq!(after_visited_bridge.next_hop, target);
     }

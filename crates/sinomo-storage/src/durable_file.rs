@@ -9,7 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use thiserror::Error;
 
-pub const DEFAULT_OBJECT_FILE_MAX_READ_BYTES: u64 = 128 * 1024 * 1024;
+/// Default object-file reads are bounded by address space and fallible
+/// allocation, not by a fixed byte ceiling. Callers with a protocol-level cap can
+/// still pass a smaller `max_read_bytes` explicitly.
+pub const DEFAULT_OBJECT_FILE_MAX_READ_BYTES: u64 = u64::MAX;
 pub const DEFAULT_OBJECT_FILE_CACHE_CAPACITY: usize = 4096;
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -22,24 +25,35 @@ pub enum DurableFileError {
         kind: io::ErrorKind,
         detail: String,
     },
+    #[error(
+        "storage resource exhausted at {path} during {operation}: requested {requested_bytes} bytes"
+    )]
+    ResourceExhausted {
+        path: String,
+        operation: String,
+        requested_bytes: usize,
+    },
 }
 
 impl DurableFileError {
     pub fn path(&self) -> &str {
         match self {
-            DurableFileError::Io { path, .. } => path,
+            DurableFileError::Io { path, .. }
+            | DurableFileError::ResourceExhausted { path, .. } => path,
         }
     }
 
     pub fn detail(&self) -> &str {
         match self {
             DurableFileError::Io { detail, .. } => detail,
+            DurableFileError::ResourceExhausted { operation, .. } => operation,
         }
     }
 
     pub fn kind(&self) -> io::ErrorKind {
         match self {
             DurableFileError::Io { kind, .. } => *kind,
+            DurableFileError::ResourceExhausted { .. } => io::ErrorKind::OutOfMemory,
         }
     }
 }
@@ -187,6 +201,56 @@ pub fn read_full_chunk<R: Read>(
     read_full_chunk_with_observer("stream", reader, buf, |_| {})
 }
 
+fn durable_allocation_error(
+    path: impl std::fmt::Display,
+    operation: &str,
+    requested_bytes: usize,
+) -> DurableFileError {
+    DurableFileError::ResourceExhausted {
+        path: path.to_string(),
+        operation: operation.to_string(),
+        requested_bytes,
+    }
+}
+
+fn try_reserve_vec<T>(
+    path: impl std::fmt::Display,
+    vec: &mut Vec<T>,
+    additional: usize,
+    operation: &str,
+) -> Result<(), DurableFileError> {
+    let requested_items =
+        vec.len()
+            .checked_add(additional)
+            .ok_or_else(|| DurableFileError::Io {
+                path: path.to_string(),
+                kind: io::ErrorKind::InvalidData,
+                detail: "allocation size overflow".to_string(),
+            })?;
+    let requested_bytes = requested_items
+        .checked_mul(std::mem::size_of::<T>().max(1))
+        .ok_or_else(|| DurableFileError::Io {
+            path: path.to_string(),
+            kind: io::ErrorKind::InvalidData,
+            detail: "allocation size overflow".to_string(),
+        })?;
+    vec.try_reserve(additional)
+        .map_err(|_| durable_allocation_error(path, operation, requested_bytes))
+}
+
+fn try_zeroed_vec(
+    path: impl std::fmt::Display,
+    len: usize,
+    operation: &str,
+) -> Result<Vec<u8>, DurableFileError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| durable_allocation_error(path, operation, len))?;
+    bytes.resize(len, 0);
+    Ok(bytes)
+}
+
 pub fn read_full_chunk_with_observer<R, F>(
     path: impl std::fmt::Display,
     reader: &mut R,
@@ -265,7 +329,7 @@ where
         seek_to_record_start(file, path, record_start)?;
         return Ok(None);
     }
-    let mut bytes = vec![0_u8; length];
+    let mut bytes = try_zeroed_vec(path.display(), length, "read length-prefixed record")?;
     match read_full_chunk_with_observer(path.display(), file, &mut bytes, &mut on_read)? {
         DurableReadChunk::Complete => {}
         DurableReadChunk::CleanEof | DurableReadChunk::Truncated => {
@@ -675,17 +739,36 @@ pub fn read_object_file_bytes_from_open_file(
         });
     }
 
-    let mut bytes = Vec::with_capacity(len as usize);
+    let mut bytes = Vec::new();
+    let initial_capacity = usize::try_from(len).map_err(|_| DurableFileError::Io {
+        path: path.display().to_string(),
+        kind: io::ErrorKind::InvalidData,
+        detail: format!("object file length {len} does not fit in usize"),
+    })?;
+    try_reserve_vec(
+        path.display(),
+        &mut bytes,
+        initial_capacity,
+        "read object file",
+    )?;
     let mut limited = file.take(max_read_bytes.saturating_add(1));
-    limited
-        .read_to_end(&mut bytes)
-        .map_err(|source| io_error(path.display(), source))?;
-    if bytes.len() as u64 > max_read_bytes {
-        return Err(DurableFileError::Io {
-            path: path.display().to_string(),
-            kind: io::ErrorKind::InvalidData,
-            detail: format!("object file read exceeded max of {max_read_bytes} bytes"),
-        });
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        let read = limited
+            .read(&mut chunk)
+            .map_err(|source| io_error(path.display(), source))?;
+        if read == 0 {
+            break;
+        }
+        if (bytes.len() as u64).saturating_add(read as u64) > max_read_bytes {
+            return Err(DurableFileError::Io {
+                path: path.display().to_string(),
+                kind: io::ErrorKind::InvalidData,
+                detail: format!("object file read exceeded max of {max_read_bytes} bytes"),
+            });
+        }
+        try_reserve_vec(path.display(), &mut bytes, read, "read object file")?;
+        bytes.extend_from_slice(&chunk[..read]);
     }
     Ok(bytes)
 }
@@ -916,10 +999,12 @@ fn read_existing_object_file_for_compare(path: &Path, expected_len: u64) -> Opti
     if file.metadata().ok()?.len() != expected_len {
         return None;
     }
-    let mut bytes = Vec::with_capacity(expected_len as usize);
+    let expected_len_usize = usize::try_from(expected_len).ok()?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(expected_len_usize).ok()?;
     let mut limited = file.take(expected_len.saturating_add(1));
     limited.read_to_end(&mut bytes).ok()?;
-    (bytes.len() as u64 == expected_len).then_some(bytes)
+    (bytes.len() == expected_len_usize).then_some(bytes)
 }
 
 fn create_parent_dir(path: &Path) -> Result<(), DurableFileError> {
@@ -1100,6 +1185,25 @@ mod tests {
         .expect("relaxed batch");
         assert_eq!(fs::read(&path).expect("read skipped"), b"first");
         assert_eq!(fs::read(&new_path).expect("read created"), b"created");
+    }
+
+    #[test]
+    fn explicit_object_file_read_cap_rejects_before_reading_body() {
+        let root = sinomo_testdir::TestDir::new("storage-object-file-custom-read-cap");
+        let path = root.join("object.sobj");
+        fs::write(&path, b"this body is intentionally longer than eight bytes").expect("write");
+
+        let error = read_object_file_bytes(&path, 8).expect_err("custom cap");
+        assert!(
+            matches!(
+                error,
+                DurableFileError::Io {
+                    kind: io::ErrorKind::InvalidData,
+                    ..
+                }
+            ),
+            "unexpected custom cap error: {error:?}"
+        );
     }
 
     #[test]

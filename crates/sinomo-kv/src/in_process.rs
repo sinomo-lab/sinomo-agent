@@ -1,6 +1,6 @@
 use crate::internal::*;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct SimulatedKeyState {
     pub(crate) present: bool,
     pub(crate) lease_id: Option<LeaseId>,
@@ -32,19 +32,405 @@ pub(crate) fn simulated_put_is_no_effect(
         && old_state.lease_id == lease_id
         && old_state.value_hash == Some(blake3::hash(value))
 }
+
+#[derive(Debug, Default)]
+struct SimulatedLeaseSet {
+    leases: BTreeSet<LeaseId>,
+}
+
+impl SimulatedLeaseSet {
+    fn from_leases(leases: &KvLeaseIndex) -> Result<Self, KvError> {
+        let active = leases.keys().copied().collect();
+        Ok(Self { leases: active })
+    }
+
+    fn len(&self) -> usize {
+        self.leases.len()
+    }
+
+    fn contains(&self, lease_id: &LeaseId) -> bool {
+        self.leases.contains(lease_id)
+    }
+
+    fn try_insert(&mut self, lease_id: LeaseId) -> Result<(), KvError> {
+        self.leases.insert(lease_id);
+        Ok(())
+    }
+
+    fn remove(&mut self, lease_id: &LeaseId) {
+        self.leases.remove(lease_id);
+    }
+}
+
+#[derive(Debug, Default)]
+struct SimulatedKeyStateIndex {
+    entries: BTreeMap<String, SimulatedKeyState>,
+}
+
+impl SimulatedKeyStateIndex {
+    fn get(&self, key: &str) -> Option<SimulatedKeyState> {
+        self.entries.get(key).copied()
+    }
+
+    fn try_insert(
+        &mut self,
+        key: &str,
+        state: SimulatedKeyState,
+        operation: &str,
+    ) -> Result<(), KvError> {
+        self.entries
+            .insert(try_clone_kv_string(key, operation)?, state);
+        Ok(())
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&str, &SimulatedKeyState)> {
+        self.entries
+            .iter()
+            .map(|(key, state)| (key.as_str(), state))
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = (&str, &mut SimulatedKeyState)> {
+        self.entries
+            .iter_mut()
+            .map(|(key, state)| (key.as_str(), state))
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut SimulatedKeyState> {
+        self.entries.values_mut()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct KvEntryIndex {
+    entries: BTreeMap<String, KvEntry>,
+}
+
+impl KvEntryIndex {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &KvEntry> {
+        self.entries.values()
+    }
+
+    fn get(&self, key: &str) -> Option<&KvEntry> {
+        self.entries.get(key)
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    fn remove(&mut self, key: &str) -> Option<KvEntry> {
+        self.entries.remove(key)
+    }
+
+    fn try_insert(
+        &mut self,
+        entry: KvEntry,
+        operation: &str,
+    ) -> Result<Option<KvEntry>, KvError> {
+        let key = try_clone_kv_string(&entry.key, operation)?;
+        Ok(self.entries.insert(key, entry))
+    }
+
+    fn prefix_entries<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a KvEntry> + 'a {
+        self.entries
+            .range(prefix.to_owned()..)
+            .map_while(move |(_, entry)| entry.key.starts_with(prefix).then_some(entry))
+    }
+
+    fn first_prefix_entry(&self, prefix: &str) -> Option<&KvEntry> {
+        self.entries
+            .range(prefix.to_owned()..)
+            .next()
+            .and_then(|(_, entry)| entry.key.starts_with(prefix).then_some(entry))
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct KvLeaseIndex {
+    leases: BTreeMap<LeaseId, KvLease>,
+}
+
+impl KvLeaseIndex {
+    fn len(&self) -> usize {
+        self.leases.len()
+    }
+
+    pub(crate) fn contains_key(&self, lease_id: &LeaseId) -> bool {
+        self.leases.contains_key(lease_id)
+    }
+
+    fn get(&self, lease_id: &LeaseId) -> Option<&KvLease> {
+        self.leases.get(lease_id)
+    }
+
+    fn get_mut(&mut self, lease_id: &LeaseId) -> Option<&mut KvLease> {
+        self.leases.get_mut(lease_id)
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &LeaseId> {
+        self.leases.keys()
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &KvLease> {
+        self.leases.values()
+    }
+
+    fn try_reserve_insert(&mut self, lease_id: LeaseId, operation: &str) -> Result<(), KvError> {
+        let _ = (lease_id, operation);
+        Ok(())
+    }
+
+    fn insert_reserved(&mut self, lease: KvLease) -> Option<KvLease> {
+        self.leases.insert(lease.lease_id, lease)
+    }
+
+    fn try_insert(
+        &mut self,
+        lease: KvLease,
+        operation: &str,
+    ) -> Result<Option<KvLease>, KvError> {
+        self.try_reserve_insert(lease.lease_id, operation)?;
+        Ok(self.insert_reserved(lease))
+    }
+
+    fn remove(&mut self, lease_id: &LeaseId) -> Option<KvLease> {
+        self.leases.remove(lease_id)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct KvLeaseDeadlineByIdIndex {
+    deadlines: BTreeMap<LeaseId, u64>,
+}
+
+impl KvLeaseDeadlineByIdIndex {
+    fn get(&self, lease_id: &LeaseId) -> Option<&u64> {
+        self.deadlines.get(lease_id)
+    }
+
+    fn try_reserve_insert(&mut self, lease_id: LeaseId, operation: &str) -> Result<(), KvError> {
+        let _ = (lease_id, operation);
+        Ok(())
+    }
+
+    fn insert_reserved(&mut self, lease_id: LeaseId, deadline: u64) -> Option<u64> {
+        self.deadlines.insert(lease_id, deadline)
+    }
+
+    pub(crate) fn try_insert(
+        &mut self,
+        lease_id: LeaseId,
+        deadline: u64,
+        operation: &str,
+    ) -> Result<Option<u64>, KvError> {
+        self.try_reserve_insert(lease_id, operation)?;
+        Ok(self.insert_reserved(lease_id, deadline))
+    }
+
+    fn remove(&mut self, lease_id: &LeaseId) -> Option<u64> {
+        self.deadlines.remove(lease_id)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct KvLeaseDeadlineIndex {
+    deadlines: BTreeMap<u64, BTreeSet<LeaseId>>,
+}
+
+impl KvLeaseDeadlineIndex {
+    fn try_reserve_insert(
+        &mut self,
+        deadline: u64,
+        lease_id: LeaseId,
+        operation: &str,
+    ) -> Result<(), KvError> {
+        let _ = (deadline, lease_id, operation);
+        Ok(())
+    }
+
+    fn insert_reserved(&mut self, deadline: u64, lease_id: LeaseId) {
+        self.deadlines.entry(deadline).or_default().insert(lease_id);
+    }
+
+    pub(crate) fn try_insert(
+        &mut self,
+        deadline: u64,
+        lease_id: LeaseId,
+        operation: &str,
+    ) -> Result<(), KvError> {
+        self.try_reserve_insert(deadline, lease_id, operation)?;
+        self.insert_reserved(deadline, lease_id);
+        Ok(())
+    }
+
+    fn remove(&mut self, deadline: u64, lease_id: LeaseId) -> bool {
+        let Some(lease_ids) = self.deadlines.get_mut(&deadline) else {
+            return false;
+        };
+        let removed = lease_ids.remove(&lease_id);
+        if lease_ids.is_empty() {
+            self.deadlines.remove(&deadline);
+        }
+        removed
+    }
+
+    fn push_expired_candidates(
+        &self,
+        lease_clock: u64,
+        candidates: &mut Vec<LeaseId>,
+    ) -> Result<(), KvError> {
+        for (_, lease_ids) in self
+            .deadlines
+            .range(..=lease_clock)
+        {
+            for lease_id in lease_ids {
+                try_reserve_kv_items(candidates, 1, "collect expired lease candidates")?;
+                candidates.push(*lease_id);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct KvLeaseKeyIndex {
+    keys_by_lease: BTreeMap<LeaseId, BTreeSet<String>>,
+}
+
+impl KvLeaseKeyIndex {
+    #[allow(dead_code)]
+    pub(crate) fn contains_key(&self, lease_id: &LeaseId) -> bool {
+        self.keys_by_lease.contains_key(lease_id)
+    }
+
+    pub(crate) fn get(&self, lease_id: &LeaseId) -> Option<&BTreeSet<String>> {
+        self.keys_by_lease.get(lease_id)
+    }
+
+    fn remove(&mut self, lease_id: &LeaseId) -> Option<BTreeSet<String>> {
+        self.keys_by_lease.remove(lease_id)
+    }
+
+    fn try_reserve_add_key(
+        &mut self,
+        lease_id: LeaseId,
+        key: &str,
+        operation: &str,
+    ) -> Result<(), KvError> {
+        let _ = (lease_id, key, operation);
+        Ok(())
+    }
+
+    fn add_key_reserved(&mut self, lease_id: LeaseId, key: String) -> Result<(), KvError> {
+        self.keys_by_lease.entry(lease_id).or_default().insert(key);
+        Ok(())
+    }
+
+    pub(crate) fn try_add_key(
+        &mut self,
+        lease_id: LeaseId,
+        key: String,
+        operation: &str,
+    ) -> Result<(), KvError> {
+        self.try_reserve_add_key(lease_id, &key, operation)?;
+        self.add_key_reserved(lease_id, key)
+    }
+
+    fn remove_key(&mut self, lease_id: LeaseId, key: &str) {
+        let Some(keys) = self.keys_by_lease.get_mut(&lease_id) else {
+            return;
+        };
+        keys.remove(key);
+        if keys.is_empty() {
+            self.keys_by_lease.remove(&lease_id);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct KvWatchIndex {
+    watches: BTreeMap<WatchId, KvWatchState>,
+}
+
+impl KvWatchIndex {
+    fn len(&self) -> usize {
+        self.watches.len()
+    }
+
+    pub(crate) fn get(&self, watch_id: &WatchId) -> Option<&KvWatchState> {
+        self.watches.get(watch_id)
+    }
+
+    fn get_mut(&mut self, watch_id: &WatchId) -> Option<&mut KvWatchState> {
+        self.watches.get_mut(watch_id)
+    }
+
+    fn try_insert(
+        &mut self,
+        watch_id: WatchId,
+        watch: KvWatchState,
+        operation: &str,
+    ) -> Result<Option<KvWatchState>, KvError> {
+        let _ = operation;
+        Ok(self.watches.insert(watch_id, watch))
+    }
+
+    fn remove(&mut self, watch_id: &WatchId) -> Option<KvWatchState> {
+        self.watches.remove(watch_id)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct KvWatchPrefixIndex {
+    watch_ids_by_prefix: BTreeMap<String, BTreeSet<WatchId>>,
+}
+
+impl KvWatchPrefixIndex {
+    fn get(&self, prefix: &str) -> Option<&BTreeSet<WatchId>> {
+        self.watch_ids_by_prefix.get(prefix)
+    }
+
+    fn try_add(
+        &mut self,
+        watch_id: WatchId,
+        prefix: &str,
+        operation: &str,
+    ) -> Result<(), KvError> {
+        self.watch_ids_by_prefix
+            .entry(try_clone_kv_string(prefix, operation)?)
+            .or_default()
+            .insert(watch_id);
+        Ok(())
+    }
+
+    fn remove(&mut self, watch_id: WatchId, prefix: &str) {
+        let Some(watch_ids) = self.watch_ids_by_prefix.get_mut(prefix) else {
+            return;
+        };
+        watch_ids.remove(&watch_id);
+        if watch_ids.is_empty() {
+            self.watch_ids_by_prefix.remove(prefix);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct InProcessKvStore {
     pub(crate) revision: KvRevision,
     pub(crate) compacted_revision: KvRevision,
-    pub(crate) entries: BTreeMap<String, KvEntry>,
+    pub(crate) entries: KvEntryIndex,
     pub(crate) events: Vec<Arc<KvEvent>>,
-    pub(crate) leases: BTreeMap<LeaseId, KvLease>,
+    pub(crate) leases: KvLeaseIndex,
     pub(crate) lease_clock: u64,
-    pub(crate) lease_deadline_by_id: BTreeMap<LeaseId, u64>,
-    pub(crate) lease_deadlines: BTreeMap<u64, BTreeSet<LeaseId>>,
-    pub(crate) lease_keys: BTreeMap<LeaseId, BTreeSet<String>>,
-    pub(crate) watches: BTreeMap<WatchId, KvWatchState>,
-    pub(crate) watch_prefixes: BTreeMap<String, BTreeSet<WatchId>>,
+    pub(crate) lease_deadline_by_id: KvLeaseDeadlineByIdIndex,
+    pub(crate) lease_deadlines: KvLeaseDeadlineIndex,
+    pub(crate) lease_keys: KvLeaseKeyIndex,
+    pub(crate) watches: KvWatchIndex,
+    pub(crate) watch_prefixes: KvWatchPrefixIndex,
     pub(crate) next_watch_id: u64,
 }
 
@@ -69,14 +455,17 @@ impl InProcessKvStore {
         self.entries.get(key)
     }
 
-    pub fn range_prefix(&self, prefix: &str) -> Vec<KvEntry> {
-        self.prefix_entries(prefix).cloned().collect()
+    pub fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+        let mut entries = Vec::new();
+        for entry in self.prefix_entries(prefix) {
+            try_reserve_kv_items(&mut entries, 1, "collect kv prefix range")?;
+            entries.push(try_clone_kv_entry(entry, "collect kv prefix range")?);
+        }
+        Ok(entries)
     }
 
     pub fn prefix_entries<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a KvEntry> + 'a {
-        self.entries
-            .range(prefix.to_string()..)
-            .map_while(move |(key, entry)| key.starts_with(prefix).then_some(entry))
+        self.entries.prefix_entries(prefix)
     }
 
     pub fn range_prefix_limited(
@@ -110,7 +499,8 @@ impl InProcessKvStore {
                     max_bytes: max_payload_bytes,
                 });
             }
-            entries.push(entry.clone());
+            try_reserve_kv_items(&mut entries, 1, "collect kv prefix range")?;
+            entries.push(try_clone_kv_entry(entry, "collect kv prefix range")?);
         }
         Ok(entries)
     }
@@ -144,10 +534,12 @@ impl InProcessKvStore {
     }
 
     pub fn range_prefix_serde<T: DeserializeOwned>(&self, prefix: &str) -> Result<Vec<T>, KvError> {
-        self.range_prefix(prefix)
-            .iter()
-            .map(KvEntry::decode)
-            .collect()
+        let mut values = Vec::new();
+        for entry in self.prefix_entries(prefix) {
+            try_reserve_kv_items(&mut values, 1, "decode kv prefix range")?;
+            values.push(entry.decode()?);
+        }
+        Ok(values)
     }
 
     pub fn range_prefix_serde_limited_by_payload_bytes<T: DeserializeOwned>(
@@ -156,10 +548,13 @@ impl InProcessKvStore {
         max_entries: usize,
         max_payload_bytes: usize,
     ) -> Result<Vec<T>, KvError> {
-        self.range_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes)?
-            .iter()
-            .map(KvEntry::decode)
-            .collect()
+        let entries = self.range_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes)?;
+        let mut values = Vec::new();
+        try_reserve_kv_items(&mut values, entries.len(), "decode limited kv prefix range")?;
+        for entry in entries {
+            values.push(entry.decode()?);
+        }
+        Ok(values)
     }
 
     pub fn delete(&mut self, key: impl Into<String>) -> Result<bool, KvError> {
@@ -175,7 +570,17 @@ impl InProcessKvStore {
         let succeeded = txn.compares.iter().all(|compare| self.compare(compare));
         let ops = if succeeded { txn.success } else { txn.failure };
         self.validate_ops(&ops)?;
-        let mut responses = Vec::with_capacity(ops.len());
+        let mut responses = Vec::new();
+        let requested_bytes = ops
+            .len()
+            .checked_mul(std::mem::size_of::<KvOpResponse>().max(1))
+            .unwrap_or(usize::MAX);
+        responses
+            .try_reserve(ops.len())
+            .map_err(|_| KvError::ResourceExhausted {
+                operation: "kv transaction responses".to_string(),
+                requested_bytes,
+            })?;
         let mut revision = self.revision;
 
         for op in ops {
@@ -230,7 +635,17 @@ impl InProcessKvStore {
         };
         self.validate_ops(ops)?;
 
-        let mut responses = Vec::with_capacity(ops.len());
+        let mut responses = Vec::new();
+        let requested_bytes = ops
+            .len()
+            .checked_mul(std::mem::size_of::<KvOpResponse>().max(1))
+            .unwrap_or(usize::MAX);
+        responses
+            .try_reserve(ops.len())
+            .map_err(|_| KvError::ResourceExhausted {
+                operation: "kv no-effect transaction responses".to_string(),
+                requested_bytes,
+            })?;
         for op in ops {
             let Some(response) = self.no_effect_response_for_op(op) else {
                 return Ok(None);
@@ -315,24 +730,34 @@ impl InProcessKvStore {
         let watch_id = WatchId(self.next_watch_id.max(1));
         self.next_watch_id = watch_id.0.saturating_add(1);
         let prefix = prefix.into();
-        let backlog = self
+        let prefix_for_index = try_clone_kv_string(&prefix, "register kv watch prefix")?;
+        let mut backlog = Vec::new();
+        for event in self
             .events
             .iter()
             .filter(|event| event.revision >= start_revision && event.key.starts_with(&prefix))
-            .cloned()
-            .collect();
+        {
+            try_reserve_kv_items(&mut backlog, 1, "collect kv watch backlog")?;
+            backlog.push(Arc::clone(event));
+        }
         let mut watch = KvWatchState {
             watch: KvWatch {
                 watch_id,
                 prefix,
                 start_revision,
             },
-            pending: backlog,
+            pending: backlog.into(),
             compacted_revision: None,
         };
         compact_watch_pending(&mut watch);
-        self.index_watch_prefix(watch_id, &watch.watch.prefix);
-        self.watches.insert(watch_id, watch);
+        self.index_watch_prefix(watch_id, &prefix_for_index)?;
+        if let Err(error) = self
+            .watches
+            .try_insert(watch_id, watch, "register kv watch")
+        {
+            self.remove_watch_prefix_index(watch_id, &prefix_for_index);
+            return Err(error);
+        }
         Ok(watch_id)
     }
 
@@ -355,58 +780,74 @@ impl InProcessKvStore {
             .watches
             .get_mut(&watch_id)
             .ok_or(KvError::UnknownWatch { watch_id })?;
-        Ok(watch
-            .pending
-            .drain(..)
-            .map(|event| event.as_ref().clone())
-            .collect())
+        let mut drained = Vec::new();
+        try_reserve_kv_items(&mut drained, watch.pending.len(), "drain kv watch events")?;
+        for event in watch.pending.drain(..) {
+            drained.push(try_clone_kv_event(&event, "drain kv watch events")?);
+        }
+        Ok(drained)
     }
 
     pub fn cancel_watch(&mut self, watch_id: WatchId) -> Result<bool, KvError> {
         Ok(self.remove_watch(watch_id).is_some())
     }
 
-    pub fn snapshot(&self) -> KvSnapshot {
-        KvSnapshot {
-            revision: self.revision,
-            compacted_revision: self.compacted_revision,
-            entries: self.entries.values().cloned().collect(),
-            leases: self.current_leases_for_snapshot(),
-            events: self
-                .events
-                .iter()
-                .map(|event| event.as_ref().clone())
-                .collect(),
-        }
+    pub fn snapshot(&self) -> Result<KvSnapshot, KvError> {
+        self.try_snapshot()
     }
 
-    pub fn restore(snapshot: KvSnapshot) -> Self {
-        let entries: BTreeMap<_, _> = snapshot
-            .entries
-            .into_iter()
-            .map(|entry| (entry.key.clone(), entry))
-            .collect();
-        let lease_keys = build_lease_key_index(&entries);
-        let leases: BTreeMap<_, _> = snapshot
-            .leases
-            .into_iter()
-            .map(|lease| (lease.lease_id, lease))
-            .collect();
-        let (lease_deadline_by_id, lease_deadlines) = build_lease_deadline_index(&leases, 0);
-        Self {
+    pub fn try_snapshot(&self) -> Result<KvSnapshot, KvError> {
+        let mut entries = Vec::new();
+        try_reserve_kv_items(&mut entries, self.entries.len(), "build kv snapshot entries")?;
+        for entry in self.entries.values() {
+            entries.push(try_clone_kv_entry(entry, "build kv snapshot entries")?);
+        }
+
+        let mut events = Vec::new();
+        try_reserve_kv_items(&mut events, self.events.len(), "build kv snapshot events")?;
+        for event in &self.events {
+            events.push(try_clone_kv_event(event, "build kv snapshot events")?);
+        }
+
+        Ok(KvSnapshot {
+            revision: self.revision,
+            compacted_revision: self.compacted_revision,
+            entries,
+            leases: self.try_current_leases_for_snapshot()?,
+            events,
+        })
+    }
+
+    pub fn restore(snapshot: KvSnapshot) -> Result<Self, KvError> {
+        let mut entries = KvEntryIndex::default();
+        for entry in snapshot.entries {
+            entries.try_insert(entry, "restore kv snapshot entries")?;
+        }
+        let lease_keys = build_lease_key_index(entries.values())?;
+        let mut leases = KvLeaseIndex::default();
+        for lease in snapshot.leases {
+            leases.try_insert(lease, "restore kv snapshot leases")?;
+        }
+        let (lease_deadline_by_id, lease_deadlines) = build_lease_deadline_index(&leases, 0)?;
+        let mut events = Vec::new();
+        try_reserve_kv_items(&mut events, snapshot.events.len(), "restore kv snapshot events")?;
+        for event in snapshot.events {
+            events.push(Arc::new(event));
+        }
+        Ok(Self {
             revision: snapshot.revision,
             compacted_revision: snapshot.compacted_revision,
             entries,
-            events: snapshot.events.into_iter().map(Arc::new).collect(),
+            events,
             leases,
             lease_clock: 0,
             lease_deadline_by_id,
             lease_deadlines,
             lease_keys,
-            watches: BTreeMap::new(),
-            watch_prefixes: BTreeMap::new(),
+            watches: KvWatchIndex::default(),
+            watch_prefixes: KvWatchPrefixIndex::default(),
             next_watch_id: 1,
-        }
+        })
     }
 
     pub fn compact(&mut self, revision: KvRevision) -> Result<(), KvError> {
@@ -429,7 +870,7 @@ impl InProcessKvStore {
 
     pub fn tick_leases(&mut self, ticks: u64) -> Result<Vec<LeaseId>, KvError> {
         self.lease_clock = self.lease_clock.saturating_add(ticks);
-        let candidates = self.expired_lease_candidates();
+        let candidates = self.expired_lease_candidates()?;
 
         let mut expired = Vec::new();
         let mut mutation_events = 0_usize;
@@ -442,7 +883,7 @@ impl InProcessKvStore {
             }
             let remaining_budget =
                 MAX_KV_MUTATION_EVENTS_PER_COMMAND.saturating_sub(mutation_events);
-            let (keys, complete) = self.lease_revoke_batch(lease_id, remaining_budget);
+            let (keys, complete) = self.lease_revoke_batch(lease_id, remaining_budget)?;
             if keys.is_empty() && !complete {
                 break;
             }
@@ -480,7 +921,7 @@ impl InProcessKvStore {
                         max: MAX_ACTIVE_LEASES,
                     });
                 }
-                self.upsert_lease(KvLease::new(lease_id, ttl_ticks));
+                self.upsert_lease(KvLease::new(lease_id, ttl_ticks))?;
                 Ok(KvOpResponse::LeaseGrant { lease_id })
             }
             KvOp::LeaseKeepAlive { lease_id } => {
@@ -489,7 +930,7 @@ impl InProcessKvStore {
                     .get(&lease_id)
                     .ok_or(KvError::UnknownLease { lease_id })?
                     .ttl_ticks;
-                self.upsert_lease(KvLease::new(lease_id, ttl_ticks));
+                self.upsert_lease(KvLease::new(lease_id, ttl_ticks))?;
                 Ok(KvOpResponse::LeaseKeepAlive { lease_id })
             }
             KvOp::LeaseRevoke { lease_id } => {
@@ -517,8 +958,8 @@ impl InProcessKvStore {
     }
 
     fn validate_ops(&self, ops: &[KvOp]) -> Result<(), KvError> {
-        let mut active_leases = self.leases.keys().copied().collect::<BTreeSet<_>>();
-        let mut touched_keys = BTreeMap::<String, SimulatedKeyState>::new();
+        let mut active_leases = SimulatedLeaseSet::from_leases(&self.leases)?;
+        let mut touched_keys = SimulatedKeyStateIndex::default();
         let mut deleted_prefixes = Vec::<String>::new();
         let mut revoked_leases = Vec::<LeaseId>::new();
         let mut mutation_events = 0_usize;
@@ -559,10 +1000,11 @@ impl InProcessKvStore {
                     if !simulated_put_is_no_effect(&old_state, value, Some(*lease_id)) {
                         record_kv_mutation_events(&mut mutation_events, 1)?;
                     }
-                    touched_keys.insert(
-                        key.clone(),
+                    touched_keys.try_insert(
+                        key,
                         SimulatedKeyState::present_with_value(Some(*lease_id), value),
-                    );
+                        "track simulated touched key",
+                    )?;
                 }
                 KvOp::Put {
                     key,
@@ -578,10 +1020,11 @@ impl InProcessKvStore {
                     if !simulated_put_is_no_effect(&old_state, value, None) {
                         record_kv_mutation_events(&mut mutation_events, 1)?;
                     }
-                    touched_keys.insert(
-                        key.clone(),
+                    touched_keys.try_insert(
+                        key,
                         SimulatedKeyState::present_with_value(None, value),
-                    );
+                        "track simulated touched key",
+                    )?;
                 }
                 KvOp::Delete { key } => {
                     if self
@@ -590,7 +1033,11 @@ impl InProcessKvStore {
                     {
                         record_kv_mutation_events(&mut mutation_events, 1)?;
                     }
-                    touched_keys.insert(key.clone(), SimulatedKeyState::ABSENT);
+                    touched_keys.try_insert(
+                        key,
+                        SimulatedKeyState::ABSENT,
+                        "track simulated touched key",
+                    )?;
                 }
                 KvOp::DeletePrefix { prefix } => {
                     let deleted_count = self.simulated_delete_prefix_count(
@@ -601,12 +1048,20 @@ impl InProcessKvStore {
                         MAX_DELETE_PREFIX_KEYS,
                     )?;
                     record_kv_mutation_events(&mut mutation_events, deleted_count)?;
-                    for (key, state) in &mut touched_keys {
+                    for (key, state) in touched_keys.iter_mut() {
                         if key.starts_with(prefix) {
                             *state = SimulatedKeyState::ABSENT;
                         }
                     }
-                    deleted_prefixes.push(prefix.clone());
+                    try_reserve_kv_items(
+                        &mut deleted_prefixes,
+                        1,
+                        "track simulated deleted prefix",
+                    )?;
+                    deleted_prefixes.push(try_clone_kv_string(
+                        prefix,
+                        "track simulated deleted prefix",
+                    )?);
                 }
                 KvOp::LeaseGrant {
                     lease_id,
@@ -623,7 +1078,7 @@ impl InProcessKvStore {
                             max: MAX_ACTIVE_LEASES,
                         });
                     }
-                    active_leases.insert(*lease_id);
+                    active_leases.try_insert(*lease_id)?;
                 }
                 KvOp::LeaseKeepAlive { lease_id } => {
                     if !active_leases.contains(lease_id) {
@@ -646,6 +1101,11 @@ impl InProcessKvStore {
                             *state = SimulatedKeyState::ABSENT;
                         }
                     }
+                    try_reserve_kv_items(
+                        &mut revoked_leases,
+                        1,
+                        "track simulated revoked lease",
+                    )?;
                     revoked_leases.push(*lease_id);
                 }
             }
@@ -668,39 +1128,62 @@ impl InProcessKvStore {
             if old_lease_id != Some(lease_id) {
                 self.validate_lease_key_capacity(lease_id)?;
             }
+            self.lease_keys
+                .try_reserve_add_key(lease_id, &key, "index kv lease key")?;
         }
 
         let revision = self.bump_revision();
         let old_lease_id = self.entries.get(&key).and_then(|entry| entry.lease_id);
-        let entry = match self.entries.remove(&key) {
-            Some(mut existing) => {
-                existing.value = value.clone();
-                existing.modify_revision = revision;
-                existing.version = KvVersion(existing.version.0.saturating_add(1));
-                existing.lease_id = lease_id;
-                existing
+        let existing_meta = self
+            .entries
+            .get(&key)
+            .map(|entry| (entry.create_revision, entry.version));
+        let entry = if let Some((create_revision, version)) = existing_meta {
+            KvEntry {
+                key: try_clone_kv_string(&key, "store kv put key")?,
+                value: try_clone_kv_bytes(&value, "store kv put value")?,
+                create_revision,
+                modify_revision: revision,
+                version: KvVersion(version.0.saturating_add(1)),
+                lease_id,
             }
-            None => KvEntry {
-                key: key.clone(),
-                value: value.clone(),
+        } else {
+            KvEntry {
+                key: try_clone_kv_string(&key, "store kv put key")?,
+                value: try_clone_kv_bytes(&value, "store kv put value")?,
                 create_revision: revision,
                 modify_revision: revision,
                 version: KvVersion(1),
                 lease_id,
-            },
+            }
         };
-        if let Some(old_lease_id) = old_lease_id {
+
+        let added_lease_key = if let Some(lease_id) = lease_id
+            && old_lease_id != Some(lease_id)
+        {
+            self.add_lease_key(lease_id, key.clone())?;
+            true
+        } else {
+            false
+        };
+        if let Err(error) = self.entries.try_insert(entry, "insert kv entry") {
+            if added_lease_key
+                && let Some(lease_id) = lease_id
+            {
+                self.remove_lease_key(lease_id, &key);
+            }
+            return Err(error);
+        }
+        if let Some(old_lease_id) = old_lease_id
+            && Some(old_lease_id) != lease_id
+        {
             self.remove_lease_key(old_lease_id, &key);
         }
-        if let Some(lease_id) = lease_id {
-            self.add_lease_key(lease_id, key.clone());
-        }
-        self.entries.insert(key.clone(), entry);
         self.record_event(KvEvent {
             revision,
-            key: key.clone(),
+            key: try_clone_kv_string(&key, "record kv put key")?,
             kind: KvEventKind::Put { value },
-        });
+        })?;
         Ok(KvOpResponse::Put { key, revision })
     }
 
@@ -717,9 +1200,9 @@ impl InProcessKvStore {
         let revision = self.bump_revision();
         self.record_event(KvEvent {
             revision,
-            key: key.clone(),
+            key: try_clone_kv_string(&key, "record kv delete key")?,
             kind: KvEventKind::Delete,
-        });
+        })?;
         Ok(KvOpResponse::Delete { key, deleted: true })
     }
 
@@ -741,10 +1224,7 @@ impl InProcessKvStore {
         max_keys: usize,
     ) -> Result<Vec<String>, KvError> {
         let mut keys = Vec::new();
-        for key in self.entries.range(prefix.to_string()..).map(|(key, _)| key) {
-            if !key.starts_with(prefix) {
-                break;
-            }
+        for entry in self.entries.prefix_entries(prefix) {
             if keys.len() >= max_keys {
                 return Err(KvError::DeletePrefixLimit {
                     prefix: prefix.to_string(),
@@ -752,7 +1232,11 @@ impl InProcessKvStore {
                     max_keys,
                 });
             }
-            keys.push(key.clone());
+            try_reserve_kv_items(&mut keys, 1, "collect delete-prefix keys")?;
+            keys.push(try_clone_kv_string(
+                &entry.key,
+                "collect delete-prefix keys",
+            )?);
         }
         Ok(keys)
     }
@@ -760,18 +1244,20 @@ impl InProcessKvStore {
     fn simulated_delete_prefix_count(
         &self,
         prefix: &str,
-        touched_keys: &BTreeMap<String, SimulatedKeyState>,
+        touched_keys: &SimulatedKeyStateIndex,
         deleted_prefixes: &[String],
         revoked_leases: &[LeaseId],
         max_keys: usize,
     ) -> Result<usize, KvError> {
         let mut count = 0_usize;
-        for key in self.entries.range(prefix.to_string()..).map(|(key, _)| key) {
-            if !key.starts_with(prefix) {
-                break;
-            }
+        for entry in self.entries.prefix_entries(prefix) {
             if self
-                .simulated_key_state(key, touched_keys, deleted_prefixes, revoked_leases)
+                .simulated_key_state(
+                    &entry.key,
+                    touched_keys,
+                    deleted_prefixes,
+                    revoked_leases,
+                )
                 .present
             {
                 count = count.saturating_add(1);
@@ -784,7 +1270,7 @@ impl InProcessKvStore {
                 }
             }
         }
-        for (key, state) in touched_keys {
+        for (key, state) in touched_keys.iter() {
             if state.present && key.starts_with(prefix) && !self.entries.contains_key(key) {
                 count = count.saturating_add(1);
                 if count > max_keys {
@@ -802,7 +1288,7 @@ impl InProcessKvStore {
     fn simulated_lease_revoke_count(
         &self,
         lease_id: LeaseId,
-        touched_keys: &BTreeMap<String, SimulatedKeyState>,
+        touched_keys: &SimulatedKeyStateIndex,
         deleted_prefixes: &[String],
         revoked_leases: &[LeaseId],
     ) -> usize {
@@ -812,7 +1298,7 @@ impl InProcessKvStore {
     fn simulated_lease_key_count(
         &self,
         lease_id: LeaseId,
-        touched_keys: &BTreeMap<String, SimulatedKeyState>,
+        touched_keys: &SimulatedKeyStateIndex,
         deleted_prefixes: &[String],
         revoked_leases: &[LeaseId],
     ) -> usize {
@@ -826,13 +1312,13 @@ impl InProcessKvStore {
                 }
             }
         }
-        for (key, state) in touched_keys {
+        for (key, state) in touched_keys.iter() {
             if state.present
                 && state.lease_id == Some(lease_id)
                 && !self
                     .lease_keys
                     .get(&lease_id)
-                    .is_some_and(|keys| keys.contains(key))
+                    .is_some_and(|keys| keys.iter().any(|existing| existing == key))
             {
                 count = count.saturating_add(1);
             }
@@ -876,10 +1362,7 @@ impl InProcessKvStore {
                 })
             }
             KvOp::DeletePrefix { prefix } => {
-                let mut entries = self.entries.range(prefix.clone()..);
-                let has_matching_key = entries
-                    .next()
-                    .is_some_and(|(key, _)| key.starts_with(prefix));
+                let has_matching_key = self.entries.first_prefix_entry(prefix).is_some();
                 (!has_matching_key).then(|| KvOpResponse::DeletePrefix {
                     prefix: prefix.clone(),
                     deleted_count: 0,
@@ -926,28 +1409,46 @@ impl InProcessKvStore {
                 max_events: max_keys,
             });
         }
-        Ok(keys.iter().cloned().collect())
+        let mut retained = Vec::new();
+        try_reserve_kv_items(&mut retained, keys.len(), "collect lease keys")?;
+        for key in keys {
+            retained.push(try_clone_kv_string(key, "collect lease keys")?);
+        }
+        Ok(retained)
     }
 
-    fn lease_revoke_batch(&self, lease_id: LeaseId, max_keys: usize) -> (Vec<String>, bool) {
+    fn lease_revoke_batch(
+        &self,
+        lease_id: LeaseId,
+        max_keys: usize,
+    ) -> Result<(Vec<String>, bool), KvError> {
         let Some(keys) = self.lease_keys.get(&lease_id) else {
-            return (Vec::new(), true);
+            return Ok((Vec::new(), true));
         };
         let complete = keys.len() <= max_keys;
-        (keys.iter().take(max_keys).cloned().collect(), complete)
+        let mut retained = Vec::new();
+        try_reserve_kv_items(
+            &mut retained,
+            keys.len().min(max_keys),
+            "collect lease revoke batch",
+        )?;
+        for key in keys.iter().take(max_keys) {
+            retained.push(try_clone_kv_string(key, "collect lease revoke batch")?);
+        }
+        Ok((retained, complete))
     }
 
-    fn current_leases_for_snapshot(&self) -> Vec<KvLease> {
-        self.leases
-            .values()
-            .map(|lease| {
-                let mut lease = lease.clone();
-                lease.remaining_ticks = self
-                    .lease_remaining_ticks(lease.lease_id)
-                    .unwrap_or(lease.remaining_ticks);
-                lease
-            })
-            .collect()
+    fn try_current_leases_for_snapshot(&self) -> Result<Vec<KvLease>, KvError> {
+        let mut leases = Vec::new();
+        try_reserve_kv_items(&mut leases, self.leases.len(), "build kv snapshot leases")?;
+        for lease in self.leases.values() {
+            let mut lease = lease.clone();
+            lease.remaining_ticks = self
+                .lease_remaining_ticks(lease.lease_id)
+                .unwrap_or(lease.remaining_ticks);
+            leases.push(lease);
+        }
+        Ok(leases)
     }
 
     fn lease_remaining_ticks(&self, lease_id: LeaseId) -> Option<u64> {
@@ -960,37 +1461,33 @@ impl InProcessKvStore {
         )
     }
 
-    fn expired_lease_candidates(&self) -> Vec<LeaseId> {
+    fn expired_lease_candidates(&self) -> Result<Vec<LeaseId>, KvError> {
+        let mut candidates = Vec::new();
         self.lease_deadlines
-            .range(..=self.lease_clock)
-            .flat_map(|(_, lease_ids)| lease_ids.iter().copied())
-            .collect()
+            .push_expired_candidates(self.lease_clock, &mut candidates)?;
+        Ok(candidates)
     }
 
-    fn upsert_lease(&mut self, lease: KvLease) {
+    fn upsert_lease(&mut self, lease: KvLease) -> Result<(), KvError> {
         let lease_id = lease.lease_id;
-        self.remove_lease_deadline(lease_id);
         let deadline = self.lease_clock.saturating_add(lease.remaining_ticks);
-        self.lease_deadline_by_id.insert(lease_id, deadline);
+        self.leases
+            .try_reserve_insert(lease_id, "upsert kv lease")?;
+        self.lease_deadline_by_id
+            .try_reserve_insert(lease_id, "index kv lease deadline")?;
         self.lease_deadlines
-            .entry(deadline)
-            .or_default()
-            .insert(lease_id);
-        self.leases.insert(lease_id, lease);
+            .try_reserve_insert(deadline, lease_id, "index kv lease deadline")?;
+        self.remove_lease_deadline(lease_id);
+        self.lease_deadline_by_id
+            .insert_reserved(lease_id, deadline);
+        self.lease_deadlines.insert_reserved(deadline, lease_id);
+        self.leases.insert_reserved(lease);
+        Ok(())
     }
 
     fn remove_lease_deadline(&mut self, lease_id: LeaseId) -> Option<u64> {
         let deadline = self.lease_deadline_by_id.remove(&lease_id)?;
-        let should_remove_deadline =
-            if let Some(lease_ids) = self.lease_deadlines.get_mut(&deadline) {
-                lease_ids.remove(&lease_id);
-                lease_ids.is_empty()
-            } else {
-                false
-            };
-        if should_remove_deadline {
-            self.lease_deadlines.remove(&deadline);
-        }
+        self.lease_deadlines.remove(deadline, lease_id);
         Some(deadline)
     }
 
@@ -1020,12 +1517,12 @@ impl InProcessKvStore {
     fn simulated_key_state(
         &self,
         key: &str,
-        touched_keys: &BTreeMap<String, SimulatedKeyState>,
+        touched_keys: &SimulatedKeyStateIndex,
         deleted_prefixes: &[String],
         revoked_leases: &[LeaseId],
     ) -> SimulatedKeyState {
         if let Some(state) = touched_keys.get(key) {
-            return *state;
+            return state;
         }
         if deleted_prefixes
             .iter()
@@ -1077,25 +1574,38 @@ impl InProcessKvStore {
         self.revision
     }
 
-    fn record_event(&mut self, event: KvEvent) {
+    fn record_event(&mut self, event: KvEvent) -> Result<(), KvError> {
+        let watch_ids = self.matching_watch_ids_for_event_key(&event.key)?;
         let event = Arc::new(event);
-        for watch_id in self.matching_watch_ids_for_event_key(&event.key) {
+        try_reserve_kv_items(&mut self.events, 1, "record kv event")?;
+        for watch_id in watch_ids {
             if let Some(watch) = self.watches.get_mut(&watch_id)
                 && event.revision >= watch.watch.start_revision
             {
+                let requested_bytes = watch
+                    .pending
+                    .len()
+                    .saturating_add(1)
+                    .saturating_mul(std::mem::size_of::<KvEvent>().max(1));
+                watch
+                    .pending
+                    .try_reserve(1)
+                    .map_err(|_| KvError::ResourceExhausted {
+                        operation: "queue kv watch event".to_string(),
+                        requested_bytes,
+                    })?;
                 watch.pending.push_back(Arc::clone(&event));
                 compact_watch_pending(watch);
             }
         }
         self.events.push(event);
         self.trim_event_history();
+        Ok(())
     }
 
-    fn index_watch_prefix(&mut self, watch_id: WatchId, prefix: &str) {
+    fn index_watch_prefix(&mut self, watch_id: WatchId, prefix: &str) -> Result<(), KvError> {
         self.watch_prefixes
-            .entry(prefix.to_string())
-            .or_default()
-            .insert(watch_id);
+            .try_add(watch_id, prefix, "index kv watch prefix")
     }
 
     fn remove_watch(&mut self, watch_id: WatchId) -> Option<KvWatchState> {
@@ -1105,35 +1615,39 @@ impl InProcessKvStore {
     }
 
     fn remove_watch_prefix_index(&mut self, watch_id: WatchId, prefix: &str) {
-        let should_remove = if let Some(watch_ids) = self.watch_prefixes.get_mut(prefix) {
-            watch_ids.remove(&watch_id);
-            watch_ids.is_empty()
-        } else {
-            false
-        };
-        if should_remove {
-            self.watch_prefixes.remove(prefix);
-        }
+        self.watch_prefixes.remove(watch_id, prefix);
     }
 
-    fn matching_watch_ids_for_event_key(&self, key: &str) -> Vec<WatchId> {
+    fn matching_watch_ids_for_event_key(&self, key: &str) -> Result<Vec<WatchId>, KvError> {
         let mut watch_ids = Vec::new();
         if let Some(prefix_watch_ids) = self.watch_prefixes.get("") {
+            try_reserve_kv_items(
+                &mut watch_ids,
+                prefix_watch_ids.len(),
+                "collect matching watch ids",
+            )?;
             watch_ids.extend(prefix_watch_ids.iter().copied());
         }
         for (start, ch) in key.char_indices() {
             let end = start + ch.len_utf8();
             if let Some(prefix_watch_ids) = self.watch_prefixes.get(&key[..end]) {
+                try_reserve_kv_items(
+                    &mut watch_ids,
+                    prefix_watch_ids.len(),
+                    "collect matching watch ids",
+                )?;
                 watch_ids.extend(prefix_watch_ids.iter().copied());
             }
         }
-        watch_ids
+        Ok(watch_ids)
     }
 
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn matching_watch_ids_for_event_key_for_test(&self, key: &str) -> Vec<WatchId> {
-        let mut watch_ids = self.matching_watch_ids_for_event_key(key);
+        let mut watch_ids = self
+            .matching_watch_ids_for_event_key(key)
+            .expect("matching watch ids");
         watch_ids.sort();
         watch_ids
     }
@@ -1142,19 +1656,13 @@ impl InProcessKvStore {
         self.compact_event_history_to(MAX_RETAINED_EVENTS);
     }
 
-    fn add_lease_key(&mut self, lease_id: LeaseId, key: String) {
-        self.lease_keys.entry(lease_id).or_default().insert(key);
+    fn add_lease_key(&mut self, lease_id: LeaseId, key: String) -> Result<(), KvError> {
+        self.lease_keys
+            .try_add_key(lease_id, key, "index kv lease key")
     }
 
     fn remove_lease_key(&mut self, lease_id: LeaseId, key: &str) {
-        let Some(keys) = self.lease_keys.get_mut(&lease_id) else {
-            return;
-        };
-        keys.remove(key);
-        let remove_empty = keys.is_empty();
-        if remove_empty {
-            self.lease_keys.remove(&lease_id);
-        }
+        self.lease_keys.remove_key(lease_id, key);
     }
 }
 
@@ -1194,47 +1702,176 @@ pub(crate) fn compact_watch_pending(watch: &mut KvWatchState) {
     );
 }
 
+fn single_log_entry_vec(entry: KvLogEntry, operation: &str) -> Result<Vec<KvLogEntry>, KvError> {
+    let mut entries = Vec::new();
+    try_reserve_kv_items(&mut entries, 1, operation)?;
+    entries.push(entry);
+    Ok(entries)
+}
+
+fn try_clone_kv_log_entry(entry: &KvLogEntry, operation: &str) -> Result<KvLogEntry, KvError> {
+    Ok(KvLogEntry {
+        index: entry.index,
+        term: entry.term,
+        command: try_clone_kv_command(&entry.command, operation)?,
+        revision: entry.revision,
+    })
+}
+
+fn try_clone_raft_vote_request(
+    request: &RaftRequestVoteRequest,
+    operation: &str,
+) -> Result<RaftRequestVoteRequest, KvError> {
+    Ok(RaftRequestVoteRequest {
+        term: request.term,
+        candidate_id: try_clone_kv_node_id(&request.candidate_id, operation)?,
+        last_log_index: request.last_log_index,
+        last_log_term: request.last_log_term,
+    })
+}
+
+#[derive(Clone, Debug, Default)]
+struct KvNodeSet {
+    nodes: BTreeSet<NodeId>,
+}
+
+impl KvNodeSet {
+    fn from_ids(node_ids: Vec<NodeId>, operation: &str) -> Result<Self, KvError> {
+        let _ = operation;
+        let nodes = node_ids.into_iter().collect();
+        Ok(Self { nodes })
+    }
+
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn contains(&self, node_id: &NodeId) -> bool {
+        self.nodes.contains(node_id)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &NodeId> {
+        self.nodes.iter()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct KvRaftNodeIndex {
+    nodes: BTreeMap<NodeId, ReplicatedKvNode>,
+    online: BTreeSet<NodeId>,
+}
+
+impl KvRaftNodeIndex {
+    fn from_voters(voters: &KvNodeSet) -> Result<Self, KvError> {
+        let mut nodes = BTreeMap::new();
+        let mut online = BTreeSet::new();
+        for node_id in voters.iter() {
+            let node_id = try_clone_kv_node_id(node_id, "initialize raft node id")?;
+            online.insert(try_clone_kv_node_id(&node_id, "initialize raft online node id")?);
+            nodes.insert(node_id, ReplicatedKvNode::empty());
+        }
+        Ok(Self { nodes, online })
+    }
+
+    fn contains_key(&self, node_id: &NodeId) -> bool {
+        self.nodes.contains_key(node_id)
+    }
+
+    fn get(&self, node_id: &NodeId) -> Option<&ReplicatedKvNode> {
+        self.nodes.get(node_id)
+    }
+
+    fn get_mut(&mut self, node_id: &NodeId) -> Option<&mut ReplicatedKvNode> {
+        self.nodes.get_mut(node_id)
+    }
+
+    fn is_online(&self, node_id: &NodeId) -> bool {
+        self.online.contains(node_id)
+    }
+
+    fn set_online(&mut self, node_id: &NodeId, online: bool) -> Result<(), KvError> {
+        if !self.nodes.contains_key(node_id) {
+            return Err(KvError::UnknownNode {
+                node_id: try_clone_kv_node_id(node_id, "report unknown raft node")?,
+            });
+        }
+        if online {
+            self.online
+                .insert(try_clone_kv_node_id(node_id, "mark raft node online")?);
+        } else {
+            self.online.remove(node_id);
+        }
+        Ok(())
+    }
+
+    fn online_node_ids(&self, operation: &str) -> Result<Vec<NodeId>, KvError> {
+        let mut node_ids = Vec::new();
+        try_reserve_kv_items(&mut node_ids, self.online.len(), operation)?;
+        for node_id in &self.online {
+            node_ids.push(try_clone_kv_node_id(node_id, operation)?);
+        }
+        Ok(node_ids)
+    }
+
+    fn online_voter_count(&self, voters: &KvNodeSet) -> usize {
+        voters
+            .iter()
+            .filter(|node_id| self.is_online(node_id))
+            .count()
+    }
+
+    fn online_voter_ids(
+        &self,
+        voters: &KvNodeSet,
+        operation: &str,
+    ) -> Result<Vec<NodeId>, KvError> {
+        let online_count = self.online_voter_count(voters);
+        let mut node_ids = Vec::new();
+        try_reserve_kv_items(&mut node_ids, online_count, operation)?;
+        for node_id in voters.iter().filter(|node_id| self.is_online(node_id)) {
+            node_ids.push(try_clone_kv_node_id(node_id, operation)?);
+        }
+        Ok(node_ids)
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut ReplicatedKvNode> {
+        self.nodes.values_mut()
+    }
+
+    fn try_insert_online(
+        &mut self,
+        node_id: NodeId,
+        node: ReplicatedKvNode,
+        operation: &str,
+    ) -> Result<Option<ReplicatedKvNode>, KvError> {
+        self.online
+            .insert(try_clone_kv_node_id(&node_id, operation)?);
+        Ok(self.nodes.insert(node_id, node))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct InProcessRaftKvCluster {
     term: u64,
     leader_id: NodeId,
-    voters: BTreeSet<NodeId>,
-    online: BTreeSet<NodeId>,
-    nodes: BTreeMap<NodeId, ReplicatedKvNode>,
+    voters: KvNodeSet,
+    nodes: KvRaftNodeIndex,
     next_log_index: u64,
     commit_index: u64,
 }
 
 impl InProcessRaftKvCluster {
     pub fn new(voter_ids: Vec<NodeId>) -> Result<Self, KvError> {
-        let Some(leader_id) = voter_ids.first().cloned() else {
+        let Some(leader_id) = voter_ids.first() else {
             return Err(KvError::NoVoters);
         };
-        let voters: BTreeSet<NodeId> = voter_ids.into_iter().collect();
-        let online = voters.clone();
-        let nodes = voters
-            .iter()
-            .cloned()
-            .map(|node_id| {
-                (
-                    node_id.clone(),
-                    ReplicatedKvNode {
-                        store: InProcessKvStore::new(),
-                        log: Vec::new(),
-                        hard_state: RaftHardState::default(),
-                        applied_index: 0,
-                        snapshot_index: 0,
-                        snapshot_term: 0,
-                        txn_responses: BTreeMap::new(),
-                    },
-                )
-            })
-            .collect();
+        let leader_id = try_clone_kv_node_id(leader_id, "select initial raft leader")?;
+        let voters = KvNodeSet::from_ids(voter_ids, "initialize raft voters")?;
+        let nodes = KvRaftNodeIndex::from_voters(&voters)?;
         Ok(Self {
             term: 1,
             leader_id,
             voters,
-            online,
             nodes,
             next_log_index: 1,
             commit_index: 0,
@@ -1249,13 +1886,12 @@ impl InProcessRaftKvCluster {
         self.nodes.get(node_id).map(|node| &node.store)
     }
 
-    pub fn set_node_online(&mut self, node_id: &NodeId, online: bool) {
+    pub fn set_node_online(&mut self, node_id: &NodeId, online: bool) -> Result<(), KvError> {
+        self.nodes.set_online(node_id, online)?;
         if online {
-            self.online.insert(node_id.clone());
-            let _ = self.catch_up_node(node_id);
-        } else {
-            self.online.remove(node_id);
+            self.catch_up_node(node_id)?;
         }
+        Ok(())
     }
 
     pub fn apply_as_leader(&mut self, command: KvCommand) -> Result<KvRevision, KvError> {
@@ -1273,12 +1909,12 @@ impl InProcessRaftKvCluster {
     }
 
     fn propose_command(&mut self, command: KvCommand) -> Result<RaftCommitOutcome, KvError> {
-        if !self.online.contains(&self.leader_id) {
+        if !self.nodes.is_online(&self.leader_id) {
             return Err(KvError::LeaderOffline {
-                leader_id: self.leader_id.clone(),
+                leader_id: try_clone_kv_node_id(&self.leader_id, "report offline raft leader")?,
             });
         }
-        let online_voters = self.voters.intersection(&self.online).count();
+        let online_voters = self.nodes.online_voter_count(&self.voters);
         if online_voters < self.quorum_size() {
             return Err(KvError::QuorumUnavailable {
                 online_voters,
@@ -1294,17 +1930,27 @@ impl InProcessRaftKvCluster {
             command,
             revision: KvRevision::ZERO,
         };
-        let leader_id = self.leader_id.clone();
+        let leader_id = try_clone_kv_node_id(&self.leader_id, "propose raft leader entry")?;
         self.node_mut(&leader_id)?
-            .append_entries(vec![entry.clone()])?;
+            .append_entries(single_log_entry_vec(
+                try_clone_kv_log_entry(&entry, "append leader raft entry")?,
+                "append leader raft entry",
+            )?)?;
         let mut voter_acks = usize::from(self.voters.contains(&leader_id));
 
-        for node_id in self.online.iter().cloned().collect::<Vec<_>>() {
-            if node_id == leader_id {
+        let online_nodes = self.nodes.online_node_ids("collect online raft nodes")?;
+        for node_id in online_nodes.iter() {
+            if *node_id == leader_id {
                 continue;
             }
-            let ack = self.append_entries_to_follower(&node_id, vec![entry.clone()])?;
-            if ack.success && self.voters.contains(&node_id) {
+            let ack = self.append_entries_to_follower(
+                node_id,
+                single_log_entry_vec(
+                    try_clone_kv_log_entry(&entry, "append follower raft entry")?,
+                    "append follower raft entry",
+                )?,
+            )?;
+            if ack.success && self.voters.contains(node_id) {
                 voter_acks += 1;
             }
         }
@@ -1317,7 +1963,6 @@ impl InProcessRaftKvCluster {
         }
 
         self.commit_index = index;
-        let online_nodes = self.online.iter().cloned().collect::<Vec<_>>();
         for node_id in online_nodes {
             self.node_mut(&node_id)?.commit_to(index)?;
         }
@@ -1327,7 +1972,7 @@ impl InProcessRaftKvCluster {
             .iter()
             .find(|entry| entry.index == index)
             .ok_or(KvError::MissingCommittedEntry { index })?;
-        let txn_response = leader.txn_responses.get(&index).cloned();
+        let txn_response = leader.txn_responses.get_cloned(index)?;
         Ok(RaftCommitOutcome {
             revision: committed.revision,
             txn_response,
@@ -1350,7 +1995,7 @@ impl InProcessRaftKvCluster {
             .unwrap_or(0);
         let request = RaftAppendEntriesRequest {
             term: self.term,
-            leader_id: self.leader_id.clone(),
+            leader_id: try_clone_kv_node_id(&self.leader_id, "build raft append request")?,
             prev_log_index,
             prev_log_term,
             entries,
@@ -1364,31 +2009,50 @@ impl InProcessRaftKvCluster {
     pub fn catch_up_node(&mut self, node_id: &NodeId) -> Result<(), KvError> {
         if !self.nodes.contains_key(node_id) {
             return Err(KvError::UnknownNode {
-                node_id: node_id.clone(),
+                node_id: try_clone_kv_node_id(node_id, "report unknown raft node")?,
             });
         }
         if node_id == &self.leader_id {
             return Ok(());
         }
-        let leader = self.node(&self.leader_id)?.clone();
+        let follower_last_log_index = self.node(node_id)?.last_log_index();
+        let (snapshot, missing, leader_commit_index) = {
+            let leader = self.node(&self.leader_id)?;
+            let (snapshot, missing_after_index) = if follower_last_log_index < leader.snapshot_index
+            {
+                (
+                    Some(RaftSnapshot {
+                        last_included_index: leader.applied_index,
+                        last_included_term: leader
+                            .term_at(leader.applied_index)
+                            .unwrap_or(leader.term()),
+                        kv: leader.store.try_snapshot()?,
+                    }),
+                    leader.applied_index,
+                )
+            } else {
+                (None, follower_last_log_index)
+            };
+            let mut missing = Vec::new();
+            for entry in leader
+                .log
+                .iter()
+                .filter(|entry| entry.index > missing_after_index)
+            {
+                try_reserve_kv_items(&mut missing, 1, "collect missing raft entries")?;
+                missing.push(try_clone_kv_log_entry(
+                    entry,
+                    "collect missing raft entries",
+                )?);
+            }
+            (snapshot, missing, leader.hard_state.commit_index)
+        };
         let follower = self.node_mut(node_id)?;
-        if follower.last_log_index() < leader.snapshot_index {
-            follower.install_snapshot(RaftSnapshot {
-                last_included_index: leader.applied_index,
-                last_included_term: leader
-                    .term_at(leader.applied_index)
-                    .unwrap_or(leader.term()),
-                kv: leader.store.snapshot(),
-            });
+        if let Some(snapshot) = snapshot {
+            follower.install_snapshot(snapshot)?;
         }
-        let missing = leader
-            .log
-            .iter()
-            .filter(|entry| entry.index > follower.last_log_index())
-            .cloned()
-            .collect::<Vec<_>>();
         follower.append_entries(missing)?;
-        follower.commit_to(leader.hard_state.commit_index)
+        follower.commit_to(leader_commit_index)
     }
 
     pub fn request_vote(
@@ -1440,19 +2104,21 @@ impl InProcessRaftKvCluster {
                 node_id: new_leader_id,
             });
         }
-        if !self.online.contains(&new_leader_id) {
+        if !self.nodes.is_online(&new_leader_id) {
             return Err(KvError::LeaderOffline {
                 leader_id: new_leader_id,
             });
         }
         self.catch_up_node(&new_leader_id)?;
         self.term = self.term.saturating_add(1);
-        self.leader_id = new_leader_id.clone();
+        self.leader_id = try_clone_kv_node_id(&new_leader_id, "transfer raft leader")?;
         let term = self.term;
         for node in self.nodes.values_mut() {
             node.hard_state.current_term = term;
-            node.hard_state.voted_for = Some(new_leader_id.clone());
-            node.hard_state.leader_id = Some(new_leader_id.clone());
+            node.hard_state.voted_for =
+                Some(try_clone_kv_node_id(&new_leader_id, "record transferred raft vote")?);
+            node.hard_state.leader_id =
+                Some(try_clone_kv_node_id(&new_leader_id, "record transferred raft leader")?);
         }
         Ok(())
     }
@@ -1463,28 +2129,32 @@ impl InProcessRaftKvCluster {
                 node_id: candidate_id,
             });
         }
-        if !self.online.contains(&candidate_id) {
+        if !self.nodes.is_online(&candidate_id) {
             return Err(KvError::LeaderOffline {
                 leader_id: candidate_id,
             });
         }
         self.catch_up_node(&candidate_id)?;
-        let candidate = self.node(&candidate_id)?.clone();
+        let (last_log_index, last_log_term) = {
+            let candidate = self.node(&candidate_id)?;
+            (candidate.last_log_index(), candidate.last_log_term())
+        };
         let election_term = self.term.saturating_add(1);
         let request = RaftRequestVoteRequest {
             term: election_term,
-            candidate_id: candidate_id.clone(),
-            last_log_index: candidate.last_log_index(),
-            last_log_term: candidate.last_log_term(),
+            candidate_id: try_clone_kv_node_id(&candidate_id, "build raft vote request")?,
+            last_log_index,
+            last_log_term,
         };
         let mut granted = 0;
-        for voter_id in self
-            .voters
-            .intersection(&self.online)
-            .cloned()
-            .collect::<Vec<_>>()
-        {
-            let response = self.request_vote(&voter_id, request.clone())?;
+        let online_voters = self
+            .nodes
+            .online_voter_ids(&self.voters, "collect online raft voters")?;
+        for voter_id in online_voters {
+            let response = self.request_vote(
+                &voter_id,
+                try_clone_raft_vote_request(&request, "send raft vote request")?,
+            )?;
             if response.term > self.term {
                 self.term = response.term;
             }
@@ -1496,28 +2166,33 @@ impl InProcessRaftKvCluster {
             return Ok(false);
         }
         self.term = election_term.max(self.term);
-        self.leader_id = candidate_id.clone();
+        self.leader_id = try_clone_kv_node_id(&candidate_id, "elect raft leader")?;
         for node in self.nodes.values_mut() {
             if node.hard_state.current_term <= self.term {
                 node.hard_state.current_term = self.term;
-                node.hard_state.leader_id = Some(candidate_id.clone());
+                node.hard_state.leader_id =
+                    Some(try_clone_kv_node_id(&candidate_id, "record elected raft leader")?);
             }
         }
         Ok(true)
     }
 
     fn node(&self, node_id: &NodeId) -> Result<&ReplicatedKvNode, KvError> {
-        self.nodes.get(node_id).ok_or_else(|| KvError::UnknownNode {
-            node_id: node_id.clone(),
-        })
+        match self.nodes.get(node_id) {
+            Some(node) => Ok(node),
+            None => Err(KvError::UnknownNode {
+                node_id: try_clone_kv_node_id(node_id, "report unknown raft node")?,
+            }),
+        }
     }
 
     fn node_mut(&mut self, node_id: &NodeId) -> Result<&mut ReplicatedKvNode, KvError> {
-        self.nodes
-            .get_mut(node_id)
-            .ok_or_else(|| KvError::UnknownNode {
-                node_id: node_id.clone(),
-            })
+        match self.nodes.get_mut(node_id) {
+            Some(node) => Ok(node),
+            None => Err(KvError::UnknownNode {
+                node_id: try_clone_kv_node_id(node_id, "report unknown raft node")?,
+            }),
+        }
     }
 
     pub fn put(&mut self, key: impl Into<String>, value: Vec<u8>) -> Result<KvRevision, KvError> {
@@ -1547,7 +2222,7 @@ impl InProcessRaftKvCluster {
             last_included_index: self.commit_index,
             last_included_term: self.term,
             kv: snapshot,
-        });
+        })?;
         Ok(())
     }
 
@@ -1559,24 +2234,14 @@ impl InProcessRaftKvCluster {
         if self.nodes.contains_key(&node_id) {
             return Err(KvError::DuplicateNode { node_id });
         }
-        self.nodes.insert(
-            node_id.clone(),
-            ReplicatedKvNode {
-                store: InProcessKvStore::restore(snapshot),
-                log: Vec::new(),
-                hard_state: RaftHardState {
-                    current_term: self.term,
-                    voted_for: None,
-                    leader_id: Some(self.leader_id.clone()),
-                    commit_index: self.commit_index,
-                },
-                applied_index: self.commit_index,
-                snapshot_index: self.commit_index,
-                snapshot_term: self.term,
-                txn_responses: BTreeMap::new(),
-            },
-        );
-        self.online.insert(node_id);
+        let node = ReplicatedKvNode::from_snapshot(
+            snapshot,
+            self.term,
+            &self.leader_id,
+            self.commit_index,
+        )?;
+        self.nodes
+            .try_insert_online(node_id, node, "add raft learner node")?;
         Ok(())
     }
 
@@ -1599,6 +2264,51 @@ impl CommitEntries {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct KvTxnResponseIndex {
+    responses: BTreeMap<u64, KvTxnResponse>,
+}
+
+impl KvTxnResponseIndex {
+    fn len(&self) -> usize {
+        self.responses.len()
+    }
+
+    pub(crate) fn get(&self, index: u64) -> Option<&KvTxnResponse> {
+        self.responses.get(&index)
+    }
+
+    fn get_cloned(&self, index: u64) -> Result<Option<KvTxnResponse>, KvError> {
+        let Some(response) = self.get(index) else {
+            return Ok(None);
+        };
+        Ok(Some(try_clone_kv_txn_response(
+            response,
+            "clone raft txn response",
+        )?))
+    }
+
+    fn try_insert(
+        &mut self,
+        index: u64,
+        response: KvTxnResponse,
+    ) -> Result<Option<KvTxnResponse>, KvError> {
+        Ok(self.responses.insert(index, response))
+    }
+
+    fn retain_applied_through(&mut self, committed: u64) {
+        self.responses.retain(|index, _| *index <= committed);
+    }
+
+    fn retain_after(&mut self, cutoff: u64) {
+        self.responses.retain(|index, _| *index > cutoff);
+    }
+
+    fn clear(&mut self) {
+        self.responses.clear();
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ReplicatedKvNode {
     pub(crate) store: InProcessKvStore,
@@ -1607,10 +2317,47 @@ pub(crate) struct ReplicatedKvNode {
     pub(crate) applied_index: u64,
     pub(crate) snapshot_index: u64,
     pub(crate) snapshot_term: u64,
-    pub(crate) txn_responses: BTreeMap<u64, KvTxnResponse>,
+    pub(crate) txn_responses: KvTxnResponseIndex,
 }
 
 impl ReplicatedKvNode {
+    fn empty() -> Self {
+        Self {
+            store: InProcessKvStore::new(),
+            log: Vec::new(),
+            hard_state: RaftHardState::default(),
+            applied_index: 0,
+            snapshot_index: 0,
+            snapshot_term: 0,
+            txn_responses: KvTxnResponseIndex::default(),
+        }
+    }
+
+    fn from_snapshot(
+        snapshot: KvSnapshot,
+        term: u64,
+        leader_id: &NodeId,
+        commit_index: u64,
+    ) -> Result<Self, KvError> {
+        Ok(Self {
+            store: InProcessKvStore::restore(snapshot)?,
+            log: Vec::new(),
+            hard_state: RaftHardState {
+                current_term: term,
+                voted_for: None,
+                leader_id: Some(try_clone_kv_node_id(
+                    leader_id,
+                    "record raft learner leader",
+                )?),
+                commit_index,
+            },
+            applied_index: commit_index,
+            snapshot_index: commit_index,
+            snapshot_term: term,
+            txn_responses: KvTxnResponseIndex::default(),
+        })
+    }
+
     pub(crate) fn term(&self) -> u64 {
         self.hard_state.current_term
     }
@@ -1759,7 +2506,10 @@ impl ReplicatedKvNode {
             {
                 Ok(existing_position) if self.log[existing_position].term != entry.term => {
                     self.log.truncate(existing_position);
-                    self.log.push(entry.clone());
+                    try_reserve_kv_items(&mut self.log, 1, "append raft log entry")?;
+                    self.log
+                        .push(try_clone_kv_log_entry(&entry, "append raft log entry")?);
+                    try_reserve_kv_items(&mut appended, 1, "record appended raft entry")?;
                     appended.push(entry);
                 }
                 Ok(existing_position) if self.log[existing_position].command != entry.command => {
@@ -1774,7 +2524,10 @@ impl ReplicatedKvNode {
                             actual: entry.index,
                         });
                     }
-                    self.log.push(entry.clone());
+                    try_reserve_kv_items(&mut self.log, 1, "append raft log entry")?;
+                    self.log
+                        .push(try_clone_kv_log_entry(&entry, "append raft log entry")?);
+                    try_reserve_kv_items(&mut appended, 1, "record appended raft entry")?;
                     appended.push(entry);
                 }
             }
@@ -1787,7 +2540,7 @@ impl ReplicatedKvNode {
         let old_log_len = self.log.len();
         let old_response_len = self.txn_responses.len();
         self.log.retain(|entry| entry.index <= committed);
-        self.txn_responses.retain(|index, _| *index <= committed);
+        self.txn_responses.retain_applied_through(committed);
         old_log_len != self.log.len() || old_response_len != self.txn_responses.len()
     }
 
@@ -1795,7 +2548,15 @@ impl ReplicatedKvNode {
         &mut self,
         request: RaftAppendEntriesRequest,
     ) -> Result<RaftAppendEntriesPreparation, KvError> {
-        if request.term < self.hard_state.current_term {
+        let RaftAppendEntriesRequest {
+            term,
+            leader_id,
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit,
+        } = request;
+        if term < self.hard_state.current_term {
             return Ok(RaftAppendEntriesPreparation {
                 response: RaftAppendEntriesResponse {
                     term: self.hard_state.current_term,
@@ -1806,12 +2567,12 @@ impl ReplicatedKvNode {
                 commit_index: None,
             });
         }
-        if request.term > self.hard_state.current_term {
+        if term > self.hard_state.current_term {
             self.hard_state.voted_for = None;
         }
-        self.hard_state.current_term = request.term;
-        self.hard_state.leader_id = Some(request.leader_id.clone());
-        if self.term_at(request.prev_log_index) != Some(request.prev_log_term) {
+        self.hard_state.current_term = term;
+        self.hard_state.leader_id = Some(leader_id);
+        if self.term_at(prev_log_index) != Some(prev_log_term) {
             return Ok(RaftAppendEntriesPreparation {
                 response: RaftAppendEntriesResponse {
                     term: self.hard_state.current_term,
@@ -1822,8 +2583,8 @@ impl ReplicatedKvNode {
                 commit_index: None,
             });
         }
-        let appended_entries = self.append_entries(request.entries)?;
-        let commit_index = request.leader_commit.min(self.last_log_index());
+        let appended_entries = self.append_entries(entries)?;
+        let commit_index = leader_commit.min(self.last_log_index());
         Ok(RaftAppendEntriesPreparation {
             response: RaftAppendEntriesResponse {
                 term: self.hard_state.current_term,
@@ -1924,7 +2685,11 @@ impl ReplicatedKvNode {
         let end = self
             .log
             .partition_point(|entry| entry.index <= commit_index);
-        let entries = self.log[start..end].to_vec();
+        let mut entries = Vec::new();
+        try_reserve_kv_items(&mut entries, end.saturating_sub(start), "collect commit entries")?;
+        for entry in &self.log[start..end] {
+            entries.push(try_clone_kv_log_entry(entry, "collect commit entries")?);
+        }
         let mut expected_index = self.applied_index.saturating_add(1);
         for entry in &entries {
             if entry.index != expected_index {
@@ -1982,7 +2747,7 @@ impl ReplicatedKvNode {
             log_entry.revision = revision;
         }
         if let Some(response) = txn_response {
-            self.txn_responses.insert(entry.index, response);
+            self.txn_responses.try_insert(entry.index, response)?;
         }
         self.applied_index = entry.index;
         Ok(())
@@ -1999,11 +2764,11 @@ impl ReplicatedKvNode {
         self.snapshot_index = snapshot_index;
         let cutoff = snapshot_index.saturating_sub(retain);
         self.log.retain(|entry| entry.index > cutoff);
-        self.txn_responses.retain(|index, _| *index > cutoff);
+        self.txn_responses.retain_after(cutoff);
     }
 
-    pub(crate) fn install_snapshot(&mut self, snapshot: RaftSnapshot) {
-        self.store = InProcessKvStore::restore(snapshot.kv);
+    pub(crate) fn install_snapshot(&mut self, snapshot: RaftSnapshot) -> Result<(), KvError> {
+        self.store = InProcessKvStore::restore(snapshot.kv)?;
         self.snapshot_index = snapshot.last_included_index;
         self.snapshot_term = snapshot.last_included_term;
         self.applied_index = snapshot.last_included_index;
@@ -2011,6 +2776,7 @@ impl ReplicatedKvNode {
         self.log
             .retain(|entry| entry.index > snapshot.last_included_index);
         self.txn_responses.clear();
+        Ok(())
     }
 }
 

@@ -1713,7 +1713,9 @@ mod tests {
         assert!(response.succeeded);
         assert!(store.get(&key).is_some());
 
-        let entries = store.range_prefix(CLUSTER_TRUSTED_ARTIFACT_SIGNER_PREFIX);
+        let entries = store
+            .range_prefix(CLUSTER_TRUSTED_ARTIFACT_SIGNER_PREFIX)
+            .expect("signer range");
         let signers = trusted_artifact_signers_from_kv_entries(&entries).expect("decode signers");
         assert_eq!(signers, vec![signer.clone()]);
 
@@ -1737,7 +1739,9 @@ mod tests {
 
         let mut store = sinomo_kv::InProcessKvStore::new();
         store.txn(txn).expect("apply signer txn");
-        let mut entries = store.range_prefix(CLUSTER_TRUSTED_ARTIFACT_SIGNER_PREFIX);
+        let mut entries = store
+            .range_prefix(CLUSTER_TRUSTED_ARTIFACT_SIGNER_PREFIX)
+            .expect("signer range");
         entries[0].key = format!("{CLUSTER_TRUSTED_ARTIFACT_SIGNER_PREFIX}wrong");
 
         let error = trusted_artifact_signers_from_kv_entries(&entries)

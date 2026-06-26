@@ -6242,8 +6242,11 @@ fn cluster_state_sync_txn_removes_stale_member_endpoint_keys_before_republishing
     store
         .put_serde(stale_key.clone(), &stale_endpoint, None)
         .expect("stale endpoint");
-    sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot())
-        .expect("cluster kv snapshot");
+    sinomo_runtime::kv::write_cluster_kv_snapshot(
+        &paths.kv_paths(),
+        &store.snapshot().expect("snapshot"),
+    )
+    .expect("cluster kv snapshot");
 
     let txn = cluster_state_sync_txn(&paths, &state).expect("cluster state sync txn");
     let endpoint_prefix = format!("/cluster/endpoints/{node_id}/");
@@ -6400,8 +6403,11 @@ fn cluster_network_expiration_keeps_local_owned_records() {
             None,
         )
         .expect("local connectivity");
-    sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot())
-        .expect("cluster kv snapshot");
+    sinomo_runtime::kv::write_cluster_kv_snapshot(
+        &paths.kv_paths(),
+        &store.snapshot().expect("snapshot"),
+    )
+    .expect("cluster kv snapshot");
 
     let snapshot =
         expire_cluster_network_records_in_kv(&paths, &state, now).expect("expire local records");
@@ -6420,7 +6426,7 @@ fn imported_daemon_snapshot_defers_volatile_only_materialized_refresh() {
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
 
-    let baseline = InProcessKvStore::new().snapshot();
+    let baseline = InProcessKvStore::new().snapshot().expect("snapshot");
     sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &baseline)
         .expect("write baseline snapshot");
     let before_metadata = std::fs::metadata(&paths.kv_snapshot).expect("snapshot metadata");
@@ -6439,11 +6445,11 @@ fn imported_daemon_snapshot_defers_volatile_only_materialized_refresh() {
         observed_at: now,
         expires_at: now + time::Duration::hours(1),
     };
-    let mut imported = InProcessKvStore::restore(baseline.clone());
+    let mut imported = InProcessKvStore::restore(baseline.clone()).expect("restore");
     imported
         .put_serde(cluster_network_info_key(&node_id), &info, None)
         .expect("volatile network info");
-    let imported = imported.snapshot();
+    let imported = imported.snapshot().expect("snapshot");
     assert!(
         imported.revision > baseline.revision,
         "test setup must create a newer imported daemon snapshot"
@@ -6518,8 +6524,11 @@ fn stable_connectivity_sync_does_not_rewrite_source_prefix() {
     store
         .put_serde(key.clone(), &stored, None)
         .expect("stored connectivity");
-    sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot())
-        .expect("cluster kv snapshot");
+    sinomo_runtime::kv::write_cluster_kv_snapshot(
+        &paths.kv_paths(),
+        &store.snapshot().expect("snapshot"),
+    )
+    .expect("cluster kv snapshot");
 
     sinomo_runtime::network::sync_cluster_connectivity_records_to_kv(
         &paths,
@@ -11451,8 +11460,11 @@ fn rollout_target_uses_main_endpoint_when_shadow_is_unreachable() {
             )
             .expect("connectivity record");
     }
-    sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot())
-        .expect("cluster kv snapshot");
+    sinomo_runtime::kv::write_cluster_kv_snapshot(
+        &paths.kv_paths(),
+        &store.snapshot().expect("snapshot"),
+    )
+    .expect("cluster kv snapshot");
 
     let selected = rollout_target_endpoint_for_main_with_connectivity(
         &paths,
@@ -11597,8 +11609,11 @@ fn rollout_target_prefers_healthy_main_tcp_over_shadow_iroh_backup() {
             None,
         )
         .expect("connectivity record");
-    sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot())
-        .expect("cluster kv snapshot");
+    sinomo_runtime::kv::write_cluster_kv_snapshot(
+        &paths.kv_paths(),
+        &store.snapshot().expect("snapshot"),
+    )
+    .expect("cluster kv snapshot");
 
     let selected = rollout_target_endpoint_for_main_with_connectivity(
         &paths,
@@ -11644,8 +11659,11 @@ fn rollout_endpoint_candidates_include_kv_only_endpoint_records() {
             None,
         )
         .expect("endpoint record");
-    sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot())
-        .expect("cluster kv snapshot");
+    sinomo_runtime::kv::write_cluster_kv_snapshot(
+        &paths.kv_paths(),
+        &store.snapshot().expect("snapshot"),
+    )
+    .expect("cluster kv snapshot");
 
     let endpoints = network::ClusterEndpointSelector::new(&paths, &state)
         .select(network::ClusterEndpointSelectionPurpose::Rollout);
@@ -13233,7 +13251,8 @@ fn models_default_writes_cluster_model_config_to_kv_for_clustered_node() {
     let store = sinomo_runtime::kv::InProcessKvStore::restore(
         sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&cluster_paths.kv_paths())
             .expect("cluster kv"),
-    );
+    )
+    .expect("restore");
     let entry = store
         .get(sinomo_lm::LM_PROVIDER_CONFIG_KV_KEY)
         .expect("lm config kv entry");
@@ -13290,7 +13309,8 @@ fn local_mode_forces_model_config_to_local_file_on_clustered_node() {
     let store = sinomo_runtime::kv::InProcessKvStore::restore(
         sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&cluster_paths.kv_paths())
             .expect("cluster kv"),
-    );
+    )
+    .expect("restore");
     assert!(store.get(sinomo_lm::LM_PROVIDER_CONFIG_KV_KEY).is_none());
 }
 
@@ -13346,7 +13366,8 @@ fn daemonless_cli_model_defaults_use_local_file_on_clustered_node() {
     let store = sinomo_runtime::kv::InProcessKvStore::restore(
         sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&cluster_paths.kv_paths())
             .expect("cluster kv"),
-    );
+    )
+    .expect("restore");
     assert!(store.get(sinomo_lm::LM_PROVIDER_CONFIG_KV_KEY).is_none());
 }
 
@@ -13392,7 +13413,8 @@ fn models_runtime_writes_cluster_runtime_config_to_kv_for_clustered_node() {
     let store = sinomo_runtime::kv::InProcessKvStore::restore(
         sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&cluster_paths.kv_paths())
             .expect("cluster kv"),
-    );
+    )
+    .expect("restore");
     let entry = store
         .get(sinomo_lm::LM_RUNTIME_CONFIG_KV_KEY)
         .expect("lm runtime kv entry");
@@ -13443,7 +13465,8 @@ fn local_mode_writes_model_runtime_config_to_local_file_on_clustered_node() {
     let store = sinomo_runtime::kv::InProcessKvStore::restore(
         sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&cluster_paths.kv_paths())
             .expect("cluster kv"),
-    );
+    )
+    .expect("restore");
     assert!(store.get(sinomo_lm::LM_RUNTIME_CONFIG_KV_KEY).is_none());
 }
 
@@ -13504,7 +13527,8 @@ fn sandbox_policy_writes_cluster_policy_config_to_kv_for_clustered_node() {
     let store = sinomo_runtime::kv::InProcessKvStore::restore(
         sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&cluster_paths.kv_paths())
             .expect("cluster kv"),
-    );
+    )
+    .expect("restore");
     let entry = store
         .get(sinomo_runtime::sandbox::SANDBOX_POLICY_CONFIG_KV_KEY)
         .expect("sandbox policy kv entry");
@@ -13564,7 +13588,8 @@ fn local_mode_writes_sandbox_policy_to_local_file_on_clustered_node() {
     let store = sinomo_runtime::kv::InProcessKvStore::restore(
         sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&cluster_paths.kv_paths())
             .expect("cluster kv"),
-    );
+    )
+    .expect("restore");
     assert!(
         store
             .get(sinomo_runtime::sandbox::SANDBOX_POLICY_CONFIG_KV_KEY)

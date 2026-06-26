@@ -117,11 +117,20 @@ pub(crate) fn cluster_member_publish_matches_kv(
         }
 
         let endpoint_prefix = cluster_endpoint_prefix(&member.node_id);
-        let mut existing_endpoints = snapshot
-            .range_prefix_limited(&endpoint_prefix, MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS)?
-            .into_iter()
-            .filter_map(|entry| entry.decode::<ClusterEndpointRecord>().ok())
-            .collect::<Vec<_>>();
+        let mut existing_endpoints = Vec::new();
+        for entry in
+            snapshot.range_prefix_limited(&endpoint_prefix, MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS)?
+        {
+            let Some(endpoint) = entry.decode::<ClusterEndpointRecord>().ok() else {
+                continue;
+            };
+            crate::object::try_reserve_vec(
+                &mut existing_endpoints,
+                1,
+                "collect existing member endpoints",
+            )?;
+            existing_endpoints.push(endpoint);
+        }
         existing_endpoints.sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
         if !cluster_endpoint_list_stable_eq(&existing_endpoints, &member.endpoints) {
             return Ok(false);

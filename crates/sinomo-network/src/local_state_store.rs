@@ -14,9 +14,11 @@ use crate::local_membership::{
 use crate::member_store::merge_member_record;
 #[cfg(test)]
 use crate::object_file_store::remove_optional_file;
-use crate::object_file_store::{read_optional_object_file, write_object_file};
+use crate::object_file_store::{read_optional_object_file, write_object_file_with_semantic_skip};
 use sinomo_core::ClusterBootstrapState;
-use sinomo_node::{cluster_node_is_local_process, upsert_member_record};
+use sinomo_node::{
+    cluster_bootstrap_state_stable_eq, cluster_node_is_local_process, upsert_member_record,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -131,15 +133,17 @@ pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState,
         }
     };
     if !kv_members.is_empty() {
-        let local_process_members = state
-            .members
-            .iter()
-            .filter(|member| {
-                cluster_node_is_local_process(&state, &member.node_id)
-                    && member.state.is_authorized()
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut local_process_members = Vec::new();
+        for member in state.members.iter().filter(|member| {
+            cluster_node_is_local_process(&state, &member.node_id) && member.state.is_authorized()
+        }) {
+            crate::object::try_reserve_vec(
+                &mut local_process_members,
+                1,
+                "collect local process members",
+            )?;
+            local_process_members.push(member.clone());
+        }
         state.members = kv_members;
         preserve_locally_learned_remote_route_endpoints(&mut state, local_remote_route_endpoints);
         for local_member in local_process_members {
@@ -228,7 +232,9 @@ pub fn write_cluster_state(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<(), NetworkError> {
-    write_object_file(&paths.state, state)?;
+    write_object_file_with_semantic_skip(&paths.state, state, |existing| {
+        cluster_bootstrap_state_stable_eq(existing, state)
+    })?;
     record_current_cluster_kv_reader_node_id_cache(paths, state.local_node_id.clone());
     Ok(())
 }

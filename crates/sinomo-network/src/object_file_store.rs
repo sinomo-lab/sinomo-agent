@@ -77,9 +77,35 @@ pub(crate) fn write_object_file<T: Serialize>(
     value: &T,
 ) -> Result<(), NetworkError> {
     let desired = SinomoObjectCodec::default().encode(value)?;
+    write_encoded_object_file(path, &desired)
+}
+
+pub(crate) fn write_object_file_with_semantic_skip<T, F>(
+    path: &PathBuf,
+    value: &T,
+    stable_eq: F,
+) -> Result<(), NetworkError>
+where
+    T: Serialize + serde::de::DeserializeOwned,
+    F: FnOnce(&T) -> bool,
+{
+    let desired = SinomoObjectCodec::default().encode(value)?;
+    if fs::metadata(path)
+        .map(|metadata| metadata.len() == desired.len() as u64)
+        .unwrap_or(false)
+        && let Ok(Some(existing)) = read_optional_object_file::<T>(path)
+        && stable_eq(&existing)
+    {
+        record_object_file_semantic_skip();
+        return Ok(());
+    }
+    write_encoded_object_file(path, &desired)
+}
+
+fn write_encoded_object_file(path: &PathBuf, desired: &[u8]) -> Result<(), NetworkError> {
     let result = durable_file::write_object_file_bytes_if_changed(
         path,
-        &desired,
+        desired,
         &LAST_WRITTEN_OBJECT_FILES,
         durable_file::DurableObjectFileOptions::new("sobj", "tmp"),
     )
@@ -96,6 +122,28 @@ pub(crate) fn write_object_file<T: Serialize>(
         }
     }
     Ok(())
+}
+
+pub(crate) fn record_object_file_semantic_skip() {
+    if let Some(observer) = io_observer() {
+        observer.on_object_file_skipped_write();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn write_object_file_compare_read_bytes_for_test<T: Serialize>(
+    path: &PathBuf,
+    value: &T,
+) -> Result<Option<u64>, NetworkError> {
+    let desired = SinomoObjectCodec::default().encode(value)?;
+    durable_file::write_object_file_bytes_if_changed(
+        path,
+        &desired,
+        &LAST_WRITTEN_OBJECT_FILES,
+        durable_file::DurableObjectFileOptions::new("sobj", "tmp"),
+    )
+    .map(|result| result.compare_read_bytes)
+    .map_err(network_durable_file_error)
 }
 
 /// Write a fully encoded object and publish it only if `path` is absent.
@@ -148,9 +196,19 @@ fn create_new_link_or_unsupported_for_test(
 }
 
 fn network_durable_file_error(error: durable_file::DurableFileError) -> NetworkError {
-    NetworkError::StorageIo {
-        path: error.path().to_string(),
-        detail: error.detail().to_string(),
+    match error {
+        durable_file::DurableFileError::ResourceExhausted {
+            operation,
+            requested_bytes,
+            ..
+        } => NetworkError::ResourceExhausted {
+            operation,
+            requested_bytes,
+        },
+        error => NetworkError::StorageIo {
+            path: error.path().to_string(),
+            detail: error.detail().to_string(),
+        },
     }
 }
 

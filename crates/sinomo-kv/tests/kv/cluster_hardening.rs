@@ -96,12 +96,16 @@ impl ClusterSim {
     }
 
     fn partition(&mut self, node_index: usize) {
-        self.cluster.set_node_online(&self.nodes[node_index], false);
+        self.cluster
+            .set_node_online(&self.nodes[node_index], false)
+            .unwrap();
         self.online[node_index] = false;
     }
 
     fn heal(&mut self, node_index: usize) {
-        self.cluster.set_node_online(&self.nodes[node_index], true);
+        self.cluster
+            .set_node_online(&self.nodes[node_index], true)
+            .unwrap();
         self.online[node_index] = true;
     }
 
@@ -165,7 +169,7 @@ fn assert_online_nodes_match_model(
                 "{node_id} model value for {key}"
             );
         }
-        for entry in store.range_prefix("/cluster/model/") {
+        for entry in store.range_prefix("/cluster/model/").expect("range prefix") {
             assert!(
                 model.contains_key(&entry.key),
                 "{node_id} has unexpected model key {}",
@@ -190,8 +194,8 @@ fn cluster_quorum_commit_respects_single_three_and_five_voter_thresholds() {
         "kv_five_d",
         "kv_five_e",
     ]);
-    cluster.set_node_online(&nodes[1], false);
-    cluster.set_node_online(&nodes[2], false);
+    cluster.set_node_online(&nodes[1], false).unwrap();
+    cluster.set_node_online(&nodes[2], false).unwrap();
     cluster
         .put("/cluster/quorum/majority", b"committed".to_vec())
         .expect("three of five commit");
@@ -216,13 +220,13 @@ fn cluster_quorum_commit_respects_single_three_and_five_voter_thresholds() {
     assert_node_missing(&cluster, &nodes[1], "/cluster/quorum/majority");
     assert_node_missing(&cluster, &nodes[2], "/cluster/quorum/majority");
 
-    cluster.set_node_online(&nodes[1], true);
-    cluster.set_node_online(&nodes[2], true);
+    cluster.set_node_online(&nodes[1], true).unwrap();
+    cluster.set_node_online(&nodes[2], true).unwrap();
     assert_all_nodes_value(&cluster, &nodes, "/cluster/quorum/majority", b"committed");
 
-    cluster.set_node_online(&nodes[1], false);
-    cluster.set_node_online(&nodes[2], false);
-    cluster.set_node_online(&nodes[3], false);
+    cluster.set_node_online(&nodes[1], false).unwrap();
+    cluster.set_node_online(&nodes[2], false).unwrap();
+    cluster.set_node_online(&nodes[3], false).unwrap();
     let before_commit_index = cluster.commit_index();
     let error = cluster
         .put("/cluster/quorum/minority", b"blocked".to_vec())
@@ -245,7 +249,7 @@ fn cluster_partition_election_keeps_majority_history_after_old_leader_heals() {
         .put("/cluster/partition/base", b"base".to_vec())
         .expect("base write");
 
-    cluster.set_node_online(&nodes[0], false);
+    cluster.set_node_online(&nodes[0], false).unwrap();
     let error = cluster
         .put("/cluster/partition/minority", b"blocked".to_vec())
         .expect_err("isolated leader cannot write");
@@ -257,7 +261,7 @@ fn cluster_partition_election_keeps_majority_history_after_old_leader_heals() {
         .expect("majority write");
     assert_node_missing(&cluster, &nodes[0], "/cluster/partition/majority");
 
-    cluster.set_node_online(&nodes[0], true);
+    cluster.set_node_online(&nodes[0], true).unwrap();
     assert_all_nodes_value(&cluster, &nodes, "/cluster/partition/base", b"base");
     assert_all_nodes_value(&cluster, &nodes, "/cluster/partition/majority", b"majority");
     assert_node_missing(&cluster, &nodes[0], "/cluster/partition/minority");
@@ -268,7 +272,7 @@ fn cluster_partition_election_keeps_majority_history_after_old_leader_heals() {
 fn cluster_replication_catchup_replays_gap_free_history_to_healed_voter() {
     let (nodes, mut cluster) =
         cluster_with_nodes(&["kv_catchup_a", "kv_catchup_b", "kv_catchup_c"]);
-    cluster.set_node_online(&nodes[2], false);
+    cluster.set_node_online(&nodes[2], false).unwrap();
     for index in 0..6 {
         cluster
             .put(
@@ -286,7 +290,7 @@ fn cluster_replication_catchup_replays_gap_free_history_to_healed_voter() {
         KvRevision::ZERO
     );
 
-    cluster.set_node_online(&nodes[2], true);
+    cluster.set_node_online(&nodes[2], true).unwrap();
     assert_all_nodes_revision(&cluster, &nodes, KvRevision(6));
     assert_eq!(
         cluster
@@ -311,7 +315,11 @@ fn cluster_replication_catchup_replicates_tail_to_snapshot_joined_learner() {
     cluster
         .put("/cluster/learner/before", b"before".to_vec())
         .expect("initial write");
-    let snapshot = cluster.store(&nodes[0]).expect("leader store").snapshot();
+    let snapshot = cluster
+        .store(&nodes[0])
+        .expect("leader store")
+        .snapshot()
+        .expect("snapshot");
     let learner = node_id("kv_learner_c");
     cluster
         .add_learner_from_snapshot(learner.clone(), snapshot)
@@ -376,7 +384,7 @@ fn cluster_watch_fanout_delivers_backlog_and_future_events_on_followers() {
     assert_eq!(backlog.len(), 1);
     assert_eq!(backlog[0].key, "/cluster/watch/backlog");
 
-    cluster.set_node_online(&nodes[1], false);
+    cluster.set_node_online(&nodes[1], false).unwrap();
     cluster
         .put("/cluster/watch/missed", b"missed".to_vec())
         .expect("write while follower offline");
@@ -387,7 +395,7 @@ fn cluster_watch_fanout_delivers_backlog_and_future_events_on_followers() {
             .is_empty()
     );
 
-    cluster.set_node_online(&nodes[1], true);
+    cluster.set_node_online(&nodes[1], true).unwrap();
     let caught_up = cluster
         .drain_watch(&nodes[1], watch_id)
         .expect("drain caught up event");
@@ -556,7 +564,7 @@ fn cluster_lease_semantics_revoke_removes_ephemeral_key_on_every_node() {
 #[test]
 fn cluster_read_consistency_keeps_partitioned_follower_stale_until_healed() {
     let (nodes, mut cluster) = cluster_with_nodes(&["kv_read_a", "kv_read_b", "kv_read_c"]);
-    cluster.set_node_online(&nodes[2], false);
+    cluster.set_node_online(&nodes[2], false).unwrap();
     cluster
         .put("/cluster/read/a", b"a".to_vec())
         .expect("first write");
@@ -569,6 +577,7 @@ fn cluster_read_consistency_keeps_partitioned_follower_stale_until_healed() {
             .store(&nodes[0])
             .expect("leader")
             .range_prefix("/cluster/read/")
+            .expect("range prefix")
             .len(),
         2
     );
@@ -577,15 +586,17 @@ fn cluster_read_consistency_keeps_partitioned_follower_stale_until_healed() {
             .store(&nodes[2])
             .expect("offline follower")
             .range_prefix("/cluster/read/")
+            .expect("range prefix")
             .is_empty()
     );
 
-    cluster.set_node_online(&nodes[2], true);
+    cluster.set_node_online(&nodes[2], true).unwrap();
     assert_eq!(
         cluster
             .store(&nodes[2])
             .expect("healed follower")
             .range_prefix("/cluster/read/")
+            .expect("range prefix")
             .len(),
         2
     );

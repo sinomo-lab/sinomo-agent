@@ -25,13 +25,21 @@ pub fn lock_cluster_kv_watch_event_log_for_append(
 pub fn encode_cluster_kv_watch_event_log_batch(
     events: &[KvEvent],
 ) -> Result<EncodedClusterKvWatchEventLogBatch, KvError> {
-    let mut records = Vec::with_capacity(events.len());
+    let mut records = Vec::new();
+    let requested_bytes = events
+        .len()
+        .checked_mul(std::mem::size_of::<Vec<u8>>().max(1))
+        .unwrap_or(usize::MAX);
+    records
+        .try_reserve(events.len())
+        .map_err(|_| KvError::ResourceExhausted {
+            operation: "encode watch event log batch".to_string(),
+            requested_bytes,
+        })?;
     let mut bytes = 0_u64;
     for event in events {
         let record = sinomo_object_serde::to_bytes(event, KV_OBJECT_VERSION_ID, LengthMode::U32)
-            .map_err(|source| KvError::Serialization {
-                detail: source.to_string(),
-            })?;
+            .map_err(kv_object_error)?;
         let len = u32::try_from(record.len()).map_err(|_| KvError::Serialization {
             detail: "cluster kv watch-event log record exceeds u32 length".to_string(),
         })?;
@@ -123,8 +131,7 @@ where
 {
     let checkpoint = read_cluster_kv_watch_event_checkpoint(paths)?;
     let log = read_cluster_kv_watch_event_log_with_observer(paths, on_log_read)?;
-    let events =
-        compact_cluster_kv_watch_events(checkpoint.into_iter().chain(log.events).collect());
+    let events = compact_cluster_kv_watch_checkpoint_and_log(checkpoint, log.events)?;
     Ok(ClusterKvWatchEventsRead {
         events,
         log_records: log.records,
@@ -189,8 +196,7 @@ where
                 &mut log_file,
                 &mut on_log_read,
             )?;
-            let existing =
-                compact_cluster_kv_watch_events(checkpoint.into_iter().chain(log.events).collect());
+            let existing = compact_cluster_kv_watch_checkpoint_and_log(checkpoint, log.events)?;
             if log.truncated {
                 write_cluster_kv_watch_event_checkpoint(paths, &existing)?;
                 truncate_cluster_kv_watch_event_log_file(paths, &mut log_file)?;
@@ -205,11 +211,14 @@ where
         };
 
     let retained = compact_cluster_kv_watch_events_incremental(existing.clone(), incoming);
-    let appended = retained
+    let mut appended = Vec::new();
+    for event in retained
         .iter()
         .filter(|event| !cluster_kv_events_contain(&existing, event))
-        .cloned()
-        .collect::<Vec<_>>();
+    {
+        try_reserve_kv_items(&mut appended, 1, "collect appended watch events")?;
+        appended.push(event.clone());
+    }
     if appended.is_empty() {
         return Ok(ClusterKvWatchEventAppendReport {
             appended,
@@ -259,6 +268,21 @@ where
         log_records: current_log_records,
         append_safe: true,
     })
+}
+
+fn compact_cluster_kv_watch_checkpoint_and_log(
+    checkpoint: Vec<KvEvent>,
+    log_events: Vec<KvEvent>,
+) -> Result<Vec<KvEvent>, KvError> {
+    let mut events = Vec::new();
+    try_reserve_kv_items(
+        &mut events,
+        checkpoint.len().saturating_add(log_events.len()),
+        "compact watch event log",
+    )?;
+    events.extend(checkpoint);
+    events.extend(log_events);
+    Ok(compact_cluster_kv_watch_events(events))
 }
 
 pub fn read_cluster_kv_watch_event_log(
@@ -377,7 +401,20 @@ where
             });
         }
         match decode_cluster_kv_watch_event_log_record(&record.bytes) {
-            Ok(event) => events.push(event),
+            Ok(event) => {
+                let requested_bytes = events
+                    .len()
+                    .checked_add(1)
+                    .and_then(|items| items.checked_mul(std::mem::size_of::<KvEvent>().max(1)))
+                    .unwrap_or(usize::MAX);
+                events
+                    .try_reserve(1)
+                    .map_err(|_| KvError::ResourceExhausted {
+                        operation: "read watch event log".to_string(),
+                        requested_bytes,
+                    })?;
+                events.push(event);
+            }
             Err(source) => {
                 eprintln!(
                     "warning: ignoring unreadable cluster kv watch-event log record {} in {}: {}",

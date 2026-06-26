@@ -17,6 +17,40 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tower_layer::Layer;
 use tower_service::Service;
 
+fn serialize_network_bytes<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    crate::fallible_serde::serialize_bytes(bytes, serializer)
+}
+
+fn deserialize_network_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    crate::fallible_serde::deserialize_bytes_with_operation(deserializer, "object rpc bytes")
+}
+
+fn serialize_optional_network_bytes<S>(
+    bytes: &Option<Vec<u8>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    crate::fallible_serde::serialize_optional_bytes(bytes, serializer)
+}
+
+fn deserialize_optional_network_bytes<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    crate::fallible_serde::deserialize_optional_bytes_with_operation(
+        deserializer,
+        "object rpc auth bytes",
+    )
+}
+
 pub type ObjectRpcFuture =
     Pin<Box<dyn Future<Output = Result<ObjectRpcResponse, NetworkError>> + Send + 'static>>;
 
@@ -77,9 +111,17 @@ pub struct ObjectRpcRequest {
     pub category: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_network_bytes",
+        deserialize_with = "deserialize_optional_network_bytes"
+    )]
     pub auth: Option<Vec<u8>>,
-    #[serde(with = "serde_bytes")]
+    #[serde(
+        serialize_with = "serialize_network_bytes",
+        deserialize_with = "deserialize_network_bytes"
+    )]
     pub body: Vec<u8>,
 }
 
@@ -266,7 +308,10 @@ pub struct ObjectRpcResponse {
     pub route: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
-    #[serde(with = "serde_bytes")]
+    #[serde(
+        serialize_with = "serialize_network_bytes",
+        deserialize_with = "deserialize_network_bytes"
+    )]
     pub body: Vec<u8>,
 }
 
@@ -390,7 +435,11 @@ pub struct ObjectRouteDescriptor {
     pub observability: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_scope: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::fallible_serde::deserialize_vec"
+    )]
     pub required_capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency_limit: Option<usize>,
@@ -1420,6 +1469,52 @@ fn validate_no_control_chars(value: &str, context: &str) -> Result<(), NetworkEr
 mod tests {
     use super::*;
 
+    struct HugeByteSizeHintDeserializer;
+
+    impl<'de> serde::Deserializer<'de> for HugeByteSizeHintDeserializer {
+        type Error = sinomo_object::Error;
+
+        fn deserialize_any<V>(self, visitor: V) -> std::result::Result<V::Value, Self::Error>
+        where
+            V: serde::de::Visitor<'de>,
+        {
+            visitor.visit_seq(HugeByteSizeHintSeqAccess)
+        }
+
+        fn deserialize_byte_buf<V>(self, visitor: V) -> std::result::Result<V::Value, Self::Error>
+        where
+            V: serde::de::Visitor<'de>,
+        {
+            visitor.visit_seq(HugeByteSizeHintSeqAccess)
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes
+            option unit unit_struct newtype_struct seq tuple tuple_struct map struct
+            enum identifier ignored_any
+        }
+    }
+
+    struct HugeByteSizeHintSeqAccess;
+
+    impl<'de> serde::de::SeqAccess<'de> for HugeByteSizeHintSeqAccess {
+        type Error = sinomo_object::Error;
+
+        fn next_element_seed<T>(
+            &mut self,
+            _seed: T,
+        ) -> std::result::Result<Option<T::Value>, Self::Error>
+        where
+            T: serde::de::DeserializeSeed<'de>,
+        {
+            Ok(None)
+        }
+
+        fn size_hint(&self) -> Option<usize> {
+            Some(usize::MAX)
+        }
+    }
+
     #[derive(Serialize)]
     struct OwnedPayload<'a> {
         name: &'a str,
@@ -1432,6 +1527,20 @@ mod tests {
         name: &'a str,
         #[serde(with = "serde_bytes")]
         bytes: &'a [u8],
+    }
+
+    #[test]
+    fn object_rpc_bytes_deserializer_rejects_huge_size_hint_before_collecting() {
+        let error = deserialize_network_bytes(HugeByteSizeHintDeserializer)
+            .expect_err("huge byte size hint should fail fallibly");
+
+        assert_eq!(
+            NetworkError::object(error),
+            NetworkError::ResourceExhausted {
+                operation: "object rpc bytes".to_string(),
+                requested_bytes: usize::MAX,
+            }
+        );
     }
 
     #[test]

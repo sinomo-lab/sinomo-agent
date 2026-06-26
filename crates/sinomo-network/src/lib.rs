@@ -23,6 +23,7 @@ mod endpoint_advertisement;
 mod endpoint_records;
 mod endpoint_selector;
 mod error;
+mod fallible_serde;
 mod file_mark;
 mod health;
 mod invite;

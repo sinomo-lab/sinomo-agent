@@ -1,8 +1,8 @@
 use serde::Serialize;
 use serde::de::Deserializer as _;
 use serde::de::{
-    self, DeserializeOwned, DeserializeSeed, EnumAccess, IntoDeserializer, MapAccess, SeqAccess,
-    VariantAccess, Visitor,
+    self, DeserializeOwned, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess,
+    Visitor,
 };
 use serde::ser::{
     self, SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant, SerializeTuple,
@@ -12,7 +12,8 @@ use serde::ser::{
 use crate::{
     AlignmentHint, Array, Document, ElementType, Error, Field, LengthMode, List, MAGIC, Object,
     OptionalValue, Reader, Result, TypeId, Value, encode_element_type, patch_length,
-    read_element_type, read_schema, write_bytes, write_length, write_string, write_u16,
+    read_element_type, read_schema, try_box, try_extend_from_slice, try_push_vec,
+    try_string_from_str, try_vec_with_capacity, write_bytes, write_length, write_string, write_u16,
 };
 use std::ops::Range;
 
@@ -65,10 +66,14 @@ fn append_bytes_inner<T: Serialize + ?Sized>(
     length_mode: LengthMode,
 ) -> Result<()> {
     let start = out.len();
-    out.extend_from_slice(MAGIC);
-    write_u16(out, version_id);
-    out.push(length_mode.code());
-    out.push(AlignmentHint::NotAligned.code());
+    try_extend_from_slice(out, MAGIC, "serde document magic")?;
+    write_u16(out, version_id)?;
+    try_push_vec(out, length_mode.code(), "serde document length mode")?;
+    try_push_vec(
+        out,
+        AlignmentHint::NotAligned.code(),
+        "serde document alignment hint",
+    )?;
     let length_offset = out.len();
     write_length(out, length_mode, 0)?; // document length, patched below
     write_length(out, length_mode, 0)?; // empty dynamic schema (0 types)
@@ -175,7 +180,7 @@ fn serialize_element_into<T: Serialize + ?Sized>(
     value: &T,
 ) -> Result<()> {
     let type_id_offset = out.len();
-    out.push(0); // patched once the element type is known
+    try_push_vec(out, 0, "serde element type id")?; // patched once the element type is known
     let element_type = value.serialize(ByteSerializer { out, mode })?;
     out[type_id_offset] = element_type_id(&element_type)?;
     Ok(())
@@ -189,8 +194,12 @@ struct ByteSerializer<'a> {
 }
 
 impl<'a> ByteSerializer<'a> {
-    fn builtin(self, type_id: TypeId, write: impl FnOnce(&mut Vec<u8>)) -> Result<ElementType> {
-        write(self.out);
+    fn builtin(
+        self,
+        type_id: TypeId,
+        write: impl FnOnce(&mut Vec<u8>) -> Result<()>,
+    ) -> Result<ElementType> {
+        write(self.out)?;
         Ok(ElementType::Builtin(type_id))
     }
 }
@@ -207,54 +216,64 @@ impl<'a> ser::Serializer for ByteSerializer<'a> {
     type SerializeStructVariant = ByteVariantStructSerializer<'a>;
 
     fn serialize_bool(self, v: bool) -> Result<ElementType> {
-        self.builtin(TypeId::Boolean, |out| out.push(u8::from(v)))
+        self.builtin(TypeId::Boolean, |out| {
+            try_push_vec(out, u8::from(v), "bool")
+        })
     }
 
     fn serialize_i8(self, v: i8) -> Result<ElementType> {
-        self.builtin(TypeId::Int8, |out| out.push(v as u8))
+        self.builtin(TypeId::Int8, |out| try_push_vec(out, v as u8, "i8"))
     }
 
     fn serialize_i16(self, v: i16) -> Result<ElementType> {
-        self.builtin(TypeId::Int16, |out| out.extend_from_slice(&v.to_le_bytes()))
+        self.builtin(TypeId::Int16, |out| {
+            try_extend_from_slice(out, &v.to_le_bytes(), "i16")
+        })
     }
 
     fn serialize_i32(self, v: i32) -> Result<ElementType> {
-        self.builtin(TypeId::Int32, |out| out.extend_from_slice(&v.to_le_bytes()))
+        self.builtin(TypeId::Int32, |out| {
+            try_extend_from_slice(out, &v.to_le_bytes(), "i32")
+        })
     }
 
     fn serialize_i64(self, v: i64) -> Result<ElementType> {
-        self.builtin(TypeId::Int64, |out| out.extend_from_slice(&v.to_le_bytes()))
+        self.builtin(TypeId::Int64, |out| {
+            try_extend_from_slice(out, &v.to_le_bytes(), "i64")
+        })
     }
 
     fn serialize_u8(self, v: u8) -> Result<ElementType> {
-        self.builtin(TypeId::Uint8, |out| out.push(v))
+        self.builtin(TypeId::Uint8, |out| try_push_vec(out, v, "u8"))
     }
 
     fn serialize_u16(self, v: u16) -> Result<ElementType> {
         self.builtin(TypeId::Uint16, |out| {
-            out.extend_from_slice(&v.to_le_bytes())
+            try_extend_from_slice(out, &v.to_le_bytes(), "u16")
         })
     }
 
     fn serialize_u32(self, v: u32) -> Result<ElementType> {
         self.builtin(TypeId::Uint32, |out| {
-            out.extend_from_slice(&v.to_le_bytes())
+            try_extend_from_slice(out, &v.to_le_bytes(), "u32")
         })
     }
 
     fn serialize_u64(self, v: u64) -> Result<ElementType> {
         self.builtin(TypeId::Uint64, |out| {
-            out.extend_from_slice(&v.to_le_bytes())
+            try_extend_from_slice(out, &v.to_le_bytes(), "u64")
         })
     }
 
     fn serialize_f32(self, v: f32) -> Result<ElementType> {
-        self.builtin(TypeId::Float, |out| out.extend_from_slice(&v.to_le_bytes()))
+        self.builtin(TypeId::Float, |out| {
+            try_extend_from_slice(out, &v.to_le_bytes(), "f32")
+        })
     }
 
     fn serialize_f64(self, v: f64) -> Result<ElementType> {
         self.builtin(TypeId::Double, |out| {
-            out.extend_from_slice(&v.to_le_bytes())
+            try_extend_from_slice(out, &v.to_le_bytes(), "f64")
         })
     }
 
@@ -276,8 +295,11 @@ impl<'a> ser::Serializer for ByteSerializer<'a> {
         // Absent optional: element type defaults to `bytes`, presence byte 0.
         let inner = ElementType::Builtin(TypeId::Bytes);
         encode_element_type(self.out, self.mode, &inner)?;
-        self.out.push(0);
-        Ok(ElementType::Optional(Box::new(inner)))
+        try_push_vec(self.out, 0, "optional presence")?;
+        Ok(ElementType::Optional(try_box(
+            inner,
+            "optional element type",
+        )?))
     }
 
     fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> Result<ElementType> {
@@ -289,9 +311,12 @@ impl<'a> ser::Serializer for ByteSerializer<'a> {
             mode: self.mode,
         })?;
         encode_element_type(self.out, self.mode, &inner)?;
-        self.out.push(1);
-        self.out.extend_from_slice(&scratch);
-        Ok(ElementType::Optional(Box::new(inner)))
+        try_push_vec(self.out, 1, "optional presence")?;
+        try_extend_from_slice(self.out, &scratch, "optional payload")?;
+        Ok(ElementType::Optional(try_box(
+            inner,
+            "optional element type",
+        )?))
     }
 
     fn serialize_unit(self) -> Result<ElementType> {
@@ -359,7 +384,7 @@ impl<'a> ser::Serializer for ByteSerializer<'a> {
         // `{ variant: [ .. ] }`: outer object header, then the list value.
         write_length(self.out, self.mode, 1)?;
         write_string(self.out, self.mode, variant)?;
-        self.out.push(TypeId::List.byte());
+        try_push_vec(self.out, TypeId::List.byte(), "tuple variant list type")?;
         Ok(ByteVariantSeqSerializer {
             inner: ByteSeqSerializer::new(self.out, self.mode, Some(_len)),
         })
@@ -395,7 +420,11 @@ impl<'a> ser::Serializer for ByteSerializer<'a> {
         // `{ variant: { .. } }`: outer object header, then the inner object value.
         write_length(self.out, self.mode, 1)?;
         write_string(self.out, self.mode, variant)?;
-        self.out.push(TypeId::Object.byte());
+        try_push_vec(
+            self.out,
+            TypeId::Object.byte(),
+            "struct variant object type",
+        )?;
         write_length(self.out, self.mode, len as u64)?;
         Ok(ByteVariantStructSerializer {
             inner: ByteStructSerializer {
@@ -440,7 +469,7 @@ impl<'a> ByteSeqSerializer<'a> {
                 encode_element_type(self.out, self.mode, &element_type)?;
                 self.length_offset = self.out.len();
                 write_length(self.out, self.mode, 0)?; // patched in `finish`
-                self.out.extend_from_slice(&scratch);
+                try_extend_from_slice(self.out, &scratch, "sequence first element")?;
                 self.element_type = Some(element_type);
                 self.count = 1;
             }
@@ -477,7 +506,10 @@ impl<'a> ByteSeqSerializer<'a> {
                 element_type
             }
         };
-        Ok(ElementType::List(Box::new(element_type)))
+        Ok(ElementType::List(try_box(
+            element_type,
+            "list element type",
+        )?))
     }
 }
 
@@ -680,6 +712,40 @@ impl<'r, 'a> SobjDeserializer<'r, 'a> {
     }
 }
 
+struct SobjStrDeserializer<'a> {
+    value: &'a str,
+    context: &'static str,
+}
+
+impl<'de, 'a> de::Deserializer<'de> for SobjStrDeserializer<'a>
+where
+    'a: 'de,
+{
+    type Error = Error;
+
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        visitor.visit_borrowed_str(self.value)
+    }
+
+    fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        visitor.visit_borrowed_str(self.value)
+    }
+
+    fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        visitor.visit_string(try_string_from_str(self.value, self.context)?)
+    }
+
+    fn deserialize_identifier<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        visitor.visit_borrowed_str(self.value)
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char bytes byte_buf
+        option unit unit_struct newtype_struct seq tuple tuple_struct map struct
+        enum ignored_any
+    }
+}
+
 /// Reads a value of the resolved `type_id` from `reader`, driving the serde visitor.
 fn deserialize_value<'de, 'a, V>(
     reader: &mut Reader<'a>,
@@ -768,6 +834,49 @@ where
         deserialize_value(reader, type_id, visitor)
     }
 
+    fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        let SobjDeserializer { reader, shape } = self;
+        let type_id = Self::type_id(reader, &shape)?;
+        match type_id {
+            TypeId::String => visitor.visit_borrowed_str(reader.read_string()?),
+            _ => Err(Error::Serde("expected string".to_owned())),
+        }
+    }
+
+    fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        let SobjDeserializer { reader, shape } = self;
+        let type_id = Self::type_id(reader, &shape)?;
+        match type_id {
+            TypeId::String => {
+                visitor.visit_string(try_string_from_str(reader.read_string()?, "serde string")?)
+            }
+            _ => Err(Error::Serde("expected string".to_owned())),
+        }
+    }
+
+    fn deserialize_bytes<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        let SobjDeserializer { reader, shape } = self;
+        let type_id = Self::type_id(reader, &shape)?;
+        match type_id {
+            TypeId::Bytes => visitor.visit_borrowed_bytes(reader.read_bytes()?),
+            _ => Err(Error::Serde("expected bytes".to_owned())),
+        }
+    }
+
+    fn deserialize_byte_buf<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        let SobjDeserializer { reader, shape } = self;
+        let type_id = Self::type_id(reader, &shape)?;
+        match type_id {
+            TypeId::Bytes => {
+                let bytes = reader.read_bytes()?;
+                let mut owned = try_vec_with_capacity(bytes.len(), "serde byte buffer")?;
+                try_extend_from_slice(&mut owned, bytes, "serde byte buffer")?;
+                visitor.visit_byte_buf(owned)
+            }
+            _ => Err(Error::Serde("expected bytes".to_owned())),
+        }
+    }
+
     fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
         let SobjDeserializer { reader, shape } = self;
         let type_id = Self::type_id(reader, &shape)?;
@@ -816,7 +925,10 @@ where
         match type_id {
             TypeId::String => {
                 let variant = reader.read_string()?;
-                visitor.visit_enum(variant.into_deserializer())
+                visitor.visit_enum(EnumValueAccess {
+                    variant,
+                    value: None,
+                })
             }
             TypeId::Object => {
                 if reader.read_len_usize()? != 1 {
@@ -832,7 +944,7 @@ where
     }
 
     serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes byte_buf
+        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char
         option seq tuple tuple_struct map struct identifier ignored_any
     }
 }
@@ -854,8 +966,11 @@ where
         }
         self.remaining -= 1;
         let key = self.reader.read_string()?;
-        seed.deserialize(de::value::BorrowedStrDeserializer::new(key))
-            .map(Some)
+        seed.deserialize(SobjStrDeserializer {
+            value: key,
+            context: "object key",
+        })
+        .map(Some)
     }
 
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value> {
@@ -914,7 +1029,10 @@ where
     type Variant = Self;
 
     fn variant_seed<V: DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, Self::Variant)> {
-        let variant = seed.deserialize(self.variant.into_deserializer())?;
+        let variant = seed.deserialize(SobjStrDeserializer {
+            value: self.variant,
+            context: "enum variant",
+        })?;
         Ok((variant, self))
     }
 }
@@ -1028,15 +1146,21 @@ impl ser::Serializer for ValueSerializer {
     }
 
     fn serialize_char(self, v: char) -> Result<Value> {
-        Ok(Value::String(v.to_string()))
+        let mut bytes = [0_u8; 4];
+        Ok(Value::String(try_string_from_str(
+            v.encode_utf8(&mut bytes),
+            "value char",
+        )?))
     }
 
     fn serialize_str(self, v: &str) -> Result<Value> {
-        Ok(Value::String(v.to_owned()))
+        Ok(Value::String(try_string_from_str(v, "value string")?))
     }
 
     fn serialize_bytes(self, v: &[u8]) -> Result<Value> {
-        Ok(Value::Bytes(v.to_vec()))
+        let mut bytes = try_vec_with_capacity(v.len(), "value bytes")?;
+        try_extend_from_slice(&mut bytes, v, "value bytes")?;
+        Ok(Value::Bytes(bytes))
     }
 
     fn serialize_none(self) -> Result<Value> {
@@ -1047,8 +1171,8 @@ impl ser::Serializer for ValueSerializer {
 
     fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> Result<Value> {
         let value = to_value(value)?;
-        let element_type = element_type_for_value(&value);
-        Ok(Value::optional(OptionalValue::some(element_type, value)))
+        let element_type = element_type_for_value(&value)?;
+        Value::try_optional(OptionalValue::try_some(element_type, value)?)
     }
 
     fn serialize_unit(self) -> Result<Value> {
@@ -1067,7 +1191,7 @@ impl ser::Serializer for ValueSerializer {
         _variant_index: u32,
         variant: &'static str,
     ) -> Result<Value> {
-        Ok(Value::String(variant.to_owned()))
+        Ok(Value::String(try_string_from_str(variant, "enum variant")?))
     }
 
     fn serialize_newtype_struct<T: Serialize + ?Sized>(
@@ -1092,7 +1216,7 @@ impl ser::Serializer for ValueSerializer {
     }
 
     fn serialize_seq(self, len: Option<usize>) -> Result<SeqSerializer> {
-        Ok(SeqSerializer::new(len))
+        SeqSerializer::new(len)
     }
 
     fn serialize_tuple(self, len: usize) -> Result<SeqSerializer> {
@@ -1112,20 +1236,20 @@ impl ser::Serializer for ValueSerializer {
     ) -> Result<TupleVariantSerializer> {
         Ok(TupleVariantSerializer {
             variant,
-            inner: SeqSerializer::new(Some(len)),
+            inner: SeqSerializer::new(Some(len))?,
         })
     }
 
     fn serialize_map(self, len: Option<usize>) -> Result<MapSerializer> {
         Ok(MapSerializer {
-            fields: Vec::with_capacity(len.unwrap_or(0)),
+            fields: try_vec_with_capacity(len.unwrap_or(0), "value map fields")?,
             pending_key: None,
         })
     }
 
     fn serialize_struct(self, _name: &'static str, len: usize) -> Result<StructSerializer> {
         Ok(StructSerializer {
-            fields: Vec::with_capacity(len),
+            fields: try_vec_with_capacity(len, "value struct fields")?,
         })
     }
 
@@ -1138,7 +1262,7 @@ impl ser::Serializer for ValueSerializer {
     ) -> Result<StructVariantSerializer> {
         Ok(StructVariantSerializer {
             variant,
-            fields: Vec::with_capacity(len),
+            fields: try_vec_with_capacity(len, "value struct variant fields")?,
         })
     }
 }
@@ -1148,15 +1272,15 @@ struct SeqSerializer {
 }
 
 impl SeqSerializer {
-    fn new(len: Option<usize>) -> Self {
-        Self {
-            values: Vec::with_capacity(len.unwrap_or(0)),
-        }
+    fn new(len: Option<usize>) -> Result<Self> {
+        Ok(Self {
+            values: try_vec_with_capacity(len.unwrap_or(0), "value sequence values")?,
+        })
     }
 
     fn finish(self) -> Result<Value> {
         let element_type = common_element_type(&self.values)?;
-        Ok(Value::list(List::new(element_type, self.values)))
+        Value::try_list(List::new(element_type, self.values))
     }
 }
 
@@ -1165,7 +1289,8 @@ impl SerializeSeq for SeqSerializer {
     type Error = Error;
 
     fn serialize_element<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<()> {
-        self.values.push(to_value(value)?);
+        let value = to_value(value)?;
+        try_push_vec(&mut self.values, value, "value sequence values")?;
         Ok(())
     }
 
@@ -1240,7 +1365,8 @@ impl SerializeMap for MapSerializer {
             .pending_key
             .take()
             .ok_or_else(|| Error::Serde("map value serialized before key".to_owned()))?;
-        self.fields.push(Field::new(key, to_value(value)?));
+        let value = Field::new(key, to_value(value)?);
+        try_push_vec(&mut self.fields, value, "value map fields")?;
         Ok(())
     }
 
@@ -1262,7 +1388,8 @@ impl SerializeStruct for StructSerializer {
         key: &'static str,
         value: &T,
     ) -> Result<()> {
-        self.fields.push(Field::new(key, to_value(value)?));
+        let value = Field::new(key, to_value(value)?);
+        try_push_vec(&mut self.fields, value, "value struct fields")?;
         Ok(())
     }
 
@@ -1285,7 +1412,8 @@ impl SerializeStructVariant for StructVariantSerializer {
         key: &'static str,
         value: &T,
     ) -> Result<()> {
-        self.fields.push(Field::new(key, to_value(value)?));
+        let value = Field::new(key, to_value(value)?);
+        try_push_vec(&mut self.fields, value, "value struct variant fields")?;
         Ok(())
     }
 
@@ -1507,6 +1635,22 @@ where
         }
     }
 
+    fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        match self.value {
+            Value::String(value) => visitor.visit_borrowed_str(value),
+            _ => Err(Error::Serde("expected string".to_owned())),
+        }
+    }
+
+    fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        match self.value {
+            Value::String(value) => {
+                visitor.visit_string(try_string_from_str(value, "value string")?)
+            }
+            _ => Err(Error::Serde("expected string".to_owned())),
+        }
+    }
+
     fn deserialize_enum<V: Visitor<'de>>(
         self,
         _name: &'static str,
@@ -1514,7 +1658,10 @@ where
         visitor: V,
     ) -> Result<V::Value> {
         match self.value {
-            Value::String(variant) => visitor.visit_enum(variant.as_str().into_deserializer()),
+            Value::String(variant) => visitor.visit_enum(EnumValueAccess {
+                variant,
+                value: None,
+            }),
             Value::Object(object) if object.fields.len() == 1 => {
                 visitor.visit_enum(EnumValueAccess {
                     variant: object.fields[0].key.as_str(),
@@ -1529,14 +1676,13 @@ where
         match self.value {
             Value::Bytes(value) => visitor.visit_borrowed_bytes(value),
             Value::List(list) if list.element_type == ElementType::Builtin(TypeId::Uint8) => {
-                let bytes = list
-                    .values
-                    .iter()
-                    .map(|value| match value {
-                        Value::Uint8(byte) => Ok(*byte),
-                        _ => Err(Error::TypeMismatch),
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let mut bytes = try_vec_with_capacity(list.values.len(), "value byte list")?;
+                for value in &list.values {
+                    let Value::Uint8(byte) = value else {
+                        return Err(Error::TypeMismatch);
+                    };
+                    try_push_vec(&mut bytes, *byte, "value byte list")?;
+                }
                 visitor.visit_byte_buf(bytes)
             }
             _ => self.deserialize_any(visitor),
@@ -1544,7 +1690,24 @@ where
     }
 
     fn deserialize_byte_buf<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        self.deserialize_bytes(visitor)
+        match self.value {
+            Value::Bytes(value) => {
+                let mut bytes = try_vec_with_capacity(value.len(), "value bytes")?;
+                try_extend_from_slice(&mut bytes, value, "value bytes")?;
+                visitor.visit_byte_buf(bytes)
+            }
+            Value::List(list) if list.element_type == ElementType::Builtin(TypeId::Uint8) => {
+                let mut bytes = try_vec_with_capacity(list.values.len(), "value byte list")?;
+                for value in &list.values {
+                    let Value::Uint8(byte) = value else {
+                        return Err(Error::TypeMismatch);
+                    };
+                    try_push_vec(&mut bytes, *byte, "value byte list")?;
+                }
+                visitor.visit_byte_buf(bytes)
+            }
+            _ => self.deserialize_bytes(visitor),
+        }
     }
 
     fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
@@ -1591,7 +1754,7 @@ where
     }
 
     serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
+        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char
         unit_struct tuple tuple_struct identifier ignored_any
     }
 }
@@ -1620,8 +1783,11 @@ where
         let Some(field) = self.fields.get(self.index) else {
             return Ok(None);
         };
-        seed.deserialize(field.key.as_str().into_deserializer())
-            .map(Some)
+        seed.deserialize(SobjStrDeserializer {
+            value: field.key.as_str(),
+            context: "object key",
+        })
+        .map(Some)
     }
 
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value> {
@@ -1786,7 +1952,10 @@ where
     type Variant = Self;
 
     fn variant_seed<V: DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, Self::Variant)> {
-        let variant = seed.deserialize(self.variant.into_deserializer())?;
+        let variant = seed.deserialize(SobjStrDeserializer {
+            value: self.variant,
+            context: "enum variant",
+        })?;
         Ok((variant, self))
     }
 }
@@ -1831,25 +2000,36 @@ where
     }
 }
 
-fn element_type_for_value(value: &Value) -> ElementType {
-    match value {
+fn element_type_for_value(value: &Value) -> Result<ElementType> {
+    Ok(match value {
         Value::Object(_) => ElementType::Object,
-        Value::List(list) => ElementType::List(Box::new(list.element_type.clone())),
-        Value::Array(array) => ElementType::Array(Box::new(array.element_type.clone())),
-        Value::Optional(optional) => ElementType::Optional(Box::new(optional.element_type.clone())),
+        Value::List(list) => {
+            ElementType::List(try_box(list.element_type.clone(), "list element type")?)
+        }
+        Value::Array(array) => {
+            ElementType::Array(try_box(array.element_type.clone(), "array element type")?)
+        }
+        Value::Optional(optional) => ElementType::Optional(try_box(
+            optional.element_type.clone(),
+            "optional element type",
+        )?),
         other => ElementType::Builtin(other.type_id()),
-    }
+    })
 }
 
 fn common_element_type(values: &[Value]) -> Result<ElementType> {
     let Some(first) = values.first() else {
         return Ok(ElementType::Builtin(TypeId::Bytes));
     };
-    let element_type = element_type_for_value(first);
-    if values
-        .iter()
-        .all(|value| element_type_for_value(value) == element_type)
-    {
+    let element_type = element_type_for_value(first)?;
+    let mut matches = true;
+    for value in values {
+        if element_type_for_value(value)? != element_type {
+            matches = false;
+            break;
+        }
+    }
+    if matches {
         Ok(element_type)
     } else {
         Err(Error::TypeMismatch)
@@ -1878,6 +2058,24 @@ mod streaming_tests {
             let decoded: T = from_bytes(&streamed).expect("decode");
             assert_eq!(&decoded, value, "round-trip mismatch (mode {mode:?})");
         }
+    }
+
+    #[test]
+    fn streaming_accessors_expose_size_hints_for_fast_preallocation() {
+        let mut map_reader = Reader::new(&[], LengthMode::U64);
+        let map = ObjectMapAccess {
+            reader: &mut map_reader,
+            remaining: 7,
+        };
+        assert_eq!(map.size_hint(), Some(7));
+
+        let mut seq_reader = Reader::new(&[], LengthMode::U64);
+        let seq = ListSeqAccess {
+            reader: &mut seq_reader,
+            element_type: ElementType::Builtin(TypeId::Uint8),
+            remaining: 11,
+        };
+        assert_eq!(seq.size_hint(), Some(11));
     }
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]

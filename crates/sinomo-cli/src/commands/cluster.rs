@@ -2626,8 +2626,12 @@ pub(crate) fn read_cluster_kv_snapshot(paths: &ClusterPaths) -> Result<KvSnapsho
         Err(error) => {
             eprintln!("warning: ignoring unreadable cluster kv snapshot: {error}");
             read_cluster_kv_store(paths)
-                .map(|store| store.snapshot())
-                .or_else(|_| Ok(sinomo_runtime::kv::InProcessKvStore::new().snapshot()))
+                .and_then(|store| store.snapshot().map_err(Into::into))
+                .or_else(|_| {
+                    sinomo_runtime::kv::InProcessKvStore::new()
+                        .snapshot()
+                        .map_err(Into::into)
+                })
         }
     }
 }

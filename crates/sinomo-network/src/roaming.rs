@@ -256,7 +256,11 @@ pub struct IrohEndpointRecord {
     pub cluster_id: ClusterId,
     pub node_id: NodeId,
     pub endpoint_public_key: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::fallible_serde::deserialize_vec"
+    )]
     pub direct_addresses: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_url: Option<String>,
@@ -761,7 +765,16 @@ impl IrohProxyByteBudget {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let would_use = state.in_flight_bytes.saturating_add(frame_bytes);
+        let would_use = match state.in_flight_bytes.checked_add(frame_bytes) {
+            Some(would_use) => would_use,
+            None => {
+                return Err(NetworkError::IrohProxyFrameBudgetExceeded {
+                    frame_bytes,
+                    in_flight_bytes: state.in_flight_bytes,
+                    max_in_flight_bytes: self.max_bytes,
+                });
+            }
+        };
         if frame_bytes > self.max_bytes || would_use > self.max_bytes {
             return Err(NetworkError::IrohProxyFrameBudgetExceeded {
                 frame_bytes,
@@ -811,7 +824,7 @@ fn reserve_iroh_proxy_frame(
     }
     let frame_bytes = crate::object::object_frame_total_bytes(len_prefix.len(), body_bytes)?;
     let permit = budget.try_acquire(frame_bytes)?;
-    let mut frame = vec![0_u8; frame_bytes];
+    let mut frame = crate::object::try_zeroed_vec(frame_bytes, "reserve iroh daemon proxy frame")?;
     frame[..len_prefix.len()].copy_from_slice(&len_prefix);
     Ok((frame, permit))
 }
@@ -885,7 +898,12 @@ where
         "length",
     )
     .await?;
-    let mut len_prefix = len_bytes.to_vec();
+    let mut len_prefix = Vec::new();
+    crate::object::try_extend_from_slice(
+        &mut len_prefix,
+        &len_bytes,
+        "read iroh daemon frame prefix",
+    )?;
     let extended_len_bytes =
         if u32::from_be_bytes(len_bytes) == crate::OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL {
             let mut extended_len_bytes = [0_u8; 8];
@@ -896,7 +914,11 @@ where
                 "extended length",
             )
             .await?;
-            len_prefix.extend_from_slice(&extended_len_bytes);
+            crate::object::try_extend_from_slice(
+                &mut len_prefix,
+                &extended_len_bytes,
+                "read iroh daemon frame extended prefix",
+            )?;
             Some(extended_len_bytes)
         } else {
             None
@@ -940,7 +962,12 @@ where
         "length",
     )
     .await?;
-    let mut len_prefix = len_bytes.to_vec();
+    let mut len_prefix = Vec::new();
+    crate::object::try_extend_from_slice(
+        &mut len_prefix,
+        &len_bytes,
+        "read iroh daemon frame prefix",
+    )?;
     let extended_len_bytes =
         if u32::from_be_bytes(len_bytes) == crate::OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL {
             let mut extended_len_bytes = [0_u8; 8];
@@ -952,7 +979,11 @@ where
                 "extended length",
             )
             .await?;
-            len_prefix.extend_from_slice(&extended_len_bytes);
+            crate::object::try_extend_from_slice(
+                &mut len_prefix,
+                &extended_len_bytes,
+                "read iroh daemon frame extended prefix",
+            )?;
             Some(extended_len_bytes)
         } else {
             None

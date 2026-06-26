@@ -554,6 +554,17 @@ pub(crate) fn read_wal_entries(
                     truncated = true;
                     break;
                 }
+                let requested_bytes = entries
+                    .len()
+                    .checked_add(1)
+                    .and_then(|items| items.checked_mul(std::mem::size_of::<KvLogEntry>().max(1)))
+                    .unwrap_or(usize::MAX);
+                entries
+                    .try_reserve(1)
+                    .map_err(|_| KvError::ResourceExhausted {
+                        operation: "read wal entries".to_string(),
+                        requested_bytes,
+                    })?;
                 entries.push(entry);
             }
             Err(source) => {
@@ -579,25 +590,57 @@ pub(crate) fn append_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;
-    let mut records = Vec::with_capacity(entries.len());
-    for entry in entries {
-        records.push(encode_wal_record_payload(entry, path)?);
+    match encode_wal_record_payloads(entries, path) {
+        Ok(records) => {
+            durable_file::append_length_prefixed_records(
+                &mut file,
+                path,
+                records.iter().map(Vec::as_slice),
+                durable_file::DurableRecordAppendOptions::new(
+                    durable_file::DurableLengthEndian::Big,
+                ),
+            )
+            .map_err(kv_durable_file_error)?;
+        }
+        Err(KvError::ResourceExhausted { .. }) => {
+            for entry in entries {
+                let record = encode_wal_record_payload(entry, path)?;
+                durable_file::append_length_prefixed_records(
+                    &mut file,
+                    path,
+                    [record.as_slice()],
+                    durable_file::DurableRecordAppendOptions::new(
+                        durable_file::DurableLengthEndian::Big,
+                    ),
+                )
+                .map_err(kv_durable_file_error)?;
+            }
+        }
+        Err(error) => return Err(error),
     }
-    durable_file::append_length_prefixed_records(
-        &mut file,
-        path,
-        records.iter().map(Vec::as_slice),
-        durable_file::DurableRecordAppendOptions::new(durable_file::DurableLengthEndian::Big)
-            .sync(durable_file::DurableFileSync::Data),
-    )
-    .map(|_| ())
-    .map_err(kv_durable_file_error)
+    file.sync_data().map_err(|source| KvError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(())
 }
 
 pub(crate) fn open_wal_file_for_append(path: &Path) -> Result<File, KvError> {
     durable_file::open_file_for_append(path)
         .map(|append| append.file)
         .map_err(kv_durable_file_error)
+}
+
+fn encode_wal_record_payloads(
+    entries: &[KvLogEntry],
+    path: &Path,
+) -> Result<Vec<Vec<u8>>, KvError> {
+    let mut records = Vec::new();
+    try_reserve_kv_items(&mut records, entries.len(), "encode wal records")?;
+    for entry in entries {
+        records.push(encode_wal_record_payload(entry, path)?);
+    }
+    Ok(records)
 }
 
 fn encode_wal_record_payload(entry: &KvLogEntry, path: &Path) -> Result<Vec<u8>, KvError> {
@@ -614,9 +657,7 @@ fn append_wal_record_payload(
 ) -> Result<std::ops::Range<usize>, KvError> {
     let record =
         sinomo_object_serde::append_bytes(out, entry, KV_WAL_OBJECT_VERSION_ID, LengthMode::U32)
-            .map_err(|source| KvError::Serialization {
-                detail: source.to_string(),
-            })?;
+            .map_err(kv_object_error)?;
     u32::try_from(record.len()).map_err(|_| KvError::Serialization {
         detail: format!("wal record for {} exceeds u32 length", path.display()),
     })?;
@@ -625,6 +666,12 @@ fn append_wal_record_payload(
 
 pub(crate) fn encode_wal_record(entry: &KvLogEntry, path: &Path) -> Result<Vec<u8>, KvError> {
     let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(4)
+        .map_err(|_| KvError::ResourceExhausted {
+            operation: "encode wal record length".to_string(),
+            requested_bytes: 4,
+        })?;
     encoded.extend_from_slice(&0_u32.to_be_bytes());
     let record = append_wal_record_payload(&mut encoded, entry, path)?;
     let record_len = u32::try_from(record.len()).map_err(|_| KvError::Serialization {
@@ -667,7 +714,14 @@ pub(crate) fn wal_file_matches_entries(
 
     for entry in entries {
         let expected = encode_wal_record(entry, path)?;
-        let mut existing = vec![0_u8; expected.len()];
+        let mut existing = Vec::new();
+        existing
+            .try_reserve_exact(expected.len())
+            .map_err(|_| KvError::ResourceExhausted {
+                operation: "compare wal records".to_string(),
+                requested_bytes: expected.len(),
+            })?;
+        existing.resize(expected.len(), 0);
         if file.read_exact(&mut existing).is_err() || existing != expected {
             return Ok(false);
         }
@@ -781,8 +835,11 @@ pub(crate) fn decode_object_file<T: for<'de> Deserialize<'de>>(
     path: &Path,
     bytes: &[u8],
 ) -> Result<T, KvError> {
-    sinomo_object_serde::from_bytes(&bytes).map_err(|source| KvError::Serialization {
-        detail: format!("{}: {source}", path.display()),
+    sinomo_object_serde::from_bytes(&bytes).map_err(|source| match kv_object_error(source) {
+        KvError::Serialization { detail } => KvError::Serialization {
+            detail: format!("{}: {detail}", path.display()),
+        },
+        error => error,
     })
 }
 
@@ -807,9 +864,7 @@ pub(crate) fn write_object_file_if_changed<T: Serialize>(
     value: &T,
 ) -> Result<bool, KvError> {
     let content = sinomo_object_serde::to_bytes(value, KV_WAL_OBJECT_VERSION_ID, LengthMode::U32)
-        .map_err(|source| KvError::Serialization {
-        detail: source.to_string(),
-    })?;
+        .map_err(kv_object_error)?;
     write_object_file_bytes_if_changed(path, &content)
 }
 
@@ -847,9 +902,19 @@ pub(crate) fn replace_file(temp_path: &Path, path: &Path) -> Result<(), KvError>
 }
 
 pub(crate) fn kv_durable_file_error(error: durable_file::DurableFileError) -> KvError {
-    KvError::Io {
-        path: error.path().to_string(),
-        detail: error.detail().to_string(),
+    match error {
+        durable_file::DurableFileError::ResourceExhausted {
+            operation,
+            requested_bytes,
+            ..
+        } => KvError::ResourceExhausted {
+            operation,
+            requested_bytes,
+        },
+        error => KvError::Io {
+            path: error.path().to_string(),
+            detail: error.detail().to_string(),
+        },
     }
 }
 
