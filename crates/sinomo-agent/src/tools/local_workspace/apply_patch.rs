@@ -636,6 +636,7 @@ fn apply_structured_changes(
             patch_result(
                 AgentToolStatus::Failed,
                 format_patch_failure_summary(tool_name, &detail),
+                config,
                 &plan,
                 &root,
                 &format!("{tool_name} failed during mutation"),
@@ -651,6 +652,7 @@ fn apply_structured_changes(
         patch_result(
             AgentToolStatus::Succeeded,
             summary.clone(),
+            config,
             &plan,
             &root,
             "structured patch applied inside workspace root",
@@ -1124,6 +1126,7 @@ fn apply_planned_patch(
             root.display()
         ));
     }
+    validate_planned_patch_sandbox_access(config, &root, plan)?;
     for change in plan
         .file_changes
         .iter()
@@ -1158,6 +1161,34 @@ fn apply_planned_patch(
         ensure_local_tool_not_cancelled(cancellation_token, tool_name)?;
         fs::remove_file(&change.path)
             .map_err(|source| format!("delete `{}`: {source}", change.display_path))?;
+    }
+    Ok(())
+}
+
+fn validate_planned_patch_sandbox_access(
+    config: &LocalWorkspaceAgentConfig,
+    root: &Path,
+    plan: &PlannedPatch,
+) -> Result<(), String> {
+    for change in &plan.file_changes {
+        if change.old_content.is_some() {
+            validate_local_workspace_file_access(
+                config,
+                root,
+                &change.path,
+                LocalWorkspaceFileAccess::Read,
+                &change.display_path,
+            )?;
+        }
+        if change.new_content.is_some() || change.status == PatchFileStatus::Deleted {
+            validate_local_workspace_file_access(
+                config,
+                root,
+                &change.path,
+                LocalWorkspaceFileAccess::Write,
+                &change.display_path,
+            )?;
+        }
     }
     Ok(())
 }
@@ -1291,34 +1322,35 @@ fn read_existing_patch_file(
     config: &LocalWorkspaceAgentConfig,
     path: &Path,
 ) -> Result<VirtualFileState, PatchFileReadError> {
-    ensure_path_stays_under_root(root, path, &display_workspace_path(config, path))
-        .map_err(PatchFileReadError::Invalid)?;
+    let display_path = display_workspace_path(config, path);
+    ensure_path_stays_under_root(root, path, &display_path).map_err(PatchFileReadError::Invalid)?;
+    validate_local_workspace_file_access(
+        config,
+        root,
+        path,
+        LocalWorkspaceFileAccess::Read,
+        &display_path,
+    )
+    .map_err(PatchFileReadError::Invalid)?;
     if !path.exists() {
         return Err(PatchFileReadError::NotFound);
     }
-    ensure_no_symlink_components(root, path, true, &display_workspace_path(config, path))
+    ensure_no_symlink_components(root, path, true, &display_path)
         .map_err(PatchFileReadError::Invalid)?;
     let metadata = fs::metadata(path).map_err(|source| {
-        PatchFileReadError::Invalid(format!(
-            "inspect `{}`: {source}",
-            display_workspace_path(config, path)
-        ))
+        PatchFileReadError::Invalid(format!("inspect `{display_path}`: {source}"))
     })?;
     if metadata.is_dir() {
         return Err(PatchFileReadError::Invalid(format!(
-            "path `{}` is a directory",
-            display_workspace_path(config, path)
+            "path `{display_path}` is a directory"
         )));
     }
     let content = fs::read_to_string(path).map_err(|source| {
-        PatchFileReadError::Invalid(format!(
-            "read `{}`: {source}",
-            display_workspace_path(config, path)
-        ))
+        PatchFileReadError::Invalid(format!("read `{display_path}`: {source}"))
     })?;
     Ok(VirtualFileState {
         content,
-        display_path: display_workspace_path(config, path),
+        display_path,
         mode_source: Some(path.to_path_buf()),
     })
 }
@@ -1655,6 +1687,7 @@ fn patch_failure_result(
 fn patch_result(
     status: AgentToolStatus,
     summary: String,
+    config: &LocalWorkspaceAgentConfig,
     plan: &PlannedPatch,
     root: &Path,
     evidence_reason: &str,
@@ -1681,6 +1714,10 @@ fn patch_result(
                 }),
             )
             .with_output_value(&payload, false)
+            .with_metadata(serde_json::json!({
+                "workspace_root": root.display().to_string(),
+                "sandbox": local_workspace_sandbox_metadata(config),
+            }))
             .with_record(
                 AGENT_CODING_EVIDENCE_KIND,
                 &AgentCodingToolEvidence {

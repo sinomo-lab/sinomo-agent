@@ -15742,6 +15742,56 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
+    fn local_workspace_run_command_uses_simple_sandbox_by_default() {
+        if !sinomo_runtime::sandbox_simple::SandboxSimpleNativeCommandRunner::landlock_supported() {
+            return;
+        }
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-command-simple-sandbox");
+        let registry = AgentToolRegistry::local_workspace_with_config(
+            LocalWorkspaceAgentConfig::new(&root)
+                .without_agent_home_sifs_path()
+                .allowing_shell_commands(true),
+        );
+        let input = agent_input("simple sandbox command");
+
+        let outcome = registry.execute(
+            &input.session,
+            0,
+            0,
+            &AgentToolCall {
+                call_id: None,
+                tool: "run_command".to_string(),
+                input: serde_json::json!({ "command": "printf ok > inside.txt" }),
+                r#async: false,
+                summary: "run sandboxed command".to_string(),
+            },
+        );
+
+        assert_eq!(outcome.status, AgentToolStatus::Succeeded);
+        assert_eq!(
+            fs::read_to_string(root.join("inside.txt")).expect("inside file"),
+            "ok"
+        );
+        assert_eq!(
+            outcome
+                .evidence
+                .metadata
+                .pointer("/sandbox/runtime")
+                .and_then(serde_json::Value::as_str),
+            Some("simple_sandbox")
+        );
+        assert_eq!(
+            outcome
+                .evidence
+                .metadata
+                .pointer("/sandbox/checked")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
     fn local_workspace_run_command_honors_timeout_and_cwd() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-command-timeout");
         let subdir = root.join("subdir");
@@ -16011,6 +16061,22 @@ mod tests {
                 .diff_ref
                 .as_deref()
                 .is_some_and(|path| Path::new(path).exists())
+        );
+        assert_eq!(
+            outcome
+                .evidence
+                .metadata
+                .pointer("/sandbox/runtime")
+                .and_then(serde_json::Value::as_str),
+            Some("simple_sandbox")
+        );
+        assert_eq!(
+            outcome
+                .evidence
+                .metadata
+                .pointer("/sandbox/checked")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
         );
     }
 

@@ -284,6 +284,12 @@ struct LocalCommandOptions {
     summary_override: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalWorkspaceFileAccess {
+    Read,
+    Write,
+}
+
 fn local_run_command_from_call(
     config: &LocalWorkspaceAgentConfig,
     call: &AgentToolCall,
@@ -1519,6 +1525,7 @@ fn local_command_result_from_output(
             "timed_out": timed_out,
             "cancelled": cancelled,
             "timeout_ms": timeout_ms,
+            "sandbox": local_workspace_sandbox_metadata(config),
         }));
     if !changed_files.is_empty() {
         evidence = evidence.with_record(
@@ -1548,6 +1555,75 @@ fn local_command_result_from_output(
     } else {
         AgentToolResult::failed(summary, payload).with_evidence(evidence)
     }
+}
+
+fn local_workspace_sandbox_metadata(config: &LocalWorkspaceAgentConfig) -> serde_json::Value {
+    match config.command_runtime {
+        LocalWorkspaceCommandRuntime::SimpleSandbox => serde_json::json!({
+            "runtime": "simple_sandbox",
+            "checked": true,
+            "allow_unenforced": config.sandbox_allow_unenforced,
+            "runtime_root": config.sandbox_runtime_root,
+            "agent_home_sifs_path": config.agent_home_sifs_path,
+            "agent_home_local_root": config.agent_home_local_root,
+        }),
+        LocalWorkspaceCommandRuntime::LocalProcess => serde_json::json!({
+            "runtime": "local_process",
+            "checked": false,
+        }),
+    }
+}
+
+fn validate_local_workspace_file_access(
+    config: &LocalWorkspaceAgentConfig,
+    root: &Path,
+    path: &Path,
+    access: LocalWorkspaceFileAccess,
+    requested: &str,
+) -> Result<(), String> {
+    if config.command_runtime != LocalWorkspaceCommandRuntime::SimpleSandbox {
+        return Ok(());
+    }
+    let agent_home_local = agent_home_local_mirror(config);
+    let allowed_paths = match access {
+        LocalWorkspaceFileAccess::Read => {
+            sandbox_extra_read_paths(root, root, &[], agent_home_local.as_deref())
+        }
+        LocalWorkspaceFileAccess::Write => {
+            sandbox_extra_write_paths(root, agent_home_local.as_deref())
+        }
+    };
+    if sandbox_path_is_allowed(path, &allowed_paths) {
+        return Ok(());
+    }
+    Err(format!(
+        "path `{requested}` is outside the simple sandbox {:?} allowlist",
+        access
+    ))
+}
+
+fn sandbox_path_is_allowed(path: &Path, allowed_paths: &[PathBuf]) -> bool {
+    let Some(path_anchor) = existing_path_anchor(path) else {
+        return false;
+    };
+    allowed_paths.iter().any(|allowed| {
+        let allowed_anchor = fs::canonicalize(allowed).unwrap_or_else(|_| allowed.clone());
+        path_anchor == allowed_anchor || path_anchor.starts_with(&allowed_anchor)
+    })
+}
+
+fn existing_path_anchor(path: &Path) -> Option<PathBuf> {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return Some(canonical);
+    }
+    let mut ancestor = path.parent();
+    while let Some(candidate) = ancestor {
+        if let Ok(canonical) = fs::canonicalize(candidate) {
+            return Some(canonical);
+        }
+        ancestor = candidate.parent();
+    }
+    None
 }
 
 fn write_local_evidence(
@@ -1957,6 +2033,48 @@ mod tests {
         assert_eq!(
             agent_home_local_mirror(&config),
             Some(data_dir.root().join("agents").join(agent_id).join("home"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn simple_sandbox_command_denies_writes_outside_workspace_when_enforced() {
+        if !SandboxSimpleNativeCommandRunner::landlock_supported() {
+            return;
+        }
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-sandbox-deny-write");
+        let workspace = root.join("workspace");
+        let runtime_root = root.join("sandbox-runtime");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let outside = root.join("outside.txt");
+        let config = LocalWorkspaceAgentConfig::new(&workspace)
+            .with_sandbox_runtime_root(&runtime_root)
+            .without_agent_home_sifs_path();
+        let program = "tee";
+        let host_program = "/usr/bin/tee";
+        if !Path::new(host_program).exists() {
+            return;
+        }
+        let args = vec![outside.display().to_string()];
+
+        let execution = execute_local_command(
+            &config,
+            program,
+            &args,
+            Some(b"blocked"),
+            Some(5000),
+            None,
+            &AgentCancellationToken::new(),
+            AgentToolProgressSink::default(),
+        )
+        .expect("sandbox command should start");
+
+        assert!(!execution.output.success);
+        assert!(!outside.exists());
+        assert!(
+            String::from_utf8_lossy(&execution.output.stderr)
+                .to_ascii_lowercase()
+                .contains("permission")
         );
     }
 

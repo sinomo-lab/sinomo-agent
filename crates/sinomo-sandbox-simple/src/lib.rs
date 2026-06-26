@@ -483,7 +483,9 @@ fn execute_native_command_std(
         })?;
     linux::ensure_landlock_or_allowed(config.allow_unenforced)?;
 
-    let mut command = Command::new(argv0);
+    let env = native_environment(request, layout, cwd);
+    let program = resolve_native_program(argv0, &env, cwd)?;
+    let mut command = Command::new(&program);
     command
         .args(request.argv.iter().skip(1))
         .current_dir(cwd)
@@ -495,7 +497,7 @@ fn execute_native_command_std(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_clear();
-    for (name, value) in native_environment(request, layout, cwd) {
+    for (name, value) in env {
         command.env(name, value);
     }
     #[cfg(target_os = "linux")]
@@ -516,7 +518,14 @@ fn execute_native_command_std(
     let mut child = command
         .spawn()
         .map_err(|source| SandboxWasiError::Runtime {
-            detail: format!("failed to start simple-native command `{argv0}`: {source}"),
+            detail: if program == Path::new(argv0) {
+                format!("failed to start simple-native command `{argv0}`: {source}")
+            } else {
+                format!(
+                    "failed to start simple-native command `{argv0}` resolved to `{}`: {source}",
+                    program.display()
+                )
+            },
         })?;
     let child_pid = child.id() as i32;
     if let Some(stdin) = &request.stdin {
@@ -606,26 +615,32 @@ fn resolve_native_cwd(
     cwd: &SandboxPath,
 ) -> Result<PathBuf, SandboxCommandExecutionError> {
     match fs.host_path(cwd) {
-        Ok(path) => Ok(path),
-        Err(SandboxFsError::NotFound { .. }) => {
-            #[cfg(windows)]
-            if let Some(path) = windows_host_path_from_sandbox_path(cwd)
-                && path.exists()
-            {
-                return Ok(path);
-            }
-            let path = PathBuf::from(cwd.as_str());
-            if path.exists() {
-                Ok(path)
-            } else if cwd.as_str() == "/" {
-                Ok(layout.root.clone())
-            } else {
-                Err(SandboxCommandExecutionError::Fs(SandboxFsError::NotFound {
-                    path: cwd.clone(),
-                }))
-            }
-        }
+        Ok(path) if path.exists() => Ok(path),
+        Ok(_) => resolve_host_or_root_cwd(layout, cwd),
+        Err(SandboxFsError::NotFound { .. }) => resolve_host_or_root_cwd(layout, cwd),
         Err(error) => Err(SandboxCommandExecutionError::Fs(error)),
+    }
+}
+
+fn resolve_host_or_root_cwd(
+    layout: &LocalSandboxInstanceLayout,
+    cwd: &SandboxPath,
+) -> Result<PathBuf, SandboxCommandExecutionError> {
+    #[cfg(windows)]
+    if let Some(path) = windows_host_path_from_sandbox_path(cwd)
+        && path.exists()
+    {
+        return Ok(path);
+    }
+    let path = PathBuf::from(cwd.as_str());
+    if path.exists() {
+        Ok(path)
+    } else if cwd.as_str() == "/" {
+        Ok(layout.root.clone())
+    } else {
+        Err(SandboxCommandExecutionError::Fs(SandboxFsError::NotFound {
+            path: cwd.clone(),
+        }))
     }
 }
 
@@ -641,6 +656,34 @@ fn windows_host_path_from_sandbox_path(cwd: &SandboxPath) -> Option<PathBuf> {
     host_path.push(':');
     host_path.push_str(&encoded[2..].replace('/', "\\"));
     Some(PathBuf::from(host_path))
+}
+
+#[cfg(not(windows))]
+fn resolve_native_program(
+    argv0: &str,
+    envs: &[(String, String)],
+    cwd: &Path,
+) -> Result<PathBuf, SandboxWasiError> {
+    if argv0.contains('/') || argv0.contains('\\') {
+        return Ok(PathBuf::from(argv0));
+    }
+    let path = envs
+        .iter()
+        .find_map(|(name, value)| (name == "PATH").then_some(value.as_str()))
+        .unwrap_or("/usr/local/bin:/usr/bin:/bin");
+    for dir in env::split_paths(path) {
+        let candidate = if dir.as_os_str().is_empty() {
+            cwd.join(argv0)
+        } else {
+            dir.join(argv0)
+        };
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(SandboxWasiError::Runtime {
+        detail: format!("failed to resolve simple-native command `{argv0}` on PATH"),
+    })
 }
 
 fn native_environment(
@@ -1888,6 +1931,44 @@ mod tests {
             fs::read_to_string(layout.work.join("out.txt")).expect("out"),
             "ok"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn simple_native_can_execute_from_extra_host_workspace_cwd() {
+        if !SandboxSimpleNativeCommandRunner::landlock_supported() {
+            return;
+        }
+        let (dir, store, sandbox_id) = create_store();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let (mut manifest, _layout) = store.load(&sandbox_id).expect("load");
+        manifest.cwd =
+            SandboxPath::new(workspace.display().to_string()).expect("host workspace cwd");
+        store.save_manifest(&manifest).expect("save manifest");
+        let node_id = NodeId::from_legacy_named("sandbox_simple_test").expect("node");
+        let toolchain_store = sinomo_sandbox::LocalSandboxToolchainStore::new(std::env::temp_dir());
+        let outcome = SandboxSimpleNativeCommandRunner::new(SandboxSimpleNativeConfig {
+            allow_unenforced: false,
+            extra_read_paths: vec![workspace.clone()],
+            extra_write_paths: vec![workspace],
+            extra_execute_paths: Vec::new(),
+        })
+        .run_toolchain_command_with_stdin_policy_and_output_sink(
+            &store,
+            &toolchain_store,
+            &sandbox_id,
+            "true",
+            vec!["true".to_string()],
+            None,
+            0,
+            &node_id,
+            &SandboxPolicy::default(),
+            None,
+        )
+        .expect("simple-native host workspace cwd command");
+
+        assert_eq!(outcome.response.exit_status, 0);
     }
 
     #[test]
