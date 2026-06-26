@@ -5,8 +5,9 @@ use crate::{
     LanguageModelProviderInfo, LanguageModelProviderOptions, LanguageModelProviderToolSpec,
     LanguageModelRequest, LanguageModelRequestItem, LanguageModelResponse,
     LanguageModelResponseFormat, LanguageModelResponseItem, LanguageModelRole,
-    LanguageModelToolCall, LanguageModelToolChoice, LanguageModelToolSpec, LanguageModelUsage,
-    PROVIDER_DEFAULT_MODEL, apply_provider_vendor_options_to_payload, render_plain_prompt,
+    LanguageModelStreamEvent, LanguageModelToolCall, LanguageModelToolChoice,
+    LanguageModelToolSpec, LanguageModelUsage, PROVIDER_DEFAULT_MODEL,
+    apply_provider_vendor_options_to_payload, read_server_sent_events, render_plain_prompt,
     selected_model,
 };
 use reqwest::blocking::Client;
@@ -201,6 +202,50 @@ impl LanguageModelProvider for OpenAiProvider {
             tool_calls,
             usage,
         })
+    }
+
+    fn complete_streaming_events(
+        &self,
+        request: &LanguageModelRequest,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        let model = selected_model(&self.config.default_model, request);
+        let api_key = self.api_key()?;
+        let url = format!(
+            "{}/responses",
+            self.config.api_base_url.trim_end_matches('/')
+        );
+        let mut headers = openai_headers(&api_key, Self::PROVIDER_ID, &model)?;
+        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        let mut payload = openai_responses_payload(request, &model, &self.config.options);
+        payload["stream"] = serde_json::json!(true);
+        let response = self
+            .http
+            .post(url)
+            .headers(headers)
+            .json(&payload)
+            .send()
+            .map_err(|source| LanguageModelError::ProviderInvocationFailed {
+                provider: Self::PROVIDER_ID.to_string(),
+                model: model.clone(),
+                detail: source.to_string(),
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            return Err(LanguageModelError::ProviderInvocationFailed {
+                provider: Self::PROVIDER_ID.to_string(),
+                model,
+                detail: format!("OpenAI Responses API failed: HTTP {status}: {body}"),
+            });
+        }
+
+        on_event(LanguageModelStreamEvent::Started {
+            provider: Self::PROVIDER_ID.to_string(),
+            model: model.clone(),
+        });
+        stream_openai_responses_response(response, Self::PROVIDER_ID, &model, on_event)
     }
 }
 
@@ -531,6 +576,196 @@ fn extract_openai_response_text(value: &serde_json::Value) -> String {
                 .join("\n")
         })
         .unwrap_or_default()
+}
+
+fn stream_openai_responses_response(
+    response: reqwest::blocking::Response,
+    provider: &str,
+    model: &str,
+    on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+) -> Result<LanguageModelResponse, LanguageModelError> {
+    let mut output = Vec::new();
+    let mut output_text = String::new();
+    let mut completed_response = None;
+    let mut emitted_text = false;
+    let mut emitted_finished = false;
+
+    read_server_sent_events(response, provider, model, |event| {
+        let mut value =
+            serde_json::from_str::<serde_json::Value>(&event.data).map_err(|source| {
+                LanguageModelError::ProviderInvocationFailed {
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                    detail: format!(
+                        "failed to parse OpenAI stream event: {source}: {}",
+                        event.data
+                    ),
+                }
+            })?;
+        if value.get("type").is_none()
+            && let (Some(event_name), Some(object)) = (event.event, value.as_object_mut())
+        {
+            object.insert("type".to_string(), serde_json::json!(event_name));
+        }
+        match value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+        {
+            "response.output_text.delta" => {
+                if let Some(delta) = value.get("delta").and_then(serde_json::Value::as_str) {
+                    output_text.push_str(delta);
+                    emitted_text = true;
+                    on_event(LanguageModelStreamEvent::TextDelta {
+                        delta: delta.to_string(),
+                    });
+                }
+            }
+            "response.output_item.done" => {
+                if let Some(item) = value.get("item") {
+                    if let Some(call) = openai_output_item_tool_call(item) {
+                        on_event(LanguageModelStreamEvent::ToolCallStarted {
+                            call_id: call.call_id.clone(),
+                            name: call.name.clone(),
+                        });
+                        on_event(LanguageModelStreamEvent::ToolCallCompleted {
+                            call_id: call.call_id.clone(),
+                            name: call.name,
+                            input: call.input,
+                        });
+                    }
+                    output.push(item.clone());
+                }
+            }
+            "response.completed" => {
+                let mut final_response = value
+                    .get("response")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let missing_or_empty_output = final_response
+                    .get("output")
+                    .and_then(serde_json::Value::as_array)
+                    .is_none_or(Vec::is_empty);
+                if missing_or_empty_output && !output.is_empty() {
+                    final_response["output"] = serde_json::json!(output.clone());
+                }
+                if final_response.get("output_text").is_none() && !output_text.is_empty() {
+                    final_response["output_text"] = serde_json::json!(output_text.clone());
+                }
+                let final_text = extract_openai_response_text(&final_response);
+                if !emitted_text && !final_text.is_empty() {
+                    emitted_text = true;
+                    on_event(LanguageModelStreamEvent::TextDelta {
+                        delta: final_text.clone(),
+                    });
+                }
+                if let Some(usage) = extract_openai_usage(&final_response) {
+                    on_event(LanguageModelStreamEvent::Usage { usage });
+                }
+                on_event(LanguageModelStreamEvent::Finished {
+                    finish_reason: openai_responses_finish_reason(&final_response),
+                });
+                emitted_finished = true;
+                completed_response = Some(final_response);
+            }
+            "response.failed" | "error" => {
+                let detail = openai_responses_event_error_message(&value)
+                    .unwrap_or_else(|| format!("OpenAI stream failed: {value}"));
+                on_event(LanguageModelStreamEvent::Error {
+                    detail: detail.clone(),
+                });
+                return Err(LanguageModelError::ProviderInvocationFailed {
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                    detail,
+                });
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+
+    let mut final_response = completed_response.unwrap_or_else(|| serde_json::json!({}));
+    let missing_or_empty_output = final_response
+        .get("output")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(Vec::is_empty);
+    if missing_or_empty_output && !output.is_empty() {
+        final_response["output"] = serde_json::json!(output);
+    }
+    if final_response.get("output_text").is_none() && !output_text.is_empty() {
+        final_response["output_text"] = serde_json::json!(output_text);
+    }
+
+    let content = extract_openai_response_text(&final_response);
+    if !emitted_text && !content.is_empty() {
+        on_event(LanguageModelStreamEvent::TextDelta {
+            delta: content.clone(),
+        });
+    }
+    let tool_calls = extract_openai_tool_calls(&final_response);
+    let items = tool_calls
+        .iter()
+        .cloned()
+        .map(|call| LanguageModelResponseItem::ToolCall { call })
+        .collect();
+    let usage = extract_openai_usage(&final_response);
+    if !emitted_finished {
+        if let Some(usage) = &usage {
+            on_event(LanguageModelStreamEvent::Usage {
+                usage: usage.clone(),
+            });
+        }
+        on_event(LanguageModelStreamEvent::Finished {
+            finish_reason: openai_responses_finish_reason(&final_response),
+        });
+    }
+
+    Ok(LanguageModelResponse {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        content,
+        items,
+        tool_calls,
+        usage,
+    })
+}
+
+fn extract_openai_usage(value: &serde_json::Value) -> Option<LanguageModelUsage> {
+    value.get("usage").map(|usage| LanguageModelUsage {
+        input_tokens: usage
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_u64),
+        output_tokens: usage
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_u64),
+    })
+}
+
+fn openai_responses_finish_reason(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            value
+                .get("finish_reason")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            value
+                .get("incomplete_details")
+                .and_then(|details| details.get("reason"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::to_string)
+}
+
+fn openai_responses_event_error_message(value: &serde_json::Value) -> Option<String> {
+    value
+        .pointer("/response/error/message")
+        .or_else(|| value.pointer("/error/message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 fn extract_openai_tool_calls(value: &serde_json::Value) -> Vec<LanguageModelToolCall> {

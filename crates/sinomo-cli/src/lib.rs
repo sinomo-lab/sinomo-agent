@@ -52,9 +52,10 @@ use sinomo_lm::{
     LM_PROVIDER_CONFIG_KEY, LM_PROVIDER_CONFIG_KV_KEY, LM_RUNTIME_CONFIG_KEY,
     LM_RUNTIME_CONFIG_KV_KEY, LanguageModelError, LanguageModelModelOptions,
     LanguageModelProviderOptions, LanguageModelProviderUsage, LanguageModelRequest,
-    LanguageModelResponse, ModelConfig, ModelPaths, ModelRuntimeConfig, NvidiaProvider,
-    OpenAiProvider, ProviderAccountConfig, ProviderReasoningEffort, ProviderTextVerbosity,
-    codex_provider, collect_provider_model_catalogs, collect_provider_usage,
+    LanguageModelResponse, LanguageModelStreamEvent, ModelConfig, ModelPaths, ModelRuntimeConfig,
+    NvidiaProvider, OpenAiProvider, ProviderAccountConfig, ProviderReasoningEffort,
+    ProviderTextVerbosity, codex_provider, collect_provider_model_catalogs, collect_provider_usage,
+    complete_configured_model_request_streaming_events_with_account,
     complete_configured_model_request_with_account,
     current_default_model as resolve_current_default_model, default_model_provider_ids,
     github_copilot_provider, load_model_config, model_config_cluster_kv_txn,
@@ -1971,6 +1972,18 @@ impl InteractionModel for ConfiguredInteractionModel {
         request: &LanguageModelRequest,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<LanguageModelResponse, LanguageModelError> {
+        self.complete_streaming_events(request, &mut |event| {
+            if let LanguageModelStreamEvent::TextDelta { delta } = event {
+                on_delta(&delta);
+            }
+        })
+    }
+
+    fn complete_streaming_events(
+        &self,
+        request: &LanguageModelRequest,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
         if self.provider == MINICPM_PROVIDER_ID
             && let Some(endpoint) = self.runtime_config.pytorch_bridge.endpoint.clone()
         {
@@ -1989,6 +2002,10 @@ impl InteractionModel for ConfiguredInteractionModel {
                     .unwrap_or(300),
                 auth_token: None,
             });
+            on_event(LanguageModelStreamEvent::Started {
+                provider: MINICPM_PROVIDER_ID.to_string(),
+                model: model.clone(),
+            });
             let response = provider
                 .complete_streaming(
                     sinomo_pytorch::PytorchRequest::from_language_model_request(
@@ -1998,13 +2015,25 @@ impl InteractionModel for ConfiguredInteractionModel {
                             ..request.clone()
                         },
                     ),
-                    on_delta,
+                    &mut |delta| {
+                        on_event(LanguageModelStreamEvent::TextDelta {
+                            delta: delta.to_string(),
+                        });
+                    },
                 )
                 .map_err(|source| LanguageModelError::ProviderInvocationFailed {
                     provider: MINICPM_PROVIDER_ID.to_string(),
                     model: self.model.clone(),
                     detail: source.to_string(),
                 })?;
+            if let Some(usage) = &response.usage {
+                on_event(LanguageModelStreamEvent::Usage {
+                    usage: usage.clone(),
+                });
+            }
+            on_event(LanguageModelStreamEvent::Finished {
+                finish_reason: None,
+            });
             return Ok(LanguageModelResponse {
                 provider: MINICPM_PROVIDER_ID.to_string(),
                 model: self.model.clone(),
@@ -2020,9 +2049,35 @@ impl InteractionModel for ConfiguredInteractionModel {
             } else {
                 self.model.clone()
             };
-            return self.complete_streaming_with_managed_pytorch(request, &model, on_delta);
+            on_event(LanguageModelStreamEvent::Started {
+                provider: MINICPM_PROVIDER_ID.to_string(),
+                model: model.clone(),
+            });
+            let response =
+                self.complete_streaming_with_managed_pytorch(request, &model, &mut |delta| {
+                    on_event(LanguageModelStreamEvent::TextDelta {
+                        delta: delta.to_string(),
+                    });
+                })?;
+            if let Some(usage) = &response.usage {
+                on_event(LanguageModelStreamEvent::Usage {
+                    usage: usage.clone(),
+                });
+            }
+            on_event(LanguageModelStreamEvent::Finished {
+                finish_reason: None,
+            });
+            return Ok(response);
         }
-        self.complete(request)
+        complete_configured_model_request_streaming_events_with_account(
+            &self.data_dir,
+            &self.provider,
+            &self.model,
+            self.account.as_ref(),
+            None,
+            request,
+            on_event,
+        )
     }
 }
 

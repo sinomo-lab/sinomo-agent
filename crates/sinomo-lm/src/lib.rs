@@ -58,7 +58,7 @@ use sinomo_runtime::local::SinomoDataDir;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
@@ -1923,6 +1923,35 @@ pub fn complete_configured_model_request_with_account(
         model: model.to_string(),
         ..request.clone()
     };
+    let provider = configured_model_provider(data_dir, provider, model, account, working_dir)?;
+    provider.complete(&request)
+}
+
+pub fn complete_configured_model_request_streaming_events_with_account(
+    data_dir: &SinomoDataDir,
+    provider: &str,
+    model: &str,
+    account: Option<&ProviderAccountConfig>,
+    working_dir: Option<PathBuf>,
+    request: &LanguageModelRequest,
+    on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+) -> Result<LanguageModelResponse, LanguageModelError> {
+    let request = LanguageModelRequest {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        ..request.clone()
+    };
+    let provider = configured_model_provider(data_dir, provider, model, account, working_dir)?;
+    provider.complete_streaming_events(&request, on_event)
+}
+
+fn configured_model_provider(
+    data_dir: &SinomoDataDir,
+    provider: &str,
+    model: &str,
+    account: Option<&ProviderAccountConfig>,
+    working_dir: Option<PathBuf>,
+) -> Result<Box<dyn LanguageModelProvider>, LanguageModelError> {
     let provider_options = provider_options_for_model(account, model);
     match provider {
         GitHubCopilotProvider::PROVIDER_ID => {
@@ -1941,14 +1970,14 @@ pub fn complete_configured_model_request_with_account(
                 ),
                 token_store_path: Some(credentials_path),
             });
-            provider.complete(&request)
+            Ok(Box::new(provider))
         }
         GitHubCopilotCliProvider::PROVIDER_ID => {
             let provider = GitHubCopilotCliProvider::new(GitHubCopilotCliConfig {
                 model: model_or_default(model, GitHubCopilotCliConfig::default().model),
                 ..GitHubCopilotCliConfig::default()
             });
-            provider.complete(&request)
+            Ok(Box::new(provider))
         }
         CodexCliProvider::PROVIDER_ID => {
             let provider = CodexCliProvider::new(CodexCliConfig {
@@ -1957,16 +1986,17 @@ pub fn complete_configured_model_request_with_account(
                 reasoning_effort: provider_options.reasoning_effort,
                 ..CodexCliConfig::default()
             });
-            provider.complete(&request)
+            Ok(Box::new(provider))
         }
         CODEX_PROVIDER_ID => {
             let credentials_path = data_dir.provider_credentials_file(CODEX_PROVIDER_ID);
-            codex_provider_for_model_with_options_and_credentials(
-                model,
-                provider_options,
-                Some(credentials_path),
-            )
-            .complete(&request)
+            Ok(Box::new(
+                codex_provider_for_model_with_options_and_credentials(
+                    model,
+                    provider_options,
+                    Some(credentials_path),
+                ),
+            ))
         }
         ClaudeCodeProvider::PROVIDER_ID => {
             let provider = ClaudeCodeProvider::new(ClaudeCodeConfig {
@@ -1975,7 +2005,7 @@ pub fn complete_configured_model_request_with_account(
                 reasoning_effort: provider_options.reasoning_effort,
                 ..ClaudeCodeConfig::default()
             });
-            provider.complete(&request)
+            Ok(Box::new(provider))
         }
         AnthropicProvider::PROVIDER_ID => {
             let credentials_path =
@@ -1993,7 +2023,7 @@ pub fn complete_configured_model_request_with_account(
                     .unwrap_or(Some(credentials_path)),
                 options: provider_options.clone(),
             });
-            provider.complete(&request)
+            Ok(Box::new(provider))
         }
         OpenAiProvider::PROVIDER_ID => {
             let credentials_path = data_dir.provider_credentials_file(OpenAiProvider::PROVIDER_ID);
@@ -2010,7 +2040,7 @@ pub fn complete_configured_model_request_with_account(
                     .unwrap_or(Some(credentials_path)),
                 options: provider_options.clone(),
             });
-            provider.complete(&request)
+            Ok(Box::new(provider))
         }
         DeepSeekProvider::PROVIDER_ID => {
             let credentials_path =
@@ -2027,7 +2057,7 @@ pub fn complete_configured_model_request_with_account(
                     .map(|_| None)
                     .unwrap_or(Some(credentials_path)),
             });
-            provider.complete(&request)
+            Ok(Box::new(provider))
         }
         GeminiProvider::PROVIDER_ID => {
             let credentials_path = data_dir.provider_credentials_file(GeminiProvider::PROVIDER_ID);
@@ -2043,7 +2073,7 @@ pub fn complete_configured_model_request_with_account(
                     .map(|_| None)
                     .unwrap_or(Some(credentials_path)),
             });
-            provider.complete(&request)
+            Ok(Box::new(provider))
         }
         NvidiaProvider::PROVIDER_ID => {
             let credentials_path = data_dir.provider_credentials_file(NvidiaProvider::PROVIDER_ID);
@@ -2059,7 +2089,7 @@ pub fn complete_configured_model_request_with_account(
                     .map(|_| None)
                     .unwrap_or(Some(credentials_path)),
             });
-            provider.complete(&request)
+            Ok(Box::new(provider))
         }
         _ => Err(LanguageModelError::ProviderInvocationFailed {
             provider: provider.to_string(),
@@ -2067,6 +2097,277 @@ pub fn complete_configured_model_request_with_account(
             detail: "unknown language model provider".to_string(),
         }),
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ServerSentEvent {
+    pub event: Option<String>,
+    pub data: String,
+}
+
+pub(crate) fn read_server_sent_events<R>(
+    reader: R,
+    provider: &str,
+    model: &str,
+    mut on_event: impl FnMut(ServerSentEvent) -> Result<(), LanguageModelError>,
+) -> Result<(), LanguageModelError>
+where
+    R: Read,
+{
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    let mut event_name = None;
+    let mut data_lines = Vec::new();
+
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line).map_err(|source| {
+            LanguageModelError::ProviderInvocationFailed {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                detail: format!("failed to read streaming response: {source}"),
+            }
+        })?;
+        if read == 0 {
+            flush_server_sent_event(&mut event_name, &mut data_lines, &mut on_event)?;
+            break;
+        }
+
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            flush_server_sent_event(&mut event_name, &mut data_lines, &mut on_event)?;
+        } else if line.starts_with(':') {
+            continue;
+        } else if let Some(value) = line.strip_prefix("event:") {
+            event_name = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data_lines.push(value.trim_start().to_string());
+        }
+    }
+
+    Ok(())
+}
+
+fn flush_server_sent_event(
+    event_name: &mut Option<String>,
+    data_lines: &mut Vec<String>,
+    on_event: &mut impl FnMut(ServerSentEvent) -> Result<(), LanguageModelError>,
+) -> Result<(), LanguageModelError> {
+    if data_lines.is_empty() {
+        event_name.take();
+        return Ok(());
+    }
+    let data = std::mem::take(data_lines).join("\n");
+    let event = event_name.take();
+    let trimmed = data.trim();
+    if trimmed.is_empty() || trimmed == "[DONE]" {
+        return Ok(());
+    }
+    on_event(ServerSentEvent { event, data })
+}
+
+pub(crate) fn stream_openai_chat_completion_response<R>(
+    reader: R,
+    provider: &str,
+    model: &str,
+    on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+) -> Result<LanguageModelResponse, LanguageModelError>
+where
+    R: Read,
+{
+    let mut content = String::new();
+    let mut tool_calls = Vec::<ChatCompletionToolCallAccumulator>::new();
+    let mut usage = None;
+    let mut finish_reason = None;
+
+    read_server_sent_events(reader, provider, model, |event| {
+        let value = serde_json::from_str::<serde_json::Value>(&event.data).map_err(|source| {
+            LanguageModelError::ProviderInvocationFailed {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                detail: format!(
+                    "failed to parse chat completion stream event: {source}: {}",
+                    event.data
+                ),
+            }
+        })?;
+        if let Some(detail) = value
+            .pointer("/error/message")
+            .and_then(serde_json::Value::as_str)
+        {
+            on_event(LanguageModelStreamEvent::Error {
+                detail: detail.to_string(),
+            });
+            return Err(LanguageModelError::ProviderInvocationFailed {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                detail: detail.to_string(),
+            });
+        }
+        if let Some(delta) = value
+            .pointer("/choices/0/delta/content")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                value
+                    .pointer("/choices/0/text")
+                    .and_then(serde_json::Value::as_str)
+            })
+            && !delta.is_empty()
+        {
+            content.push_str(delta);
+            on_event(LanguageModelStreamEvent::TextDelta {
+                delta: delta.to_string(),
+            });
+        }
+        if let Some(delta_tool_calls) = value
+            .pointer("/choices/0/delta/tool_calls")
+            .and_then(serde_json::Value::as_array)
+        {
+            for call_delta in delta_tool_calls {
+                apply_chat_completion_tool_call_delta(call_delta, &mut tool_calls, on_event);
+            }
+        }
+        if let Some(event_usage) = openai_chat_completion_usage(&value) {
+            usage = Some(event_usage);
+        }
+        if let Some(reason) = value
+            .pointer("/choices/0/finish_reason")
+            .and_then(serde_json::Value::as_str)
+        {
+            finish_reason = Some(reason.to_string());
+        }
+        Ok(())
+    })?;
+
+    let completed_tool_calls = tool_calls
+        .into_iter()
+        .filter_map(|call| call.complete(on_event))
+        .collect::<Vec<_>>();
+    let items = completed_tool_calls
+        .iter()
+        .cloned()
+        .map(|call| LanguageModelResponseItem::ToolCall { call })
+        .collect();
+    if let Some(usage) = &usage {
+        on_event(LanguageModelStreamEvent::Usage {
+            usage: usage.clone(),
+        });
+    }
+    on_event(LanguageModelStreamEvent::Finished { finish_reason });
+
+    Ok(LanguageModelResponse {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        content,
+        items,
+        tool_calls: completed_tool_calls,
+        usage,
+    })
+}
+
+#[derive(Clone, Debug, Default)]
+struct ChatCompletionToolCallAccumulator {
+    call_id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+    started: bool,
+}
+
+impl ChatCompletionToolCallAccumulator {
+    fn complete(
+        mut self,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Option<LanguageModelToolCall> {
+        let name = self.name.take()?;
+        if !self.started {
+            on_event(LanguageModelStreamEvent::ToolCallStarted {
+                call_id: self.call_id.clone(),
+                name: name.clone(),
+            });
+        }
+        let input = parse_streamed_tool_arguments(&self.arguments);
+        on_event(LanguageModelStreamEvent::ToolCallCompleted {
+            call_id: self.call_id.clone(),
+            name: name.clone(),
+            input: input.clone(),
+        });
+        Some(LanguageModelToolCall {
+            call_id: self.call_id,
+            name,
+            input,
+            summary: None,
+        })
+    }
+}
+
+fn apply_chat_completion_tool_call_delta(
+    value: &serde_json::Value,
+    tool_calls: &mut Vec<ChatCompletionToolCallAccumulator>,
+    on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+) {
+    let index = value
+        .get("index")
+        .and_then(serde_json::Value::as_u64)
+        .map(|index| index as usize)
+        .unwrap_or(tool_calls.len());
+    while tool_calls.len() <= index {
+        tool_calls.push(ChatCompletionToolCallAccumulator::default());
+    }
+    let call = &mut tool_calls[index];
+    if let Some(id) = value.get("id").and_then(serde_json::Value::as_str)
+        && call.call_id.is_none()
+    {
+        call.call_id = Some(id.to_string());
+    }
+    if let Some(name) = value
+        .pointer("/function/name")
+        .and_then(serde_json::Value::as_str)
+        && call.name.is_none()
+    {
+        call.name = Some(name.to_string());
+    }
+    if !call.started
+        && let Some(name) = &call.name
+    {
+        call.started = true;
+        on_event(LanguageModelStreamEvent::ToolCallStarted {
+            call_id: call.call_id.clone(),
+            name: name.clone(),
+        });
+    }
+    if let Some(arguments_delta) = value
+        .pointer("/function/arguments")
+        .and_then(serde_json::Value::as_str)
+        && !arguments_delta.is_empty()
+    {
+        call.arguments.push_str(arguments_delta);
+        on_event(LanguageModelStreamEvent::ToolCallDelta {
+            call_id: call.call_id.clone(),
+            name: call.name.clone(),
+            arguments_delta: arguments_delta.to_string(),
+        });
+    }
+}
+
+fn parse_streamed_tool_arguments(arguments: &str) -> serde_json::Value {
+    if arguments.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!(arguments))
+    }
+}
+
+fn openai_chat_completion_usage(value: &serde_json::Value) -> Option<LanguageModelUsage> {
+    value.get("usage").map(|usage| LanguageModelUsage {
+        input_tokens: usage
+            .get("prompt_tokens")
+            .or_else(|| usage.get("input_tokens"))
+            .and_then(serde_json::Value::as_u64),
+        output_tokens: usage
+            .get("completion_tokens")
+            .or_else(|| usage.get("output_tokens"))
+            .and_then(serde_json::Value::as_u64),
+    })
 }
 
 pub fn model_or_default(model: &str, default_model: String) -> String {
@@ -3852,6 +4153,119 @@ mod tests {
                 model,
                 ..
             } if provider == "unknown-provider" && model == "test-model"
+        ));
+    }
+
+    #[test]
+    fn chat_completion_stream_emits_text_usage_and_finish() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],",
+            "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut events = Vec::new();
+
+        let response = stream_openai_chat_completion_response(
+            body.as_bytes(),
+            "test",
+            "model",
+            &mut |event| {
+                events.push(event);
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.content, "hello");
+        assert_eq!(
+            response.usage,
+            Some(LanguageModelUsage {
+                input_tokens: Some(3),
+                output_tokens: Some(4),
+            })
+        );
+        assert_eq!(
+            events,
+            vec![
+                LanguageModelStreamEvent::TextDelta {
+                    delta: "hel".to_string()
+                },
+                LanguageModelStreamEvent::TextDelta {
+                    delta: "lo".to_string()
+                },
+                LanguageModelStreamEvent::Usage {
+                    usage: LanguageModelUsage {
+                        input_tokens: Some(3),
+                        output_tokens: Some(4),
+                    }
+                },
+                LanguageModelStreamEvent::Finished {
+                    finish_reason: Some("stop".to_string())
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn chat_completion_stream_reconstructs_tool_calls() {
+        let first = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\""
+                        }
+                    }]
+                }
+            }]
+        });
+        let second = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {
+                            "arguments": ":\"Cargo.toml\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let body = format!("data: {first}\n\ndata: {second}\n\ndata: [DONE]\n\n");
+        let mut events = Vec::new();
+
+        let response = stream_openai_chat_completion_response(
+            body.as_bytes(),
+            "test",
+            "model",
+            &mut |event| {
+                events.push(event);
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.content, "");
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].call_id.as_deref(), Some("call_1"));
+        assert_eq!(response.tool_calls[0].name, "read_file");
+        assert_eq!(
+            response.tool_calls[0].input,
+            serde_json::json!({ "path": "Cargo.toml" })
+        );
+        assert!(matches!(
+            events.first(),
+            Some(LanguageModelStreamEvent::ToolCallStarted { name, .. }) if name == "read_file"
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(LanguageModelStreamEvent::Finished {
+                finish_reason: Some(reason)
+            }) if reason == "tool_calls"
         ));
     }
 

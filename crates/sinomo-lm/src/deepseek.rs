@@ -3,8 +3,9 @@ use crate::{
     LanguageModelError, LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
     LanguageModelProviderInfo, LanguageModelRequest, LanguageModelRequestItem,
     LanguageModelResponse, LanguageModelResponseFormat, LanguageModelResponseItem,
-    LanguageModelRole, LanguageModelToolCall, LanguageModelToolChoice, LanguageModelToolSpec,
-    LanguageModelUsage, PROVIDER_DEFAULT_MODEL, render_plain_prompt, selected_model,
+    LanguageModelRole, LanguageModelStreamEvent, LanguageModelToolCall, LanguageModelToolChoice,
+    LanguageModelToolSpec, LanguageModelUsage, PROVIDER_DEFAULT_MODEL, render_plain_prompt,
+    selected_model, stream_openai_chat_completion_response,
 };
 use reqwest::blocking::Client;
 use reqwest::header::{
@@ -230,6 +231,47 @@ impl LanguageModelProvider for DeepSeekProvider {
             tool_calls,
             usage,
         })
+    }
+
+    fn complete_streaming_events(
+        &self,
+        request: &LanguageModelRequest,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        let model = selected_model(&self.config.default_model, request);
+        let api_key = self.api_key()?;
+        let url = deepseek_chat_completions_url(&self.config.api_base_url);
+        let mut payload = deepseek_chat_completion_payload(request, &model);
+        payload["stream"] = serde_json::json!(true);
+        let mut headers = deepseek_headers(&api_key, Self::PROVIDER_ID, &model)?;
+        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        let response = self
+            .http
+            .post(url)
+            .headers(headers)
+            .json(&payload)
+            .send()
+            .map_err(|source| LanguageModelError::ProviderInvocationFailed {
+                provider: Self::PROVIDER_ID.to_string(),
+                model: model.clone(),
+                detail: source.to_string(),
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            return Err(LanguageModelError::ProviderInvocationFailed {
+                provider: Self::PROVIDER_ID.to_string(),
+                model,
+                detail: format!("DeepSeek Chat Completions API failed: HTTP {status}: {body}"),
+            });
+        }
+
+        on_event(LanguageModelStreamEvent::Started {
+            provider: Self::PROVIDER_ID.to_string(),
+            model: model.clone(),
+        });
+        stream_openai_chat_completion_response(response, Self::PROVIDER_ID, &model, on_event)
     }
 }
 

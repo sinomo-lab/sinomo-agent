@@ -2,8 +2,8 @@ use crate::api_key::{default_api_key_credentials_path, resolve_api_key, save_api
 use crate::{
     LanguageModelError, LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
     LanguageModelProviderInfo, LanguageModelRequest, LanguageModelResponse,
-    LanguageModelResponseFormat, LanguageModelRole, LanguageModelUsage, PROVIDER_DEFAULT_MODEL,
-    render_plain_prompt, selected_model,
+    LanguageModelResponseFormat, LanguageModelRole, LanguageModelStreamEvent, LanguageModelUsage,
+    PROVIDER_DEFAULT_MODEL, read_server_sent_events, render_plain_prompt, selected_model,
 };
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
@@ -169,6 +169,49 @@ impl LanguageModelProvider for GeminiProvider {
             usage,
         })
     }
+
+    fn complete_streaming_events(
+        &self,
+        request: &LanguageModelRequest,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        let model = selected_model(&self.config.default_model, request);
+        let api_key = self.api_key()?;
+        let url = format!(
+            "{}/{}:streamGenerateContent?alt=sse",
+            self.config.api_base_url.trim_end_matches('/'),
+            gemini_model_path(&model),
+        );
+        let mut headers = gemini_headers(&api_key, Self::PROVIDER_ID, &model)?;
+        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        let response = self
+            .http
+            .post(url)
+            .headers(headers)
+            .json(&gemini_generate_content_payload(request, &model))
+            .send()
+            .map_err(|source| LanguageModelError::ProviderInvocationFailed {
+                provider: Self::PROVIDER_ID.to_string(),
+                model: model.clone(),
+                detail: source.to_string(),
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            return Err(LanguageModelError::ProviderInvocationFailed {
+                provider: Self::PROVIDER_ID.to_string(),
+                model,
+                detail: format!("Gemini StreamGenerateContent API failed: HTTP {status}: {body}"),
+            });
+        }
+
+        on_event(LanguageModelStreamEvent::Started {
+            provider: Self::PROVIDER_ID.to_string(),
+            model: model.clone(),
+        });
+        stream_gemini_generate_content_response(response, &model, on_event)
+    }
 }
 
 fn gemini_headers(
@@ -292,6 +335,73 @@ pub(crate) fn extract_gemini_usage(value: &serde_json::Value) -> Option<Language
         output_tokens: usage
             .get("candidatesTokenCount")
             .and_then(serde_json::Value::as_u64),
+    })
+}
+
+fn stream_gemini_generate_content_response(
+    response: reqwest::blocking::Response,
+    model: &str,
+    on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+) -> Result<LanguageModelResponse, LanguageModelError> {
+    let mut content = String::new();
+    let mut usage = None;
+    let mut finish_reason = None;
+
+    read_server_sent_events(response, GeminiProvider::PROVIDER_ID, model, |event| {
+        let value = serde_json::from_str::<serde_json::Value>(&event.data).map_err(|source| {
+            LanguageModelError::ProviderInvocationFailed {
+                provider: GeminiProvider::PROVIDER_ID.to_string(),
+                model: model.to_string(),
+                detail: format!(
+                    "failed to parse Gemini stream event: {source}: {}",
+                    event.data
+                ),
+            }
+        })?;
+        if let Some(detail) = value
+            .pointer("/error/message")
+            .and_then(serde_json::Value::as_str)
+        {
+            on_event(LanguageModelStreamEvent::Error {
+                detail: detail.to_string(),
+            });
+            return Err(LanguageModelError::ProviderInvocationFailed {
+                provider: GeminiProvider::PROVIDER_ID.to_string(),
+                model: model.to_string(),
+                detail: detail.to_string(),
+            });
+        }
+        let delta = extract_gemini_response_text(&value);
+        if !delta.is_empty() {
+            content.push_str(&delta);
+            on_event(LanguageModelStreamEvent::TextDelta { delta });
+        }
+        if let Some(event_usage) = extract_gemini_usage(&value) {
+            usage = Some(event_usage);
+        }
+        if let Some(reason) = value
+            .pointer("/candidates/0/finishReason")
+            .and_then(serde_json::Value::as_str)
+        {
+            finish_reason = Some(reason.to_string());
+        }
+        Ok(())
+    })?;
+
+    if let Some(usage) = &usage {
+        on_event(LanguageModelStreamEvent::Usage {
+            usage: usage.clone(),
+        });
+    }
+    on_event(LanguageModelStreamEvent::Finished { finish_reason });
+
+    Ok(LanguageModelResponse {
+        provider: GeminiProvider::PROVIDER_ID.to_string(),
+        model: model.to_string(),
+        content,
+        items: Vec::new(),
+        tool_calls: Vec::new(),
+        usage,
     })
 }
 

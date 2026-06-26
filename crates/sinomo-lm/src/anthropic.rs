@@ -2,8 +2,9 @@ use crate::api_key::{default_api_key_credentials_path, resolve_api_key, save_api
 use crate::{
     LanguageModelError, LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
     LanguageModelProviderInfo, LanguageModelProviderOptions, LanguageModelRequest,
-    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole, LanguageModelUsage,
-    PROVIDER_DEFAULT_MODEL, apply_provider_vendor_options_to_payload, render_plain_prompt,
+    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole,
+    LanguageModelStreamEvent, LanguageModelUsage, PROVIDER_DEFAULT_MODEL,
+    apply_provider_vendor_options_to_payload, read_server_sent_events, render_plain_prompt,
     selected_model,
 };
 use reqwest::blocking::Client;
@@ -189,6 +190,50 @@ impl LanguageModelProvider for AnthropicProvider {
             usage,
         })
     }
+
+    fn complete_streaming_events(
+        &self,
+        request: &LanguageModelRequest,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        let model = selected_model(&self.config.default_model, request);
+        let api_key = self.api_key()?;
+        let url = format!(
+            "{}/v1/messages",
+            self.config.api_base_url.trim_end_matches('/')
+        );
+        let mut payload = anthropic_messages_payload(request, &model, &self.config.options);
+        payload["stream"] = serde_json::json!(true);
+        let mut headers = anthropic_headers(&api_key, Self::PROVIDER_ID, &model)?;
+        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        let response = self
+            .http
+            .post(url)
+            .headers(headers)
+            .json(&payload)
+            .send()
+            .map_err(|source| LanguageModelError::ProviderInvocationFailed {
+                provider: Self::PROVIDER_ID.to_string(),
+                model: model.clone(),
+                detail: source.to_string(),
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            return Err(LanguageModelError::ProviderInvocationFailed {
+                provider: Self::PROVIDER_ID.to_string(),
+                model,
+                detail: format!("Anthropic Messages API failed: HTTP {status}: {body}"),
+            });
+        }
+
+        on_event(LanguageModelStreamEvent::Started {
+            provider: Self::PROVIDER_ID.to_string(),
+            model: model.clone(),
+        });
+        stream_anthropic_messages_response(response, &model, on_event)
+    }
 }
 
 fn anthropic_headers(
@@ -299,6 +344,135 @@ fn extract_anthropic_text(value: &serde_json::Value) -> String {
                 .join("\n")
         })
         .unwrap_or_default()
+}
+
+fn stream_anthropic_messages_response(
+    response: reqwest::blocking::Response,
+    model: &str,
+    on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+) -> Result<LanguageModelResponse, LanguageModelError> {
+    let mut content = String::new();
+    let mut usage = LanguageModelUsage {
+        input_tokens: None,
+        output_tokens: None,
+    };
+    let mut finish_reason = None;
+    let mut saw_usage = false;
+    let mut emitted_finished = false;
+
+    read_server_sent_events(response, AnthropicProvider::PROVIDER_ID, model, |event| {
+        let mut value =
+            serde_json::from_str::<serde_json::Value>(&event.data).map_err(|source| {
+                LanguageModelError::ProviderInvocationFailed {
+                    provider: AnthropicProvider::PROVIDER_ID.to_string(),
+                    model: model.to_string(),
+                    detail: format!(
+                        "failed to parse Anthropic stream event: {source}: {}",
+                        event.data
+                    ),
+                }
+            })?;
+        if value.get("type").is_none()
+            && let (Some(event_name), Some(object)) = (event.event, value.as_object_mut())
+        {
+            object.insert("type".to_string(), serde_json::json!(event_name));
+        }
+        match value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+        {
+            "message_start" => {
+                if let Some(input_tokens) = value
+                    .pointer("/message/usage/input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    usage.input_tokens = Some(input_tokens);
+                    saw_usage = true;
+                }
+            }
+            "content_block_delta" => {
+                if value
+                    .pointer("/delta/type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("text_delta")
+                    && let Some(delta) = value
+                        .pointer("/delta/text")
+                        .and_then(serde_json::Value::as_str)
+                    && !delta.is_empty()
+                {
+                    content.push_str(delta);
+                    on_event(LanguageModelStreamEvent::TextDelta {
+                        delta: delta.to_string(),
+                    });
+                }
+            }
+            "message_delta" => {
+                if let Some(output_tokens) = value
+                    .pointer("/usage/output_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    usage.output_tokens = Some(output_tokens);
+                    saw_usage = true;
+                }
+                if let Some(reason) = value
+                    .pointer("/delta/stop_reason")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    finish_reason = Some(reason.to_string());
+                }
+            }
+            "message_stop" => {
+                if saw_usage {
+                    on_event(LanguageModelStreamEvent::Usage {
+                        usage: usage.clone(),
+                    });
+                }
+                on_event(LanguageModelStreamEvent::Finished {
+                    finish_reason: finish_reason.clone(),
+                });
+                emitted_finished = true;
+            }
+            "error" => {
+                let detail = value
+                    .pointer("/error/message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Anthropic stream failed")
+                    .to_string();
+                on_event(LanguageModelStreamEvent::Error {
+                    detail: detail.clone(),
+                });
+                return Err(LanguageModelError::ProviderInvocationFailed {
+                    provider: AnthropicProvider::PROVIDER_ID.to_string(),
+                    model: model.to_string(),
+                    detail,
+                });
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+
+    let usage = saw_usage.then_some(usage);
+    if !emitted_finished {
+        if let Some(usage) = &usage {
+            on_event(LanguageModelStreamEvent::Usage {
+                usage: usage.clone(),
+            });
+        }
+        on_event(LanguageModelStreamEvent::Finished {
+            finish_reason: finish_reason.clone(),
+        });
+    }
+
+    Ok(LanguageModelResponse {
+        provider: AnthropicProvider::PROVIDER_ID.to_string(),
+        model: model.to_string(),
+        content,
+        items: Vec::new(),
+        tool_calls: Vec::new(),
+        usage,
+    })
 }
 
 #[cfg(test)]
