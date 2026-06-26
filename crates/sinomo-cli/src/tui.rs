@@ -6175,6 +6175,7 @@ where
     M: InteractionModel + Send + Sync + 'static,
 {
     runtime: Option<RuntimeMainAgentSlot<M>>,
+    runtime_storage: AgentRuntimeStorage,
     runtime_control_registry: sinomo_agent::AgentRuntimeControlRegistry,
     runtime_cursor: AgentRuntimeEventCursor,
     agent_definition: AgentDefinition,
@@ -6262,6 +6263,7 @@ where
     ) -> Self {
         Self {
             runtime: Some(RuntimeMainAgentSlot::Pending(model)),
+            runtime_storage: AgentRuntimeStorage::new(),
             runtime_control_registry: sinomo_agent::AgentRuntimeControlRegistry::new(),
             runtime_cursor: AgentRuntimeEventCursor {
                 offset: 0,
@@ -6280,6 +6282,11 @@ where
 
     pub fn with_tool_registry(mut self, registry: sinomo_agent::AgentToolRegistry) -> Self {
         self.tool_registry = registry;
+        self
+    }
+
+    pub fn with_runtime_storage(mut self, storage: AgentRuntimeStorage) -> Self {
+        self.runtime_storage = storage;
         self
     }
 
@@ -6312,7 +6319,7 @@ where
         let agent = Agent::new(model, self.provider.clone(), self.model_name.clone())
             .with_agent_definition(self.agent_definition.clone())
             .with_tool_registry(self.tool_registry.clone());
-        AgentSessionRuntime::new(agent, session)
+        AgentSessionRuntime::with_storage(agent, session, self.runtime_storage.clone())
     }
 
     fn ensure_runtime(
@@ -6491,6 +6498,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         );
         Ok(
             Self::with_thinking(model, runtime_info.provider, runtime_info.model, thinking)
+                .with_runtime_storage(AgentRuntimeStorage::from_data_dir(data_dir))
                 .with_tool_registry(main_agent_config_tool_registry(data_dir)?),
         )
     }
@@ -6526,6 +6534,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
             resolved.model,
             thinking,
         )
+        .with_runtime_storage(AgentRuntimeStorage::from_data_dir(data_dir))
         .with_tool_registry(tool_registry)
         .with_account_and_options(Some(resolved.account), options))
     }

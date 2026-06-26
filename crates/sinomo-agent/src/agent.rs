@@ -28,8 +28,8 @@ use sinomo_lm::{
     inferred_model_context_window_tokens, language_model_system_instructions,
 };
 use sinomo_memory::{
-    MemoryContextProvider, MemoryPolicy, MemoryQuery, MemoryRecordStore, MemoryRetrievalReport,
-    MemoryRetrievalResult,
+    DurableMemoryStore, MemoryContextProvider, MemoryPolicy, MemoryQuery, MemoryRecordStore,
+    MemoryRetrievalReport, MemoryRetrievalResult,
 };
 use sinomo_runtime::core::{
     Confidence, EventEnvelope, EventKind, LatencyClass, MemoryRecord, MemoryScope, MemorySourceRef,
@@ -5488,6 +5488,51 @@ where
     }
 }
 
+#[derive(Clone, Default)]
+pub struct AgentRuntimeStorage {
+    memory_record_store: Option<Arc<dyn MemoryRecordStore>>,
+}
+
+impl AgentRuntimeStorage {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_data_dir(data_dir: &SinomoDataDir) -> Self {
+        Self::new().with_memory_record_store(DurableMemoryStore::from_data_dir(data_dir))
+    }
+
+    pub fn with_memory_record_store<T>(mut self, store: T) -> Self
+    where
+        T: MemoryRecordStore + 'static,
+    {
+        self.memory_record_store = Some(Arc::new(store));
+        self
+    }
+
+    pub fn with_shared_memory_record_store(mut self, store: Arc<dyn MemoryRecordStore>) -> Self {
+        self.memory_record_store = Some(store);
+        self
+    }
+
+    pub fn memory_record_store(&self) -> Option<Arc<dyn MemoryRecordStore>> {
+        self.memory_record_store.clone()
+    }
+
+    fn apply_to_agent<M>(&self, agent: Agent<M>) -> Agent<M>
+    where
+        M: InteractionModel,
+    {
+        match (
+            agent.memory_record_store.is_some() || agent.memory_context_provider.is_some(),
+            &self.memory_record_store,
+        ) {
+            (false, Some(store)) => agent.with_shared_memory_store(store.clone()),
+            _ => agent,
+        }
+    }
+}
+
 struct AgentSessionRuntimeState {
     control: AgentSessionControlPlane,
     runtime_events: Vec<AgentRuntimeEvent>,
@@ -5501,6 +5546,22 @@ where
 {
     pub fn new(agent: Agent<M>, session: AgentSession) -> Self {
         Self::from_arc(Arc::new(agent), session)
+    }
+
+    pub fn with_storage(
+        agent: Agent<M>,
+        session: AgentSession,
+        storage: AgentRuntimeStorage,
+    ) -> Self {
+        Self::new(storage.apply_to_agent(agent), session)
+    }
+
+    pub fn with_data_dir_storage(
+        agent: Agent<M>,
+        session: AgentSession,
+        data_dir: &SinomoDataDir,
+    ) -> Self {
+        Self::with_storage(agent, session, AgentRuntimeStorage::from_data_dir(data_dir))
     }
 
     pub fn from_arc(agent: Arc<Agent<M>>, session: AgentSession) -> Self {
@@ -7385,6 +7446,11 @@ impl<M: InteractionModel> Agent<M> {
         T: MemoryRecordStore + 'static,
     {
         let store = Arc::new(store);
+        self = self.with_shared_memory_store(store);
+        self
+    }
+
+    pub fn with_shared_memory_store(mut self, store: Arc<dyn MemoryRecordStore>) -> Self {
         self.memory_context_provider = Some(store.clone());
         self.memory_record_store = Some(store);
         self
@@ -14926,6 +14992,57 @@ mod tests {
                 .record
                 .summary
                 .contains("Remembered outcome.")
+        );
+    }
+
+    #[test]
+    fn agent_session_runtime_injects_default_memory_store() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-runtime-memory");
+        let data_dir = SinomoDataDir::new(root.to_path_buf());
+        let model = SequencedModel::new([r#"{
+            "response_mode": "answer",
+            "text": "Runtime memory outcome.",
+            "tool_calls": [],
+            "background_handoff": null,
+            "next_state": "listening"
+        }"#]);
+        let agent =
+            Agent::new(model, "fake", "fake").with_agent_definition(AgentDefinition::main());
+        let input = agent_input("remember runtime storage");
+        let session = AgentSession::new(input.session.session_id.clone(), AgentRole::Main);
+        let runtime = AgentSessionRuntime::with_data_dir_storage(agent, session, &data_dir);
+        let op = AgentOp::start_turn(input.clone());
+        let op_id = op.op_id.clone();
+
+        let submit = runtime.submit_op(op).expect("submit");
+        assert!(submit.accepted);
+        runtime.join_active_turn().expect("join");
+        let outcome = runtime
+            .turn_result(&op_id)
+            .expect("turn result")
+            .expect("outcome");
+        assert_eq!(
+            outcome.run.as_ref().expect("run").final_decision.text,
+            "Runtime memory outcome."
+        );
+
+        let store = DurableMemoryStore::from_data_dir(&data_dir);
+        let result = sinomo_memory::MemoryContextProvider::retrieve(
+            &store,
+            &sinomo_memory::MemoryQuery {
+                session_id: Some(input.session.session_id.clone()),
+                agent_id: Some("main-agent".to_string()),
+                task_hint: Some("runtime storage".to_string()),
+                ..sinomo_memory::MemoryQuery::default()
+            },
+        )
+        .expect("retrieve memory");
+        assert_eq!(result.records.len(), 1);
+        assert!(
+            result.records[0]
+                .record
+                .summary
+                .contains("Runtime memory outcome.")
         );
     }
 
