@@ -3799,6 +3799,7 @@ fn lifecycle_maintenance_runs_version_blob_and_tombstone_collection() {
     let report = dfs
         .run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
             scrub_content: true,
+            stale_staging_gc: None,
             anti_entropy: None,
             version_gc: Some(ContentStoreVersionGcOptions::delete_eligible(
                 std::time::Duration::from_nanos(0),
@@ -4417,7 +4418,7 @@ fn cluster_smoke_opens_service_and_publishes_metadata() {
     assert!(report.path.starts_with("/services/dfs-smoke/24680-"));
     let sent = sent.lock().expect("sent lock");
     assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].0, "10.77.0.4:21353");
+    assert_eq!(sent[0].0, replica.to_string());
     assert!(
         sent[0].1 > 0,
         "cluster smoke should publish metadata created by the smoke write"
@@ -6012,6 +6013,91 @@ fn metadata_journal_publisher_routes_primary_shards_and_reports_non_primary() {
 }
 
 #[test]
+fn metadata_journal_publish_suppresses_proven_topology_mismatch_for_epoch() {
+    let root = temp_root("metadata-journal-publish-suppresses-topology-mismatch");
+    let local = NodeId::from_legacy_named("node_meta_suppress_local").expect("local");
+    let replica = NodeId::from_legacy_named("node_meta_suppress_replica").expect("replica");
+    let shard_id = DfsMetadataShardId::new("root");
+    let file_system = file_system(local.clone());
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: shard_id.0.clone(),
+        primary_node_id: local.clone(),
+        replica_node_ids: vec![replica.clone()],
+        epoch: 7,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let suppression = DfsMetadataReplicationSuppressionRecord {
+        target_node_id: replica.clone(),
+        shard_id: shard_id.clone(),
+        shard_epoch: 7,
+        reason: "local node node_meta_suppress_replica is not configured as a replica for metadata shard root"
+            .to_string(),
+        updated_at_unix_nanos: dfs_now_unix_nanos(),
+    };
+    let mut host = RecordingMetadataJournalPublisherHost::new(root.join("suppressed"));
+
+    let (outcomes, targets) = prepare_dfs_metadata_journal_publish_with_host(
+        file_system.file_system_id.clone(),
+        &local,
+        vec![shard.clone()],
+        &mut host,
+        &[suppression.clone()],
+        DfsMetadataJournalReplicationOptions::default(),
+    )
+    .expect("prepare suppressed publish");
+
+    assert!(targets.is_empty());
+    assert_eq!(host.opened_shards, vec![shard_id.clone()]);
+    assert!(
+        host.cursor_requests.is_empty(),
+        "suppressed target must not read/update replication cursor"
+    );
+    assert_eq!(
+        outcomes,
+        vec![
+            DfsMetadataJournalReplicationOutcome::TopologyMismatchSuppressed {
+                target_node_id: replica.clone(),
+                shard_id: shard_id.clone(),
+                epoch: 7,
+                reason: suppression.reason.clone(),
+            }
+        ]
+    );
+
+    let mut host = RecordingMetadataJournalPublisherHost::new(root.join("epoch-changed"));
+    let mut changed_epoch_shard = shard;
+    changed_epoch_shard.epoch = 8;
+    let (outcomes, targets) = prepare_dfs_metadata_journal_publish_with_host(
+        file_system.file_system_id,
+        &local,
+        vec![changed_epoch_shard],
+        &mut host,
+        &[suppression],
+        DfsMetadataJournalReplicationOptions::default(),
+    )
+    .expect("prepare changed-epoch publish");
+
+    assert!(targets.is_empty());
+    assert_eq!(
+        host.cursor_requests,
+        vec![(replica.clone(), shard_id.clone())],
+        "shard epoch changes must invalidate topology suppression"
+    );
+    assert_eq!(
+        outcomes,
+        vec![DfsMetadataJournalReplicationOutcome::NoChanges {
+            target_node_id: replica,
+            shard_id,
+            after_sequence: 0,
+        }]
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_metadata_journal_publish_reads_cluster_state_and_shards() {
     let root = temp_root("cluster-metadata-journal-publish");
     let data_dir = SinomoDataDir::new(&root);
@@ -6117,7 +6203,7 @@ fn cluster_metadata_journal_publish_reads_cluster_state_and_shards() {
 
     assert_eq!(
         sent.lock().expect("sent lock").as_slice(),
-        &[("10.77.0.2:21353".to_string(), 2)]
+        &[(replica.to_string(), 2)]
     );
     assert_eq!(
         report.outcomes,
@@ -6258,7 +6344,9 @@ fn scheduled_cluster_metadata_publish_uses_async_peer_transport() {
     assert!(errors.lock().expect("errors").is_empty());
     let calls = peer.calls.lock().expect("calls");
     assert_eq!(calls.len(), 1);
-    assert!(calls[0].starts_with("rpc:/dfs/metadata/journal-batch:10.77.0.3:21353:dfs_meta_"));
+    assert!(calls[0].starts_with(&format!(
+        "rpc:/dfs/metadata/journal-batch:{replica}:dfs_meta_"
+    )));
     assert!(calls[0].ends_with("_2"));
     drop(calls);
     assert_eq!(
@@ -6407,7 +6495,7 @@ fn async_cluster_metadata_publish_repairs_sequence_conflict_with_snapshot() {
                 .lock()
                 .expect("snapshot installs")
                 .as_slice(),
-            &[("10.77.0.4:21353".to_string(), 1)]
+            &[(replica.to_string(), 1)]
         );
         assert_eq!(
             report.outcomes,
@@ -9582,6 +9670,118 @@ fn retry_pending_repairs_bounded_limits_scheduled_transfers() {
         })
         .count();
     assert_eq!(replica_messages, 1);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn persisted_repair_attempts_prevent_duplicate_retry_after_reopen() {
+    let root = temp_root("persisted-repair-attempts-prevent-duplicate-retry");
+    let owner = NodeId::from_legacy_named("node_persisted_repair_owner").expect("owner node");
+    let replica = NodeId::from_legacy_named("node_persisted_repair_replica").expect("replica");
+    let object_id = DfsObjectId::from_legacy_named("obj_persisted_repair").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_persisted_repair_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_persisted_repair_2").expect("version");
+    let content_root = root.join("owner-content");
+    let metadata_root = root.join("owner-metadata");
+    let network = InProcessNetwork::new();
+    let owner_backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), metadata_root.clone())
+            .expect("owner backend");
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        LocalContentStore::new(content_root.clone()).expect("owner content"),
+    )
+    .with_metadata_backend(owner_backend)
+    .expect("metadata backend");
+    let mut replica_transport = network.add_node(replica.clone());
+    owner_dfs
+        .add_file_system(file_system(owner.clone()))
+        .expect("filesystem");
+    let mut metadata = file_metadata(owner.clone());
+    metadata.object_id = object_id.clone();
+    metadata.version = version_1;
+    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    owner_dfs.add_object_metadata(metadata).expect("object");
+
+    let write = owner_dfs
+        .write_distributed_eventual_from_reader_with_candidates_and_parent_touch(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id,
+                target_version: version_2,
+                requesting_node_id: owner.clone(),
+            },
+            std::io::Cursor::new(b"persisted repair retry body".to_vec()),
+            vec![owner.clone(), replica.clone()],
+            DfsReplicationPolicy::new(1, 2).expect("policy"),
+            true,
+            false,
+        )
+        .expect("write should commit");
+    let NetworkedDfsWriteOutcome::Committed {
+        intent_id,
+        content_hash,
+        repair_jobs,
+        ..
+    } = write
+    else {
+        panic!("expected committed write, got {write:?}");
+    };
+    assert_eq!(repair_jobs.len(), 1);
+    let repair_job = repair_jobs[0].clone();
+    let now = dfs_now_unix_nanos();
+    let repair_attempts = vec![DfsRepairAttemptRecord {
+        intent_id,
+        object_id: repair_job.object_id.clone(),
+        version: repair_job.version.clone(),
+        content_hash,
+        missing_replica_node_id: repair_job.missing_replica_node_id.clone(),
+        attempts: 1,
+        in_flight: true,
+        last_attempt_unix_nanos: now,
+        next_retry_unix_nanos: now.saturating_add(60_000_000_000),
+        last_error: None,
+    }];
+    let _ = drain_dfs_messages(&mut replica_transport);
+
+    drop(owner_dfs);
+    let reopened_network = InProcessNetwork::new();
+    let reopened_backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), metadata_root.clone())
+            .expect("reopened owner backend");
+    let mut reopened_dfs = NetworkedDfsService::new(
+        reopened_network.add_node(owner),
+        LocalContentStore::new(content_root).expect("reopened owner content"),
+    )
+    .with_metadata_backend(reopened_backend)
+    .expect("reopened metadata backend");
+    let mut reopened_replica_transport = reopened_network.add_node(replica);
+
+    let duplicate = reopened_dfs
+        .retry_pending_repairs_bounded_with_attempts(1, &repair_attempts)
+        .expect("retry after reopen");
+    assert!(
+        duplicate.is_empty(),
+        "reopened maintenance must honor persisted retry backoff"
+    );
+    assert_eq!(
+        reopened_dfs
+            .operational_metrics()
+            .expect("reopened metrics")
+            .repair_attempt_count,
+        1
+    );
+    let replica_messages = drain_dfs_messages(&mut reopened_replica_transport)
+        .into_iter()
+        .filter(|message| {
+            matches!(
+                message,
+                DfsNetworkMessage::RepairReplica(_) | DfsNetworkMessage::RepairReplicaChunk(_)
+            )
+        })
+        .count();
+    assert_eq!(replica_messages, 0);
 
     std::fs::remove_dir_all(root).ok();
 }

@@ -288,6 +288,56 @@ pub struct ContentStoreGcReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentStoreStagingGcOptions {
+    pub dry_run: bool,
+    pub min_staging_age_nanos: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_deletions: Option<u64>,
+}
+
+impl ContentStoreStagingGcOptions {
+    pub fn dry_run(min_staging_age: Duration) -> Self {
+        Self {
+            dry_run: true,
+            min_staging_age_nanos: duration_nanos_saturating(min_staging_age),
+            max_deletions: None,
+        }
+    }
+
+    pub fn delete_eligible(min_staging_age: Duration) -> Self {
+        Self {
+            dry_run: false,
+            min_staging_age_nanos: duration_nanos_saturating(min_staging_age),
+            max_deletions: None,
+        }
+    }
+
+    pub fn with_max_deletions(mut self, max_deletions: u64) -> Self {
+        self.max_deletions = Some(max_deletions);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentStoreStagingGcReport {
+    pub dry_run: bool,
+    pub min_staging_age_nanos: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_deletions: Option<u64>,
+    pub scanned_staging_count: u64,
+    pub scanned_staging_bytes: u64,
+    pub eligible_staging_count: u64,
+    pub eligible_staging_bytes: u64,
+    pub deleted_staging_count: u64,
+    pub deleted_staging_bytes: u64,
+    pub retained_young_staging_count: u64,
+    pub retained_young_staging_bytes: u64,
+    pub retained_limit_staging_count: u64,
+    pub retained_limit_staging_bytes: u64,
+    pub max_deletions_reached: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentStoreVersionGcOptions {
     pub dry_run: bool,
     pub min_version_age_nanos: u64,
@@ -421,6 +471,13 @@ impl OrphanBlobGcCandidate {
             Self::Loose { size_bytes, .. } | Self::Packed { size_bytes, .. } => *size_bytes,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct StagingGcCandidate {
+    path: PathBuf,
+    size_bytes: u64,
+    modified_at: SystemTime,
 }
 
 #[derive(Debug, Clone)]
@@ -1787,6 +1844,65 @@ impl LocalContentStore {
                         })?;
                     }
                 }
+            }
+        }
+        Ok(report)
+    }
+
+    pub fn collect_stale_staging(
+        &self,
+        options: ContentStoreStagingGcOptions,
+    ) -> Result<ContentStoreStagingGcReport> {
+        let now = SystemTime::now();
+        let mut candidates = Vec::new();
+        collect_staging_gc_candidates(&self.root.join("staging"), &mut candidates)?;
+        candidates.sort_by(|left, right| left.path.cmp(&right.path));
+
+        let mut report = ContentStoreStagingGcReport {
+            dry_run: options.dry_run,
+            min_staging_age_nanos: options.min_staging_age_nanos,
+            max_deletions: options.max_deletions,
+            ..ContentStoreStagingGcReport::default()
+        };
+        for candidate in candidates {
+            report.scanned_staging_count = report.scanned_staging_count.saturating_add(1);
+            report.scanned_staging_bytes = report
+                .scanned_staging_bytes
+                .saturating_add(candidate.size_bytes);
+            let age_nanos = now
+                .duration_since(candidate.modified_at)
+                .map(duration_nanos_saturating)
+                .unwrap_or(0);
+            if age_nanos < options.min_staging_age_nanos {
+                report.retained_young_staging_count =
+                    report.retained_young_staging_count.saturating_add(1);
+                report.retained_young_staging_bytes = report
+                    .retained_young_staging_bytes
+                    .saturating_add(candidate.size_bytes);
+                continue;
+            }
+            report.eligible_staging_count = report.eligible_staging_count.saturating_add(1);
+            report.eligible_staging_bytes = report
+                .eligible_staging_bytes
+                .saturating_add(candidate.size_bytes);
+            if options
+                .max_deletions
+                .is_some_and(|max_deletions| report.deleted_staging_count >= max_deletions)
+            {
+                report.max_deletions_reached = true;
+                report.retained_limit_staging_count =
+                    report.retained_limit_staging_count.saturating_add(1);
+                report.retained_limit_staging_bytes = report
+                    .retained_limit_staging_bytes
+                    .saturating_add(candidate.size_bytes);
+                continue;
+            }
+            if !options.dry_run {
+                self.remove_tracked_staging_file_if_exists(&candidate.path)?;
+                report.deleted_staging_count = report.deleted_staging_count.saturating_add(1);
+                report.deleted_staging_bytes = report
+                    .deleted_staging_bytes
+                    .saturating_add(candidate.size_bytes);
             }
         }
         Ok(report)
@@ -4682,6 +4798,43 @@ fn recursive_file_count_and_bytes(path: &Path) -> Result<(u64, u64)> {
     Ok((file_count, total_bytes))
 }
 
+fn collect_staging_gc_candidates(
+    path: &Path,
+    candidates: &mut Vec<StagingGcCandidate>,
+) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    for entry in read_dir(path)? {
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            collect_staging_gc_candidates(&entry_path, candidates)?;
+            continue;
+        }
+        if !entry_path.is_file() {
+            continue;
+        }
+        let metadata = entry_path
+            .metadata()
+            .map_err(|source| ContentStoreError::Io {
+                path: entry_path.clone(),
+                source,
+            })?;
+        let modified_at = metadata
+            .modified()
+            .map_err(|source| ContentStoreError::Io {
+                path: entry_path.clone(),
+                source,
+            })?;
+        candidates.push(StagingGcCandidate {
+            path: entry_path,
+            size_bytes: metadata.len(),
+            modified_at,
+        });
+    }
+    Ok(())
+}
+
 fn projected_file_growth(path: &Path, new_len: u64) -> Result<u64> {
     let existing_len = match path.metadata() {
         Ok(metadata) => metadata.len(),
@@ -6422,6 +6575,59 @@ mod tests {
                 .is_none(),
             "chunked assembly must clean temporary staging files"
         );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn stale_staging_gc_removes_abandoned_chunked_file() {
+        let root = temp_root("stale_staging_gc_removes_abandoned_chunked_file");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let bytes = b"abandoned chunked staging bytes";
+        let assembler = store
+            .begin_chunked_object_version(
+                "object-abandoned-staging",
+                "v1",
+                &content_hash(bytes),
+                bytes.len() as u64,
+                1,
+                bytes.len(),
+            )
+            .expect("begin chunked object");
+        std::mem::forget(assembler);
+
+        let staged_stats = store.stats().expect("stats after abandoned staging");
+        assert_eq!(staged_stats.staging_file_count, 1);
+        assert_eq!(staged_stats.staging_bytes, bytes.len() as u64);
+
+        let dry_run = store
+            .collect_stale_staging(ContentStoreStagingGcOptions::dry_run(Duration::from_nanos(
+                0,
+            )))
+            .expect("dry-run staging gc");
+        assert_eq!(dry_run.scanned_staging_count, 1);
+        assert_eq!(dry_run.eligible_staging_count, 1);
+        assert_eq!(dry_run.deleted_staging_count, 0);
+        assert_eq!(
+            store
+                .stats()
+                .expect("stats after dry run")
+                .staging_file_count,
+            1
+        );
+
+        let report = store
+            .collect_stale_staging(ContentStoreStagingGcOptions::delete_eligible(
+                Duration::from_nanos(0),
+            ))
+            .expect("staging gc");
+        assert_eq!(report.scanned_staging_count, 1);
+        assert_eq!(report.eligible_staging_count, 1);
+        assert_eq!(report.deleted_staging_count, 1);
+        assert_eq!(report.deleted_staging_bytes, bytes.len() as u64);
+        let final_stats = store.stats().expect("stats after staging gc");
+        assert_eq!(final_stats.staging_file_count, 0);
+        assert_eq!(final_stats.staging_bytes, 0);
 
         cleanup(&root);
     }

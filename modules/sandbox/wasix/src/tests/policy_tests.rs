@@ -829,7 +829,8 @@ fn sandbox_policy_config_round_trips_through_cluster_kv_snapshot() {
     let mut store = InProcessKvStore::new();
     store.txn(txn).expect("commit");
 
-    let loaded = sandbox_policy_config_from_cluster_kv_snapshot(&store.snapshot())
+    let snapshot = store.snapshot().expect("snapshot");
+    let loaded = sandbox_policy_config_from_cluster_kv_snapshot(&snapshot)
         .expect("load")
         .expect("config");
 

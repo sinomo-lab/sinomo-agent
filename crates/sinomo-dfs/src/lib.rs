@@ -16,7 +16,8 @@ mod transfer;
 pub use content_store::{
     BlobRangeReader, BlobReader, ChunkedBlobAssembler, ContentManifest, ContentStoreError,
     ContentStoreGcOptions, ContentStoreGcReport, ContentStoreQuota, ContentStoreQuotaResource,
-    ContentStoreQuotaUsage, ContentStoreScrubIssue, ContentStoreScrubReport, ContentStoreStats,
+    ContentStoreQuotaUsage, ContentStoreScrubIssue, ContentStoreScrubReport,
+    ContentStoreStagingGcOptions, ContentStoreStagingGcReport, ContentStoreStats,
     ContentStoreVersionGcOptions, ContentStoreVersionGcReport, ContentVersionIdentity,
     LocalContentStore, ObjectVersionReader,
 };
@@ -1162,6 +1163,7 @@ const DFS_ADAPTIVE_TRANSFER_WINDOW_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const DFS_REMOTE_READ_RETRY_DELAY: Duration = Duration::from_secs(1);
 const DFS_CHUNK_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const DFS_REPAIR_RETRY_SUPPRESSED_TICK: u64 = u64::MAX;
+const DFS_REPAIR_RETRY_TICK_DURATION: Duration = Duration::from_secs(5);
 const DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE: usize = 4096;
 const DFS_METADATA_OBJECT_VERSION_PAGE_SIZE: usize = 1024;
 const DFS_METADATA_OBJECT_INTENT_PAGE_SIZE: usize = 1024;
@@ -1234,6 +1236,10 @@ pub fn register_storage_paths(
         (
             "dfs/metadata-replication-cursors",
             "durable per-replica DFS metadata journal replication cursors",
+        ),
+        (
+            "dfs/maintenance",
+            "durable DFS maintenance cursors, retry ledgers, and suppression records",
         ),
         (
             "dfs/metadata",
@@ -2306,6 +2312,7 @@ pub struct DfsOperationalMetrics {
     pub coordinator_receipt_count: usize,
     pub coordinator_committed_version_count: usize,
     pub repair_job_count: usize,
+    pub repair_attempt_count: usize,
     pub pending_write_count: usize,
     pub pending_read_count: usize,
     pub stage_retry_count: usize,
@@ -2398,6 +2405,8 @@ pub struct DfsLifecycleMaintenanceOptions {
     #[serde(default)]
     pub scrub_content: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_staging_gc: Option<ContentStoreStagingGcOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anti_entropy: Option<DfsAntiEntropyOptions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_gc: Option<ContentStoreVersionGcOptions>,
@@ -2411,6 +2420,8 @@ pub struct DfsLifecycleMaintenanceOptions {
 pub struct DfsLifecycleMaintenanceReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_scrub: Option<ContentStoreScrubReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_staging_gc: Option<ContentStoreStagingGcReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anti_entropy: Option<DfsAntiEntropyReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2435,6 +2446,42 @@ pub struct DfsAntiEntropyCursorRecord {
     pub next_cursor: Option<DfsObjectPageCursor>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsRepairAttemptRecord {
+    pub intent_id: String,
+    pub object_id: DfsObjectId,
+    pub version: DfsVersion,
+    pub content_hash: String,
+    pub missing_replica_node_id: NodeId,
+    pub attempts: u32,
+    pub in_flight: bool,
+    pub last_attempt_unix_nanos: u64,
+    pub next_retry_unix_nanos: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsRepairAttemptSnapshot {
+    #[serde(default)]
+    pub records: Vec<DfsRepairAttemptRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataReplicationSuppressionRecord {
+    pub target_node_id: NodeId,
+    pub shard_id: DfsMetadataShardId,
+    pub shard_epoch: u64,
+    pub reason: String,
+    pub updated_at_unix_nanos: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataReplicationSuppressionSnapshot {
+    #[serde(default)]
+    pub records: Vec<DfsMetadataReplicationSuppressionRecord>,
+}
+
 #[derive(Clone, Debug)]
 pub struct LocalDfsMaintenanceHost {
     data_dir: SinomoDataDir,
@@ -2447,6 +2494,10 @@ impl LocalDfsMaintenanceHost {
 
     fn cursor_path(&self, file_system_id: &DfsFileSystemId) -> PathBuf {
         default_dfs_anti_entropy_cursor_path(&self.data_dir, file_system_id)
+    }
+
+    fn repair_attempt_path(&self) -> PathBuf {
+        default_dfs_repair_attempt_snapshot_path(&self.data_dir)
     }
 }
 
@@ -2471,6 +2522,26 @@ impl DfsMaintenanceHost for LocalDfsMaintenanceHost {
     ) -> Result<(), DfsError> {
         clear_dfs_anti_entropy_cursor(&self.cursor_path(file_system_id))
     }
+
+    fn load_repair_attempt_records(&mut self) -> Result<Vec<DfsRepairAttemptRecord>, DfsError> {
+        read_dfs_repair_attempt_snapshot(&self.repair_attempt_path()).map(|snapshot| {
+            snapshot
+                .map(|snapshot| snapshot.records)
+                .unwrap_or_default()
+        })
+    }
+
+    fn store_repair_attempt_records(
+        &mut self,
+        records: &[DfsRepairAttemptRecord],
+    ) -> Result<(), DfsError> {
+        write_dfs_repair_attempt_snapshot(
+            &self.repair_attempt_path(),
+            &DfsRepairAttemptSnapshot {
+                records: records.to_vec(),
+            },
+        )
+    }
 }
 
 pub fn default_dfs_anti_entropy_cursor_path(
@@ -2484,6 +2555,147 @@ pub fn default_dfs_anti_entropy_cursor_path(
             "{}.sobj",
             dfs_path_safe_segment(&file_system_id.to_string())
         ))
+}
+
+pub fn default_dfs_repair_attempt_snapshot_path(data_dir: &SinomoDataDir) -> PathBuf {
+    data_dir
+        .dfs_dir()
+        .join("maintenance")
+        .join("repair-attempts.sobj")
+}
+
+pub fn default_dfs_metadata_replication_suppression_snapshot_path(
+    data_dir: &SinomoDataDir,
+) -> PathBuf {
+    data_dir
+        .dfs_dir()
+        .join("maintenance")
+        .join("metadata-replication-suppressions.sobj")
+}
+
+pub fn read_dfs_repair_attempt_snapshot(
+    path: &Path,
+) -> Result<Option<DfsRepairAttemptSnapshot>, DfsError> {
+    match std::fs::read(path) {
+        Ok(bytes) => sinomo_object_serde::from_bytes(&bytes)
+            .map(Some)
+            .map_err(|source| DfsError::Serialization {
+                message: format!(
+                    "DFS repair attempt snapshot object error at {}: {source}",
+                    path.display()
+                ),
+            }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(DfsError::Metadata {
+            message: format!(
+                "could not read DFS repair attempt snapshot {}: {source}",
+                path.display()
+            ),
+        }),
+    }
+}
+
+pub fn write_dfs_repair_attempt_snapshot(
+    path: &Path,
+    snapshot: &DfsRepairAttemptSnapshot,
+) -> Result<(), DfsError> {
+    if snapshot.records.is_empty() {
+        return clear_dfs_cursor_file(path);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| DfsError::Metadata {
+            message: format!(
+                "could not create DFS repair attempt snapshot directory {}: {source}",
+                parent.display()
+            ),
+        })?;
+    }
+    let bytes = sinomo_object_serde::to_bytes(snapshot, 1, LengthMode::U32).map_err(|source| {
+        DfsError::Serialization {
+            message: format!(
+                "DFS repair attempt snapshot object error at {}: {source}",
+                path.display()
+            ),
+        }
+    })?;
+    std::fs::write(path, bytes).map_err(|source| DfsError::Metadata {
+        message: format!(
+            "could not write DFS repair attempt snapshot {}: {source}",
+            path.display()
+        ),
+    })
+}
+
+pub fn read_dfs_metadata_replication_suppression_snapshot(
+    path: &Path,
+) -> Result<Option<DfsMetadataReplicationSuppressionSnapshot>, DfsError> {
+    match std::fs::read(path) {
+        Ok(bytes) => sinomo_object_serde::from_bytes(&bytes)
+            .map(Some)
+            .map_err(|source| DfsError::Serialization {
+                message: format!(
+                    "DFS metadata replication suppression snapshot object error at {}: {source}",
+                    path.display()
+                ),
+            }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(DfsError::Metadata {
+            message: format!(
+                "could not read DFS metadata replication suppression snapshot {}: {source}",
+                path.display()
+            ),
+        }),
+    }
+}
+
+pub fn write_dfs_metadata_replication_suppression_snapshot(
+    path: &Path,
+    snapshot: &DfsMetadataReplicationSuppressionSnapshot,
+) -> Result<(), DfsError> {
+    if snapshot.records.is_empty() {
+        return clear_dfs_cursor_file(path);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| DfsError::Metadata {
+            message: format!(
+                "could not create DFS metadata replication suppression snapshot directory {}: {source}",
+                parent.display()
+            ),
+        })?;
+    }
+    let bytes = sinomo_object_serde::to_bytes(snapshot, 1, LengthMode::U32).map_err(|source| {
+        DfsError::Serialization {
+            message: format!(
+                "DFS metadata replication suppression snapshot object error at {}: {source}",
+                path.display()
+            ),
+        }
+    })?;
+    std::fs::write(path, bytes).map_err(|source| DfsError::Metadata {
+        message: format!(
+            "could not write DFS metadata replication suppression snapshot {}: {source}",
+            path.display()
+        ),
+    })
+}
+
+pub fn put_local_dfs_metadata_replication_suppression(
+    data_dir: &SinomoDataDir,
+    record: DfsMetadataReplicationSuppressionRecord,
+) -> Result<(), DfsError> {
+    let path = default_dfs_metadata_replication_suppression_snapshot_path(data_dir);
+    let mut snapshot = read_dfs_metadata_replication_suppression_snapshot(&path)?
+        .unwrap_or_else(DfsMetadataReplicationSuppressionSnapshot::default);
+    snapshot.records.retain(|existing| {
+        existing.target_node_id != record.target_node_id || existing.shard_id != record.shard_id
+    });
+    snapshot.records.push(record);
+    snapshot.records.sort_by(|left, right| {
+        left.shard_id
+            .cmp(&right.shard_id)
+            .then_with(|| left.target_node_id.cmp(&right.target_node_id))
+    });
+    write_dfs_metadata_replication_suppression_snapshot(&path, &snapshot)
 }
 
 pub fn legacy_dfs_anti_entropy_cursor_path(path: &Path) -> PathBuf {
@@ -2718,6 +2930,8 @@ pub struct DfsMaintenanceRunOptions {
     pub anti_entropy_max_objects: usize,
     pub anti_entropy_max_issues: usize,
     pub repair_metadata: bool,
+    pub cleanup_stale_staging: bool,
+    pub stale_staging_min_age: Duration,
 }
 
 impl Default for DfsMaintenanceRunOptions {
@@ -2726,6 +2940,8 @@ impl Default for DfsMaintenanceRunOptions {
             anti_entropy_max_objects: DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_OBJECTS,
             anti_entropy_max_issues: DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_ISSUES,
             repair_metadata: true,
+            cleanup_stale_staging: true,
+            stale_staging_min_age: DFS_CHUNK_TRANSFER_IDLE_TIMEOUT,
         }
     }
 }
@@ -2745,6 +2961,17 @@ pub trait DfsMaintenanceHost: Send {
         &mut self,
         file_system_id: &DfsFileSystemId,
     ) -> Result<(), DfsError>;
+
+    fn load_repair_attempt_records(&mut self) -> Result<Vec<DfsRepairAttemptRecord>, DfsError> {
+        Ok(Vec::new())
+    }
+
+    fn store_repair_attempt_records(
+        &mut self,
+        _records: &[DfsRepairAttemptRecord],
+    ) -> Result<(), DfsError> {
+        Ok(())
+    }
 }
 
 pub fn run_dfs_lifecycle_maintenance_with_host<T: DfsMessageTransport>(
@@ -2757,6 +2984,9 @@ pub fn run_dfs_lifecycle_maintenance_with_host<T: DfsMessageTransport>(
     };
     let file_systems = metadata_backend.list_file_systems()?;
     let mut reports = Vec::with_capacity(file_systems.len());
+    let mut stale_staging_gc = options
+        .cleanup_stale_staging
+        .then(|| ContentStoreStagingGcOptions::delete_eligible(options.stale_staging_min_age));
 
     for file_system in file_systems {
         let saved_cursor = host.load_anti_entropy_cursor(&file_system.file_system_id)?;
@@ -2772,6 +3002,7 @@ pub fn run_dfs_lifecycle_maintenance_with_host<T: DfsMessageTransport>(
         }
         let after = saved_cursor.and_then(|cursor| cursor.next_cursor);
         let report = service.run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
+            stale_staging_gc: stale_staging_gc.take(),
             anti_entropy: Some(DfsAntiEntropyOptions {
                 file_system_id: file_system.file_system_id.clone(),
                 after,
@@ -2887,6 +3118,19 @@ pub fn dfs_lifecycle_maintenance_notice_lines(
 ) -> Vec<String> {
     let mut lines = Vec::new();
     for report in reports {
+        if let Some(staging_gc) = report.stale_staging_gc.as_ref()
+            && (staging_gc.deleted_staging_count > 0 || staging_gc.max_deletions_reached)
+        {
+            lines.push(format!(
+                "DFS staging GC: scanned={} eligible={} deleted={} bytes_deleted={} dry_run={} max_deletions_reached={}",
+                staging_gc.scanned_staging_count,
+                staging_gc.eligible_staging_count,
+                staging_gc.deleted_staging_count,
+                staging_gc.deleted_staging_bytes,
+                staging_gc.dry_run,
+                staging_gc.max_deletions_reached
+            ));
+        }
         let Some(anti_entropy) = report.anti_entropy.as_ref() else {
             continue;
         };
@@ -3018,8 +3262,12 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
         })?;
     let lifecycle_reports =
         run_dfs_lifecycle_maintenance_with_host(service, maintenance_host, options.lifecycle)?;
-    let scheduled_repairs = service.retry_pending_repairs_bounded(options.repair_max_jobs)?;
+    let repair_attempts = maintenance_host.load_repair_attempt_records()?;
+    let scheduled_repairs = service
+        .retry_pending_repairs_bounded_with_attempts(options.repair_max_jobs, &repair_attempts)?;
     let followup_events = service.process_incoming()?;
+    service.observe_repair_maintenance_events(&followup_events);
+    maintenance_host.store_repair_attempt_records(&service.active_repair_attempt_records())?;
     let metadata_replication = publish_dfs_metadata_journal_with_host(
         file_system_id,
         local_node_id,
@@ -3062,10 +3310,16 @@ where
         })?;
     let lifecycle_reports =
         run_dfs_lifecycle_maintenance_with_host(service, maintenance_host, options.lifecycle)?;
+    let repair_attempts = maintenance_host.load_repair_attempt_records()?;
     let scheduled_repairs = service
-        .retry_pending_repairs_async_bounded(options.repair_max_jobs)
+        .retry_pending_repairs_async_bounded_with_attempts(
+            options.repair_max_jobs,
+            &repair_attempts,
+        )
         .await?;
     let followup_events = service.process_incoming_async().await?;
+    service.observe_repair_maintenance_events(&followup_events);
+    maintenance_host.store_repair_attempt_records(&service.active_repair_attempt_records())?;
     let metadata_replication = publish_dfs_metadata_journal_with_async_host(
         file_system_id,
         local_node_id,
@@ -5864,6 +6118,7 @@ pub struct NetworkedDfsService<T> {
     active_replica_stages: BTreeMap<DfsObjectId, ActiveReplicaStage>,
     pending_writes: BTreeMap<String, PendingNetworkedWrite>,
     pending_reads: BTreeMap<String, PendingNetworkedRead>,
+    repair_attempt_records: BTreeMap<(String, NodeId), DfsRepairAttemptRecord>,
     transient_remote_read_pruned_locations:
         BTreeMap<(DfsObjectId, DfsVersion, Option<String>), BTreeSet<NodeId>>,
     incoming_read_transfers: BTreeMap<String, InProgressReadTransfer>,
@@ -6057,6 +6312,12 @@ pub enum DfsMetadataJournalReplicationOutcome {
         shard_id: DfsMetadataShardId,
         after_sequence: u64,
     },
+    TopologyMismatchSuppressed {
+        target_node_id: NodeId,
+        shard_id: DfsMetadataShardId,
+        epoch: u64,
+        reason: String,
+    },
     Rejected {
         target_node_id: NodeId,
         shard_id: DfsMetadataShardId,
@@ -6137,6 +6398,7 @@ pub fn dfs_metadata_replication_notice_lines(
             )),
             DfsMetadataJournalReplicationOutcome::NoChanges { .. }
             | DfsMetadataJournalReplicationOutcome::MissingEndpoint { .. }
+            | DfsMetadataJournalReplicationOutcome::TopologyMismatchSuppressed { .. }
             | DfsMetadataJournalReplicationOutcome::MissingShard { .. }
             | DfsMetadataJournalReplicationOutcome::NotPrimary { .. } => None,
         })
@@ -7049,6 +7311,7 @@ struct DfsPreparedClusterMetadataJournalPublish {
 struct DfsPreparedMetadataJournalTargetPublish {
     target_node_id: NodeId,
     shard_id: DfsMetadataShardId,
+    shard_epoch: u64,
     after_sequence: u64,
     commands: Vec<DfsMetadataJournalBatchCommand>,
     backlog_after_sequence: Option<u64>,
@@ -7068,12 +7331,18 @@ fn prepare_cluster_dfs_metadata_journal_publish(
     let file_system = distributed_sifs(state.local_node_id.clone());
     let shards = cluster_dfs_metadata_shards(&cluster_paths, &file_system.file_system_id)?;
     let endpoints = cluster_dfs_data_endpoints(&cluster_paths, &state);
+    let metadata_suppressions = read_dfs_metadata_replication_suppression_snapshot(
+        &default_dfs_metadata_replication_suppression_snapshot_path(&data_dir),
+    )?
+    .map(|snapshot| snapshot.records)
+    .unwrap_or_default();
     let mut host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     let (outcomes, targets) = prepare_dfs_metadata_journal_publish_with_host(
         file_system.file_system_id,
         &state.local_node_id,
         shards,
         &mut host,
+        &metadata_suppressions,
         options,
     )?;
     Ok(Some(DfsPreparedClusterMetadataJournalPublish {
@@ -7106,6 +7375,7 @@ fn prepare_dfs_metadata_journal_publish_with_host(
     local_node_id: &NodeId,
     mut shards: Vec<DfsMetadataShardConfig>,
     host: &mut impl DfsMetadataJournalPublisherHost,
+    metadata_suppressions: &[DfsMetadataReplicationSuppressionRecord],
     options: DfsMetadataJournalReplicationOptions,
 ) -> Result<
     (
@@ -7146,6 +7416,22 @@ fn prepare_dfs_metadata_journal_publish_with_host(
             .into_iter()
             .filter(|target_node_id| target_node_id != local_node_id)
         {
+            if let Some(suppression) = dfs_metadata_replication_suppression_for(
+                metadata_suppressions,
+                &target_node_id,
+                &shard_id,
+                shard.epoch,
+            ) {
+                outcomes.push(
+                    DfsMetadataJournalReplicationOutcome::TopologyMismatchSuppressed {
+                        target_node_id,
+                        shard_id: shard_id.clone(),
+                        epoch: shard.epoch,
+                        reason: suppression.reason.clone(),
+                    },
+                );
+                continue;
+            }
             let after_sequence =
                 host.metadata_replication_cursor(&mut *backend, &target_node_id, &shard_id)?;
             match prepare_dfs_metadata_journal_target_publish(
@@ -7153,6 +7439,7 @@ fn prepare_dfs_metadata_journal_publish_with_host(
                 local_node_id,
                 target_node_id,
                 shard_id.clone(),
+                shard.epoch,
                 after_sequence,
                 options,
             )? {
@@ -7183,6 +7470,7 @@ fn prepare_dfs_metadata_journal_target_publish(
     local_node_id: &NodeId,
     target_node_id: NodeId,
     shard_id: DfsMetadataShardId,
+    shard_epoch: u64,
     after_sequence: u64,
     options: DfsMetadataJournalReplicationOptions,
 ) -> Result<DfsPreparedMetadataJournalTargetPublishResult, DfsError> {
@@ -7233,11 +7521,61 @@ fn prepare_dfs_metadata_journal_target_publish(
         target: DfsPreparedMetadataJournalTargetPublish {
             target_node_id,
             shard_id,
+            shard_epoch,
             after_sequence,
             commands,
             backlog_after_sequence,
         },
     })
+}
+
+fn dfs_metadata_replication_suppression_for<'a>(
+    records: &'a [DfsMetadataReplicationSuppressionRecord],
+    target_node_id: &NodeId,
+    shard_id: &DfsMetadataShardId,
+    shard_epoch: u64,
+) -> Option<&'a DfsMetadataReplicationSuppressionRecord> {
+    records.iter().find(|record| {
+        record.target_node_id == *target_node_id
+            && record.shard_id == *shard_id
+            && record.shard_epoch == shard_epoch
+    })
+}
+
+async fn put_local_dfs_metadata_replication_suppression_async(
+    data_dir: SinomoDataDir,
+    record: DfsMetadataReplicationSuppressionRecord,
+) -> Result<(), DfsError> {
+    tokio::task::spawn_blocking(move || {
+        put_local_dfs_metadata_replication_suppression(&data_dir, record)
+    })
+    .await
+    .map_err(|source| DfsError::Metadata {
+        message: format!("DFS metadata replication suppression write task failed: {source}"),
+    })?
+}
+
+async fn record_dfs_metadata_replication_topology_mismatch_async(
+    data_dir: &SinomoDataDir,
+    target_node_id: &NodeId,
+    shard_id: &DfsMetadataShardId,
+    shard_epoch: u64,
+    reason: &str,
+) -> Result<(), DfsError> {
+    if !metadata_replication_rejection_is_topology_mismatch(reason) {
+        return Ok(());
+    }
+    put_local_dfs_metadata_replication_suppression_async(
+        data_dir.clone(),
+        DfsMetadataReplicationSuppressionRecord {
+            target_node_id: target_node_id.clone(),
+            shard_id: shard_id.clone(),
+            shard_epoch,
+            reason: reason.to_owned(),
+            updated_at_unix_nanos: dfs_now_unix_nanos(),
+        },
+    )
+    .await
 }
 
 async fn execute_prepared_dfs_metadata_journal_publish_async(
@@ -7271,6 +7609,7 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
     let DfsPreparedMetadataJournalTargetPublish {
         target_node_id,
         shard_id,
+        shard_epoch,
         mut after_sequence,
         commands,
         backlog_after_sequence,
@@ -7340,6 +7679,7 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
                         local_node_id,
                         &target_node_id,
                         &shard_id,
+                        shard_epoch,
                         after_sequence,
                         reason,
                         transport,
@@ -7348,6 +7688,14 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
                     )
                     .await?;
                 } else {
+                    record_dfs_metadata_replication_topology_mismatch_async(
+                        data_dir,
+                        &target_node_id,
+                        &shard_id,
+                        shard_epoch,
+                        &reason,
+                    )
+                    .await?;
                     outcomes.push(DfsMetadataJournalReplicationOutcome::Rejected {
                         target_node_id: target_node_id.clone(),
                         shard_id: shard_id.clone(),
@@ -7378,6 +7726,7 @@ async fn execute_prepared_dfs_metadata_snapshot_repair_async(
     local_node_id: &NodeId,
     target_node_id: &NodeId,
     shard_id: &DfsMetadataShardId,
+    shard_epoch: u64,
     after_sequence: u64,
     reason: String,
     transport: &mut dyn AsyncDfsMetadataJournalReplicationTransport,
@@ -7438,10 +7787,19 @@ async fn execute_prepared_dfs_metadata_snapshot_repair_async(
         DfsMetadataSnapshotInstallResult::Rejected {
             reason: snapshot_reason,
         } => {
+            let reason = format!("{reason}; snapshot repair rejected: {snapshot_reason}");
+            record_dfs_metadata_replication_topology_mismatch_async(
+                data_dir,
+                target_node_id,
+                shard_id,
+                shard_epoch,
+                &reason,
+            )
+            .await?;
             outcomes.push(DfsMetadataJournalReplicationOutcome::Rejected {
                 target_node_id: target_node_id.clone(),
                 shard_id: shard_id.clone(),
-                reason: format!("{reason}; snapshot repair rejected: {snapshot_reason}"),
+                reason,
             });
         }
     }
@@ -7555,11 +7913,17 @@ pub async fn publish_dfs_metadata_journal_with_async_host(
     transport: &mut dyn AsyncDfsMetadataJournalReplicationTransport,
     options: DfsMetadataJournalReplicationOptions,
 ) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
+    let metadata_suppressions = read_dfs_metadata_replication_suppression_snapshot(
+        &default_dfs_metadata_replication_suppression_snapshot_path(data_dir),
+    )?
+    .map(|snapshot| snapshot.records)
+    .unwrap_or_default();
     let (outcomes, targets) = prepare_dfs_metadata_journal_publish_with_host(
         file_system_id,
         local_node_id,
         shards,
         host,
+        &metadata_suppressions,
         options,
     )?;
     execute_prepared_dfs_metadata_journal_publish_async(
@@ -8234,6 +8598,12 @@ pub fn replicate_dfs_metadata_shard_to_target(
 fn metadata_journal_rejection_is_sequence_conflict(reason: &str) -> bool {
     reason.contains("metadata journal sequence")
         && reason.contains("already exists with a different entry")
+}
+
+fn metadata_replication_rejection_is_topology_mismatch(reason: &str) -> bool {
+    reason.contains("metadata journal batch has no local shard config")
+        || reason.contains("metadata snapshot install has no local shard config")
+        || reason.contains("is not configured as a replica for metadata shard")
 }
 
 pub const DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -9706,6 +10076,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             active_replica_stages: BTreeMap::new(),
             pending_writes: BTreeMap::new(),
             pending_reads: BTreeMap::new(),
+            repair_attempt_records: BTreeMap::new(),
             transient_remote_read_pruned_locations: BTreeMap::new(),
             incoming_read_transfers: BTreeMap::new(),
             incoming_read_memory_transfers: BTreeMap::new(),
@@ -9758,12 +10129,14 @@ impl<T> NetworkedDfsService<T>
 where
     T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
 {
-    async fn retry_pending_repairs_async_bounded(
+    async fn retry_pending_repairs_async_bounded_with_attempts(
         &mut self,
         max_scheduled: usize,
+        repair_attempts: &[DfsRepairAttemptRecord],
     ) -> Result<Vec<DistributedRepairJob>, DfsError> {
         self.prune_idle_chunk_transfers();
         self.restore_pending_writes_for_repair_jobs()?;
+        self.restore_repair_attempt_records(repair_attempts);
         if self.pending_writes.is_empty() || max_scheduled == 0 {
             return Ok(Vec::new());
         }
@@ -10877,6 +11250,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             coordinator_receipt_count: self.coordinator.receipt_count(),
             coordinator_committed_version_count: self.coordinator.committed_version_count(),
             repair_job_count: self.coordinator.repair_jobs().len(),
+            repair_attempt_count: self.active_repair_attempt_records().len(),
             pending_write_count: self.pending_writes.len(),
             pending_read_count: self.pending_reads.len(),
             stage_retry_count,
@@ -10998,6 +11372,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             None
         };
+        let stale_staging_gc = options
+            .stale_staging_gc
+            .map(|options| self.content.collect_stale_staging(options))
+            .transpose()?;
         let anti_entropy = options
             .anti_entropy
             .map(|options| self.run_local_content_anti_entropy(options))
@@ -11020,6 +11398,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
         Ok(DfsLifecycleMaintenanceReport {
             content_scrub,
+            stale_staging_gc,
             anti_entropy,
             version_gc,
             orphan_gc,
@@ -18230,8 +18609,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         max_scheduled: usize,
     ) -> Result<Vec<DistributedRepairJob>, DfsError> {
+        self.retry_pending_repairs_bounded_with_attempts(max_scheduled, &[])
+    }
+
+    fn retry_pending_repairs_bounded_with_attempts(
+        &mut self,
+        max_scheduled: usize,
+        repair_attempts: &[DfsRepairAttemptRecord],
+    ) -> Result<Vec<DistributedRepairJob>, DfsError> {
         self.prune_idle_chunk_transfers();
         self.restore_pending_writes_for_repair_jobs()?;
+        self.restore_repair_attempt_records(repair_attempts);
         if self.pending_writes.is_empty() || max_scheduled == 0 {
             return Ok(Vec::new());
         }
@@ -24647,6 +25035,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn repair_retry_is_due(&self, intent_id: &str, replica_node_id: &NodeId) -> bool {
+        if self
+            .repair_attempt_records
+            .get(&(intent_id.to_string(), replica_node_id.clone()))
+            .is_some_and(|record| record.next_retry_unix_nanos > dfs_now_unix_nanos())
+        {
+            return false;
+        }
         self.pending_writes
             .get(intent_id)
             .and_then(|pending| pending.repair_retries.get(replica_node_id))
@@ -24654,6 +25049,111 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 !repair_retry_state_is_suppressed(state)
                     && state.next_retry_tick <= self.repair_retry_tick
             })
+    }
+
+    fn restore_repair_attempt_records(&mut self, records: &[DfsRepairAttemptRecord]) {
+        self.repair_attempt_records.clear();
+        for record in records {
+            let Some(pending) = self.pending_writes.get_mut(&record.intent_id) else {
+                continue;
+            };
+            if pending.object_id != record.object_id
+                || pending.version != record.version
+                || pending.content_hash != record.content_hash
+            {
+                continue;
+            }
+            self.repair_attempt_records.insert(
+                (
+                    record.intent_id.clone(),
+                    record.missing_replica_node_id.clone(),
+                ),
+                record.clone(),
+            );
+            let state = pending
+                .repair_retries
+                .entry(record.missing_replica_node_id.clone())
+                .or_default();
+            state.attempts = state.attempts.max(record.attempts);
+            state.inflight =
+                record.in_flight && record.next_retry_unix_nanos > dfs_now_unix_nanos();
+        }
+    }
+
+    fn active_repair_attempt_records(&self) -> Vec<DfsRepairAttemptRecord> {
+        let now = dfs_now_unix_nanos();
+        let mut records = Vec::new();
+        for (intent_id, pending) in &self.pending_writes {
+            for (replica_node_id, state) in &pending.repair_retries {
+                if state.attempts == 0 || repair_retry_state_is_suppressed(state) {
+                    continue;
+                }
+                let key = (intent_id.clone(), replica_node_id.clone());
+                if let Some(existing) = self.repair_attempt_records.get(&key)
+                    && existing.next_retry_unix_nanos > now
+                    && existing.attempts >= state.attempts
+                {
+                    records.push(existing.clone());
+                    continue;
+                }
+                let remaining_ticks = state.next_retry_tick.saturating_sub(self.repair_retry_tick);
+                let next_retry_unix_nanos =
+                    now.saturating_add(repair_retry_delay_nanos_for_ticks(remaining_ticks));
+                let last_error = self
+                    .repair_attempt_records
+                    .get(&key)
+                    .and_then(|record| record.last_error.clone());
+                records.push(DfsRepairAttemptRecord {
+                    intent_id: intent_id.clone(),
+                    object_id: pending.object_id.clone(),
+                    version: pending.version.clone(),
+                    content_hash: pending.content_hash.clone(),
+                    missing_replica_node_id: replica_node_id.clone(),
+                    attempts: state.attempts,
+                    in_flight: state.inflight,
+                    last_attempt_unix_nanos: now,
+                    next_retry_unix_nanos,
+                    last_error,
+                });
+            }
+        }
+        records.sort_by(|left, right| {
+            left.intent_id.cmp(&right.intent_id).then_with(|| {
+                left.missing_replica_node_id
+                    .cmp(&right.missing_replica_node_id)
+            })
+        });
+        records
+    }
+
+    fn observe_repair_maintenance_events(&mut self, events: &[NetworkedDfsServiceEvent]) {
+        for event in events {
+            match event {
+                NetworkedDfsServiceEvent::ReplicaRepaired {
+                    intent_id,
+                    replica_node_id,
+                    ..
+                } => {
+                    self.repair_attempt_records
+                        .remove(&(intent_id.clone(), replica_node_id.clone()));
+                }
+                NetworkedDfsServiceEvent::RepairRejected {
+                    intent_id,
+                    replica_node_id,
+                    reason,
+                    ..
+                } => {
+                    if let Some(record) = self
+                        .repair_attempt_records
+                        .get_mut(&(intent_id.clone(), replica_node_id.clone()))
+                    {
+                        record.in_flight = false;
+                        record.last_error = Some(reason.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     fn pending_repair_is_locally_authoritative(
@@ -27493,6 +27993,11 @@ fn write_intent_status_requires_hydrate_restore(status: &DfsWriteIntentStatus) -
 
 fn repair_retry_delay_ticks(attempts: u32) -> u64 {
     1_u64 << attempts.saturating_sub(1).min(6)
+}
+
+fn repair_retry_delay_nanos_for_ticks(ticks: u64) -> u64 {
+    let tick_nanos = u64::try_from(DFS_REPAIR_RETRY_TICK_DURATION.as_nanos()).unwrap_or(u64::MAX);
+    ticks.saturating_mul(tick_nanos)
 }
 
 fn repair_retry_state_is_suppressed(state: &RepairRetryState) -> bool {
