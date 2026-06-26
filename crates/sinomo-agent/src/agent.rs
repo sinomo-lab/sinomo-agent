@@ -28,11 +28,12 @@ use sinomo_lm::{
     inferred_model_context_window_tokens, language_model_system_instructions,
 };
 use sinomo_memory::{
-    MemoryContextProvider, MemoryQuery, MemoryRetrievalReport, MemoryRetrievalResult,
+    MemoryContextProvider, MemoryPolicy, MemoryQuery, MemoryRecordStore, MemoryRetrievalReport,
+    MemoryRetrievalResult,
 };
 use sinomo_runtime::core::{
-    Confidence, EventEnvelope, EventKind, LatencyClass, MemoryRecord, MemoryScope, PrivacyClass,
-    RoutingMetadata, RoutingScope, Salience, Source,
+    Confidence, EventEnvelope, EventKind, LatencyClass, MemoryRecord, MemoryScope, MemorySourceRef,
+    MemoryTier, PrivacyClass, RoutingMetadata, RoutingScope, Salience, Source, TrustDomain,
 };
 use sinomo_runtime::events::{EventId, SessionId};
 use sinomo_runtime::local::SinomoDataDir;
@@ -7280,6 +7281,7 @@ pub struct Agent<M> {
     tools: AgentToolRegistry,
     context_assembler: ContextAssembler,
     memory_context_provider: Option<Arc<dyn MemoryContextProvider>>,
+    memory_record_store: Option<Arc<dyn MemoryRecordStore>>,
     compactor: AgentCompactor,
     compaction_engine: Arc<RwLock<Box<dyn AgentCompactionEngine<M>>>>,
     trace_store: Box<dyn AgentTraceStore>,
@@ -7299,6 +7301,7 @@ impl<M: InteractionModel> Agent<M> {
             tools: AgentToolRegistry::new(),
             context_assembler: ContextAssembler,
             memory_context_provider: None,
+            memory_record_store: None,
             compactor: AgentCompactor::default(),
             compaction_engine: Arc::new(RwLock::new(Box::new(
                 CodexStyleAgentCompactionEngine::default(),
@@ -7368,6 +7371,16 @@ impl<M: InteractionModel> Agent<M> {
         T: MemoryContextProvider + 'static,
     {
         self.memory_context_provider = Some(Arc::new(provider));
+        self
+    }
+
+    pub fn with_memory_store<T>(mut self, store: T) -> Self
+    where
+        T: MemoryRecordStore + 'static,
+    {
+        let store = Arc::new(store);
+        self.memory_context_provider = Some(store.clone());
+        self.memory_record_store = Some(store);
         self
     }
 
@@ -7633,6 +7646,18 @@ impl<M: InteractionModel> Agent<M> {
             })
     }
 
+    fn record_completed_turn_memories(&self, input: &AgentLoopInput, run: &AgentRun) {
+        let Some(store) = &self.memory_record_store else {
+            return;
+        };
+        let policy = MemoryPolicy::default();
+        let _ = store.promote_event(&input.latest_event, &policy);
+        if let Some(record) = completed_turn_memory_record(self.config.definition.key(), input, run)
+        {
+            let _ = store.write_record(record);
+        }
+    }
+
     pub fn start_turn(
         &self,
         session: &mut AgentSession,
@@ -7731,6 +7756,7 @@ impl<M: InteractionModel> Agent<M> {
                 event_count: run.events.len(),
             },
         )?;
+        self.record_completed_turn_memories(input, &run);
         self.save_session(session)?;
         Ok(run)
     }
@@ -10373,6 +10399,80 @@ fn build_candidate_evidence_bundle(
     })
 }
 
+fn completed_turn_memory_record(
+    agent_id: &str,
+    input: &AgentLoopInput,
+    run: &AgentRun,
+) -> Option<MemoryRecord> {
+    let mut parts = vec![format!("Agent turn completed with {:?}.", run.stop_reason)];
+    let final_text = run.final_decision.text.trim();
+    if !final_text.is_empty() {
+        parts.push(format!(
+            "Final response: {}",
+            model_visible_text_excerpt(final_text, 2048)
+        ));
+    }
+    if !run.tool_results.is_empty() {
+        let summaries = run
+            .tool_results
+            .iter()
+            .take(3)
+            .map(|outcome| {
+                format!(
+                    "{}: {:?}: {}",
+                    outcome.call.tool,
+                    outcome.status,
+                    model_visible_text_excerpt(outcome.summary.trim(), 256)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        parts.push(format!(
+            "Tool results: {} total. {}",
+            run.tool_results.len(),
+            summaries
+        ));
+    }
+    if let Some(bundle) = &run.candidate_evidence_bundle {
+        if let Some(summary) = bundle.context_summary.as_deref() {
+            parts.push(format!(
+                "Task evidence: {}",
+                model_visible_text_excerpt(summary.trim(), 512)
+            ));
+        }
+    }
+    if parts.len() == 1 && final_text.is_empty() {
+        return None;
+    }
+
+    let created_at = run
+        .events
+        .last()
+        .map(|event| event.time)
+        .unwrap_or_else(time::OffsetDateTime::now_utc);
+    let mut source_refs = vec![
+        MemorySourceRef::new("session", input.session.session_id.to_string()),
+        MemorySourceRef::new("event", input.latest_event.event_id.to_string()),
+    ];
+    if let Some(completed_event) = run.events.last() {
+        source_refs.push(MemorySourceRef::new(
+            "agent_event",
+            completed_event.event_id.to_string(),
+        ));
+    }
+
+    Some(MemoryRecord::new(
+        MemoryScope::Agent {
+            agent_id: agent_id.to_string(),
+        },
+        MemoryTier::Warm,
+        parts.join(" "),
+        source_refs,
+        TrustDomain::new("trust.local").expect("valid trust domain"),
+        created_at,
+    ))
+}
+
 fn agent_session_event(
     op_id: &TaskId,
     session_id: &SessionId,
@@ -10464,7 +10564,7 @@ mod tests {
         user_interaction_input_event,
     };
     use sinomo_lm::{LanguageModelError, LanguageModelResponseFormat};
-    use sinomo_memory::FlatFileMemoryStore;
+    use sinomo_memory::DurableMemoryStore;
     use sinomo_runtime::events::SessionId;
     use sinomo_runtime::node::NodeId;
     use std::collections::VecDeque;
@@ -12313,6 +12413,19 @@ mod tests {
             }
             sinomo_runtime::storage::StoragePathOwner::File(_) => {
                 panic!("agent storage should be an escape path")
+            }
+        }
+
+        let memory_owner = layout
+            .owner_for("memory/records/segments/0000000000000001.sobjlog")
+            .expect("memory owner");
+        match memory_owner {
+            sinomo_runtime::storage::StoragePathOwner::Escape(escape) => {
+                assert_eq!(escape.module, "sinomo-memory");
+                assert_eq!(escape.ring, sinomo_runtime::storage::StorageRing::R2);
+            }
+            sinomo_runtime::storage::StoragePathOwner::File(_) => {
+                panic!("memory log segment should be covered by the memory segment subtree")
             }
         }
     }
@@ -14715,7 +14828,7 @@ mod tests {
     #[test]
     fn context_assembler_includes_retrieved_memory_blocks() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-memory-context");
-        let store = FlatFileMemoryStore::new(root.join("memory"));
+        let store = DurableMemoryStore::new(root.join("memory"));
         store
             .put_record(
                 MemoryScope::Agent {
@@ -14770,6 +14883,43 @@ mod tests {
             .join("\n");
         assert!(request_text.contains("\"retrieved_memories\""));
         assert!(request_text.contains("scoped patches are preferred"));
+    }
+
+    #[test]
+    fn agent_writes_completed_turn_summary_to_memory_store() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-memory-write");
+        let store = DurableMemoryStore::new(root.join("memory"));
+        let model = SequencedModel::new([r#"{
+            "response_mode": "answer",
+            "text": "Remembered outcome.",
+            "tool_calls": [],
+            "background_handoff": null,
+            "next_state": "listening"
+        }"#]);
+        let agent = Agent::new(model, "fake", "fake").with_memory_store(store.clone());
+        let input = agent_input("remember this outcome");
+        let mut session = AgentSession::new(input.session.session_id.clone(), AgentRole::Main);
+
+        let run = agent.start_turn(&mut session, &input).expect("turn");
+
+        assert_eq!(run.final_decision.text, "Remembered outcome.");
+        let result = sinomo_memory::MemoryContextProvider::retrieve(
+            &store,
+            &sinomo_memory::MemoryQuery {
+                session_id: Some(input.session.session_id.clone()),
+                agent_id: Some("main-agent".to_string()),
+                task_hint: Some("outcome".to_string()),
+                ..sinomo_memory::MemoryQuery::default()
+            },
+        )
+        .expect("retrieve memory");
+        assert_eq!(result.records.len(), 1);
+        assert!(
+            result.records[0]
+                .record
+                .summary
+                .contains("Remembered outcome.")
+        );
     }
 
     #[test]

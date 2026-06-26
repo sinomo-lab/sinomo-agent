@@ -62,6 +62,7 @@ impl AgentCancellationToken {
 pub fn register_storage_paths(
     layout: &mut sinomo_runtime::storage::StorageLayout,
 ) -> Result<(), sinomo_runtime::storage::StorageContractError> {
+    sinomo_memory::register_storage_paths(layout)?;
     layout.register_escape_path(
         "sinomo-agent",
         sinomo_runtime::storage::StorageRing::R2,

@@ -6,15 +6,24 @@ use sinomo_runtime::core::{
     TrustDomain,
 };
 use sinomo_runtime::events::{SessionId, StoredEvent};
-use std::collections::VecDeque;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use sinomo_runtime::object::{LengthMode, serde_ext};
+use sinomo_runtime::storage::durable_file::{
+    self, DurableAtomicFileOptions, DurableFileSync, DurableLengthEndian,
+    DurableRecordAppendOptions, DurableRecordReadOptions,
+};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use time::OffsetDateTime;
 
 const DEFAULT_RETRIEVAL_RECORD_LIMIT: usize = 8;
 const DEFAULT_RETRIEVAL_BYTE_LIMIT: usize = 16 * 1024;
+const DEFAULT_MEMORY_RECORDS_PER_SEGMENT: u64 = 1024;
+const MEMORY_STORAGE_SCHEMA_VERSION: u32 = 1;
+const MEMORY_SOBJ_VERSION: u16 = 1;
+const MAX_MEMORY_LOG_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct MemoryPolicy {
@@ -129,7 +138,7 @@ impl MemoryManager {
     }
 
     pub fn ingest(&mut self, event: StoredEvent) -> Option<WarmMemoryEntry> {
-        let promoted = self.maybe_promote(&event);
+        let promoted = self.promote_event(&event.event);
         self.hot.ingest(event);
         if let Some(entry) = promoted.clone() {
             self.warm.promote(entry);
@@ -169,13 +178,13 @@ impl MemoryManager {
         }
     }
 
-    fn maybe_promote(&self, stored: &StoredEvent) -> Option<WarmMemoryEntry> {
-        let event = &stored.event;
+    pub fn promote_event(&self, event: &EventEnvelope) -> Option<WarmMemoryEntry> {
         let reason = promotion_reason(event)?;
         if event.salience.get() < self.policy.warm_salience_threshold
             && !matches!(
                 reason,
                 PromotionReason::SafetyIncident
+                    | PromotionReason::UserImportant
                     | PromotionReason::AgentTrace
                     | PromotionReason::DeliberationSummary
             )
@@ -257,14 +266,50 @@ pub struct MemoryIndexEntry {
     pub memory_id: MemoryId,
     pub scope: MemoryScope,
     pub tier: MemoryTier,
+    #[serde(default)]
+    pub sequence: u64,
     pub path: String,
     pub bytes: usize,
     #[serde(with = "time::serde::rfc3339")]
     pub indexed_at: OffsetDateTime,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MemoryTokenIndexEntry {
+    pub token: String,
+    pub memory_ids: Vec<MemoryId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MemoryIndexSnapshot {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub last_sequence: u64,
+    pub entries: Vec<MemoryIndexEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub token_index: Vec<MemoryTokenIndexEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MemorySnapshot {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub last_sequence: u64,
+    pub records: Vec<MemoryRecord>,
+}
+
 pub trait MemoryContextProvider: Send + Sync {
     fn retrieve(&self, query: &MemoryQuery) -> Result<MemoryRetrievalResult, MemoryError>;
+}
+
+pub trait MemoryRecordStore: MemoryContextProvider {
+    fn write_record(&self, record: MemoryRecord) -> Result<MemoryRecord, MemoryError>;
+
+    fn promote_event(
+        &self,
+        event: &EventEnvelope,
+        policy: &MemoryPolicy,
+    ) -> Result<Option<MemoryRecord>, MemoryError>;
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -274,17 +319,32 @@ pub struct MemoryRetrievalResult {
 }
 
 #[derive(Clone, Debug)]
-pub struct FlatFileMemoryStore {
+pub struct DurableMemoryStore {
     root: PathBuf,
+    records_per_segment: u64,
+    write_lock: Arc<Mutex<()>>,
 }
 
-impl FlatFileMemoryStore {
+impl DurableMemoryStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            records_per_segment: DEFAULT_MEMORY_RECORDS_PER_SEGMENT,
+            write_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    pub fn with_records_per_segment(mut self, records_per_segment: u64) -> Self {
+        self.records_per_segment = records_per_segment.max(1);
+        self
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn from_data_dir(data_dir: &sinomo_runtime::local::SinomoDataDir) -> Self {
+        Self::new(data_dir.root().join("memory"))
     }
 
     pub fn write_record(&self, record: MemoryRecord) -> Result<MemoryRecord, MemoryError> {
@@ -303,34 +363,24 @@ impl FlatFileMemoryStore {
             });
         }
 
-        let record_path = self.record_path(&record.scope, &record.memory_id);
-        let record_existed = record_path.exists();
-        if !record_existed {
-            if let Some(parent) = record_path.parent() {
-                fs::create_dir_all(parent).map_err(|source| MemoryError::Io {
-                    path: parent.display().to_string(),
-                    source,
-                })?;
-            }
-            let bytes =
-                serde_json::to_vec_pretty(&record).map_err(|source| MemoryError::Serialize {
-                    path: record_path.display().to_string(),
-                    source,
-                })?;
-            let tmp_path = record_path.with_extension(format!("json.tmp-{}", std::process::id()));
-            fs::write(&tmp_path, bytes).map_err(|source| MemoryError::Io {
-                path: tmp_path.display().to_string(),
-                source,
-            })?;
-            fs::rename(&tmp_path, &record_path).map_err(|source| MemoryError::Io {
-                path: record_path.display().to_string(),
-                source,
-            })?;
+        let _guard = self.write_guard()?;
+        let mut state = self.replay_state()?;
+        if state.records.contains_key(&record.memory_id) {
+            return Ok(record);
         }
-
-        if !record_existed {
-            self.append_index(&record, &record_path)?;
-        }
+        let sequence = state
+            .last_sequence
+            .checked_add(1)
+            .ok_or(MemoryError::SequenceOverflow)?;
+        self.append_log_entry(&MemoryLogEntry::put(sequence, record.clone()))?;
+        state.last_sequence = sequence;
+        state
+            .record_sequences
+            .insert(record.memory_id.clone(), sequence);
+        state
+            .records
+            .insert(record.memory_id.clone(), record.clone());
+        self.write_index_snapshot(&state)?;
 
         Ok(record)
     }
@@ -355,40 +405,93 @@ impl FlatFileMemoryStore {
     }
 
     pub fn records_for_scope(&self, scope: &MemoryScope) -> Result<Vec<MemoryRecord>, MemoryError> {
-        let records_dir = self.scope_dir(scope).join("records");
-        if !records_dir.exists() {
-            return Ok(Vec::new());
-        }
-        let mut records = Vec::new();
-        for entry in fs::read_dir(&records_dir).map_err(|source| MemoryError::Io {
-            path: records_dir.display().to_string(),
-            source,
-        })? {
-            let entry = entry.map_err(|source| MemoryError::Io {
-                path: records_dir.display().to_string(),
-                source,
-            })?;
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-                continue;
-            }
-            let bytes = fs::read(&path).map_err(|source| MemoryError::Io {
-                path: path.display().to_string(),
-                source,
-            })?;
-            let record: MemoryRecord =
-                serde_json::from_slice(&bytes).map_err(|source| MemoryError::Deserialize {
-                    path: path.display().to_string(),
-                    source,
-                })?;
-            records.push(record);
-        }
+        let mut records = self
+            .replay_state()?
+            .records
+            .into_values()
+            .filter(|record| &record.scope == scope)
+            .collect::<Vec<_>>();
         records.sort_by(|left, right| {
             left.created_at
                 .cmp(&right.created_at)
                 .then_with(|| left.memory_id.cmp(&right.memory_id))
         });
         Ok(records)
+    }
+
+    pub fn promote_event(
+        &self,
+        event: &EventEnvelope,
+        policy: &MemoryPolicy,
+    ) -> Result<Option<MemoryRecord>, MemoryError> {
+        let manager = MemoryManager::new(policy.clone());
+        let Some(entry) = manager.promote_event(event) else {
+            return Ok(None);
+        };
+        self.write_record(entry.record).map(Some)
+    }
+
+    pub fn compact(&self) -> Result<MemorySnapshot, MemoryError> {
+        let _guard = self.write_guard()?;
+        let mut state = self.replay_state()?;
+        let snapshot = MemorySnapshot {
+            schema_version: MEMORY_STORAGE_SCHEMA_VERSION,
+            last_sequence: state.last_sequence,
+            records: state.records.values().cloned().collect(),
+        };
+        self.write_sobj_file(&self.snapshot_path(), &snapshot)?;
+        state.snapshot_sequence = snapshot.last_sequence;
+        self.write_index_snapshot(&state)?;
+        self.clear_log_segments()?;
+        Ok(snapshot)
+    }
+
+    pub fn load_snapshot(&self) -> Result<Option<MemorySnapshot>, MemoryError> {
+        let path = self.snapshot_path();
+        match durable_file::read_object_file_bytes(
+            &path,
+            durable_file::DEFAULT_OBJECT_FILE_MAX_READ_BYTES,
+        ) {
+            Ok(bytes) => {
+                let snapshot = decode_sobj::<MemorySnapshot>(&path, &bytes)?;
+                if snapshot.schema_version != MEMORY_STORAGE_SCHEMA_VERSION {
+                    return Err(MemoryError::UnsupportedSchema {
+                        path: path.display().to_string(),
+                        schema_version: snapshot.schema_version,
+                    });
+                }
+                Ok(Some(snapshot))
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(MemoryError::DurableFile {
+                path: source.path().to_string(),
+                detail: source.detail().to_string(),
+            }),
+        }
+    }
+
+    pub fn load_index(&self) -> Result<Option<MemoryIndexSnapshot>, MemoryError> {
+        let path = self.index_path();
+        match durable_file::read_object_file_bytes(
+            &path,
+            durable_file::DEFAULT_OBJECT_FILE_MAX_READ_BYTES,
+        ) {
+            Ok(bytes) => {
+                let index = decode_sobj::<MemoryIndexSnapshot>(&path, &bytes)?;
+                if index.schema_version != MEMORY_STORAGE_SCHEMA_VERSION {
+                    return Err(MemoryError::UnsupportedSchema {
+                        path: path.display().to_string(),
+                        schema_version: index.schema_version,
+                    });
+                }
+                Ok(Some(index))
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(MemoryError::DurableFile {
+                path: source.path().to_string(),
+                detail: source.detail().to_string(),
+            }),
+        }
     }
 
     fn retrieve_records(&self, query: &MemoryQuery) -> Result<MemoryRetrievalResult, MemoryError> {
@@ -460,68 +563,339 @@ impl FlatFileMemoryStore {
         })
     }
 
-    fn append_index(&self, record: &MemoryRecord, record_path: &Path) -> Result<(), MemoryError> {
-        let scope_dir = self.scope_dir(&record.scope);
-        fs::create_dir_all(&scope_dir).map_err(|source| MemoryError::Io {
-            path: scope_dir.display().to_string(),
-            source,
-        })?;
-        let index_path = scope_dir.join("index.jsonl");
-        let relative_path = record_path
-            .strip_prefix(&scope_dir)
-            .unwrap_or(record_path)
-            .display()
-            .to_string();
-        let bytes = fs::metadata(record_path)
-            .map(|metadata| metadata.len() as usize)
-            .unwrap_or_default();
-        let entry = MemoryIndexEntry {
-            memory_id: record.memory_id.clone(),
-            scope: record.scope.clone(),
-            tier: record.tier.clone(),
-            path: relative_path,
-            bytes,
-            indexed_at: OffsetDateTime::now_utc(),
+    fn replay_state(&self) -> Result<MemoryReplayState, MemoryError> {
+        let mut state = MemoryReplayState::default();
+        if let Some(snapshot) = self.load_snapshot()? {
+            state.snapshot_sequence = snapshot.last_sequence;
+            state.last_sequence = snapshot.last_sequence;
+            for record in snapshot.records {
+                state
+                    .record_sequences
+                    .insert(record.memory_id.clone(), snapshot.last_sequence);
+                state.records.insert(record.memory_id.clone(), record);
+            }
+        }
+        for entry in self.read_log_entries()? {
+            let sequence = if entry.sequence == 0 {
+                state
+                    .last_sequence
+                    .checked_add(1)
+                    .ok_or(MemoryError::SequenceOverflow)?
+            } else {
+                entry.sequence
+            };
+            state.last_sequence = state.last_sequence.max(sequence);
+            if sequence <= state.snapshot_sequence {
+                continue;
+            }
+            match entry.op {
+                MemoryLogOperation::PutRecord { record } => {
+                    state
+                        .record_sequences
+                        .insert(record.memory_id.clone(), sequence);
+                    state.records.insert(record.memory_id.clone(), record);
+                }
+            }
+        }
+        Ok(state)
+    }
+
+    fn read_log_entries(&self) -> Result<Vec<MemoryLogEntry>, MemoryError> {
+        let mut entries = Vec::new();
+        for path in self.log_paths()? {
+            entries.extend(self.read_log_entries_from_path(&path)?);
+        }
+        entries.sort_by_key(|entry| entry.sequence);
+        Ok(entries)
+    }
+
+    fn read_log_entries_from_path(&self, path: &Path) -> Result<Vec<MemoryLogEntry>, MemoryError> {
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(MemoryError::Io {
+                    path: path.display().to_string(),
+                    source,
+                });
+            }
         };
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&index_path)
-            .map_err(|source| MemoryError::Io {
-                path: index_path.display().to_string(),
-                source,
-            })?;
-        let line = serde_json::to_string(&entry).map_err(|source| MemoryError::Serialize {
-            path: index_path.display().to_string(),
-            source,
+        let mut entries = Vec::new();
+        let options = DurableRecordReadOptions::new(DurableLengthEndian::Big)
+            .max_record_bytes(MAX_MEMORY_LOG_RECORD_BYTES);
+        while let Some(record) = durable_file::read_length_prefixed_record(&mut file, path, options)
+            .map_err(|source| MemoryError::DurableFile {
+                path: source.path().to_string(),
+                detail: source.detail().to_string(),
+            })?
+        {
+            let entry = decode_sobj::<MemoryLogEntry>(path, &record.bytes)?;
+            if entry.schema_version != MEMORY_STORAGE_SCHEMA_VERSION {
+                return Err(MemoryError::UnsupportedSchema {
+                    path: path.display().to_string(),
+                    schema_version: entry.schema_version,
+                });
+            }
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    fn append_log_entry(&self, entry: &MemoryLogEntry) -> Result<(), MemoryError> {
+        if entry.sequence == 0 {
+            return Err(MemoryError::InvalidLogSequence { sequence: 0 });
+        }
+        let path = self.segment_path(entry.sequence);
+        let bytes = encode_sobj(&path, entry)?;
+        let mut append_file = durable_file::open_file_for_append(&path).map_err(|source| {
+            MemoryError::DurableFile {
+                path: source.path().to_string(),
+                detail: source.detail().to_string(),
+            }
         })?;
-        writeln!(file, "{line}").map_err(|source| MemoryError::Io {
-            path: index_path.display().to_string(),
-            source,
+        durable_file::append_length_prefixed_records(
+            &mut append_file.file,
+            &path,
+            std::iter::once(bytes),
+            DurableRecordAppendOptions::new(DurableLengthEndian::Big).sync(DurableFileSync::Data),
+        )
+        .map_err(|source| MemoryError::DurableFile {
+            path: source.path().to_string(),
+            detail: source.detail().to_string(),
         })?;
         Ok(())
     }
 
-    fn record_path(&self, scope: &MemoryScope, memory_id: &MemoryId) -> PathBuf {
-        self.scope_dir(scope)
-            .join("records")
-            .join(format!("{memory_id}.json"))
+    fn write_index_snapshot(&self, state: &MemoryReplayState) -> Result<(), MemoryError> {
+        let indexed_at = OffsetDateTime::now_utc();
+        let entries = state
+            .records
+            .values()
+            .map(|record| MemoryIndexEntry {
+                memory_id: record.memory_id.clone(),
+                scope: record.scope.clone(),
+                tier: record.tier.clone(),
+                sequence: state
+                    .record_sequences
+                    .get(&record.memory_id)
+                    .copied()
+                    .unwrap_or(state.snapshot_sequence),
+                path: self.index_record_path(record, state),
+                bytes: encode_sobj(&self.index_path(), record)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or_default(),
+                indexed_at,
+            })
+            .collect::<Vec<_>>();
+        let token_index = build_token_index(state.records.values());
+        let index = MemoryIndexSnapshot {
+            schema_version: MEMORY_STORAGE_SCHEMA_VERSION,
+            last_sequence: state.last_sequence,
+            entries,
+            token_index,
+        };
+        self.write_sobj_file(&self.index_path(), &index)
     }
 
-    fn scope_dir(&self, scope: &MemoryScope) -> PathBuf {
-        match scope {
-            MemoryScope::Cluster => self.root.join("cluster"),
-            MemoryScope::Agent { agent_id } => {
-                self.root.join("agents").join(safe_component(agent_id))
+    fn index_record_path(&self, record: &MemoryRecord, state: &MemoryReplayState) -> String {
+        let sequence = state
+            .record_sequences
+            .get(&record.memory_id)
+            .copied()
+            .unwrap_or(state.snapshot_sequence);
+        if sequence == 0 || sequence <= state.snapshot_sequence {
+            return format!("records/snapshot.sobj#{}", record.memory_id);
+        }
+        format!(
+            "records/segments/{:016}.sobjlog#{}",
+            self.segment_number_for_sequence(sequence),
+            record.memory_id
+        )
+    }
+
+    fn log_paths(&self) -> Result<Vec<PathBuf>, MemoryError> {
+        let mut paths = Vec::new();
+        let segments_dir = self.segments_dir();
+        let entries = match fs::read_dir(&segments_dir) {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                paths.sort();
+                return Ok(paths);
             }
+            Err(source) => {
+                return Err(MemoryError::Io {
+                    path: segments_dir.display().to_string(),
+                    source,
+                });
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|source| MemoryError::Io {
+                path: segments_dir.display().to_string(),
+                source,
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("sobjlog") {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        Ok(paths)
+    }
+
+    fn clear_log_segments(&self) -> Result<(), MemoryError> {
+        for path in self.log_paths()? {
+            durable_file::remove_file_if_exists_and_sync_parent(&path).map_err(|source| {
+                MemoryError::DurableFile {
+                    path: source.path().to_string(),
+                    detail: source.detail().to_string(),
+                }
+            })?;
+        }
+        durable_file::remove_empty_dir_if_exists_and_sync_parent(&self.segments_dir()).map_err(
+            |source| MemoryError::DurableFile {
+                path: source.path().to_string(),
+                detail: source.detail().to_string(),
+            },
+        )?;
+        Ok(())
+    }
+
+    fn write_sobj_file<T: Serialize + ?Sized>(
+        &self,
+        path: &Path,
+        value: &T,
+    ) -> Result<(), MemoryError> {
+        let bytes = encode_sobj(path, value)?;
+        self.write_file_atomic(path, &bytes)
+    }
+
+    fn write_file_atomic(&self, path: &Path, bytes: &[u8]) -> Result<(), MemoryError> {
+        durable_file::write_file_atomic(
+            path,
+            bytes,
+            DurableAtomicFileOptions::new("sobj", "memory-tmp").sync_all(),
+        )
+        .map_err(|source| MemoryError::DurableFile {
+            path: source.path().to_string(),
+            detail: source.detail().to_string(),
+        })
+    }
+
+    fn write_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>, MemoryError> {
+        self.write_lock
+            .lock()
+            .map_err(|source| MemoryError::LockPoisoned {
+                detail: source.to_string(),
+            })
+    }
+
+    fn segment_path(&self, sequence: u64) -> PathBuf {
+        self.segments_dir().join(format!(
+            "{:016}.sobjlog",
+            self.segment_number_for_sequence(sequence)
+        ))
+    }
+
+    fn segment_number_for_sequence(&self, sequence: u64) -> u64 {
+        sequence
+            .saturating_sub(1)
+            .saturating_div(self.records_per_segment)
+            .saturating_add(1)
+    }
+
+    fn segments_dir(&self) -> PathBuf {
+        self.root.join("records").join("segments")
+    }
+
+    fn snapshot_path(&self) -> PathBuf {
+        self.root.join("records").join("snapshot.sobj")
+    }
+
+    fn index_path(&self) -> PathBuf {
+        self.root.join("index.sobj")
+    }
+}
+
+impl MemoryContextProvider for DurableMemoryStore {
+    fn retrieve(&self, query: &MemoryQuery) -> Result<MemoryRetrievalResult, MemoryError> {
+        self.retrieve_records(query)
+    }
+}
+
+impl MemoryRecordStore for DurableMemoryStore {
+    fn write_record(&self, record: MemoryRecord) -> Result<MemoryRecord, MemoryError> {
+        DurableMemoryStore::write_record(self, record)
+    }
+
+    fn promote_event(
+        &self,
+        event: &EventEnvelope,
+        policy: &MemoryPolicy,
+    ) -> Result<Option<MemoryRecord>, MemoryError> {
+        DurableMemoryStore::promote_event(self, event, policy)
+    }
+}
+
+pub type LogStructuredMemoryStore = DurableMemoryStore;
+
+#[derive(Clone, Debug, Default)]
+struct MemoryReplayState {
+    snapshot_sequence: u64,
+    last_sequence: u64,
+    records: BTreeMap<MemoryId, MemoryRecord>,
+    record_sequences: BTreeMap<MemoryId, u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct MemoryLogEntry {
+    schema_version: u32,
+    #[serde(default)]
+    sequence: u64,
+    #[serde(with = "time::serde::rfc3339")]
+    appended_at: OffsetDateTime,
+    op: MemoryLogOperation,
+}
+
+impl MemoryLogEntry {
+    fn put(sequence: u64, record: MemoryRecord) -> Self {
+        Self {
+            schema_version: MEMORY_STORAGE_SCHEMA_VERSION,
+            sequence,
+            appended_at: OffsetDateTime::now_utc(),
+            op: MemoryLogOperation::PutRecord { record },
         }
     }
 }
 
-impl MemoryContextProvider for FlatFileMemoryStore {
-    fn retrieve(&self, query: &MemoryQuery) -> Result<MemoryRetrievalResult, MemoryError> {
-        self.retrieve_records(query)
-    }
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum MemoryLogOperation {
+    PutRecord { record: MemoryRecord },
+}
+
+pub fn register_storage_paths(
+    layout: &mut sinomo_runtime::storage::StorageLayout,
+) -> Result<(), sinomo_runtime::storage::StorageContractError> {
+    use sinomo_runtime::storage::{ObjectSchema, STORAGE_CONTRACT_OBJECT_VERSION, StorageRing};
+    layout.register_escape_path(
+        "sinomo-memory",
+        StorageRing::R2,
+        "memory/records/segments",
+        "segmented length-prefixed SOBJ memory record logs",
+    )?;
+    layout.register_sinomo_object(
+        "sinomo-memory",
+        StorageRing::R2,
+        "memory/records/snapshot.sobj",
+        ObjectSchema::new("MemorySnapshot", STORAGE_CONTRACT_OBJECT_VERSION),
+    )?;
+    layout.register_sinomo_object(
+        "sinomo-memory",
+        StorageRing::R2,
+        "memory/index.sobj",
+        ObjectSchema::new("MemoryIndexSnapshot", STORAGE_CONTRACT_OBJECT_VERSION),
+    )
 }
 
 fn memory_scope_rank(scope: &MemoryScope) -> u8 {
@@ -568,26 +942,72 @@ fn score_record(record: &MemoryRecord, query: &MemoryQuery) -> (i32, String) {
     (score, reasons.join(", "))
 }
 
-fn safe_component(value: &str) -> String {
-    let mut safe = String::new();
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-            safe.push(ch);
-        } else {
-            safe.push('_');
+fn build_token_index<'a>(
+    records: impl IntoIterator<Item = &'a MemoryRecord>,
+) -> Vec<MemoryTokenIndexEntry> {
+    let mut by_token = BTreeMap::<String, BTreeSet<MemoryId>>::new();
+    for record in records {
+        for token in memory_record_tokens(record) {
+            by_token
+                .entry(token)
+                .or_default()
+                .insert(record.memory_id.clone());
         }
     }
-    if safe.is_empty() {
-        "unnamed".to_string()
-    } else {
-        safe
+    by_token
+        .into_iter()
+        .map(|(token, memory_ids)| MemoryTokenIndexEntry {
+            token,
+            memory_ids: memory_ids.into_iter().collect(),
+        })
+        .collect()
+}
+
+fn memory_record_tokens(record: &MemoryRecord) -> BTreeSet<String> {
+    let mut tokens = BTreeSet::new();
+    collect_tokens(&record.summary, &mut tokens);
+    for source in &record.source_refs {
+        collect_tokens(&source.kind, &mut tokens);
+        collect_tokens(&source.value, &mut tokens);
     }
+    if let MemoryScope::Agent { agent_id } = &record.scope {
+        collect_tokens(agent_id, &mut tokens);
+    }
+    tokens
+}
+
+fn collect_tokens(text: &str, tokens: &mut BTreeSet<String>) {
+    for token in text
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| token.len() >= 2)
+    {
+        tokens.insert(token);
+    }
+}
+
+fn encode_sobj<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<Vec<u8>, MemoryError> {
+    serde_ext::to_bytes(value, MEMORY_SOBJ_VERSION, LengthMode::U32).map_err(|source| {
+        MemoryError::SobjSerialize {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }
+    })
+}
+
+fn decode_sobj<T: for<'de> Deserialize<'de>>(path: &Path, bytes: &[u8]) -> Result<T, MemoryError> {
+    serde_ext::from_bytes(bytes).map_err(|source| MemoryError::SobjDeserialize {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
 }
 
 fn promotion_reason(event: &EventEnvelope) -> Option<PromotionReason> {
     let kind = event.kind.as_str();
     if kind.starts_with("safety.") {
         Some(PromotionReason::SafetyIncident)
+    } else if kind.starts_with("memory.") {
+        Some(PromotionReason::UserImportant)
     } else if kind == "agent.turn.completed" {
         Some(PromotionReason::AgentTrace)
     } else if kind == "deliberation.summary.completed" {
@@ -648,18 +1068,20 @@ pub enum MemoryError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to serialize memory data for {path}: {source}")]
-    Serialize {
-        path: String,
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error("failed to deserialize memory data from {path}: {source}")]
-    Deserialize {
-        path: String,
-        #[source]
-        source: serde_json::Error,
-    },
+    #[error("memory durable file error at {path}: {detail}")]
+    DurableFile { path: String, detail: String },
+    #[error("failed to serialize memory SOBJ for {path}: {detail}")]
+    SobjSerialize { path: String, detail: String },
+    #[error("failed to deserialize memory SOBJ from {path}: {detail}")]
+    SobjDeserialize { path: String, detail: String },
+    #[error("unsupported memory storage schema {schema_version} at {path}")]
+    UnsupportedSchema { path: String, schema_version: u32 },
+    #[error("memory log sequence overflow")]
+    SequenceOverflow,
+    #[error("invalid memory log sequence {sequence}")]
+    InvalidLogSequence { sequence: u64 },
+    #[error("memory store lock poisoned: {detail}")]
+    LockPoisoned { detail: String },
 }
 
 #[cfg(test)]
@@ -671,6 +1093,7 @@ mod tests {
     };
     use sinomo_runtime::events::{EventId, EventSequence};
     use sinomo_runtime::node::NodeId;
+    use std::fs;
 
     fn stored(id: &str, kind: &str, salience: f32) -> StoredEvent {
         StoredEvent {
@@ -735,9 +1158,25 @@ mod tests {
     }
 
     #[test]
-    fn flat_file_store_writes_immutable_records_and_index() {
-        let root = temp_memory_root("sinomo-memory-flat-file");
-        let store = FlatFileMemoryStore::new(&root);
+    fn explicit_memory_events_promote_below_salience_threshold() {
+        let manager = MemoryManager::new(MemoryPolicy {
+            hot_event_limit: 4,
+            warm_salience_threshold: 0.9,
+        });
+        let event = stored("evt_memory", "memory.user-important", 0.1).event;
+
+        let promoted = manager
+            .promote_event(&event)
+            .expect("promoted memory event");
+
+        assert_eq!(promoted.reason, PromotionReason::UserImportant);
+        assert!(promoted.record.summary.contains("urgent alert"));
+    }
+
+    #[test]
+    fn durable_store_writes_immutable_records_and_index() {
+        let root = temp_memory_root("sinomo-memory-durable");
+        let store = DurableMemoryStore::new(&root);
         let record = store
             .put_record(
                 MemoryScope::Agent {
@@ -751,24 +1190,35 @@ mod tests {
             )
             .expect("write record");
 
-        let record_path = root
-            .join("agents")
-            .join("coding-agent")
-            .join("records")
-            .join(format!("{}.json", record.memory_id));
-        assert!(record_path.exists());
         assert!(
-            root.join("agents")
-                .join("coding-agent")
-                .join("index.jsonl")
+            root.join("records")
+                .join("segments")
+                .join("0000000000000001.sobjlog")
                 .exists()
+        );
+        assert!(root.join("index.sobj").exists());
+        let index = store
+            .load_index()
+            .expect("load index")
+            .expect("index exists");
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(index.last_sequence, 1);
+        assert_eq!(index.entries[0].memory_id, record.memory_id);
+        assert_eq!(index.entries[0].sequence, 1);
+        assert!(index.entries[0].path.starts_with("records/segments/"));
+        assert!(
+            index
+                .token_index
+                .iter()
+                .any(|entry| entry.token == "patches"
+                    && entry.memory_ids.contains(&record.memory_id))
         );
     }
 
     #[test]
-    fn flat_file_store_retrieves_cluster_and_agent_memory() {
+    fn durable_store_retrieves_cluster_and_agent_memory() {
         let root = temp_memory_root("sinomo-memory-retrieve");
-        let store = FlatFileMemoryStore::new(&root);
+        let store = DurableMemoryStore::new(&root);
         store
             .put_record(
                 MemoryScope::Cluster,
@@ -810,5 +1260,152 @@ mod tests {
                 .iter()
                 .any(|record| matches!(record.record.scope, MemoryScope::Cluster))
         );
+    }
+
+    #[test]
+    fn durable_store_replays_records_after_restart() {
+        let root = temp_memory_root("sinomo-memory-replay");
+        let store = DurableMemoryStore::new(&root);
+        let record = store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "Use durable replay for memory recovery",
+                vec![MemorySourceRef::new("session", "sess_memory")],
+                TrustDomain::new("trust.local").expect("trust"),
+                OffsetDateTime::now_utc(),
+            )
+            .expect("write");
+
+        let reopened = DurableMemoryStore::new(&root);
+        let records = reopened
+            .records_for_scope(&MemoryScope::Cluster)
+            .expect("records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].memory_id, record.memory_id);
+    }
+
+    #[test]
+    fn durable_store_rotates_log_segments_and_replays_all_records() {
+        let root = temp_memory_root("sinomo-memory-segments");
+        let store = DurableMemoryStore::new(&root).with_records_per_segment(1);
+        store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "First segmented memory record",
+                Vec::new(),
+                TrustDomain::new("trust.local").expect("trust"),
+                OffsetDateTime::now_utc(),
+            )
+            .expect("first");
+        store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "Second segmented memory record",
+                Vec::new(),
+                TrustDomain::new("trust.local").expect("trust"),
+                OffsetDateTime::now_utc(),
+            )
+            .expect("second");
+
+        assert!(
+            root.join("records")
+                .join("segments")
+                .join("0000000000000001.sobjlog")
+                .exists()
+        );
+        assert!(
+            root.join("records")
+                .join("segments")
+                .join("0000000000000002.sobjlog")
+                .exists()
+        );
+
+        let reopened = DurableMemoryStore::new(&root).with_records_per_segment(1);
+        assert_eq!(
+            reopened
+                .records_for_scope(&MemoryScope::Cluster)
+                .expect("records")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn durable_store_compacts_to_snapshot_and_clears_segments() {
+        let root = temp_memory_root("sinomo-memory-compact");
+        let store = DurableMemoryStore::new(&root);
+        store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "Compact memory snapshots from log records",
+                Vec::new(),
+                TrustDomain::new("trust.local").expect("trust"),
+                OffsetDateTime::now_utc(),
+            )
+            .expect("write");
+
+        let snapshot = store.compact().expect("compact");
+        assert_eq!(snapshot.records.len(), 1);
+        assert_eq!(snapshot.last_sequence, 1);
+        assert!(
+            root.join("records").join("snapshot.sobj").exists(),
+            "snapshot should be written under records/"
+        );
+        assert!(
+            !root
+                .join("records")
+                .join("segments")
+                .join("0000000000000001.sobjlog")
+                .exists(),
+            "compaction should remove replayed segment files"
+        );
+        let reopened = DurableMemoryStore::new(&root);
+        assert_eq!(
+            reopened
+                .records_for_scope(&MemoryScope::Cluster)
+                .expect("records")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn durable_store_ignores_trailing_partial_log_record() {
+        let root = temp_memory_root("sinomo-memory-partial-log");
+        let store = DurableMemoryStore::new(&root);
+        let record = store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "Ignore partial tail records",
+                Vec::new(),
+                TrustDomain::new("trust.local").expect("trust"),
+                OffsetDateTime::now_utc(),
+            )
+            .expect("write");
+        {
+            use std::io::Write as _;
+            let mut log = fs::OpenOptions::new()
+                .append(true)
+                .open(
+                    root.join("records")
+                        .join("segments")
+                        .join("0000000000000001.sobjlog"),
+                )
+                .expect("open log");
+            log.write_all(&16_u32.to_be_bytes()).expect("length");
+            log.write_all(b"partial").expect("partial bytes");
+        }
+
+        let reopened = DurableMemoryStore::new(&root);
+        let records = reopened
+            .records_for_scope(&MemoryScope::Cluster)
+            .expect("records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].memory_id, record.memory_id);
     }
 }
