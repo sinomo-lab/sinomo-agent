@@ -54,6 +54,23 @@ The design is influenced by several agent-memory patterns:
 - Multi-agent shared-memory work highlights leakage, stale propagation,
   contradiction persistence, and provenance collapse as first-class risks:
   <https://arxiv.org/abs/2606.24535>.
+- Long-term memory benchmarks such as LongMemEval, LoCoMo, and BEAM motivate
+  explicit coverage for information extraction, multi-session reasoning,
+  knowledge updates, temporal reasoning, abstention, and compression under very
+  long interaction histories:
+  <https://github.com/xiaowu0162/longmemeval>,
+  <https://snap-research.github.io/locomo/>, and
+  <https://github.com/mohammadtavakoli78/BEAM>.
+- Agentic memory benchmarks such as MemoryAgentBench, MemoryArena, and
+  LongMemEval-V2 motivate testing whether prior experience changes later
+  actions, workflow choices, and multi-session task success:
+  <https://github.com/HUST-AI-HYZ/MemoryAgentBench>,
+  <https://arxiv.org/abs/2602.16313>, and
+  <https://github.com/xiaowu0162/LongMemEval-V2>.
+- RAG evaluation work such as RAGAS motivates separating retrieval quality from
+  answer quality through context precision, recall, faithfulness, and answer
+  relevance style measurements:
+  <https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_precision/>.
 
 Sinomo should adopt the durable patterns and avoid the common failure mode where
 "memory" becomes an opaque bag of mutable summaries.
@@ -265,6 +282,53 @@ Memory context blocks should preserve cache friendliness:
 
 Context reports should include memory source counts, byte counts, retrieval
 criteria, and omitted-memory reasons.
+
+## Evaluation
+
+Memory evaluation is part of the architecture because memory failures are often
+model-facing rather than pure storage bugs. Sinomo evaluates memory on four
+axes:
+
+| Axis | What it checks |
+|---|---|
+| Retrieval quality | Relevant memory is selected with low noise, bounded latency, stable ordering, and clear omission reasons |
+| Downstream model usefulness | Retrieved memory improves answers, citations, abstention, temporal/update correctness, and action choices |
+| Governance and scope correctness | Private or stale memory does not leak, superseded records are handled, and every model-facing block carries source references |
+| Operational and cache efficiency | Memory blocks remain stable and append-friendly, selected bytes stay bounded, and compaction preserves provenance |
+
+The test layers are deliberately separated:
+
+- `sinomo-memory` Rust tests validate deterministic store, replay, index,
+  scope, byte-limit, supersession, consolidation, and replication invariants.
+- Cheap cluster sanity checks should verify that configured memory scopes can be
+  written, replayed, queried, and included in context without expensive model
+  calls.
+- Expensive live/model checks belong in `sinomo-benchmarks`, where they can run
+  against real providers and emit scorecard artifacts without becoming normal
+  unit-test gates.
+
+The optional benchmark plan `agent-memory-quality` uses
+`modules/benchmark/sinomo-benchmarks/agent/run_memory_eval.py`. Its checked-in
+scenarios cover information extraction, multi-session reasoning, knowledge
+update supersession, temporal reasoning, scope-boundary abstention, and
+procedural workflow recall. Plan and fixture modes are deterministic:
+
+```bash
+python3 modules/benchmark/sinomo-benchmarks/agent/run_memory_eval.py --mode plan
+python3 modules/benchmark/sinomo-benchmarks/agent/run_memory_eval.py --mode fixture --summary-out benchmark-results/agent-memory/fixture-summary.json
+```
+
+Live runs call the configured Sinomo agent and score marker use, memory ID
+citations, forbidden leakage, source-reference coverage, retrieval recall, and
+cache churn:
+
+```bash
+python3 modules/benchmark/sinomo-benchmarks/agent/run_memory_eval.py --mode run --provider codex --model gpt-5.2-codex --summary-out benchmark-results/agent-memory/summary.json --progress-out benchmark-results/agent-memory/progress.jsonl
+```
+
+These scorecards are evaluation evidence. They should inform regressions,
+release gates, and architecture work, but they should not replace deterministic
+store tests or context-assembly trace inspection.
 
 ## Consolidation
 

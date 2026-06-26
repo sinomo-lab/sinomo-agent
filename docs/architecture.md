@@ -1055,6 +1055,15 @@ Memory writes should be selective. Events should be promoted when they are
 salient, repeated, unresolved, user-important, needed for future planning,
 linked to task success/failure, or required for safety and auditability.
 
+Memory evaluation is layered. `sinomo-memory` tests cover deterministic store,
+scope, replay, supersession, consolidation, and replication invariants. Cheap
+cluster sanity checks should exercise configured memory visibility without
+expensive provider calls. Expensive live/model evaluation belongs in
+`sinomo-benchmarks`; the optional `agent-memory-quality` plan runs
+`modules/benchmark/sinomo-benchmarks/agent/run_memory_eval.py` to score
+retrieval quality, model usefulness, governance/scope behavior, and
+cache-friendly context stability against real models.
+
 ## Storage, Routing, and Sync
 
 The base runtime should avoid required external stateful dependencies. Early

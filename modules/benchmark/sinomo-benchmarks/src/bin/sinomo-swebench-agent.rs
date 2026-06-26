@@ -3,7 +3,7 @@ use sinomo_agent::{
     Agent, AgentConfig, AgentContextBudget, AgentLoopInput, AgentModelEvent, AgentOp, AgentRole,
     AgentRun, AgentRunModelMetrics, AgentSession, AgentSessionRuntime, AgentStopReason,
     AgentStoragePaths, AgentToolPairIntegrity, AgentToolRegistry, AgentToolStatus,
-    AgentToolSurface, BoundedContext, FileAgentTraceStore, InteractionModel, InteractionSession,
+    AgentToolSurface, FileAgentTraceStore, InteractionModel, InteractionSession,
     InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig,
     default_coding_agent_tools, user_interaction_input_event,
 };
@@ -12,7 +12,6 @@ use sinomo_lm::{
     ProviderAccountConfig, complete_configured_model_request_with_account, load_model_config,
     normalize_model_provider, provider_account_config,
 };
-use sinomo_runtime::core::ContextPacket;
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::node::NodeId;
@@ -439,11 +438,6 @@ fn benchmark_agent(
 fn agent_loop_input(session: &InteractionSession, message: &str) -> AgentLoopInput {
     let latest_event = user_interaction_input_event(session, message);
     AgentLoopInput {
-        context: BoundedContext {
-            session_id: session.session_id.clone(),
-            events: Vec::new(),
-            packet: ContextPacket::default(),
-        },
         session: session.clone(),
         latest_event,
         async_update: None,
