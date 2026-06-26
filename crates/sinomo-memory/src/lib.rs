@@ -3906,6 +3906,41 @@ mod tests {
         path
     }
 
+    fn trust_local() -> TrustDomain {
+        TrustDomain::new("trust.local").expect("trust")
+    }
+
+    fn fixed_time(nanos: i64) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("time")
+            + time::Duration::nanoseconds(nanos)
+    }
+
+    fn selected_memory_ids(result: &MemoryRetrievalResult) -> Vec<MemoryId> {
+        result
+            .records
+            .iter()
+            .map(|record| record.record.memory_id.clone())
+            .collect()
+    }
+
+    fn assert_source_ref(source_refs: &[MemorySourceRef], kind: &str, value: &str) {
+        assert!(
+            source_refs
+                .iter()
+                .any(|source| source.kind == kind && source.value == value),
+            "missing source ref {kind}={value}"
+        );
+    }
+
+    fn assert_noncanonical_derived(error: MemoryError, expected_kind: &'static str) {
+        match error {
+            MemoryError::NonCanonicalDerivedMemoryId { kind, .. } => {
+                assert_eq!(kind, expected_kind)
+            }
+            other => panic!("expected non-canonical {expected_kind} id, got {other:?}"),
+        }
+    }
+
     #[test]
     fn hot_memory_keeps_bounded_recent_events() {
         let mut hot = HotMemory::new(2);
@@ -4239,6 +4274,819 @@ mod tests {
             MemoryScope::Cluster
         ));
         assert_eq!(unauthorized.report.filtered.len(), records.len() - 1);
+    }
+
+    #[test]
+    fn durable_store_does_not_treat_session_as_visibility_scope() {
+        let root = temp_memory_root("sinomo-memory-session-not-scope");
+        let store = DurableMemoryStore::new(&root);
+        let session_id = SessionId::from_legacy_named("sess_shared").expect("session");
+        let session_ref = MemorySourceRef::new("session", session_id.to_string());
+        let cluster = store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "Cluster-visible memory with session provenance",
+                vec![session_ref.clone()],
+                trust_local(),
+                fixed_time(1),
+            )
+            .expect("cluster record");
+        let hidden_agent = store
+            .put_record(
+                MemoryScope::Agent {
+                    agent_id: "agent_a".to_string(),
+                },
+                MemoryTier::Warm,
+                "Agent-private memory with matching session provenance",
+                vec![session_ref.clone()],
+                trust_local(),
+                fixed_time(2),
+            )
+            .expect("agent record");
+        let hidden_chat = store
+            .put_record(
+                MemoryScope::Chat {
+                    chat_id: "chat_a".to_string(),
+                },
+                MemoryTier::Warm,
+                "Chat memory with matching session provenance",
+                vec![session_ref.clone()],
+                trust_local(),
+                fixed_time(3),
+            )
+            .expect("chat record");
+        let hidden_task = store
+            .put_record(
+                MemoryScope::Task {
+                    task_id: "task_a".to_string(),
+                },
+                MemoryTier::Warm,
+                "Task memory with matching session provenance",
+                vec![session_ref],
+                trust_local(),
+                fixed_time(4),
+            )
+            .expect("task record");
+
+        let result = store
+            .retrieve(&MemoryQuery {
+                session_id: Some(session_id),
+                max_records: 16,
+                max_bytes: 64 * 1024,
+                ..MemoryQuery::default()
+            })
+            .expect("retrieve");
+
+        assert_eq!(selected_memory_ids(&result), vec![cluster.memory_id]);
+        for hidden in [hidden_agent, hidden_chat, hidden_task] {
+            assert!(
+                result
+                    .report
+                    .filtered
+                    .iter()
+                    .any(|entry| entry.memory_id == hidden.memory_id),
+                "expected session-provenance-only record to be filtered"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_store_retrieval_enforces_byte_limit_and_audits_only_selected() {
+        let root = temp_memory_root("sinomo-memory-byte-limit");
+        let store = DurableMemoryStore::new(&root);
+        let small = store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "Small byte bounded memory",
+                Vec::new(),
+                trust_local(),
+                fixed_time(1),
+            )
+            .expect("small record");
+        let large = store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "Large byte bounded memory ".repeat(512),
+                Vec::new(),
+                trust_local(),
+                fixed_time(2),
+            )
+            .expect("large record");
+        let small_bytes = serde_json::to_vec(&small).expect("serialize").len();
+
+        let result = store
+            .retrieve(&MemoryQuery {
+                max_records: 8,
+                max_bytes: small_bytes,
+                ..MemoryQuery::default()
+            })
+            .expect("retrieve");
+
+        assert_eq!(selected_memory_ids(&result), vec![small.memory_id.clone()]);
+        assert_eq!(result.report.selected_bytes, small_bytes);
+        assert!(result.report.omitted.iter().any(|entry| {
+            entry.memory_id == large.memory_id && entry.reason == "byte limit reached"
+        }));
+        let retrieval_accesses = store
+            .access_records()
+            .expect("access records")
+            .into_iter()
+            .filter(|record| record.operation == MemoryAccessOperation::Retrieval)
+            .collect::<Vec<_>>();
+        assert_eq!(retrieval_accesses.len(), 1);
+        assert_eq!(retrieval_accesses[0].memory_ids, vec![small.memory_id]);
+    }
+
+    #[test]
+    fn durable_store_retrieval_order_is_stable_after_irrelevant_append() {
+        let root = temp_memory_root("sinomo-memory-cache-stability");
+        let store = DurableMemoryStore::new(&root);
+        let first = store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "Stable prefix memory one",
+                Vec::new(),
+                trust_local(),
+                fixed_time(1),
+            )
+            .expect("first record");
+        let second = store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "Stable prefix memory two",
+                Vec::new(),
+                trust_local(),
+                fixed_time(2),
+            )
+            .expect("second record");
+        let query = MemoryQuery {
+            max_records: 2,
+            max_bytes: 64 * 1024,
+            ..MemoryQuery::default()
+        };
+        let before = selected_memory_ids(&store.retrieve(&query).expect("retrieve before"));
+
+        let later = store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "Later appended cluster memory should not churn the selected prefix",
+                Vec::new(),
+                trust_local(),
+                fixed_time(3),
+            )
+            .expect("later record");
+        store
+            .put_record(
+                MemoryScope::Agent {
+                    agent_id: "other-agent".to_string(),
+                },
+                MemoryTier::Warm,
+                "Filtered agent-private memory should not churn the selected prefix",
+                Vec::new(),
+                trust_local(),
+                fixed_time(4),
+            )
+            .expect("filtered record");
+
+        assert_eq!(
+            before,
+            vec![first.memory_id.clone(), second.memory_id.clone()]
+        );
+        let after_result = store.retrieve(&query).expect("retrieve after");
+        assert_eq!(selected_memory_ids(&after_result), before);
+        assert!(after_result.report.omitted.iter().any(|entry| {
+            entry.memory_id == later.memory_id && entry.reason == "record limit reached"
+        }));
+
+        let report = evaluate_memory_retrieval(
+            &store,
+            &MemoryEvaluationSuite {
+                cases: vec![MemoryEvaluationCase {
+                    name: "stable prefix after append".to_string(),
+                    query,
+                    expected_memory_ids: before.clone(),
+                    forbidden_memory_ids: vec![later.memory_id],
+                    expected_superseded_memory_ids: Vec::new(),
+                    required_source_refs: Vec::new(),
+                    previous_included_memory_ids: before,
+                }],
+            },
+        )
+        .expect("evaluate");
+        assert_eq!(report.summary.cache_churn_records, 0);
+        assert_eq!(report.summary.passed_cases, 1);
+    }
+
+    #[test]
+    fn durable_store_records_retrieval_access_with_full_query_provenance() {
+        let root = temp_memory_root("sinomo-memory-query-provenance");
+        let store = DurableMemoryStore::new(&root);
+        store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "Deployment recovery memory selected by task hint",
+                Vec::new(),
+                trust_local(),
+                fixed_time(1),
+            )
+            .expect("record");
+        let session_id = SessionId::from_legacy_named("sess_query_provenance").expect("session");
+
+        store
+            .retrieve(&MemoryQuery {
+                session_id: Some(session_id.clone()),
+                agent_id: Some("agent_a".to_string()),
+                chat_id: Some("chat_a".to_string()),
+                channel_id: Some("channel_a".to_string()),
+                task_id: Some("task_a".to_string()),
+                workspace_id: Some("workspace_a".to_string()),
+                user_id: Some("user_a".to_string()),
+                team_id: Some("team_a".to_string()),
+                task_hint: Some("deployment recovery".to_string()),
+                max_records: 8,
+                max_bytes: 64 * 1024,
+            })
+            .expect("retrieve");
+
+        let retrieval_access = store
+            .access_records()
+            .expect("access records")
+            .into_iter()
+            .find(|record| record.operation == MemoryAccessOperation::Retrieval)
+            .expect("retrieval access");
+        assert_source_ref(
+            &retrieval_access.source_refs,
+            "session",
+            &session_id.to_string(),
+        );
+        assert_source_ref(&retrieval_access.source_refs, "agent", "agent_a");
+        assert_source_ref(&retrieval_access.source_refs, "chat", "chat_a");
+        assert_source_ref(&retrieval_access.source_refs, "channel", "channel_a");
+        assert_source_ref(&retrieval_access.source_refs, "task", "task_a");
+        assert_source_ref(&retrieval_access.source_refs, "workspace", "workspace_a");
+        assert_source_ref(&retrieval_access.source_refs, "user", "user_a");
+        assert_source_ref(&retrieval_access.source_refs, "team", "team_a");
+        assert_source_ref(
+            &retrieval_access.source_refs,
+            "task_hint",
+            "deployment recovery",
+        );
+    }
+
+    #[test]
+    fn durable_store_rejects_non_canonical_base_and_derived_ids() {
+        let root = temp_memory_root("sinomo-memory-noncanonical");
+        let store = DurableMemoryStore::new(&root);
+        let mut bad_record = MemoryRecord::new(
+            MemoryScope::Cluster,
+            MemoryTier::Warm,
+            "Non-canonical memory id",
+            Vec::new(),
+            trust_local(),
+            fixed_time(1),
+        );
+        bad_record.memory_id = MemoryId::from_legacy_named("bad_memory_id").expect("id");
+        assert!(matches!(
+            store
+                .write_record(bad_record)
+                .expect_err("bad memory id should be rejected"),
+            MemoryError::NonCanonicalMemoryId { .. }
+        ));
+
+        let first = store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "First canonical source",
+                Vec::new(),
+                trust_local(),
+                fixed_time(2),
+            )
+            .expect("first");
+        let second = store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "Second canonical source",
+                Vec::new(),
+                trust_local(),
+                fixed_time(3),
+            )
+            .expect("second");
+
+        let mut link = MemoryLinkRecord::new(
+            first.memory_id.clone(),
+            second.memory_id.clone(),
+            MemoryLinkRelation::Related,
+            Vec::new(),
+            fixed_time(4),
+        );
+        link.link_id = Id::from_legacy_named("bad_link_id").expect("id");
+        assert_noncanonical_derived(
+            store
+                .write_link(link)
+                .expect_err("bad link id should be rejected"),
+            "memory-link",
+        );
+
+        let mut supersession = MemorySupersessionRecord::new(
+            first.memory_id.clone(),
+            second.memory_id.clone(),
+            "replacement",
+            Vec::new(),
+            fixed_time(5),
+        );
+        supersession.supersession_id = Id::from_legacy_named("bad_supersession_id").expect("id");
+        assert_noncanonical_derived(
+            store
+                .write_supersession(supersession)
+                .expect_err("bad supersession id should be rejected"),
+            "memory-supersession",
+        );
+
+        let mut consolidation = MemoryConsolidationRecord::new(
+            second.memory_id.clone(),
+            vec![first.memory_id.clone(), second.memory_id.clone()],
+            Vec::new(),
+            fixed_time(6),
+        );
+        consolidation.consolidation_id = Id::from_legacy_named("bad_consolidation_id").expect("id");
+        assert_noncanonical_derived(
+            store
+                .write_consolidation(consolidation)
+                .expect_err("bad consolidation id should be rejected"),
+            "memory-consolidation",
+        );
+
+        let mut job = MemoryConsolidationJobRecord::new(
+            MemoryConsolidationJobKind::Reflection,
+            MemoryScope::Cluster,
+            MemoryTier::Cold,
+            "Reflect on sources",
+            vec![first.memory_id.clone()],
+            Vec::new(),
+            fixed_time(7),
+        );
+        job.job_id = Id::from_legacy_named("bad_job_id").expect("id");
+        assert_noncanonical_derived(
+            store
+                .write_consolidation_job(job)
+                .expect_err("bad job id should be rejected"),
+            "memory-consolidation-job",
+        );
+
+        let job = store
+            .schedule_consolidation_job(
+                MemoryConsolidationJobKind::Reflection,
+                MemoryScope::Cluster,
+                MemoryTier::Cold,
+                "Reflect on sources",
+                vec![first.memory_id.clone()],
+                Vec::new(),
+                fixed_time(8),
+            )
+            .expect("job");
+        let mut status = MemoryConsolidationJobStatusRecord::new(
+            job.job_id,
+            MemoryConsolidationJobStatus::Running,
+            "running",
+            None,
+            Vec::new(),
+            fixed_time(9),
+        );
+        status.status_id = Id::from_legacy_named("bad_status_id").expect("id");
+        assert_noncanonical_derived(
+            store
+                .record_consolidation_job_status(status)
+                .expect_err("bad status id should be rejected"),
+            "memory-consolidation-job-status",
+        );
+
+        let mut access = MemoryAccessRecord::new(
+            MemoryAccessOperation::ContextInclusion,
+            vec![first.memory_id],
+            "included",
+            Vec::new(),
+            fixed_time(10),
+        );
+        access.access_id = Id::from_legacy_named("bad_access_id").expect("id");
+        assert_noncanonical_derived(
+            store
+                .write_access_record(access)
+                .expect_err("bad access id should be rejected"),
+            "memory-access",
+        );
+    }
+
+    #[test]
+    fn durable_store_duplicate_writes_are_idempotent() {
+        let root = temp_memory_root("sinomo-memory-idempotent");
+        let store = DurableMemoryStore::new(&root);
+        let first = MemoryRecord::new(
+            MemoryScope::Cluster,
+            MemoryTier::Warm,
+            "Idempotent first record",
+            Vec::new(),
+            trust_local(),
+            fixed_time(1),
+        );
+        let second = MemoryRecord::new(
+            MemoryScope::Cluster,
+            MemoryTier::Warm,
+            "Idempotent second record",
+            Vec::new(),
+            trust_local(),
+            fixed_time(2),
+        );
+        store.write_record(first.clone()).expect("first write");
+        store.write_record(first.clone()).expect("duplicate first");
+        store.write_record(second.clone()).expect("second write");
+        store
+            .write_record(second.clone())
+            .expect("duplicate second");
+
+        let link = MemoryLinkRecord::new(
+            first.memory_id.clone(),
+            second.memory_id.clone(),
+            MemoryLinkRelation::Related,
+            Vec::new(),
+            fixed_time(3),
+        );
+        store.write_link(link.clone()).expect("link");
+        store.write_link(link.clone()).expect("duplicate link");
+
+        let access = MemoryAccessRecord::new(
+            MemoryAccessOperation::ContextInclusion,
+            vec![first.memory_id.clone(), second.memory_id.clone()],
+            "context inclusion",
+            Vec::new(),
+            fixed_time(4),
+        );
+        store
+            .write_access_record(access.clone())
+            .expect("access record");
+        store
+            .write_access_record(access.clone())
+            .expect("duplicate access record");
+
+        assert_eq!(
+            store
+                .records_for_scope(&MemoryScope::Cluster)
+                .expect("records")
+                .len(),
+            2
+        );
+        assert_eq!(store.link_records().expect("links").len(), 1);
+        assert_eq!(
+            store
+                .access_records()
+                .expect("access")
+                .iter()
+                .filter(|record| record.access_id == access.access_id)
+                .count(),
+            1
+        );
+        let index = store
+            .load_index()
+            .expect("load index")
+            .expect("index exists");
+        assert_eq!(
+            index
+                .entries
+                .iter()
+                .filter(|entry| entry.memory_id == first.memory_id)
+                .count(),
+            1
+        );
+        assert_eq!(
+            index
+                .derived_entries
+                .iter()
+                .filter(|entry| entry.derived_id == link.link_id)
+                .count(),
+            1
+        );
+        assert_eq!(
+            index
+                .derived_entries
+                .iter()
+                .filter(|entry| entry.derived_id == access.access_id)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn durable_store_replays_snapshot_plus_later_log_segments() {
+        let root = temp_memory_root("sinomo-memory-snapshot-tail");
+        let store = DurableMemoryStore::new(&root);
+        let before_snapshot = store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "Record before compaction",
+                Vec::new(),
+                trust_local(),
+                fixed_time(1),
+            )
+            .expect("before snapshot");
+        store.compact().expect("compact");
+        let after_snapshot = store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "Record after compaction",
+                Vec::new(),
+                trust_local(),
+                fixed_time(2),
+            )
+            .expect("after snapshot");
+        let link = store
+            .write_link(MemoryLinkRecord::new(
+                before_snapshot.memory_id.clone(),
+                after_snapshot.memory_id.clone(),
+                MemoryLinkRelation::Related,
+                Vec::new(),
+                fixed_time(3),
+            ))
+            .expect("link");
+
+        let reopened = DurableMemoryStore::new(&root);
+        let records = reopened
+            .records_for_scope(&MemoryScope::Cluster)
+            .expect("records");
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            reopened.link_records().expect("links")[0].link_id,
+            link.link_id
+        );
+        let index = reopened
+            .load_index()
+            .expect("load index")
+            .expect("index exists");
+        let before_entry = index
+            .entries
+            .iter()
+            .find(|entry| entry.memory_id == before_snapshot.memory_id)
+            .expect("before entry");
+        assert!(before_entry.path.starts_with("records/snapshot.sobj#"));
+        let after_entry = index
+            .entries
+            .iter()
+            .find(|entry| entry.memory_id == after_snapshot.memory_id)
+            .expect("after entry");
+        assert!(after_entry.path.starts_with("records/segments/"));
+        assert!(index.derived_entries.iter().any(|entry| {
+            entry.derived_id == link.link_id && entry.path.starts_with("records/segments/")
+        }));
+    }
+
+    #[test]
+    fn durable_store_latest_supersession_wins_and_chains_filter_cleanly() {
+        let root = temp_memory_root("sinomo-memory-supersession-chain");
+        let store = DurableMemoryStore::new(&root);
+        let original = store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "Original recovery note",
+                Vec::new(),
+                trust_local(),
+                fixed_time(1),
+            )
+            .expect("original");
+        let intermediate = store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "Intermediate recovery note",
+                Vec::new(),
+                trust_local(),
+                fixed_time(2),
+            )
+            .expect("intermediate");
+        let latest = store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "Latest recovery note",
+                Vec::new(),
+                trust_local(),
+                fixed_time(3),
+            )
+            .expect("latest");
+        store
+            .supersede_record(
+                original.memory_id.clone(),
+                intermediate.memory_id.clone(),
+                "intermediate replaced original",
+                Vec::new(),
+                fixed_time(4),
+            )
+            .expect("original to intermediate");
+        let original_to_latest = store
+            .supersede_record(
+                original.memory_id.clone(),
+                latest.memory_id.clone(),
+                "latest replaced original",
+                Vec::new(),
+                fixed_time(5),
+            )
+            .expect("original to latest");
+        store
+            .supersede_record(
+                intermediate.memory_id.clone(),
+                latest.memory_id.clone(),
+                "latest replaced intermediate",
+                Vec::new(),
+                fixed_time(6),
+            )
+            .expect("intermediate to latest");
+
+        let result = store.retrieve(&MemoryQuery::default()).expect("retrieve");
+
+        assert_eq!(selected_memory_ids(&result), vec![latest.memory_id.clone()]);
+        assert!(
+            !result
+                .records
+                .iter()
+                .any(|record| record.record.memory_id == original.memory_id)
+        );
+        assert!(
+            !result
+                .records
+                .iter()
+                .any(|record| record.record.memory_id == intermediate.memory_id)
+        );
+        assert!(result.report.superseded.iter().any(|trace| {
+            trace.memory_id == original.memory_id
+                && trace.superseded_by == latest.memory_id
+                && trace.supersession_id == original_to_latest.supersession_id
+        }));
+        assert!(result.report.superseded.iter().any(|trace| {
+            trace.memory_id == intermediate.memory_id && trace.superseded_by == latest.memory_id
+        }));
+    }
+
+    #[test]
+    fn durable_store_consolidation_does_not_grant_source_scope_visibility() {
+        let root = temp_memory_root("sinomo-memory-consolidation-visibility");
+        let store = DurableMemoryStore::new(&root);
+        let private_source = store
+            .put_record(
+                MemoryScope::Agent {
+                    agent_id: "agent_private".to_string(),
+                },
+                MemoryTier::Warm,
+                "Agent-private lesson source",
+                Vec::new(),
+                trust_local(),
+                fixed_time(1),
+            )
+            .expect("private source");
+        let (task_summary, consolidation) = store
+            .consolidate_records(
+                MemoryScope::Task {
+                    task_id: "task_shared".to_string(),
+                },
+                MemoryTier::Cold,
+                "Task-visible derived lesson",
+                vec![private_source.memory_id.clone()],
+                vec![MemorySourceRef::new("task", "task_shared")],
+                trust_local(),
+                fixed_time(2),
+            )
+            .expect("consolidation");
+
+        let result = store
+            .retrieve(&MemoryQuery {
+                task_id: Some("task_shared".to_string()),
+                max_records: 8,
+                max_bytes: 64 * 1024,
+                ..MemoryQuery::default()
+            })
+            .expect("retrieve");
+
+        assert_eq!(selected_memory_ids(&result), vec![task_summary.memory_id]);
+        assert!(result.report.filtered.iter().any(|entry| {
+            entry.memory_id == private_source.memory_id
+                && entry.reason == "scope not visible for query"
+        }));
+        assert_source_ref(
+            &result.records[0].record.source_refs,
+            "memory",
+            &private_source.memory_id.to_string(),
+        );
+        assert_eq!(
+            consolidation.source_memory_ids,
+            vec![private_source.memory_id]
+        );
+    }
+
+    #[test]
+    fn durable_store_rebuilds_indexes_from_snapshot_plus_tail() {
+        let root = temp_memory_root("sinomo-memory-index-snapshot-tail");
+        let store = DurableMemoryStore::new(&root);
+        let first = store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "alpha index source",
+                Vec::new(),
+                trust_local(),
+                fixed_time(1),
+            )
+            .expect("first");
+        let second = store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "beta index source",
+                Vec::new(),
+                trust_local(),
+                fixed_time(2),
+            )
+            .expect("second");
+        let compacted_link = store
+            .write_link(MemoryLinkRecord::new(
+                first.memory_id.clone(),
+                second.memory_id.clone(),
+                MemoryLinkRelation::Related,
+                Vec::new(),
+                fixed_time(3),
+            ))
+            .expect("compacted link");
+        store.compact().expect("compact");
+        let third = store
+            .put_record(
+                MemoryScope::Cluster,
+                MemoryTier::Warm,
+                "gamma index source",
+                Vec::new(),
+                trust_local(),
+                fixed_time(4),
+            )
+            .expect("third");
+        let tail_link = store
+            .write_link(MemoryLinkRecord::new(
+                second.memory_id.clone(),
+                third.memory_id.clone(),
+                MemoryLinkRelation::Related,
+                Vec::new(),
+                fixed_time(5),
+            ))
+            .expect("tail link");
+        let tail_supersession = store
+            .supersede_record(
+                first.memory_id.clone(),
+                third.memory_id.clone(),
+                "gamma replaces alpha",
+                Vec::new(),
+                fixed_time(6),
+            )
+            .expect("tail supersession");
+
+        let embedding_index = store
+            .rebuild_embedding_index(&TokenHashEmbeddingIndexProvider::default(), fixed_time(7))
+            .expect("embedding index");
+        assert_eq!(embedding_index.embeddings.len(), 3);
+        for memory_id in [&first.memory_id, &second.memory_id, &third.memory_id] {
+            assert!(
+                embedding_index
+                    .embeddings
+                    .iter()
+                    .any(|entry| &entry.memory_id == memory_id),
+                "missing embedding for {memory_id}"
+            );
+        }
+
+        let graph_index = store
+            .rebuild_graph_index(&LocalMemoryGraphIndexProvider)
+            .expect("graph index");
+        assert_eq!(graph_index.nodes.len(), 3);
+        assert!(graph_index.edges.iter().any(|edge| {
+            edge.derived_id == compacted_link.link_id
+                && edge.from_memory_id == first.memory_id
+                && edge.to_memory_id == second.memory_id
+        }));
+        assert!(graph_index.edges.iter().any(|edge| {
+            edge.derived_id == tail_link.link_id
+                && edge.from_memory_id == second.memory_id
+                && edge.to_memory_id == third.memory_id
+        }));
+        assert!(graph_index.edges.iter().any(|edge| {
+            edge.derived_id == tail_supersession.supersession_id
+                && edge.from_memory_id == first.memory_id
+                && edge.to_memory_id == third.memory_id
+                && edge.relation == "superseded-by"
+        }));
     }
 
     #[test]
