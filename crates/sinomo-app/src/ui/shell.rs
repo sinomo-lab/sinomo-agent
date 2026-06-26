@@ -292,12 +292,17 @@ impl Widget for Shell {
                 } else {
                     false
                 };
-                if files_changed {
+                let chat_changed = if self.shared.is_ready() {
+                    self.shared.chat_mut().pump_delete()
+                } else {
+                    false
+                };
+                if files_changed || chat_changed {
                     ctx.request_measure();
                     ctx.request_arrange();
                     ctx.request_semantics();
                 }
-                if changed || device_changed || files_changed {
+                if changed || device_changed || files_changed || chat_changed {
                     ctx.request_paint();
                 }
             }

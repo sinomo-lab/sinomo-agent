@@ -180,25 +180,19 @@ pub fn delete(data_dir: &SinomoDataDir, id: &str) -> std::io::Result<()> {
             "invalid chat id",
         ));
     }
+    let browser = SifsBrowser::open(data_dir)
+        .map_err(|detail| std::io::Error::new(std::io::ErrorKind::Other, detail))?;
     let deleted_unix = now_unix();
-    let mut record = load_sifs_record(data_dir, id).unwrap_or_else(|| StoredSessionRecord {
-        meta: SessionMeta {
-            id: id.to_string(),
-            title: "Deleted chat".to_string(),
-            updated_unix: deleted_unix,
-            message_count: 0,
-            title_source: None,
-            deleted_unix: None,
-        },
-        transcript: StoredTranscript::default(),
-    });
-    record.meta.updated_unix = deleted_unix;
-    record.meta.title = "Deleted chat".to_string();
-    record.meta.message_count = 0;
-    record.meta.title_source = None;
-    record.meta.deleted_unix = Some(deleted_unix);
-    record.transcript = StoredTranscript::default();
-    save_sifs(data_dir, id, &record.meta, &record.transcript)
+    let meta = SessionMeta {
+        id: id.to_string(),
+        title: "Deleted chat".to_string(),
+        updated_unix: deleted_unix,
+        message_count: 0,
+        title_source: None,
+        deleted_unix: Some(deleted_unix),
+    };
+    let transcript = StoredTranscript::default();
+    save_sifs_with_browser(&browser, id, &meta, &transcript)
         .map_err(|detail| std::io::Error::new(std::io::ErrorKind::Other, detail))
 }
 
@@ -230,6 +224,15 @@ fn save_sifs(
     transcript: &StoredTranscript,
 ) -> Result<(), String> {
     let browser = SifsBrowser::open(data_dir)?;
+    save_sifs_with_browser(&browser, id, meta, transcript)
+}
+
+fn save_sifs_with_browser(
+    browser: &SifsBrowser,
+    id: &str,
+    meta: &SessionMeta,
+    transcript: &StoredTranscript,
+) -> Result<(), String> {
     let record = StoredSessionRecord {
         meta: meta.clone(),
         transcript: transcript.clone(),
@@ -321,10 +324,14 @@ fn list_legacy_sifs(browser: &SifsBrowser) -> Vec<SessionMeta> {
 
 fn load_sifs_record(data_dir: &SinomoDataDir, id: &str) -> Option<StoredSessionRecord> {
     let browser = SifsBrowser::open(data_dir).ok()?;
-    if let Some(record) = load_flat_sifs_record(&browser, id) {
+    load_sifs_record_from_browser(&browser, id)
+}
+
+fn load_sifs_record_from_browser(browser: &SifsBrowser, id: &str) -> Option<StoredSessionRecord> {
+    if let Some(record) = load_flat_sifs_record(browser, id) {
         return Some(record);
     }
-    load_legacy_sifs_record(&browser, id)
+    load_legacy_sifs_record(browser, id)
 }
 
 fn read_sifs_index(browser: &SifsBrowser) -> Result<StoredSessionIndex, String> {
