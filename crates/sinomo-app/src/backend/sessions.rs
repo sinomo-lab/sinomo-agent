@@ -8,7 +8,7 @@
 //! the source of truth.
 
 use serde::{Deserialize, Serialize};
-use sinomo_cli::app_api::SifsBrowser;
+use sinomo_cli::app_api::{SifsBrowser, SifsEntry};
 use sinomo_runtime::local::SinomoDataDir;
 
 pub const SIFS_SESSIONS_ROOT: &str = "/services/sinomo-app/chat/sessions";
@@ -466,17 +466,22 @@ fn load_sifs_record_from_browser(browser: &SifsBrowser, id: &str) -> Option<Stor
 }
 
 fn load_flat_sifs_record(browser: &SifsBrowser, id: &str) -> Option<StoredSessionRecord> {
-    let bytes = browser.read_file(&sifs_session_file(id).ok()?).ok()?;
+    let file_path = sifs_session_file(id).ok()?;
+    let file_name = sifs_path_file_name(&file_path)?;
+    let service_entries = browser.list_if_exists("/services").ok()?;
+    let listed_path = listed_sifs_file_path(&service_entries, file_name)?;
+    let bytes = browser.read_file(&listed_path).ok()?;
     serde_json::from_slice::<StoredSessionRecord>(&bytes).ok()
 }
 
 fn load_legacy_sifs_record(browser: &SifsBrowser, id: &str) -> Option<StoredSessionRecord> {
     let dir = sifs_session_dir(id).ok()?;
-    let transcript_bytes = browser.read_file(&format!("{dir}/transcript.json")).ok()?;
+    let entries = browser.list_if_exists(&dir).ok()?;
+    let transcript_path = listed_sifs_file_path(&entries, "transcript.json")?;
+    let transcript_bytes = browser.read_file(&transcript_path).ok()?;
     let transcript = serde_json::from_slice::<StoredTranscript>(&transcript_bytes).ok()?;
-    let meta = browser
-        .read_file(&format!("{dir}/meta.json"))
-        .ok()
+    let meta = listed_sifs_file_path(&entries, "meta.json")
+        .and_then(|path| browser.read_file(&path).ok())
         .and_then(|bytes| serde_json::from_slice::<SessionMeta>(&bytes).ok())
         .unwrap_or_else(|| SessionMeta {
             id: id.to_string(),
@@ -487,6 +492,17 @@ fn load_legacy_sifs_record(browser: &SifsBrowser, id: &str) -> Option<StoredSess
             deleted_unix: None,
         });
     Some(StoredSessionRecord { meta, transcript })
+}
+
+fn sifs_path_file_name(path: &str) -> Option<&str> {
+    path.rsplit('/').next().filter(|name| !name.is_empty())
+}
+
+fn listed_sifs_file_path(entries: &[SifsEntry], name: &str) -> Option<String> {
+    entries
+        .iter()
+        .find(|entry| !entry.is_dir && entry.name == name)
+        .map(|entry| entry.path.clone())
 }
 
 fn sifs_session_file(id: &str) -> Result<String, String> {
@@ -577,6 +593,37 @@ mod tests {
                 .any(|session| session.id == meta.id && session.title == meta.title),
             "flat session records should be listed even when the index is absent"
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_sifs_transcript_without_meta_still_loads() {
+        let root = temp_data_dir("sifs-legacy-transcript");
+        let data_dir = SinomoDataDir::new(&root);
+        let id = "01hxy6qa9k0t9vr4g9n8d3q5d9";
+        let dir = sifs_session_dir(id).expect("session dir");
+        let transcript = StoredTranscript {
+            messages: vec![StoredMessage::new(
+                "user",
+                "legacy hello",
+                "user",
+                "message",
+            )],
+        };
+        let browser = SifsBrowser::open(&data_dir).expect("open sifs");
+        browser.create_dir_all(&dir).expect("create legacy dir");
+        browser
+            .write_file(
+                &format!("{dir}/transcript.json"),
+                &serde_json::to_vec(&transcript).expect("transcript json"),
+            )
+            .expect("write legacy transcript");
+
+        let loaded = load_sifs_record(&data_dir, id).expect("legacy transcript loads");
+        assert_eq!(loaded.meta.title, "New chat");
+        assert_eq!(loaded.meta.message_count, 1);
+        assert_eq!(loaded.transcript.messages[0].text, "legacy hello");
 
         let _ = fs::remove_dir_all(root);
     }
