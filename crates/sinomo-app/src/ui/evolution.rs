@@ -43,6 +43,7 @@ const ROW_H: f32 = 78.0;
 const SECTION_GAP: f32 = 16.0;
 const DECISION_SECTION_H: f32 = 146.0;
 const DECISION_BUTTON_H: f32 = 32.0;
+const READINESS_DETAIL_BUTTON_W: f32 = 136.0;
 const OBJECTIVE_PLACEHOLDER: &str = "Describe the improvement or task";
 const SCOPE_PLACEHOLDER: &str = "Optional: crates/sinomo-dfs/**, docs/**";
 
@@ -53,6 +54,7 @@ pub struct EvolutionState {
     pub scope_draft: String,
     pub target_ring_index: usize,
     pub start_advanced_open: bool,
+    pub readiness_details_open: bool,
     pub start_status: Option<String>,
     pub start_error: Option<String>,
     start_rx: Option<Receiver<EvolutionStartEvent>>,
@@ -73,6 +75,7 @@ impl EvolutionState {
             scope_draft: String::new(),
             target_ring_index: 1,
             start_advanced_open: false,
+            readiness_details_open: false,
             start_status: None,
             start_error: None,
             start_rx: None,
@@ -122,6 +125,10 @@ impl EvolutionState {
 
     pub fn toggle_start_advanced(&mut self) {
         self.start_advanced_open = !self.start_advanced_open;
+    }
+
+    pub fn set_readiness_details_open(&mut self, open: bool) {
+        self.readiness_details_open = open;
     }
 
     pub fn can_start(&self) -> bool {
@@ -337,6 +344,8 @@ pub fn view(shared: Shared) -> impl Widget {
 struct EvolutionView {
     shared: Shared,
     start: WidgetPod,
+    readiness_show: WidgetPod,
+    readiness_hide: WidgetPod,
     approve: WidgetPod,
     reject: WidgetPod,
     pump_alive: Cell<bool>,
@@ -347,6 +356,30 @@ impl EvolutionView {
     fn new(shared: Shared) -> Self {
         let reader = theme_reader(&shared);
         let start = WidgetPod::new(StartControls::new(shared.clone()));
+        let readiness_show = {
+            let s = shared.clone();
+            Button::new("Show details")
+                .icon(IconGlyph::ChevronDown)
+                .min_height(DECISION_BUTTON_H)
+                .theme_when(clone_reader(&reader))
+                .on_press_with_ctx(move |ctx| {
+                    s.evolution_mut().set_readiness_details_open(true);
+                    ctx.request_arrange();
+                    ctx.request_paint();
+                })
+        };
+        let readiness_hide = {
+            let s = shared.clone();
+            Button::new("Hide details")
+                .icon(IconGlyph::ChevronUp)
+                .min_height(DECISION_BUTTON_H)
+                .theme_when(clone_reader(&reader))
+                .on_press_with_ctx(move |ctx| {
+                    s.evolution_mut().set_readiness_details_open(false);
+                    ctx.request_arrange();
+                    ctx.request_paint();
+                })
+        };
         let approve = {
             let s = shared.clone();
             Button::new("Approve")
@@ -384,6 +417,8 @@ impl EvolutionView {
         Self {
             shared,
             start,
+            readiness_show: WidgetPod::new(readiness_show),
+            readiness_hide: WidgetPod::new(readiness_hide),
             approve: WidgetPod::new(approve),
             reject: WidgetPod::new(reject),
             pump_alive: Cell::new(false),
@@ -770,6 +805,35 @@ impl Widget for EvolutionView {
         );
         self.start
             .measure(ctx, Constraints::tight(rect_size(layout.start_controls)));
+        let (show_readiness_toggle, readiness_details_open) = {
+            let evolution = self.shared.evolution();
+            let selected_job = evolution
+                .selected
+                .and_then(|index| evolution.dashboard.jobs.get(index));
+            (
+                readiness_detail_toggle_visible(&evolution.dashboard, selected_job),
+                evolution.readiness_details_open,
+            )
+        };
+        if let Some(rail) = layout.rail.filter(|_| show_readiness_toggle) {
+            let rect = readiness_detail_toggle_rect(rail, readiness_details_open);
+            if readiness_details_open {
+                self.readiness_show
+                    .measure(ctx, Constraints::tight(Size::ZERO));
+                self.readiness_hide
+                    .measure(ctx, Constraints::tight(rect_size(rect)));
+            } else {
+                self.readiness_show
+                    .measure(ctx, Constraints::tight(rect_size(rect)));
+                self.readiness_hide
+                    .measure(ctx, Constraints::tight(Size::ZERO));
+            }
+        } else {
+            self.readiness_show
+                .measure(ctx, Constraints::tight(Size::ZERO));
+            self.readiness_hide
+                .measure(ctx, Constraints::tight(Size::ZERO));
+        }
         if let Some((approve, reject)) = layout.rail.and_then(decision_button_layout) {
             self.approve
                 .measure(ctx, Constraints::tight(rect_size(approve)));
@@ -787,6 +851,29 @@ impl Widget for EvolutionView {
         let advanced_open = self.shared.evolution().start_advanced_open;
         let layout = layout_for(bounds, advanced_open);
         self.start.arrange(ctx, layout.start_controls);
+        let (show_readiness_toggle, readiness_details_open) = {
+            let evolution = self.shared.evolution();
+            let selected_job = evolution
+                .selected
+                .and_then(|index| evolution.dashboard.jobs.get(index));
+            (
+                readiness_detail_toggle_visible(&evolution.dashboard, selected_job),
+                evolution.readiness_details_open,
+            )
+        };
+        if let Some(rail) = layout.rail.filter(|_| show_readiness_toggle) {
+            let rect = readiness_detail_toggle_rect(rail, readiness_details_open);
+            if readiness_details_open {
+                self.readiness_show.arrange(ctx, Rect::ZERO);
+                self.readiness_hide.arrange(ctx, rect);
+            } else {
+                self.readiness_show.arrange(ctx, rect);
+                self.readiness_hide.arrange(ctx, Rect::ZERO);
+            }
+        } else {
+            self.readiness_show.arrange(ctx, Rect::ZERO);
+            self.readiness_hide.arrange(ctx, Rect::ZERO);
+        }
         if let Some((approve, reject)) = layout.rail.and_then(decision_button_layout) {
             self.approve.arrange(ctx, approve);
             self.reject.arrange(ctx, reject);
@@ -799,12 +886,13 @@ impl Widget for EvolutionView {
     fn paint(&self, ctx: &mut PaintCtx) {
         let (theme, pal) = self.palette();
         let bounds = ctx.bounds();
-        let (dashboard, selected, advanced_open) = {
+        let (dashboard, selected, advanced_open, readiness_details_open) = {
             let state = self.shared.evolution();
             (
                 state.dashboard.clone(),
                 state.selected,
                 state.start_advanced_open,
+                state.readiness_details_open,
             )
         };
         let layout = layout_for(bounds, advanced_open);
@@ -834,7 +922,23 @@ impl Widget for EvolutionView {
                     deciding: state.is_deciding(),
                 }
             };
-            paint_rail(ctx, &theme, &pal, rail, &dashboard, selected_job, &action);
+            paint_rail(
+                ctx,
+                &theme,
+                &pal,
+                rail,
+                &dashboard,
+                selected_job,
+                &action,
+                readiness_details_open,
+            );
+            if readiness_detail_toggle_visible(&dashboard, selected_job) {
+                if readiness_details_open {
+                    self.readiness_hide.paint(ctx);
+                } else {
+                    self.readiness_show.paint(ctx);
+                }
+            }
             if selected_job.is_some() {
                 self.approve.paint(ctx);
                 self.reject.paint(ctx);
@@ -850,6 +954,22 @@ impl Widget for EvolutionView {
         );
         node.name = Some("Evolution dashboard".to_string());
         ctx.push(node);
+        let (dashboard, selected, readiness_details_open) = {
+            let state = self.shared.evolution();
+            (
+                state.dashboard.clone(),
+                state.selected,
+                state.readiness_details_open,
+            )
+        };
+        let selected_job = selected.and_then(|index| dashboard.jobs.get(index));
+        if readiness_detail_toggle_visible(&dashboard, selected_job) {
+            if readiness_details_open {
+                self.readiness_hide.semantics(ctx);
+            } else {
+                self.readiness_show.semantics(ctx);
+            }
+        }
         self.start.semantics(ctx);
         self.approve.semantics(ctx);
         self.reject.semantics(ctx);
@@ -857,12 +977,16 @@ impl Widget for EvolutionView {
 
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
         visitor.visit(&self.start);
+        visitor.visit(&self.readiness_show);
+        visitor.visit(&self.readiness_hide);
         visitor.visit(&self.approve);
         visitor.visit(&self.reject);
     }
 
     fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
         visitor.visit(&mut self.start);
+        visitor.visit(&mut self.readiness_show);
+        visitor.visit(&mut self.readiness_hide);
         visitor.visit(&mut self.approve);
         visitor.visit(&mut self.reject);
     }
@@ -950,6 +1074,28 @@ fn decision_button_layout(rail: Rect) -> Option<(Rect, Rect)> {
     let approve = Rect::new(section.x() + 12.0, button_y, button_w, DECISION_BUTTON_H);
     let reject = Rect::new(approve.max_x() + 8.0, button_y, button_w, DECISION_BUTTON_H);
     Some((approve, reject))
+}
+
+fn readiness_section_height(details_open: bool) -> f32 {
+    if details_open { 154.0 } else { 132.0 }
+}
+
+fn readiness_detail_toggle_rect(rail: Rect, details_open: bool) -> Rect {
+    let inner = rail.inflate(-PAD, -PAD);
+    let width = READINESS_DETAIL_BUTTON_W.min(inner.width());
+    Rect::new(
+        inner.x(),
+        inner.y() + 38.0 + readiness_section_height(details_open) + 10.0,
+        width,
+        DECISION_BUTTON_H,
+    )
+}
+
+fn readiness_detail_toggle_visible(
+    dashboard: &EvolutionDashboard,
+    selected_job: Option<&EvolutionJobSummary>,
+) -> bool {
+    selected_job.is_none() && !dashboard.source.trim().is_empty()
 }
 
 fn start_height_for(width: f32, advanced_open: bool) -> f32 {
@@ -1453,7 +1599,7 @@ fn paint_detail_empty(ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palet
     );
     widgets::draw_centered(
         ctx,
-        "Awaiting a persisted candidate record",
+        "Start or select a job to review progress",
         pal.text_style(theme, 13.0, FontWeight::NORMAL, pal.text_faint),
         panel.x() + panel.width() / 2.0,
         panel.y() + 58.0,
@@ -1682,6 +1828,7 @@ fn paint_rail(
     dashboard: &EvolutionDashboard,
     job: Option<&EvolutionJobSummary>,
     action: &DecisionActionStatus,
+    readiness_details_open: bool,
 ) {
     ctx.fill_rect(rect, pal.sidebar);
     widgets::hairline_left(ctx, rect, pal.border);
@@ -1693,17 +1840,13 @@ fn paint_rail(
         pal.text_style(theme, 15.0, FontWeight::SEMIBOLD, pal.text),
     );
     let Some(job) = job else {
-        let rows = [
-            ("Decision".to_string(), "no candidate selected".to_string()),
-            ("Artifacts".to_string(), "not available".to_string()),
-            ("Rollback".to_string(), "not available".to_string()),
-            ("Source".to_string(), tail_path(&dashboard.source, 72)),
-        ];
+        let rows = readiness_rows(dashboard, readiness_details_open);
+        let section_h = readiness_section_height(readiness_details_open);
         paint_rail_section(
             ctx,
             theme,
             pal,
-            Rect::new(inner.x(), inner.y() + 38.0, inner.width(), 132.0),
+            Rect::new(inner.x(), inner.y() + 38.0, inner.width(), section_h),
             "Readiness",
             &rows,
         );
@@ -1821,6 +1964,29 @@ fn paint_rail_section(
         y += 22.0;
     }
     rect.max_y()
+}
+
+fn readiness_rows(dashboard: &EvolutionDashboard, details_open: bool) -> Vec<(String, String)> {
+    let mut rows = vec![
+        ("Decision".to_string(), "select a candidate".to_string()),
+        ("Artifacts".to_string(), "shown after selection".to_string()),
+        ("Rollback".to_string(), "shown after selection".to_string()),
+        ("Source".to_string(), source_readiness_label(dashboard)),
+    ];
+    if details_open && !dashboard.source.trim().is_empty() {
+        rows.push(("Source path".to_string(), tail_path(&dashboard.source, 72)));
+    }
+    rows
+}
+
+fn source_readiness_label(dashboard: &EvolutionDashboard) -> String {
+    if dashboard.source.trim().is_empty() {
+        "unavailable".to_string()
+    } else if dashboard.error.is_some() {
+        "needs attention".to_string()
+    } else {
+        "ready".to_string()
+    }
 }
 
 fn evidence_rows(job: &EvolutionJobSummary) -> Vec<(String, String)> {
@@ -2139,6 +2305,76 @@ mod tests {
             !subtitle.contains(r"C:\Users"),
             "raw source paths belong in technical details, not the primary header"
         );
+    }
+
+    #[test]
+    fn readiness_rows_hide_source_path_until_details_open() {
+        let dashboard = EvolutionDashboard {
+            source: r"C:\Users\IX\.sinomo\evolution".to_string(),
+            error: None,
+            ..EvolutionDashboard::default()
+        };
+
+        let collapsed = readiness_rows(&dashboard, false);
+        let collapsed_text = collapsed
+            .iter()
+            .map(|(label, value)| format!("{label}: {value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(collapsed_text.contains("Source: ready"));
+        assert!(
+            !collapsed_text.contains(r"C:\Users"),
+            "collapsed readiness should not expose the local source path"
+        );
+
+        let expanded = readiness_rows(&dashboard, true);
+        let expanded_text = expanded
+            .iter()
+            .map(|(label, value)| format!("{label}: {value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(expanded_text.contains("Source path:"));
+        assert!(expanded_text.contains(r"C:\Users\IX\.sinomo\evolution"));
+    }
+
+    #[test]
+    fn readiness_details_button_toggles_source_details() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut evolution = shared.evolution_mut();
+            evolution.dashboard = EvolutionDashboard {
+                source: r"C:\Users\IX\.sinomo\evolution".to_string(),
+                jobs: Vec::new(),
+                error: None,
+            };
+            evolution.selected = None;
+            evolution.readiness_details_open = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Evolution readiness details")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Show details")
+            .click()?;
+        assert!(shared.evolution().readiness_details_open);
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Hide details")
+            .click()?;
+        assert!(!shared.evolution().readiness_details_open);
+
+        Ok(())
     }
 
     #[test]
