@@ -713,6 +713,22 @@ fn connection_issue_key(shared: &Shared) -> String {
         .join("\n")
 }
 
+fn connection_issue_summary(issue: &ConnectionIssue) -> &'static str {
+    match issue.tab {
+        Tab::Sinomo => "Chat history and agent channels need recovery.",
+        Tab::Files => "SIFS browsing cannot open through the daemon.",
+        _ => "A surface needs recovery.",
+    }
+}
+
+fn connection_issue_recovery_hint(issue: &ConnectionIssue) -> &'static str {
+    match issue.tab {
+        Tab::Sinomo => "Return to chat after credentials or SIFS access is fixed.",
+        Tab::Files => "Return to Files after credentials or SIFS access is fixed.",
+        _ => "Return to the affected surface after the issue is fixed.",
+    }
+}
+
 fn open_tab(shared: &Shared, tab: Tab) {
     shared.borrow_mut().active_tab = tab;
 }
@@ -971,6 +987,20 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
     let detail = issue.detail.clone();
     let tab = issue.tab;
     let action = issue.action;
+    let status = {
+        let s = shared.clone();
+        Label::new("Needs attention")
+            .font_size(12.0)
+            .color_when(move || palette(&s).warn)
+    };
+    let summary = muted_label(shared, connection_issue_summary(&issue)).font_size(12.0);
+    let recovery = muted_label(shared, connection_issue_recovery_hint(&issue)).font_size(12.0);
+    let detail_label = {
+        let s = shared.clone();
+        Label::new("Low-level detail")
+            .font_size(11.0)
+            .color_when(move || palette(&s).text_faint)
+    };
     let detail_field = {
         let name = match tab {
             Tab::Sinomo => "connection-chat-detail",
@@ -980,6 +1010,7 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
         SizedBox::new().height(68.0).with_child(
             TextArea::new(name)
                 .value(detail)
+                .read_only()
                 .theme_when(clone_reader(reader)),
         )
     };
@@ -994,11 +1025,23 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
             .theme_when(clone_reader(reader))
             .on_press(move || open_tab(&s, tab))
     };
+    let header = Stack::vertical()
+        .spacing(3.0)
+        .alignment(Alignment::Stretch)
+        .with_child(status)
+        .with_child(summary);
+    let action_row = Stack::vertical()
+        .spacing(5.0)
+        .alignment(Alignment::Start)
+        .with_child(button)
+        .with_child(recovery);
     let stack = Stack::vertical()
         .spacing(8.0)
-        .alignment(Alignment::Start)
+        .alignment(Alignment::Stretch)
+        .with_child(header)
+        .with_child(detail_label)
         .with_child(detail_field)
-        .with_child(button);
+        .with_child(action_row);
 
     FormRow::new(issue.title, stack)
         .stacked()
@@ -2555,11 +2598,19 @@ mod tests {
         let issues = connection_issues(&shared);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].title, "Chat sessions");
+        assert_eq!(
+            connection_issue_summary(&issues[0]),
+            "Chat history and agent channels need recovery."
+        );
 
         shared.files_mut().error = Some("device authorization was denied".to_string());
         let issues = connection_issues(&shared);
         assert_eq!(issues.len(), 2);
         assert_eq!(issues[1].title, "SIFS browser");
+        assert_eq!(
+            connection_issue_summary(&issues[1]),
+            "SIFS browsing cannot open through the daemon."
+        );
 
         shared.chat_mut().notice = None;
         shared.chat_mut().activity.push(ChatActivityEntry {
