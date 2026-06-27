@@ -723,7 +723,7 @@ impl Widget for EvolutionView {
                     deciding: state.is_deciding(),
                 }
             };
-            paint_rail(ctx, &theme, &pal, rail, selected_job, &action);
+            paint_rail(ctx, &theme, &pal, rail, &dashboard, selected_job, &action);
             if selected_job.is_some() {
                 self.approve.paint(ctx);
                 self.reject.paint(ctx);
@@ -877,16 +877,7 @@ fn paint_header(
         title,
     );
 
-    let subtitle = match &dashboard.error {
-        Some(error) => format!("local evidence unavailable - {}", compact(error, 110)),
-        None => format!(
-            "{} jobs - {} active - {} awaiting decision - source {}",
-            dashboard.jobs.len(),
-            dashboard.active_count(),
-            dashboard.awaiting_decision_count(),
-            tail_path(&dashboard.source, 42)
-        ),
-    };
+    let subtitle = evolution_header_subtitle(dashboard);
     widgets::draw_text_in(
         ctx,
         Rect::new(
@@ -1561,6 +1552,7 @@ fn paint_rail(
     theme: &sui::DefaultTheme,
     pal: &Palette,
     rect: Rect,
+    dashboard: &EvolutionDashboard,
     job: Option<&EvolutionJobSummary>,
     action: &DecisionActionStatus,
 ) {
@@ -1578,12 +1570,13 @@ fn paint_rail(
             ("Decision".to_string(), "no candidate selected".to_string()),
             ("Artifacts".to_string(), "not available".to_string()),
             ("Rollback".to_string(), "not available".to_string()),
+            ("Source".to_string(), tail_path(&dashboard.source, 72)),
         ];
         paint_rail_section(
             ctx,
             theme,
             pal,
-            Rect::new(inner.x(), inner.y() + 38.0, inner.width(), 108.0),
+            Rect::new(inner.x(), inner.y() + 38.0, inner.width(), 132.0),
             "Readiness",
             &rows,
         );
@@ -1880,6 +1873,23 @@ fn changed_files_summary(files: &[String]) -> String {
     }
 }
 
+fn evolution_header_subtitle(dashboard: &EvolutionDashboard) -> String {
+    match &dashboard.error {
+        Some(error) => format!("local evidence unavailable - {}", compact(error, 110)),
+        None => format!(
+            "{} jobs - {} active - {} awaiting decision - {}",
+            dashboard.jobs.len(),
+            dashboard.active_count(),
+            dashboard.awaiting_decision_count(),
+            if dashboard.source.trim().is_empty() {
+                "source unavailable"
+            } else {
+                "source ready"
+            }
+        ),
+    }
+}
+
 fn tail_path(path: &str, max: usize) -> String {
     if path.chars().count() <= max {
         path.to_string()
@@ -1956,6 +1966,27 @@ mod tests {
             "...s/01j9candidate"
         );
         assert_eq!(tail_path("/short/path", 18), "/short/path");
+    }
+
+    #[test]
+    fn evolution_header_subtitle_hides_source_path() {
+        let dashboard = EvolutionDashboard {
+            source: r"C:\Users\IX\.sinomo\evolution".to_string(),
+            jobs: vec![EvolutionJobSummary {
+                phase: EvolutionPhase::AwaitingDecision,
+                status_key: "awaiting-approval".to_string(),
+                ..EvolutionJobSummary::default()
+            }],
+            error: None,
+        };
+
+        let subtitle = evolution_header_subtitle(&dashboard);
+        assert!(subtitle.contains("1 jobs"));
+        assert!(subtitle.contains("source ready"));
+        assert!(
+            !subtitle.contains(r"C:\Users"),
+            "raw source paths belong in technical details, not the primary header"
+        );
     }
 
     #[test]
