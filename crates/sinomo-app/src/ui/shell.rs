@@ -18,10 +18,10 @@ use std::cell::Cell;
 
 use sui::{
     ArrangeCtx, Constraints, Event, EventCtx, EventPhase, FontWeight, Image, ImageFit, ImageHandle,
-    MeasureCtx, PaintCtx, PointerButton, PointerEventKind, Rect, SemanticsAction, SemanticsCtx,
-    SemanticsNode, SemanticsRole, SemanticsValue, SingleChild, Size, Spinner, SwitchView, TabBar,
-    ThemeShadow, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
-    WindowRenderOptions,
+    Insets, MeasureCtx, PaintCtx, PointerButton, PointerEventKind, Rect, SemanticsAction,
+    SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, SingleChild, Size, Spinner,
+    SwitchView, TabBar, ThemeShadow, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    WindowEvent, WindowRenderOptions,
 };
 
 use crate::state::{Shared, Tab};
@@ -196,11 +196,26 @@ fn build_tab_bar(shared: &Shared, compact: bool) -> TabBar {
         // changes so programmatic navigation keeps the chrome and content in sync.
         .selected(shared.active_tab().index())
         .gap(if compact { COMPACT_TAB_GAP } else { TAB_GAP })
-        .theme_when({
-            let s = shared.clone();
-            move || s.theme()
-        })
+        .theme_when(tab_bar_theme(shared, compact))
         .on_change(on_change)
+}
+
+fn tab_bar_theme(shared: &Shared, compact: bool) -> impl Fn() -> sui::DefaultTheme + 'static {
+    let s = shared.clone();
+    move || {
+        let mut theme = s.theme();
+        if compact {
+            theme.metrics.tab_min_width = 54.0;
+            theme.metrics.tab_padding = Insets {
+                left: 10.0,
+                top: 4.0,
+                right: 10.0,
+                bottom: 4.0,
+            };
+            theme.metrics.tab_gap = COMPACT_TAB_GAP;
+        }
+        theme
+    }
 }
 
 fn tab_label(tab: Tab, compact: bool) -> &'static str {
@@ -905,6 +920,11 @@ mod tests {
         assert!(
             tab_bar.bounds.max_x() <= 520.0 + 0.5,
             "tab bar should use the remaining title-bar width without running under right chrome: {:?}",
+            tab_bar.bounds
+        );
+        assert!(
+            tab_bar.bounds.width() <= 390.0,
+            "compact tab labels should fit at their natural width instead of being clipped to the viewport: {:?}",
             tab_bar.bounds
         );
         assert!(

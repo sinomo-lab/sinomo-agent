@@ -312,6 +312,7 @@ fn capture_settings_composed() {
     // Wide, dark: master/detail with the Providers section showing in the detail pane.
     {
         let shared = boot(Tab::Settings);
+        shared.borrow_mut().theme_mode = AppThemeMode::Dark;
         shared.settings_mut().selected = Some(SettingsSection::Providers);
         let runtime = build_runtime(shared).expect("build runtime");
         let app = TestApp::from_runtime(runtime).expect("headless test app");
