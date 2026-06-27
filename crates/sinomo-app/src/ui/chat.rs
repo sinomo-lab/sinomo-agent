@@ -2706,6 +2706,32 @@ fn activity_visible_detail(text: &str) -> String {
     connection_recovery_display_detail(text).unwrap_or_else(|| compact_line(text, 96))
 }
 
+fn activity_status_summary(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let summary = if lower.contains("agent channel")
+        || lower.contains("channel create")
+        || lower.contains("channel store")
+    {
+        Some("Channel storage needs recovery")
+    } else if lower.contains("chat list") {
+        Some("Chat history needs recovery")
+    } else if lower.contains("chat save") {
+        Some("Chat history cannot be saved")
+    } else if lower.contains("daemon") || lower.contains("cluster") {
+        Some("Cluster service needs attention")
+    } else if text_mentions_connection_problem(text) {
+        Some("Chat storage needs recovery")
+    } else if lower.contains("runtime control metadata") && lower.contains("detached") {
+        Some("Runtime controls need refresh")
+    } else {
+        None
+    };
+
+    summary
+        .map(str::to_string)
+        .unwrap_or_else(|| activity_visible_detail(text))
+}
+
 fn transcript_message_display_text(message: &ChatMessage) -> String {
     if message.kind != ChatMessageKind::Error {
         return if message.text.is_empty() {
@@ -3939,7 +3965,7 @@ impl Widget for RuntimeOverview {
             chat.control.steering_count + chat.control.follow_up_count
         );
         let monitor = if matches!(health.tone, ActivityTone::Warn | ActivityTone::Bad) {
-            let visible_detail = activity_visible_detail(&health.detail);
+            let visible_detail = activity_status_summary(&health.detail);
             format!("{} · {monitor}", compact_line(&visible_detail, 42))
         } else {
             monitor
@@ -4482,7 +4508,7 @@ fn draw_activity_status_card(
     draw_health_chip(ctx, pal, theme, chip, health);
 
     let detail_style = pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text);
-    let visible_detail = activity_visible_detail(&health.detail);
+    let visible_detail = activity_status_summary(&health.detail);
     widgets::draw_text_in(
         ctx,
         Rect::new(rect.x() + 22.0, rect.y() + 36.0, rect.width() - 34.0, 16.0),
@@ -7442,6 +7468,27 @@ mod tests {
         assert!(!visible.contains("file storage"));
 
         let neutral = activity_visible_detail("context assembled: 4.0 KB");
+        assert_eq!(neutral, "context assembled: 4.0 KB");
+    }
+
+    #[test]
+    fn activity_status_summary_keeps_health_card_actionable() {
+        assert_eq!(
+            activity_status_summary("chat list: device authorization was denied"),
+            "Chat history needs recovery"
+        );
+        assert_eq!(
+            activity_status_summary(
+                "chat connection: Agent channel storage could not open through SIFS; device authorization was denied.",
+            ),
+            "Channel storage needs recovery"
+        );
+        assert_eq!(
+            activity_status_summary("runtime control metadata is detached"),
+            "Runtime controls need refresh"
+        );
+
+        let neutral = activity_status_summary("context assembled: 4.0 KB");
         assert_eq!(neutral, "context assembled: 4.0 KB");
     }
 
