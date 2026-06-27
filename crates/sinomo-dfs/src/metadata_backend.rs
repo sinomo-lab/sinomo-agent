@@ -3287,7 +3287,6 @@ impl LocalShardedMetadataBackend {
                     if let Some(target_object) = self
                         .shard_backend(&target_shard_id)?
                         .get_object(&object.object_id)?
-                        && target_object != object
                         && target_object.kind != DfsObjectKind::Tombstone
                     {
                         let target_object_shard_id = self.select_shard_id_for_path(
@@ -12761,11 +12760,24 @@ mod tests {
         let mut stale = object(version("version_1"));
         stale.path = "/services/readme.md".to_string();
         let mut current = stale.clone();
-        current.version = version("version_2");
-        current.content_hash = Some("blake3:current".to_string());
+        current.content_hash = Some("blake3:current-object".to_string());
         current.content_size_bytes = Some(7);
-        current.modified_at_unix_nanos = 2;
-        current.changed_at_unix_nanos = 2;
+        let stale_version = DfsObjectVersionRecord {
+            file_system_id: stale.file_system_id.clone(),
+            object_id: stale.object_id.clone(),
+            version: stale.version.clone(),
+            content_hash: Some("blake3:stale-version".to_string()),
+            size_bytes: Some(13),
+            locations: stale.current_locations.clone(),
+            created_by_event_id: stale.created_by_event_id.clone(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            visible: true,
+        };
+        let current_version = DfsObjectVersionRecord {
+            content_hash: current.content_hash.clone(),
+            size_bytes: current.content_size_bytes,
+            ..stale_version.clone()
+        };
         {
             let mut root_only = LocalShardedMetadataBackend::new(
                 &root,
@@ -12774,6 +12786,9 @@ mod tests {
             .expect("root-only sharded backend");
             root_only.put_file_system(&file_system).expect("filesystem");
             root_only.put_object(&stale).expect("stale root object");
+            root_only
+                .put_version(&stale_version)
+                .expect("stale root version");
         }
 
         let mut backend = LocalShardedMetadataBackend::new(
@@ -12799,6 +12814,9 @@ mod tests {
             services
                 .put_object(&current)
                 .expect("current services object");
+            services
+                .put_version(&current_version)
+                .expect("current services version");
         }
 
         let report = backend
@@ -12838,6 +12856,12 @@ mod tests {
                 &normalize_path(&current.path),
                 &DfsMetadataShardId::new("services")
             ))
+        );
+        assert_eq!(
+            backend
+                .get_version(&current.object_id, &current.version)
+                .expect("current version"),
+            Some(current_version)
         );
 
         cleanup(&root);
