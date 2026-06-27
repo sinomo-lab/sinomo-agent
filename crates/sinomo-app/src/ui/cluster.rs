@@ -162,8 +162,18 @@ impl Widget for ClusterView {
 
                 let snapshot = self.shared.cluster().snapshot.clone();
                 let topology = build_topology(&snapshot);
-                if self.shared.cluster().selected.is_some()
-                    && detail_toggle_rect(ctx.bounds()).contains(pointer.position)
+                let selected = self.shared.cluster().selected.clone();
+                if overview_detail_toggle_visible(&snapshot, selected.as_ref())
+                    && overview_detail_toggle_rect(ctx.bounds(), overview_warning_action)
+                        .contains(pointer.position)
+                {
+                    let open = self.shared.cluster().diagnostics_open;
+                    self.shared.cluster_mut().diagnostics_open = !open;
+                    ctx.request_paint();
+                    ctx.set_handled();
+                    return;
+                }
+                if selected.is_some() && detail_toggle_rect(ctx.bounds()).contains(pointer.position)
                 {
                     let open = self.shared.cluster().diagnostics_open;
                     self.shared.cluster_mut().diagnostics_open = !open;
@@ -239,9 +249,13 @@ impl Widget for ClusterView {
         node.name = Some("Cluster topology. Select a node or LAN segment for details.".to_string());
         ctx.push(node);
 
-        let show_warning_action = {
+        let (show_warning_action, show_overview_details, diagnostics_open) = {
             let cluster = self.shared.cluster();
-            cluster.selected.is_none() && !cluster.snapshot.warnings.is_empty()
+            (
+                cluster.selected.is_none() && !cluster.snapshot.warnings.is_empty(),
+                overview_detail_toggle_visible(&cluster.snapshot, cluster.selected.as_ref()),
+                cluster.diagnostics_open,
+            )
         };
         if show_warning_action {
             let mut action = SemanticsNode::new(
@@ -252,6 +266,23 @@ impl Widget for ClusterView {
             action.parent = Some(ctx.widget_id());
             action.name = Some("Connection settings".to_string());
             action.description = Some("Open connection settings for cluster warning".to_string());
+            action.actions = vec![SemanticsAction::Activate];
+            ctx.push(action);
+        }
+        if show_overview_details {
+            let mut action = SemanticsNode::new(
+                cluster_detail_toggle_widget_id(ctx.widget_id()),
+                SemanticsRole::Button,
+                overview_detail_toggle_rect(ctx.bounds(), show_warning_action),
+            );
+            action.parent = Some(ctx.widget_id());
+            action.name = Some(if diagnostics_open {
+                "Hide diagnostics".to_string()
+            } else {
+                "Show diagnostics".to_string()
+            });
+            action.description =
+                Some("Show technical cluster source and identifier details".to_string());
             action.actions = vec![SemanticsAction::Activate];
             ctx.push(action);
         }
@@ -284,7 +315,7 @@ fn paint_header(
         snapshot.nodes.len(),
         links,
         topology.lan_segments.len(),
-        snapshot.source
+        source_summary(&snapshot.source)
     );
     let style = pal.text_style(theme, 13.0, FontWeight::NORMAL, pal.text_muted);
     widgets::draw_text_in(
@@ -491,8 +522,9 @@ fn paint_detail_panel(
 
     let lines = selection
         .map(|selection| detail_lines(snapshot, topology, selection, diagnostics_open))
-        .unwrap_or_else(|| overview_lines(snapshot, topology));
+        .unwrap_or_else(|| overview_lines(snapshot, topology, diagnostics_open));
     let show_warning_action = selection.is_none() && !snapshot.warnings.is_empty();
+    let show_overview_details = overview_detail_toggle_visible(snapshot, selection);
     let title_style = pal.text_style(theme, 15.0, FontWeight::SEMIBOLD, pal.text);
     let label_style = pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text_muted);
     let value_style = pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text);
@@ -513,8 +545,8 @@ fn paint_detail_panel(
         cy += 32.0;
         let content_bottom = if selection.is_some() {
             detail_toggle_rect(bounds).y() - 8.0
-        } else if show_warning_action {
-            cluster_warning_action_rect(bounds).y() - 8.0
+        } else if show_warning_action || show_overview_details {
+            overview_action_row_y(bounds) - 8.0
         } else {
             panel.max_y() - PANEL_PAD
         };
@@ -583,12 +615,27 @@ fn paint_detail_panel(
             detail_toggle_rect(bounds),
             diagnostics_open,
         );
-    } else if show_warning_action {
-        paint_cluster_warning_action(ctx, theme, pal, cluster_warning_action_rect(bounds));
+    } else {
+        if show_warning_action {
+            paint_cluster_warning_action(ctx, theme, pal, cluster_warning_action_rect(bounds));
+        }
+        if show_overview_details {
+            paint_detail_toggle(
+                ctx,
+                theme,
+                pal,
+                overview_detail_toggle_rect(bounds, show_warning_action),
+                diagnostics_open,
+            );
+        }
     }
 }
 
-fn overview_lines(snapshot: &ClusterSnapshot, topology: &Topology) -> Vec<String> {
+fn overview_lines(
+    snapshot: &ClusterSnapshot,
+    topology: &Topology,
+    diagnostics_open: bool,
+) -> Vec<String> {
     let online = snapshot
         .nodes
         .iter()
@@ -605,24 +652,8 @@ fn overview_lines(snapshot: &ClusterSnapshot, topology: &Topology) -> Vec<String
         .filter(|edge| !edge.virtual_lan)
         .count();
     let mut lines = vec![
-        "Cluster details".to_string(),
-        format!("source: {}", snapshot.source),
-        format!(
-            "cluster: {}",
-            snapshot
-                .cluster_id
-                .as_deref()
-                .map(|id| short(id, 28))
-                .unwrap_or("-".into())
-        ),
-        format!(
-            "local: {}",
-            snapshot
-                .local_node_id
-                .as_deref()
-                .map(|id| short(id, 28))
-                .unwrap_or("-".into())
-        ),
+        "Cluster overview".to_string(),
+        format!("source: {}", source_summary(&snapshot.source)),
         format!("nodes: {online} / {} online", snapshot.nodes.len()),
         format!("public: {public} reachable"),
         format!("topology: {direct_edges} edges"),
@@ -631,9 +662,29 @@ fn overview_lines(snapshot: &ClusterSnapshot, topology: &Topology) -> Vec<String
     if let Some(warning) = snapshot.warnings.first() {
         lines.push(format!("warning: {}", short(warning, 42)));
     }
+    if diagnostics_open {
+        lines.push(format!("diagnostics: {}", snapshot.source));
+        lines.push(format!(
+            "cluster: {}",
+            snapshot
+                .cluster_id
+                .as_deref()
+                .map(|id| short(id, 42))
+                .unwrap_or("-".into())
+        ));
+        lines.push(format!(
+            "local: {}",
+            snapshot
+                .local_node_id
+                .as_deref()
+                .map(|id| short(id, 42))
+                .unwrap_or("-".into())
+        ));
+    } else {
+        lines.push("hint: Show diagnostics for source and cluster identifiers.".to_string());
+    }
     lines.push(
-        "hint: Select a node or LAN segment for process, endpoint, and reachability details."
-            .to_string(),
+        "hint: Select a node or LAN segment for process and reachability details.".to_string(),
     );
     lines
 }
@@ -730,6 +781,23 @@ fn node_detail_lines(node: &ClusterNodeInfo, diagnostics_open: bool) -> Vec<Stri
     lines
 }
 
+fn source_summary(source: &str) -> &'static str {
+    if source.starts_with("daemon ") {
+        "daemon connected"
+    } else if source.trim().is_empty() {
+        "not available"
+    } else {
+        "snapshot loaded"
+    }
+}
+
+fn overview_detail_toggle_visible(
+    _snapshot: &ClusterSnapshot,
+    selection: Option<&ClusterSelection>,
+) -> bool {
+    selection.is_none()
+}
+
 fn detail_panel_rect(bounds: Rect) -> Rect {
     let panel_w = PANEL_W.min((bounds.width() - PAD * 2.0).max(220.0));
     Rect::new(
@@ -754,14 +822,34 @@ fn cluster_warning_action_rect(bounds: Rect) -> Rect {
     let panel = detail_panel_rect(bounds);
     Rect::new(
         panel.x() + PANEL_PAD,
-        panel.max_y() - PANEL_PAD - DETAIL_BUTTON_H,
+        overview_action_row_y(bounds),
         172.0,
         DETAIL_BUTTON_H,
     )
 }
 
+fn overview_detail_toggle_rect(bounds: Rect, has_warning_action: bool) -> Rect {
+    let panel = detail_panel_rect(bounds);
+    let width = 144.0;
+    let x = if has_warning_action {
+        (cluster_warning_action_rect(bounds).max_x() + 8.0).min(panel.max_x() - PANEL_PAD - width)
+    } else {
+        panel.x() + PANEL_PAD
+    };
+    Rect::new(x, overview_action_row_y(bounds), width, DETAIL_BUTTON_H)
+}
+
+fn overview_action_row_y(bounds: Rect) -> f32 {
+    let panel = detail_panel_rect(bounds);
+    panel.max_y() - PANEL_PAD - DETAIL_BUTTON_H
+}
+
 fn cluster_warning_action_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
     sui::WidgetId::new(parent.get().wrapping_mul(41).wrapping_add(9_301))
+}
+
+fn cluster_detail_toggle_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
+    sui::WidgetId::new(parent.get().wrapping_mul(41).wrapping_add(9_307))
 }
 
 fn paint_detail_toggle(
@@ -1214,13 +1302,38 @@ mod tests {
             ..ClusterSnapshot::default()
         };
         let topology = build_topology(&snapshot);
-        let lines = overview_lines(&snapshot, &topology);
+        let lines = overview_lines(&snapshot, &topology, false);
 
-        assert_eq!(lines[0], "Cluster details");
+        assert_eq!(lines[0], "Cluster overview");
         assert!(lines.iter().any(|line| line == "nodes: 2 / 2 online"));
         assert!(lines.iter().any(|line| line == "public: 1 reachable"));
         assert!(lines.iter().any(|line| line == "topology: 1 edges"));
+        assert!(lines.iter().any(|line| line == "source: daemon connected"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "hint: Show diagnostics for source and cluster identifiers.")
+        );
         assert!(lines.iter().any(|line| line.starts_with("hint: Select")));
+        assert!(
+            !lines.iter().any(|line| line.contains("127.0.0.1")),
+            "raw daemon source belongs in diagnostics"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("cluster-test")),
+            "cluster identifiers belong in diagnostics"
+        );
+
+        let open = overview_lines(&snapshot, &topology, true);
+        assert!(
+            open.iter()
+                .any(|line| line == "diagnostics: daemon 127.0.0.1:21353")
+        );
+        assert!(
+            open.iter()
+                .any(|line| line == "cluster: cluster-test-123456789")
+        );
+        assert!(open.iter().any(|line| line == "local: node-public"));
     }
 
     #[test]
@@ -1259,6 +1372,44 @@ mod tests {
             shared.settings().selected,
             Some(SettingsSection::Connection)
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn overview_diagnostics_toggle_reveals_technical_details() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut cluster = shared.cluster_mut();
+            cluster.snapshot = ClusterSnapshot {
+                cluster_id: Some("cluster-test-123456789".to_string()),
+                local_node_id: Some("node-a".to_string()),
+                source: "daemon 127.0.0.1:21353".to_string(),
+                nodes: vec![node("node-a")],
+                ..ClusterSnapshot::default()
+            };
+            cluster.selected = None;
+            cluster.diagnostics_open = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Cluster overview diagnostics")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Show diagnostics")
+            .with_description("Show technical cluster source and identifier details")
+            .click()?;
+
+        assert!(shared.cluster().diagnostics_open);
 
         Ok(())
     }
