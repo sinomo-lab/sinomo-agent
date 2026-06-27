@@ -46,6 +46,7 @@ const DECISION_BUTTON_H: f32 = 32.0;
 const READINESS_DETAIL_BUTTON_W: f32 = 136.0;
 const OBJECTIVE_PLACEHOLDER: &str = "Describe the improvement or task";
 const SCOPE_PLACEHOLDER: &str = "Optional: crates/sinomo-dfs/**, docs/**";
+const EVOLUTION_EMPTY_SUBTITLE: &str = "Describe an objective above, then Start.";
 
 pub struct EvolutionState {
     pub dashboard: EvolutionDashboard,
@@ -1369,7 +1370,7 @@ fn paint_queue(
         let message = dashboard
             .error
             .as_deref()
-            .unwrap_or("No self-evolution jobs have been recorded");
+            .unwrap_or("Start a job to create the first candidate");
         widgets::draw_centered(
             ctx,
             "No candidates",
@@ -1599,7 +1600,7 @@ fn paint_detail_empty(ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palet
     );
     widgets::draw_centered(
         ctx,
-        "Start or select a job to review progress",
+        EVOLUTION_EMPTY_SUBTITLE,
         pal.text_style(theme, 13.0, FontWeight::NORMAL, pal.text_faint),
         panel.x() + panel.width() / 2.0,
         panel.y() + 58.0,
@@ -1614,11 +1615,18 @@ fn paint_detail_empty(ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palet
             panel.width() - 28.0,
             60.0,
         ),
-        &[
-            ("Queue".to_string(), "no candidate selected".to_string()),
-            ("Evidence".to_string(), "not available".to_string()),
-        ],
+        &empty_detail_rows(),
     );
+}
+
+fn empty_detail_rows() -> Vec<(String, String)> {
+    vec![
+        ("Next".to_string(), "describe the improvement above".to_string()),
+        (
+            "Options".to_string(),
+            "scope and target ring are optional".to_string(),
+        ),
+    ]
 }
 
 fn paint_status_pill(
@@ -2305,6 +2313,25 @@ mod tests {
             !subtitle.contains(r"C:\Users"),
             "raw source paths belong in technical details, not the primary header"
         );
+    }
+
+    #[test]
+    fn empty_evolution_state_points_to_start_workflow() {
+        assert_eq!(
+            EVOLUTION_EMPTY_SUBTITLE,
+            "Describe an objective above, then Start."
+        );
+        let rows = empty_detail_rows();
+        assert!(rows
+            .iter()
+            .any(|(label, value)| label == "Next" && value == "describe the improvement above"));
+        assert!(rows
+            .iter()
+            .any(|(label, value)| label == "Options" && value.contains("optional")));
+        assert!(rows.iter().all(|(_, value)| !value.contains("not available")));
+        assert!(rows
+            .iter()
+            .all(|(_, value)| !value.contains("no candidate selected")));
     }
 
     #[test]
