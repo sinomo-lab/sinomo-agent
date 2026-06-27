@@ -1195,6 +1195,23 @@ fn render_mode_to_index(mode: AppRenderMode) -> usize {
     }
 }
 
+fn render_mode_hint(mode: AppRenderMode) -> &'static str {
+    match mode {
+        AppRenderMode::Automatic => {
+            "Uses the display's preferred color mode. Choose Force SDR when screenshots or remote captures look washed out or too bright."
+        }
+        AppRenderMode::ForceSdr => {
+            "Recommended for debugging, screen sharing, and capture tools that do not handle HDR surfaces correctly."
+        }
+        AppRenderMode::PreferWideGamut => {
+            "Uses wide-gamut output when supported while avoiding HDR brightness behavior."
+        }
+        AppRenderMode::PreferHdr => {
+            "Requests HDR output when the display supports it; useful for final visual checks on HDR-capable screens."
+        }
+    }
+}
+
 fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let mode_index = mode_to_index(shared.borrow().theme_mode);
     let tab_bar = {
@@ -1222,19 +1239,46 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
                 s.set_render_mode(index_to_render_mode(index));
             })
     };
-    let body = FieldGroup::new()
-        .spacing(6.0)
-        .with_child(
-            FormRow::new("Theme", tab_bar)
-                .inline()
-                .theme_when(clone_reader(reader)),
-        )
+    let theme_body = FieldGroup::new().spacing(6.0).with_child(
+        FormRow::new("Theme", tab_bar)
+            .inline()
+            .theme_when(clone_reader(reader)),
+    );
+    let theme_section = FormSection::new("Appearance", theme_body)
+        .description("Choose the app theme used by every tab.")
+        .theme_when(clone_reader(reader));
+
+    let current_render_mode = shared.render_mode();
+    let render_body = FieldGroup::new()
+        .spacing(8.0)
+        .with_child(value_row(
+            shared,
+            reader,
+            "Current mode",
+            current_render_mode.label(),
+        ))
         .with_child(
             FormRow::new("Color output", render_select)
                 .inline()
                 .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormRow::new(
+                "Guidance",
+                muted_label(shared, render_mode_hint(current_render_mode)),
+            )
+            .stacked()
+            .theme_when(clone_reader(reader)),
         );
-    FormSection::new("Appearance", body).theme_when(clone_reader(reader))
+    let render_section = FormSection::new("Rendering", render_body)
+        .description("Controls the desktop surface color space. This affects the window renderer, not cluster data or model output.")
+        .theme_when(clone_reader(reader));
+
+    Stack::vertical()
+        .spacing(12.0)
+        .alignment(Alignment::Stretch)
+        .with_child(theme_section)
+        .with_child(render_section)
 }
 
 fn section_connection(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -3476,6 +3520,51 @@ mod tests {
             .with_name("Remove account")
             .expect()
             .to_be_visible()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn appearance_settings_explain_force_sdr_rendering() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            app.render_mode = AppRenderMode::ForceSdr;
+            app.ready
+                .as_mut()
+                .expect("ready state")
+                .settings
+                .open(SettingsSection::Appearance);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings appearance")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert_eq!(
+            window.get_by_text("Rendering").count()?,
+            1,
+            "Appearance should expose render settings as a first-class section"
+        );
+        assert!(
+            window.get_by_text("Current mode").count()? >= 1,
+            "Rendering should show the currently active mode"
+        );
+        assert_eq!(
+            window
+                .get_by_text("Recommended for debugging, screen sharing, and capture tools that do not handle HDR surfaces correctly.")
+                .count()?,
+            1,
+            "Force SDR should explain why it is useful for screenshots and debugging"
+        );
 
         Ok(())
     }
