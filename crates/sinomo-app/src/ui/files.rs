@@ -722,12 +722,18 @@ impl InspectorView {
     /// A short, single-line summary used for change detection.
     fn summary(&self) -> String {
         let files = self.shared.files();
+        if files.loading {
+            return format!("loading|{}", files.path);
+        }
+        if let Some(error) = &files.error {
+            return format!("error|{}|{}", files.path, error);
+        }
         match files.selected_entry() {
             Some(entry) => format!(
                 "{}|{}|{}|{}",
                 entry.path, entry.is_dir, entry.is_link, files.clustered
             ),
-            None => "none".to_string(),
+            None => format!("unselected|{}|{}", files.path, files.entries.len()),
         }
     }
 }
@@ -769,13 +775,61 @@ impl Widget for InspectorView {
         widgets::draw_text_in(ctx, Rect::new(x, y, w, 18.0), "INSPECTOR", header);
         y += 30.0;
 
-        let Some(entry) = files.selected_entry() else {
-            let hint = pal.text_style(&theme, 13.0, FontWeight::NORMAL, pal.text_faint);
-            widgets::draw_text_in(
+        if files.loading {
+            self.state_panel(
                 ctx,
-                Rect::new(x, y + 8.0, w, 40.0),
-                "Select a file to see its SIFS placement.",
-                hint,
+                &theme,
+                &pal,
+                x,
+                y,
+                w,
+                "Loading SIFS",
+                &[
+                    ("Path", files.path.clone()),
+                    ("Authority", "SIFS through daemon".to_string()),
+                    ("Status", "opening distributed filesystem".to_string()),
+                ],
+            );
+            return;
+        }
+
+        if let Some(error) = &files.error {
+            self.state_panel(
+                ctx,
+                &theme,
+                &pal,
+                x,
+                y,
+                w,
+                "SIFS unavailable",
+                &[
+                    ("Reason", error.clone()),
+                    ("Authority", "SIFS through daemon".to_string()),
+                    ("Next", "open Connection settings".to_string()),
+                ],
+            );
+            return;
+        }
+
+        let Some(entry) = files.selected_entry() else {
+            let status = if files.entries.is_empty() {
+                "No entries in this directory"
+            } else {
+                "Select an object to inspect placement"
+            };
+            self.state_panel(
+                ctx,
+                &theme,
+                &pal,
+                x,
+                y,
+                w,
+                "SIFS browser",
+                &[
+                    ("Path", files.path.clone()),
+                    ("Entries", files.entries.len().to_string()),
+                    ("Status", status.to_string()),
+                ],
             );
             return;
         };
@@ -897,6 +951,54 @@ impl Widget for InspectorView {
 }
 
 impl InspectorView {
+    #[allow(clippy::too_many_arguments)]
+    fn state_panel(
+        &self,
+        ctx: &mut PaintCtx,
+        theme: &sui::DefaultTheme,
+        pal: &Palette,
+        x: f32,
+        y: f32,
+        w: f32,
+        title: &str,
+        rows: &[(&str, String)],
+    ) {
+        let row_h = 34.0;
+        let panel_h = 44.0 + row_h * rows.len() as f32;
+        let panel = Rect::new(x, y, w, panel_h);
+        widgets::round_panel(ctx, panel, pal.panel, pal.border, 8.0);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(
+                panel.x() + 12.0,
+                panel.y() + 10.0,
+                panel.width() - 24.0,
+                20.0,
+            ),
+            title,
+            pal.text_style(theme, 13.5, FontWeight::SEMIBOLD, pal.text),
+        );
+
+        let label_style = pal.text_style(theme, 10.5, FontWeight::MEDIUM, pal.text_faint);
+        let value_style = pal.text_style(theme, 11.5, FontWeight::NORMAL, pal.text);
+        let mut row_y = panel.y() + 38.0;
+        for (label, value) in rows {
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(panel.x() + 12.0, row_y, 78.0, 18.0),
+                label,
+                label_style.clone(),
+            );
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(panel.x() + 92.0, row_y, panel.width() - 104.0, 18.0),
+                &short(value, 36),
+                value_style.clone(),
+            );
+            row_y += row_h;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn info_row(
         &self,
@@ -1473,6 +1575,46 @@ mod tests {
             state.selected_entry().map(|e| e.name.as_str()),
             Some("a.txt")
         );
+    }
+
+    #[test]
+    fn inspector_summary_reflects_unavailable_state() {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/".to_string();
+            files.error = Some("device authorization was denied".to_string());
+        }
+
+        let inspector = InspectorView::new(shared);
+
+        assert_eq!(
+            inspector.summary(),
+            "error|/|device authorization was denied"
+        );
+    }
+
+    #[test]
+    fn inspector_summary_reflects_loading_and_empty_state() {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loading = true;
+            files.path = "/services".to_string();
+        }
+        let inspector = InspectorView::new(shared.clone());
+        assert_eq!(inspector.summary(), "loading|/services");
+
+        {
+            let mut files = shared.files_mut();
+            files.loading = false;
+            files.entries.clear();
+        }
+        assert_eq!(inspector.summary(), "unselected|/services|0");
     }
 
     #[test]
