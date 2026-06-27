@@ -3,15 +3,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use sui::{
-    ArrangeCtx, Color, Constraints, Event, EventCtx, FontWeight, MeasureCtx, PaintCtx, Path,
-    PathBuilder, Point, PointerButton, PointerEventKind, Rect, SemanticsCtx, SemanticsNode,
-    SemanticsRole, Size, StrokeStyle, Widget, WindowEvent,
+    ArrangeCtx, Color, Constraints, Event, EventCtx, FontWeight, IconGlyph, MeasureCtx, PaintCtx,
+    Path, PathBuilder, Point, PointerButton, PointerEventKind, Rect, SemanticsAction, SemanticsCtx,
+    SemanticsNode, SemanticsRole, Size, StrokeStyle, Widget, WindowEvent, draw_glyph,
 };
 
 use crate::backend::Backend;
 use crate::backend::cluster::{ClusterLinkInfo, ClusterNodeInfo, ClusterSnapshot};
-use crate::state::Shared;
+use crate::state::{Shared, Tab};
 use crate::theme::Palette;
+use crate::ui::settings::SettingsSection;
 use crate::ui::widgets;
 
 const HEADER_H: f32 = 78.0;
@@ -128,6 +129,14 @@ impl ClusterView {
         let pal = Palette::from_theme(&theme, widgets::theme_is_dark(&self.shared));
         (theme, pal)
     }
+
+    fn open_connection_settings(&self) {
+        let mut app = self.shared.borrow_mut();
+        app.active_tab = Tab::Settings;
+        if let Some(ready) = app.ready.as_mut() {
+            ready.settings.open(SettingsSection::Connection);
+        }
+    }
 }
 
 impl Widget for ClusterView {
@@ -138,6 +147,19 @@ impl Widget for ClusterView {
                     && pointer.button == Some(PointerButton::Primary)
                     && ctx.bounds().contains(pointer.position) =>
             {
+                let overview_warning_action = {
+                    let cluster = self.shared.cluster();
+                    cluster.selected.is_none() && !cluster.snapshot.warnings.is_empty()
+                };
+                if overview_warning_action
+                    && cluster_warning_action_rect(ctx.bounds()).contains(pointer.position)
+                {
+                    self.open_connection_settings();
+                    ctx.request_paint();
+                    ctx.set_handled();
+                    return;
+                }
+
                 let snapshot = self.shared.cluster().snapshot.clone();
                 let topology = build_topology(&snapshot);
                 if self.shared.cluster().selected.is_some()
@@ -216,6 +238,23 @@ impl Widget for ClusterView {
         );
         node.name = Some("Cluster topology. Select a node or LAN segment for details.".to_string());
         ctx.push(node);
+
+        let show_warning_action = {
+            let cluster = self.shared.cluster();
+            cluster.selected.is_none() && !cluster.snapshot.warnings.is_empty()
+        };
+        if show_warning_action {
+            let mut action = SemanticsNode::new(
+                cluster_warning_action_widget_id(ctx.widget_id()),
+                SemanticsRole::Button,
+                cluster_warning_action_rect(ctx.bounds()),
+            );
+            action.parent = Some(ctx.widget_id());
+            action.name = Some("Connection settings".to_string());
+            action.description = Some("Open connection settings for cluster warning".to_string());
+            action.actions = vec![SemanticsAction::Activate];
+            ctx.push(action);
+        }
     }
 }
 
@@ -453,6 +492,7 @@ fn paint_detail_panel(
     let lines = selection
         .map(|selection| detail_lines(snapshot, topology, selection, diagnostics_open))
         .unwrap_or_else(|| overview_lines(snapshot, topology));
+    let show_warning_action = selection.is_none() && !snapshot.warnings.is_empty();
     let title_style = pal.text_style(theme, 15.0, FontWeight::SEMIBOLD, pal.text);
     let label_style = pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text_muted);
     let value_style = pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text);
@@ -473,6 +513,8 @@ fn paint_detail_panel(
         cy += 32.0;
         let content_bottom = if selection.is_some() {
             detail_toggle_rect(bounds).y() - 8.0
+        } else if show_warning_action {
+            cluster_warning_action_rect(bounds).y() - 8.0
         } else {
             panel.max_y() - PANEL_PAD
         };
@@ -541,6 +583,8 @@ fn paint_detail_panel(
             detail_toggle_rect(bounds),
             diagnostics_open,
         );
+    } else if show_warning_action {
+        paint_cluster_warning_action(ctx, theme, pal, cluster_warning_action_rect(bounds));
     }
 }
 
@@ -706,6 +750,20 @@ fn detail_toggle_rect(bounds: Rect) -> Rect {
     )
 }
 
+fn cluster_warning_action_rect(bounds: Rect) -> Rect {
+    let panel = detail_panel_rect(bounds);
+    Rect::new(
+        panel.x() + PANEL_PAD,
+        panel.max_y() - PANEL_PAD - DETAIL_BUTTON_H,
+        172.0,
+        DETAIL_BUTTON_H,
+    )
+}
+
+fn cluster_warning_action_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
+    sui::WidgetId::new(parent.get().wrapping_mul(41).wrapping_add(9_301))
+}
+
 fn paint_detail_toggle(
     ctx: &mut PaintCtx,
     theme: &sui::DefaultTheme,
@@ -723,6 +781,27 @@ fn paint_detail_toggle(
             "Show diagnostics"
         },
         pal.text_style(theme, 11.5, FontWeight::MEDIUM, pal.text),
+    );
+}
+
+fn paint_cluster_warning_action(
+    ctx: &mut PaintCtx,
+    theme: &sui::DefaultTheme,
+    pal: &Palette,
+    rect: Rect,
+) {
+    widgets::round_panel(ctx, rect, pal.accent, pal.accent, 7.0);
+    draw_glyph(
+        ctx,
+        IconGlyph::Alert,
+        Rect::new(rect.x() + 10.0, rect.y() + 7.0, 14.0, 14.0),
+        pal.on_accent,
+    );
+    widgets::draw_text_in(
+        ctx,
+        Rect::new(rect.x() + 30.0, rect.y() + 5.0, rect.width() - 40.0, 18.0),
+        "Connection settings",
+        pal.text_style(theme, 11.5, FontWeight::MEDIUM, pal.on_accent),
     );
 }
 
@@ -1012,6 +1091,8 @@ fn short(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::Backend;
+    use crate::state::AppState;
     use crate::theme::{AppThemeMode, resolve_theme};
 
     fn node(id: &str) -> ClusterNodeInfo {
@@ -1140,6 +1221,46 @@ mod tests {
         assert!(lines.iter().any(|line| line == "public: 1 reachable"));
         assert!(lines.iter().any(|line| line == "topology: 1 edges"));
         assert!(lines.iter().any(|line| line.starts_with("hint: Select")));
+    }
+
+    #[test]
+    fn warning_overview_action_opens_connection_settings() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut cluster = shared.cluster_mut();
+            cluster.snapshot = ClusterSnapshot {
+                source: "daemon 127.0.0.1:21353".to_string(),
+                nodes: vec![node("node-a")],
+                warnings: vec!["daemon health unavailable: network error".to_string()],
+                ..ClusterSnapshot::default()
+            };
+            cluster.selected = None;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Cluster warning action")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Connection settings")
+            .with_description("Open connection settings for cluster warning")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+        assert_eq!(
+            shared.settings().selected,
+            Some(SettingsSection::Connection)
+        );
+
+        Ok(())
     }
 
     #[test]

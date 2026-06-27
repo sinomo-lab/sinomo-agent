@@ -226,7 +226,7 @@ fn cluster_node_click_opens_detail_selection() {
     let root = window.root();
     app.run_until_idle().expect("settle cluster layout");
 
-    click_at(&root, 640.0, 206.0);
+    click_at(&root, 450.0, 232.0);
     app.run_until_idle().expect("settle detail panel");
 
     assert_eq!(
