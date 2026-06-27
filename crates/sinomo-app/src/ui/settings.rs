@@ -1475,8 +1475,8 @@ fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
 
     let mut body = FieldGroup::new()
         .spacing(6.0)
-        .with_child(value_row(shared, reader, "Node ID", short_node_id))
-        .with_child(value_row(shared, reader, "Role", role))
+        .with_child(value_row(shared, reader, "This device", role.clone()))
+        .with_child(value_row(shared, reader, "Connection", mode_label.clone()))
         .with_child(
             FormRow::new("Details", Stack::horizontal().with_child(detail_button))
                 .inline()
@@ -1484,6 +1484,7 @@ fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         );
     if expanded {
         body = body
+            .with_child(value_row(shared, reader, "Node ID", short_node_id))
             .with_child(copyable_text_row(
                 reader,
                 "node-full-id",
@@ -3961,6 +3962,56 @@ mod tests {
             collapsed, expanded,
             "node detail disclosure must invalidate the retained section"
         );
+    }
+
+    #[test]
+    fn node_settings_summary_keeps_ids_in_details() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            let settings = &mut app.ready.as_mut().expect("ready state").settings;
+            settings.open(SettingsSection::Node);
+            settings.node_id = "01node-full-id-for-test".to_string();
+            settings.role = "mobile".to_string();
+            settings.mode_label = "Cluster".to_string();
+            settings.status_detail = "Connected to daemon at 127.0.0.1:21353".to_string();
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings node summary")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window.get_by_text("This device").expect().to_be_visible()?;
+        window.get_by_text("mobile").expect().to_be_visible()?;
+        window.get_by_text("Connection").expect().to_be_visible()?;
+        window.get_by_text("Cluster").expect().to_be_visible()?;
+        window.get_by_text("Node ID").expect().to_be_hidden()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("node-full-id")
+            .expect()
+            .to_be_hidden()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Show detail")
+            .click()?;
+        window.get_by_text("Node ID").expect().to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("node-full-id")
+            .expect()
+            .to_have_value("01node-full-id-for-test")?;
+
+        Ok(())
     }
 
     #[test]
