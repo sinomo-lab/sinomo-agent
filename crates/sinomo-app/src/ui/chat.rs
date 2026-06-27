@@ -310,10 +310,17 @@ impl RuntimeRecoveryTarget {
         }
     }
 
-    fn label(self) -> &'static str {
+    fn footer_label(self) -> &'static str {
         match self {
             RuntimeRecoveryTarget::Providers => "Provider setup",
-            RuntimeRecoveryTarget::Connection => "Connection settings",
+            RuntimeRecoveryTarget::Connection => "Connection",
+        }
+    }
+
+    fn footer_min_width(self) -> f32 {
+        match self {
+            RuntimeRecoveryTarget::Providers => 142.0,
+            RuntimeRecoveryTarget::Connection => 116.0,
         }
     }
 
@@ -5442,12 +5449,9 @@ fn runtime_recovery_button(shared: &Shared, reader: &ThemeReader) -> Option<Size
     let s = shared.clone();
     Some(
         SizedBox::new().height(SELECTOR_H).with_child(
-            sui::Button::new(target.label())
+            sui::Button::new(target.footer_label())
                 .icon(IconGlyph::Alert)
-                .min_width(match target {
-                    RuntimeRecoveryTarget::Providers => 142.0,
-                    RuntimeRecoveryTarget::Connection => 154.0,
-                })
+                .min_width(target.footer_min_width())
                 .theme_when(composer_control_reader(reader))
                 .on_press(move || open_settings_section(&s, target.settings_section())),
         ),
@@ -7779,7 +7783,10 @@ mod tests {
             state.runtime_recovery_target(),
             Some(RuntimeRecoveryTarget::Providers)
         );
-        assert_eq!(RuntimeRecoveryTarget::Providers.label(), "Provider setup");
+        assert_eq!(
+            RuntimeRecoveryTarget::Providers.footer_label(),
+            "Provider setup"
+        );
         assert_eq!(
             state.recovery_empty_detail(RuntimeRecoveryTarget::Providers),
             "No language model provider is configured yet."
@@ -7792,8 +7799,8 @@ mod tests {
             Some(RuntimeRecoveryTarget::Connection)
         );
         assert_eq!(
-            RuntimeRecoveryTarget::Connection.label(),
-            "Connection settings"
+            RuntimeRecoveryTarget::Connection.footer_label(),
+            "Connection"
         );
         assert!(
             state
@@ -7953,7 +7960,7 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("Connection settings")
+                .with_name("Connection")
                 .count()?,
             0,
             "the footer settings button should not duplicate the recovery card action"
@@ -8264,6 +8271,48 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Files);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_channel_recovery_footer_settings_opens_connection_settings() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.notice =
+                Some("channel create failed: device authorization was denied".to_string());
+            chat.push_activity(
+                "channel create",
+                "device authorization was denied",
+                ActivityTone::Warn,
+            );
+            chat.messages.push(ChatMessage::user("Existing context"));
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Channel recovery footer connection")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Connection")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+        assert_eq!(
+            shared.settings().selected,
+            Some(SettingsSection::Connection)
+        );
 
         Ok(())
     }
