@@ -1954,12 +1954,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_mkdir_all(&mut self, path: &str) -> Result<()> {
         let normalized = normalize_posix_path(path)?;
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
-            return self.route_namespace_operation(
+            self.route_namespace_operation(
                 primary,
                 DfsNamespaceOperation::MkdirAll {
                     path: path.to_string(),
                 },
-            );
+            )?;
+            self.stat_routed_namespace_result(&normalized, false)
+                .map(drop)?;
+            return Ok(());
         }
         self.posix_mkdir_all_local(path)
     }

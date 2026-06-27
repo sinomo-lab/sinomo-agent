@@ -49,6 +49,7 @@ services:
       CLUSTER_NAME: dev-cluster
       SINOMO_DISABLE_IROH: "1"
       SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      SINOMO_CLUSTER_JOIN_TRACE: "${SINOMO_CLUSTER_JOIN_TRACE:-0}"
       SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       SINOMO_DFS_PERF_TRACE: "${SINOMO_DFS_PERF_TRACE:-0}"
       # The seed (voter) publishes a join invite for every segment, each naming the
@@ -72,8 +73,10 @@ services:
       CLUSTER_NAME: dev-cluster
       SINOMO_DISABLE_IROH: "1"
       SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      SINOMO_CLUSTER_JOIN_TRACE: "${SINOMO_CLUSTER_JOIN_TRACE:-0}"
       SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       SINOMO_DFS_PERF_TRACE: "${SINOMO_DFS_PERF_TRACE:-0}"
+      WAIT_FOR_INTRODUCER_READY: "1"
       INTRODUCER: node1:21353
       JOIN_INVITE: /shared/seg-a-invite.json
     volumes:
@@ -94,8 +97,10 @@ services:
       CLUSTER_NAME: dev-cluster
       SINOMO_DISABLE_IROH: "1"
       SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      SINOMO_CLUSTER_JOIN_TRACE: "${SINOMO_CLUSTER_JOIN_TRACE:-0}"
       SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       SINOMO_DFS_PERF_TRACE: "${SINOMO_DFS_PERF_TRACE:-0}"
+      WAIT_FOR_INTRODUCER_READY: "1"
       INTRODUCER: node1:21353
       JOIN_INVITE: /shared/seg-a-invite.json
     volumes:
@@ -116,13 +121,12 @@ services:
       CLUSTER_NAME: dev-cluster
       SINOMO_DISABLE_IROH: "1"
       SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      SINOMO_CLUSTER_JOIN_TRACE: "${SINOMO_CLUSTER_JOIN_TRACE:-0}"
       SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       SINOMO_DFS_PERF_TRACE: "${SINOMO_DFS_PERF_TRACE:-0}"
       INTRODUCER: node3:21353
       JOIN_INVITE: /shared/seg-ab-invite.json
-      # Two segments deep: node3 must finish joining before node4 can; give it
-      # a longer (still bounded) retry window than the default 60.
-      JOIN_ATTEMPTS: "180"
+      WAIT_FOR_INTRODUCER_READY: "1"
     volumes:
       - node4-data:/data
       - invite:/shared
@@ -140,12 +144,12 @@ services:
       CLUSTER_NAME: dev-cluster
       SINOMO_DISABLE_IROH: "1"
       SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      SINOMO_CLUSTER_JOIN_TRACE: "${SINOMO_CLUSTER_JOIN_TRACE:-0}"
       SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       SINOMO_DFS_PERF_TRACE: "${SINOMO_DFS_PERF_TRACE:-0}"
       INTRODUCER: node4:21353
       JOIN_INVITE: /shared/seg-b-invite.json
-      # Three segments deep (waits on node4, which waits on node3).
-      JOIN_ATTEMPTS: "240"
+      WAIT_FOR_INTRODUCER_READY: "1"
     volumes:
       - node5-data:/data
       - invite:/shared
@@ -163,12 +167,12 @@ services:
       CLUSTER_NAME: dev-cluster
       SINOMO_DISABLE_IROH: "1"
       SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      SINOMO_CLUSTER_JOIN_TRACE: "${SINOMO_CLUSTER_JOIN_TRACE:-0}"
       SINOMO_DAEMON_WORKER_THREADS: "${SINOMO_DAEMON_WORKER_THREADS:-8}"
       SINOMO_DFS_PERF_TRACE: "${SINOMO_DFS_PERF_TRACE:-0}"
       INTRODUCER: node4:21353
       JOIN_INVITE: /shared/seg-b-invite.json
-      # Three segments deep (waits on node4, which waits on node3).
-      JOIN_ATTEMPTS: "240"
+      WAIT_FOR_INTRODUCER_READY: "1"
     volumes:
       - node6-data:/data
       - invite:/shared

@@ -55,6 +55,7 @@ pub(crate) enum ClusterCliCommand {
     Status,
     Health,
     Doctor,
+    Connectivity,
     Peers,
     Leave,
 }
@@ -194,6 +195,9 @@ pub(crate) fn parse_cluster_command(args: &[String]) -> Result<ClusterCliCommand
         }
         Some((command, [])) if matches!(command.as_str(), "doctor" | "diagnose") => {
             Ok(ClusterCliCommand::Doctor)
+        }
+        Some((command, [])) if matches!(command.as_str(), "connectivity" | "routes") => {
+            Ok(ClusterCliCommand::Connectivity)
         }
         Some((command, [])) if command == "peers" => Ok(ClusterCliCommand::Peers),
         Some((command, [])) if command == "leave" => Ok(ClusterCliCommand::Leave),
@@ -562,6 +566,7 @@ pub(crate) fn run_cluster_cli_command(command: ClusterCliCommand) -> Result<(), 
         ClusterCliCommand::Status => cluster_status(),
         ClusterCliCommand::Health => cluster_health(),
         ClusterCliCommand::Doctor => cluster_doctor(),
+        ClusterCliCommand::Connectivity => cluster_connectivity(),
         ClusterCliCommand::Peers => cluster_peers(),
         ClusterCliCommand::Leave => cluster_leave(),
     }
@@ -687,7 +692,9 @@ pub(crate) fn local_daemon_can_serve_cluster_kv_snapshot(
 
 pub(crate) fn cluster_init(options: ClusterInitOptions) -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
-    cluster_init_with_paths(options, &paths)
+    cluster_init_with_paths(options, &paths)?;
+    nudge_local_daemon_cluster_activation();
+    Ok(())
 }
 
 pub(crate) fn cluster_init_with_paths(
@@ -808,9 +815,7 @@ pub(crate) fn cluster_migration_plan_with_paths(
     })?;
     if cluster_state_needs_join_registration(&source) {
         return Err(CliError::Parse {
-            detail:
-                "local cluster state is already a pending join; retry `sinomo cluster join <invite>`"
-                    .to_string(),
+            detail: "local cluster state is an incomplete legacy join; run `sinomo cluster join <invite>` again for a fresh one-shot attempt or `sinomo cluster leave` to discard it".to_string(),
         });
     }
     if options.mode == ClusterMigrationMode::SingleNode
@@ -1090,7 +1095,9 @@ pub(crate) fn default_invite_introducers(
 
 pub(crate) fn cluster_join(options: ClusterJoinOptions) -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
-    cluster_join_with_paths(options, &paths)
+    cluster_join_with_paths(options, &paths)?;
+    nudge_local_daemon_cluster_activation();
+    Ok(())
 }
 
 pub(crate) fn cluster_join_with_paths(
@@ -1101,11 +1108,34 @@ pub(crate) fn cluster_join_with_paths(
     if paths.state.exists() {
         let existing = read_cluster_state(paths)?;
         if cluster_state_needs_join_registration(&existing) {
-            return cluster_join_retry_with_paths(options, paths, existing);
+            return cluster_join_fresh_after_stale_pending_state(options, paths, existing);
         }
         return cluster_join_single_node_migration_with_paths(options, paths, existing);
     }
     cluster_join_fresh_with_paths(options, paths)
+}
+
+fn cluster_join_fresh_after_stale_pending_state(
+    mut options: ClusterJoinOptions,
+    paths: &ClusterPaths,
+    stale: ClusterBootstrapState,
+) -> Result<(), CliError> {
+    if options.node_id.is_none() {
+        options.node_id = Some(stale.local_node_id);
+    }
+    remove_stale_pending_cluster_join_state(paths)?;
+    cluster_join_fresh_with_paths(options, paths)
+}
+
+fn remove_stale_pending_cluster_join_state(paths: &ClusterPaths) -> Result<(), CliError> {
+    match fs::remove_file(&paths.state) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(CliError::Io {
+            path: paths.state.display().to_string(),
+            detail: format!("failed to remove stale pending cluster join state: {source}"),
+        }),
+    }
 }
 
 fn cluster_join_fresh_with_paths(
@@ -1156,10 +1186,14 @@ fn cluster_join_fresh_with_paths(
         timestamp,
     );
     ensure_local_daemon_cluster_members(&mut state, &main_options, &shadow_options, timestamp);
-    network::write_cluster_state(paths, &state)?;
     reconcile_cluster_join_with_introducers(&mut state, &invite, Some(paths))?;
+    if cluster_state_needs_join_registration(&state) {
+        return Err(CliError::ClusterReadOnly {
+            detail: "cluster join was not accepted by any introducer; local cluster state was not changed".to_string(),
+        });
+    }
     network::write_cluster_state(paths, &state)?;
-    println!("cluster join recorded: {}", state.cluster_id);
+    println!("cluster join completed: {}", state.cluster_id);
     println!("local node: {}", state.local_node_id);
     println!("invite: {}", options.invite);
     println!("state: {}", paths.state.display());
@@ -1180,7 +1214,7 @@ fn cluster_join_single_node_migration_with_paths(
     )?;
     if report.migration.source_cluster_id != source.cluster_id {
         return Err(CliError::Parse {
-            detail: "source cluster changed while planning migration; retry cluster join"
+            detail: "source cluster changed while planning migration; run cluster join again"
                 .to_string(),
         });
     }
@@ -1645,45 +1679,6 @@ fn write_cluster_migration_kv_import_report(
     })
 }
 
-pub(crate) fn cluster_join_retry_with_paths(
-    options: ClusterJoinOptions,
-    paths: &ClusterPaths,
-    mut state: ClusterBootstrapState,
-) -> Result<(), CliError> {
-    let timestamp = OffsetDateTime::now_utc();
-    let invite = parse_cluster_join_invite_argument(&options.invite)?;
-    if network::invite_has_embedded_signature(&invite) {
-        verify_cluster_join_invite_signature(&invite)?;
-    }
-    if network::invite_has_embedded_cluster_identity(&invite)
-        && invite.cluster_id != state.cluster_id
-    {
-        return Err(CliError::Parse {
-            detail: format!(
-                "join retry invite cluster `{}` does not match local cluster `{}`",
-                invite.cluster_id, state.cluster_id
-            ),
-        });
-    }
-    let (main_options, shadow_options) = local_daemon_cluster_options()?;
-    let (main_public_key, shadow_public_key) = local_daemon_public_keys(paths)?;
-    state = network::prepare_cluster_join_retry_state(
-        state,
-        main_public_key,
-        shadow_public_key,
-        timestamp,
-    );
-    ensure_local_daemon_cluster_members(&mut state, &main_options, &shadow_options, timestamp);
-    reconcile_cluster_join_with_introducers(&mut state, &invite, Some(paths))?;
-    state.updated_at = timestamp;
-    network::write_cluster_state(paths, &state)?;
-    println!("cluster join reconciled: {}", state.cluster_id);
-    println!("local node: {}", state.local_node_id);
-    println!("invite: {}", options.invite);
-    println!("state: {}", paths.state.display());
-    Ok(())
-}
-
 fn local_daemon_public_keys(paths: &ClusterPaths) -> Result<(String, String), CliError> {
     let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
         path: paths.root.display().to_string(),
@@ -1920,10 +1915,9 @@ fn send_join_rpc(
         ClusterTransportKind::Iroh => send_join_endpoint_rpc(endpoint, request, timeout),
         // Join RPCs must carry an idle deadline, not just a connect timeout:
         // an introducer that accepts the stream and never answers otherwise
-        // hangs the join forever, and the caller's bounded retry loop (the
-        // only recovery during cold formation) never reaches a second
-        // attempt. The idle budget is generous because a healthy introducer
-        // may legitimately relay the registration to a voter across bridges.
+        // hangs the one-shot join forever. The idle budget is generous because
+        // a healthy introducer may legitimately relay the registration to a
+        // voter across bridges.
         _ => crate::daemon_send_daemon_rpc_with_timeouts(
             &endpoint.address,
             request,
@@ -2157,6 +2151,55 @@ pub(crate) fn cluster_doctor() -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn cluster_connectivity() -> Result<(), CliError> {
+    let paths = cluster_paths_from_defaults()?;
+    refresh_cluster_kv_from_local_daemon(&paths)?;
+    let state = read_cluster_state(&paths)?;
+    let local = network::read_local_cluster_connectivity_records(&paths)?;
+    let kv = network::read_cluster_connectivity_graph_from_kv(&paths).unwrap_or_default();
+    println!("cluster: {}", state.cluster_id);
+    println!("local node: {}", state.local_node_id);
+    print_connectivity_records("local", local);
+    print_connectivity_records("kv", kv);
+    Ok(())
+}
+
+fn print_connectivity_records(scope: &str, records: Vec<network::ClusterConnectivityRecord>) {
+    println!("{scope}: {} records", records.len());
+    if records.is_empty() {
+        return;
+    }
+    println!(
+        "scope\tsource\ttarget\tendpoint\ttransport\tstate\tfailures\tlatency_ms\taddress\treason\tobserved_at\texpires_at"
+    );
+    for record in records {
+        let latency = record
+            .latency_ms
+            .map(|latency| latency.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let reason = record
+            .failure_reason
+            .as_ref()
+            .map(|reason| format!("{reason:?}"))
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{}\t{}\t{}\t{}\t{:?}\t{:?}\t{}\t{}\t{}\t{}\t{}\t{}",
+            scope,
+            record.source_node_id,
+            record.target_node_id,
+            record.endpoint_id,
+            record.transport,
+            record.state,
+            record.consecutive_failures,
+            latency,
+            record.address,
+            reason,
+            record.observed_at,
+            record.expires_at
+        );
+    }
 }
 
 fn cluster_health_rows_for_cli(
@@ -2465,6 +2508,7 @@ pub(crate) fn cluster_peer_members(
 pub(crate) fn cluster_leave() -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
     let report = cluster_leave_with_paths(&paths)?;
+    nudge_local_daemon_cluster_activation();
     match &report.previous_cluster_id {
         Some(cluster_id) => println!("cluster left: {cluster_id}"),
         None => println!("cluster left: no previous local cluster state"),
@@ -2476,6 +2520,15 @@ pub(crate) fn cluster_leave() -> Result<(), CliError> {
     }
     println!("state: {}", report.state_path.display());
     Ok(())
+}
+
+fn nudge_local_daemon_cluster_activation() {
+    if let Ok(Some(status)) = default_main_daemon_status() {
+        let _ = crate::daemon_send_daemon_cluster_maintenance_refresh(
+            &status.address,
+            DAEMON_PROBE_TIMEOUT,
+        );
+    }
 }
 
 pub(crate) fn cluster_leave_with_paths(

@@ -204,6 +204,11 @@ pub fn cluster_network_maintenance_last_timestamp_for_next_due(
     interval: Duration,
     delay: Duration,
 ) -> Instant {
-    now.checked_add(delay.saturating_sub(interval))
-        .unwrap_or(now)
+    if delay >= interval {
+        now.checked_add(delay.saturating_sub(interval))
+            .unwrap_or(now)
+    } else {
+        now.checked_sub(interval.saturating_sub(delay))
+            .unwrap_or(now)
+    }
 }

@@ -28,8 +28,8 @@ cd "$(dirname "$0")/.."
 
 IDLE_WINDOW="${1:-${SINOMO_GATE_IDLE_WINDOW:-60}}"
 BRIDGE_RECOVERY_WAIT="${2:-${SINOMO_GATE_BRIDGE_RECOVERY_WAIT:-90}}"
-FORMATION_WAIT="${SINOMO_GATE_FORMATION_WAIT:-180}"
-POLL_INTERVAL="${SINOMO_GATE_POLL_INTERVAL:-5}"
+FORMATION_WAIT="${SINOMO_GATE_FORMATION_WAIT:-10}"
+POLL_INTERVAL="${SINOMO_GATE_POLL_INTERVAL:-1}"
 EXPECTED_MAINS="${SINOMO_GATE_EXPECTED_MAINS:-6}"
 REBUILD="${SINOMO_GATE_REBUILD:-1}"
 RESET_VOLUMES="${SINOMO_GATE_RESET_VOLUMES:-$REBUILD}"
@@ -67,13 +67,15 @@ cluster_health() {
 }
 
 wait_for_cluster_ready() {
-  local deadline now online warnings
-  deadline=$(( $(date +%s) + FORMATION_WAIT ))
+  local started deadline now elapsed online warnings
+  started="$(date +%s)"
+  deadline=$(( started + FORMATION_WAIT ))
   while :; do
     online="$(main_online_count)"
     warnings="$(doctor_connectivity_warnings)"
     if [ "${online:-0}" -ge "$EXPECTED_MAINS" ] && [ -z "$warnings" ]; then
-      echo "cluster ready (${online} main daemons online)"
+      elapsed=$(( $(date +%s) - started ))
+      echo "cluster ready (${online} main daemons online, ${elapsed}s)"
       return 0
     fi
     now="$(date +%s)"

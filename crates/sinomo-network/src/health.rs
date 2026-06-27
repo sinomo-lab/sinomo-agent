@@ -20,6 +20,8 @@ use sinomo_node::{
 };
 
 const CLUSTER_HEALTH_PEER_ROWS_MAX_PEERS: usize = 8;
+const CLUSTER_HEALTH_PEER_ROWS_TOTAL_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(2);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClusterHealthRow {
@@ -266,12 +268,29 @@ pub trait ClusterStatusProbe {
     }
 }
 
-pub trait ClusterStatusAsyncProbe {
+pub trait ClusterStatusAsyncProbe: Sync {
     fn probe_member_status_async<'a>(
         &'a self,
         state: &'a ClusterBootstrapState,
         member: &'a ClusterMemberRecord,
     ) -> ClusterMembershipRpcFuture<'a, Option<ClusterNodeStatusRecord>>;
+
+    fn probe_member_statuses_async<'a>(
+        &'a self,
+        state: &'a ClusterBootstrapState,
+        members: &'a [ClusterMemberRecord],
+    ) -> ClusterMembershipRpcFuture<'a, BTreeMap<NodeId, Option<ClusterNodeStatusRecord>>> {
+        Box::pin(async move {
+            let mut statuses = BTreeMap::new();
+            for member in members {
+                statuses.insert(
+                    member.node_id.clone(),
+                    self.probe_member_status_async(state, member).await?,
+                );
+            }
+            Ok(statuses)
+        })
+    }
 
     fn peer_local_health_rows_async<'a>(
         &'a self,
@@ -353,17 +372,24 @@ pub async fn cluster_health_rows_with_async_probe<P: ClusterStatusAsyncProbe + ?
         operation: "cluster health status read".to_string(),
         detail: format!("cluster health status read task failed: {source}"),
     })??;
+    let reportable_members = state
+        .members
+        .iter()
+        .filter(|member| {
+            !matches!(member.state, ClusterMemberState::Removed)
+                && cluster_health_member_is_reportable(member)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let live_statuses = probe
+        .probe_member_statuses_async(state, &reportable_members)
+        .await?;
     let mut rows = Vec::new();
-    for member in &state.members {
-        if matches!(member.state, ClusterMemberState::Removed)
-            || !cluster_health_member_is_reportable(member)
-        {
-            continue;
-        }
+    for member in &reportable_members {
         let expected_process = cluster_member_expected_daemon_process(member);
-        let live = probe
-            .probe_member_status_async(state, member)
-            .await?
+        let live = live_statuses
+            .get(&member.node_id)
+            .and_then(|status| status.clone())
             .filter(|status| cluster_node_status_matches_member(status, member, expected_process));
         let stored =
             stored_cluster_node_status_for_member(&stored_statuses, member, expected_process);
@@ -394,7 +420,15 @@ pub async fn cluster_health_rows_with_async_probe<P: ClusterStatusAsyncProbe + ?
         });
     }
     if include_peer_views {
-        merge_reachable_peer_health_rows_async(state, &mut rows, probe).await?;
+        match tokio::time::timeout(
+            CLUSTER_HEALTH_PEER_ROWS_TOTAL_BUDGET,
+            merge_reachable_peer_health_rows_async(state, &mut rows, probe),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {}
+        }
     }
     rows.sort_by(|left, right| left.member.node_id.cmp(&right.member.node_id));
     Ok(rows)

@@ -1,7 +1,6 @@
 use crate::ClusterPaths;
 use crate::error::NetworkError;
 use crate::kv_local_store::apply_cluster_raft_append;
-use crate::local_membership::cluster_state_needs_join_registration;
 use crate::local_state_store::{read_cluster_state, write_cluster_state};
 use crate::member_store::merge_cluster_state_from_peer;
 use crate::membership_rpc::ClusterAuthenticatedPeer;
@@ -75,15 +74,7 @@ pub(crate) fn handle_cluster_raft_append_request(
                 authenticated_peer,
                 &request.append.leader_id,
             );
-    let leader_authorized_for_pending_join = cluster_state_needs_join_registration(&state)
-        && request.append.leader_id == request.state.local_node_id
-        && sinomo_kv::cluster_kv_raft_node_is_voter(&request.state, &request.append.leader_id)
-        && cluster_authenticated_peer_matches_node(
-            &request.state,
-            authenticated_peer,
-            &request.append.leader_id,
-        );
-    if !leader_authorized_by_local_state && !leader_authorized_for_pending_join {
+    if !leader_authorized_by_local_state {
         return cluster_raft_append_rejection(
             paths,
             &state,

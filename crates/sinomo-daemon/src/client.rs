@@ -103,7 +103,7 @@ pub(crate) fn send_daemon_rpc_raw(
 /// Like [`send_daemon_rpc`], but with an idle deadline on the stream as well
 /// as the connect timeout. Use for RPCs that must never hang on a silent
 /// peer (e.g. cluster join, where an unresponsive introducer otherwise wedges
-/// the caller's retry loop forever).
+/// the caller forever).
 pub fn send_daemon_rpc_with_timeouts(
     address: &str,
     request: &ObjectRpcRequest,
@@ -958,6 +958,19 @@ pub fn fetch_daemon_status_from_address(
         crate::DAEMON_STATUS_ROUTE,
         crate::DAEMON_RPC_CATEGORY,
         &(),
+        timeout,
+    )
+}
+
+pub fn send_daemon_cluster_maintenance_refresh(
+    address: &str,
+    timeout: Duration,
+) -> Result<crate::DaemonClusterMaintenanceRefreshResponse, DaemonError> {
+    send_daemon_rpc_body(
+        address,
+        crate::DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
+        crate::DAEMON_RPC_CATEGORY,
+        &crate::DaemonClusterMaintenanceRefreshRequest,
         timeout,
     )
 }
