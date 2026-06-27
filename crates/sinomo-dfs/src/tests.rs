@@ -6160,6 +6160,16 @@ fn metadata_journal_publish_suppresses_proven_topology_mismatch_for_epoch() {
 }
 
 #[test]
+fn metadata_replication_primary_mismatch_is_topology_mismatch() {
+    assert!(metadata_replication_rejection_is_topology_mismatch(
+        "metadata journal source node_b is not shard services primary node_a"
+    ));
+    assert!(metadata_replication_rejection_is_topology_mismatch(
+        "metadata snapshot source node_b is not shard users primary node_a"
+    ));
+}
+
+#[test]
 fn cluster_metadata_journal_publish_reads_cluster_state_and_shards() {
     let root = temp_root("cluster-metadata-journal-publish");
     let data_dir = SinomoDataDir::new(&root);

@@ -1850,6 +1850,10 @@ pub fn publish_cluster_dfs_metadata_journal_with_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
     options: DfsMetadataJournalReplicationOptions,
 ) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
+    refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_transport(
+        cluster_paths,
+        peer_transport.as_ref(),
+    )?;
     publish_cluster_dfs_metadata_journal(
         data_dir,
         cluster_paths,
@@ -1873,6 +1877,112 @@ pub async fn publish_cluster_dfs_metadata_journal_with_async_peer_transport(
         options,
     )
     .await
+}
+
+pub async fn publish_cluster_dfs_metadata_journal_with_peer_transports_async(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    sync_peer_transport: Arc<dyn DfsPeerTransport>,
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    options: DfsMetadataJournalReplicationOptions,
+) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
+    let refresh_cluster_paths = cluster_paths.clone();
+    tokio::task::spawn_blocking(move || {
+        refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_transport(
+            &refresh_cluster_paths,
+            sync_peer_transport.as_ref(),
+        )
+    })
+    .await
+    .map_err(|source| DfsError::Metadata {
+        message: format!("DFS metadata publish KV refresh task failed: {source}"),
+    })??;
+
+    publish_cluster_dfs_metadata_journal_async(
+        data_dir,
+        cluster_paths,
+        async_dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
+        options,
+    )
+    .await
+}
+
+pub fn refresh_cluster_dfs_kv_snapshot_with_peer_transport(
+    cluster_paths: &ClusterPaths,
+    peer_transport: Arc<dyn DfsPeerTransport>,
+) -> Result<(), DfsError> {
+    if !cluster_paths.state.exists() {
+        return Ok(());
+    }
+    let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
+        .map_err(DfsError::from_network)?;
+    if sinomo_kv::cluster_kv_raft_local_is_voter(&state) {
+        return Ok(());
+    }
+    refresh_cluster_dfs_kv_snapshot_with_peer_transport_for_state(
+        cluster_paths,
+        &state,
+        peer_transport.as_ref(),
+    )
+}
+
+fn refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_transport(
+    cluster_paths: &ClusterPaths,
+    peer_transport: &dyn DfsPeerTransport,
+) -> Result<(), DfsError> {
+    if !cluster_paths.state.exists() {
+        return Ok(());
+    }
+    let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
+        .map_err(DfsError::from_network)?;
+    if sinomo_kv::cluster_kv_raft_local_is_voter(&state) {
+        return Ok(());
+    }
+    let file_system = distributed_sifs(state.local_node_id.clone());
+    let shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
+    if !shards
+        .iter()
+        .any(|shard| shard.primary_node_id == state.local_node_id)
+    {
+        return Ok(());
+    }
+    refresh_cluster_dfs_kv_snapshot_with_peer_transport_for_state(
+        cluster_paths,
+        &state,
+        peer_transport,
+    )
+}
+
+fn refresh_cluster_dfs_kv_snapshot_with_peer_transport_for_state(
+    cluster_paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    peer_transport: &dyn DfsPeerTransport,
+) -> Result<(), DfsError> {
+    let payload = sinomo_kv::cluster_kv_snapshot_rpc_payload()?;
+    let request = object_rpc_request_from_kv_payload(payload);
+    let options = sinomo_network::ClusterControlPlaneTimeouts::default_daemon_transport()
+        .kv_snapshot_refresh_options();
+    let _ = sinomo_network::refresh_current_cluster_kv_store_with_local_storage_and_transport(
+        cluster_paths,
+        state,
+        options,
+        |endpoint, timeout| {
+            let response = peer_transport
+                .call_object_rpc(
+                    &endpoint.node_id,
+                    &request,
+                    DfsObjectRpcSendOptions::new(timeout).with_observe_connectivity(false),
+                )
+                .map_err(|source| NetworkError::Io {
+                    operation: "DFS cluster KV snapshot refresh".to_string(),
+                    detail: source.to_string(),
+                })?;
+            response.error_detail()?;
+            sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&response.body).map_err(Into::into)
+        },
+    );
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -3776,6 +3886,11 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport(
     if !cluster_paths.state.exists() {
         return Ok(None);
     }
+
+    refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_transport(
+        &cluster_paths,
+        sync_peer_transport.as_ref(),
+    )?;
 
     let state = sinomo_network::read_cluster_state_without_kv_async(runtime, &cluster_paths)
         .await
@@ -6700,6 +6815,48 @@ where
     )
 }
 
+pub fn schedule_cluster_dfs_metadata_publish_after_events_with_peer_transports_on_runtime<R, E>(
+    runtime: tokio::runtime::Handle,
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    sync_peer_transport: Arc<dyn DfsPeerTransport>,
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    events: &[NetworkedDfsServiceEvent],
+    schedule_options: DfsMetadataPublishScheduleOptions,
+    replication_options: DfsMetadataJournalReplicationOptions,
+    on_report: R,
+    on_error: E,
+) -> Option<DfsMetadataPublishScheduleStart>
+where
+    R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
+    E: FnMut(String) + Send + 'static,
+{
+    schedule_default_dfs_metadata_publish_after_events_async_on_runtime(
+        runtime,
+        events,
+        schedule_options,
+        move || {
+            let data_dir = data_dir.clone();
+            let cluster_paths = cluster_paths.clone();
+            let sync_peer_transport = Arc::clone(&sync_peer_transport);
+            let peer_transport = Arc::clone(&peer_transport);
+            async move {
+                publish_cluster_dfs_metadata_journal_with_peer_transports_async(
+                    &data_dir,
+                    &cluster_paths,
+                    sync_peer_transport,
+                    peer_transport,
+                    replication_options,
+                )
+                .await
+                .map_err(|error| error.to_string())
+            }
+        },
+        on_report,
+        on_error,
+    )
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsMetadataPublishScheduleOptions {
     pub max_retry_rounds: usize,
@@ -8598,6 +8755,12 @@ fn metadata_replication_rejection_is_topology_mismatch(reason: &str) -> bool {
     reason.contains("metadata journal batch has no local shard config")
         || reason.contains("metadata snapshot install has no local shard config")
         || reason.contains("is not configured as a replica for metadata shard")
+        || (reason.contains("metadata journal source")
+            && reason.contains("is not shard")
+            && reason.contains("primary"))
+        || (reason.contains("metadata snapshot source")
+            && reason.contains("is not shard")
+            && reason.contains("primary"))
 }
 
 pub const DEFAULT_DFS_MESSAGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);

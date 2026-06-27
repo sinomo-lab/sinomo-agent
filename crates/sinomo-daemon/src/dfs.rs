@@ -796,10 +796,11 @@ async fn handle_daemon_dfs_message_async(
     let should_publish_metadata = sinomo_dfs::dfs_events_should_publish_metadata(&events);
     if should_publish_metadata {
         notify_daemon_dfs_maintenance_work();
-        sinomo_dfs::schedule_cluster_dfs_metadata_publish_after_events_with_async_peer_transport_on_runtime(
+        sinomo_dfs::schedule_cluster_dfs_metadata_publish_after_events_with_peer_transports_on_runtime(
             runtime.clone(),
             data_dir,
             cluster_paths,
+            daemon_dfs_blocking_peer_transport_on_runtime(runtime),
             daemon_dfs_async_peer_transport(runtime),
             &events,
             daemon_dfs_metadata_publish_schedule_options(),
