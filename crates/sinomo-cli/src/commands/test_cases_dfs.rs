@@ -70,6 +70,9 @@ pub fn register_dfs_cluster_test_cases(
 ) -> SinomoTestRegistryBuilder {
     builder
         .register(dfs_read_your_write())
+        .register(dfs_concurrent_file_race())
+        .register(dfs_concurrent_dir_race())
+        .register(dfs_failover_current_read())
         .register(dfs_invariants())
         .register(dfs_lightweight_latency())
         .register(dfs_protocol_codec_baseline())
@@ -96,6 +99,42 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_read_your_write(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_concurrent_file_race(ctx) {
+        id: "cluster.dfs.concurrent-file-race",
+        summary: "Race two SIFS file writers and verify the final current read is one complete payload",
+        tags: ["cluster-dfs", "probe", "correctness"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_concurrent_file_race(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_concurrent_dir_race(ctx) {
+        id: "cluster.dfs.concurrent-dir-race",
+        summary: "Race child creation with parent rmdir and verify no orphan child remains",
+        tags: ["cluster-dfs", "probe", "correctness"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_concurrent_dir_race(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_failover_current_read(ctx) {
+        id: "cluster.dfs.failover-current-read",
+        summary: "Verify a current SIFS read refreshes after another writer advances the visible version",
+        tags: ["cluster-dfs", "probe", "correctness"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_failover_current_read(ctx)
         }
     }
 }
@@ -327,6 +366,232 @@ fn run_read_your_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     Ok(SinomoTestOutcome::passed(format!(
         "write/read/rename/delete roundtrip held read-your-write on node {node}"
     )))
+}
+
+fn run_concurrent_file_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let base = ctx
+        .parameter("base")
+        .unwrap_or(DEFAULT_ROUNDTRIP_BASE)
+        .trim_end_matches('/')
+        .to_string();
+    let timeout = expect_timeout(ctx)?;
+    let data_dir = SinomoDataDir::new(ctx.data_dir());
+    let backend = open_backend(ctx)?;
+    let node = backend.node_label();
+    let nonce = probe_nonce();
+    let path = format!("{base}/file-race-{nonce}.bin");
+    let seed = vec![b'A'; 4096];
+    let writer_a = vec![b'B'; 4096];
+    let writer_b = vec![b'C'; 4096];
+    backend
+        .write_file(&path, &seed)
+        .map_err(SinomoTestError::failed)?;
+    ctx.record("node", &node);
+    ctx.record("path", &path);
+
+    let started = Instant::now();
+    let run_writer =
+        |label: &'static str, data_dir: SinomoDataDir, path: String, bytes: Vec<u8>| {
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let result = SifsFileManagerBackend::open(&data_dir)
+                    .and_then(|backend| backend.write_file(&path, &bytes));
+                (
+                    label,
+                    result.map(|_| ()).map_err(|error| error.to_string()),
+                    started.elapsed().as_millis() as u64,
+                )
+            })
+        };
+    let thread_a = run_writer("writer-a", data_dir.clone(), path.clone(), writer_a.clone());
+    let thread_b = run_writer("writer-b", data_dir.clone(), path.clone(), writer_b.clone());
+    let results = vec![
+        thread_a
+            .join()
+            .map_err(|_| SinomoTestError::failed("writer-a thread panicked"))?,
+        thread_b
+            .join()
+            .map_err(|_| SinomoTestError::failed("writer-b thread panicked"))?,
+    ];
+    ctx.record(
+        "operation_results",
+        results
+            .iter()
+            .map(|(label, result, elapsed_ms)| {
+                format!("{label}:{result:?}:elapsed_ms={elapsed_ms}")
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    let deadline = started + timeout;
+    let valid = [&seed, &writer_a, &writer_b];
+    loop {
+        let read = backend.read_file(&path).map_err(SinomoTestError::failed)?;
+        if valid
+            .iter()
+            .any(|candidate| candidate.as_slice() == read.as_slice())
+        {
+            ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
+            ctx.record("final_bytes", read.len());
+            ctx.record(
+                "successful_writers",
+                results
+                    .iter()
+                    .filter(|(_, result, _)| result.is_ok())
+                    .count(),
+            );
+            return Ok(SinomoTestOutcome::passed(format!(
+                "concurrent file race on {node} ended with one complete payload at {path}"
+            )));
+        }
+        if Instant::now() >= deadline {
+            ctx.record("last_read_bytes", read.len());
+            return Ok(SinomoTestOutcome::failed(format!(
+                "concurrent file race on {node} produced a non-serialized payload at {path}"
+            )));
+        }
+        std::thread::sleep(EXPECT_POLL_INTERVAL);
+    }
+}
+
+fn run_concurrent_dir_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let base = ctx
+        .parameter("base")
+        .unwrap_or(DEFAULT_ROUNDTRIP_BASE)
+        .trim_end_matches('/')
+        .to_string();
+    let data_dir = SinomoDataDir::new(ctx.data_dir());
+    let backend = open_backend(ctx)?;
+    let node = backend.node_label();
+    let nonce = probe_nonce();
+    let dir = format!("{base}/dir-race-{nonce}");
+    let child = format!("{dir}/child.txt");
+    backend.create_dir(&dir).map_err(SinomoTestError::failed)?;
+    ctx.record("node", &node);
+    ctx.record("dir", &dir);
+    ctx.record("child", &child);
+
+    let create_dir = data_dir.clone();
+    let create_child = child.clone();
+    let create_thread = std::thread::spawn(move || {
+        let started = Instant::now();
+        let result = SifsFileManagerBackend::open(&create_dir)
+            .and_then(|backend| backend.write_file(&create_child, b"child"));
+        (
+            "child-create",
+            result.map(|_| ()).map_err(|error| error.to_string()),
+            started.elapsed().as_millis() as u64,
+        )
+    });
+    let remove_dir = data_dir.clone();
+    let remove_path = dir.clone();
+    let remove_thread = std::thread::spawn(move || {
+        let started = Instant::now();
+        let result = SifsFileManagerBackend::open(&remove_dir)
+            .and_then(|backend| backend.delete_dir(&remove_path));
+        (
+            "rmdir",
+            result.map(|_| ()).map_err(|error| error.to_string()),
+            started.elapsed().as_millis() as u64,
+        )
+    });
+    let results = vec![
+        create_thread
+            .join()
+            .map_err(|_| SinomoTestError::failed("child-create thread panicked"))?,
+        remove_thread
+            .join()
+            .map_err(|_| SinomoTestError::failed("rmdir thread panicked"))?,
+    ];
+    ctx.record(
+        "operation_results",
+        results
+            .iter()
+            .map(|(label, result, elapsed_ms)| {
+                format!("{label}:{result:?}:elapsed_ms={elapsed_ms}")
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    let dir_present = backend.stat(&dir).is_ok();
+    let child_present = backend.stat(&child).is_ok();
+    ctx.record("dir_present", dir_present);
+    ctx.record("child_present", child_present);
+    if (dir_present && child_present) || (!dir_present && !child_present) {
+        Ok(SinomoTestOutcome::passed(format!(
+            "concurrent dir race on {node} left no orphan child under {dir}"
+        )))
+    } else {
+        Ok(SinomoTestOutcome::failed(format!(
+            "concurrent dir race on {node} left inconsistent state: dir_present={dir_present}, child_present={child_present}"
+        )))
+    }
+}
+
+fn run_failover_current_read(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let base = ctx
+        .parameter("base")
+        .unwrap_or(DEFAULT_ROUNDTRIP_BASE)
+        .trim_end_matches('/')
+        .to_string();
+    let timeout = expect_timeout(ctx)?;
+    let data_dir = SinomoDataDir::new(ctx.data_dir());
+    let backend = open_backend(ctx)?;
+    let node = backend.node_label();
+    let nonce = probe_nonce();
+    let path = format!("{base}/current-read-{nonce}.txt");
+    let old = format!("old current-read payload {nonce}");
+    let new = format!("new current-read payload {nonce}");
+    backend
+        .write_file(&path, old.as_bytes())
+        .map_err(SinomoTestError::failed)?;
+    let cached_reader = SifsFileManagerBackend::open_read_only(&data_dir).map_err(|error| {
+        SinomoTestError::failed(format!("cannot open cached reader backend: {error}"))
+    })?;
+    let first = cached_reader
+        .read_file(&path)
+        .map_err(SinomoTestError::failed)?;
+    if first != old.as_bytes() {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "initial current read on {node} returned unexpected bytes at {path}"
+        )));
+    }
+    backend
+        .write_file(&path, new.as_bytes())
+        .map_err(SinomoTestError::failed)?;
+
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut observations = Vec::new();
+    loop {
+        let read = cached_reader
+            .read_file(&path)
+            .map_err(SinomoTestError::failed)?;
+        observations.push(format!(
+            "elapsed_ms={}:bytes={}",
+            started.elapsed().as_millis(),
+            read.len()
+        ));
+        if read == new.as_bytes() {
+            ctx.record("node", &node);
+            ctx.record("path", &path);
+            ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
+            ctx.record("observations", observations);
+            return Ok(SinomoTestOutcome::passed(format!(
+                "current read on {node} refreshed to the latest visible version at {path}"
+            )));
+        }
+        if Instant::now() >= deadline {
+            ctx.record("node", &node);
+            ctx.record("path", &path);
+            ctx.record("observations", observations);
+            return Ok(SinomoTestOutcome::failed(format!(
+                "current read on {node} did not refresh to the latest visible version at {path} within {}s",
+                timeout.as_secs()
+            )));
+        }
+        std::thread::sleep(EXPECT_POLL_INTERVAL);
+    }
 }
 
 fn run_protocol_codec_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult {
