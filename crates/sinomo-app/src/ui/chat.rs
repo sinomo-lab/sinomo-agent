@@ -293,7 +293,7 @@ impl RuntimeRecoveryTarget {
                 "Use Provider setup below to add credentials or choose an available model."
             }
             RuntimeRecoveryTarget::Connection => {
-                "Use Connection settings below to inspect daemon, chat, and SIFS status."
+                "Use Connection settings below to inspect daemon, chat, channel, and SIFS status."
             }
         }
     }
@@ -950,6 +950,27 @@ impl ChatState {
             RuntimeRecoveryTarget::Connection => self
                 .runtime_degraded_detail()
                 .unwrap_or_else(|| compact_line(&self.runtime_health().detail, 112)),
+        }
+    }
+
+    fn recovery_empty_title(&self, target: RuntimeRecoveryTarget) -> &'static str {
+        match target {
+            RuntimeRecoveryTarget::Providers => target.empty_title(),
+            RuntimeRecoveryTarget::Connection => {
+                let detail = self
+                    .connection_attention_detail_full()
+                    .unwrap_or_else(|| self.runtime_health().detail);
+                let lower = detail.to_ascii_lowercase();
+                if lower.contains("channel create") || lower.contains("channel store") {
+                    "Channel needs connection attention"
+                } else if lower.contains("chat list") {
+                    "Chat list needs connection attention"
+                } else if lower.contains("chat save") {
+                    "Chat save needs connection attention"
+                } else {
+                    target.empty_title()
+                }
+            }
         }
     }
 
@@ -2492,6 +2513,39 @@ fn text_mentions_connection_problem(text: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+fn transcript_message_display_text(message: &ChatMessage) -> String {
+    if message.kind != ChatMessageKind::Error {
+        return if message.text.is_empty() {
+            "…".to_string()
+        } else {
+            message.text.clone()
+        };
+    }
+
+    let detail = message
+        .text
+        .strip_prefix("Error:")
+        .unwrap_or(message.text.as_str())
+        .trim();
+    if detail.is_empty() {
+        return "Error\nNo detail was recorded.".to_string();
+    }
+
+    if text_mentions_connection_problem(detail) {
+        let lower = detail.to_ascii_lowercase();
+        let summary = if lower.contains("agent channel") || lower.contains("channel store") {
+            "Agent channel storage could not open through SIFS."
+        } else if lower.contains("device authorization") {
+            "Device authorization blocked this chat action."
+        } else {
+            "The chat runtime could not reach a required cluster service."
+        };
+        format!("Connection issue\n{summary}\nDetail: {detail}")
+    } else {
+        format!("Error\n{detail}")
+    }
+}
+
 /// A small uppercase section heading `Label` (AGENTS / CHATS), color tracking the theme.
 fn heading(shared: &Shared, text: &str) -> Label {
     let s = shared.clone();
@@ -4032,11 +4086,7 @@ impl Widget for TranscriptView {
             };
             for msg in &chat.messages {
                 let is_user = msg.role == ChatRole::User;
-                let text = if msg.text.is_empty() {
-                    "…".to_string()
-                } else {
-                    msg.text.clone()
-                };
+                let text = transcript_message_display_text(msg);
                 let lines = widgets::wrap_lines(&text, inner_w, measure);
                 let widest = lines.iter().map(|l| measure(l)).fold(0.0_f32, f32::max);
                 let bubble_w = widest.min(inner_w) + 24.0;
@@ -4198,7 +4248,7 @@ impl TranscriptView {
         widgets::draw_text_in(
             ctx,
             Rect::new(text_x, card.y() + 17.0, text_w, 22.0),
-            target.empty_title(),
+            chat.recovery_empty_title(target),
             title_style,
         );
 
@@ -6017,6 +6067,23 @@ mod tests {
     }
 
     #[test]
+    fn transcript_error_display_keeps_low_level_detail_but_leads_with_recovery_context() {
+        let connection = ChatMessage::system_error(
+            "Error: chat unavailable: failed to parse command: open agent channel SIFS store failed: device authorization was denied",
+        );
+        let rendered = transcript_message_display_text(&connection);
+        assert!(rendered.starts_with("Connection issue\n"));
+        assert!(rendered.contains("Agent channel storage could not open through SIFS."));
+        assert!(rendered.contains("Detail: chat unavailable"));
+
+        let provider = ChatMessage::system_error("Error: provider unavailable");
+        assert_eq!(
+            transcript_message_display_text(&provider),
+            "Error\nprovider unavailable"
+        );
+    }
+
+    #[test]
     fn empty_turn_done_marks_placeholder_as_system_info() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
@@ -6346,6 +6413,20 @@ mod tests {
         assert_eq!(
             state.runtime_recovery_target(),
             Some(RuntimeRecoveryTarget::Connection)
+        );
+        assert_eq!(
+            state.recovery_empty_title(RuntimeRecoveryTarget::Connection),
+            "Chat list needs connection attention"
+        );
+
+        state.notice = Some("channel create failed: device authorization was denied".to_string());
+        assert_eq!(
+            state.runtime_recovery_target(),
+            Some(RuntimeRecoveryTarget::Connection)
+        );
+        assert_eq!(
+            state.recovery_empty_title(RuntimeRecoveryTarget::Connection),
+            "Channel needs connection attention"
         );
 
         state.notice = Some(
