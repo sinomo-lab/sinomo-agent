@@ -34,7 +34,7 @@
 //! at runtime, so the composer row is wrapped in a [`RebuildOnChange`] keyed on
 //! a small signature of the selection state.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -2697,6 +2697,11 @@ fn transcript_message_display_text(message: &ChatMessage) -> String {
     }
 }
 
+fn transcript_message_recovery_action(message: &ChatMessage) -> Option<RecoveryCardAction> {
+    (message.kind == ChatMessageKind::Error && text_mentions_connection_problem(&message.text))
+        .then_some(RecoveryCardAction::OpenConnectionSettings)
+}
+
 /// A small uppercase section heading `Label` (AGENTS / CHATS), color tracking the theme.
 fn heading(shared: &Shared, text: &str) -> Label {
     let s = shared.clone();
@@ -4345,6 +4350,7 @@ struct TranscriptView {
     bounds: Cell<Rect>,
     hovered_recovery_action: Cell<Option<RecoveryCardAction>>,
     pressed_recovery_action: Cell<Option<RecoveryCardAction>>,
+    transcript_recovery_actions: RefCell<Vec<(RecoveryCardAction, Rect)>>,
 }
 
 impl TranscriptView {
@@ -4356,6 +4362,7 @@ impl TranscriptView {
             bounds: Cell::new(Rect::ZERO),
             hovered_recovery_action: Cell::new(None),
             pressed_recovery_action: Cell::new(None),
+            transcript_recovery_actions: RefCell::new(Vec::new()),
         }
     }
 
@@ -4486,11 +4493,18 @@ impl TranscriptView {
                 .is_empty()
                 .then(|| chat.runtime_recovery_target())
                 .flatten()
-        }?;
-        let chat = self.shared.chat();
-        Self::recovery_action_rects(bounds, target, &chat)
-            .into_iter()
-            .find_map(|(action, rect)| rect.contains(position).then_some(action))
+        };
+        if let Some(target) = target {
+            let chat = self.shared.chat();
+            return Self::recovery_action_rects(bounds, target, &chat)
+                .into_iter()
+                .find_map(|(action, rect)| rect.contains(position).then_some(action));
+        }
+
+        self.transcript_recovery_actions
+            .borrow()
+            .iter()
+            .find_map(|(action, rect)| rect.contains(position).then_some(*action))
     }
 
     fn activate_recovery_action(&self, action: RecoveryCardAction) {
@@ -4612,6 +4626,7 @@ impl Widget for TranscriptView {
         let area = ctx.bounds();
         self.bounds.set(area);
         self.viewport_height.set(area.height());
+        self.transcript_recovery_actions.borrow_mut().clear();
 
         let chat = self.shared.chat();
         if chat.messages.is_empty() {
@@ -4634,6 +4649,7 @@ impl Widget for TranscriptView {
             lines: Vec<String>,
             bubble_w: f32,
             bubble_h: f32,
+            action: Option<RecoveryCardAction>,
         }
         let mut laid: Vec<Laid> = Vec::with_capacity(chat.messages.len());
         let mut total = PAD;
@@ -4648,8 +4664,13 @@ impl Widget for TranscriptView {
                 let text = transcript_message_display_text(msg);
                 let lines = widgets::wrap_lines(&text, inner_w, measure);
                 let widest = lines.iter().map(|l| measure(l)).fold(0.0_f32, f32::max);
-                let bubble_w = widest.min(inner_w) + 24.0;
-                let bubble_h = lines.len().max(1) as f32 * line_h + 20.0;
+                let action = transcript_message_recovery_action(msg);
+                let action_w = action
+                    .map(Self::recovery_card_action_width)
+                    .unwrap_or_default();
+                let bubble_w = widest.min(inner_w).max(action_w) + 24.0;
+                let action_h = if action.is_some() { 38.0 } else { 0.0 };
+                let bubble_h = lines.len().max(1) as f32 * line_h + 20.0 + action_h;
                 total += bubble_h + 12.0;
                 laid.push(Laid {
                     is_user,
@@ -4657,6 +4678,7 @@ impl Widget for TranscriptView {
                     lines,
                     bubble_w,
                     bubble_h,
+                    action,
                 });
             }
         }
@@ -4671,6 +4693,7 @@ impl Widget for TranscriptView {
         };
 
         // Draw pass: only mutable ctx ops here.
+        let mut action_rects = Vec::new();
         let mut y = area.y() + PAD - scroll;
         for item in &laid {
             let is_error = item.kind == ChatMessageKind::Error;
@@ -4710,9 +4733,18 @@ impl Widget for TranscriptView {
                     );
                     ty += line_h;
                 }
+                if let Some(action) = item.action {
+                    let action_w =
+                        Self::recovery_card_action_width(action).min(item.bubble_w - 24.0);
+                    let action_rect =
+                        Rect::new(bx + 12.0, y + item.bubble_h - 38.0, action_w, 28.0);
+                    self.paint_recovery_action(ctx, &theme, &pal, action, action_rect, true);
+                    action_rects.push((action, action_rect));
+                }
             }
             y += item.bubble_h + 12.0;
         }
+        *self.transcript_recovery_actions.borrow_mut() = action_rects;
         ctx.pop_clip();
 
         // Streaming / typing notice, pinned to the bottom of the transcript.
@@ -4742,9 +4774,29 @@ impl Widget for TranscriptView {
                 .then(|| chat.runtime_recovery_target())
                 .flatten()
         };
-        let Some(target) = target else {
+        if target.is_none() {
+            for (slot, (action, rect)) in self
+                .transcript_recovery_actions
+                .borrow()
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                let mut node = SemanticsNode::new(
+                    Self::recovery_action_widget_id(ctx.widget_id(), 100 + slot),
+                    SemanticsRole::Button,
+                    rect,
+                );
+                node.parent = Some(ctx.widget_id());
+                node.name = Some(action.label().to_string());
+                node.description = Some(action.description().to_string());
+                node.actions = vec![SemanticsAction::Activate];
+                node.state.hovered = self.hovered_recovery_action.get() == Some(action);
+                ctx.push(node);
+            }
             return;
-        };
+        }
+        let Some(target) = target else { return };
 
         let chat = self.shared.chat();
         for (slot, (action, rect)) in Self::recovery_action_rects(ctx.bounds(), target, &chat)
@@ -6945,6 +6997,45 @@ mod tests {
             transcript_message_display_text(&provider),
             "Error\nprovider unavailable"
         );
+    }
+
+    #[test]
+    fn rendered_connection_error_message_opens_connection_settings() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.models_loading = false;
+            chat.notice = None;
+            chat.messages.push(ChatMessage::system_error(
+                "Error: chat unavailable: failed to parse command: open agent channel SIFS store failed: device authorization was denied",
+            ));
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Connection error message action")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Open settings")
+            .with_description("Connection settings")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+        assert_eq!(
+            shared.settings().selected,
+            Some(SettingsSection::Connection)
+        );
+
+        Ok(())
     }
 
     #[test]
