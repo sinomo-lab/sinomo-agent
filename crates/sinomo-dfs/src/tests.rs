@@ -4827,6 +4827,67 @@ fn smoke_driver_commits_local_candidate_and_publishes_metadata() {
 }
 
 #[test]
+fn smoke_driver_reports_local_commit_when_remote_replica_is_pending() {
+    let root = temp_root("smoke-driver-remote-pending");
+    let local = NodeId::from_legacy_named("node_smoke_driver_pending_local").expect("local");
+    let replica = NodeId::from_legacy_named("node_smoke_driver_pending_replica").expect("replica");
+    let metadata =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+            .expect("metadata backend");
+    let content = LocalContentStore::new(root.join("content")).expect("content store");
+    let mut dfs = NetworkedDfsService::new(
+        FailingSendTransport {
+            local_node_id: local.clone(),
+        },
+        content,
+    )
+    .with_metadata_backend(metadata)
+    .expect("metadata backend");
+    let mut smoke_host = FixedSmokeHost {
+        pending_repair_count: 1,
+    };
+    let mut publisher_host = RecordingMetadataJournalPublisherHost::new(root.join("journal"));
+    let mut transport = ApplyingMetadataJournalTransport::new(replica.clone());
+    let file_system = distributed_sifs(local.clone());
+
+    let report = run_dfs_smoke_with_host(
+        &mut dfs,
+        &local,
+        vec![local.clone(), replica.clone()],
+        vec![replica.clone()],
+        &mut smoke_host,
+        file_system.file_system_id,
+        Vec::new(),
+        &mut publisher_host,
+        &mut transport,
+        DfsSmokeOptions {
+            nonce: Some(67890),
+            ..DfsSmokeOptions::default()
+        },
+    )
+    .expect("smoke");
+
+    assert_eq!(
+        report.requested_replica_node_ids,
+        vec![local.clone(), replica]
+    );
+    assert_eq!(report.committed_replica_node_ids, vec![local]);
+    assert_eq!(report.pending_repair_count, 1);
+    assert_eq!(report.attempts.len(), 1);
+    assert!(report.attempts[0].committed);
+    assert!(report.path.starts_with("/services/dfs-smoke/67890-"));
+    assert!(matches!(
+        report.metadata_replication.outcomes.as_slice(),
+        [DfsMetadataJournalReplicationOutcome::MissingShard { shard_id, .. }]
+            if shard_id == &DfsMetadataShardId::new("root")
+    ));
+    assert!(publisher_host.opened_shards.is_empty());
+    assert_eq!(transport.batches, 0);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn local_content_anti_entropy_pages_and_repairs_stale_locations() {
     let root = temp_root("local-content-anti-entropy");
     let node_id = NodeId::from_legacy_named("node_anti_entropy").expect("node");

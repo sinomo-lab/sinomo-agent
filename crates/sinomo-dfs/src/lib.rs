@@ -3812,19 +3812,13 @@ pub fn run_dfs_smoke_with_host<T: DfsMessageTransport>(
             .map(|node_id| node_id.to_string())
             .collect::<Vec<_>>()
             .join("-");
-        let replica_count = replica_candidates.len();
         let path = format!("/services/dfs-smoke/{nonce}-{target_label}.txt");
         let body = format!("sinomo dfs smoke {nonce} {target_label}\n");
         match service
             .posix_write_file(
                 &path,
                 body.as_bytes(),
-                DfsWriteOptions {
-                    policy: DfsReplicationPolicy::new(replica_count, replica_count)?,
-                    replica_candidates: replica_candidates.clone(),
-                    wait_for_commit: true,
-                    foreground_replica_repair: true,
-                },
+                DfsWriteOptions::replicated_eventual(replica_candidates.clone()),
             )
             .map_err(dfs_posix_error)
         {
