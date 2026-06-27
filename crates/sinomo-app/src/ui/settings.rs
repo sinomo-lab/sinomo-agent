@@ -21,11 +21,11 @@ use std::sync::mpsc::Receiver;
 
 use serde_json::Value;
 use sui::{
-    Alignment, ArrangeCtx, Constraints, DefaultTheme, Event, EventCtx, FieldGroup, FontWeight,
-    FormRow, FormSection, Label, ListItem, ListView, MeasureCtx, PaintCtx, PointerEventKind, Rect,
-    ScrollState, ScrollView, Select, SemanticsCtx, Separator, Size, SizedBox, Stack, Switch,
-    SwitchView, TabBar, TextArea, TextInput, Widget, WidgetPod, WidgetPodMutVisitor,
-    WidgetPodVisitor, WindowEvent,
+    Alignment, ArrangeCtx, Color, Constraints, DefaultTheme, Event, EventCtx, FieldGroup,
+    FontWeight, FormRow, FormSection, Label, ListItem, ListView, MeasureCtx, PaintCtx,
+    PointerEventKind, Rect, ScrollState, ScrollView, Select, SemanticsCtx, Separator, Size,
+    SizedBox, Stack, Switch, SwitchView, TabBar, TextArea, TextInput, Widget, WidgetPod,
+    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
 };
 
 use sinomo_runtime::config::ConfigClient;
@@ -776,6 +776,52 @@ fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     move || reader()
 }
 
+fn mix_color(from: Color, to: Color, amount: f32) -> Color {
+    let amount = amount.clamp(0.0, 1.0);
+    Color::new(
+        from.space,
+        from.red + (to.red - from.red) * amount,
+        from.green + (to.green - from.green) * amount,
+        from.blue + (to.blue - from.blue) * amount,
+        from.alpha + (to.alpha - from.alpha) * amount,
+    )
+    .clamped()
+}
+
+fn secondary_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || {
+        let mut theme = reader();
+        theme.palette.accent = theme.palette.control;
+        theme.palette.accent_hover = theme.palette.control_hover;
+        theme.palette.accent_pressed = theme.palette.control_active;
+        theme.palette.accent_border = theme.palette.border;
+        theme.palette.accent_border_hover = theme.palette.border_hover;
+        theme.palette.accent_border_focus = theme.palette.border_focus;
+        theme.palette.accent_text = theme.palette.text;
+        theme
+    }
+}
+
+fn danger_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || {
+        let mut theme = reader();
+        let danger = theme.palette.danger;
+        let contrast = theme.palette.danger_text;
+        let border = theme.palette.border;
+        theme.palette.accent = danger;
+        theme.palette.accent_hover = mix_color(danger, contrast, 0.08);
+        theme.palette.accent_pressed = mix_color(danger, contrast, 0.16);
+        theme.palette.accent_border = mix_color(danger, border, 0.12);
+        theme.palette.accent_border_hover = mix_color(danger, border, 0.20);
+        theme.palette.accent_border_focus = danger;
+        theme.palette.accent_text = contrast;
+        theme.palette.focus_ring = danger.with_alpha(theme.palette.focus_ring.alpha);
+        theme
+    }
+}
+
 /// Resolve the app chrome palette for the current theme (used by the `Label` color readers and the
 /// `StatusReflector` so muted/accent text matches the bespoke chrome).
 fn palette(shared: &Shared) -> Palette {
@@ -868,6 +914,28 @@ fn node_detail_key(shared: &Shared) -> String {
         settings.clustered,
         settings.cluster_summary,
         settings.node_detail_expanded
+    )
+}
+
+fn cluster_section_key(shared: &Shared) -> String {
+    let settings = shared.settings();
+    let invite_key = settings
+        .invite_result
+        .as_ref()
+        .map(|invite| {
+            format!(
+                "{}:{}:{}:{}",
+                invite.uri, invite.join_command, invite.expires_at, invite.persisted_key
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "clustered:{};summary:{:?};invite:{invite_key};error:{:?};status:{:?};leave:{}",
+        settings.clustered,
+        settings.cluster_summary,
+        settings.cluster_action_error,
+        settings.cluster_action_status,
+        settings.leave_confirming
     )
 }
 
@@ -1379,6 +1447,18 @@ fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
 }
 
 fn section_cluster(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || cluster_section_key(&s)
+        },
+        move |_key| WidgetPod::new(section_cluster_body(&s, &r)),
+    )
+}
+
+fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let (clustered, cluster_summary, invite_result, action_error, action_status, leave_confirming) = {
         let settings = shared.settings();
         (
@@ -1443,7 +1523,7 @@ fn section_cluster(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
                 let s = shared.clone();
                 sui::Button::new("Confirm leave")
                     .icon(sui::IconGlyph::Trash)
-                    .theme_when(clone_reader(reader))
+                    .theme_when(danger_button_theme(reader))
                     .on_press(move || {
                         let Some(backend) = ready_backend(&s) else {
                             apply_cluster_error(&s, "backend is not ready");
@@ -1466,7 +1546,7 @@ fn section_cluster(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
                 let s = shared.clone();
                 sui::Button::new("Cancel")
                     .icon(sui::IconGlyph::Close)
-                    .theme_when(clone_reader(reader))
+                    .theme_when(secondary_button_theme(reader))
                     .on_press(move || {
                         s.settings_mut().cancel_leave_cluster();
                     })
@@ -1495,7 +1575,7 @@ fn section_cluster(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
                 let s = shared.clone();
                 sui::Button::new("Leave cluster")
                     .icon(sui::IconGlyph::Trash)
-                    .theme_when(clone_reader(reader))
+                    .theme_when(danger_button_theme(reader))
                     .on_press(move || {
                         s.settings_mut().confirm_leave_cluster();
                     })
@@ -1789,14 +1869,14 @@ fn provider_management_row(
             let s = shared.clone();
             sui::Button::new("Cancel")
                 .icon(sui::IconGlyph::Close)
-                .theme_when(clone_reader(reader))
+                .theme_when(secondary_button_theme(reader))
                 .on_press(move || s.settings_mut().cancel_provider_remove())
         };
         let remove = {
             let s = shared.clone();
             sui::Button::new("Remove account")
                 .icon(sui::IconGlyph::Trash)
-                .theme_when(clone_reader(reader))
+                .theme_when(danger_button_theme(reader))
                 .on_press(move || {
                     let removed = { s.settings_mut().remove_provider(index) };
                     if removed {
@@ -1831,7 +1911,7 @@ fn provider_management_row(
             let s = shared.clone();
             sui::Button::new("Remove account")
                 .icon(sui::IconGlyph::Trash)
-                .theme_when(clone_reader(reader))
+                .theme_when(danger_button_theme(reader))
                 .on_press(move || s.settings_mut().confirm_provider_remove(index))
         };
         FormRow::new("Management", remove)
@@ -2015,7 +2095,7 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         let s = shared.clone();
         sui::Button::new("Cancel")
             .icon(sui::IconGlyph::ChevronLeft)
-            .theme_when(clone_reader(reader))
+            .theme_when(secondary_button_theme(reader))
             .on_press(move || s.settings_mut().close_provider_add())
     };
     let add_label = if uses_device_login {
@@ -3657,6 +3737,64 @@ mod tests {
 
         let error = open_external_url("codex://login").unwrap_err();
         assert!(error.contains("http"));
+    }
+
+    #[test]
+    fn destructive_and_secondary_button_themes_remap_accent_slots() {
+        let reader: ThemeReader = Rc::new(DefaultTheme::light);
+        let base = reader();
+
+        let danger = danger_button_theme(&reader)();
+        assert_eq!(danger.palette.accent, base.palette.danger);
+        assert_eq!(danger.palette.accent_text, base.palette.danger_text);
+        assert_ne!(danger.palette.accent, base.palette.accent);
+
+        let secondary = secondary_button_theme(&reader)();
+        assert_eq!(secondary.palette.accent, base.palette.control);
+        assert_eq!(secondary.palette.accent_hover, base.palette.control_hover);
+        assert_eq!(
+            secondary.palette.accent_pressed,
+            base.palette.control_active
+        );
+        assert_eq!(secondary.palette.accent_text, base.palette.text);
+    }
+
+    #[test]
+    fn cluster_leave_button_uses_confirmation_flow() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            let settings = &mut app.ready.as_mut().expect("ready state").settings;
+            settings.open(SettingsSection::Cluster);
+            settings.clustered = true;
+            settings.cluster_summary = Some("cluster test · voter".to_string());
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Cluster settings")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Leave cluster")
+            .click()?;
+        assert!(shared.settings().leave_confirming);
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Cancel")
+            .click()?;
+        assert!(!shared.settings().leave_confirming);
+
+        Ok(())
     }
 
     #[test]
