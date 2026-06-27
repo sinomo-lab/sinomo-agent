@@ -23,9 +23,11 @@ use crate::ui::widgets;
 const HEADER_H: f32 = 78.0;
 const PAD: f32 = 20.0;
 const GAP: f32 = 14.0;
-const START_WIDE_H: f32 = 108.0;
-const START_NARROW_H: f32 = 158.0;
+const START_WIDE_H: f32 = 124.0;
+const START_NARROW_H: f32 = 206.0;
 const START_BREAKPOINT: f32 = 760.0;
+const CONTROL_LABEL_H: f32 = 14.0;
+const CONTROL_LABEL_GAP: f32 = 5.0;
 const CONTROL_H: f32 = 38.0;
 const CONTROL_GAP: f32 = 8.0;
 const QUEUE_W: f32 = 306.0;
@@ -272,6 +274,9 @@ impl EvolutionView {
 
 #[derive(Clone, Copy)]
 struct StartControlsLayout {
+    objective_label: Rect,
+    scope_label: Rect,
+    target_label: Rect,
     objective: Rect,
     scope: Rect,
     target: Rect,
@@ -406,6 +411,7 @@ impl Widget for StartControls {
 }
 
 fn start_controls_layout(bounds: Rect) -> StartControlsLayout {
+    let block_h = control_block_height();
     if bounds.width() >= START_BREAKPOINT {
         let button_w = 112.0;
         let target_w = 138.0;
@@ -413,7 +419,8 @@ fn start_controls_layout(bounds: Rect) -> StartControlsLayout {
         let flexible_w = (bounds.width() - fixed_w).max(0.0);
         let objective_w = flexible_w * 0.58;
         let scope_w = flexible_w - objective_w;
-        let y = bounds.y() + (bounds.height() - CONTROL_H).max(0.0) / 2.0;
+        let label_y = bounds.y() + (bounds.height() - block_h).max(0.0) / 2.0;
+        let y = label_y + CONTROL_LABEL_H + CONTROL_LABEL_GAP;
         let mut x = bounds.x();
         let objective = Rect::new(x, y, objective_w, CONTROL_H);
         x = objective.max_x() + CONTROL_GAP;
@@ -423,29 +430,46 @@ fn start_controls_layout(bounds: Rect) -> StartControlsLayout {
         x = target.max_x() + CONTROL_GAP;
         let start = Rect::new(x, y, button_w, CONTROL_H);
         StartControlsLayout {
+            objective_label: label_rect(objective, label_y),
+            scope_label: label_rect(scope, label_y),
+            target_label: label_rect(target, label_y),
             objective,
             scope,
             target,
             start,
         }
     } else {
-        let row2_y = bounds.y() + CONTROL_H + CONTROL_GAP;
+        let label_y = bounds.y();
+        let row1_y = label_y + CONTROL_LABEL_H + CONTROL_LABEL_GAP;
+        let row2_label_y = row1_y + CONTROL_H + CONTROL_GAP;
+        let row2_y = row2_label_y + CONTROL_LABEL_H + CONTROL_LABEL_GAP;
         let button_w = bounds.width().min(104.0);
         let target_w = (bounds.width() - button_w - CONTROL_GAP)
             .max(0.0)
             .min(138.0);
         let scope_w = (bounds.width() - button_w - target_w - CONTROL_GAP * 2.0).max(0.0);
-        let objective = Rect::new(bounds.x(), bounds.y(), bounds.width(), CONTROL_H);
+        let objective = Rect::new(bounds.x(), row1_y, bounds.width(), CONTROL_H);
         let scope = Rect::new(bounds.x(), row2_y, scope_w, CONTROL_H);
         let target = Rect::new(scope.max_x() + CONTROL_GAP, row2_y, target_w, CONTROL_H);
         let start = Rect::new(target.max_x() + CONTROL_GAP, row2_y, button_w, CONTROL_H);
         StartControlsLayout {
+            objective_label: label_rect(objective, label_y),
+            scope_label: label_rect(scope, row2_label_y),
+            target_label: label_rect(target, row2_label_y),
             objective,
             scope,
             target,
             start,
         }
     }
+}
+
+fn control_block_height() -> f32 {
+    CONTROL_LABEL_H + CONTROL_LABEL_GAP + CONTROL_H
+}
+
+fn label_rect(control: Rect, y: f32) -> Rect {
+    Rect::new(control.x(), y, control.width(), CONTROL_LABEL_H)
 }
 
 impl Widget for EvolutionView {
@@ -519,7 +543,15 @@ impl Widget for EvolutionView {
 
         ctx.fill_bounds(pal.window);
         paint_header(ctx, &theme, &pal, layout.header, &dashboard);
-        paint_start_panel(ctx, &theme, &pal, layout.start, &dashboard, &self.shared);
+        paint_start_panel(
+            ctx,
+            &theme,
+            &pal,
+            layout.start,
+            layout.start_controls,
+            &dashboard,
+            &self.shared,
+        );
         self.start.paint(ctx);
         paint_queue(ctx, &theme, &pal, layout.queue, &dashboard, selected);
         paint_detail(ctx, &theme, &pal, layout.detail, selected_job);
@@ -617,9 +649,9 @@ fn start_height_for(width: f32) -> f32 {
 
 fn start_controls_height_for(width: f32) -> f32 {
     if width >= START_BREAKPOINT {
-        CONTROL_H
+        control_block_height()
     } else {
-        CONTROL_H * 2.0 + CONTROL_GAP
+        control_block_height() * 2.0 + CONTROL_GAP
     }
 }
 
@@ -722,6 +754,7 @@ fn paint_start_panel(
     theme: &sui::DefaultTheme,
     pal: &Palette,
     rect: Rect,
+    controls_rect: Rect,
     dashboard: &EvolutionDashboard,
     shared: &Shared,
 ) {
@@ -749,10 +782,29 @@ fn paint_start_panel(
                 },
             )
         } else {
-            (
-                format!("{} jobs tracked", dashboard.jobs.len()),
-                pal.text_muted,
-            )
+            let objective = evolution.objective_draft.trim();
+            if objective.is_empty() {
+                let label = if dashboard.jobs.is_empty() {
+                    "Objective required - scope is optional".to_string()
+                } else {
+                    format!("Objective required - {} jobs tracked", dashboard.jobs.len())
+                };
+                (label, pal.text_muted)
+            } else {
+                let ring = EVOLUTION_TARGET_RINGS
+                    .get(evolution.target_ring_index)
+                    .map(|option| option.label)
+                    .unwrap_or("R1 runtime");
+                let scope_count = parse_scope_paths(&evolution.scope_draft).len();
+                let scope = if scope_count == 0 {
+                    "workspace policy scope".to_string()
+                } else if scope_count == 1 {
+                    "1 scoped path".to_string()
+                } else {
+                    format!("{scope_count} scoped paths")
+                };
+                (format!("Ready for {ring} - {scope}"), pal.accent)
+            }
         }
     };
     let status_rect = if rect.width() >= 640.0 {
@@ -775,6 +827,34 @@ fn paint_start_panel(
         status_rect,
         &status,
         pal.text_style(theme, 12.0, FontWeight::MEDIUM, status_color),
+    );
+    paint_start_labels(ctx, theme, pal, controls_rect);
+}
+
+fn paint_start_labels(
+    ctx: &mut PaintCtx,
+    theme: &sui::DefaultTheme,
+    pal: &Palette,
+    controls_rect: Rect,
+) {
+    let layout = start_controls_layout(controls_rect);
+    paint_start_label(ctx, theme, pal, layout.objective_label, "Objective");
+    paint_start_label(ctx, theme, pal, layout.scope_label, "Scope");
+    paint_start_label(ctx, theme, pal, layout.target_label, "Target ring");
+}
+
+fn paint_start_label(
+    ctx: &mut PaintCtx,
+    theme: &sui::DefaultTheme,
+    pal: &Palette,
+    rect: Rect,
+    label: &str,
+) {
+    widgets::draw_text_in(
+        ctx,
+        rect,
+        label,
+        pal.text_style(theme, 10.5, FontWeight::MEDIUM, pal.text_faint),
     );
 }
 
@@ -1032,19 +1112,43 @@ fn paint_detail(
 }
 
 fn paint_detail_empty(ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette, rect: Rect) {
+    let panel_w = rect.width().min(420.0);
+    let panel_h = 154.0;
+    let panel = Rect::new(
+        rect.x() + (rect.width() - panel_w) / 2.0,
+        rect.y() + (rect.height() - panel_h) / 2.0,
+        panel_w,
+        panel_h,
+    );
+    widgets::round_panel(ctx, panel, pal.panel, pal.border, 8.0);
     widgets::draw_centered(
         ctx,
         "No evolution job selected",
         pal.text_style(theme, 18.0, FontWeight::SEMIBOLD, pal.text_muted),
-        rect.x() + rect.width() / 2.0,
-        rect.y() + rect.height() / 2.0 - 12.0,
+        panel.x() + panel.width() / 2.0,
+        panel.y() + 32.0,
     );
     widgets::draw_centered(
         ctx,
-        "Create or record a candidate to populate this dashboard",
+        "Awaiting a persisted candidate record",
         pal.text_style(theme, 13.0, FontWeight::NORMAL, pal.text_faint),
-        rect.x() + rect.width() / 2.0,
-        rect.y() + rect.height() / 2.0 + 16.0,
+        panel.x() + panel.width() / 2.0,
+        panel.y() + 58.0,
+    );
+    paint_rows(
+        ctx,
+        theme,
+        pal,
+        Rect::new(
+            panel.x() + 14.0,
+            panel.y() + 80.0,
+            panel.width() - 28.0,
+            60.0,
+        ),
+        &[
+            ("Queue".to_string(), "no candidate selected".to_string()),
+            ("Evidence".to_string(), "not available".to_string()),
+        ],
     );
 }
 
@@ -1264,11 +1368,18 @@ fn paint_rail(
         pal.text_style(theme, 15.0, FontWeight::SEMIBOLD, pal.text),
     );
     let Some(job) = job else {
-        widgets::draw_text_in(
+        let rows = [
+            ("Decision".to_string(), "no candidate selected".to_string()),
+            ("Artifacts".to_string(), "not available".to_string()),
+            ("Rollback".to_string(), "not available".to_string()),
+        ];
+        paint_rail_section(
             ctx,
-            Rect::new(inner.x(), inner.y() + 34.0, inner.width(), 34.0),
-            "Select a candidate to inspect approval readiness and artifact paths",
-            pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text_faint),
+            theme,
+            pal,
+            Rect::new(inner.x(), inner.y() + 38.0, inner.width(), 108.0),
+            "Readiness",
+            &rows,
         );
         return;
     };
@@ -1534,4 +1645,35 @@ fn compact(text: &str, max: usize) -> String {
 
 fn short(text: &str, max: usize) -> String {
     compact(text, max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wide_start_controls_reserve_label_space() {
+        let layout =
+            start_controls_layout(Rect::new(0.0, 0.0, 900.0, start_controls_height_for(900.0)));
+
+        assert!(layout.objective_label.max_y() <= layout.objective.y());
+        assert!(layout.scope_label.max_y() <= layout.scope.y());
+        assert!(layout.target_label.max_y() <= layout.target.y());
+        assert_eq!(layout.objective.y(), layout.scope.y());
+        assert_eq!(layout.scope.y(), layout.target.y());
+        assert_eq!(layout.target.y(), layout.start.y());
+    }
+
+    #[test]
+    fn narrow_start_controls_stack_labeled_rows() {
+        let layout =
+            start_controls_layout(Rect::new(0.0, 0.0, 520.0, start_controls_height_for(520.0)));
+
+        assert!(layout.objective_label.max_y() <= layout.objective.y());
+        assert!(layout.objective.max_y() + CONTROL_GAP <= layout.scope_label.y());
+        assert!(layout.scope_label.max_y() <= layout.scope.y());
+        assert!(layout.target_label.max_y() <= layout.target.y());
+        assert!(layout.scope.max_x() <= layout.target.x());
+        assert!(layout.target.max_x() <= layout.start.x());
+    }
 }
