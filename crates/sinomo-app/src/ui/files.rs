@@ -804,7 +804,7 @@ const INSPECTOR_DETAIL_BUTTON_W: f32 = 104.0;
 const INSPECTOR_DETAIL_BUTTON_H: f32 = 24.0;
 
 fn sifs_loading_rows(path: &str, details_open: bool) -> Vec<(&'static str, String)> {
-    let mut rows = vec![("Status", "Connecting to file storage".to_string())];
+    let mut rows = vec![("Status", "Connecting to SIFS".to_string())];
     if details_open {
         rows.push(("Path", path.to_string()));
         rows.push(("Authority", "SIFS through daemon".to_string()));
@@ -922,7 +922,7 @@ impl Widget for InspectorView {
                 x,
                 y,
                 w,
-                "File storage unavailable",
+                "SIFS unavailable",
                 &rows,
                 Some(details_open),
             );
@@ -1827,6 +1827,18 @@ mod tests {
 
     #[test]
     fn sifs_unavailable_rows_hide_diagnostics_until_expanded() {
+        let loading = sifs_loading_rows("/services", false);
+        assert!(
+            loading
+                .iter()
+                .any(|(label, value)| *label == "Status" && value == "Connecting to SIFS")
+        );
+        assert!(
+            !loading
+                .iter()
+                .any(|(_, value)| value.contains("file storage"))
+        );
+
         let collapsed = sifs_unavailable_rows("device authorization was denied", false);
         assert!(collapsed.iter().any(|(label, _)| *label == "Next"));
         assert!(!collapsed.iter().any(|(label, _)| *label == "Reason"));

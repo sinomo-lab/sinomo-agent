@@ -330,7 +330,7 @@ impl RuntimeRecoveryTarget {
                 "Add credentials or choose an available model from provider setup."
             }
             RuntimeRecoveryTarget::Connection => {
-                "Retry the chat list first. If it still fails, open Connection settings."
+                "Retry now. If chat storage is still unavailable, check SIFS or open Connection settings."
             }
         }
     }
@@ -2684,9 +2684,9 @@ fn connection_recovery_display_detail(text: &str) -> Option<String> {
     {
         "Sinomo could not open channel storage."
     } else if lower.contains("chat list") {
-        "Sinomo could not load saved chats from file storage."
+        "Sinomo could not load saved chats from chat storage."
     } else if lower.contains("chat save") {
-        "Sinomo could not save chat history to file storage."
+        "Sinomo could not save chat history to chat storage."
     } else if lower.contains("daemon") || lower.contains("cluster") {
         "The local cluster service is not reachable."
     } else {
@@ -7411,10 +7411,11 @@ mod tests {
                 .expect("chat list display detail");
         assert_eq!(
             chat_list,
-            "Sinomo could not load saved chats from file storage."
+            "Sinomo could not load saved chats from chat storage."
         );
         assert!(!chat_list.contains("device authorization"));
         assert!(!chat_list.contains("SIFS"));
+        assert!(!chat_list.contains("file storage"));
 
         let channel = connection_recovery_display_detail(
             "channel create failed: device authorization was denied",
@@ -7431,9 +7432,10 @@ mod tests {
         let visible = activity_visible_detail("chat list failed: device authorization was denied");
         assert_eq!(
             visible,
-            "Sinomo could not load saved chats from file storage."
+            "Sinomo could not load saved chats from chat storage."
         );
         assert!(!visible.contains("device authorization"));
+        assert!(!visible.contains("file storage"));
 
         let neutral = activity_visible_detail("context assembled: 4.0 KB");
         assert_eq!(neutral, "context assembled: 4.0 KB");
@@ -7810,7 +7812,7 @@ mod tests {
         );
         assert_eq!(
             state.recovery_empty_detail(RuntimeRecoveryTarget::Connection),
-            "Sinomo could not load saved chats from file storage."
+            "Sinomo could not load saved chats from chat storage."
         );
         assert!(
             !state
