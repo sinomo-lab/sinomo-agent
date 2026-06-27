@@ -4925,8 +4925,17 @@ pub fn dfs_service_endpoint_for_member(
         .endpoints
         .iter()
         .filter(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly)
+        .filter(|endpoint| sinomo_network::cluster_endpoint_can_carry_main_daemon_rpc(endpoint))
         .min_by_key(|endpoint| dfs_service_endpoint_rank(endpoint))
-        .or_else(|| member.endpoints.first())
+        .or_else(|| {
+            member
+                .endpoints
+                .iter()
+                .filter(|endpoint| {
+                    sinomo_network::cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
+                })
+                .min_by_key(|endpoint| dfs_service_endpoint_rank(endpoint))
+        })
         .map(|endpoint| endpoint.address.clone())
         .unwrap_or_else(|| format!("cluster-member://{}", member.node_id))
 }

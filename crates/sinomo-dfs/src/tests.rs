@@ -1132,6 +1132,51 @@ fn test_endpoint(node_id: &NodeId, address: &str) -> ClusterEndpointRecord {
 }
 
 #[test]
+fn dfs_service_endpoint_for_member_ignores_shadow_daemon_endpoints() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        sinomo_node::ClusterId::from_legacy_named("cluster_dfs_service_endpoint_shadow_filter")
+            .expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_dfs_service_endpoint_shadow_filter_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_dfs_service_endpoint_shadow_filter_remote")
+        .expect("remote");
+    let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "dfs service endpoint shadow filter",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+    let shadow = sinomo_node::shadow_daemon_node_id(&remote);
+    let mut folded_shadow_endpoint = test_endpoint(&shadow, "node2:21354");
+    folded_shadow_endpoint.node_id = remote.clone();
+    folded_shadow_endpoint.priority = 0;
+    let main_endpoint = test_endpoint(&remote, "node2:21353");
+    let mut member = sinomo_core::ClusterMemberRecord::local_voter(
+        cluster_id,
+        remote.clone(),
+        "remote",
+        "pk-remote",
+        now,
+    );
+    member.endpoints = vec![folded_shadow_endpoint.clone(), main_endpoint.clone()];
+    state.members.push(member.clone());
+
+    assert_eq!(
+        dfs_service_endpoint_for_member(&state, &member, "loopback://127.0.0.1:21353"),
+        main_endpoint.address
+    );
+
+    member.endpoints = vec![folded_shadow_endpoint];
+    assert_eq!(
+        dfs_service_endpoint_for_member(&state, &member, "loopback://127.0.0.1:21353"),
+        format!("cluster-member://{remote}")
+    );
+}
+
+#[test]
 fn adaptive_chunk_window_scales_by_profile_and_object_size() {
     let large_object = 64 * 1024 * 1024;
     let byte_budget_window =

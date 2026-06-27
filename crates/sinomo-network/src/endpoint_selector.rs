@@ -946,7 +946,7 @@ pub(crate) fn cluster_endpoint_identifies_shadow_daemon_for_node(
     stable_shadow_endpoint || cluster_endpoint_uses_default_shadow_daemon_port(endpoint)
 }
 
-pub(crate) fn cluster_endpoint_can_carry_main_daemon_rpc(endpoint: &ClusterEndpointRecord) -> bool {
+pub fn cluster_endpoint_can_carry_main_daemon_rpc(endpoint: &ClusterEndpointRecord) -> bool {
     !cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
 }
 

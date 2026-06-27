@@ -138,6 +138,7 @@ pub(crate) use endpoint_records::{
 };
 pub use endpoint_selector::{
     ClusterEndpointSelectionPurpose, ClusterEndpointSelector, ClusterEndpointTransferProfile,
+    cluster_endpoint_can_carry_main_daemon_rpc,
 };
 #[cfg(test)]
 pub(crate) use endpoint_selector::{
