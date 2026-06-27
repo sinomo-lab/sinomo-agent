@@ -15691,6 +15691,79 @@ fn repair_attempt_restore_resumes_saved_chunk_window() {
 }
 
 #[test]
+fn completed_chunked_stage_and_repair_keep_probe_offset_until_response() {
+    let root = temp_root("completed-chunked-transfer-keeps-probe-offset");
+    let owner = NodeId::from_legacy_named("node_completed_probe_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_completed_probe_replica").expect("node");
+    let object_id = DfsObjectId::from_legacy_named("obj_completed_probe").expect("object");
+    let version = DfsVersion::from_legacy_named("version_completed_probe").expect("version");
+    let mut dfs = networked_sifs_with_backend(&root, owner);
+    let chunked_size = DFS_BLOB_INLINE_LIMIT_BYTES as u64 + DFS_BLOB_CHUNK_BYTES as u64 + 7;
+
+    let repair_intent_id = "dfs_intent_completed_repair_probe";
+    dfs.pending_writes.insert(
+        repair_intent_id.to_string(),
+        pending_networked_write(
+            object_id.clone(),
+            version.clone(),
+            "blake3:completed-repair-probe".to_string(),
+            chunked_size,
+        ),
+    );
+    dfs.record_repair_window_progress(
+        repair_intent_id,
+        &replica,
+        "dfs_repair_completed_probe".to_string(),
+        StageBlobSendOutcome {
+            sent: true,
+            complete: true,
+            next_chunk_index: 17,
+        },
+    );
+    let pending = dfs
+        .pending_writes
+        .get(repair_intent_id)
+        .expect("repair pending write");
+    assert_eq!(
+        pending.repair_next_chunk_indexes.get(&replica),
+        Some(&16),
+        "lost repair completion responses should retry with a final-chunk probe, not from chunk 0"
+    );
+
+    let stage_intent_id = "dfs_intent_completed_stage_probe";
+    dfs.pending_writes.insert(
+        stage_intent_id.to_string(),
+        pending_networked_write(
+            object_id,
+            version,
+            "blake3:completed-stage-probe".to_string(),
+            chunked_size,
+        ),
+    );
+    dfs.record_stage_window_progress(
+        stage_intent_id,
+        &replica,
+        "dfs_stage_completed_probe".to_string(),
+        StageBlobSendOutcome {
+            sent: true,
+            complete: true,
+            next_chunk_index: 5,
+        },
+    );
+    let pending = dfs
+        .pending_writes
+        .get(stage_intent_id)
+        .expect("stage pending write");
+    assert_eq!(
+        pending.stage_next_chunk_indexes.get(&replica),
+        Some(&4),
+        "lost stage completion responses should retry with a final-chunk probe, not from chunk 0"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn repair_response_conflicting_receipt_preserves_retry_state() {
     let root = temp_root("repair-conflicting-receipt-keeps-retry");
     let owner = NodeId::from_legacy_named("node_repair_conflict_owner").expect("node");

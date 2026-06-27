@@ -25151,9 +25151,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         outcome: StageBlobSendOutcome,
     ) {
         if outcome.complete {
+            let retry_probe_chunk_index =
+                Self::completed_chunked_transfer_retry_probe_chunk_index(outcome.next_chunk_index);
             self.record_stage_inflight(intent_id, replica_node_id, request_id);
             if let Some(pending) = self.pending_writes.get_mut(intent_id) {
-                pending.stage_next_chunk_indexes.remove(replica_node_id);
+                if pending.size_bytes > DFS_BLOB_INLINE_LIMIT_BYTES as u64 {
+                    if let Some(next_chunk_index) = retry_probe_chunk_index {
+                        pending
+                            .stage_next_chunk_indexes
+                            .insert(replica_node_id.clone(), next_chunk_index);
+                    } else {
+                        pending.stage_next_chunk_indexes.remove(replica_node_id);
+                    }
+                } else {
+                    pending.stage_next_chunk_indexes.remove(replica_node_id);
+                }
             }
             return;
         }
@@ -25191,6 +25203,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             pending.stage_inflight_request_ids.remove(replica_node_id);
             pending.stage_next_chunk_indexes.remove(replica_node_id);
         }
+    }
+
+    fn completed_chunked_transfer_retry_probe_chunk_index(next_chunk_index: u32) -> Option<u32> {
+        next_chunk_index.checked_sub(1)
     }
 
     fn record_stage_patch_fallback(&mut self, intent_id: &str, replica_node_id: &NodeId) {
@@ -25461,9 +25477,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         outcome: StageBlobSendOutcome,
     ) {
         if outcome.complete {
+            let retry_probe_chunk_index =
+                Self::completed_chunked_transfer_retry_probe_chunk_index(outcome.next_chunk_index);
             self.record_repair_inflight(intent_id, replica_node_id, request_id);
             if let Some(pending) = self.pending_writes.get_mut(intent_id) {
-                pending.repair_next_chunk_indexes.remove(replica_node_id);
+                if pending.size_bytes > DFS_BLOB_INLINE_LIMIT_BYTES as u64 {
+                    if let Some(next_chunk_index) = retry_probe_chunk_index {
+                        pending
+                            .repair_next_chunk_indexes
+                            .insert(replica_node_id.clone(), next_chunk_index);
+                    } else {
+                        pending.repair_next_chunk_indexes.remove(replica_node_id);
+                    }
+                } else {
+                    pending.repair_next_chunk_indexes.remove(replica_node_id);
+                }
             }
             return;
         }
