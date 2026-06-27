@@ -10259,6 +10259,55 @@ fn stat_prefers_backend_tombstone_over_stale_memory_file() {
 }
 
 #[test]
+fn tombstone_tracking_ignores_stale_live_path_metadata() {
+    let root = temp_root("tombstone-ignores-stale-live");
+    let owner = NodeId::from_legacy_named("node_tombstone_stale_live").expect("owner");
+    let path = "/tombstone-stale-live.txt";
+    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    dfs.tombstones_by_metadata_path.clear();
+    let stale_version = DfsVersion::new("00000000000000000000000001").expect("version");
+    let tombstone_version = DfsVersion::new("00000000000000000000000002").expect("version");
+    let fresh_version = DfsVersion::new("00000000000000000000000003").expect("version");
+
+    let mut tombstone = file_metadata(owner.clone());
+    tombstone.object_id =
+        DfsObjectId::from_legacy_named("obj_tombstone_stale_live_delete").expect("object");
+    tombstone.path = path.to_string();
+    tombstone.kind = DfsObjectKind::Tombstone;
+    tombstone.version = tombstone_version;
+    dfs.track_metadata_tombstone(&tombstone);
+
+    let key = (sifs_file_system_id(), metadata_path(path));
+    assert!(
+        dfs.tombstones_by_metadata_path.contains_key(&key),
+        "newer tombstone should be tracked for the deleted path"
+    );
+
+    let mut stale_live = file_metadata(owner.clone());
+    stale_live.object_id =
+        DfsObjectId::from_legacy_named("obj_tombstone_stale_live_old").expect("object");
+    stale_live.path = path.to_string();
+    stale_live.version = stale_version;
+    dfs.track_hydrated_metadata_tombstone(&stale_live);
+    assert!(
+        dfs.tombstones_by_metadata_path.contains_key(&key),
+        "older live metadata must not clear a newer tombstone"
+    );
+
+    let mut fresh_live = stale_live;
+    fresh_live.object_id =
+        DfsObjectId::from_legacy_named("obj_tombstone_stale_live_fresh").expect("object");
+    fresh_live.version = fresh_version;
+    dfs.track_hydrated_metadata_tombstone(&fresh_live);
+    assert!(
+        !dfs.tombstones_by_metadata_path.contains_key(&key),
+        "newer live metadata should clear the older tombstone"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn hydrate_from_metadata_backend_clears_partial_blob_transfers() {
     let root = temp_root("hydrate-clears-partial-blob-transfers");
     let node_id = NodeId::from_legacy_named("node_hydrate_clear").expect("node");
@@ -15411,6 +15460,111 @@ fn repair_authority_rejection_suppresses_stale_retry_loop() {
     assert!(
         !dfs.repair_retry_is_due(&intent_id, &replica),
         "fetch wakeups must not re-enable suppressed stale-authority repairs"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn repair_attempt_restore_preserves_lost_authority_suppression() {
+    let root = temp_root("repair-attempt-restore-lost-authority");
+    let owner = NodeId::from_legacy_named("node_repair_restore_reject_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_repair_restore_reject_replica").expect("node");
+    let new_primary =
+        NodeId::from_legacy_named("node_repair_restore_reject_primary").expect("node");
+    let object_id = DfsObjectId::from_legacy_named("obj_repair_restore_reject").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    let mut metadata = file_metadata(owner.clone());
+    metadata.object_id = object_id.clone();
+    metadata.version = version_1;
+    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    dfs.add_object_metadata(metadata).expect("metadata");
+
+    let write = dfs
+        .write_distributed_eventual(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: owner.clone(),
+            },
+            b"repair restore lost authority bytes".to_vec(),
+            vec![owner, replica.clone()],
+            DfsReplicationPolicy::new(1, 2).expect("policy"),
+        )
+        .expect("write commits locally with pending repair");
+    let intent_id = match write {
+        NetworkedDfsWriteOutcome::Committed {
+            intent_id,
+            repair_jobs,
+            ..
+        } => {
+            assert_eq!(repair_jobs.len(), 1);
+            assert_eq!(repair_jobs[0].missing_replica_node_id, replica);
+            intent_id
+        }
+        other => panic!("expected committed write with repair job, got {other:?}"),
+    };
+
+    let request_id = "dfs_net_req_repair_restore_auth_reject".to_string();
+    dfs.record_repair_inflight(&intent_id, &replica, request_id.clone());
+    let event = dfs
+        .handle_repair_replica_response(
+            replica.clone(),
+            DfsRepairReplicaResponse {
+                request_id,
+                intent_id: intent_id.clone(),
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                version: version_2,
+                replica_node_id: replica.clone(),
+                result: DfsBlobTransferResult::Rejected {
+                    reason: format!(
+                        "source is not current metadata shard primary for sifs; primary is {new_primary} at epoch 2"
+                    ),
+                },
+            },
+        )
+        .expect("authority rejection is handled");
+    dfs.observe_repair_maintenance_events(&[event]);
+
+    let records = dfs.active_repair_attempt_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].intent_id, intent_id);
+    assert_eq!(records[0].missing_replica_node_id, replica);
+    assert!(
+        records[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("source is not current metadata shard primary"))
+    );
+
+    let pending = dfs
+        .pending_writes
+        .get_mut(&intent_id)
+        .expect("pending write");
+    pending.repair_retries.clear();
+    pending.repair_inflight_request_ids.clear();
+    pending.repair_next_chunk_indexes.clear();
+    dfs.repair_attempt_records.clear();
+
+    let scheduled = dfs
+        .retry_pending_repairs_bounded_with_attempts(1, &records)
+        .expect("restore attempts");
+    assert!(
+        scheduled.is_empty(),
+        "restored lost-authority attempt must not schedule another stale repair"
+    );
+    assert!(
+        !dfs.repair_retry_is_due(&intent_id, &replica),
+        "restored lost-authority attempt must stay suppressed"
+    );
+    assert_eq!(
+        dfs.active_repair_attempt_records().len(),
+        1,
+        "suppression record must remain durable across the next tick"
     );
 
     std::fs::remove_dir_all(root).ok();

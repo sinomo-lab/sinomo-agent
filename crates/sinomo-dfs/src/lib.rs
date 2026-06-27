@@ -12835,6 +12835,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     fn track_hydrated_metadata_tombstone(&mut self, object: &DfsObjectMetadata) {
         if object.kind != DfsObjectKind::Tombstone {
+            let key = (object.file_system_id.clone(), metadata_path(&object.path));
+            if self
+                .tombstones_by_metadata_path
+                .get(&key)
+                .is_some_and(|existing| existing.version > object.version)
+            {
+                return;
+            }
             self.track_metadata_tombstone(object);
             return;
         }
@@ -25069,6 +25077,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .entry(record.missing_replica_node_id.clone())
                 .or_default();
             state.attempts = state.attempts.max(record.attempts);
+            if repair_attempt_record_indicates_lost_authority(record) {
+                state.attempts = state.attempts.max(1);
+                state.inflight = false;
+                state.next_retry_tick = DFS_REPAIR_RETRY_SUPPRESSED_TICK;
+                pending
+                    .repair_inflight_request_ids
+                    .remove(&record.missing_replica_node_id);
+                pending
+                    .repair_next_chunk_indexes
+                    .remove(&record.missing_replica_node_id);
+                continue;
+            }
             state.inflight =
                 record.in_flight && record.next_retry_unix_nanos > dfs_now_unix_nanos();
         }
@@ -25079,10 +25099,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut records = Vec::new();
         for (intent_id, pending) in &self.pending_writes {
             for (replica_node_id, state) in &pending.repair_retries {
-                if state.attempts == 0 || repair_retry_state_is_suppressed(state) {
+                let key = (intent_id.clone(), replica_node_id.clone());
+                if repair_retry_state_is_suppressed(state) {
+                    if let Some(existing) = self.repair_attempt_records.get(&key)
+                        && repair_attempt_record_indicates_lost_authority(existing)
+                    {
+                        let mut record = existing.clone();
+                        record.attempts = record.attempts.max(state.attempts);
+                        record.in_flight = false;
+                        record.next_retry_unix_nanos = u64::MAX;
+                        records.push(record);
+                    }
                     continue;
                 }
-                let key = (intent_id.clone(), replica_node_id.clone());
+                if state.attempts == 0 {
+                    continue;
+                }
                 if let Some(existing) = self.repair_attempt_records.get(&key)
                     && existing.next_retry_unix_nanos > now
                     && existing.attempts >= state.attempts
@@ -25137,12 +25169,42 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     reason,
                     ..
                 } => {
-                    if let Some(record) = self
-                        .repair_attempt_records
-                        .get_mut(&(intent_id.clone(), replica_node_id.clone()))
-                    {
+                    let key = (intent_id.clone(), replica_node_id.clone());
+                    if let Some(record) = self.repair_attempt_records.get_mut(&key) {
                         record.in_flight = false;
                         record.last_error = Some(reason.clone());
+                    } else if let Some(pending) = self.pending_writes.get(intent_id) {
+                        let state = pending.repair_retries.get(replica_node_id);
+                        let attempts = state.map(|state| state.attempts).unwrap_or(1).max(1);
+                        let next_retry_unix_nanos = if state
+                            .is_some_and(repair_retry_state_is_suppressed)
+                            && repair_rejection_indicates_lost_authority(reason)
+                        {
+                            u64::MAX
+                        } else {
+                            let remaining_ticks = state
+                                .map(|state| {
+                                    state.next_retry_tick.saturating_sub(self.repair_retry_tick)
+                                })
+                                .unwrap_or(0);
+                            dfs_now_unix_nanos()
+                                .saturating_add(repair_retry_delay_nanos_for_ticks(remaining_ticks))
+                        };
+                        self.repair_attempt_records.insert(
+                            key,
+                            DfsRepairAttemptRecord {
+                                intent_id: intent_id.clone(),
+                                object_id: pending.object_id.clone(),
+                                version: pending.version.clone(),
+                                content_hash: pending.content_hash.clone(),
+                                missing_replica_node_id: replica_node_id.clone(),
+                                attempts,
+                                in_flight: false,
+                                last_attempt_unix_nanos: dfs_now_unix_nanos(),
+                                next_retry_unix_nanos,
+                                last_error: Some(reason.clone()),
+                            },
+                        );
                     }
                 }
                 _ => {}
@@ -27996,6 +28058,13 @@ fn repair_retry_delay_nanos_for_ticks(ticks: u64) -> u64 {
 
 fn repair_retry_state_is_suppressed(state: &RepairRetryState) -> bool {
     state.next_retry_tick == DFS_REPAIR_RETRY_SUPPRESSED_TICK
+}
+
+fn repair_attempt_record_indicates_lost_authority(record: &DfsRepairAttemptRecord) -> bool {
+    record
+        .last_error
+        .as_deref()
+        .is_some_and(repair_rejection_indicates_lost_authority)
 }
 
 fn wake_repair_retry_state(state: &mut RepairRetryState) {
