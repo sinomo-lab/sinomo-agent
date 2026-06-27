@@ -192,14 +192,15 @@ impl Placeholder {
 impl Widget for Placeholder {
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
         if let Some(action) = &mut self.action {
-            action.measure(ctx, Constraints::tight(Size::new(220.0, 32.0)));
+            let action_width = 360.0_f32.min((constraints.max.width - 32.0).max(0.0));
+            action.measure(ctx, Constraints::tight(Size::new(action_width, 32.0)));
         }
         constraints.max
     }
 
     fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
         if let Some(action) = &mut self.action {
-            let w = 220.0_f32.min((bounds.width() - 32.0).max(0.0));
+            let w = 360.0_f32.min((bounds.width() - 32.0).max(0.0));
             let cx = bounds.x() + bounds.width() / 2.0;
             let cy = bounds.y() + bounds.height() / 2.0 - 18.0;
             action.arrange(ctx, Rect::new(cx - w / 2.0, cy + 54.0, w, 32.0));

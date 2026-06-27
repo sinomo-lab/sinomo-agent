@@ -221,6 +221,27 @@ impl FilesState {
         }
     }
 
+    fn retry(&mut self, waker: Option<sui::UiHandle>) {
+        self.reset_for_retry();
+        self.ensure_loaded(waker);
+    }
+
+    fn reset_for_retry(&mut self) {
+        self.browser = None;
+        self.error = None;
+        self.entries.clear();
+        self.selected = None;
+        self.node_id.clear();
+        self.loaded = false;
+        self.loading = false;
+        self.pending_request_id = None;
+        self.worker_tx = None;
+        self.worker_rx = None;
+        self.worker_result_tx = None;
+        self.worker_waker = None;
+        self.list_revision = self.list_revision.wrapping_add(1);
+    }
+
     fn ensure_worker(&mut self, waker: sui::UiHandle) {
         if self.worker_tx.is_some() {
             return;
@@ -612,17 +633,34 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
         );
     }
     if let Some(error) = error {
-        let action = {
+        let retry = {
+            let s = shared.clone();
+            sui::Button::new("Retry SIFS")
+                .icon(IconGlyph::Redo)
+                .min_width(112.0)
+                .theme_when(clone_reader(reader))
+                .on_press(move || {
+                    let waker = { s.borrow().waker.clone() };
+                    s.files_mut().retry(waker);
+                })
+        };
+        let settings = {
             let s = shared.clone();
             sui::Button::new("Connection settings")
                 .icon(IconGlyph::Alert)
+                .min_width(160.0)
                 .theme_when(clone_reader(reader))
                 .on_press(move || open_settings_section(&s, SettingsSection::Connection))
         };
+        let actions = Stack::horizontal()
+            .spacing(8.0)
+            .alignment(Alignment::Center)
+            .with_child(retry)
+            .with_child(settings);
         return WidgetPod::new(
             centered_note(shared, "▤", "SIFS unavailable", format!("{error}"))
                 .glyph(IconGlyph::Storage)
-                .action(action),
+                .action(actions),
         );
     }
     if is_empty {
@@ -805,7 +843,7 @@ impl Widget for InspectorView {
                 &[
                     ("Reason", error.clone()),
                     ("Authority", "SIFS through daemon".to_string()),
-                    ("Next", "open Connection settings".to_string()),
+                    ("Next", "retry SIFS or open Connection settings".to_string()),
                 ],
             );
             return;
@@ -1677,6 +1715,44 @@ mod tests {
     }
 
     #[test]
+    fn retry_resets_stale_sifs_worker_snapshot() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        let (tx, _rx) = mpsc::channel();
+        let (_result_tx, result_rx) = mpsc::channel();
+
+        state.loaded = true;
+        state.loading = true;
+        state.error = Some("device authorization was denied".to_string());
+        state.node_id = "node-old".to_string();
+        state.entries = vec![SifsEntry {
+            name: "old".to_string(),
+            path: "/old".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: Some(1),
+        }];
+        state.selected = Some(0);
+        state.pending_request_id = Some(42);
+        state.worker_tx = Some(tx);
+        state.worker_rx = Some(result_rx);
+        state.path = "/services".to_string();
+
+        state.reset_for_retry();
+
+        assert!(!state.loaded);
+        assert!(!state.loading);
+        assert!(state.error.is_none());
+        assert!(state.entries.is_empty());
+        assert_eq!(state.selected, None);
+        assert_eq!(state.pending_request_id, None);
+        assert!(state.worker_tx.is_none());
+        assert!(state.worker_rx.is_none());
+        assert_eq!(state.node_id, "");
+        assert_eq!(state.path, "/services");
+    }
+
+    #[test]
     fn path_normalization_keeps_sifs_paths_absolute() {
         assert_eq!(
             normalize_path("/users/../services/./sinomo"),
@@ -1722,6 +1798,58 @@ mod tests {
             shared.settings().selected,
             Some(SettingsSection::Connection)
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_placeholder_retries_sifs() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/services".to_string();
+            files.error = Some("device authorization was denied".to_string());
+            files.entries = vec![SifsEntry {
+                name: "old".to_string(),
+                path: "/services/old".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(1),
+            }];
+            files.selected = Some(0);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files retry")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Retry SIFS")
+            .click()?;
+
+        let files = shared.files();
+        assert!(files.loaded);
+        assert!(
+            files.loading
+                || files.error.as_deref() == Some("SIFS browsing requires a daemon connection")
+        );
+        assert_ne!(
+            files.error.as_deref(),
+            Some("device authorization was denied")
+        );
+        assert!(files.entries.is_empty());
+        assert_eq!(files.selected, None);
+        assert_eq!(files.path, "/services");
 
         Ok(())
     }
