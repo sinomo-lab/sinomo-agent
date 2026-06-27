@@ -9,18 +9,22 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::local::SinomoDataDir;
 
+use crate::rendering::AppRenderMode;
 use crate::theme::AppThemeMode;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppUiConfig {
     #[serde(default)]
     pub theme: AppThemeMode,
+    #[serde(default)]
+    pub render_mode: AppRenderMode,
 }
 
 impl Default for AppUiConfig {
     fn default() -> Self {
         Self {
             theme: AppThemeMode::System,
+            render_mode: AppRenderMode::Automatic,
         }
     }
 }
@@ -42,9 +46,22 @@ pub fn load_theme(data_dir: &SinomoDataDir) -> AppThemeMode {
     load_ui_config(data_dir).theme
 }
 
+pub fn load_render_mode(data_dir: &SinomoDataDir) -> AppRenderMode {
+    load_ui_config(data_dir).render_mode
+}
+
 pub fn save_theme(data_dir: &SinomoDataDir, theme: AppThemeMode) -> Result<(), String> {
     let mut config = load_ui_config(data_dir);
     config.theme = theme;
+    save_ui_config(data_dir, &config)
+}
+
+pub fn save_render_mode(
+    data_dir: &SinomoDataDir,
+    render_mode: AppRenderMode,
+) -> Result<(), String> {
+    let mut config = load_ui_config(data_dir);
+    config.render_mode = render_mode;
     save_ui_config(data_dir, &config)
 }
 
@@ -110,5 +127,16 @@ mod tests {
         assert_eq!(load_theme(&data_dir), AppThemeMode::Light);
         let saved = fs::read_to_string(ui_config_file(&data_dir)).expect("read saved config");
         assert!(saved.contains("\"theme\": \"light\""));
+    }
+
+    #[test]
+    fn save_render_mode_round_trips_local_ui_config() {
+        let data_dir = temp_data_dir("render-round-trip");
+
+        save_render_mode(&data_dir, AppRenderMode::ForceSdr).expect("save render mode");
+
+        assert_eq!(load_render_mode(&data_dir), AppRenderMode::ForceSdr);
+        let saved = fs::read_to_string(ui_config_file(&data_dir)).expect("read saved config");
+        assert!(saved.contains("\"render_mode\": \"force_sdr\""));
     }
 }

@@ -20,7 +20,7 @@ use sui::{
     ArrangeCtx, Constraints, Event, EventCtx, EventPhase, FontWeight, Image, ImageFit, ImageHandle,
     MeasureCtx, PaintCtx, Rect, SemanticsCtx, SemanticsNode, SemanticsRole, SingleChild, Size,
     Spinner, SwitchView, TabBar, ThemeShadow, Widget, WidgetPod, WidgetPodMutVisitor,
-    WidgetPodVisitor, WindowEvent,
+    WidgetPodVisitor, WindowEvent, WindowRenderOptions,
 };
 
 use crate::state::{Shared, Tab};
@@ -56,6 +56,7 @@ pub struct Shell {
     /// switch needs a fresh measure+arrange for the newly-shown view. We diff on `RedrawRequested`
     /// to catch it (the same diff-on-redraw the tabs use internally for nested switches).
     last_tab: Cell<Tab>,
+    last_render_options: Cell<Option<WindowRenderOptions>>,
     bar_rect: Rect,
     tab_strip_rect: Rect,
     body_rect: Rect,
@@ -89,6 +90,7 @@ impl Shell {
             spinner,
             content: None,
             last_tab: Cell::new(initial_tab),
+            last_render_options: Cell::new(None),
             bar_rect: Rect::ZERO,
             tab_strip_rect: Rect::ZERO,
             body_rect: Rect::ZERO,
@@ -121,6 +123,16 @@ impl Shell {
         let dark = widgets::theme_is_dark(&self.shared);
         let pal = Palette::from_theme(&theme, dark);
         (theme, pal)
+    }
+
+    fn sync_render_options(&self, ctx: &mut EventCtx) {
+        let options = self.shared.render_options();
+        if self.last_render_options.get() == Some(options) {
+            return;
+        }
+        sui::set_window_render_options(ctx.window_id(), options);
+        self.last_render_options.set(Some(options));
+        ctx.request_paint();
     }
 }
 
@@ -305,6 +317,7 @@ impl Widget for Shell {
                 if changed || device_changed || files_changed || chat_changed {
                     ctx.request_paint();
                 }
+                self.sync_render_options(ctx);
             }
             return;
         }
@@ -322,6 +335,7 @@ impl Widget for Shell {
                 ctx.request_semantics();
                 ctx.request_paint();
             }
+            self.sync_render_options(ctx);
         }
     }
 

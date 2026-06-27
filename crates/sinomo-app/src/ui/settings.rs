@@ -39,6 +39,7 @@ use crate::backend::config::{
     set_provider_base_url, set_provider_effort, set_provider_enabled, set_provider_model,
     set_value,
 };
+use crate::rendering::AppRenderMode;
 use crate::state::Shared;
 use crate::theme::{AppThemeMode, Palette};
 use crate::ui::widgets;
@@ -589,12 +590,15 @@ fn provider_field_key(provider: &str, account: &str, field: ProviderField) -> St
 
 /// A short, right-aligned value preview for a section, shown in the narrow menu rows.
 pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
-    let settings = shared.settings();
     match section {
-        SettingsSection::Appearance => shared.borrow().theme_mode.label().to_string(),
-        SettingsSection::Connection => settings.mode_label.clone(),
-        SettingsSection::Node => settings.role.clone(),
+        SettingsSection::Appearance => {
+            let app = shared.borrow();
+            format!("{} · {}", app.theme_mode.label(), app.render_mode.label())
+        }
+        SettingsSection::Connection => shared.settings().mode_label.clone(),
+        SettingsSection::Node => shared.settings().role.clone(),
         SettingsSection::Cluster => {
+            let settings = shared.settings();
             if settings.clustered {
                 "Connected".to_string()
             } else {
@@ -602,6 +606,7 @@ pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
             }
         }
         SettingsSection::Providers => {
+            let settings = shared.settings();
             if settings.provider_forms.is_empty() {
                 "Not set up".to_string()
             } else {
@@ -610,13 +615,14 @@ pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
             }
         }
         SettingsSection::Configuration => {
+            let settings = shared.settings();
             if settings.config_error.is_some() {
                 "Unavailable".to_string()
             } else {
                 format!("{} keys", settings.config_items.len())
             }
         }
-        SettingsSection::About => format!("v{}", settings.version),
+        SettingsSection::About => format!("v{}", shared.settings().version),
     }
 }
 
@@ -800,6 +806,24 @@ fn mode_to_index(mode: AppThemeMode) -> usize {
     }
 }
 
+fn index_to_render_mode(i: usize) -> AppRenderMode {
+    match i {
+        1 => AppRenderMode::ForceSdr,
+        2 => AppRenderMode::PreferWideGamut,
+        3 => AppRenderMode::PreferHdr,
+        _ => AppRenderMode::Automatic,
+    }
+}
+
+fn render_mode_to_index(mode: AppRenderMode) -> usize {
+    match mode {
+        AppRenderMode::Automatic => 0,
+        AppRenderMode::ForceSdr => 1,
+        AppRenderMode::PreferWideGamut => 2,
+        AppRenderMode::PreferHdr => 3,
+    }
+}
+
 fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let mode_index = mode_to_index(shared.borrow().theme_mode);
     let tab_bar = {
@@ -812,11 +836,33 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
                 s.set_theme_mode(index_to_mode(i));
             })
     };
-    let body = FieldGroup::new().with_child(
-        FormRow::new("Theme", tab_bar)
-            .inline()
-            .theme_when(clone_reader(reader)),
-    );
+    let render_select = {
+        let s = shared.clone();
+        Select::new("render-color-output")
+            .options([
+                AppRenderMode::Automatic.label(),
+                AppRenderMode::ForceSdr.label(),
+                AppRenderMode::PreferWideGamut.label(),
+                AppRenderMode::PreferHdr.label(),
+            ])
+            .selected(render_mode_to_index(shared.render_mode()))
+            .theme_when(clone_reader(reader))
+            .on_change(move |index, _| {
+                s.set_render_mode(index_to_render_mode(index));
+            })
+    };
+    let body = FieldGroup::new()
+        .spacing(6.0)
+        .with_child(
+            FormRow::new("Theme", tab_bar)
+                .inline()
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            FormRow::new("Color output", render_select)
+                .inline()
+                .theme_when(clone_reader(reader)),
+        );
     FormSection::new("Appearance", body).theme_when(clone_reader(reader))
 }
 

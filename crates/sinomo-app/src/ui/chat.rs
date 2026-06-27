@@ -65,6 +65,7 @@ use crate::backend::chat_engine::{ChatCommand, ChatEvent, ChatHandle, ChatRole, 
 use crate::backend::sessions::{self, StoredMessage};
 use crate::state::{Shared, Tab};
 use crate::theme::Palette;
+use crate::ui::settings::SettingsSection;
 use crate::ui::widgets;
 
 /// Below this content width the sidebar collapses away (transcript + composer only).
@@ -256,6 +257,35 @@ pub struct ChatActivityEntry {
     pub title: String,
     pub detail: String,
     pub tone: ActivityTone,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum RuntimeRecoveryTarget {
+    Providers,
+    Connection,
+}
+
+impl RuntimeRecoveryTarget {
+    fn key(self) -> &'static str {
+        match self {
+            RuntimeRecoveryTarget::Providers => "providers",
+            RuntimeRecoveryTarget::Connection => "connection",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            RuntimeRecoveryTarget::Providers => "Fix provider",
+            RuntimeRecoveryTarget::Connection => "Connection",
+        }
+    }
+
+    fn settings_section(self) -> SettingsSection {
+        match self {
+            RuntimeRecoveryTarget::Providers => SettingsSection::Providers,
+            RuntimeRecoveryTarget::Connection => SettingsSection::Connection,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -806,6 +836,43 @@ impl ChatState {
                 let combined = format!("{} {}", entry.title, entry.detail);
                 text_mentions_runtime_problem(&combined).then(|| compact_line(&combined, 96))
             })
+    }
+
+    fn runtime_recovery_target(&self) -> Option<RuntimeRecoveryTarget> {
+        if self.providers.is_empty() {
+            return Some(RuntimeRecoveryTarget::Providers);
+        }
+
+        let health = self.runtime_health();
+        if !matches!(health.tone, ActivityTone::Warn | ActivityTone::Bad) {
+            return None;
+        }
+
+        let detail = health.detail.to_ascii_lowercase();
+        if ["chat list", "chat save", "sifs", "dfs", "daemon", "cluster"]
+            .iter()
+            .any(|needle| detail.contains(needle))
+        {
+            return Some(RuntimeRecoveryTarget::Connection);
+        }
+
+        if [
+            "auth",
+            "credential",
+            "provider",
+            "model",
+            "api key",
+            "sign-in",
+            "sign in",
+            "login",
+        ]
+        .iter()
+        .any(|needle| detail.contains(needle))
+        {
+            Some(RuntimeRecoveryTarget::Providers)
+        } else {
+            Some(RuntimeRecoveryTarget::Connection)
+        }
     }
 
     fn event_belongs_to_visible_session(&self, session_id: &str) -> bool {
@@ -2312,6 +2379,8 @@ fn text_mentions_runtime_problem(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     [
         "sifs mirror failed",
+        "auth",
+        "credential",
         "dfs",
         "sandbox",
         "policy",
@@ -4009,7 +4078,7 @@ impl TranscriptView {
 /// loading flag — anything that changes the *set* of options or which selectors are shown. (The
 /// selected-index reactivity is handled by each `Select`'s `selected_when`; this only drives the
 /// rebuild when the option lists themselves change.)
-fn selector_signature(shared: &Shared) -> (usize, usize, usize, bool, bool, String) {
+fn selector_signature(shared: &Shared) -> (usize, usize, usize, bool, bool, String, String) {
     let chat = shared.chat();
     (
         chat.provider_idx,
@@ -4022,6 +4091,10 @@ fn selector_signature(shared: &Shared) -> (usize, usize, usize, bool, bool, Stri
             .map(|provider| format!("{}@{}:{}", provider.id, provider.account, provider.name))
             .collect::<Vec<_>>()
             .join("\u{1f}"),
+        chat.runtime_recovery_target()
+            .map(RuntimeRecoveryTarget::key)
+            .unwrap_or("none")
+            .to_string(),
     )
 }
 
@@ -4110,7 +4183,32 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         row = row.with_child(SizedBox::new().height(SELECTOR_H).with_child(effort));
     }
 
+    if let Some(action) = runtime_recovery_button(shared, reader) {
+        row = row.with_child(action);
+    }
+
     WidgetPod::new(row)
+}
+
+fn runtime_recovery_button(shared: &Shared, reader: &ThemeReader) -> Option<SizedBox> {
+    let target = shared.chat().runtime_recovery_target()?;
+    let s = shared.clone();
+    Some(
+        SizedBox::new().height(SELECTOR_H).with_child(
+            sui::Button::new(target.label())
+                .icon(IconGlyph::Alert)
+                .theme_when(composer_control_reader(reader))
+                .on_press(move || open_settings_section(&s, target.settings_section())),
+        ),
+    )
+}
+
+fn open_settings_section(shared: &Shared, section: SettingsSection) {
+    let mut app = shared.borrow_mut();
+    app.active_tab = Tab::Settings;
+    if let Some(ready) = app.ready.as_mut() {
+        ready.settings.open(section);
+    }
 }
 
 fn open_provider_setup(shared: &Shared) {
@@ -4439,6 +4537,10 @@ fn view_signature(shared: &Shared) -> u64 {
     chat.effort_visible().hash(&mut h);
     chat.streaming.hash(&mut h);
     chat.models_loading.hash(&mut h);
+    chat.runtime_recovery_target()
+        .map(RuntimeRecoveryTarget::key)
+        .unwrap_or("none")
+        .hash(&mut h);
     chat.providers.len().hash(&mut h);
     for provider in &chat.providers {
         provider.id.hash(&mut h);
@@ -6015,6 +6117,43 @@ mod tests {
                 .iter()
                 .any(|entry| entry.title == "agent error" && entry.tone == ActivityTone::Bad)
         );
+    }
+
+    #[test]
+    fn runtime_recovery_target_routes_to_actionable_settings_section() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.providers.clear();
+        assert_eq!(
+            state.runtime_recovery_target(),
+            Some(RuntimeRecoveryTarget::Providers)
+        );
+
+        seed_default_provider(&mut state);
+        state.notice = Some("chat save failed: DFS services shard replay delayed".to_string());
+        assert_eq!(
+            state.runtime_recovery_target(),
+            Some(RuntimeRecoveryTarget::Connection)
+        );
+
+        state.notice = Some("chat list failed: device authorization was denied".to_string());
+        assert_eq!(
+            state.runtime_recovery_target(),
+            Some(RuntimeRecoveryTarget::Connection)
+        );
+
+        state.notice = Some(
+            "authentication required for codex: no Sinomo Codex ChatGPT sign-in found".to_string(),
+        );
+        assert_eq!(
+            state.runtime_recovery_target(),
+            Some(RuntimeRecoveryTarget::Providers)
+        );
+
+        state.notice = None;
+        state.info.provider = "deepseek".to_string();
+        state.info.model = "deepseek-chat".to_string();
+        assert_eq!(state.runtime_recovery_target(), None);
     }
 
     #[test]

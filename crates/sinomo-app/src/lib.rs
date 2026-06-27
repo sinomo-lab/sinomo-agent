@@ -7,29 +7,23 @@
 //! mobile node so it stays daemon-backed during bootstrap.
 
 pub mod backend;
+pub mod rendering;
 pub mod state;
 pub mod theme;
 pub mod ui;
 
-use sui::{App, Window, WindowRenderOptions, default_sui_logo_image};
+use sui::{App, Window, default_sui_logo_image};
 
 use crate::backend::Backend;
 use crate::state::{AppState, ConnectEvent, ReadyState, Shared, Tab};
 use crate::ui::Shell;
 use crate::ui::shell::logo_image_handle;
 
-/// Use the same text rendering policy as the SUI widget book. Forced hinting
-/// and stem darkening make adjacent app labels look uneven on some Windows
-/// displays.
-fn render_options() -> WindowRenderOptions {
-    WindowRenderOptions::new(true, 1.0)
-}
-
 /// Construct the application around a given shared state. Exposed so headless
 /// tooling (visual tests) can build and render the same widget tree the app uses.
 pub fn build_application(shared: Shared) -> sui::Result<App> {
     App::new()
-        .render_options(render_options())
+        .render_options(shared.render_options())
         .with_resources(|resources| {
             let logo = default_sui_logo_image(96)?;
             resources.image(logo_image_handle(), logo)
@@ -49,8 +43,8 @@ pub fn boot(initial_tab: Tab) -> Shared {
 
 /// Build a runtime with render options applied (for headless tooling/tests).
 pub fn build_runtime(shared: Shared) -> sui::Result<sui::Runtime> {
+    let options = shared.render_options();
     let runtime = build_application(shared)?.build()?;
-    let options = render_options();
     for window_id in runtime.window_ids() {
         sui::set_window_render_options(window_id, options);
     }
@@ -90,13 +84,28 @@ pub fn run() -> sui::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use sui::{WindowStemDarkening, WindowTextHinting};
+    use crate::rendering::{AppRenderMode, resolve_render_options};
+    use sui::{WindowColorManagementMode, WindowStemDarkening, WindowTextHinting};
 
     #[test]
     fn render_options_match_widget_book_text_policy() {
-        let options = super::render_options();
+        let options = resolve_render_options(AppRenderMode::Automatic);
 
         assert_eq!(options.text_hinting, WindowTextHinting::None);
         assert_eq!(options.stem_darkening, WindowStemDarkening::None);
+        assert_eq!(
+            options.color_management_mode,
+            WindowColorManagementMode::Automatic
+        );
+    }
+
+    #[test]
+    fn render_options_can_force_sdr_for_debug_capture() {
+        let options = resolve_render_options(AppRenderMode::ForceSdr);
+
+        assert_eq!(
+            options.color_management_mode,
+            WindowColorManagementMode::ForceSdr
+        );
     }
 }

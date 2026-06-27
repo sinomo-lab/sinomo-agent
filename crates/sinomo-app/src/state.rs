@@ -11,11 +11,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
-use sui::DefaultTheme;
+use sui::{DefaultTheme, WindowRenderOptions};
 
 use sinomo_runtime::local::SinomoDataDir;
 
 use crate::backend::{Backend, app_config};
+use crate::rendering::{AppRenderMode, resolve_render_options};
 use crate::theme::{AppThemeMode, resolve_theme};
 use crate::ui::chat::ChatState;
 use crate::ui::cluster::ClusterState;
@@ -110,6 +111,7 @@ impl ReadyState {
 pub struct AppState {
     pub active_tab: Tab,
     pub theme_mode: AppThemeMode,
+    pub render_mode: AppRenderMode,
     pub data_dir: Arc<SinomoDataDir>,
     /// Live status line for the title-bar indicator while connecting.
     pub status: String,
@@ -127,9 +129,11 @@ impl AppState {
     pub fn connecting() -> Self {
         let data_dir = Arc::new(app_config::default_data_dir());
         let theme_mode = app_config::load_theme(&data_dir);
+        let render_mode = app_config::load_render_mode(&data_dir);
         Self {
             active_tab: Tab::Sinomo,
             theme_mode,
+            render_mode,
             data_dir,
             status: "Starting…".to_string(),
             ready: None,
@@ -143,9 +147,11 @@ impl AppState {
     pub fn ready(backend: Backend) -> Self {
         let data_dir = backend.data_dir.clone();
         let theme_mode = app_config::load_theme(&data_dir);
+        let render_mode = app_config::load_render_mode(&data_dir);
         Self {
             active_tab: Tab::Sinomo,
             theme_mode,
+            render_mode,
             data_dir,
             status: backend.mode_label(),
             ready: Some(ReadyState::build(backend)),
@@ -157,6 +163,10 @@ impl AppState {
     /// The resolved widget theme for the current mode.
     pub fn theme(&self) -> DefaultTheme {
         resolve_theme(self.theme_mode)
+    }
+
+    pub fn render_options(&self) -> WindowRenderOptions {
+        resolve_render_options(self.render_mode)
     }
 
     pub fn is_ready(&self) -> bool {
@@ -183,6 +193,14 @@ impl Shared {
 
     pub fn theme(&self) -> DefaultTheme {
         self.0.borrow().theme()
+    }
+
+    pub fn render_options(&self) -> WindowRenderOptions {
+        self.0.borrow().render_options()
+    }
+
+    pub fn render_mode(&self) -> AppRenderMode {
+        self.0.borrow().render_mode
     }
 
     pub fn active_tab(&self) -> Tab {
@@ -304,8 +322,10 @@ impl Shared {
                 ConnectEvent::Connected(ready) => {
                     let data_dir = ready.backend.data_dir.clone();
                     let theme_mode = app_config::load_theme(&data_dir);
+                    let render_mode = app_config::load_render_mode(&data_dir);
                     let mut state = self.0.borrow_mut();
                     state.theme_mode = theme_mode;
+                    state.render_mode = render_mode;
                     state.data_dir = data_dir;
                     state.status = ready.backend.mode_label();
                     state.ready = Some(*ready);
@@ -329,6 +349,20 @@ impl Shared {
         };
         if let Err(error) = app_config::save_theme(&data_dir, mode) {
             tracing::warn!(%error, "failed to persist app UI theme preference");
+        }
+    }
+
+    pub fn set_render_mode(&self, mode: AppRenderMode) {
+        let data_dir = {
+            let mut state = self.0.borrow_mut();
+            if state.render_mode == mode {
+                return;
+            }
+            state.render_mode = mode;
+            state.data_dir.clone()
+        };
+        if let Err(error) = app_config::save_render_mode(&data_dir, mode) {
+            tracing::warn!(%error, "failed to persist app render preference");
         }
     }
 }
