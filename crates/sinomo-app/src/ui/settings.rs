@@ -19,6 +19,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
+use serde_json::Value;
 use sui::{
     Alignment, ArrangeCtx, Constraints, DefaultTheme, Event, EventCtx, FieldGroup, FontWeight,
     FormRow, FormSection, Label, ListItem, ListView, MeasureCtx, PaintCtx, PointerEventKind, Rect,
@@ -132,6 +133,7 @@ pub struct SettingsState {
     pub provider_add_base_url: String,
     pub provider_add_error: Option<String>,
     connection_detail_expanded: Vec<Tab>,
+    advanced_detail_expanded: Vec<String>,
 }
 
 /// A text-editable field of a provider in the Providers section.
@@ -234,6 +236,7 @@ impl SettingsState {
             provider_add_base_url: String::new(),
             provider_add_error: None,
             connection_detail_expanded: Vec::new(),
+            advanced_detail_expanded: Vec::new(),
         }
     }
 
@@ -264,6 +267,24 @@ impl SettingsState {
             self.connection_detail_expanded.remove(index);
         } else {
             self.connection_detail_expanded.push(tab);
+        }
+    }
+
+    fn advanced_detail_expanded(&self, key: &str) -> bool {
+        self.advanced_detail_expanded
+            .iter()
+            .any(|expanded| expanded == key)
+    }
+
+    fn toggle_advanced_detail(&mut self, key: &str) {
+        if let Some(index) = self
+            .advanced_detail_expanded
+            .iter()
+            .position(|expanded| expanded == key)
+        {
+            self.advanced_detail_expanded.remove(index);
+        } else {
+            self.advanced_detail_expanded.push(key.to_string());
         }
     }
 
@@ -739,6 +760,32 @@ fn connection_issue_key(shared: &Shared) -> String {
             .join(",")
     };
     format!("{issue_key}\nexpanded:{detail_key}")
+}
+
+fn configuration_key(shared: &Shared) -> String {
+    let settings = shared.settings();
+    let item_key = settings
+        .config_items
+        .iter()
+        .map(|item| {
+            format!(
+                "{}:{}:{:?}:{:?}:{}",
+                item.key,
+                item.source,
+                item.edit_kind,
+                item.bool_value,
+                item.edit_value.len()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let expanded = settings
+        .advanced_detail_expanded
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{item_key}\nexpanded:{expanded}")
 }
 
 fn connection_issue_summary(issue: &ConnectionIssue) -> &'static str {
@@ -1679,6 +1726,18 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
 }
 
 fn section_configuration(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || configuration_key(&s)
+        },
+        move |_key| configuration_body(&s, &r),
+    )
+}
+
+fn configuration_body(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let body: WidgetPod = {
         let settings = shared.settings();
         if let Some(error) = &settings.config_error {
@@ -1698,22 +1757,22 @@ fn section_configuration(shared: &Shared, reader: &ThemeReader) -> impl Widget +
             WidgetPod::new(stack)
         }
     };
-    FormSection::new("Advanced", PodHost::new(body)).theme_when(clone_reader(reader))
+    WidgetPod::new(
+        FormSection::new("Advanced", PodHost::new(body))
+            .description(
+                "Resolved configuration values. Sensitive fields stay redacted in this view.",
+            )
+            .theme_when(clone_reader(reader)),
+    )
 }
 
-/// One Advanced config row: a toggle for booleans, otherwise a text field with a muted subtitle
-/// showing the source layer (or the parse error in accent color).
+/// One Advanced config row: a toggle for booleans, otherwise a redacted summary with an explicit
+/// raw-value disclosure. Sensitive raw values remain read-only and redacted in Advanced.
 fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widget + use<> {
-    let (key, edit_kind, bool_value, edit_value, source) = {
-        let item = &shared.settings().config_items[index];
-        (
-            item.key.clone(),
-            item.edit_kind,
-            item.bool_value,
-            item.edit_value.clone(),
-            item.source,
-        )
-    };
+    let item = shared.settings().config_items[index].clone();
+    let key = item.key.clone();
+    let edit_kind = item.edit_kind;
+    let bool_value = item.bool_value;
     let display_key = key.trim_start_matches('/').to_string();
 
     if let Some(on) = bool_value {
@@ -1733,55 +1792,313 @@ fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widge
         }
     }
 
-    // Non-boolean: a text field plus a subtitle (source layer, or parse error in accent).
-    let field = text_row(
-        reader,
-        &format!("config-{index}"),
-        &display_key,
-        edit_value,
-        "—",
-        {
-            let s = shared.clone();
-            move |value: String| {
-                s.settings_mut().set_config_value(index, &value);
-            }
-        },
-    );
-
-    let subtitle = {
+    let expanded = shared.settings().advanced_detail_expanded(&key);
+    let sensitive = config_item_has_sensitive_detail(&item);
+    let row_key = config_field_key(&key);
+    let metadata = config_metadata_line(&item);
+    let description = short_one_line(&item.description, 128);
+    let summary = config_value_summary(&item);
+    let summary_label = {
         let s = shared.clone();
-        let row_key = config_field_key(&key);
-        let source = source.to_string();
-        Label::new(source.clone())
+        Label::new(summary)
+            .font_size(12.0)
+            .color_when(move || palette(&s).text_muted)
+    };
+    let meta_label = {
+        let s = shared.clone();
+        let metadata = metadata.clone();
+        Label::new(metadata.clone())
             .font_size(10.5)
             .text_when({
                 let s = s.clone();
                 let row_key = row_key.clone();
-                let source = source.clone();
+                let metadata = metadata.clone();
                 move || {
                     s.settings()
                         .field_errors
                         .get(&row_key)
                         .cloned()
-                        .unwrap_or_else(|| source.clone())
+                        .unwrap_or_else(|| metadata.clone())
                 }
             })
-            .color_when(move || {
-                let pal = palette(&s);
-                if s.settings().field_errors.contains_key(&row_key) {
-                    pal.accent
-                } else {
-                    pal.text_faint
+            .color_when({
+                let s = s.clone();
+                let row_key = row_key.clone();
+                move || {
+                    let pal = palette(&s);
+                    if s.settings().field_errors.contains_key(&row_key) {
+                        pal.accent
+                    } else {
+                        pal.text_faint
+                    }
                 }
             })
     };
-
-    let stacked = Stack::vertical()
-        .spacing(2.0)
+    let disclosure = {
+        let s = shared.clone();
+        let key = key.clone();
+        let label = if expanded {
+            "Hide value"
+        } else if sensitive {
+            "Show redacted detail"
+        } else {
+            "Edit raw value"
+        };
+        sui::Button::new(label)
+            .icon(if expanded {
+                sui::IconGlyph::ChevronUp
+            } else {
+                sui::IconGlyph::ChevronDown
+            })
+            .theme_when(clone_reader(reader))
+            .on_press(move || s.settings_mut().toggle_advanced_detail(&key))
+    };
+    let mut details = Stack::vertical()
+        .spacing(6.0)
         .alignment(Alignment::Stretch)
-        .with_child(field)
-        .with_child(subtitle);
-    PodHost::new(WidgetPod::new(stacked))
+        .with_child(summary_label)
+        .with_child(meta_label);
+    if !description.is_empty() {
+        details = details.with_child(muted_label(shared, description).font_size(11.0));
+    }
+    details = details.with_child(disclosure);
+    if expanded {
+        details = details.with_child(config_detail_editor(shared, reader, index, &item));
+    }
+    PodHost::new(WidgetPod::new(
+        FormRow::new(display_key, details)
+            .stacked()
+            .theme_when(clone_reader(reader)),
+    ))
+}
+
+fn config_detail_editor(
+    shared: &Shared,
+    reader: &ThemeReader,
+    index: usize,
+    item: &ConfigItem,
+) -> impl Widget + use<> {
+    let detail = config_detail_value(item);
+    let editable = !config_item_has_sensitive_detail(item);
+    let note = if editable {
+        "Raw value is editable and writes through the config service."
+    } else {
+        "Sensitive fields are redacted here. Use the dedicated settings section to update credentials."
+    };
+    let mut editor = TextArea::new(format!("config-{index}-raw"))
+        .value(detail)
+        .placeholder("Raw value")
+        .theme_when(clone_reader(reader));
+    if editable {
+        let s = shared.clone();
+        editor = editor.on_change(move |value| {
+            s.settings_mut().set_config_value(index, &value);
+        });
+    } else {
+        editor = editor.read_only();
+    }
+    Stack::vertical()
+        .spacing(5.0)
+        .alignment(Alignment::Stretch)
+        .with_child(muted_label(shared, note).font_size(11.0))
+        .with_child(SizedBox::new().height(112.0).with_child(editor))
+}
+
+fn config_metadata_line(item: &ConfigItem) -> String {
+    let kind = match item.edit_kind {
+        ConfigEditKind::Bool => "Boolean",
+        ConfigEditKind::Text => "Text",
+        ConfigEditKind::Number => "Number",
+        ConfigEditKind::Json => "JSON",
+    };
+    let owner = item.owner.trim();
+    if owner.is_empty() {
+        format!("{} · {kind}", item.source)
+    } else {
+        format!("{} · {owner} · {kind}", item.source)
+    }
+}
+
+fn config_value_summary(item: &ConfigItem) -> String {
+    match item.edit_kind {
+        ConfigEditKind::Bool => match item.bool_value {
+            Some(true) => "Enabled".to_string(),
+            Some(false) => "Disabled".to_string(),
+            None => "Unset".to_string(),
+        },
+        ConfigEditKind::Text => {
+            if item.edit_value.trim().is_empty() {
+                "Unset".to_string()
+            } else if sensitive_field_name(&item.key) {
+                "Configured secret".to_string()
+            } else {
+                short_one_line(&item.edit_value, 96)
+            }
+        }
+        ConfigEditKind::Number => {
+            if item.edit_value.trim().is_empty() {
+                "Unset".to_string()
+            } else {
+                item.edit_value.clone()
+            }
+        }
+        ConfigEditKind::Json => config_json_summary(item),
+    }
+}
+
+fn config_json_summary(item: &ConfigItem) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(&item.edit_value) else {
+        return if item.edit_value.trim().is_empty() {
+            "Unset".to_string()
+        } else if config_item_has_sensitive_detail(item) {
+            "JSON value · sensitive fields redacted".to_string()
+        } else {
+            short_one_line(&item.edit_value, 96)
+        };
+    };
+    if item.key.trim_matches('/') == "lm.providers" {
+        if let Some(accounts) = value.get("accounts").and_then(Value::as_array) {
+            let enabled = accounts
+                .iter()
+                .filter(|account| {
+                    account
+                        .get("enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .count();
+            let suffix = if contains_sensitive_json_field(&value) {
+                " · sensitive fields redacted"
+            } else {
+                ""
+            };
+            return format!(
+                "Provider config · {} accounts · {} enabled{}",
+                accounts.len(),
+                enabled,
+                suffix
+            );
+        }
+    }
+    let mut summary = match &value {
+        Value::Null => "Unset".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => short_one_line(value, 96),
+        Value::Array(items) => format!("JSON array · {} items", items.len()),
+        Value::Object(map) => format!("JSON object · {} keys", map.len()),
+    };
+    if contains_sensitive_json_field(&value) || sensitive_field_name(&item.key) {
+        summary.push_str(" · sensitive fields redacted");
+    }
+    summary
+}
+
+fn config_detail_value(item: &ConfigItem) -> String {
+    if !config_item_has_sensitive_detail(item) {
+        return pretty_config_value(item).unwrap_or_else(|| item.edit_value.clone());
+    }
+
+    if item.edit_value.trim().is_empty() {
+        return String::new();
+    }
+    if sensitive_field_name(&item.key) {
+        return "[redacted]".to_string();
+    }
+    let Ok(mut value) = serde_json::from_str::<Value>(&item.edit_value) else {
+        return "[redacted]".to_string();
+    };
+    redact_sensitive_json_fields(&mut value);
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "[redacted]".to_string())
+}
+
+fn pretty_config_value(item: &ConfigItem) -> Option<String> {
+    if item.edit_kind != ConfigEditKind::Json {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(&item.edit_value).ok()?;
+    serde_json::to_string_pretty(&value).ok()
+}
+
+fn config_item_has_sensitive_detail(item: &ConfigItem) -> bool {
+    if sensitive_field_name(&item.key) {
+        return true;
+    }
+    if item.edit_kind != ConfigEditKind::Json {
+        return false;
+    }
+    serde_json::from_str::<Value>(&item.edit_value)
+        .map(|value| contains_sensitive_json_field(&value))
+        .unwrap_or(false)
+}
+
+fn contains_sensitive_json_field(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, value)| sensitive_field_name(key) || contains_sensitive_json_field(value)),
+        Value::Array(items) => items.iter().any(contains_sensitive_json_field),
+        _ => false,
+    }
+}
+
+fn redact_sensitive_json_fields(value: &mut Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            let mut redacted = false;
+            for (key, value) in map.iter_mut() {
+                if sensitive_field_name(key) {
+                    if !value.is_null() {
+                        *value = Value::String("[redacted]".to_string());
+                    }
+                    redacted = true;
+                } else if redact_sensitive_json_fields(value) {
+                    redacted = true;
+                }
+            }
+            redacted
+        }
+        Value::Array(items) => {
+            let mut redacted = false;
+            for value in items {
+                if redact_sensitive_json_fields(value) {
+                    redacted = true;
+                }
+            }
+            redacted
+        }
+        _ => false,
+    }
+}
+
+fn sensitive_field_name(name: &str) -> bool {
+    let compact: String = name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    [
+        "apikey",
+        "secret",
+        "token",
+        "password",
+        "credential",
+        "privatekey",
+        "clientsecret",
+        "accesstoken",
+        "refreshtoken",
+    ]
+    .iter()
+    .any(|needle| compact.contains(needle))
+}
+
+fn short_one_line(value: &str, max: usize) -> String {
+    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max {
+        collapsed
+    } else {
+        short(&collapsed, max)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2632,6 +2949,53 @@ mod tests {
         let backend = Backend::local_fallback();
         let state = SettingsState::new(&backend);
         assert!(state.provider_add_api_key.is_empty());
+    }
+
+    fn test_config_item(key: &str, kind: ConfigEditKind, raw: &str) -> ConfigItem {
+        ConfigItem {
+            key: key.to_string(),
+            owner: "test".to_string(),
+            description: "test setting".to_string(),
+            value: raw.to_string(),
+            source: "cluster",
+            bool_value: None,
+            edit_kind: kind,
+            edit_value: raw.to_string(),
+        }
+    }
+
+    #[test]
+    fn advanced_provider_config_summary_redacts_api_keys() {
+        let item = test_config_item(
+            "lm.providers",
+            ConfigEditKind::Json,
+            r#"{"accounts":[{"provider":"deepseek","account":"default","enabled":true,"api_key":"sk-live-secret","default_model":"deepseek-v4-flash"}],"default_provider":"deepseek"}"#,
+        );
+
+        let summary = config_value_summary(&item);
+        assert!(summary.contains("Provider config"));
+        assert!(summary.contains("sensitive fields redacted"));
+        assert!(!summary.contains("sk-live-secret"));
+        assert!(config_item_has_sensitive_detail(&item));
+
+        let detail = config_detail_value(&item);
+        assert!(detail.contains("[redacted]"));
+        assert!(!detail.contains("sk-live-secret"));
+    }
+
+    #[test]
+    fn advanced_non_sensitive_json_detail_remains_visible() {
+        let item = test_config_item(
+            "dfs.expose",
+            ConfigEditKind::Json,
+            r#"{"entries":[{"path":"/workspace","read_only":true}]}"#,
+        );
+
+        assert!(!config_item_has_sensitive_detail(&item));
+        assert_eq!(config_value_summary(&item), "JSON object · 1 keys");
+        let detail = config_detail_value(&item);
+        assert!(detail.contains("\"entries\""));
+        assert!(detail.contains("\"/workspace\""));
     }
 
     #[test]
