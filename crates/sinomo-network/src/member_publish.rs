@@ -149,26 +149,27 @@ pub(crate) fn publish_local_members_via_voter_with_host(
     if members.is_empty() {
         return Ok(());
     }
-    if !options.force_kv_snapshot_sync
-        && cluster_member_publish_matches_kv(paths, &members).unwrap_or(false)
-    {
-        return Ok(());
-    }
     let request = ClusterMemberPublishRequest {
         members,
         local_kv_revision: local_cluster_kv_snapshot_revision(paths),
     };
     let mut failures = Vec::new();
+    let mut accepted_without_newer_snapshot = false;
     for endpoint in member_publish_targets_voter_first(paths, state) {
         match host.send_cluster_member_publish(&endpoint, &request, options.member_publish_timeout)
         {
             Ok(response) if response.accepted => {
-                if let Some(snapshot) = response.kv_snapshot
-                    && imported_snapshot_advances_local_kv(paths, &snapshot)
-                {
-                    write_imported_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
+                let mut imported_newer_snapshot = false;
+                if let Some(snapshot) = response.kv_snapshot {
+                    if imported_snapshot_advances_local_kv(paths, &snapshot) {
+                        write_imported_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
+                        imported_newer_snapshot = true;
+                    }
                 }
-                return Ok(());
+                if !options.force_kv_snapshot_sync || imported_newer_snapshot {
+                    return Ok(());
+                }
+                accepted_without_newer_snapshot = true;
             }
             Ok(response) => failures.push(format!(
                 "{} ({:?}) rejected member publish: {}",
@@ -179,6 +180,9 @@ pub(crate) fn publish_local_members_via_voter_with_host(
                 endpoint.address, endpoint.transport, error
             )),
         }
+    }
+    if options.force_kv_snapshot_sync && accepted_without_newer_snapshot {
+        return Ok(());
     }
     Err(NetworkError::ClusterReadOnly {
         detail: format!(
@@ -202,23 +206,6 @@ pub(crate) async fn publish_local_members_via_voter_async_with_host(
     let members = cluster_local_process_members(state);
     if members.is_empty() {
         return Ok(());
-    }
-    if !options.force_kv_snapshot_sync {
-        let paths_for_match = paths.clone();
-        let members_for_match = members.clone();
-        let already_published = runtime
-            .spawn_blocking(move || {
-                cluster_member_publish_matches_kv(&paths_for_match, &members_for_match)
-                    .unwrap_or(false)
-            })
-            .await
-            .map_err(|source| NetworkError::Io {
-                operation: "cluster local member publish match".to_string(),
-                detail: format!("member publish match task failed: {source}"),
-            })?;
-        if already_published {
-            return Ok(());
-        }
     }
     let paths_for_targets = paths.clone();
     let state_for_targets = state.clone();
@@ -244,15 +231,17 @@ pub(crate) async fn publish_local_members_via_voter_async_with_host(
         local_kv_revision,
     };
     let mut failures = Vec::new();
+    let mut accepted_without_newer_snapshot = false;
     for endpoint in targets {
         match host
             .send_cluster_member_publish_async(&endpoint, &request, options.member_publish_timeout)
             .await
         {
             Ok(response) if response.accepted => {
+                let mut imported_newer_snapshot = false;
                 if let Some(snapshot) = response.kv_snapshot {
                     let paths_for_write = paths.clone();
-                    runtime
+                    imported_newer_snapshot = runtime
                         .spawn_blocking(move || {
                             if !imported_snapshot_advances_local_kv(&paths_for_write, &snapshot) {
                                 return Ok(false);
@@ -268,7 +257,10 @@ pub(crate) async fn publish_local_members_via_voter_async_with_host(
                             detail: format!("member publish snapshot import task failed: {source}"),
                         })??;
                 }
-                return Ok(());
+                if !options.force_kv_snapshot_sync || imported_newer_snapshot {
+                    return Ok(());
+                }
+                accepted_without_newer_snapshot = true;
             }
             Ok(response) => failures.push(format!(
                 "{} ({:?}) rejected member publish: {}",
@@ -279,6 +271,9 @@ pub(crate) async fn publish_local_members_via_voter_async_with_host(
                 endpoint.address, endpoint.transport, error
             )),
         }
+    }
+    if options.force_kv_snapshot_sync && accepted_without_newer_snapshot {
+        return Ok(());
     }
     Err(NetworkError::ClusterReadOnly {
         detail: format!(
@@ -303,9 +298,6 @@ pub fn publish_local_members_to_quorum_if_needed_with_host(
         return Ok(None);
     }
     let already_published = cluster_member_publish_matches_kv(paths, &members).unwrap_or(false);
-    if already_published && !options.force_kv_snapshot_sync {
-        return Ok(None);
-    }
     if sinomo_kv::cluster_kv_raft_local_is_voter(state)
         && host.cluster_has_local_quorum(paths, state)
     {
@@ -347,9 +339,6 @@ pub async fn publish_local_members_to_quorum_if_needed_async_with_host(
             operation: "cluster local member publish match".to_string(),
             detail: format!("member publish match task failed: {source}"),
         })?;
-    if already_published && !options.force_kv_snapshot_sync {
-        return Ok(None);
-    }
     if sinomo_kv::cluster_kv_raft_local_is_voter(state)
         && host.cluster_has_local_quorum_async(paths, state).await?
     {

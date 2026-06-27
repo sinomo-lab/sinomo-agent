@@ -1,8 +1,8 @@
 use crate::{
-    DfsConflictRecord, DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataShardId,
-    DfsMetadataTableSnapshot, DfsNamespaceTransaction, DfsObjectId, DfsObjectMetadata,
-    DfsObjectVersionRecord, DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsVersion,
-    DfsWriteIntentRecord, NetworkedDfsWriteOutcome,
+    DfsConflictRecord, DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataShardConfig,
+    DfsMetadataShardId, DfsMetadataTableSnapshot, DfsNamespaceTransaction, DfsObjectId,
+    DfsObjectMetadata, DfsObjectVersionRecord, DfsReplicaReceiptRecord, DfsReplicationPolicy,
+    DfsVersion, DfsWriteIntentRecord, NetworkedDfsWriteOutcome,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::{DfsWriteReceipt, DfsWriteRequest};
@@ -474,6 +474,8 @@ pub struct DfsStageBlobCommand {
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_shard: Option<DfsMetadataShardConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -506,6 +508,8 @@ pub struct DfsStageBlobChunkCommand {
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_shard: Option<DfsMetadataShardConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -523,6 +527,8 @@ pub struct DfsStagePatchCommand {
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_shard: Option<DfsMetadataShardConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -545,6 +551,8 @@ pub struct DfsStagePatchChunkCommand {
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_shard: Option<DfsMetadataShardConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -559,6 +567,8 @@ pub struct DfsCommitVersionCommand {
     pub content_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_shard: Option<DfsMetadataShardConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -586,6 +596,8 @@ pub struct DfsRepairReplicaCommand {
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_shard: Option<DfsMetadataShardConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -618,6 +630,8 @@ pub struct DfsRepairReplicaChunkCommand {
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_shard: Option<DfsMetadataShardConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -627,6 +641,8 @@ pub struct DfsFetchBlobCommand {
     pub object_id: DfsObjectId,
     pub version: DfsVersion,
     pub content_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_shard: Option<DfsMetadataShardConfig>,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub start_chunk_index: u32,
     #[serde(default, skip_serializing_if = "is_zero_u32")]

@@ -1,7 +1,12 @@
 use crate::ClusterPaths;
+use crate::connectivity::ClusterConnectivityRecord;
+use crate::connectivity_publish::{
+    cluster_connectivity_publish_record_matches, cluster_network_record_live,
+};
 use crate::error::NetworkError;
 use crate::file_mark::{ClusterFileMark, cluster_file_mark};
 use crate::io_observer::io_observer;
+use crate::keyspace::cluster_connectivity_key;
 use crate::local_state_store::read_cluster_state_without_kv;
 
 use sinomo_core::ClusterBootstrapState;
@@ -14,13 +19,14 @@ use sinomo_kv::{
     RaftRequestVoteResponse, RaftSnapshot,
 };
 use sinomo_node::NodeId;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 #[cfg(test)]
 use std::time::SystemTime;
+use time::OffsetDateTime;
 
 const FILE_CACHE_CAPACITY: usize = 4096;
 static CLUSTER_KV_METADATA_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
@@ -201,16 +207,24 @@ pub(crate) fn write_imported_cluster_kv_snapshot_if_changed(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
 ) -> Result<bool, NetworkError> {
-    let wrote = sinomo_kv::write_imported_cluster_kv_snapshot_if_changed(
-        &paths.kv_paths(),
-        snapshot,
-        sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
-    )?;
+    let wrote = if imported_snapshot_requires_route_read_model_materialization(paths, snapshot)? {
+        sinomo_kv::write_cluster_kv_snapshot_if_changed(&paths.kv_paths(), snapshot)?
+    } else {
+        sinomo_kv::write_imported_cluster_kv_snapshot_if_changed(
+            &paths.kv_paths(),
+            snapshot,
+            sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
+        )?
+    };
     observe_cluster_kv_snapshot_write(paths, wrote);
     Ok(wrote)
 }
 
 pub(crate) fn observe_cluster_kv_snapshot_write(paths: &ClusterPaths, wrote: bool) {
+    if wrote {
+        crate::route::invalidate_cluster_delivery_routing_table_cache(paths);
+        crate::route_graph_read_model::invalidate_cluster_route_graph_cache(paths);
+    }
     if let Some(observer) = io_observer() {
         if wrote {
             observer.on_kv_snapshot_actual_write();
@@ -221,6 +235,59 @@ pub(crate) fn observe_cluster_kv_snapshot_write(paths: &ClusterPaths, wrote: boo
             observer.on_kv_snapshot_skipped_write();
         }
     }
+}
+
+fn imported_snapshot_requires_route_read_model_materialization(
+    paths: &ClusterPaths,
+    snapshot: &KvSnapshot,
+) -> Result<bool, NetworkError> {
+    let Some(existing) = read_cluster_kv_latest_observed_snapshot_arc_if_present(paths)? else {
+        return Ok(false);
+    };
+    route_connectivity_projection_changed(existing.as_ref(), snapshot, OffsetDateTime::now_utc())
+}
+
+fn route_connectivity_projection_changed(
+    existing: &KvSnapshot,
+    incoming: &KvSnapshot,
+    now: OffsetDateTime,
+) -> Result<bool, NetworkError> {
+    let existing_records = live_connectivity_records_by_key(existing, now)?;
+    let incoming_records = live_connectivity_records_by_key(incoming, now)?;
+    if existing_records.len() != incoming_records.len() {
+        return Ok(true);
+    }
+    for (key, incoming_record) in incoming_records {
+        let Some(existing_record) = existing_records.get(&key) else {
+            return Ok(true);
+        };
+        if !cluster_connectivity_publish_record_matches(existing_record, &incoming_record, now) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn live_connectivity_records_by_key(
+    snapshot: &KvSnapshot,
+    now: OffsetDateTime,
+) -> Result<BTreeMap<String, ClusterConnectivityRecord>, NetworkError> {
+    let mut records = BTreeMap::new();
+    for entry in snapshot.prefix_entries("/cluster/network/connectivity/") {
+        let record = entry.decode::<ClusterConnectivityRecord>()?;
+        if !cluster_network_record_live(record.expires_at, now) {
+            continue;
+        }
+        records.insert(
+            cluster_connectivity_key(
+                &record.source_node_id,
+                &record.target_node_id,
+                &record.endpoint_id,
+            ),
+            record,
+        );
+    }
+    Ok(records)
 }
 
 #[cfg(test)]
@@ -459,9 +526,8 @@ pub(crate) fn append_cluster_raft_command(
 /// `None` asks the voter to ship its full snapshot back.
 pub(crate) fn local_cluster_kv_snapshot_revision(paths: &ClusterPaths) -> Option<KvRevision> {
     let node_id = read_cluster_kv_reader_node_id(paths).ok()?;
-    paths
-        .kv_paths()
-        .current_snapshot_revision_for_node(&node_id)
+    sinomo_kv::read_cluster_kv_current_snapshot_arc_for_node(&paths.kv_paths(), node_id)
+        .map(|snapshot| snapshot.revision)
         .ok()
 }
 

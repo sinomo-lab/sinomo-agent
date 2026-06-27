@@ -16,6 +16,7 @@ mod status;
 pub const DAEMON_RPC_CATEGORY: &str = "daemon";
 pub const DAEMON_STATUS_ROUTE: &str = "/daemon/status";
 pub const DAEMON_SHUTDOWN_ROUTE: &str = "/daemon/shutdown";
+pub const DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE: &str = "/daemon/cluster/maintenance-refresh";
 pub const DAEMON_DFS_BROWSER_STATUS_ROUTE: &str = "/daemon/dfs/browser/status";
 pub const DAEMON_DFS_BROWSER_LIST_ROUTE: &str = "/daemon/dfs/browser/list";
 pub const DAEMON_DFS_BROWSER_READ_FILE_ROUTE: &str = "/daemon/dfs/browser/read-file";
@@ -28,6 +29,15 @@ pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
     DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
 ];
+
+pub(crate) fn cluster_join_trace(args: std::fmt::Arguments<'_>) {
+    let enabled = std::env::var("SINOMO_CLUSTER_JOIN_TRACE")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"));
+    if enabled {
+        eprintln!("[sinomo cluster join] {args}");
+    }
+}
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonDfsBrowserStatusRequest;
@@ -86,6 +96,12 @@ pub struct DaemonDfsBrowserCreateDirAllRequest {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonDfsBrowserCreateDirAllResponse;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonClusterMaintenanceRefreshRequest;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonClusterMaintenanceRefreshResponse;
 
 #[derive(Clone)]
 pub struct DaemonServiceRegistryHook {
@@ -170,6 +186,7 @@ impl DaemonServiceRegistryHook {
 pub use auth::{
     AuthenticatedDaemonCommand, DaemonSignerAuthority, SignedDaemonCommand,
     authenticate_daemon_control_request, authorize_authenticated_daemon_command,
+    daemon_rpc_body_sha256, sign_daemon_rpc_request_digest_for_local_node,
     sign_daemon_rpc_request_for_local_node, sign_daemon_rpc_request_from_data_dir,
 };
 #[cfg(test)]
@@ -185,9 +202,9 @@ pub(crate) use client::{
 };
 pub use client::{
     RemoteConfigClient, fetch_daemon_status_from_address, fetch_daemon_status_from_endpoint,
-    fetch_daemon_status_from_endpoint_async, send_daemon_rollout_binary,
-    send_daemon_rollout_binary_to_endpoint, send_daemon_rollout_binary_upload_chunk,
-    send_daemon_rollout_binary_upload_chunk_to_endpoint,
+    fetch_daemon_status_from_endpoint_async, send_daemon_cluster_maintenance_refresh,
+    send_daemon_rollout_binary, send_daemon_rollout_binary_to_endpoint,
+    send_daemon_rollout_binary_upload_chunk, send_daemon_rollout_binary_upload_chunk_to_endpoint,
     send_daemon_rollout_binary_upload_finalize,
     send_daemon_rollout_binary_upload_finalize_to_endpoint, send_daemon_rollout_build,
     send_daemon_rollout_build_to_endpoint, send_daemon_rollout_clear_status,

@@ -36,7 +36,7 @@
 #
 # Env knobs:
 #   SINOMO_TEST_PROJECT         compose project name   (default sinomo-dfs-test)
-#   SINOMO_TEST_FORMATION_WAIT  formation gate seconds (default 420)
+#   SINOMO_TEST_FORMATION_WAIT  formation gate seconds (default 10)
 #   SINOMO_TEST_EXPECT_TIMEOUT  cross-node poll seconds (default 90)
 #   SINOMO_TEST_PERF_FILES      files per bulk-performance leg (default 64)
 #   SINOMO_TEST_PERF_WARMUP_FILES files in the no-threshold warmup leg (default 8)
@@ -109,10 +109,10 @@ SINOMO_ROOT="$(dirname "$SINOMO_DOCKER_DIR")"
 COMPOSE_FILE="${COMPOSE_FILE:-$SINOMO_DOCKER_DIR/docker-compose.dev.yml}"
 
 PROJECT="${SINOMO_TEST_PROJECT:-sinomo-dfs-test}"
-FORMATION_WAIT="${SINOMO_TEST_FORMATION_WAIT:-420}"
+FORMATION_WAIT="${SINOMO_TEST_FORMATION_WAIT:-10}"
 DFS_READY_WAIT="${SINOMO_TEST_DFS_READY_WAIT:-240}"
 EXPECT_TIMEOUT="${SINOMO_TEST_EXPECT_TIMEOUT:-90}"
-POLL_INTERVAL="${SINOMO_TEST_POLL_INTERVAL:-5}"
+POLL_INTERVAL="${SINOMO_TEST_POLL_INTERVAL:-1}"
 EXPECTED_MAINS=6
 PERF_FILES="${SINOMO_TEST_PERF_FILES:-64}"
 PERF_WARMUP_FILES="${SINOMO_TEST_PERF_WARMUP_FILES:-8}"
@@ -222,14 +222,16 @@ cluster_health() {
 }
 
 wait_for_cluster_ready() {
-  local label="$1" deadline now online warnings
+  local label="$1" started deadline now elapsed online warnings
   log "$label: waiting for $EXPECTED_MAINS clean main daemons (<=${FORMATION_WAIT}s)"
-  deadline=$(( $(date +%s) + FORMATION_WAIT ))
+  started="$(date +%s)"
+  deadline=$(( started + FORMATION_WAIT ))
   while :; do
     online="$(main_online_count)"
     warnings="$(doctor_connectivity_warnings)"
     if [ "${online:-0}" -ge "$EXPECTED_MAINS" ] && [ -z "$warnings" ]; then
-      log "$label: cluster ready (${online} main daemons online)"
+      elapsed=$(( $(date +%s) - started ))
+      log "$label: cluster ready (${online} main daemons online, ${elapsed}s)"
       return 0
     fi
     now="$(date +%s)"

@@ -513,6 +513,7 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         if violations.is_empty() {
             ctx.record("object_count", metrics.object_count);
             ctx.record("repair_job_count", metrics.repair_job_count);
+            ctx.record("repair_attempt_count", metrics.repair_attempt_count);
             ctx.record("pending_write_count", metrics.pending_write_count);
             ctx.record(
                 "pending_metadata_replication_count",
@@ -1605,23 +1606,34 @@ fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let node = backend.node_label();
     let measurement_started = Instant::now();
     let proc_io_before = current_proc_io();
-    let mut last_state: String;
+    let mut last_state = "not attempted".to_string();
+    let mut last_state_elapsed_ms = 0_u64;
+    let mut attempts = 0_u64;
+    let mut mismatch_attempts = 0_u64;
+    let mut error_attempts = 0_u64;
 
     loop {
+        attempts = attempts.saturating_add(1);
         let read_started = Instant::now();
         match backend.read_file(&path) {
             Ok(actual) => {
                 let read_elapsed = read_started.elapsed();
                 if actual.as_slice() != expected.as_slice() {
+                    mismatch_attempts = mismatch_attempts.saturating_add(1);
                     last_state = format!(
                         "{path} content mismatch ({} bytes, expected {})",
                         actual.len(),
                         expected.len()
                     );
+                    last_state_elapsed_ms = measurement_started.elapsed().as_millis() as u64;
                     if Instant::now() >= deadline {
                         ctx.record("node", &node);
                         ctx.record("path", &path);
                         ctx.record("bytes", bytes as u64);
+                        ctx.record("attempts", attempts);
+                        ctx.record("mismatch_attempts", mismatch_attempts);
+                        ctx.record("error_attempts", error_attempts);
+                        ctx.record("last_state_elapsed_ms", last_state_elapsed_ms);
                         ctx.record("last_state", &last_state);
                         return Ok(SinomoTestOutcome::failed(format!(
                             "large expect on node {node} did not read matching {bytes} byte file at {path} within {}s: {last_state}",
@@ -1654,6 +1666,13 @@ fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     convergence_elapsed.as_millis() as u64,
                 );
                 ctx.record("read_elapsed_ms", read_elapsed_ms);
+                ctx.record("attempts", attempts);
+                ctx.record("mismatch_attempts", mismatch_attempts);
+                ctx.record("error_attempts", error_attempts);
+                ctx.record("last_state_elapsed_ms", last_state_elapsed_ms);
+                if attempts > 1 {
+                    ctx.record("last_state_before_success", &last_state);
+                }
                 ctx.record("bytes_per_second", bytes_per_second);
                 ctx.record("data_read_bytes_per_second", data_read_bytes_per_second);
                 ctx.record("min_bytes_per_second", min_bytes_per_second);
@@ -1708,7 +1727,9 @@ fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 )));
             }
             Err(error) => {
+                error_attempts = error_attempts.saturating_add(1);
                 last_state = format!("{path}: {error}");
+                last_state_elapsed_ms = measurement_started.elapsed().as_millis() as u64;
             }
         }
 
@@ -1716,6 +1737,10 @@ fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             ctx.record("node", &node);
             ctx.record("path", &path);
             ctx.record("bytes", bytes as u64);
+            ctx.record("attempts", attempts);
+            ctx.record("mismatch_attempts", mismatch_attempts);
+            ctx.record("error_attempts", error_attempts);
+            ctx.record("last_state_elapsed_ms", last_state_elapsed_ms);
             ctx.record("last_state", &last_state);
             return Ok(SinomoTestOutcome::failed(format!(
                 "large expect on node {node} did not read matching {bytes} byte file at {path} within {}s: {last_state}",
@@ -1839,6 +1864,7 @@ fn dfs_protocol_codec_samples(
                 chunk_hash: None,
                 bytes: payload.to_vec(),
                 object_metadata: None,
+                authority_shard: None,
             }),
         )?,
         dfs_protocol_codec_sample(

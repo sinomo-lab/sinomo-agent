@@ -3,7 +3,8 @@
 use crate::{
     DfsConflictPageCursor, DfsConflictRecord, DfsConflictStatus, DfsFileSystem, DfsMetadataBackend,
     DfsMetadataShardStatus, DfsObjectMetadata, DfsObjectPageCursor, DfsObjectVersionRecord,
-    DfsReplicaReceiptRecord, DfsWriteIntentRecord, DfsWriteIntentStatus, MetadataBackendError,
+    DfsRepairAttemptRecord, DfsReplicaReceiptRecord, DfsWriteIntentRecord, DfsWriteIntentStatus,
+    MetadataBackendError,
 };
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -99,6 +100,8 @@ pub struct DfsOperatorStatus {
     pub failed_namespace_job_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metadata_shards: Vec<DfsMetadataShardStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repair_attempts: Vec<DfsRepairAttemptRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -218,6 +221,7 @@ impl<'a> DfsOperatorInspector<'a> {
             pending_namespace_job_count: summary.pending_namespace_job_count,
             failed_namespace_job_count: summary.failed_namespace_job_count,
             metadata_shards: self.backend.metadata_shard_statuses()?,
+            repair_attempts: Vec::new(),
         })
     }
 

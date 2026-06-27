@@ -1,4 +1,6 @@
-use crate::commands::cli_commit_cluster_kv_txn_with_quorum_response;
+use crate::commands::{
+    cli_commit_cluster_kv_txn_with_quorum_response, refresh_cluster_kv_from_local_daemon,
+};
 use crate::file_manager::{
     FileManagerBackend, FileManagerEntry, FileManagerEntryKind, FileManagerMetadata,
     FileManagerRead, validated_relative_child_path,
@@ -11,7 +13,8 @@ use sinomo_runtime::dfs::{
     cluster_dfs_data_endpoints, content_services_prefix, default_dfs_metadata_root,
     default_dfs_metadata_shards_root, fallback_dfs_node_id, metadata_shards_prefix,
     open_local_sharded_metadata_backend, open_root_local_metadata_backend,
-    publish_cluster_dfs_metadata_journal_with_peer_transport, sifs_file_system_id,
+    publish_cluster_dfs_metadata_journal_with_peer_transport,
+    refresh_cluster_dfs_kv_snapshot_with_peer_transport, sifs_file_system_id,
 };
 use sinomo_runtime::kv::{self, KvError, KvOp, KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;
@@ -108,7 +111,8 @@ impl SifsFileManagerBackend {
         if !cluster_paths.state.exists() {
             return false;
         }
-        let Ok(state) = network::read_cluster_state_without_kv(&cluster_paths) else {
+        refresh_sifs_cluster_kv_snapshot(&cluster_paths);
+        let Ok(state) = network::read_cluster_state(&cluster_paths) else {
             return false;
         };
         service.refresh_endpoint_targets(cluster_dfs_data_endpoints(&cluster_paths, &state));
@@ -696,6 +700,13 @@ fn open_sifs_service_with_hydration(
         .ensure_root_layout()
         .map_err(|error| format!("cannot prepare Sinomo data directory: {error}"))?;
     let cluster_paths = ClusterPaths::new(data_dir);
+    let peer_transport = Arc::new(SifsDfsPeerTransport::new(rpc_runtime.clone()));
+    let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
+    refresh_sifs_cluster_kv_snapshot(&cluster_paths);
+    let _ = refresh_cluster_dfs_kv_snapshot_with_peer_transport(
+        &cluster_paths,
+        Arc::clone(&sync_peer_transport),
+    );
     let (local_node_id, endpoints) = if cluster_paths.state.exists() {
         let state = network::read_cluster_state_without_kv(&cluster_paths)
             .map_err(|error| format!("cannot read local cluster state: {error}"))?;
@@ -706,8 +717,6 @@ fn open_sifs_service_with_hydration(
     };
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
         .map_err(|error| format!("cannot open DFS content store: {error}"))?;
-    let peer_transport = Arc::new(SifsDfsPeerTransport::new(rpc_runtime.clone()));
-    let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
     let async_peer_transport: Arc<dyn AsyncDfsPeerTransport> = peer_transport;
     let mut service = NetworkedDfsService::new(
         DfsEndpointTransport::with_peer_transports(
@@ -751,6 +760,12 @@ fn open_sifs_service_with_hydration(
         .bootstrap_distributed_sifs()
         .map_err(|error| format!("cannot bootstrap SIFS namespace: {error}"))?;
     Ok(service)
+}
+
+fn refresh_sifs_cluster_kv_snapshot(cluster_paths: &ClusterPaths) {
+    if cluster_paths.state.exists() {
+        let _ = refresh_cluster_kv_from_local_daemon(cluster_paths);
+    }
 }
 
 #[derive(Clone, Debug)]

@@ -8,13 +8,12 @@
 
 use crate::endpoint_selector::cluster_endpoint_can_carry_main_daemon_rpc;
 use crate::file_mark::{ClusterFileMark, cluster_file_mark};
-use crate::kv_read_model::read_cluster_endpoints_from_kv;
 use crate::prelude::*;
 use crate::{
     ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityState, ClusterPaths,
     DaemonControlRequest, DaemonRpcTimeouts, NetworkError, ObjectRpcRequest, ObjectRpcResponse,
 };
-use sinomo_node::DAEMON_MAIN_RUN_CAPABILITY;
+use sinomo_kv::KvRevision;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
@@ -37,8 +36,6 @@ const CLUSTER_RELAY_MAX_FAILURE_DETAILS: usize = 8;
 const CLUSTER_RELAY_FAILURE_DETAIL_MAX_CHARS: usize = 512;
 const CLUSTER_DELIVERY_DEGRADED_LINK_COST: u64 = 50_000;
 const CLUSTER_DELIVERY_UNOBSERVED_TARGET_COST: u64 = CLUSTER_DELIVERY_DEGRADED_LINK_COST / 2;
-const CLUSTER_DELIVERY_CROSS_PREFIX_PRIVATE_TARGET_PENALTY: u64 =
-    CLUSTER_DELIVERY_DEGRADED_LINK_COST;
 const CLUSTER_DELIVERY_UNOBSERVED_NEIGHBOR_COST: u64 = 75_000;
 const MAX_CLUSTER_DELIVERY_ROUTING_TABLE_CACHE_ENTRIES: usize = 128;
 
@@ -115,10 +112,6 @@ impl RouteNodeSet {
         };
         self.nodes.remove(index);
         true
-    }
-
-    fn contains(&self, node_id: &NodeId) -> bool {
-        self.position(node_id).is_ok()
     }
 
     fn min_by_distance(
@@ -346,6 +339,18 @@ pub(crate) struct RelayEnvelope {
         deserialize_with = "crate::fallible_serde::deserialize_vec"
     )]
     pub(crate) visited: Vec<NodeId>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::fallible_serde::deserialize_vec"
+    )]
+    pub(crate) planned_path: Vec<NodeId>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::fallible_serde::deserialize_vec"
+    )]
+    pub(crate) target_endpoints: Vec<ClusterEndpointRecord>,
     /// Maximum per-hop transport timeout, in milliseconds, inherited from the
     /// originating caller. Intermediate relays must not expand this budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -367,6 +372,8 @@ impl RelayEnvelope {
             target_node_id,
             ttl: CLUSTER_RELAY_DEFAULT_TTL,
             visited: Vec::new(),
+            planned_path: Vec::new(),
+            target_endpoints: Vec::new(),
             max_hop_timeout_ms: None,
             inner,
         }
@@ -585,6 +592,7 @@ impl ClusterDeliveryFailedEdges {
 struct ClusterDeliveryRoutePlan {
     next_hop: NodeId,
     endpoints: Vec<ClusterEndpointRecord>,
+    path: Vec<NodeId>,
 }
 
 #[derive(Clone, Debug)]
@@ -597,6 +605,7 @@ struct ClusterDeliveryRoutePath {
 struct ClusterDeliveryRouteCandidate {
     plan: ClusterDeliveryRoutePlan,
     path: Vec<NodeId>,
+    first_hop_cost: u64,
     cost: u64,
     complete: bool,
 }
@@ -659,25 +668,6 @@ impl ClusterDeliveryRoutingTable {
         failed_edges: &ClusterDeliveryFailedEdges,
         visited: &[NodeId],
     ) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
-        self.route_plan_with_incomplete_policy(target_node_id, failed_edges, visited, true)
-    }
-
-    fn complete_route_plan(
-        &self,
-        target_node_id: &NodeId,
-        failed_edges: &ClusterDeliveryFailedEdges,
-        visited: &[NodeId],
-    ) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
-        self.route_plan_with_incomplete_policy(target_node_id, failed_edges, visited, false)
-    }
-
-    fn route_plan_with_incomplete_policy(
-        &self,
-        target_node_id: &NodeId,
-        failed_edges: &ClusterDeliveryFailedEdges,
-        visited: &[NodeId],
-        allow_incomplete: bool,
-    ) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
         let Some(candidates) = self.routes.get(target_node_id) else {
             return Ok(None);
         };
@@ -685,7 +675,6 @@ impl ClusterDeliveryRoutingTable {
             candidates,
             failed_edges,
             visited,
-            allow_incomplete,
         ))
     }
 }
@@ -701,6 +690,7 @@ struct ClusterDeliveryRoutingTableCacheEntry {
 struct ClusterDeliveryRoutingTableCacheMark {
     state: ClusterFileMark,
     kv_snapshot: ClusterFileMark,
+    kv_revision: Option<KvRevision>,
     local_connectivity_generation: u64,
 }
 
@@ -722,7 +712,6 @@ fn cluster_delivery_route_plan(
             .unwrap_or_default(),
         failed_edges,
         visited,
-        true,
     )
 }
 
@@ -750,6 +739,7 @@ fn cluster_delivery_route_candidates(
             continue;
         }
         if *next_hop == *target_node_id {
+            let path = cluster_delivery_two_node_path(local_node_id, next_hop)?;
             crate::object::try_reserve_vec(
                 &mut candidates,
                 1,
@@ -759,8 +749,10 @@ fn cluster_delivery_route_candidates(
                 plan: ClusterDeliveryRoutePlan {
                     next_hop: try_clone_route_node_id(next_hop, "cluster delivery next hop")?,
                     endpoints,
+                    path: try_clone_route_node_ids(&path, "cluster delivery route plan path")?,
                 },
-                path: cluster_delivery_two_node_path(local_node_id, next_hop)?,
+                path,
+                first_hop_cost: edge_cost,
                 cost: edge_cost,
                 complete: true,
             });
@@ -787,12 +779,15 @@ fn cluster_delivery_route_candidates(
                 plan: ClusterDeliveryRoutePlan {
                     next_hop: try_clone_route_node_id(next_hop, "cluster delivery next hop")?,
                     endpoints,
+                    path: try_clone_route_node_ids(&nodes, "cluster delivery route plan path")?,
                 },
                 path: nodes,
+                first_hop_cost: edge_cost,
                 cost: edge_cost.saturating_add(path.cost),
                 complete: true,
             });
         } else {
+            let path = cluster_delivery_two_node_path(local_node_id, next_hop)?;
             crate::object::try_reserve_vec(
                 &mut candidates,
                 1,
@@ -802,19 +797,28 @@ fn cluster_delivery_route_candidates(
                 plan: ClusterDeliveryRoutePlan {
                     next_hop: try_clone_route_node_id(next_hop, "cluster delivery next hop")?,
                     endpoints,
+                    path: try_clone_route_node_ids(&path, "cluster delivery route plan path")?,
                 },
-                path: cluster_delivery_two_node_path(local_node_id, next_hop)?,
+                path,
+                first_hop_cost: edge_cost,
                 cost: edge_cost,
                 complete: false,
             });
         }
     }
-    candidates.sort_by_key(|candidate| {
+    candidates.sort_by(|left, right| {
         (
-            if candidate.complete { 0 } else { 1 },
-            candidate.cost,
-            candidate.plan.next_hop.to_string(),
+            left.first_hop_cost,
+            if left.complete { 0 } else { 1 },
+            left.cost,
+            left.plan.next_hop.as_str(),
         )
+            .cmp(&(
+                right.first_hop_cost,
+                if right.complete { 0 } else { 1 },
+                right.cost,
+                right.plan.next_hop.as_str(),
+            ))
     });
     Ok(candidates)
 }
@@ -840,19 +844,12 @@ fn cluster_delivery_select_route_candidate(
     candidates: &[ClusterDeliveryRouteCandidate],
     failed_edges: &ClusterDeliveryFailedEdges,
     visited: &[NodeId],
-    allow_incomplete: bool,
 ) -> Option<ClusterDeliveryRoutePlan> {
     candidates
         .iter()
         .filter(|candidate| {
-            candidate.complete
-                && cluster_delivery_route_candidate_is_compatible(candidate, failed_edges, visited)
+            cluster_delivery_route_candidate_is_compatible(candidate, failed_edges, visited)
         })
-        .chain(candidates.iter().filter(|candidate| {
-            allow_incomplete
-                && !candidate.complete
-                && cluster_delivery_route_candidate_is_compatible(candidate, failed_edges, visited)
-        }))
         .map(|candidate| candidate.plan.clone())
         .next()
 }
@@ -893,29 +890,6 @@ async fn cluster_delivery_route_plan_async(
         target_node_id,
         &failed_edges,
         &visited,
-        true,
-    )
-    .await
-}
-
-async fn cluster_delivery_complete_route_plan_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    local_node_id: &NodeId,
-    target_node_id: &NodeId,
-    failed_edges: ClusterDeliveryFailedEdges,
-    visited: Vec<NodeId>,
-) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
-    cluster_delivery_route_plan_from_routing_table_async(
-        runtime,
-        paths,
-        state,
-        local_node_id,
-        target_node_id,
-        &failed_edges,
-        &visited,
-        false,
     )
     .await
 }
@@ -928,7 +902,6 @@ async fn cluster_delivery_route_plan_from_routing_table_async(
     target_node_id: &NodeId,
     failed_edges: &ClusterDeliveryFailedEdges,
     visited: &[NodeId],
-    allow_incomplete: bool,
 ) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
     if let Some(plan) = cluster_delivery_route_plan_from_cached_routing_table(
         paths,
@@ -937,7 +910,6 @@ async fn cluster_delivery_route_plan_from_routing_table_async(
         target_node_id,
         failed_edges,
         visited,
-        allow_incomplete,
         OffsetDateTime::now_utc(),
     ) {
         return plan;
@@ -955,11 +927,7 @@ async fn cluster_delivery_route_plan_from_routing_table_async(
         .spawn_blocking(move || {
             let before_mark = cluster_delivery_routing_table_cache_mark(&paths);
             let table = cluster_delivery_build_routing_table(&paths, &state, &local_node_id)?;
-            let plan = if allow_incomplete {
-                table.route_plan(&target_node_id, &failed_edges, &visited)?
-            } else {
-                table.complete_route_plan(&target_node_id, &failed_edges, &visited)?
-            };
+            let plan = table.route_plan(&target_node_id, &failed_edges, &visited)?;
             let after_mark = cluster_delivery_routing_table_cache_mark(&paths);
             if before_mark == after_mark {
                 store_cluster_delivery_routing_table_cache_entry(&paths, after_mark, table);
@@ -980,7 +948,6 @@ fn cluster_delivery_route_plan_from_cached_routing_table(
     target_node_id: &NodeId,
     failed_edges: &ClusterDeliveryFailedEdges,
     visited: &[NodeId],
-    allow_incomplete: bool,
     now: OffsetDateTime,
 ) -> Option<Result<Option<ClusterDeliveryRoutePlan>, NetworkError>> {
     let mark = cluster_delivery_routing_table_cache_mark(paths)?;
@@ -1001,15 +968,11 @@ fn cluster_delivery_route_plan_from_cached_routing_table(
     }
     let entry = cache.get_mut(&paths.root)?;
     entry.last_used = cluster_delivery_routing_table_cache_tick();
-    Some(if allow_incomplete {
+    Some(
         entry
             .table
-            .route_plan(target_node_id, failed_edges, visited)
-    } else {
-        entry
-            .table
-            .complete_route_plan(target_node_id, failed_edges, visited)
-    })
+            .route_plan(target_node_id, failed_edges, visited),
+    )
 }
 
 fn cluster_delivery_build_routing_table(
@@ -1069,6 +1032,7 @@ fn cluster_delivery_routing_table_cache_mark(
     Some(ClusterDeliveryRoutingTableCacheMark {
         state: cluster_file_mark(&paths.state)?,
         kv_snapshot: cluster_file_mark(&paths.kv_snapshot)?,
+        kv_revision: crate::kv_local_store::local_cluster_kv_snapshot_revision(paths),
         local_connectivity_generation:
             crate::connectivity_store::local_cluster_connectivity_content_generation(paths),
     })
@@ -1100,6 +1064,28 @@ fn store_cluster_delivery_routing_table_cache_entry(
     );
 }
 
+pub(crate) fn invalidate_cluster_delivery_routing_table_cache(paths: &ClusterPaths) {
+    if let Ok(mut cache) = CLUSTER_DELIVERY_ROUTING_TABLES.lock() {
+        cache.remove(&paths.root);
+    }
+}
+
+fn record_cluster_delivery_endpoint_identity_mismatch(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+) {
+    let _ = crate::connectivity_store::record_local_cluster_endpoint_command_connectivity(
+        paths,
+        state,
+        endpoint,
+        ClusterConnectivityState::Unreachable,
+        None,
+        false,
+    );
+    invalidate_cluster_delivery_routing_table_cache(paths);
+}
+
 fn evict_cluster_delivery_routing_table_cache_entry_if_needed(
     cache: &mut HashMap<PathBuf, ClusterDeliveryRoutingTableCacheEntry>,
     protected: &PathBuf,
@@ -1128,17 +1114,12 @@ fn cluster_delivery_route_graph(
 ) -> Result<ClusterDeliveryRouteGraph, NetworkError> {
     let local_connectivity = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
     let local_private_prefixes = cluster_delivery_local_private_prefixes(state, local_node_id)?;
-    let kv_main_endpoints = cluster_delivery_kv_main_daemon_endpoints(paths, state)?;
     let mut graph = ClusterDeliveryRouteGraph::default();
     for member in &state.members {
         if !member.state.is_authorized() {
             continue;
         }
-        for endpoint in member.endpoints.iter().chain(
-            kv_main_endpoints
-                .iter()
-                .filter(|endpoint| endpoint.node_id == member.node_id),
-        ) {
+        for endpoint in &member.endpoints {
             if !cluster_delivery_local_endpoint_is_usable(local_node_id, endpoint) {
                 continue;
             }
@@ -1173,49 +1154,6 @@ fn cluster_delivery_route_graph(
         graph.push_edge_clone(&record.source_node_id, &record.target_node_id, None, cost)?;
     }
     Ok(graph)
-}
-
-fn cluster_delivery_kv_main_daemon_endpoints(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
-    let mut main_daemon_node_ids = RouteNodeSet::default();
-    for member in state.members.iter().filter(|member| {
-        member.state.is_authorized() && cluster_delivery_member_runs_main_daemon(member)
-    }) {
-        main_daemon_node_ids
-            .try_insert_clone(&member.node_id, "collect route main daemon nodes")?;
-    }
-    let mut endpoints = Vec::new();
-    let kv_endpoints = match read_cluster_endpoints_from_kv(paths) {
-        Ok(kv_endpoints) => kv_endpoints,
-        Err(error @ NetworkError::ResourceExhausted { .. }) => return Err(error),
-        Err(_) => Vec::new(),
-    };
-    for endpoint in kv_endpoints {
-        if endpoint.privacy == ClusterEndpointPrivacy::LocalOnly
-            || !main_daemon_node_ids.contains(&endpoint.node_id)
-            || !cluster_endpoint_can_carry_main_daemon_rpc(&endpoint)
-            || !matches!(
-                endpoint.transport,
-                ClusterTransportKind::LanTcp
-                    | ClusterTransportKind::Loopback
-                    | ClusterTransportKind::Iroh
-            )
-        {
-            continue;
-        }
-        crate::object::try_reserve_vec(&mut endpoints, 1, "collect route KV endpoints")?;
-        endpoints.push(endpoint);
-    }
-    Ok(endpoints)
-}
-
-fn cluster_delivery_member_runs_main_daemon(member: &ClusterMemberRecord) -> bool {
-    member
-        .capabilities
-        .iter()
-        .any(|capability| capability.as_str() == DAEMON_MAIN_RUN_CAPABILITY)
 }
 
 fn cluster_delivery_local_endpoint_is_usable(
@@ -1340,14 +1278,9 @@ fn cluster_delivery_local_endpoint_cost(
             &record.state,
         )
         .map(|cost| cost + endpoint_priority),
-        None if endpoint.node_id == *target_node_id => {
-            Some(cluster_delivery_unobserved_target_endpoint_cost(
-                endpoint,
-                path_cost,
-                endpoint_priority,
-                local_private_prefixes,
-            ))
-        }
+        None if endpoint.node_id == *target_node_id => Some(
+            cluster_delivery_unobserved_target_endpoint_cost(path_cost, endpoint_priority),
+        ),
         None if cluster_delivery_endpoint_shares_local_private_prefix(
             endpoint,
             local_private_prefixes,
@@ -1359,24 +1292,8 @@ fn cluster_delivery_local_endpoint_cost(
     }
 }
 
-fn cluster_delivery_unobserved_target_endpoint_cost(
-    endpoint: &ClusterEndpointRecord,
-    path_cost: u64,
-    endpoint_priority: u64,
-    local_private_prefixes: &ClusterDeliveryPrivatePrefixes,
-) -> u64 {
-    let private_cross_prefix_penalty = if matches!(endpoint.transport, ClusterTransportKind::LanTcp)
-        && cluster_delivery_private_prefix_for_address(&endpoint.address).is_some()
-        && !cluster_delivery_endpoint_shares_local_private_prefix(endpoint, local_private_prefixes)
-    {
-        CLUSTER_DELIVERY_CROSS_PREFIX_PRIVATE_TARGET_PENALTY
-    } else {
-        0
-    };
-    CLUSTER_DELIVERY_UNOBSERVED_TARGET_COST
-        + path_cost
-        + endpoint_priority
-        + private_cross_prefix_penalty
+fn cluster_delivery_unobserved_target_endpoint_cost(path_cost: u64, endpoint_priority: u64) -> u64 {
+    CLUSTER_DELIVERY_UNOBSERVED_TARGET_COST + path_cost + endpoint_priority
 }
 
 fn cluster_delivery_connectivity_record_cost(record: &ClusterConnectivityRecord) -> Option<u64> {
@@ -1570,6 +1487,32 @@ fn cluster_delivery_endpoint_shares_local_private_prefix(
 ) -> bool {
     cluster_delivery_private_prefix_for_address(&endpoint.address)
         .is_some_and(|prefix| local_private_prefixes.contains(&prefix))
+}
+
+fn cluster_delivery_target_endpoint_hints(
+    state: &ClusterBootstrapState,
+    target_node_id: &NodeId,
+) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+    let mut endpoints = Vec::new();
+    let Some(member) = state
+        .members
+        .iter()
+        .find(|member| member.node_id == *target_node_id && member.state.is_authorized())
+    else {
+        return Ok(endpoints);
+    };
+    for endpoint in member.endpoints.iter().filter(|endpoint| {
+        endpoint.node_id == *target_node_id
+            && endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
+            && cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
+    }) {
+        crate::object::try_reserve_vec(&mut endpoints, 1, "cluster relay endpoint hints")?;
+        endpoints.push(try_clone_route_endpoint(
+            endpoint,
+            "cluster relay endpoint hints",
+        )?);
+    }
+    Ok(endpoints)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1876,13 +1819,19 @@ where
         let Some(remaining) = deadline.checked_remaining() else {
             return Err(deadline.timeout_error(endpoint));
         };
-        let request = request.clone().with_trace_context_if_missing();
-        let request_auth = self.host.sign_endpoint_rpc_request_async(&request).await?;
+        let traced_request;
+        let request = if request.traceparent().is_some() {
+            request
+        } else {
+            traced_request = request.clone().with_trace_context_if_missing();
+            &traced_request
+        };
+        let request_auth = self.host.sign_endpoint_rpc_request_async(request).await?;
         self.host
             .send_signed_endpoint_rpc_async(
                 endpoint,
                 &request_auth,
-                &request,
+                request,
                 cluster_endpoint_transport_timeouts(options.timeouts, remaining),
             )
             .await
@@ -1897,11 +1846,17 @@ where
         request: &ObjectRpcRequest,
         options: ClusterObjectRpcOptions,
     ) -> Result<ObjectRpcResponse, NetworkError> {
-        let request = request.clone().with_trace_context_if_missing();
+        let traced_request;
+        let request = if request.traceparent().is_some() {
+            request
+        } else {
+            traced_request = request.clone().with_trace_context_if_missing();
+            &traced_request
+        };
         let traceparent = request.traceparent().unwrap_or_default().to_string();
         let call_started_at = Instant::now();
         let sign_started_at = Instant::now();
-        let request_auth = self.host.sign_endpoint_rpc_request_async(&request).await?;
+        let request_auth = self.host.sign_endpoint_rpc_request_async(request).await?;
         let request_sign_us = cluster_object_rpc_elapsed_us(sign_started_at);
         metrics::histogram!(
             "sinomo.object_rpc.sign.us",
@@ -1985,7 +1940,7 @@ where
                         .send_signed_endpoint_rpc_async(
                             &endpoint,
                             &request_auth,
-                            &request,
+                            request,
                             hop_timeouts,
                         )
                         .await;
@@ -1997,12 +1952,16 @@ where
                     )
                 } else {
                     let outer_build_started_at = Instant::now();
+                    let target_endpoints =
+                        cluster_delivery_target_endpoint_hints(state, target_node_id)?;
                     let outer = relay_request_for_signed_rpc_with_max_hop_timeout(
                         &state.cluster_id,
                         target_node_id,
-                        &request,
+                        request,
                         request_auth.clone(),
                         std::iter::once(state.local_node_id.clone()),
+                        &route_plan.path,
+                        &target_endpoints,
                         options.timeouts.connect_timeout,
                     )?;
                     let outer_build_us = cluster_object_rpc_elapsed_us(outer_build_started_at);
@@ -2084,6 +2043,9 @@ where
                                 "cluster object rpc responder mismatch"
                             );
                             let failure = if final_hop {
+                                record_cluster_delivery_endpoint_identity_mismatch(
+                                    paths, state, &endpoint,
+                                );
                                 format!(
                                     "{} ({:?}) responder mismatch: expected {}, got {}",
                                     endpoint.address,
@@ -2366,11 +2328,26 @@ fn relay_request_for_signed_rpc_with_max_hop_timeout(
     request: &ObjectRpcRequest,
     request_auth: impl Into<Vec<u8>>,
     visited: impl IntoIterator<Item = NodeId>,
+    planned_path: &[NodeId],
+    target_endpoints: &[ClusterEndpointRecord],
     max_hop_timeout: Option<Duration>,
 ) -> Result<ObjectRpcRequest, NetworkError> {
     let inner = request.clone().with_auth(request_auth.into());
     let mut envelope = RelayEnvelope::new(cluster_id.clone(), target_node_id.clone(), inner);
     envelope.visited.extend(visited);
+    envelope.planned_path =
+        try_clone_route_node_ids(planned_path, "cluster relay planned route path")?;
+    crate::object::try_reserve_vec(
+        &mut envelope.target_endpoints,
+        target_endpoints.len(),
+        "cluster relay target endpoint hints",
+    )?;
+    for endpoint in target_endpoints {
+        envelope.target_endpoints.push(try_clone_route_endpoint(
+            endpoint,
+            "cluster relay target endpoint hints",
+        )?);
+    }
     envelope.max_hop_timeout_ms = max_hop_timeout.map(duration_millis_u64);
     envelope.into_request()
 }
@@ -3065,7 +3042,12 @@ async fn cluster_relay_forward_plan(
     envelope: &RelayEnvelope,
     failed_edges: ClusterDeliveryFailedEdges,
 ) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
-    cluster_delivery_complete_route_plan_async(
+    if let Some(plan) =
+        cluster_relay_planned_forward_plan(paths, state, local_node_id, envelope, &failed_edges)?
+    {
+        return Ok(Some(plan));
+    }
+    cluster_delivery_route_plan_async(
         runtime,
         paths,
         state,
@@ -3077,6 +3059,130 @@ async fn cluster_relay_forward_plan(
     .await
 }
 
+fn cluster_relay_planned_forward_plan(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    local_node_id: &NodeId,
+    envelope: &RelayEnvelope,
+    failed_edges: &ClusterDeliveryFailedEdges,
+) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
+    if envelope.planned_path.is_empty() {
+        return Ok(None);
+    }
+    let Some(position) = envelope
+        .planned_path
+        .iter()
+        .position(|node| node == local_node_id)
+    else {
+        return Ok(None);
+    };
+    let Some(next_hop) = envelope.planned_path.get(position.saturating_add(1)) else {
+        return Ok(None);
+    };
+    if envelope.visited.iter().any(|node| node == next_hop)
+        || failed_edges.contains(local_node_id, next_hop)
+    {
+        return Ok(None);
+    }
+    let endpoints = if next_hop == &envelope.target_node_id && !envelope.target_endpoints.is_empty()
+    {
+        cluster_relay_planned_target_endpoints(local_node_id, &envelope.target_endpoints)?
+    } else {
+        cluster_relay_planned_next_hop_endpoints(paths, state, local_node_id, next_hop)?
+    };
+    Ok(Some(ClusterDeliveryRoutePlan {
+        next_hop: try_clone_route_node_id(next_hop, "cluster relay planned next hop")?,
+        endpoints,
+        path: try_clone_route_node_ids(
+            &envelope.planned_path[position..],
+            "cluster relay planned route path",
+        )?,
+    }))
+}
+
+fn cluster_relay_planned_target_endpoints(
+    local_node_id: &NodeId,
+    target_endpoints: &[ClusterEndpointRecord],
+) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+    let mut endpoints = Vec::new();
+    for endpoint in target_endpoints
+        .iter()
+        .filter(|endpoint| cluster_delivery_local_endpoint_is_usable(local_node_id, endpoint))
+    {
+        crate::object::try_reserve_vec(&mut endpoints, 1, "cluster relay planned endpoints")?;
+        endpoints.push(try_clone_route_endpoint(
+            endpoint,
+            "cluster relay planned endpoints",
+        )?);
+    }
+    endpoints.sort_by_key(|endpoint| {
+        (
+            cluster_delivery_endpoint_path_cost(
+                &endpoint.transport,
+                &endpoint.address,
+                &endpoint.privacy,
+            ),
+            endpoint.priority,
+            cluster_delivery_transport_sort_rank(&endpoint.transport),
+            endpoint.address.clone(),
+        )
+    });
+    Ok(endpoints)
+}
+
+fn cluster_relay_planned_next_hop_endpoints(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    local_node_id: &NodeId,
+    next_hop: &NodeId,
+) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+    let local_connectivity = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
+    let local_private_prefixes = cluster_delivery_local_private_prefixes(state, local_node_id)?;
+    let mut candidates = Vec::new();
+    for endpoint in state
+        .members
+        .iter()
+        .filter(|member| member.node_id == *next_hop && member.state.is_authorized())
+        .flat_map(|member| member.endpoints.iter())
+        .filter(|endpoint| cluster_delivery_local_endpoint_is_usable(local_node_id, endpoint))
+    {
+        let Some(cost) = cluster_delivery_local_endpoint_cost(
+            &local_connectivity,
+            endpoint,
+            next_hop,
+            &local_private_prefixes,
+        ) else {
+            continue;
+        };
+        crate::object::try_reserve_vec(&mut candidates, 1, "cluster relay planned endpoints")?;
+        candidates.push((
+            cost,
+            endpoint.priority,
+            cluster_delivery_transport_sort_rank(&endpoint.transport),
+            endpoint.address.clone(),
+            try_clone_route_endpoint(endpoint, "cluster relay planned endpoints")?,
+        ));
+    }
+    candidates.sort_by(|left, right| {
+        (&left.0, &left.1, &left.2, left.3.as_str()).cmp(&(
+            &right.0,
+            &right.1,
+            &right.2,
+            right.3.as_str(),
+        ))
+    });
+    let mut endpoints = Vec::new();
+    crate::object::try_reserve_vec(
+        &mut endpoints,
+        candidates.len(),
+        "cluster relay planned endpoints",
+    )?;
+    for (_, _, _, _, endpoint) in candidates {
+        endpoints.push(endpoint);
+    }
+    Ok(endpoints)
+}
+
 pub fn relay_response_is_routing_error(response: &ObjectRpcResponse) -> bool {
     response.route == CLUSTER_RELAY_ROUTE && response.error_detail().is_err()
 }
@@ -3085,6 +3191,7 @@ pub fn relay_response_is_routing_error(response: &ObjectRpcResponse) -> bool {
 mod tests {
     use super::*;
     use sinomo_core::{ClusterMemberRecord, ClusterMemberRole, ClusterMemberState};
+    use sinomo_kv::InProcessKvStore;
     use sinomo_local::SinomoDataDir;
     use sinomo_node::main_daemon_capabilities;
     use std::collections::{BTreeMap, VecDeque};
@@ -3141,19 +3248,6 @@ mod tests {
 
     fn endpoint(node_id: &NodeId, address: &str, priority: u16) -> ClusterEndpointRecord {
         crate::daemon_lan_endpoint(node_id, address.to_string(), priority)
-    }
-
-    fn iroh_endpoint(node_id: &NodeId, public_key: &str, priority: u16) -> ClusterEndpointRecord {
-        ClusterEndpointRecord {
-            endpoint_id: crate::stable_iroh_endpoint_id(node_id, public_key),
-            node_id: node_id.clone(),
-            transport: ClusterTransportKind::Iroh,
-            address: format!("iroh://{public_key}?relay=https://relay.example./"),
-            source: ClusterEndpointSource::Rendezvous,
-            privacy: ClusterEndpointPrivacy::Relayed,
-            priority,
-            last_observed_latency_ms: None,
-        }
     }
 
     fn add_local_endpoint(state: &mut ClusterBootstrapState, endpoint: ClusterEndpointRecord) {
@@ -3286,67 +3380,6 @@ mod tests {
     }
 
     #[test]
-    fn delivery_plan_uses_kv_main_endpoint_when_state_has_only_shadow_endpoint() {
-        let (_root, paths) = test_paths("sinomo-network-delivery-plan-kv-main-endpoint");
-        let cluster_id = cid("cluster_delivery_plan_kv_main_endpoint");
-        let local = nid("node_delivery_plan_kv_main_endpoint_local");
-        let target = nid("node_delivery_plan_kv_main_endpoint_target");
-        let mut state = test_state(cluster_id, local.clone());
-        let shadow = sinomo_node::shadow_daemon_node_id(&target);
-        let mut folded_shadow_endpoint = endpoint(&shadow, "192.0.2.54:21354", 0);
-        folded_shadow_endpoint.node_id = target.clone();
-        let direct_main_endpoint = endpoint(&target, "198.51.100.54:21353", 0);
-        add_member(
-            &mut state,
-            target.clone(),
-            "target",
-            vec![folded_shadow_endpoint.clone()],
-        );
-        mark_local_endpoints_healthy(&paths, &state, std::slice::from_ref(&direct_main_endpoint));
-
-        let mut store = InProcessKvStore::new();
-        match KvOp::put_serde(
-            crate::keyspace::cluster_endpoint_key(&target, &direct_main_endpoint),
-            &direct_main_endpoint,
-            None,
-        )
-        .expect("endpoint put op")
-        {
-            KvOp::Put {
-                key,
-                value,
-                lease_id,
-            } => {
-                store.put(key, value, lease_id).expect("seed endpoint");
-            }
-            _ => unreachable!("put_serde creates put op"),
-        }
-        crate::kv_local_store::write_cluster_kv_snapshot(
-            &paths,
-            &store.snapshot().expect("snapshot"),
-        )
-        .expect("write snapshot");
-
-        let plan = cluster_delivery_route_plan(
-            &paths,
-            &state,
-            &local,
-            &target,
-            &ClusterDeliveryFailedEdges::default(),
-            &[],
-        )
-        .expect("route plan");
-
-        assert_eq!(plan.next_hop, target);
-        assert_eq!(plan.endpoints[0].address, direct_main_endpoint.address);
-        assert!(
-            plan.endpoints
-                .iter()
-                .all(|endpoint| endpoint.endpoint_id != folded_shadow_endpoint.endpoint_id)
-        );
-    }
-
-    #[test]
     fn delivery_plan_prefers_healthy_multihop_over_unobserved_direct_target() {
         let (_root, paths) = test_paths("sinomo-network-delivery-plan-direct-unobserved");
         let cluster_id = cid("cluster_delivery_plan_direct_unobserved");
@@ -3453,6 +3486,70 @@ mod tests {
     }
 
     #[test]
+    fn delivery_plan_prefers_complete_route_over_cheaper_exploratory_neighbor() {
+        let (_root, paths) = test_paths("sinomo-network-delivery-plan-complete-before-probe");
+        let cluster_id = cid("cluster_delivery_plan_complete_before_probe");
+        let local = nid("node_delivery_plan_complete_local");
+        let target = nid("node_delivery_plan_complete_target");
+        let complete_bridge = nid("node_delivery_plan_complete_bridge");
+        let exploratory_bridge = nid("node_delivery_plan_exploratory_bridge");
+        let mut state = test_state(cluster_id.clone(), local.clone());
+        add_local_endpoint(&mut state, endpoint(&local, "172.26.0.9:21353", 0));
+        add_member(&mut state, target.clone(), "target", Vec::new());
+        let complete_bridge_endpoint = endpoint(&complete_bridge, "172.26.0.2:21353", 0);
+        let exploratory_bridge_endpoint = endpoint(&exploratory_bridge, "172.26.0.3:21353", 0);
+        let target_endpoint = endpoint(&target, "172.23.0.10:21353", 0);
+        add_member(
+            &mut state,
+            complete_bridge.clone(),
+            "complete-bridge",
+            vec![complete_bridge_endpoint.clone()],
+        );
+        add_member(
+            &mut state,
+            exploratory_bridge,
+            "exploratory-bridge",
+            vec![exploratory_bridge_endpoint.clone()],
+        );
+        mark_local_endpoints_healthy(
+            &paths,
+            &state,
+            &[
+                complete_bridge_endpoint.clone(),
+                exploratory_bridge_endpoint,
+            ],
+        );
+        let bridge_to_target_record = connectivity_record_from_source(
+            &cluster_id,
+            &complete_bridge,
+            &target_endpoint,
+            ClusterConnectivityState::Degraded,
+            None,
+        );
+        crate::write_local_cluster_connectivity_records(
+            &paths,
+            &complete_bridge,
+            std::slice::from_ref(&bridge_to_target_record),
+        )
+        .expect("write bridge record");
+
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local,
+            &target,
+            &ClusterDeliveryFailedEdges::default(),
+            &[],
+        )
+        .expect("route plan");
+
+        assert_eq!(plan.next_hop, complete_bridge);
+        assert_eq!(plan.path, vec![local, complete_bridge, target]);
+        assert_eq!(plan.endpoints.len(), 1);
+        assert_eq!(plan.endpoints[0].address, complete_bridge_endpoint.address);
+    }
+
+    #[test]
     fn delivery_plan_uses_exploratory_neighbor_after_failed_direct_edge() {
         let (_root, paths) = test_paths("sinomo-network-delivery-plan-failed-direct");
         let cluster_id = cid("cluster_delivery_plan_failed_direct");
@@ -3479,7 +3576,7 @@ mod tests {
             .and_then(|member| member.endpoints.first())
             .cloned()
             .expect("bridge endpoint");
-        mark_local_endpoints_healthy(&paths, &state, &[bridge_endpoint]);
+        mark_local_endpoints_healthy(&paths, &state, std::slice::from_ref(&bridge_endpoint));
         let mut failed_edges = ClusterDeliveryFailedEdges::default();
         failed_edges
             .try_insert(&local, &target)
@@ -3493,12 +3590,12 @@ mod tests {
     }
 
     #[test]
-    fn delivery_plan_treats_far_direct_target_as_candidate() {
-        let (_root, paths) = test_paths("sinomo-network-delivery-plan-observed-bridge");
-        let cluster_id = cid("cluster_delivery_plan_observed_bridge");
-        let local = nid("node_delivery_plan_observed_local");
-        let bridge = nid("node_delivery_plan_observed_bridge");
-        let target = nid("node_delivery_plan_observed_target");
+    fn delivery_plan_prefers_healthy_near_bridge_over_far_direct_target() {
+        let (_root, paths) = test_paths("sinomo-network-delivery-plan-near-bridge");
+        let cluster_id = cid("cluster_delivery_plan_near_bridge");
+        let local = nid("node_delivery_plan_near_bridge_local");
+        let bridge = nid("node_delivery_plan_near_bridge_bridge");
+        let target = nid("node_delivery_plan_near_bridge_target");
         let mut state = test_state(cluster_id, local.clone());
         add_local_endpoint(&mut state, endpoint(&local, "172.25.0.9:21353", 0));
         let target_endpoint = endpoint(&target, "172.23.0.2:21353", 0);
@@ -3515,7 +3612,7 @@ mod tests {
             "bridge",
             vec![bridge_endpoint.clone()],
         );
-        mark_local_endpoints_healthy(&paths, &state, &[bridge_endpoint]);
+        mark_local_endpoints_healthy(&paths, &state, std::slice::from_ref(&bridge_endpoint));
 
         let plan = cluster_delivery_route_plan(
             &paths,
@@ -3527,51 +3624,14 @@ mod tests {
         )
         .expect("route plan");
 
-        assert_eq!(plan.next_hop, target);
+        assert_eq!(plan.next_hop, bridge);
         assert_eq!(plan.endpoints.len(), 1);
-        assert_eq!(plan.endpoints[0].address, target_endpoint.address);
+        assert_eq!(plan.endpoints[0].address, bridge_endpoint.address);
     }
 
     #[test]
-    fn delivery_plan_prefers_iroh_over_unobserved_cross_prefix_private_target() {
-        let (_root, paths) = test_paths("sinomo-network-delivery-plan-iroh-before-stale-private");
-        let cluster_id = cid("cluster_delivery_plan_iroh_before_stale_private");
-        let local = nid("node_delivery_plan_iroh_before_stale_private_local");
-        let target = nid("node_delivery_plan_iroh_before_stale_private_target");
-        let mut state = test_state(cluster_id, local.clone());
-        add_local_endpoint(&mut state, endpoint(&local, "172.25.0.9:21353", 0));
-        let stale_private_endpoint = endpoint(&target, "172.23.0.2:21353", 0);
-        let relayed_endpoint = iroh_endpoint(&target, "iroh_public_key_route_stale_private", 90);
-        add_member(
-            &mut state,
-            target.clone(),
-            "target",
-            vec![stale_private_endpoint.clone(), relayed_endpoint.clone()],
-        );
-
-        let plan = cluster_delivery_route_plan(
-            &paths,
-            &state,
-            &local,
-            &target,
-            &ClusterDeliveryFailedEdges::default(),
-            &[],
-        )
-        .expect("route plan");
-
-        assert_eq!(plan.next_hop, target);
-        assert_eq!(plan.endpoints[0].endpoint_id, relayed_endpoint.endpoint_id);
-        assert!(
-            plan.endpoints
-                .iter()
-                .any(|endpoint| endpoint.endpoint_id == stale_private_endpoint.endpoint_id),
-            "cross-prefix private target endpoint should remain as fallback"
-        );
-    }
-
-    #[test]
-    fn delivery_plan_keeps_degraded_direct_target_as_candidate() {
-        let (_root, paths) = test_paths("sinomo-network-delivery-plan-degraded-target");
+    fn delivery_plan_prefers_healthy_bridge_over_degraded_direct_target() {
+        let (_root, paths) = test_paths("sinomo-network-delivery-plan-bridge-over-degraded");
         let cluster_id = cid("cluster_delivery_plan_degraded_target");
         let local = nid("node_delivery_plan_degraded_local");
         let bridge = nid("node_delivery_plan_degraded_bridge");
@@ -3604,7 +3664,7 @@ mod tests {
             std::slice::from_ref(&degraded_target_record),
         )
         .expect("write degraded target record");
-        mark_local_endpoints_healthy(&paths, &state, &[bridge_endpoint]);
+        mark_local_endpoints_healthy(&paths, &state, std::slice::from_ref(&bridge_endpoint));
 
         let plan = cluster_delivery_route_plan(
             &paths,
@@ -3616,9 +3676,9 @@ mod tests {
         )
         .expect("route plan");
 
-        assert_eq!(plan.next_hop, target);
+        assert_eq!(plan.next_hop, bridge);
         assert_eq!(plan.endpoints.len(), 1);
-        assert_eq!(plan.endpoints[0].address, target_endpoint.address);
+        assert_eq!(plan.endpoints[0].address, bridge_endpoint.address);
     }
 
     #[test]
@@ -3936,7 +3996,7 @@ mod tests {
             "target",
             vec![stale_endpoint.clone(), good_endpoint.clone()],
         );
-        mark_local_endpoints_healthy(&paths, &state, &[stale_endpoint, good_endpoint]);
+        mark_local_endpoints_healthy(&paths, &state, &[stale_endpoint.clone(), good_endpoint]);
         let runtime = tokio::runtime::Handle::current();
         let mut host = RecordingTargetHost::new([
             SendOutcome::ResponseFrom("wrong-node", wrong),
@@ -3963,6 +4023,21 @@ mod tests {
         assert_eq!(host.sent.len(), 2);
         assert_eq!(host.sent[0].0.address, "10.90.5.10:21353");
         assert_eq!(host.sent[1].0.address, "10.90.5.11:21353");
+        let records =
+            crate::connectivity_store::read_local_cluster_connectivity_records_for_source(
+                &paths,
+                &state.local_node_id,
+            )
+            .expect("local connectivity records");
+        let stale_record = records
+            .iter()
+            .find(|record| record.endpoint_id == stale_endpoint.endpoint_id)
+            .expect("stale endpoint record");
+        assert_eq!(stale_record.state, ClusterConnectivityState::Unreachable);
+        assert_eq!(
+            stale_record.failure_reason,
+            Some(crate::ClusterConnectivityFailureReason::IdentityMismatch)
+        );
     }
 
     #[tokio::test]
@@ -4043,6 +4118,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delivery_routing_table_updates_after_imported_connectivity_change() {
+        let (_root, paths) = test_paths("sinomo-network-delivery-routing-table-imported-updates");
+        let cluster_id = cid("cluster_delivery_routing_table_imported_updates");
+        let local = nid("node_delivery_routing_table_imported_local");
+        let bridge = nid("node_delivery_routing_table_imported_bridge");
+        let target = nid("node_delivery_routing_table_imported_target");
+        let bridge_endpoint = endpoint(&bridge, "10.90.9.10:21353", 0);
+        let mut state = test_state(cluster_id.clone(), local.clone());
+        add_member(
+            &mut state,
+            bridge.clone(),
+            "bridge",
+            vec![bridge_endpoint.clone()],
+        );
+        add_member(&mut state, target.clone(), "target", Vec::new());
+        crate::write_cluster_state(&paths, &state).expect("write state");
+        crate::kv_local_store::write_cluster_kv_snapshot(
+            &paths,
+            &InProcessKvStore::new().snapshot().expect("empty snapshot"),
+        )
+        .expect("write empty snapshot");
+        mark_local_endpoints_healthy(&paths, &state, &[bridge_endpoint]);
+        let runtime = tokio::runtime::Handle::current();
+
+        let first = cluster_delivery_route_plan_async(
+            &runtime,
+            &paths,
+            &state,
+            &local,
+            &target,
+            ClusterDeliveryFailedEdges::default(),
+            Vec::new(),
+        )
+        .await
+        .expect("first plan")
+        .expect("initial bridge discovery route");
+        assert_eq!(
+            first.path,
+            vec![local.clone(), bridge.clone()],
+            "route table should initially cache the incomplete bridge discovery path"
+        );
+
+        let target_endpoint = endpoint(&target, "10.90.9.11:21353", 0);
+        let bridge_to_target_record = connectivity_record_from_source(
+            &cluster_id,
+            &bridge,
+            &target_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+        );
+        let mut store = InProcessKvStore::new();
+        store
+            .put_serde(
+                crate::keyspace::cluster_connectivity_key(
+                    &bridge,
+                    &target,
+                    &target_endpoint.endpoint_id,
+                ),
+                &bridge_to_target_record,
+                None,
+            )
+            .expect("imported bridge connectivity");
+        crate::kv_local_store::write_imported_cluster_kv_snapshot_if_changed(
+            &paths,
+            &store.snapshot().expect("imported snapshot"),
+        )
+        .expect("import bridge connectivity snapshot");
+
+        let second = cluster_delivery_route_plan_async(
+            &runtime,
+            &paths,
+            &state,
+            &local,
+            &target,
+            ClusterDeliveryFailedEdges::default(),
+            Vec::new(),
+        )
+        .await
+        .expect("second plan")
+        .expect("bridge route");
+        assert_eq!(second.next_hop, bridge);
+        assert_eq!(second.path, vec![local, bridge, target]);
+    }
+
+    #[test]
+    fn delivery_routing_table_cache_mark_tracks_current_kv_revision() {
+        let (_root, paths) = test_paths("sinomo-network-delivery-routing-table-kv-revision");
+        let cluster_id = cid("cluster_delivery_routing_table_kv_revision");
+        let local = nid("node_delivery_routing_table_kv_revision_local");
+        let state = test_state(cluster_id, local);
+        crate::write_cluster_state(&paths, &state).expect("write state");
+
+        let mut first_store = InProcessKvStore::new();
+        first_store
+            .put("/route/cache/revision", b"first".to_vec(), None)
+            .expect("seed first revision");
+        crate::kv_local_store::write_cluster_kv_snapshot(&paths, &first_store.snapshot().unwrap())
+            .expect("write first snapshot");
+        let first_mark = cluster_delivery_routing_table_cache_mark(&paths).expect("first mark");
+
+        let mut second_store = first_store;
+        second_store
+            .put("/route/cache/revision", b"second".to_vec(), None)
+            .expect("seed second revision");
+        crate::kv_local_store::write_cluster_kv_snapshot(&paths, &second_store.snapshot().unwrap())
+            .expect("write second snapshot");
+        let second_mark = cluster_delivery_routing_table_cache_mark(&paths).expect("second mark");
+
+        assert_ne!(first_mark.kv_revision, second_mark.kv_revision);
+        assert_ne!(first_mark, second_mark);
+    }
+
+    #[tokio::test]
     async fn delivery_routing_table_serves_relay_with_visited_origin() {
         let (_root, paths) = test_paths("sinomo-network-delivery-routing-table-relay-visited");
         let cluster_id = cid("cluster_delivery_routing_table_relay_visited");
@@ -4076,65 +4264,6 @@ mod tests {
 
         assert_eq!(plan.next_hop, target);
         assert_eq!(plan.endpoints[0].address, "10.90.7.10:21353");
-    }
-
-    #[tokio::test]
-    async fn relay_forward_plan_rejects_incomplete_bridge_route() {
-        let (_root, paths) = test_paths("sinomo-network-relay-complete-routes-only");
-        let cluster_id = cid("cluster_relay_complete_routes_only");
-        let origin = nid("node_relay_complete_routes_origin");
-        let local = nid("node_relay_complete_routes_local");
-        let bridge = nid("node_relay_complete_routes_bridge");
-        let target = nid("node_relay_complete_routes_target");
-        let bridge_endpoint = endpoint(&bridge, "10.90.8.2:21353", 0);
-        let mut state = test_state(cluster_id.clone(), local.clone());
-        add_member(&mut state, origin.clone(), "origin", Vec::new());
-        add_member(
-            &mut state,
-            bridge.clone(),
-            "bridge",
-            vec![bridge_endpoint.clone()],
-        );
-        add_member(&mut state, target.clone(), "target", Vec::new());
-        mark_local_endpoints_healthy(&paths, &state, std::slice::from_ref(&bridge_endpoint));
-        let runtime = tokio::runtime::Handle::current();
-
-        let origin_plan = cluster_delivery_route_plan_async(
-            &runtime,
-            &paths,
-            &state,
-            &local,
-            &target,
-            ClusterDeliveryFailedEdges::default(),
-            Vec::new(),
-        )
-        .await
-        .expect("origin route table plan")
-        .expect("origin can still use incomplete fallback");
-        assert_eq!(origin_plan.next_hop, bridge);
-
-        let mut envelope = RelayEnvelope::new(
-            cluster_id,
-            target,
-            ObjectRpcRequest::encode_body("/test/incomplete-relay", "test", &())
-                .expect("inner relay request"),
-        );
-        envelope.visited.push(origin);
-        let relay_plan = cluster_relay_forward_plan(
-            &runtime,
-            &paths,
-            &state,
-            &local,
-            &envelope,
-            ClusterDeliveryFailedEdges::default(),
-        )
-        .await
-        .expect("relay route table plan");
-
-        assert!(
-            relay_plan.is_none(),
-            "relay forwarding should not use incomplete bridge-only routes"
-        );
     }
 
     #[test]
@@ -4352,5 +4481,45 @@ mod tests {
         assert_eq!(host.target_sent[0].0.node_id, target);
         assert_eq!(host.target_sent[0].1.route, request().route);
         assert_eq!(host.target_sent[0].1.auth, Some(b"inner-auth".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn relay_forward_uses_planned_final_hop_when_local_state_lacks_target() {
+        let (_root, paths) = test_paths("sinomo-network-relay-forward-stale-target-state");
+        let cluster_id = cid("cluster_relay_forward_stale_target_state");
+        let origin = nid("node_relay_forward_stale_origin");
+        let local = nid("node_relay_forward_stale_local");
+        let target = nid("node_relay_forward_stale_target");
+        let state = test_state(cluster_id.clone(), local.clone());
+        let target_endpoint = endpoint(&target, "node5:21353", 0);
+        let inner = request().with_auth(b"inner-auth".to_vec());
+        let mut envelope = RelayEnvelope::new(cluster_id, target.clone(), inner);
+        envelope.visited.push(origin.clone());
+        envelope.planned_path = vec![origin, local.clone(), target.clone()];
+        envelope.target_endpoints = vec![target_endpoint.clone()];
+        let relay_request = envelope.into_request().expect("relay request");
+        let runtime = tokio::runtime::Handle::current();
+        let mut host = RecordingRelayHost::default();
+
+        let rpc_response = handle_cluster_relay_async_with_host(
+            &runtime,
+            &paths,
+            &state,
+            &local,
+            &relay_request,
+            ClusterRelayOptions::new(DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5))),
+            &mut host,
+        )
+        .await
+        .expect("relay forward");
+
+        assert_eq!(
+            rpc_response.decode_body::<String>().expect("body"),
+            "forwarded"
+        );
+        assert_eq!(host.sent.len(), 0);
+        assert_eq!(host.target_sent.len(), 1);
+        assert_eq!(host.target_sent[0].0.address, target_endpoint.address);
+        assert_eq!(host.target_sent[0].0.node_id, target);
     }
 }

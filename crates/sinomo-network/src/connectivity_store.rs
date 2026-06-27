@@ -55,7 +55,7 @@ fn bump_local_cluster_connectivity_content_generation(paths: &ClusterPaths) {
     }
 }
 
-pub(crate) fn read_local_cluster_connectivity_records(
+pub fn read_local_cluster_connectivity_records(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
     let now = OffsetDateTime::now_utc();

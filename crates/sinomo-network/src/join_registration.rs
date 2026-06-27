@@ -36,6 +36,15 @@ use sinomo_node::{
 };
 use std::time::{Duration, Instant};
 
+fn join_registration_trace(args: std::fmt::Arguments<'_>) {
+    let enabled = std::env::var("SINOMO_CLUSTER_JOIN_TRACE")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"));
+    if enabled {
+        eprintln!("[sinomo cluster join] {args}");
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterJoinReconciliation {
     pub accepted_endpoint: Option<ClusterEndpointRecord>,
@@ -188,6 +197,7 @@ pub fn handle_cluster_join_registration_request_with_host(
 
     let snapshot = host.commit_join_registration_state(paths, &prepared.state)?;
     write_cluster_state(paths, &prepared.state)?;
+    host.remember_successful_join_targets(paths, &prepared.state, &request.members)?;
     prepared.kv_snapshot = Some(snapshot);
     Ok(prepared)
 }
@@ -240,6 +250,12 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
             CLUSTER_MEMBERSHIP_RPC_CATEGORY,
             &request,
         )?;
+        let forward_started = Instant::now();
+        join_registration_trace(format_args!(
+            "registration forward invite={} started with {} member(s)",
+            request.invite.invite_id,
+            request.members.len()
+        ));
         let response = forward_cluster_membership_rpc_to_state_authority_async_with_host(
             runtime,
             paths,
@@ -249,8 +265,24 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
             host,
         )
         .await?;
+        join_registration_trace(format_args!(
+            "registration forward invite={} rpc returned in {:?}",
+            request.invite.invite_id,
+            forward_started.elapsed()
+        ));
+        let decode_started = Instant::now();
         let response: ClusterJoinRegistrationResponse = response.decode_body()?;
+        join_registration_trace(format_args!(
+            "registration forward invite={} decode completed in {:?}",
+            request.invite.invite_id,
+            decode_started.elapsed()
+        ));
         if response.accepted {
+            let record_started = Instant::now();
+            join_registration_trace(format_args!(
+                "registration forward invite={} record acceptance started",
+                request.invite.invite_id
+            ));
             record_forwarded_join_registration_acceptance_async_with_host(
                 runtime,
                 paths,
@@ -260,6 +292,11 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
                 host,
             )
             .await?;
+            join_registration_trace(format_args!(
+                "registration forward invite={} record acceptance completed in {:?}",
+                request.invite.invite_id,
+                record_started.elapsed()
+            ));
         }
         return Ok(response);
     }
@@ -276,6 +313,8 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
             operation: "write cluster state".to_string(),
             detail: format!("cluster state write task failed: {source}"),
         })??;
+    host.remember_successful_join_targets_async(paths, &prepared.state, &request.members)
+        .await?;
     prepared.kv_snapshot = Some(snapshot);
     Ok(prepared)
 }

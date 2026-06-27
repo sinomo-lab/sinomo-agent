@@ -103,17 +103,6 @@ pub fn prepare_pending_cluster_join_state(
     state
 }
 
-pub fn prepare_cluster_join_retry_state(
-    mut state: ClusterBootstrapState,
-    main_public_key: String,
-    shadow_public_key: String,
-    timestamp: OffsetDateTime,
-) -> ClusterBootstrapState {
-    ensure_daemon_cluster_members(&mut state, Vec::new(), Vec::new(), timestamp);
-    assign_local_daemon_member_public_keys(&mut state, main_public_key, shadow_public_key);
-    state
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterLocalDaemonMembershipObservation {
     pub main_endpoints: Vec<ClusterEndpointRecord>,

@@ -26,10 +26,11 @@ use crate::{
     DfsMetadataBackend, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
     DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
     DfsOperatorInspector, DfsOperatorStatus, DfsSmokeReport, decode_dfs_message_rpc_request,
-    default_dfs_metadata_root, default_dfs_metadata_shards_root, dfs_module_surfaces,
-    dfs_route_is_message_data_plane, ensure_default_cluster_aware_dfs_expose_config,
-    handle_dfs_direct_read_rpc_request, metadata_shards_prefix,
-    open_local_sharded_metadata_backend, open_root_local_metadata_backend, sifs_file_system_id,
+    default_dfs_metadata_root, default_dfs_metadata_shards_root,
+    default_dfs_repair_attempt_snapshot_path, dfs_module_surfaces, dfs_route_is_message_data_plane,
+    ensure_default_cluster_aware_dfs_expose_config, handle_dfs_direct_read_rpc_request,
+    metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
+    read_dfs_repair_attempt_snapshot, sifs_file_system_id,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
@@ -303,6 +304,7 @@ fn dfs_status(data_dir: &SinomoDataDir) -> Result<DfsOperatorStatus, ServiceErro
     let mut status = DfsOperatorInspector::new(metadata.as_ref())
         .status()
         .map_err(service_error)?;
+    attach_dfs_service_maintenance_observations(&mut status, data_dir)?;
     dfs_service_perf_trace(format_args!(
         "status inspector_ms={} total_ms={}",
         inspector_started_at.elapsed().as_millis(),
@@ -327,6 +329,18 @@ fn dfs_status(data_dir: &SinomoDataDir) -> Result<DfsOperatorStatus, ServiceErro
     Ok(status)
 }
 
+fn attach_dfs_service_maintenance_observations(
+    status: &mut DfsOperatorStatus,
+    data_dir: &SinomoDataDir,
+) -> Result<(), ServiceError> {
+    status.repair_attempts =
+        read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(data_dir))
+            .map_err(service_error)?
+            .map(|snapshot| snapshot.records)
+            .unwrap_or_default();
+    Ok(())
+}
+
 /// Serve a DFS operator inspection request against the local metadata backend.
 fn dfs_inspection(
     data_dir: &SinomoDataDir,
@@ -336,9 +350,11 @@ fn dfs_inspection(
     let metadata = open_metadata_backend(data_dir)?;
     let inspector = DfsOperatorInspector::new(metadata.as_ref());
     let response = match request {
-        DaemonDfsInspectionRequest::Status => DaemonDfsInspectionResponse::Status {
-            status: inspector.status().map_err(service_error)?,
-        },
+        DaemonDfsInspectionRequest::Status => {
+            let mut status = inspector.status().map_err(service_error)?;
+            attach_dfs_service_maintenance_observations(&mut status, data_dir)?;
+            DaemonDfsInspectionResponse::Status { status }
+        }
         DaemonDfsInspectionRequest::FileSystem { file_system_id } => {
             DaemonDfsInspectionResponse::FileSystem {
                 file_system: inspector

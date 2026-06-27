@@ -5,7 +5,7 @@ use crate::endpoint_records::cleanup_member_iroh_endpoints;
 use crate::error::NetworkError;
 use crate::keyspace::cluster_endpoint_prefix;
 use crate::kv_local_store::{
-    read_cluster_kv_cached_snapshot_if_present,
+    read_cluster_kv_cached_snapshot_if_present, read_cluster_kv_current_snapshot_arc,
     read_cluster_kv_latest_observed_snapshot_arc_if_present,
 };
 #[cfg(test)]
@@ -31,7 +31,7 @@ impl ClusterConnectivityRecordQuery for KvBackedClusterConnectivityRecordQuery {
 pub fn read_cluster_members_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterMemberRecord>, NetworkError> {
-    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
+    let Some(snapshot) = read_cluster_kv_current_or_cached_snapshot_arc_if_present(paths)? else {
         return Ok(Vec::new());
     };
     read_cluster_members_from_snapshot(snapshot.as_ref())
@@ -70,7 +70,7 @@ pub fn read_cluster_members_from_snapshot(
 pub(crate) fn read_cluster_endpoints_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
-    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
+    let Some(snapshot) = read_cluster_kv_current_or_cached_snapshot_arc_if_present(paths)? else {
         return Ok(Vec::new());
     };
     let endpoint_map = read_cluster_endpoints_from_snapshot(&snapshot)?;
@@ -92,6 +92,18 @@ pub(crate) fn read_cluster_endpoints_from_kv(
             ))
     });
     Ok(endpoints)
+}
+
+fn read_cluster_kv_current_or_cached_snapshot_arc_if_present(
+    paths: &ClusterPaths,
+) -> Result<Option<std::sync::Arc<KvSnapshot>>, NetworkError> {
+    match read_cluster_kv_current_snapshot_arc(paths) {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(current_error) => match read_cluster_kv_cached_snapshot_if_present(paths)? {
+            Some(snapshot) => Ok(Some(snapshot)),
+            None => Err(current_error),
+        },
+    }
 }
 
 fn read_cluster_member_endpoints_from_snapshot(

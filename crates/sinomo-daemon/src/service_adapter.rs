@@ -115,10 +115,10 @@ use crate::rollout::{
     handle_daemon_rollout_native_dylib_module_request,
 };
 use crate::{
-    DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE, DAEMON_DFS_BROWSER_LIST_ROUTE,
-    DAEMON_DFS_BROWSER_READ_FILE_ROUTE, DAEMON_DFS_BROWSER_ROUTES, DAEMON_DFS_BROWSER_STATUS_ROUTE,
-    DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
-    DAEMON_STATUS_ROUTE,
+    DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE, DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
+    DAEMON_DFS_BROWSER_LIST_ROUTE, DAEMON_DFS_BROWSER_READ_FILE_ROUTE, DAEMON_DFS_BROWSER_ROUTES,
+    DAEMON_DFS_BROWSER_STATUS_ROUTE, DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, DAEMON_RPC_CATEGORY,
+    DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE,
 };
 
 static DAEMON_CLUSTER_NETWORK_PING_NODE_IDS: OnceLock<
@@ -394,7 +394,11 @@ impl Service for DaemonControlService {
     }
 
     fn routes(&self) -> &'static [&'static str] {
-        &[DAEMON_STATUS_ROUTE, DAEMON_SHUTDOWN_ROUTE]
+        &[
+            DAEMON_STATUS_ROUTE,
+            DAEMON_SHUTDOWN_ROUTE,
+            DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
+        ]
     }
 
     fn route_categories(&self) -> Vec<ServiceRoute> {
@@ -435,6 +439,18 @@ impl Service for DaemonControlService {
                             &"sinomo daemon stopping".to_string(),
                         )?,
                         ServiceDisposition::Stop,
+                    )
+                }
+                DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE => {
+                    let _: crate::DaemonClusterMaintenanceRefreshRequest = request.decode_body()?;
+                    crate::control::request_daemon_cluster_maintenance_refresh();
+                    tracing::info!("sinomo daemon cluster maintenance refresh requested by RPC");
+                    (
+                        ObjectRpcResponse::encode_body(
+                            DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
+                            &crate::DaemonClusterMaintenanceRefreshResponse,
+                        )?,
+                        ServiceDisposition::Continue,
                     )
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
@@ -754,10 +770,42 @@ fn service_signer_cluster_identity(
 /// lives in `sinomo-network`; the daemon handler still supplies host-local member refresh,
 /// authority forwarding, and cluster state persistence.
 /// Server-side budgets for join handling, deliberately below the joiner's
-/// 30s idle deadline so a stuck step yields a structured error the retry
-/// loop can act on.
+/// 30s idle deadline so a stuck step yields a structured error for the
+/// one-shot join attempt.
 const CLUSTER_JOIN_CHALLENGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 const CLUSTER_JOIN_REGISTRATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(25);
+static CLUSTER_JOIN_REGISTRATION_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+async fn remember_accepted_join_response_state_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    accepted_state: sinomo_core::ClusterBootstrapState,
+) -> Result<(usize, usize), NetworkError> {
+    let paths = paths.clone();
+    runtime
+        .spawn_blocking(move || {
+            let mut local_state = sinomo_network::read_cluster_state_without_kv(&paths)?;
+            if local_state.cluster_id != accepted_state.cluster_id {
+                return Err(NetworkError::Io {
+                    operation: "remember accepted cluster join".to_string(),
+                    detail: format!(
+                        "accepted cluster {} does not match local cluster {}",
+                        accepted_state.cluster_id, local_state.cluster_id
+                    ),
+                });
+            }
+            let before_members = local_state.members.len();
+            sinomo_network::merge_cluster_join_registration(&mut local_state, accepted_state);
+            let after_members = local_state.members.len();
+            sinomo_network::write_cluster_state(&paths, &local_state)?;
+            Ok((before_members, after_members))
+        })
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "remember accepted cluster join".to_string(),
+            detail: format!("accepted cluster join state task failed: {source}"),
+        })?
+}
 
 struct ClusterMembershipService {
     paths: DaemonPaths,
@@ -789,16 +837,21 @@ impl Service for ClusterMembershipService {
             if request.route == CLUSTER_JOIN_CHALLENGE_ROUTE {
                 let challenge: sinomo_network::ClusterInviteChallengeRequest =
                     request.decode_body()?;
+                crate::cluster_join_trace(format_args!(
+                    "challenge invite={} received",
+                    challenge.invite_id
+                ));
                 // The whole proof acquisition (local attempt + authority forward)
                 // runs under a hard budget: a hung step must surface an error
                 // to the joiner — never hold its stream open silently, or the
-                // joiner's bounded retry loop can wedge for its whole window.
+                // one-shot join command can wedge for its whole window.
                 let proof_paths = paths.clone();
                 let proof_runtime = runtime.clone();
                 let proof_challenge = challenge.clone();
                 let proof = tokio::time::timeout(CLUSTER_JOIN_CHALLENGE_BUDGET, async move {
                     let challenge_paths = proof_paths.clone();
                     let challenge_for_local = proof_challenge.clone();
+                    let local_started = std::time::Instant::now();
                     let local_proof = tokio::task::spawn_blocking(move || {
                         crate::auth::create_cluster_invite_challenge_proof(
                             &challenge_paths,
@@ -812,14 +865,27 @@ impl Service for ClusterMembershipService {
                         ))
                     })?;
                     match local_proof {
-                        Ok(proof) => Ok(proof),
+                        Ok(proof) => {
+                            crate::cluster_join_trace(format_args!(
+                                "challenge invite={} local proof ok in {:?}",
+                                proof_challenge.invite_id,
+                                local_started.elapsed()
+                            ));
+                            Ok(proof)
+                        }
                         Err(local_error) => {
+                            crate::cluster_join_trace(format_args!(
+                                "challenge invite={} local proof failed in {:?}: {local_error}",
+                                proof_challenge.invite_id,
+                                local_started.elapsed()
+                            ));
                             // A bridge introducer may hold the invite but not be proof-capable.
                             // Relay to a cluster state authority that can produce an issuer-signed proof.
                             let runtime = require_service_runtime(
                                 proof_runtime.as_ref(),
                                 "cluster join challenge",
                             )?;
+                            let forward_started = std::time::Instant::now();
                             match forward_cluster_invite_challenge_to_cluster_state_authority_async_on_runtime(
                                 &proof_paths,
                                 &proof_challenge,
@@ -827,8 +893,20 @@ impl Service for ClusterMembershipService {
                             )
                             .await
                             {
-                                Ok(proof) => Ok(proof),
+                                Ok(proof) => {
+                                    crate::cluster_join_trace(format_args!(
+                                        "challenge invite={} forward proof ok in {:?}",
+                                        proof_challenge.invite_id,
+                                        forward_started.elapsed()
+                                    ));
+                                    Ok(proof)
+                                }
                                 Err(forward_error) => {
+                                    crate::cluster_join_trace(format_args!(
+                                        "challenge invite={} forward proof failed in {:?}: {forward_error}",
+                                        proof_challenge.invite_id,
+                                        forward_started.elapsed()
+                                    ));
                                     tracing::warn!(
                                         "sinomo daemon join challenge for invite {} failed (local: {local_error}; forward-to-authority: {forward_error})",
                                         proof_challenge.invite_id
@@ -841,6 +919,10 @@ impl Service for ClusterMembershipService {
                 })
                 .await
                 .unwrap_or_else(|_| {
+                    crate::cluster_join_trace(format_args!(
+                        "challenge invite={} timed out after {:?}",
+                        challenge.invite_id, CLUSTER_JOIN_CHALLENGE_BUDGET
+                    ));
                     tracing::warn!(
                         "sinomo daemon join challenge for invite {} timed out after {}s",
                         challenge.invite_id,
@@ -858,7 +940,25 @@ impl Service for ClusterMembershipService {
             }
             let cluster_paths = cluster_paths_from_daemon_paths(&paths).map_err(daemon_error)?;
             if request.route == CLUSTER_JOIN_REGISTER_ROUTE {
-                let payload = request.decode_body().map_err(ServiceError::from)?;
+                let payload: sinomo_network::ClusterJoinRegistrationRequest =
+                    request.decode_body().map_err(ServiceError::from)?;
+                let register_started = std::time::Instant::now();
+                let invite_id = payload.invite.invite_id.clone();
+                crate::cluster_join_trace(format_args!(
+                    "register invite={} received with {} member(s)",
+                    invite_id,
+                    payload.members.len()
+                ));
+                let lock_started = std::time::Instant::now();
+                let _registration_guard = CLUSTER_JOIN_REGISTRATION_LOCK
+                    .get_or_init(|| tokio::sync::Mutex::new(()))
+                    .lock()
+                    .await;
+                crate::cluster_join_trace(format_args!(
+                    "register invite={} acquired registration lock in {:?}",
+                    invite_id,
+                    lock_started.elapsed()
+                ));
                 let service_runtime =
                     require_service_runtime(runtime.as_ref(), "cluster join registration")?;
                 let response = tokio::time::timeout(
@@ -876,6 +976,10 @@ impl Service for ClusterMembershipService {
                 )
                 .await
                 .map_err(|_| {
+                    crate::cluster_join_trace(format_args!(
+                        "register invite={} timed out after {:?}",
+                        invite_id, CLUSTER_JOIN_REGISTRATION_BUDGET
+                    ));
                     tracing::warn!(
                         "sinomo daemon join registration timed out after {}s",
                         CLUSTER_JOIN_REGISTRATION_BUDGET.as_secs()
@@ -883,6 +987,36 @@ impl Service for ClusterMembershipService {
                     ServiceError::Service("cluster join registration timed out".to_string())
                 })?
                 .map_err(ServiceError::from)?;
+                crate::cluster_join_trace(format_args!(
+                    "register invite={} completed accepted={} in {:?}",
+                    invite_id,
+                    response.accepted,
+                    register_started.elapsed()
+                ));
+                if response.accepted {
+                    match remember_accepted_join_response_state_async(
+                        service_runtime,
+                        &cluster_paths,
+                        response.state.clone(),
+                    )
+                    .await
+                    {
+                        Ok((before_members, after_members)) => {
+                            crate::cluster_join_trace(format_args!(
+                                "register invite={} remembered accepted state locally members {} -> {}",
+                                invite_id, before_members, after_members
+                            ));
+                            crate::control::request_daemon_cluster_maintenance_refresh();
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "sinomo daemon join registration accepted invite {} but failed to refresh local state: {}",
+                                invite_id,
+                                error
+                            );
+                        }
+                    }
+                }
                 ctx.respond(ObjectRpcResponse::encode_body(
                     CLUSTER_JOIN_REGISTER_ROUTE,
                     &response,

@@ -122,6 +122,15 @@ pub fn sign_daemon_rpc_request_for_local_node(
     sinomo_network::sign_daemon_rpc_request_for_local_node(request).map_err(DaemonError::from)
 }
 
+pub fn sign_daemon_rpc_request_digest_for_local_node(
+    route: &str,
+    category: &str,
+    rpc_body_sha256: Vec<u8>,
+) -> Result<Vec<u8>, DaemonError> {
+    sinomo_network::sign_daemon_rpc_request_digest_for_local_node(route, category, rpc_body_sha256)
+        .map_err(DaemonError::from)
+}
+
 pub fn sign_daemon_rpc_request_from_data_dir(
     data_dir: &SinomoDataDir,
     request: &sinomo_network::ObjectRpcRequest,

@@ -50,10 +50,13 @@ pub(crate) const ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE: Duration = Duration::fro
 const DAEMON_SANDBOX_STREAM_CHANNEL_CAPACITY: usize = 64;
 const DAEMON_DFS_MESSAGE_REPLAY_RETENTION: Duration = Duration::from_secs(120);
 const DAEMON_DFS_MESSAGE_REPLAY_WAIT: Duration = Duration::from_secs(30);
+const DAEMON_DFS_MESSAGE_REPLAY_MAX_CACHED_BODY_BYTES: usize =
+    sinomo_dfs::DFS_DIRECT_READ_STREAM_CHUNK_BYTES;
 
 static DAEMON_DFS_MESSAGE_REPLAY_CACHE: OnceLock<
     Mutex<BTreeMap<PathBuf, BTreeMap<Vec<u8>, DaemonDfsMessageReplayEntry>>>,
 > = OnceLock::new();
+static DAEMON_CLUSTER_MAINTENANCE_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 
 #[derive(Clone)]
 enum DaemonDfsMessageReplayState {
@@ -101,6 +104,16 @@ async fn daemon_optional_notify(notify: Option<Arc<tokio::sync::Notify>>) {
     } else {
         std::future::pending::<()>().await;
     }
+}
+
+fn daemon_cluster_maintenance_notify() -> Arc<tokio::sync::Notify> {
+    Arc::clone(
+        DAEMON_CLUSTER_MAINTENANCE_NOTIFY.get_or_init(|| Arc::new(tokio::sync::Notify::new())),
+    )
+}
+
+pub(crate) fn request_daemon_cluster_maintenance_refresh() {
+    daemon_cluster_maintenance_notify().notify_one();
 }
 
 async fn start_daemon_network_environment_watch(label: &str) -> Option<Arc<tokio::sync::Notify>> {
@@ -377,6 +390,7 @@ async fn run_daemon_background_maintenance_loop(
         .checked_sub(DAEMON_ROLLOUT_TELEMETRY_INTERVAL)
         .unwrap_or(maintenance_started);
     let dfs_maintenance_notify = daemon_dfs_maintenance_notify();
+    let cluster_maintenance_notify = daemon_cluster_maintenance_notify();
     let network_environment_notify = if label == "daemon" {
         start_daemon_network_environment_watch(&label).await
     } else {
@@ -568,24 +582,26 @@ async fn run_daemon_background_maintenance_loop(
             dfs_maintenance_probe_due,
             shadow_finalization_due,
         );
-        if (dfs_maintenance_enabled && label == "daemon") || network_environment_notify.is_some() {
-            let dfs_notify = (dfs_maintenance_enabled && label == "daemon")
-                .then(|| Arc::clone(&dfs_maintenance_notify));
-            let network_notify = network_environment_notify.as_ref().map(Arc::clone);
-            tokio::select! {
-                _ = tokio::time::sleep(sleep_duration) => {}
-                _ = daemon_optional_notify(dfs_notify) => {
-                    dfs_triggered_maintenance_requested = true;
-                    last_dfs_maintenance = Instant::now()
-                        .checked_sub(DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL)
-                        .unwrap_or(last_dfs_maintenance);
-                }
-                _ = daemon_optional_notify(network_notify) => {
-                    cluster_network.request_network_environment_refresh(Instant::now());
-                }
+        let dfs_notify = (dfs_maintenance_enabled && label == "daemon")
+            .then(|| Arc::clone(&dfs_maintenance_notify));
+        let network_notify = network_environment_notify.as_ref().map(Arc::clone);
+        let cluster_notify = Some(Arc::clone(&cluster_maintenance_notify));
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_duration) => {}
+            _ = daemon_optional_notify(dfs_notify) => {
+                dfs_triggered_maintenance_requested = true;
+                last_dfs_maintenance = Instant::now()
+                    .checked_sub(DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL)
+                    .unwrap_or(last_dfs_maintenance);
             }
-        } else {
-            tokio::time::sleep(sleep_duration).await;
+            _ = daemon_optional_notify(network_notify) => {
+                tracing::info!("sinomo {label} cluster maintenance refreshed after network environment change");
+                cluster_network.request_network_environment_refresh(Instant::now());
+            }
+            _ = daemon_optional_notify(cluster_notify) => {
+                tracing::info!("sinomo {label} cluster maintenance refresh requested");
+                cluster_network.request_network_environment_refresh(Instant::now());
+            }
         }
     }
 }
@@ -1104,6 +1120,13 @@ fn prune_daemon_dfs_message_replay_cache(
     });
 }
 
+fn daemon_dfs_message_response_is_replay_cacheable(
+    response: &sinomo_network::ObjectRpcResponse,
+) -> bool {
+    !sinomo_dfs::dfs_route_is_message_data_plane(&response.route)
+        || response.body.len() < DAEMON_DFS_MESSAGE_REPLAY_MAX_CACHED_BODY_BYTES
+}
+
 async fn wait_for_daemon_dfs_message_replay(
     paths: &DaemonPaths,
     key: &[u8],
@@ -1155,17 +1178,38 @@ pub(crate) fn complete_daemon_dfs_message_replay(
             return;
         };
         prune_daemon_dfs_message_replay_cache(&mut cache);
-        let entries = cache.entry(paths.root.clone()).or_default();
-        let entry = entries
-            .entry(key.to_vec())
-            .or_insert_with(|| DaemonDfsMessageReplayEntry {
-                state: DaemonDfsMessageReplayState::InFlight,
-                notify: Arc::new(tokio::sync::Notify::new()),
-                updated_at: Instant::now(),
-            });
-        entry.state = DaemonDfsMessageReplayState::Complete(response.clone());
-        entry.updated_at = Instant::now();
-        Arc::clone(&entry.notify)
+        if !daemon_dfs_message_response_is_replay_cacheable(response) {
+            let Some(entries) = cache.get_mut(&paths.root) else {
+                return;
+            };
+            let Some(entry) = entries.remove(key) else {
+                return;
+            };
+            let notify = entry.notify;
+            if entries.is_empty() {
+                cache.remove(&paths.root);
+            }
+            tracing::debug!(
+                target: "sinomo.daemon.dfs",
+                route = %response.route,
+                body_bytes = response.body.len(),
+                "skipped DFS message replay cache for large response"
+            );
+            notify
+        } else {
+            let entries = cache.entry(paths.root.clone()).or_default();
+            let entry =
+                entries
+                    .entry(key.to_vec())
+                    .or_insert_with(|| DaemonDfsMessageReplayEntry {
+                        state: DaemonDfsMessageReplayState::InFlight,
+                        notify: Arc::new(tokio::sync::Notify::new()),
+                        updated_at: Instant::now(),
+                    });
+            entry.state = DaemonDfsMessageReplayState::Complete(response.clone());
+            entry.updated_at = Instant::now();
+            Arc::clone(&entry.notify)
+        }
     };
     notify.notify_waiters();
 }
@@ -4059,6 +4103,29 @@ mod tests {
                 sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
             )
             .map_err(Into::into)
+    }
+
+    #[test]
+    fn dfs_message_replay_skips_large_data_plane_responses() {
+        let small = sinomo_network::ObjectRpcResponse::from_encoded_body(
+            sinomo_dfs::DFS_DATA_FETCH_BLOB_ROUTE,
+            vec![0_u8; DAEMON_DFS_MESSAGE_REPLAY_MAX_CACHED_BODY_BYTES - 1],
+        );
+        assert!(daemon_dfs_message_response_is_replay_cacheable(&small));
+
+        let large = sinomo_network::ObjectRpcResponse::from_encoded_body(
+            sinomo_dfs::DFS_DATA_FETCH_BLOB_ROUTE,
+            vec![0_u8; DAEMON_DFS_MESSAGE_REPLAY_MAX_CACHED_BODY_BYTES],
+        );
+        assert!(!daemon_dfs_message_response_is_replay_cacheable(&large));
+
+        let large_non_dfs = sinomo_network::ObjectRpcResponse::from_encoded_body(
+            sinomo_network::CLUSTER_NETWORK_PING_ROUTE,
+            vec![0_u8; DAEMON_DFS_MESSAGE_REPLAY_MAX_CACHED_BODY_BYTES],
+        );
+        assert!(daemon_dfs_message_response_is_replay_cacheable(
+            &large_non_dfs
+        ));
     }
 
     #[test]

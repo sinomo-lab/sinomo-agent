@@ -6950,6 +6950,7 @@ fn networked_dfs_rejects_stale_commit_after_backend_metadata_advances() {
             version: version_2.clone(),
             content_hash: v2_manifest.content_hash,
             object_metadata: Some(current_metadata),
+            authority_shard: None,
         }),
     );
     let events = replica_dfs
@@ -7067,6 +7068,7 @@ fn networked_dfs_rejects_stale_stage_after_backend_metadata_advances() {
             content_hash: content_hash(stale_bytes),
             bytes: stale_bytes.to_vec(),
             object_metadata: Some(stale_metadata),
+            authority_shard: None,
         }),
     );
     let events = replica_dfs
@@ -7188,6 +7190,7 @@ fn networked_dfs_rejects_stage_from_stale_owner_after_backend_handoff() {
             content_hash: content_hash(stale_bytes),
             bytes: stale_bytes.to_vec(),
             object_metadata: Some(stale_memory),
+            authority_shard: None,
         }),
     );
 
@@ -7306,6 +7309,7 @@ fn networked_dfs_rejects_stale_repair_after_backend_metadata_advances() {
             content_hash: content_hash(stale_bytes),
             bytes: stale_bytes.to_vec(),
             object_metadata: Some(stale_metadata),
+            authority_shard: None,
         }),
     );
     let events = replica_dfs
@@ -8749,6 +8753,7 @@ fn networked_dfs_rejects_stage_chunk_count_that_disagrees_with_declared_size() {
         chunk_hash: None,
         bytes: vec![9],
         object_metadata: None,
+        authority_shard: None,
     });
     send_dfs_test_message(&mut owner_transport, &owner, &replica, bad_chunk);
     let events = replica_dfs
@@ -8799,6 +8804,7 @@ fn networked_dfs_rejects_stage_chunk_hash_mismatch() {
         chunk_hash: Some(content_hash(b"different stage chunk")),
         bytes,
         object_metadata: None,
+        authority_shard: None,
     });
     send_dfs_test_message(&mut owner_transport, &owner, &replica, bad_chunk);
     let events = replica_dfs
@@ -8854,6 +8860,7 @@ fn networked_dfs_rejects_repair_chunk_count_that_disagrees_with_declared_size() 
         chunk_hash: None,
         bytes: vec![11],
         object_metadata: None,
+        authority_shard: None,
     });
     send_dfs_test_message(&mut owner_transport, &owner, &replica, bad_chunk);
     let events = replica_dfs
@@ -8926,6 +8933,7 @@ fn networked_dfs_chunked_repair_auth_failure_notifies_sender() {
         chunk_hash: None,
         bytes: b"repair auth bytes".to_vec(),
         object_metadata: Some(object_metadata),
+        authority_shard: None,
     };
     send_dfs_test_message(
         &mut attacker_transport,
@@ -9017,6 +9025,7 @@ fn networked_dfs_chunked_stage_accepts_out_of_order_chunks() {
         chunk_hash: None,
         bytes: bytes[chunk_size..].to_vec(),
         object_metadata: Some(metadata.clone()),
+        authority_shard: None,
     };
     let first = DfsStageBlobChunkCommand {
         chunk_index: 0,
@@ -9112,6 +9121,7 @@ fn networked_dfs_chunked_repair_accepts_out_of_order_chunks() {
         chunk_hash: None,
         bytes: bytes[chunk_size..].to_vec(),
         object_metadata: Some(metadata.clone()),
+        authority_shard: None,
     };
     let first = DfsRepairReplicaChunkCommand {
         chunk_index: 0,
@@ -9216,6 +9226,7 @@ fn networked_dfs_chunked_stage_retry_uses_latest_request_id() {
         chunk_hash: None,
         bytes: bytes[..chunk_size].to_vec(),
         object_metadata: Some(metadata.clone()),
+        authority_shard: None,
     };
     send_dfs_test_message(
         &mut owner_transport,
@@ -9244,6 +9255,7 @@ fn networked_dfs_chunked_stage_retry_uses_latest_request_id() {
         chunk_hash: None,
         bytes: bytes[..chunk_size].to_vec(),
         object_metadata: Some(metadata.clone()),
+        authority_shard: None,
     };
     let retry_second = DfsStageBlobChunkCommand {
         chunk_index: 1,
@@ -9334,6 +9346,7 @@ fn networked_dfs_chunked_repair_retry_uses_latest_request_id() {
         chunk_hash: None,
         bytes: bytes[..chunk_size].to_vec(),
         object_metadata: Some(metadata.clone()),
+        authority_shard: None,
     };
     send_dfs_test_message(
         &mut owner_transport,
@@ -9362,6 +9375,7 @@ fn networked_dfs_chunked_repair_retry_uses_latest_request_id() {
         chunk_hash: None,
         bytes: bytes[..chunk_size].to_vec(),
         object_metadata: Some(metadata),
+        authority_shard: None,
     };
     let retry_second = DfsRepairReplicaChunkCommand {
         chunk_index: 1,
@@ -9455,6 +9469,7 @@ fn networked_dfs_stage_chunk_duplicate_is_idempotent() {
         chunk_hash: None,
         bytes: first_chunk.clone(),
         object_metadata: Some(metadata),
+        authority_shard: None,
     };
     send_dfs_test_message(
         &mut owner_transport,
@@ -9494,6 +9509,7 @@ fn networked_dfs_stage_chunk_duplicate_is_idempotent() {
         chunk_hash: None,
         bytes: second_chunk,
         object_metadata: None,
+        authority_shard: None,
     };
     send_dfs_test_message(
         &mut owner_transport,
@@ -10838,6 +10854,16 @@ fn networked_dfs_retries_offline_repair_when_replica_appears() {
             .any(|event| matches!(event, NetworkedDfsServiceEvent::ReplicaRepaired { .. }))
     );
     assert!(owner_dfs.coordinator().repair_jobs().is_empty());
+    let owner_metrics = owner_dfs
+        .operational_metrics()
+        .expect("owner metrics after repair");
+    assert_eq!(owner_metrics.repair_job_count, 0);
+    assert_eq!(owner_metrics.pending_write_count, 0);
+    assert_eq!(owner_metrics.repair_attempt_count, 0);
+    assert_eq!(owner_metrics.repair_retry_count, 0);
+    assert_eq!(owner_metrics.repair_inflight_count, 0);
+    assert_eq!(owner_metrics.repair_window_resume_count, 0);
+    assert_eq!(owner_metrics.repair_window_resume_bytes, 0);
     assert!(
         owner_dfs
             .metadata()

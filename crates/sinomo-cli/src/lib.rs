@@ -116,6 +116,7 @@ use sinomo_runtime::daemon::{
     probe_daemon_status, remove_boot_entry as daemon_remove_boot_entry,
     run_daemon_control_loop_with_services as daemon_run_daemon_control_loop_with_services,
     run_shadow_daemon_supervision_loop as daemon_run_shadow_daemon_supervision_loop,
+    send_daemon_cluster_maintenance_refresh as daemon_send_daemon_cluster_maintenance_refresh,
     send_daemon_rollout_binary as daemon_send_daemon_rollout_binary,
     send_daemon_rollout_binary_to_endpoint as daemon_send_daemon_rollout_binary_to_endpoint,
     send_daemon_rollout_binary_upload_chunk as daemon_send_daemon_rollout_binary_upload_chunk,

@@ -103,9 +103,9 @@ the connectivity graph's **healthy** links. So every node integrates into one cl
   cross-segment members read `offline` there only because node1 cannot dial their segment
   directly — they are full members.
 
-Joins are best-effort and time-bounded, so **no node hangs**; a cross-segment joiner retries
-while its upstream bridge finishes joining, so cohesion typically settles within ~a minute of
-startup.
+Joins are best-effort and time-bounded, so **no node hangs**; each joiner waits for the dev
+harness readiness marker, then runs one cluster join command. The docker gates treat clean
+six-node formation taking more than 10 seconds as a bug.
 
 ## Layout
 
