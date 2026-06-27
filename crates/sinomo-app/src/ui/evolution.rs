@@ -35,6 +35,8 @@ const RAIL_W: f32 = 318.0;
 const QUEUE_HEADER_H: f32 = 48.0;
 const ROW_H: f32 = 78.0;
 const SECTION_GAP: f32 = 16.0;
+const OBJECTIVE_PLACEHOLDER: &str = "Describe the improvement or task";
+const SCOPE_PLACEHOLDER: &str = "Optional: crates/sinomo-dfs/**, docs/**";
 
 pub struct EvolutionState {
     pub dashboard: EvolutionDashboard,
@@ -298,7 +300,7 @@ impl StartControls {
             let s = shared.clone();
             TextInput::new("evolution-objective")
                 .value(shared.evolution().objective_draft.clone())
-                .placeholder("Improve the DFS performance")
+                .placeholder(OBJECTIVE_PLACEHOLDER)
                 .theme_when(clone_reader(&reader))
                 .on_change(move |value| {
                     s.evolution_mut().set_objective_draft(value);
@@ -309,7 +311,7 @@ impl StartControls {
             let s = shared.clone();
             TextInput::new("evolution-scope")
                 .value(shared.evolution().scope_draft.clone())
-                .placeholder("crates/sinomo-dfs/**, docs/**")
+                .placeholder(SCOPE_PLACEHOLDER)
                 .theme_when(clone_reader(&reader))
                 .on_change(move |value| {
                     s.evolution_mut().set_scope_draft(value);
@@ -785,9 +787,12 @@ fn paint_start_panel(
             let objective = evolution.objective_draft.trim();
             if objective.is_empty() {
                 let label = if dashboard.jobs.is_empty() {
-                    "Objective required - scope is optional".to_string()
+                    "Enter an objective to start a supervised evolution job".to_string()
                 } else {
-                    format!("Objective required - {} jobs tracked", dashboard.jobs.len())
+                    format!(
+                        "Enter an objective to start - {} jobs tracked",
+                        dashboard.jobs.len()
+                    )
                 };
                 (label, pal.text_muted)
             } else {
@@ -1650,6 +1655,8 @@ fn short(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::Backend;
+    use crate::state::{AppState, Shared};
 
     #[test]
     fn wide_start_controls_reserve_label_space() {
@@ -1675,5 +1682,37 @@ mod tests {
         assert!(layout.target_label.max_y() <= layout.target.y());
         assert!(layout.scope.max_x() <= layout.target.x());
         assert!(layout.target.max_x() <= layout.start.x());
+    }
+
+    #[test]
+    fn start_form_opens_blank_with_prompt_placeholders() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        assert!(shared.evolution().objective_draft.is_empty());
+        assert!(shared.evolution().scope_draft.is_empty());
+        assert!(!shared.evolution().can_start());
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Evolution form")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("evolution-objective")
+            .expect()
+            .to_have_value("")?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("evolution-scope")
+            .expect()
+            .to_have_value("")?;
+
+        Ok(())
     }
 }
