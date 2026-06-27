@@ -30,7 +30,7 @@ use thiserror::Error;
 
 const POSIX_WAIT_FOR_COMMIT_READY_DRAIN_LIMIT: usize = 8;
 const POSIX_WAIT_FOR_COMMIT_IDLE_SLEEP: Duration = Duration::from_millis(10);
-const POSIX_WAIT_FOR_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
+const POSIX_WAIT_FOR_COMMIT_TIMEOUT: Duration = Duration::from_secs(45);
 const POSIX_LIST_DIR_COLLECT_PAGE_SIZE: usize = 4096;
 const POSIX_LINK_COUNT_PAGE_SIZE: usize = 4096;
 const POSIX_RECURSIVE_CLEAR_JOB_BATCH_STEPS: usize = 512;

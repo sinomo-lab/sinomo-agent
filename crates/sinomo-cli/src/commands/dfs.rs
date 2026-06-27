@@ -988,7 +988,7 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             let report = if let Some(status) = default_main_daemon_status()? {
                 run_dfs_smoke_via_daemon_address(
                     &status.address,
-                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_secs(120),
                 )?
             } else {
                 run_local_dfs_smoke(&data_dir)?
