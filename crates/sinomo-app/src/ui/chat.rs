@@ -994,6 +994,11 @@ impl ChatState {
         }
     }
 
+    fn should_offer_chat_list_retry(&self) -> bool {
+        self.connection_attention_detail_full()
+            .is_some_and(|detail| detail.to_ascii_lowercase().contains("chat list"))
+    }
+
     fn recovery_empty_detail(&self, target: RuntimeRecoveryTarget) -> String {
         match target {
             RuntimeRecoveryTarget::Providers if self.providers.is_empty() => {
@@ -4351,15 +4356,34 @@ impl TranscriptView {
         )
     }
 
-    fn recovery_card_actions(target: RuntimeRecoveryTarget) -> &'static [RecoveryCardAction] {
-        const CONNECTION: [RecoveryCardAction; 2] = [
-            RecoveryCardAction::RetryChatList,
-            RecoveryCardAction::OpenConnectionSettings,
-        ];
-        const PROVIDERS: [RecoveryCardAction; 1] = [RecoveryCardAction::OpenProviderSetup];
+    fn recovery_card_actions(
+        chat: &ChatState,
+        target: RuntimeRecoveryTarget,
+    ) -> Vec<RecoveryCardAction> {
         match target {
-            RuntimeRecoveryTarget::Providers => &PROVIDERS,
-            RuntimeRecoveryTarget::Connection => &CONNECTION,
+            RuntimeRecoveryTarget::Providers => vec![RecoveryCardAction::OpenProviderSetup],
+            RuntimeRecoveryTarget::Connection => {
+                let mut actions = Vec::new();
+                if chat.should_offer_chat_list_retry() {
+                    actions.push(RecoveryCardAction::RetryChatList);
+                }
+                actions.push(RecoveryCardAction::OpenConnectionSettings);
+                actions
+            }
+        }
+    }
+
+    fn recovery_action_is_primary(
+        chat: &ChatState,
+        target: RuntimeRecoveryTarget,
+        action: RecoveryCardAction,
+    ) -> bool {
+        match action {
+            RecoveryCardAction::RetryChatList | RecoveryCardAction::OpenProviderSetup => true,
+            RecoveryCardAction::OpenConnectionSettings => {
+                !Self::recovery_card_actions(chat, target)
+                    .contains(&RecoveryCardAction::RetryChatList)
+            }
         }
     }
 
@@ -4374,10 +4398,11 @@ impl TranscriptView {
     fn recovery_action_rects(
         area: Rect,
         target: RuntimeRecoveryTarget,
+        chat: &ChatState,
     ) -> Vec<(RecoveryCardAction, Rect)> {
         let card = Self::recovery_card_rect(area);
         let text = Self::recovery_card_text_rect(card);
-        let actions = Self::recovery_card_actions(target);
+        let actions = Self::recovery_card_actions(chat, target);
         let button_h = 28.0;
         let gap = 8.0;
 
@@ -4431,7 +4456,8 @@ impl TranscriptView {
                 .then(|| chat.runtime_recovery_target())
                 .flatten()
         }?;
-        Self::recovery_action_rects(bounds, target)
+        let chat = self.shared.chat();
+        Self::recovery_action_rects(bounds, target, &chat)
             .into_iter()
             .find_map(|(action, rect)| rect.contains(position).then_some(action))
     }
@@ -4685,7 +4711,8 @@ impl Widget for TranscriptView {
             return;
         };
 
-        for (slot, (action, rect)) in Self::recovery_action_rects(ctx.bounds(), target)
+        let chat = self.shared.chat();
+        for (slot, (action, rect)) in Self::recovery_action_rects(ctx.bounds(), target, &chat)
             .into_iter()
             .enumerate()
         {
@@ -4806,7 +4833,7 @@ impl TranscriptView {
             widgets::wrap_lines(chat.recovery_empty_hint(target), text.width(), measure)
         };
         y = y.max(card.y() + 86.0);
-        let action_top = Self::recovery_action_rects(area, target)
+        let action_top = Self::recovery_action_rects(area, target, chat)
             .into_iter()
             .map(|(_, rect)| rect.y())
             .fold(card.y() + card.height(), f32::min);
@@ -4823,8 +4850,9 @@ impl TranscriptView {
             y += hint_style.line_height + 2.0;
         }
 
-        for (action, rect) in Self::recovery_action_rects(area, target) {
-            self.paint_recovery_action(ctx, theme, pal, action, rect);
+        for (action, rect) in Self::recovery_action_rects(area, target, chat) {
+            let primary = Self::recovery_action_is_primary(chat, target, action);
+            self.paint_recovery_action(ctx, theme, pal, action, rect, primary);
         }
     }
 
@@ -4835,13 +4863,10 @@ impl TranscriptView {
         pal: &Palette,
         action: RecoveryCardAction,
         rect: Rect,
+        primary: bool,
     ) {
         let hovered = self.hovered_recovery_action.get() == Some(action);
         let pressed = self.pressed_recovery_action.get() == Some(action);
-        let primary = matches!(
-            action,
-            RecoveryCardAction::RetryChatList | RecoveryCardAction::OpenProviderSetup
-        );
         let (fill, border, text_color, icon_color) = if primary {
             let fill = if pressed { pal.selected } else { pal.accent };
             (fill, fill, pal.on_accent, pal.on_accent)
@@ -5045,8 +5070,12 @@ fn runtime_recovery_button(shared: &Shared, reader: &ThemeReader) -> Option<Size
 }
 
 fn retry_chat_list_button(shared: &Shared, reader: &ThemeReader) -> Option<SizedBox> {
-    let target = shared.chat().runtime_recovery_target()?;
+    let chat = shared.chat();
+    let target = chat.runtime_recovery_target()?;
     if target != RuntimeRecoveryTarget::Connection {
+        return None;
+    }
+    if !chat.should_offer_chat_list_retry() {
         return None;
     }
     let s = shared.clone();
@@ -7464,6 +7493,108 @@ mod tests {
             .get_by_role(SemanticsRole::Button)
             .with_name("Open settings")
             .with_description("Connection settings")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+        assert_eq!(
+            shared.settings().selected,
+            Some(SettingsSection::Connection)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_channel_recovery_card_hides_chat_list_retry() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.notice =
+                Some("channel create failed: device authorization was denied".to_string());
+            chat.push_activity(
+                "channel create",
+                "device authorization was denied",
+                ActivityTone::Warn,
+            );
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Channel recovery card settings")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Retry now")
+                .count()?,
+            0,
+            "channel creation failures should not offer a chat-list retry action"
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Open settings")
+            .with_description("Connection settings")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+        assert_eq!(
+            shared.settings().selected,
+            Some(SettingsSection::Connection)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_channel_recovery_footer_hides_chat_list_retry() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.notice =
+                Some("channel create failed: device authorization was denied".to_string());
+            chat.push_activity(
+                "channel create",
+                "device authorization was denied",
+                ActivityTone::Warn,
+            );
+            chat.messages.push(ChatMessage::user("Existing context"));
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Channel recovery footer settings")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Retry chat list")
+                .count()?,
+            0,
+            "the footer should not offer chat-list retry for channel failures"
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Connection settings")
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
