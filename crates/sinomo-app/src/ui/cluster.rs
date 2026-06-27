@@ -179,9 +179,15 @@ impl Widget for ClusterView {
         paint_edges(ctx, &pal, &topology, &layout);
         paint_vertices(ctx, &theme, &pal, &layout, &selected);
         paint_legend(ctx, &theme, &pal, bounds);
-        if let Some(selection) = selected {
-            paint_detail_panel(ctx, &theme, &pal, bounds, &snapshot, &topology, &selection);
-        }
+        paint_detail_panel(
+            ctx,
+            &theme,
+            &pal,
+            bounds,
+            &snapshot,
+            &topology,
+            selected.as_ref(),
+        );
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
@@ -190,7 +196,7 @@ impl Widget for ClusterView {
             SemanticsRole::GenericContainer,
             ctx.bounds(),
         );
-        node.name = Some("Cluster topology".to_string());
+        node.name = Some("Cluster topology. Select a node or LAN segment for details.".to_string());
         ctx.push(node);
     }
 }
@@ -392,18 +398,21 @@ fn paint_detail_panel(
     bounds: Rect,
     snapshot: &ClusterSnapshot,
     topology: &Topology,
-    selection: &ClusterSelection,
+    selection: Option<&ClusterSelection>,
 ) {
     let panel_w = PANEL_W.min((bounds.width() - PAD * 2.0).max(220.0));
     let x = bounds.max_x() - panel_w - PAD;
     let y = bounds.y() + HEADER_H + 18.0;
-    let panel = Rect::new(x, y, panel_w, 270.0);
+    let panel = Rect::new(x, y, panel_w, 312.0);
     widgets::round_panel(ctx, panel, pal.panel.with_alpha(0.96), pal.border, 8.0);
 
-    let lines = detail_lines(snapshot, topology, selection);
+    let lines = selection
+        .map(|selection| detail_lines(snapshot, topology, selection))
+        .unwrap_or_else(|| overview_lines(snapshot, topology));
     let title_style = pal.text_style(theme, 15.0, FontWeight::SEMIBOLD, pal.text);
     let label_style = pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text_muted);
     let value_style = pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text);
+    let hint_style = pal.text_style(theme, 11.5, FontWeight::NORMAL, pal.text_faint);
     let mut cy = panel.y() + PANEL_PAD;
     if let Some((title, rest)) = lines.split_first() {
         widgets::draw_text_in(
@@ -418,7 +427,22 @@ fn paint_detail_panel(
             title_style,
         );
         cy += 32.0;
-        for line in rest.iter().take(10) {
+        for line in rest.iter().take(11) {
+            if let Some(hint) = line.strip_prefix("hint:") {
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(
+                        panel.x() + PANEL_PAD,
+                        cy,
+                        panel.width() - PANEL_PAD * 2.0,
+                        18.0,
+                    ),
+                    hint.trim(),
+                    hint_style.clone(),
+                );
+                cy += 22.0;
+                continue;
+            }
             let (label, value) = line
                 .split_once(':')
                 .map(|(label, value)| (label, value.trim()))
@@ -457,6 +481,56 @@ fn paint_detail_panel(
             cy += 21.0;
         }
     }
+}
+
+fn overview_lines(snapshot: &ClusterSnapshot, topology: &Topology) -> Vec<String> {
+    let online = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.availability == "online")
+        .count();
+    let public = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.public_reachable)
+        .count();
+    let direct_edges = topology
+        .edges
+        .iter()
+        .filter(|edge| !edge.virtual_lan)
+        .count();
+    let mut lines = vec![
+        "Cluster details".to_string(),
+        format!("source: {}", snapshot.source),
+        format!(
+            "cluster: {}",
+            snapshot
+                .cluster_id
+                .as_deref()
+                .map(|id| short(id, 28))
+                .unwrap_or("-".into())
+        ),
+        format!(
+            "local: {}",
+            snapshot
+                .local_node_id
+                .as_deref()
+                .map(|id| short(id, 28))
+                .unwrap_or("-".into())
+        ),
+        format!("nodes: {online} / {} online", snapshot.nodes.len()),
+        format!("public: {public} reachable"),
+        format!("topology: {direct_edges} edges"),
+        format!("LAN: {} segments", topology.lan_segments.len()),
+    ];
+    if let Some(warning) = snapshot.warnings.first() {
+        lines.push(format!("warning: {}", short(warning, 42)));
+    }
+    lines.push(
+        "hint: Select a node or LAN segment for process, endpoint, and reachability details."
+            .to_string(),
+    );
+    lines
 }
 
 fn detail_lines(
@@ -513,10 +587,13 @@ fn node_detail_lines(node: &ClusterNodeInfo) -> Vec<String> {
 }
 
 fn graph_rect(bounds: Rect) -> Rect {
+    let panel_w = PANEL_W.min((bounds.width() - PAD * 2.0).max(220.0));
+    let reserve_panel = bounds.width() >= 900.0;
+    let right_reserve = if reserve_panel { panel_w + PAD } else { 0.0 };
     Rect::new(
         bounds.x() + PAD,
         bounds.y() + HEADER_H + PAD,
-        (bounds.width() - PAD * 2.0).max(1.0),
+        (bounds.width() - PAD * 2.0 - right_reserve).max(1.0),
         (bounds.height() - HEADER_H - PAD * 2.0 - 34.0).max(1.0),
     )
 }
@@ -881,5 +958,32 @@ mod tests {
 
         assert!(topology.lan_segments.is_empty());
         assert_eq!(topology.edges.len(), 2);
+    }
+
+    #[test]
+    fn overview_lines_surface_cluster_inspector_summary() {
+        let mut public = node("node-public");
+        public.public_reachable = true;
+        let snapshot = ClusterSnapshot {
+            cluster_id: Some("cluster-test-123456789".to_string()),
+            local_node_id: Some("node-public".to_string()),
+            source: "daemon 127.0.0.1:21353".to_string(),
+            nodes: vec![public, node("node-b")],
+            links: vec![link(
+                "node-public",
+                "node-b",
+                "internet-direct",
+                "203.0.113.10:21353",
+            )],
+            ..ClusterSnapshot::default()
+        };
+        let topology = build_topology(&snapshot);
+        let lines = overview_lines(&snapshot, &topology);
+
+        assert_eq!(lines[0], "Cluster details");
+        assert!(lines.iter().any(|line| line == "nodes: 2 / 2 online"));
+        assert!(lines.iter().any(|line| line == "public: 1 reachable"));
+        assert!(lines.iter().any(|line| line == "topology: 1 edges"));
+        assert!(lines.iter().any(|line| line.starts_with("hint: Select")));
     }
 }
