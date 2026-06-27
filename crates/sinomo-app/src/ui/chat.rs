@@ -3952,6 +3952,14 @@ impl Widget for ActivityRail {
         );
 
         let mut y = bounds.y() + 42.0;
+        let bottom = bounds.y() + bounds.height();
+        let health = chat.runtime_health();
+        let status_card = Rect::new(x, y, w, 78.0);
+        if status_card.y() + status_card.height() <= bottom {
+            draw_activity_status_card(ctx, &pal, &theme, status_card, &chat, &health);
+            y += status_card.height() + 16.0;
+        }
+
         if chat.control.tasks.is_empty()
             && chat.tool_calls.is_empty()
             && chat.activity.is_empty()
@@ -3967,6 +3975,9 @@ impl Widget for ActivityRail {
         }
 
         if !chat.control.tasks.is_empty() {
+            if y + 22.0 > bottom {
+                return;
+            }
             widgets::draw_text_in(
                 ctx,
                 Rect::new(x, y, w, 14.0),
@@ -3975,7 +3986,7 @@ impl Widget for ActivityRail {
             );
             y += 22.0;
             for task in chat.control.tasks.iter().take(4) {
-                if y + 42.0 > bounds.y() + bounds.height() {
+                if y + 42.0 > bottom {
                     return;
                 }
                 let dot = Rect::new(x, y + 5.0, 7.0, 7.0);
@@ -4003,6 +4014,9 @@ impl Widget for ActivityRail {
         }
 
         if !chat.tool_calls.is_empty() {
+            if y + 22.0 > bottom {
+                return;
+            }
             widgets::draw_text_in(
                 ctx,
                 Rect::new(x, y, w, 14.0),
@@ -4011,7 +4025,7 @@ impl Widget for ActivityRail {
             );
             y += 22.0;
             for call in chat.tool_calls.iter().rev().take(3) {
-                if y + 42.0 > bounds.y() + bounds.height() {
+                if y + 42.0 > bottom {
                     return;
                 }
                 let dot = Rect::new(x, y + 5.0, 7.0, 7.0);
@@ -4047,7 +4061,7 @@ impl Widget for ActivityRail {
         }
 
         if let Some(context) = &chat.context {
-            if y + 40.0 > bounds.y() + bounds.height() {
+            if y + 40.0 > bottom {
                 return;
             }
             widgets::draw_text_in(
@@ -4062,7 +4076,7 @@ impl Widget for ActivityRail {
             let visible_lane_count = context.lanes.iter().filter(|lane| lane.bytes > 0).count();
             let mut drawn = 0usize;
             for lane in context.lanes.iter().filter(|lane| lane.bytes > 0).take(4) {
-                if y + 24.0 > bounds.y() + bounds.height() {
+                if y + 24.0 > bottom {
                     return;
                 }
                 let dot = Rect::new(x, y + 5.0, 7.0, 7.0);
@@ -4102,29 +4116,107 @@ impl Widget for ActivityRail {
             return;
         }
 
+        if y + 22.0 > bottom {
+            return;
+        }
         widgets::draw_text_in(ctx, Rect::new(x, y, w, 14.0), "EVENTS", heading_style);
         y += 22.0;
+        let mut visible = 0usize;
         for entry in chat.activity.iter().rev().take(10) {
-            if y + 48.0 > bounds.y() + bounds.height() {
+            if y + 54.0 > bottom {
                 break;
             }
-            let dot = Rect::new(x, y + 5.0, 7.0, 7.0);
-            widgets::fill_round_rect(ctx, dot, tone_color(&pal, entry.tone), 3.5);
+            draw_activity_event_card(ctx, &pal, &theme, Rect::new(x, y, w, 46.0), entry);
+            y += 52.0;
+            visible += 1;
+        }
+        if chat.activity.len() > visible && y + 18.0 <= bottom {
             widgets::draw_text_in(
                 ctx,
-                Rect::new(x + 14.0, y, w - 14.0, 16.0),
-                &compact_line(&entry.title, 34),
-                text_style.clone(),
+                Rect::new(x + 12.0, y, w - 24.0, 16.0),
+                &format!("{} more event(s)", chat.activity.len() - visible),
+                detail_style,
             );
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(x + 14.0, y + 17.0, w - 14.0, 16.0),
-                &compact_line(&entry.detail, 54),
-                detail_style.clone(),
-            );
-            y += 44.0;
         }
     }
+}
+
+fn draw_activity_status_card(
+    ctx: &mut PaintCtx,
+    pal: &Palette,
+    theme: &DefaultTheme,
+    rect: Rect,
+    chat: &ChatState,
+    health: &RuntimeHealth,
+) {
+    widgets::round_panel(ctx, rect, pal.panel, pal.border, 8.0);
+    let color = tone_color(pal, health.tone);
+    widgets::fill_round_rect(
+        ctx,
+        Rect::new(rect.x() + 10.0, rect.y() + 12.0, 3.0, rect.height() - 24.0),
+        color,
+        1.5,
+    );
+
+    let chip = Rect::new(rect.x() + 22.0, rect.y() + 10.0, 112.0, 20.0);
+    draw_health_chip(ctx, pal, theme, chip, health);
+
+    let detail_style = pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text);
+    widgets::draw_text_in(
+        ctx,
+        Rect::new(rect.x() + 22.0, rect.y() + 36.0, rect.width() - 34.0, 16.0),
+        &compact_line(&health.detail, 34),
+        detail_style,
+    );
+
+    let queued = chat.control.steering_count + chat.control.follow_up_count;
+    let active = if chat.streaming || chat.control.active_turn {
+        "active"
+    } else {
+        "idle"
+    };
+    let detail = format!(
+        "{} · {} tasks · {} tools · {} queued",
+        active,
+        chat.control.task_count.max(chat.control.tasks.len()),
+        chat.tool_calls.len(),
+        queued
+    );
+    widgets::draw_text_in(
+        ctx,
+        Rect::new(rect.x() + 22.0, rect.y() + 55.0, rect.width() - 34.0, 15.0),
+        &compact_line(&detail, 34),
+        pal.text_style(theme, 10.5, FontWeight::NORMAL, pal.text_faint),
+    );
+}
+
+fn draw_activity_event_card(
+    ctx: &mut PaintCtx,
+    pal: &Palette,
+    theme: &DefaultTheme,
+    rect: Rect,
+    entry: &ChatActivityEntry,
+) {
+    widgets::round_panel(ctx, rect, pal.field, pal.border, 7.0);
+    let color = tone_color(pal, entry.tone);
+    widgets::fill_round_rect(
+        ctx,
+        Rect::new(rect.x() + 10.0, rect.y() + 13.0, 7.0, 7.0),
+        color,
+        3.5,
+    );
+    widgets::draw_text_in(
+        ctx,
+        Rect::new(rect.x() + 24.0, rect.y() + 7.0, rect.width() - 34.0, 16.0),
+        &compact_line(&entry.title, 34),
+        pal.text_style(theme, 12.0, FontWeight::SEMIBOLD, pal.text),
+    );
+    widgets::draw_text_in(
+        ctx,
+        Rect::new(rect.x() + 24.0, rect.y() + 25.0, rect.width() - 34.0, 15.0),
+        &compact_line(&entry.detail, 50),
+        pal.text_style(theme, 10.5, FontWeight::NORMAL, pal.text_faint),
+    );
 }
 
 // ---------------------------------------------------------------------------
