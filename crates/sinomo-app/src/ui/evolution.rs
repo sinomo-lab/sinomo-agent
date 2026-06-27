@@ -30,6 +30,7 @@ const CONTROL_LABEL_H: f32 = 14.0;
 const CONTROL_LABEL_GAP: f32 = 5.0;
 const CONTROL_H: f32 = 38.0;
 const CONTROL_GAP: f32 = 8.0;
+const TRUNCATION_MARKER: &str = "...";
 const QUEUE_W: f32 = 306.0;
 const RAIL_W: f32 = 318.0;
 const QUEUE_HEADER_H: f32 = 48.0;
@@ -1625,25 +1626,29 @@ fn changed_files_summary(files: &[String]) -> String {
 fn tail_path(path: &str, max: usize) -> String {
     if path.chars().count() <= max {
         path.to_string()
+    } else if max <= TRUNCATION_MARKER.len() {
+        TRUNCATION_MARKER.chars().take(max).collect()
     } else {
         let tail: String = path
             .chars()
             .rev()
-            .take(max.saturating_sub(1))
+            .take(max - TRUNCATION_MARKER.len())
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
             .collect();
-        format!("~{tail}")
+        format!("{TRUNCATION_MARKER}{tail}")
     }
 }
 
 fn compact(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         text.to_string()
+    } else if max <= TRUNCATION_MARKER.len() {
+        TRUNCATION_MARKER.chars().take(max).collect()
     } else {
-        let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
-        out.push('~');
+        let mut out: String = text.chars().take(max - TRUNCATION_MARKER.len()).collect();
+        out.push_str(TRUNCATION_MARKER);
         out
     }
 }
@@ -1682,6 +1687,18 @@ mod tests {
         assert!(layout.target_label.max_y() <= layout.target.y());
         assert!(layout.scope.max_x() <= layout.target.x());
         assert!(layout.target.max_x() <= layout.start.x());
+    }
+
+    #[test]
+    fn truncation_helpers_use_standard_ellipsis_marker() {
+        assert_eq!(compact("abcdef", 6), "abcdef");
+        assert_eq!(compact("abcdef", 5), "ab...");
+        assert_eq!(compact("abcdef", 3), "...");
+        assert_eq!(
+            tail_path("/home/ix/.sinomo/evolution/candidates/01j9candidate", 18),
+            "...s/01j9candidate"
+        );
+        assert_eq!(tail_path("/short/path", 18), "/short/path");
     }
 
     #[test]
