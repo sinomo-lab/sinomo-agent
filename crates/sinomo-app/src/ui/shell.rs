@@ -764,9 +764,21 @@ fn shell_status(shared: &Shared) -> ShellStatus {
             connected_daemon: ready.backend.connection.is_daemon(),
         }
     } else {
+        let count = issues.len();
         ShellStatus {
-            label: "Needs attention".to_string(),
-            detail: issues.join(" · "),
+            label: if count == 1 {
+                "Needs attention".to_string()
+            } else {
+                format!("{count} issues")
+            },
+            detail: if count == 1 {
+                issues.join(" · ")
+            } else {
+                format!(
+                    "{count} app surfaces need attention: {}",
+                    issues.join(" · ")
+                )
+            },
             degraded: true,
             connected_daemon: ready.backend.connection.is_daemon(),
         }
@@ -954,5 +966,50 @@ mod tests {
         let status = shell_status(&shared);
         assert_eq!(status.label, "Needs attention");
         assert!(status.detail.contains("SIFS store failed"));
+    }
+
+    #[test]
+    fn attention_status_pill_counts_multiple_surface_issues() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let mut state = AppState::ready(backend);
+        state.active_tab = Tab::Sinomo;
+        let shared = Shared::new(state);
+        {
+            let mut chat = shared.chat_mut();
+            chat.notice = Some("chat list failed: device authorization was denied".to_string());
+        }
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.error = Some("device authorization was denied".to_string());
+        }
+
+        let status = shell_status(&shared);
+        assert_eq!(status.label, "2 issues");
+        assert!(
+            status.detail.contains("2 app surfaces need attention"),
+            "detail should summarize the surface count: {}",
+            status.detail
+        );
+        assert!(status.detail.contains("chat list failed"));
+        assert!(status.detail.contains("SIFS unavailable"));
+
+        let runtime = crate::build_runtime(shared.clone())?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("2 issues")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+        assert_eq!(
+            shared.settings().selected,
+            Some(SettingsSection::Connection)
+        );
+
+        Ok(())
     }
 }
