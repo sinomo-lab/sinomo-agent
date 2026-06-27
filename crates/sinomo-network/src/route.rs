@@ -1819,13 +1819,19 @@ where
         let Some(remaining) = deadline.checked_remaining() else {
             return Err(deadline.timeout_error(endpoint));
         };
-        let request = request.clone().with_trace_context_if_missing();
-        let request_auth = self.host.sign_endpoint_rpc_request_async(&request).await?;
+        let traced_request;
+        let request = if request.traceparent().is_some() {
+            request
+        } else {
+            traced_request = request.clone().with_trace_context_if_missing();
+            &traced_request
+        };
+        let request_auth = self.host.sign_endpoint_rpc_request_async(request).await?;
         self.host
             .send_signed_endpoint_rpc_async(
                 endpoint,
                 &request_auth,
-                &request,
+                request,
                 cluster_endpoint_transport_timeouts(options.timeouts, remaining),
             )
             .await
@@ -1840,11 +1846,17 @@ where
         request: &ObjectRpcRequest,
         options: ClusterObjectRpcOptions,
     ) -> Result<ObjectRpcResponse, NetworkError> {
-        let request = request.clone().with_trace_context_if_missing();
+        let traced_request;
+        let request = if request.traceparent().is_some() {
+            request
+        } else {
+            traced_request = request.clone().with_trace_context_if_missing();
+            &traced_request
+        };
         let traceparent = request.traceparent().unwrap_or_default().to_string();
         let call_started_at = Instant::now();
         let sign_started_at = Instant::now();
-        let request_auth = self.host.sign_endpoint_rpc_request_async(&request).await?;
+        let request_auth = self.host.sign_endpoint_rpc_request_async(request).await?;
         let request_sign_us = cluster_object_rpc_elapsed_us(sign_started_at);
         metrics::histogram!(
             "sinomo.object_rpc.sign.us",
@@ -1928,7 +1940,7 @@ where
                         .send_signed_endpoint_rpc_async(
                             &endpoint,
                             &request_auth,
-                            &request,
+                            request,
                             hop_timeouts,
                         )
                         .await;
@@ -1945,7 +1957,7 @@ where
                     let outer = relay_request_for_signed_rpc_with_max_hop_timeout(
                         &state.cluster_id,
                         target_node_id,
-                        &request,
+                        request,
                         request_auth.clone(),
                         std::iter::once(state.local_node_id.clone()),
                         &route_plan.path,

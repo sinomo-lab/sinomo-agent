@@ -69,6 +69,32 @@ pub fn sign_daemon_rpc_request_from_data_dir(
     )
 }
 
+pub fn sign_daemon_rpc_request_digest_for_local_node(
+    route: &str,
+    category: &str,
+    rpc_body_sha256: Vec<u8>,
+) -> Result<Vec<u8>, NetworkError> {
+    let data_dir = SinomoDataDir::from_env_or_home().map_err(|source| NetworkError::Io {
+        operation: "daemon RPC auth data directory".to_string(),
+        detail: source.to_string(),
+    })?;
+    sign_daemon_rpc_request_digest_from_data_dir(&data_dir, route, category, rpc_body_sha256)
+}
+
+pub fn sign_daemon_rpc_request_digest_from_data_dir(
+    data_dir: &SinomoDataDir,
+    route: &str,
+    category: &str,
+    rpc_body_sha256: Vec<u8>,
+) -> Result<Vec<u8>, NetworkError> {
+    sign_daemon_rpc_request_from_data_dir_with_body_sha256(
+        data_dir,
+        route,
+        category,
+        Some(rpc_body_sha256),
+    )
+}
+
 pub fn daemon_rpc_body_sha256(request: &ObjectRpcRequest) -> Vec<u8> {
     digest::digest(&digest::SHA256, &request.body)
         .as_ref()

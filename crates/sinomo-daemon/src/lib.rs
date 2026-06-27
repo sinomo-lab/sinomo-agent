@@ -186,6 +186,7 @@ impl DaemonServiceRegistryHook {
 pub use auth::{
     AuthenticatedDaemonCommand, DaemonSignerAuthority, SignedDaemonCommand,
     authenticate_daemon_control_request, authorize_authenticated_daemon_command,
+    daemon_rpc_body_sha256, sign_daemon_rpc_request_digest_for_local_node,
     sign_daemon_rpc_request_for_local_node, sign_daemon_rpc_request_from_data_dir,
 };
 #[cfg(test)]
