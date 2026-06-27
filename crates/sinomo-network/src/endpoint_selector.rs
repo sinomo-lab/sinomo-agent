@@ -621,9 +621,13 @@ pub(crate) fn try_cluster_raft_command_targets_impl(
     let graph = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
     let node_statuses = cluster_node_status_map_from_kv(paths);
     let mut endpoints_by_node = EndpointByNodeIndex::default();
-    for endpoint in
-        try_cluster_sync_targets_with_connectivity_context(state, &graph, &node_statuses)?
-    {
+    let mut command_targets =
+        try_cluster_sync_targets_with_connectivity_context(state, &graph, &node_statuses)?;
+    append_cluster_kv_main_daemon_endpoints(paths, state, &mut command_targets)?;
+    for endpoint in command_targets {
+        if !cluster_endpoint_can_carry_main_daemon_rpc(&endpoint) {
+            continue;
+        }
         endpoints_by_node.try_push(endpoint, "group raft endpoints by node")?;
     }
     for endpoints in endpoints_by_node.values_mut() {
@@ -685,6 +689,7 @@ fn try_cluster_live_voter_command_targets_impl(
     state: &ClusterBootstrapState,
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
     let node_statuses = cluster_node_status_map_from_kv(paths);
+    let graph = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
     let mut targets = Vec::new();
     for endpoint in try_cluster_raft_command_targets_impl(paths, state)? {
         if !sinomo_kv::cluster_kv_raft_node_is_voter(state, &endpoint.node_id) {
@@ -693,6 +698,7 @@ fn try_cluster_live_voter_command_targets_impl(
         if node_statuses
             .get(&endpoint.node_id)
             .is_some_and(|status| status.availability == ClusterNodeAvailability::Offline)
+            && graph.unavailability_rank(&endpoint) > 0
         {
             continue;
         }
@@ -811,8 +817,9 @@ pub(crate) fn try_cluster_daemon_command_targets_impl(
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
     let graph = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
     let node_statuses = cluster_node_status_map_from_kv(paths);
-    let sync_targets =
+    let mut sync_targets =
         try_cluster_sync_targets_with_connectivity_context(state, &graph, &node_statuses)?;
+    append_cluster_kv_main_daemon_endpoints(paths, state, &mut sync_targets)?;
     let trace = cluster_endpoint_selector_trace_enabled();
     let mut usable_targets = Vec::new();
     for endpoint in sync_targets

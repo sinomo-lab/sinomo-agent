@@ -6113,9 +6113,34 @@ fn dfs_data_targets_include_kv_main_daemon_endpoints() {
         ),
     )
     .expect("write endpoint record");
+    sync_cluster_node_status_to_kv(
+        &paths,
+        ClusterNodeStatusRecord {
+            cluster_id: state.cluster_id.clone(),
+            node_id: remote.clone(),
+            process: sinomo_node::DAEMON_MAIN_CLUSTER_ROLE.to_string(),
+            availability: ClusterNodeAvailability::Offline,
+            daemon_version: "0.1.0-test".to_string(),
+            commit: None,
+            target_os: Some("test-os".to_string()),
+            target_arch: Some("test-arch".to_string()),
+            pid: Some(42),
+            address: Some("127.0.0.1:21353".to_string()),
+            bind_address: Some("0.0.0.0:21353".to_string()),
+            executable: Some("sinomo".to_string()),
+            rollout: None,
+            daemon_started_at: None,
+            observed_at: now,
+        },
+    )
+    .expect("write stale offline status");
 
-    let dfs_targets = ClusterEndpointSelector::new(&paths, &state)
-        .select(ClusterEndpointSelectionPurpose::DfsData);
+    let selector = ClusterEndpointSelector::new(&paths, &state);
+    let dfs_targets = selector.select(ClusterEndpointSelectionPurpose::DfsData);
+    let raft_targets = selector.select(ClusterEndpointSelectionPurpose::ClusterStateCommand);
+    let live_voter_targets =
+        selector.select(ClusterEndpointSelectionPurpose::AvailableClusterStateAuthority);
+    let main_targets = selector.select(ClusterEndpointSelectionPurpose::MainDaemonCommand);
 
     assert!(
         dfs_targets
@@ -6128,6 +6153,30 @@ fn dfs_data_targets_include_kv_main_daemon_endpoints() {
             .iter()
             .all(|endpoint| endpoint.endpoint_id != folded_shadow_endpoint.endpoint_id),
         "DFS data selection must not include folded shadow endpoints"
+    );
+    assert!(
+        raft_targets
+            .iter()
+            .any(|endpoint| endpoint.endpoint_id == direct_main_endpoint.endpoint_id),
+        "Raft command selection should include main daemon endpoints from cluster KV"
+    );
+    assert!(
+        raft_targets
+            .iter()
+            .all(|endpoint| endpoint.endpoint_id != folded_shadow_endpoint.endpoint_id),
+        "Raft command selection must not route consensus traffic to folded shadow endpoints"
+    );
+    assert!(
+        live_voter_targets
+            .iter()
+            .any(|endpoint| endpoint.endpoint_id == direct_main_endpoint.endpoint_id),
+        "live voter selection should use a KV main endpoint when stale status says offline but connectivity has not marked the endpoint unreachable"
+    );
+    assert!(
+        main_targets
+            .iter()
+            .any(|endpoint| endpoint.endpoint_id == direct_main_endpoint.endpoint_id),
+        "main daemon command selection should include main daemon endpoints from cluster KV"
     );
 }
 
