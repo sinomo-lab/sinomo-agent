@@ -502,6 +502,21 @@ fn palette(shared: &Shared) -> Palette {
     Palette::from_theme(&shared.theme(), widgets::theme_is_dark(shared))
 }
 
+fn secondary_button_theme(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || {
+        let mut theme = reader();
+        theme.palette.accent = theme.palette.control;
+        theme.palette.accent_hover = theme.palette.control_hover;
+        theme.palette.accent_pressed = theme.palette.control_active;
+        theme.palette.accent_border = theme.palette.border;
+        theme.palette.accent_border_hover = theme.palette.border_hover;
+        theme.palette.accent_border_focus = theme.palette.border_focus;
+        theme.palette.accent_text = theme.palette.text;
+        theme
+    }
+}
+
 fn human_size(size: Option<u64>) -> String {
     match size {
         None => "—".to_string(),
@@ -649,7 +664,7 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
             sui::Button::new("Connection settings")
                 .icon(IconGlyph::Alert)
                 .min_width(160.0)
-                .theme_when(clone_reader(reader))
+                .theme_when(secondary_button_theme(reader))
                 .on_press(move || open_settings_section(&s, SettingsSection::Connection))
         };
         let actions = Stack::horizontal()
@@ -843,7 +858,7 @@ impl Widget for InspectorView {
                 &[
                     ("Reason", error.clone()),
                     ("Authority", "SIFS through daemon".to_string()),
-                    ("Next", "retry, then settings".to_string()),
+                    ("Next", "Retry SIFS, then open settings".to_string()),
                 ],
             );
             return;
@@ -1001,8 +1016,25 @@ impl InspectorView {
         title: &str,
         rows: &[(&str, String)],
     ) {
-        let row_h = 34.0;
-        let panel_h = 44.0 + row_h * rows.len() as f32;
+        let label_style = pal.text_style(theme, 10.5, FontWeight::MEDIUM, pal.text_faint);
+        let value_style = pal.text_style(theme, 11.5, FontWeight::NORMAL, pal.text);
+        let value_w = (w - 24.0).max(0.0);
+        let row_layout: Vec<(&str, Vec<String>)> = rows
+            .iter()
+            .map(|(label, value)| {
+                let lines = widgets::wrap_lines(value, value_w, |s| {
+                    ctx.measure_text(s, value_style.clone())
+                        .map(|m| m.width)
+                        .unwrap_or(0.0)
+                });
+                (*label, lines)
+            })
+            .collect();
+        let panel_h = 44.0
+            + row_layout
+                .iter()
+                .map(|(_, lines)| 15.0 + (lines.len().max(1) as f32 * 16.0) + 8.0)
+                .sum::<f32>();
         let panel = Rect::new(x, y, w, panel_h);
         widgets::round_panel(ctx, panel, pal.panel, pal.border, 8.0);
         widgets::draw_text_in(
@@ -1017,23 +1049,25 @@ impl InspectorView {
             pal.text_style(theme, 13.5, FontWeight::SEMIBOLD, pal.text),
         );
 
-        let label_style = pal.text_style(theme, 10.5, FontWeight::MEDIUM, pal.text_faint);
-        let value_style = pal.text_style(theme, 11.5, FontWeight::NORMAL, pal.text);
         let mut row_y = panel.y() + 38.0;
-        for (label, value) in rows {
+        for (label, lines) in row_layout {
             widgets::draw_text_in(
                 ctx,
-                Rect::new(panel.x() + 12.0, row_y, 78.0, 18.0),
+                Rect::new(panel.x() + 12.0, row_y, value_w, 14.0),
                 label,
                 label_style.clone(),
             );
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(panel.x() + 92.0, row_y, panel.width() - 104.0, 18.0),
-                &short(value, 36),
-                value_style.clone(),
-            );
-            row_y += row_h;
+            row_y += 15.0;
+            for line in lines.iter().take(3) {
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(panel.x() + 12.0, row_y, value_w, 16.0),
+                    line,
+                    value_style.clone(),
+                );
+                row_y += 16.0;
+            }
+            row_y += 8.0;
         }
     }
 
@@ -1653,6 +1687,21 @@ mod tests {
             files.entries.clear();
         }
         assert_eq!(inspector.summary(), "unselected|/services|0");
+    }
+
+    #[test]
+    fn files_secondary_button_theme_remaps_accent_slots() {
+        let reader: ThemeReader = Rc::new(DefaultTheme::light);
+        let base = reader();
+        let secondary = secondary_button_theme(&reader)();
+
+        assert_eq!(secondary.palette.accent, base.palette.control);
+        assert_eq!(secondary.palette.accent_hover, base.palette.control_hover);
+        assert_eq!(
+            secondary.palette.accent_pressed,
+            base.palette.control_active
+        );
+        assert_eq!(secondary.palette.accent_text, base.palette.text);
     }
 
     #[test]
