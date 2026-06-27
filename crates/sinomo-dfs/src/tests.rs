@@ -26865,6 +26865,40 @@ fn sifs_cluster_posix_mkdir_all_replays_deep_catch_up_across_batches() {
 }
 
 #[test]
+fn sifs_cluster_posix_mkdir_all_under_services_replays_created_chain() {
+    let cluster = sifs_two_primary_cluster("sifs-xshard-mkdir-all-services-chain");
+    let SifsTwoPrimaryCluster {
+        root,
+        services_primary,
+        mut replica,
+        ..
+    } = cluster;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let services_stop = Arc::clone(&stop);
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+
+    replica
+        .posix_mkdir_all("/services/cluster-tests/latency-regression")
+        .expect("routed services mkdir_all");
+    assert!(
+        replica.posix_stat("/services/cluster-tests").is_ok(),
+        "mkdir_all must sync the intermediate directory"
+    );
+    assert!(
+        replica
+            .posix_stat("/services/cluster-tests/latency-regression")
+            .is_ok(),
+        "mkdir_all must sync the created leaf directory"
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    services_thread.join().expect("services thread");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn sifs_cluster_posix_rejects_adoption_from_non_source_primary() {
     let mut cluster = sifs_two_primary_cluster("sifs-xshard-rogue");
     let mut rogue_object = file_metadata(cluster.replica_node.clone());

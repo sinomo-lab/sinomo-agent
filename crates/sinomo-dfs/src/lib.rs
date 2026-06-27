@@ -17021,21 +17021,43 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .next())
     }
 
+    fn synced_mkdir_all_paths(path: &str) -> Vec<String> {
+        let Some(normalized) = posix::normalized_posix_path_key(path) else {
+            return Vec::new();
+        };
+        if normalized == "/" {
+            return vec![normalized];
+        }
+        let mut paths = Vec::new();
+        let mut current = String::new();
+        for part in normalized.trim_matches('/').split('/') {
+            current.push('/');
+            current.push_str(part);
+            paths.push(current.clone());
+        }
+        paths
+    }
+
     fn synced_namespace_objects_for_operation(
         &self,
         file_system_id: &DfsFileSystemId,
         operation: &DfsNamespaceOperation,
     ) -> Result<Vec<DfsObjectMetadata>, DfsError> {
-        let paths = match operation {
+        let paths: Vec<String> = match operation {
             DfsNamespaceOperation::SyncPath { path }
-            | DfsNamespaceOperation::LookupPath { path } => vec![path.as_str()],
-            DfsNamespaceOperation::LookupPaths { paths } => {
-                paths.iter().map(String::as_str).collect()
+            | DfsNamespaceOperation::LookupPath { path }
+            | DfsNamespaceOperation::Mkdir { path } => {
+                posix::normalized_posix_path_key(path).into_iter().collect()
             }
+            DfsNamespaceOperation::MkdirAll { path } => Self::synced_mkdir_all_paths(path),
+            DfsNamespaceOperation::LookupPaths { paths } => paths
+                .iter()
+                .filter_map(|path| posix::normalized_posix_path_key(path))
+                .collect(),
             _ => return Ok(Vec::new()),
         };
         let mut objects = Vec::new();
-        for path in paths {
+        for path in &paths {
             if let Some(object) = self.synced_namespace_object_for_path(file_system_id, path)? {
                 objects.push(object);
             }
@@ -19384,13 +19406,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .iter()
             .any(|job| job.intent_id == intent_id);
         if has_repair_jobs {
-            return;
-        }
-        if self
-            .pending_writes
-            .get(intent_id)
-            .is_some_and(|pending| !pending.repair_retries.is_empty())
-        {
             return;
         }
         self.remove_pending_write_state(intent_id);
