@@ -5981,11 +5981,14 @@ fn main_daemon_command_targets_skip_folded_shadow_daemon_endpoints() {
         vec![main_endpoint.endpoint_id.clone()],
         "node-scoped relay-hop selection should return only the target main endpoint"
     );
-    assert!(
-        dfs_targets.iter().all(|endpoint| endpoint.endpoint_id
-            != folded_shadow_endpoint.endpoint_id
-            && endpoint.endpoint_id != port_only_shadow_endpoint.endpoint_id),
-        "DFS data routing uses the same main-daemon target surface"
+    assert_eq!(
+        dfs_targets
+            .iter()
+            .filter(|endpoint| endpoint.node_id == main_endpoint.node_id)
+            .map(|endpoint| endpoint.endpoint_id.clone())
+            .collect::<Vec<_>>(),
+        vec![main_endpoint.endpoint_id.clone()],
+        "DFS data routing must use the same main-daemon target surface"
     );
     let status_targets = selector
         .select(ClusterEndpointSelectionPurpose::MemberDaemonStatus)
@@ -6148,11 +6151,14 @@ fn dfs_data_targets_include_kv_main_daemon_endpoints() {
             .any(|endpoint| endpoint.endpoint_id == direct_main_endpoint.endpoint_id),
         "DFS data selection should include main daemon endpoints from cluster KV"
     );
-    assert!(
+    assert_eq!(
         dfs_targets
             .iter()
-            .all(|endpoint| endpoint.endpoint_id != folded_shadow_endpoint.endpoint_id),
-        "DFS data selection must not include folded shadow endpoints"
+            .filter(|endpoint| endpoint.node_id == remote)
+            .map(|endpoint| endpoint.endpoint_id.clone())
+            .collect::<Vec<_>>(),
+        vec![direct_main_endpoint.endpoint_id.clone()],
+        "DFS data selection must use the KV main endpoint instead of folded shadow endpoints"
     );
     assert!(
         raft_targets
