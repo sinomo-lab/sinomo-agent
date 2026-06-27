@@ -1026,8 +1026,16 @@ impl ChatState {
             }
             RuntimeRecoveryTarget::Providers => compact_line(&self.runtime_health().detail, 112),
             RuntimeRecoveryTarget::Connection => self
-                .runtime_degraded_detail()
-                .unwrap_or_else(|| compact_line(&self.runtime_health().detail, 112)),
+                .connection_attention_detail_full()
+                .as_deref()
+                .and_then(connection_recovery_display_detail)
+                .unwrap_or_else(|| {
+                    let detail = self
+                        .runtime_degraded_detail()
+                        .unwrap_or_else(|| self.runtime_health().detail);
+                    connection_recovery_display_detail(&detail)
+                        .unwrap_or_else(|| compact_line(&detail, 112))
+                }),
         }
     }
 
@@ -2664,6 +2672,33 @@ fn connection_problem_summary(text: &str) -> Option<String> {
     Some(summary.to_string())
 }
 
+fn connection_recovery_display_detail(text: &str) -> Option<String> {
+    if !text_mentions_connection_problem(text) {
+        return None;
+    }
+
+    let lower = text.to_ascii_lowercase();
+    let summary = if lower.contains("agent channel")
+        || lower.contains("channel create")
+        || lower.contains("channel store")
+    {
+        "Sinomo could not open channel storage."
+    } else if lower.contains("chat list") {
+        "Sinomo could not load saved chats from file storage."
+    } else if lower.contains("chat save") {
+        "Sinomo could not save chat history to file storage."
+    } else if lower.contains("daemon") || lower.contains("cluster") {
+        "The local cluster service is not reachable."
+    } else {
+        "Chat storage needs connection attention."
+    };
+    Some(summary.to_string())
+}
+
+fn activity_visible_detail(text: &str) -> String {
+    connection_recovery_display_detail(text).unwrap_or_else(|| compact_line(text, 96))
+}
+
 fn transcript_message_display_text(message: &ChatMessage) -> String {
     if message.kind != ChatMessageKind::Error {
         return if message.text.is_empty() {
@@ -3897,7 +3932,8 @@ impl Widget for RuntimeOverview {
             chat.control.steering_count + chat.control.follow_up_count
         );
         let monitor = if matches!(health.tone, ActivityTone::Warn | ActivityTone::Bad) {
-            format!("{} · {monitor}", compact_line(&health.detail, 42))
+            let visible_detail = activity_visible_detail(&health.detail);
+            format!("{} · {monitor}", compact_line(&visible_detail, 42))
         } else {
             monitor
         };
@@ -4439,10 +4475,11 @@ fn draw_activity_status_card(
     draw_health_chip(ctx, pal, theme, chip, health);
 
     let detail_style = pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text);
+    let visible_detail = activity_visible_detail(&health.detail);
     widgets::draw_text_in(
         ctx,
         Rect::new(rect.x() + 22.0, rect.y() + 36.0, rect.width() - 34.0, 16.0),
-        &compact_line(&health.detail, 34),
+        &compact_line(&visible_detail, 34),
         detail_style,
     );
 
@@ -4581,7 +4618,7 @@ fn draw_activity_event_card(
     widgets::draw_text_in(
         ctx,
         Rect::new(rect.x() + 24.0, rect.y() + 25.0, rect.width() - 34.0, 15.0),
-        &compact_line(&entry.detail, 50),
+        &compact_line(&activity_visible_detail(&entry.detail), 50),
         pal.text_style(theme, 10.5, FontWeight::NORMAL, pal.text_faint),
     );
 }
@@ -5407,6 +5444,10 @@ fn runtime_recovery_button(shared: &Shared, reader: &ThemeReader) -> Option<Size
         SizedBox::new().height(SELECTOR_H).with_child(
             sui::Button::new(target.label())
                 .icon(IconGlyph::Alert)
+                .min_width(match target {
+                    RuntimeRecoveryTarget::Providers => 142.0,
+                    RuntimeRecoveryTarget::Connection => 154.0,
+                })
                 .theme_when(composer_control_reader(reader))
                 .on_press(move || open_settings_section(&s, target.settings_section())),
         ),
@@ -7364,6 +7405,41 @@ mod tests {
     }
 
     #[test]
+    fn connection_recovery_display_detail_hides_low_level_storage_errors() {
+        let chat_list =
+            connection_recovery_display_detail("chat list failed: device authorization was denied")
+                .expect("chat list display detail");
+        assert_eq!(
+            chat_list,
+            "Sinomo could not load saved chats from file storage."
+        );
+        assert!(!chat_list.contains("device authorization"));
+        assert!(!chat_list.contains("SIFS"));
+
+        let channel = connection_recovery_display_detail(
+            "channel create failed: device authorization was denied",
+        )
+        .expect("channel display detail");
+        assert_eq!(channel, "Sinomo could not open channel storage.");
+        assert!(!channel.contains("device authorization"));
+
+        assert!(connection_recovery_display_detail("provider unavailable").is_none());
+    }
+
+    #[test]
+    fn collapsed_activity_detail_uses_connection_summary() {
+        let visible = activity_visible_detail("chat list failed: device authorization was denied");
+        assert_eq!(
+            visible,
+            "Sinomo could not load saved chats from file storage."
+        );
+        assert!(!visible.contains("device authorization"));
+
+        let neutral = activity_visible_detail("context assembled: 4.0 KB");
+        assert_eq!(neutral, "context assembled: 4.0 KB");
+    }
+
+    #[test]
     fn empty_turn_done_marks_placeholder_as_system_info() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
@@ -7720,7 +7796,7 @@ mod tests {
         assert!(
             state
                 .recovery_empty_detail(RuntimeRecoveryTarget::Connection)
-                .contains("chat save failed")
+                .contains("Sinomo could not save chat history")
         );
 
         state.notice = Some("chat list failed: device authorization was denied".to_string());
@@ -7732,6 +7808,15 @@ mod tests {
             state.recovery_empty_title(RuntimeRecoveryTarget::Connection),
             "Chat list needs connection attention"
         );
+        assert_eq!(
+            state.recovery_empty_detail(RuntimeRecoveryTarget::Connection),
+            "Sinomo could not load saved chats from file storage."
+        );
+        assert!(
+            !state
+                .recovery_empty_detail(RuntimeRecoveryTarget::Connection)
+                .contains("device authorization")
+        );
 
         state.notice = Some("channel create failed: device authorization was denied".to_string());
         assert_eq!(
@@ -7741,6 +7826,10 @@ mod tests {
         assert_eq!(
             state.recovery_empty_title(RuntimeRecoveryTarget::Connection),
             "Channel needs connection attention"
+        );
+        assert_eq!(
+            state.recovery_empty_detail(RuntimeRecoveryTarget::Connection),
+            "Sinomo could not open channel storage."
         );
         assert_eq!(
             state.recovery_empty_hint(RuntimeRecoveryTarget::Connection),
