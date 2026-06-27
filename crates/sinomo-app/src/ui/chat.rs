@@ -4653,8 +4653,9 @@ fn selector_signature(shared: &Shared) -> (usize, usize, usize, bool, bool, bool
 fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     if shared.chat().providers.is_empty() {
         if shared.chat().shows_recovery_empty_card() {
+            let recovery_target = shared.chat().runtime_recovery_target();
             let s = shared.clone();
-            let row = Stack::horizontal()
+            let mut row = Stack::horizontal()
                 .spacing(8.0)
                 .alignment(Alignment::Center)
                 .with_child(
@@ -4664,20 +4665,16 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                             .color_when(move || palette(&s).text_faint),
                     ),
                 );
+            if recovery_target == Some(RuntimeRecoveryTarget::Connection) {
+                row = row.with_child(provider_setup_button(shared, reader));
+            }
             return WidgetPod::new(row);
         }
 
-        let setup = {
-            let s = shared.clone();
-            sui::Button::new("Setup provider")
-                .icon(IconGlyph::Add)
-                .theme_when(composer_control_reader(reader))
-                .on_press(move || open_provider_setup(&s))
-        };
         let row = Stack::horizontal()
             .spacing(8.0)
             .alignment(Alignment::Center)
-            .with_child(SizedBox::new().height(SELECTOR_H).with_child(setup));
+            .with_child(provider_setup_button(shared, reader));
         return WidgetPod::new(row);
     }
 
@@ -4762,6 +4759,16 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     WidgetPod::new(row)
 }
 
+fn provider_setup_button(shared: &Shared, reader: &ThemeReader) -> SizedBox {
+    let s = shared.clone();
+    SizedBox::new().height(SELECTOR_H).with_child(
+        sui::Button::new("Setup provider")
+            .icon(IconGlyph::Add)
+            .theme_when(composer_control_reader(reader))
+            .on_press(move || open_provider_setup(&s)),
+    )
+}
+
 fn runtime_recovery_button(shared: &Shared, reader: &ThemeReader) -> Option<SizedBox> {
     let target = shared.chat().runtime_recovery_target()?;
     let s = shared.clone();
@@ -4815,28 +4822,39 @@ fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let input = {
         let s = shared.clone();
         let draft = shared.chat().input.clone();
-        TextArea::new("chat-input")
+        let provider_ready = !shared.chat().providers.is_empty();
+        let placeholder = if provider_ready {
+            "Message Sinomo...  (Enter to send, Shift+Enter for newline)"
+        } else {
+            "Set up a provider before sending."
+        };
+        let mut input = TextArea::new("chat-input")
             .value(draft)
-            .placeholder("Message Sinomo…  (⏎ to send, ⇧⏎ for newline)")
+            .placeholder(placeholder)
             .padding(Insets {
                 left: 12.0,
                 top: 8.0,
                 right: 12.0,
                 bottom: 8.0,
             })
-            .theme_when(composer_control_reader(reader))
-            .on_change({
+            .theme_when(composer_control_reader(reader));
+        if provider_ready {
+            input = input.on_change({
                 let s = s.clone();
                 move |value| {
                     s.chat_mut().set_draft(value);
                 }
-            })
+            });
             // Enter sends, Shift+Enter inserts a newline (the on_submit only fires while the
             // TextArea is focused — Enter only reaches a focused input). While streaming, `submit()`
             // queues the draft as a follow-up for the active runtime turn.
-            .on_submit(move |_text| {
+            input = input.on_submit(move |_text| {
                 s.chat_mut().submit();
-            })
+            });
+        } else {
+            input = input.read_only();
+        }
+        input
     };
 
     let streaming = shared.chat().streaming;
@@ -4892,7 +4910,8 @@ fn composer(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         )
     };
 
-    // The input row is rebuilt when the streaming flag flips (Send <-> Interrupt). The draft text is
+    // The input row is rebuilt when the streaming flag flips (Send <-> Interrupt) and when provider
+    // availability changes (editable composer <-> setup-required read-only state). The draft text is
     // owned by the `TextArea`, so we do NOT rebuild on every keystroke.
     let input_host = {
         let s = shared.clone();
@@ -4900,7 +4919,10 @@ fn composer(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         RebuildOnChange::new(
             {
                 let s = s.clone();
-                move || s.chat().streaming
+                move || {
+                    let chat = s.chat();
+                    (chat.streaming, chat.providers.is_empty())
+                }
             },
             move |_streaming| input_row(&s, &r),
         )

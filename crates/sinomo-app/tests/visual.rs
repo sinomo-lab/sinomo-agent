@@ -597,7 +597,9 @@ fn capture_typing() {
     let dir = shots_dir();
     std::fs::create_dir_all(&dir).expect("create shots dir");
 
-    let runtime = build_runtime(boot(Tab::Sinomo)).expect("build runtime");
+    let shared = boot(Tab::Sinomo);
+    seed_chat_providers(&shared);
+    let runtime = build_runtime(shared).expect("build runtime");
     let app = TestApp::from_runtime(runtime).expect("headless test app");
     let window = app.main_window().expect("main window");
     let root = window.root();
@@ -1525,6 +1527,7 @@ fn shift_enter_in_composer_inserts_a_newline() {
     };
 
     let shared = boot(Tab::Sinomo);
+    seed_chat_providers(&shared);
     let runtime = build_runtime(shared.clone()).expect("build runtime");
     let app = TestApp::from_runtime(runtime).expect("headless test app");
     let window = app.main_window().expect("main window");
@@ -1556,6 +1559,78 @@ fn shift_enter_in_composer_inserts_a_newline() {
         "Shift+Enter inserts a newline into the draft (draft = {:?})",
         shared.chat().input
     );
+}
+
+/// When no provider is configured, the composer should read as setup-required rather than accepting
+/// a draft that cannot be sent. Connection recovery may be visible at the same time, so the selector
+/// still exposes provider setup as a separate prerequisite.
+#[test]
+fn composer_without_provider_is_read_only_and_opens_setup() {
+    use sui::{
+        Event, KeyState, KeyboardEvent, Point, PointerButton, PointerEvent, PointerEventKind,
+        SemanticsRole,
+    };
+
+    let shared = boot(Tab::Sinomo);
+    {
+        let mut chat = shared.chat_mut();
+        chat.providers.clear();
+        chat.models_loading = false;
+        chat.notice =
+            Some("chat list failed: chat persistence requires a daemon connection".to_string());
+    }
+
+    let runtime = build_runtime(shared.clone()).expect("build runtime");
+    let app = TestApp::from_runtime(runtime).expect("headless test app");
+    let window = app.main_window().expect("main window");
+    let root = window.root();
+    app.run_until_idle().expect("settle initial layout");
+
+    let pos = Point::new(600.0, 675.0);
+    let mut down = PointerEvent::new(PointerEventKind::Down, pos);
+    down.button = Some(PointerButton::Primary);
+    root.dispatch_event(Event::Pointer(down)).expect("down");
+    let mut up = PointerEvent::new(PointerEventKind::Up, pos);
+    up.button = Some(PointerButton::Primary);
+    root.dispatch_event(Event::Pointer(up)).expect("up");
+
+    for key in ["H", "i"] {
+        root.dispatch_event(Event::Keyboard(KeyboardEvent::new(key, KeyState::Pressed)))
+            .expect("key");
+    }
+    root.dispatch_event(Event::Keyboard(KeyboardEvent::new(
+        "Enter",
+        KeyState::Pressed,
+    )))
+    .expect("enter");
+    app.run_until_idle().expect("settle typing attempt");
+
+    assert!(
+        shared.chat().input.is_empty(),
+        "no-provider composer must not accept a draft"
+    );
+    assert!(
+        shared.chat().messages.is_empty(),
+        "Enter on the no-provider composer must not send a turn"
+    );
+    assert!(
+        !shared.chat().streaming,
+        "Enter on the no-provider composer must not start streaming"
+    );
+
+    window
+        .get_by_role(SemanticsRole::Button)
+        .with_name("Setup provider")
+        .click()
+        .expect("click Setup provider");
+
+    assert_eq!(shared.borrow().active_tab, Tab::Settings);
+    let settings = shared.settings();
+    assert_eq!(
+        settings.selected,
+        Some(sinomo_app::ui::settings::SettingsSection::Providers)
+    );
+    assert!(settings.provider_add_open);
 }
 
 /// Issue 3 (relayout outside a pointer gesture): when `streaming` flips while the request-animation
