@@ -16766,7 +16766,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn handle_distributed_write_request(
         &mut self,
         requester_node_id: NodeId,
-        command: DfsDistributedWriteCommand,
+        mut command: DfsDistributedWriteCommand,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let request_id = command.request_id.clone();
         let object_id = command.request.object_id.clone();
@@ -16794,6 +16794,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         {
             DfsDistributedWriteResult::Outcome { outcome }
         } else {
+            self.rebase_routed_path_write_if_current(&mut command)?;
             match self
                 .ensure_routed_write_object_metadata(
                     &command.request,
@@ -16861,6 +16862,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             repair_jobs,
                             ..
                         } if command.foreground_replica_repair && !repair_jobs.is_empty() => {
+                            if let Some(path) = created_object_path.as_deref() {
+                                self.touch_routed_create_parent_directory(path);
+                            }
                             self.pending_remote_write_responses.insert(
                                 intent_id.clone(),
                                 PendingRemoteWriteResponse {
@@ -16868,7 +16872,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     request_id: request_id.clone(),
                                     object_id: object_id.clone(),
                                     metadata_journal_after_sequence,
-                                    created_object_path: created_object_path.clone(),
+                                    created_object_path: None,
                                     foreground_replica_repair: command.foreground_replica_repair,
                                     created_at: Instant::now(),
                                 },
@@ -16954,6 +16958,57 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             requester_node_id,
             result,
         })
+    }
+
+    fn rebase_routed_path_write_if_current(
+        &mut self,
+        command: &mut DfsDistributedWriteCommand,
+    ) -> Result<(), DfsError> {
+        if command.bytes.is_empty() && command.content_hash.is_none() {
+            return Ok(());
+        }
+        let Some(path_object) = command.object_metadata.as_ref() else {
+            return Ok(());
+        };
+        let current = match self.current_object_for_write(&command.request.object_id) {
+            Ok(current) => current,
+            Err(DfsError::UnknownObject { .. }) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let target = if current.kind == DfsObjectKind::Hardlink {
+            self.resolve_hardlink_target(&current)
+                .map_err(|error| DfsError::Metadata {
+                    message: error.to_string(),
+                })?
+        } else {
+            current.clone()
+        };
+        if !matches!(target.kind, DfsObjectKind::File | DfsObjectKind::Symlink) {
+            return Ok(());
+        }
+        let path_resolves_to_hardlink = current.kind == DfsObjectKind::Hardlink;
+        if path_object.content_hash.is_none() && !path_resolves_to_hardlink {
+            return Ok(());
+        }
+        if path_object.path != current.path && path_object.path != target.path {
+            return Ok(());
+        }
+        let stale_base = command
+            .expected_base_version
+            .as_ref()
+            .is_some_and(|expected| expected != &target.version);
+        let different_object = command.request.object_id != target.object_id;
+        if !stale_base && !different_object {
+            return Ok(());
+        }
+        command.request.object_id = target.object_id.clone();
+        command.request.target_version = namespace::next_version(&target.version);
+        command.expected_base_version = Some(target.version.clone());
+        command.object_metadata = Some(target);
+        if command.content_hash.is_some() && !different_object {
+            command.foreground_replica_repair = false;
+        }
+        Ok(())
     }
 
     fn routed_write_response_metadata_journal_batches(
@@ -17328,6 +17383,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .get_mut(&response.request_id)
             .expect("pending routed write was validated before metadata replay");
         let mut remote_intent_alias = None;
+        let mut committed_manifest_publish = None;
         match &response.result {
             DfsDistributedWriteResult::Outcome {
                 outcome:
@@ -17350,6 +17406,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsDistributedWriteResult::Outcome {
                 outcome: outcome @ NetworkedDfsWriteOutcome::Committed { intent_id, .. },
             } => {
+                committed_manifest_publish = Some((pending.command.clone(), outcome.clone()));
                 pending.result = Some(Ok(outcome.clone()));
                 if intent_id != &response.request_id {
                     remote_intent_alias = Some((intent_id.clone(), pending.clone()));
@@ -17362,6 +17419,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 pending.result = Some(Err(routed_write_rejection_error(reason)));
             }
         }
+        if let Some((command, outcome)) = committed_manifest_publish {
+            self.publish_committed_routed_write_manifest_if_local(&command, &outcome);
+        }
         if let Some((intent_id, pending)) = remote_intent_alias {
             self.pending_routed_writes
                 .entry(intent_id)
@@ -17373,6 +17433,41 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             primary_node_id,
             result: response.result,
         })
+    }
+
+    fn publish_committed_routed_write_manifest_if_local(
+        &mut self,
+        command: &DfsDistributedWriteCommand,
+        outcome: &NetworkedDfsWriteOutcome,
+    ) {
+        let NetworkedDfsWriteOutcome::Committed {
+            version,
+            content_hash,
+            ..
+        } = outcome
+        else {
+            return;
+        };
+        let size_bytes = command
+            .content_size_bytes
+            .unwrap_or_else(|| command.bytes.len() as u64);
+        let object_id = self
+            .current_read_object_metadata(&command.request.object_id)
+            .ok()
+            .and_then(|object| self.resolve_hardlink_target(&object).ok())
+            .map(|object| object.object_id)
+            .unwrap_or_else(|| command.request.object_id.clone());
+        if let Err(error) = self.content.put_blob_only_manifest(
+            object_id.as_str(),
+            version.as_str(),
+            content_hash,
+            size_bytes,
+        ) {
+            dfs_perf_trace(format_args!(
+                "routed-write-local-manifest-publish-failed node={} request={} object={} version={} error={}",
+                self.node_id, command.request_id, object_id, version, error
+            ));
+        }
     }
 
     fn routed_response_journal_batch_targets_local_primary(
@@ -19407,6 +19502,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .iter()
             .any(|job| job.intent_id == intent_id);
         if has_repair_jobs {
+            return;
+        }
+        if self.pending_writes.get(intent_id).is_some_and(|pending| {
+            pending
+                .repair_retries
+                .values()
+                .any(|state| state.inflight || state.next_retry_tick > self.repair_retry_tick)
+        }) {
             return;
         }
         self.remove_pending_write_state(intent_id);
@@ -25742,10 +25845,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             state.inflight =
                 record.in_flight && record.next_retry_unix_nanos > dfs_now_unix_nanos();
-            if let Some(next_chunk_index) = record.next_chunk_index {
+            if state.inflight
+                && let Some(next_chunk_index) = record.next_chunk_index
+            {
                 pending
                     .repair_next_chunk_indexes
                     .insert(record.missing_replica_node_id.clone(), next_chunk_index);
+            } else {
+                pending
+                    .repair_next_chunk_indexes
+                    .remove(&record.missing_replica_node_id);
             }
         }
     }

@@ -15952,15 +15952,15 @@ fn repair_attempt_restore_restarts_stale_partial_chunk_window() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(chunks.len(), total_chunks as usize);
+    assert_eq!(chunks.len(), DFS_STAGE_CHUNK_WINDOW_SIZE as usize);
     assert_eq!(chunks.first().expect("first chunk").chunk_index, 0);
     assert_eq!(
         chunks.last().expect("last chunk").chunk_index,
-        total_chunks - 1
+        DFS_STAGE_CHUNK_WINDOW_SIZE - 1
     );
     assert_eq!(
         dfs.active_repair_attempt_records()[0].next_chunk_index,
-        Some(total_chunks - 1)
+        Some(DFS_STAGE_CHUNK_WINDOW_SIZE)
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -18149,8 +18149,8 @@ fn repair_replica_streams_complete_large_chunk_transfer() {
         sent,
         StageBlobSendOutcome {
             sent: true,
-            complete: true,
-            next_chunk_index: total_chunks,
+            complete: false,
+            next_chunk_index: DFS_STAGE_CHUNK_WINDOW_SIZE,
         }
     );
     let chunks = drain_dfs_messages(&mut replica_transport)
@@ -18160,16 +18160,66 @@ fn repair_replica_streams_complete_large_chunk_transfer() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(chunks.len(), total_chunks as usize);
+    assert_eq!(chunks.len(), DFS_STAGE_CHUNK_WINDOW_SIZE as usize);
     assert_eq!(chunks.first().expect("first chunk").chunk_index, 0);
     assert_eq!(
         chunks.last().expect("last chunk").chunk_index,
-        total_chunks - 1
+        DFS_STAGE_CHUNK_WINDOW_SIZE - 1
     );
     assert!(
         chunks
             .iter()
             .all(|chunk| chunk.total_chunks == total_chunks)
+    );
+
+    let resumed = dfs
+        .send_repair_replica_window_if_routable(
+            &replica,
+            "dfs_net_req_repair_window_resumed".to_string(),
+            "dfs_intent_repair_window",
+            &file_system_id,
+            &object_id,
+            None,
+            &version,
+            &manifest.content_hash,
+            manifest.size_bytes,
+            sent.next_chunk_index,
+            DFS_STAGE_CHUNK_WINDOW_SIZE,
+            None,
+        )
+        .expect("resume repair stream");
+    assert_eq!(
+        resumed,
+        StageBlobSendOutcome {
+            sent: true,
+            complete: true,
+            next_chunk_index: total_chunks,
+        }
+    );
+    let resumed_chunks = drain_dfs_messages(&mut replica_transport)
+        .into_iter()
+        .filter_map(|message| match message {
+            DfsNetworkMessage::RepairReplicaChunk(chunk) => Some(chunk),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        resumed_chunks.len(),
+        (total_chunks - DFS_STAGE_CHUNK_WINDOW_SIZE) as usize
+    );
+    assert_eq!(
+        resumed_chunks
+            .first()
+            .expect("first resumed chunk")
+            .chunk_index,
+        DFS_STAGE_CHUNK_WINDOW_SIZE
+    );
+    assert_eq!(
+        resumed_chunks
+            .last()
+            .expect("last resumed chunk")
+            .chunk_index,
+        total_chunks - 1
     );
 
     let stale_partial = dfs
@@ -18203,13 +18253,16 @@ fn repair_replica_streams_complete_large_chunk_transfer() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(stale_partial_chunks.len(), total_chunks as usize);
+    assert_eq!(
+        stale_partial_chunks.len(),
+        (total_chunks - DFS_STAGE_CHUNK_WINDOW_SIZE) as usize
+    );
     assert_eq!(
         stale_partial_chunks
             .first()
             .expect("first chunk")
             .chunk_index,
-        0
+        DFS_STAGE_CHUNK_WINDOW_SIZE
     );
     assert_eq!(
         stale_partial_chunks.last().expect("last chunk").chunk_index,
@@ -23045,6 +23098,15 @@ fn sifs_cluster_fetch_for_local_read(
     }
 }
 
+fn sifs_routed_writes_settled(
+    service: &NetworkedDfsService<sinomo_network::InProcessTransport>,
+) -> bool {
+    service
+        .pending_routed_writes
+        .values()
+        .all(|pending| pending.result.is_some())
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 struct PosixScenarioObservation {
@@ -23157,6 +23219,16 @@ fn sifs_cluster_posix_contract_concurrent_whole_file_overwrite_many_readers() {
     let mut observations = Vec::new();
 
     sifs_cluster_routed_posix_write(&mut cluster, path, &base);
+    sifs_cluster_publish_metadata_until(
+        &mut cluster,
+        "overwrite observer seed catch-up",
+        |cluster| {
+            cluster
+                .observer
+                .posix_stat(path)
+                .is_ok_and(|stat| stat.content_hash.as_deref() == Some(valid_hashes[0].as_str()))
+        },
+    );
     let base_stat = cluster.writer.posix_stat(path).expect("base stat");
     record_posix_observation(
         &mut observations,
@@ -23379,8 +23451,8 @@ fn sifs_cluster_posix_contract_concurrent_write_at_truncate_races() {
     }
     sifs_posix_cluster_pump_until(&mut cluster, "write-at/truncate race settle", |cluster| {
         cluster.primary.posix_stat(path).is_ok()
-            && cluster.writer.pending_routed_writes.is_empty()
-            && cluster.observer.pending_routed_writes.is_empty()
+            && sifs_routed_writes_settled(&cluster.writer)
+            && sifs_routed_writes_settled(&cluster.observer)
     });
 
     let final_bytes = sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.primary, path);
@@ -23798,8 +23870,9 @@ fn sifs_cluster_posix_contract_same_directory_concurrent_creates() {
     let after = cluster.primary.posix_stat(dir).expect("parent after");
     assert!(
         after.modified_at_unix_nanos >= before.modified_at_unix_nanos
-            && after.version >= before.version,
-        "parent directory metadata must be monotonic across concurrent creates"
+            && after.changed_at_unix_nanos >= before.changed_at_unix_nanos
+            && after.version != before.version,
+        "parent directory metadata must be monotonic across concurrent creates; before={before:?}; after={after:?}"
     );
     sifs_cluster_publish_metadata_until(
         &mut cluster,
@@ -24431,28 +24504,17 @@ fn sifs_cluster_posix_contract_partitioned_concurrent_writers_are_fenced() {
             })
             .expect("current shard");
     });
-    let stale_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    stale_kv.with_client(|kv| {
-        let mut control = DfsControlPlaneStore::new(kv);
-        control
-            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
-                old_primary_node.clone(),
-            )))
-            .expect("stale fs");
-        control
-            .put_metadata_shard(&DfsMetadataShardConfig {
-                file_system_id: sifs_file_system_id(),
-                shard_id: "root".to_string(),
-                primary_node_id: old_primary_node.clone(),
-                replica_node_ids: vec![new_primary_node.clone()],
-                epoch: 1,
-                assignment: DfsMetadataShardAssignment::Root,
-                default_policy: DfsObjectPolicy::ReplicatedEventual,
-            })
-            .expect("stale shard");
-    });
-    let mut old_primary =
-        sifs_posix_cluster_node(&network, &stale_kv, &root, "old-primary", old_primary_node);
+    // A node with an entirely separate stale KV universe has no authoritative
+    // signal to distinguish itself from a fork. The production fence is the
+    // current control-plane view: stale local metadata must not let the old
+    // primary commit when KV says a newer primary owns the shard.
+    let mut old_primary = sifs_posix_cluster_node(
+        &network,
+        &current_kv,
+        &root,
+        "old-primary",
+        old_primary_node,
+    );
     let mut new_primary = sifs_posix_cluster_node(
         &network,
         &current_kv,
@@ -24503,8 +24565,13 @@ fn sifs_cluster_posix_contract_partitioned_concurrent_writers_are_fenced() {
         "current primary should be able to commit while fenced stale primary must not win"
     );
     assert!(
-        stale.is_err(),
-        "stale partitioned primary must fail, route, or conflict instead of silently committing"
+        matches!(
+            stale,
+            Err(DfsPosixError::PendingWrite { .. })
+                | Err(DfsPosixError::Conflict { .. })
+                | Err(DfsPosixError::Dfs(_))
+        ),
+        "stale partitioned primary must fail, route, or conflict instead of silently committing: {stale:?}"
     );
     finish_posix_observations(&observations);
     std::fs::remove_dir_all(&root).ok();

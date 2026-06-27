@@ -1093,6 +1093,31 @@ impl LocalContentStore {
         )
     }
 
+    pub fn put_blob_only_manifest(
+        &self,
+        object_id: &str,
+        version: &str,
+        content_hash: &str,
+        size_bytes: u64,
+    ) -> Result<ContentManifest> {
+        let reader = self.open_blob_stream(content_hash)?;
+        if reader.size_bytes() != size_bytes {
+            return Err(ContentStoreError::InvalidChunkedContent {
+                message: format!(
+                    "blob-only manifest size does not match blob: object={object_id}, version={version}, manifest={size_bytes}, blob={}",
+                    reader.size_bytes()
+                ),
+            });
+        }
+        self.write_manifest_create_new_or_existing(ContentManifest {
+            object_id: object_id.to_owned(),
+            version: version.to_owned(),
+            content_hash: content_hash.to_owned(),
+            size_bytes,
+            extents: Vec::new(),
+        })
+    }
+
     pub fn flush_deferred_durable_dirs(&self) -> Result<()> {
         let blobs = {
             let mut blobs =

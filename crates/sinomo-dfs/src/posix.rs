@@ -3062,8 +3062,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ..
             } => bytes,
             NetworkedDfsReadOutcome::PendingReplication { .. }
-            | NetworkedDfsReadOutcome::NotConfirmed { .. }
-            | NetworkedDfsReadOutcome::NotFound => return Err(DfsPosixError::NotFound { path }),
+            | NetworkedDfsReadOutcome::NotConfirmed { .. } => {
+                return Err(DfsPosixError::Conflict {
+                    path,
+                    reason: "current file content is not locally available for ranged write; retry"
+                        .to_string(),
+                });
+            }
+            NetworkedDfsReadOutcome::NotFound => return Err(DfsPosixError::NotFound { path }),
             NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
                 return Err(read_conflict_error(path, conflicts));
             }
@@ -3162,8 +3168,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ..
             } => bytes,
             NetworkedDfsReadOutcome::PendingReplication { .. }
-            | NetworkedDfsReadOutcome::NotConfirmed { .. }
-            | NetworkedDfsReadOutcome::NotFound => return Err(DfsPosixError::NotFound { path }),
+            | NetworkedDfsReadOutcome::NotConfirmed { .. } => {
+                return Err(DfsPosixError::Conflict {
+                    path,
+                    reason: "current file content is not locally available for truncate; retry"
+                        .to_string(),
+                });
+            }
+            NetworkedDfsReadOutcome::NotFound => return Err(DfsPosixError::NotFound { path }),
             NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
                 return Err(read_conflict_error(path, conflicts));
             }
@@ -6319,7 +6331,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map_err(Into::into)
     }
 
-    fn resolve_hardlink_target(&self, object: &DfsObjectMetadata) -> Result<DfsObjectMetadata> {
+    pub(crate) fn resolve_hardlink_target(
+        &self,
+        object: &DfsObjectMetadata,
+    ) -> Result<DfsObjectMetadata> {
         let mut current = object.clone();
         for _ in 0..16 {
             if current.kind != DfsObjectKind::Hardlink {
@@ -6479,7 +6494,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 path: path.to_string(),
             });
         }
-        let now = now_unix_nanos();
+        let now = now_unix_nanos()
+            .max(object.modified_at_unix_nanos.saturating_add(1))
+            .max(object.changed_at_unix_nanos.saturating_add(1));
         object.modified_at_unix_nanos = now;
         object.changed_at_unix_nanos = now;
         object.version = next_version(&object.version);
