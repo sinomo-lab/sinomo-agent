@@ -3690,20 +3690,21 @@ pub(crate) fn run_cluster_dfs_smoke_with_message_sender(
 
     let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
         .map_err(DfsError::from_network)?;
-    let mut content_nodes = sinomo_kv::read_cluster_kv_prefix_entries(
+    let local_node_id = state.local_node_id.clone();
+    let content_advertisements = sinomo_kv::read_cluster_kv_prefix_entries(
         &cluster_paths.kv_paths(),
         content_services_prefix(),
     )
     .map_err(DfsError::from)?
     .into_iter()
     .filter_map(|entry| entry.decode::<DfsNodeAdvertisement>().ok())
-    .filter(|advertisement| advertisement.accepts_content)
-    .map(|advertisement| advertisement.node_id)
     .collect::<Vec<_>>();
-    content_nodes.sort();
-    content_nodes.dedup();
+    let content_nodes = dfs_smoke_content_node_ids(
+        &local_node_id,
+        content_advertisements,
+        OffsetDateTime::now_utc(),
+    );
 
-    let local_node_id = state.local_node_id.clone();
     let file_system = distributed_sifs(local_node_id.clone());
     let metadata_shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
     let endpoints = cluster_dfs_data_endpoints(cluster_paths, &state);
@@ -3736,6 +3737,47 @@ pub(crate) fn run_cluster_dfs_smoke_with_message_sender(
         options,
     )
     .map(Some)
+}
+
+const DFS_SMOKE_CONTENT_ADVERTISEMENT_MAX_AGE_SECONDS: i64 = 60 * 60;
+
+fn dfs_smoke_content_node_ids(
+    local_node_id: &NodeId,
+    advertisements: Vec<DfsNodeAdvertisement>,
+    now: OffsetDateTime,
+) -> Vec<NodeId> {
+    let mut content_nodes = Vec::new();
+    let mut fresh_remote_content_nodes = Vec::new();
+    for advertisement in advertisements {
+        if !advertisement.accepts_content {
+            continue;
+        }
+        if advertisement.node_id != *local_node_id
+            && dfs_smoke_content_advertisement_is_fresh(&advertisement, now)
+        {
+            fresh_remote_content_nodes.push(advertisement.node_id.clone());
+        }
+        content_nodes.push(advertisement.node_id);
+    }
+
+    let mut selected = if fresh_remote_content_nodes.is_empty() {
+        content_nodes
+    } else {
+        fresh_remote_content_nodes
+    };
+    selected.sort();
+    selected.dedup();
+    selected
+}
+
+fn dfs_smoke_content_advertisement_is_fresh(
+    advertisement: &DfsNodeAdvertisement,
+    now: OffsetDateTime,
+) -> bool {
+    advertisement.accepts_content
+        && (advertisement.updated_at >= now
+            || now - advertisement.updated_at
+                <= time::Duration::seconds(DFS_SMOKE_CONTENT_ADVERTISEMENT_MAX_AGE_SECONDS))
 }
 
 pub fn run_dfs_smoke_with_host<T: DfsMessageTransport>(

@@ -4504,6 +4504,41 @@ fn dfs_smoke_replica_candidates_preserve_routable_order() {
 }
 
 #[test]
+fn dfs_smoke_content_nodes_prefer_fresh_remote_advertisements() {
+    let local = NodeId::from_legacy_named("node_dfs_smoke_fresh_ads_local").expect("local node");
+    let stale = NodeId::from_legacy_named("node_dfs_smoke_fresh_ads_stale").expect("stale node");
+    let fresh =
+        NodeId::from_legacy_named("node_dfs_smoke_fresh_ads_reachable").expect("fresh node");
+    let now = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(2);
+
+    let mut local_advertisement = DfsNodeAdvertisement::content(local.clone(), "local");
+    local_advertisement.updated_at = now - time::Duration::hours(2);
+    let mut stale_advertisement = DfsNodeAdvertisement::content(stale.clone(), "stale");
+    stale_advertisement.updated_at = now - time::Duration::hours(2);
+    let mut fresh_advertisement = DfsNodeAdvertisement::content(fresh.clone(), "fresh");
+    fresh_advertisement.updated_at = now - time::Duration::minutes(5);
+
+    let content_nodes = dfs_smoke_content_node_ids(
+        &local,
+        vec![
+            local_advertisement,
+            stale_advertisement,
+            fresh_advertisement,
+        ],
+        now,
+    );
+    assert_eq!(
+        content_nodes,
+        vec![fresh.clone()],
+        "DFS smoke should avoid stale content advertisements when a fresh remote is available"
+    );
+
+    let candidates =
+        dfs_smoke_replica_candidate_sets(&local, content_nodes, vec![stale.clone(), fresh.clone()]);
+    assert_eq!(candidates, vec![vec![local, fresh]]);
+}
+
+#[test]
 fn default_cluster_smoke_bootstraps_dfs_before_running_smoke() {
     let root = temp_root("default-cluster-smoke-bootstrap");
     let data_dir = SinomoDataDir::new(&root);
