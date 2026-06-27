@@ -1012,18 +1012,7 @@ impl ChatState {
 
     fn should_offer_sifs_check(&self) -> bool {
         self.connection_attention_detail_full()
-            .is_some_and(|detail| {
-                let lower = detail.to_ascii_lowercase();
-                [
-                    "sifs",
-                    "dfs",
-                    "session store",
-                    "channel store",
-                    "device authorization",
-                ]
-                .iter()
-                .any(|needle| lower.contains(needle))
-            })
+            .is_some_and(|detail| detail_should_offer_sifs_check(&detail))
     }
 
     fn recovery_empty_detail(&self, target: RuntimeRecoveryTarget) -> String {
@@ -2706,6 +2695,19 @@ fn activity_visible_detail(text: &str) -> String {
     connection_recovery_display_detail(text).unwrap_or_else(|| compact_line(text, 96))
 }
 
+fn detail_should_offer_sifs_check(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "sifs",
+        "dfs",
+        "session store",
+        "channel store",
+        "device authorization",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 fn activity_status_summary(text: &str) -> String {
     let lower = text.to_ascii_lowercase();
     let summary = if lower.contains("agent channel")
@@ -2815,15 +2817,27 @@ fn transcript_message_display_text(message: &ChatMessage) -> String {
         } else {
             "The chat runtime could not reach a required cluster service."
         };
-        format!("Connection issue\n{summary}\nOpen Connection settings for low-level detail.")
+        let next = if detail_should_offer_sifs_check(detail) {
+            "Check SIFS first. Connection settings has low-level detail."
+        } else {
+            "Open Connection settings for low-level detail."
+        };
+        format!("Connection issue\n{summary}\n{next}")
     } else {
         format!("Error\n{detail}")
     }
 }
 
 fn transcript_message_recovery_action(message: &ChatMessage) -> Option<RecoveryCardAction> {
-    (message.kind == ChatMessageKind::Error && text_mentions_connection_problem(&message.text))
-        .then_some(RecoveryCardAction::OpenConnectionSettings)
+    if message.kind != ChatMessageKind::Error || !text_mentions_connection_problem(&message.text) {
+        return None;
+    }
+
+    if detail_should_offer_sifs_check(&message.text) {
+        Some(RecoveryCardAction::CheckSifs)
+    } else {
+        Some(RecoveryCardAction::OpenConnectionSettings)
+    }
 }
 
 /// A small uppercase section heading `Label` (AGENTS / CHATS), color tracking the theme.
@@ -7338,9 +7352,9 @@ mod tests {
         let rendered = transcript_message_display_text(&connection);
         assert!(rendered.starts_with("Connection issue\n"));
         assert!(rendered.contains("This chat needs storage authorization."));
-        assert!(rendered.contains("Open Connection settings for low-level detail."));
+        assert!(rendered.contains("Check SIFS first. Connection settings has low-level detail."));
         assert!(!rendered.contains("failed to parse command"));
-        assert!(!rendered.contains("SIFS"));
+        assert!(!rendered.contains("SIFS store failed"));
         assert!(!rendered.contains("device authorization was denied"));
 
         let provider = ChatMessage::system_error("Error: provider unavailable");
@@ -7351,7 +7365,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_connection_error_message_opens_connection_settings() -> sui::Result<()> {
+    fn rendered_storage_error_message_opens_files() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -7368,6 +7382,41 @@ mod tests {
             .window(
                 sui::WindowBuilder::new()
                     .title("Connection error message action")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Check SIFS")
+            .with_description("Open SIFS browser")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Files);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_daemon_error_message_opens_connection_settings() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.models_loading = false;
+            chat.notice = None;
+            chat.messages.push(ChatMessage::system_error(
+                "Error: chat unavailable: daemon connection failed",
+            ));
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Daemon error message action")
                     .root(view(shared.clone())),
             )
             .build()?;
