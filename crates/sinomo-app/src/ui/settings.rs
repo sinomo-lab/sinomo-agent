@@ -134,6 +134,7 @@ pub struct SettingsState {
     pub provider_add_error: Option<String>,
     pub provider_action_error: Option<String>,
     connection_detail_expanded: Vec<Tab>,
+    node_detail_expanded: bool,
     advanced_detail_expanded: Vec<String>,
     provider_remove_confirming: Option<(String, String)>,
 }
@@ -239,6 +240,7 @@ impl SettingsState {
             provider_add_error: None,
             provider_action_error: None,
             connection_detail_expanded: Vec::new(),
+            node_detail_expanded: false,
             advanced_detail_expanded: Vec::new(),
             provider_remove_confirming: None,
         }
@@ -274,6 +276,14 @@ impl SettingsState {
         } else {
             self.connection_detail_expanded.push(tab);
         }
+    }
+
+    fn node_detail_expanded(&self) -> bool {
+        self.node_detail_expanded
+    }
+
+    fn toggle_node_detail(&mut self) {
+        self.node_detail_expanded = !self.node_detail_expanded;
     }
 
     fn advanced_detail_expanded(&self, key: &str) -> bool {
@@ -821,6 +831,20 @@ fn connection_issue_key(shared: &Shared) -> String {
     format!("{issue_key}\nexpanded:{detail_key}")
 }
 
+fn node_detail_key(shared: &Shared) -> String {
+    let settings = shared.settings();
+    format!(
+        "{}\n{}\n{}\n{}\n{}\n{:?}\nexpanded:{}",
+        settings.node_id,
+        settings.role,
+        settings.mode_label,
+        settings.status_detail,
+        settings.clustered,
+        settings.cluster_summary,
+        settings.node_detail_expanded
+    )
+}
+
 fn configuration_key(shared: &Shared) -> String {
     let settings = shared.settings();
     let item_key = settings
@@ -876,8 +900,27 @@ fn copyable_text_row(
 ) -> FormRow {
     let input = TextInput::new(name)
         .value(value)
+        .read_only()
         .theme_when(clone_reader(reader));
     FormRow::new(label, input)
+        .stacked()
+        .theme_when(clone_reader(reader))
+}
+
+/// A stacked read-only text area for longer generated values.
+fn copyable_area_row(
+    reader: &ThemeReader,
+    name: &str,
+    label: &str,
+    value: impl Into<String>,
+) -> FormRow {
+    let area = SizedBox::new().height(72.0).with_child(
+        TextArea::new(name)
+            .value(value)
+            .read_only()
+            .theme_when(clone_reader(reader)),
+    );
+    FormRow::new(label, area)
         .stacked()
         .theme_when(clone_reader(reader))
 }
@@ -1205,14 +1248,74 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
 }
 
 fn section_node(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (node_id, role) = {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || node_detail_key(&s)
+        },
+        move |_sig| WidgetPod::new(section_node_body(&s, &r)),
+    )
+}
+
+fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let (short_node_id, full_node_id, role, mode_label, status_detail, cluster_summary, expanded) = {
         let s = shared.settings();
-        (short(&s.node_id, 30), s.role.clone())
+        (
+            short(&s.node_id, 30),
+            s.node_id.clone(),
+            s.role.clone(),
+            s.mode_label.clone(),
+            s.status_detail.clone(),
+            s.cluster_summary.clone(),
+            s.node_detail_expanded(),
+        )
     };
-    let body = FieldGroup::new()
+    let detail_button = {
+        let s = shared.clone();
+        sui::Button::new(if expanded {
+            "Hide detail"
+        } else {
+            "Show detail"
+        })
+        .icon(if expanded {
+            sui::IconGlyph::ChevronUp
+        } else {
+            sui::IconGlyph::ChevronDown
+        })
+        .theme_when(clone_reader(reader))
+        .on_press(move || s.settings_mut().toggle_node_detail())
+    };
+
+    let mut body = FieldGroup::new()
         .spacing(6.0)
-        .with_child(value_row(shared, reader, "Node ID", node_id))
-        .with_child(value_row(shared, reader, "Role", role));
+        .with_child(value_row(shared, reader, "Node ID", short_node_id))
+        .with_child(value_row(shared, reader, "Role", role))
+        .with_child(
+            FormRow::new("Details", detail_button)
+                .inline()
+                .theme_when(clone_reader(reader)),
+        );
+    if expanded {
+        body = body
+            .with_child(copyable_text_row(
+                reader,
+                "node-full-id",
+                "Full node ID",
+                full_node_id,
+            ))
+            .with_child(value_row(shared, reader, "Connection", mode_label))
+            .with_child(copyable_area_row(
+                reader,
+                "node-connection-detail",
+                "Connection detail",
+                status_detail,
+            ));
+        if let Some(summary) = cluster_summary {
+            body = body.with_child(value_row(shared, reader, "Cluster", summary));
+        }
+    }
     FormSection::new("Node", body).theme_when(clone_reader(reader))
 }
 
@@ -3158,6 +3261,23 @@ mod tests {
         let detail = config_detail_value(&item);
         assert!(detail.contains("\"entries\""));
         assert!(detail.contains("\"/workspace\""));
+    }
+
+    #[test]
+    fn node_detail_signature_tracks_disclosure_state() {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let collapsed = node_detail_key(&shared);
+
+        assert!(collapsed.contains("expanded:false"));
+        shared.settings_mut().toggle_node_detail();
+
+        let expanded = node_detail_key(&shared);
+        assert!(expanded.contains("expanded:true"));
+        assert_ne!(
+            collapsed, expanded,
+            "node detail disclosure must invalidate the retained section"
+        );
     }
 
     #[test]
