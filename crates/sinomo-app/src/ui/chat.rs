@@ -1027,6 +1027,25 @@ impl ChatState {
         }
     }
 
+    fn recovery_empty_hint(&self, target: RuntimeRecoveryTarget) -> &'static str {
+        match target {
+            RuntimeRecoveryTarget::Providers => target.empty_hint(),
+            RuntimeRecoveryTarget::Connection => {
+                let detail = self
+                    .connection_attention_detail_full()
+                    .unwrap_or_else(|| self.runtime_health().detail);
+                let lower = detail.to_ascii_lowercase();
+                if lower.contains("channel create") {
+                    "Check SIFS access in Connection settings, then create the channel again."
+                } else if lower.contains("chat save") {
+                    "Open Connection settings if saving keeps failing; retry the chat list after access is restored."
+                } else {
+                    target.empty_hint()
+                }
+            }
+        }
+    }
+
     fn event_belongs_to_visible_session(&self, session_id: &str) -> bool {
         session_id.is_empty() || self.session_id.is_empty() || self.session_id == session_id
     }
@@ -1156,15 +1175,33 @@ impl ChatState {
     }
 
     fn reset_visible_session(&mut self, session_id: String) {
+        let preserved_notice = self
+            .notice
+            .as_ref()
+            .filter(|notice| text_mentions_connection_problem(notice))
+            .cloned();
+        let preserved_activity: Vec<ChatActivityEntry> = self
+            .activity
+            .iter()
+            .filter(|entry| {
+                matches!(entry.tone, ActivityTone::Warn | ActivityTone::Bad)
+                    && text_mentions_connection_problem(&format!(
+                        "{} {}",
+                        entry.title, entry.detail
+                    ))
+            })
+            .cloned()
+            .collect();
+
         self.session_id = session_id;
         self.messages.clear();
         self.input.clear();
         self.cursor = 0;
         self.streaming = false;
-        self.notice = None;
+        self.notice = preserved_notice;
         self.context = None;
         self.usage = None;
-        self.activity.clear();
+        self.activity = preserved_activity;
         self.tool_calls.clear();
         self.control = ChatControlOverview::default();
         self.scroll = 0.0;
@@ -4719,7 +4756,7 @@ impl TranscriptView {
                     .map(|m| m.width)
                     .unwrap_or(0.0)
             };
-            widgets::wrap_lines(target.empty_hint(), text.width(), measure)
+            widgets::wrap_lines(chat.recovery_empty_hint(target), text.width(), measure)
         };
         y = y.max(card.y() + 86.0);
         let action_top = Self::recovery_action_rects(area, target)
@@ -6560,6 +6597,10 @@ mod tests {
         );
         assert!(state.input.is_empty(), "New chat clears the composer draft");
         assert!(!state.streaming, "New chat leaves the visible chat idle");
+        assert!(
+            state.notice.is_none(),
+            "New chat clears transient per-turn notices"
+        );
         assert_eq!(
             state.pending_session_reset.as_deref(),
             Some(new_session_id.as_str())
@@ -6596,6 +6637,43 @@ mod tests {
             session_id: new_session_id,
         });
         assert!(state.pending_session_reset.is_none());
+    }
+
+    #[test]
+    fn new_session_preserves_connection_attention_until_retry_succeeds() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        state.notice = Some("chat list failed: device authorization was denied".to_string());
+        state.push_activity(
+            "chat list",
+            "device authorization was denied",
+            ActivityTone::Warn,
+        );
+        state.set_draft("draft that should clear".to_string());
+
+        state.new_session();
+
+        assert!(state.messages.is_empty());
+        assert!(state.input.is_empty());
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("chat list failed: device authorization was denied")
+        );
+        assert!(
+            state.activity.iter().any(|entry| {
+                entry.title == "chat list" && entry.detail == "device authorization was denied"
+            }),
+            "New chat must not hide unresolved storage attention"
+        );
+        assert_eq!(
+            state.runtime_recovery_target(),
+            Some(RuntimeRecoveryTarget::Connection)
+        );
+        assert_eq!(
+            state.recovery_empty_title(RuntimeRecoveryTarget::Connection),
+            "Chat list needs connection attention"
+        );
     }
 
     #[test]
@@ -7073,6 +7151,10 @@ mod tests {
         assert_eq!(
             state.recovery_empty_title(RuntimeRecoveryTarget::Connection),
             "Channel needs connection attention"
+        );
+        assert_eq!(
+            state.recovery_empty_hint(RuntimeRecoveryTarget::Connection),
+            "Check SIFS access in Connection settings, then create the channel again."
         );
 
         state.notice = Some(
