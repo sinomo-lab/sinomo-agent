@@ -4032,15 +4032,128 @@ fn context_lane_summary(label: &str, bytes: usize, total: usize) -> String {
 
 struct ActivityRail {
     shared: Shared,
+    detail_expanded: Cell<bool>,
+    detail_hovered: Cell<bool>,
+    detail_pressed: Cell<bool>,
 }
 
 impl ActivityRail {
     fn new(shared: Shared) -> Self {
-        Self { shared }
+        Self {
+            shared,
+            detail_expanded: Cell::new(false),
+            detail_hovered: Cell::new(false),
+            detail_pressed: Cell::new(false),
+        }
+    }
+
+    fn status_card_rect(bounds: Rect) -> Rect {
+        let x = bounds.x() + 14.0;
+        let w = (bounds.width() - 28.0).max(0.0);
+        Rect::new(x, bounds.y() + 42.0, w, 78.0)
+    }
+
+    fn detail_toggle_rect(status_card: Rect) -> Rect {
+        Rect::new(
+            status_card.max_x() - 104.0,
+            status_card.y() + 8.0,
+            92.0,
+            24.0,
+        )
+    }
+
+    fn detail_panel_rect(status_card: Rect) -> Rect {
+        Rect::new(
+            status_card.x(),
+            status_card.max_y() + 8.0,
+            status_card.width(),
+            92.0,
+        )
+    }
+
+    fn detail_entry(chat: &ChatState, health: &RuntimeHealth) -> Option<ChatActivityEntry> {
+        chat.activity
+            .iter()
+            .rev()
+            .find(|entry| matches!(entry.tone, ActivityTone::Warn | ActivityTone::Bad))
+            .cloned()
+            .or_else(|| {
+                matches!(health.tone, ActivityTone::Warn | ActivityTone::Bad).then(|| {
+                    ChatActivityEntry {
+                        title: health.label.to_string(),
+                        detail: health.detail.clone(),
+                        tone: health.tone,
+                    }
+                })
+            })
+    }
+
+    fn detail_toggle_hit(&self, bounds: Rect, position: Point) -> bool {
+        let has_detail = {
+            let chat = self.shared.chat();
+            let health = chat.runtime_health();
+            Self::detail_entry(&chat, &health).is_some()
+        };
+        has_detail && Self::detail_toggle_rect(Self::status_card_rect(bounds)).contains(position)
+    }
+
+    fn request_detail_refresh(ctx: &mut EventCtx) {
+        ctx.request_paint();
+        ctx.request_semantics();
     }
 }
 
 impl Widget for ActivityRail {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        match event {
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
+                let hovered = self.detail_toggle_hit(ctx.bounds(), pointer.position);
+                if self.detail_hovered.get() != hovered {
+                    self.detail_hovered.set(hovered);
+                    Self::request_detail_refresh(ctx);
+                }
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Down
+                    && pointer.button == Some(PointerButton::Primary) =>
+            {
+                if self.detail_toggle_hit(ctx.bounds(), pointer.position) {
+                    self.detail_pressed.set(true);
+                    ctx.request_pointer_capture(pointer.pointer_id);
+                    Self::request_detail_refresh(ctx);
+                    ctx.set_handled();
+                }
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Up
+                    && pointer.button == Some(PointerButton::Primary) =>
+            {
+                if self.detail_pressed.take() {
+                    if self.detail_toggle_hit(ctx.bounds(), pointer.position) {
+                        self.detail_expanded.set(!self.detail_expanded.get());
+                    }
+                    ctx.release_pointer_capture(pointer.pointer_id);
+                    Self::request_detail_refresh(ctx);
+                    ctx.set_handled();
+                }
+            }
+            Event::Pointer(pointer)
+                if matches!(
+                    pointer.kind,
+                    PointerEventKind::Leave | PointerEventKind::Cancel
+                ) =>
+            {
+                let had_state = self.detail_hovered.replace(false) || self.detail_pressed.take();
+                if had_state {
+                    ctx.release_pointer_capture(pointer.pointer_id);
+                    Self::request_detail_refresh(ctx);
+                    ctx.set_handled();
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
         constraints.max
     }
@@ -4068,10 +4181,31 @@ impl Widget for ActivityRail {
         let mut y = bounds.y() + 42.0;
         let bottom = bounds.y() + bounds.height();
         let health = chat.runtime_health();
-        let status_card = Rect::new(x, y, w, 78.0);
+        let status_card = Self::status_card_rect(bounds);
+        let detail_entry = Self::detail_entry(&chat, &health);
         if status_card.y() + status_card.height() <= bottom {
             draw_activity_status_card(ctx, &pal, &theme, status_card, &chat, &health);
+            if detail_entry.is_some() {
+                draw_activity_detail_toggle(
+                    ctx,
+                    &pal,
+                    &theme,
+                    Self::detail_toggle_rect(status_card),
+                    self.detail_expanded.get(),
+                    self.detail_hovered.get(),
+                    self.detail_pressed.get(),
+                );
+            }
             y += status_card.height() + 16.0;
+            if self.detail_expanded.get()
+                && let Some(entry) = detail_entry.as_ref()
+            {
+                let panel = Self::detail_panel_rect(status_card);
+                if panel.max_y() + 8.0 <= bottom {
+                    draw_activity_detail_panel(ctx, &pal, &theme, panel, entry);
+                    y = panel.max_y() + 16.0;
+                }
+            }
         }
 
         if chat.control.tasks.is_empty()
@@ -4253,6 +4387,35 @@ impl Widget for ActivityRail {
             );
         }
     }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let has_detail = {
+            let chat = self.shared.chat();
+            let health = chat.runtime_health();
+            Self::detail_entry(&chat, &health).is_some()
+        };
+        if !has_detail {
+            return;
+        }
+
+        let action = if self.detail_expanded.get() {
+            "Hide detail"
+        } else {
+            "Show detail"
+        };
+        let mut node = SemanticsNode::new(
+            sui::WidgetId::new(ctx.widget_id().get().wrapping_mul(43).wrapping_add(12_001)),
+            SemanticsRole::Button,
+            Self::detail_toggle_rect(Self::status_card_rect(ctx.bounds())),
+        );
+        node.parent = Some(ctx.widget_id());
+        node.name = Some(action.to_string());
+        node.description = Some("Activity detail".to_string());
+        node.actions = vec![SemanticsAction::Activate];
+        node.state.hovered = self.detail_hovered.get();
+        node.state.selected = self.detail_expanded.get();
+        ctx.push(node);
+    }
 }
 
 fn draw_activity_status_card(
@@ -4302,6 +4465,96 @@ fn draw_activity_status_card(
         &compact_line(&detail, 34),
         pal.text_style(theme, 10.5, FontWeight::NORMAL, pal.text_faint),
     );
+}
+
+fn draw_activity_detail_toggle(
+    ctx: &mut PaintCtx,
+    pal: &Palette,
+    theme: &DefaultTheme,
+    rect: Rect,
+    expanded: bool,
+    hovered: bool,
+    pressed: bool,
+) {
+    let fill = if pressed {
+        pal.selected
+    } else if hovered {
+        pal.hover
+    } else {
+        pal.field
+    };
+    widgets::round_panel(ctx, rect, fill, pal.border, 7.0);
+    let icon = if expanded {
+        IconGlyph::ChevronUp
+    } else {
+        IconGlyph::ChevronDown
+    };
+    draw_glyph(
+        ctx,
+        icon,
+        Rect::new(rect.x() + 8.0, rect.y() + 5.0, 14.0, 14.0),
+        pal.text_muted,
+    );
+    widgets::draw_text_in(
+        ctx,
+        Rect::new(
+            rect.x() + 26.0,
+            rect.y(),
+            rect.width() - 32.0,
+            rect.height(),
+        ),
+        if expanded {
+            "Hide detail"
+        } else {
+            "Show detail"
+        },
+        pal.text_style(theme, 10.0, FontWeight::SEMIBOLD, pal.text_muted),
+    );
+}
+
+fn draw_activity_detail_panel(
+    ctx: &mut PaintCtx,
+    pal: &Palette,
+    theme: &DefaultTheme,
+    rect: Rect,
+    entry: &ChatActivityEntry,
+) {
+    widgets::round_panel(ctx, rect, pal.panel, pal.border, 7.0);
+    widgets::fill_round_rect(
+        ctx,
+        Rect::new(rect.x() + 10.0, rect.y() + 13.0, 7.0, 7.0),
+        tone_color(pal, entry.tone),
+        3.5,
+    );
+    widgets::draw_text_in(
+        ctx,
+        Rect::new(rect.x() + 24.0, rect.y() + 7.0, rect.width() - 34.0, 16.0),
+        &compact_line(&entry.title, 36),
+        pal.text_style(theme, 12.0, FontWeight::SEMIBOLD, pal.text),
+    );
+
+    let detail_style = pal.text_style(theme, 10.5, FontWeight::NORMAL, pal.text_faint);
+    let measure = |text: &str| {
+        ctx.measure_text(text, detail_style.clone())
+            .map(|m| m.width)
+            .unwrap_or(0.0)
+    };
+    let lines = widgets::wrap_lines(&entry.detail, rect.width() - 24.0, measure);
+    let mut y = rect.y() + 29.0;
+    for line in lines.iter().take(3) {
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(
+                rect.x() + 12.0,
+                y,
+                rect.width() - 24.0,
+                detail_style.line_height + 2.0,
+            ),
+            line,
+            detail_style.clone(),
+        );
+        y += detail_style.line_height + 2.0;
+    }
 }
 
 fn draw_activity_event_card(
@@ -7033,6 +7286,64 @@ mod tests {
         assert_eq!(
             shared.settings().selected,
             Some(SettingsSection::Connection)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn activity_rail_detail_toggle_expands_latest_warning() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.models_loading = false;
+            chat.push_activity(
+                "chat connection",
+                "Agent channel storage could not open through SIFS: device authorization was denied",
+                ActivityTone::Warn,
+            );
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Activity detail")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Show detail")
+            .with_description("Activity detail")
+            .click()?;
+
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Hide detail")
+                .with_description("Activity detail")
+                .count()?,
+            1
+        );
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Hide detail")
+            .with_description("Activity detail")
+            .click()?;
+
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Show detail")
+                .with_description("Activity detail")
+                .count()?,
+            1
         );
 
         Ok(())
