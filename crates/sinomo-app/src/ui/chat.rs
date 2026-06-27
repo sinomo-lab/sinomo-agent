@@ -337,7 +337,7 @@ impl RuntimeRecoveryTarget {
                 "Add credentials or choose an available model from provider setup."
             }
             RuntimeRecoveryTarget::Connection => {
-                "Retry now. If chat storage is still unavailable, check SIFS or open Connection settings."
+                "Retry now. If the problem continues, inspect SIFS from Files or open Connection settings."
             }
         }
     }
@@ -1076,7 +1076,7 @@ impl ChatState {
                     .unwrap_or_else(|| self.runtime_health().detail);
                 let lower = detail.to_ascii_lowercase();
                 if lower.contains("channel create") {
-                    "Check SIFS access in Connection settings, then create the channel again."
+                    "Open Connection settings if channel creation keeps failing; inspect SIFS from Files for storage diagnostics."
                 } else if lower.contains("chat save") {
                     "Open Connection settings if saving keeps failing; retry the chat list after access is restored."
                 } else {
@@ -2689,15 +2689,15 @@ fn connection_recovery_display_detail(text: &str) -> Option<String> {
         || lower.contains("channel create")
         || lower.contains("channel store")
     {
-        "Sinomo could not open channel storage."
+        "Sinomo could not open this chat channel."
     } else if lower.contains("chat list") {
-        "Sinomo could not load saved chats from chat storage."
+        "Sinomo could not load saved chats."
     } else if lower.contains("chat save") {
-        "Sinomo could not save chat history to chat storage."
+        "Sinomo could not save chat history."
     } else if lower.contains("daemon") || lower.contains("cluster") {
         "The local cluster service is not reachable."
     } else {
-        "Chat storage needs connection attention."
+        "Chat needs connection attention."
     };
     Some(summary.to_string())
 }
@@ -2752,14 +2752,25 @@ fn transcript_message_display_text(message: &ChatMessage) -> String {
 
     if text_mentions_connection_problem(detail) {
         let lower = detail.to_ascii_lowercase();
+        let denied = lower.contains("device authorization") || lower.contains("denied");
         let summary = if lower.contains("agent channel") || lower.contains("channel store") {
-            "Agent channel storage could not open through SIFS."
+            if denied {
+                "This chat needs storage authorization."
+            } else {
+                "Sinomo could not open this chat channel."
+            }
+        } else if lower.contains("chat list") {
+            "Saved chats could not be loaded."
+        } else if lower.contains("chat save") {
+            "This chat could not be saved."
         } else if lower.contains("device authorization") {
-            "Device authorization blocked this chat action."
+            "This chat action needs storage authorization."
+        } else if lower.contains("daemon") || lower.contains("cluster") {
+            "The local cluster service is not reachable."
         } else {
             "The chat runtime could not reach a required cluster service."
         };
-        format!("Connection issue\n{summary}\nUse Connection settings for low-level detail.")
+        format!("Connection issue\n{summary}\nOpen Connection settings for low-level detail.")
     } else {
         format!("Error\n{detail}")
     }
@@ -7311,9 +7322,10 @@ mod tests {
         );
         let rendered = transcript_message_display_text(&connection);
         assert!(rendered.starts_with("Connection issue\n"));
-        assert!(rendered.contains("Agent channel storage could not open through SIFS."));
-        assert!(rendered.contains("Use Connection settings for low-level detail."));
+        assert!(rendered.contains("This chat needs storage authorization."));
+        assert!(rendered.contains("Open Connection settings for low-level detail."));
         assert!(!rendered.contains("failed to parse command"));
+        assert!(!rendered.contains("SIFS"));
         assert!(!rendered.contains("device authorization was denied"));
 
         let provider = ChatMessage::system_error("Error: provider unavailable");
@@ -7441,18 +7453,20 @@ mod tests {
                 .expect("chat list display detail");
         assert_eq!(
             chat_list,
-            "Sinomo could not load saved chats from chat storage."
+            "Sinomo could not load saved chats."
         );
         assert!(!chat_list.contains("device authorization"));
         assert!(!chat_list.contains("SIFS"));
-        assert!(!chat_list.contains("file storage"));
+        assert!(!chat_list.contains("storage"));
 
         let channel = connection_recovery_display_detail(
             "channel create failed: device authorization was denied",
         )
         .expect("channel display detail");
-        assert_eq!(channel, "Sinomo could not open channel storage.");
+        assert_eq!(channel, "Sinomo could not open this chat channel.");
         assert!(!channel.contains("device authorization"));
+        assert!(!channel.contains("SIFS"));
+        assert!(!channel.contains("storage"));
 
         assert!(connection_recovery_display_detail("provider unavailable").is_none());
     }
@@ -7462,10 +7476,10 @@ mod tests {
         let visible = activity_visible_detail("chat list failed: device authorization was denied");
         assert_eq!(
             visible,
-            "Sinomo could not load saved chats from chat storage."
+            "Sinomo could not load saved chats."
         );
         assert!(!visible.contains("device authorization"));
-        assert!(!visible.contains("file storage"));
+        assert!(!visible.contains("storage"));
 
         let neutral = activity_visible_detail("context assembled: 4.0 KB");
         assert_eq!(neutral, "context assembled: 4.0 KB");
@@ -7866,12 +7880,17 @@ mod tests {
         );
         assert_eq!(
             state.recovery_empty_detail(RuntimeRecoveryTarget::Connection),
-            "Sinomo could not load saved chats from chat storage."
+            "Sinomo could not load saved chats."
         );
         assert!(
             !state
                 .recovery_empty_detail(RuntimeRecoveryTarget::Connection)
                 .contains("device authorization")
+        );
+        assert!(
+            !state
+                .recovery_empty_detail(RuntimeRecoveryTarget::Connection)
+                .contains("storage")
         );
 
         state.notice = Some("channel create failed: device authorization was denied".to_string());
@@ -7885,11 +7904,11 @@ mod tests {
         );
         assert_eq!(
             state.recovery_empty_detail(RuntimeRecoveryTarget::Connection),
-            "Sinomo could not open channel storage."
+            "Sinomo could not open this chat channel."
         );
         assert_eq!(
             state.recovery_empty_hint(RuntimeRecoveryTarget::Connection),
-            "Check SIFS access in Connection settings, then create the channel again."
+            "Open Connection settings if channel creation keeps failing; inspect SIFS from Files for storage diagnostics."
         );
 
         state.notice = Some(
