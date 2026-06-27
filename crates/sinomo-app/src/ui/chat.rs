@@ -946,6 +946,10 @@ impl ChatState {
         }
     }
 
+    fn shows_recovery_empty_card(&self) -> bool {
+        self.messages.is_empty() && self.runtime_recovery_target().is_some()
+    }
+
     pub fn connection_attention_detail(&self) -> Option<String> {
         self.connection_attention_detail_full()
             .map(|detail| compact_line(&detail, 112))
@@ -4624,7 +4628,7 @@ impl TranscriptView {
 /// loading flag — anything that changes the *set* of options or which selectors are shown. (The
 /// selected-index reactivity is handled by each `Select`'s `selected_when`; this only drives the
 /// rebuild when the option lists themselves change.)
-fn selector_signature(shared: &Shared) -> (usize, usize, usize, bool, bool, String, String) {
+fn selector_signature(shared: &Shared) -> (usize, usize, usize, bool, bool, bool, String, String) {
     let chat = shared.chat();
     (
         chat.provider_idx,
@@ -4632,6 +4636,7 @@ fn selector_signature(shared: &Shared) -> (usize, usize, usize, bool, bool, Stri
         chat.current_models().len(),
         chat.effort_visible(),
         chat.models_loading,
+        chat.shows_recovery_empty_card(),
         chat.providers
             .iter()
             .map(|provider| format!("{}@{}:{}", provider.id, provider.account, provider.name))
@@ -4647,6 +4652,21 @@ fn selector_signature(shared: &Shared) -> (usize, usize, usize, bool, bool, Stri
 /// Build the provider / model / effort selector row for the current selection.
 fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     if shared.chat().providers.is_empty() {
+        if shared.chat().shows_recovery_empty_card() {
+            let s = shared.clone();
+            let row = Stack::horizontal()
+                .spacing(8.0)
+                .alignment(Alignment::Center)
+                .with_child(
+                    SizedBox::new().height(SELECTOR_H).with_child(
+                        Label::new("Provider setup required")
+                            .font_size(12.0)
+                            .color_when(move || palette(&s).text_faint),
+                    ),
+                );
+            return WidgetPod::new(row);
+        }
+
         let setup = {
             let s = shared.clone();
             sui::Button::new("Setup provider")
@@ -4729,12 +4749,14 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         row = row.with_child(SizedBox::new().height(SELECTOR_H).with_child(effort));
     }
 
-    if let Some(action) = retry_chat_list_button(shared, reader) {
-        row = row.with_child(action);
-    }
+    if !shared.chat().shows_recovery_empty_card() {
+        if let Some(action) = retry_chat_list_button(shared, reader) {
+            row = row.with_child(action);
+        }
 
-    if let Some(action) = runtime_recovery_button(shared, reader) {
-        row = row.with_child(action);
+        if let Some(action) = runtime_recovery_button(shared, reader) {
+            row = row.with_child(action);
+        }
     }
 
     WidgetPod::new(row)
@@ -6807,6 +6829,7 @@ mod tests {
                 "device authorization was denied",
                 ActivityTone::Warn,
             );
+            chat.messages.push(ChatMessage::user("Existing context"));
             chat.models_loading = false;
         }
 
@@ -6829,6 +6852,70 @@ mod tests {
         assert!(chat.notice.is_none());
         assert!(chat.activity.iter().all(|entry| entry.title != "chat list"));
         assert_eq!(chat.runtime_recovery_target(), None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_empty_recovery_card_suppresses_duplicate_footer_actions() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.notice = Some("chat list failed: device authorization was denied".to_string());
+            chat.push_activity(
+                "chat list",
+                "device authorization was denied",
+                ActivityTone::Warn,
+            );
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat recovery card duplicate actions")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Retry chat list")
+                .count()?,
+            0,
+            "the footer retry button should not duplicate the recovery card action"
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Connection settings")
+                .count()?,
+            0,
+            "the footer settings button should not duplicate the recovery card action"
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Retry now")
+                .with_description("Retry the chat list")
+                .count()?,
+            1,
+            "the card keeps a single primary retry action"
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Open settings")
+                .with_description("Connection settings")
+                .count()?,
+            1,
+            "the card keeps a single settings action"
+        );
 
         Ok(())
     }
@@ -6933,6 +7020,15 @@ mod tests {
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
+
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Setup provider")
+                .count()?,
+            0,
+            "the composer setup button should not duplicate the recovery card action"
+        );
 
         window
             .get_by_role(SemanticsRole::Button)
