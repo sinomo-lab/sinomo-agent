@@ -7515,10 +7515,7 @@ mod tests {
         let chat_list =
             connection_recovery_display_detail("chat list failed: device authorization was denied")
                 .expect("chat list display detail");
-        assert_eq!(
-            chat_list,
-            "Sinomo could not load saved chats."
-        );
+        assert_eq!(chat_list, "Sinomo could not load saved chats.");
         assert!(!chat_list.contains("device authorization"));
         assert!(!chat_list.contains("SIFS"));
         assert!(!chat_list.contains("storage"));
@@ -7538,10 +7535,7 @@ mod tests {
     #[test]
     fn collapsed_activity_detail_uses_connection_summary() {
         let visible = activity_visible_detail("chat list failed: device authorization was denied");
-        assert_eq!(
-            visible,
-            "Sinomo could not load saved chats."
-        );
+        assert_eq!(visible, "Sinomo could not load saved chats.");
         assert!(!visible.contains("device authorization"));
         assert!(!visible.contains("storage"));
 

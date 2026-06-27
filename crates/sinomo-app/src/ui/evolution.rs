@@ -1621,7 +1621,10 @@ fn paint_detail_empty(ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palet
 
 fn empty_detail_rows() -> Vec<(String, String)> {
     vec![
-        ("Next".to_string(), "describe the improvement above".to_string()),
+        (
+            "Next".to_string(),
+            "describe the improvement above".to_string(),
+        ),
         (
             "Options".to_string(),
             "scope and target ring are optional".to_string(),
@@ -2322,16 +2325,22 @@ mod tests {
             "Describe an objective above, then Start."
         );
         let rows = empty_detail_rows();
-        assert!(rows
-            .iter()
-            .any(|(label, value)| label == "Next" && value == "describe the improvement above"));
-        assert!(rows
-            .iter()
-            .any(|(label, value)| label == "Options" && value.contains("optional")));
-        assert!(rows.iter().all(|(_, value)| !value.contains("not available")));
-        assert!(rows
-            .iter()
-            .all(|(_, value)| !value.contains("no candidate selected")));
+        assert!(
+            rows.iter()
+                .any(|(label, value)| label == "Next" && value == "describe the improvement above")
+        );
+        assert!(
+            rows.iter()
+                .any(|(label, value)| label == "Options" && value.contains("optional"))
+        );
+        assert!(
+            rows.iter()
+                .all(|(_, value)| !value.contains("not available"))
+        );
+        assert!(
+            rows.iter()
+                .all(|(_, value)| !value.contains("no candidate selected"))
+        );
     }
 
     #[test]
