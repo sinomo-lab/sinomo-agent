@@ -843,7 +843,7 @@ impl Widget for InspectorView {
                 &[
                     ("Reason", error.clone()),
                     ("Authority", "SIFS through daemon".to_string()),
-                    ("Next", "retry SIFS or open Connection settings".to_string()),
+                    ("Next", "retry, then settings".to_string()),
                 ],
             );
             return;

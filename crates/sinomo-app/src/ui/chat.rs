@@ -293,7 +293,7 @@ impl RuntimeRecoveryTarget {
                 "Use Provider setup below to add credentials or choose an available model."
             }
             RuntimeRecoveryTarget::Connection => {
-                "Use Connection settings below to inspect daemon, chat, channel, and SIFS status."
+                "Retry the chat list below, then inspect Connection settings if it still fails."
             }
         }
     }
@@ -518,10 +518,26 @@ impl ChatState {
         let (sessions, error) =
             list_conversations_with_error(&self.data_dir, self.sifs_daemon.as_ref());
         self.sessions = sessions;
-        if let Some(detail) = error {
-            self.notice = Some(format!("chat list failed: {detail}"));
-            self.push_activity("chat list", detail, ActivityTone::Warn);
+        match error {
+            Some(detail) => {
+                self.notice = Some(format!("chat list failed: {detail}"));
+                self.push_activity("chat list", detail, ActivityTone::Warn);
+            }
+            None => {
+                if self
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.starts_with("chat list failed:"))
+                {
+                    self.notice = None;
+                }
+                self.activity.retain(|entry| entry.title != "chat list");
+            }
         }
+    }
+
+    fn retry_chat_list(&mut self) {
+        self.refresh_sessions();
     }
 
     fn save_chat_record(
@@ -4425,6 +4441,10 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         row = row.with_child(SizedBox::new().height(SELECTOR_H).with_child(effort));
     }
 
+    if let Some(action) = retry_chat_list_button(shared, reader) {
+        row = row.with_child(action);
+    }
+
     if let Some(action) = runtime_recovery_button(shared, reader) {
         row = row.with_child(action);
     }
@@ -4441,6 +4461,23 @@ fn runtime_recovery_button(shared: &Shared, reader: &ThemeReader) -> Option<Size
                 .icon(IconGlyph::Alert)
                 .theme_when(composer_control_reader(reader))
                 .on_press(move || open_settings_section(&s, target.settings_section())),
+        ),
+    )
+}
+
+fn retry_chat_list_button(shared: &Shared, reader: &ThemeReader) -> Option<SizedBox> {
+    let target = shared.chat().runtime_recovery_target()?;
+    if target != RuntimeRecoveryTarget::Connection {
+        return None;
+    }
+    let s = shared.clone();
+    Some(
+        SizedBox::new().height(SELECTOR_H).with_child(
+            sui::Button::new("Retry chat list")
+                .icon(IconGlyph::Redo)
+                .min_width(132.0)
+                .theme_when(composer_control_reader(reader))
+                .on_press(move || s.chat_mut().retry_chat_list()),
         ),
     )
 }
@@ -6441,6 +6478,69 @@ mod tests {
         state.info.provider = "deepseek".to_string();
         state.info.model = "deepseek-chat".to_string();
         assert_eq!(state.runtime_recovery_target(), None);
+    }
+
+    #[test]
+    fn retry_chat_list_clears_stale_connection_warning_after_success() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+        state.notice = Some("chat list failed: device authorization was denied".to_string());
+        state.push_activity(
+            "chat list",
+            "device authorization was denied",
+            ActivityTone::Warn,
+        );
+
+        state.retry_chat_list();
+
+        assert!(state.notice.is_none());
+        assert!(
+            state
+                .activity
+                .iter()
+                .all(|entry| entry.title != "chat list")
+        );
+        assert_eq!(state.runtime_recovery_target(), None);
+    }
+
+    #[test]
+    fn rendered_retry_chat_list_button_uses_existing_refresh_path() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.notice = Some("chat list failed: device authorization was denied".to_string());
+            chat.push_activity(
+                "chat list",
+                "device authorization was denied",
+                ActivityTone::Warn,
+            );
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat retry")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Retry chat list")
+            .click()?;
+
+        let chat = shared.chat();
+        assert!(chat.notice.is_none());
+        assert!(chat.activity.iter().all(|entry| entry.title != "chat list"));
+        assert_eq!(chat.runtime_recovery_target(), None);
+
+        Ok(())
     }
 
     #[test]
