@@ -12729,13 +12729,18 @@ fn cluster_join_registration_handler_voter_commits_through_host() {
     };
     invite.signature = sign_cluster_join_invite(&invite, &issuer_identity).expect("sign invite");
     sync_cluster_invitation_to_kv(&paths, &invite).expect("sync invitation");
-    let learner_member = ClusterMemberRecord::pending_learner(
+    let mut learner_member = ClusterMemberRecord::pending_learner(
         cluster_id,
         joined_node_id.clone(),
         "joined",
         "pk-joined",
         now,
     );
+    learner_member.endpoints = vec![daemon_lan_endpoint(
+        &joined_node_id,
+        "10.42.0.11:21353".to_string(),
+        10,
+    )];
     let observed_main_endpoint =
         daemon_lan_endpoint(&issuer_node_id, "10.42.0.10:21353".to_string(), 10);
     let observed_shadow_endpoint = daemon_lan_endpoint(
@@ -12769,10 +12774,7 @@ fn cluster_join_registration_handler_voter_commits_through_host() {
     assert!(response.accepted, "join should be accepted");
     assert_eq!(host.observations, 1);
     assert_eq!(host.committed.len(), 1);
-    assert_eq!(
-        host.remembered_targets, 0,
-        "voter-local joins should not record forwarded targets"
-    );
+    assert_eq!(host.remembered_targets, 1);
     let committed = &host.committed[0];
     assert!(committed.members.iter().any(|member| {
         member.node_id == joined_node_id && member.state == ClusterMemberState::Learner
@@ -12845,13 +12847,18 @@ fn cluster_join_registration_async_handler_voter_commits_through_host() {
     };
     invite.signature = sign_cluster_join_invite(&invite, &issuer_identity).expect("sign invite");
     sync_cluster_invitation_to_kv(&paths, &invite).expect("sync invitation");
-    let learner_member = ClusterMemberRecord::pending_learner(
+    let mut learner_member = ClusterMemberRecord::pending_learner(
         cluster_id,
         joined_node_id.clone(),
         "joined",
         "pk-joined",
         now,
     );
+    learner_member.endpoints = vec![daemon_lan_endpoint(
+        &joined_node_id,
+        "10.42.0.11:21353".to_string(),
+        10,
+    )];
     let observed_main_endpoint =
         daemon_lan_endpoint(&issuer_node_id, "10.42.1.10:21353".to_string(), 10);
     let observed_shadow_endpoint = daemon_lan_endpoint(
@@ -12891,10 +12898,7 @@ fn cluster_join_registration_async_handler_voter_commits_through_host() {
     assert!(response.accepted, "join should be accepted");
     assert_eq!(host.observations, 1);
     assert_eq!(host.committed.len(), 1);
-    assert_eq!(
-        host.remembered_targets, 0,
-        "voter-local joins should not record forwarded targets"
-    );
+    assert_eq!(host.remembered_targets, 1);
     let committed = &host.committed[0];
     assert!(committed.members.iter().any(|member| {
         member.node_id == joined_node_id && member.state == ClusterMemberState::Learner

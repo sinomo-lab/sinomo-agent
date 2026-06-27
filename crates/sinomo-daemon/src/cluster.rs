@@ -673,7 +673,26 @@ fn publish_command_connectivity_if_needed(
     record: &ClusterConnectivityRecord,
     runtime: Option<&tokio::runtime::Handle>,
 ) {
-    if sinomo_kv::cluster_kv_raft_local_is_voter(state)
+    publish_command_connectivity_if_needed_with_policy(paths, state, record, runtime, false);
+}
+
+fn publish_join_connectivity_if_needed(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    record: &ClusterConnectivityRecord,
+    runtime: &tokio::runtime::Handle,
+) {
+    publish_command_connectivity_if_needed_with_policy(paths, state, record, Some(runtime), true);
+}
+
+fn publish_command_connectivity_if_needed_with_policy(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    record: &ClusterConnectivityRecord,
+    runtime: Option<&tokio::runtime::Handle>,
+    allow_local_voter: bool,
+) {
+    if (!allow_local_voter && sinomo_kv::cluster_kv_raft_local_is_voter(state))
         || cached_connectivity_matches(paths, record)
     {
         return;
@@ -710,6 +729,25 @@ fn publish_command_connectivity_if_needed(
         }
         in_flight.set(false);
     });
+}
+
+fn remember_successful_join_endpoint_connectivity(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    runtime: &tokio::runtime::Handle,
+) {
+    let Ok(record) = sinomo_network::record_local_cluster_endpoint_command_connectivity(
+        paths,
+        state,
+        endpoint,
+        sinomo_network::ClusterConnectivityState::Healthy,
+        None,
+        true,
+    ) else {
+        return;
+    };
+    publish_join_connectivity_if_needed(paths, state, &record, runtime);
 }
 
 pub(crate) fn remember_cluster_endpoint_command_connectivity(
@@ -1411,18 +1449,11 @@ impl sinomo_network::ClusterJoinRegistrationHost for DaemonClusterJoinRegistrati
         state: &ClusterBootstrapState,
         endpoint: &ClusterEndpointRecord,
     ) -> Result<(), sinomo_network::NetworkError> {
-        // Joining through a bridge has a narrow ordering window: the voter has
-        // accepted the member before the joiner has imported the accepted state.
-        // Keep this response-path observation local and let the periodic
-        // connectivity publisher advertise it after the joiner settles.
-        remember_cluster_endpoint_command_connectivity(
-            paths,
-            state,
-            endpoint,
-            sinomo_network::ClusterConnectivityState::Healthy,
-            None,
-            None,
-        );
+        // Joining through a bridge has a narrow ordering window: the voter can
+        // accept the member before the rest of the cluster has a routable edge
+        // to it. Publish this accepted response-path observation immediately so
+        // route planning does not wait for the periodic probe publisher.
+        remember_successful_join_endpoint_connectivity(paths, state, endpoint, &self.runtime);
         Ok(())
     }
 }
@@ -1492,15 +1523,9 @@ impl sinomo_network::ClusterJoinRegistrationAsyncHost for DaemonClusterJoinRegis
         state: &'a ClusterBootstrapState,
         endpoint: &'a ClusterEndpointRecord,
     ) -> sinomo_network::ClusterMembershipRpcFuture<'a, ()> {
+        let runtime = self.runtime.clone();
         Box::pin(async move {
-            remember_cluster_endpoint_command_connectivity(
-                paths,
-                state,
-                endpoint,
-                sinomo_network::ClusterConnectivityState::Healthy,
-                None,
-                None,
-            );
+            remember_successful_join_endpoint_connectivity(paths, state, endpoint, &runtime);
             Ok(())
         })
     }

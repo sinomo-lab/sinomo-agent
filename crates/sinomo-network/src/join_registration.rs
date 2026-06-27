@@ -188,6 +188,7 @@ pub fn handle_cluster_join_registration_request_with_host(
 
     let snapshot = host.commit_join_registration_state(paths, &prepared.state)?;
     write_cluster_state(paths, &prepared.state)?;
+    host.remember_successful_join_targets(paths, &prepared.state, &request.members)?;
     prepared.kv_snapshot = Some(snapshot);
     Ok(prepared)
 }
@@ -276,6 +277,8 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
             operation: "write cluster state".to_string(),
             detail: format!("cluster state write task failed: {source}"),
         })??;
+    host.remember_successful_join_targets_async(paths, &prepared.state, &request.members)
+        .await?;
     prepared.kv_snapshot = Some(snapshot);
     Ok(prepared)
 }
