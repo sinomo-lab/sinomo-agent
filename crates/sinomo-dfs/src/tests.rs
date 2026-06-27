@@ -4417,7 +4417,7 @@ fn cluster_smoke_opens_service_and_publishes_metadata() {
     assert!(report.path.starts_with("/services/dfs-smoke/24680-"));
     let sent = sent.lock().expect("sent lock");
     assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].0, "10.77.0.4:21353");
+    assert_eq!(sent[0].0, replica.to_string());
     assert!(
         sent[0].1 > 0,
         "cluster smoke should publish metadata created by the smoke write"
@@ -4436,6 +4436,26 @@ fn cluster_smoke_opens_service_and_publishes_metadata() {
     ));
 
     std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn dfs_smoke_replica_candidates_preserve_routable_order() {
+    let local = NodeId::from_legacy_named("node_dfs_smoke_candidates_local").expect("local node");
+    let stale = NodeId::from_legacy_named("node_dfs_smoke_candidates_stale").expect("stale node");
+    let reachable =
+        NodeId::from_legacy_named("node_dfs_smoke_candidates_reachable").expect("reachable node");
+
+    let candidates = dfs_smoke_replica_candidate_sets(
+        &local,
+        vec![local.clone(), stale.clone(), reachable.clone()],
+        vec![reachable.clone(), stale.clone(), reachable.clone()],
+    );
+
+    assert_eq!(
+        candidates,
+        vec![vec![local.clone(), reachable], vec![local.clone(), stale],],
+        "DFS smoke should try endpoints in selector order instead of sorted node-id order"
+    );
 }
 
 #[test]

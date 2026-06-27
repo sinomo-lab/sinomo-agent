@@ -3865,12 +3865,18 @@ fn dfs_smoke_replica_candidate_sets(
 ) -> Vec<Vec<NodeId>> {
     content_node_ids.sort();
     content_node_ids.dedup();
-    let routable_node_ids = routable_node_ids.into_iter().collect::<BTreeSet<_>>();
-    let remote_candidates = content_node_ids
-        .into_iter()
-        .filter(|node_id| node_id != local_node_id)
-        .filter(|node_id| routable_node_ids.contains(node_id))
-        .collect::<Vec<_>>();
+    let content_node_ids = content_node_ids.into_iter().collect::<BTreeSet<_>>();
+    let mut seen_remote_candidates = BTreeSet::new();
+    let mut remote_candidates = Vec::new();
+    for node_id in routable_node_ids {
+        if node_id == *local_node_id
+            || !content_node_ids.contains(&node_id)
+            || !seen_remote_candidates.insert(node_id.clone())
+        {
+            continue;
+        }
+        remote_candidates.push(node_id);
+    }
     if remote_candidates.is_empty() {
         vec![vec![local_node_id.clone()]]
     } else {
