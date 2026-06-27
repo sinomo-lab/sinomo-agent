@@ -859,11 +859,51 @@ pub(crate) fn try_cluster_dfs_data_targets_impl(
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
     let graph = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
     let node_statuses = cluster_node_status_map_from_kv(paths);
-    try_prefer_bounded_daemon_command_targets(try_cluster_sync_targets_with_connectivity_context(
-        state,
-        &graph,
-        &node_statuses,
-    )?)
+    let mut targets =
+        try_cluster_sync_targets_with_connectivity_context(state, &graph, &node_statuses)?;
+    append_cluster_kv_main_daemon_endpoints(paths, state, &mut targets)?;
+    targets.sort_by(|left, right| {
+        cluster_sync_targets_with_connectivity_cmp(&graph, &node_statuses, left, right)
+    });
+    try_prefer_bounded_daemon_command_targets(targets)
+}
+
+fn append_cluster_kv_main_daemon_endpoints(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    targets: &mut Vec<ClusterEndpointRecord>,
+) -> Result<(), NetworkError> {
+    let mut main_daemon_node_ids = EndpointNodeSet::default();
+    for member in state.members.iter().filter(|member| {
+        member.node_id != state.local_node_id
+            && member.state.is_authorized()
+            && cluster_member_has_main_daemon_capability(member)
+    }) {
+        main_daemon_node_ids.try_insert_clone(&member.node_id, "collect main daemon nodes")?;
+    }
+    match read_cluster_endpoints_from_kv(paths) {
+        Ok(kv_endpoints) => {
+            for endpoint in kv_endpoints {
+                if endpoint.privacy == ClusterEndpointPrivacy::LocalOnly
+                    || !main_daemon_node_ids.contains(&endpoint.node_id)
+                    || !cluster_endpoint_can_carry_main_daemon_rpc(&endpoint)
+                    || !matches!(
+                        endpoint.transport,
+                        ClusterTransportKind::LanTcp
+                            | ClusterTransportKind::Loopback
+                            | ClusterTransportKind::Iroh
+                    )
+                {
+                    continue;
+                }
+                crate::object::try_reserve_vec(targets, 1, "collect DFS data KV endpoints")?;
+                targets.push(endpoint);
+            }
+        }
+        Err(error @ NetworkError::ResourceExhausted { .. }) => return Err(error),
+        Err(_) => {}
+    }
+    Ok(())
 }
 
 pub(crate) fn try_cluster_main_daemon_command_targets_impl(

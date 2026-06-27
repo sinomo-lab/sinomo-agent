@@ -194,9 +194,9 @@ pub use join_registration::{
 pub(crate) use keyspace::cluster_identity_key;
 #[cfg(test)]
 pub(crate) use keyspace::{
-    cluster_capability_policy_key, cluster_connectivity_key, cluster_endpoint_key,
-    cluster_invitation_key, cluster_invitation_state_key, cluster_member_key,
-    cluster_network_info_key, cluster_node_status_key, cluster_node_status_key_for_process,
+    cluster_capability_policy_key, cluster_connectivity_key, cluster_invitation_key,
+    cluster_invitation_state_key, cluster_member_key, cluster_network_info_key,
+    cluster_node_status_key, cluster_node_status_key_for_process,
     cluster_node_status_key_for_record,
 };
 #[cfg(test)]

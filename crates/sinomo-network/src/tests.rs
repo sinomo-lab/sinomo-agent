@@ -18,7 +18,9 @@ use crate::invite::{
     CLUSTER_INVITE_CHALLENGE_PROTOCOL, cluster_invite_challenge_signing_payload,
     verify_cluster_invite_challenge_proof,
 };
-use crate::keyspace::{cluster_connectivity_source_prefix, cluster_endpoint_prefix};
+use crate::keyspace::{
+    cluster_connectivity_source_prefix, cluster_endpoint_key, cluster_endpoint_prefix,
+};
 use crate::lan::{
     AsyncMdnsDiscoverySocket, LanQuicEventFrameCodec, MdnsDiscoveryAdvertisement,
     MdnsDiscoveryCache, MdnsDiscoveryRecord, apply_lan_discovery_advertisements,
@@ -6063,6 +6065,69 @@ fn main_daemon_command_targets_filter_known_unreachable_endpoints() {
             .collect::<Vec<_>>(),
         vec![&stale_tcp.endpoint_id],
         "DFS data routing should keep the target record so relay can handle known-bad direct paths"
+    );
+}
+
+#[test]
+fn dfs_data_targets_include_kv_main_daemon_endpoints() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-dfs-data-kv-endpoints");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_dfs_data_kv_endpoints").expect("cluster");
+    let local = NodeId::from_legacy_named("node_network_dfs_data_kv_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_network_dfs_data_kv_remote").expect("remote");
+    let shadow = sinomo_node::shadow_daemon_node_id(&remote);
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network dfs data kv endpoints",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let mut folded_shadow_endpoint =
+        daemon_lan_endpoint(&shadow, "192.0.2.54:21354".to_string(), 0);
+    folded_shadow_endpoint.node_id = remote.clone();
+    let direct_main_endpoint = daemon_lan_endpoint(&remote, "198.51.100.54:21353".to_string(), 0);
+    let mut member =
+        ClusterMemberRecord::local_voter(cluster_id, remote.clone(), "remote", "pk-remote", now);
+    member.capabilities = main_daemon_capabilities(&member.role);
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![folded_shadow_endpoint.clone()];
+    state.members.push(member);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    append_cluster_raft_command(
+        &paths,
+        &local,
+        sinomo_kv::KvCommand::Op(
+            sinomo_kv::KvOp::put_serde(
+                cluster_endpoint_key(&remote, &direct_main_endpoint),
+                &direct_main_endpoint,
+                None,
+            )
+            .expect("endpoint op"),
+        ),
+    )
+    .expect("write endpoint record");
+
+    let dfs_targets = ClusterEndpointSelector::new(&paths, &state)
+        .select(ClusterEndpointSelectionPurpose::DfsData);
+
+    assert!(
+        dfs_targets
+            .iter()
+            .any(|endpoint| endpoint.endpoint_id == direct_main_endpoint.endpoint_id),
+        "DFS data selection should include main daemon endpoints from cluster KV"
+    );
+    assert!(
+        dfs_targets
+            .iter()
+            .all(|endpoint| endpoint.endpoint_id != folded_shadow_endpoint.endpoint_id),
+        "DFS data selection must not include folded shadow endpoints"
     );
 }
 
