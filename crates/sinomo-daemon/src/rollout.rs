@@ -32,8 +32,9 @@ use sinomo_rollout::{
     restore_rollout_binary_from_backup, rollout_artifact_suffix, rollout_build_dev_artifacts,
     rollout_main_activation_path, rollout_previous_binary_path, rollout_remote_repo_path,
     rollout_shadow_finalize_path, rollout_staged_main_binary, rollout_staged_shadow_binary,
-    rollout_timestamp_now, source_heads_match, stage_pending_shadow_rollout, stage_rollout_bytes,
-    stage_rollout_file, write_json, write_main_activation, write_rollout_status,
+    rollout_timestamp_now, source_heads_match, stage_pending_shadow_rollout,
+    stage_rollout_bytes_pair, stage_rollout_file, stage_rollout_file_pair, write_json,
+    write_main_activation, write_rollout_status,
 };
 use std::env;
 use std::fs::{self, File};
@@ -110,6 +111,38 @@ fn write_cluster_rollout_progress(
     );
     publish_rollout_progress_to_cluster(daemon_paths);
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rejected_cluster_rollout_response(
+    daemon_paths: &DaemonPaths,
+    rollout_paths: &SelfRolloutPaths,
+    mode: &str,
+    source: &str,
+    requested_at: &str,
+    phase: &str,
+    progress_message: &str,
+    detail: String,
+) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    let _ = write_cluster_rollout_progress(
+        daemon_paths,
+        rollout_paths,
+        "rejected",
+        mode,
+        Some(detail.clone()),
+        source,
+        requested_at,
+        phase,
+        CLUSTER_ROLLOUT_PROGRESS_TOTAL,
+        progress_message,
+    );
+    Ok(ClusterRolloutBinaryResponse {
+        status: "rejected".to_string(),
+        detail,
+        main_binary: PathBuf::new(),
+        shadow_binary: PathBuf::new(),
+        source_head: None,
+    })
 }
 
 fn publish_rollout_progress_to_cluster(daemon_paths: &DaemonPaths) {
@@ -1178,8 +1211,21 @@ pub fn handle_daemon_rollout_binary_request(
         2,
         "staging candidate binaries",
     )?;
-    stage_rollout_bytes(&binary, &staged_main_binary)?;
-    stage_rollout_bytes(&binary, &staged_shadow_binary)?;
+    if let Err(error) =
+        stage_rollout_bytes_pair(&binary, &staged_main_binary, &staged_shadow_binary)
+    {
+        let detail = format!("stage candidate binaries failed: {error}");
+        return rejected_cluster_rollout_response(
+            paths,
+            &rollout_paths,
+            "cluster-binary-push",
+            &source,
+            &requested_at,
+            "staging-failed",
+            "staging failed",
+            detail,
+        );
+    }
     if !request.native_dylib_modules.is_empty() {
         write_cluster_rollout_progress(
             paths,
@@ -1294,15 +1340,29 @@ pub fn handle_daemon_rollout_native_dylib_module_request(
     let shadow_binary = rollout_paths.shadow_binary.clone();
     let staged_main_binary = rollout_staged_main_binary(&rollout_paths);
     let staged_shadow_binary = rollout_staged_shadow_binary(&rollout_paths);
-    stage_rollout_file(&main_binary, &staged_main_binary)?;
-    stage_rollout_file(
-        if shadow_binary.exists() {
-            &shadow_binary
-        } else {
-            &main_binary
-        },
-        &staged_shadow_binary,
-    )?;
+    let staging_result = stage_rollout_file(&main_binary, &staged_main_binary).and_then(|()| {
+        stage_rollout_file(
+            if shadow_binary.exists() {
+                &shadow_binary
+            } else {
+                &main_binary
+            },
+            &staged_shadow_binary,
+        )
+    });
+    if let Err(error) = staging_result {
+        let detail = format!("stage daemon refresh binaries failed: {error}");
+        return rejected_cluster_rollout_response(
+            paths,
+            &rollout_paths,
+            "cluster-module-native-dylib",
+            &source,
+            &requested_at,
+            "staging-failed",
+            "staging failed",
+            detail,
+        );
+    }
 
     let install_result = match install_cluster_rollout_native_dylib_module(data_dir, &request) {
         Ok(result) => result,
@@ -1616,8 +1676,21 @@ pub fn handle_daemon_rollout_binary_upload_finalize_request(
         2,
         "staging uploaded candidate binaries",
     )?;
-    stage_rollout_file(&uploaded_binary, &staged_main_binary)?;
-    stage_rollout_file(&uploaded_binary, &staged_shadow_binary)?;
+    if let Err(error) =
+        stage_rollout_file_pair(&uploaded_binary, &staged_main_binary, &staged_shadow_binary)
+    {
+        let detail = format!("stage uploaded candidate binaries failed: {error}");
+        return rejected_cluster_rollout_response(
+            paths,
+            &rollout_paths,
+            "cluster-binary-push",
+            &source,
+            &requested_at,
+            "staging-failed",
+            "staging failed",
+            detail,
+        );
+    }
     if !uploaded_modules.is_empty() {
         write_cluster_rollout_progress(
             paths,
@@ -2914,8 +2987,23 @@ pub fn handle_daemon_rollout_build_request(
         3,
         "staging built binaries",
     )?;
-    stage_rollout_file(&built_artifacts.built_binary, &staged_main_binary)?;
-    stage_rollout_file(&built_artifacts.built_binary, &staged_shadow_binary)?;
+    if let Err(error) = stage_rollout_file_pair(
+        &built_artifacts.built_binary,
+        &staged_main_binary,
+        &staged_shadow_binary,
+    ) {
+        let detail = format!("stage remote-build binaries failed: {error}");
+        return rejected_cluster_rollout_response(
+            paths,
+            &rollout_paths,
+            "cluster-remote-build",
+            &source,
+            &requested_at,
+            "staging-failed",
+            "staging failed",
+            detail,
+        );
+    }
     if !built_artifacts.native_dylib_modules.is_empty() {
         write_cluster_rollout_progress(
             paths,

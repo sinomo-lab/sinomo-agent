@@ -57,7 +57,8 @@ pub use artifact::{
     activate_staged_rollout_binary, binary_should_update, current_executable_path,
     current_executable_should_update, install_binary_atomically, install_current_executable,
     restore_rollout_binary_from_backup, rollout_previous_binary_path, same_path_if_exists,
-    stage_rollout_bytes, stage_rollout_file, stage_rollout_file_with_retry,
+    stage_rollout_bytes, stage_rollout_bytes_pair, stage_rollout_file, stage_rollout_file_pair,
+    stage_rollout_file_with_retry,
 };
 pub use cluster_kv::{
     read_cluster_module_rollout_desired_from_kv,

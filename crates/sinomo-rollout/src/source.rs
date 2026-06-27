@@ -2,7 +2,7 @@ use crate::{
     RolloutError, SelfRolloutNativeDylibModuleBuild, SelfRolloutPaths,
     append_native_dylib_module_build_args, discover_all_native_dylib_module_builds,
     discover_default_native_dylib_module_builds, ensure_rollout_layout, rollout_staged_main_binary,
-    rollout_staged_shadow_binary, stage_rollout_file,
+    rollout_staged_shadow_binary, stage_rollout_file_pair,
 };
 use std::env;
 use std::fs;
@@ -519,8 +519,11 @@ pub fn stage_local_rollout_artifacts(
 ) -> Result<LocalRolloutArtifacts, RolloutError> {
     let staged_main_binary = rollout_staged_main_binary(paths);
     let staged_shadow_binary = rollout_staged_shadow_binary(paths);
-    stage_rollout_file(&built_artifacts.built_binary, &staged_main_binary)?;
-    stage_rollout_file(&built_artifacts.built_binary, &staged_shadow_binary)?;
+    stage_rollout_file_pair(
+        &built_artifacts.built_binary,
+        &staged_main_binary,
+        &staged_shadow_binary,
+    )?;
     Ok(LocalRolloutArtifacts {
         built_binary: built_artifacts.built_binary,
         staged_main_binary,

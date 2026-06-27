@@ -1,5 +1,6 @@
 use crate::RolloutError;
 use std::fs;
+use std::io::ErrorKind;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -13,10 +14,13 @@ pub fn stage_rollout_bytes(bytes: &[u8], destination: &Path) -> Result<(), Rollo
             detail: source.to_string(),
         })?;
     }
-    fs::write(destination, bytes).map_err(|source| RolloutError::Io {
-        path: destination.display().to_string(),
-        detail: source.to_string(),
-    })?;
+    if let Err(source) = fs::write(destination, bytes) {
+        let _ = fs::remove_file(destination);
+        return Err(RolloutError::Io {
+            path: destination.display().to_string(),
+            detail: source.to_string(),
+        });
+    }
     set_executable(destination)
 }
 
@@ -27,11 +31,57 @@ pub fn stage_rollout_file(source: &Path, destination: &Path) -> Result<(), Rollo
             detail: source.to_string(),
         })?;
     }
-    fs::copy(source, destination).map_err(|error| RolloutError::Io {
-        path: format!("{} -> {}", source.display(), destination.display()),
-        detail: error.to_string(),
-    })?;
+    if let Err(error) = fs::copy(source, destination) {
+        let _ = fs::remove_file(destination);
+        return Err(RolloutError::Io {
+            path: format!("{} -> {}", source.display(), destination.display()),
+            detail: error.to_string(),
+        });
+    }
     set_executable(destination)
+}
+
+pub fn stage_rollout_bytes_pair(
+    bytes: &[u8],
+    primary_destination: &Path,
+    linked_destination: &Path,
+) -> Result<(), RolloutError> {
+    stage_rollout_bytes(bytes, primary_destination)?;
+    stage_rollout_link_or_copy(primary_destination, linked_destination)
+}
+
+pub fn stage_rollout_file_pair(
+    source: &Path,
+    primary_destination: &Path,
+    linked_destination: &Path,
+) -> Result<(), RolloutError> {
+    stage_rollout_file(source, primary_destination)?;
+    stage_rollout_link_or_copy(primary_destination, linked_destination)
+}
+
+fn stage_rollout_link_or_copy(source: &Path, destination: &Path) -> Result<(), RolloutError> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|source| RolloutError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    remove_staged_file_if_present(destination)?;
+    match fs::hard_link(source, destination) {
+        Ok(()) => set_executable(destination),
+        Err(_) => stage_rollout_file(source, destination),
+    }
+}
+
+fn remove_staged_file_if_present(destination: &Path) -> Result<(), RolloutError> {
+    match fs::remove_file(destination) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(RolloutError::Io {
+            path: destination.display().to_string(),
+            detail: error.to_string(),
+        }),
+    }
 }
 
 pub fn stage_rollout_file_with_retry(
@@ -231,5 +281,40 @@ mod tests {
             b"previous"
         );
         assert!(!root.join("sinomo.previous").exists());
+    }
+
+    #[test]
+    fn stage_rollout_file_pair_replaces_both_staged_outputs() {
+        let root = sinomo_testdir::TestDir::new("sinomo-rollout-stage-pair");
+        let source = root.join("candidate");
+        let staged_main = root.join("staged").join("sinomo-main");
+        let staged_shadow = root.join("staged").join("sinomo-shadow");
+        fs::create_dir_all(staged_main.parent().expect("staged parent")).expect("staged parent");
+        fs::write(&source, b"candidate").expect("source");
+        fs::write(&staged_main, b"old-main").expect("old main");
+        fs::write(&staged_shadow, b"partial-shadow").expect("old shadow");
+
+        stage_rollout_file_pair(&source, &staged_main, &staged_shadow).expect("stage pair");
+
+        assert_eq!(fs::read(&staged_main).expect("main bytes"), b"candidate");
+        assert_eq!(
+            fs::read(&staged_shadow).expect("shadow bytes"),
+            b"candidate"
+        );
+    }
+
+    #[test]
+    fn stage_rollout_bytes_pair_stages_same_bytes_to_both_outputs() {
+        let root = sinomo_testdir::TestDir::new("sinomo-rollout-stage-bytes-pair");
+        let staged_main = root.join("staged").join("sinomo-main");
+        let staged_shadow = root.join("staged").join("sinomo-shadow");
+
+        stage_rollout_bytes_pair(b"candidate", &staged_main, &staged_shadow).expect("stage pair");
+
+        assert_eq!(fs::read(&staged_main).expect("main bytes"), b"candidate");
+        assert_eq!(
+            fs::read(&staged_shadow).expect("shadow bytes"),
+            b"candidate"
+        );
     }
 }
