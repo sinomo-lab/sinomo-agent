@@ -2562,6 +2562,8 @@ pub struct DfsRepairAttemptRecord {
     pub last_attempt_unix_nanos: u64,
     pub next_retry_unix_nanos: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_chunk_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
 
@@ -20153,6 +20155,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 command.expected_base_version.clone(),
                 command.version.clone(),
                 command.content_hash.clone(),
+                command.object_metadata.clone(),
                 command.total_size_bytes,
                 command.total_chunks,
                 assembler,
@@ -20212,7 +20215,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &transfer.version,
             &local_node_id,
             &manifest.content_hash,
-            None,
+            transfer.object_metadata.as_ref(),
         )?;
         self.record_active_replica_stage(
             &transfer.object_id,
@@ -21084,6 +21087,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 command.expected_base_version.clone(),
                 command.version.clone(),
                 command.content_hash.clone(),
+                command.object_metadata.clone(),
                 command.total_size_bytes,
                 command.total_chunks,
                 assembler,
@@ -21151,7 +21155,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &transfer.version,
             &local_node_id,
             &manifest.content_hash,
-            None,
+            transfer.object_metadata.as_ref(),
         )?;
         self.send_dfs_message_if_routable(
             &requester_node_id,
@@ -25254,6 +25258,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             state.inflight =
                 record.in_flight && record.next_retry_unix_nanos > dfs_now_unix_nanos();
+            if let Some(next_chunk_index) = record.next_chunk_index {
+                pending
+                    .repair_next_chunk_indexes
+                    .insert(record.missing_replica_node_id.clone(), next_chunk_index);
+            }
         }
     }
 
@@ -25271,6 +25280,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         record.attempts = record.attempts.max(state.attempts);
                         record.in_flight = false;
                         record.next_retry_unix_nanos = u64::MAX;
+                        record.next_chunk_index = None;
                         records.push(record);
                     }
                     continue;
@@ -25302,6 +25312,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     in_flight: state.inflight,
                     last_attempt_unix_nanos: now,
                     next_retry_unix_nanos,
+                    next_chunk_index: pending
+                        .repair_next_chunk_indexes
+                        .get(replica_node_id)
+                        .copied(),
                     last_error,
                 });
             }
@@ -25365,6 +25379,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 in_flight: false,
                                 last_attempt_unix_nanos: dfs_now_unix_nanos(),
                                 next_retry_unix_nanos,
+                                next_chunk_index: pending
+                                    .repair_next_chunk_indexes
+                                    .get(replica_node_id)
+                                    .copied(),
                                 last_error: Some(reason.clone()),
                             },
                         );
