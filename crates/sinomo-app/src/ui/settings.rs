@@ -23,8 +23,8 @@ use sui::{
     Alignment, ArrangeCtx, Constraints, DefaultTheme, Event, EventCtx, FieldGroup, FontWeight,
     FormRow, FormSection, Label, ListItem, ListView, MeasureCtx, PaintCtx, PointerEventKind, Rect,
     ScrollState, ScrollView, Select, SemanticsCtx, Separator, Size, SizedBox, Stack, Switch,
-    SwitchView, TabBar, TextInput, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    WindowEvent,
+    SwitchView, TabBar, TextArea, TextInput, Widget, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, WindowEvent,
 };
 
 use sinomo_runtime::config::ConfigClient;
@@ -681,10 +681,10 @@ fn connection_issues(shared: &Shared) -> Vec<ConnectionIssue> {
     };
 
     let mut issues = Vec::new();
-    if let Some(notice) = ready.chat.notice.as_deref().filter(|text| !text.is_empty()) {
+    if let Some(detail) = ready.chat.connection_attention_detail_full() {
         issues.push(ConnectionIssue {
             title: "Chat sessions",
-            detail: notice.to_string(),
+            detail,
             tab: Tab::Sinomo,
             action: "Open Chat",
         });
@@ -971,6 +971,18 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
     let detail = issue.detail.clone();
     let tab = issue.tab;
     let action = issue.action;
+    let detail_field = {
+        let name = match tab {
+            Tab::Sinomo => "connection-chat-detail",
+            Tab::Files => "connection-files-detail",
+            _ => "connection-issue-detail",
+        };
+        SizedBox::new().height(68.0).with_child(
+            TextArea::new(name)
+                .value(detail)
+                .theme_when(clone_reader(reader)),
+        )
+    };
     let button = {
         let s = shared.clone();
         sui::Button::new(action)
@@ -985,7 +997,7 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
     let stack = Stack::vertical()
         .spacing(8.0)
         .alignment(Alignment::Start)
-        .with_child(muted_label(shared, detail).semantic_name(format!("{} detail", issue.title)))
+        .with_child(detail_field)
         .with_child(button);
 
     FormRow::new(issue.title, stack)
@@ -2437,6 +2449,7 @@ mod tests {
     use super::*;
     use crate::backend::Backend;
     use crate::state::{AppState, Shared};
+    use crate::ui::chat::{ActivityTone, ChatActivityEntry};
 
     /// A settings state plus the index of a non-boolean (text-editable) config key, or `None`
     /// when this environment has no such keys registered.
@@ -2547,6 +2560,17 @@ mod tests {
         let issues = connection_issues(&shared);
         assert_eq!(issues.len(), 2);
         assert_eq!(issues[1].title, "SIFS browser");
+
+        shared.chat_mut().notice = None;
+        shared.chat_mut().activity.push(ChatActivityEntry {
+            title: "agent error".to_string(),
+            detail: "chat unavailable: failed to parse command: open agent channel SIFS store failed: device authorization was denied".to_string(),
+            tone: ActivityTone::Bad,
+        });
+        let issues = connection_issues(&shared);
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].title, "Chat sessions");
+        assert!(issues[0].detail.contains("SIFS store failed"));
     }
 
     #[test]

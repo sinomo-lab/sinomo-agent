@@ -275,8 +275,26 @@ impl RuntimeRecoveryTarget {
 
     fn label(self) -> &'static str {
         match self {
-            RuntimeRecoveryTarget::Providers => "Fix provider",
-            RuntimeRecoveryTarget::Connection => "Connection",
+            RuntimeRecoveryTarget::Providers => "Provider setup",
+            RuntimeRecoveryTarget::Connection => "Connection settings",
+        }
+    }
+
+    fn empty_title(self) -> &'static str {
+        match self {
+            RuntimeRecoveryTarget::Providers => "Provider setup required",
+            RuntimeRecoveryTarget::Connection => "Chat needs connection attention",
+        }
+    }
+
+    fn empty_hint(self) -> &'static str {
+        match self {
+            RuntimeRecoveryTarget::Providers => {
+                "Use Provider setup below to add credentials or choose an available model."
+            }
+            RuntimeRecoveryTarget::Connection => {
+                "Use Connection settings below to inspect daemon, chat, and SIFS status."
+            }
         }
     }
 
@@ -839,6 +857,10 @@ impl ChatState {
     }
 
     fn runtime_recovery_target(&self) -> Option<RuntimeRecoveryTarget> {
+        if self.connection_attention_detail().is_some() {
+            return Some(RuntimeRecoveryTarget::Connection);
+        }
+
         if self.providers.is_empty() {
             return Some(RuntimeRecoveryTarget::Providers);
         }
@@ -872,6 +894,62 @@ impl ChatState {
             Some(RuntimeRecoveryTarget::Providers)
         } else {
             Some(RuntimeRecoveryTarget::Connection)
+        }
+    }
+
+    pub fn connection_attention_detail(&self) -> Option<String> {
+        self.connection_attention_detail_full()
+            .map(|detail| compact_line(&detail, 112))
+    }
+
+    pub fn connection_attention_detail_full(&self) -> Option<String> {
+        let mut candidates = Vec::new();
+        if let Some(notice) = self.notice.as_deref().filter(|text| !text.is_empty()) {
+            candidates.push(notice.to_string());
+        }
+        for task in self
+            .control
+            .tasks
+            .iter()
+            .filter(|task| task_tone(&task.status) == ActivityTone::Bad)
+        {
+            candidates.push(format!("{}: {}", task.status, task.summary));
+        }
+        for entry in self
+            .activity
+            .iter()
+            .rev()
+            .filter(|entry| matches!(entry.tone, ActivityTone::Warn | ActivityTone::Bad))
+        {
+            candidates.push(format!("{}: {}", entry.title, entry.detail));
+        }
+
+        if let Some(detail) = candidates
+            .into_iter()
+            .find(|detail| text_mentions_connection_problem(detail))
+        {
+            return Some(detail);
+        }
+
+        let health = self.runtime_health();
+        if matches!(health.tone, ActivityTone::Warn | ActivityTone::Bad)
+            && text_mentions_connection_problem(&health.detail)
+        {
+            Some(health.detail)
+        } else {
+            None
+        }
+    }
+
+    fn recovery_empty_detail(&self, target: RuntimeRecoveryTarget) -> String {
+        match target {
+            RuntimeRecoveryTarget::Providers if self.providers.is_empty() => {
+                "No language model provider is configured yet.".to_string()
+            }
+            RuntimeRecoveryTarget::Providers => compact_line(&self.runtime_health().detail, 112),
+            RuntimeRecoveryTarget::Connection => self
+                .runtime_degraded_detail()
+                .unwrap_or_else(|| compact_line(&self.runtime_health().detail, 112)),
         }
     }
 
@@ -2391,6 +2469,24 @@ fn text_mentions_runtime_problem(text: &str) -> bool {
         "timed out",
         "timeout",
         "failed",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn text_mentions_connection_problem(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "chat list",
+        "chat save",
+        "chat unavailable",
+        "sifs",
+        "dfs",
+        "daemon",
+        "cluster",
+        "device authorization",
+        "session store",
+        "channel store",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -4039,6 +4135,11 @@ impl TranscriptView {
         area: Rect,
         chat: &ChatState,
     ) {
+        if let Some(target) = chat.runtime_recovery_target() {
+            self.paint_recovery_empty_state(ctx, theme, pal, area, chat, target);
+            return;
+        }
+
         let cx = area.x() + area.width() / 2.0;
         let cy = area.y() + area.height() / 2.0;
         // A real Lucide Sparkles glyph for the empty-state mark (tinted to the muted chrome color),
@@ -4064,6 +4165,97 @@ impl TranscriptView {
         widgets::draw_centered(ctx, &format!("Chat with {agent}"), title, cx, cy + 2.0);
         let sub = pal.text_style(theme, 12.5, FontWeight::NORMAL, pal.text_faint);
         widgets::draw_centered(ctx, "Type a message below to begin.", sub, cx, cy + 26.0);
+    }
+
+    fn paint_recovery_empty_state(
+        &self,
+        ctx: &mut PaintCtx,
+        theme: &sui::DefaultTheme,
+        pal: &Palette,
+        area: Rect,
+        chat: &ChatState,
+        target: RuntimeRecoveryTarget,
+    ) {
+        let cx = area.x() + area.width() / 2.0;
+        let cy = area.y() + area.height() / 2.0;
+        let card_w = (area.width() - 56.0).max(220.0).min(560.0);
+        let card_h = 168.0_f32.min((area.height() - 48.0).max(132.0));
+        let card = Rect::new(cx - card_w / 2.0, cy - card_h / 2.0, card_w, card_h);
+        sui::paint_theme_shadow(ctx, card, [10.0; 4], &theme.shadows.box_shadow.xs);
+        widgets::round_panel(ctx, card, pal.panel, pal.warn, 12.0);
+
+        let icon_side = 28.0;
+        draw_glyph(
+            ctx,
+            IconGlyph::Alert,
+            Rect::new(card.x() + 18.0, card.y() + 20.0, icon_side, icon_side),
+            pal.warn,
+        );
+
+        let text_x = card.x() + 60.0;
+        let text_w = (card.width() - 82.0).max(120.0);
+        let title_style = pal.text_style(theme, 15.0, FontWeight::SEMIBOLD, pal.text);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(text_x, card.y() + 17.0, text_w, 22.0),
+            target.empty_title(),
+            title_style,
+        );
+
+        let detail_style = pal.text_style(theme, 12.5, FontWeight::NORMAL, pal.text_muted);
+        let detail = chat.recovery_empty_detail(target);
+        let detail_lines = {
+            let measure = |text: &str| {
+                ctx.measure_text(text, detail_style.clone())
+                    .map(|m| m.width)
+                    .unwrap_or(0.0)
+            };
+            widgets::wrap_lines(&detail, text_w, measure)
+        };
+        let mut y = card.y() + 50.0;
+        for line in detail_lines.iter().take(2) {
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(text_x, y, text_w, detail_style.line_height + 3.0),
+                line,
+                detail_style.clone(),
+            );
+            y += detail_style.line_height + 2.0;
+        }
+
+        let hint_style = pal.text_style(theme, 11.5, FontWeight::NORMAL, pal.text_faint);
+        let hint_lines = {
+            let measure = |text: &str| {
+                ctx.measure_text(text, hint_style.clone())
+                    .map(|m| m.width)
+                    .unwrap_or(0.0)
+            };
+            widgets::wrap_lines(target.empty_hint(), text_w, measure)
+        };
+        y = y.max(card.y() + 86.0);
+        for line in hint_lines.iter().take(2) {
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(text_x, y, text_w, hint_style.line_height + 3.0),
+                line,
+                hint_style.clone(),
+            );
+            y += hint_style.line_height + 2.0;
+        }
+
+        let pill = Rect::new(text_x, card.y() + card.height() - 34.0, 142.0, 22.0);
+        widgets::fill_round_rect(ctx, pill, pal.field, 11.0);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(
+                pill.x() + 10.0,
+                pill.y(),
+                pill.width() - 20.0,
+                pill.height(),
+            ),
+            target.label(),
+            pal.text_style(theme, 10.5, FontWeight::SEMIBOLD, pal.text_muted),
+        );
     }
 }
 
@@ -6128,12 +6320,26 @@ mod tests {
             state.runtime_recovery_target(),
             Some(RuntimeRecoveryTarget::Providers)
         );
+        assert_eq!(RuntimeRecoveryTarget::Providers.label(), "Provider setup");
+        assert_eq!(
+            state.recovery_empty_detail(RuntimeRecoveryTarget::Providers),
+            "No language model provider is configured yet."
+        );
 
         seed_default_provider(&mut state);
         state.notice = Some("chat save failed: DFS services shard replay delayed".to_string());
         assert_eq!(
             state.runtime_recovery_target(),
             Some(RuntimeRecoveryTarget::Connection)
+        );
+        assert_eq!(
+            RuntimeRecoveryTarget::Connection.label(),
+            "Connection settings"
+        );
+        assert!(
+            state
+                .recovery_empty_detail(RuntimeRecoveryTarget::Connection)
+                .contains("chat save failed")
         );
 
         state.notice = Some("chat list failed: device authorization was denied".to_string());

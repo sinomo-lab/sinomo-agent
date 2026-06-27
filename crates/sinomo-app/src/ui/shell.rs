@@ -634,8 +634,8 @@ fn shell_status(shared: &Shared) -> ShellStatus {
     };
 
     let mut issues = Vec::new();
-    if let Some(notice) = ready.chat.notice.as_deref().filter(|text| !text.is_empty()) {
-        issues.push(notice.to_string());
+    if let Some(detail) = ready.chat.connection_attention_detail() {
+        issues.push(detail);
     }
     if let Some(error) = ready.files.error.as_deref().filter(|text| !text.is_empty()) {
         issues.push(format!("SIFS unavailable: {error}"));
@@ -663,6 +663,7 @@ mod tests {
     use super::*;
     use crate::backend::Backend;
     use crate::state::AppState;
+    use crate::ui::chat::{ActivityTone, ChatActivityEntry};
     use crate::ui::settings::SettingsSection;
 
     #[test]
@@ -754,5 +755,25 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn attention_status_pill_tracks_chat_activity_errors() {
+        let backend = Backend::local_fallback();
+        let mut state = AppState::ready(backend);
+        state.active_tab = Tab::Sinomo;
+        let shared = Shared::new(state);
+        {
+            let mut chat = shared.chat_mut();
+            chat.activity.push(ChatActivityEntry {
+                title: "agent error".to_string(),
+                detail: "chat unavailable: failed to parse command: open agent channel SIFS store failed: device authorization was denied".to_string(),
+                tone: ActivityTone::Bad,
+            });
+        }
+
+        let status = shell_status(&shared);
+        assert_eq!(status.label, "Needs attention");
+        assert!(status.detail.contains("SIFS store failed"));
     }
 }
