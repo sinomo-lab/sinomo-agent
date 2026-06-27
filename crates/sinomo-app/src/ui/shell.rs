@@ -33,6 +33,12 @@ const LOGO_SIZE: f32 = 24.0;
 const EDGE_PAD: f32 = 18.0;
 const TAB_SEG_HEIGHT: f32 = 32.0;
 const TAB_GAP: f32 = 6.0;
+const COMPACT_TAB_GAP: f32 = 2.0;
+const STATUS_GAP: f32 = 12.0;
+const STATUS_PILL_H: f32 = 24.0;
+const STATUS_PILL_W: f32 = 150.0;
+const COMPACT_CHROME_WIDTH: f32 = 620.0;
+const COMPACT_STATUS_PILL_W: f32 = 24.0;
 /// Spinner shown in the connecting indicator / loading screen.
 const SPINNER_SIZE: f32 = 18.0;
 
@@ -57,6 +63,7 @@ pub struct Shell {
     /// switch needs a fresh measure+arrange for the newly-shown view. We diff on `RedrawRequested`
     /// to catch it (the same diff-on-redraw the tabs use internally for nested switches).
     last_tab: Cell<Tab>,
+    compact_tabs: Cell<bool>,
     last_render_options: Cell<Option<WindowRenderOptions>>,
     bar_rect: Rect,
     tab_strip_rect: Rect,
@@ -75,7 +82,7 @@ impl Shell {
                 .corner_radius(0.0),
         );
 
-        let tabs = WidgetPod::new(build_tab_bar(&shared));
+        let tabs = WidgetPod::new(build_tab_bar(&shared, false));
         let spinner = WidgetPod::new(
             Spinner::new("shell-connecting")
                 .size(SPINNER_SIZE)
@@ -93,6 +100,7 @@ impl Shell {
             spinner,
             content: None,
             last_tab: Cell::new(initial_tab),
+            compact_tabs: Cell::new(false),
             last_render_options: Cell::new(None),
             bar_rect: Rect::ZERO,
             tab_strip_rect: Rect::ZERO,
@@ -140,13 +148,21 @@ impl Shell {
         ctx.request_paint();
     }
 
+    fn sync_tab_bar_density(&mut self, compact: bool) {
+        if self.compact_tabs.get() == compact {
+            return;
+        }
+        self.compact_tabs.set(compact);
+        self.tabs = WidgetPod::new(build_tab_bar(&self.shared, compact));
+    }
+
     fn sync_active_tab(&mut self, ctx: &mut EventCtx) {
         let current = self.shared.active_tab();
         if current == self.last_tab.get() {
             return;
         }
         self.last_tab.set(current);
-        self.tabs = WidgetPod::new(build_tab_bar(&self.shared));
+        self.tabs = WidgetPod::new(build_tab_bar(&self.shared, self.compact_tabs.get()));
         ctx.request_measure();
         ctx.request_arrange();
         ctx.request_semantics();
@@ -164,8 +180,8 @@ impl Shell {
 
 /// Build the tab strip `TabBar`, bound to the active tab and writing the selection back to
 /// `shared.active_tab` on change. Threads the theme reader so it restyles on theme switch.
-fn build_tab_bar(shared: &Shared) -> TabBar {
-    let labels = Tab::ALL.iter().map(|tab| tab.title());
+fn build_tab_bar(shared: &Shared, compact: bool) -> TabBar {
+    let labels = Tab::ALL.iter().map(|tab| tab_label(*tab, compact));
     let on_change = {
         let s = shared.clone();
         move |index: usize, _label: String| {
@@ -179,7 +195,7 @@ fn build_tab_bar(shared: &Shared) -> TabBar {
         // TabBar caches the selected index. Shell rebuilds this strip whenever `shared.active_tab`
         // changes so programmatic navigation keeps the chrome and content in sync.
         .selected(shared.active_tab().index())
-        .gap(TAB_GAP)
+        .gap(if compact { COMPACT_TAB_GAP } else { TAB_GAP })
         .theme_when({
             let s = shared.clone();
             move || s.theme()
@@ -187,9 +203,24 @@ fn build_tab_bar(shared: &Shared) -> TabBar {
         .on_change(on_change)
 }
 
+fn tab_label(tab: Tab, compact: bool) -> &'static str {
+    if compact {
+        match tab {
+            Tab::Sinomo => "Chat",
+            Tab::Evolution => "Evolve",
+            Tab::Cluster => Tab::Cluster.title(),
+            Tab::Files => Tab::Files.title(),
+            Tab::Settings => Tab::Settings.title(),
+        }
+    } else {
+        tab.title()
+    }
+}
+
 impl Widget for Shell {
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
         let size = constraints.max;
+        self.sync_tab_bar_density(compact_chrome(size.width));
 
         self.logo
             .measure(ctx, Constraints::tight(Size::new(LOGO_SIZE, LOGO_SIZE)));
@@ -220,6 +251,8 @@ impl Widget for Shell {
 
     fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
         self.bar_rect = Rect::new(bounds.x(), bounds.y(), bounds.width(), TOPBAR_HEIGHT);
+        let compact = compact_chrome(bounds.width());
+        let show_spinner = !self.shared.is_ready() && !compact;
 
         let logo_y = bounds.y() + (TOPBAR_HEIGHT - LOGO_SIZE) / 2.0;
         self.logo.arrange(
@@ -228,29 +261,48 @@ impl Widget for Shell {
         );
 
         // Tab strip begins after the brand mark + wordmark.
-        let seg_x = bounds.x() + EDGE_PAD + LOGO_SIZE + 12.0 + brand_word_width() + 26.0;
+        let seg_x = tab_strip_x(bounds.x(), compact);
         let seg_y = bounds.y() + (TOPBAR_HEIGHT - TAB_SEG_HEIGHT) / 2.0;
+        let status_rect = status_pill_arrange_rect(bounds, compact);
+        let status_x = status_rect.x();
+        let tab_right = if compact {
+            bounds.x() + bounds.width()
+        } else {
+            let spinner_w = if show_spinner {
+                SPINNER_SIZE + 8.0
+            } else {
+                0.0
+            };
+            status_x - STATUS_GAP - spinner_w
+        };
         let seg_w = self
             .tab_strip_rect
             .width()
-            .min((bounds.width() - seg_x - EDGE_PAD).max(0.0));
+            .min((tab_right - seg_x).max(0.0));
         self.tab_strip_rect = Rect::new(seg_x, seg_y, seg_w, TAB_SEG_HEIGHT);
         self.tabs.arrange(ctx, self.tab_strip_rect);
 
         // Connecting spinner: just left of where the status pill sits, vertically centered.
-        let spinner_x =
-            bounds.x() + bounds.width() - EDGE_PAD - status_pill_max_width() - SPINNER_SIZE - 8.0;
         let spinner_y = bounds.y() + (TOPBAR_HEIGHT - SPINNER_SIZE) / 2.0;
+        let spinner_x = if show_spinner {
+            status_x - SPINNER_SIZE - 8.0
+        } else {
+            status_x
+        };
         self.spinner.arrange(
             ctx,
-            Rect::new(spinner_x, spinner_y, SPINNER_SIZE, SPINNER_SIZE),
+            Rect::new(
+                spinner_x,
+                spinner_y,
+                if show_spinner { SPINNER_SIZE } else { 0.0 },
+                if show_spinner { SPINNER_SIZE } else { 0.0 },
+            ),
         );
-        let pill_h = 24.0;
         self.status_pill_rect.set(Rect::new(
-            bounds.x() + bounds.width() - EDGE_PAD - status_pill_max_width(),
-            bounds.y() + (TOPBAR_HEIGHT - pill_h) / 2.0,
-            status_pill_max_width(),
-            pill_h,
+            status_rect.x(),
+            status_rect.y(),
+            status_rect.width(),
+            status_rect.height(),
         ));
 
         let body_y = bounds.y() + TOPBAR_HEIGHT;
@@ -284,27 +336,29 @@ impl Widget for Shell {
 
         self.logo.paint(ctx);
 
-        // Wordmark.
-        let word_x = self.bar_rect.x() + EDGE_PAD + LOGO_SIZE + 12.0;
-        let word_style = pal.text_style(&theme, 16.0, FontWeight::SEMIBOLD, pal.text);
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(
-                word_x,
-                self.bar_rect.y(),
-                brand_word_width() + 8.0,
-                TOPBAR_HEIGHT,
-            ),
-            "Sinomo",
-            word_style,
-        );
+        if !compact_chrome(self.bar_rect.width()) {
+            // Wordmark.
+            let word_x = self.bar_rect.x() + EDGE_PAD + LOGO_SIZE + 12.0;
+            let word_style = pal.text_style(&theme, 16.0, FontWeight::SEMIBOLD, pal.text);
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(
+                    word_x,
+                    self.bar_rect.y(),
+                    brand_word_width() + 8.0,
+                    TOPBAR_HEIGHT,
+                ),
+                "Sinomo",
+                word_style,
+            );
+        }
 
         // Tab strip (composed `TabBar`). Only meaningful once the tabs exist; while connecting the
         // content is `None`, but the strip is still shown so the chrome is stable.
         self.tabs.paint(ctx);
 
         // While connecting, a spinner sits next to the status text; once ready, the status pill.
-        if connecting {
+        if connecting && !compact_chrome(self.bar_rect.width()) {
             self.spinner.paint(ctx);
         }
         self.paint_status_pill(ctx, &theme, &pal, connecting);
@@ -524,14 +578,24 @@ impl Shell {
 
         // While connecting, drop the leading dot (the spinner to the left conveys the activity) and
         // show just the status text in a pill; once ready, the pill has a status dot.
+        let compact = compact_chrome(self.bar_rect.width());
         let pill_w = if connecting {
             tw + 14.0 * 2.0
         } else {
             tw + 16.0 + 14.0
         };
-        let pill_h = 24.0;
-        let pill_x = self.bar_rect.x() + self.bar_rect.width() - EDGE_PAD - pill_w;
-        let pill_y = self.bar_rect.y() + (TOPBAR_HEIGHT - pill_h) / 2.0;
+        let pill_h = STATUS_PILL_H;
+        let (pill_x, pill_y, pill_w, pill_h) = if compact {
+            let rect = self.status_pill_rect.get();
+            (rect.x(), rect.y(), rect.width(), rect.height())
+        } else {
+            (
+                self.bar_rect.x() + self.bar_rect.width() - EDGE_PAD - pill_w,
+                self.bar_rect.y() + (TOPBAR_HEIGHT - pill_h) / 2.0,
+                pill_w,
+                pill_h,
+            )
+        };
         let pill = Rect::new(pill_x, pill_y, pill_w, pill_h);
         self.status_pill_rect.set(pill);
         let pressed = self.status_pill_pressed.get();
@@ -554,7 +618,16 @@ impl Shell {
             pill_h / 2.0,
         );
 
-        if connecting {
+        if compact {
+            let r = 4.0;
+            ctx.fill(
+                sui::Path::circle(
+                    sui::Point::new(pill_x + pill_w / 2.0, pill_y + pill_h / 2.0),
+                    r,
+                ),
+                dot,
+            );
+        } else if connecting {
             widgets::draw_text_in(
                 ctx,
                 Rect::new(pill_x + 14.0, pill_y, pill_w - 14.0, pill_h),
@@ -601,10 +674,37 @@ fn draw_loading_spinner(ctx: &mut PaintCtx, pal: &Palette, cx: f32, cy: f32, siz
     }
 }
 
-/// A roomy upper bound on the status pill width, used to reserve space for the connecting spinner to
-/// its left during arrange (the exact pill width is measured at paint time).
-fn status_pill_max_width() -> f32 {
-    150.0
+fn compact_chrome(width: f32) -> bool {
+    width < COMPACT_CHROME_WIDTH
+}
+
+fn tab_strip_x(bounds_x: f32, compact: bool) -> f32 {
+    if compact {
+        bounds_x + EDGE_PAD + LOGO_SIZE + 16.0
+    } else {
+        bounds_x + EDGE_PAD + LOGO_SIZE + 12.0 + brand_word_width() + 26.0
+    }
+}
+
+/// Position reserved for the status affordance during arrange. On compact title bars the full status
+/// text remains in semantics while the visual treatment becomes a small logo badge, keeping the tab
+/// strip free to use the remaining title-bar width.
+fn status_pill_arrange_rect(bounds: Rect, compact: bool) -> Rect {
+    if compact {
+        Rect::new(
+            bounds.x() + EDGE_PAD + LOGO_SIZE - COMPACT_STATUS_PILL_W + 15.0,
+            bounds.y() + (TOPBAR_HEIGHT - COMPACT_STATUS_PILL_W) / 2.0,
+            COMPACT_STATUS_PILL_W,
+            COMPACT_STATUS_PILL_W,
+        )
+    } else {
+        Rect::new(
+            bounds.x() + bounds.width() - EDGE_PAD - STATUS_PILL_W,
+            bounds.y() + (TOPBAR_HEIGHT - STATUS_PILL_H) / 2.0,
+            STATUS_PILL_W,
+            STATUS_PILL_H,
+        )
+    }
 }
 
 /// Approximate width reserved for the "Sinomo" wordmark (kept simple; the tab strip measures its
@@ -752,6 +852,65 @@ mod tests {
         assert_eq!(
             tab_bar.value,
             Some(sui::SemanticsValue::Text("Settings".to_string()))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn compact_titlebar_keeps_attention_pill_out_of_tabs() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let mut state = AppState::ready(backend);
+        state.active_tab = Tab::Settings;
+        let shared = Shared::new(state);
+        {
+            let mut chat = shared.chat_mut();
+            chat.notice = Some("chat list failed: device authorization was denied".to_string());
+        }
+
+        let runtime = crate::build_runtime(shared)?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let root = window.root();
+        app.run_until_idle()?;
+
+        root.dispatch_event(Event::Window(WindowEvent::Resized(Size::new(520.0, 720.0))))?;
+        app.run_until_idle()?;
+
+        let snapshot = window.snapshot()?;
+        let tab_bar = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::TabBar && node.name.as_deref() == Some("shell-tabs")
+            })
+            .expect("shell tab bar semantics");
+        let status = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Button
+                    && node.name.as_deref() == Some("Needs attention")
+            })
+            .expect("attention status semantics");
+
+        assert!(
+            status.bounds.max_x() <= tab_bar.bounds.x(),
+            "compact status badge {:?} should stay before tab bar {:?}",
+            status.bounds,
+            tab_bar.bounds
+        );
+        assert!(
+            tab_bar.bounds.max_x() <= 520.0 + 0.5,
+            "tab bar should use the remaining title-bar width without running under right chrome: {:?}",
+            tab_bar.bounds
+        );
+        assert!(
+            status.bounds.width() <= COMPACT_STATUS_PILL_W + 0.5,
+            "compact status should not reserve the full pill width: {:?}",
+            status.bounds
         );
 
         Ok(())
