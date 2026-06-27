@@ -92,11 +92,11 @@ impl RolloutTarget {
         }
     }
 
-    pub(crate) fn endpoint(endpoint: ClusterEndpointRecord) -> Self {
+    pub(crate) fn explicit_endpoint(endpoint: ClusterEndpointRecord) -> Self {
         Self {
             address: endpoint.address.clone(),
-            rollout_node_id: Some(endpoint.node_id.clone()),
             endpoint: Some(endpoint),
+            rollout_node_id: None,
         }
     }
 
@@ -1079,19 +1079,17 @@ pub(crate) fn rollout_status() -> Result<(), CliError> {
 
 pub(crate) fn rollout_diagnostics(options: RolloutOptions) -> Result<(), CliError> {
     let targets = if options.targets.is_empty() {
-        vec![
+        vec![RolloutTarget::address(
             default_main_daemon_status()?
                 .map(|status| status.address)
                 .unwrap_or_else(|| daemon_connect_address(&options.host, options.port)),
-        ]
+        )]
     } else {
-        unique_rollout_targets(options.targets)
+        explicit_rollout_targets(options.targets)
     };
     for target in targets {
-        println!("== {target} ==");
-        match daemon_send_daemon_rollout_diagnostics(&target, CLUSTER_HEALTH_PROBE_TIMEOUT)
-            .map_err(CliError::from)
-        {
+        println!("== {} ==", target.label());
+        match send_daemon_rollout_diagnostics(&target) {
             Ok(response) => print!("{response}"),
             Err(error) => println!("failed: {error}"),
         }
@@ -1127,11 +1125,10 @@ pub(crate) fn rollout_clear_status(options: RolloutOptions) -> Result<(), CliErr
     }
 
     for target in unique_rollout_targets(options.targets) {
-        match daemon_send_daemon_rollout_clear_status(&target, DAEMON_CLUSTER_KV_TXN_TIMEOUT)
-            .map_err(CliError::from)
-        {
-            Ok(response) => print!("{target}: {response}"),
-            Err(error) => println!("{target}: failed: {error}"),
+        let target = explicit_rollout_target(target);
+        match send_daemon_rollout_clear_status(&target) {
+            Ok(response) => print!("{}: {response}", target.label()),
+            Err(error) => println!("{}: failed: {error}", target.label()),
         }
     }
     Ok(())
@@ -1480,20 +1477,7 @@ pub(crate) fn rollout_cluster_targets(
         None
     };
     if !options.targets.is_empty() {
-        let mut targets = Vec::new();
-        for address in options.targets.iter().cloned() {
-            let target = if address.starts_with("iroh://") {
-                RolloutTarget::endpoint(network::invite_introducer_endpoint(
-                    &NodeId::from_legacy_named("node_rollout_explicit_target")
-                        .expect("static rollout target node id"),
-                    address,
-                ))
-            } else {
-                RolloutTarget::address(address)
-            };
-            push_unique_rollout_target(&mut targets, target);
-        }
-        return Ok(targets);
+        return Ok(explicit_rollout_targets(options.targets.clone()));
     }
     if let Some(state) = state.as_ref() {
         return Ok(rollout_cluster_targets_from_state(
@@ -1507,6 +1491,26 @@ pub(crate) fn rollout_cluster_targets(
         push_unique_rollout_target(&mut targets, local_target);
     }
     Ok(targets)
+}
+
+fn explicit_rollout_targets(addresses: Vec<String>) -> Vec<RolloutTarget> {
+    let mut targets = Vec::new();
+    for address in addresses {
+        push_unique_rollout_target(&mut targets, explicit_rollout_target(address));
+    }
+    targets
+}
+
+fn explicit_rollout_target(address: String) -> RolloutTarget {
+    if address.starts_with("iroh://") {
+        RolloutTarget::explicit_endpoint(network::invite_introducer_endpoint(
+            &NodeId::from_legacy_named("node_rollout_explicit_target")
+                .expect("static rollout target node id"),
+            address,
+        ))
+    } else {
+        RolloutTarget::address(address)
+    }
 }
 
 pub(crate) fn rollout_cluster_targets_from_state(
@@ -2174,6 +2178,26 @@ pub(crate) fn send_daemon_rollout_native_dylib_module(
             DAEMON_ROLLOUT_TIMEOUT,
         )
         .map_err(Into::into)
+    }
+}
+
+pub(crate) fn send_daemon_rollout_clear_status(target: &RolloutTarget) -> Result<String, CliError> {
+    if let Some(endpoint) = &target.endpoint {
+        daemon_send_daemon_rollout_clear_status_to_endpoint(endpoint, DAEMON_CLUSTER_KV_TXN_TIMEOUT)
+            .map_err(Into::into)
+    } else {
+        daemon_send_daemon_rollout_clear_status(&target.address, DAEMON_CLUSTER_KV_TXN_TIMEOUT)
+            .map_err(Into::into)
+    }
+}
+
+pub(crate) fn send_daemon_rollout_diagnostics(target: &RolloutTarget) -> Result<String, CliError> {
+    if let Some(endpoint) = &target.endpoint {
+        daemon_send_daemon_rollout_diagnostics_to_endpoint(endpoint, CLUSTER_HEALTH_PROBE_TIMEOUT)
+            .map_err(Into::into)
+    } else {
+        daemon_send_daemon_rollout_diagnostics(&target.address, CLUSTER_HEALTH_PROBE_TIMEOUT)
+            .map_err(Into::into)
     }
 }
 

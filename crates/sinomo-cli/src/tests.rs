@@ -11093,6 +11093,8 @@ fn rollout_cluster_targets_deduplicate_explicit_targets() {
         targets[1].address,
         "iroh://iroh_public_key_dedup?relay=https://relay.example./"
     );
+    assert!(targets[1].endpoint.is_some());
+    assert_eq!(targets[1].rollout_node_id(), None);
 }
 
 #[test]

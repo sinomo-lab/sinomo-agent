@@ -1303,6 +1303,19 @@ pub fn send_daemon_rollout_clear_status(
     )
 }
 
+pub fn send_daemon_rollout_clear_status_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    timeout: Duration,
+) -> Result<String, DaemonError> {
+    send_daemon_rpc_body_to_endpoint(
+        endpoint,
+        ROLLOUT_CLEAR_STATUS_ROUTE,
+        ROLLOUT_RPC_CATEGORY,
+        &(),
+        timeout,
+    )
+}
+
 pub fn send_daemon_rollout_diagnostics(
     address: &str,
     timeout: Duration,
@@ -1311,6 +1324,18 @@ pub fn send_daemon_rollout_diagnostics(
         ObjectRpcRequest::encode_body(ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_RPC_CATEGORY, &())?
             .with_response_retry_safe();
     send_daemon_rpc_request_with_decoder(address, &request, timeout, |response| {
+        response.decode_body()
+    })
+}
+
+pub fn send_daemon_rollout_diagnostics_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    timeout: Duration,
+) -> Result<String, DaemonError> {
+    let request =
+        ObjectRpcRequest::encode_body(ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_RPC_CATEGORY, &())?
+            .with_response_retry_safe();
+    send_daemon_rpc_request_to_endpoint_with_decoder(endpoint, &request, timeout, |response| {
         response.decode_body()
     })
 }
