@@ -20,6 +20,7 @@ const NODE_R: f32 = 22.0;
 const LAN_R: f32 = 18.0;
 const PANEL_W: f32 = 360.0;
 const PANEL_PAD: f32 = 16.0;
+const DETAIL_BUTTON_H: f32 = 28.0;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClusterSelection {
@@ -30,6 +31,7 @@ pub enum ClusterSelection {
 pub struct ClusterState {
     pub snapshot: ClusterSnapshot,
     pub selected: Option<ClusterSelection>,
+    pub diagnostics_open: bool,
 }
 
 impl ClusterState {
@@ -37,6 +39,7 @@ impl ClusterState {
         Self {
             snapshot: backend.cluster_snapshot(),
             selected: None,
+            diagnostics_open: false,
         }
     }
 }
@@ -137,10 +140,23 @@ impl Widget for ClusterView {
             {
                 let snapshot = self.shared.cluster().snapshot.clone();
                 let topology = build_topology(&snapshot);
+                if self.shared.cluster().selected.is_some()
+                    && detail_toggle_rect(ctx.bounds()).contains(pointer.position)
+                {
+                    let open = self.shared.cluster().diagnostics_open;
+                    self.shared.cluster_mut().diagnostics_open = !open;
+                    ctx.request_paint();
+                    ctx.set_handled();
+                    return;
+                }
                 let graph = graph_rect(ctx.bounds());
                 let layout = layout_vertices(&topology, graph);
                 let selection = hit_test(&layout, pointer.position);
-                self.shared.cluster_mut().selected = selection;
+                let mut cluster = self.shared.cluster_mut();
+                if cluster.selected != selection {
+                    cluster.diagnostics_open = false;
+                }
+                cluster.selected = selection;
                 ctx.request_paint();
                 ctx.set_handled();
             }
@@ -167,6 +183,7 @@ impl Widget for ClusterView {
         let graph = graph_rect(bounds);
         let layout = layout_vertices(&topology, graph);
         let selected = self.shared.cluster().selected.clone();
+        let diagnostics_open = self.shared.cluster().diagnostics_open;
 
         ctx.fill_bounds(pal.window);
         paint_header(ctx, &theme, &pal, bounds, &snapshot, &topology);
@@ -187,6 +204,7 @@ impl Widget for ClusterView {
             &snapshot,
             &topology,
             selected.as_ref(),
+            diagnostics_open,
         );
     }
 
@@ -399,6 +417,7 @@ fn paint_detail_panel(
     snapshot: &ClusterSnapshot,
     topology: &Topology,
     selection: Option<&ClusterSelection>,
+    diagnostics_open: bool,
 ) {
     let panel_w = PANEL_W.min((bounds.width() - PAD * 2.0).max(220.0));
     let x = bounds.max_x() - panel_w - PAD;
@@ -407,7 +426,7 @@ fn paint_detail_panel(
     widgets::round_panel(ctx, panel, pal.panel.with_alpha(0.96), pal.border, 8.0);
 
     let lines = selection
-        .map(|selection| detail_lines(snapshot, topology, selection))
+        .map(|selection| detail_lines(snapshot, topology, selection, diagnostics_open))
         .unwrap_or_else(|| overview_lines(snapshot, topology));
     let title_style = pal.text_style(theme, 15.0, FontWeight::SEMIBOLD, pal.text);
     let label_style = pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text_muted);
@@ -427,7 +446,15 @@ fn paint_detail_panel(
             title_style,
         );
         cy += 32.0;
-        for line in rest.iter().take(11) {
+        let content_bottom = if selection.is_some() {
+            detail_toggle_rect(bounds).y() - 8.0
+        } else {
+            panel.max_y() - PANEL_PAD
+        };
+        for line in rest {
+            if cy + 18.0 > content_bottom {
+                break;
+            }
             if let Some(hint) = line.strip_prefix("hint:") {
                 widgets::draw_text_in(
                     ctx,
@@ -480,6 +507,15 @@ fn paint_detail_panel(
             }
             cy += 21.0;
         }
+    }
+    if selection.is_some() {
+        paint_detail_toggle(
+            ctx,
+            theme,
+            pal,
+            detail_toggle_rect(bounds),
+            diagnostics_open,
+        );
     }
 }
 
@@ -537,27 +573,44 @@ fn detail_lines(
     snapshot: &ClusterSnapshot,
     topology: &Topology,
     selection: &ClusterSelection,
+    diagnostics_open: bool,
 ) -> Vec<String> {
     match selection {
         ClusterSelection::Node(id) => snapshot
             .nodes
             .iter()
             .find(|node| &node.node_id == id)
-            .map(node_detail_lines)
+            .map(|node| node_detail_lines(node, diagnostics_open))
             .unwrap_or_else(|| vec![id.clone(), "status: missing".to_string()]),
         ClusterSelection::LanSegment(id) => {
             let members = topology.lan_segments.get(id).cloned().unwrap_or_default();
-            vec![
+            let mut lines = vec![
                 id.replace('-', " "),
                 format!("members: {}", members.len()),
-                format!("nodes: {}", members.join(", ")),
                 "basis: observed LAN connectivity clique".to_string(),
-            ]
+            ];
+            if diagnostics_open {
+                lines.push("diagnostics: member node IDs".to_string());
+                lines.extend(
+                    members
+                        .iter()
+                        .take(6)
+                        .map(|member| format!("node: {}", short(member, 42))),
+                );
+            } else if !members.is_empty() {
+                lines.push("hint: Show diagnostics for member node IDs.".to_string());
+            }
+            lines
         }
     }
 }
 
-fn node_detail_lines(node: &ClusterNodeInfo) -> Vec<String> {
+fn node_detail_lines(node: &ClusterNodeInfo, diagnostics_open: bool) -> Vec<String> {
+    let reachable_endpoints = node
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.reachable)
+        .count();
     let mut lines = vec![
         if node.display_name.is_empty() {
             short(&node.node_id, 18)
@@ -568,22 +621,84 @@ fn node_detail_lines(node: &ClusterNodeInfo) -> Vec<String> {
         format!("health: {}", node.availability),
         format!("process: {}", node.process),
         format!("role: {} {}", node.member_role, node.member_state),
-        format!("platform: {}", node.platform.as_deref().unwrap_or("-")),
         format!("address: {}", node.address.as_deref().unwrap_or("-")),
         format!(
+            "endpoints: {} / {} reachable",
+            reachable_endpoints,
+            node.endpoints.len()
+        ),
+    ];
+    if diagnostics_open {
+        lines.push("diagnostics: endpoint addresses".to_string());
+        lines.extend(node.endpoints.iter().take(4).map(|endpoint| {
+            let state = if endpoint.reachable {
+                "reachable"
+            } else {
+                "unreachable"
+            };
+            format!(
+                "{}: {} ({state})",
+                endpoint.transport,
+                short(&endpoint.address, 52)
+            )
+        }));
+        lines.push(format!(
             "public: {}",
             if node.public_reachable {
                 "reachable"
             } else {
                 "not observed"
             }
-        ),
-        format!("version: {}", node.daemon_version),
-    ];
-    if let Some(endpoint) = node.endpoints.iter().find(|endpoint| endpoint.reachable) {
-        lines.push(format!("endpoint: {}", endpoint.address));
+        ));
+        lines.push(format!(
+            "platform: {}",
+            node.platform.as_deref().unwrap_or("-")
+        ));
+        lines.push(format!("version: {}", node.daemon_version));
+    } else if !node.endpoints.is_empty() {
+        lines.push("hint: Show diagnostics for endpoint addresses.".to_string());
     }
     lines
+}
+
+fn detail_panel_rect(bounds: Rect) -> Rect {
+    let panel_w = PANEL_W.min((bounds.width() - PAD * 2.0).max(220.0));
+    Rect::new(
+        bounds.max_x() - panel_w - PAD,
+        bounds.y() + HEADER_H + 18.0,
+        panel_w,
+        312.0,
+    )
+}
+
+fn detail_toggle_rect(bounds: Rect) -> Rect {
+    let panel = detail_panel_rect(bounds);
+    Rect::new(
+        panel.x() + PANEL_PAD,
+        panel.max_y() - PANEL_PAD - DETAIL_BUTTON_H,
+        144.0,
+        DETAIL_BUTTON_H,
+    )
+}
+
+fn paint_detail_toggle(
+    ctx: &mut PaintCtx,
+    theme: &sui::DefaultTheme,
+    pal: &Palette,
+    rect: Rect,
+    diagnostics_open: bool,
+) {
+    widgets::round_panel(ctx, rect, pal.field, pal.border, 7.0);
+    widgets::draw_text_in(
+        ctx,
+        Rect::new(rect.x() + 10.0, rect.y() + 5.0, rect.width() - 20.0, 18.0),
+        if diagnostics_open {
+            "Hide diagnostics"
+        } else {
+            "Show diagnostics"
+        },
+        pal.text_style(theme, 11.5, FontWeight::MEDIUM, pal.text),
+    );
 }
 
 fn graph_rect(bounds: Rect) -> Rect {
@@ -914,6 +1029,20 @@ mod tests {
         }
     }
 
+    fn endpoint(address: &str, reachable: bool) -> crate::backend::cluster::ClusterEndpointInfo {
+        crate::backend::cluster::ClusterEndpointInfo {
+            endpoint_id: "endpoint-a".to_string(),
+            transport: "iroh".to_string(),
+            address: address.to_string(),
+            source: "member".to_string(),
+            privacy: "internet".to_string(),
+            priority: 10,
+            latency_ms: Some(42),
+            public_ip: true,
+            reachable,
+        }
+    }
+
     #[test]
     fn topology_collapses_three_node_lan_clique() {
         let snapshot = ClusterSnapshot {
@@ -985,5 +1114,40 @@ mod tests {
         assert!(lines.iter().any(|line| line == "public: 1 reachable"));
         assert!(lines.iter().any(|line| line == "topology: 1 edges"));
         assert!(lines.iter().any(|line| line.starts_with("hint: Select")));
+    }
+
+    #[test]
+    fn node_detail_keeps_endpoint_addresses_behind_diagnostics() {
+        let mut node = node("node-a");
+        node.endpoints = vec![endpoint(
+            "iroh://e6e7579b45088dc226274eadd8dec9782eb042c1c753ba5be249c96c1c8c0e2e?relay=https://use1-1.relay.no.iroh-canary.iroh.link/",
+            true,
+        )];
+
+        let closed = node_detail_lines(&node, false);
+        assert!(
+            closed
+                .iter()
+                .any(|line| line == "endpoints: 1 / 1 reachable")
+        );
+        assert!(
+            closed
+                .iter()
+                .any(|line| line == "hint: Show diagnostics for endpoint addresses.")
+        );
+        assert!(
+            !closed.iter().any(|line| line.contains("iroh://")),
+            "raw endpoint should not be in primary node details"
+        );
+
+        let open = node_detail_lines(&node, true);
+        assert!(
+            open.iter()
+                .any(|line| line == "diagnostics: endpoint addresses")
+        );
+        assert!(
+            open.iter().any(|line| line.contains("iroh://")),
+            "diagnostics should expose the endpoint address"
+        );
     }
 }
