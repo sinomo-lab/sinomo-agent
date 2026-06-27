@@ -921,7 +921,8 @@ fn capture_shell_chrome() {
 #[test]
 fn capture_chat_composed() {
     use sinomo_app::theme::AppThemeMode;
-    use sinomo_app::ui::chat::ChatMessage;
+    use sinomo_app::ui::chat::{ChatMessage, ConversationKind, SessionRef};
+    use sui::SemanticsRole;
 
     // Write these alongside the other shots, but also mirror them under `target/shots` so they are
     // easy to find regardless of the SINOMO_APP_SHOTS override.
@@ -1064,6 +1065,37 @@ fn capture_chat_composed() {
         app.run_until_idle().expect("settle chat-selector layout");
         open_chat_provider_select(&window);
         capture("chat-composed-selector-open", &window);
+    }
+
+    // Chat edit popup: open through the row's semantic edit button so the capture covers the
+    // rename/delete surface without relying on hover coordinates.
+    {
+        let shared = boot(Tab::Sinomo);
+        shared.borrow_mut().theme_mode = AppThemeMode::Light;
+        {
+            let mut chat = shared.chat_mut();
+            let session_id = "visual-chat-edit".to_string();
+            chat.sessions = vec![SessionRef {
+                id: session_id.clone(),
+                title: "Roadmap review".to_string(),
+                kind: ConversationKind::Chat,
+                updated_unix: 1,
+                participant_count: 1,
+            }];
+            chat.session_id = session_id;
+            chat.models_loading = false;
+        }
+        let runtime = build_runtime(shared).expect("build runtime");
+        let app = TestApp::from_runtime(runtime).expect("headless test app");
+        let window = app.main_window().expect("main window");
+        app.run_until_idle().expect("settle chat-edit layout");
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Edit Roadmap review")
+            .click()
+            .expect("open edit dialog");
+        app.run_until_idle().expect("settle edit dialog");
+        capture("chat-composed-edit-dialog", &window);
     }
 }
 

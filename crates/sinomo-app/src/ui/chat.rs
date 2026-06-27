@@ -2752,6 +2752,10 @@ impl ChatSessionRow {
             Some(ChatSessionRowHit::Row)
         }
     }
+
+    fn edit_widget_id(parent: sui::WidgetId) -> sui::WidgetId {
+        sui::WidgetId::new(parent.get().wrapping_mul(37).wrapping_add(9_011))
+    }
 }
 
 impl Widget for ChatSessionRow {
@@ -2944,7 +2948,8 @@ impl Widget for ChatSessionRow {
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let mut node = SemanticsNode::new(ctx.widget_id(), SemanticsRole::ListItem, ctx.bounds());
+        let row_id = ctx.widget_id();
+        let mut node = SemanticsNode::new(row_id, SemanticsRole::ListItem, ctx.bounds());
         node.name = Some(self.session.title.clone());
         node.description = Some(match self.session.kind {
             ConversationKind::Chat => "Chat".to_string(),
@@ -2957,6 +2962,24 @@ impl Widget for ChatSessionRow {
         node.state.selected = self.active();
         node.actions = vec![SemanticsAction::Focus, SemanticsAction::Activate];
         ctx.push(node);
+
+        let mut edit = SemanticsNode::new(
+            Self::edit_widget_id(row_id),
+            SemanticsRole::Button,
+            self.edit_rect(ctx.bounds()),
+        );
+        edit.parent = Some(row_id);
+        edit.name = Some(format!("Edit {}", self.session.title));
+        edit.description = Some(match self.session.kind {
+            ConversationKind::Chat => "Rename or delete this chat".to_string(),
+            ConversationKind::Channel => {
+                "Rename, delete, or manage agents for this channel".to_string()
+            }
+        });
+        edit.actions = vec![SemanticsAction::Activate];
+        edit.state.hovered = self.hovered;
+        edit.state.selected = self.editing();
+        ctx.push(edit);
     }
 
     fn accepts_focus(&self) -> bool {
@@ -3452,6 +3475,12 @@ impl Widget for SessionEditPopup {
 
     fn paint(&self, ctx: &mut PaintCtx) {
         let panel = self.panel_rect;
+        let scrim = if self.theme.surfaces.dark {
+            Color::srgba(0.0, 0.0, 0.0, 0.42)
+        } else {
+            Color::srgba(0.08, 0.12, 0.18, 0.14)
+        };
+        ctx.fill_rect(ctx.bounds(), scrim);
         sui::paint_theme_shadow(
             ctx,
             panel,
@@ -6030,6 +6059,53 @@ mod tests {
             shared.chat().session_edit_id.is_none(),
             "Done should close the edit dialog"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_session_edit_button_opens_dialog() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let session_id = SessionId::generate().to_string();
+        {
+            let mut chat = shared.chat_mut();
+            chat.sessions = vec![SessionRef {
+                id: session_id.clone(),
+                title: "Dialog chat".to_string(),
+                kind: ConversationKind::Chat,
+                updated_unix: 1,
+                participant_count: 1,
+            }];
+            chat.session_id = session_id.clone();
+            chat.models_loading = false;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Chat edit button")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Edit Dialog chat")
+            .click()?;
+
+        assert_eq!(
+            shared.chat().session_edit_id.as_deref(),
+            Some(session_id.as_str()),
+            "row edit button should open the edit dialog"
+        );
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Done")
+            .click()?;
+        assert!(shared.chat().session_edit_id.is_none());
 
         Ok(())
     }
