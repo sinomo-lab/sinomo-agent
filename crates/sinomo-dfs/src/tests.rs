@@ -15764,6 +15764,115 @@ fn completed_chunked_stage_and_repair_keep_probe_offset_until_response() {
 }
 
 #[test]
+fn out_of_order_initial_stage_and_repair_chunks_are_rejected() {
+    let root = temp_root("out-of-order-initial-stage-repair-chunks");
+    let owner = NodeId::from_legacy_named("node_out_of_order_chunk_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_out_of_order_chunk_replica").expect("node");
+    let object_id = DfsObjectId::from_legacy_named("obj_out_of_order_chunk").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_out_of_order_chunk_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_out_of_order_chunk_2").expect("version");
+    let network = InProcessNetwork::new();
+    let mut owner_transport = network.add_node(owner.clone());
+    let replica_transport = network.add_node(replica.clone());
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let metadata_backend =
+        open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+    let mut dfs = NetworkedDfsService::new(replica_transport, content)
+        .with_metadata_backend(metadata_backend)
+        .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    let mut metadata = file_metadata(owner.clone());
+    metadata.object_id = object_id.clone();
+    metadata.version = version_1.clone();
+    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    dfs.add_object_metadata(metadata.clone()).expect("metadata");
+
+    let total_chunks = 5;
+    let chunk_index = total_chunks - 1;
+    let total_size_bytes = DFS_BLOB_CHUNK_BYTES as u64 * u64::from(chunk_index) + 11;
+    let bytes = vec![7_u8; 11];
+    let content_hash = "blake3:out-of-order-chunk-probe";
+
+    let stage_event = dfs
+        .handle_stage_blob_chunk(
+            owner.clone(),
+            DfsStageBlobChunkCommand {
+                request_id: "dfs_stage_out_of_order_chunk".to_string(),
+                intent_id: "dfs_intent_stage_out_of_order_chunk".to_string(),
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                expected_base_version: Some(version_1.clone()),
+                version: version_2.clone(),
+                content_hash: content_hash.to_string(),
+                total_size_bytes,
+                chunk_index,
+                total_chunks,
+                chunk_hash: Some(chunk_hash(&bytes)),
+                bytes: bytes.clone(),
+                object_metadata: Some(metadata.clone()),
+            },
+        )
+        .expect("stage chunk handled")
+        .expect("stage rejection event");
+    assert!(matches!(
+        stage_event,
+        NetworkedDfsServiceEvent::BlobStageRejected { reason, .. }
+            if reason.contains("without earlier chunks")
+    ));
+    assert!(
+        dfs.incoming_blob_transfers.is_empty(),
+        "out-of-order initial stage chunk must not allocate a dangling transfer"
+    );
+    assert!(matches!(
+        drain_dfs_messages(&mut owner_transport).as_slice(),
+        [DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
+            result: DfsBlobTransferResult::Rejected { reason },
+            ..
+        })] if reason.contains("without earlier chunks")
+    ));
+
+    let repair_event = dfs
+        .handle_repair_replica_chunk(
+            owner.clone(),
+            DfsRepairReplicaChunkCommand {
+                request_id: "dfs_repair_out_of_order_chunk".to_string(),
+                intent_id: "dfs_intent_repair_out_of_order_chunk".to_string(),
+                file_system_id: sifs_file_system_id(),
+                object_id,
+                expected_base_version: Some(version_1),
+                version: version_2,
+                content_hash: content_hash.to_string(),
+                total_size_bytes,
+                chunk_index,
+                total_chunks,
+                chunk_hash: Some(chunk_hash(&bytes)),
+                bytes,
+                object_metadata: Some(metadata),
+            },
+        )
+        .expect("repair chunk handled")
+        .expect("repair rejection event");
+    assert!(matches!(
+        repair_event,
+        NetworkedDfsServiceEvent::RepairRejected { reason, .. }
+            if reason.contains("without earlier chunks")
+    ));
+    assert!(
+        dfs.incoming_blob_transfers.is_empty(),
+        "out-of-order initial repair chunk must not allocate a dangling transfer"
+    );
+    assert!(matches!(
+        drain_dfs_messages(&mut owner_transport).as_slice(),
+        [DfsNetworkMessage::RepairReplicaResponse(DfsRepairReplicaResponse {
+            result: DfsBlobTransferResult::Rejected { reason },
+            ..
+        })] if reason.contains("without earlier chunks")
+    ));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn repair_response_conflicting_receipt_preserves_retry_state() {
     let root = temp_root("repair-conflicting-receipt-keeps-retry");
     let owner = NodeId::from_legacy_named("node_repair_conflict_owner").expect("node");

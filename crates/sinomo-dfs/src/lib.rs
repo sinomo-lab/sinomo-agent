@@ -20130,6 +20130,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     content_hash: command.content_hash,
                 }));
             }
+            if command.chunk_index != 0 {
+                let reason = format!(
+                    "stage blob chunk transfer {} started at chunk {} without earlier chunks",
+                    command.intent_id, command.chunk_index
+                );
+                return self.reject_stage_blob_chunk(requester_node_id, command, reason);
+            }
             let assembler = match self.content.begin_chunked_object_version(
                 command.object_id.as_str(),
                 command.version.as_str(),
@@ -21061,6 +21068,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     replica_node_id: self.node_id.clone(),
                     content_hash: command.content_hash,
                 }));
+            }
+            if command.chunk_index != 0 {
+                let reason = format!(
+                    "repair replica chunk transfer {} started at chunk {} without earlier chunks",
+                    command.intent_id, command.chunk_index
+                );
+                return self.reject_repair_replica_chunk(requester_node_id, command, reason);
             }
             let assembler = match self.content.begin_chunked_object_version(
                 command.object_id.as_str(),
