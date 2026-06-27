@@ -1842,6 +1842,24 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
                 "cluster join node rpc",
             ))
         }
+
+        fn record_endpoint_command_connectivity(
+            &mut self,
+            paths: &ClusterPaths,
+            state: &ClusterBootstrapState,
+            endpoint: &ClusterEndpointRecord,
+            connectivity_state: network::ClusterConnectivityState,
+            latency_ms: Option<u64>,
+        ) {
+            let _ = network::record_local_cluster_endpoint_command_connectivity(
+                paths,
+                state,
+                endpoint,
+                connectivity_state,
+                latency_ms,
+                true,
+            );
+        }
     }
 
     let mut host = network::ClusterControlPlaneDriver::new(CliClusterJoinReconciliationTransport);

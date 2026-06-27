@@ -11143,6 +11143,19 @@ fn rollout_cluster_targets_include_shadow_only_repair_route() {
     remote_shadow.endpoints.push(shadow_iroh.clone());
     state.members.push(remote_main);
     state.members.push(remote_shadow);
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(
+            cluster_endpoint_key(&remote_shadow_id, &shadow_iroh),
+            &shadow_iroh,
+            None,
+        )
+        .expect("shadow endpoint record");
+    sinomo_runtime::kv::write_cluster_kv_snapshot(
+        &paths.kv_paths(),
+        &store.snapshot().expect("snapshot"),
+    )
+    .expect("cluster kv snapshot");
 
     let targets = rollout_cluster_targets_from_state(&paths, &state, None);
 
