@@ -2385,7 +2385,7 @@ fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widge
             } else {
                 sui::IconGlyph::ChevronDown
             })
-            .theme_when(clone_reader(reader))
+            .theme_when(secondary_button_theme(reader))
             .on_press(move || s.settings_mut().toggle_advanced_detail(&key))
     };
     let mut details = Stack::vertical()
@@ -2396,7 +2396,7 @@ fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widge
     if !description.is_empty() {
         details = details.with_child(muted_label(shared, description).font_size(11.0));
     }
-    details = details.with_child(disclosure);
+    details = details.with_child(Stack::horizontal().with_child(disclosure));
     if expanded {
         details = details.with_child(config_detail_editor(shared, reader, index, &item));
     }
@@ -3745,6 +3745,65 @@ mod tests {
         let detail = config_detail_value(&item);
         assert!(detail.contains("\"entries\""));
         assert!(detail.contains("\"/workspace\""));
+    }
+
+    #[test]
+    fn advanced_raw_value_disclosure_opens_editor() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            let settings = &mut app.ready.as_mut().expect("ready state").settings;
+            settings.open(SettingsSection::Configuration);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings advanced raw disclosure")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("config-0-raw")
+            .expect()
+            .to_be_hidden()?;
+        assert!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Edit raw value")
+                .count()?
+                >= 1,
+            "advanced configuration should expose raw value disclosures"
+        );
+
+        let root = window.root();
+        let mut down =
+            sui::PointerEvent::new(sui::PointerEventKind::Down, sui::Point::new(510.0, 210.0));
+        down.button = Some(sui::PointerButton::Primary);
+        root.dispatch_event(sui::Event::Pointer(down))?;
+        let mut up =
+            sui::PointerEvent::new(sui::PointerEventKind::Up, sui::Point::new(510.0, 210.0));
+        up.button = Some(sui::PointerButton::Primary);
+        root.dispatch_event(sui::Event::Pointer(up))?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Hide value")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("config-0-raw")
+            .expect()
+            .to_be_visible()?;
+
+        Ok(())
     }
 
     #[test]
