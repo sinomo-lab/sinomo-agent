@@ -3284,6 +3284,24 @@ impl LocalShardedMetadataBackend {
                         }
                         continue;
                     }
+                    if let Some(target_object) = self
+                        .shard_backend(&target_shard_id)?
+                        .get_object(&object.object_id)?
+                        && target_object != object
+                        && target_object.kind != DfsObjectKind::Tombstone
+                    {
+                        let target_object_shard_id = self.select_shard_id_for_path(
+                            &target_object.file_system_id,
+                            &target_object.path,
+                        )?;
+                        if target_object_shard_id == target_shard_id {
+                            self.write_object_shard_index(&target_object, &target_shard_id)?;
+                            report.indexed_objects = report.indexed_objects.saturating_add(1);
+                            report.skipped_stale_sources =
+                                report.skipped_stale_sources.saturating_add(1);
+                            continue;
+                        }
+                    }
                     let bundle =
                         self.object_shard_migration_bundle(&source_shard_id, &object.object_id)?;
                     self.install_object_shard_migration_bundle(
@@ -12729,6 +12747,95 @@ mod tests {
                 .map(|index| (&index.path, &index.shard_id)),
             Some((
                 &normalize_path(&object.path),
+                &DfsMetadataShardId::new("services")
+            ))
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_skips_stale_source_when_target_shard_already_has_object() {
+        let root = temp_root("sharded_backend_skips_stale_source_target_object");
+        let file_system = file_system();
+        let mut stale = object(version("version_1"));
+        stale.path = "/services/readme.md".to_string();
+        let mut current = stale.clone();
+        current.version = version("version_2");
+        current.content_hash = Some("blake3:current".to_string());
+        current.content_size_bytes = Some(7);
+        current.modified_at_unix_nanos = 2;
+        current.changed_at_unix_nanos = 2;
+        {
+            let mut root_only = LocalShardedMetadataBackend::new(
+                &root,
+                vec![shard_config("root", DfsMetadataShardAssignment::Root)],
+            )
+            .expect("root-only sharded backend");
+            root_only.put_file_system(&file_system).expect("filesystem");
+            root_only.put_object(&stale).expect("stale root object");
+        }
+
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        {
+            let services = backend
+                .shard_backend_mut(&DfsMetadataShardId::new("services"))
+                .expect("services shard");
+            services
+                .put_file_system(&file_system)
+                .expect("services filesystem");
+            services
+                .put_object(&current)
+                .expect("current services object");
+        }
+
+        let report = backend
+            .migrate_objects_to_configured_shards(&file_system.file_system_id, 16)
+            .expect("migration skips stale root copy");
+
+        assert_eq!(
+            report,
+            DfsMetadataShardMigrationReport {
+                file_system_id: file_system.file_system_id.clone(),
+                scanned_objects: 1,
+                indexed_objects: 1,
+                migrated_objects: 0,
+                skipped_stale_sources: 1,
+                reached_limit: false,
+            }
+        );
+        assert_eq!(
+            backend
+                .get_object(&current.object_id)
+                .expect("current object"),
+            Some(current.clone())
+        );
+        assert_eq!(
+            backend
+                .get_object_by_path(&file_system.file_system_id, &current.path)
+                .expect("current path"),
+            Some(current.clone())
+        );
+        assert_eq!(
+            backend
+                .read_object_shard_index(&current.object_id)
+                .expect("object index")
+                .as_ref()
+                .map(|index| (&index.path, &index.shard_id)),
+            Some((
+                &normalize_path(&current.path),
                 &DfsMetadataShardId::new("services")
             ))
         );
