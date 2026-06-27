@@ -2556,7 +2556,7 @@ fn transcript_message_display_text(message: &ChatMessage) -> String {
         } else {
             "The chat runtime could not reach a required cluster service."
         };
-        format!("Connection issue\n{summary}\nDetail: {detail}")
+        format!("Connection issue\n{summary}\nUse Connection settings for low-level detail.")
     } else {
         format!("Error\n{detail}")
     }
@@ -6104,14 +6104,16 @@ mod tests {
     }
 
     #[test]
-    fn transcript_error_display_keeps_low_level_detail_but_leads_with_recovery_context() {
+    fn transcript_error_display_defers_connection_detail_to_settings() {
         let connection = ChatMessage::system_error(
             "Error: chat unavailable: failed to parse command: open agent channel SIFS store failed: device authorization was denied",
         );
         let rendered = transcript_message_display_text(&connection);
         assert!(rendered.starts_with("Connection issue\n"));
         assert!(rendered.contains("Agent channel storage could not open through SIFS."));
-        assert!(rendered.contains("Detail: chat unavailable"));
+        assert!(rendered.contains("Use Connection settings for low-level detail."));
+        assert!(!rendered.contains("failed to parse command"));
+        assert!(!rendered.contains("device authorization was denied"));
 
         let provider = ChatMessage::system_error("Error: provider unavailable");
         assert_eq!(
