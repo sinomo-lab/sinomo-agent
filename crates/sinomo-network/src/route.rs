@@ -659,6 +659,25 @@ impl ClusterDeliveryRoutingTable {
         failed_edges: &ClusterDeliveryFailedEdges,
         visited: &[NodeId],
     ) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
+        self.route_plan_with_incomplete_policy(target_node_id, failed_edges, visited, true)
+    }
+
+    fn complete_route_plan(
+        &self,
+        target_node_id: &NodeId,
+        failed_edges: &ClusterDeliveryFailedEdges,
+        visited: &[NodeId],
+    ) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
+        self.route_plan_with_incomplete_policy(target_node_id, failed_edges, visited, false)
+    }
+
+    fn route_plan_with_incomplete_policy(
+        &self,
+        target_node_id: &NodeId,
+        failed_edges: &ClusterDeliveryFailedEdges,
+        visited: &[NodeId],
+        allow_incomplete: bool,
+    ) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
         let Some(candidates) = self.routes.get(target_node_id) else {
             return Ok(None);
         };
@@ -666,6 +685,7 @@ impl ClusterDeliveryRoutingTable {
             candidates,
             failed_edges,
             visited,
+            allow_incomplete,
         ))
     }
 }
@@ -702,6 +722,7 @@ fn cluster_delivery_route_plan(
             .unwrap_or_default(),
         failed_edges,
         visited,
+        true,
     )
 }
 
@@ -819,6 +840,7 @@ fn cluster_delivery_select_route_candidate(
     candidates: &[ClusterDeliveryRouteCandidate],
     failed_edges: &ClusterDeliveryFailedEdges,
     visited: &[NodeId],
+    allow_incomplete: bool,
 ) -> Option<ClusterDeliveryRoutePlan> {
     candidates
         .iter()
@@ -827,7 +849,8 @@ fn cluster_delivery_select_route_candidate(
                 && cluster_delivery_route_candidate_is_compatible(candidate, failed_edges, visited)
         })
         .chain(candidates.iter().filter(|candidate| {
-            !candidate.complete
+            allow_incomplete
+                && !candidate.complete
                 && cluster_delivery_route_candidate_is_compatible(candidate, failed_edges, visited)
         }))
         .map(|candidate| candidate.plan.clone())
@@ -870,6 +893,29 @@ async fn cluster_delivery_route_plan_async(
         target_node_id,
         &failed_edges,
         &visited,
+        true,
+    )
+    .await
+}
+
+async fn cluster_delivery_complete_route_plan_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+    failed_edges: ClusterDeliveryFailedEdges,
+    visited: Vec<NodeId>,
+) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
+    cluster_delivery_route_plan_from_routing_table_async(
+        runtime,
+        paths,
+        state,
+        local_node_id,
+        target_node_id,
+        &failed_edges,
+        &visited,
+        false,
     )
     .await
 }
@@ -882,6 +928,7 @@ async fn cluster_delivery_route_plan_from_routing_table_async(
     target_node_id: &NodeId,
     failed_edges: &ClusterDeliveryFailedEdges,
     visited: &[NodeId],
+    allow_incomplete: bool,
 ) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
     if let Some(plan) = cluster_delivery_route_plan_from_cached_routing_table(
         paths,
@@ -890,6 +937,7 @@ async fn cluster_delivery_route_plan_from_routing_table_async(
         target_node_id,
         failed_edges,
         visited,
+        allow_incomplete,
         OffsetDateTime::now_utc(),
     ) {
         return plan;
@@ -907,7 +955,11 @@ async fn cluster_delivery_route_plan_from_routing_table_async(
         .spawn_blocking(move || {
             let before_mark = cluster_delivery_routing_table_cache_mark(&paths);
             let table = cluster_delivery_build_routing_table(&paths, &state, &local_node_id)?;
-            let plan = table.route_plan(&target_node_id, &failed_edges, &visited)?;
+            let plan = if allow_incomplete {
+                table.route_plan(&target_node_id, &failed_edges, &visited)?
+            } else {
+                table.complete_route_plan(&target_node_id, &failed_edges, &visited)?
+            };
             let after_mark = cluster_delivery_routing_table_cache_mark(&paths);
             if before_mark == after_mark {
                 store_cluster_delivery_routing_table_cache_entry(&paths, after_mark, table);
@@ -928,6 +980,7 @@ fn cluster_delivery_route_plan_from_cached_routing_table(
     target_node_id: &NodeId,
     failed_edges: &ClusterDeliveryFailedEdges,
     visited: &[NodeId],
+    allow_incomplete: bool,
     now: OffsetDateTime,
 ) -> Option<Result<Option<ClusterDeliveryRoutePlan>, NetworkError>> {
     let mark = cluster_delivery_routing_table_cache_mark(paths)?;
@@ -948,11 +1001,15 @@ fn cluster_delivery_route_plan_from_cached_routing_table(
     }
     let entry = cache.get_mut(&paths.root)?;
     entry.last_used = cluster_delivery_routing_table_cache_tick();
-    Some(
+    Some(if allow_incomplete {
         entry
             .table
-            .route_plan(target_node_id, failed_edges, visited),
-    )
+            .route_plan(target_node_id, failed_edges, visited)
+    } else {
+        entry
+            .table
+            .complete_route_plan(target_node_id, failed_edges, visited)
+    })
 }
 
 fn cluster_delivery_build_routing_table(
@@ -3008,7 +3065,7 @@ async fn cluster_relay_forward_plan(
     envelope: &RelayEnvelope,
     failed_edges: ClusterDeliveryFailedEdges,
 ) -> Result<Option<ClusterDeliveryRoutePlan>, NetworkError> {
-    cluster_delivery_route_plan_async(
+    cluster_delivery_complete_route_plan_async(
         runtime,
         paths,
         state,
@@ -4019,6 +4076,65 @@ mod tests {
 
         assert_eq!(plan.next_hop, target);
         assert_eq!(plan.endpoints[0].address, "10.90.7.10:21353");
+    }
+
+    #[tokio::test]
+    async fn relay_forward_plan_rejects_incomplete_bridge_route() {
+        let (_root, paths) = test_paths("sinomo-network-relay-complete-routes-only");
+        let cluster_id = cid("cluster_relay_complete_routes_only");
+        let origin = nid("node_relay_complete_routes_origin");
+        let local = nid("node_relay_complete_routes_local");
+        let bridge = nid("node_relay_complete_routes_bridge");
+        let target = nid("node_relay_complete_routes_target");
+        let bridge_endpoint = endpoint(&bridge, "10.90.8.2:21353", 0);
+        let mut state = test_state(cluster_id.clone(), local.clone());
+        add_member(&mut state, origin.clone(), "origin", Vec::new());
+        add_member(
+            &mut state,
+            bridge.clone(),
+            "bridge",
+            vec![bridge_endpoint.clone()],
+        );
+        add_member(&mut state, target.clone(), "target", Vec::new());
+        mark_local_endpoints_healthy(&paths, &state, std::slice::from_ref(&bridge_endpoint));
+        let runtime = tokio::runtime::Handle::current();
+
+        let origin_plan = cluster_delivery_route_plan_async(
+            &runtime,
+            &paths,
+            &state,
+            &local,
+            &target,
+            ClusterDeliveryFailedEdges::default(),
+            Vec::new(),
+        )
+        .await
+        .expect("origin route table plan")
+        .expect("origin can still use incomplete fallback");
+        assert_eq!(origin_plan.next_hop, bridge);
+
+        let mut envelope = RelayEnvelope::new(
+            cluster_id,
+            target,
+            ObjectRpcRequest::encode_body("/test/incomplete-relay", "test", &())
+                .expect("inner relay request"),
+        );
+        envelope.visited.push(origin);
+        let relay_plan = cluster_relay_forward_plan(
+            &runtime,
+            &paths,
+            &state,
+            &local,
+            &envelope,
+            ClusterDeliveryFailedEdges::default(),
+        )
+        .await
+        .expect("relay route table plan");
+
+        assert!(
+            relay_plan.is_none(),
+            "relay forwarding should not use incomplete bridge-only routes"
+        );
     }
 
     #[test]
