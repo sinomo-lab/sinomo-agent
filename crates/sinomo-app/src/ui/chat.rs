@@ -2383,26 +2383,15 @@ fn open_agent_channel_store(
             .open_browser()
             .map(SifsAgentChannelStore::from_browser)
             .map_err(|detail| std::io::Error::new(std::io::ErrorKind::Other, detail)),
-        None => open_local_agent_channel_store_for_tests(data_dir),
+        None => open_local_agent_channel_store(data_dir),
     }
 }
 
-#[cfg(test)]
-fn open_local_agent_channel_store_for_tests(
+fn open_local_agent_channel_store(
     data_dir: &SinomoDataDir,
 ) -> std::io::Result<SifsAgentChannelStore> {
     SifsAgentChannelStore::open(data_dir)
         .map_err(|detail| std::io::Error::new(std::io::ErrorKind::Other, detail))
-}
-
-#[cfg(not(test))]
-fn open_local_agent_channel_store_for_tests(
-    _data_dir: &SinomoDataDir,
-) -> std::io::Result<SifsAgentChannelStore> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotConnected,
-        "agent channel persistence requires a daemon connection",
-    ))
 }
 
 fn parse_channel_id(id: &str) -> std::io::Result<SessionId> {
@@ -3256,9 +3245,10 @@ fn channel_agents_editor(
             } else {
                 format!("{} ({})", participant.agent_name, participant.agent_key)
             };
+            let remove_label = label.clone();
             let remove = {
                 let s = shared.clone();
-                IconButton::new(IconGlyph::Trash, format!("Remove {label}"))
+                IconButton::new(IconGlyph::Trash, format!("Remove {remove_label}"))
                     .size(26.0)
                     .icon_size(14.0)
                     .theme_when(clone_reader(reader))
@@ -3269,19 +3259,7 @@ fn channel_agents_editor(
                         ctx.request_paint();
                     })
             };
-            let text = {
-                let s = shared.clone();
-                Label::new(label).color_when(move || palette(&s).text)
-            };
-            list = list.with_child(
-                SizedBox::new().height(28.0).with_child(
-                    Flex::horizontal()
-                        .gap(6.0)
-                        .align_items(Alignment::Center)
-                        .with_item(text, FlexItem::flex(1.0).min_width(0.0))
-                        .with_item(remove, FlexItem::fixed(26.0)),
-                ),
-            );
+            list = list.with_child(ChannelAgentRow::new(shared.clone(), label, remove));
         }
     }
 
@@ -3332,6 +3310,85 @@ fn channel_agents_editor(
                 .alignment(Alignment::Start)
                 .with_child(add),
         )
+}
+
+struct ChannelAgentRow {
+    shared: Shared,
+    label: String,
+    remove: WidgetPod,
+}
+
+impl ChannelAgentRow {
+    const HEIGHT: f32 = 28.0;
+    const REMOVE_SIZE: f32 = 26.0;
+    const GAP: f32 = 8.0;
+
+    fn new<W>(shared: Shared, label: String, remove: W) -> Self
+    where
+        W: Widget + 'static,
+    {
+        Self {
+            shared,
+            label,
+            remove: WidgetPod::new(remove),
+        }
+    }
+}
+
+impl Widget for ChannelAgentRow {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.remove.measure(
+            ctx,
+            Constraints::tight(Size::new(Self::REMOVE_SIZE, Self::REMOVE_SIZE)),
+        );
+        let width = if constraints.max.width.is_finite() {
+            constraints.max.width
+        } else {
+            280.0
+        };
+        constraints.clamp(Size::new(width, Self::HEIGHT))
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let y = bounds.y() + (bounds.height() - Self::REMOVE_SIZE) * 0.5;
+        self.remove.arrange(
+            ctx,
+            Rect::new(
+                bounds.max_x() - Self::REMOVE_SIZE,
+                y,
+                Self::REMOVE_SIZE,
+                Self::REMOVE_SIZE,
+            ),
+        );
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let theme = self.shared.theme();
+        let pal = palette(&self.shared);
+        let label_rect = Rect::new(
+            ctx.bounds().x(),
+            ctx.bounds().y(),
+            (ctx.bounds().width() - Self::REMOVE_SIZE - Self::GAP).max(0.0),
+            ctx.bounds().height(),
+        );
+        let style = pal.text_style(&theme, 12.5, FontWeight::NORMAL, pal.text);
+        ctx.push_clip_rect(label_rect);
+        widgets::draw_text_in(ctx, label_rect, &self.label, style);
+        ctx.pop_clip();
+        self.remove.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.remove.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.remove);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.remove);
+    }
 }
 
 struct SessionEditPopup {
@@ -6106,6 +6163,56 @@ mod tests {
             .with_name("Done")
             .click()?;
         assert!(shared.chat().session_edit_id.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_channel_edit_dialog_shows_agent_list() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let data_dir = backend.data_dir.clone();
+        let shared = Shared::new(AppState::ready(backend));
+        let channel_id = SessionId::generate();
+        let mut channel = AgentChannel::new_channel(channel_id.clone(), "Team channel");
+        channel.ensure_participant("main-agent", "main-agent");
+        channel.ensure_participant("coding-agent", "coding-agent");
+        SifsAgentChannelStore::open(&data_dir)
+            .expect("open channel store")
+            .save_channel(&channel)
+            .expect("save channel");
+        let session_id = channel_id.to_string();
+        {
+            let mut chat = shared.chat_mut();
+            chat.sessions = vec![SessionRef {
+                id: session_id.clone(),
+                title: "Team channel".to_string(),
+                kind: ConversationKind::Channel,
+                updated_unix: 1,
+                participant_count: 2,
+            }];
+            chat.session_id = session_id.clone();
+            chat.models_loading = false;
+        }
+
+        let runtime = crate::build_runtime(shared.clone())?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Edit Team channel")
+            .click()?;
+        app.run_until_idle()?;
+        let snapshot = window.snapshot()?;
+
+        for label in ["Remove main-agent", "Remove coding-agent"] {
+            assert!(
+                snapshot.accessibility.nodes.iter().any(|node| {
+                    node.role == SemanticsRole::Button && node.name.as_deref() == Some(label)
+                }),
+                "{label} control should be visible in the channel edit dialog"
+            );
+        }
 
         Ok(())
     }

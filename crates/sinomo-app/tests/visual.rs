@@ -1113,6 +1113,70 @@ fn capture_chat_composed() {
         app.run_until_idle().expect("settle edit dialog");
         capture("chat-composed-edit-dialog", &window);
     }
+
+    // Channel edit popup: seed a real SIFS-backed channel so the dialog shows the editable agent
+    // list, not just the empty placeholder.
+    {
+        use sinomo_agent::{AgentChannel, AgentChannelStore};
+        use sinomo_cli::app_api::SifsAgentChannelStore;
+        use sinomo_runtime::events::SessionId;
+
+        let shared = boot(Tab::Sinomo);
+        let data_dir = shared.borrow().data_dir.clone();
+        let channel_id = SessionId::generate();
+        let mut channel = AgentChannel::new_channel(channel_id.clone(), "Release triage");
+        channel.ensure_participant("main-agent", "main-agent");
+        channel.ensure_participant("coding-agent", "coding-agent");
+        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        store.save_channel(&channel).expect("save visual channel");
+        let stored = SifsAgentChannelStore::open(&data_dir)
+            .expect("reopen channel store")
+            .load_channel(&channel_id)
+            .expect("load visual channel")
+            .expect("visual channel persisted");
+        assert_eq!(stored.enabled_participants_in_order().len(), 2);
+        {
+            let mut chat = shared.chat_mut();
+            let session_id = channel_id.to_string();
+            chat.sessions = vec![SessionRef {
+                id: session_id.clone(),
+                title: "Release triage".to_string(),
+                kind: ConversationKind::Channel,
+                updated_unix: 1,
+                participant_count: 2,
+            }];
+            chat.session_id = session_id;
+            chat.models_loading = false;
+        }
+        let runtime = build_runtime(shared).expect("build runtime");
+        let app = TestApp::from_runtime(runtime).expect("headless test app");
+        let window = app.main_window().expect("main window");
+        app.run_until_idle().expect("settle channel-edit layout");
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Edit Release triage")
+            .click()
+            .expect("open channel edit dialog");
+        app.run_until_idle().expect("settle channel edit dialog");
+        let snapshot = window.snapshot().expect("channel edit snapshot");
+        let button_names = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .filter(|node| node.role == SemanticsRole::Button)
+            .filter_map(|node| node.name.as_deref())
+            .collect::<Vec<_>>()
+            .join(", ");
+        for label in ["Remove main-agent", "Remove coding-agent"] {
+            assert!(
+                snapshot.accessibility.nodes.iter().any(|node| {
+                    node.role == SemanticsRole::Button && node.name.as_deref() == Some(label)
+                }),
+                "{label} control should be visible in the channel edit dialog; buttons: {button_names}"
+            );
+        }
+        capture("chat-composed-channel-edit-dialog", &window);
+    }
 }
 
 /// Deterministic capture for the runtime telemetry chrome: the context budget bar, model usage,
