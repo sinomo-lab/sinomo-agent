@@ -467,6 +467,21 @@ fn seed_chat_providers(shared: &sinomo_app::state::Shared) {
     chat.models_loading = false;
 }
 
+fn seed_healthy_chat_runtime(shared: &sinomo_app::state::Shared) {
+    use sinomo_app::backend::chat_engine::RuntimeInfo;
+
+    let mut chat = shared.chat_mut();
+    chat.info = RuntimeInfo {
+        agent: "main-agent".to_string(),
+        provider: "openai".to_string(),
+        model: "gpt-4o".to_string(),
+        account: Some("default".to_string()),
+        effort: None,
+    };
+    chat.notice = None;
+    chat.activity.clear();
+}
+
 fn open_chat_provider_select(window: &sui_testing::TestWindow) -> sui::Rect {
     use sui::SemanticsRole;
 
@@ -1345,6 +1360,8 @@ fn capture_final_polish() {
             let shared = boot(Tab::Sinomo);
             shared.borrow_mut().theme_mode = mode;
             seed_conversation(&shared);
+            seed_chat_providers(&shared);
+            seed_healthy_chat_runtime(&shared);
             render(&format!("sinomo-{suffix}"), shared);
         }
 
@@ -1394,6 +1411,7 @@ fn capture_final_polish() {
             shared.borrow_mut().theme_mode = mode;
             seed_conversation(&shared);
             seed_chat_providers(&shared);
+            seed_healthy_chat_runtime(&shared);
             let runtime = build_runtime(shared).expect("build runtime");
             let app = TestApp::from_runtime(runtime).expect("headless test app");
             let window = app.main_window().expect("main window");
