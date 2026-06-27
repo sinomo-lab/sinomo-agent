@@ -137,6 +137,7 @@ pub struct SettingsState {
     node_detail_expanded: bool,
     advanced_detail_expanded: Vec<String>,
     provider_detail_expanded: Vec<String>,
+    provider_storage_detail_expanded: bool,
     provider_remove_confirming: Option<(String, String)>,
 }
 
@@ -244,6 +245,7 @@ impl SettingsState {
             node_detail_expanded: false,
             advanced_detail_expanded: Vec::new(),
             provider_detail_expanded: Vec::new(),
+            provider_storage_detail_expanded: false,
             provider_remove_confirming: None,
         }
     }
@@ -335,6 +337,14 @@ impl SettingsState {
         } else {
             self.provider_detail_expanded.push(key);
         }
+    }
+
+    fn provider_storage_detail_expanded(&self) -> bool {
+        self.provider_storage_detail_expanded
+    }
+
+    fn toggle_provider_storage_detail(&mut self) {
+        self.provider_storage_detail_expanded = !self.provider_storage_detail_expanded;
     }
 
     fn confirm_provider_remove(&mut self, index: usize) {
@@ -1993,6 +2003,10 @@ fn provider_section_signature(shared: &Shared) -> String {
         format!("action-error:{:?}", settings.provider_action_error),
         format!("remove:{:?}", settings.provider_remove_confirming),
         format!("expanded:{:?}", settings.provider_detail_expanded),
+        format!(
+            "storage-expanded:{}",
+            settings.provider_storage_detail_expanded
+        ),
     ];
     parts.extend(settings.provider_forms.iter().map(|form| {
         format!(
@@ -2017,9 +2031,57 @@ fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
             })
     };
     let body = if shared.settings().provider_forms.is_empty() {
-        FieldGroup::new()
+        let storage_expanded = shared.settings().provider_storage_detail_expanded();
+        let storage_button = {
+            let s = shared.clone();
+            sui::Button::new(if storage_expanded {
+                "Hide storage detail"
+            } else {
+                "Show storage detail"
+            })
+            .icon(if storage_expanded {
+                sui::IconGlyph::ChevronUp
+            } else {
+                sui::IconGlyph::ChevronDown
+            })
+            .theme_when(secondary_button_theme(reader))
+            .on_press(move || s.settings_mut().toggle_provider_storage_detail())
+        };
+        let mut group = FieldGroup::new()
             .spacing(8.0)
-            .with_child(muted_label(shared, "No provider accounts configured"))
+            .with_child(value_row(
+                shared,
+                reader,
+                "Status",
+                "No provider accounts configured",
+            ))
+            .with_child(value_row(
+                shared,
+                reader,
+                "Chat",
+                "Add a provider account to enable model responses in the Sinomo tab.",
+            ))
+            .with_child(value_row(
+                shared,
+                reader,
+                "Authentication",
+                "Use an API key or device login, depending on the provider.",
+            ))
+            .with_child(
+                FormRow::new("Storage", storage_button)
+                    .inline()
+                    .auto_control_width()
+                    .theme_when(clone_reader(reader)),
+            );
+        if storage_expanded {
+            group = group.with_child(value_row(
+                shared,
+                reader,
+                "Config key",
+                "Saved in lm.providers and reflected in the chat provider selector.",
+            ));
+        }
+        group
     } else {
         FieldGroup::new().spacing(8.0).with_child(value_row(
             shared,
@@ -2030,6 +2092,9 @@ fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
     };
     stack = stack.with_child(
         FormSection::new("Providers", body)
+            .description(
+                "Configure model accounts for chat, agent turns, and provider-specific defaults.",
+            )
             .header_action(add)
             .theme_when(clone_reader(reader)),
     );
@@ -2188,7 +2253,11 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         .get(selected_index)
         .map(|provider| format!("Add {}", provider_display_name(provider)))
         .unwrap_or_else(|| "Add provider".to_string());
-    FormSection::new(title, body).theme_when(clone_reader(reader))
+    FormSection::new(title, body)
+        .description(
+            "Add an account, then adjust low-level defaults from the provider card when needed.",
+        )
+        .theme_when(clone_reader(reader))
 }
 
 fn section_configuration(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -3520,6 +3589,68 @@ mod tests {
             .with_name("Remove account")
             .expect()
             .to_be_visible()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn provider_empty_state_explains_chat_setup_and_opens_add_form() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            let settings = &mut app.ready.as_mut().expect("ready state").settings;
+            settings.open(SettingsSection::Providers);
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings providers empty")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        assert!(
+            window
+                .get_by_text("Add a provider account to enable model responses in the Sinomo tab.")
+                .count()?
+                >= 1,
+            "empty provider state should explain the user-facing outcome"
+        );
+        assert!(
+            window
+                .get_by_text("Saved in lm.providers and reflected in the chat provider selector.")
+                .count()?
+                == 0,
+            "low-level storage detail should stay collapsed by default"
+        );
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Show storage detail")
+            .click()?;
+        assert!(
+            window
+                .get_by_text("Saved in lm.providers and reflected in the chat provider selector.")
+                .count()?
+                >= 1,
+            "storage detail should expose the cluster config key when requested"
+        );
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Add provider")
+            .click()?;
+
+        assert!(shared.settings().provider_add_open);
+        assert!(
+            window.get_by_text("Add Anthropic").count()? >= 1,
+            "Add provider should switch into the add form"
+        );
 
         Ok(())
     }
