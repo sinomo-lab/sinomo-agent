@@ -8,11 +8,13 @@
 
 use crate::endpoint_selector::cluster_endpoint_can_carry_main_daemon_rpc;
 use crate::file_mark::{ClusterFileMark, cluster_file_mark};
+use crate::kv_read_model::read_cluster_endpoints_from_kv;
 use crate::prelude::*;
 use crate::{
     ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityState, ClusterPaths,
     DaemonControlRequest, DaemonRpcTimeouts, NetworkError, ObjectRpcRequest, ObjectRpcResponse,
 };
+use sinomo_node::DAEMON_MAIN_RUN_CAPABILITY;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
@@ -111,6 +113,10 @@ impl RouteNodeSet {
         };
         self.nodes.remove(index);
         true
+    }
+
+    fn contains(&self, node_id: &NodeId) -> bool {
+        self.position(node_id).is_ok()
     }
 
     fn min_by_distance(
@@ -1063,12 +1069,17 @@ fn cluster_delivery_route_graph(
 ) -> Result<ClusterDeliveryRouteGraph, NetworkError> {
     let local_connectivity = ClusterConnectivityGraph::try_read_for_local(paths, state)?;
     let local_private_prefixes = cluster_delivery_local_private_prefixes(state, local_node_id)?;
+    let kv_main_endpoints = cluster_delivery_kv_main_daemon_endpoints(paths, state)?;
     let mut graph = ClusterDeliveryRouteGraph::default();
     for member in &state.members {
         if !member.state.is_authorized() {
             continue;
         }
-        for endpoint in &member.endpoints {
+        for endpoint in member.endpoints.iter().chain(
+            kv_main_endpoints
+                .iter()
+                .filter(|endpoint| endpoint.node_id == member.node_id),
+        ) {
             if !cluster_delivery_local_endpoint_is_usable(local_node_id, endpoint) {
                 continue;
             }
@@ -1103,6 +1114,49 @@ fn cluster_delivery_route_graph(
         graph.push_edge_clone(&record.source_node_id, &record.target_node_id, None, cost)?;
     }
     Ok(graph)
+}
+
+fn cluster_delivery_kv_main_daemon_endpoints(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+    let mut main_daemon_node_ids = RouteNodeSet::default();
+    for member in state.members.iter().filter(|member| {
+        member.state.is_authorized() && cluster_delivery_member_runs_main_daemon(member)
+    }) {
+        main_daemon_node_ids
+            .try_insert_clone(&member.node_id, "collect route main daemon nodes")?;
+    }
+    let mut endpoints = Vec::new();
+    let kv_endpoints = match read_cluster_endpoints_from_kv(paths) {
+        Ok(kv_endpoints) => kv_endpoints,
+        Err(error @ NetworkError::ResourceExhausted { .. }) => return Err(error),
+        Err(_) => Vec::new(),
+    };
+    for endpoint in kv_endpoints {
+        if endpoint.privacy == ClusterEndpointPrivacy::LocalOnly
+            || !main_daemon_node_ids.contains(&endpoint.node_id)
+            || !cluster_endpoint_can_carry_main_daemon_rpc(&endpoint)
+            || !matches!(
+                endpoint.transport,
+                ClusterTransportKind::LanTcp
+                    | ClusterTransportKind::Loopback
+                    | ClusterTransportKind::Iroh
+            )
+        {
+            continue;
+        }
+        crate::object::try_reserve_vec(&mut endpoints, 1, "collect route KV endpoints")?;
+        endpoints.push(endpoint);
+    }
+    Ok(endpoints)
+}
+
+fn cluster_delivery_member_runs_main_daemon(member: &ClusterMemberRecord) -> bool {
+    member
+        .capabilities
+        .iter()
+        .any(|capability| capability.as_str() == DAEMON_MAIN_RUN_CAPABILITY)
 }
 
 fn cluster_delivery_local_endpoint_is_usable(
@@ -3136,6 +3190,67 @@ mod tests {
 
         assert_eq!(plan.next_hop, target);
         assert_eq!(plan.endpoints[0].address, fast.address);
+    }
+
+    #[test]
+    fn delivery_plan_uses_kv_main_endpoint_when_state_has_only_shadow_endpoint() {
+        let (_root, paths) = test_paths("sinomo-network-delivery-plan-kv-main-endpoint");
+        let cluster_id = cid("cluster_delivery_plan_kv_main_endpoint");
+        let local = nid("node_delivery_plan_kv_main_endpoint_local");
+        let target = nid("node_delivery_plan_kv_main_endpoint_target");
+        let mut state = test_state(cluster_id, local.clone());
+        let shadow = sinomo_node::shadow_daemon_node_id(&target);
+        let mut folded_shadow_endpoint = endpoint(&shadow, "192.0.2.54:21354", 0);
+        folded_shadow_endpoint.node_id = target.clone();
+        let direct_main_endpoint = endpoint(&target, "198.51.100.54:21353", 0);
+        add_member(
+            &mut state,
+            target.clone(),
+            "target",
+            vec![folded_shadow_endpoint.clone()],
+        );
+        mark_local_endpoints_healthy(&paths, &state, std::slice::from_ref(&direct_main_endpoint));
+
+        let mut store = InProcessKvStore::new();
+        match KvOp::put_serde(
+            crate::keyspace::cluster_endpoint_key(&target, &direct_main_endpoint),
+            &direct_main_endpoint,
+            None,
+        )
+        .expect("endpoint put op")
+        {
+            KvOp::Put {
+                key,
+                value,
+                lease_id,
+            } => {
+                store.put(key, value, lease_id).expect("seed endpoint");
+            }
+            _ => unreachable!("put_serde creates put op"),
+        }
+        crate::kv_local_store::write_cluster_kv_snapshot(
+            &paths,
+            &store.snapshot().expect("snapshot"),
+        )
+        .expect("write snapshot");
+
+        let plan = cluster_delivery_route_plan(
+            &paths,
+            &state,
+            &local,
+            &target,
+            &ClusterDeliveryFailedEdges::default(),
+            &[],
+        )
+        .expect("route plan");
+
+        assert_eq!(plan.next_hop, target);
+        assert_eq!(plan.endpoints[0].address, direct_main_endpoint.address);
+        assert!(
+            plan.endpoints
+                .iter()
+                .all(|endpoint| endpoint.endpoint_id != folded_shadow_endpoint.endpoint_id)
+        );
     }
 
     #[test]
