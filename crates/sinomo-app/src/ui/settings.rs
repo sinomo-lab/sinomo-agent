@@ -131,6 +131,7 @@ pub struct SettingsState {
     pub provider_add_model: String,
     pub provider_add_base_url: String,
     pub provider_add_error: Option<String>,
+    connection_detail_expanded: Vec<Tab>,
 }
 
 /// A text-editable field of a provider in the Providers section.
@@ -232,6 +233,7 @@ impl SettingsState {
             provider_add_model: provider_default_model(CONFIGURABLE_PROVIDERS[0]),
             provider_add_base_url: String::new(),
             provider_add_error: None,
+            connection_detail_expanded: Vec::new(),
         }
     }
 
@@ -246,6 +248,22 @@ impl SettingsState {
         self.provider_add_error = None;
         if self.provider_add_model.trim().is_empty() {
             self.provider_add_model = provider_default_model(self.provider_add_provider());
+        }
+    }
+
+    fn connection_detail_expanded(&self, tab: Tab) -> bool {
+        self.connection_detail_expanded.contains(&tab)
+    }
+
+    fn toggle_connection_detail(&mut self, tab: Tab) {
+        if let Some(index) = self
+            .connection_detail_expanded
+            .iter()
+            .position(|expanded| *expanded == tab)
+        {
+            self.connection_detail_expanded.remove(index);
+        } else {
+            self.connection_detail_expanded.push(tab);
         }
     }
 
@@ -706,11 +724,21 @@ fn connection_issue_count(shared: &Shared) -> usize {
 }
 
 fn connection_issue_key(shared: &Shared) -> String {
-    connection_issues(shared)
+    let issue_key = connection_issues(shared)
         .into_iter()
         .map(|issue| format!("{}:{}", issue.title, issue.detail))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    let detail_key = {
+        let settings = shared.settings();
+        settings
+            .connection_detail_expanded
+            .iter()
+            .map(|tab| tab.title())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    format!("{issue_key}\nexpanded:{detail_key}")
 }
 
 fn connection_issue_summary(issue: &ConnectionIssue) -> &'static str {
@@ -987,6 +1015,7 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
     let detail = issue.detail.clone();
     let tab = issue.tab;
     let action = issue.action;
+    let expanded = shared.settings().connection_detail_expanded(tab);
     let status = {
         let s = shared.clone();
         Label::new("Needs attention")
@@ -1025,23 +1054,44 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
             .theme_when(clone_reader(reader))
             .on_press(move || open_tab(&s, tab))
     };
+    let detail_button = {
+        let s = shared.clone();
+        sui::Button::new(if expanded {
+            "Hide detail"
+        } else {
+            "Show detail"
+        })
+        .icon(if expanded {
+            sui::IconGlyph::ChevronUp
+        } else {
+            sui::IconGlyph::ChevronDown
+        })
+        .theme_when(clone_reader(reader))
+        .on_press(move || s.settings_mut().toggle_connection_detail(tab))
+    };
     let header = Stack::vertical()
         .spacing(3.0)
         .alignment(Alignment::Stretch)
         .with_child(status)
         .with_child(summary);
+    let controls = Stack::horizontal()
+        .spacing(8.0)
+        .alignment(Alignment::Start)
+        .with_child(button)
+        .with_child(detail_button);
     let action_row = Stack::vertical()
         .spacing(5.0)
         .alignment(Alignment::Start)
-        .with_child(button)
+        .with_child(controls)
         .with_child(recovery);
-    let stack = Stack::vertical()
+    let mut stack = Stack::vertical()
         .spacing(8.0)
         .alignment(Alignment::Stretch)
         .with_child(header)
-        .with_child(detail_label)
-        .with_child(detail_field)
         .with_child(action_row);
+    if expanded {
+        stack = stack.with_child(detail_label).with_child(detail_field);
+    }
 
     FormRow::new(issue.title, stack)
         .stacked()
@@ -2656,6 +2706,72 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Sinomo);
+
+        Ok(())
+    }
+
+    #[test]
+    fn connection_attention_detail_expands_on_request() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            app.ready
+                .as_mut()
+                .expect("ready state")
+                .settings
+                .open(SettingsSection::Connection);
+        }
+        shared.chat_mut().notice =
+            Some("chat list failed: device authorization was denied".to_string());
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Settings attention disclosure")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Show detail")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("connection-chat-detail")
+            .expect()
+            .to_be_hidden()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Show detail")
+            .click()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Hide detail")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("connection-chat-detail")
+            .expect()
+            .to_have_value("chat list failed: device authorization was denied")?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Hide detail")
+            .click()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("connection-chat-detail")
+            .expect()
+            .to_be_hidden()?;
 
         Ok(())
     }
