@@ -36,9 +36,9 @@ use crate::backend::config::{
     CONFIGURABLE_PROVIDERS, ConfigEditKind, ConfigItem, ProviderForm, REASONING_EFFORT_OPTIONS,
     add_provider_account, cluster_provider_summaries, cycle_provider_reasoning_effort,
     provider_default_model, provider_display_name, provider_forms, reasoning_effort_index,
-    resolve_items, run_provider_device_login, set_bool, set_provider_api_key,
-    set_provider_base_url, set_provider_effort, set_provider_enabled, set_provider_model,
-    set_value,
+    remove_provider_account, resolve_items, run_provider_device_login, set_bool,
+    set_provider_api_key, set_provider_base_url, set_provider_effort, set_provider_enabled,
+    set_provider_model, set_value,
 };
 use crate::rendering::AppRenderMode;
 use crate::state::{Shared, Tab};
@@ -132,8 +132,10 @@ pub struct SettingsState {
     pub provider_add_model: String,
     pub provider_add_base_url: String,
     pub provider_add_error: Option<String>,
+    pub provider_action_error: Option<String>,
     connection_detail_expanded: Vec<Tab>,
     advanced_detail_expanded: Vec<String>,
+    provider_remove_confirming: Option<(String, String)>,
 }
 
 /// A text-editable field of a provider in the Providers section.
@@ -235,8 +237,10 @@ impl SettingsState {
             provider_add_model: provider_default_model(CONFIGURABLE_PROVIDERS[0]),
             provider_add_base_url: String::new(),
             provider_add_error: None,
+            provider_action_error: None,
             connection_detail_expanded: Vec::new(),
             advanced_detail_expanded: Vec::new(),
+            provider_remove_confirming: None,
         }
     }
 
@@ -249,6 +253,8 @@ impl SettingsState {
         self.selected = Some(SettingsSection::Providers);
         self.provider_add_open = true;
         self.provider_add_error = None;
+        self.provider_action_error = None;
+        self.provider_remove_confirming = None;
         if self.provider_add_model.trim().is_empty() {
             self.provider_add_model = provider_default_model(self.provider_add_provider());
         }
@@ -291,6 +297,25 @@ impl SettingsState {
     fn close_provider_add(&mut self) {
         self.provider_add_open = false;
         self.provider_add_error = None;
+    }
+
+    fn provider_remove_confirming(&self, provider: &str, account: &str) -> bool {
+        self.provider_remove_confirming
+            .as_ref()
+            .is_some_and(|(p, a)| p == provider && a == account)
+    }
+
+    fn confirm_provider_remove(&mut self, index: usize) {
+        let Some(form) = self.provider_forms.get(index) else {
+            return;
+        };
+        self.provider_action_error = None;
+        self.provider_remove_confirming = Some((form.provider.clone(), form.account.clone()));
+    }
+
+    fn cancel_provider_remove(&mut self) {
+        self.provider_remove_confirming = None;
+        self.provider_action_error = None;
     }
 
     fn provider_add_provider(&self) -> &'static str {
@@ -349,6 +374,8 @@ impl SettingsState {
             Ok(()) => {
                 let account = sinomo_lm::normalize_provider_account_name(Some(&account));
                 self.close_provider_add();
+                self.provider_action_error = None;
+                self.provider_remove_confirming = None;
                 self.provider_add_account = "default".to_string();
                 self.provider_add_api_key.clear();
                 self.provider_add_base_url.clear();
@@ -358,6 +385,7 @@ impl SettingsState {
             }
             Err(error) => {
                 self.provider_add_error = Some(error.clone());
+                self.provider_action_error = None;
                 Err(error)
             }
         }
@@ -462,10 +490,39 @@ impl SettingsState {
         let account = form.account.clone();
         let enabled = !form.enabled;
         if set_provider_enabled(self.config.as_ref(), &provider, &account, enabled).is_ok() {
+            self.provider_action_error = None;
+            self.provider_remove_confirming = None;
             self.reload();
             return true;
         }
         false
+    }
+
+    fn remove_provider(&mut self, index: usize) -> bool {
+        let Some(form) = self.provider_forms.get(index) else {
+            return false;
+        };
+        let provider = form.provider.clone();
+        let account = form.account.clone();
+        match remove_provider_account(self.config.as_ref(), &provider, &account) {
+            Ok(()) => {
+                if self
+                    .device_login
+                    .as_ref()
+                    .is_some_and(|login| login.provider == provider && login.account == account)
+                {
+                    self.device_login = None;
+                }
+                self.provider_action_error = None;
+                self.provider_remove_confirming = None;
+                self.reload();
+                true
+            }
+            Err(error) => {
+                self.provider_action_error = Some(error);
+                false
+            }
+        }
     }
 
     /// Write a provider text field (API key / model / base URL) at `index`. Like
@@ -492,6 +549,8 @@ impl SettingsState {
         match result {
             Ok(()) => {
                 self.field_errors.remove(&row);
+                self.provider_action_error = None;
+                self.provider_remove_confirming = None;
             }
             Err(error) => {
                 self.field_errors.insert(row, error);
@@ -1495,10 +1554,77 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
             on_change,
         ));
     }
+    body = body.with_child(provider_management_row(shared, reader, index, &form));
 
     FormSection::new(form.display_name.clone(), body)
         .header_action(enable_switch)
         .theme_when(clone_reader(reader))
+}
+
+fn provider_management_row(
+    shared: &Shared,
+    reader: &ThemeReader,
+    index: usize,
+    form: &ProviderForm,
+) -> FormRow {
+    let confirming = shared
+        .settings()
+        .provider_remove_confirming(&form.provider, &form.account);
+    let action_error = shared.settings().provider_action_error.clone();
+    if confirming {
+        let cancel = {
+            let s = shared.clone();
+            sui::Button::new("Cancel")
+                .icon(sui::IconGlyph::Close)
+                .theme_when(clone_reader(reader))
+                .on_press(move || s.settings_mut().cancel_provider_remove())
+        };
+        let remove = {
+            let s = shared.clone();
+            sui::Button::new("Remove account")
+                .icon(sui::IconGlyph::Trash)
+                .theme_when(clone_reader(reader))
+                .on_press(move || {
+                    let removed = { s.settings_mut().remove_provider(index) };
+                    if removed {
+                        refresh_chat_provider_summaries(&s);
+                    }
+                })
+        };
+        let controls = Stack::horizontal()
+            .spacing(8.0)
+            .alignment(Alignment::Start)
+            .with_child(cancel)
+            .with_child(remove);
+        let mut stack = Stack::vertical()
+            .spacing(6.0)
+            .alignment(Alignment::Start)
+            .with_child(muted_label(
+                shared,
+                "This removes the provider account from lm.providers.",
+            ))
+            .with_child(controls);
+        if let Some(error) = action_error {
+            stack = stack.with_child(Label::new(error).font_size(11.0).color_when({
+                let s = shared.clone();
+                move || palette(&s).accent
+            }));
+        }
+        FormRow::new("Management", stack)
+            .stacked()
+            .theme_when(clone_reader(reader))
+    } else {
+        let remove = {
+            let s = shared.clone();
+            sui::Button::new("Remove account")
+                .icon(sui::IconGlyph::Trash)
+                .theme_when(clone_reader(reader))
+                .on_press(move || s.settings_mut().confirm_provider_remove(index))
+        };
+        FormRow::new("Management", remove)
+            .inline()
+            .theme_when(clone_reader(reader))
+    }
 }
 
 fn section_providers(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -1527,6 +1653,8 @@ fn provider_section_signature(shared: &Shared) -> String {
         format!("add:{}", settings.provider_add_open),
         format!("add-provider:{}", settings.provider_add_provider_index),
         format!("error:{:?}", settings.provider_add_error),
+        format!("action-error:{:?}", settings.provider_action_error),
+        format!("remove:{:?}", settings.provider_remove_confirming),
     ];
     parts.extend(settings.provider_forms.iter().map(|form| {
         format!(
@@ -2949,6 +3077,40 @@ mod tests {
         let backend = Backend::local_fallback();
         let state = SettingsState::new(&backend);
         assert!(state.provider_add_api_key.is_empty());
+    }
+
+    #[test]
+    fn provider_remove_requires_confirmation_and_removes_account() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+        add_provider_account(
+            state.config.as_ref(),
+            "openai",
+            "work",
+            "sk-work",
+            "gpt-5",
+            "",
+        )
+        .expect("add provider account");
+        state.reload();
+        assert_eq!(state.provider_forms.len(), 1);
+        assert!(!state.provider_remove_confirming("openai", "work"));
+
+        state.confirm_provider_remove(0);
+        assert!(state.provider_remove_confirming("openai", "work"));
+
+        state.cancel_provider_remove();
+        assert!(!state.provider_remove_confirming("openai", "work"));
+
+        state.confirm_provider_remove(0);
+        assert!(state.remove_provider(0));
+        assert!(state.provider_forms.is_empty());
+        assert!(
+            crate::backend::config::load_provider_config(state.config.as_ref())
+                .expect("provider config")
+                .accounts
+                .is_empty()
+        );
     }
 
     fn test_config_item(key: &str, kind: ConfigEditKind, raw: &str) -> ConfigItem {

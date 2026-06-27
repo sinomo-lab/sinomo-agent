@@ -283,6 +283,57 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].account, "personal");
     }
+
+    #[test]
+    fn removing_one_provider_account_keeps_other_accounts_available() {
+        let (client, _root) = test_client("remove-one-account");
+        add_provider_account(&client, "openai", "work", "sk-work", "gpt-5", "")
+            .expect("add work account");
+        add_provider_account(
+            &client,
+            "openai",
+            "personal",
+            "sk-personal",
+            "gpt-5-mini",
+            "",
+        )
+        .expect("add personal account");
+
+        remove_provider_account(&client, "openai", "work").expect("remove work account");
+
+        let config = load_provider_config(&client).expect("provider config");
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(config.accounts[0].account, "personal");
+        assert_eq!(config.accounts[0].api_key.as_deref(), Some("sk-personal"));
+
+        let summaries = cluster_provider_summaries(&client);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].account, "personal");
+    }
+
+    #[test]
+    fn removing_default_provider_account_repairs_defaults() {
+        let (client, _root) = test_client("remove-default-account");
+        add_provider_account(&client, "openai", "work", "sk-work", "gpt-5", "")
+            .expect("add work account");
+        add_provider_account(
+            &client,
+            "deepseek",
+            "default",
+            "sk-deepseek",
+            "deepseek-v4-flash",
+            "",
+        )
+        .expect("add deepseek account");
+
+        remove_provider_account(&client, "openai", "work").expect("remove default account");
+
+        let config = load_provider_config(&client).expect("provider config");
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(config.default_provider.as_deref(), Some("deepseek"));
+        assert_eq!(config.default_account.as_deref(), Some("default"));
+        assert_eq!(config.default_model.as_deref(), Some("deepseek-v4-flash"));
+    }
 }
 
 /// Resolve the `lm.providers` config object into a `ModelConfig` via the client.
@@ -443,6 +494,75 @@ pub fn set_provider_enabled(
     update_provider_account(client, provider, account, |account| {
         account.enabled = enabled
     })
+}
+
+/// Remove a provider account from `lm.providers`.
+pub fn remove_provider_account(
+    client: &dyn ConfigClient,
+    provider: &str,
+    account: &str,
+) -> Result<(), String> {
+    let provider = normalize_configurable_provider(provider)?;
+    let account_name = normalize_provider_account_name(Some(account));
+    let mut config = load_provider_config(client).unwrap_or_default();
+    let before = config.accounts.len();
+    config.accounts.retain(|candidate| {
+        normalize_model_provider(&candidate.provider).as_deref() != Some(provider.as_str())
+            || normalize_provider_account_name(Some(&candidate.account)) != account_name
+    });
+    if config.accounts.len() == before {
+        return Err(format!(
+            "{} account {} was not found",
+            provider_display_name(&provider),
+            account_name
+        ));
+    }
+
+    repair_provider_defaults_after_removal(&mut config, &provider, &account_name);
+    write_provider_config(client, &config)
+}
+
+fn repair_provider_defaults_after_removal(
+    config: &mut ModelConfig,
+    removed_provider: &str,
+    removed_account: &str,
+) {
+    if config.accounts.is_empty() {
+        config.default_provider = None;
+        config.default_account = None;
+        config.default_model = None;
+        return;
+    }
+
+    let default_provider = config
+        .default_provider
+        .as_deref()
+        .and_then(normalize_model_provider);
+    let default_account = normalize_provider_account_name(config.default_account.as_deref());
+    let removed_default =
+        default_provider.as_deref() == Some(removed_provider) && default_account == removed_account;
+    let default_still_exists = default_provider.as_deref().is_some_and(|provider| {
+        config.accounts.iter().any(|account| {
+            normalize_model_provider(&account.provider).as_deref() == Some(provider)
+                && normalize_provider_account_name(Some(&account.account)) == default_account
+        })
+    });
+
+    if !removed_default && default_still_exists {
+        return;
+    }
+
+    let fallback = config
+        .accounts
+        .iter()
+        .find(|account| account.enabled)
+        .or_else(|| config.accounts.first())
+        .expect("non-empty accounts has a fallback");
+    config.default_provider = Some(
+        normalize_model_provider(&fallback.provider).unwrap_or_else(|| fallback.provider.clone()),
+    );
+    config.default_account = Some(normalize_provider_account_name(Some(&fallback.account)));
+    config.default_model = fallback.default_model.clone();
 }
 
 /// Set a provider's default model in `lm.providers` (empty clears it).
