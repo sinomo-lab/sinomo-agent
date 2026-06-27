@@ -18,9 +18,10 @@ use std::cell::Cell;
 
 use sui::{
     ArrangeCtx, Constraints, Event, EventCtx, EventPhase, FontWeight, Image, ImageFit, ImageHandle,
-    MeasureCtx, PaintCtx, Rect, SemanticsCtx, SemanticsNode, SemanticsRole, SingleChild, Size,
-    Spinner, SwitchView, TabBar, ThemeShadow, Widget, WidgetPod, WidgetPodMutVisitor,
-    WidgetPodVisitor, WindowEvent, WindowRenderOptions,
+    MeasureCtx, PaintCtx, PointerButton, PointerEventKind, Rect, SemanticsAction, SemanticsCtx,
+    SemanticsNode, SemanticsRole, SemanticsValue, SingleChild, Size, Spinner, SwitchView, TabBar,
+    ThemeShadow, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
+    WindowRenderOptions,
 };
 
 use crate::state::{Shared, Tab};
@@ -59,6 +60,8 @@ pub struct Shell {
     last_render_options: Cell<Option<WindowRenderOptions>>,
     bar_rect: Rect,
     tab_strip_rect: Rect,
+    status_pill_rect: Cell<Rect>,
+    status_pill_pressed: Cell<bool>,
     body_rect: Rect,
 }
 
@@ -93,6 +96,8 @@ impl Shell {
             last_render_options: Cell::new(None),
             bar_rect: Rect::ZERO,
             tab_strip_rect: Rect::ZERO,
+            status_pill_rect: Cell::new(Rect::ZERO),
+            status_pill_pressed: Cell::new(false),
             body_rect: Rect::ZERO,
         };
         // Built already-ready (headless tooling / visual tests) → show the tabs immediately. The
@@ -146,6 +151,14 @@ impl Shell {
         ctx.request_arrange();
         ctx.request_semantics();
         ctx.request_paint();
+    }
+
+    fn open_connection_settings(&self) {
+        let mut app = self.shared.borrow_mut();
+        app.active_tab = Tab::Settings;
+        if let Some(ready) = app.ready.as_mut() {
+            ready.settings.open(settings::SettingsSection::Connection);
+        }
     }
 }
 
@@ -232,6 +245,13 @@ impl Widget for Shell {
             ctx,
             Rect::new(spinner_x, spinner_y, SPINNER_SIZE, SPINNER_SIZE),
         );
+        let pill_h = 24.0;
+        self.status_pill_rect.set(Rect::new(
+            bounds.x() + bounds.width() - EDGE_PAD - status_pill_max_width(),
+            bounds.y() + (TOPBAR_HEIGHT - pill_h) / 2.0,
+            status_pill_max_width(),
+            pill_h,
+        ));
 
         let body_y = bounds.y() + TOPBAR_HEIGHT;
         let body_h = (bounds.height() - TOPBAR_HEIGHT).max(0.0);
@@ -294,6 +314,53 @@ impl Widget for Shell {
         if ctx.phase() != EventPhase::Target {
             return;
         }
+        match event {
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Down
+                    && pointer.button == Some(PointerButton::Primary)
+                    && self.shared.is_ready()
+                    && self.status_pill_rect.get().contains(pointer.position) =>
+            {
+                self.status_pill_pressed.set(true);
+                ctx.request_paint();
+                ctx.request_semantics();
+                ctx.request_pointer_capture(pointer.pointer_id);
+                ctx.set_handled();
+                return;
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Up
+                    && pointer.button == Some(PointerButton::Primary)
+                    && self.status_pill_pressed.get() =>
+            {
+                let activate = self.status_pill_rect.get().contains(pointer.position);
+                self.status_pill_pressed.set(false);
+                ctx.release_pointer_capture(pointer.pointer_id);
+                if activate {
+                    self.open_connection_settings();
+                    self.sync_active_tab(ctx);
+                }
+                ctx.request_measure();
+                ctx.request_arrange();
+                ctx.request_semantics();
+                ctx.request_paint();
+                ctx.set_handled();
+                return;
+            }
+            Event::Pointer(pointer)
+                if matches!(
+                    pointer.kind,
+                    PointerEventKind::Cancel | PointerEventKind::Leave
+                ) && self.status_pill_pressed.get() =>
+            {
+                self.status_pill_pressed.set(false);
+                ctx.request_paint();
+                ctx.request_semantics();
+                ctx.set_handled();
+                return;
+            }
+            _ => {}
+        }
         // The background connect thread wakes us via the sui external-wake mechanism; drain its
         // progress/result here. When the backend arrives, build the tab content and relayout.
         if let Event::Custom(custom) = event {
@@ -355,6 +422,31 @@ impl Widget for Shell {
         if !self.shared.is_ready() {
             self.spinner.semantics(ctx);
         }
+        let status = shell_status(&self.shared);
+        let ready = self.shared.is_ready();
+        let mut status_node = SemanticsNode::new(
+            sui::WidgetId::new(ctx.widget_id().get().wrapping_mul(31).wrapping_add(1_001)),
+            if ready {
+                SemanticsRole::Button
+            } else {
+                SemanticsRole::Text
+            },
+            self.status_pill_rect.get(),
+        );
+        status_node.name = Some(status.label);
+        status_node.description = Some(status.detail);
+        status_node.value = Some(SemanticsValue::Text(if status.degraded {
+            "degraded".to_string()
+        } else if ready {
+            "connected".to_string()
+        } else {
+            "connecting".to_string()
+        }));
+        if ready {
+            status_node.actions = vec![SemanticsAction::Activate];
+        }
+        status_node.state.selected = status.degraded;
+        ctx.push(status_node);
         if let Some(content) = &self.content {
             content.semantics(ctx);
         }
@@ -414,15 +506,11 @@ impl Shell {
         pal: &Palette,
         connecting: bool,
     ) {
-        let label = self.shared.status_text();
-        let connected_daemon = {
-            let state = self.shared.borrow();
-            state
-                .ready
-                .as_ref()
-                .is_some_and(|ready| ready.backend.connection.is_daemon())
-        };
-        let dot = if connected_daemon {
+        let status = shell_status(&self.shared);
+        let label = status.label;
+        let dot = if status.degraded {
+            pal.warn
+        } else if status.connected_daemon {
             pal.good
         } else {
             pal.accent
@@ -445,7 +533,26 @@ impl Shell {
         let pill_x = self.bar_rect.x() + self.bar_rect.width() - EDGE_PAD - pill_w;
         let pill_y = self.bar_rect.y() + (TOPBAR_HEIGHT - pill_h) / 2.0;
         let pill = Rect::new(pill_x, pill_y, pill_w, pill_h);
-        widgets::round_panel(ctx, pill, pal.field, pal.border, pill_h / 2.0);
+        self.status_pill_rect.set(pill);
+        let pressed = self.status_pill_pressed.get();
+        let bg = if pressed {
+            pal.hover
+        } else if status.degraded {
+            pal.field
+        } else {
+            pal.field
+        };
+        widgets::round_panel(
+            ctx,
+            pill,
+            bg,
+            if status.degraded {
+                pal.warn
+            } else {
+                pal.border
+            },
+            pill_h / 2.0,
+        );
 
         if connecting {
             widgets::draw_text_in(
@@ -506,6 +613,51 @@ fn brand_word_width() -> f32 {
     58.0
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellStatus {
+    label: String,
+    detail: String,
+    degraded: bool,
+    connected_daemon: bool,
+}
+
+fn shell_status(shared: &Shared) -> ShellStatus {
+    let state = shared.borrow();
+    let Some(ready) = state.ready.as_ref() else {
+        let status = state.status.clone();
+        return ShellStatus {
+            label: status.clone(),
+            detail: status,
+            degraded: false,
+            connected_daemon: false,
+        };
+    };
+
+    let mut issues = Vec::new();
+    if let Some(notice) = ready.chat.notice.as_deref().filter(|text| !text.is_empty()) {
+        issues.push(notice.to_string());
+    }
+    if let Some(error) = ready.files.error.as_deref().filter(|text| !text.is_empty()) {
+        issues.push(format!("SIFS unavailable: {error}"));
+    }
+
+    if issues.is_empty() {
+        ShellStatus {
+            label: ready.backend.mode_label(),
+            detail: ready.backend.status_detail(),
+            degraded: false,
+            connected_daemon: ready.backend.connection.is_daemon(),
+        }
+    } else {
+        ShellStatus {
+            label: "Needs attention".to_string(),
+            detail: issues.join(" · "),
+            degraded: true,
+            connected_daemon: ready.backend.connection.is_daemon(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,6 +686,51 @@ mod tests {
         window
             .get_by_role(SemanticsRole::Button)
             .with_name("Connection settings")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+        assert_eq!(
+            shared.settings().selected,
+            Some(SettingsSection::Connection)
+        );
+
+        let snapshot = window.snapshot()?;
+        let tab_bar = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::TabBar && node.name.as_deref() == Some("shell-tabs")
+            })
+            .expect("shell tab bar semantics");
+        assert_eq!(
+            tab_bar.value,
+            Some(sui::SemanticsValue::Text("Settings".to_string()))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn attention_status_pill_opens_connection_settings() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let mut state = AppState::ready(backend);
+        state.active_tab = Tab::Sinomo;
+        let shared = Shared::new(state);
+        {
+            let mut chat = shared.chat_mut();
+            chat.notice = Some("chat list failed: device authorization was denied".to_string());
+        }
+
+        assert_eq!(shell_status(&shared).label, "Needs attention");
+
+        let runtime = crate::build_runtime(shared.clone())?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Needs attention")
             .click()?;
 
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
