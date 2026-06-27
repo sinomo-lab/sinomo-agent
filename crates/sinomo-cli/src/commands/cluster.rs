@@ -2563,7 +2563,17 @@ pub(crate) fn refresh_cluster_kv_from_local_daemon(paths: &ClusterPaths) -> Resu
         return refresh_cluster_kv_from_reachable_voters(paths);
     };
     match daemon_fetch_cluster_kv_snapshot(&status.address, DAEMON_PROBE_TIMEOUT) {
-        Ok(snapshot) => write_imported_cluster_kv_snapshot(paths, &snapshot),
+        Ok(snapshot) => {
+            write_imported_cluster_kv_snapshot(paths, &snapshot)?;
+            if network::read_cluster_state(paths)
+                .map(|state| sinomo_runtime::kv::cluster_kv_raft_local_is_voter(&state))
+                .unwrap_or(false)
+            {
+                Ok(())
+            } else {
+                refresh_cluster_kv_from_reachable_voters(paths)
+            }
+        }
         Err(_) => refresh_cluster_kv_from_reachable_voters(paths),
     }
 }
