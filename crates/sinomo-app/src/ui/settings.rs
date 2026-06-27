@@ -990,7 +990,7 @@ fn connection_issue_summary(issue: &ConnectionIssue) -> &'static str {
 fn connection_issue_recovery_hint(issue: &ConnectionIssue) -> &'static str {
     match issue.tab {
         Tab::Sinomo if connection_issue_has_sifs_recovery(issue) => {
-            "Check SIFS if storage is denied, then return to chat."
+            "Inspect SIFS access from Files, then return to chat."
         }
         Tab::Sinomo => "Return to chat after credentials are fixed.",
         Tab::Files => "Return to Files after credentials or SIFS access is fixed.",
@@ -1332,7 +1332,7 @@ fn connection_attention_section(shared: &Shared, reader: &ThemeReader) -> impl W
     let description = if connection_issue_count(shared) == 0 {
         "User-facing chat and SIFS surfaces are currently reachable.".to_string()
     } else {
-        "These are visible app-layer issues. Connection to the daemon can still be healthy while a specific surface needs attention.".to_string()
+        "These are user-visible issues. The daemon can be connected while a chat or file surface still needs recovery.".to_string()
     };
     FormSection::new("Attention", body)
         .description(description)
@@ -4004,8 +4004,9 @@ mod tests {
         assert!(connection_issue_has_sifs_recovery(&issues[0]));
         assert_eq!(
             connection_issue_recovery_hint(&issues[0]),
-            "Check SIFS if storage is denied, then return to chat."
+            "Inspect SIFS access from Files, then return to chat."
         );
+        assert!(!connection_issue_recovery_hint(&issues[0]).contains("denied"));
     }
 
     #[test]
