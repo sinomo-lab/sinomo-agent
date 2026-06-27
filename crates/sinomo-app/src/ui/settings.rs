@@ -371,6 +371,10 @@ impl SettingsState {
         sinomo_cli::provider_uses_device_login(self.provider_add_provider())
     }
 
+    fn provider_add_can_submit(&self) -> bool {
+        self.provider_add_uses_device_login() || !self.provider_add_api_key.trim().is_empty()
+    }
+
     fn set_provider_add_provider(&mut self, index: usize) {
         if index >= CONFIGURABLE_PROVIDERS.len() {
             return;
@@ -2159,17 +2163,24 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
             "Device login after add",
         ));
     } else {
-        body = body.with_child(text_row(
-            reader,
-            "provider-add-api-key",
-            "API key",
-            "",
-            "Paste API key",
-            {
-                let s = shared.clone();
-                move |value| s.settings_mut().set_provider_add_api_key(value)
-            },
-        ));
+        body = body
+            .with_child(text_row(
+                reader,
+                "provider-add-api-key",
+                "API key",
+                "",
+                "Paste API key",
+                {
+                    let s = shared.clone();
+                    move |value| s.settings_mut().set_provider_add_api_key(value)
+                },
+            ))
+            .with_child(value_row(
+                shared,
+                reader,
+                "Requirement",
+                "API key required before adding.",
+            ));
     }
 
     body = body
@@ -2217,6 +2228,10 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
         sui::Button::new(add_label)
             .icon(sui::IconGlyph::Check)
             .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || s.settings().provider_add_can_submit()
+            })
             .on_press(move || {
                 let result = { s.settings_mut().add_provider_from_form() };
                 let Ok((provider, account, uses_device_login)) = result else {
@@ -3487,6 +3502,41 @@ mod tests {
     }
 
     #[test]
+    fn provider_add_requires_api_key_for_key_based_providers() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+        state.open_provider_add();
+        state.set_provider_add_provider(
+            CONFIGURABLE_PROVIDERS
+                .iter()
+                .position(|provider| !sinomo_cli::provider_uses_device_login(provider))
+                .expect("api-key provider"),
+        );
+
+        assert!(
+            !state.provider_add_can_submit(),
+            "API-key providers should not be addable with an empty credential"
+        );
+
+        state.set_provider_add_api_key("sk-test".to_string());
+        assert!(
+            state.provider_add_can_submit(),
+            "typing an API key should enable the add action"
+        );
+
+        state.set_provider_add_provider(
+            CONFIGURABLE_PROVIDERS
+                .iter()
+                .position(|provider| sinomo_cli::provider_uses_device_login(provider))
+                .expect("device-login provider"),
+        );
+        assert!(
+            state.provider_add_can_submit(),
+            "device-login providers collect credentials after the account is added"
+        );
+    }
+
+    #[test]
     fn provider_remove_requires_confirmation_and_removes_account() {
         let backend = Backend::local_fallback();
         let mut state = SettingsState::new(&backend);
@@ -3650,6 +3700,13 @@ mod tests {
         assert!(
             window.get_by_text("Add Anthropic").count()? >= 1,
             "Add provider should switch into the add form"
+        );
+        assert!(
+            window
+                .get_by_text("API key required before adding.")
+                .count()?
+                >= 1,
+            "API-key provider add form should explain why the primary action starts disabled"
         );
 
         Ok(())
