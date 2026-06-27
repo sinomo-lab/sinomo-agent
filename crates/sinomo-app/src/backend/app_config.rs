@@ -16,7 +16,7 @@ use crate::theme::AppThemeMode;
 pub struct AppUiConfig {
     #[serde(default)]
     pub theme: AppThemeMode,
-    #[serde(default)]
+    #[serde(default = "default_render_mode")]
     pub render_mode: AppRenderMode,
 }
 
@@ -24,8 +24,16 @@ impl Default for AppUiConfig {
     fn default() -> Self {
         Self {
             theme: AppThemeMode::System,
-            render_mode: AppRenderMode::Automatic,
+            render_mode: default_render_mode(),
         }
+    }
+}
+
+pub fn default_render_mode() -> AppRenderMode {
+    if cfg!(debug_assertions) {
+        AppRenderMode::ForceSdr
+    } else {
+        AppRenderMode::Automatic
     }
 }
 
@@ -116,6 +124,18 @@ mod tests {
 
         assert_eq!(load_ui_config(&data_dir), AppUiConfig::default());
         assert_eq!(load_theme(&data_dir), AppThemeMode::System);
+    }
+
+    #[test]
+    fn missing_ui_config_uses_debug_capture_render_default() {
+        let data_dir = temp_data_dir("missing-render");
+
+        assert_eq!(load_render_mode(&data_dir), default_render_mode());
+        if cfg!(debug_assertions) {
+            assert_eq!(load_render_mode(&data_dir), AppRenderMode::ForceSdr);
+        } else {
+            assert_eq!(load_render_mode(&data_dir), AppRenderMode::Automatic);
+        }
     }
 
     #[test]
