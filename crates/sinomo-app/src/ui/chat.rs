@@ -2732,6 +2732,51 @@ fn activity_status_summary(text: &str) -> String {
         .unwrap_or_else(|| activity_visible_detail(text))
 }
 
+fn count_label(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
+}
+
+fn activity_work_summary(chat: &ChatState) -> String {
+    let active = chat.streaming || chat.control.active_turn;
+    let tasks = chat.control.task_count.max(chat.control.tasks.len());
+    let tools = chat.tool_calls.len();
+    let queued = chat.control.steering_count + chat.control.follow_up_count;
+
+    if !active && tasks == 0 && tools == 0 && queued == 0 {
+        return "Idle · no queued work".to_string();
+    }
+
+    let mut parts = vec![if active { "Active" } else { "Idle" }.to_string()];
+    if tasks > 0 {
+        parts.push(count_label(tasks, "task", "tasks"));
+    }
+    if queued > 0 {
+        parts.push(count_label(queued, "queued turn", "queued turns"));
+    }
+    if tools > 0 {
+        parts.push(count_label(tools, "tool update", "tool updates"));
+    }
+    parts.join(" · ")
+}
+
+fn usage_summary(chat: &ChatState) -> Option<String> {
+    chat.usage.as_ref().map(|usage| {
+        let output = usage
+            .output_tokens
+            .map(format_token_count)
+            .unwrap_or_else(|| "?".to_string());
+        let input = usage
+            .input_tokens
+            .map(format_token_count)
+            .unwrap_or_else(|| "?".to_string());
+        format!("{input} in · {output} out")
+    })
+}
+
 fn transcript_message_display_text(message: &ChatMessage) -> String {
     if message.kind != ChatMessageKind::Error {
         return if message.text.is_empty() {
@@ -3950,41 +3995,23 @@ impl Widget for RuntimeOverview {
         };
         widgets::draw_text_in(ctx, Rect::new(x, top, title_w, 18.0), &runtime, title_style);
 
-        let usage = chat
-            .usage
-            .as_ref()
-            .map(|usage| {
-                let output = usage
-                    .output_tokens
-                    .map(format_token_count)
-                    .unwrap_or_else(|| "?".to_string());
-                let input = usage
-                    .input_tokens
-                    .map(format_token_count)
-                    .unwrap_or_else(|| "?".to_string());
-                format!("{input} in · {output} out")
-            })
-            .unwrap_or_else(|| "usage pending".to_string());
-        let monitor = format!(
-            "{} · {} tasks · {} queued",
-            if chat.streaming || chat.control.active_turn {
-                "active"
-            } else {
-                "idle"
-            },
-            chat.control.task_count,
-            chat.control.steering_count + chat.control.follow_up_count
-        );
+        let usage = usage_summary(&chat);
+        let monitor = activity_work_summary(&chat);
         let monitor = if matches!(health.tone, ActivityTone::Warn | ActivityTone::Bad) {
             let visible_detail = activity_status_summary(&health.detail);
             format!("{} · {monitor}", compact_line(&visible_detail, 42))
         } else {
             monitor
         };
+        let monitor = if let Some(usage) = usage {
+            format!("{monitor} · {usage}")
+        } else {
+            monitor
+        };
         widgets::draw_text_in(
             ctx,
             Rect::new(x, top + 20.0, title_w, 16.0),
-            &format!("{monitor} · {usage}"),
+            &monitor,
             meta_style,
         );
 
@@ -4527,19 +4554,7 @@ fn draw_activity_status_card(
         detail_style,
     );
 
-    let queued = chat.control.steering_count + chat.control.follow_up_count;
-    let active = if chat.streaming || chat.control.active_turn {
-        "active"
-    } else {
-        "idle"
-    };
-    let detail = format!(
-        "{} · {} tasks · {} tools · {} queued",
-        active,
-        chat.control.task_count.max(chat.control.tasks.len()),
-        chat.tool_calls.len(),
-        queued
-    );
+    let detail = activity_work_summary(chat);
     widgets::draw_text_in(
         ctx,
         Rect::new(rect.x() + 22.0, rect.y() + 55.0, rect.width() - 34.0, 15.0),
@@ -7504,6 +7519,48 @@ mod tests {
 
         let neutral = activity_status_summary("context assembled: 4.0 KB");
         assert_eq!(neutral, "context assembled: 4.0 KB");
+    }
+
+    #[test]
+    fn activity_work_summary_hides_zero_count_noise() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+
+        assert_eq!(activity_work_summary(&state), "Idle · no queued work");
+        assert_eq!(usage_summary(&state), None);
+
+        state.control.active_turn = true;
+        state.control.task_count = 2;
+        state.control.follow_up_count = 1;
+        state.tool_calls.push(ChatToolActivity {
+            step_index: 0,
+            call_index: Some(0),
+            call_id: Some("call-test".to_string()),
+            tool: "shell".to_string(),
+            input_preview: "cargo check".to_string(),
+            status: "running".to_string(),
+        });
+
+        assert_eq!(
+            activity_work_summary(&state),
+            "Active · 2 tasks · 1 queued turn · 1 tool update"
+        );
+    }
+
+    #[test]
+    fn usage_summary_only_renders_real_usage() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        assert_eq!(usage_summary(&state), None);
+
+        state.usage = Some(ChatUsageSnapshot {
+            provider: "DeepSeek".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+            input_tokens: Some(1200),
+            output_tokens: Some(42),
+        });
+
+        assert_eq!(usage_summary(&state), Some("1.2k in · 42 out".to_string()));
     }
 
     #[test]
