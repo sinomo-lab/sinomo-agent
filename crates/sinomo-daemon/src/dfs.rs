@@ -646,6 +646,14 @@ fn process_daemon_dfs_message_command_on_runtime(
     };
     let route_ms = route_started.elapsed().as_millis();
     let signature = route_snapshot.signature.clone();
+    if command.routed_message.target_node_id != signature.local_node_id {
+        return Err(sinomo_dfs::DfsError::Network {
+            message: format!(
+                "dfs message target {} does not match local node {}",
+                command.routed_message.target_node_id, signature.local_node_id
+            ),
+        });
+    }
     let endpoints = route_snapshot.endpoints.clone();
     let cache_select_started = Instant::now();
     let cache_lock_wait_started = Instant::now();
@@ -788,10 +796,11 @@ async fn handle_daemon_dfs_message_async(
     let should_publish_metadata = sinomo_dfs::dfs_events_should_publish_metadata(&events);
     if should_publish_metadata {
         notify_daemon_dfs_maintenance_work();
-        sinomo_dfs::schedule_cluster_dfs_metadata_publish_after_events_with_async_peer_transport_on_runtime(
+        sinomo_dfs::schedule_cluster_dfs_metadata_publish_after_events_with_peer_transports_on_runtime(
             runtime.clone(),
             data_dir,
             cluster_paths,
+            daemon_dfs_blocking_peer_transport_on_runtime(runtime),
             daemon_dfs_async_peer_transport(runtime),
             &events,
             daemon_dfs_metadata_publish_schedule_options(),
@@ -2939,9 +2948,19 @@ mod tests {
             .lock()
             .expect("primary service lock")
             .last_metadata_refresh;
-        assert_eq!(
-            first_refresh, second_refresh,
-            "endpoint-list refreshes should not rebuild the hydrated service cache"
+        assert!(
+            second_refresh >= first_refresh,
+            "namespace lookups should keep fresh metadata available after endpoint refreshes"
+        );
+        let second_primary_service = {
+            let cache = daemon_dfs_message_service_cache()
+                .lock()
+                .expect("cache lock");
+            Arc::clone(&cache.get(&cache_key).expect("cache entry").primary_service)
+        };
+        assert!(
+            Arc::ptr_eq(&primary_service, &second_primary_service),
+            "endpoint-list refreshes should reuse the hydrated service lane"
         );
     }
 
@@ -3452,16 +3471,8 @@ mod tests {
             "pk-local",
             now,
         );
-        let mut local_member = sinomo_core::ClusterMemberRecord::local_voter(
-            cluster_id,
-            local.clone(),
-            "local",
-            "pk-local",
-            now,
-        );
-        local_member.capabilities =
+        state.members[0].capabilities =
             sinomo_node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
-        state.members.push(local_member);
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
         sinomo_network::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
             .expect("sync raft");

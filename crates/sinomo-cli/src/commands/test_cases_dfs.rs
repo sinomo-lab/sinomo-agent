@@ -513,6 +513,7 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         if violations.is_empty() {
             ctx.record("object_count", metrics.object_count);
             ctx.record("repair_job_count", metrics.repair_job_count);
+            ctx.record("repair_attempt_count", metrics.repair_attempt_count);
             ctx.record("pending_write_count", metrics.pending_write_count);
             ctx.record(
                 "pending_metadata_replication_count",

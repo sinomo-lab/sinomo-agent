@@ -782,8 +782,8 @@ fn cluster_delivery_route_candidates(
     }
     candidates.sort_by_key(|candidate| {
         (
-            if candidate.complete { 0 } else { 1 },
             candidate.cost,
+            if candidate.complete { 0 } else { 1 },
             candidate.plan.next_hop.to_string(),
         )
     });
@@ -815,13 +815,8 @@ fn cluster_delivery_select_route_candidate(
     candidates
         .iter()
         .filter(|candidate| {
-            candidate.complete
-                && cluster_delivery_route_candidate_is_compatible(candidate, failed_edges, visited)
+            cluster_delivery_route_candidate_is_compatible(candidate, failed_edges, visited)
         })
-        .chain(candidates.iter().filter(|candidate| {
-            !candidate.complete
-                && cluster_delivery_route_candidate_is_compatible(candidate, failed_edges, visited)
-        }))
         .map(|candidate| candidate.plan.clone())
         .next()
 }
@@ -3271,7 +3266,7 @@ mod tests {
             .and_then(|member| member.endpoints.first())
             .cloned()
             .expect("bridge endpoint");
-        mark_local_endpoints_healthy(&paths, &state, &[bridge_endpoint]);
+        mark_local_endpoints_healthy(&paths, &state, std::slice::from_ref(&bridge_endpoint));
         let mut failed_edges = ClusterDeliveryFailedEdges::default();
         failed_edges
             .try_insert(&local, &target)
@@ -3285,12 +3280,12 @@ mod tests {
     }
 
     #[test]
-    fn delivery_plan_treats_far_direct_target_as_candidate() {
-        let (_root, paths) = test_paths("sinomo-network-delivery-plan-observed-bridge");
-        let cluster_id = cid("cluster_delivery_plan_observed_bridge");
-        let local = nid("node_delivery_plan_observed_local");
-        let bridge = nid("node_delivery_plan_observed_bridge");
-        let target = nid("node_delivery_plan_observed_target");
+    fn delivery_plan_prefers_healthy_near_bridge_over_far_direct_target() {
+        let (_root, paths) = test_paths("sinomo-network-delivery-plan-near-bridge");
+        let cluster_id = cid("cluster_delivery_plan_near_bridge");
+        let local = nid("node_delivery_plan_near_bridge_local");
+        let bridge = nid("node_delivery_plan_near_bridge_bridge");
+        let target = nid("node_delivery_plan_near_bridge_target");
         let mut state = test_state(cluster_id, local.clone());
         add_local_endpoint(&mut state, endpoint(&local, "172.25.0.9:21353", 0));
         let target_endpoint = endpoint(&target, "172.23.0.2:21353", 0);
@@ -3307,7 +3302,7 @@ mod tests {
             "bridge",
             vec![bridge_endpoint.clone()],
         );
-        mark_local_endpoints_healthy(&paths, &state, &[bridge_endpoint]);
+        mark_local_endpoints_healthy(&paths, &state, std::slice::from_ref(&bridge_endpoint));
 
         let plan = cluster_delivery_route_plan(
             &paths,
@@ -3319,14 +3314,14 @@ mod tests {
         )
         .expect("route plan");
 
-        assert_eq!(plan.next_hop, target);
+        assert_eq!(plan.next_hop, bridge);
         assert_eq!(plan.endpoints.len(), 1);
-        assert_eq!(plan.endpoints[0].address, target_endpoint.address);
+        assert_eq!(plan.endpoints[0].address, bridge_endpoint.address);
     }
 
     #[test]
-    fn delivery_plan_keeps_degraded_direct_target_as_candidate() {
-        let (_root, paths) = test_paths("sinomo-network-delivery-plan-degraded-target");
+    fn delivery_plan_prefers_healthy_bridge_over_degraded_direct_target() {
+        let (_root, paths) = test_paths("sinomo-network-delivery-plan-bridge-over-degraded");
         let cluster_id = cid("cluster_delivery_plan_degraded_target");
         let local = nid("node_delivery_plan_degraded_local");
         let bridge = nid("node_delivery_plan_degraded_bridge");
@@ -3359,7 +3354,7 @@ mod tests {
             std::slice::from_ref(&degraded_target_record),
         )
         .expect("write degraded target record");
-        mark_local_endpoints_healthy(&paths, &state, &[bridge_endpoint]);
+        mark_local_endpoints_healthy(&paths, &state, std::slice::from_ref(&bridge_endpoint));
 
         let plan = cluster_delivery_route_plan(
             &paths,
@@ -3371,9 +3366,9 @@ mod tests {
         )
         .expect("route plan");
 
-        assert_eq!(plan.next_hop, target);
+        assert_eq!(plan.next_hop, bridge);
         assert_eq!(plan.endpoints.len(), 1);
-        assert_eq!(plan.endpoints[0].address, target_endpoint.address);
+        assert_eq!(plan.endpoints[0].address, bridge_endpoint.address);
     }
 
     #[test]

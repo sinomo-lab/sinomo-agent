@@ -1,5 +1,6 @@
 use crate::{
-    ChunkedBlobAssembler, DFS_BLOB_CHUNK_BYTES, DfsError, DfsFileSystemId, DfsObjectId, DfsVersion,
+    ChunkedBlobAssembler, DFS_BLOB_CHUNK_BYTES, DfsError, DfsFileSystemId, DfsObjectId,
+    DfsObjectMetadata, DfsVersion,
 };
 use sinomo_node::NodeId;
 use std::collections::{BTreeMap, BTreeSet};
@@ -380,6 +381,7 @@ pub(crate) struct InProgressBlobTransfer {
     pub(crate) expected_base_version: Option<DfsVersion>,
     pub(crate) version: DfsVersion,
     pub(crate) content_hash: String,
+    pub(crate) object_metadata: Option<DfsObjectMetadata>,
     pub(crate) chunks: ChunkedTransferState,
 }
 
@@ -393,6 +395,7 @@ impl InProgressBlobTransfer {
         expected_base_version: Option<DfsVersion>,
         version: DfsVersion,
         content_hash: String,
+        object_metadata: Option<DfsObjectMetadata>,
         total_size_bytes: u64,
         total_chunks: u32,
         assembler: ChunkedBlobAssembler,
@@ -405,6 +408,7 @@ impl InProgressBlobTransfer {
             expected_base_version,
             version,
             content_hash,
+            object_metadata,
             chunks: ChunkedTransferState::new(
                 "chunked DFS blob transfer",
                 total_size_bytes,

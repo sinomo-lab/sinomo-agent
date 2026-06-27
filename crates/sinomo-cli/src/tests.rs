@@ -6389,6 +6389,7 @@ fn cluster_network_expiration_keeps_local_owned_records() {
         consecutive_failures: 3,
         last_success_at: None,
         last_failure_at: Some("2026-05-06T00:00:00Z".to_string()),
+        failure_reason: None,
         observed_at: expired,
         expires_at: expired,
     };
@@ -6507,6 +6508,7 @@ fn stable_connectivity_sync_does_not_rewrite_source_prefix() {
         consecutive_failures: 0,
         last_success_at: Some("2026-05-06T00:00:00Z".to_string()),
         last_failure_at: None,
+        failure_reason: None,
         observed_at: now - time::Duration::seconds(60),
         expires_at: now + time::Duration::seconds(120),
     };
@@ -11141,6 +11143,19 @@ fn rollout_cluster_targets_include_shadow_only_repair_route() {
     remote_shadow.endpoints.push(shadow_iroh.clone());
     state.members.push(remote_main);
     state.members.push(remote_shadow);
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(
+            cluster_endpoint_key(&remote_shadow_id, &shadow_iroh),
+            &shadow_iroh,
+            None,
+        )
+        .expect("shadow endpoint record");
+    sinomo_runtime::kv::write_cluster_kv_snapshot(
+        &paths.kv_paths(),
+        &store.snapshot().expect("snapshot"),
+    )
+    .expect("cluster kv snapshot");
 
     let targets = rollout_cluster_targets_from_state(&paths, &state, None);
 
@@ -11445,6 +11460,7 @@ fn rollout_target_uses_main_endpoint_when_shadow_is_unreachable() {
             consecutive_failures: 0,
             last_success_at: None,
             last_failure_at: None,
+            failure_reason: None,
             observed_at: now,
             expires_at: now + time::Duration::seconds(120),
         };
@@ -11603,6 +11619,7 @@ fn rollout_target_prefers_healthy_main_tcp_over_shadow_iroh_backup() {
                 consecutive_failures: 0,
                 last_success_at: Some("ok".to_string()),
                 last_failure_at: None,
+                failure_reason: None,
                 observed_at: now,
                 expires_at: now + time::Duration::seconds(120),
             },
