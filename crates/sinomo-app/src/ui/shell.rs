@@ -134,6 +134,19 @@ impl Shell {
         self.last_render_options.set(Some(options));
         ctx.request_paint();
     }
+
+    fn sync_active_tab(&mut self, ctx: &mut EventCtx) {
+        let current = self.shared.active_tab();
+        if current == self.last_tab.get() {
+            return;
+        }
+        self.last_tab.set(current);
+        self.tabs = WidgetPod::new(build_tab_bar(&self.shared));
+        ctx.request_measure();
+        ctx.request_arrange();
+        ctx.request_semantics();
+        ctx.request_paint();
+    }
 }
 
 /// Build the tab strip `TabBar`, bound to the active tab and writing the selection back to
@@ -150,9 +163,8 @@ fn build_tab_bar(shared: &Shared) -> TabBar {
     };
     TabBar::new("shell-tabs")
         .tabs(labels)
-        // NOTE: TabBar has no reactive `selected_when`; it caches the clicked tab internally and the
-        // Shell relayouts content via diff-on-redraw. Fine today (nothing switches tabs
-        // programmatically); a reactive TabBar selection would be a future sui enhancement.
+        // TabBar caches the selected index. Shell rebuilds this strip whenever `shared.active_tab`
+        // changes so programmatic navigation keeps the chrome and content in sync.
         .selected(shared.active_tab().index())
         .gap(TAB_GAP)
         .theme_when({
@@ -317,6 +329,7 @@ impl Widget for Shell {
                 if changed || device_changed || files_changed || chat_changed {
                     ctx.request_paint();
                 }
+                self.sync_active_tab(ctx);
                 self.sync_render_options(ctx);
             }
             return;
@@ -327,14 +340,7 @@ impl Widget for Shell {
         // the relayout (diff-on-redraw, mirroring how the old hand-painted `switch_to` relayouted,
         // and how the inner tab hosts catch nested switches).
         if matches!(event, Event::Window(WindowEvent::RedrawRequested)) {
-            let current = self.shared.active_tab();
-            if current != self.last_tab.get() {
-                self.last_tab.set(current);
-                ctx.request_measure();
-                ctx.request_arrange();
-                ctx.request_semantics();
-                ctx.request_paint();
-            }
+            self.sync_active_tab(ctx);
             self.sync_render_options(ctx);
         }
     }
@@ -498,4 +504,58 @@ fn status_pill_max_width() -> f32 {
 /// own natural width to the right of it).
 fn brand_word_width() -> f32 {
     58.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Backend;
+    use crate::state::AppState;
+    use crate::ui::settings::SettingsSection;
+
+    #[test]
+    fn programmatic_settings_navigation_updates_tab_bar_value() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let mut state = AppState::ready(backend);
+        state.active_tab = Tab::Files;
+        let shared = Shared::new(state);
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.error = Some("device authorization was denied".to_string());
+            files.entries.clear();
+        }
+
+        let runtime = crate::build_runtime(shared.clone())?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Connection settings")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+        assert_eq!(
+            shared.settings().selected,
+            Some(SettingsSection::Connection)
+        );
+
+        let snapshot = window.snapshot()?;
+        let tab_bar = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::TabBar && node.name.as_deref() == Some("shell-tabs")
+            })
+            .expect("shell tab bar semantics");
+        assert_eq!(
+            tab_bar.value,
+            Some(sui::SemanticsValue::Text("Settings".to_string()))
+        );
+
+        Ok(())
+    }
 }

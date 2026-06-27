@@ -39,8 +39,9 @@ use sinomo_cli::app_api::{SifsBrowser, SifsEntry};
 use sinomo_runtime::local::SinomoDataDir;
 
 use crate::backend::Backend;
-use crate::state::Shared;
+use crate::state::{Shared, Tab};
 use crate::theme::Palette;
+use crate::ui::settings::SettingsSection;
 use crate::ui::widgets;
 
 /// Below this content width the tab collapses to a list-only column (the inspector is hidden).
@@ -611,9 +612,17 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
         );
     }
     if let Some(error) = error {
+        let action = {
+            let s = shared.clone();
+            sui::Button::new("Connection settings")
+                .icon(IconGlyph::Alert)
+                .theme_when(clone_reader(reader))
+                .on_press(move || open_settings_section(&s, SettingsSection::Connection))
+        };
         return WidgetPod::new(
             centered_note(shared, "▤", "SIFS unavailable", format!("{error}"))
-                .glyph(IconGlyph::Storage),
+                .glyph(IconGlyph::Storage)
+                .action(action),
         );
     }
     if is_empty {
@@ -674,6 +683,14 @@ fn centered_note(
     subtitle: impl Into<String>,
 ) -> widgets::Placeholder {
     widgets::Placeholder::new(shared.clone(), mark, title, subtitle)
+}
+
+fn open_settings_section(shared: &Shared, section: SettingsSection) {
+    let mut app = shared.borrow_mut();
+    app.active_tab = Tab::Settings;
+    if let Some(ready) = app.ready.as_mut() {
+        ready.settings.open(section);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1379,6 +1396,7 @@ pub fn view(shared: Shared) -> impl Widget {
 mod tests {
     use super::*;
     use crate::backend::Backend;
+    use crate::state::AppState;
 
     #[test]
     fn crumbs_start_at_root_and_split_on_segments() {
@@ -1528,5 +1546,41 @@ mod tests {
             Some("/services".to_string())
         );
         assert_eq!(parent_path("/"), None);
+    }
+
+    #[test]
+    fn unavailable_placeholder_opens_connection_settings() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.error = Some("device authorization was denied".to_string());
+            files.entries.clear();
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files unavailable")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Connection settings")
+            .click()?;
+
+        assert_eq!(shared.borrow().active_tab, Tab::Settings);
+        assert_eq!(
+            shared.settings().selected,
+            Some(SettingsSection::Connection)
+        );
+
+        Ok(())
     }
 }

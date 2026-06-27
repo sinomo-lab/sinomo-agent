@@ -153,6 +153,7 @@ pub struct Placeholder {
     glyph: Option<IconGlyph>,
     title: String,
     subtitle: String,
+    action: Option<WidgetPod>,
 }
 
 impl Placeholder {
@@ -168,6 +169,7 @@ impl Placeholder {
             glyph: None,
             title: title.into(),
             subtitle: subtitle.into(),
+            action: None,
         }
     }
 
@@ -176,11 +178,32 @@ impl Placeholder {
         self.glyph = Some(glyph);
         self
     }
+
+    /// Add a compact centered action below the subtitle.
+    pub fn action<W>(mut self, action: W) -> Self
+    where
+        W: Widget + 'static,
+    {
+        self.action = Some(WidgetPod::new(action));
+        self
+    }
 }
 
 impl Widget for Placeholder {
-    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        if let Some(action) = &mut self.action {
+            action.measure(ctx, Constraints::tight(Size::new(220.0, 32.0)));
+        }
         constraints.max
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        if let Some(action) = &mut self.action {
+            let w = 220.0_f32.min((bounds.width() - 32.0).max(0.0));
+            let cx = bounds.x() + bounds.width() / 2.0;
+            let cy = bounds.y() + bounds.height() / 2.0 - 18.0;
+            action.arrange(ctx, Rect::new(cx - w / 2.0, cy + 54.0, w, 32.0));
+        }
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
@@ -190,7 +213,8 @@ impl Widget for Placeholder {
         ctx.fill_bounds(pal.window);
 
         let cx = bounds.x() + bounds.width() / 2.0;
-        let cy = bounds.y() + bounds.height() / 2.0;
+        let cy =
+            bounds.y() + bounds.height() / 2.0 - if self.action.is_some() { 18.0 } else { 0.0 };
 
         match self.glyph {
             Some(glyph) => {
@@ -214,6 +238,28 @@ impl Widget for Placeholder {
 
         let sub_style = pal.text_style(&theme, 13.0, sui::FontWeight::NORMAL, pal.text_faint);
         draw_centered(ctx, &self.subtitle, sub_style, cx, cy + 30.0);
+
+        if let Some(action) = &self.action {
+            action.paint(ctx);
+        }
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        if let Some(action) = &self.action {
+            action.semantics(ctx);
+        }
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        if let Some(action) = &self.action {
+            visitor.visit(action);
+        }
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        if let Some(action) = &mut self.action {
+            visitor.visit(action);
+        }
     }
 }
 
